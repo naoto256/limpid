@@ -1,0 +1,24 @@
+[Unit]
+Description=limpid Prometheus exporter
+Documentation=https://github.com/naoto256/limpid
+After=limpid.service
+Requires=limpid.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/limpid-prometheus
+ExecStart=/usr/bin/limpid-prometheus --bind ${LIMPID_PROMETHEUS_BIND} --socket ${LIMPID_PROMETHEUS_SOCKET}
+Restart=on-failure
+RestartSec=5
+
+# Run as same user as limpid (needs access to control socket)
+User=syslog
+Group=syslog
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

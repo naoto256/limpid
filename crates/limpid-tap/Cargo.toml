@@ -1,0 +1,9 @@
+[package]
+name = "limpid-tap"
+version = "0.1.0"
+edition = "2024"
+description = "Debug tool for tapping limpid output queues"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"

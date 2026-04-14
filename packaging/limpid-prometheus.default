@@ -1,0 +1,8 @@
+# Configuration for limpid-prometheus
+# This file is sourced by the systemd unit.
+
+# HTTP bind address
+LIMPID_PROMETHEUS_BIND=127.0.0.1:9100
+
+# limpid control socket path
+LIMPID_PROMETHEUS_SOCKET=/var/run/limpid/control.sock

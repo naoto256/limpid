@@ -1,0 +1,56 @@
+[package]
+name = "limpid"
+version = "0.1.0"
+edition = "2024"
+description = "Log pipelines, limpid as intent."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+pest = "2"
+pest_derive = "2"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+regex-lite = "0.1"
+glob = "0.3"
+libc = "0.2"
+async-trait = "0.1"
+maxminddb = "0.27"
+tokio-rustls = "0.26"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+flate2 = "1"
+sha2 = "0.10"
+sha1 = "0.10"
+md-5 = "0.10"
+digest = "0.10"
+systemd = { version = "0.10", optional = true }
+rdkafka = { version = "0.36", features = ["cmake-build"], optional = true }
+
+[features]
+journal = ["dep:systemd"]
+kafka = ["dep:rdkafka"]
+
+[dev-dependencies]
+tempfile = "3"
+
+[package.metadata.deb]
+maintainer = "Naoto Morishima"
+copyright = "2026, Naoto Morishima"
+extended-description = "A log pipeline daemon with a readable DSL. Replaces rsyslogd, syslog-ng, and fluentd."
+section = "admin"
+priority = "optional"
+assets = [
+    ["target/release/limpid", "usr/bin/", "755"],
+    ["target/release/limpid-tap", "usr/bin/", "755"],
+    ["../../packaging/limpid.conf.example", "usr/share/limpid/limpid.conf.example", "644"],
+    ["../../README.md", "usr/share/doc/limpid/README.md", "644"],
+]
+maintainer-scripts = "../../packaging"
+systemd-units = { unit-name = "limpid", unit-scripts = "../../packaging" }
