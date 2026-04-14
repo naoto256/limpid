@@ -1,0 +1,42 @@
+#!/bin/sh
+set -e
+
+# Create syslog user/group if not present (some distros already have it)
+if ! getent group syslog >/dev/null 2>&1; then
+    groupadd --system syslog
+fi
+if ! getent passwd syslog >/dev/null 2>&1; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin -g syslog syslog
+fi
+
+# Create directories with correct ownership
+mkdir -p /etc/limpid/inputs /etc/limpid/outputs /etc/limpid/processes /etc/limpid/pipelines
+mkdir -p /var/lib/limpid /var/log/limpid
+chown syslog:syslog /var/lib/limpid /var/log/limpid
+
+# Install example config if none exists
+if [ ! -f /etc/limpid/limpid.conf ]; then
+    cp /usr/share/limpid/limpid.conf.example /etc/limpid/limpid.conf
+fi
+
+# Warn if rsyslog/syslog-ng is running
+for svc in rsyslog syslog-ng td-agent fluentd; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        echo ""
+        echo "WARNING: $svc is currently running."
+        echo "  limpid cannot bind to syslog ports while $svc is active."
+        echo "  To switch: systemctl stop $svc && systemctl disable $svc"
+        echo ""
+    fi
+done
+
+# Enable and start limpid (don't start automatically on first install)
+systemctl daemon-reload
+systemctl enable limpid
+
+#DEBHELPER#
+
+echo ""
+echo "limpid installed. To start:"
+echo "  systemctl start limpid"
+echo ""

@@ -1,0 +1,278 @@
+// ============================================================================
+// limpid DSL grammar
+// ============================================================================
+
+// -- Top level ---------------------------------------------------------------
+
+config = { SOI ~ top_level_item* ~ EOI }
+
+top_level_item = {
+    definition
+  | include_directive
+  | global_block
+}
+
+// Include directive: `include "inputs/*.limpid"`
+include_directive = {
+    kw_include ~ string_lit
+}
+
+definition = {
+    def_input
+  | def_output
+  | def_process
+  | def_pipeline
+}
+
+// Global config block: `name { key value ... }` (no `def` keyword)
+global_block = {
+    !kw_def ~ !kw_include ~ ident ~ "{" ~ property* ~ "}"
+}
+
+// -- Comments & whitespace ---------------------------------------------------
+
+WHITESPACE = _{ " " | "\t" | NEWLINE | ";" }
+COMMENT    = _{ "//" ~ (!NEWLINE ~ ANY)* }
+
+// -- Keywords ----------------------------------------------------------------
+
+kw_def      = _{ "def" }
+kw_input    = _{ "input" }
+kw_output   = _{ "output" }
+kw_process  = _{ "process" }
+kw_pipeline = _{ "pipeline" }
+kw_if       = _{ "if" }
+kw_else     = _{ "else" }
+kw_switch   = _{ "switch" }
+kw_default  = _{ "default" }
+kw_try      = _{ "try" }
+kw_catch    = _{ "catch" }
+kw_drop     = _{ "drop" }
+kw_finish   = _{ "finish" }
+kw_foreach  = _{ "foreach" }
+kw_and      = _{ "and" }
+kw_or       = _{ "or" }
+kw_not      = _{ "not" }
+kw_true     = _{ "true" }
+kw_false    = _{ "false" }
+kw_null     = _{ "null" }
+kw_include  = _{ "include" }
+
+// Word boundary: keyword must not be followed by ident chars
+// We use pest's negative lookahead via the rules below
+// (Keywords are consumed as silent rules, so matching is handled in compound rules)
+
+// -- Identifiers -------------------------------------------------------------
+
+ident = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+
+// Dotted identifier path: `fields.src.country`
+ident_path = { ident ~ ("." ~ ident)* }
+
+// -- Literals ----------------------------------------------------------------
+
+string_lit  = @{ "\"" ~ string_inner ~ "\"" }
+string_inner = @{ (!"\"" ~ !"\\" ~ ANY | "\\" ~ ANY)* }
+
+integer_lit = @{ "-"? ~ ASCII_DIGIT+ }
+float_lit   = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+
+bool_lit = { kw_true | kw_false }
+null_lit = { kw_null }
+
+// -- Input definition --------------------------------------------------------
+
+def_input = {
+    kw_def ~ kw_input ~ ident ~ "{" ~ property* ~ "}"
+}
+
+// -- Output definition -------------------------------------------------------
+
+def_output = {
+    kw_def ~ kw_output ~ ident ~ "{" ~ property* ~ "}"
+}
+
+// -- Properties (key-value or nested block) ----------------------------------
+
+property = {
+    ident ~ "{" ~ property* ~ "}"       // nested block: `tls { ... }`
+  | ident ~ expr                         // key-value: `type syslog_udp`, `bind "0.0.0.0:514"`
+}
+
+// -- Process definition ------------------------------------------------------
+
+def_process = {
+    kw_def ~ kw_process ~ ident ~ "{" ~ process_stmt* ~ "}"
+}
+
+process_stmt = {
+    process_drop
+  | process_try_catch
+  | process_if
+  | process_switch
+  | process_foreach
+  | process_call
+  | process_assign
+  | process_expr_stmt
+}
+
+// Expression statement: allows calling side-effecting functions like table_upsert()
+// without assigning to a variable.
+process_expr_stmt = { func_call }
+
+process_drop = { kw_drop }
+
+process_try_catch = {
+    kw_try ~ try_body ~ kw_catch ~ catch_body
+}
+
+try_body   = { "{" ~ process_stmt* ~ "}" }
+catch_body = { "{" ~ process_stmt* ~ "}" }
+
+process_if = {
+    kw_if ~ expr ~ process_block
+    ~ (kw_else ~ kw_if ~ expr ~ process_block)*
+    ~ (kw_else ~ process_block)?
+}
+
+process_block = { "{" ~ process_stmt* ~ "}" }
+
+process_switch = {
+    kw_switch ~ expr ~ "{" ~ process_switch_arm* ~ "}"
+}
+
+process_switch_arm = {
+    kw_default ~ "{" ~ process_stmt* ~ "}"
+  | expr ~ "{" ~ process_stmt* ~ "}"
+}
+
+process_foreach = {
+    kw_foreach ~ expr ~ "{" ~ process_stmt* ~ "}"
+}
+
+process_call = {
+    kw_process ~ ident ~ ("(" ~ func_args ~ ")")?
+}
+
+process_assign = {
+    assign_target ~ "=" ~ expr
+}
+
+assign_target = {
+    ident_path
+}
+
+// -- Pipeline definition -----------------------------------------------------
+
+def_pipeline = {
+    kw_def ~ kw_pipeline ~ ident ~ "{" ~ pipeline_stmt* ~ "}"
+}
+
+pipeline_stmt = {
+    pipeline_drop
+  | pipeline_finish
+  | pipeline_input
+  | pipeline_process_chain
+  | pipeline_output
+  | pipeline_if
+  | pipeline_switch
+}
+
+pipeline_drop = { kw_drop }
+pipeline_finish = { kw_finish }
+
+pipeline_input = {
+    kw_input ~ ident
+}
+
+pipeline_output = {
+    kw_output ~ ident
+}
+
+// `process name1 | name2 | { ... }`
+pipeline_process_chain = {
+    kw_process ~ process_chain_element ~ ("|" ~ process_chain_element)*
+}
+
+process_chain_element = {
+    inline_process
+  | process_ref
+}
+
+// Named process reference with optional arguments
+process_ref = {
+    ident ~ ("(" ~ func_args ~ ")")?
+}
+
+// Inline (anonymous) process: `{ ... }`
+inline_process = {
+    "{" ~ process_stmt* ~ "}"
+}
+
+pipeline_if = {
+    kw_if ~ expr ~ pipeline_block
+    ~ (kw_else ~ kw_if ~ expr ~ pipeline_block)*
+    ~ (kw_else ~ pipeline_block)?
+}
+
+pipeline_block = { "{" ~ pipeline_stmt* ~ "}" }
+
+pipeline_switch = {
+    kw_switch ~ expr ~ "{" ~ pipeline_switch_arm* ~ "}"
+}
+
+pipeline_switch_arm = {
+    kw_default ~ "{" ~ pipeline_stmt* ~ "}"
+  | expr ~ "{" ~ pipeline_stmt* ~ "}"
+}
+
+// -- Expressions -------------------------------------------------------------
+
+// Precedence climbing: or < and < not < comparison < additive < multiplicative < unary < atom
+expr = { unary_expr ~ (bin_op ~ unary_expr)* }
+
+unary_expr = {
+    unary_op ~ unary_expr
+  | postfix_expr
+}
+
+// Postfix property access: `geoip(x).country`, `(expr).field`
+postfix_expr = { atom ~ ("." ~ ident)* }
+
+unary_op = { kw_not | "-" }
+
+bin_op = {
+    "==" | "!=" | "<=" | ">=" | "<" | ">"
+  | kw_and | kw_or
+  | "+" | "-" | "*" | "/" | "%"
+}
+
+atom = {
+    "(" ~ expr ~ ")"
+  | hash_lit
+  | func_call
+  | float_lit
+  | integer_lit
+  | string_lit
+  | bool_lit
+  | null_lit
+  | ident_path
+}
+
+func_call = {
+    ident ~ "(" ~ func_args ~ ")"
+}
+
+func_args = {
+    (expr ~ ("," ~ expr)*)?
+}
+
+hash_lit = {
+    "{" ~ (hash_entry ~ ("," ~ hash_entry)* ~ ","?)? ~ "}"
+}
+
+// Hash entries use newline-separation (no comma required) matching DSL examples
+// But we also allow comma separation for flexibility
+hash_entry = {
+    ident ~ ":" ~ expr
+}

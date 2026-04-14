@@ -1,0 +1,32 @@
+[Unit]
+Description=limpid log pipeline daemon
+Documentation=https://github.com/naoto256/limpid
+After=network.target
+Conflicts=rsyslog.service syslog-ng.service syslog.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/limpid --config /etc/limpid/limpid.conf
+ExecReload=/bin/kill -HUP $MAINPID
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=5
+
+# Run as dedicated user
+User=syslog
+Group=syslog
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+# Directories (systemd creates with correct ownership)
+RuntimeDirectory=limpid
+StateDirectory=limpid
+ConfigurationDirectory=limpid
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/limpid /var/run/limpid /var/log
+
+[Install]
+WantedBy=multi-user.target

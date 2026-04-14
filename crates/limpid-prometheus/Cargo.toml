@@ -1,0 +1,30 @@
+[package]
+name = "limpid-prometheus"
+version = "0.1.0"
+edition = "2024"
+description = "Prometheus exporter for limpid — converts control socket JSON to Prometheus text format"
+
+[[bin]]
+name = "limpid-prometheus"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+serde_json = "1"
+
+[package.metadata.deb]
+maintainer = "Naoto Morishima"
+copyright = "2026, Naoto Morishima"
+extended-description = "Prometheus exporter for limpid. Converts control socket JSON stats to Prometheus text exposition format."
+section = "admin"
+priority = "optional"
+depends = "limpid"
+assets = [
+    ["target/release/limpid-prometheus", "usr/bin/", "755"],
+    ["../../packaging/limpid-prometheus.default", "etc/default/limpid-prometheus", "644"],
+]
+systemd-units = { unit-name = "limpid-prometheus", unit-scripts = "../../packaging" }

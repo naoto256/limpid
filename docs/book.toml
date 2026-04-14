@@ -1,0 +1,8 @@
+[book]
+title = "limpid"
+description = "Log pipelines, limpid as intent."
+authors = ["Naoto Morishima"]
+language = "en"
+
+[output.html]
+git-repository-url = "https://github.com/naoto256/limpid"

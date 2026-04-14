@@ -1,0 +1,14 @@
+// /etc/limpid/limpid.conf — main configuration
+
+include "inputs/*.limpid"
+include "outputs/*.limpid"
+include "processes/*.limpid"
+include "pipelines/*.limpid"
+
+geoip {
+    database "/usr/share/GeoIP/GeoLite2-City.mmdb"
+}
+
+control {
+    socket "/var/run/limpid/control.sock"
+}
