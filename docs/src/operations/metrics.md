@@ -34,10 +34,10 @@ limpid tracks metrics at every level of the pipeline. Each component counts its 
 
 ```bash
 # Human-readable table
-sudo limpid-tap --stats
+sudo limpidctl stats
 
 # JSON (for scripting)
-sudo limpid-tap --stats --json
+sudo limpidctl stats --json
 ```
 
 ### HTTP (Prometheus)

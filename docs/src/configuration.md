@@ -81,7 +81,7 @@ Requires a [MaxMind GeoLite2 City database](https://dev.maxmind.com/geoip/geolit
 
 ### control
 
-Configures the Unix socket for `limpid-tap` and metrics.
+Configures the Unix socket for `limpidctl` and metrics.
 
 ```
 control {

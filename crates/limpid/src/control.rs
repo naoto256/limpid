@@ -1,14 +1,15 @@
-//! Control socket: Unix domain socket server for limpid-tap and
+//! Control socket: Unix domain socket server for limpidctl and
 //! other management tools.
 //!
 //! Protocol: line-based over Unix stream socket.
 //! All responses except `tap` are JSON.
 //!
 //! Commands:
-//!   health        — {"status":"ok","uptime_seconds":N}
-//!   stats         — pipeline/input/output metrics (JSON)
-//!   list          — pipeline structure with tap points (JSON)
-//!   tap <target>  — stream events (LF-delimited text)
+//!   health                      — {"status":"ok","uptime_seconds":N}
+//!   stats                       — pipeline/input/output metrics (JSON)
+//!   list                        — pipeline structure with tap points (JSON)
+//!   tap <kind> <name>           — stream event messages (LF-delimited text)
+//!   tap <kind> <name> json      — stream full Event JSON (one per line)
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -180,21 +181,29 @@ async fn handle_connection(
     let cmd = line.trim();
     debug!("control socket: received command: {}", cmd);
 
-    if let Some(tap_target) = cmd.strip_prefix("tap ") {
-        let tap_target = tap_target.trim();
-        // Validate format: "input <name>", "process <name>", or "output <name>"
-        let valid = tap_target.starts_with("input ")
-            || tap_target.starts_with("process ")
-            || tap_target.starts_with("output ");
-        if !valid {
-            let _ = writer
-                .write_all(b"error: expected 'tap input <name>', 'tap process <name>', or 'tap output <name>'\n")
-                .await;
-            return;
-        }
-        match tap.subscribe(tap_target).await {
+    if let Some(tap_args) = cmd.strip_prefix("tap ") {
+        let tap_args = tap_args.trim();
+        // Accept:
+        //   "<kind> <name>"        → raw message mode
+        //   "<kind> <name> json"   → full-Event JSON mode
+        let parts: Vec<&str> = tap_args.split_whitespace().collect();
+        let (tap_target, json_mode) = match parts.as_slice() {
+            [kind, name] if matches!(*kind, "input" | "process" | "output") => {
+                (format!("{} {}", kind, name), false)
+            }
+            [kind, name, "json"] if matches!(*kind, "input" | "process" | "output") => {
+                (format!("{} {}", kind, name), true)
+            }
+            _ => {
+                let _ = writer
+                    .write_all(b"error: expected 'tap <input|process|output> <name> [json]'\n")
+                    .await;
+                return;
+            }
+        };
+        match tap.subscribe(&tap_target).await {
             Some(subscription) => {
-                handle_tap(tap_target, subscription, &mut writer).await;
+                handle_tap(&tap_target, subscription, &mut writer, json_mode).await;
             }
             None => {
                 let _ = writer
@@ -328,22 +337,31 @@ async fn handle_tap(
     output_name: &str,
     mut subscription: crate::tap::TapSubscription,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
+    json_mode: bool,
 ) {
-    let _ = writer
-        .write_all(
-            format!(
-                "tapping '{}' — events will stream below\n",
-                output_name
+    // Skip the human-readable header in JSON mode so output is pure NDJSON
+    // (safe to pipe to `jq` or `limpidctl inject --json`).
+    if !json_mode {
+        let _ = writer
+            .write_all(
+                format!(
+                    "tapping '{}' — events will stream below\n",
+                    output_name
+                )
+                .as_bytes(),
             )
-            .as_bytes(),
-        )
-        .await;
+            .await;
+    }
 
     loop {
         match subscription.recv().await {
             Ok(event) => {
-                let msg = String::from_utf8_lossy(&event.message);
-                if writer.write_all(msg.as_bytes()).await.is_err() {
+                let line = if json_mode {
+                    event.to_json_string()
+                } else {
+                    String::from_utf8_lossy(&event.message).into_owned()
+                };
+                if writer.write_all(line.as_bytes()).await.is_err() {
                     break;
                 }
                 if writer.write_all(b"\n").await.is_err() {

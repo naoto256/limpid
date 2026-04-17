@@ -7,7 +7,7 @@ limpid uses [cargo-deb](https://github.com/kornelski/cargo-deb) to build `.deb` 
 ```bash
 cargo install cargo-deb
 
-# Main daemon (includes limpid-tap)
+# Main daemon (includes limpidctl)
 cargo deb -p limpid
 
 # Prometheus exporter
@@ -36,7 +36,7 @@ cargo deb -p limpid -- --features journal,kafka
 | Path | Description |
 |------|-------------|
 | `/usr/bin/limpid` | Daemon binary |
-| `/usr/bin/limpid-tap` | Debug tap CLI |
+| `/usr/bin/limpidctl` | Control and debug CLI |
 | `/usr/share/limpid/limpid.conf.example` | Example configuration |
 | `/usr/share/doc/limpid/README.md` | Documentation |
 | `/etc/systemd/system/limpid.service` | systemd unit file |

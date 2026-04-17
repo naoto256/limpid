@@ -48,7 +48,7 @@ section = "admin"
 priority = "optional"
 assets = [
     ["target/release/limpid", "usr/bin/", "755"],
-    ["target/release/limpid-tap", "usr/bin/", "755"],
+    ["target/release/limpidctl", "usr/bin/", "755"],
     ["../../packaging/limpid.conf.example", "usr/share/limpid/limpid.conf.example", "644"],
     ["../../README.md", "usr/share/doc/limpid/README.md", "644"],
 ]

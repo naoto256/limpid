@@ -43,28 +43,39 @@ limpid --debug --config /etc/limpid/limpid.conf
 
 All fields except `raw` are optional. `source` can be `ip:port` or just `ip`.
 
-## limpid-tap
+## limpidctl
 
 ```bash
 # Stream events from an output
-limpid-tap output ama
+limpidctl tap output ama
 
 # Stream events entering an input
-limpid-tap input fw_syslog
+limpidctl tap input fw_syslog
 
 # Stream events after a process
-limpid-tap process parse_cef
+limpidctl tap process parse_cef
+
+# Stream full Event JSON (one per line) — useful for piping to jq
+limpidctl tap output ama --json
 
 # List available tap points
-limpid-tap --list
+limpidctl list
+limpidctl list --json
 
 # Show metrics
-limpid-tap --stats
-limpid-tap --stats --json
+limpidctl stats
+limpidctl stats --json
 
 # Health check
-limpid-tap --health
+limpidctl health
+limpidctl health --json
 ```
+
+### Global options
+
+| Flag | Description |
+|------|-------------|
+| `--socket <path>` | Control socket path (default: `/var/run/limpid/control.sock`) |
 
 See [Debug Tap](./tap.md) for details.
 

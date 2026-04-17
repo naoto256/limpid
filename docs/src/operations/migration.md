@@ -63,7 +63,7 @@ sudo systemctl start limpid
 sudo systemctl status limpid
 
 # Verify
-sudo limpid-tap --stats
+sudo limpidctl stats
 ```
 
 ## Step 4: Verify
@@ -74,7 +74,7 @@ logger "migration test from limpid"
 
 # Check output
 tail /var/log/limpid/syslog.log
-sudo limpid-tap --stats
+sudo limpidctl stats
 ```
 
 ## Rollback
