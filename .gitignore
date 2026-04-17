@@ -3,3 +3,11 @@ CLAUDE.md
 DESIGN.md
 docs/book/
 HANDOVER.md
+
+# Secrets / credentials — never commit
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.crt

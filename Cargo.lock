@@ -834,7 +834,7 @@ dependencies = [
 
 [[package]]
 name = "limpid"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -867,7 +867,7 @@ dependencies = [
 
 [[package]]
 name = "limpid-prometheus"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "http-body-util",
@@ -879,7 +879,7 @@ dependencies = [
 
 [[package]]
 name = "limpidctl"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "serde_json",

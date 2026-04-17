@@ -130,6 +130,10 @@ fn json_to_prometheus(json: &str) -> Result<String, String> {
             &mut out, "limpid_input_events_invalid_total",
             "Total invalid events rejected by input.", "input", inputs, "events_invalid",
         );
+        write_counter(
+            &mut out, "limpid_input_events_injected_total",
+            "Total events injected into this input's channel via limpidctl inject.", "input", inputs, "events_injected",
+        );
     }
 
     if let Some(pipelines) = root.get("pipelines").and_then(|v| v.as_object()) {
@@ -152,6 +156,14 @@ fn json_to_prometheus(json: &str) -> Result<String, String> {
     }
 
     if let Some(outputs) = root.get("outputs").and_then(|v| v.as_object()) {
+        write_counter(
+            &mut out, "limpid_output_events_received_total",
+            "Total events that entered this output's queue (from pipelines + injects).", "output", outputs, "events_received",
+        );
+        write_counter(
+            &mut out, "limpid_output_events_injected_total",
+            "Total events injected into this output's queue via limpidctl inject.", "output", outputs, "events_injected",
+        );
         write_counter(
             &mut out, "limpid_output_events_written_total",
             "Total events successfully written by output.", "output", outputs, "events_written",

@@ -49,6 +49,48 @@ sudo limpidctl tap input syslog | grep -E '<[0-3]>'
 sudo limpidctl tap output siem --json | jq 'select(.severity <= 3)'
 ```
 
+## Inject
+
+`limpidctl inject` is the symmetric counterpart of `tap` — instead of reading events from a pipeline point, it pushes events into one.
+
+- `inject input <name>` — events are written to that input's event channel and flow through every pipeline referencing the input (bypassing the input module itself).
+- `inject output <name>` — events are pushed directly into the output's queue, bypassing pipelines entirely.
+
+Process injection is not supported: a process by itself has no pipeline context.
+
+```bash
+# Raw mode — each stdin line becomes one event's message bytes.
+# Source is set to 127.0.0.1:0 (same convention used by the `tail` and `journal` inputs).
+limpidctl inject input fw_syslog < raw.log
+limpidctl inject output ama < messages.log
+
+# JSON mode — each stdin line is a full Event object
+# (the same format emitted by `tap --json`). Invalid lines are
+# logged at warn level and skipped; the rest are still injected.
+limpidctl inject input fw_syslog --json < events.jsonl
+limpidctl inject output ama --json < events.jsonl
+```
+
+On success, `limpidctl inject` prints the number of events injected:
+
+```json
+{"injected": 1234}
+```
+
+### Replay with tap → inject
+
+Because `tap --json` and `inject --json` share the same Event JSON schema, you can record traffic from one daemon and replay it into another (or back into the same one):
+
+```bash
+# Capture 1000 events from a live input
+limpidctl tap input fw_syslog --json | head -n 1000 > replay.jsonl
+
+# Later, replay them into a staging daemon's equivalent input
+limpidctl --socket /run/limpid-staging.sock inject input fw_syslog --json < replay.jsonl
+```
+
+This is useful for reproducing parse failures, load-testing a new pipeline, or seeding a development daemon with realistic traffic.
+
 ## Metrics
 
 ```bash
@@ -62,18 +104,20 @@ sudo limpidctl stats --json
 Example output:
 
 ```
-Inputs:
-  syslog_tcp                    177 received         0 invalid
-  syslog_udp                    177 received         0 invalid
-
 Pipelines:
   forward                       177 received       171 finished         6 dropped         0 discarded
   archive                       177 received       166 finished        11 dropped         0 discarded
 
+Inputs:
+  syslog_tcp                    177 received         0 invalid         0 injected
+  syslog_udp                    177 received         0 invalid         5 injected
+
 Outputs:
-  siem                          171 written         0 failed         0 retries
-  fw02                          166 written         0 failed         0 retries
+  siem                          171 received         0 injected       171 written         0 failed         0 retries
+  fw02                          166 received         0 injected       166 written         0 failed         0 retries
 ```
+
+Inject counters make synthetic/replay traffic distinguishable from real receipts. See [Metrics](./metrics.md) for details.
 
 ## Control socket
 

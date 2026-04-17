@@ -4,6 +4,8 @@
 //!   limpidctl tap input <name> [--json]     Stream events from a named input
 //!   limpidctl tap process <name> [--json]   Stream events after a named process
 //!   limpidctl tap output <name> [--json]    Stream events from a named output
+//!   limpidctl inject input <name> [--json]  Inject stdin lines into a named input
+//!   limpidctl inject output <name> [--json] Inject stdin lines into a named output queue
 //!   limpidctl list [--json]                 List pipelines and tap points
 //!   limpidctl stats [--json]                Show pipeline/output metrics
 //!   limpidctl health [--json]               Check daemon health
@@ -51,6 +53,29 @@ enum Command {
     /// Check daemon health
     Health {
         /// Output raw JSON instead of formatted text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inject events into an input or output (reads from stdin, one per line)
+    Inject {
+        #[command(subcommand)]
+        kind: InjectKind,
+    },
+}
+
+#[derive(Subcommand)]
+enum InjectKind {
+    /// Push raw lines or full-Event JSON into a named input's channel
+    Input {
+        name: String,
+        /// Each stdin line is a full Event JSON (as emitted by `tap --json`)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Push raw lines or full-Event JSON directly into a named output's queue
+    Output {
+        name: String,
+        /// Each stdin line is a full Event JSON (as emitted by `tap --json`)
         #[arg(long)]
         json: bool,
     },
@@ -114,6 +139,18 @@ fn main() {
                 format_stats(&response);
             }
         }
+        Command::Inject { kind } => {
+            let (kind_str, name, json) = match kind {
+                InjectKind::Input { name, json } => ("input", name, json),
+                InjectKind::Output { name, json } => ("output", name, json),
+            };
+            let command = if json {
+                format!("inject {} {} json", kind_str, name)
+            } else {
+                format!("inject {} {}", kind_str, name)
+            };
+            run_inject(&cli.socket, &command);
+        }
         Command::Health { json } => {
             let response = query_command(&cli.socket, "health");
             if json {
@@ -138,6 +175,61 @@ fn run_tap(socket: &PathBuf, command: &str) {
             Err(_) => break,
         }
     }
+}
+
+fn run_inject(socket: &PathBuf, command: &str) {
+    let mut stream = connect(socket);
+    if let Err(e) = writeln!(stream, "{}", command) {
+        eprintln!("Failed to send command: {}", e);
+        std::process::exit(1);
+    }
+
+    // Copy stdin line-by-line to the socket.
+    let stdin = std::io::stdin();
+    let stdin_lock = stdin.lock();
+    let stdin_reader = BufReader::new(stdin_lock);
+    for line in stdin_reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Failed to read stdin: {}", e);
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = writeln!(stream, "{}", line) {
+            eprintln!("Failed to write to daemon: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    // Signal EOF to the daemon so it finalizes and sends the response.
+    if let Err(e) = stream.shutdown(std::net::Shutdown::Write) {
+        eprintln!("Failed to shut down write half: {}", e);
+        std::process::exit(1);
+    }
+
+    // Read single-line response.
+    let reader = BufReader::new(stream);
+    let mut response = String::new();
+    for line in reader.lines() {
+        match line {
+            Ok(text) => {
+                if !response.is_empty() {
+                    response.push('\n');
+                }
+                response.push_str(&text);
+            }
+            Err(_) => break,
+        }
+    }
+
+    let trimmed = response.trim();
+    if let Some(rest) = trimmed.strip_prefix("error:") {
+        eprintln!("error:{}", rest);
+        std::process::exit(1);
+    }
+
+    println!("{}", trimmed);
 }
 
 fn connect(socket: &PathBuf) -> UnixStream {
@@ -207,37 +299,41 @@ fn format_stats(json: &str) {
         Err(_) => { print!("{}", json); return; }
     };
 
-    if let Some(inputs) = v.get("inputs").and_then(|v| v.as_object()) {
-        let mut names: Vec<&String> = inputs.keys().collect();
-        names.sort();
-        if !names.is_empty() {
-            println!("Inputs:");
-            for name in &names {
-                let m = &inputs[*name];
-                println!(
-                    "  {:<24} {:>8} received  {:>8} invalid",
-                    name,
-                    m.get("events_received").and_then(|v| v.as_u64()).unwrap_or(0),
-                    m.get("events_invalid").and_then(|v| v.as_u64()).unwrap_or(0),
-                );
-            }
-        }
-    }
+    let get = |m: &serde_json::Value, k: &str| m.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
 
+    // Pipelines first — the main concept.
     if let Some(pipelines) = v.get("pipelines").and_then(|v| v.as_object()) {
         let mut names: Vec<&String> = pipelines.keys().collect();
         names.sort();
         if !names.is_empty() {
-            println!("\nPipelines:");
+            println!("Pipelines:");
             for name in &names {
                 let m = &pipelines[*name];
                 println!(
                     "  {:<24} {:>8} received  {:>8} finished  {:>8} dropped  {:>8} discarded",
                     name,
-                    m.get("events_received").and_then(|v| v.as_u64()).unwrap_or(0),
-                    m.get("events_finished").and_then(|v| v.as_u64()).unwrap_or(0),
-                    m.get("events_dropped").and_then(|v| v.as_u64()).unwrap_or(0),
-                    m.get("events_discarded").and_then(|v| v.as_u64()).unwrap_or(0),
+                    get(m, "events_received"),
+                    get(m, "events_finished"),
+                    get(m, "events_dropped"),
+                    get(m, "events_discarded"),
+                );
+            }
+        }
+    }
+
+    if let Some(inputs) = v.get("inputs").and_then(|v| v.as_object()) {
+        let mut names: Vec<&String> = inputs.keys().collect();
+        names.sort();
+        if !names.is_empty() {
+            println!("\nInputs:");
+            for name in &names {
+                let m = &inputs[*name];
+                println!(
+                    "  {:<24} {:>8} received  {:>8} invalid  {:>8} injected",
+                    name,
+                    get(m, "events_received"),
+                    get(m, "events_invalid"),
+                    get(m, "events_injected"),
                 );
             }
         }
@@ -251,11 +347,13 @@ fn format_stats(json: &str) {
             for name in &names {
                 let m = &outputs[*name];
                 println!(
-                    "  {:<24} {:>8} written  {:>8} failed  {:>8} retries",
+                    "  {:<24} {:>8} received  {:>8} injected  {:>8} written  {:>8} failed  {:>8} retries",
                     name,
-                    m.get("events_written").and_then(|v| v.as_u64()).unwrap_or(0),
-                    m.get("events_failed").and_then(|v| v.as_u64()).unwrap_or(0),
-                    m.get("retries").and_then(|v| v.as_u64()).unwrap_or(0),
+                    get(m, "events_received"),
+                    get(m, "events_injected"),
+                    get(m, "events_written"),
+                    get(m, "events_failed"),
+                    get(m, "retries"),
                 );
             }
         }

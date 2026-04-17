@@ -398,6 +398,9 @@ fn fold_by_precedence(operands: &mut Vec<Expr>, operators: &mut Vec<BinOp>) -> R
     if operands.len() == 1 {
         return Ok(operands.remove(0));
     }
+    if operators.is_empty() {
+        bail!("malformed expression: no operators for {} operands", operands.len());
+    }
 
     // Find lowest precedence operator (rightmost for left-associativity)
     let min_prec = operators.iter().map(precedence).min().unwrap();

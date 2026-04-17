@@ -85,8 +85,11 @@ pub enum OverflowStrategy {
 #[derive(Clone)]
 pub struct QueueSender {
     inner: SenderInner,
-    #[allow(dead_code)] // will be used for per-output metrics
+    #[allow(dead_code)]
     name: Arc<String>,
+    /// Optional metrics — if set, `send()` increments `events_received` on success.
+    /// Set by the runtime after the output module's metrics handle is available.
+    metrics: Option<Arc<crate::metrics::OutputMetrics>>,
 }
 
 #[derive(Clone)]
@@ -97,10 +100,27 @@ enum SenderInner {
 
 impl QueueSender {
     pub async fn send(&self, event: Event) -> bool {
-        match &self.inner {
+        let ok = match &self.inner {
             SenderInner::Memory(tx) => tx.send(event).await.is_ok(),
             SenderInner::Disk(tx) => tx.send(event).await,
+        };
+        if ok
+            && let Some(m) = &self.metrics
+        {
+            m.events_received
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        ok
+    }
+
+    /// Attach output metrics so subsequent `send()` calls count `events_received`.
+    pub fn attach_metrics(&mut self, metrics: Arc<crate::metrics::OutputMetrics>) {
+        self.metrics = Some(metrics);
+    }
+
+    /// Access the attached metrics (e.g. to increment `events_injected` on inject).
+    pub fn metrics(&self) -> Option<&Arc<crate::metrics::OutputMetrics>> {
+        self.metrics.as_ref()
     }
 }
 
@@ -142,6 +162,7 @@ pub fn create_queue(name: String, config: QueueConfig) -> anyhow::Result<(QueueS
                 QueueSender {
                     inner: SenderInner::Memory(tx),
                     name: Arc::clone(&name),
+                    metrics: None,
                 },
                 QueueReceiver {
                     inner: ReceiverInner::Memory(rx),
@@ -155,6 +176,7 @@ pub fn create_queue(name: String, config: QueueConfig) -> anyhow::Result<(QueueS
                 QueueSender {
                     inner: SenderInner::Disk(tx),
                     name: Arc::clone(&name),
+                    metrics: None,
                 },
                 QueueReceiver {
                     inner: ReceiverInner::Disk(rx),
