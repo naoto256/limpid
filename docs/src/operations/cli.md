@@ -58,6 +58,16 @@ limpidctl tap process parse_cef
 # Stream full Event JSON (one per line) — useful for piping to jq
 limpidctl tap output ama --json
 
+# Inject raw lines into an input (each stdin line becomes one event)
+limpidctl inject input fw_syslog < raw.log
+
+# Inject full-Event JSON (as emitted by `tap --json`) into an input
+limpidctl inject input fw_syslog --json < events.jsonl
+
+# Inject directly into an output queue, bypassing pipelines
+limpidctl inject output ama < messages.log
+limpidctl inject output ama --json < events.jsonl
+
 # List available tap points
 limpidctl list
 limpidctl list --json

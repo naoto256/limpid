@@ -59,8 +59,7 @@ impl Runtime {
         for (name, output_def) in &config.outputs {
             let queue_config = QueueConfig::from_output_properties(name, &output_def.properties)?;
             let retry_config = RetryConfig::from_output_properties(&output_def.properties)?;
-            let (sender, receiver) = queue::create_queue(name.clone(), queue_config)?;
-            output_senders.insert(name.clone(), sender);
+            let (mut sender, receiver) = queue::create_queue(name.clone(), queue_config)?;
 
             let output_type = props::get_ident(&output_def.properties, "type")
                 .ok_or_else(|| anyhow::anyhow!("output '{}' has no type", name))?;
@@ -73,6 +72,10 @@ impl Runtime {
                     return Err(e);
                 }
             };
+
+            // Attach metrics so QueueSender::send counts events_received.
+            sender.attach_metrics(Arc::clone(&created.metrics));
+            output_senders.insert(name.clone(), sender);
 
             // Collect metrics handle (output owns the data, we just hold a reference)
             let output_metrics = Arc::clone(&created.metrics);
@@ -127,6 +130,11 @@ impl Runtime {
         let compiled_config = config.clone();
         let config = Arc::new(config);
 
+        let mut input_senders: HashMap<
+            String,
+            (mpsc::Sender<Event>, Arc<crate::metrics::InputMetrics>),
+        > = HashMap::new();
+
         for (input_name, pipelines) in input_pipelines {
             let input_def = config
                 .inputs
@@ -152,6 +160,7 @@ impl Runtime {
             };
             let iname = input_name.clone();
             let shutdown_for_worker = shutdown_rx.clone();
+            let sender_for_inject = event_tx.clone();
             handles.push(tokio::spawn(async move {
                 run_pipeline_workers(event_rx, &workers, &ctx, &iname, shutdown_for_worker).await;
             }));
@@ -166,6 +175,10 @@ impl Runtime {
                     return Err(e);
                 }
             };
+            input_senders.insert(
+                input_name.clone(),
+                (sender_for_inject, Arc::clone(&created.metrics)),
+            );
             metrics_registry.register_input(&input_name, created.metrics);
             handles.push(created.handle);
         }
@@ -177,7 +190,15 @@ impl Runtime {
             .get("control")
             .and_then(|p| props::get_string(p, "socket"));
         let started_at = std::time::Instant::now();
-        let control = ControlServer::new(control_path, tap.clone(), Arc::clone(&metrics_registry), Arc::clone(&config), started_at);
+        let control = ControlServer::new(
+            control_path,
+            tap.clone(),
+            Arc::clone(&metrics_registry),
+            Arc::clone(&config),
+            input_senders,
+            Arc::clone(&output_senders),
+            started_at,
+        );
         let s = shutdown_rx.clone();
         handles.push(tokio::spawn(async move {
             control.run(s).await;

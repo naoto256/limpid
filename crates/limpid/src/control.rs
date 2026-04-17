@@ -10,19 +10,26 @@
 //!   list                        — pipeline structure with tap points (JSON)
 //!   tap <kind> <name>           — stream event messages (LF-delimited text)
 //!   tap <kind> <name> json      — stream full Event JSON (one per line)
+//!   inject <kind> <name>        — push raw lines (read to EOF, reply {"injected":N})
+//!   inject <kind> <name> json   — push full Event JSON lines (skip invalid lines)
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use bytes::Bytes;
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
+use tokio::sync::mpsc;
 use tracing::{info, warn, error, debug};
 
 use crate::dsl::ast::*;
+use crate::event::Event;
 use crate::metrics::MetricsRegistry;
 use crate::pipeline::CompiledConfig;
+use crate::queue::QueueSender;
 use crate::tap::TapRegistry;
 
 const DEFAULT_SOCKET_PATH: &str = "/var/run/limpid/control.sock";
@@ -30,11 +37,16 @@ const DEFAULT_SOCKET_PATH: &str = "/var/run/limpid/control.sock";
 /// Maximum command line length (bytes). Prevents OOM from malicious clients.
 const MAX_COMMAND_LEN: usize = 4096;
 
+/// Per-input inject target: event channel + metrics handle (for events_injected).
+pub type InputInjectTarget = (mpsc::Sender<Event>, Arc<crate::metrics::InputMetrics>);
+
 pub struct ControlServer {
     socket_path: PathBuf,
     tap: TapRegistry,
     metrics: Arc<MetricsRegistry>,
     config: Arc<CompiledConfig>,
+    input_senders: Arc<HashMap<String, InputInjectTarget>>,
+    output_senders: Arc<HashMap<String, QueueSender>>,
     started_at: Instant,
 }
 
@@ -44,6 +56,8 @@ impl ControlServer {
         tap: TapRegistry,
         metrics: Arc<MetricsRegistry>,
         config: Arc<CompiledConfig>,
+        input_senders: HashMap<String, InputInjectTarget>,
+        output_senders: Arc<HashMap<String, QueueSender>>,
         started_at: Instant,
     ) -> Self {
         Self {
@@ -53,6 +67,8 @@ impl ControlServer {
             tap,
             metrics,
             config,
+            input_senders: Arc::new(input_senders),
+            output_senders,
             started_at,
         }
     }
@@ -109,6 +125,8 @@ impl ControlServer {
         let config = self.config;
         let started_at = self.started_at;
         let metrics = self.metrics;
+        let input_senders = self.input_senders;
+        let output_senders = self.output_senders;
 
         let mut conn_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
@@ -134,8 +152,10 @@ impl ControlServer {
                             let tap = Arc::clone(&tap);
                             let metrics_reg = Arc::clone(&metrics);
                             let config = Arc::clone(&config);
+                            let input_senders = Arc::clone(&input_senders);
+                            let output_senders = Arc::clone(&output_senders);
                             conn_handles.push(tokio::spawn(async move {
-                                handle_connection(stream, tap, metrics_reg, config, started_at).await;
+                                handle_connection(stream, tap, metrics_reg, config, input_senders, output_senders, started_at).await;
                             }));
                         }
                         Err(e) => {
@@ -156,10 +176,13 @@ async fn handle_connection(
     tap: Arc<TapRegistry>,
     metrics: Arc<MetricsRegistry>,
     config: Arc<CompiledConfig>,
+    input_senders: Arc<HashMap<String, InputInjectTarget>>,
+    output_senders: Arc<HashMap<String, QueueSender>>,
     started_at: Instant,
 ) {
     let (reader, mut writer) = stream.into_split();
-    // Limit read to MAX_COMMAND_LEN bytes BEFORE buffering to prevent OOM
+    // Limit the FIRST line read to MAX_COMMAND_LEN bytes to prevent OOM,
+    // then unwrap for streaming commands (inject) that need unbounded reads.
     let limited = reader.take(MAX_COMMAND_LEN as u64);
     let mut reader = BufReader::new(limited);
 
@@ -180,6 +203,28 @@ async fn handle_connection(
 
     let cmd = line.trim();
     debug!("control socket: received command: {}", cmd);
+
+    if let Some(inject_args) = cmd.strip_prefix("inject ") {
+        let parts: Vec<&str> = inject_args.split_whitespace().collect();
+        let (kind, name, json_mode) = match parts.as_slice() {
+            [kind, name] if matches!(*kind, "input" | "output") => (*kind, (*name).to_string(), false),
+            [kind, name, "json"] if matches!(*kind, "input" | "output") => {
+                (*kind, (*name).to_string(), true)
+            }
+            _ => {
+                let _ = writer
+                    .write_all(b"error: expected 'inject <input|output> <name> [json]'\n")
+                    .await;
+                return;
+            }
+        };
+        // Lift the per-connection byte cap — inject streams can be large.
+        // Any bytes buffered past the first line remain intact inside
+        // the BufReader and will be consumed by handle_inject.
+        reader.get_mut().set_limit(u64::MAX);
+        handle_inject(kind, &name, json_mode, reader, &mut writer, &input_senders, &output_senders).await;
+        return;
+    }
 
     if let Some(tap_args) = cmd.strip_prefix("tap ") {
         let tap_args = tap_args.trim();
@@ -331,6 +376,114 @@ fn collect_pipeline_tap_points(
             PipelineStatement::Drop | PipelineStatement::Finish => {}
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_inject(
+    kind: &str,
+    name: &str,
+    json_mode: bool,
+    mut reader: BufReader<tokio::io::Take<tokio::net::unix::OwnedReadHalf>>,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    input_senders: &HashMap<String, InputInjectTarget>,
+    output_senders: &HashMap<String, QueueSender>,
+) {
+    enum Target {
+        Input(mpsc::Sender<Event>, Arc<crate::metrics::InputMetrics>),
+        Output(QueueSender),
+    }
+
+    let target = match kind {
+        "input" => match input_senders.get(name) {
+            Some((tx, metrics)) => Target::Input(tx.clone(), Arc::clone(metrics)),
+            None => {
+                let _ = writer
+                    .write_all(format!("error: unknown input '{}'\n", name).as_bytes())
+                    .await;
+                return;
+            }
+        },
+        "output" => match output_senders.get(name) {
+            Some(tx) => Target::Output(tx.clone()),
+            None => {
+                let _ = writer
+                    .write_all(format!("error: unknown output '{}'\n", name).as_bytes())
+                    .await;
+                return;
+            }
+        },
+        _ => {
+            let _ = writer
+                .write_all(b"error: inject kind must be 'input' or 'output'\n")
+                .await;
+            return;
+        }
+    };
+
+    let default_source: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut injected: u64 = 0;
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => {
+                debug!("control socket: inject read error: {}", e);
+                break;
+            }
+        }
+
+        // Strip trailing newline(s)
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let event = if json_mode {
+            match Event::from_json(trimmed) {
+                Some(ev) => ev,
+                None => {
+                    warn!("inject {} '{}': skipping invalid JSON line", kind, name);
+                    continue;
+                }
+            }
+        } else {
+            Event::new(Bytes::copy_from_slice(trimmed.as_bytes()), default_source)
+        };
+
+        let ok = match &target {
+            Target::Input(tx, metrics) => {
+                let sent = tx.send(event).await.is_ok();
+                if sent {
+                    metrics
+                        .events_injected
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                sent
+            }
+            Target::Output(tx) => {
+                let sent = tx.send(event).await;
+                if sent
+                    && let Some(m) = tx.metrics()
+                {
+                    m.events_injected
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                sent
+            }
+        };
+        if !ok {
+            warn!("inject {} '{}': downstream channel closed", kind, name);
+            break;
+        }
+        injected += 1;
+    }
+
+    let response = json!({ "injected": injected }).to_string();
+    let _ = writer.write_all(response.as_bytes()).await;
+    let _ = writer.write_all(b"\n").await;
 }
 
 async fn handle_tap(

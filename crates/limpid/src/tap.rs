@@ -75,6 +75,8 @@ impl TapRegistry {
         let map = self.inner.read().await;
         if let Some(channel) = map.get(key)
             && channel.subscriber_count.load(Ordering::Relaxed) > 0 {
+                // Best-effort: broadcast send fails when subscribers are lagged
+                // or have disconnected. Tap is debug-only; dropping is intentional.
                 let _ = channel.sender.send(Arc::new(event.clone()));
             }
     }
@@ -85,6 +87,7 @@ impl TapRegistry {
         if let Ok(map) = self.inner.try_read()
             && let Some(channel) = map.get(key)
                 && channel.subscriber_count.load(Ordering::Relaxed) > 0 {
+                    // Best-effort: see `emit` above.
                     let _ = channel.sender.send(Arc::new(event.clone()));
                 }
     }

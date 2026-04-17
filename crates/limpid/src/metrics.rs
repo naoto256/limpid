@@ -9,8 +9,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub struct InputMetrics {
+    /// Events actually received by the input module (network, socket, file, etc).
+    /// Injected events are NOT counted here — see `events_injected`.
     pub events_received: AtomicU64,
     pub events_invalid: AtomicU64,
+    /// Events pushed into this input's channel via `limpidctl inject`.
+    pub events_injected: AtomicU64,
 }
 
 impl Default for InputMetrics {
@@ -18,6 +22,7 @@ impl Default for InputMetrics {
         Self {
             events_received: AtomicU64::new(0),
             events_invalid: AtomicU64::new(0),
+            events_injected: AtomicU64::new(0),
         }
     }
 }
@@ -41,6 +46,11 @@ impl Default for PipelineMetrics {
 }
 
 pub struct OutputMetrics {
+    /// Total events that entered this output's queue (from pipelines + injects).
+    /// `events_received - events_injected` = events delivered via pipelines.
+    pub events_received: AtomicU64,
+    /// Events pushed into this output's queue via `limpidctl inject`.
+    pub events_injected: AtomicU64,
     pub events_written: AtomicU64,
     pub events_failed: AtomicU64,
     pub retries: AtomicU64,
@@ -49,6 +59,8 @@ pub struct OutputMetrics {
 impl Default for OutputMetrics {
     fn default() -> Self {
         Self {
+            events_received: AtomicU64::new(0),
+            events_injected: AtomicU64::new(0),
             events_written: AtomicU64::new(0),
             events_failed: AtomicU64::new(0),
             retries: AtomicU64::new(0),
@@ -90,15 +102,7 @@ impl MetricsRegistry {
     pub fn to_json(&self) -> String {
         let mut map = serde_json::Map::new();
 
-        let mut inputs = serde_json::Map::new();
-        for (name, m) in &self.inputs {
-            let mut i = serde_json::Map::new();
-            i.insert("events_received".into(), m.events_received.load(Ordering::Relaxed).into());
-            i.insert("events_invalid".into(), m.events_invalid.load(Ordering::Relaxed).into());
-            inputs.insert(name.clone(), serde_json::Value::Object(i));
-        }
-        map.insert("inputs".into(), serde_json::Value::Object(inputs));
-
+        // Pipelines first — they're the main concept.
         let mut pipelines = serde_json::Map::new();
         for (name, m) in &self.pipelines {
             let mut p = serde_json::Map::new();
@@ -110,9 +114,21 @@ impl MetricsRegistry {
         }
         map.insert("pipelines".into(), serde_json::Value::Object(pipelines));
 
+        let mut inputs = serde_json::Map::new();
+        for (name, m) in &self.inputs {
+            let mut i = serde_json::Map::new();
+            i.insert("events_received".into(), m.events_received.load(Ordering::Relaxed).into());
+            i.insert("events_invalid".into(), m.events_invalid.load(Ordering::Relaxed).into());
+            i.insert("events_injected".into(), m.events_injected.load(Ordering::Relaxed).into());
+            inputs.insert(name.clone(), serde_json::Value::Object(i));
+        }
+        map.insert("inputs".into(), serde_json::Value::Object(inputs));
+
         let mut outputs = serde_json::Map::new();
         for (name, m) in &self.outputs {
             let mut o = serde_json::Map::new();
+            o.insert("events_received".into(), m.events_received.load(Ordering::Relaxed).into());
+            o.insert("events_injected".into(), m.events_injected.load(Ordering::Relaxed).into());
             o.insert("events_written".into(), m.events_written.load(Ordering::Relaxed).into());
             o.insert("events_failed".into(), m.events_failed.load(Ordering::Relaxed).into());
             o.insert("retries".into(), m.retries.load(Ordering::Relaxed).into());
