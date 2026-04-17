@@ -8,10 +8,10 @@ git clone https://github.com/naoto256/limpid.git
 cd limpid
 
 # Build all binaries
-cargo build --release -p limpid -p limpid-tap -p limpid-prometheus
+cargo build --release -p limpid -p limpidctl -p limpid-prometheus
 
 # Binaries are in target/release/
-ls target/release/limpid target/release/limpid-tap target/release/limpid-prometheus
+ls target/release/limpid target/release/limpidctl target/release/limpid-prometheus
 ```
 
 ### Optional features
@@ -33,7 +33,7 @@ cargo build --release -p limpid --features journal,kafka
 ```bash
 cargo install cargo-deb
 
-# Main daemon (includes limpid-tap)
+# Main daemon (includes limpidctl)
 cargo deb -p limpid
 sudo dpkg -i target/debian/limpid_*.deb
 
@@ -120,8 +120,8 @@ tail /var/log/limpid/syslog.log
 
 ```bash
 # Real-time event stream
-sudo limpid-tap output archive
+sudo limpidctl tap output archive
 
 # Metrics
-sudo limpid-tap --stats
+sudo limpidctl stats
 ```

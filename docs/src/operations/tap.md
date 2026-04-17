@@ -1,52 +1,62 @@
 # Debug Tap
 
-`limpid-tap` lets you stream events from any point in the pipeline in real time, without restarting the daemon or modifying configuration.
+`limpidctl tap` lets you stream events from any point in the pipeline in real time, without restarting the daemon or modifying configuration.
 
 ## Usage
 
 ```bash
 # Stream events from an output queue
-sudo limpid-tap output ama
+sudo limpidctl tap output ama
 
 # Stream events entering an input
-sudo limpid-tap input splunk_udp
+sudo limpidctl tap input splunk_udp
 
 # Stream events after a named process
-sudo limpid-tap process parse_cef
+sudo limpidctl tap process parse_cef
 
 # List all available tap points
-sudo limpid-tap --list
+sudo limpidctl list
+```
+
+By default, tap emits each event's `message` bytes as a line of text. Add `--json` to emit the full Event (timestamp, source, facility, severity, raw, message, fields) as one JSON object per line:
+
+```bash
+# Full Event JSON, one per line — pipe to jq for inspection
+sudo limpidctl tap output ama --json | jq .
+
+# Extract just severity + message
+sudo limpidctl tap input splunk_udp --json | jq -r '[.severity, .message] | @tsv'
 ```
 
 ## How it works
 
-Tap points are registered for every input, process, and output. When you connect with `limpid-tap`, events are broadcast to your terminal via the control socket.
+Tap points are registered for every input, process, and output. When you connect with `limpidctl tap`, events are broadcast to your terminal via the control socket.
 
 **Zero overhead when not tapping** — the only cost is an atomic load (subscriber count check) per event per tap point. No events are cloned or serialized unless someone is actually listening.
 
 ## Filtering
 
-`limpid-tap` streams all events from the tap point. For filtering, pipe to standard Unix tools:
+`limpidctl tap` streams all events from the tap point. For filtering, pipe to standard Unix tools:
 
 ```bash
 # Only FortiGate events
-sudo limpid-tap output ama | grep Fortinet
+sudo limpidctl tap output ama | grep Fortinet
 
-# Only high-severity
-sudo limpid-tap input syslog | grep -E '<[0-3]>'
+# Only high-severity (raw PRI-prefixed text)
+sudo limpidctl tap input syslog | grep -E '<[0-3]>'
 
-# Parse as JSON
-sudo limpid-tap output siem | jq .
+# Structured filter via full-Event JSON
+sudo limpidctl tap output siem --json | jq 'select(.severity <= 3)'
 ```
 
 ## Metrics
 
 ```bash
 # Human-readable
-sudo limpid-tap --stats
+sudo limpidctl stats
 
 # JSON (for scripts)
-sudo limpid-tap --stats --json
+sudo limpidctl stats --json
 ```
 
 Example output:
@@ -67,8 +77,8 @@ Outputs:
 
 ## Control socket
 
-`limpid-tap` connects to the daemon's Unix control socket (default: `/var/run/limpid/control.sock`). Use `--socket` to specify a different path:
+`limpidctl` connects to the daemon's Unix control socket (default: `/var/run/limpid/control.sock`). Use `--socket` to specify a different path:
 
 ```bash
-limpid-tap --socket /custom/path/control.sock --stats
+limpidctl --socket /custom/path/control.sock stats
 ```

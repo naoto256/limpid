@@ -878,7 +878,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "limpid-tap"
+name = "limpidctl"
 version = "0.1.0"
 dependencies = [
  "clap",

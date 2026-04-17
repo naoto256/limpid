@@ -27,7 +27,7 @@ jobs:
         run: cargo install cargo-deb
 
       - name: Build release
-        run: cargo build --release -p limpid -p limpid-tap -p limpid-prometheus --features journal
+        run: cargo build --release -p limpid -p limpidctl -p limpid-prometheus --features journal
 
       - name: Build .deb packages
         run: |

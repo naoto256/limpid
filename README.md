@@ -14,7 +14,7 @@ A log pipeline daemon that replaces rsyslogd, syslog-ng, and fluentd with a sing
 ## Quick start
 
 ```bash
-cargo build --release -p limpid -p limpid-tap -p limpid-prometheus
+cargo build --release -p limpid -p limpidctl -p limpid-prometheus
 limpid --check --config /etc/limpid/limpid.conf
 limpid --config /etc/limpid/limpid.conf
 ```

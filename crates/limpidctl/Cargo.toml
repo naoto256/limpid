@@ -1,8 +1,12 @@
 [package]
-name = "limpid-tap"
+name = "limpidctl"
 version = "0.1.0"
 edition = "2024"
-description = "Debug tool for tapping limpid output queues"
+description = "Control and debug CLI for limpid"
+
+[[bin]]
+name = "limpidctl"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

@@ -1,101 +1,141 @@
-//! limpid-tap: debug tool for tapping into limpid event streams.
+//! limpidctl: control and debug CLI for limpid.
 //!
 //! Usage:
-//!   limpid-tap input <name>      Stream events from a named input
-//!   limpid-tap process <name>    Stream events after a named process
-//!   limpid-tap output <name>     Stream events from a named output
-//!   limpid-tap --list            List pipelines and tap points
-//!   limpid-tap --stats           Show pipeline/output metrics
-//!   limpid-tap --health          Check daemon health
+//!   limpidctl tap input <name> [--json]     Stream events from a named input
+//!   limpidctl tap process <name> [--json]   Stream events after a named process
+//!   limpidctl tap output <name> [--json]    Stream events from a named output
+//!   limpidctl list [--json]                 List pipelines and tap points
+//!   limpidctl stats [--json]                Show pipeline/output metrics
+//!   limpidctl health [--json]               Check daemon health
 //!
-//! Connects to limpid's control socket (default: /var/run/limpid/control.sock)
+//! Connects to limpid's control socket (default: /var/run/limpid/control.sock).
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 const DEFAULT_SOCKET: &str = "/var/run/limpid/control.sock";
 
 #[derive(Parser)]
-#[command(name = "limpid-tap", about = "Debug tool for tapping limpid event streams")]
+#[command(name = "limpidctl", about = "Control and debug CLI for limpid")]
 struct Cli {
-    /// Tap target: input/process/output followed by name
-    target: Vec<String>,
-
-    /// List pipelines and tap points
-    #[arg(long)]
-    list: bool,
-
-    /// Show pipeline/output metrics
-    #[arg(long)]
-    stats: bool,
-
-    /// Check daemon health
-    #[arg(long)]
-    health: bool,
-
-    /// Output raw JSON instead of formatted text
-    #[arg(long)]
-    json: bool,
-
     /// Control socket path
-    #[arg(long, default_value = DEFAULT_SOCKET)]
+    #[arg(long, global = true, default_value = DEFAULT_SOCKET)]
     socket: PathBuf,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Stream events from a tap point
+    Tap {
+        #[command(subcommand)]
+        kind: TapKind,
+    },
+    /// List pipelines and tap points
+    List {
+        /// Output raw JSON instead of formatted text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show pipeline/input/output metrics
+    Stats {
+        /// Output raw JSON instead of formatted text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check daemon health
+    Health {
+        /// Output raw JSON instead of formatted text
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum TapKind {
+    /// Stream events entering a named input
+    Input {
+        name: String,
+        /// Stream full Event as JSON (one per line) instead of raw message
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stream events after a named process
+    Process {
+        name: String,
+        /// Stream full Event as JSON (one per line) instead of raw message
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stream events from a named output
+    Output {
+        name: String,
+        /// Stream full Event as JSON (one per line) instead of raw message
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
 
-    let command = if cli.health {
-        "health".to_string()
-    } else if cli.list {
-        "list".to_string()
-    } else if cli.stats {
-        "stats".to_string()
-    } else if cli.target.len() == 2 {
-        let kind = &cli.target[0];
-        let name = &cli.target[1];
-        match kind.as_str() {
-            "input" | "process" | "output" => format!("tap {} {}", kind, name),
-            _ => {
-                eprintln!("Unknown tap type '{}'. Use: input, process, or output", kind);
-                std::process::exit(1);
+    match cli.command {
+        Command::Tap { kind } => {
+            let (kind_str, name, json) = match kind {
+                TapKind::Input { name, json } => ("input", name, json),
+                TapKind::Process { name, json } => ("process", name, json),
+                TapKind::Output { name, json } => ("output", name, json),
+            };
+            let command = if json {
+                format!("tap {} {} json", kind_str, name)
+            } else {
+                format!("tap {} {}", kind_str, name)
+            };
+            run_tap(&cli.socket, &command);
+        }
+        Command::List { json } => {
+            let response = query_command(&cli.socket, "list");
+            if json {
+                print!("{}", response);
+            } else {
+                format_list(&response);
             }
         }
-    } else {
-        eprintln!("Usage: limpid-tap <input|process|output> <name>");
-        eprintln!("       limpid-tap --list | --stats | --health");
+        Command::Stats { json } => {
+            let response = query_command(&cli.socket, "stats");
+            if json {
+                print!("{}", response);
+            } else {
+                format_stats(&response);
+            }
+        }
+        Command::Health { json } => {
+            let response = query_command(&cli.socket, "health");
+            if json {
+                print!("{}", response);
+            } else {
+                format_health(&response);
+            }
+        }
+    }
+}
+
+fn run_tap(socket: &PathBuf, command: &str) {
+    let mut stream = connect(socket);
+    if let Err(e) = writeln!(stream, "{}", command) {
+        eprintln!("Failed to send command: {}", e);
         std::process::exit(1);
-    };
-
-    // Tap commands stream indefinitely — don't use query_command
-    let is_tap = command.starts_with("tap ");
-    if is_tap {
-        let mut stream = connect(&cli.socket);
-        if let Err(e) = writeln!(stream, "{}", command) {
-            eprintln!("Failed to send command: {}", e);
-            std::process::exit(1);
-        }
-        let reader = BufReader::new(stream);
-        for line in reader.lines() {
-            match line {
-                Ok(text) => println!("{}", text),
-                Err(_) => break,
-            }
-        }
-    } else {
-        let response = query_command(&cli.socket, &command);
-
-        if cli.json {
-            println!("{}", response);
-        } else if cli.health {
-            format_health(&response);
-        } else if cli.stats {
-            format_stats(&response);
-        } else if cli.list {
-            format_list(&response);
+    }
+    let reader = BufReader::new(stream);
+    for line in reader.lines() {
+        match line {
+            Ok(text) => println!("{}", text),
+            Err(_) => break,
         }
     }
 }
