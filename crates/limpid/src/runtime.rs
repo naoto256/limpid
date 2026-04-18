@@ -269,7 +269,7 @@ fn init_geoip(config: &CompiledConfig) {
     crate::functions::geoip::init(db_path.as_ref());
 }
 
-fn init_tables(config: &CompiledConfig) -> Result<crate::functions::table::TableStore> {
+pub(crate) fn init_tables(config: &CompiledConfig) -> Result<crate::functions::table::TableStore> {
     use crate::dsl::ast::Property;
     use crate::functions::table::{TableConfig, TableStore};
     use std::time::Duration;
