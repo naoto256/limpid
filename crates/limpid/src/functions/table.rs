@@ -156,12 +156,6 @@ pub struct TableStore {
 }
 
 impl TableStore {
-    pub fn new() -> Self {
-        Self {
-            tables: Arc::new(HashMap::new()),
-        }
-    }
-
     /// Build a TableStore from table configurations. Called once at startup.
     pub fn from_configs(configs: Vec<TableConfig>) -> Result<Self> {
         let mut tables = HashMap::new();

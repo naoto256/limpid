@@ -23,7 +23,7 @@ mod tests {
 
     fn make_funcs() -> FunctionRegistry {
         let mut reg = FunctionRegistry::new();
-        let table_store = crate::functions::table::TableStore::new();
+        let table_store = crate::functions::table::TableStore::from_configs(vec![]).unwrap();
         crate::functions::register_builtins(&mut reg, table_store);
         reg
     }

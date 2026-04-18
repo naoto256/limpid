@@ -187,8 +187,7 @@ fn run_test(config_path: &str, pipeline_name: &str, input_json: Option<&str>) ->
             compiled.pipelines.keys().cloned().collect::<Vec<_>>().join(", ")
         ))?;
 
-    let table_store = functions::table::TableStore::new();
-    // TODO: parse table blocks from compiled config for --test mode
+    let table_store = runtime::init_tables(&compiled)?;
     let mut func_registry = FunctionRegistry::new();
     functions::register_builtins(&mut func_registry, table_store);
     let mut registry = crate::modules::ModuleRegistry::new();
