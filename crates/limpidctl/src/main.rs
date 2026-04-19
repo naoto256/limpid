@@ -15,7 +15,9 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 
 const DEFAULT_SOCKET: &str = "/var/run/limpid/control.sock";
@@ -71,6 +73,11 @@ enum InjectKind {
         /// Each stdin line is a full Event JSON (as emitted by `tap --json`)
         #[arg(long)]
         json: bool,
+        /// Replay events at their original timing using each event's `timestamp` field.
+        /// Accepts `realtime` (= `1x`) or a factor like `10x` / `0.2x`.
+        /// Defaults to `1x` when given without a value. Requires `--json`.
+        #[arg(long, value_name = "FACTOR", num_args = 0..=1, default_missing_value = "1x")]
+        replay_timing: Option<String>,
     },
     /// Push raw lines or full-Event JSON directly into a named output's queue
     Output {
@@ -78,6 +85,11 @@ enum InjectKind {
         /// Each stdin line is a full Event JSON (as emitted by `tap --json`)
         #[arg(long)]
         json: bool,
+        /// Replay events at their original timing using each event's `timestamp` field.
+        /// Accepts `realtime` (= `1x`) or a factor like `10x` / `0.2x`.
+        /// Defaults to `1x` when given without a value. Requires `--json`.
+        #[arg(long, value_name = "FACTOR", num_args = 0..=1, default_missing_value = "1x")]
+        replay_timing: Option<String>,
     },
 }
 
@@ -140,16 +152,42 @@ fn main() {
             }
         }
         Command::Inject { kind } => {
-            let (kind_str, name, json) = match kind {
-                InjectKind::Input { name, json } => ("input", name, json),
-                InjectKind::Output { name, json } => ("output", name, json),
+            let (kind_str, name, json, replay_timing) = match kind {
+                InjectKind::Input {
+                    name,
+                    json,
+                    replay_timing,
+                } => ("input", name, json, replay_timing),
+                InjectKind::Output {
+                    name,
+                    json,
+                    replay_timing,
+                } => ("output", name, json, replay_timing),
+            };
+            let replay = match replay_timing {
+                None => None,
+                Some(spec) => {
+                    if !json {
+                        eprintln!(
+                            "error: --replay-timing requires --json (raw line mode has no timestamps)"
+                        );
+                        std::process::exit(2);
+                    }
+                    match parse_replay_factor(&spec) {
+                        Ok(f) => Some(f),
+                        Err(e) => {
+                            eprintln!("error: invalid --replay-timing value {:?}: {}", spec, e);
+                            std::process::exit(2);
+                        }
+                    }
+                }
             };
             let command = if json {
                 format!("inject {} {} json", kind_str, name)
             } else {
                 format!("inject {} {}", kind_str, name)
             };
-            run_inject(&cli.socket, &command);
+            run_inject(&cli.socket, &command, replay);
         }
         Command::Health { json } => {
             let response = query_command(&cli.socket, "health");
@@ -177,17 +215,21 @@ fn run_tap(socket: &PathBuf, command: &str) {
     }
 }
 
-fn run_inject(socket: &PathBuf, command: &str) {
+fn run_inject(socket: &PathBuf, command: &str, replay: Option<f64>) {
     let mut stream = connect(socket);
     if let Err(e) = writeln!(stream, "{}", command) {
         eprintln!("Failed to send command: {}", e);
         std::process::exit(1);
     }
 
-    // Copy stdin line-by-line to the socket.
+    // Copy stdin line-by-line to the socket. When `replay` is set, gate each
+    // line on the event's `timestamp` field so the daemon receives events at
+    // their original (or scaled) cadence.
     let stdin = std::io::stdin();
     let stdin_lock = stdin.lock();
     let stdin_reader = BufReader::new(stdin_lock);
+    let mut replay_state: Option<ReplayState> = replay.map(ReplayState::new);
+
     for line in stdin_reader.lines() {
         let line = match line {
             Ok(l) => l,
@@ -196,6 +238,19 @@ fn run_inject(socket: &PathBuf, command: &str) {
                 std::process::exit(1);
             }
         };
+        // Skip blank lines without disturbing replay state — they carry no event.
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(state) = replay_state.as_mut() {
+            match extract_timestamp(&line) {
+                Ok(ts) => state.wait_for(ts),
+                Err(e) => {
+                    eprintln!("error: --replay-timing: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
         if let Err(e) = writeln!(stream, "{}", line) {
             eprintln!("Failed to write to daemon: {}", e);
             std::process::exit(1);
@@ -268,12 +323,25 @@ fn query_command(socket: &PathBuf, command: &str) -> String {
 fn format_health(json: &str) {
     let v: serde_json::Value = match serde_json::from_str(json) {
         Ok(v) => v,
-        Err(_) => { print!("{}", json); return; }
+        Err(_) => {
+            print!("{}", json);
+            return;
+        }
     };
 
-    let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("unknown");
-    let uptime = v.get("uptime_seconds").and_then(|u| u.as_u64()).unwrap_or(0);
-    println!("{} (uptime: {})", status.to_uppercase(), format_duration(uptime));
+    let status = v
+        .get("status")
+        .and_then(|s| s.as_str())
+        .unwrap_or("unknown");
+    let uptime = v
+        .get("uptime_seconds")
+        .and_then(|u| u.as_u64())
+        .unwrap_or(0);
+    println!(
+        "{} (uptime: {})",
+        status.to_uppercase(),
+        format_duration(uptime)
+    );
 }
 
 fn format_duration(secs: u64) -> String {
@@ -296,7 +364,10 @@ fn format_duration(secs: u64) -> String {
 fn format_stats(json: &str) {
     let v: serde_json::Value = match serde_json::from_str(json) {
         Ok(v) => v,
-        Err(_) => { print!("{}", json); return; }
+        Err(_) => {
+            print!("{}", json);
+            return;
+        }
     };
 
     let get = |m: &serde_json::Value, k: &str| m.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
@@ -363,7 +434,10 @@ fn format_stats(json: &str) {
 fn format_list(json: &str) {
     let v: serde_json::Value = match serde_json::from_str(json) {
         Ok(v) => v,
-        Err(_) => { print!("{}", json); return; }
+        Err(_) => {
+            print!("{}", json);
+            return;
+        }
     };
 
     let pipelines = match v.get("pipelines").and_then(|v| v.as_array()) {
@@ -396,5 +470,229 @@ fn format_list(json: &str) {
         }
 
         println!();
+    }
+}
+
+/// Parse a `--replay-timing` factor spec into a positive multiplier where
+/// `1.0` means realtime, `10.0` means 10x faster, `0.2` means 5x slower.
+fn parse_replay_factor(spec: &str) -> Result<f64, String> {
+    let s = spec.trim();
+    if s.eq_ignore_ascii_case("realtime") {
+        return Ok(1.0);
+    }
+    // Strip a trailing `x` or `X` if present; either form is accepted.
+    let num_str = s.strip_suffix(|c: char| c == 'x' || c == 'X').unwrap_or(s);
+    let v: f64 = num_str.parse().map_err(|_| {
+        format!(
+            "expected `realtime` or a positive `<float>x` (got {:?})",
+            spec
+        )
+    })?;
+    if !v.is_finite() || v <= 0.0 {
+        return Err(format!(
+            "factor must be a finite positive number (got {:?})",
+            spec
+        ));
+    }
+    Ok(v)
+}
+
+/// Pull the top-level `timestamp` field out of an Event JSON line and
+/// parse it as RFC3339. Returns a clear error so callers can abort —
+/// silently skipping would violate the "zero hidden behavior" principle.
+fn extract_timestamp(line: &str) -> Result<DateTime<Utc>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(line).map_err(|e| format!("not valid JSON: {}", e))?;
+    let ts = v
+        .get("timestamp")
+        .ok_or_else(|| "event has no top-level `timestamp` field".to_string())?
+        .as_str()
+        .ok_or_else(|| "`timestamp` field is not a string".to_string())?;
+    DateTime::parse_from_rfc3339(ts)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| format!("`timestamp` is not RFC3339 ({}): {:?}", e, ts))
+}
+
+/// Tracks the wall-clock anchor used to gate replay sleeps.
+struct ReplayState {
+    factor: f64,
+    /// Wall-clock instant + event-time anchor of the first event we saw.
+    anchor: Option<(Instant, DateTime<Utc>)>,
+    /// Last event timestamp we processed; used to detect non-monotonic input.
+    last_event_ts: Option<DateTime<Utc>>,
+    /// Whether we've already emitted a catch-up warning (avoid per-event spam).
+    catchup_warned: bool,
+}
+
+impl ReplayState {
+    fn new(factor: f64) -> Self {
+        Self {
+            factor,
+            anchor: None,
+            last_event_ts: None,
+            catchup_warned: false,
+        }
+    }
+
+    /// Sleep until the wall-clock instant at which `event_ts` should be sent,
+    /// based on the first event's timestamp and the speed factor. The first
+    /// call sets the anchor and returns immediately.
+    fn wait_for(&mut self, event_ts: DateTime<Utc>) {
+        // Warn on out-of-order timestamps but flush through with no delay —
+        // we don't reorder; the input JSONL's order wins.
+        if let Some(last) = self.last_event_ts
+            && event_ts < last
+        {
+            eprintln!(
+                "warning: --replay-timing: event timestamp went backwards ({} < {}); flushing immediately",
+                event_ts.to_rfc3339(),
+                last.to_rfc3339()
+            );
+            self.last_event_ts = Some(event_ts);
+            return;
+        }
+        self.last_event_ts = Some(event_ts);
+
+        let (anchor_wall, anchor_event) = match self.anchor {
+            Some(a) => a,
+            None => {
+                // First event becomes the anchor; send it immediately.
+                self.anchor = Some((Instant::now(), event_ts));
+                return;
+            }
+        };
+
+        // Event-time delta since the anchor, scaled by speed factor.
+        let event_delta = event_ts.signed_duration_since(anchor_event);
+        let event_delta_secs = event_delta
+            .num_microseconds()
+            .map(|us| us as f64 / 1_000_000.0)
+            // Fallback for huge gaps that overflow microsecond range.
+            .unwrap_or_else(|| event_delta.num_milliseconds() as f64 / 1_000.0);
+        let scaled_secs = event_delta_secs / self.factor;
+        if !scaled_secs.is_finite() || scaled_secs <= 0.0 {
+            return;
+        }
+        let target = anchor_wall + Duration::from_secs_f64(scaled_secs);
+        let now = Instant::now();
+        if target > now {
+            std::thread::sleep(target - now);
+        } else if !self.catchup_warned {
+            // We're already behind schedule on the very first lag — warn once
+            // so the user knows replay isn't keeping up with the requested rate.
+            let lag = now - target;
+            eprintln!(
+                "warning: --replay-timing: behind schedule by {:.3}s; replay will catch up by sending events without delay",
+                lag.as_secs_f64()
+            );
+            self.catchup_warned = true;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_factor_accepts_realtime_aliases() {
+        assert_eq!(parse_replay_factor("realtime").unwrap(), 1.0);
+        assert_eq!(parse_replay_factor("REALTIME").unwrap(), 1.0);
+        assert_eq!(parse_replay_factor("1x").unwrap(), 1.0);
+        assert_eq!(parse_replay_factor("1X").unwrap(), 1.0);
+        assert_eq!(parse_replay_factor("1").unwrap(), 1.0);
+    }
+
+    #[test]
+    fn parse_factor_accepts_fractional_and_large() {
+        assert!((parse_replay_factor("10x").unwrap() - 10.0).abs() < 1e-9);
+        assert!((parse_replay_factor("0.2x").unwrap() - 0.2).abs() < 1e-9);
+        assert!((parse_replay_factor("0.5").unwrap() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_factor_rejects_invalid() {
+        assert!(parse_replay_factor("").is_err());
+        assert!(parse_replay_factor("fast").is_err());
+        assert!(parse_replay_factor("0x").is_err());
+        assert!(parse_replay_factor("-1x").is_err());
+        assert!(parse_replay_factor("nanx").is_err());
+        assert!(parse_replay_factor("infx").is_err());
+    }
+
+    #[test]
+    fn extract_timestamp_reads_rfc3339_field() {
+        let line = r#"{"timestamp":"2024-01-02T03:04:05Z","raw":"hi","source":"127.0.0.1:514","message":"hi"}"#;
+        let ts = extract_timestamp(line).unwrap();
+        assert_eq!(ts.to_rfc3339(), "2024-01-02T03:04:05+00:00");
+    }
+
+    #[test]
+    fn extract_timestamp_rejects_missing_or_malformed() {
+        // Missing field
+        let line = r#"{"raw":"hi","source":"127.0.0.1:514","message":"hi"}"#;
+        assert!(extract_timestamp(line).is_err());
+        // Wrong type
+        let line = r#"{"timestamp":1234,"raw":"hi"}"#;
+        assert!(extract_timestamp(line).is_err());
+        // Bad format
+        let line = r#"{"timestamp":"yesterday"}"#;
+        assert!(extract_timestamp(line).is_err());
+        // Not JSON
+        assert!(extract_timestamp("not json at all").is_err());
+    }
+
+    #[test]
+    fn replay_state_first_event_is_immediate() {
+        let mut s = ReplayState::new(1.0);
+        let t0 = Utc::now();
+        let start = Instant::now();
+        s.wait_for(t0);
+        // First event sets the anchor; should return well under 50ms.
+        assert!(start.elapsed() < Duration::from_millis(50));
+        assert!(s.anchor.is_some());
+    }
+
+    #[test]
+    fn replay_state_scales_delta_by_factor() {
+        // 10x speed: a 1-second event-time gap should sleep ~100ms.
+        let mut s = ReplayState::new(10.0);
+        let t0: DateTime<Utc> = "2024-01-01T00:00:00Z".parse().unwrap();
+        let t1: DateTime<Utc> = "2024-01-01T00:00:01Z".parse().unwrap();
+        s.wait_for(t0);
+        let start = Instant::now();
+        s.wait_for(t1);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(80) && elapsed < Duration::from_millis(300),
+            "expected ~100ms sleep at 10x, got {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn replay_state_backwards_timestamp_does_not_sleep() {
+        let mut s = ReplayState::new(1.0);
+        let t0: DateTime<Utc> = "2024-01-01T00:00:10Z".parse().unwrap();
+        let t_back: DateTime<Utc> = "2024-01-01T00:00:05Z".parse().unwrap();
+        s.wait_for(t0);
+        let start = Instant::now();
+        s.wait_for(t_back);
+        // Should flush immediately with a warning to stderr.
+        assert!(start.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn replay_state_catch_up_no_sleep_when_behind() {
+        // factor=1000x makes the schedule effectively instantaneous so
+        // by the time we hand it the next event we're already "behind."
+        let mut s = ReplayState::new(1000.0);
+        let t0: DateTime<Utc> = "2024-01-01T00:00:00Z".parse().unwrap();
+        let t1: DateTime<Utc> = "2024-01-01T00:00:00.000001Z".parse().unwrap();
+        s.wait_for(t0);
+        std::thread::sleep(Duration::from_millis(10));
+        let start = Instant::now();
+        s.wait_for(t1);
+        assert!(start.elapsed() < Duration::from_millis(20));
     }
 }

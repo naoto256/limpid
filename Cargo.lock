@@ -881,6 +881,7 @@ dependencies = [
 name = "limpidctl"
 version = "0.2.1"
 dependencies = [
+ "chrono",
  "clap",
  "serde_json",
 ]
