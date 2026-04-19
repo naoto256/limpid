@@ -4,6 +4,9 @@ DESIGN.md
 docs/book/
 HANDOVER.md
 
+# Local working notes — never commit (per global CLAUDE.md)
+_*.md
+
 # Secrets / credentials — never commit
 .env
 .env.*
