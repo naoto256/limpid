@@ -4,5 +4,6 @@ This release replaces most built-in processes with DSL functions, adds first-cla
 
 ## New features
 
+- **String interpolation** (`${expr}`) in any string literal, with the full DSL available inside. See [String Templates](../processing/templates.md).
 - **`strftime(value, format[, tz])`** for timestamp formatting. See [Timestamp formatting](../processing/functions.md#timestamp-formatting).
 - **`+` concatenates strings** when either operand is a string; stays as numeric addition otherwise.

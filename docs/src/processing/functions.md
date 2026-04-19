@@ -52,7 +52,7 @@ fields.clean = regex_replace(fields.msg, "\\d+", "N")
 
 ### format(template)
 
-Expands `%{...}` placeholders against the current event.
+Expands `%{...}` placeholders against the current event. Kept for backward compatibility and for callers who want an event-wide template in one argument; new code should prefer the [`${expr}` interpolation](./templates.md) that any string literal supports.
 
 ```
 message = format("%{hostname} %{appname}[%{procid}]: %{syslog_msg}")

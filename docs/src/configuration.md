@@ -124,6 +124,7 @@ See [Table functions](./processing/functions.md#table-functions) for usage.
 - `//` for line comments
 - Semicolons are **optional** — use them to separate statements on one line
 - Strings use double quotes: `"hello"`
+- Strings support `${expr}` interpolation (any DSL expression); escape a literal `${` as `\${`. See [String Templates](./processing/templates.md).
 - Integers: `42`, `-1`
 - Booleans: `true`, `false`
 - Null: `null`
