@@ -102,7 +102,7 @@ def input fw {
 
 def output archive {
     type file
-    path "/var/log/limpid/${source}/${date}.log"
+    path "/var/log/limpid/${source}/${strftime(timestamp, "%Y-%m-%d", "local")}.log"
 }
 
 def output elasticsearch {
