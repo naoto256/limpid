@@ -68,6 +68,10 @@ limpidctl inject input fw_syslog --json < events.jsonl
 limpidctl inject output ama < messages.log
 limpidctl inject output ama --json < events.jsonl
 
+# Replay with original cadence (or 10x faster, 0.2x slower, ...)
+limpidctl inject input fw_syslog --json --replay-timing < events.jsonl
+limpidctl inject input fw_syslog --json --replay-timing=10x < events.jsonl
+
 # List available tap points
 limpidctl list
 limpidctl list --json
