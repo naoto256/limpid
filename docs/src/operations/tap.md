@@ -91,6 +91,46 @@ limpidctl --socket /run/limpid-staging.sock inject input fw_syslog --json < repl
 
 This is useful for reproducing parse failures, load-testing a new pipeline, or seeding a development daemon with realistic traffic.
 
+### Replaying with original timing
+
+By default, `inject --json` streams events as fast as stdin allows. That is fine for reproducing a single parse failure, but it does not reproduce workloads where timing matters — rate-limit behaviour, output backpressure under spikes, or filter saturation all depend on the **cadence** of incoming events, not just their content.
+
+`--replay-timing` replays events with the same wall-clock gaps they had at capture time, using each event's top-level `timestamp` field (emitted by `tap --json`):
+
+```bash
+# Real-time replay — gaps between events match the capture
+limpidctl inject input fw_syslog --json --replay-timing < replay.jsonl
+
+# 10× faster — replay a one-hour capture in six minutes
+limpidctl inject input fw_syslog --json --replay-timing=10x < replay.jsonl
+
+# 0.2× (5× slower) — useful for stepping through a burst in detail
+limpidctl inject input fw_syslog --json --replay-timing=0.2x < replay.jsonl
+
+# `realtime` is a synonym for `1x`
+limpidctl inject input fw_syslog --json --replay-timing=realtime < replay.jsonl
+```
+
+The first event is sent immediately and anchors the schedule. Each subsequent event is held until `(event.timestamp − first.timestamp) / factor` of wall-clock time has elapsed, then sent.
+
+**Requires `--json`.** Raw line mode has no timestamps to replay against — passing `--replay-timing` without `--json` is an error.
+
+**Error handling is strict by design** (no hidden behaviour):
+
+| Situation | Behaviour |
+|---|---|
+| Event has no `timestamp`, or it does not parse as RFC 3339 | Abort with an error on that event |
+| Invalid factor (e.g. `--replay-timing=bogus`, `0x`, negative) | Abort before connecting |
+| `timestamp` goes backwards between events | Log a warning to stderr, send immediately, continue. Ordering follows the input JSONL — `inject` does **not** reorder |
+| Wall clock falls behind the schedule (slow stdin, backpressure) | Catch up by sending with zero delay. A single warning is logged on stderr the first time this happens |
+
+Filtering to a time range is intentionally not a flag — use `jq` before piping:
+
+```bash
+jq -c 'select(.timestamp >= "2026-01-01T12:00:00Z" and .timestamp < "2026-01-01T13:00:00Z")' \
+  replay.jsonl | limpidctl inject input fw_syslog --json --replay-timing
+```
+
 ## Metrics
 
 ```bash
