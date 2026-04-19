@@ -69,39 +69,43 @@ Available placeholders:
 
 > **Note:** The shorthand `%{xxx}` checks fields first but is shadowed by reserved names (`source`, `facility`, `severity`, `timestamp`, `message`, `raw`). Use `%{fields.xxx}` to avoid ambiguity.
 
+## Timestamp formatting
+
+### strftime(value, format[, timezone])
+
+Formats an RFC 3339 timestamp (such as the event's `timestamp` field) according to a [`chrono` strftime](https://docs.rs/chrono/latest/chrono/format/strftime/) format string.
+
+```
+strftime(timestamp, "%Y-%m-%d")          // 2026-04-19
+strftime(timestamp, "%b %e %H:%M:%S")    // Apr 19 10:30:45
+strftime(timestamp, "%Y-%m-%d", "local") // convert to local time first
+strftime(timestamp, "%H:%M", "UTC")      // force UTC
+strftime(timestamp, "%H:%M", "+09:00")   // fixed offset
+```
+
+| Argument | Description |
+|----------|-------------|
+| `value` | RFC 3339 string (e.g. `"2026-04-19T10:30:45+00:00"`). `timestamp` always parses. |
+| `format` | `chrono` strftime format. |
+| `timezone` *(optional)* | `"local"`, `"UTC"` (case-insensitive), or `±HH:MM` / `±HHMM`. If omitted, `value`'s own offset is used. |
+
+Both an invalid RFC 3339 input and an invalid timezone specifier are errors — `strftime` never silently returns an empty string.
+
 ## Hash functions
 
-### md5(str)
+### md5(str) / sha1(str) / sha256(str)
 
-Returns the MD5 hex digest of the input string.
+Return the hex digest.
 
 ```
 fields.fingerprint = md5(message)
-// "e4d7f1b4ed2e42d15898f4b27b019da4"
-```
-
-### sha1(str)
-
-Returns the SHA-1 hex digest.
-
-```
-fields.hash = sha1(message)
-```
-
-### sha256(str)
-
-Returns the SHA-256 hex digest.
-
-```
 fields.hash = sha256(message)
-```
 
-Useful for event deduplication, fingerprinting, or anonymization:
-
-```
 // Anonymize source IP
 fields.src_hash = sha256(fields.src)
 ```
+
+Useful for event deduplication, fingerprinting, or anonymisation.
 
 ## Serialization
 
