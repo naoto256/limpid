@@ -269,6 +269,72 @@ pub fn register_builtins(reg: &mut FunctionRegistry, table_store: table::TableSt
         let template = val_to_str(&args[0]);
         Ok(Value::String(expand_format_template(&template, event)))
     });
+
+    reg.register("strftime", |args, _event| {
+        // strftime(value, fmt)           — format in value's own timezone
+        // strftime(value, fmt, "local")  — convert to local time, then format
+        // strftime(value, fmt, "UTC")    — convert to UTC, then format
+        // strftime(value, fmt, "+09:00") — convert to fixed offset, then format
+        if !(args.len() == 2 || args.len() == 3) {
+            bail!("strftime() expects 2 or 3 arguments (value, format[, timezone])");
+        }
+        let value = val_to_str(&args[0]);
+        let fmt = val_to_str(&args[1]);
+        let tz = if args.len() == 3 {
+            Some(val_to_str(&args[2]))
+        } else {
+            None
+        };
+
+        // Parse value as RFC3339 (Event::timestamp serialises this way, as
+        // does `now()`). Treat any parse failure as a loud error — silently
+        // producing an empty string on bad input would violate the
+        // zero-hidden-behaviour principle.
+        let dt = chrono::DateTime::parse_from_rfc3339(&value)
+            .map_err(|e| anyhow::anyhow!("strftime(): invalid RFC3339 timestamp '{}': {}", value, e))?;
+
+        let formatted = match tz.as_deref() {
+            None => dt.format(&fmt).to_string(),
+            Some("local") => dt.with_timezone(&chrono::Local).format(&fmt).to_string(),
+            Some("UTC") | Some("utc") => dt.with_timezone(&chrono::Utc).format(&fmt).to_string(),
+            Some(offset) => {
+                let fixed = parse_fixed_offset(offset).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "strftime(): invalid timezone '{}' (expected 'local', 'UTC', or ±HH:MM)",
+                        offset
+                    )
+                })?;
+                dt.with_timezone(&fixed).format(&fmt).to_string()
+            }
+        };
+
+        Ok(Value::String(formatted))
+    });
+}
+
+/// Parse `+HH:MM` / `-HH:MM` (or `+HHMM`) into a `FixedOffset`.
+fn parse_fixed_offset(s: &str) -> Option<chrono::FixedOffset> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let sign = match bytes[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let rest = &s[1..];
+    let (h_str, m_str) = if let Some((h, m)) = rest.split_once(':') {
+        (h, m)
+    } else if rest.len() == 4 {
+        rest.split_at(2)
+    } else {
+        return None;
+    };
+    let h: i32 = h_str.parse().ok()?;
+    let m: i32 = m_str.parse().ok()?;
+    let secs = sign * (h * 3600 + m * 60);
+    chrono::FixedOffset::east_opt(secs)
 }
 
 /// Expand `%{name}` placeholders in a format template against an event.
@@ -353,5 +419,167 @@ fn resolve_format_fields(
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Null => String::new(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::functions::table::TableStore;
+    use bytes::Bytes;
+    use std::net::SocketAddr;
+
+    fn make_registry() -> FunctionRegistry {
+        let mut reg = FunctionRegistry::new();
+        let table_store = TableStore::from_configs(vec![]).unwrap();
+        register_builtins(&mut reg, table_store);
+        reg
+    }
+
+    fn dummy_event() -> Event {
+        Event::new(
+            Bytes::from("test"),
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        )
+    }
+
+    #[test]
+    fn strftime_formats_rfc3339_input() {
+        let reg = make_registry();
+        let e = dummy_event();
+        let result = reg
+            .call(
+                "strftime",
+                &[
+                    Value::String("2026-04-19T10:30:45+00:00".into()),
+                    Value::String("%Y/%m/%d %H:%M:%S".into()),
+                ],
+                &e,
+            )
+            .unwrap();
+        assert_eq!(result, Value::String("2026/04/19 10:30:45".into()));
+    }
+
+    #[test]
+    fn strftime_bsd_syslog_format() {
+        // Reproduce the old `prepend_timestamp` default format.
+        let reg = make_registry();
+        let e = dummy_event();
+        let result = reg
+            .call(
+                "strftime",
+                &[
+                    Value::String("2026-04-19T05:07:09+00:00".into()),
+                    Value::String("%b %e %H:%M:%S".into()),
+                ],
+                &e,
+            )
+            .unwrap();
+        assert_eq!(result, Value::String("Apr 19 05:07:09".into()));
+    }
+
+    #[test]
+    fn strftime_utc_timezone() {
+        let reg = make_registry();
+        let e = dummy_event();
+        // Input is +09:00; force to UTC.
+        let result = reg
+            .call(
+                "strftime",
+                &[
+                    Value::String("2026-04-19T10:30:45+09:00".into()),
+                    Value::String("%Y-%m-%dT%H:%M:%S%z".into()),
+                    Value::String("UTC".into()),
+                ],
+                &e,
+            )
+            .unwrap();
+        assert_eq!(result, Value::String("2026-04-19T01:30:45+0000".into()));
+    }
+
+    #[test]
+    fn strftime_fixed_offset() {
+        let reg = make_registry();
+        let e = dummy_event();
+        let result = reg
+            .call(
+                "strftime",
+                &[
+                    Value::String("2026-04-19T10:30:45+00:00".into()),
+                    Value::String("%H:%M".into()),
+                    Value::String("+09:00".into()),
+                ],
+                &e,
+            )
+            .unwrap();
+        assert_eq!(result, Value::String("19:30".into()));
+    }
+
+    #[test]
+    fn strftime_rejects_invalid_rfc3339() {
+        let reg = make_registry();
+        let e = dummy_event();
+        let err = reg
+            .call(
+                "strftime",
+                &[
+                    Value::String("not-a-timestamp".into()),
+                    Value::String("%Y".into()),
+                ],
+                &e,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid RFC3339"));
+    }
+
+    #[test]
+    fn strftime_rejects_bad_timezone() {
+        let reg = make_registry();
+        let e = dummy_event();
+        let err = reg
+            .call(
+                "strftime",
+                &[
+                    Value::String("2026-04-19T10:30:45+00:00".into()),
+                    Value::String("%Y".into()),
+                    Value::String("bogus".into()),
+                ],
+                &e,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid timezone"));
+    }
+
+    #[test]
+    fn strftime_rejects_wrong_arity() {
+        let reg = make_registry();
+        let e = dummy_event();
+        let err = reg
+            .call(
+                "strftime",
+                &[Value::String("2026-04-19T10:30:45+00:00".into())],
+                &e,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("2 or 3 arguments"));
+    }
+
+    #[test]
+    fn parse_fixed_offset_variants() {
+        assert_eq!(
+            parse_fixed_offset("+09:00").map(|o| o.local_minus_utc()),
+            Some(9 * 3600)
+        );
+        assert_eq!(
+            parse_fixed_offset("-05:30").map(|o| o.local_minus_utc()),
+            Some(-(5 * 3600 + 30 * 60))
+        );
+        assert_eq!(
+            parse_fixed_offset("+0900").map(|o| o.local_minus_utc()),
+            Some(9 * 3600)
+        );
+        assert!(parse_fixed_offset("UTC").is_none());
+        assert!(parse_fixed_offset("").is_none());
+        assert!(parse_fixed_offset("09:00").is_none()); // missing sign
     }
 }
