@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 
 use crate::dsl::ast::Property;
 use crate::event::Event;
+use crate::functions::FunctionRegistry;
 use crate::metrics::{InputMetrics, OutputMetrics};
 use crate::queue::OutputWriter;
 
@@ -74,6 +75,12 @@ pub trait Input: Module + HasMetrics<Stats = InputMetrics> + Send + 'static {
 #[async_trait::async_trait]
 pub trait Output: Module + HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     async fn write(&self, event: &Event) -> Result<()>;
+
+    /// Called once after construction to hand the output a reference to
+    /// the pipeline's `FunctionRegistry`. Outputs that evaluate DSL
+    /// expressions at write time (e.g. `${...}` templates in a path)
+    /// override this to stash the registry. Default: no-op.
+    fn attach_funcs(&mut self, _funcs: Arc<FunctionRegistry>) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -107,7 +114,11 @@ type InputFactory = Box<
         + Sync,
 >;
 
-type OutputFactory = Box<dyn Fn(&str, &[Property]) -> Result<CreatedOutput> + Send + Sync>;
+type OutputFactory = Box<
+    dyn Fn(&str, &[Property], Arc<FunctionRegistry>) -> Result<CreatedOutput>
+        + Send
+        + Sync,
+>;
 
 // ---------------------------------------------------------------------------
 // Registry
@@ -148,7 +159,8 @@ impl ModuleRegistry {
 
     pub fn register_output<F>(&mut self, type_name: &str, factory: F)
     where
-        F: Fn(&str, &[Property]) -> Result<CreatedOutput> + Send + Sync + 'static,
+        F: Fn(&str, &[Property], Arc<FunctionRegistry>) -> Result<CreatedOutput>
+            + Send + Sync + 'static,
     {
         self.outputs
             .insert(type_name.to_string(), Box::new(factory));
@@ -202,12 +214,13 @@ impl ModuleRegistry {
         type_name: &str,
         name: &str,
         properties: &[Property],
+        funcs: Arc<FunctionRegistry>,
     ) -> Result<CreatedOutput> {
         let factory = self
             .outputs
             .get(type_name)
             .ok_or_else(|| anyhow::anyhow!("unknown output type: {}", type_name))?;
-        factory(name, properties)
+        factory(name, properties, funcs)
     }
 }
 
@@ -260,8 +273,9 @@ fn register_output_type<T>(registry: &mut ModuleRegistry, type_name: &str)
 where
     T: Output + Sync + 'static,
 {
-    registry.register_output(type_name, |name, properties| {
-        let output = T::from_properties(name, properties)?;
+    registry.register_output(type_name, |name, properties, funcs| {
+        let mut output = T::from_properties(name, properties)?;
+        output.attach_funcs(funcs);
         let metrics = HasMetrics::metrics(&output);
         Ok(CreatedOutput {
             writer: Box::new(OutputWriterWrapper(output)),

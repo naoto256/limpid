@@ -6,18 +6,12 @@
 //!   owner  "syslog"                    — file owner (requires CAP_CHOWN)
 //!   group  "adm"                       — file group (requires CAP_CHOWN or membership)
 //!
-//! Dynamic path templates:
-//!   ${source}         — source IP address
-//!   ${facility}       — facility number
-//!   ${severity}       — severity number
-//!   ${date}           — YYYY-MM-DD
-//!   ${year}           — 4-digit year
-//!   ${month}          — 2-digit month
-//!   ${day}            — 2-digit day
-//!   ${fields.xxx}     — value of fields.xxx (nested: ${fields.geo.country})
-//!
-//! Example:
-//!   path "/var/log/limpid/${source}/${date}.log"
+//! Dynamic path templates use the DSL's native `${expr}` interpolation,
+//! e.g. `path "/var/log/${source}/${strftime(timestamp, "%Y-%m-%d")}.log"`.
+//! Any DSL expression works (identifiers, function calls, string concat).
+//! Interpolations that dereference `fields.*` are sanitised to strip
+//! `/`, `\`, and `..` so untrusted event data can't escape into sibling
+//! directories; other interpolations render verbatim.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -29,20 +23,24 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
-use crate::dsl::ast::Property;
+use crate::dsl::ast::{Expr, Property, TemplateFragment};
+use crate::dsl::eval::{eval_expr, value_to_string};
 use crate::dsl::props;
 use crate::event::Event;
+use crate::functions::FunctionRegistry;
 use crate::metrics::OutputMetrics;
 use crate::modules::{HasMetrics, Module, ModuleSchema, Output};
 
 pub struct FileOutput {
-    path_template: String,
-    is_dynamic: bool,
+    /// Parsed path expression. A plain `Expr::StringLit` means a static
+    /// path; `Expr::Template` requires per-event evaluation.
+    path: Expr,
     mode: Option<u32>,
     owner: Option<String>,
     group: Option<String>,
     /// Tracks which paths have been created (for applying mode/owner/group once)
     created_paths: Mutex<HashSet<PathBuf>>,
+    funcs: Option<Arc<FunctionRegistry>>,
     metrics: Arc<OutputMetrics>,
 }
 
@@ -52,10 +50,21 @@ impl Module for FileOutput {
     }
 
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
-        let path = props::get_string(properties, "path")
-            .ok_or_else(|| anyhow::anyhow!("output '{}': file requires 'path'", name))?;
+        let path = props::get_expr(properties, "path")
+            .ok_or_else(|| anyhow::anyhow!("output '{}': file requires 'path'", name))?
+            .clone();
 
-        let is_dynamic = path.contains("${");
+        // `path` must eventually render to a string. Allow StringLit and
+        // Template at config-load time; other shapes (e.g. bare integer)
+        // would be a user error so we reject here rather than at write.
+        match &path {
+            Expr::StringLit(_) | Expr::Template(_) => {}
+            other => anyhow::bail!(
+                "output '{}': file 'path' must be a string, got {:?}",
+                name,
+                other
+            ),
+        }
 
         let mode = props::get_string(properties, "mode")
             .map(|s| {
@@ -73,12 +82,12 @@ impl Module for FileOutput {
         let group = props::get_string(properties, "group");
 
         Ok(Self {
-            path_template: path,
-            is_dynamic,
+            path,
             mode,
             owner,
             group,
             created_paths: Mutex::new(HashSet::new()),
+            funcs: None,
             metrics: Arc::new(OutputMetrics::default()),
         })
     }
@@ -93,23 +102,24 @@ impl HasMetrics for FileOutput {
 
 #[async_trait::async_trait]
 impl Output for FileOutput {
+    fn attach_funcs(&mut self, funcs: Arc<FunctionRegistry>) {
+        self.funcs = Some(funcs);
+    }
+
     async fn write(&self, event: &Event) -> Result<()> {
-        let path = if self.is_dynamic {
-            let resolved = resolve_template(&self.path_template, event);
-            let path = PathBuf::from(&resolved);
-            // Sanitize: reject path traversal components
-            for component in path.components() {
-                if matches!(component, std::path::Component::ParentDir) {
-                    anyhow::bail!("path traversal rejected: {}", resolved);
-                }
+        let (resolved, is_dynamic) = self.render_path(event)?;
+        let path = PathBuf::from(&resolved);
+
+        // Defence in depth: reject path traversal components even after
+        // per-fragment sanitisation.
+        for component in path.components() {
+            if matches!(component, std::path::Component::ParentDir) {
+                anyhow::bail!("path traversal rejected: {}", resolved);
             }
-            path
-        } else {
-            PathBuf::from(&self.path_template)
-        };
+        }
 
         // Ensure parent directory exists (needed for dynamic paths)
-        if self.is_dynamic
+        if is_dynamic
             && let Some(parent) = path.parent()
             && let Err(e) = tokio::fs::create_dir_all(parent).await
         {
@@ -152,84 +162,68 @@ impl Output for FileOutput {
 }
 
 // ---------------------------------------------------------------------------
-// Template resolution
+// Path rendering
 // ---------------------------------------------------------------------------
 
-fn resolve_template(template: &str, event: &Event) -> String {
-    let mut result = String::with_capacity(template.len());
-    let mut chars = template.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '$' && chars.peek() == Some(&'{') {
-            chars.next(); // consume '{'
-            let mut var = String::new();
-            for c in chars.by_ref() {
-                if c == '}' {
-                    break;
+impl FileOutput {
+    /// Render `self.path` against `event`. Returns `(rendered, is_dynamic)`
+    /// where `is_dynamic` is true when the template had any interpolated
+    /// fragments (used to decide whether to `mkdir -p` the parent).
+    ///
+    /// For `Template`, each `Interp` fragment is evaluated separately so
+    /// that values derived from `fields.*` can be sanitised without
+    /// affecting literal path separators or server-owned interpolations
+    /// like `${source}`.
+    fn render_path(&self, event: &Event) -> Result<(String, bool)> {
+        match &self.path {
+            Expr::StringLit(s) => Ok((s.clone(), false)),
+            Expr::Template(fragments) => {
+                let funcs = self.funcs.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "output file: FunctionRegistry not attached — \
+                         dynamic path template requires attach_funcs() before write"
+                    )
+                })?;
+                let mut out = String::new();
+                for frag in fragments {
+                    match frag {
+                        TemplateFragment::Literal(s) => out.push_str(s),
+                        TemplateFragment::Interp(expr) => {
+                            let rendered = value_to_string(&eval_expr(expr, event, funcs)?);
+                            if is_fields_reference(expr) {
+                                out.push_str(&sanitize_path_component(&rendered));
+                            } else {
+                                out.push_str(&rendered);
+                            }
+                        }
+                    }
                 }
-                var.push(c);
+                Ok((out, true))
             }
-            result.push_str(&resolve_variable(&var, event));
-        } else {
-            result.push(ch);
+            other => anyhow::bail!(
+                "output file: unsupported path expression shape: {:?}",
+                other
+            ),
         }
     }
-
-    result
 }
 
-/// Sanitize a template variable value: remove path separators and traversal components.
+/// Does `expr` dereference `fields.*` (i.e. user-controlled event data)?
+/// Conservative: only flags literal `fields.xxx[.yyy]` identifiers. Other
+/// expressions whose results happen to originate from fields (e.g.
+/// `lower(fields.host)`) are rendered without sanitisation — users who
+/// care should write their sanitisation explicitly.
+fn is_fields_reference(expr: &Expr) -> bool {
+    match expr {
+        Expr::Ident(parts) => parts.first().is_some_and(|s| s == "fields") && parts.len() > 1,
+        Expr::PropertyAccess(base, _) => is_fields_reference(base),
+        _ => false,
+    }
+}
+
+/// Sanitize a path component: strip `/`, `\`, and `..`.
 fn sanitize_path_component(s: &str) -> String {
     s.replace(['/', '\\'], "_").replace("..", "_")
-}
-
-fn resolve_variable(var: &str, event: &Event) -> String {
-    match var {
-        "source" => event.source.ip().to_string(), // IP addresses are safe
-        "facility" => event.facility.map(|f| f.to_string()).unwrap_or_default(),
-        "severity" => event.severity.map(|s| s.to_string()).unwrap_or_default(),
-        "date" => event.timestamp.format("%Y-%m-%d").to_string(),
-        "year" => event.timestamp.format("%Y").to_string(),
-        "month" => event.timestamp.format("%m").to_string(),
-        "day" => event.timestamp.format("%d").to_string(),
-        v if v.starts_with("fields.") => {
-            let path: Vec<&str> = v["fields.".len()..].split('.').collect();
-            sanitize_path_component(&resolve_fields_path(&path, &event.fields))
-        }
-        _ => String::new(),
-    }
-}
-
-fn resolve_fields_path(
-    path: &[&str],
-    fields: &std::collections::HashMap<String, serde_json::Value>,
-) -> String {
-    use serde_json::Value;
-
-    let first = match fields.get(path[0]) {
-        Some(v) => v,
-        None => return String::new(),
-    };
-
-    let mut current = first;
-    for &segment in &path[1..] {
-        match current {
-            Value::Object(map) => {
-                current = match map.get(segment) {
-                    Some(v) => v,
-                    None => return String::new(),
-                };
-            }
-            _ => return String::new(),
-        }
-    }
-
-    match current {
-        Value::String(s) => s.clone(),
-        Value::Number(n) => n.to_string(),
-        Value::Null => String::new(),
-        other => other.to_string(),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -284,7 +278,11 @@ impl FileOutput {
                 if (uid.is_some() || gid.is_some())
                     && let Err(e) = std::os::unix::fs::chown(&path, uid, gid)
                 {
-                    tracing::warn!("output file '{}': failed to chown: {}", path.display(), e);
+                    tracing::warn!(
+                        "output file '{}': failed to chown: {}",
+                        path.display(),
+                        e
+                    );
                 }
             })
             .await
@@ -311,4 +309,128 @@ fn resolve_gid(name: &str) -> Result<u32> {
         anyhow::bail!("group '{}' not found", name);
     }
     Ok(unsafe { (*gr).gr_gid })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::functions::table::TableStore;
+    use bytes::Bytes;
+    use serde_json::Value;
+    use std::net::SocketAddr;
+
+    fn funcs() -> Arc<FunctionRegistry> {
+        let mut reg = FunctionRegistry::new();
+        let store = TableStore::from_configs(vec![]).unwrap();
+        crate::functions::register_builtins(&mut reg, store);
+        Arc::new(reg)
+    }
+
+    fn event_with_fields() -> Event {
+        let mut e = Event::new(
+            Bytes::from("hello"),
+            "192.168.1.10:514".parse::<SocketAddr>().unwrap(),
+        );
+        e.severity = Some(3);
+        e.facility = Some(16);
+        e.fields
+            .insert("host".into(), Value::String("web01".into()));
+        // field containing a path separator — must be sanitised
+        e.fields
+            .insert("ip".into(), Value::String("10.0.0.1/24".into()));
+        e
+    }
+
+    fn make_output(path: Expr) -> FileOutput {
+        FileOutput {
+            path,
+            mode: None,
+            owner: None,
+            group: None,
+            created_paths: Mutex::new(HashSet::new()),
+            funcs: Some(funcs()),
+            metrics: Arc::new(OutputMetrics::default()),
+        }
+    }
+
+    #[test]
+    fn render_static_path() {
+        let out = make_output(Expr::StringLit("/var/log/app.log".into()));
+        let (rendered, dynamic) = out.render_path(&event_with_fields()).unwrap();
+        assert_eq!(rendered, "/var/log/app.log");
+        assert!(!dynamic);
+    }
+
+    #[test]
+    fn render_template_with_ident_interp() {
+        // "/var/log/${source}.log"
+        let out = make_output(Expr::Template(vec![
+            TemplateFragment::Literal("/var/log/".into()),
+            TemplateFragment::Interp(Expr::Ident(vec!["source".into()])),
+            TemplateFragment::Literal(".log".into()),
+        ]));
+        let (rendered, dynamic) = out.render_path(&event_with_fields()).unwrap();
+        assert_eq!(rendered, "/var/log/192.168.1.10.log");
+        assert!(dynamic);
+    }
+
+    #[test]
+    fn render_template_sanitizes_fields_reference() {
+        // "/var/log/${fields.ip}.log" — fields.ip contains "10.0.0.1/24",
+        // the `/` must be replaced with `_`.
+        let out = make_output(Expr::Template(vec![
+            TemplateFragment::Literal("/var/log/".into()),
+            TemplateFragment::Interp(Expr::Ident(vec!["fields".into(), "ip".into()])),
+            TemplateFragment::Literal(".log".into()),
+        ]));
+        let (rendered, _) = out.render_path(&event_with_fields()).unwrap();
+        assert_eq!(rendered, "/var/log/10.0.0.1_24.log");
+    }
+
+    #[test]
+    fn render_template_does_not_sanitize_non_fields_interp() {
+        // `${source}` is a top-level ident (not fields.*), so its value
+        // is passed through even if it contains separators (IPv4 won't,
+        // but the principle holds).
+        let out = make_output(Expr::Template(vec![
+            TemplateFragment::Literal("a-".into()),
+            TemplateFragment::Interp(Expr::Ident(vec!["source".into()])),
+            TemplateFragment::Literal("-b".into()),
+        ]));
+        let (rendered, _) = out.render_path(&event_with_fields()).unwrap();
+        assert_eq!(rendered, "a-192.168.1.10-b");
+    }
+
+    #[test]
+    fn render_template_errors_without_attached_funcs() {
+        let mut out = make_output(Expr::Template(vec![TemplateFragment::Interp(
+            Expr::Ident(vec!["source".into()]),
+        )]));
+        out.funcs = None;
+        let err = out.render_path(&event_with_fields()).unwrap_err();
+        assert!(err.to_string().contains("FunctionRegistry not attached"));
+    }
+
+    #[test]
+    fn is_fields_reference_detects_nested_paths() {
+        assert!(is_fields_reference(&Expr::Ident(vec![
+            "fields".into(),
+            "x".into()
+        ])));
+        assert!(is_fields_reference(&Expr::Ident(vec![
+            "fields".into(),
+            "x".into(),
+            "y".into()
+        ])));
+        // `fields` alone is not a reference to a specific field
+        assert!(!is_fields_reference(&Expr::Ident(vec!["fields".into()])));
+        // non-fields idents don't count
+        assert!(!is_fields_reference(&Expr::Ident(vec!["source".into()])));
+        // function calls always render without sanitisation (users
+        // opt-in to their own sanitisation)
+        assert!(!is_fields_reference(&Expr::FuncCall(
+            "lower".into(),
+            vec![Expr::Ident(vec!["fields".into(), "host".into()])],
+        )));
+    }
 }

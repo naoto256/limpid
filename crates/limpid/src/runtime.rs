@@ -63,7 +63,12 @@ impl Runtime {
 
             let output_type = props::get_ident(&output_def.properties, "type")
                 .ok_or_else(|| anyhow::anyhow!("output '{}' has no type", name))?;
-            let created = match registry.create_output(&output_type, name, &output_def.properties) {
+            let created = match registry.create_output(
+                &output_type,
+                name,
+                &output_def.properties,
+                Arc::clone(&func_registry),
+            ) {
                 Ok(c) => c,
                 Err(e) => {
                     error!(
