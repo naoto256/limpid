@@ -152,7 +152,20 @@ fn eval_bin_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
         ))),
         BinOp::And => Ok(Value::Bool(is_truthy(left) && is_truthy(right))),
         BinOp::Or => Ok(Value::Bool(is_truthy(left) || is_truthy(right))),
-        BinOp::Add => numeric_op(left, right, |a, b| a + b),
+        BinOp::Add => {
+            // If either side is a String, concatenate as strings. This gives
+            // the usual dynamic-language intuition for building messages like
+            // `"[" + severity + "] " + message`.
+            if matches!(left, Value::String(_)) || matches!(right, Value::String(_)) {
+                Ok(Value::String(format!(
+                    "{}{}",
+                    value_to_string(left),
+                    value_to_string(right)
+                )))
+            } else {
+                numeric_op(left, right, |a, b| a + b)
+            }
+        }
         BinOp::Sub => numeric_op(left, right, |a, b| a - b),
         BinOp::Mul => numeric_op(left, right, |a, b| a * b),
         BinOp::Div => numeric_op(left, right, |a, b| if b != 0.0 { a / b } else { 0.0 }),
