@@ -27,6 +27,7 @@
 - [Processing](./processing/README.md)
   - [Built-in Processes](./processing/builtin-processes.md)
   - [Expression Functions](./processing/functions.md)
+  - [String Templates](./processing/templates.md)
   - [User-defined Processes](./processing/user-defined.md)
 - [Pipelines](./pipelines/README.md)
   - [Routing](./pipelines/routing.md)
