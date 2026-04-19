@@ -4,4 +4,5 @@ This release replaces most built-in processes with DSL functions, adds first-cla
 
 ## New features
 
+- **`strftime(value, format[, tz])`** for timestamp formatting. See [Timestamp formatting](../processing/functions.md#timestamp-formatting).
 - **`+` concatenates strings** when either operand is a string; stays as numeric addition otherwise.
