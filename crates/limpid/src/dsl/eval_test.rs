@@ -97,6 +97,70 @@ mod tests {
     }
 
     #[test]
+    fn test_eval_add_string_concat() {
+        let e = make_event();
+        let f = make_funcs();
+
+        // String + String → concat
+        let expr = Expr::BinOp(
+            Box::new(Expr::StringLit("hello ".into())),
+            BinOp::Add,
+            Box::new(Expr::StringLit("world".into())),
+        );
+        assert_eq!(
+            eval_expr(&expr, &e, &f).unwrap(),
+            Value::String("hello world".into())
+        );
+
+        // Mixed String + Number → both coerced to string
+        let expr = Expr::BinOp(
+            Box::new(Expr::StringLit("count=".into())),
+            BinOp::Add,
+            Box::new(Expr::IntLit(42)),
+        );
+        assert_eq!(
+            eval_expr(&expr, &e, &f).unwrap(),
+            Value::String("count=42".into())
+        );
+
+        // Number + String → same
+        let expr = Expr::BinOp(
+            Box::new(Expr::IntLit(42)),
+            BinOp::Add,
+            Box::new(Expr::StringLit(" ms".into())),
+        );
+        assert_eq!(
+            eval_expr(&expr, &e, &f).unwrap(),
+            Value::String("42 ms".into())
+        );
+
+        // Number + Number still numeric (no regression). numeric_op uses f64
+        // internally, so the result is Number(7.0), not Number(7).
+        let expr = Expr::BinOp(
+            Box::new(Expr::IntLit(3)),
+            BinOp::Add,
+            Box::new(Expr::IntLit(4)),
+        );
+        let result = eval_expr(&expr, &e, &f).unwrap();
+        assert_eq!(result.as_f64(), Some(7.0));
+
+        // Chained: "a" + "b" + "c" (left-associative)
+        let expr = Expr::BinOp(
+            Box::new(Expr::BinOp(
+                Box::new(Expr::StringLit("a".into())),
+                BinOp::Add,
+                Box::new(Expr::StringLit("b".into())),
+            )),
+            BinOp::Add,
+            Box::new(Expr::StringLit("c".into())),
+        );
+        assert_eq!(
+            eval_expr(&expr, &e, &f).unwrap(),
+            Value::String("abc".into())
+        );
+    }
+
+    #[test]
     fn test_eval_binop_logical() {
         let e = make_event();
         let f = make_funcs();
