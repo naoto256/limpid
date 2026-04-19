@@ -3,7 +3,7 @@
 use anyhow::{Result, bail};
 use serde_json::Value;
 
-use super::ast::{BinOp, Expr, UnaryOp};
+use super::ast::{BinOp, Expr, TemplateFragment, UnaryOp};
 use crate::event::Event;
 use crate::functions::FunctionRegistry;
 
@@ -11,6 +11,23 @@ use crate::functions::FunctionRegistry;
 pub fn eval_expr(expr: &Expr, event: &Event, funcs: &FunctionRegistry) -> Result<Value> {
     match expr {
         Expr::StringLit(s) => Ok(Value::String(s.clone())),
+        Expr::Template(fragments) => {
+            // Render template fragments against the current event.
+            // Interpolated values are coerced to string via value_to_string
+            // so that `${facility}` (Number) and `${fields.foo}` (arbitrary)
+            // both interpolate cleanly.
+            let mut out = String::new();
+            for frag in fragments {
+                match frag {
+                    TemplateFragment::Literal(s) => out.push_str(s),
+                    TemplateFragment::Interp(expr) => {
+                        let v = eval_expr(expr, event, funcs)?;
+                        out.push_str(&value_to_string(&v));
+                    }
+                }
+            }
+            Ok(Value::String(out))
+        }
         Expr::IntLit(n) => Ok(Value::Number((*n).into())),
         Expr::FloatLit(f) => Ok(Value::Number(
             serde_json::Number::from_f64(*f).unwrap_or(0.into()),

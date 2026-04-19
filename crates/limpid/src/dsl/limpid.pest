@@ -71,8 +71,15 @@ ident_path = { ident ~ ("." ~ ident)* }
 
 // -- Literals ----------------------------------------------------------------
 
-string_lit  = @{ "\"" ~ string_inner ~ "\"" }
-string_inner = @{ (!"\"" ~ !"\\" ~ ANY | "\\" ~ ANY)* }
+// String literals support `${expr}` interpolation inline. Backslash at
+// the beginning of an escape applies to the next byte (including `${`);
+// e.g. `"\\${x}"` renders literal `${x}`.
+string_lit = ${ "\"" ~ string_frag* ~ "\"" }
+string_frag = _{ string_interp | string_plain }
+string_interp = !{ "${" ~ expr ~ "}" }
+string_plain = @{ (escape_seq | string_plain_char)+ }
+string_plain_char = { !"\"" ~ !"${" ~ !"\\" ~ ANY }
+escape_seq = @{ "\\" ~ ANY }
 
 integer_lit = @{ "-"? ~ ASCII_DIGIT+ }
 float_lit   = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }

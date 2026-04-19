@@ -2,9 +2,16 @@
 //!
 //! Used by modules to parse their own configuration from DSL property lists.
 
-use super::ast::{Expr, Property};
+use super::ast::{Expr, Property, TemplateFragment};
 
 /// Get a string value for a key (from StringLit, Ident, or IntLit).
+///
+/// For `Template` expressions (strings containing `${...}`), this
+/// reconstructs the source-level form (`"literal${ident.path}literal"`)
+/// so existing modules with their own template evaluators (e.g.
+/// `output file` with its dynamic path) keep working without change.
+/// Consumers that want structured evaluation should use
+/// `get_expr` and evaluate via `dsl::eval::eval_expr`.
 pub fn get_string(props: &[Property], key: &str) -> Option<String> {
     for prop in props {
         if let Property::KeyValue(k, expr) = prop
@@ -12,6 +19,7 @@ pub fn get_string(props: &[Property], key: &str) -> Option<String> {
         {
             return match expr {
                 Expr::StringLit(s) => Some(s.clone()),
+                Expr::Template(frags) => Some(template_to_source(frags)),
                 Expr::Ident(parts) => Some(parts.join(".")),
                 Expr::IntLit(n) => Some(n.to_string()),
                 _ => None,
@@ -19,6 +27,62 @@ pub fn get_string(props: &[Property], key: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Return the raw `Expr` bound to `key`, if any. Modules wanting to
+/// evaluate templates per-event (with a `FunctionRegistry`) should use
+/// this rather than `get_string`.
+#[allow(dead_code)]
+pub fn get_expr<'a>(props: &'a [Property], key: &str) -> Option<&'a Expr> {
+    for prop in props {
+        if let Property::KeyValue(k, expr) = prop
+            && k == key
+        {
+            return Some(expr);
+        }
+    }
+    None
+}
+
+/// Best-effort reconstruction of a Template's source text. Used only
+/// for backwards compatibility with modules that still run their own
+/// string-level template parser. Handles identifiers and string/int
+/// literals; other expression shapes fall back to their `Debug` form.
+fn template_to_source(frags: &[TemplateFragment]) -> String {
+    let mut out = String::new();
+    for f in frags {
+        match f {
+            TemplateFragment::Literal(s) => out.push_str(s),
+            TemplateFragment::Interp(expr) => {
+                out.push_str("${");
+                push_expr_source(&mut out, expr);
+                out.push('}');
+            }
+        }
+    }
+    out
+}
+
+fn push_expr_source(out: &mut String, expr: &Expr) {
+    match expr {
+        Expr::Ident(parts) => out.push_str(&parts.join(".")),
+        Expr::StringLit(s) => {
+            out.push('"');
+            for c in s.chars() {
+                match c {
+                    '\\' => out.push_str("\\\\"),
+                    '"' => out.push_str("\\\""),
+                    c => out.push(c),
+                }
+            }
+            out.push('"');
+        }
+        Expr::IntLit(n) => out.push_str(&n.to_string()),
+        Expr::FloatLit(n) => out.push_str(&n.to_string()),
+        Expr::BoolLit(b) => out.push_str(if *b { "true" } else { "false" }),
+        Expr::Null => out.push_str("null"),
+        other => out.push_str(&format!("{:?}", other)),
+    }
 }
 
 /// Get an identifier value for a key (first segment of ident path).

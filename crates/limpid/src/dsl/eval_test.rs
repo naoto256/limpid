@@ -204,6 +204,44 @@ mod tests {
     }
 
     #[test]
+    fn test_eval_template() {
+        let e = make_event();
+        let f = make_funcs();
+        // "[${severity}] from ${fields.src}"
+        let expr = Expr::Template(vec![
+            TemplateFragment::Literal("[".into()),
+            TemplateFragment::Interp(Expr::Ident(vec!["severity".into()])),
+            TemplateFragment::Literal("] from ".into()),
+            TemplateFragment::Interp(Expr::Ident(vec![
+                "fields".into(),
+                "src".into(),
+            ])),
+        ]);
+        assert_eq!(
+            eval_expr(&expr, &e, &f).unwrap(),
+            Value::String("[3] from 192.168.1.1".into())
+        );
+    }
+
+    #[test]
+    fn test_eval_template_missing_interp_empty() {
+        let e = make_event();
+        let f = make_funcs();
+        let expr = Expr::Template(vec![
+            TemplateFragment::Literal("prefix-".into()),
+            TemplateFragment::Interp(Expr::Ident(vec![
+                "fields".into(),
+                "missing".into(),
+            ])),
+            TemplateFragment::Literal("-suffix".into()),
+        ]);
+        assert_eq!(
+            eval_expr(&expr, &e, &f).unwrap(),
+            Value::String("prefix--suffix".into())
+        );
+    }
+
+    #[test]
     fn test_eval_lower_upper() {
         let e = make_event();
         let f = make_funcs();

@@ -482,7 +482,7 @@ fn parse_atom_or_unary(pair: Pair<Rule>) -> Result<Expr> {
         Rule::atom => parse_atom(pair),
         Rule::expr => parse_expr(pair),
         // Direct literal/ident matches from property values etc.
-        Rule::string_lit => Ok(Expr::StringLit(parse_string_lit(&pair))),
+        Rule::string_lit => parse_string_lit_expr(&pair),
         Rule::integer_lit => Ok(Expr::IntLit(pair.as_str().parse()?)),
         Rule::float_lit => Ok(Expr::FloatLit(pair.as_str().parse()?)),
         Rule::bool_lit => Ok(Expr::BoolLit(pair.as_str() == "true")),
@@ -521,7 +521,7 @@ fn parse_atom(pair: Pair<Rule>) -> Result<Expr> {
         Rule::hash_lit => parse_hash_lit(inner),
         Rule::float_lit => Ok(Expr::FloatLit(inner.as_str().parse()?)),
         Rule::integer_lit => Ok(Expr::IntLit(inner.as_str().parse()?)),
-        Rule::string_lit => Ok(Expr::StringLit(parse_string_lit(&inner))),
+        Rule::string_lit => parse_string_lit_expr(&inner),
         Rule::bool_lit => Ok(Expr::BoolLit(inner.as_str() == "true")),
         Rule::null_lit => Ok(Expr::Null),
         Rule::ident_path => {
@@ -560,31 +560,100 @@ fn parse_hash_lit(pair: Pair<Rule>) -> Result<Expr> {
     Ok(Expr::HashLit(entries))
 }
 
+/// Extract a string literal as a plain `String`.
+///
+/// Used in contexts where `${expr}` interpolation isn't meaningful
+/// (e.g. `include` paths, which resolve at config-load time with no
+/// event available). Interpolation fragments are rendered as literal
+/// `${...}` text so the user sees something useful in error messages
+/// rather than a mysteriously-collapsed path.
 fn parse_string_lit(pair: &Pair<Rule>) -> String {
-    let raw = pair.as_str();
-    // Strip surrounding quotes
-    let content = &raw[1..raw.len() - 1];
-    // Handle basic escape sequences
-    let mut result = String::new();
-    let mut chars = content.chars();
+    let mut out = String::new();
+    for frag in pair.clone().into_inner() {
+        match frag.as_rule() {
+            Rule::string_plain => process_plain_into(&mut out, frag.as_str()),
+            Rule::string_interp => {
+                // Preserve the raw source form; callers that forbid
+                // interpolation here should validate out-of-band.
+                out.push_str(frag.as_str());
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Parse a string literal as an expression, producing either a plain
+/// `StringLit` (no interpolation) or a `Template` (one or more `${expr}`).
+fn parse_string_lit_expr(pair: &Pair<Rule>) -> Result<Expr> {
+    let mut fragments: Vec<TemplateFragment> = Vec::new();
+    let mut current_literal = String::new();
+
+    for frag in pair.clone().into_inner() {
+        match frag.as_rule() {
+            Rule::string_plain => process_plain_into(&mut current_literal, frag.as_str()),
+            Rule::string_interp => {
+                if !current_literal.is_empty() {
+                    fragments.push(TemplateFragment::Literal(std::mem::take(
+                        &mut current_literal,
+                    )));
+                }
+                let expr_pair = frag
+                    .into_inner()
+                    .find(|p| p.as_rule() == Rule::expr)
+                    .ok_or_else(|| anyhow::anyhow!("empty `${{}}` interpolation"))?;
+                let expr = parse_expr(expr_pair)?;
+                fragments.push(TemplateFragment::Interp(expr));
+            }
+            _ => {}
+        }
+    }
+    if !current_literal.is_empty() {
+        fragments.push(TemplateFragment::Literal(current_literal));
+    }
+
+    // If there's no interpolation, collapse to a plain StringLit so
+    // existing code that matches on Expr::StringLit stays ergonomic.
+    let has_interp = fragments
+        .iter()
+        .any(|f| matches!(f, TemplateFragment::Interp(_)));
+    if has_interp {
+        Ok(Expr::Template(fragments))
+    } else {
+        let combined = fragments
+            .into_iter()
+            .filter_map(|f| match f {
+                TemplateFragment::Literal(s) => Some(s),
+                TemplateFragment::Interp(_) => None,
+            })
+            .collect::<String>();
+        Ok(Expr::StringLit(combined))
+    }
+}
+
+/// Process a `string_plain` span (atomic in the grammar) into `out`,
+/// resolving common backslash escape sequences. `\${` yields a literal
+/// `${`; other unknown escapes are passed through as-is.
+fn process_plain_into(out: &mut String, s: &str) {
+    let mut chars = s.chars();
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.next() {
-                Some('n') => result.push('\n'),
-                Some('t') => result.push('\t'),
-                Some('\\') => result.push('\\'),
-                Some('"') => result.push('"'),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('\\') => out.push('\\'),
+                Some('"') => out.push('"'),
+                Some('$') => out.push('$'),
                 Some(other) => {
-                    result.push('\\');
-                    result.push(other);
+                    out.push('\\');
+                    out.push(other);
                 }
-                None => result.push('\\'),
+                None => out.push('\\'),
             }
         } else {
-            result.push(c);
+            out.push(c);
         }
     }
-    result
 }
 
 fn parse_bin_op(pair: &Pair<Rule>) -> Result<BinOp> {
@@ -907,5 +976,122 @@ def pipeline test {
 "#;
         let config = parse_config(input).unwrap();
         assert!(matches!(&config.definitions[0], Definition::Pipeline(..)));
+    }
+
+    // ---- String template interpolation --------------------------------
+
+    fn property_value<'a>(props: &'a [Property], key: &str) -> &'a Expr {
+        for p in props {
+            if let Property::KeyValue(k, v) = p
+                && k == key
+            {
+                return v;
+            }
+        }
+        panic!("property {} not found", key);
+    }
+
+    #[test]
+    fn plain_string_parses_as_string_lit() {
+        let input = r#"
+def output sink {
+    type file
+    path "/var/log/app.log"
+}
+"#;
+        let config = parse_config(input).unwrap();
+        match &config.definitions[0] {
+            Definition::Output(def) => match property_value(&def.properties, "path") {
+                Expr::StringLit(s) => assert_eq!(s, "/var/log/app.log"),
+                other => panic!("expected StringLit, got {:?}", other),
+            },
+            _ => panic!("expected Output definition"),
+        }
+    }
+
+    #[test]
+    fn interpolated_string_parses_as_template() {
+        let input = r#"
+def output sink {
+    type file
+    path "/var/log/${source}/${fields.date}.log"
+}
+"#;
+        let config = parse_config(input).unwrap();
+        match &config.definitions[0] {
+            Definition::Output(def) => match property_value(&def.properties, "path") {
+                Expr::Template(frags) => {
+                    assert_eq!(frags.len(), 5);
+                    // /var/log/
+                    assert!(matches!(&frags[0], TemplateFragment::Literal(s) if s == "/var/log/"));
+                    // ${source}
+                    assert!(matches!(
+                        &frags[1],
+                        TemplateFragment::Interp(Expr::Ident(parts)) if parts == &vec!["source".to_string()]
+                    ));
+                    // /
+                    assert!(matches!(&frags[2], TemplateFragment::Literal(s) if s == "/"));
+                    // ${fields.date}
+                    assert!(matches!(
+                        &frags[3],
+                        TemplateFragment::Interp(Expr::Ident(parts))
+                            if parts == &vec!["fields".to_string(), "date".to_string()]
+                    ));
+                    // .log
+                    assert!(matches!(&frags[4], TemplateFragment::Literal(s) if s == ".log"));
+                }
+                other => panic!("expected Template, got {:?}", other),
+            },
+            _ => panic!("expected Output definition"),
+        }
+    }
+
+    #[test]
+    fn escaped_dollar_brace_is_literal() {
+        // `\${x}` should render as literal `${x}` (no interpolation)
+        let input = r#"
+def output sink {
+    type file
+    path "literal-\${x}-here"
+}
+"#;
+        let config = parse_config(input).unwrap();
+        match &config.definitions[0] {
+            Definition::Output(def) => match property_value(&def.properties, "path") {
+                Expr::StringLit(s) => assert_eq!(s, "literal-${x}-here"),
+                other => panic!("expected StringLit, got {:?}", other),
+            },
+            _ => panic!("expected Output definition"),
+        }
+    }
+
+    #[test]
+    fn interpolation_inside_func_call_expression() {
+        // `"[${severity}] ${message}"` — template with multiple identifiers
+        let input = r#"
+def process annotate {
+    message = "[${severity}] ${message}"
+}
+"#;
+        let config = parse_config(input).unwrap();
+        match &config.definitions[0] {
+            Definition::Process(def) => match &def.body[0] {
+                ProcessStatement::Assign(AssignTarget::Message, Expr::Template(frags)) => {
+                    assert_eq!(frags.len(), 4);
+                    assert!(matches!(&frags[0], TemplateFragment::Literal(s) if s == "["));
+                    assert!(matches!(
+                        &frags[1],
+                        TemplateFragment::Interp(Expr::Ident(parts)) if parts == &vec!["severity".to_string()]
+                    ));
+                    assert!(matches!(&frags[2], TemplateFragment::Literal(s) if s == "] "));
+                    assert!(matches!(
+                        &frags[3],
+                        TemplateFragment::Interp(Expr::Ident(parts)) if parts == &vec!["message".to_string()]
+                    ));
+                }
+                other => panic!("expected template assignment, got {:?}", other),
+            },
+            _ => panic!("expected Process definition"),
+        }
     }
 }
