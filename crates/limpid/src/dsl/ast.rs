@@ -174,8 +174,12 @@ pub enum AssignTarget {
 
 #[derive(Debug, Clone)]
 pub enum Expr {
-    /// String literal: `"hello"`
+    /// String literal without interpolation: `"hello"`
     StringLit(String),
+    /// String literal with `${expr}` interpolation: `"/log/${source}.log"`.
+    /// When no interpolations are present, the parser emits `StringLit`
+    /// instead, so reaching `Template` guarantees at least one `Interp`.
+    Template(Vec<TemplateFragment>),
     /// Integer literal: `42`
     IntLit(i64),
     /// Float literal: `3.14`
@@ -196,6 +200,14 @@ pub enum Expr {
     HashLit(Vec<(String, Expr)>),
     /// Postfix property access: `geoip(x).country.name`
     PropertyAccess(Box<Expr>, Vec<String>),
+}
+
+#[derive(Debug, Clone)]
+pub enum TemplateFragment {
+    /// Literal text between interpolations (after escape processing).
+    Literal(String),
+    /// `${expr}` interpolation — evaluated against the event at render time.
+    Interp(Expr),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
