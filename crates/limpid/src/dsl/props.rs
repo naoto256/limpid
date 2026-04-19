@@ -32,7 +32,6 @@ pub fn get_string(props: &[Property], key: &str) -> Option<String> {
 /// Return the raw `Expr` bound to `key`, if any. Modules wanting to
 /// evaluate templates per-event (with a `FunctionRegistry`) should use
 /// this rather than `get_string`.
-#[allow(dead_code)]
 pub fn get_expr<'a>(props: &'a [Property], key: &str) -> Option<&'a Expr> {
     for prop in props {
         if let Property::KeyValue(k, expr) = prop
