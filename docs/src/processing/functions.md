@@ -226,4 +226,16 @@ Expressions support the following operators:
 | `<`, `<=`, `>`, `>=` | Numeric comparison |
 | `and`, `or` | Logical |
 | `not` | Logical negation |
-| `+`, `-`, `*`, `/`, `%` | Arithmetic (numeric) |
+| `+` | Arithmetic addition **or** string concatenation (see below) |
+| `-`, `*`, `/`, `%` | Arithmetic (numeric) |
+
+### `+` overloading
+
+If either operand is a string, `+` concatenates after stringifying the other side:
+
+```
+message = "[" + severity + "] " + message
+message = source + " " + message
+```
+
+If both operands are numeric, `+` is ordinary addition. Mixing with `null`, arrays, or objects is an error — stringify explicitly with `to_json()` first if that is what you want.

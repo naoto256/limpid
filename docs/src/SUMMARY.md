@@ -41,3 +41,4 @@
 - [Packaging](./operations/packaging.md)
 - [systemd](./operations/systemd.md)
 - [Migrating from rsyslog](./operations/migration.md)
+- [Upgrading to 0.3](./operations/upgrade-0.3.md)
