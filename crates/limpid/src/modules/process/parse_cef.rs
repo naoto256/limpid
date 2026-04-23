@@ -39,13 +39,27 @@ pub fn apply(mut event: Event) -> Result<Event, ProcessError> {
     }
     // `remaining` is now the extensions string
 
-    event.fields.insert("cef_version".into(), Value::String(parts[0].to_string()));
-    event.fields.insert("device_vendor".into(), Value::String(parts[1].to_string()));
-    event.fields.insert("device_product".into(), Value::String(parts[2].to_string()));
-    event.fields.insert("device_version".into(), Value::String(parts[3].to_string()));
-    event.fields.insert("signature_id".into(), Value::String(parts[4].to_string()));
-    event.fields.insert("name".into(), Value::String(parts[5].to_string()));
-    event.fields.insert("cef_severity".into(), Value::String(parts[6].to_string()));
+    event
+        .fields
+        .insert("cef_version".into(), Value::String(parts[0].to_string()));
+    event
+        .fields
+        .insert("device_vendor".into(), Value::String(parts[1].to_string()));
+    event
+        .fields
+        .insert("device_product".into(), Value::String(parts[2].to_string()));
+    event
+        .fields
+        .insert("device_version".into(), Value::String(parts[3].to_string()));
+    event
+        .fields
+        .insert("signature_id".into(), Value::String(parts[4].to_string()));
+    event
+        .fields
+        .insert("name".into(), Value::String(parts[5].to_string()));
+    event
+        .fields
+        .insert("cef_severity".into(), Value::String(parts[6].to_string()));
 
     // Parse extensions: key=value pairs
     parse_cef_extensions(remaining, &mut event);
@@ -86,7 +100,8 @@ fn parse_cef_extensions(extensions: &str, event: &mut Event) {
                     // Look ahead for potential key
                     let lookahead = i + 1;
                     let mut j = lookahead;
-                    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
+                    {
                         j += 1;
                     }
                     if j < bytes.len() && bytes[j] == b'=' && j > lookahead {
@@ -111,13 +126,17 @@ fn parse_cef_extensions(extensions: &str, event: &mut Event) {
             let next_val_start = key_positions[idx + 1].1;
             let next_key_len = key_positions[idx + 1].0.len();
             // next key position: next_val_start - key_len - 1(=) - 1(space)
-            next_val_start.saturating_sub(next_key_len + 2).max(val_start)
+            next_val_start
+                .saturating_sub(next_key_len + 2)
+                .max(val_start)
         } else {
             extensions.len()
         };
 
         let value = extensions[val_start..val_end].trim();
-        event.fields.insert(key.clone(), Value::String(value.to_string()));
+        event
+            .fields
+            .insert(key.clone(), Value::String(value.to_string()));
     }
 }
 
@@ -142,8 +161,14 @@ mod tests {
         let result = apply(event).unwrap();
 
         assert_eq!(result.fields["cef_version"], Value::String("0".into()));
-        assert_eq!(result.fields["device_vendor"], Value::String("Fortinet".into()));
-        assert_eq!(result.fields["device_product"], Value::String("FortiGate".into()));
+        assert_eq!(
+            result.fields["device_vendor"],
+            Value::String("Fortinet".into())
+        );
+        assert_eq!(
+            result.fields["device_product"],
+            Value::String("FortiGate".into())
+        );
         assert_eq!(result.fields["signature_id"], Value::String("1234".into()));
         assert_eq!(result.fields["src"], Value::String("10.0.0.1".into()));
         assert_eq!(result.fields["dst"], Value::String("10.0.0.2".into()));
@@ -152,12 +177,13 @@ mod tests {
 
     #[test]
     fn test_parse_cef_with_syslog_header() {
-        let event = make_event(
-            "<134>CEF:0|Security|IDS|1.0|100|Attack|8|src=192.168.1.1",
-        );
+        let event = make_event("<134>CEF:0|Security|IDS|1.0|100|Attack|8|src=192.168.1.1");
         let result = apply(event).unwrap();
 
-        assert_eq!(result.fields["device_vendor"], Value::String("Security".into()));
+        assert_eq!(
+            result.fields["device_vendor"],
+            Value::String("Security".into())
+        );
         assert_eq!(result.fields["src"], Value::String("192.168.1.1".into()));
     }
 

@@ -31,7 +31,12 @@ mod tests {
     /// No-op registry that passes events through unchanged.
     struct NoopRegistry;
     impl ProcessRegistry for NoopRegistry {
-        fn call(&self, _name: &str, _args: &[Value], event: Event) -> Result<Option<Event>, ProcessError> {
+        fn call(
+            &self,
+            _name: &str,
+            _args: &[Value],
+            event: Event,
+        ) -> Result<Option<Event>, ProcessError> {
             Ok(Some(event))
         }
     }
@@ -39,7 +44,12 @@ mod tests {
     /// Registry that always fails.
     struct FailRegistry;
     impl ProcessRegistry for FailRegistry {
-        fn call(&self, _name: &str, _args: &[Value], _event: Event) -> Result<Option<Event>, ProcessError> {
+        fn call(
+            &self,
+            _name: &str,
+            _args: &[Value],
+            _event: Event,
+        ) -> Result<Option<Event>, ProcessError> {
             Err(ProcessError::Failed("test error".into()))
         }
     }

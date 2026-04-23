@@ -19,11 +19,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
-use tracing::{info, warn, error, debug};
+use tracing::{debug, error, info, warn};
 
 use crate::dsl::ast::*;
 use crate::event::Event;
@@ -207,7 +207,9 @@ async fn handle_connection(
     if let Some(inject_args) = cmd.strip_prefix("inject ") {
         let parts: Vec<&str> = inject_args.split_whitespace().collect();
         let (kind, name, json_mode) = match parts.as_slice() {
-            [kind, name] if matches!(*kind, "input" | "output") => (*kind, (*name).to_string(), false),
+            [kind, name] if matches!(*kind, "input" | "output") => {
+                (*kind, (*name).to_string(), false)
+            }
             [kind, name, "json"] if matches!(*kind, "input" | "output") => {
                 (*kind, (*name).to_string(), true)
             }
@@ -222,7 +224,16 @@ async fn handle_connection(
         // Any bytes buffered past the first line remain intact inside
         // the BufReader and will be consumed by handle_inject.
         reader.get_mut().set_limit(u64::MAX);
-        handle_inject(kind, &name, json_mode, reader, &mut writer, &input_senders, &output_senders).await;
+        handle_inject(
+            kind,
+            &name,
+            json_mode,
+            reader,
+            &mut writer,
+            &input_senders,
+            &output_senders,
+        )
+        .await;
         return;
     }
 
@@ -264,9 +275,7 @@ async fn handle_connection(
             }
             "stats" => metrics.to_json(),
             "list" => build_list_json(&config),
-            _ => {
-                json!({"error": format!("unknown command '{}'", cmd)}).to_string()
-            }
+            _ => json!({"error": format!("unknown command '{}'", cmd)}).to_string(),
         };
         let _ = writer.write_all(response.as_bytes()).await;
         let _ = writer.write_all(b"\n").await;
@@ -281,7 +290,9 @@ fn build_list_json(config: &CompiledConfig) -> String {
     names.sort();
 
     for name in names {
-        let Some(pipeline_def) = config.pipelines.get(name) else { continue };
+        let Some(pipeline_def) = config.pipelines.get(name) else {
+            continue;
+        };
         let mut input = None;
         let mut processes = Vec::new();
         let mut outputs = Vec::new();
@@ -465,9 +476,7 @@ async fn handle_inject(
             }
             Target::Output(tx) => {
                 let sent = tx.send(event).await;
-                if sent
-                    && let Some(m) = tx.metrics()
-                {
+                if sent && let Some(m) = tx.metrics() {
                     m.events_injected
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -496,13 +505,7 @@ async fn handle_tap(
     // (safe to pipe to `jq` or `limpidctl inject --json`).
     if !json_mode {
         let _ = writer
-            .write_all(
-                format!(
-                    "tapping '{}' — events will stream below\n",
-                    output_name
-                )
-                .as_bytes(),
-            )
+            .write_all(format!("tapping '{}' — events will stream below\n", output_name).as_bytes())
             .await;
     }
 

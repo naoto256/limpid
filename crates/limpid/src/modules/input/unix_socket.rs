@@ -11,14 +11,14 @@ use std::sync::atomic::Ordering;
 use anyhow::Result;
 use bytes::Bytes;
 use tokio::net::UnixDatagram;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
+use super::validate::validate_pri;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::event::Event;
 use crate::metrics::InputMetrics;
 use crate::modules::{FromProperties, HasMetrics, Input};
-use super::validate::validate_pri;
 
 const UNIX_SOURCE: &str = "127.0.0.1:0";
 
@@ -40,17 +40,26 @@ impl FromProperties for UnixSocketInput {
 
 impl HasMetrics for UnixSocketInput {
     type Stats = InputMetrics;
-    fn metrics(&self) -> Arc<InputMetrics> { Arc::clone(&self.metrics) }
+    fn metrics(&self) -> Arc<InputMetrics> {
+        Arc::clone(&self.metrics)
+    }
 }
 
 #[async_trait::async_trait]
 impl Input for UnixSocketInput {
-    async fn run(self, tx: tokio::sync::mpsc::Sender<Event>, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
+    async fn run(
+        self,
+        tx: tokio::sync::mpsc::Sender<Event>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
         // Remove stale socket file if it exists (but not if it's a symlink)
         if std::path::Path::new(&self.path).exists() {
             match std::fs::symlink_metadata(&self.path) {
                 Ok(meta) if meta.file_type().is_symlink() => {
-                    error!("unix_socket: {:?} is a symlink — refusing to remove", self.path);
+                    error!(
+                        "unix_socket: {:?} is a symlink — refusing to remove",
+                        self.path
+                    );
                     anyhow::bail!("unix_socket: {:?} is a symlink", self.path);
                 }
                 _ => {
@@ -66,8 +75,13 @@ impl Input for UnixSocketInput {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Err(e) = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o666)) {
-                warn!("unix_socket {}: failed to set permissions: {}", self.path, e);
+            if let Err(e) =
+                std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o666))
+            {
+                warn!(
+                    "unix_socket {}: failed to set permissions: {}",
+                    self.path, e
+                );
             }
         }
 

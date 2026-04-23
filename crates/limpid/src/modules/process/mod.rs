@@ -21,7 +21,13 @@ pub fn register_builtins(reg: &mut ModuleRegistry) {
     reg.register_process("parse_kv", |_args, event| parse_kv::apply(event));
     reg.register_process("parse_syslog", |_args, event| parse_syslog::apply(event));
     reg.register_process("strip_pri", |_args, event| strip_pri::apply(event));
-    reg.register_process("prepend_source", |_args, event| prepend_source::apply(event));
-    reg.register_process("prepend_timestamp", |_args, event| prepend_timestamp::apply(event));
-    reg.register_process("regex_replace", |args, event| regex_replace::apply(event, args));
+    reg.register_process("prepend_source", |_args, event| {
+        prepend_source::apply(event)
+    });
+    reg.register_process("prepend_timestamp", |_args, event| {
+        prepend_timestamp::apply(event)
+    });
+    reg.register_process("regex_replace", |args, event| {
+        regex_replace::apply(event, args)
+    });
 }

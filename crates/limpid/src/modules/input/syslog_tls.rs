@@ -7,7 +7,7 @@ use anyhow::Result;
 use tokio::io::BufReader;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-use tracing::{info, warn, error, debug};
+use tracing::{debug, error, info, warn};
 
 use crate::dsl::ast::Property;
 use crate::dsl::props;
@@ -33,8 +33,8 @@ pub struct SyslogTlsInput {
 
 impl FromProperties for SyslogTlsInput {
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
-        let bind = props::get_string(properties, "bind")
-            .unwrap_or_else(|| "0.0.0.0:6514".to_string());
+        let bind =
+            props::get_string(properties, "bind").unwrap_or_else(|| "0.0.0.0:6514".to_string());
         let framing = match props::get_ident(properties, "framing").as_deref() {
             Some("octet_counting") => TcpFraming::OctetCounting,
             Some("non_transparent") => TcpFraming::NonTransparent,
@@ -49,7 +49,8 @@ impl FromProperties for SyslogTlsInput {
         let ca = props::get_string(tls_block, "ca");
         let rate_limit = props::get_strictly_positive_int(properties, "rate_limit")?;
         let max_connections = props::get_positive_int(properties, "max_connections")?
-            .unwrap_or(super::syslog_tcp::DEFAULT_MAX_CONNECTIONS) as usize;
+            .unwrap_or(super::syslog_tcp::DEFAULT_MAX_CONNECTIONS)
+            as usize;
 
         Ok(Self {
             bind_addr: bind,
@@ -75,7 +76,11 @@ impl HasMetrics for SyslogTlsInput {
 
 #[async_trait::async_trait]
 impl Input for SyslogTlsInput {
-    async fn run(self, tx: tokio::sync::mpsc::Sender<Event>, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
+    async fn run(
+        self,
+        tx: tokio::sync::mpsc::Sender<Event>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
         let server_config = crate::tls::build_server_config(&self.tls_config)?;
         let acceptor = TlsAcceptor::from(server_config);
 

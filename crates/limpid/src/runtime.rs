@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::sync::{mpsc, watch};
-use tracing::{info, error};
+use tracing::{error, info};
 
 use crate::control::ControlServer;
 use crate::dsl::ast::*;
@@ -66,9 +66,16 @@ impl Runtime {
             let created = match registry.create_output(&output_type, name, &output_def.properties) {
                 Ok(c) => c,
                 Err(e) => {
-                    error!("failed to create output '{}': {} — aborting startup", name, e);
-                    for h in &handles { h.abort(); }
-                    for h in handles { let _ = h.await; }
+                    error!(
+                        "failed to create output '{}': {} — aborting startup",
+                        name, e
+                    );
+                    for h in &handles {
+                        h.abort();
+                    }
+                    for h in handles {
+                        let _ = h.await;
+                    }
                     return Err(e);
                 }
             };
@@ -94,8 +101,16 @@ impl Runtime {
             let shutdown = shutdown_rx.clone();
             let tap_clone = tap.clone();
             handles.push(tokio::spawn(async move {
-                queue::run_queue_consumer(receiver, writer, retry_config, secondary_sender, Some(tap_clone), output_metrics, shutdown)
-                    .await;
+                queue::run_queue_consumer(
+                    receiver,
+                    writer,
+                    retry_config,
+                    secondary_sender,
+                    Some(tap_clone),
+                    output_metrics,
+                    shutdown,
+                )
+                .await;
             }));
         }
 
@@ -144,9 +159,8 @@ impl Runtime {
             let input_type = props::get_ident(&input_def.properties, "type")
                 .ok_or_else(|| anyhow::anyhow!("input '{}' has no type", input_name))?;
 
-            let queue_size =
-                props::get_positive_int(&input_def.properties, "queue_size")?
-                    .unwrap_or(4096) as usize;
+            let queue_size = props::get_positive_int(&input_def.properties, "queue_size")?
+                .unwrap_or(4096) as usize;
             let (event_tx, event_rx) = mpsc::channel::<Event>(queue_size);
 
             // Pipeline workers
@@ -166,12 +180,25 @@ impl Runtime {
             }));
 
             // Input — registry builds, spawns, and returns metrics handle
-            let created = match registry.create_input(&input_type, &input_name, &input_def.properties, event_tx, shutdown_rx.clone()) {
+            let created = match registry.create_input(
+                &input_type,
+                &input_name,
+                &input_def.properties,
+                event_tx,
+                shutdown_rx.clone(),
+            ) {
                 Ok(c) => c,
                 Err(e) => {
-                    error!("failed to start input '{}': {} — aborting startup", input_name, e);
-                    for h in &handles { h.abort(); }
-                    for h in handles { let _ = h.await; }
+                    error!(
+                        "failed to start input '{}': {} — aborting startup",
+                        input_name, e
+                    );
+                    for h in &handles {
+                        h.abort();
+                    }
+                    for h in handles {
+                        let _ = h.await;
+                    }
                     return Err(e);
                 }
             };
@@ -227,7 +254,10 @@ impl Runtime {
 
         const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
-        info!("initiating graceful shutdown (timeout: {}s)", SHUTDOWN_TIMEOUT.as_secs());
+        info!(
+            "initiating graceful shutdown (timeout: {}s)",
+            SHUTDOWN_TIMEOUT.as_secs()
+        );
         let _ = self.shutdown_tx.send(true);
 
         // Collect abort handles before moving JoinHandles into join_all
@@ -238,7 +268,10 @@ impl Runtime {
                 info!("shutdown complete");
             }
             Err(_) => {
-                error!("shutdown timed out after {}s — aborting remaining tasks", SHUTDOWN_TIMEOUT.as_secs());
+                error!(
+                    "shutdown timed out after {}s — aborting remaining tasks",
+                    SHUTDOWN_TIMEOUT.as_secs()
+                );
                 for ah in &abort_handles {
                     ah.abort();
                 }
@@ -249,9 +282,10 @@ impl Runtime {
     async fn join_all(handles: Vec<tokio::task::JoinHandle<()>>) {
         for handle in handles {
             if let Err(e) = handle.await
-                && e.is_panic() {
-                    error!("task panicked during shutdown: {}", e);
-                }
+                && e.is_panic()
+            {
+                error!("task panicked during shutdown: {}", e);
+            }
         }
     }
 }
@@ -281,8 +315,7 @@ pub(crate) fn init_tables(config: &CompiledConfig) -> Result<crate::functions::t
             if let Property::Block(table_name, inner_props) = prop {
                 let load_path = props::get_string(inner_props, "load").map(PathBuf::from);
                 let max = props::get_positive_int(inner_props, "max")?.map(|n| n as usize);
-                let ttl = props::get_positive_int(inner_props, "ttl")?
-                    .map(Duration::from_secs);
+                let ttl = props::get_positive_int(inner_props, "ttl")?.map(Duration::from_secs);
 
                 configs.push(TableConfig {
                     name: table_name.clone(),
@@ -382,7 +415,14 @@ async fn run_pipeline_with_outputs(
     event: Event,
     ctx: &PipelineContext,
 ) -> Result<crate::pipeline::PipelineRunResult> {
-    let result = crate::pipeline::run_pipeline(pipeline, event, &ctx.config, &ctx.builtins, &ctx.funcs, Some(&ctx.tap))?;
+    let result = crate::pipeline::run_pipeline(
+        pipeline,
+        event,
+        &ctx.config,
+        &ctx.builtins,
+        &ctx.funcs,
+        Some(&ctx.tap),
+    )?;
 
     for (output_name, output_event) in &result.outputs {
         if let Some(sender) = ctx.output_senders.get(output_name) {
@@ -406,7 +446,10 @@ async fn process_event(
 ) {
     ctx.tap.emit(input_tap_key, event).await;
     for worker in workers {
-        worker.metrics.events_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        worker
+            .metrics
+            .events_received
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let event_copy = event.clone();
         match run_pipeline_with_outputs(&worker.def, event_copy, ctx).await {
@@ -414,13 +457,22 @@ async fn process_event(
                 use crate::pipeline::PipelineTermination;
                 match result.termination {
                     PipelineTermination::Dropped => {
-                        worker.metrics.events_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        worker
+                            .metrics
+                            .events_dropped
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     PipelineTermination::Finished => {
                         if result.outputs.is_empty() {
-                            worker.metrics.events_discarded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            worker
+                                .metrics
+                                .events_discarded
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         } else {
-                            worker.metrics.events_finished.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            worker
+                                .metrics
+                                .events_finished
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                 }

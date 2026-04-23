@@ -3,18 +3,18 @@
 use anyhow::{Result, bail};
 use serde_json::Value;
 
+use super::ast::{BinOp, Expr, UnaryOp};
 use crate::event::Event;
 use crate::functions::FunctionRegistry;
-use super::ast::{Expr, BinOp, UnaryOp};
 
 /// Evaluate an expression in the context of an Event, producing a serde_json::Value.
 pub fn eval_expr(expr: &Expr, event: &Event, funcs: &FunctionRegistry) -> Result<Value> {
     match expr {
         Expr::StringLit(s) => Ok(Value::String(s.clone())),
         Expr::IntLit(n) => Ok(Value::Number((*n).into())),
-        Expr::FloatLit(f) => {
-            Ok(Value::Number(serde_json::Number::from_f64(*f).unwrap_or(0.into())))
-        }
+        Expr::FloatLit(f) => Ok(Value::Number(
+            serde_json::Number::from_f64(*f).unwrap_or(0.into()),
+        )),
         Expr::BoolLit(b) => Ok(Value::Bool(*b)),
         Expr::Null => Ok(Value::Null),
 
@@ -104,7 +104,10 @@ fn resolve_ident(parts: &[String], event: &Event) -> Result<Value> {
 }
 
 /// Direct lookup into event.fields HashMap — no clone.
-fn resolve_fields_direct(parts: &[String], fields: &std::collections::HashMap<String, Value>) -> Result<Value> {
+fn resolve_fields_direct(
+    parts: &[String],
+    fields: &std::collections::HashMap<String, Value>,
+) -> Result<Value> {
     let first = fields.get(&parts[0]).unwrap_or(&Value::Null);
     if parts.len() == 1 {
         return Ok(first.clone());
@@ -133,12 +136,16 @@ fn eval_bin_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
     match op {
         BinOp::Eq => Ok(Value::Bool(values_equal(left, right))),
         BinOp::Ne => Ok(Value::Bool(!values_equal(left, right))),
-        BinOp::Lt => Ok(Value::Bool(compare_values(left, right) == Some(std::cmp::Ordering::Less))),
+        BinOp::Lt => Ok(Value::Bool(
+            compare_values(left, right) == Some(std::cmp::Ordering::Less),
+        )),
         BinOp::Le => Ok(Value::Bool(matches!(
             compare_values(left, right),
             Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
         ))),
-        BinOp::Gt => Ok(Value::Bool(compare_values(left, right) == Some(std::cmp::Ordering::Greater))),
+        BinOp::Gt => Ok(Value::Bool(
+            compare_values(left, right) == Some(std::cmp::Ordering::Greater),
+        )),
         BinOp::Ge => Ok(Value::Bool(matches!(
             compare_values(left, right),
             Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)

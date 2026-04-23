@@ -22,8 +22,8 @@ pub fn apply(mut event: Event) -> Result<Event, ProcessError> {
     let raw = String::from_utf8_lossy(&event.raw).into_owned();
 
     // Skip PRI: <PRI>rest
-    let after_pri = skip_pri(&raw)
-        .ok_or_else(|| ProcessError::Failed("no PRI header found".into()))?;
+    let after_pri =
+        skip_pri(&raw).ok_or_else(|| ProcessError::Failed("no PRI header found".into()))?;
 
     // Detect RFC version: RFC 5424 starts with VERSION SP (e.g. "1 ")
     if after_pri.len() >= 2
@@ -72,7 +72,9 @@ fn parse_rfc5424(input: &str, event: &mut Event) {
         set_field(event, "msgid", msgid);
     }
     if !msg.is_empty() {
-        event.fields.insert("syslog_msg".into(), Value::String(msg.to_string()));
+        event
+            .fields
+            .insert("syslog_msg".into(), Value::String(msg.to_string()));
         event.message = bytes::Bytes::from(msg.to_string());
     }
 }
@@ -110,7 +112,9 @@ fn parse_rfc3164(input: &str, event: &mut Event) {
         set_field(event, "procid", pid);
     }
     if !msg.is_empty() {
-        event.fields.insert("syslog_msg".into(), Value::String(msg.to_string()));
+        event
+            .fields
+            .insert("syslog_msg".into(), Value::String(msg.to_string()));
         event.message = bytes::Bytes::from(msg.to_string());
     }
 }
@@ -126,11 +130,12 @@ fn parse_tag_and_msg(input: &str) -> (&str, Option<&str>, &str) {
 
         // Check for [PID] in tag
         if let Some(bracket_start) = tag_part.find('[')
-            && let Some(bracket_end) = tag_part.find(']') {
-                let appname = &tag_part[..bracket_start];
-                let procid = &tag_part[bracket_start + 1..bracket_end];
-                return (appname, Some(procid), msg);
-            }
+            && let Some(bracket_end) = tag_part.find(']')
+        {
+            let appname = &tag_part[..bracket_start];
+            let procid = &tag_part[bracket_start + 1..bracket_end];
+            return (appname, Some(procid), msg);
+        }
 
         return (tag_part, None, msg);
     }
@@ -213,22 +218,34 @@ mod tests {
 
     #[test]
     fn test_rfc5424_basic() {
-        let event = make_event("<134>1 2026-04-15T10:30:00Z firewall01 sshd 1234 - - Failed password");
+        let event =
+            make_event("<134>1 2026-04-15T10:30:00Z firewall01 sshd 1234 - - Failed password");
         let result = apply(event).unwrap();
-        assert_eq!(result.fields["hostname"], Value::String("firewall01".into()));
+        assert_eq!(
+            result.fields["hostname"],
+            Value::String("firewall01".into())
+        );
         assert_eq!(result.fields["appname"], Value::String("sshd".into()));
         assert_eq!(result.fields["procid"], Value::String("1234".into()));
-        assert_eq!(result.fields["syslog_msg"], Value::String("Failed password".into()));
+        assert_eq!(
+            result.fields["syslog_msg"],
+            Value::String("Failed password".into())
+        );
     }
 
     #[test]
     fn test_rfc5424_with_structured_data() {
-        let event = make_event("<134>1 2026-04-15T10:30:00Z host app 999 ID1 [meta src=\"10.0.0.1\"] Hello world");
+        let event = make_event(
+            "<134>1 2026-04-15T10:30:00Z host app 999 ID1 [meta src=\"10.0.0.1\"] Hello world",
+        );
         let result = apply(event).unwrap();
         assert_eq!(result.fields["hostname"], Value::String("host".into()));
         assert_eq!(result.fields["appname"], Value::String("app".into()));
         assert_eq!(result.fields["msgid"], Value::String("ID1".into()));
-        assert_eq!(result.fields["syslog_msg"], Value::String("Hello world".into()));
+        assert_eq!(
+            result.fields["syslog_msg"],
+            Value::String("Hello world".into())
+        );
     }
 
     #[test]
@@ -238,7 +255,10 @@ mod tests {
         assert_eq!(result.fields["hostname"], Value::String("myhost".into()));
         assert_eq!(result.fields["appname"], Value::String("sshd".into()));
         assert_eq!(result.fields["procid"], Value::String("1234".into()));
-        assert_eq!(result.fields["syslog_msg"], Value::String("Failed password for root".into()));
+        assert_eq!(
+            result.fields["syslog_msg"],
+            Value::String("Failed password for root".into())
+        );
     }
 
     #[test]
@@ -247,7 +267,10 @@ mod tests {
         let result = apply(event).unwrap();
         assert_eq!(result.fields["hostname"], Value::String("myhost".into()));
         assert_eq!(result.fields["appname"], Value::String("kernel".into()));
-        assert_eq!(result.fields["syslog_msg"], Value::String("Out of memory".into()));
+        assert_eq!(
+            result.fields["syslog_msg"],
+            Value::String("Out of memory".into())
+        );
     }
 
     #[test]

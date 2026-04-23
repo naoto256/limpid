@@ -101,9 +101,7 @@ impl Table {
         let is_new = !self.entries.contains_key(&key);
 
         // Evict oldest if at capacity and this is a new key
-        if is_new
-            && let Some(max) = self.max
-        {
+        if is_new && let Some(max) = self.max {
             while self.entries.len() >= max {
                 if self.insertion_order.is_empty() {
                     break; // safety: no more tracked entries to evict
@@ -112,10 +110,8 @@ impl Table {
             }
         }
 
-        self.entries.insert(
-            key.clone(),
-            TableEntry { value, expires_at },
-        );
+        self.entries
+            .insert(key.clone(), TableEntry { value, expires_at });
 
         if is_new {
             self.insertion_order.push_back(key);
@@ -181,7 +177,10 @@ impl TableStore {
                     table.insertion_order.push_back(key);
                 }
             } else {
-                info!("table '{}': created (max: {:?}, ttl: {:?})", config.name, config.max, config.default_ttl);
+                info!(
+                    "table '{}': created (max: {:?}, ttl: {:?})",
+                    config.name, config.max, config.default_ttl
+                );
             }
 
             if let Some(max) = config.max
@@ -189,7 +188,9 @@ impl TableStore {
             {
                 warn!(
                     "table '{}': loaded {} entries but max is {} — excess entries will be evicted on first upsert",
-                    config.name, table.entries.len(), max
+                    config.name,
+                    table.entries.len(),
+                    max
                 );
             }
 

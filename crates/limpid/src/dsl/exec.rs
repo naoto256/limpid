@@ -4,11 +4,11 @@ use anyhow::{Result, bail};
 use bytes::Bytes;
 use serde_json::Value;
 
+use super::ast::*;
+use super::eval::{eval_expr, is_truthy, value_to_string, values_match};
 use crate::event::Event;
 use crate::functions::FunctionRegistry;
 use crate::modules::ProcessError;
-use super::ast::*;
-use super::eval::{eval_expr, is_truthy, value_to_string, values_match};
 
 /// Result of executing a process body.
 pub enum ExecResult {
@@ -20,7 +20,12 @@ pub enum ExecResult {
 
 /// A registry of named processes that can be called from DSL.
 pub trait ProcessRegistry {
-    fn call(&self, name: &str, args: &[Value], event: Event) -> std::result::Result<Option<Event>, ProcessError>;
+    fn call(
+        &self,
+        name: &str,
+        args: &[Value],
+        event: Event,
+    ) -> std::result::Result<Option<Event>, ProcessError>;
 }
 
 /// Execute a sequence of process statements against an event.
@@ -68,7 +73,11 @@ fn exec_process_stmt(
                 Ok(Some(e)) => Ok(ExecResult::Continue(e)),
                 Ok(None) => Ok(ExecResult::Dropped),
                 Err(e) => {
-                    tracing::debug!("process '{}' failed: {} — passing event through unchanged", name, e);
+                    tracing::debug!(
+                        "process '{}' failed: {} — passing event through unchanged",
+                        name,
+                        e
+                    );
                     Ok(ExecResult::Continue(backup))
                 }
             }
@@ -100,10 +109,9 @@ fn exec_process_stmt(
                 Err(e) => {
                     // Bind error message to `error` identifier (accessible via fields._error)
                     let mut recovered = event_backup;
-                    recovered.fields.insert(
-                        "_error".into(),
-                        serde_json::Value::String(e.to_string()),
-                    );
+                    recovered
+                        .fields
+                        .insert("_error".into(), serde_json::Value::String(e.to_string()));
                     let mut result = exec_process_body(catch_body, recovered, registry, funcs);
                     // Clean up _error after catch body
                     if let Ok(ExecResult::Continue(ref mut evt)) = result {
@@ -168,12 +176,10 @@ fn exec_branch_body_process(
 ) -> Result<ExecResult> {
     for item in body {
         match item {
-            BranchBody::Process(stmt) => {
-                match exec_process_stmt(stmt, event, registry, funcs)? {
-                    ExecResult::Continue(e) => event = e,
-                    ExecResult::Dropped => return Ok(ExecResult::Dropped),
-                }
-            }
+            BranchBody::Process(stmt) => match exec_process_stmt(stmt, event, registry, funcs)? {
+                ExecResult::Continue(e) => event = e,
+                ExecResult::Dropped => return Ok(ExecResult::Dropped),
+            },
             BranchBody::Pipeline(_) => {
                 bail!("pipeline statement found in process context")
             }
@@ -195,8 +201,12 @@ fn apply_assign(event: &mut Event, target: &AssignTarget, value: Value) -> Resul
         AssignTarget::Severity => {
             event.severity = match &value {
                 Value::Number(n) => {
-                    let v = n.as_u64().ok_or_else(|| anyhow::anyhow!("severity must be a non-negative integer"))?;
-                    if v > 7 { bail!("severity must be 0-7, got {}", v); }
+                    let v = n.as_u64().ok_or_else(|| {
+                        anyhow::anyhow!("severity must be a non-negative integer")
+                    })?;
+                    if v > 7 {
+                        bail!("severity must be 0-7, got {}", v);
+                    }
                     Some(v as u8)
                 }
                 Value::Null => None,
@@ -208,8 +218,12 @@ fn apply_assign(event: &mut Event, target: &AssignTarget, value: Value) -> Resul
         AssignTarget::Facility => {
             event.facility = match &value {
                 Value::Number(n) => {
-                    let v = n.as_u64().ok_or_else(|| anyhow::anyhow!("facility must be a non-negative integer"))?;
-                    if v > 23 { bail!("facility must be 0-23, got {}", v); }
+                    let v = n.as_u64().ok_or_else(|| {
+                        anyhow::anyhow!("facility must be a non-negative integer")
+                    })?;
+                    if v > 23 {
+                        bail!("facility must be 0-23, got {}", v);
+                    }
                     Some(v as u8)
                 }
                 Value::Null => None,

@@ -38,7 +38,9 @@ impl FromProperties for TcpOutput {
                 let port = props::get_int(properties, "port").unwrap_or(514);
                 Some(format!("{}:{}", host, port))
             })
-            .ok_or_else(|| anyhow::anyhow!("output '{}': tcp requires 'address' or 'host'+'port'", name))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("output '{}': tcp requires 'address' or 'host'+'port'", name)
+            })?;
         let framing = match props::get_ident(properties, "framing").as_deref() {
             Some("non_transparent") => TcpOutputFraming::NonTransparent,
             _ => TcpOutputFraming::OctetCounting,
@@ -54,7 +56,9 @@ impl FromProperties for TcpOutput {
 
 impl HasMetrics for TcpOutput {
     type Stats = OutputMetrics;
-    fn metrics(&self) -> Arc<OutputMetrics> { Arc::clone(&self.metrics) }
+    fn metrics(&self) -> Arc<OutputMetrics> {
+        Arc::clone(&self.metrics)
+    }
 }
 
 #[async_trait::async_trait]

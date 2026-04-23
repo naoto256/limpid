@@ -42,11 +42,17 @@ pub trait HasMetrics {
 
 #[async_trait::async_trait]
 pub trait Input: FromProperties + HasMetrics<Stats = InputMetrics> + Send + 'static {
-    async fn run(self, tx: mpsc::Sender<Event>, shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()>;
+    async fn run(
+        self,
+        tx: mpsc::Sender<Event>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()>;
 }
 
 #[async_trait::async_trait]
-pub trait Output: FromProperties + HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
+pub trait Output:
+    FromProperties + HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static
+{
     async fn write(&self, event: &Event) -> Result<()>;
 }
 
@@ -71,22 +77,24 @@ pub struct CreatedOutput {
 // ---------------------------------------------------------------------------
 
 type InputFactory = Box<
-    dyn Fn(&str, &[Property], mpsc::Sender<Event>, tokio::sync::watch::Receiver<bool>) -> Result<CreatedInput>
+    dyn Fn(
+            &str,
+            &[Property],
+            mpsc::Sender<Event>,
+            tokio::sync::watch::Receiver<bool>,
+        ) -> Result<CreatedInput>
         + Send
         + Sync,
 >;
 
-type OutputFactory = Box<
-    dyn Fn(&str, &[Property]) -> Result<CreatedOutput>
-        + Send
-        + Sync,
->;
+type OutputFactory = Box<dyn Fn(&str, &[Property]) -> Result<CreatedOutput> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
-type ProcessFn = Box<dyn Fn(&[serde_json::Value], Event) -> Result<Event, ProcessError> + Send + Sync>;
+type ProcessFn =
+    Box<dyn Fn(&[serde_json::Value], Event) -> Result<Event, ProcessError> + Send + Sync>;
 
 pub struct ModuleRegistry {
     inputs: HashMap<String, InputFactory>,
@@ -105,18 +113,25 @@ impl ModuleRegistry {
 
     pub fn register_input<F>(&mut self, type_name: &str, factory: F)
     where
-        F: Fn(&str, &[Property], mpsc::Sender<Event>, tokio::sync::watch::Receiver<bool>) -> Result<CreatedInput>
-            + Send + Sync + 'static,
+        F: Fn(
+                &str,
+                &[Property],
+                mpsc::Sender<Event>,
+                tokio::sync::watch::Receiver<bool>,
+            ) -> Result<CreatedInput>
+            + Send
+            + Sync
+            + 'static,
     {
         self.inputs.insert(type_name.to_string(), Box::new(factory));
     }
 
     pub fn register_output<F>(&mut self, type_name: &str, factory: F)
     where
-        F: Fn(&str, &[Property]) -> Result<CreatedOutput>
-            + Send + Sync + 'static,
+        F: Fn(&str, &[Property]) -> Result<CreatedOutput> + Send + Sync + 'static,
     {
-        self.outputs.insert(type_name.to_string(), Box::new(factory));
+        self.outputs
+            .insert(type_name.to_string(), Box::new(factory));
     }
 
     pub fn create_input(
@@ -145,8 +160,15 @@ impl ModuleRegistry {
         self.processes.contains_key(name)
     }
 
-    pub fn call_process(&self, name: &str, args: &[serde_json::Value], event: Event) -> Result<Event, ProcessError> {
-        let f = self.processes.get(name)
+    pub fn call_process(
+        &self,
+        name: &str,
+        args: &[serde_json::Value],
+        event: Event,
+    ) -> Result<Event, ProcessError> {
+        let f = self
+            .processes
+            .get(name)
             .ok_or_else(|| ProcessError::Failed(format!("unknown builtin process: {}", name)))?;
         f(args, event)
     }

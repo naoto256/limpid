@@ -37,21 +37,30 @@ impl FromProperties for UdpOutput {
 
 impl HasMetrics for UdpOutput {
     type Stats = OutputMetrics;
-    fn metrics(&self) -> Arc<OutputMetrics> { Arc::clone(&self.metrics) }
+    fn metrics(&self) -> Arc<OutputMetrics> {
+        Arc::clone(&self.metrics)
+    }
 }
 
 #[async_trait::async_trait]
 impl Output for UdpOutput {
     async fn write(&self, event: &Event) -> Result<()> {
-        let socket = self.socket.get_or_try_init(|| async {
-            let sock = UdpSocket::bind("0.0.0.0:0").await
-                .context("udp output: failed to bind ephemeral socket")?;
-            sock.connect(&self.address).await
-                .with_context(|| format!("udp output: failed to connect to {}", self.address))?;
-            Ok::<_, anyhow::Error>(sock)
-        }).await?;
+        let socket = self
+            .socket
+            .get_or_try_init(|| async {
+                let sock = UdpSocket::bind("0.0.0.0:0")
+                    .await
+                    .context("udp output: failed to bind ephemeral socket")?;
+                sock.connect(&self.address).await.with_context(|| {
+                    format!("udp output: failed to connect to {}", self.address)
+                })?;
+                Ok::<_, anyhow::Error>(sock)
+            })
+            .await?;
 
-        socket.send(&event.message).await
+        socket
+            .send(&event.message)
+            .await
             .with_context(|| format!("udp output: send to {}", self.address))?;
 
         self.metrics.events_written.fetch_add(1, Ordering::Relaxed);

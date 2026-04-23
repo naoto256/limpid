@@ -9,16 +9,15 @@ use anyhow::Result;
 use bytes::Bytes;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::TcpListener;
-use tracing::{info, warn, error, debug};
+use tracing::{debug, error, info, warn};
 
-
+use super::rate_limit::RateLimiter;
+use super::validate::validate_pri;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::event::Event;
 use crate::metrics::InputMetrics;
 use crate::modules::{FromProperties, HasMetrics, Input};
-use super::rate_limit::RateLimiter;
-use super::validate::validate_pri;
 
 /// Maximum size of a single syslog message (bytes).
 /// RFC 5424 recommends supporting at least 2048; we allow up to 1 MiB.
@@ -64,8 +63,8 @@ pub struct SyslogTcpInput {
 
 impl FromProperties for SyslogTcpInput {
     fn from_properties(_name: &str, properties: &[Property]) -> anyhow::Result<Self> {
-        let bind = props::get_string(properties, "bind")
-            .unwrap_or_else(|| "0.0.0.0:514".to_string());
+        let bind =
+            props::get_string(properties, "bind").unwrap_or_else(|| "0.0.0.0:514".to_string());
         let framing = match props::get_ident(properties, "framing").as_deref() {
             Some("octet_counting") => TcpFraming::OctetCounting,
             Some("non_transparent") => TcpFraming::NonTransparent,
@@ -93,7 +92,11 @@ impl HasMetrics for SyslogTcpInput {
 
 #[async_trait::async_trait]
 impl Input for SyslogTcpInput {
-    async fn run(self, tx: tokio::sync::mpsc::Sender<Event>, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
+    async fn run(
+        self,
+        tx: tokio::sync::mpsc::Sender<Event>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
         let listener = TcpListener::bind(&self.bind_addr).await?;
         info!("syslog_tcp listening on {}", self.bind_addr);
 
@@ -215,7 +218,10 @@ pub(crate) async fn detect_framing<R: tokio::io::AsyncRead + Unpin>(
     let buf = match result {
         Ok(Ok(buf)) => buf,
         Ok(Err(e)) => {
-            warn!("syslog_tcp [{}]: I/O error during framing detection: {}", addr, e);
+            warn!(
+                "syslog_tcp [{}]: I/O error during framing detection: {}",
+                addr, e
+            );
             return None;
         }
         Err(_) => {
@@ -285,7 +291,8 @@ pub(crate) async fn read_octet_counting<R: tokio::io::AsyncRead + Unpin>(
                 addr, e,
             );
             if let Some(m) = metrics {
-                m.events_invalid.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                m.events_invalid
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             return CloseReason::FramingError(format!("invalid PRI: {}", e));
         }
@@ -300,7 +307,8 @@ pub(crate) async fn read_octet_counting<R: tokio::io::AsyncRead + Unpin>(
             return CloseReason::ChannelClosed;
         }
         if let Some(m) = metrics {
-            m.events_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            m.events_received
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -341,23 +349,31 @@ async fn read_msg_len<R: tokio::io::AsyncRead + Unpin>(
 
         if !byte.is_ascii_digit() {
             warn!(
-                "syslog_tcp [{}]: non-digit byte 0x{:02x} in MSG-LEN", addr, byte
+                "syslog_tcp [{}]: non-digit byte 0x{:02x} in MSG-LEN",
+                addr, byte
             );
             return Err(CloseReason::FramingError(format!(
-                "non-digit 0x{:02x} in MSG-LEN", byte
+                "non-digit 0x{:02x} in MSG-LEN",
+                byte
             )));
         }
 
         // NONZERO-DIGIT: first digit must not be '0'
         if len_str.is_empty() && byte == b'0' {
-            warn!("syslog_tcp [{}]: MSG-LEN starts with '0' (invalid per RFC 6587)", addr);
+            warn!(
+                "syslog_tcp [{}]: MSG-LEN starts with '0' (invalid per RFC 6587)",
+                addr
+            );
             return Err(CloseReason::FramingError("MSG-LEN leading zero".into()));
         }
 
         len_str.push(byte as char);
 
         if len_str.len() > MAX_MSG_LEN_DIGITS {
-            warn!("syslog_tcp [{}]: MSG-LEN too many digits ({})", addr, len_str);
+            warn!(
+                "syslog_tcp [{}]: MSG-LEN too many digits ({})",
+                addr, len_str
+            );
             return Err(CloseReason::FramingError("MSG-LEN too many digits".into()));
         }
     }
@@ -368,10 +384,12 @@ async fn read_msg_len<R: tokio::io::AsyncRead + Unpin>(
 
     if msg_len > MAX_MESSAGE_SIZE {
         warn!(
-            "syslog_tcp [{}]: MSG-LEN {} exceeds limit {}", addr, msg_len, MAX_MESSAGE_SIZE
+            "syslog_tcp [{}]: MSG-LEN {} exceeds limit {}",
+            addr, msg_len, MAX_MESSAGE_SIZE
         );
         return Err(CloseReason::FramingError(format!(
-            "MSG-LEN {} exceeds limit", msg_len
+            "MSG-LEN {} exceeds limit",
+            msg_len
         )));
     }
 
@@ -413,10 +431,12 @@ pub(crate) async fn read_non_transparent<R: tokio::io::AsyncRead + Unpin>(
                     if !buf.is_empty() {
                         if let Err(e) = validate_pri(&buf) {
                             warn!(
-                                "syslog_tcp [{}]: invalid syslog message at EOF ({})", addr, e
+                                "syslog_tcp [{}]: invalid syslog message at EOF ({})",
+                                addr, e
                             );
                             if let Some(m) = metrics {
-                                m.events_invalid.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                m.events_invalid
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                         } else {
                             if let Some(limiter) = limiter {
@@ -428,7 +448,8 @@ pub(crate) async fn read_non_transparent<R: tokio::io::AsyncRead + Unpin>(
                                 return CloseReason::ChannelClosed;
                             }
                             if let Some(m) = metrics {
-                                m.events_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                m.events_received
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
                     }
@@ -458,7 +479,8 @@ pub(crate) async fn read_non_transparent<R: tokio::io::AsyncRead + Unpin>(
                 addr, e,
             );
             if let Some(m) = metrics {
-                m.events_invalid.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                m.events_invalid
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             return CloseReason::FramingError(format!("invalid PRI: {}", e));
         }
@@ -473,7 +495,8 @@ pub(crate) async fn read_non_transparent<R: tokio::io::AsyncRead + Unpin>(
             return CloseReason::ChannelClosed;
         }
         if let Some(m) = metrics {
-            m.events_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            m.events_received
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }

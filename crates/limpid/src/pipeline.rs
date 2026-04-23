@@ -90,29 +90,43 @@ impl CompiledConfig {
         Ok(())
     }
 
-    fn validate_pipeline_stmt(&self, pipeline_name: &str, stmt: &PipelineStatement, builtins: &ModuleRegistry) -> Result<()> {
+    fn validate_pipeline_stmt(
+        &self,
+        pipeline_name: &str,
+        stmt: &PipelineStatement,
+        builtins: &ModuleRegistry,
+    ) -> Result<()> {
         match stmt {
             PipelineStatement::Input(input_name) => {
                 if !self.inputs.contains_key(input_name) {
-                    bail!("pipeline '{}': references unknown input '{}'", pipeline_name, input_name);
+                    bail!(
+                        "pipeline '{}': references unknown input '{}'",
+                        pipeline_name,
+                        input_name
+                    );
                 }
             }
             PipelineStatement::Output(output_name) => {
                 if !self.outputs.contains_key(output_name) {
-                    bail!("pipeline '{}': references unknown output '{}'", pipeline_name, output_name);
+                    bail!(
+                        "pipeline '{}': references unknown output '{}'",
+                        pipeline_name,
+                        output_name
+                    );
                 }
             }
             PipelineStatement::ProcessChain(chain) => {
                 for element in chain {
                     if let ProcessChainElement::Named(proc_name, _) = element
                         && !self.processes.contains_key(proc_name)
-                            && !builtins.is_builtin_process(proc_name)
-                        {
-                            bail!(
-                                "pipeline '{}': references unknown process '{}'",
-                                pipeline_name, proc_name
-                            );
-                        }
+                        && !builtins.is_builtin_process(proc_name)
+                    {
+                        bail!(
+                            "pipeline '{}': references unknown process '{}'",
+                            pipeline_name,
+                            proc_name
+                        );
+                    }
                 }
             }
             PipelineStatement::If(if_chain) => {
@@ -189,7 +203,12 @@ impl<'a> DslProcessRegistry<'a> {
         funcs: &'a FunctionRegistry,
         tap: Option<&'a TapRegistry>,
     ) -> Self {
-        Self { processes, builtins, funcs, tap }
+        Self {
+            processes,
+            builtins,
+            funcs,
+            tap,
+        }
     }
 }
 
@@ -206,7 +225,11 @@ impl ProcessRegistry for DslProcessRegistry<'_> {
             let result = self.builtins.call_process(name, args, event);
             match &result {
                 Ok(e) => {
-                    trace!("process '{}': ok, fields={:?}", name, e.fields.keys().collect::<Vec<_>>());
+                    trace!(
+                        "process '{}': ok, fields={:?}",
+                        name,
+                        e.fields.keys().collect::<Vec<_>>()
+                    );
                     self.emit_tap(name, e);
                 }
                 Err(e) => trace!("process '{}': error: {}", name, e),
@@ -232,7 +255,10 @@ impl ProcessRegistry for DslProcessRegistry<'_> {
         }
 
         // 3. Unknown process — warn and pass through
-        tracing::warn!("unknown process '{}', passing event through unchanged", name);
+        tracing::warn!(
+            "unknown process '{}', passing event through unchanged",
+            name
+        );
         Ok(Some(event))
     }
 }
@@ -266,7 +292,14 @@ pub fn run_pipeline(
         detail: format!("raw: {}", String::from_utf8_lossy(&event.raw)),
     });
 
-    let (_, termination) = exec_pipeline_body(&pipeline.body, event, &registry, funcs, &mut trace_entries, &mut outputs)?;
+    let (_, termination) = exec_pipeline_body(
+        &pipeline.body,
+        event,
+        &registry,
+        funcs,
+        &mut trace_entries,
+        &mut outputs,
+    )?;
 
     Ok(PipelineRunResult {
         trace: trace_entries,
@@ -307,9 +340,7 @@ fn exec_pipeline_stmt(
     let finished = || Ok((None, PipelineTermination::Finished));
 
     match stmt {
-        PipelineStatement::Input(_) => {
-            cont(event)
-        }
+        PipelineStatement::Input(_) => cont(event),
 
         PipelineStatement::ProcessChain(chain) => {
             let mut current = event;
@@ -329,7 +360,15 @@ fn exec_pipeline_stmt(
                                     label: if args.is_empty() {
                                         name.clone()
                                     } else {
-                                        format!("{}({})", name, evaluated_args.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "))
+                                        format!(
+                                            "{}({})",
+                                            name,
+                                            evaluated_args
+                                                .iter()
+                                                .map(|a| a.to_string())
+                                                .collect::<Vec<_>>()
+                                                .join(", ")
+                                        )
                                     },
                                     detail: "ok".into(),
                                 });
@@ -344,7 +383,11 @@ fn exec_pipeline_stmt(
                                 return dropped();
                             }
                             Err(e) => {
-                                tracing::warn!("process '{}': {} — event passed through unchanged", name, e);
+                                tracing::warn!(
+                                    "process '{}': {} — event passed through unchanged",
+                                    name,
+                                    e
+                                );
                                 trace.push(TraceEntry {
                                     stage: "process".into(),
                                     label: name.clone(),
@@ -418,11 +461,15 @@ fn exec_pipeline_stmt(
             let disc_val = eval_expr(discriminant, &event, funcs)?;
             for arm in arms {
                 if arm.pattern.is_none() {
-                    return exec_pipeline_branch_body(&arm.body, event, registry, funcs, trace, outputs);
+                    return exec_pipeline_branch_body(
+                        &arm.body, event, registry, funcs, trace, outputs,
+                    );
                 }
                 let pattern_val = eval_expr(arm.pattern.as_ref().unwrap(), &event, funcs)?;
                 if values_match(&disc_val, &pattern_val) {
-                    return exec_pipeline_branch_body(&arm.body, event, registry, funcs, trace, outputs);
+                    return exec_pipeline_branch_body(
+                        &arm.body, event, registry, funcs, trace, outputs,
+                    );
                 }
             }
             cont(event)

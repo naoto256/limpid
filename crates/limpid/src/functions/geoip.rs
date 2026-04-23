@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use anyhow::Result;
-use maxminddb::{geoip2, Reader};
+use maxminddb::{Reader, geoip2};
 use serde_json::Value;
 
 /// Global GeoIP database reader (initialized once at startup).
@@ -62,13 +62,15 @@ pub fn lookup(ip_str: &str) -> Result<Value> {
     }
 
     if let Some(lat) = city.location.latitude
-        && let Some(n) = serde_json::Number::from_f64(lat) {
-            map.insert("latitude".into(), Value::Number(n));
-        }
+        && let Some(n) = serde_json::Number::from_f64(lat)
+    {
+        map.insert("latitude".into(), Value::Number(n));
+    }
     if let Some(lon) = city.location.longitude
-        && let Some(n) = serde_json::Number::from_f64(lon) {
-            map.insert("longitude".into(), Value::Number(n));
-        }
+        && let Some(n) = serde_json::Number::from_f64(lon)
+    {
+        map.insert("longitude".into(), Value::Number(n));
+    }
 
     Ok(Value::Object(map))
 }

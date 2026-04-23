@@ -15,8 +15,7 @@ pub struct LimpidParser;
 
 /// Parse a complete configuration string into a `Config` AST.
 pub fn parse_config(input: &str) -> Result<Config> {
-    let mut pairs = LimpidParser::parse(Rule::config, input)
-        .context("failed to parse DSL")?;
+    let mut pairs = LimpidParser::parse(Rule::config, input).context("failed to parse DSL")?;
 
     let config_pair = pairs.next().unwrap();
     let mut definitions = Vec::new();
@@ -34,8 +33,13 @@ pub fn parse_config(input: &str) -> Result<Config> {
                             Rule::def_input => Definition::Input(parse_input_def(def_inner)?),
                             Rule::def_output => Definition::Output(parse_output_def(def_inner)?),
                             Rule::def_process => Definition::Process(parse_process_def(def_inner)?),
-                            Rule::def_pipeline => Definition::Pipeline(parse_pipeline_def(def_inner)?),
-                            _ => unreachable!("unexpected definition rule: {:?}", def_inner.as_rule()),
+                            Rule::def_pipeline => {
+                                Definition::Pipeline(parse_pipeline_def(def_inner)?)
+                            }
+                            _ => unreachable!(
+                                "unexpected definition rule: {:?}",
+                                def_inner.as_rule()
+                            ),
                         };
                         definitions.push(def);
                     }
@@ -54,13 +58,19 @@ pub fn parse_config(input: &str) -> Result<Config> {
         }
     }
 
-    Ok(Config { definitions, global_blocks, includes })
+    Ok(Config {
+        definitions,
+        global_blocks,
+        includes,
+    })
 }
 
 fn parse_global_block(pair: Pair<Rule>) -> Result<GlobalBlock> {
     let mut inner = pair.into_inner();
     let name = inner.next().unwrap().as_str().to_string();
-    let properties = inner.map(|p| parse_property(p)).collect::<Result<Vec<_>>>()?;
+    let properties = inner
+        .map(|p| parse_property(p))
+        .collect::<Result<Vec<_>>>()?;
     Ok(GlobalBlock { name, properties })
 }
 
@@ -71,14 +81,18 @@ fn parse_global_block(pair: Pair<Rule>) -> Result<GlobalBlock> {
 fn parse_input_def(pair: Pair<Rule>) -> Result<InputDef> {
     let mut inner = pair.into_inner();
     let name = inner.next().unwrap().as_str().to_string();
-    let properties = inner.map(|p| parse_property(p)).collect::<Result<Vec<_>>>()?;
+    let properties = inner
+        .map(|p| parse_property(p))
+        .collect::<Result<Vec<_>>>()?;
     Ok(InputDef { name, properties })
 }
 
 fn parse_output_def(pair: Pair<Rule>) -> Result<OutputDef> {
     let mut inner = pair.into_inner();
     let name = inner.next().unwrap().as_str().to_string();
-    let properties = inner.map(|p| parse_property(p)).collect::<Result<Vec<_>>>()?;
+    let properties = inner
+        .map(|p| parse_property(p))
+        .collect::<Result<Vec<_>>>()?;
     Ok(OutputDef { name, properties })
 }
 
@@ -112,7 +126,9 @@ fn parse_property(pair: Pair<Rule>) -> Result<Property> {
 fn parse_process_def(pair: Pair<Rule>) -> Result<ProcessDef> {
     let mut inner = pair.into_inner();
     let name = inner.next().unwrap().as_str().to_string();
-    let body = inner.map(|p| parse_process_stmt(p)).collect::<Result<Vec<_>>>()?;
+    let body = inner
+        .map(|p| parse_process_stmt(p))
+        .collect::<Result<Vec<_>>>()?;
     Ok(ProcessDef { name, body })
 }
 
@@ -158,7 +174,10 @@ fn parse_process_assign(pair: Pair<Rule>) -> Result<ProcessStatement> {
 
 fn parse_assign_target(pair: Pair<Rule>) -> Result<AssignTarget> {
     let path_pair = first_inner(pair)?;
-    let parts: Vec<String> = path_pair.into_inner().map(|p| p.as_str().to_string()).collect();
+    let parts: Vec<String> = path_pair
+        .into_inner()
+        .map(|p| p.as_str().to_string())
+        .collect();
 
     match parts.as_slice() {
         [single] if single == "message" => Ok(AssignTarget::Message),
@@ -183,7 +202,9 @@ fn parse_process_switch(pair: Pair<Rule>) -> Result<ProcessStatement> {
     let mut inner = pair.into_inner();
     let discriminant = parse_expr_from_pair(inner.next().unwrap())?;
     let arms = inner
-        .map(|arm| parse_switch_arm_generic(arm, |p| Ok(BranchBody::Process(parse_process_stmt(p)?))))
+        .map(|arm| {
+            parse_switch_arm_generic(arm, |p| Ok(BranchBody::Process(parse_process_stmt(p)?)))
+        })
         .collect::<Result<Vec<_>>>()?;
     Ok(ProcessStatement::Switch(discriminant, arms))
 }
@@ -192,15 +213,23 @@ fn parse_process_try_catch(pair: Pair<Rule>) -> Result<ProcessStatement> {
     let mut inner = pair.into_inner();
     let try_pair = inner.next().unwrap();
     let catch_pair = inner.next().unwrap();
-    let try_body = try_pair.into_inner().map(|p| parse_process_stmt(p)).collect::<Result<Vec<_>>>()?;
-    let catch_body = catch_pair.into_inner().map(|p| parse_process_stmt(p)).collect::<Result<Vec<_>>>()?;
+    let try_body = try_pair
+        .into_inner()
+        .map(|p| parse_process_stmt(p))
+        .collect::<Result<Vec<_>>>()?;
+    let catch_body = catch_pair
+        .into_inner()
+        .map(|p| parse_process_stmt(p))
+        .collect::<Result<Vec<_>>>()?;
     Ok(ProcessStatement::TryCatch(try_body, catch_body))
 }
 
 fn parse_process_foreach(pair: Pair<Rule>) -> Result<ProcessStatement> {
     let mut inner = pair.into_inner();
     let iterable = parse_expr_from_pair(inner.next().unwrap())?;
-    let body = inner.map(|p| parse_process_stmt(p)).collect::<Result<Vec<_>>>()?;
+    let body = inner
+        .map(|p| parse_process_stmt(p))
+        .collect::<Result<Vec<_>>>()?;
     Ok(ProcessStatement::ForEach(iterable, body))
 }
 
@@ -211,7 +240,9 @@ fn parse_process_foreach(pair: Pair<Rule>) -> Result<ProcessStatement> {
 fn parse_pipeline_def(pair: Pair<Rule>) -> Result<PipelineDef> {
     let mut inner = pair.into_inner();
     let name = inner.next().unwrap().as_str().to_string();
-    let body = inner.map(|p| parse_pipeline_stmt(p)).collect::<Result<Vec<_>>>()?;
+    let body = inner
+        .map(|p| parse_pipeline_stmt(p))
+        .collect::<Result<Vec<_>>>()?;
     Ok(PipelineDef { name, body })
 }
 
@@ -279,7 +310,9 @@ fn parse_pipeline_switch(pair: Pair<Rule>) -> Result<PipelineStatement> {
     let mut inner = pair.into_inner();
     let discriminant = parse_expr_from_pair(inner.next().unwrap())?;
     let arms = inner
-        .map(|arm| parse_switch_arm_generic(arm, |p| Ok(BranchBody::Pipeline(parse_pipeline_stmt(p)?))))
+        .map(|arm| {
+            parse_switch_arm_generic(arm, |p| Ok(BranchBody::Pipeline(parse_pipeline_stmt(p)?)))
+        })
         .collect::<Result<Vec<_>>>()?;
     Ok(PipelineStatement::Switch(discriminant, arms))
 }
@@ -323,7 +356,10 @@ where
         }
     }
 
-    Ok(IfChain { branches, else_body })
+    Ok(IfChain {
+        branches,
+        else_body,
+    })
 }
 
 fn parse_switch_arm_generic<F>(pair: Pair<Rule>, mut parse_body: F) -> Result<SwitchArm>
@@ -399,13 +435,19 @@ fn fold_by_precedence(operands: &mut Vec<Expr>, operators: &mut Vec<BinOp>) -> R
         return Ok(operands.remove(0));
     }
     if operators.is_empty() {
-        bail!("malformed expression: no operators for {} operands", operands.len());
+        bail!(
+            "malformed expression: no operators for {} operands",
+            operands.len()
+        );
     }
 
     // Find lowest precedence operator (rightmost for left-associativity)
     let min_prec = operators.iter().map(precedence).min().unwrap();
     // Find the *last* operator with that precedence (left-associative: fold left, so find first)
-    let idx = operators.iter().position(|op| precedence(op) == min_prec).unwrap();
+    let idx = operators
+        .iter()
+        .position(|op| precedence(op) == min_prec)
+        .unwrap();
 
     let op = operators.remove(idx);
     let mut right_operands = operands.split_off(idx + 1);
@@ -502,9 +544,7 @@ fn parse_func_call_expr(pair: Pair<Rule>) -> Result<Expr> {
 }
 
 fn parse_func_args(pair: Pair<Rule>) -> Result<Vec<Expr>> {
-    pair.into_inner()
-        .map(|p| parse_expr_from_pair(p))
-        .collect()
+    pair.into_inner().map(|p| parse_expr_from_pair(p)).collect()
 }
 
 fn parse_hash_lit(pair: Pair<Rule>) -> Result<Expr> {
@@ -575,7 +615,6 @@ fn first_inner(pair: Pair<Rule>) -> Result<Pair<Rule>> {
         .next()
         .ok_or_else(|| anyhow::anyhow!("expected at least one inner pair in grammar rule"))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -729,16 +768,14 @@ def pipeline test {
 "#;
         let config = parse_config(input).unwrap();
         match &config.definitions[0] {
-            Definition::Pipeline(def) => {
-                match &def.body[1] {
-                    PipelineStatement::ProcessChain(chain) => {
-                        assert_eq!(chain.len(), 2);
-                        assert!(matches!(&chain[0], ProcessChainElement::Named(..)));
-                        assert!(matches!(&chain[1], ProcessChainElement::Inline(..)));
-                    }
-                    _ => panic!("expected ProcessChain"),
+            Definition::Pipeline(def) => match &def.body[1] {
+                PipelineStatement::ProcessChain(chain) => {
+                    assert_eq!(chain.len(), 2);
+                    assert!(matches!(&chain[0], ProcessChainElement::Named(..)));
+                    assert!(matches!(&chain[1], ProcessChainElement::Inline(..)));
                 }
-            }
+                _ => panic!("expected ProcessChain"),
+            },
             _ => panic!("expected Pipeline definition"),
         }
     }
@@ -756,15 +793,13 @@ def process strict_parse {
 "#;
         let config = parse_config(input).unwrap();
         match &config.definitions[0] {
-            Definition::Process(def) => {
-                match &def.body[0] {
-                    ProcessStatement::TryCatch(try_body, catch_body) => {
-                        assert_eq!(try_body.len(), 1);
-                        assert_eq!(catch_body.len(), 1);
-                    }
-                    _ => panic!("expected TryCatch"),
+            Definition::Process(def) => match &def.body[0] {
+                ProcessStatement::TryCatch(try_body, catch_body) => {
+                    assert_eq!(try_body.len(), 1);
+                    assert_eq!(catch_body.len(), 1);
                 }
-            }
+                _ => panic!("expected TryCatch"),
+            },
             _ => panic!("expected Process definition"),
         }
     }
@@ -794,14 +829,12 @@ def process test {
 "#;
         let config = parse_config(input).unwrap();
         match &config.definitions[0] {
-            Definition::Process(def) => {
-                match &def.body[0] {
-                    ProcessStatement::Assign(_, Expr::HashLit(entries)) => {
-                        assert_eq!(entries.len(), 2);
-                    }
-                    _ => panic!("expected Assign with HashLit"),
+            Definition::Process(def) => match &def.body[0] {
+                ProcessStatement::Assign(_, Expr::HashLit(entries)) => {
+                    assert_eq!(entries.len(), 2);
                 }
-            }
+                _ => panic!("expected Assign with HashLit"),
+            },
             _ => panic!("expected Process definition"),
         }
     }

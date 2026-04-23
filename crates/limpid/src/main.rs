@@ -86,8 +86,7 @@ fn run_daemon(config_path: &str) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let config_file = Path::new(config_path).to_path_buf();
-        let config = config::load_config(&config_file)
-            .context("configuration error")?;
+        let config = config::load_config(&config_file).context("configuration error")?;
         let compiled = CompiledConfig::from_config(config)?;
 
         let mut runtime = runtime::Runtime::start(compiled, config_file).await?;
@@ -106,15 +105,17 @@ fn run_daemon(config_path: &str) -> Result<()> {
                     let old_config = runtime.compiled_config();
 
                     // Phase 2: Load and validate new config from disk
-                    let new_compiled = match config::load_config(&file)
-                        .and_then(CompiledConfig::from_config)
-                    {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::error!("reload: invalid configuration: {} — keeping current", e);
-                            continue;
-                        }
-                    };
+                    let new_compiled =
+                        match config::load_config(&file).and_then(CompiledConfig::from_config) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::error!(
+                                    "reload: invalid configuration: {} — keeping current",
+                                    e
+                                );
+                                continue;
+                            }
+                        };
 
                     // Phase 3: Shutdown old, start new.
                     // Note: brief downtime occurs while ports are released and re-bound.
@@ -137,7 +138,10 @@ fn run_daemon(config_path: &str) -> Result<()> {
                                     tracing::warn!("reload: rolled back to previous configuration");
                                 }
                                 Err(e2) => {
-                                    tracing::error!("reload: rollback also failed: {} — exiting", e2);
+                                    tracing::error!(
+                                        "reload: rollback also failed: {} — exiting",
+                                        e2
+                                    );
                                     std::process::exit(1);
                                 }
                             }
@@ -153,8 +157,7 @@ fn run_daemon(config_path: &str) -> Result<()> {
 
 /// --check: validate configuration and exit.
 fn run_check(config_path: &str) -> Result<()> {
-    let config = config::load_config(Path::new(config_path))
-        .context("configuration error")?;
+    let config = config::load_config(Path::new(config_path)).context("configuration error")?;
     let compiled = CompiledConfig::from_config(config)?;
     let mut registry = crate::modules::ModuleRegistry::new();
     crate::modules::register_builtins(&mut registry);
@@ -174,18 +177,20 @@ fn run_check(config_path: &str) -> Result<()> {
 
 /// --test-pipeline: run a sample event through a pipeline and display trace.
 fn run_test(config_path: &str, pipeline_name: &str, input_json: Option<&str>) -> Result<()> {
-    let config = config::load_config(Path::new(config_path))
-        .context("failed to load configuration")?;
+    let config =
+        config::load_config(Path::new(config_path)).context("failed to load configuration")?;
     let compiled = CompiledConfig::from_config(config)?;
 
-    let pipeline_def = compiled
-        .pipelines
-        .get(pipeline_name)
-        .context(format!(
-            "pipeline '{}' not found. Available: {}",
-            pipeline_name,
-            compiled.pipelines.keys().cloned().collect::<Vec<_>>().join(", ")
-        ))?;
+    let pipeline_def = compiled.pipelines.get(pipeline_name).context(format!(
+        "pipeline '{}' not found. Available: {}",
+        pipeline_name,
+        compiled
+            .pipelines
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))?;
 
     let table_store = runtime::init_tables(&compiled)?;
     let mut func_registry = FunctionRegistry::new();
@@ -194,7 +199,14 @@ fn run_test(config_path: &str, pipeline_name: &str, input_json: Option<&str>) ->
     crate::modules::register_builtins(&mut registry);
 
     let event = build_test_event(input_json)?;
-    let result = run_pipeline(pipeline_def, event, &compiled, &registry, &func_registry, None)?;
+    let result = run_pipeline(
+        pipeline_def,
+        event,
+        &compiled,
+        &registry,
+        &func_registry,
+        None,
+    )?;
 
     // Display trace
     println!("=== Pipeline: {} ===", pipeline_name);
@@ -264,11 +276,15 @@ fn build_test_event(input_json: Option<&str>) -> Result<Event> {
         let mut event = Event::new(Bytes::from(raw), source);
 
         if let Some(f) = v.get("facility").and_then(|v| v.as_u64()) {
-            if f > 23 { bail!("facility must be 0-23, got {}", f); }
+            if f > 23 {
+                bail!("facility must be 0-23, got {}", f);
+            }
             event.facility = Some(f as u8);
         }
         if let Some(s) = v.get("severity").and_then(|v| v.as_u64()) {
-            if s > 7 { bail!("severity must be 0-7, got {}", s); }
+            if s > 7 {
+                bail!("severity must be 0-7, got {}", s);
+            }
             event.severity = Some(s as u8);
         }
         if let Some(fields) = v.get("fields").and_then(|v| v.as_object()) {

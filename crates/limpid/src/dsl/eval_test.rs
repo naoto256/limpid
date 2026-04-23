@@ -6,8 +6,8 @@ mod tests {
     use serde_json::Value;
     use std::net::SocketAddr;
 
-    use crate::dsl::eval::*;
     use crate::dsl::ast::*;
+    use crate::dsl::eval::*;
     use crate::event::Event;
     use crate::functions::FunctionRegistry;
 
@@ -18,7 +18,8 @@ mod tests {
         );
         e.severity = Some(3);
         e.facility = Some(16);
-        e.fields.insert("src".into(), Value::String("192.168.1.1".into()));
+        e.fields
+            .insert("src".into(), Value::String("192.168.1.1".into()));
         e.fields.insert("count".into(), Value::Number(42.into()));
         e
     }
@@ -34,9 +35,18 @@ mod tests {
     fn test_eval_literals() {
         let e = make_event();
         let f = make_funcs();
-        assert_eq!(eval_expr(&Expr::StringLit("hello".into()), &e, &f).unwrap(), Value::String("hello".into()));
-        assert_eq!(eval_expr(&Expr::IntLit(99), &e, &f).unwrap(), Value::Number(99.into()));
-        assert_eq!(eval_expr(&Expr::BoolLit(true), &e, &f).unwrap(), Value::Bool(true));
+        assert_eq!(
+            eval_expr(&Expr::StringLit("hello".into()), &e, &f).unwrap(),
+            Value::String("hello".into())
+        );
+        assert_eq!(
+            eval_expr(&Expr::IntLit(99), &e, &f).unwrap(),
+            Value::Number(99.into())
+        );
+        assert_eq!(
+            eval_expr(&Expr::BoolLit(true), &e, &f).unwrap(),
+            Value::Bool(true)
+        );
         assert_eq!(eval_expr(&Expr::Null, &e, &f).unwrap(), Value::Null);
     }
 
@@ -44,8 +54,14 @@ mod tests {
     fn test_eval_ident_fields() {
         let e = make_event();
         let f = make_funcs();
-        assert_eq!(eval_expr(&Expr::Ident(vec!["severity".into()]), &e, &f).unwrap(), Value::Number(3.into()));
-        assert_eq!(eval_expr(&Expr::Ident(vec!["facility".into()]), &e, &f).unwrap(), Value::Number(16.into()));
+        assert_eq!(
+            eval_expr(&Expr::Ident(vec!["severity".into()]), &e, &f).unwrap(),
+            Value::Number(3.into())
+        );
+        assert_eq!(
+            eval_expr(&Expr::Ident(vec!["facility".into()]), &e, &f).unwrap(),
+            Value::Number(16.into())
+        );
         assert_eq!(
             eval_expr(&Expr::Ident(vec!["fields".into(), "src".into()]), &e, &f).unwrap(),
             Value::String("192.168.1.1".into())
@@ -128,10 +144,16 @@ mod tests {
         let e = make_event();
         let f = make_funcs();
         let lower = Expr::FuncCall("lower".into(), vec![Expr::StringLit("HELLO".into())]);
-        assert_eq!(eval_expr(&lower, &e, &f).unwrap(), Value::String("hello".into()));
+        assert_eq!(
+            eval_expr(&lower, &e, &f).unwrap(),
+            Value::String("hello".into())
+        );
 
         let upper = Expr::FuncCall("upper".into(), vec![Expr::StringLit("hello".into())]);
-        assert_eq!(eval_expr(&upper, &e, &f).unwrap(), Value::String("HELLO".into()));
+        assert_eq!(
+            eval_expr(&upper, &e, &f).unwrap(),
+            Value::String("HELLO".into())
+        );
     }
 
     #[test]
@@ -179,7 +201,10 @@ mod tests {
             ("city".into(), Expr::StringLit("Tokyo".into())),
         ]);
         let expr = Expr::PropertyAccess(Box::new(hash), vec!["country".into()]);
-        assert_eq!(eval_expr(&expr, &e, &f).unwrap(), Value::String("JP".into()));
+        assert_eq!(
+            eval_expr(&expr, &e, &f).unwrap(),
+            Value::String("JP".into())
+        );
     }
 
     #[test]
@@ -187,34 +212,37 @@ mod tests {
         let e = make_event();
         let f = make_funcs();
         // { geo: { country: "JP" } }.geo.country → "JP"
-        let inner_hash = Expr::HashLit(vec![
-            ("country".into(), Expr::StringLit("JP".into())),
-        ]);
-        let outer_hash = Expr::HashLit(vec![
-            ("geo".into(), inner_hash),
-        ]);
-        let expr = Expr::PropertyAccess(
-            Box::new(outer_hash),
-            vec!["geo".into(), "country".into()],
+        let inner_hash = Expr::HashLit(vec![("country".into(), Expr::StringLit("JP".into()))]);
+        let outer_hash = Expr::HashLit(vec![("geo".into(), inner_hash)]);
+        let expr = Expr::PropertyAccess(Box::new(outer_hash), vec!["geo".into(), "country".into()]);
+        assert_eq!(
+            eval_expr(&expr, &e, &f).unwrap(),
+            Value::String("JP".into())
         );
-        assert_eq!(eval_expr(&expr, &e, &f).unwrap(), Value::String("JP".into()));
     }
 
     #[test]
     fn test_property_access_missing_field() {
         let e = make_event();
         let f = make_funcs();
-        let hash = Expr::HashLit(vec![
-            ("country".into(), Expr::StringLit("JP".into())),
-        ]);
+        let hash = Expr::HashLit(vec![("country".into(), Expr::StringLit("JP".into()))]);
         let expr = Expr::PropertyAccess(Box::new(hash), vec!["missing".into()]);
         assert_eq!(eval_expr(&expr, &e, &f).unwrap(), Value::Null);
     }
 
     #[test]
     fn test_values_match_fn() {
-        assert!(values_match(&Value::String("a".into()), &Value::String("a".into())));
-        assert!(!values_match(&Value::String("a".into()), &Value::String("b".into())));
-        assert!(values_match(&Value::Number(42.into()), &Value::Number(42.into())));
+        assert!(values_match(
+            &Value::String("a".into()),
+            &Value::String("a".into())
+        ));
+        assert!(!values_match(
+            &Value::String("a".into()),
+            &Value::String("b".into())
+        ));
+        assert!(values_match(
+            &Value::Number(42.into()),
+            &Value::Number(42.into())
+        ));
     }
 }

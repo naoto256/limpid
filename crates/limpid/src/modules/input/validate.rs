@@ -23,12 +23,13 @@ pub fn validate_pri(msg: &[u8]) -> Result<(), String> {
         Some(pos) if (2..=4).contains(&pos) => {
             let prival = &msg[1..pos];
             if prival.iter().all(|b| b.is_ascii_digit())
-                && let Ok(n) = std::str::from_utf8(prival).unwrap_or("").parse::<u16>() {
-                    if n <= 191 {
-                        return Ok(());
-                    }
-                    return Err(format!("PRI value {} out of range (0–191)", n));
+                && let Ok(n) = std::str::from_utf8(prival).unwrap_or("").parse::<u16>()
+            {
+                if n <= 191 {
+                    return Ok(());
                 }
+                return Err(format!("PRI value {} out of range (0–191)", n));
+            }
             Err(format!(
                 "invalid PRI content: {:?}",
                 std::str::from_utf8(prival)

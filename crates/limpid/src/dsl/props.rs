@@ -8,14 +8,15 @@ use super::ast::{Expr, Property};
 pub fn get_string(props: &[Property], key: &str) -> Option<String> {
     for prop in props {
         if let Property::KeyValue(k, expr) = prop
-            && k == key {
-                return match expr {
-                    Expr::StringLit(s) => Some(s.clone()),
-                    Expr::Ident(parts) => Some(parts.join(".")),
-                    Expr::IntLit(n) => Some(n.to_string()),
-                    _ => None,
-                };
-            }
+            && k == key
+        {
+            return match expr {
+                Expr::StringLit(s) => Some(s.clone()),
+                Expr::Ident(parts) => Some(parts.join(".")),
+                Expr::IntLit(n) => Some(n.to_string()),
+                _ => None,
+            };
+        }
     }
     None
 }
@@ -24,9 +25,10 @@ pub fn get_string(props: &[Property], key: &str) -> Option<String> {
 pub fn get_ident(props: &[Property], key: &str) -> Option<String> {
     for prop in props {
         if let Property::KeyValue(k, Expr::Ident(parts)) = prop
-            && k == key {
-                return parts.first().cloned();
-            }
+            && k == key
+        {
+            return parts.first().cloned();
+        }
     }
     None
 }
@@ -35,9 +37,10 @@ pub fn get_ident(props: &[Property], key: &str) -> Option<String> {
 pub fn get_int(props: &[Property], key: &str) -> Option<i64> {
     for prop in props {
         if let Property::KeyValue(k, Expr::IntLit(n)) = prop
-            && k == key {
-                return Some(*n);
-            }
+            && k == key
+        {
+            return Some(*n);
+        }
     }
     None
 }
@@ -66,9 +69,10 @@ pub fn get_strictly_positive_int(props: &[Property], key: &str) -> anyhow::Resul
 pub fn get_block<'a>(props: &'a [Property], key: &str) -> Option<&'a Vec<Property>> {
     for prop in props {
         if let Property::Block(k, inner) = prop
-            && k == key {
-                return Some(inner);
-            }
+            && k == key
+        {
+            return Some(inner);
+        }
     }
     None
 }
@@ -77,9 +81,13 @@ pub fn get_block<'a>(props: &'a [Property], key: &str) -> Option<&'a Vec<Propert
 pub fn parse_size(s: &str) -> anyhow::Result<u64> {
     let s = s.trim().to_uppercase();
     let parse = |num_str: &str, unit: &str, multiplier: u64| -> anyhow::Result<u64> {
-        num_str.trim().parse::<u64>()
+        num_str
+            .trim()
+            .parse::<u64>()
             .map(|n| n * multiplier)
-            .map_err(|_| anyhow::anyhow!("invalid size '{}': expected a number before '{}'", s, unit))
+            .map_err(|_| {
+                anyhow::anyhow!("invalid size '{}': expected a number before '{}'", s, unit)
+            })
     };
     if s.ends_with("GB") {
         parse(&s[..s.len() - 2], "GB", 1024 * 1024 * 1024)
@@ -88,8 +96,12 @@ pub fn parse_size(s: &str) -> anyhow::Result<u64> {
     } else if s.ends_with("KB") {
         parse(&s[..s.len() - 2], "KB", 1024)
     } else {
-        s.parse::<u64>()
-            .map_err(|_| anyhow::anyhow!("invalid size '{}': expected a number with optional KB/MB/GB suffix", s))
+        s.parse::<u64>().map_err(|_| {
+            anyhow::anyhow!(
+                "invalid size '{}': expected a number with optional KB/MB/GB suffix",
+                s
+            )
+        })
     }
 }
 
@@ -97,20 +109,27 @@ pub fn parse_size(s: &str) -> anyhow::Result<u64> {
 pub fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
     let s = s.trim();
     if let Some(num) = s.strip_suffix("ms") {
-        let n: u64 = num.trim().parse()
-            .map_err(|_| anyhow::anyhow!("invalid duration '{}': expected a number before 'ms'", s))?;
+        let n: u64 = num.trim().parse().map_err(|_| {
+            anyhow::anyhow!("invalid duration '{}': expected a number before 'ms'", s)
+        })?;
         Ok(std::time::Duration::from_millis(n))
     } else if let Some(num) = s.strip_suffix('s') {
-        let n: u64 = num.trim().parse()
-            .map_err(|_| anyhow::anyhow!("invalid duration '{}': expected a number before 's'", s))?;
+        let n: u64 = num.trim().parse().map_err(|_| {
+            anyhow::anyhow!("invalid duration '{}': expected a number before 's'", s)
+        })?;
         Ok(std::time::Duration::from_secs(n))
     } else if let Some(num) = s.strip_suffix('m') {
-        let n: u64 = num.trim().parse()
-            .map_err(|_| anyhow::anyhow!("invalid duration '{}': expected a number before 'm'", s))?;
+        let n: u64 = num.trim().parse().map_err(|_| {
+            anyhow::anyhow!("invalid duration '{}': expected a number before 'm'", s)
+        })?;
         Ok(std::time::Duration::from_secs(n * 60))
     } else {
-        let n: u64 = s.parse()
-            .map_err(|_| anyhow::anyhow!("invalid duration '{}': expected a number with optional ms/s/m suffix", s))?;
+        let n: u64 = s.parse().map_err(|_| {
+            anyhow::anyhow!(
+                "invalid duration '{}': expected a number with optional ms/s/m suffix",
+                s
+            )
+        })?;
         Ok(std::time::Duration::from_millis(n))
     }
 }
