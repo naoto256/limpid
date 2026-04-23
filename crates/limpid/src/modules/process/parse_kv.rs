@@ -139,7 +139,9 @@ mod tests {
 
     #[test]
     fn test_fortinet_style() {
-        let event = make_event("date=2026-04-15 time=10:30:00 devname=FW01 srcip=10.0.0.1 dstip=192.168.1.1 action=deny");
+        let event = make_event(
+            "date=2026-04-15 time=10:30:00 devname=FW01 srcip=10.0.0.1 dstip=192.168.1.1 action=deny",
+        );
         let result = apply(event).unwrap();
         assert_eq!(result.fields["date"], Value::String("2026-04-15".into()));
         assert_eq!(result.fields["devname"], Value::String("FW01".into()));

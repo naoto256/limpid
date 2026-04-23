@@ -19,7 +19,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
-use tracing::{info, warn, debug, error};
+use tracing::{debug, error, info, warn};
 
 use crate::dsl::ast::Property;
 use crate::dsl::props;
@@ -67,7 +67,11 @@ impl HasMetrics for TailInput {
 
 #[async_trait::async_trait]
 impl Input for TailInput {
-    async fn run(self, tx: tokio::sync::mpsc::Sender<Event>, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
+    async fn run(
+        self,
+        tx: tokio::sync::mpsc::Sender<Event>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
         info!("tail watching {}", self.path.display());
 
         let source_addr = TAIL_SOURCE.parse().unwrap();
@@ -78,9 +82,10 @@ impl Input for TailInput {
 
         // If no state file or first run, start from end of file
         if (self.state_file.is_none() || offset == 0)
-            && let Ok(meta) = tokio::fs::metadata(&self.path).await {
-                offset = meta.len();
-            }
+            && let Ok(meta) = tokio::fs::metadata(&self.path).await
+        {
+            offset = meta.len();
+        }
 
         loop {
             // Check for shutdown
@@ -108,11 +113,17 @@ impl Input for TailInput {
             // Detect rotation: inode changed or file truncated
             let current_inode = get_inode(&self.path);
             if current_inode != last_inode {
-                info!("tail {}: rotation detected (inode changed), resetting to beginning", self.path.display());
+                info!(
+                    "tail {}: rotation detected (inode changed), resetting to beginning",
+                    self.path.display()
+                );
                 offset = 0;
                 last_inode = current_inode;
             } else if meta.len() < offset {
-                info!("tail {}: file truncated, resetting to beginning", self.path.display());
+                info!(
+                    "tail {}: file truncated, resetting to beginning",
+                    self.path.display()
+                );
                 offset = 0;
             }
 
@@ -200,7 +211,11 @@ impl TailInput {
             if let Err(e) = std::fs::write(&tmp_path, offset.to_string())
                 .and_then(|_| std::fs::rename(&tmp_path, state_file))
             {
-                error!("tail: failed to save position to {}: {}", state_file.display(), e);
+                error!(
+                    "tail: failed to save position to {}: {}",
+                    state_file.display(),
+                    e
+                );
                 let _ = std::fs::remove_file(&tmp_path);
             }
         }

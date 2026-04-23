@@ -59,8 +59,7 @@ impl FromProperties for HttpOutput {
             .to_uppercase();
         let content_type = props::get_string(properties, "content_type")
             .unwrap_or_else(|| "application/json".to_string());
-        let batch_size = props::get_positive_int(properties, "batch_size")?
-            .unwrap_or(1) as usize;
+        let batch_size = props::get_positive_int(properties, "batch_size")?.unwrap_or(1) as usize;
         let batch_timeout = match props::get_string(properties, "batch_timeout") {
             Some(s) => props::parse_duration(&s)?,
             None => Duration::from_secs(5),
@@ -78,9 +77,10 @@ impl FromProperties for HttpOutput {
                         crate::dsl::ast::Expr::StringLit(s) => Some(s.clone()),
                         crate::dsl::ast::Expr::Ident(parts) => Some(parts.join(".")),
                         _ => None,
-                    } {
-                        headers.push((key.clone(), val));
                     }
+                {
+                    headers.push((key.clone(), val));
+                }
             }
         }
 
@@ -93,19 +93,27 @@ impl FromProperties for HttpOutput {
 
         if !is_https {
             if !verify {
-                tracing::warn!("output '{}': 'verify false' has no effect on non-HTTPS URL", name);
+                tracing::warn!(
+                    "output '{}': 'verify false' has no effect on non-HTTPS URL",
+                    name
+                );
             }
             if has_tls_block {
-                tracing::warn!("output '{}': 'tls' block has no effect on non-HTTPS URL", name);
+                tracing::warn!(
+                    "output '{}': 'tls' block has no effect on non-HTTPS URL",
+                    name
+                );
             }
         }
 
         if !verify && has_tls_block {
-            tracing::warn!("output '{}': 'tls' block is ignored because 'verify false' disables certificate validation", name);
+            tracing::warn!(
+                "output '{}': 'tls' block is ignored because 'verify false' disables certificate validation",
+                name
+            );
         }
 
-        let mut client_builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30));
+        let mut client_builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
 
         if !verify {
             client_builder = client_builder.danger_accept_invalid_certs(true);
@@ -113,13 +121,15 @@ impl FromProperties for HttpOutput {
 
         if verify
             && let Some(tls_block) = props::get_block(properties, "tls")
-                && let Some(ca_path) = props::get_string(tls_block, "ca") {
-                    let ca_pem = std::fs::read(&ca_path)
-                        .with_context(|| format!("output '{}': failed to read CA cert: {}", name, ca_path))?;
-                    let ca_cert = reqwest::Certificate::from_pem(&ca_pem)
-                        .with_context(|| format!("output '{}': invalid CA cert: {}", name, ca_path))?;
-                    client_builder = client_builder.add_root_certificate(ca_cert);
-                }
+            && let Some(ca_path) = props::get_string(tls_block, "ca")
+        {
+            let ca_pem = std::fs::read(&ca_path).with_context(|| {
+                format!("output '{}': failed to read CA cert: {}", name, ca_path)
+            })?;
+            let ca_cert = reqwest::Certificate::from_pem(&ca_pem)
+                .with_context(|| format!("output '{}': invalid CA cert: {}", name, ca_path))?;
+            client_builder = client_builder.add_root_certificate(ca_cert);
+        }
 
         let client = client_builder
             .build()
@@ -145,7 +155,9 @@ impl FromProperties for HttpOutput {
 
 impl HasMetrics for HttpOutput {
     type Stats = OutputMetrics;
-    fn metrics(&self) -> Arc<OutputMetrics> { Arc::clone(&self.metrics) }
+    fn metrics(&self) -> Arc<OutputMetrics> {
+        Arc::clone(&self.metrics)
+    }
 }
 
 #[async_trait::async_trait]
@@ -190,7 +202,9 @@ impl HttpOutput {
         let count = batch.len();
         match self.inner.send_batch(&batch).await {
             Ok(()) => {
-                self.metrics.events_written.fetch_add(count as u64, Ordering::Relaxed);
+                self.metrics
+                    .events_written
+                    .fetch_add(count as u64, Ordering::Relaxed);
                 Ok(())
             }
             Err(e) => {
@@ -232,13 +246,19 @@ impl HttpOutput {
 
             let count = batch.len();
             if let Err(e) = inner.send_batch(&batch).await {
-                tracing::warn!("http output: timer flush failed: {} — {} events returned to buffer", e, count);
+                tracing::warn!(
+                    "http output: timer flush failed: {} — {} events returned to buffer",
+                    e,
+                    count
+                );
                 let mut buf = inner.batch.lock().await;
                 let new_events = std::mem::take(&mut *buf);
                 *buf = batch;
                 buf.extend(new_events);
             } else {
-                metrics.events_written.fetch_add(count as u64, Ordering::Relaxed);
+                metrics
+                    .events_written
+                    .fetch_add(count as u64, Ordering::Relaxed);
             }
         }));
     }
@@ -249,13 +269,15 @@ impl Inner {
         let body_str = messages.join("\n");
 
         let body: Vec<u8> = if self.compress {
-            use flate2::write::GzEncoder;
             use flate2::Compression;
+            use flate2::write::GzEncoder;
             use std::io::Write;
             let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-            encoder.write_all(body_str.as_bytes())
+            encoder
+                .write_all(body_str.as_bytes())
                 .context("http output: gzip compression failed")?;
-            encoder.finish()
+            encoder
+                .finish()
                 .context("http output: gzip finalization failed")?
         } else {
             body_str.into_bytes()
@@ -304,11 +326,12 @@ impl Drop for HttpOutput {
         }
         // Check buffer via try_lock (best-effort in Drop)
         if let Ok(buf) = self.inner.batch.try_lock()
-            && !buf.is_empty() {
-                tracing::warn!(
-                    "http output: {} events in buffer lost on shutdown (will be re-delivered from queue)",
-                    buf.len()
-                );
-            }
+            && !buf.is_empty()
+        {
+            tracing::warn!(
+                "http output: {} events in buffer lost on shutdown (will be re-delivered from queue)",
+                buf.len()
+            );
+        }
     }
 }

@@ -56,8 +56,12 @@ impl FromProperties for FileOutput {
         let mode = props::get_string(properties, "mode")
             .map(|s| {
                 let s = s.trim_start_matches('0');
-                u32::from_str_radix(s, 8)
-                    .with_context(|| format!("output '{}': invalid mode (expected octal, e.g. \"0640\")", name))
+                u32::from_str_radix(s, 8).with_context(|| {
+                    format!(
+                        "output '{}': invalid mode (expected octal, e.g. \"0640\")",
+                        name
+                    )
+                })
             })
             .transpose()?;
 
@@ -78,7 +82,9 @@ impl FromProperties for FileOutput {
 
 impl HasMetrics for FileOutput {
     type Stats = OutputMetrics;
-    fn metrics(&self) -> Arc<OutputMetrics> { Arc::clone(&self.metrics) }
+    fn metrics(&self) -> Arc<OutputMetrics> {
+        Arc::clone(&self.metrics)
+    }
 }
 
 #[async_trait::async_trait]
@@ -101,9 +107,14 @@ impl Output for FileOutput {
         // Ensure parent directory exists (needed for dynamic paths)
         if self.is_dynamic
             && let Some(parent) = path.parent()
-                && let Err(e) = tokio::fs::create_dir_all(parent).await {
-                    tracing::warn!("output file: failed to create directory '{}': {}", parent.display(), e);
-                }
+            && let Err(e) = tokio::fs::create_dir_all(parent).await
+        {
+            tracing::warn!(
+                "output file: failed to create directory '{}': {}",
+                parent.display(),
+                e
+            );
+        }
 
         let first_create = {
             let mut guard = self.created_paths.lock().await;
@@ -149,7 +160,9 @@ fn resolve_template(template: &str, event: &Event) -> String {
             chars.next(); // consume '{'
             let mut var = String::new();
             for c in chars.by_ref() {
-                if c == '}' { break; }
+                if c == '}' {
+                    break;
+                }
                 var.push(c);
             }
             result.push_str(&resolve_variable(&var, event));
@@ -183,7 +196,10 @@ fn resolve_variable(var: &str, event: &Event) -> String {
     }
 }
 
-fn resolve_fields_path(path: &[&str], fields: &std::collections::HashMap<String, serde_json::Value>) -> String {
+fn resolve_fields_path(
+    path: &[&str],
+    fields: &std::collections::HashMap<String, serde_json::Value>,
+) -> String {
     use serde_json::Value;
 
     let first = match fields.get(path[0]) {
@@ -221,12 +237,15 @@ impl FileOutput {
         use std::os::unix::fs::PermissionsExt;
 
         if let Some(mode) = self.mode
-            && let Err(e) = tokio::fs::set_permissions(
-                path,
-                std::fs::Permissions::from_mode(mode),
-            ).await {
-                tracing::warn!("output file '{}': failed to set mode: {}", path.display(), e);
-            }
+            && let Err(e) =
+                tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).await
+        {
+            tracing::warn!(
+                "output file '{}': failed to set mode: {}",
+                path.display(),
+                e
+            );
+        }
 
         if self.owner.is_some() || self.group.is_some() {
             let owner = self.owner.clone();
@@ -235,20 +254,37 @@ impl FileOutput {
 
             tokio::task::spawn_blocking(move || {
                 let uid = owner.as_deref().and_then(|name| {
-                    resolve_uid(name).inspect_err(|e| {
-                        tracing::warn!("output file '{}': failed to resolve owner '{}': {}", path.display(), name, e);
-                    }).ok()
+                    resolve_uid(name)
+                        .inspect_err(|e| {
+                            tracing::warn!(
+                                "output file '{}': failed to resolve owner '{}': {}",
+                                path.display(),
+                                name,
+                                e
+                            );
+                        })
+                        .ok()
                 });
                 let gid = group.as_deref().and_then(|name| {
-                    resolve_gid(name).inspect_err(|e| {
-                        tracing::warn!("output file '{}': failed to resolve group '{}': {}", path.display(), name, e);
-                    }).ok()
+                    resolve_gid(name)
+                        .inspect_err(|e| {
+                            tracing::warn!(
+                                "output file '{}': failed to resolve group '{}': {}",
+                                path.display(),
+                                name,
+                                e
+                            );
+                        })
+                        .ok()
                 });
                 if (uid.is_some() || gid.is_some())
-                    && let Err(e) = std::os::unix::fs::chown(&path, uid, gid) {
-                        tracing::warn!("output file '{}': failed to chown: {}", path.display(), e);
-                    }
-            }).await.ok();
+                    && let Err(e) = std::os::unix::fs::chown(&path, uid, gid)
+                {
+                    tracing::warn!("output file '{}': failed to chown: {}", path.display(), e);
+                }
+            })
+            .await
+            .ok();
         }
     }
 }

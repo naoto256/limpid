@@ -36,7 +36,10 @@ impl Event {
     /// Serialize the event to a JSON Value.
     pub fn to_json_value(&self) -> Value {
         let mut map = serde_json::Map::new();
-        map.insert("timestamp".into(), Value::String(self.timestamp.to_rfc3339()));
+        map.insert(
+            "timestamp".into(),
+            Value::String(self.timestamp.to_rfc3339()),
+        );
         map.insert("source".into(), Value::String(self.source.to_string()));
         if let Some(f) = self.facility {
             map.insert("facility".into(), Value::Number(f.into()));
@@ -81,8 +84,14 @@ impl Event {
         let mut event = Self {
             timestamp,
             source,
-            facility: v.get("facility").and_then(|v| v.as_u64()).and_then(|v| u8::try_from(v).ok()),
-            severity: v.get("severity").and_then(|v| v.as_u64()).and_then(|v| u8::try_from(v).ok()),
+            facility: v
+                .get("facility")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u8::try_from(v).ok()),
+            severity: v
+                .get("severity")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u8::try_from(v).ok()),
             raw: Bytes::from(raw.clone()),
             message: Bytes::from(
                 v.get("message")

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tracing::{warn, error, debug};
+use tracing::{debug, error, warn};
 
 use crate::event::Event;
 
@@ -79,7 +79,10 @@ pub struct DiskQueueReceiver {
     dir: PathBuf,
 }
 
-pub fn create_disk_queue(path: &str, max_size: u64) -> anyhow::Result<(DiskQueueSender, DiskQueueReceiver)> {
+pub fn create_disk_queue(
+    path: &str,
+    max_size: u64,
+) -> anyhow::Result<(DiskQueueSender, DiskQueueReceiver)> {
     let dir = PathBuf::from(path);
     fs::create_dir_all(&dir)
         .map_err(|e| anyhow::anyhow!("failed to create disk queue directory '{}': {}", path, e))?;
@@ -174,86 +177,92 @@ impl DiskQueueReceiver {
 
     fn try_read_next(&mut self) -> Option<Event> {
         loop {
-        let seg_path = segment_path(&self.dir, self.read_seq);
-        if !seg_path.exists() {
+            let seg_path = segment_path(&self.dir, self.read_seq);
+            if !seg_path.exists() {
+                let write_seq = {
+                    let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.write_seq
+                };
+                if self.read_seq < write_seq {
+                    self.read_seq += 1;
+                    self.read_offset = 0;
+                    self.sync_read_seq();
+                    continue; // loop instead of recurse
+                }
+                return None;
+            }
+
+            let mut file = match fs::File::open(&seg_path) {
+                Ok(f) => f,
+                Err(_) => return None,
+            };
+
+            // Seek to byte offset instead of scanning lines
+            use std::io::Seek;
+            if self.read_offset > 0
+                && file
+                    .seek(std::io::SeekFrom::Start(self.read_offset))
+                    .is_err()
+            {
+                return None;
+            }
+
+            let mut reader = BufReader::new(file);
+            let mut line = String::new();
+
+            loop {
+                line.clear();
+                let bytes_read = match reader.read_line(&mut line) {
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                if bytes_read == 0 {
+                    break; // EOF
+                }
+
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    self.read_offset += bytes_read as u64;
+                    continue;
+                }
+
+                self.read_offset += bytes_read as u64;
+                save_cursor(&self.dir, self.read_seq, self.read_offset);
+
+                if let Some(event) = Event::from_json(trimmed) {
+                    return Some(event);
+                }
+
+                warn!(
+                    "disk queue: skipping corrupted line in segment {} at byte offset {}",
+                    self.read_seq, self.read_offset
+                );
+            }
+
+            // Finished this segment — try next
             let write_seq = {
                 let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 state.write_seq
             };
+
             if self.read_seq < write_seq {
+                // Delete consumed segment
+                if let Err(e) = fs::remove_file(&seg_path) {
+                    warn!(
+                        "disk queue: failed to remove consumed segment {}: {}",
+                        self.read_seq, e
+                    );
+                } else {
+                    debug!("disk queue: removed consumed segment {}", self.read_seq);
+                }
                 self.read_seq += 1;
                 self.read_offset = 0;
                 self.sync_read_seq();
+                save_cursor(&self.dir, self.read_seq, self.read_offset);
                 continue; // loop instead of recurse
             }
+
             return None;
-        }
-
-        let mut file = match fs::File::open(&seg_path) {
-            Ok(f) => f,
-            Err(_) => return None,
-        };
-
-        // Seek to byte offset instead of scanning lines
-        use std::io::Seek;
-        if self.read_offset > 0
-            && file.seek(std::io::SeekFrom::Start(self.read_offset)).is_err() {
-                return None;
-            }
-
-        let mut reader = BufReader::new(file);
-        let mut line = String::new();
-
-        loop {
-            line.clear();
-            let bytes_read = match reader.read_line(&mut line) {
-                Ok(n) => n,
-                Err(_) => break,
-            };
-            if bytes_read == 0 {
-                break; // EOF
-            }
-
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                self.read_offset += bytes_read as u64;
-                continue;
-            }
-
-            self.read_offset += bytes_read as u64;
-            save_cursor(&self.dir, self.read_seq, self.read_offset);
-
-            if let Some(event) = Event::from_json(trimmed) {
-                return Some(event);
-            }
-
-            warn!(
-                "disk queue: skipping corrupted line in segment {} at byte offset {}",
-                self.read_seq, self.read_offset
-            );
-        }
-
-        // Finished this segment — try next
-        let write_seq = {
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.write_seq
-        };
-
-        if self.read_seq < write_seq {
-            // Delete consumed segment
-            if let Err(e) = fs::remove_file(&seg_path) {
-                warn!("disk queue: failed to remove consumed segment {}: {}", self.read_seq, e);
-            } else {
-                debug!("disk queue: removed consumed segment {}", self.read_seq);
-            }
-            self.read_seq += 1;
-            self.read_offset = 0;
-            self.sync_read_seq();
-            save_cursor(&self.dir, self.read_seq, self.read_offset);
-            continue; // loop instead of recurse
-        }
-
-        return None;
         } // end loop
     }
 
@@ -333,15 +342,17 @@ fn enforce_max_size(dir: &Path, max_size: u64, current_read_seq: u64, _current_w
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with("seg-") && name.ends_with(".wal")
-                && let Ok(meta) = entry.metadata() {
-                    let size = meta.len();
-                    let seq_str = &name[4..name.len() - 4];
-                    if let Ok(seq) = seq_str.parse::<u64>() {
-                        segments.push((seq, size));
-                        total += size;
-                    }
+            if name.starts_with("seg-")
+                && name.ends_with(".wal")
+                && let Ok(meta) = entry.metadata()
+            {
+                let size = meta.len();
+                let seq_str = &name[4..name.len() - 4];
+                if let Ok(seq) = seq_str.parse::<u64>() {
+                    segments.push((seq, size));
+                    total += size;
                 }
+            }
         }
     }
 
@@ -360,7 +371,10 @@ fn enforce_max_size(dir: &Path, max_size: u64, current_read_seq: u64, _current_w
         }
         let path = segment_path(dir, seq);
         if fs::remove_file(&path).is_ok() {
-            warn!("disk queue: removed old segment {} to enforce max size", seq);
+            warn!(
+                "disk queue: removed old segment {} to enforce max size",
+                seq
+            );
             total -= size;
         }
     }
@@ -410,11 +424,13 @@ fn save_cursor(dir: &Path, seq: u64, offset: u64) {
     let tmp_path = path.with_extension("tmp");
     let data = format!("{}:{}", seq, offset);
     if let Err(e) = fs::write(&tmp_path, &data).and_then(|_| fs::rename(&tmp_path, &path)) {
-        error!("disk queue: failed to save cursor: {} — events may be re-delivered on restart", e);
+        error!(
+            "disk queue: failed to save cursor: {} — events may be re-delivered on restart",
+            e
+        );
         let _ = fs::remove_file(&tmp_path);
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -430,7 +446,9 @@ mod tests {
         let mut event = make_event("<134>test");
         event.facility = Some(16);
         event.severity = Some(6);
-        event.fields.insert("key".into(), serde_json::Value::String("val".into()));
+        event
+            .fields
+            .insert("key".into(), serde_json::Value::String("val".into()));
 
         let json = event.to_json_value();
         let json_str = serde_json::to_string(&json).unwrap();
@@ -439,7 +457,10 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&recovered.raw), "<134>test");
         assert_eq!(recovered.facility, Some(16));
         assert_eq!(recovered.severity, Some(6));
-        assert_eq!(recovered.fields["key"], serde_json::Value::String("val".into()));
+        assert_eq!(
+            recovered.fields["key"],
+            serde_json::Value::String("val".into())
+        );
     }
 
     #[tokio::test]

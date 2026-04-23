@@ -5,8 +5,8 @@
 //! Runtime never counts — it only distributes handles.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct InputMetrics {
     /// Events actually received by the input module (network, socket, file, etc).
@@ -106,10 +106,22 @@ impl MetricsRegistry {
         let mut pipelines = serde_json::Map::new();
         for (name, m) in &self.pipelines {
             let mut p = serde_json::Map::new();
-            p.insert("events_received".into(), m.events_received.load(Ordering::Relaxed).into());
-            p.insert("events_finished".into(), m.events_finished.load(Ordering::Relaxed).into());
-            p.insert("events_dropped".into(), m.events_dropped.load(Ordering::Relaxed).into());
-            p.insert("events_discarded".into(), m.events_discarded.load(Ordering::Relaxed).into());
+            p.insert(
+                "events_received".into(),
+                m.events_received.load(Ordering::Relaxed).into(),
+            );
+            p.insert(
+                "events_finished".into(),
+                m.events_finished.load(Ordering::Relaxed).into(),
+            );
+            p.insert(
+                "events_dropped".into(),
+                m.events_dropped.load(Ordering::Relaxed).into(),
+            );
+            p.insert(
+                "events_discarded".into(),
+                m.events_discarded.load(Ordering::Relaxed).into(),
+            );
             pipelines.insert(name.clone(), serde_json::Value::Object(p));
         }
         map.insert("pipelines".into(), serde_json::Value::Object(pipelines));
@@ -117,9 +129,18 @@ impl MetricsRegistry {
         let mut inputs = serde_json::Map::new();
         for (name, m) in &self.inputs {
             let mut i = serde_json::Map::new();
-            i.insert("events_received".into(), m.events_received.load(Ordering::Relaxed).into());
-            i.insert("events_invalid".into(), m.events_invalid.load(Ordering::Relaxed).into());
-            i.insert("events_injected".into(), m.events_injected.load(Ordering::Relaxed).into());
+            i.insert(
+                "events_received".into(),
+                m.events_received.load(Ordering::Relaxed).into(),
+            );
+            i.insert(
+                "events_invalid".into(),
+                m.events_invalid.load(Ordering::Relaxed).into(),
+            );
+            i.insert(
+                "events_injected".into(),
+                m.events_injected.load(Ordering::Relaxed).into(),
+            );
             inputs.insert(name.clone(), serde_json::Value::Object(i));
         }
         map.insert("inputs".into(), serde_json::Value::Object(inputs));
@@ -127,10 +148,22 @@ impl MetricsRegistry {
         let mut outputs = serde_json::Map::new();
         for (name, m) in &self.outputs {
             let mut o = serde_json::Map::new();
-            o.insert("events_received".into(), m.events_received.load(Ordering::Relaxed).into());
-            o.insert("events_injected".into(), m.events_injected.load(Ordering::Relaxed).into());
-            o.insert("events_written".into(), m.events_written.load(Ordering::Relaxed).into());
-            o.insert("events_failed".into(), m.events_failed.load(Ordering::Relaxed).into());
+            o.insert(
+                "events_received".into(),
+                m.events_received.load(Ordering::Relaxed).into(),
+            );
+            o.insert(
+                "events_injected".into(),
+                m.events_injected.load(Ordering::Relaxed).into(),
+            );
+            o.insert(
+                "events_written".into(),
+                m.events_written.load(Ordering::Relaxed).into(),
+            );
+            o.insert(
+                "events_failed".into(),
+                m.events_failed.load(Ordering::Relaxed).into(),
+            );
             o.insert("retries".into(), m.retries.load(Ordering::Relaxed).into());
             outputs.insert(name.clone(), serde_json::Value::Object(o));
         }

@@ -49,16 +49,26 @@ impl FromProperties for KafkaOutput {
         let topic = props::get_string(properties, "topic")
             .ok_or_else(|| anyhow::anyhow!("output '{}': kafka requires 'topic'", name))?;
 
-        let compression = props::get_ident(properties, "compression")
-            .unwrap_or_else(|| "none".to_string());
-        if !matches!(compression.as_str(), "none" | "gzip" | "snappy" | "lz4" | "zstd") {
-            anyhow::bail!("output '{}': invalid compression '{}' (expected: none, gzip, snappy, lz4, zstd)", name, compression);
+        let compression =
+            props::get_ident(properties, "compression").unwrap_or_else(|| "none".to_string());
+        if !matches!(
+            compression.as_str(),
+            "none" | "gzip" | "snappy" | "lz4" | "zstd"
+        ) {
+            anyhow::bail!(
+                "output '{}': invalid compression '{}' (expected: none, gzip, snappy, lz4, zstd)",
+                name,
+                compression
+            );
         }
 
-        let acks = props::get_ident(properties, "acks")
-            .unwrap_or_else(|| "all".to_string());
+        let acks = props::get_ident(properties, "acks").unwrap_or_else(|| "all".to_string());
         if !matches!(acks.as_str(), "0" | "1" | "all") {
-            anyhow::bail!("output '{}': invalid acks '{}' (expected: 0, 1, all)", name, acks);
+            anyhow::bail!(
+                "output '{}': invalid acks '{}' (expected: 0, 1, all)",
+                name,
+                acks
+            );
         }
 
         let queue_timeout = match props::get_string(properties, "queue_timeout") {
@@ -96,7 +106,9 @@ impl FromProperties for KafkaOutput {
 
 impl HasMetrics for KafkaOutput {
     type Stats = OutputMetrics;
-    fn metrics(&self) -> Arc<OutputMetrics> { Arc::clone(&self.metrics) }
+    fn metrics(&self) -> Arc<OutputMetrics> {
+        Arc::clone(&self.metrics)
+    }
 }
 
 #[async_trait::async_trait]
@@ -136,11 +148,11 @@ impl KafkaOutput {
             KeyField::Source => event.source.ip().to_string(),
             KeyField::Facility => event.facility.map(|f| f.to_string())?,
             KeyField::Severity => event.severity.map(|s| s.to_string())?,
-            KeyField::Field(name) => {
-                event.fields.get(name)
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())?
-            }
+            KeyField::Field(name) => event
+                .fields
+                .get(name)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())?,
         };
         Some(value)
     }

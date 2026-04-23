@@ -255,7 +255,9 @@ pub fn register_builtins(reg: &mut FunctionRegistry, table_store: table::TableSt
         let pattern = val_to_str(&args[1]);
         let replacement = val_to_str(&args[2]);
         match get_cached_regex(&pattern) {
-            Ok(re) => Ok(Value::String(re.replace_all(&target, replacement.as_str()).into_owned())),
+            Ok(re) => Ok(Value::String(
+                re.replace_all(&target, replacement.as_str()).into_owned(),
+            )),
             Err(e) => bail!("invalid regex: {}", e),
         }
     });
@@ -284,7 +286,9 @@ fn expand_format_template(template: &str, event: &crate::event::Event) -> String
             chars.next(); // consume '{'
             let mut var = String::new();
             for c in chars.by_ref() {
-                if c == '}' { break; }
+                if c == '}' {
+                    break;
+                }
                 var.push(c);
             }
             result.push_str(&resolve_format_var(&var, event));
@@ -323,7 +327,10 @@ fn resolve_format_var(var: &str, event: &crate::event::Event) -> String {
     }
 }
 
-fn resolve_format_fields(path: &[&str], fields: &std::collections::HashMap<String, serde_json::Value>) -> String {
+fn resolve_format_fields(
+    path: &[&str],
+    fields: &std::collections::HashMap<String, serde_json::Value>,
+) -> String {
     let first = match fields.get(path[0]) {
         Some(v) => v,
         None => return String::new(),

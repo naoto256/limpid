@@ -5,9 +5,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio_rustls::rustls::{self, ServerConfig, ClientConfig};
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::pki_types::pem::PemObject;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::rustls::{self, ClientConfig, ServerConfig};
 
 /// TLS settings parsed from DSL `tls { ... }` block.
 #[derive(Debug, Clone)]

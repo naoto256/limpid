@@ -8,7 +8,7 @@ pub mod disk;
 
 use std::sync::Arc;
 
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use crate::dsl::ast::Property;
 use crate::dsl::props;
@@ -45,7 +45,10 @@ impl Default for QueueConfig {
 
 impl QueueConfig {
     /// Parse from an output definition's `queue { ... }` block.
-    pub fn from_output_properties(output_name: &str, output_props: &[Property]) -> anyhow::Result<Self> {
+    pub fn from_output_properties(
+        output_name: &str,
+        output_props: &[Property],
+    ) -> anyhow::Result<Self> {
         if let Some(block) = props::get_block(output_props, "queue") {
             let queue_type = match props::get_ident(block, "type").as_deref() {
                 Some("disk") => {
@@ -59,8 +62,7 @@ impl QueueConfig {
                 }
                 _ => QueueType::Memory,
             };
-            let capacity = props::get_positive_int(block, "capacity")?
-                .unwrap_or(65536) as usize;
+            let capacity = props::get_positive_int(block, "capacity")?.unwrap_or(65536) as usize;
             Ok(QueueConfig {
                 queue_type,
                 capacity,
@@ -104,9 +106,7 @@ impl QueueSender {
             SenderInner::Memory(tx) => tx.send(event).await.is_ok(),
             SenderInner::Disk(tx) => tx.send(event).await,
         };
-        if ok
-            && let Some(m) = &self.metrics
-        {
+        if ok && let Some(m) = &self.metrics {
             m.events_received
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -152,7 +152,10 @@ impl QueueReceiver {
 }
 
 /// Create a sender/receiver pair.
-pub fn create_queue(name: String, config: QueueConfig) -> anyhow::Result<(QueueSender, QueueReceiver)> {
+pub fn create_queue(
+    name: String,
+    config: QueueConfig,
+) -> anyhow::Result<(QueueSender, QueueReceiver)> {
     let name = Arc::new(name);
 
     match config.queue_type {
@@ -306,11 +309,22 @@ async fn drain_remaining(
 ) {
     let mut count = 0u64;
     while let Some(event) = receiver.try_recv() {
-        write_with_retry(writer, &event, retry_config, secondary_sender, name, metrics).await;
+        write_with_retry(
+            writer,
+            &event,
+            retry_config,
+            secondary_sender,
+            name,
+            metrics,
+        )
+        .await;
         count += 1;
     }
     if count > 0 {
-        info!("output '{}': drained {} events during shutdown", name, count);
+        info!(
+            "output '{}': drained {} events during shutdown",
+            name, count
+        );
     }
 }
 

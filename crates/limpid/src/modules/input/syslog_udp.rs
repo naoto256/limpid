@@ -7,15 +7,15 @@ use std::sync::atomic::Ordering;
 use anyhow::Result;
 use bytes::Bytes;
 use tokio::net::UdpSocket;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
+use super::rate_limit::RateLimiter;
+use super::validate::validate_pri;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::event::Event;
 use crate::metrics::InputMetrics;
 use crate::modules::{FromProperties, HasMetrics, Input};
-use super::rate_limit::RateLimiter;
-use super::validate::validate_pri;
 
 pub struct SyslogUdpInput {
     pub bind_addr: String,
@@ -25,8 +25,8 @@ pub struct SyslogUdpInput {
 
 impl FromProperties for SyslogUdpInput {
     fn from_properties(_name: &str, properties: &[Property]) -> Result<Self> {
-        let bind = props::get_string(properties, "bind")
-            .unwrap_or_else(|| "0.0.0.0:514".to_string());
+        let bind =
+            props::get_string(properties, "bind").unwrap_or_else(|| "0.0.0.0:514".to_string());
         let rate_limit = props::get_strictly_positive_int(properties, "rate_limit")?;
         Ok(Self {
             bind_addr: bind,
@@ -45,7 +45,11 @@ impl HasMetrics for SyslogUdpInput {
 
 #[async_trait::async_trait]
 impl Input for SyslogUdpInput {
-    async fn run(self, tx: tokio::sync::mpsc::Sender<Event>, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
+    async fn run(
+        self,
+        tx: tokio::sync::mpsc::Sender<Event>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
         let socket = UdpSocket::bind(&self.bind_addr).await?;
         info!("syslog_udp listening on {}", self.bind_addr);
 

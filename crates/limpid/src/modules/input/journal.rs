@@ -16,7 +16,7 @@ use std::time::Duration;
 use anyhow::Result;
 use bytes::Bytes;
 use systemd::journal::{Journal, OpenOptions};
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use crate::dsl::ast::Property;
 use crate::dsl::props;
@@ -65,7 +65,11 @@ impl HasMetrics for JournalInput {
 
 #[async_trait::async_trait]
 impl Input for JournalInput {
-    async fn run(self, tx: tokio::sync::mpsc::Sender<Event>, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
+    async fn run(
+        self,
+        tx: tokio::sync::mpsc::Sender<Event>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
         info!("journal input started");
 
         let source_addr = JOURNAL_SOURCE.parse().unwrap();
@@ -117,10 +121,11 @@ impl Input for JournalInput {
 
 /// Read a field value from the current journal entry as a String.
 fn get_field(journal: &mut Journal, field: &str) -> Option<String> {
-    journal
-        .get_data(field)
-        .ok()
-        .and_then(|entry| entry?.value().map(|v| String::from_utf8_lossy(v).into_owned()))
+    journal.get_data(field).ok().and_then(|entry| {
+        entry?
+            .value()
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+    })
 }
 
 /// Synchronous journal reader running in a blocking thread.
@@ -145,14 +150,20 @@ fn run_journal_reader(
                 warn!("journal: failed to add match '{}': {}", m, e);
             }
         } else {
-            warn!("journal: invalid match format '{}', expected 'FIELD=value'", m);
+            warn!(
+                "journal: invalid match format '{}', expected 'FIELD=value'",
+                m
+            );
         }
     }
 
     // Seek to saved cursor or end
     if let Some(cursor) = state_file.as_ref().and_then(|f| load_cursor(f)) {
         if let Err(e) = journal.seek_cursor(&cursor) {
-            warn!("journal: failed to seek to cursor, starting from end: {}", e);
+            warn!(
+                "journal: failed to seek to cursor, starting from end: {}",
+                e
+            );
             let _ = journal.seek_tail();
             let _ = journal.previous();
         } else {
@@ -207,7 +218,10 @@ fn run_journal_reader(
 }
 
 fn load_cursor(path: &PathBuf) -> Option<String> {
-    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn save_cursor(path: &PathBuf, cursor: &str) {
@@ -215,8 +229,12 @@ fn save_cursor(path: &PathBuf, cursor: &str) {
         let _ = std::fs::create_dir_all(parent);
     }
     let tmp_path = path.with_extension("tmp");
-    if let Err(e) = std::fs::write(&tmp_path, cursor).and_then(|_| std::fs::rename(&tmp_path, path)) {
-        warn!("journal: failed to save cursor: {} — events may be re-delivered on restart", e);
+    if let Err(e) = std::fs::write(&tmp_path, cursor).and_then(|_| std::fs::rename(&tmp_path, path))
+    {
+        warn!(
+            "journal: failed to save cursor: {} — events may be re-delivered on restart",
+            e
+        );
         let _ = std::fs::remove_file(&tmp_path);
     }
 }

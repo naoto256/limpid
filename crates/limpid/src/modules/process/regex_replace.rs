@@ -37,15 +37,13 @@ fn get_cached_regex(pattern: &str) -> Result<Regex, ProcessError> {
 }
 
 pub fn apply(mut event: Event, args: &[serde_json::Value]) -> Result<Event, ProcessError> {
-    let pattern = args
-        .first()
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ProcessError::Failed("regex_replace: first argument (pattern) must be a string".into()))?;
+    let pattern = args.first().and_then(|v| v.as_str()).ok_or_else(|| {
+        ProcessError::Failed("regex_replace: first argument (pattern) must be a string".into())
+    })?;
 
-    let replacement = args
-        .get(1)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ProcessError::Failed("regex_replace: second argument (replacement) must be a string".into()))?;
+    let replacement = args.get(1).and_then(|v| v.as_str()).ok_or_else(|| {
+        ProcessError::Failed("regex_replace: second argument (replacement) must be a string".into())
+    })?;
 
     let re = get_cached_regex(pattern)?;
 
@@ -94,7 +92,11 @@ mod tests {
     #[test]
     fn test_capture_group() {
         let e = make_event("date=2026-04-15 time=04:23:17");
-        let result = apply(e, &str_args(&[r"date=(\d{4})-(\d{2})-(\d{2})", "date=$1/$2/$3"])).unwrap();
+        let result = apply(
+            e,
+            &str_args(&[r"date=(\d{4})-(\d{2})-(\d{2})", "date=$1/$2/$3"]),
+        )
+        .unwrap();
         assert_eq!(
             String::from_utf8_lossy(&result.message).as_ref(),
             "date=2026/04/15 time=04:23:17"

@@ -34,8 +34,9 @@ pub fn load_config(config_file: &Path) -> Result<Config> {
 
     for include_pattern in std::mem::take(&mut config.includes) {
         let full_pattern = base_dir.join(&include_pattern);
-        let pattern_str = full_pattern.to_str()
-            .ok_or_else(|| anyhow::anyhow!("include path is not valid UTF-8: {}", include_pattern))?;
+        let pattern_str = full_pattern.to_str().ok_or_else(|| {
+            anyhow::anyhow!("include path is not valid UTF-8: {}", include_pattern)
+        })?;
 
         let mut paths: Vec<_> = glob::glob(pattern_str)
             .with_context(|| format!("invalid include pattern: {}", include_pattern))?
@@ -47,7 +48,10 @@ pub fn load_config(config_file: &Path) -> Result<Config> {
             let canonical = std::fs::canonicalize(&path)
                 .with_context(|| format!("failed to canonicalize {}", path.display()))?;
             if canonical == canonical_main {
-                bail!("self-inclusion detected: {} includes itself", config_file.display());
+                bail!(
+                    "self-inclusion detected: {} includes itself",
+                    config_file.display()
+                );
             }
 
             let inc_content = std::fs::read_to_string(&path)
@@ -83,7 +87,11 @@ mod tests {
         let main_conf = dir.path().join("main.conf");
         let sub_file = dir.path().join("sub.limpid");
 
-        fs::write(&sub_file, r#"def input fw { type syslog_udp bind "0.0.0.0:514" }"#).unwrap();
+        fs::write(
+            &sub_file,
+            r#"def input fw { type syslog_udp bind "0.0.0.0:514" }"#,
+        )
+        .unwrap();
         fs::write(&main_conf, r#"include "sub.limpid""#).unwrap();
 
         let config = load_config(&main_conf).unwrap();
@@ -97,8 +105,16 @@ mod tests {
         let sub_dir = dir.path().join("inputs");
         fs::create_dir(&sub_dir).unwrap();
 
-        fs::write(sub_dir.join("a.limpid"), r#"def input a { type syslog_udp bind "0.0.0.0:514" }"#).unwrap();
-        fs::write(sub_dir.join("b.limpid"), r#"def input b { type syslog_tcp bind "0.0.0.0:514" }"#).unwrap();
+        fs::write(
+            sub_dir.join("a.limpid"),
+            r#"def input a { type syslog_udp bind "0.0.0.0:514" }"#,
+        )
+        .unwrap();
+        fs::write(
+            sub_dir.join("b.limpid"),
+            r#"def input b { type syslog_tcp bind "0.0.0.0:514" }"#,
+        )
+        .unwrap();
 
         let main_conf = dir.path().join("main.conf");
         fs::write(&main_conf, r#"include "inputs/*.limpid""#).unwrap();
@@ -146,11 +162,15 @@ mod tests {
     fn test_no_includes() {
         let dir = TempDir::new().unwrap();
         let main_conf = dir.path().join("main.conf");
-        fs::write(&main_conf, r#"
+        fs::write(
+            &main_conf,
+            r#"
             control {
                 socket "/var/run/limpid/control.sock"
             }
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
 
         let config = load_config(&main_conf).unwrap();
         assert!(config.definitions.is_empty());

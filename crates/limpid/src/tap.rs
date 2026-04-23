@@ -9,10 +9,10 @@
 //! cost is an atomic load per event.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 
 use crate::event::Event;
 
@@ -74,11 +74,12 @@ impl TapRegistry {
     pub async fn emit(&self, key: &str, event: &Event) {
         let map = self.inner.read().await;
         if let Some(channel) = map.get(key)
-            && channel.subscriber_count.load(Ordering::Relaxed) > 0 {
-                // Best-effort: broadcast send fails when subscribers are lagged
-                // or have disconnected. Tap is debug-only; dropping is intentional.
-                let _ = channel.sender.send(Arc::new(event.clone()));
-            }
+            && channel.subscriber_count.load(Ordering::Relaxed) > 0
+        {
+            // Best-effort: broadcast send fails when subscribers are lagged
+            // or have disconnected. Tap is debug-only; dropping is intentional.
+            let _ = channel.sender.send(Arc::new(event.clone()));
+        }
     }
 
     /// Non-async emit for use in synchronous contexts (e.g. process registry).
@@ -86,12 +87,12 @@ impl TapRegistry {
     pub fn try_emit(&self, key: &str, event: &Event) {
         if let Ok(map) = self.inner.try_read()
             && let Some(channel) = map.get(key)
-                && channel.subscriber_count.load(Ordering::Relaxed) > 0 {
-                    // Best-effort: see `emit` above.
-                    let _ = channel.sender.send(Arc::new(event.clone()));
-                }
+            && channel.subscriber_count.load(Ordering::Relaxed) > 0
+        {
+            // Best-effort: see `emit` above.
+            let _ = channel.sender.send(Arc::new(event.clone()));
+        }
     }
-
 }
 
 /// A tap subscription. Decrements subscriber count on drop.

@@ -123,58 +123,106 @@ fn json_to_prometheus(json: &str) -> Result<String, String> {
 
     if let Some(inputs) = root.get("inputs").and_then(|v| v.as_object()) {
         write_counter(
-            &mut out, "limpid_input_events_received_total",
-            "Total events received by input.", "input", inputs, "events_received",
+            &mut out,
+            "limpid_input_events_received_total",
+            "Total events received by input.",
+            "input",
+            inputs,
+            "events_received",
         );
         write_counter(
-            &mut out, "limpid_input_events_invalid_total",
-            "Total invalid events rejected by input.", "input", inputs, "events_invalid",
+            &mut out,
+            "limpid_input_events_invalid_total",
+            "Total invalid events rejected by input.",
+            "input",
+            inputs,
+            "events_invalid",
         );
         write_counter(
-            &mut out, "limpid_input_events_injected_total",
-            "Total events injected into this input's channel via limpidctl inject.", "input", inputs, "events_injected",
+            &mut out,
+            "limpid_input_events_injected_total",
+            "Total events injected into this input's channel via limpidctl inject.",
+            "input",
+            inputs,
+            "events_injected",
         );
     }
 
     if let Some(pipelines) = root.get("pipelines").and_then(|v| v.as_object()) {
         write_counter(
-            &mut out, "limpid_pipeline_events_received_total",
-            "Total events received by pipeline.", "pipeline", pipelines, "events_received",
+            &mut out,
+            "limpid_pipeline_events_received_total",
+            "Total events received by pipeline.",
+            "pipeline",
+            pipelines,
+            "events_received",
         );
         write_counter(
-            &mut out, "limpid_pipeline_events_finished_total",
-            "Total events that finished pipeline processing.", "pipeline", pipelines, "events_finished",
+            &mut out,
+            "limpid_pipeline_events_finished_total",
+            "Total events that finished pipeline processing.",
+            "pipeline",
+            pipelines,
+            "events_finished",
         );
         write_counter(
-            &mut out, "limpid_pipeline_events_dropped_total",
-            "Total events explicitly dropped by pipeline.", "pipeline", pipelines, "events_dropped",
+            &mut out,
+            "limpid_pipeline_events_dropped_total",
+            "Total events explicitly dropped by pipeline.",
+            "pipeline",
+            pipelines,
+            "events_dropped",
         );
         write_counter(
-            &mut out, "limpid_pipeline_events_discarded_total",
-            "Total events discarded due to processing errors.", "pipeline", pipelines, "events_discarded",
+            &mut out,
+            "limpid_pipeline_events_discarded_total",
+            "Total events discarded due to processing errors.",
+            "pipeline",
+            pipelines,
+            "events_discarded",
         );
     }
 
     if let Some(outputs) = root.get("outputs").and_then(|v| v.as_object()) {
         write_counter(
-            &mut out, "limpid_output_events_received_total",
-            "Total events that entered this output's queue (from pipelines + injects).", "output", outputs, "events_received",
+            &mut out,
+            "limpid_output_events_received_total",
+            "Total events that entered this output's queue (from pipelines + injects).",
+            "output",
+            outputs,
+            "events_received",
         );
         write_counter(
-            &mut out, "limpid_output_events_injected_total",
-            "Total events injected into this output's queue via limpidctl inject.", "output", outputs, "events_injected",
+            &mut out,
+            "limpid_output_events_injected_total",
+            "Total events injected into this output's queue via limpidctl inject.",
+            "output",
+            outputs,
+            "events_injected",
         );
         write_counter(
-            &mut out, "limpid_output_events_written_total",
-            "Total events successfully written by output.", "output", outputs, "events_written",
+            &mut out,
+            "limpid_output_events_written_total",
+            "Total events successfully written by output.",
+            "output",
+            outputs,
+            "events_written",
         );
         write_counter(
-            &mut out, "limpid_output_events_failed_total",
-            "Total events that failed to write after all retries.", "output", outputs, "events_failed",
+            &mut out,
+            "limpid_output_events_failed_total",
+            "Total events that failed to write after all retries.",
+            "output",
+            outputs,
+            "events_failed",
         );
         write_counter(
-            &mut out, "limpid_output_retries_total",
-            "Total retry attempts by output.", "output", outputs, "retries",
+            &mut out,
+            "limpid_output_retries_total",
+            "Total retry attempts by output.",
+            "output",
+            outputs,
+            "retries",
         );
     }
 
@@ -224,11 +272,10 @@ fn escape_label_value(s: &str) -> String {
 }
 
 fn query_control(socket_path: &PathBuf, command: &str) -> Result<String, String> {
-    let mut stream = UnixStream::connect(socket_path)
-        .map_err(|e| format!("cannot connect to limpid: {}", e))?;
+    let mut stream =
+        UnixStream::connect(socket_path).map_err(|e| format!("cannot connect to limpid: {}", e))?;
 
-    writeln!(stream, "{}", command)
-        .map_err(|e| format!("cannot send command: {}", e))?;
+    writeln!(stream, "{}", command).map_err(|e| format!("cannot send command: {}", e))?;
 
     let _ = stream.shutdown(std::net::Shutdown::Write);
 

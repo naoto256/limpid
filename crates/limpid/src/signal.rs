@@ -17,12 +17,11 @@ pub enum SignalAction {
 /// Wait for either SIGTERM/SIGINT (shutdown) or SIGHUP (reload).
 /// Returns which signal was received.
 pub async fn wait_for_signal() -> Result<SignalAction> {
-    let mut sigterm = signal(SignalKind::terminate())
-        .context("failed to register SIGTERM handler")?;
-    let mut sigint = signal(SignalKind::interrupt())
-        .context("failed to register SIGINT handler")?;
-    let mut sighup = signal(SignalKind::hangup())
-        .context("failed to register SIGHUP handler")?;
+    let mut sigterm =
+        signal(SignalKind::terminate()).context("failed to register SIGTERM handler")?;
+    let mut sigint =
+        signal(SignalKind::interrupt()).context("failed to register SIGINT handler")?;
+    let mut sighup = signal(SignalKind::hangup()).context("failed to register SIGHUP handler")?;
 
     let action = tokio::select! {
         _ = sigterm.recv() => {
