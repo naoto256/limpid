@@ -85,7 +85,7 @@ impl Input for SyslogTlsInput {
         tx: tokio::sync::mpsc::Sender<Event>,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
-        let server_config = crate::tls::build_server_config(&self.tls_config)?;
+        let server_config = crate::tls::build_server_config(&self.tls_config).await?;
         let acceptor = TlsAcceptor::from(server_config);
 
         let listener = TcpListener::bind(&self.bind_addr).await?;
