@@ -52,6 +52,22 @@ assets = [
     ["target/release/limpidctl", "usr/bin/", "755"],
     ["../../packaging/limpid.conf.example", "usr/share/limpid/limpid.conf.example", "644"],
     ["../../README.md", "usr/share/doc/limpid/README.md", "644"],
+    # Snippet library — installed read-only under /usr/share/limpid/snippets/
+    # so user configs can `include "/usr/share/limpid/snippets/parsers/<vendor>.limpid"`.
+    # The config loader's allow-list (config.rs SYSTEM_SNIPPET_DIR) explicitly
+    # permits absolute includes under this prefix.
+    ["../../packaging/snippets/_common/cef.limpid",                "usr/share/limpid/snippets/_common/cef.limpid",                "644"],
+    ["../../packaging/snippets/_common/cef_vendor_dispatch.limpid", "usr/share/limpid/snippets/_common/cef_vendor_dispatch.limpid", "644"],
+    ["../../packaging/snippets/_common/format.limpid",             "usr/share/limpid/snippets/_common/format.limpid",             "644"],
+    ["../../packaging/snippets/_common/proto.limpid",              "usr/share/limpid/snippets/_common/proto.limpid",              "644"],
+    ["../../packaging/snippets/_common/severity.limpid",           "usr/share/limpid/snippets/_common/severity.limpid",           "644"],
+    ["../../packaging/snippets/parsers/azure_waf.limpid",          "usr/share/limpid/snippets/parsers/azure_waf.limpid",          "644"],
+    ["../../packaging/snippets/parsers/checkpoint.limpid",         "usr/share/limpid/snippets/parsers/checkpoint.limpid",         "644"],
+    ["../../packaging/snippets/parsers/fortigate.limpid",          "usr/share/limpid/snippets/parsers/fortigate.limpid",          "644"],
+    ["../../packaging/snippets/parsers/mde.limpid",                "usr/share/limpid/snippets/parsers/mde.limpid",                "644"],
+    ["../../packaging/snippets/parsers/paloalto.limpid",           "usr/share/limpid/snippets/parsers/paloalto.limpid",           "644"],
+    ["../../packaging/snippets/composers/ocsf_detection_finding.limpid", "usr/share/limpid/snippets/composers/ocsf_detection_finding.limpid", "644"],
+    ["../../packaging/snippets/composers/ocsf_network_activity.limpid",  "usr/share/limpid/snippets/composers/ocsf_network_activity.limpid",  "644"],
 ]
 maintainer-scripts = "../../packaging"
 systemd-units = { unit-name = "limpid", unit-scripts = "../../packaging" }
