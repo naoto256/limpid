@@ -91,16 +91,11 @@ fn span_of(pair: &Pair<Rule>, file_id: u32) -> Span {
 fn parse_global_block(pair: Pair<Rule>, file_id: u32) -> Result<GlobalBlock> {
     let mut inner = pair.into_inner();
     let name_pair = inner.next().unwrap();
-    let name_span = Some(span_of(&name_pair, file_id));
     let name = name_pair.as_str().to_string();
     let properties = inner
         .map(|p| parse_property(p, file_id))
         .collect::<Result<Vec<_>>>()?;
-    Ok(GlobalBlock {
-        name,
-        name_span,
-        properties,
-    })
+    Ok(GlobalBlock { name, properties })
 }
 
 // ---------------------------------------------------------------------------
@@ -110,37 +105,26 @@ fn parse_global_block(pair: Pair<Rule>, file_id: u32) -> Result<GlobalBlock> {
 fn parse_input_def(pair: Pair<Rule>, file_id: u32) -> Result<InputDef> {
     let mut inner = pair.into_inner();
     let name_pair = inner.next().unwrap();
-    let name_span = Some(span_of(&name_pair, file_id));
     let name = name_pair.as_str().to_string();
     let properties = inner
         .map(|p| parse_property(p, file_id))
         .collect::<Result<Vec<_>>>()?;
-    Ok(InputDef {
-        name,
-        name_span,
-        properties,
-    })
+    Ok(InputDef { name, properties })
 }
 
 fn parse_output_def(pair: Pair<Rule>, file_id: u32) -> Result<OutputDef> {
     let mut inner = pair.into_inner();
     let name_pair = inner.next().unwrap();
-    let name_span = Some(span_of(&name_pair, file_id));
     let name = name_pair.as_str().to_string();
     let properties = inner
         .map(|p| parse_property(p, file_id))
         .collect::<Result<Vec<_>>>()?;
-    Ok(OutputDef {
-        name,
-        name_span,
-        properties,
-    })
+    Ok(OutputDef { name, properties })
 }
 
 fn parse_property(pair: Pair<Rule>, file_id: u32) -> Result<Property> {
     let mut inner = pair.into_inner();
     let key_pair = inner.next().unwrap();
-    let key_span = Some(span_of(&key_pair, file_id));
     let key = key_pair.as_str().to_string();
 
     let second = inner.next().unwrap();
@@ -154,7 +138,6 @@ fn parse_property(pair: Pair<Rule>, file_id: u32) -> Result<Property> {
             }
             Ok(Property::Block {
                 key,
-                key_span,
                 properties: props,
             })
         }
@@ -164,7 +147,6 @@ fn parse_property(pair: Pair<Rule>, file_id: u32) -> Result<Property> {
             let value = parse_expr_from_pair(second, file_id)?;
             Ok(Property::KeyValue {
                 key,
-                key_span,
                 value,
                 value_span,
             })
@@ -179,16 +161,11 @@ fn parse_property(pair: Pair<Rule>, file_id: u32) -> Result<Property> {
 fn parse_process_def(pair: Pair<Rule>, file_id: u32) -> Result<ProcessDef> {
     let mut inner = pair.into_inner();
     let name_pair = inner.next().unwrap();
-    let name_span = Some(span_of(&name_pair, file_id));
     let name = name_pair.as_str().to_string();
     let body = inner
         .map(|p| parse_process_stmt(p, file_id))
         .collect::<Result<Vec<_>>>()?;
-    Ok(ProcessDef {
-        name,
-        name_span,
-        body,
-    })
+    Ok(ProcessDef { name, body })
 }
 
 fn parse_process_stmt(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
@@ -307,16 +284,11 @@ fn parse_process_foreach(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatem
 fn parse_pipeline_def(pair: Pair<Rule>, file_id: u32) -> Result<PipelineDef> {
     let mut inner = pair.into_inner();
     let name_pair = inner.next().unwrap();
-    let name_span = Some(span_of(&name_pair, file_id));
     let name = name_pair.as_str().to_string();
     let body = inner
         .map(|p| parse_pipeline_stmt(p, file_id))
         .collect::<Result<Vec<_>>>()?;
-    Ok(PipelineDef {
-        name,
-        name_span,
-        body,
-    })
+    Ok(PipelineDef { name, body })
 }
 
 fn parse_pipeline_stmt(pair: Pair<Rule>, file_id: u32) -> Result<PipelineStatement> {
