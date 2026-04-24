@@ -98,7 +98,7 @@ impl Output for TcpOutput {
 
 impl TcpOutput {
     async fn write_to(&self, stream: &mut TcpStream, event: &Event) -> Result<()> {
-        let msg = &event.message;
+        let msg = &event.egress;
 
         match self.framing {
             TcpOutputFraming::OctetCounting => {

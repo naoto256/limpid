@@ -1,8 +1,10 @@
 //! Event: the internal message representation flowing through pipelines.
 //!
-//! Each event has an immutable `raw` (original message) and a mutable
-//! `message` (output target), plus typed metadata and free-form
-//! `workspace` (pipeline-local scratch namespace).
+//! Each event has an immutable `ingress` (bytes as received from the input)
+//! and a mutable `egress` (bytes that will be handed to the output), plus
+//! typed metadata and a free-form `workspace` (pipeline-local scratch
+//! namespace). `ingress` / `egress` frame the hop contract: what came in,
+//! what goes out.
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -16,20 +18,20 @@ pub struct Event {
     pub source: SocketAddr,
     pub facility: Option<u8>,
     pub severity: Option<u8>,
-    pub raw: Bytes,
-    pub message: Bytes,
+    pub ingress: Bytes,
+    pub egress: Bytes,
     pub workspace: HashMap<String, Value>,
 }
 
 impl Event {
-    pub fn new(raw: Bytes, source: SocketAddr) -> Self {
+    pub fn new(ingress: Bytes, source: SocketAddr) -> Self {
         Self {
             timestamp: Utc::now(),
             source,
             facility: None,
             severity: None,
-            message: raw.clone(),
-            raw,
+            egress: ingress.clone(),
+            ingress,
             workspace: HashMap::new(),
         }
     }
@@ -49,12 +51,12 @@ impl Event {
             map.insert("severity".into(), Value::Number(s.into()));
         }
         map.insert(
-            "raw".into(),
-            Value::String(String::from_utf8_lossy(&self.raw).into_owned()),
+            "ingress".into(),
+            Value::String(String::from_utf8_lossy(&self.ingress).into_owned()),
         );
         map.insert(
-            "message".into(),
-            Value::String(String::from_utf8_lossy(&self.message).into_owned()),
+            "egress".into(),
+            Value::String(String::from_utf8_lossy(&self.egress).into_owned()),
         );
         if !self.workspace.is_empty() {
             map.insert(
@@ -73,7 +75,7 @@ impl Event {
     /// Deserialize an event from a JSON string.
     pub fn from_json(json_str: &str) -> Option<Self> {
         let v: Value = serde_json::from_str(json_str).ok()?;
-        let raw = v.get("raw")?.as_str()?.to_string();
+        let ingress = v.get("ingress")?.as_str()?.to_string();
         let source_str = v.get("source")?.as_str()?;
         let source: SocketAddr = source_str.parse().ok()?;
         let timestamp = v
@@ -93,11 +95,11 @@ impl Event {
                 .get("severity")
                 .and_then(|v| v.as_u64())
                 .and_then(|v| u8::try_from(v).ok()),
-            raw: Bytes::from(raw.clone()),
-            message: Bytes::from(
-                v.get("message")
+            ingress: Bytes::from(ingress.clone()),
+            egress: Bytes::from(
+                v.get("egress")
                     .and_then(|v| v.as_str())
-                    .unwrap_or(&raw)
+                    .unwrap_or(&ingress)
                     .to_string(),
             ),
             workspace: HashMap::new(),

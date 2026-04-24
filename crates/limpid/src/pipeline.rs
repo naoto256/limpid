@@ -289,7 +289,7 @@ pub fn run_pipeline(
     trace_entries.push(TraceEntry {
         stage: "input".into(),
         label: String::new(),
-        detail: format!("raw: {}", String::from_utf8_lossy(&event.raw)),
+        detail: format!("ingress: {}", String::from_utf8_lossy(&event.ingress)),
     });
 
     let (_, termination) = exec_pipeline_body(

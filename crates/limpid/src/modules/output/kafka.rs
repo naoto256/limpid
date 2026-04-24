@@ -118,7 +118,7 @@ impl HasMetrics for KafkaOutput {
 #[async_trait::async_trait]
 impl Output for KafkaOutput {
     async fn write(&self, event: &Event) -> Result<()> {
-        let payload = &event.message;
+        let payload = &event.egress;
 
         let key = self.resolve_key(event);
 

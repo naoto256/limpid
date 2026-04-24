@@ -1,4 +1,4 @@
-//! parse_kv: parses key=value pairs from the message into the event workspace.
+//! parse_kv: parses key=value pairs from the egress into the event workspace.
 //!
 //! Handles common syslog key-value formats used by FortiGate, Palo Alto, etc.
 //!
@@ -8,7 +8,7 @@
 //! - `key=value1,value2` (comma in unquoted values is included)
 //!
 //! All parsed key-value pairs are stored under `workspace.*`.
-//! The original message is preserved.
+//! The original egress is preserved.
 
 use serde_json::Value;
 
@@ -16,7 +16,7 @@ use crate::event::Event;
 use crate::modules::ProcessError;
 
 pub fn apply(mut event: Event) -> Result<Event, ProcessError> {
-    let msg = String::from_utf8_lossy(&event.message).into_owned();
+    let msg = String::from_utf8_lossy(&event.egress).into_owned();
     let pairs = parse_kv_pairs(&msg);
 
     for (key, value) in pairs {

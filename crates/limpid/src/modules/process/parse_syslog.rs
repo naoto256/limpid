@@ -11,7 +11,7 @@
 //!   workspace.msgid        — message ID (RFC 5424 only)
 //!   workspace.syslog_msg   — message body after header
 //!
-//! Also sets `message` to the parsed message body.
+//! Also sets `egress` to the parsed message body.
 
 use serde_json::Value;
 
@@ -19,11 +19,11 @@ use crate::event::Event;
 use crate::modules::ProcessError;
 
 pub fn apply(mut event: Event) -> Result<Event, ProcessError> {
-    let raw = String::from_utf8_lossy(&event.raw).into_owned();
+    let ingress = String::from_utf8_lossy(&event.ingress).into_owned();
 
     // Skip PRI: <PRI>rest
     let after_pri =
-        skip_pri(&raw).ok_or_else(|| ProcessError::Failed("no PRI header found".into()))?;
+        skip_pri(&ingress).ok_or_else(|| ProcessError::Failed("no PRI header found".into()))?;
 
     // Detect RFC version: RFC 5424 starts with VERSION SP (e.g. "1 ")
     if after_pri.len() >= 2
@@ -39,12 +39,12 @@ pub fn apply(mut event: Event) -> Result<Event, ProcessError> {
 }
 
 /// Skip `<PRI>` and return the rest of the message.
-fn skip_pri(raw: &str) -> Option<&str> {
-    if !raw.starts_with('<') {
+fn skip_pri(ingress: &str) -> Option<&str> {
+    if !ingress.starts_with('<') {
         return None;
     }
-    let end = raw.find('>')?;
-    Some(&raw[end + 1..])
+    let end = ingress.find('>')?;
+    Some(&ingress[end + 1..])
 }
 
 /// Parse RFC 5424:
@@ -75,7 +75,7 @@ fn parse_rfc5424(input: &str, event: &mut Event) {
         event
             .workspace
             .insert("syslog_msg".into(), Value::String(msg.to_string()));
-        event.message = bytes::Bytes::from(msg.to_string());
+        event.egress = bytes::Bytes::from(msg.to_string());
     }
 }
 
@@ -115,7 +115,7 @@ fn parse_rfc3164(input: &str, event: &mut Event) {
         event
             .workspace
             .insert("syslog_msg".into(), Value::String(msg.to_string()));
-        event.message = bytes::Bytes::from(msg.to_string());
+        event.egress = bytes::Bytes::from(msg.to_string());
     }
 }
 

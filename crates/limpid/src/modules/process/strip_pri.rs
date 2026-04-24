@@ -1,4 +1,4 @@
-//! strip_pri: removes the `<PRI>` header from event.message.
+//! strip_pri: removes the `<PRI>` header from event.egress.
 
 use bytes::Bytes;
 
@@ -6,8 +6,8 @@ use crate::event::Event;
 use crate::modules::ProcessError;
 
 pub fn apply(mut event: Event) -> Result<Event, ProcessError> {
-    if let Some(body) = strip(event.message.as_ref()) {
-        event.message = Bytes::copy_from_slice(body);
+    if let Some(body) = strip(event.egress.as_ref()) {
+        event.egress = Bytes::copy_from_slice(body);
     }
     Ok(event)
 }
@@ -36,12 +36,12 @@ mod tests {
     #[test]
     fn test_strips_pri() {
         let e = apply(make_event("<185>hello")).unwrap();
-        assert_eq!(&*e.message, b"hello");
+        assert_eq!(&*e.egress, b"hello");
     }
 
     #[test]
     fn test_no_pri_unchanged() {
         let e = apply(make_event("hello")).unwrap();
-        assert_eq!(&*e.message, b"hello");
+        assert_eq!(&*e.egress, b"hello");
     }
 }

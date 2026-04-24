@@ -146,7 +146,7 @@ impl Output for FileOutput {
             .open(&path)
             .await?;
 
-        let msg = String::from_utf8_lossy(&event.message);
+        let msg = String::from_utf8_lossy(&event.egress);
         let mut buf = Vec::with_capacity(msg.len() + 1);
         buf.extend_from_slice(msg.as_bytes());
         buf.push(b'\n');

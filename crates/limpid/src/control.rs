@@ -515,7 +515,7 @@ async fn handle_tap(
                 let line = if json_mode {
                     event.to_json_string()
                 } else {
-                    String::from_utf8_lossy(&event.message).into_owned()
+                    String::from_utf8_lossy(&event.egress).into_owned()
                 };
                 if writer.write_all(line.as_bytes()).await.is_err() {
                     break;

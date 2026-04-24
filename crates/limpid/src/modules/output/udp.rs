@@ -63,7 +63,7 @@ impl Output for UdpOutput {
             .await?;
 
         socket
-            .send(&event.message)
+            .send(&event.egress)
             .await
             .with_context(|| format!("udp output: send to {}", self.address))?;
 

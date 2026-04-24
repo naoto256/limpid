@@ -342,7 +342,7 @@ fn parse_fixed_offset(s: &str) -> Option<chrono::FixedOffset> {
 ///
 /// Supported placeholders:
 /// - `%{source}`, `%{facility}`, `%{severity}`, `%{timestamp}`
-/// - `%{message}`, `%{raw}`
+/// - `%{egress}`, `%{ingress}`
 /// - `%{workspace.xxx}`, `%{workspace.xxx.yyy}` (nested workspace access)
 fn expand_format_template(template: &str, event: &crate::event::Event) -> String {
     let mut result = String::with_capacity(template.len());
@@ -373,8 +373,8 @@ fn resolve_format_var(var: &str, event: &crate::event::Event) -> String {
         "facility" => event.facility.map(|f| f.to_string()).unwrap_or_default(),
         "severity" => event.severity.map(|s| s.to_string()).unwrap_or_default(),
         "timestamp" => event.timestamp.to_rfc3339(),
-        "message" => String::from_utf8_lossy(&event.message).into_owned(),
-        "raw" => String::from_utf8_lossy(&event.raw).into_owned(),
+        "egress" => String::from_utf8_lossy(&event.egress).into_owned(),
+        "ingress" => String::from_utf8_lossy(&event.ingress).into_owned(),
         v if v.starts_with("workspace.") => {
             let path: Vec<&str> = v["workspace.".len()..].split('.').collect();
             resolve_format_workspace(&path, &event.workspace)

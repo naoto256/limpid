@@ -1,4 +1,4 @@
-//! prepend_timestamp: prepends the receive timestamp to event.message.
+//! prepend_timestamp: prepends the receive timestamp to event.egress.
 //!
 //! Format: `Mmm dd HH:MM:SS ` (traditional BSD syslog timestamp, local time).
 
@@ -13,8 +13,8 @@ pub fn apply(mut event: Event) -> Result<Event, ProcessError> {
         .timestamp
         .with_timezone(&Local)
         .format("%b %e %H:%M:%S");
-    let msg = String::from_utf8_lossy(&event.message);
-    event.message = Bytes::from(format!("{} {}", ts, msg));
+    let msg = String::from_utf8_lossy(&event.egress);
+    event.egress = Bytes::from(format!("{} {}", ts, msg));
     Ok(event)
 }
 
@@ -30,7 +30,7 @@ mod tests {
             "127.0.0.1:514".parse::<SocketAddr>().unwrap(),
         );
         let result = apply(e).unwrap();
-        let msg = String::from_utf8_lossy(&result.message);
+        let msg = String::from_utf8_lossy(&result.egress);
         // Should end with " hello" and start with a month abbreviation
         assert!(msg.ends_with(" hello"));
         assert!(msg.len() > 16);

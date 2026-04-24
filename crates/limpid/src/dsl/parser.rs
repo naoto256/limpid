@@ -180,7 +180,7 @@ fn parse_assign_target(pair: Pair<Rule>) -> Result<AssignTarget> {
         .collect();
 
     match parts.as_slice() {
-        [single] if single == "message" => Ok(AssignTarget::Message),
+        [single] if single == "egress" => Ok(AssignTarget::Egress),
         [single] if single == "severity" => Ok(AssignTarget::Severity),
         [single] if single == "facility" => Ok(AssignTarget::Facility),
         [first, rest @ ..] if first == "workspace" && !rest.is_empty() => {
@@ -828,7 +828,7 @@ def pipeline splunk_archive {
 def pipeline test {
     input external_tcp
     process filter | {
-        if contains(raw, "CEF:") {
+        if contains(ingress, "CEF:") {
             facility = 16
         }
     }
@@ -942,9 +942,9 @@ def pipeline firewall {
     fn test_parse_func_call_in_expr() {
         let input = r#"
 def process test {
-    message = to_json()
+    egress = to_json()
     workspace.name = lower(workspace.name)
-    workspace.src = regex_extract(raw, "src=(\S+)")
+    workspace.src = regex_extract(ingress, "src=(\S+)")
 }
 "#;
         let config = parse_config(input).unwrap();
@@ -952,7 +952,7 @@ def process test {
             Definition::Process(def) => {
                 assert_eq!(def.body.len(), 3);
                 match &def.body[0] {
-                    ProcessStatement::Assign(AssignTarget::Message, Expr::FuncCall(name, args)) => {
+                    ProcessStatement::Assign(AssignTarget::Egress, Expr::FuncCall(name, args)) => {
                         assert_eq!(name, "to_json");
                         assert_eq!(args.len(), 0);
                     }
@@ -968,7 +968,7 @@ def process test {
         let input = r#"
 def pipeline test {
     input fw
-    if not contains(raw, "traffic") {
+    if not contains(ingress, "traffic") {
         output log
     }
     drop
@@ -1067,16 +1067,16 @@ def output sink {
 
     #[test]
     fn interpolation_inside_func_call_expression() {
-        // `"[${severity}] ${message}"` — template with multiple identifiers
+        // `"[${severity}] ${egress}"` — template with multiple identifiers
         let input = r#"
 def process annotate {
-    message = "[${severity}] ${message}"
+    egress = "[${severity}] ${egress}"
 }
 "#;
         let config = parse_config(input).unwrap();
         match &config.definitions[0] {
             Definition::Process(def) => match &def.body[0] {
-                ProcessStatement::Assign(AssignTarget::Message, Expr::Template(frags)) => {
+                ProcessStatement::Assign(AssignTarget::Egress, Expr::Template(frags)) => {
                     assert_eq!(frags.len(), 4);
                     assert!(matches!(&frags[0], TemplateFragment::Literal(s) if s == "["));
                     assert!(matches!(
@@ -1086,7 +1086,7 @@ def process annotate {
                     assert!(matches!(&frags[2], TemplateFragment::Literal(s) if s == "] "));
                     assert!(matches!(
                         &frags[3],
-                        TemplateFragment::Interp(Expr::Ident(parts)) if parts == &vec!["message".to_string()]
+                        TemplateFragment::Interp(Expr::Ident(parts)) if parts == &vec!["egress".to_string()]
                     ));
                 }
                 other => panic!("expected template assignment, got {:?}", other),

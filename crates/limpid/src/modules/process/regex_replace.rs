@@ -1,4 +1,4 @@
-//! regex_replace: replaces all matches of a regex pattern in event.message.
+//! regex_replace: replaces all matches of a regex pattern in event.egress.
 //!
 //! Usage: `process regex_replace("pattern", "replacement")`
 //!
@@ -47,13 +47,13 @@ pub fn apply(mut event: Event, args: &[serde_json::Value]) -> Result<Event, Proc
 
     let re = get_cached_regex(pattern)?;
 
-    let msg = String::from_utf8_lossy(&event.message);
+    let msg = String::from_utf8_lossy(&event.egress);
     let replaced = re.replace_all(&msg, replacement);
 
     if let std::borrow::Cow::Owned(s) = replaced {
-        event.message = Bytes::from(s);
+        event.egress = Bytes::from(s);
     }
-    // Cow::Borrowed means no match — message unchanged, no allocation
+    // Cow::Borrowed means no match — egress unchanged, no allocation
 
     Ok(event)
 }
@@ -79,14 +79,14 @@ mod tests {
     fn test_basic_replace() {
         let e = make_event("hello world");
         let result = apply(e, &str_args(&["world", "rust"])).unwrap();
-        assert_eq!(&*result.message, b"hello rust");
+        assert_eq!(&*result.egress, b"hello rust");
     }
 
     #[test]
     fn test_replace_all_occurrences() {
         let e = make_event("foo bar foo baz foo");
         let result = apply(e, &str_args(&["foo", "qux"])).unwrap();
-        assert_eq!(&*result.message, b"qux bar qux baz qux");
+        assert_eq!(&*result.egress, b"qux bar qux baz qux");
     }
 
     #[test]
@@ -98,7 +98,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            String::from_utf8_lossy(&result.message).as_ref(),
+            String::from_utf8_lossy(&result.egress).as_ref(),
             "date=2026/04/15 time=04:23:17"
         );
     }
@@ -107,7 +107,7 @@ mod tests {
     fn test_no_match_unchanged() {
         let e = make_event("hello world");
         let result = apply(e, &str_args(&["xyz", "replaced"])).unwrap();
-        assert_eq!(&*result.message, b"hello world");
+        assert_eq!(&*result.egress, b"hello world");
     }
 
     #[test]
