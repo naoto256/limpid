@@ -310,6 +310,145 @@ fn graph_unknown_format_is_rejected() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// --ultra-strict flag (Block 11-C)
+// ---------------------------------------------------------------------------
+
+fn run_with_flags(config: &std::path::Path, flags: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(limpid_bin());
+    cmd.arg("--check").arg("--config").arg(config);
+    for f in flags {
+        cmd.arg(f);
+    }
+    cmd.output().expect("failed to spawn limpid")
+}
+
+#[test]
+fn ultra_strict_promotes_unknown_function_to_error() {
+    // Unknown function → warning by default. With --ultra-strict it
+    // becomes an error and exit code is 1.
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("us_fn.conf");
+    fs::write(
+        &conf,
+        r#"
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p {
+    input i
+    process { workspace.x = upperr(ingress) }
+    output o
+}
+"#,
+    )
+    .unwrap();
+
+    // Baseline: no flag → exit 0 (warning only).
+    let out = run_with_flags(&conf, &[]);
+    assert!(
+        out.status.success(),
+        "baseline should succeed: stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // --ultra-strict: promoted to error, exit 1.
+    let out = run_with_flags(&conf, &["--ultra-strict"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn ultra_strict_leaves_type_mismatch_as_warning() {
+    // Type mismatch (lower on Int) is a TypeMismatch warning and must
+    // NOT be promoted by --ultra-strict alone.
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("us_ty.conf");
+    fs::write(
+        &conf,
+        r#"
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p {
+    input i
+    process { parse_json(ingress, {count: 0}) }
+    process { workspace.tag = lower(workspace.count) }
+    output o
+}
+"#,
+    )
+    .unwrap();
+
+    let out = run_with_flags(&conf, &["--ultra-strict"]);
+    assert!(
+        out.status.success(),
+        "type warning must remain exit 0: stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn ultra_strict_plus_strict_warnings_mixed_case() {
+    // Mixed: one unknown-ident warning (promoted to error → exit 1)
+    // and one type-mismatch warning. With both --ultra-strict and
+    // --strict-warnings, error precedence still wins so exit is 1.
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("us_mixed.conf");
+    fs::write(
+        &conf,
+        r#"
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p {
+    input i
+    process { parse_json(ingress, {count: 0}) }
+    process {
+        workspace.a = upperr(ingress)
+        workspace.b = lower(workspace.count)
+    }
+    output o
+}
+"#,
+    )
+    .unwrap();
+
+    let out = run_with_flags(&conf, &["--ultra-strict", "--strict-warnings"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "error precedence: stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn strict_warnings_without_ultra_strict_still_exits_two_on_type_warning() {
+    // Regression: --strict-warnings without --ultra-strict keeps its
+    // existing exit-2 behavior for any warning category.
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("sw_only.conf");
+    fs::write(
+        &conf,
+        r#"
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p {
+    input i
+    process { parse_json(ingress, {count: 0}) }
+    process { workspace.tag = lower(workspace.count) }
+    output o
+}
+"#,
+    )
+    .unwrap();
+
+    let out = run_with_flags(&conf, &["--strict-warnings"]);
+    assert_eq!(out.status.code(), Some(2));
+}
+
 #[test]
 fn check_self_inclusion_is_rejected() {
     let dir = TempDir::new().unwrap();

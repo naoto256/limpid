@@ -49,6 +49,16 @@ struct Cli {
     #[arg(long)]
     strict_warnings: bool,
 
+    /// Promote *unknown identifier* warnings (unresolved workspace
+    /// keys, unknown function names) to errors. Implies `--check`.
+    /// Orthogonal to `--strict-warnings`: this changes the diagnostic
+    /// **level** for one category only, while `--strict-warnings`
+    /// changes the **exit code** for any leftover warning. Combine
+    /// both to make CI fail loudly on typos (exit 1) while still
+    /// surfacing ambient warnings (exit 2 fallback).
+    #[arg(long)]
+    ultra_strict: bool,
+
     /// Render the pipeline flow graph to stdout after analysis.
     /// Accepts `mermaid` (default), `dot`, or `ascii`. The analyzer's
     /// diagnostics remain on stderr so the graph output can be piped
@@ -94,8 +104,13 @@ fn main() -> Result<()> {
             .init();
     }
 
-    if cli.check || cli.strict_warnings || cli.graph.is_some() {
-        return run_check(&cli.config, cli.strict_warnings, cli.graph.as_deref());
+    if cli.check || cli.strict_warnings || cli.ultra_strict || cli.graph.is_some() {
+        return run_check(
+            &cli.config,
+            cli.strict_warnings,
+            cli.ultra_strict,
+            cli.graph.as_deref(),
+        );
     }
 
     if let Some(ref pipeline_name) = cli.test_pipeline {
@@ -202,11 +217,22 @@ fn run_daemon(config_path: &str) -> Result<()> {
 ///
 /// Exit codes:
 /// - `0` — analyzer is clean (warnings allowed unless `--strict-warnings`)
-/// - `1` — at least one error-level diagnostic
+/// - `1` — at least one error-level diagnostic (including warnings
+///   promoted by `--ultra-strict`)
 /// - `2` — `--strict-warnings` set and at least one warning was emitted
 ///   (errors also exit 2 under `--strict-warnings` so CI sees a single
 ///   "non-zero means investigate" signal)
-fn run_check(config_path: &str, strict_warnings: bool, graph_format: Option<&str>) -> Result<()> {
+///
+/// `--ultra-strict` and `--strict-warnings` are orthogonal:
+/// - `--strict-warnings` alone: exit code change only (2 on any warning)
+/// - `--ultra-strict` alone: unknown-ident warnings become errors (exit 1)
+/// - both: unknown idents exit 1; leftover non-ident warnings exit 2
+fn run_check(
+    config_path: &str,
+    strict_warnings: bool,
+    ultra_strict: bool,
+    graph_format: Option<&str>,
+) -> Result<()> {
     let path = Path::new(config_path);
 
     // Resolve the graph format up front so a bad `--graph=foo` fails
@@ -245,8 +271,17 @@ fn run_check(config_path: &str, strict_warnings: bool, graph_format: Option<&str
     crate::modules::register_builtins(&mut registry);
     compiled.validate(&registry)?;
 
-    // Step 4: run analyzer + render diagnostics.
+    // Step 4: run analyzer + render diagnostics. Under `--ultra-strict`
+    // we post-process the diagnostics to promote unknown-ident warnings
+    // (workspace miss, function-name typo, reserved-name typo) into
+    // errors — a CI-friendly shortcut that doesn't require a separate
+    // analyzer pass.
     let diagnostics = check::analyze(&compiled, &source_map);
+    let diagnostics = if ultra_strict {
+        check::promote_unknown_idents(diagnostics)
+    } else {
+        diagnostics
+    };
 
     // If --graph was requested, emit the flow visualization to stdout
     // before diagnostics/footer land on stderr/stdout. Doing this first
@@ -279,9 +314,10 @@ fn run_check(config_path: &str, strict_warnings: bool, graph_format: Option<&str
             errors,
             warnings,
         );
-        if strict_warnings {
-            std::process::exit(2);
-        }
+        // Errors always take precedence: exit 1 regardless of
+        // `--strict-warnings`. CI that greps for "non-zero" still
+        // catches it; anyone switching on the code sees a clean
+        // "1 = at least one error" signal.
         std::process::exit(1);
     }
     if strict_warnings && warnings > 0 {
