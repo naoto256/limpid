@@ -21,8 +21,10 @@
 //! Schema-specific namespaces (`syslog.*`, `cef.*`, …) will live as
 //! sibling modules to `primitives` once Block 4 introduces them.
 
+pub mod cef;
 pub mod geoip;
 pub mod primitives;
+pub mod syslog;
 pub mod table;
 
 use std::collections::HashMap;
@@ -66,13 +68,9 @@ impl FunctionRegistry {
     }
 
     /// Register a namespaced function, callable as `<namespace>.<name>(...)`
-    /// in the DSL. Block 3 introduces the dispatch path; Block 4 will
-    /// populate the real `syslog` / `cef` / `ocsf` namespaces.
-    ///
-    /// Currently only used by tests — the `dead_code` allow goes away
-    /// once Block 4 starts calling `register_in` from the built-in
-    /// registration path.
-    #[allow(dead_code)]
+    /// in the DSL. Block 3 introduced the dispatch path; Block 4
+    /// populated the first real namespaces (`syslog`, `cef`). Future
+    /// work will add `ocsf.*` composers.
     pub fn register_in<F>(&mut self, namespace: &str, name: &str, f: F)
     where
         F: Fn(&[Value], &Event) -> Result<Value> + Send + Sync + 'static,
@@ -118,6 +116,8 @@ impl FunctionRegistry {
 /// that wires each namespace into the registry.
 pub fn register_builtins(reg: &mut FunctionRegistry, table_store: table::TableStore) {
     primitives::register(reg, table_store);
+    syslog::register(reg);
+    cef::register(reg);
 }
 
 #[cfg(test)]
@@ -357,14 +357,17 @@ mod tests {
         let reg = make_registry();
         let e = dummy_event();
         let err = reg
-            .call(Some("syslog"), "parse", &[], &e)
+            .call(Some("not_a_real_namespace"), "parse", &[], &e)
             .unwrap_err()
             .to_string();
         assert!(
             err.contains("unknown function namespace"),
             "unexpected error: {err}"
         );
-        assert!(err.contains("syslog"), "expected ns name in error: {err}");
+        assert!(
+            err.contains("not_a_real_namespace"),
+            "expected ns name in error: {err}"
+        );
     }
 
     #[test]
