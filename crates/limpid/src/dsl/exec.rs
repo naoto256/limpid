@@ -5,12 +5,13 @@ use bytes::Bytes;
 use serde_json::Value;
 
 use super::ast::*;
-use super::eval::{eval_expr, is_truthy, value_to_string, values_match};
+use super::eval::{LocalScope, eval_expr_with_scope, is_truthy, value_to_string, values_match};
 use crate::event::Event;
 use crate::functions::FunctionRegistry;
 use crate::modules::ProcessError;
 
 /// Result of executing a process body.
+#[derive(Debug)]
 pub enum ExecResult {
     /// Event passed through (possibly mutated).
     Continue(Event),
@@ -29,14 +30,37 @@ pub trait ProcessRegistry {
 }
 
 /// Execute a sequence of process statements against an event.
+///
+/// Each call starts with a fresh [`LocalScope`] — `let` bindings do not
+/// leak across process-body boundaries. This is intentional: callee
+/// processes shouldn't see the caller's scratch material, and vice
+/// versa. The only channel between caller and callee is the Event
+/// itself (`workspace` and metadata).
 pub fn exec_process_body(
+    stmts: &[ProcessStatement],
+    event: Event,
+    registry: &dyn ProcessRegistry,
+    funcs: &FunctionRegistry,
+) -> Result<ExecResult> {
+    let mut scope = LocalScope::new();
+    exec_stmts_with_scope(stmts, event, registry, funcs, &mut scope)
+}
+
+/// Run statements with the given local scope. `let` bindings mutate
+/// `scope`; branch / loop bodies are run with the same scope so a
+/// `let x` written above an `if` is visible inside (and below) the
+/// branch. Branches do not introduce inner scopes — every `let` is
+/// hoisted to the process body scope — which is the simplest useful
+/// semantics and matches how users read the code top-to-bottom.
+fn exec_stmts_with_scope(
     stmts: &[ProcessStatement],
     mut event: Event,
     registry: &dyn ProcessRegistry,
     funcs: &FunctionRegistry,
+    scope: &mut LocalScope,
 ) -> Result<ExecResult> {
     for stmt in stmts {
-        match exec_process_stmt(stmt, event, registry, funcs)? {
+        match exec_process_stmt(stmt, event, registry, funcs, scope)? {
             ExecResult::Continue(e) => event = e,
             ExecResult::Dropped => return Ok(ExecResult::Dropped),
         }
@@ -49,25 +73,36 @@ fn exec_process_stmt(
     mut event: Event,
     registry: &dyn ProcessRegistry,
     funcs: &FunctionRegistry,
+    scope: &mut LocalScope,
 ) -> Result<ExecResult> {
     match stmt {
         ProcessStatement::Drop => Ok(ExecResult::Dropped),
 
         ProcessStatement::Assign(target, expr) => {
-            let value = eval_expr(expr, &event, funcs)?;
+            let value = eval_expr_with_scope(expr, &event, funcs, scope)?;
             apply_assign(&mut event, target, value)?;
+            Ok(ExecResult::Continue(event))
+        }
+
+        ProcessStatement::LetBinding(name, expr) => {
+            let value = eval_expr_with_scope(expr, &event, funcs, scope)?;
+            scope.bind(name, value);
             Ok(ExecResult::Continue(event))
         }
 
         ProcessStatement::ProcessCall(name, args) => {
             let evaluated_args: Vec<Value> = args
                 .iter()
-                .map(|a| eval_expr(a, &event, funcs))
+                .map(|a| eval_expr_with_scope(a, &event, funcs, scope))
                 .collect::<Result<Vec<_>>>()?;
 
             // Clone before calling — required because registry.call takes ownership.
             // On error we restore from backup. Future optimization: pass &Event
             // and let the process clone only if it needs to mutate.
+            // Callee processes start with their own fresh LocalScope
+            // inside the registry implementation (see `exec_process_body`
+            // above). Our `scope` here belongs to the caller and is
+            // unaffected by the callee.
             let backup = event.clone();
             match registry.call(name, &evaluated_args, event) {
                 Ok(Some(e)) => Ok(ExecResult::Continue(e)),
@@ -83,18 +118,21 @@ fn exec_process_stmt(
             }
         }
 
-        ProcessStatement::If(if_chain) => exec_if_chain_process(if_chain, event, registry, funcs),
+        ProcessStatement::If(if_chain) => {
+            exec_if_chain_process(if_chain, event, registry, funcs, scope)
+        }
 
         ProcessStatement::Switch(discriminant, arms) => {
-            let disc_val = eval_expr(discriminant, &event, funcs)?;
+            let disc_val = eval_expr_with_scope(discriminant, &event, funcs, scope)?;
             for arm in arms {
                 if arm.pattern.is_none() {
                     // default arm
-                    return exec_branch_body_process(&arm.body, event, registry, funcs);
+                    return exec_branch_body_process(&arm.body, event, registry, funcs, scope);
                 }
-                let pattern_val = eval_expr(arm.pattern.as_ref().unwrap(), &event, funcs)?;
+                let pattern_val =
+                    eval_expr_with_scope(arm.pattern.as_ref().unwrap(), &event, funcs, scope)?;
                 if values_match(&disc_val, &pattern_val) {
-                    return exec_branch_body_process(&arm.body, event, registry, funcs);
+                    return exec_branch_body_process(&arm.body, event, registry, funcs, scope);
                 }
             }
             // No arm matched, pass through
@@ -102,17 +140,23 @@ fn exec_process_stmt(
         }
 
         ProcessStatement::TryCatch(try_body, catch_body) => {
-            // Clone event for try block so we can recover on error
+            // Clone event for try block so we can recover on error.
+            // Snapshot the scope too — a failed try must not leak its
+            // let bindings into the catch body; the catch gets the
+            // scope the try started with.
             let event_backup = event.clone();
-            match exec_process_body(try_body, event, registry, funcs) {
+            let scope_backup = scope.clone();
+            match exec_stmts_with_scope(try_body, event, registry, funcs, scope) {
                 Ok(result) => Ok(result),
                 Err(e) => {
+                    *scope = scope_backup;
                     // Bind error message to `error` identifier (accessible via workspace._error)
                     let mut recovered = event_backup;
                     recovered
                         .workspace
                         .insert("_error".into(), serde_json::Value::String(e.to_string()));
-                    let mut result = exec_process_body(catch_body, recovered, registry, funcs);
+                    let mut result =
+                        exec_stmts_with_scope(catch_body, recovered, registry, funcs, scope);
                     // Clean up _error after catch body
                     if let Ok(ExecResult::Continue(ref mut evt)) = result {
                         evt.workspace.remove("_error");
@@ -123,12 +167,12 @@ fn exec_process_stmt(
         }
 
         ProcessStatement::ForEach(iterable_expr, body) => {
-            let iterable = eval_expr(iterable_expr, &event, funcs)?;
+            let iterable = eval_expr_with_scope(iterable_expr, &event, funcs, scope)?;
             if let Value::Array(items) = iterable {
                 for item in &items {
                     // Bind current item to `workspace._item` for access in body
                     event.workspace.insert("_item".into(), item.clone());
-                    match exec_process_body(body, event, registry, funcs)? {
+                    match exec_stmts_with_scope(body, event, registry, funcs, scope)? {
                         ExecResult::Continue(e) => event = e,
                         ExecResult::Dropped => return Ok(ExecResult::Dropped),
                     }
@@ -144,7 +188,7 @@ fn exec_process_stmt(
 
         ProcessStatement::ExprStmt(expr) => {
             // Evaluate for side effects, discard result
-            let _ = eval_expr(expr, &event, funcs)?;
+            let _ = eval_expr_with_scope(expr, &event, funcs, scope)?;
             Ok(ExecResult::Continue(event))
         }
     }
@@ -155,15 +199,16 @@ fn exec_if_chain_process(
     event: Event,
     registry: &dyn ProcessRegistry,
     funcs: &FunctionRegistry,
+    scope: &mut LocalScope,
 ) -> Result<ExecResult> {
     for (condition, body) in &if_chain.branches {
-        let cond_val = eval_expr(condition, &event, funcs)?;
+        let cond_val = eval_expr_with_scope(condition, &event, funcs, scope)?;
         if is_truthy(&cond_val) {
-            return exec_branch_body_process(body, event, registry, funcs);
+            return exec_branch_body_process(body, event, registry, funcs, scope);
         }
     }
     if let Some(else_body) = &if_chain.else_body {
-        return exec_branch_body_process(else_body, event, registry, funcs);
+        return exec_branch_body_process(else_body, event, registry, funcs, scope);
     }
     Ok(ExecResult::Continue(event))
 }
@@ -173,13 +218,16 @@ fn exec_branch_body_process(
     mut event: Event,
     registry: &dyn ProcessRegistry,
     funcs: &FunctionRegistry,
+    scope: &mut LocalScope,
 ) -> Result<ExecResult> {
     for item in body {
         match item {
-            BranchBody::Process(stmt) => match exec_process_stmt(stmt, event, registry, funcs)? {
-                ExecResult::Continue(e) => event = e,
-                ExecResult::Dropped => return Ok(ExecResult::Dropped),
-            },
+            BranchBody::Process(stmt) => {
+                match exec_process_stmt(stmt, event, registry, funcs, scope)? {
+                    ExecResult::Continue(e) => event = e,
+                    ExecResult::Dropped => return Ok(ExecResult::Dropped),
+                }
+            }
             BranchBody::Pipeline(_) => {
                 bail!("pipeline statement found in process context")
             }

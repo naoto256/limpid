@@ -243,6 +243,144 @@ mod tests {
         }
     }
 
+    // ---- let bindings --------------------------------------------------
+
+    #[test]
+    fn let_binding_resolves_via_bare_ident_in_same_body() {
+        // `let x = 7; workspace.y = x` — workspace.y becomes Number(7).
+        let event = make_event();
+        let stmts = vec![
+            ProcessStatement::LetBinding("x".into(), Expr::IntLit(7)),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["y".into()]),
+                Expr::Ident(vec!["x".into()]),
+            ),
+        ];
+        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+            ExecResult::Continue(e) => {
+                assert_eq!(e.workspace["y"], Value::Number(7.into()));
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
+    }
+
+    #[test]
+    fn let_shadows_prior_binding_with_same_name() {
+        // `let x = 1; let x = 2; workspace.y = x` — workspace.y is 2.
+        let event = make_event();
+        let stmts = vec![
+            ProcessStatement::LetBinding("x".into(), Expr::IntLit(1)),
+            ProcessStatement::LetBinding("x".into(), Expr::IntLit(2)),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["y".into()]),
+                Expr::Ident(vec!["x".into()]),
+            ),
+        ];
+        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+            ExecResult::Continue(e) => {
+                assert_eq!(e.workspace["y"], Value::Number(2.into()));
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
+    }
+
+    #[test]
+    fn let_is_visible_inside_if_branch_declared_above() {
+        let event = make_event();
+        let stmts = vec![
+            ProcessStatement::LetBinding("m".into(), Expr::StringLit("hit".into())),
+            ProcessStatement::If(IfChain {
+                branches: vec![(
+                    Expr::BoolLit(true),
+                    vec![BranchBody::Process(ProcessStatement::Assign(
+                        AssignTarget::Workspace(vec!["tag".into()]),
+                        Expr::Ident(vec!["m".into()]),
+                    ))],
+                )],
+                else_body: None,
+            }),
+        ];
+        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+            ExecResult::Continue(e) => {
+                assert_eq!(e.workspace["tag"], Value::String("hit".into()));
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
+    }
+
+    #[test]
+    fn let_scope_does_not_leak_between_top_level_bodies() {
+        // `exec_process_body` starts a fresh scope each call. Running
+        // two bodies back-to-back must not carry x from the first into
+        // the second — referencing `x` in the second body fails.
+        let funcs = make_funcs();
+        let event = make_event();
+        let first = vec![ProcessStatement::LetBinding("x".into(), Expr::IntLit(1))];
+        let _ = exec_process_body(&first, event.clone(), &NoopRegistry, &funcs).unwrap();
+
+        let second = vec![ProcessStatement::Assign(
+            AssignTarget::Workspace(vec!["y".into()]),
+            Expr::Ident(vec!["x".into()]),
+        )];
+        let err = exec_process_body(&second, event, &NoopRegistry, &funcs).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown identifier"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn let_is_referenced_in_template_interpolation() {
+        let event = make_event();
+        let stmts = vec![
+            ProcessStatement::LetBinding("host".into(), Expr::StringLit("web01".into())),
+            ProcessStatement::Assign(
+                AssignTarget::Egress,
+                Expr::Template(vec![
+                    TemplateFragment::Literal("hello ".into()),
+                    TemplateFragment::Interp(Expr::Ident(vec!["host".into()])),
+                ]),
+            ),
+        ];
+        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+            ExecResult::Continue(e) => {
+                assert_eq!(&*e.egress, b"hello web01");
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
+    }
+
+    #[test]
+    fn let_does_not_survive_try_catch_failure() {
+        // let bindings introduced inside a try that later fails are
+        // discarded before the catch runs.
+        let event = make_event();
+        let stmts = vec![ProcessStatement::TryCatch(
+            vec![
+                ProcessStatement::LetBinding("x".into(), Expr::IntLit(9)),
+                // Force an error: `unknown identifier` on bare `nope`
+                ProcessStatement::Assign(
+                    AssignTarget::Workspace(vec!["y".into()]),
+                    Expr::Ident(vec!["nope".into()]),
+                ),
+            ],
+            vec![
+                // x should NOT be in scope here because the try failed.
+                ProcessStatement::Assign(
+                    AssignTarget::Workspace(vec!["recovered".into()]),
+                    Expr::Ident(vec!["x".into()]),
+                ),
+            ],
+        )];
+        let err = exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown identifier"),
+            "expected catch to fail resolving x, got: {}",
+            err
+        );
+    }
+
     #[test]
     fn test_pri_rewrite_no_op_without_pri() {
         // Message without PRI — assignment should not add one

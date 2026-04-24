@@ -142,6 +142,7 @@ fn parse_process_stmt(pair: Pair<Rule>) -> Result<ProcessStatement> {
         Rule::process_switch => parse_process_switch(inner),
         Rule::process_try_catch => parse_process_try_catch(inner),
         Rule::process_foreach => parse_process_foreach(inner),
+        Rule::process_let => parse_process_let(inner),
         Rule::process_expr_stmt => parse_process_expr_stmt(inner),
         _ => bail!("unexpected process statement: {:?}", inner.as_rule()),
     }
@@ -156,6 +157,13 @@ fn parse_process_call(pair: Pair<Rule>) -> Result<ProcessStatement> {
         vec![]
     };
     Ok(ProcessStatement::ProcessCall(name, args))
+}
+
+fn parse_process_let(pair: Pair<Rule>) -> Result<ProcessStatement> {
+    let mut inner = pair.into_inner();
+    let name = inner.next().unwrap().as_str().to_string();
+    let expr = parse_expr_from_pair(inner.next().unwrap())?;
+    Ok(ProcessStatement::LetBinding(name, expr))
 }
 
 fn parse_process_expr_stmt(pair: Pair<Rule>) -> Result<ProcessStatement> {
@@ -1092,6 +1100,60 @@ def process annotate {
                 other => panic!("expected template assignment, got {:?}", other),
             },
             _ => panic!("expected Process definition"),
+        }
+    }
+
+    // ---- let bindings --------------------------------------------------
+
+    #[test]
+    fn test_parse_let_binding() {
+        let input = r#"
+def process p {
+    let x = 7
+    workspace.y = x
+}
+"#;
+        let config = parse_config(input).unwrap();
+        match &config.definitions[0] {
+            Definition::Process(def) => {
+                assert_eq!(def.body.len(), 2);
+                match &def.body[0] {
+                    ProcessStatement::LetBinding(name, Expr::IntLit(7)) => {
+                        assert_eq!(name, "x");
+                    }
+                    other => panic!("expected LetBinding, got {:?}", other),
+                }
+                match &def.body[1] {
+                    ProcessStatement::Assign(AssignTarget::Workspace(path), Expr::Ident(parts)) => {
+                        assert_eq!(path, &vec!["y".to_string()]);
+                        assert_eq!(parts, &vec!["x".to_string()]);
+                    }
+                    other => panic!("expected assign, got {:?}", other),
+                }
+            }
+            _ => panic!("expected process"),
+        }
+    }
+
+    #[test]
+    fn test_parse_let_with_function_call_rhs() {
+        let input = r#"
+def process p {
+    let m = regex_extract(ingress, "src=(\\S+)")
+    workspace.src = m
+}
+"#;
+        let config = parse_config(input).unwrap();
+        match &config.definitions[0] {
+            Definition::Process(def) => match &def.body[0] {
+                ProcessStatement::LetBinding(name, Expr::FuncCall(fname, args)) => {
+                    assert_eq!(name, "m");
+                    assert_eq!(fname, "regex_extract");
+                    assert_eq!(args.len(), 2);
+                }
+                other => panic!("expected LetBinding with FuncCall, got {:?}", other),
+            },
+            _ => panic!("expected process"),
         }
     }
 }
