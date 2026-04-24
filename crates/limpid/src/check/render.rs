@@ -108,8 +108,16 @@ pub fn render_to(
     writeln!(out)?;
 
     // Source line.
+    //
+    // Sanitize ASCII control bytes before emitting so a hostile config
+    // (string literal containing e.g. `\x1b]0;pwned\x07`) cannot escape
+    // into terminal control sequences — OSC window-title, DECSET, and
+    // hyperlink OSC 8 are all reachable via raw ESC. We replace each
+    // control byte with `?` to preserve column count (so the caret row
+    // below still lines up char-for-char with the displayed snippet).
+    // Tab is preserved because it is a legitimate indentation byte.
     write_coloured(out, color, CYAN, true, &format!(" {} | ", line_num))?;
-    writeln!(out, "{}", resolved.line_text)?;
+    writeln!(out, "{}", sanitize_line_text(&resolved.line_text))?;
 
     // Caret row. Trim trailing whitespace inside the span so the caret
     // covers only the visible token (pest spans often over-extend).
@@ -132,6 +140,26 @@ pub fn render_to(
     }
 
     Ok(())
+}
+
+/// Replace ASCII control bytes (U+0000..U+001F except `\t`, and U+007F
+/// DEL) with `?` so the snippet renderer cannot be tricked into emitting
+/// raw terminal control sequences from a hostile config. Non-ASCII
+/// (UTF-8 multibyte) chars pass through unchanged — they are display
+/// payload, not control. Each replaced char is a single byte so the
+/// caret row's byte-based column math stays consistent.
+fn sanitize_line_text(line: &str) -> String {
+    line.chars()
+        .map(|c| {
+            if c == '\t' {
+                c
+            } else if (c as u32) < 0x20 || c == '\u{7f}' {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// Within `line` starting at byte offset `start`, return the byte
@@ -281,6 +309,35 @@ mod tests {
         render_to(&mut buf, &d, &map, false).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert_eq!(s, "error: file missing\n");
+    }
+
+    #[test]
+    fn sanitize_strips_esc_and_del_preserves_tab() {
+        // ESC (0x1b), BEL (0x07), DEL (0x7f) are replaced; tab and
+        // printable UTF-8 survive.
+        let dirty = "a\x1b]0;pwn\x07b\tc\x7fd日本";
+        let clean = sanitize_line_text(dirty);
+        assert_eq!(clean, "a?]0;pwn?b\tc?d日本");
+        assert!(!clean.contains('\x1b'));
+        assert!(!clean.contains('\x07'));
+        assert!(!clean.contains('\x7f'));
+    }
+
+    #[test]
+    fn renders_no_control_bytes_for_hostile_source() {
+        // Line literal contains an ESC + OSC that would otherwise set
+        // the terminal title. The renderer must not emit the ESC byte
+        // (own ANSI colour codes are gated off with `color=false`).
+        let src = "foo \x1b]0;pwned\x07 bar\n";
+        let map = sm(src);
+        let d = Diagnostic::error_kind(DiagKind::Other, "hostile snippet")
+            .with_span(Some(Span::new(0, 0, 3)));
+        let mut buf = Vec::new();
+        render_to(&mut buf, &d, &map, false).unwrap();
+        assert!(!buf.contains(&0x1b), "ESC leaked: {:?}", buf);
+        assert!(!buf.contains(&0x07), "BEL leaked: {:?}", buf);
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("foo ?]0;pwned? bar"), "got: {s}");
     }
 
     #[test]
