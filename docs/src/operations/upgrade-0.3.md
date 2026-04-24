@@ -1,6 +1,6 @@
 # Upgrading to 0.3
 
-This release replaces most built-in processes with DSL functions, adds first-class string interpolation, and introduces `limpidctl check`. Configuration written for 0.2 will not load unchanged — all of the breaking items below are simple mechanical rewrites.
+This release replaces most built-in processes with DSL functions, adds first-class string interpolation, and introduces `limpid --check`. Configuration written for 0.2 will not load unchanged — all of the breaking items below are simple mechanical rewrites.
 
 ## Breaking changes
 

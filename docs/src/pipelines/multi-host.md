@@ -228,7 +228,7 @@ sudo limpidctl tap output to_relay
 
 Replaying captured traffic into a staging relay is the same pattern: `tap --json` on one daemon, `inject --json` on the other. See [Debug Tap](../operations/tap.md#replay-with-tap--inject) for the full workflow, including `--replay-timing` for cadence-sensitive tests.
 
-This matters because pipeline correctness is a two-axis problem: *does the config express the right intent*, and *does the expressed intent work against real traffic shapes*. The first axis is covered by `limpidctl check` and code review. The second is covered by `inject` + `tap` on recorded traffic, in CI, against the same DSL that runs in production.
+This matters because pipeline correctness is a two-axis problem: *does the config express the right intent*, and *does the expressed intent work against real traffic shapes*. The first axis is covered by `limpid --check` and code review. The second is covered by `inject` + `tap` on recorded traffic, in CI, against the same DSL that runs in production.
 
 ## One DSL across hosts
 
