@@ -10,16 +10,18 @@
 //!
 //! - [`primitives`] — flat-namespace, schema-agnostic functions
 //!   (`contains`, `lower`, `regex_*`, `strftime`, `format`, `geoip`,
-//!   `table_*`, `md5`/`sha1`/`sha256`, `to_json`). One file per
-//!   function (or per tightly-related group) so `mod.rs` does not
-//!   become a megafile.
+//!   `table_*`, `md5`/`sha1`/`sha256`, `to_json`, `to_int`, `find_by`,
+//!   `csv_parse`, `len`, `append`, `prepend`). One file per function
+//!   (or per tightly-related group such as `hashes.rs`) so `mod.rs`
+//!   does not become a megafile.
+//! - [`syslog`] / [`cef`] — schema-specific namespaces (`syslog.*`,
+//!   `cef.*`). See Design Principle 5 in `design-principles.md`;
+//!   future schema namespaces (`ocsf.*` composers, etc.) follow the
+//!   same layout.
 //! - [`geoip`] / [`table`] — backing stores (DB reader, table store)
 //!   used by the corresponding primitives. These are *not* the DSL
 //!   registration; the registration lives in `primitives::geoip` /
 //!   `primitives::table`.
-//!
-//! Schema-specific namespaces (`syslog.*`, `cef.*`, …) will live as
-//! sibling modules to `primitives` once Block 4 introduces them.
 
 pub mod cef;
 pub mod geoip;
@@ -156,9 +158,14 @@ impl FunctionRegistry {
         }
     }
 
-    /// Register a flat primitive function (no namespace).
-    /// Equivalent to `register_in(None, name, f)`, kept as the legacy API
-    /// so the existing built-in registration path is untouched.
+    /// Register a flat primitive function without a stand-alone signature.
+    ///
+    /// Used by parser-style primitives (`parse_json`, `parse_kv`) that
+    /// pair this with `register_parser` — the parser registration
+    /// installs the `(String, Object?) -> Object` sig, so supplying one
+    /// here would be redundant. New primitives with fixed shapes should
+    /// prefer [`register_with_sig`](Self::register_with_sig) so the
+    /// central arity / arg-type check in [`call`](Self::call) kicks in.
     pub fn register<F>(&mut self, name: &str, f: F)
     where
         F: Fn(&[Value], &Event) -> Result<Value> + Send + Sync + 'static,
