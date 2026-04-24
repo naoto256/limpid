@@ -1,7 +1,5 @@
 //! TLS configuration for TCP-based inputs and outputs.
 
-use std::io::BufReader;
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -19,11 +17,28 @@ pub struct TlsConfig {
 }
 
 /// Build a rustls ServerConfig for a TLS-enabled TCP input.
-pub fn build_server_config(tls: &TlsConfig) -> Result<Arc<ServerConfig>> {
-    let certs = load_certs(&tls.cert_path)?;
-    let key = load_private_key(&tls.key_path)?;
+///
+/// File I/O is offloaded to `spawn_blocking` so we don't stall the tokio
+/// reactor thread on slow disks (NFS, EBS, etc.) during startup.
+pub async fn build_server_config(tls: &TlsConfig) -> Result<Arc<ServerConfig>> {
+    let cert_path = tls.cert_path.clone();
+    let key_path = tls.key_path.clone();
+    let ca_path = tls.ca_path.clone();
 
-    let config = if let Some(ref ca_path) = tls.ca_path {
+    tokio::task::spawn_blocking(move || build_server_config_sync(&cert_path, &key_path, ca_path))
+        .await
+        .context("tls: cert/key loader task panicked")?
+}
+
+fn build_server_config_sync(
+    cert_path: &str,
+    key_path: &str,
+    ca_path: Option<String>,
+) -> Result<Arc<ServerConfig>> {
+    let certs = load_certs(cert_path)?;
+    let key = load_private_key(key_path)?;
+
+    let config = if let Some(ref ca_path) = ca_path {
         // Client certificate verification enabled
         let ca_certs = load_certs(ca_path)?;
         let mut root_store = rustls::RootCertStore::empty();
@@ -48,10 +63,9 @@ pub fn build_server_config(tls: &TlsConfig) -> Result<Arc<ServerConfig>> {
 }
 
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let file = std::fs::File::open(Path::new(path))
-        .with_context(|| format!("failed to open cert file: {}", path))?;
-    let reader = BufReader::new(file);
-    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(reader)
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read cert file: {}", path))?;
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&bytes)
         .collect::<std::result::Result<Vec<_>, _>>()
         .with_context(|| format!("failed to parse certs from: {}", path))?;
     if certs.is_empty() {
@@ -61,10 +75,9 @@ fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
 }
 
 fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
-    let file = std::fs::File::open(Path::new(path))
-        .with_context(|| format!("failed to open key file: {}", path))?;
-    let reader = BufReader::new(file);
-    let key = PrivateKeyDer::from_pem_reader(reader)
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read key file: {}", path))?;
+    let key = PrivateKeyDer::from_pem_slice(&bytes)
         .with_context(|| format!("failed to parse key from: {}", path))?;
     Ok(key)
 }
