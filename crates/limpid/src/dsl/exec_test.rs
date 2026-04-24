@@ -10,7 +10,6 @@ mod tests {
     use crate::dsl::exec::*;
     use crate::event::Event;
     use crate::functions::FunctionRegistry;
-    use crate::modules::ProcessError;
 
     fn make_event() -> Event {
         let mut e = Event::new(

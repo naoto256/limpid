@@ -142,9 +142,6 @@ impl Runtime {
         for proc_name in config.processes.keys() {
             tap.register(&format!("process {}", proc_name)).await;
         }
-        for name in registry.process_names() {
-            tap.register(&format!("process {}", name)).await;
-        }
 
         // --- 3. Start inputs (each input owns its own InputMetrics) ---
         let compiled_config = config.clone();
@@ -173,7 +170,6 @@ impl Runtime {
             let ctx = PipelineContext {
                 output_senders: Arc::clone(&output_senders),
                 config: Arc::clone(&config),
-                builtins: Arc::clone(&registry),
                 funcs: Arc::clone(&func_registry),
                 tap: tap.clone(),
             };
@@ -342,7 +338,6 @@ pub(crate) fn init_tables(config: &CompiledConfig) -> Result<crate::functions::t
 struct PipelineContext {
     output_senders: Arc<HashMap<String, QueueSender>>,
     config: Arc<CompiledConfig>,
-    builtins: Arc<ModuleRegistry>,
     funcs: Arc<FunctionRegistry>,
     tap: TapRegistry,
 }
@@ -420,14 +415,8 @@ async fn run_pipeline_with_outputs(
     event: Event,
     ctx: &PipelineContext,
 ) -> Result<crate::pipeline::PipelineRunResult> {
-    let result = crate::pipeline::run_pipeline(
-        pipeline,
-        event,
-        &ctx.config,
-        &ctx.builtins,
-        &ctx.funcs,
-        Some(&ctx.tap),
-    )?;
+    let result =
+        crate::pipeline::run_pipeline(pipeline, event, &ctx.config, &ctx.funcs, Some(&ctx.tap))?;
 
     for (output_name, output_event) in &result.outputs {
         if let Some(sender) = ctx.output_senders.get(output_name) {

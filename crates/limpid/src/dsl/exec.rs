@@ -3,12 +3,23 @@
 use anyhow::{Result, bail};
 use bytes::Bytes;
 use serde_json::Value;
+use thiserror::Error;
 
 use super::ast::*;
 use super::eval::{LocalScope, eval_expr_with_scope, is_truthy, value_to_string, values_match};
 use crate::event::Event;
 use crate::functions::FunctionRegistry;
-use crate::modules::ProcessError;
+
+/// Error type returned by `ProcessRegistry::call`.
+///
+/// Kept narrow on purpose: the executor only needs to distinguish
+/// "this process failed" (recoverable — the caller passes the event
+/// through unchanged) from "we reached the end of the body normally".
+#[derive(Debug, Error)]
+pub enum ProcessError {
+    #[error("process failed: {0}")]
+    Failed(String),
+}
 
 /// Result of executing a process body.
 #[derive(Debug)]
