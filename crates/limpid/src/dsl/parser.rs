@@ -984,7 +984,7 @@ def process strict_parse {
     fn test_parse_expressions() {
         let input = r#"
 def process test {
-    if severity <= 3 and workspace.alert == true {
+    if workspace.syslog_severity <= 3 and workspace.alert == true {
         workspace.priority = "critical"
     }
 }
@@ -1024,7 +1024,7 @@ def input fw_syslog {
 }
 
 def process tag_critical {
-    if severity <= 3 {
+    if workspace.syslog_severity <= 3 {
         workspace.alert = true
     }
 }
@@ -1182,10 +1182,10 @@ def output sink {
 
     #[test]
     fn interpolation_inside_func_call_expression() {
-        // `"[${severity}] ${egress}"` — template with multiple identifiers
+        // `"[${source}] ${egress}"` — template with multiple identifiers
         let input = r#"
 def process annotate {
-    egress = "[${severity}] ${egress}"
+    egress = "[${source}] ${egress}"
 }
 "#;
         let config = parse_config(input).unwrap();
@@ -1196,7 +1196,7 @@ def process annotate {
                     assert!(matches!(&frags[0], TemplateFragment::Literal(s) if s == "["));
                     assert!(matches!(
                         &frags[1],
-                        TemplateFragment::Interp(Expr::Ident(parts)) if parts == &vec!["severity".to_string()]
+                        TemplateFragment::Interp(Expr::Ident(parts)) if parts == &vec!["source".to_string()]
                     ));
                     assert!(matches!(&frags[2], TemplateFragment::Literal(s) if s == "] "));
                     assert!(matches!(
