@@ -32,6 +32,7 @@ pub mod parse_json;
 pub mod parse_kv;
 pub mod regex_extract;
 pub mod regex_match;
+pub mod regex_parse;
 pub mod regex_replace;
 pub mod strftime;
 pub mod table;
@@ -45,6 +46,7 @@ pub fn register(reg: &mut FunctionRegistry, table_store: TableStore) {
     upper::register(reg);
     regex_match::register(reg);
     regex_extract::register(reg);
+    regex_parse::register(reg);
     regex_replace::register(reg);
     to_json::register(reg);
     table::register(reg, table_store);
