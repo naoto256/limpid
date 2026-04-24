@@ -6,6 +6,7 @@
 //!   limpid --test <pipeline> [--input ..] — test a pipeline with sample data
 //!   limpid --debug                    — enable per-process trace logging
 
+mod check;
 mod config;
 mod control;
 mod dsl;
@@ -167,12 +168,41 @@ fn run_daemon(config_path: &str) -> Result<()> {
 }
 
 /// --check: validate configuration and exit.
+///
+/// Runs the parser + `CompiledConfig::from_config` (which surfaces syntax and
+/// structural errors via `anyhow::Error`), then hands the compiled config to
+/// the static analyzer in [`crate::check`]. Commit 1 of Block 9 keeps the
+/// analyzer as an empty skeleton, so the user-visible output is unchanged
+/// from the prior implementation: the historical "Configuration OK" line
+/// plus the input/output/process/pipeline summary.
 fn run_check(config_path: &str) -> Result<()> {
-    let config = config::load_config(Path::new(config_path)).context("configuration error")?;
+    let path = Path::new(config_path);
+    let source = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read configuration file: {}", path.display()))?;
+    let config = config::load_config(path).context("configuration error")?;
     let compiled = CompiledConfig::from_config(config)?;
     let mut registry = crate::modules::ModuleRegistry::new();
     crate::modules::register_builtins(&mut registry);
     compiled.validate(&registry)?;
+
+    let diagnostics = check::analyze(&compiled, &source);
+
+    let mut errors = 0usize;
+    for diag in &diagnostics {
+        let tag = match diag.level {
+            check::Level::Error => {
+                errors += 1;
+                "error"
+            }
+            check::Level::Warning => "warning",
+            check::Level::Info => "info",
+        };
+        eprintln!("{}: {}", tag, diag.message);
+    }
+
+    if errors > 0 {
+        std::process::exit(1);
+    }
 
     println!("Configuration OK");
     println!(
