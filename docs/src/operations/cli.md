@@ -33,15 +33,13 @@ limpid --debug --config /etc/limpid/limpid.conf
 {
   "ingress": "<134>Apr 15 10:30:00 myhost sshd: test",
   "source": "192.0.2.3:514",
-  "facility": 16,
-  "severity": 6,
   "workspace": {
     "custom_field": "value"
   }
 }
 ```
 
-All keys except `ingress` are optional. `source` can be `ip:port` or just `ip`.
+All keys except `ingress` are optional. `source` can be `ip:port` or just `ip`. There are no facility / severity fields on the Event in 0.3 — the `<PRI>` byte lives inside `ingress` / `egress`, and pipelines that need its numeric value call `syslog.extract_pri(...)`.
 
 ## limpidctl
 
@@ -53,7 +51,7 @@ limpidctl tap output ama
 limpidctl tap input fw_syslog
 
 # Stream events after a process
-limpidctl tap process parse_cef
+limpidctl tap process enrich_fortigate
 
 # Stream full Event JSON (one per line) — useful for piping to jq
 limpidctl tap output ama --json

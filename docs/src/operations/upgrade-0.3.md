@@ -54,11 +54,11 @@ grep -nE '\b(raw|message)\b' *.limpid
 
 and rewrite each DSL-concept hit (e.g. `contains(raw, ...)` → `contains(ingress, ...)`, `message = ...` → `egress = ...`). Leave comments and string-literal text alone unless they are actually describing the DSL.
 
-**Migrating captured `tap --json` files.** `tap --json` emits the Event as JSON with the new key names. Captures made with limpid 0.2 use the old keys (`raw`, `message`, `fields`) and will not round-trip through `inject --json` on 0.3 as-is. Convert in place:
+**Migrating captured `tap --json` files.** `tap --json` emits the Event as JSON with the new key names, and 0.3 also drops the top-level `facility` / `severity` fields (see below). Captures made with limpid 0.2 use the old keys (`raw`, `message`, `fields`) and will not round-trip through `inject --json` on 0.3 as-is. Convert in place:
 
 ```bash
 jq -c '{
-  timestamp, source, facility, severity,
+  timestamp, source,
   ingress:   .raw,
   egress:    .message,
   workspace: .fields
@@ -67,8 +67,84 @@ jq -c '{
 
 Fresh captures on 0.3 emit the new keys directly — no conversion needed going forward.
 
+### Schema-specific functions moved to dot namespaces
+
+Schema-specific helpers that used to be flat-named primitives now live under their schema's dot namespace, per [Design Principle 5](../design-principles.md#principle-5--schema-identity-is-declared-by-namespace). The rename is mechanical:
+
+| Old | New |
+|-----|-----|
+| `parse_syslog(x)` | `syslog.parse(x)` |
+| `parse_cef(x)` | `cef.parse(x)` |
+| `strip_pri(x)` | `syslog.strip_pri(x)` |
+
+Two new namespaced helpers replace the old `facility = N` / `severity = N` magic assignments (see the next section):
+
+| New | Purpose |
+|-----|---------|
+| `syslog.set_pri(text, facility, severity)` | Write or rewrite the leading `<PRI>` header. |
+| `syslog.extract_pri(text)` | Return the leading `<PRI>` value as a number, or `null`. |
+
+Schema-agnostic primitives — `parse_json`, `parse_kv`, `regex_*`, `strftime`, `md5` / `sha1` / `sha256`, `to_json`, `contains`, `lower`, `upper`, `format`, `table_*`, `geoip` — keep their flat names. JSON / KV are *formats*, not schemas.
+
+### Workspace key naming convention
+
+Schema parsers now emit fields under a `<schema>_` prefix so a workspace dump stays self-describing when several schemas have populated the same event:
+
+| Function | Old workspace keys (0.2) | New workspace keys (0.3) |
+|----------|---------------------------|---------------------------|
+| `syslog.parse` | `hostname`, `appname`, `procid`, `msgid`, `syslog_msg` | `syslog_hostname`, `syslog_appname`, `syslog_procid`, `syslog_msgid`, `syslog_msg` |
+| `cef.parse` (header) | `device_vendor`, `device_product`, `device_version`, `signature_id`, `name`, `severity`, `version` | `cef_device_vendor`, `cef_device_product`, `cef_device_version`, `cef_signature_id`, `cef_name`, `cef_severity`, `cef_version` |
+| `cef.parse` (extensions) | `src`, `dst`, `act`, … | unchanged (CEF defines those names) |
+
+Update `format(...)` templates, `${...}` interpolations, and any `if workspace.X ...` conditions accordingly.
+
+### Built-in process layer removed
+
+The native `process <name>` modules are gone. Every transformation now happens in DSL — either inside a named `def process` body or an inline `process { ... }` block.
+
+| Old (0.2 process) | New (0.3 DSL) |
+|-------------------|---------------|
+| `process parse_syslog` | `process { syslog.parse(ingress) }` |
+| `process parse_cef` | `process { cef.parse(ingress) }` |
+| `process parse_json` | `process { parse_json(egress) }` |
+| `process parse_kv` | `process { parse_kv(egress) }` |
+| `process strip_pri` | `process { egress = syslog.strip_pri(egress) }` |
+| `process regex_replace("pat", "repl")` | `process { egress = regex_replace(egress, "pat", "repl") }` |
+| `process prepend_source` | `process { egress = source + " " + egress }` |
+| `process prepend_timestamp` | `process { egress = strftime(timestamp, "%b %e %H:%M:%S") + " " + egress }` |
+
+Bare-statement function calls (`syslog.parse(ingress)`, `parse_kv(egress)`, `cef.parse(ingress)`) merge their returned object into `workspace` automatically — that is the same semantic the old parser processes had, now spelled in pure DSL. See [Expression Functions: Bare statements vs assignments](../processing/functions.md#bare-statements-vs-assignments) for the rule.
+
+### Event core: `facility` / `severity` removed
+
+The Event struct no longer carries facility / severity. They are bytes inside the `<PRI>` header, and pipelines that need their numeric value extract them from `egress` (or `ingress`) on demand.
+
+- `event.facility` / `event.severity` (or bare `facility` / `severity`) → **`unknown identifier` error.**
+- `facility = N` / `severity = N` assignments → **`unknown assignment target` error.**
+- `tap --json` no longer emits top-level `facility` / `severity` keys; the `--input` JSON for `--test-pipeline` no longer accepts them either.
+- Routing on severity now reads the byte explicitly:
+
+  ```
+  let pri = syslog.extract_pri(ingress)
+  if pri != null and pri % 8 <= 3 {
+      output alert
+  }
+  ```
+
+- Rewriting the PRI is now an explicit byte operation:
+
+  ```
+  egress = syslog.set_pri(egress, 16, 6)   // local0.info
+  ```
+
+  This replaces the old side-effecting `facility = 16  severity = 6` form.
+
+This change makes `egress` the single hop contract — there is no parallel sidecar of "metadata that also travels". See [Design Principle 4](../design-principles.md#principle-4--only-egress-crosses-hop-boundaries).
+
 ## New features
 
 - **String interpolation** (`${expr}`) in any string literal, with the full DSL available inside. See [String Templates](../processing/templates.md).
 - **`strftime(value, format[, tz])`** for timestamp formatting. See [Timestamp formatting](../processing/functions.md#timestamp-formatting).
 - **`+` concatenates strings** when either operand is a string; stays as numeric addition otherwise.
+- **`let name = expr`** for process-local scratch bindings, scoped to the process body. See [User-defined Processes](../processing/user-defined.md#assignments).
+- **Dot-namespace function calls** (`syslog.parse`, `cef.parse`, `syslog.set_pri`, `syslog.extract_pri`, `syslog.strip_pri`).

@@ -26,7 +26,6 @@
   - [unix_socket](./outputs/unix-socket.md)
   - [stdout](./outputs/stdout.md)
 - [Processing](./processing/README.md)
-  - [Built-in Processes](./processing/builtin-processes.md)
   - [Expression Functions](./processing/functions.md)
   - [String Templates](./processing/templates.md)
   - [User-defined Processes](./processing/user-defined.md)

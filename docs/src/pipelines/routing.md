@@ -8,7 +8,8 @@ Pipelines support conditional routing with `if/else` and `switch` statements.
 def pipeline main {
     input syslog
 
-    if severity <= 3 {
+    process { let pri = syslog.extract_pri(ingress)  workspace.severity = pri % 8 }
+    if workspace.severity <= 3 {
         output alert
     }
     output siem
@@ -22,7 +23,7 @@ Route events based on a value:
 ```
 def pipeline archive {
     input syslog_udp
-    process strip_pri
+    process { egress = syslog.strip_pri(egress) }
 
     switch source {
         "192.0.2.1" {
@@ -35,7 +36,7 @@ def pipeline archive {
             if contains(ingress, "type=\"traffic\"") {
                 drop
             }
-            process prepend_source | prepend_timestamp
+            process { egress = source + " " + strftime(timestamp, "%b %e %H:%M:%S") + " " + egress }
             output fw03
         }
         default {
@@ -57,7 +58,8 @@ def pipeline main {
     output archive
 
     // Parse and enrich
-    process parse_cef | {
+    process {
+        cef.parse(ingress)
         workspace.geo = geoip(workspace.src)
         egress = to_json()
     }

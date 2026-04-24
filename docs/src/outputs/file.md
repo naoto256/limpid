@@ -41,7 +41,7 @@ def output per_host {
 }
 ```
 
-Any DSL expression is allowed inside `${...}` — identifiers (`source`, `severity`, `workspace.xxx`), function calls (`strftime`, `lower`, `regex_extract`), string concatenation with `+`, and so on. There are no hardcoded placeholders; for calendar components, call `strftime(timestamp, ...)` explicitly.
+Any DSL expression is allowed inside `${...}` — identifiers (`source`, `workspace.xxx`), function calls (`strftime`, `lower`, `regex_extract`), string concatenation with `+`, and so on. There are no hardcoded placeholders; for calendar components, call `strftime(timestamp, ...)` explicitly.
 
 ### Sanitisation
 

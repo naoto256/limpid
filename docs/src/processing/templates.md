@@ -9,7 +9,7 @@ def output archive {
 }
 
 def process tag {
-    egress = "[${severity}] ${workspace.hostname}: ${egress}"
+    egress = "[${workspace.syslog_appname}] ${workspace.syslog_hostname}: ${egress}"
 }
 ```
 
@@ -25,7 +25,7 @@ Inside `${...}` you have access to the full event:
 
 | Name | Meaning |
 |------|---------|
-| `source`, `facility`, `severity`, `timestamp` | Event metadata |
+| `source`, `timestamp` | Event metadata |
 | `egress`, `ingress` | Event byte buffers |
 | `workspace.xxx`, `workspace.xxx.yyy` | Named workspace values (nested lookup is supported) |
 
