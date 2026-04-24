@@ -327,8 +327,6 @@ mod tests {
             Bytes::from("hello"),
             "192.168.1.10:514".parse::<SocketAddr>().unwrap(),
         );
-        e.severity = Some(3);
-        e.facility = Some(16);
         e.workspace
             .insert("host".into(), Value::String("web01".into()));
         // value containing a path separator — must be sanitised

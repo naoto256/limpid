@@ -12,12 +12,10 @@ mod tests {
     use crate::functions::FunctionRegistry;
 
     fn make_event() -> Event {
-        let mut e = Event::new(
+        Event::new(
             Bytes::from("<134>test"),
             "10.0.0.1:514".parse::<SocketAddr>().unwrap(),
-        );
-        e.severity = Some(5);
-        e
+        )
     }
 
     fn make_funcs() -> FunctionRegistry {
@@ -50,19 +48,6 @@ mod tests {
             _event: Event,
         ) -> Result<Option<Event>, ProcessError> {
             Err(ProcessError::Failed("test error".into()))
-        }
-    }
-
-    #[test]
-    fn test_exec_assign_severity() {
-        let event = make_event();
-        let stmts = vec![ProcessStatement::Assign(
-            AssignTarget::Severity,
-            Expr::IntLit(3),
-        )];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
-            ExecResult::Continue(e) => assert_eq!(e.severity, Some(3)),
-            ExecResult::Dropped => panic!("unexpected drop"),
         }
     }
 
@@ -143,7 +128,7 @@ mod tests {
         match exec_process_body(&stmts, event, &FailRegistry, &make_funcs()).unwrap() {
             ExecResult::Continue(e) => {
                 // Event should pass through unchanged
-                assert_eq!(e.severity, Some(5));
+                assert_eq!(&*e.ingress, b"<134>test");
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -167,79 +152,6 @@ mod tests {
         // that body are handled individually.
         let result = exec_process_body(&stmts, event, &FailRegistry, &make_funcs()).unwrap();
         assert!(matches!(result, ExecResult::Continue(_)));
-    }
-
-    // --- PRI sync on facility/severity assignment ---
-
-    #[test]
-    fn test_facility_assign_rewrites_pri() {
-        // <185> = facility 23, severity 1
-        let mut event = Event::new(
-            Bytes::from("<185>msg"),
-            "10.0.0.1:514".parse::<SocketAddr>().unwrap(),
-        );
-        event.facility = None;
-        event.severity = None;
-
-        let stmts = vec![ProcessStatement::Assign(
-            AssignTarget::Facility,
-            Expr::IntLit(16),
-        )];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
-            ExecResult::Continue(e) => {
-                assert_eq!(e.facility, Some(16));
-                // new PRI = 16*8 + 1(old severity) = 129
-                assert_eq!(&*e.egress, b"<129>msg");
-            }
-            ExecResult::Dropped => panic!("unexpected drop"),
-        }
-    }
-
-    #[test]
-    fn test_severity_assign_rewrites_pri() {
-        // <185> = facility 23, severity 1
-        let mut event = Event::new(
-            Bytes::from("<185>msg"),
-            "10.0.0.1:514".parse::<SocketAddr>().unwrap(),
-        );
-        event.facility = None;
-        event.severity = None;
-
-        let stmts = vec![ProcessStatement::Assign(
-            AssignTarget::Severity,
-            Expr::IntLit(6),
-        )];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
-            ExecResult::Continue(e) => {
-                assert_eq!(e.severity, Some(6));
-                // new PRI = 23(old facility)*8 + 6 = 190
-                assert_eq!(&*e.egress, b"<190>msg");
-            }
-            ExecResult::Dropped => panic!("unexpected drop"),
-        }
-    }
-
-    #[test]
-    fn test_facility_and_severity_assign() {
-        // <185> = facility 23, severity 1
-        let mut event = Event::new(
-            Bytes::from("<185>msg"),
-            "10.0.0.1:514".parse::<SocketAddr>().unwrap(),
-        );
-        event.facility = None;
-        event.severity = None;
-
-        let stmts = vec![
-            ProcessStatement::Assign(AssignTarget::Facility, Expr::IntLit(16)),
-            ProcessStatement::Assign(AssignTarget::Severity, Expr::IntLit(6)),
-        ];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
-            ExecResult::Continue(e) => {
-                // 16*8 + 6 = 134
-                assert_eq!(&*e.egress, b"<134>msg");
-            }
-            ExecResult::Dropped => panic!("unexpected drop"),
-        }
     }
 
     // ---- let bindings --------------------------------------------------
@@ -378,25 +290,5 @@ mod tests {
             "expected catch to fail resolving x, got: {}",
             err
         );
-    }
-
-    #[test]
-    fn test_pri_rewrite_no_op_without_pri() {
-        // Message without PRI — assignment should not add one
-        let event = Event::new(
-            Bytes::from("no-pri-msg"),
-            "10.0.0.1:514".parse::<SocketAddr>().unwrap(),
-        );
-        let stmts = vec![ProcessStatement::Assign(
-            AssignTarget::Facility,
-            Expr::IntLit(16),
-        )];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
-            ExecResult::Continue(e) => {
-                assert_eq!(e.facility, Some(16));
-                assert_eq!(&*e.egress, b"no-pri-msg");
-            }
-            ExecResult::Dropped => panic!("unexpected drop"),
-        }
     }
 }

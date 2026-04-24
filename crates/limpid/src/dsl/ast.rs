@@ -68,7 +68,7 @@ pub struct ProcessDef {
 /// Statements that can appear inside a process body.
 #[derive(Debug, Clone)]
 pub enum ProcessStatement {
-    /// `workspace.xxx = expr`, `egress = expr`, `severity = expr`, etc.
+    /// `workspace.xxx = expr`, `egress = expr`, etc.
     Assign(AssignTarget, Expr),
     /// `let <name> = expr` — introduce or shadow a local scratch binding
     /// visible for the rest of the enclosing process body. Locals are
@@ -164,10 +164,6 @@ pub struct SwitchArm {
 pub enum AssignTarget {
     /// `egress`
     Egress,
-    /// `severity`
-    Severity,
-    /// `facility`
-    Facility,
     /// `workspace.xxx` or `workspace.xxx.yyy`
     Workspace(Vec<String>),
 }
@@ -192,7 +188,7 @@ pub enum Expr {
     BoolLit(bool),
     /// Null literal
     Null,
-    /// Identifier or dotted path: `severity`, `workspace.src`, `source`, `error`
+    /// Identifier or dotted path: `ingress`, `workspace.src`, `source`, `error`
     Ident(Vec<String>),
     /// Function call.
     ///

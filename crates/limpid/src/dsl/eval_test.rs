@@ -16,11 +16,10 @@ mod tests {
             Bytes::from("<134>test message"),
             "10.0.0.1:514".parse::<SocketAddr>().unwrap(),
         );
-        e.severity = Some(3);
-        e.facility = Some(16);
         e.workspace
             .insert("src".into(), Value::String("192.168.1.1".into()));
         e.workspace.insert("count".into(), Value::Number(42.into()));
+        e.workspace.insert("sev".into(), Value::Number(3.into()));
         e
     }
 
@@ -55,16 +54,17 @@ mod tests {
         let e = make_event();
         let f = make_funcs();
         assert_eq!(
-            eval_expr(&Expr::Ident(vec!["severity".into()]), &e, &f).unwrap(),
-            Value::Number(3.into())
-        );
-        assert_eq!(
-            eval_expr(&Expr::Ident(vec!["facility".into()]), &e, &f).unwrap(),
-            Value::Number(16.into())
-        );
-        assert_eq!(
             eval_expr(&Expr::Ident(vec!["workspace".into(), "src".into()]), &e, &f).unwrap(),
             Value::String("192.168.1.1".into())
+        );
+        assert_eq!(
+            eval_expr(
+                &Expr::Ident(vec!["workspace".into(), "count".into()]),
+                &e,
+                &f
+            )
+            .unwrap(),
+            Value::Number(42.into())
         );
     }
 
@@ -79,17 +79,17 @@ mod tests {
     fn test_eval_binop_comparison() {
         let e = make_event();
         let f = make_funcs();
-        // severity (3) <= 3 → true
+        // workspace.sev (3) <= 3 → true
         let expr = Expr::BinOp(
-            Box::new(Expr::Ident(vec!["severity".into()])),
+            Box::new(Expr::Ident(vec!["workspace".into(), "sev".into()])),
             BinOp::Le,
             Box::new(Expr::IntLit(3)),
         );
         assert_eq!(eval_expr(&expr, &e, &f).unwrap(), Value::Bool(true));
 
-        // severity (3) > 5 → false
+        // workspace.sev (3) > 5 → false
         let expr = Expr::BinOp(
-            Box::new(Expr::Ident(vec!["severity".into()])),
+            Box::new(Expr::Ident(vec!["workspace".into(), "sev".into()])),
             BinOp::Gt,
             Box::new(Expr::IntLit(5)),
         );
@@ -208,10 +208,10 @@ mod tests {
     fn test_eval_template() {
         let e = make_event();
         let f = make_funcs();
-        // "[${severity}] from ${workspace.src}"
+        // "[${workspace.sev}] from ${workspace.src}"
         let expr = Expr::Template(vec![
             TemplateFragment::Literal("[".into()),
-            TemplateFragment::Interp(Expr::Ident(vec!["severity".into()])),
+            TemplateFragment::Interp(Expr::Ident(vec!["workspace".into(), "sev".into()])),
             TemplateFragment::Literal("] from ".into()),
             TemplateFragment::Interp(Expr::Ident(vec!["workspace".into(), "src".into()])),
         ]);
@@ -272,8 +272,8 @@ mod tests {
         };
         let result = eval_expr(&expr, &e, &f).unwrap();
         let s = result.as_str().unwrap();
-        assert!(s.contains("\"severity\":3"));
-        assert!(s.contains("\"facility\":16"));
+        assert!(s.contains("\"workspace\""));
+        assert!(s.contains("\"src\":\"192.168.1.1\""));
     }
 
     #[test]

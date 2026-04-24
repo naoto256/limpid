@@ -23,7 +23,7 @@ mod tls;
 use std::net::SocketAddr;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
 
@@ -230,12 +230,6 @@ fn run_test(config_path: &str, pipeline_name: &str, input_json: Option<&str>) ->
                 name,
                 String::from_utf8_lossy(&evt.egress)
             );
-            if let Some(f) = evt.facility {
-                print!("  facility: {}", f);
-            }
-            if let Some(s) = evt.severity {
-                print!("  severity: {}", s);
-            }
             if !evt.workspace.is_empty() {
                 print!("  workspace: {:?}", evt.workspace);
             }
@@ -273,18 +267,6 @@ fn build_test_event(input_json: Option<&str>) -> Result<Event> {
 
         let mut event = Event::new(Bytes::from(ingress), source);
 
-        if let Some(f) = v.get("facility").and_then(|v| v.as_u64()) {
-            if f > 23 {
-                bail!("facility must be 0-23, got {}", f);
-            }
-            event.facility = Some(f as u8);
-        }
-        if let Some(s) = v.get("severity").and_then(|v| v.as_u64()) {
-            if s > 7 {
-                bail!("severity must be 0-7, got {}", s);
-            }
-            event.severity = Some(s as u8);
-        }
         if let Some(workspace) = v.get("workspace").and_then(|v| v.as_object()) {
             for (k, val) in workspace {
                 event.workspace.insert(k.clone(), val.clone());

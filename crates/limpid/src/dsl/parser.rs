@@ -189,8 +189,6 @@ fn parse_assign_target(pair: Pair<Rule>) -> Result<AssignTarget> {
 
     match parts.as_slice() {
         [single] if single == "egress" => Ok(AssignTarget::Egress),
-        [single] if single == "severity" => Ok(AssignTarget::Severity),
-        [single] if single == "facility" => Ok(AssignTarget::Facility),
         [first, rest @ ..] if first == "workspace" && !rest.is_empty() => {
             Ok(AssignTarget::Workspace(rest.to_vec()))
         }
@@ -871,7 +869,7 @@ def pipeline test {
     input external_tcp
     process filter | {
         if contains(ingress, "CEF:") {
-            facility = 16
+            workspace.kind = "cef"
         }
     }
     drop
