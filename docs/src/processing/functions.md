@@ -237,6 +237,26 @@ parse_kv(egress)
 
 Useful for FortiGate, Palo Alto, and similar firewall log formats.
 
+### csv_parse(text, field_names)
+
+Parses a single CSV row into an object keyed by the supplied field names. `field_names` is a JSON array of strings; positional columns that line up with empty names (`""`) are skipped. Useful for vendor exports that ship long flat rows with no header, most notably Palo Alto Networks syslog logs (100+ positional fields per THREAT / TRAFFIC record).
+
+```
+csv_parse(egress, ["future1", "receive_time", "serial", "log_type",
+                   "threat_type", "", "generated_time", "src_ip", "dst_ip", ...])
+// → workspace.future1 = "1", workspace.receive_time = "2026/04/25 10:00:00", ...
+```
+
+| Behaviour | Result |
+|-----------|--------|
+| Empty cell | `null` |
+| Extra columns beyond `field_names` | Dropped silently |
+| Fewer columns than `field_names` | Trailing names become `null` |
+| Quoted cells (`"a,b,c"`, `"he said ""hi"""`) | RFC 4180 unquoting |
+| Non-string `text` or non-array `field_names` | `null` |
+
+Used as a bare statement, the returned object merges into `workspace` like other format parsers.
+
 ## Timestamp formatting
 
 ### strftime(value, format[, timezone])

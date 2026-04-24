@@ -24,6 +24,7 @@ use super::table::TableStore;
 // One module per primitive function. Each module exposes a `register(reg, ...)`
 // entry point that inserts its function(s) into the registry.
 pub mod contains;
+pub mod csv_parse;
 pub mod find_by;
 pub mod format;
 pub mod geoip;
@@ -44,6 +45,7 @@ pub mod upper;
 /// Register all flat-namespace primitives.
 pub fn register(reg: &mut FunctionRegistry, table_store: TableStore) {
     contains::register(reg);
+    csv_parse::register(reg);
     find_by::register(reg);
     lower::register(reg);
     upper::register(reg);
