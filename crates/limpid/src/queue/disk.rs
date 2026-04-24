@@ -444,8 +444,6 @@ mod tests {
     #[test]
     fn test_event_roundtrip() {
         let mut event = make_event("<134>test");
-        event.facility = Some(16);
-        event.severity = Some(6);
         event
             .workspace
             .insert("key".into(), serde_json::Value::String("val".into()));
@@ -455,8 +453,6 @@ mod tests {
         let recovered = Event::from_json(&json_str).unwrap();
 
         assert_eq!(String::from_utf8_lossy(&recovered.ingress), "<134>test");
-        assert_eq!(recovered.facility, Some(16));
-        assert_eq!(recovered.severity, Some(6));
         assert_eq!(
             recovered.workspace["key"],
             serde_json::Value::String("val".into())

@@ -16,8 +16,6 @@ use std::net::SocketAddr;
 pub struct Event {
     pub timestamp: DateTime<Utc>,
     pub source: SocketAddr,
-    pub facility: Option<u8>,
-    pub severity: Option<u8>,
     pub ingress: Bytes,
     pub egress: Bytes,
     pub workspace: HashMap<String, Value>,
@@ -28,8 +26,6 @@ impl Event {
         Self {
             timestamp: Utc::now(),
             source,
-            facility: None,
-            severity: None,
             egress: ingress.clone(),
             ingress,
             workspace: HashMap::new(),
@@ -44,12 +40,6 @@ impl Event {
             Value::String(self.timestamp.to_rfc3339()),
         );
         map.insert("source".into(), Value::String(self.source.to_string()));
-        if let Some(f) = self.facility {
-            map.insert("facility".into(), Value::Number(f.into()));
-        }
-        if let Some(s) = self.severity {
-            map.insert("severity".into(), Value::Number(s.into()));
-        }
         map.insert(
             "ingress".into(),
             Value::String(String::from_utf8_lossy(&self.ingress).into_owned()),
@@ -87,14 +77,6 @@ impl Event {
         let mut event = Self {
             timestamp,
             source,
-            facility: v
-                .get("facility")
-                .and_then(|v| v.as_u64())
-                .and_then(|v| u8::try_from(v).ok()),
-            severity: v
-                .get("severity")
-                .and_then(|v| v.as_u64())
-                .and_then(|v| u8::try_from(v).ok()),
             ingress: Bytes::from(ingress.clone()),
             egress: Bytes::from(
                 v.get("egress")

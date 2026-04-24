@@ -37,8 +37,6 @@ pub struct KafkaOutput {
 #[derive(Debug, Clone)]
 enum KeyField {
     Source,
-    Facility,
-    Severity,
     Field(String),
 }
 
@@ -82,8 +80,6 @@ impl Module for KafkaOutput {
 
         let key_field = props::get_ident(properties, "key").map(|k| match k.as_str() {
             "source" => KeyField::Source,
-            "facility" => KeyField::Facility,
-            "severity" => KeyField::Severity,
             other => KeyField::Field(other.to_string()),
         });
 
@@ -150,8 +146,6 @@ impl KafkaOutput {
         let kf = self.key_field.as_ref()?;
         let value = match kf {
             KeyField::Source => event.source.ip().to_string(),
-            KeyField::Facility => event.facility.map(|f| f.to_string())?,
-            KeyField::Severity => event.severity.map(|s| s.to_string())?,
             KeyField::Field(name) => event
                 .workspace
                 .get(name)

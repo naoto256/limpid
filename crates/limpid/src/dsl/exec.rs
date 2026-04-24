@@ -280,88 +280,11 @@ fn apply_assign(event: &mut Event, target: &AssignTarget, value: Value) -> Resul
             event.egress = Bytes::from(value_to_string(&value));
             Ok(())
         }
-        AssignTarget::Severity => {
-            event.severity = match &value {
-                Value::Number(n) => {
-                    let v = n.as_u64().ok_or_else(|| {
-                        anyhow::anyhow!("severity must be a non-negative integer")
-                    })?;
-                    if v > 7 {
-                        bail!("severity must be 0-7, got {}", v);
-                    }
-                    Some(v as u8)
-                }
-                Value::Null => None,
-                _ => bail!("severity must be a number"),
-            };
-            sync_egress_pri(event);
-            Ok(())
-        }
-        AssignTarget::Facility => {
-            event.facility = match &value {
-                Value::Number(n) => {
-                    let v = n.as_u64().ok_or_else(|| {
-                        anyhow::anyhow!("facility must be a non-negative integer")
-                    })?;
-                    if v > 23 {
-                        bail!("facility must be 0-23, got {}", v);
-                    }
-                    Some(v as u8)
-                }
-                Value::Null => None,
-                _ => bail!("facility must be a number"),
-            };
-            sync_egress_pri(event);
-            Ok(())
-        }
         AssignTarget::Workspace(path) => {
             set_workspace_path(&mut event.workspace, path, value);
             Ok(())
         }
     }
-}
-
-/// If event.egress starts with a valid `<PRI>`, rewrite it to reflect
-/// the current facility/severity metadata.  Metadata fields that are
-/// None fall back to the value already encoded in the PRI.
-fn sync_egress_pri(event: &mut Event) {
-    let msg = &event.egress;
-
-    if msg.first() != Some(&b'<') {
-        return;
-    }
-    let limit = msg.len().min(6);
-    let gt_pos = match msg[..limit].iter().position(|&b| b == b'>') {
-        Some(pos) if pos >= 2 => pos,
-        _ => return,
-    };
-
-    let prival_bytes = &msg[1..gt_pos];
-    let old_pri: u16 = match std::str::from_utf8(prival_bytes)
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(v) if v <= 191 => v,
-        _ => return,
-    };
-
-    let old_facility = (old_pri / 8) as u8;
-    let old_severity = (old_pri % 8) as u8;
-
-    let facility = event.facility.unwrap_or(old_facility);
-    let severity = event.severity.unwrap_or(old_severity);
-    let new_pri = (facility as u16) * 8 + (severity as u16);
-
-    if new_pri == old_pri {
-        return;
-    }
-
-    let rest = &msg[gt_pos + 1..];
-    let header = format!("<{}>", new_pri);
-    let mut buf = Vec::with_capacity(header.len() + rest.len());
-    buf.extend_from_slice(header.as_bytes());
-    buf.extend_from_slice(rest);
-    event.egress = Bytes::from(buf);
 }
 
 fn set_workspace_path(

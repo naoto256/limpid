@@ -32,7 +32,7 @@ pub fn register(reg: &mut FunctionRegistry) {
 /// Expand `%{name}` placeholders in a format template against an event.
 ///
 /// Supported placeholders (explicit only — no bare-name shorthand):
-/// - `%{source}`, `%{facility}`, `%{severity}`, `%{timestamp}`
+/// - `%{source}`, `%{timestamp}`
 /// - `%{egress}`, `%{ingress}`
 /// - `%{workspace.xxx}`, `%{workspace.xxx.yyy}` (nested workspace access)
 fn expand_format_template(template: &str, event: &Event) -> Result<String> {
@@ -61,8 +61,6 @@ fn expand_format_template(template: &str, event: &Event) -> Result<String> {
 fn resolve_format_var(var: &str, event: &Event) -> Result<String> {
     match var {
         "source" => Ok(event.source.ip().to_string()),
-        "facility" => Ok(event.facility.map(|f| f.to_string()).unwrap_or_default()),
-        "severity" => Ok(event.severity.map(|s| s.to_string()).unwrap_or_default()),
         "timestamp" => Ok(event.timestamp.to_rfc3339()),
         "egress" => Ok(String::from_utf8_lossy(&event.egress).into_owned()),
         "ingress" => Ok(String::from_utf8_lossy(&event.ingress).into_owned()),
@@ -74,7 +72,7 @@ fn resolve_format_var(var: &str, event: &Event) -> Result<String> {
         // a workspace lookup here; we now refuse and point at the
         // explicit form so typos don't turn into empty strings.
         other => bail!(
-            "format(): unknown placeholder `%{{{}}}`; use `%{{workspace.{}}}` or one of the event-level names (source / facility / severity / timestamp / ingress / egress)",
+            "format(): unknown placeholder `%{{{}}}`; use `%{{workspace.{}}}` or one of the event-level names (source / timestamp / ingress / egress)",
             other,
             other
         ),

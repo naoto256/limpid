@@ -66,8 +66,8 @@ pub fn eval_expr(expr: &Expr, event: &Event, funcs: &FunctionRegistry) -> Result
 /// identifier resolution. Bare `x` (not `workspace.x`) resolves to the
 /// `let x = ...` binding currently in scope; if there is no such
 /// binding, resolution falls through to Event metadata (`ingress`,
-/// `egress`, `source`, `severity`, `facility`, `timestamp`, `error`,
-/// `workspace`). Anything else produces an "unknown identifier" error.
+/// `egress`, `source`, `timestamp`, `error`, `workspace`). Anything
+/// else produces an "unknown identifier" error.
 pub fn eval_expr_with_scope(
     expr: &Expr,
     event: &Event,
@@ -79,7 +79,7 @@ pub fn eval_expr_with_scope(
         Expr::Template(fragments) => {
             // Render template fragments against the current event.
             // Interpolated values are coerced to string via value_to_string
-            // so that `${facility}` (Number) and `${workspace.foo}` (arbitrary)
+            // so that `${source}` (String) and `${workspace.foo}` (arbitrary)
             // both interpolate cleanly.
             let mut out = String::new();
             for frag in fragments {
@@ -171,14 +171,6 @@ fn resolve_ident(parts: &[String], event: &Event, scope: &LocalScope) -> Result<
         Some("egress") => Ok(bytes_to_value(&event.egress)),
         Some("timestamp") => Ok(Value::String(event.timestamp.to_rfc3339())),
         Some("source") => Ok(Value::String(event.source.ip().to_string())),
-        Some("severity") => match event.severity {
-            Some(s) => Ok(Value::Number(s.into())),
-            None => Ok(Value::Null),
-        },
-        Some("facility") => match event.facility {
-            Some(f) => Ok(Value::Number(f.into())),
-            None => Ok(Value::Null),
-        },
         Some("error") => {
             // `error` is available inside catch blocks, stored as workspace._error
             Ok(event
@@ -254,7 +246,7 @@ fn eval_bin_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
         BinOp::Add => {
             // If either side is a String, concatenate as strings. This gives
             // the usual dynamic-language intuition for building messages like
-            // `"[" + severity + "] " + message`.
+            // `"[" + tag + "] " + message`.
             if matches!(left, Value::String(_)) || matches!(right, Value::String(_)) {
                 Ok(Value::String(format!(
                     "{}{}",
