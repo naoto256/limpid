@@ -19,7 +19,6 @@
 //!   element. Callers who need deeper matching can post-filter or call
 //!   `find_by` twice.
 
-use anyhow::bail;
 use serde_json::Value;
 
 use crate::functions::{FunctionRegistry, FunctionSig};
@@ -32,12 +31,7 @@ pub fn register(reg: &mut FunctionRegistry) {
             &[FieldType::Any, FieldType::String, FieldType::Any],
             FieldType::Any,
         ),
-        |args, _event| {
-            if args.len() != 3 {
-                bail!("find_by() expects 3 arguments (array, key, value)");
-            }
-            Ok(find(&args[0], &args[1], &args[2]))
-        },
+        |args, _event| Ok(find(&args[0], &args[1], &args[2])),
     );
 }
 

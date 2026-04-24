@@ -33,9 +33,8 @@ pub fn register(reg: &mut FunctionRegistry) {
 }
 
 fn parse_json_impl(args: &[Value]) -> Result<Value> {
-    if !(args.len() == 1 || args.len() == 2) {
-        bail!("parse_json() expects 1 or 2 arguments (text[, defaults])");
-    }
+    // Arity is validated centrally by the registry (register_parser installs
+    // the `(String, Object?) -> Object` signature). No manual check here.
     let text = val_to_str(&args[0]);
     let parsed: Value = serde_json::from_str(&text)
         .map_err(|e| anyhow::anyhow!("parse_json(): JSON parse error: {}", e))?;

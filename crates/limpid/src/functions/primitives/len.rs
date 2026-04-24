@@ -19,7 +19,6 @@
 //!   meaningful length and returning `0` or erroring would both
 //!   surprise; `Null` is the consistent "not applicable" signal.
 
-use anyhow::bail;
 use serde_json::Value;
 
 use crate::functions::{FunctionRegistry, FunctionSig};
@@ -29,12 +28,7 @@ pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(
         "len",
         FunctionSig::fixed(&[FieldType::Any], FieldType::Int),
-        |args, _event| {
-            if args.len() != 1 {
-                bail!("len() expects 1 argument");
-            }
-            Ok(measure(&args[0]))
-        },
+        |args, _event| Ok(measure(&args[0])),
     );
 }
 

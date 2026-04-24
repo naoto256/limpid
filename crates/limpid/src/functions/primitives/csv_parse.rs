@@ -29,7 +29,6 @@
 //! quoting is intentionally omitted for v0.5.0; the `csv` crate can be
 //! re-exposed later if a vendor uses something else.
 
-use anyhow::bail;
 use serde_json::{Map, Value};
 
 use crate::functions::{FunctionRegistry, FunctionSig};
@@ -39,12 +38,7 @@ pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(
         "csv_parse",
         FunctionSig::fixed(&[FieldType::String, FieldType::Any], FieldType::Object),
-        |args, _event| {
-            if args.len() != 2 {
-                bail!("csv_parse() expects 2 arguments (text, field_names)");
-            }
-            Ok(parse(&args[0], &args[1]))
-        },
+        |args, _event| Ok(parse(&args[0], &args[1])),
     );
 }
 

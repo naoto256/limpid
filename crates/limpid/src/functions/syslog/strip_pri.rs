@@ -4,25 +4,27 @@
 //! `N` is 1-3 digits (the valid PRI range is 0..=191). Strictly
 //! byte-oriented — no allocation when nothing to strip.
 
-use anyhow::bail;
 use serde_json::Value;
 
-use crate::functions::FunctionRegistry;
 use crate::functions::primitives::val_to_str;
 use crate::functions::syslog::pri::parse_leading_pri;
+use crate::functions::{FunctionRegistry, FunctionSig};
+use crate::modules::schema::FieldType;
 
 pub fn register(reg: &mut FunctionRegistry) {
-    reg.register_in("syslog", "strip_pri", |args, _event| {
-        if args.len() != 1 {
-            bail!("syslog.strip_pri() expects 1 argument (input string)");
-        }
-        let input = val_to_str(&args[0]);
-        let stripped = match parse_leading_pri(&input) {
-            Some((_, body)) => input[body..].to_string(),
-            None => input,
-        };
-        Ok(Value::String(stripped))
-    });
+    reg.register_in_with_sig(
+        "syslog",
+        "strip_pri",
+        FunctionSig::fixed(&[FieldType::String], FieldType::String),
+        |args, _event| {
+            let input = val_to_str(&args[0]);
+            let stripped = match parse_leading_pri(&input) {
+                Some((_, body)) => input[body..].to_string(),
+                None => input,
+            };
+            Ok(Value::String(stripped))
+        },
+    );
 }
 
 #[cfg(test)]

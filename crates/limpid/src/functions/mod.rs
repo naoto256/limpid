@@ -191,8 +191,9 @@ impl FunctionRegistry {
     }
 
     /// Sig-aware namespaced registration. Mirrors `register_with_sig`
-    /// but for `ns.fn(...)` dispatch.
-    #[allow(dead_code)] // wired for future ns.fn registrations carrying sigs
+    /// but for `ns.fn(...)` dispatch. All `syslog.*` / `cef.*` registrations
+    /// that have a fixed shape go through here so the registry's arity
+    /// check fires uniformly.
     pub fn register_in_with_sig<F>(&mut self, namespace: &str, name: &str, sig: FunctionSig, f: F)
     where
         F: Fn(&[Value], &Event) -> Result<Value> + Send + Sync + 'static,
@@ -262,6 +263,12 @@ impl FunctionRegistry {
     /// primitive registry; `Some(ns)` hits the namespaced registry.
     /// Missing entries produce distinct error messages so users can tell
     /// "unknown namespace" from "unknown function in namespace".
+    ///
+    /// Arity validation runs here (single source of truth) for every
+    /// function that has a registered [`FunctionSig`]. Functions without
+    /// a sig — only `parse_json` / `parse_kv` still go through `register`
+    /// today, and `register_parser` supplies a sig for them — skip the
+    /// check and keep their historical hand-rolled arity guards.
     pub fn call(
         &self,
         namespace: Option<&str>,
@@ -280,8 +287,63 @@ impl FunctionRegistry {
                 }
             }
         })?;
+        if let Some(sig) = self.signatures.get(&key) {
+            validate_arity(namespace, name, sig, args.len())?;
+        }
         f(args, event)
     }
+}
+
+/// Central arity check, shared by every function that has a `FunctionSig`.
+///
+/// Pulled out of `call` so individual primitives don't repeat the check —
+/// 20+ hand-rolled `if args.len() != N { bail!(...) }` blocks used to sit
+/// in each closure; the sig is the single source of truth now.
+fn validate_arity(
+    namespace: Option<&str>,
+    name: &str,
+    sig: &FunctionSig,
+    actual: usize,
+) -> Result<()> {
+    let ok = match sig.arity {
+        Arity::Fixed => actual == sig.args.len(),
+        Arity::Optional { required } => actual >= required && actual <= sig.args.len(),
+        Arity::Variadic => actual >= sig.args.len(),
+    };
+    if ok {
+        return Ok(());
+    }
+    let prefix = match namespace {
+        Some(ns) => format!("{}.{}", ns, name),
+        None => name.to_string(),
+    };
+    let expected = match sig.arity {
+        Arity::Fixed => {
+            let n = sig.args.len();
+            if n == 1 {
+                "1 argument".to_string()
+            } else {
+                format!("{} arguments", n)
+            }
+        }
+        Arity::Optional { required } => {
+            let max = sig.args.len();
+            if required == max {
+                format!("{} arguments", required)
+            } else {
+                format!("{} to {} arguments", required, max)
+            }
+        }
+        Arity::Variadic => {
+            format!("at least {} arguments", sig.args.len())
+        }
+    };
+    Err(anyhow::anyhow!(
+        "{}() expects {}, got {}",
+        prefix,
+        expected,
+        actual
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -445,7 +507,7 @@ mod tests {
                 &e,
             )
             .unwrap_err();
-        assert!(err.to_string().contains("2 or 3 arguments"));
+        assert!(err.to_string().contains("2 to 3 arguments"));
     }
 
     // ---- format() ---------------------------------------------------------

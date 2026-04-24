@@ -25,9 +25,6 @@ pub fn register(reg: &mut FunctionRegistry) {
         "format",
         FunctionSig::fixed(&[FieldType::String], FieldType::String),
         |args, event| {
-            if args.len() != 1 {
-                bail!("format() expects 1 argument (template string)");
-            }
             let template = val_to_str(&args[0]);
             Ok(Value::String(expand_format_template(&template, event)?))
         },
