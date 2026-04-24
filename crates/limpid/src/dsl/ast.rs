@@ -70,6 +70,10 @@ pub struct ProcessDef {
 pub enum ProcessStatement {
     /// `workspace.xxx = expr`, `egress = expr`, `severity = expr`, etc.
     Assign(AssignTarget, Expr),
+    /// `let <name> = expr` — introduce or shadow a local scratch binding
+    /// visible for the rest of the enclosing process body. Locals are
+    /// bare identifiers (`name`), distinct from `workspace.name`.
+    LetBinding(String, Expr),
     /// `process name` or `process name(args...)`
     ProcessCall(String, Vec<Expr>),
     /// `drop`

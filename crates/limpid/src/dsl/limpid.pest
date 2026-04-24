@@ -57,6 +57,7 @@ kw_true     = _{ "true" }
 kw_false    = _{ "false" }
 kw_null     = _{ "null" }
 kw_include  = _{ "include" }
+kw_let      = _{ "let" }
 
 // Word boundary: keyword must not be followed by ident chars
 // We use pest's negative lookahead via the rules below
@@ -118,9 +119,18 @@ process_stmt = {
   | process_if
   | process_switch
   | process_foreach
+  | process_let
   | process_call
   | process_assign
   | process_expr_stmt
+}
+
+// `let <name> = <expr>` — bind a scratch value to the local scope.
+// The binding lives until the enclosing process body returns.
+// Re-binding the same name (shadowing) is allowed. There is no
+// assignment form `x = 1`; every introduction is explicit.
+process_let = {
+    kw_let ~ ident ~ "=" ~ expr
 }
 
 // Expression statement: allows calling side-effecting functions like table_upsert()

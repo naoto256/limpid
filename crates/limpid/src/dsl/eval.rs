@@ -1,5 +1,7 @@
 //! Expression evaluator: evaluate DSL expressions against an Event.
 
+use std::collections::HashMap;
+
 use anyhow::{Result, bail};
 use serde_json::Value;
 
@@ -7,8 +9,71 @@ use super::ast::{BinOp, Expr, TemplateFragment, UnaryOp};
 use crate::event::Event;
 use crate::functions::FunctionRegistry;
 
-/// Evaluate an expression in the context of an Event, producing a serde_json::Value.
+/// Per-process scratch bindings introduced by `let <name> = expr`.
+///
+/// `let` has process scope, not hop scope — it exists precisely because
+/// `workspace` is contract-ish (pipeline-local scratch that survives
+/// across process boundaries within the pipeline), whereas a `let`
+/// binding is "material for building a single workspace write" and is
+/// dropped when the process body returns.
+///
+/// The AST's [`super::ast::ProcessStatement::LetBinding`] calls
+/// [`LocalScope::bind`] as statements execute; expression evaluation
+/// ([`eval_expr_with_scope`]) consults the same scope when resolving
+/// bare identifiers.
+///
+/// Call semantics: when a user-defined process calls another process,
+/// callers pass a *fresh* scope (or [`LocalScope::new`]). Locals do not
+/// leak across process calls. This matches the mental model of
+/// `workspace`-as-material and `let`-as-scratch — callee scratches are
+/// callee-only.
+#[derive(Debug, Clone, Default)]
+pub struct LocalScope {
+    bindings: HashMap<String, Value>,
+}
+
+impl LocalScope {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Bind (or shadow-rebind) `name` to `value`. The previous value, if
+    /// any, is discarded — by design this is the only way to "reassign"
+    /// a let (`let x = 1; let x = 2`), matching Rust's shadowing rules.
+    pub fn bind(&mut self, name: &str, value: Value) {
+        self.bindings.insert(name.to_string(), value);
+    }
+
+    /// Return the current binding for `name`, or `None` if not bound.
+    pub fn get(&self, name: &str) -> Option<&Value> {
+        self.bindings.get(name)
+    }
+}
+
+/// Evaluate an expression without any let bindings.
+///
+/// Convenience wrapper around [`eval_expr_with_scope`] for call sites
+/// that don't have a `LocalScope` (e.g. pipeline-level branches,
+/// file-output templates, tests). The evaluator treats an unbound bare
+/// identifier as an error regardless of scope; this wrapper merely
+/// saves callers from constructing an empty scope.
 pub fn eval_expr(expr: &Expr, event: &Event, funcs: &FunctionRegistry) -> Result<Value> {
+    let scope = LocalScope::new();
+    eval_expr_with_scope(expr, event, funcs, &scope)
+}
+
+/// Evaluate an expression against an Event, consulting `scope` for bare
+/// identifier resolution. Bare `x` (not `workspace.x`) resolves to the
+/// `let x = ...` binding currently in scope; if there is no such
+/// binding, resolution falls through to Event metadata (`ingress`,
+/// `egress`, `source`, `severity`, `facility`, `timestamp`, `error`,
+/// `workspace`). Anything else produces an "unknown identifier" error.
+pub fn eval_expr_with_scope(
+    expr: &Expr,
+    event: &Event,
+    funcs: &FunctionRegistry,
+    scope: &LocalScope,
+) -> Result<Value> {
     match expr {
         Expr::StringLit(s) => Ok(Value::String(s.clone())),
         Expr::Template(fragments) => {
@@ -21,7 +86,7 @@ pub fn eval_expr(expr: &Expr, event: &Event, funcs: &FunctionRegistry) -> Result
                 match frag {
                     TemplateFragment::Literal(s) => out.push_str(s),
                     TemplateFragment::Interp(expr) => {
-                        let v = eval_expr(expr, event, funcs)?;
+                        let v = eval_expr_with_scope(expr, event, funcs, scope)?;
                         out.push_str(&value_to_string(&v));
                     }
                 }
@@ -35,38 +100,38 @@ pub fn eval_expr(expr: &Expr, event: &Event, funcs: &FunctionRegistry) -> Result
         Expr::BoolLit(b) => Ok(Value::Bool(*b)),
         Expr::Null => Ok(Value::Null),
 
-        Expr::Ident(parts) => resolve_ident(parts, event),
+        Expr::Ident(parts) => resolve_ident(parts, event, scope),
 
         Expr::FuncCall(name, args) => {
             let evaluated_args: Vec<Value> = args
                 .iter()
-                .map(|a| eval_expr(a, event, funcs))
+                .map(|a| eval_expr_with_scope(a, event, funcs, scope))
                 .collect::<Result<Vec<_>>>()?;
             funcs.call(name, &evaluated_args, event)
         }
 
         Expr::BinOp(left, op, right) => {
-            let lv = eval_expr(left, event, funcs)?;
-            let rv = eval_expr(right, event, funcs)?;
+            let lv = eval_expr_with_scope(left, event, funcs, scope)?;
+            let rv = eval_expr_with_scope(right, event, funcs, scope)?;
             eval_bin_op(&lv, *op, &rv)
         }
 
         Expr::UnaryOp(op, operand) => {
-            let v = eval_expr(operand, event, funcs)?;
+            let v = eval_expr_with_scope(operand, event, funcs, scope)?;
             eval_unary_op(*op, &v)
         }
 
         Expr::HashLit(entries) => {
             let mut map = serde_json::Map::new();
             for (key, val_expr) in entries {
-                let val = eval_expr(val_expr, event, funcs)?;
+                let val = eval_expr_with_scope(val_expr, event, funcs, scope)?;
                 map.insert(key.clone(), val);
             }
             Ok(Value::Object(map))
         }
 
         Expr::PropertyAccess(base, path) => {
-            let mut current = eval_expr(base, event, funcs)?;
+            let mut current = eval_expr_with_scope(base, event, funcs, scope)?;
             for field in path {
                 current = match current {
                     Value::Object(ref map) => map.get(field).cloned().unwrap_or(Value::Null),
@@ -87,7 +152,16 @@ fn bytes_to_value(bytes: &[u8]) -> Value {
     }
 }
 
-fn resolve_ident(parts: &[String], event: &Event) -> Result<Value> {
+fn resolve_ident(parts: &[String], event: &Event, scope: &LocalScope) -> Result<Value> {
+    // Single-segment idents: check let scope first, then Event metadata.
+    // `workspace.*` must always be written explicitly — there is no
+    // "bare field lookup" fallback into workspace.
+    if parts.len() == 1
+        && let Some(v) = scope.get(&parts[0])
+    {
+        return Ok(v.clone());
+    }
+
     match parts.first().map(|s| s.as_str()) {
         Some("ingress") => Ok(bytes_to_value(&event.ingress)),
         Some("egress") => Ok(bytes_to_value(&event.egress)),
