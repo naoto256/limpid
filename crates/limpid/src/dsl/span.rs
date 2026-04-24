@@ -31,6 +31,20 @@ impl Span {
         }
     }
 
+    /// Placeholder span used by AST nodes that don't come from the
+    /// parser (test fixtures, synthesized rebuilds in the analyzer).
+    /// The [`SourceMap`] resolver returns `None` for the unregistered
+    /// `file_id = u32::MAX`, which the renderer degrades to a spanless
+    /// single-line diagnostic — matching the old pre-span behaviour.
+    #[allow(dead_code)]
+    pub const fn dummy() -> Self {
+        Self {
+            file_id: u32::MAX,
+            start: 0,
+            end: 0,
+        }
+    }
+
     #[allow(dead_code)]
     pub const fn len(&self) -> usize {
         self.end.saturating_sub(self.start)

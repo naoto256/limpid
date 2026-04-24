@@ -30,37 +30,50 @@ mod tests {
         reg
     }
 
+    /// Spanless [`Expr`] construction shortcut used throughout the test
+    /// module: `e(ExprKind::IntLit(7))` is equivalent to
+    /// `Expr::spanless(ExprKind::IntLit(7))` and avoids the need to
+    /// invoke `.into()` at every call site.
+    fn e(kind: ExprKind) -> Expr {
+        Expr::spanless(kind)
+    }
+
     #[test]
     fn test_eval_literals() {
-        let e = make_event();
+        let ev = make_event();
         let f = make_funcs();
         assert_eq!(
-            eval_expr(&Expr::StringLit("hello".into()), &e, &f).unwrap(),
+            eval_expr(&e(ExprKind::StringLit("hello".into())), &ev, &f).unwrap(),
             Value::String("hello".into())
         );
         assert_eq!(
-            eval_expr(&Expr::IntLit(99), &e, &f).unwrap(),
+            eval_expr(&e(ExprKind::IntLit(99)), &ev, &f).unwrap(),
             Value::Number(99.into())
         );
         assert_eq!(
-            eval_expr(&Expr::BoolLit(true), &e, &f).unwrap(),
+            eval_expr(&e(ExprKind::BoolLit(true)), &ev, &f).unwrap(),
             Value::Bool(true)
         );
-        assert_eq!(eval_expr(&Expr::Null, &e, &f).unwrap(), Value::Null);
+        assert_eq!(eval_expr(&e(ExprKind::Null), &ev, &f).unwrap(), Value::Null);
     }
 
     #[test]
     fn test_eval_ident_workspace() {
-        let e = make_event();
+        let ev = make_event();
         let f = make_funcs();
         assert_eq!(
-            eval_expr(&Expr::Ident(vec!["workspace".into(), "src".into()]), &e, &f).unwrap(),
+            eval_expr(
+                &e(ExprKind::Ident(vec!["workspace".into(), "src".into()])),
+                &ev,
+                &f
+            )
+            .unwrap(),
             Value::String("192.168.1.1".into())
         );
         assert_eq!(
             eval_expr(
-                &Expr::Ident(vec!["workspace".into(), "count".into()]),
-                &e,
+                &e(ExprKind::Ident(vec!["workspace".into(), "count".into()])),
+                &ev,
                 &f
             )
             .unwrap(),
@@ -70,207 +83,213 @@ mod tests {
 
     #[test]
     fn test_eval_unknown_ident_errors() {
-        let e = make_event();
+        let ev = make_event();
         let f = make_funcs();
-        assert!(eval_expr(&Expr::Ident(vec!["typo_field".into()]), &e, &f).is_err());
+        assert!(eval_expr(&e(ExprKind::Ident(vec!["typo_field".into()])), &ev, &f).is_err());
     }
 
     #[test]
     fn test_eval_binop_comparison() {
-        let e = make_event();
+        let ev = make_event();
         let f = make_funcs();
         // workspace.sev (3) <= 3 → true
-        let expr = Expr::BinOp(
-            Box::new(Expr::Ident(vec!["workspace".into(), "sev".into()])),
+        let expr = e(ExprKind::BinOp(
+            Box::new(e(ExprKind::Ident(vec!["workspace".into(), "sev".into()]))),
             BinOp::Le,
-            Box::new(Expr::IntLit(3)),
-        );
-        assert_eq!(eval_expr(&expr, &e, &f).unwrap(), Value::Bool(true));
+            Box::new(e(ExprKind::IntLit(3))),
+        ));
+        assert_eq!(eval_expr(&expr, &ev, &f).unwrap(), Value::Bool(true));
 
         // workspace.sev (3) > 5 → false
-        let expr = Expr::BinOp(
-            Box::new(Expr::Ident(vec!["workspace".into(), "sev".into()])),
+        let expr = e(ExprKind::BinOp(
+            Box::new(e(ExprKind::Ident(vec!["workspace".into(), "sev".into()]))),
             BinOp::Gt,
-            Box::new(Expr::IntLit(5)),
-        );
-        assert_eq!(eval_expr(&expr, &e, &f).unwrap(), Value::Bool(false));
+            Box::new(e(ExprKind::IntLit(5))),
+        ));
+        assert_eq!(eval_expr(&expr, &ev, &f).unwrap(), Value::Bool(false));
     }
 
     #[test]
     fn test_eval_add_string_concat() {
-        let e = make_event();
+        let ev = make_event();
         let f = make_funcs();
 
         // String + String → concat
-        let expr = Expr::BinOp(
-            Box::new(Expr::StringLit("hello ".into())),
+        let expr = e(ExprKind::BinOp(
+            Box::new(e(ExprKind::StringLit("hello ".into()))),
             BinOp::Add,
-            Box::new(Expr::StringLit("world".into())),
-        );
+            Box::new(e(ExprKind::StringLit("world".into()))),
+        ));
         assert_eq!(
-            eval_expr(&expr, &e, &f).unwrap(),
+            eval_expr(&expr, &ev, &f).unwrap(),
             Value::String("hello world".into())
         );
 
         // Mixed String + Number → both coerced to string
-        let expr = Expr::BinOp(
-            Box::new(Expr::StringLit("count=".into())),
+        let expr = e(ExprKind::BinOp(
+            Box::new(e(ExprKind::StringLit("count=".into()))),
             BinOp::Add,
-            Box::new(Expr::IntLit(42)),
-        );
+            Box::new(e(ExprKind::IntLit(42))),
+        ));
         assert_eq!(
-            eval_expr(&expr, &e, &f).unwrap(),
+            eval_expr(&expr, &ev, &f).unwrap(),
             Value::String("count=42".into())
         );
 
         // Number + String → same
-        let expr = Expr::BinOp(
-            Box::new(Expr::IntLit(42)),
+        let expr = e(ExprKind::BinOp(
+            Box::new(e(ExprKind::IntLit(42))),
             BinOp::Add,
-            Box::new(Expr::StringLit(" ms".into())),
-        );
+            Box::new(e(ExprKind::StringLit(" ms".into()))),
+        ));
         assert_eq!(
-            eval_expr(&expr, &e, &f).unwrap(),
+            eval_expr(&expr, &ev, &f).unwrap(),
             Value::String("42 ms".into())
         );
 
         // Number + Number still numeric (no regression). numeric_op uses f64
         // internally, so the result is Number(7.0), not Number(7).
-        let expr = Expr::BinOp(
-            Box::new(Expr::IntLit(3)),
+        let expr = e(ExprKind::BinOp(
+            Box::new(e(ExprKind::IntLit(3))),
             BinOp::Add,
-            Box::new(Expr::IntLit(4)),
-        );
-        let result = eval_expr(&expr, &e, &f).unwrap();
+            Box::new(e(ExprKind::IntLit(4))),
+        ));
+        let result = eval_expr(&expr, &ev, &f).unwrap();
         assert_eq!(result.as_f64(), Some(7.0));
 
         // Chained: "a" + "b" + "c" (left-associative)
-        let expr = Expr::BinOp(
-            Box::new(Expr::BinOp(
-                Box::new(Expr::StringLit("a".into())),
+        let expr = e(ExprKind::BinOp(
+            Box::new(e(ExprKind::BinOp(
+                Box::new(e(ExprKind::StringLit("a".into()))),
                 BinOp::Add,
-                Box::new(Expr::StringLit("b".into())),
-            )),
+                Box::new(e(ExprKind::StringLit("b".into()))),
+            ))),
             BinOp::Add,
-            Box::new(Expr::StringLit("c".into())),
-        );
+            Box::new(e(ExprKind::StringLit("c".into()))),
+        ));
         assert_eq!(
-            eval_expr(&expr, &e, &f).unwrap(),
+            eval_expr(&expr, &ev, &f).unwrap(),
             Value::String("abc".into())
         );
     }
 
     #[test]
     fn test_eval_binop_logical() {
-        let e = make_event();
+        let ev = make_event();
         let f = make_funcs();
         // true and false → false
-        let expr = Expr::BinOp(
-            Box::new(Expr::BoolLit(true)),
+        let expr = e(ExprKind::BinOp(
+            Box::new(e(ExprKind::BoolLit(true))),
             BinOp::And,
-            Box::new(Expr::BoolLit(false)),
-        );
-        assert_eq!(eval_expr(&expr, &e, &f).unwrap(), Value::Bool(false));
+            Box::new(e(ExprKind::BoolLit(false))),
+        ));
+        assert_eq!(eval_expr(&expr, &ev, &f).unwrap(), Value::Bool(false));
 
         // true or false → true
-        let expr = Expr::BinOp(
-            Box::new(Expr::BoolLit(true)),
+        let expr = e(ExprKind::BinOp(
+            Box::new(e(ExprKind::BoolLit(true))),
             BinOp::Or,
-            Box::new(Expr::BoolLit(false)),
-        );
-        assert_eq!(eval_expr(&expr, &e, &f).unwrap(), Value::Bool(true));
+            Box::new(e(ExprKind::BoolLit(false))),
+        ));
+        assert_eq!(eval_expr(&expr, &ev, &f).unwrap(), Value::Bool(true));
     }
 
     #[test]
     fn test_eval_not() {
-        let e = make_event();
+        let ev = make_event();
         let f = make_funcs();
-        let expr = Expr::UnaryOp(UnaryOp::Not, Box::new(Expr::BoolLit(true)));
-        assert_eq!(eval_expr(&expr, &e, &f).unwrap(), Value::Bool(false));
+        let expr = e(ExprKind::UnaryOp(
+            UnaryOp::Not,
+            Box::new(e(ExprKind::BoolLit(true))),
+        ));
+        assert_eq!(eval_expr(&expr, &ev, &f).unwrap(), Value::Bool(false));
     }
 
     #[test]
     fn test_eval_contains() {
-        let e = make_event();
+        let ev = make_event();
         let f = make_funcs();
-        let expr = Expr::FuncCall {
+        let expr = e(ExprKind::FuncCall {
             namespace: None,
             name: "contains".into(),
             args: vec![
-                Expr::Ident(vec!["ingress".into()]),
-                Expr::StringLit("test".into()),
+                e(ExprKind::Ident(vec!["ingress".into()])),
+                e(ExprKind::StringLit("test".into())),
             ],
-        };
-        assert_eq!(eval_expr(&expr, &e, &f).unwrap(), Value::Bool(true));
+        });
+        assert_eq!(eval_expr(&expr, &ev, &f).unwrap(), Value::Bool(true));
     }
 
     #[test]
     fn test_eval_template() {
-        let e = make_event();
+        let ev = make_event();
         let f = make_funcs();
         // "[${workspace.sev}] from ${workspace.src}"
-        let expr = Expr::Template(vec![
+        let expr = e(ExprKind::Template(vec![
             TemplateFragment::Literal("[".into()),
-            TemplateFragment::Interp(Expr::Ident(vec!["workspace".into(), "sev".into()])),
+            TemplateFragment::Interp(e(ExprKind::Ident(vec!["workspace".into(), "sev".into()]))),
             TemplateFragment::Literal("] from ".into()),
-            TemplateFragment::Interp(Expr::Ident(vec!["workspace".into(), "src".into()])),
-        ]);
+            TemplateFragment::Interp(e(ExprKind::Ident(vec!["workspace".into(), "src".into()]))),
+        ]));
         assert_eq!(
-            eval_expr(&expr, &e, &f).unwrap(),
+            eval_expr(&expr, &ev, &f).unwrap(),
             Value::String("[3] from 192.168.1.1".into())
         );
     }
 
     #[test]
     fn test_eval_template_missing_interp_empty() {
-        let e = make_event();
+        let ev = make_event();
         let f = make_funcs();
-        let expr = Expr::Template(vec![
+        let expr = e(ExprKind::Template(vec![
             TemplateFragment::Literal("prefix-".into()),
-            TemplateFragment::Interp(Expr::Ident(vec!["workspace".into(), "missing".into()])),
+            TemplateFragment::Interp(e(ExprKind::Ident(vec![
+                "workspace".into(),
+                "missing".into(),
+            ]))),
             TemplateFragment::Literal("-suffix".into()),
-        ]);
+        ]));
         assert_eq!(
-            eval_expr(&expr, &e, &f).unwrap(),
+            eval_expr(&expr, &ev, &f).unwrap(),
             Value::String("prefix--suffix".into())
         );
     }
 
     #[test]
     fn test_eval_lower_upper() {
-        let e = make_event();
+        let ev = make_event();
         let f = make_funcs();
-        let lower = Expr::FuncCall {
+        let lower = e(ExprKind::FuncCall {
             namespace: None,
             name: "lower".into(),
-            args: vec![Expr::StringLit("HELLO".into())],
-        };
+            args: vec![e(ExprKind::StringLit("HELLO".into()))],
+        });
         assert_eq!(
-            eval_expr(&lower, &e, &f).unwrap(),
+            eval_expr(&lower, &ev, &f).unwrap(),
             Value::String("hello".into())
         );
 
-        let upper = Expr::FuncCall {
+        let upper = e(ExprKind::FuncCall {
             namespace: None,
             name: "upper".into(),
-            args: vec![Expr::StringLit("hello".into())],
-        };
+            args: vec![e(ExprKind::StringLit("hello".into()))],
+        });
         assert_eq!(
-            eval_expr(&upper, &e, &f).unwrap(),
+            eval_expr(&upper, &ev, &f).unwrap(),
             Value::String("HELLO".into())
         );
     }
 
     #[test]
     fn test_eval_to_json() {
-        let e = make_event();
+        let ev = make_event();
         let f = make_funcs();
-        let expr = Expr::FuncCall {
+        let expr = e(ExprKind::FuncCall {
             namespace: None,
             name: "to_json".into(),
             args: vec![],
-        };
-        let result = eval_expr(&expr, &e, &f).unwrap();
+        });
+        let result = eval_expr(&expr, &ev, &f).unwrap();
         let s = result.as_str().unwrap();
         assert!(s.contains("\"workspace\""));
         assert!(s.contains("\"src\":\"192.168.1.1\""));
@@ -289,54 +308,69 @@ mod tests {
 
     #[test]
     fn test_non_numeric_comparison_returns_false() {
-        let e = make_event();
+        let ev = make_event();
         let f = make_funcs();
         // "hello" < "world" should be false (non-numeric)
-        let expr = Expr::BinOp(
-            Box::new(Expr::StringLit("hello".into())),
+        let expr = e(ExprKind::BinOp(
+            Box::new(e(ExprKind::StringLit("hello".into()))),
             BinOp::Lt,
-            Box::new(Expr::StringLit("world".into())),
-        );
-        assert_eq!(eval_expr(&expr, &e, &f).unwrap(), Value::Bool(false));
+            Box::new(e(ExprKind::StringLit("world".into()))),
+        ));
+        assert_eq!(eval_expr(&expr, &ev, &f).unwrap(), Value::Bool(false));
     }
 
     #[test]
     fn test_property_access_on_hash() {
-        let e = make_event();
+        let ev = make_event();
         let f = make_funcs();
         // { country: "JP", city: "Tokyo" }.country → "JP"
-        let hash = Expr::HashLit(vec![
-            ("country".into(), Expr::StringLit("JP".into())),
-            ("city".into(), Expr::StringLit("Tokyo".into())),
-        ]);
-        let expr = Expr::PropertyAccess(Box::new(hash), vec!["country".into()]);
+        let hash = e(ExprKind::HashLit(vec![
+            ("country".into(), e(ExprKind::StringLit("JP".into()))),
+            ("city".into(), e(ExprKind::StringLit("Tokyo".into()))),
+        ]));
+        let expr = e(ExprKind::PropertyAccess(
+            Box::new(hash),
+            vec!["country".into()],
+        ));
         assert_eq!(
-            eval_expr(&expr, &e, &f).unwrap(),
+            eval_expr(&expr, &ev, &f).unwrap(),
             Value::String("JP".into())
         );
     }
 
     #[test]
     fn test_property_access_chained() {
-        let e = make_event();
+        let ev = make_event();
         let f = make_funcs();
         // { geo: { country: "JP" } }.geo.country → "JP"
-        let inner_hash = Expr::HashLit(vec![("country".into(), Expr::StringLit("JP".into()))]);
-        let outer_hash = Expr::HashLit(vec![("geo".into(), inner_hash)]);
-        let expr = Expr::PropertyAccess(Box::new(outer_hash), vec!["geo".into(), "country".into()]);
+        let inner_hash = e(ExprKind::HashLit(vec![(
+            "country".into(),
+            e(ExprKind::StringLit("JP".into())),
+        )]));
+        let outer_hash = e(ExprKind::HashLit(vec![("geo".into(), inner_hash)]));
+        let expr = e(ExprKind::PropertyAccess(
+            Box::new(outer_hash),
+            vec!["geo".into(), "country".into()],
+        ));
         assert_eq!(
-            eval_expr(&expr, &e, &f).unwrap(),
+            eval_expr(&expr, &ev, &f).unwrap(),
             Value::String("JP".into())
         );
     }
 
     #[test]
     fn test_property_access_missing_field() {
-        let e = make_event();
+        let ev = make_event();
         let f = make_funcs();
-        let hash = Expr::HashLit(vec![("country".into(), Expr::StringLit("JP".into()))]);
-        let expr = Expr::PropertyAccess(Box::new(hash), vec!["missing".into()]);
-        assert_eq!(eval_expr(&expr, &e, &f).unwrap(), Value::Null);
+        let hash = e(ExprKind::HashLit(vec![(
+            "country".into(),
+            e(ExprKind::StringLit("JP".into())),
+        )]));
+        let expr = e(ExprKind::PropertyAccess(
+            Box::new(hash),
+            vec!["missing".into()],
+        ));
+        assert_eq!(eval_expr(&expr, &ev, &f).unwrap(), Value::Null);
     }
 
     #[test]

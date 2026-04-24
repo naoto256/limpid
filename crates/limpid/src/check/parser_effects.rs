@@ -8,7 +8,7 @@
 //! Data-driven parsers without explicit defaults widen workspace to a
 //! wildcard so downstream `workspace.*` reads remain admissible.
 
-use crate::dsl::ast::Expr;
+use crate::dsl::ast::{Expr, ExprKind};
 use crate::functions::FunctionRegistry;
 use crate::modules::schema::FieldType;
 
@@ -37,7 +37,11 @@ pub(super) fn apply_parser_effects(
     // binding too, with type inferred from the literal value. This is
     // the "user-declared schema" knob that lets parse_json / parse_kv
     // narrow the wildcard to a precise key set.
-    if let Some(Expr::HashLit(entries)) = args.get(1) {
+    if let Some(Expr {
+        kind: ExprKind::HashLit(entries),
+        ..
+    }) = args.get(1)
+    {
         for (k, v) in entries {
             let path = vec!["workspace".to_string(), k.clone()];
             bindings.bind_workspace(&path, literal_type(v));
@@ -54,13 +58,13 @@ pub(super) fn apply_parser_effects(
 /// HashLit defaults inference in parser calls; non-literal entries
 /// fall through to `Any`.
 fn literal_type(e: &Expr) -> FieldType {
-    match e {
-        Expr::StringLit(_) | Expr::Template(_) => FieldType::String,
-        Expr::IntLit(_) => FieldType::Int,
-        Expr::FloatLit(_) => FieldType::Float,
-        Expr::BoolLit(_) => FieldType::Bool,
-        Expr::Null => FieldType::Null,
-        Expr::HashLit(_) => FieldType::Object,
+    match &e.kind {
+        ExprKind::StringLit(_) | ExprKind::Template(_) => FieldType::String,
+        ExprKind::IntLit(_) => FieldType::Int,
+        ExprKind::FloatLit(_) => FieldType::Float,
+        ExprKind::BoolLit(_) => FieldType::Bool,
+        ExprKind::Null => FieldType::Null,
+        ExprKind::HashLit(_) => FieldType::Object,
         _ => FieldType::Any,
     }
 }

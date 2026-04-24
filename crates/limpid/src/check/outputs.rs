@@ -7,7 +7,7 @@
 //! and emits an Error per unresolved key. Levenshtein-based "did you
 //! mean" hints are attached when a near match exists.
 
-use crate::dsl::ast::{Expr, OutputDef, Property, TemplateFragment};
+use crate::dsl::ast::{Expr, ExprKind, OutputDef, Property, TemplateFragment};
 use crate::dsl::span::Span;
 use crate::functions::FunctionRegistry;
 
@@ -79,10 +79,10 @@ fn check_workspace_reference(
 }
 
 fn collect_workspace_refs(expr: &Expr, cb: &mut dyn FnMut(&[String])) {
-    match expr {
-        Expr::Ident(parts) => cb(parts),
-        Expr::PropertyAccess(base, suffix) => {
-            if let Expr::Ident(base_parts) = base.as_ref() {
+    match &expr.kind {
+        ExprKind::Ident(parts) => cb(parts),
+        ExprKind::PropertyAccess(base, suffix) => {
+            if let ExprKind::Ident(base_parts) = &base.kind {
                 let mut combined = base_parts.clone();
                 combined.extend(suffix.iter().cloned());
                 cb(&combined);
@@ -90,32 +90,32 @@ fn collect_workspace_refs(expr: &Expr, cb: &mut dyn FnMut(&[String])) {
                 collect_workspace_refs(base, cb);
             }
         }
-        Expr::Template(fragments) => {
+        ExprKind::Template(fragments) => {
             for f in fragments {
                 if let TemplateFragment::Interp(e) = f {
                     collect_workspace_refs(e, cb);
                 }
             }
         }
-        Expr::FuncCall { args, .. } => {
+        ExprKind::FuncCall { args, .. } => {
             for a in args {
                 collect_workspace_refs(a, cb);
             }
         }
-        Expr::BinOp(l, _, r) => {
+        ExprKind::BinOp(l, _, r) => {
             collect_workspace_refs(l, cb);
             collect_workspace_refs(r, cb);
         }
-        Expr::UnaryOp(_, inner) => collect_workspace_refs(inner, cb),
-        Expr::HashLit(entries) => {
+        ExprKind::UnaryOp(_, inner) => collect_workspace_refs(inner, cb),
+        ExprKind::HashLit(entries) => {
             for (_k, v) in entries {
                 collect_workspace_refs(v, cb);
             }
         }
-        Expr::StringLit(_)
-        | Expr::IntLit(_)
-        | Expr::FloatLit(_)
-        | Expr::BoolLit(_)
-        | Expr::Null => {}
+        ExprKind::StringLit(_)
+        | ExprKind::IntLit(_)
+        | ExprKind::FloatLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::Null => {}
     }
 }

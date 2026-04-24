@@ -2,7 +2,7 @@
 //!
 //! Used by modules to parse their own configuration from DSL property lists.
 
-use super::ast::{Expr, Property, TemplateFragment};
+use super::ast::{Expr, ExprKind, Property, TemplateFragment};
 
 /// Get a string value for a key (from StringLit, Ident, or IntLit).
 ///
@@ -21,11 +21,11 @@ pub fn get_string(props: &[Property], key: &str) -> Option<String> {
         } = prop
             && k == key
         {
-            return match expr {
-                Expr::StringLit(s) => Some(s.clone()),
-                Expr::Template(frags) => Some(template_to_source(frags)),
-                Expr::Ident(parts) => Some(parts.join(".")),
-                Expr::IntLit(n) => Some(n.to_string()),
+            return match &expr.kind {
+                ExprKind::StringLit(s) => Some(s.clone()),
+                ExprKind::Template(frags) => Some(template_to_source(frags)),
+                ExprKind::Ident(parts) => Some(parts.join(".")),
+                ExprKind::IntLit(n) => Some(n.to_string()),
                 _ => None,
             };
         }
@@ -71,9 +71,9 @@ fn template_to_source(frags: &[TemplateFragment]) -> String {
 }
 
 fn push_expr_source(out: &mut String, expr: &Expr) {
-    match expr {
-        Expr::Ident(parts) => out.push_str(&parts.join(".")),
-        Expr::StringLit(s) => {
+    match &expr.kind {
+        ExprKind::Ident(parts) => out.push_str(&parts.join(".")),
+        ExprKind::StringLit(s) => {
             out.push('"');
             for c in s.chars() {
                 match c {
@@ -84,10 +84,10 @@ fn push_expr_source(out: &mut String, expr: &Expr) {
             }
             out.push('"');
         }
-        Expr::IntLit(n) => out.push_str(&n.to_string()),
-        Expr::FloatLit(n) => out.push_str(&n.to_string()),
-        Expr::BoolLit(b) => out.push_str(if *b { "true" } else { "false" }),
-        Expr::Null => out.push_str("null"),
+        ExprKind::IntLit(n) => out.push_str(&n.to_string()),
+        ExprKind::FloatLit(n) => out.push_str(&n.to_string()),
+        ExprKind::BoolLit(b) => out.push_str(if *b { "true" } else { "false" }),
+        ExprKind::Null => out.push_str("null"),
         other => out.push_str(&format!("{:?}", other)),
     }
 }
@@ -97,7 +97,11 @@ pub fn get_ident(props: &[Property], key: &str) -> Option<String> {
     for prop in props {
         if let Property::KeyValue {
             key: k,
-            value: Expr::Ident(parts),
+            value:
+                Expr {
+                    kind: ExprKind::Ident(parts),
+                    ..
+                },
             ..
         } = prop
             && k == key
@@ -113,7 +117,11 @@ pub fn get_int(props: &[Property], key: &str) -> Option<i64> {
     for prop in props {
         if let Property::KeyValue {
             key: k,
-            value: Expr::IntLit(n),
+            value:
+                Expr {
+                    kind: ExprKind::IntLit(n),
+                    ..
+                },
             ..
         } = prop
             && k == key

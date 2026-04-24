@@ -23,7 +23,7 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
-use crate::dsl::ast::{Expr, Property, TemplateFragment};
+use crate::dsl::ast::{Expr, ExprKind, Property, TemplateFragment};
 use crate::dsl::eval::{eval_expr, value_to_string};
 use crate::dsl::props;
 use crate::event::Event;
@@ -53,8 +53,8 @@ impl Module for FileOutput {
         // `path` must eventually render to a string. Allow StringLit and
         // Template at config-load time; other shapes (e.g. bare integer)
         // would be a user error so we reject here rather than at write.
-        match &path {
-            Expr::StringLit(_) | Expr::Template(_) => {}
+        match &path.kind {
+            ExprKind::StringLit(_) | ExprKind::Template(_) => {}
             other => anyhow::bail!(
                 "output '{}': file 'path' must be a string, got {:?}",
                 name,
@@ -171,9 +171,9 @@ impl FileOutput {
     /// affecting literal path separators or server-owned interpolations
     /// like `${source}`.
     fn render_path(&self, event: &Event) -> Result<(String, bool)> {
-        match &self.path {
-            Expr::StringLit(s) => Ok((s.clone(), false)),
-            Expr::Template(fragments) => {
+        match &self.path.kind {
+            ExprKind::StringLit(s) => Ok((s.clone(), false)),
+            ExprKind::Template(fragments) => {
                 let funcs = self.funcs.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "output file: FunctionRegistry not attached — \
@@ -210,9 +210,11 @@ impl FileOutput {
 /// `lower(workspace.host)`) are rendered without sanitisation — users who
 /// care should write their sanitisation explicitly.
 fn is_workspace_reference(expr: &Expr) -> bool {
-    match expr {
-        Expr::Ident(parts) => parts.first().is_some_and(|s| s == "workspace") && parts.len() > 1,
-        Expr::PropertyAccess(base, _) => is_workspace_reference(base),
+    match &expr.kind {
+        ExprKind::Ident(parts) => {
+            parts.first().is_some_and(|s| s == "workspace") && parts.len() > 1
+        }
+        ExprKind::PropertyAccess(base, _) => is_workspace_reference(base),
         _ => false,
     }
 }
@@ -343,9 +345,15 @@ mod tests {
         }
     }
 
+    /// Spanless [`Expr`] shortcut — test fixtures aren't anchored to
+    /// real source spans.
+    fn ek(kind: ExprKind) -> Expr {
+        Expr::spanless(kind)
+    }
+
     #[test]
     fn render_static_path() {
-        let out = make_output(Expr::StringLit("/var/log/app.log".into()));
+        let out = make_output(ek(ExprKind::StringLit("/var/log/app.log".into())));
         let (rendered, dynamic) = out.render_path(&event_with_workspace()).unwrap();
         assert_eq!(rendered, "/var/log/app.log");
         assert!(!dynamic);
@@ -354,11 +362,11 @@ mod tests {
     #[test]
     fn render_template_with_ident_interp() {
         // "/var/log/${source}.log"
-        let out = make_output(Expr::Template(vec![
+        let out = make_output(ek(ExprKind::Template(vec![
             TemplateFragment::Literal("/var/log/".into()),
-            TemplateFragment::Interp(Expr::Ident(vec!["source".into()])),
+            TemplateFragment::Interp(ek(ExprKind::Ident(vec!["source".into()]))),
             TemplateFragment::Literal(".log".into()),
-        ]));
+        ])));
         let (rendered, dynamic) = out.render_path(&event_with_workspace()).unwrap();
         assert_eq!(rendered, "/var/log/192.168.1.10.log");
         assert!(dynamic);
@@ -368,11 +376,11 @@ mod tests {
     fn render_template_sanitizes_workspace_reference() {
         // "/var/log/${workspace.ip}.log" — workspace.ip contains "10.0.0.1/24",
         // the `/` must be replaced with `_`.
-        let out = make_output(Expr::Template(vec![
+        let out = make_output(ek(ExprKind::Template(vec![
             TemplateFragment::Literal("/var/log/".into()),
-            TemplateFragment::Interp(Expr::Ident(vec!["workspace".into(), "ip".into()])),
+            TemplateFragment::Interp(ek(ExprKind::Ident(vec!["workspace".into(), "ip".into()]))),
             TemplateFragment::Literal(".log".into()),
-        ]));
+        ])));
         let (rendered, _) = out.render_path(&event_with_workspace()).unwrap();
         assert_eq!(rendered, "/var/log/10.0.0.1_24.log");
     }
@@ -382,20 +390,20 @@ mod tests {
         // `${source}` is a top-level ident (not workspace.*), so its value
         // is passed through even if it contains separators (IPv4 won't,
         // but the principle holds).
-        let out = make_output(Expr::Template(vec![
+        let out = make_output(ek(ExprKind::Template(vec![
             TemplateFragment::Literal("a-".into()),
-            TemplateFragment::Interp(Expr::Ident(vec!["source".into()])),
+            TemplateFragment::Interp(ek(ExprKind::Ident(vec!["source".into()]))),
             TemplateFragment::Literal("-b".into()),
-        ]));
+        ])));
         let (rendered, _) = out.render_path(&event_with_workspace()).unwrap();
         assert_eq!(rendered, "a-192.168.1.10-b");
     }
 
     #[test]
     fn render_template_errors_without_attached_funcs() {
-        let mut out = make_output(Expr::Template(vec![TemplateFragment::Interp(Expr::Ident(
-            vec!["source".into()],
-        ))]));
+        let mut out = make_output(ek(ExprKind::Template(vec![TemplateFragment::Interp(ek(
+            ExprKind::Ident(vec!["source".into()]),
+        ))])));
         out.funcs = None;
         let err = out.render_path(&event_with_workspace()).unwrap_err();
         assert!(err.to_string().contains("FunctionRegistry not attached"));
@@ -403,27 +411,31 @@ mod tests {
 
     #[test]
     fn is_workspace_reference_detects_nested_paths() {
-        assert!(is_workspace_reference(&Expr::Ident(vec![
+        assert!(is_workspace_reference(&ek(ExprKind::Ident(vec![
             "workspace".into(),
             "x".into()
-        ])));
-        assert!(is_workspace_reference(&Expr::Ident(vec![
+        ]))));
+        assert!(is_workspace_reference(&ek(ExprKind::Ident(vec![
             "workspace".into(),
             "x".into(),
             "y".into()
-        ])));
+        ]))));
         // `workspace` alone is not a reference to a specific key
-        assert!(!is_workspace_reference(&Expr::Ident(vec![
+        assert!(!is_workspace_reference(&ek(ExprKind::Ident(vec![
             "workspace".into()
-        ])));
+        ]))));
         // non-workspace idents don't count
-        assert!(!is_workspace_reference(&Expr::Ident(vec!["source".into()])));
+        assert!(!is_workspace_reference(&ek(ExprKind::Ident(vec![
+            "source".into()
+        ]))));
         // function calls always render without sanitisation (users
         // opt-in to their own sanitisation)
-        assert!(!is_workspace_reference(&Expr::FuncCall {
+        assert!(!is_workspace_reference(&ek(ExprKind::FuncCall {
             namespace: None,
             name: "lower".into(),
-            args: vec![Expr::Ident(vec!["workspace".into(), "host".into()])],
-        }));
+            args: vec![ek(ExprKind::Ident(
+                vec!["workspace".into(), "host".into(),]
+            ))],
+        })));
     }
 }
