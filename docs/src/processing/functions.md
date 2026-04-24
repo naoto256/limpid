@@ -55,7 +55,7 @@ workspace.clean = regex_replace(workspace.msg, "\\d+", "N")
 Expands `%{...}` placeholders against the current event. Kept for backward compatibility and for callers who want an event-wide template in one argument; new code should prefer the [`${expr}` interpolation](./templates.md) that any string literal supports.
 
 ```
-egress = format("%{hostname} %{appname}[%{procid}]: %{syslog_msg}")
+egress = format("%{workspace.hostname} %{workspace.appname}[%{workspace.procid}]: %{workspace.syslog_msg}")
 ```
 
 Available placeholders:
@@ -65,9 +65,8 @@ Available placeholders:
 | `%{source}`, `%{facility}`, `%{severity}`, `%{timestamp}` | Event metadata |
 | `%{egress}`, `%{ingress}` | Event byte buffers |
 | `%{workspace.xxx}` | Named workspace value (nested: `%{workspace.geo.country}`) |
-| `%{xxx}` | Shorthand for `%{workspace.xxx}` |
 
-> **Note:** The shorthand `%{xxx}` checks `workspace` first but is shadowed by reserved names (`source`, `facility`, `severity`, `timestamp`, `egress`, `ingress`). Use `%{workspace.xxx}` to avoid ambiguity.
+> **Note:** Workspace values must be referenced with the explicit `%{workspace.xxx}` form. A bare `%{xxx}` that isn't one of the event-level names above is an error — this avoids typos silently rendering as empty strings, and keeps the `%{}` resolution rules independent of any in-scope [`let`](./user-defined.md) bindings.
 
 ## Timestamp formatting
 

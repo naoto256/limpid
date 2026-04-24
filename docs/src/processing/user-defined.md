@@ -12,7 +12,7 @@ def process enrich {
         workspace.geo = geoip(workspace.srcip)
     }
 
-    egress = format("%{devname} %{srcip} -> %{dstip} %{action}")
+    egress = format("%{workspace.devname} %{workspace.srcip} -> %{workspace.dstip} %{workspace.action}")
 }
 ```
 
@@ -31,7 +31,7 @@ def process enrich {
 
 ```
 // This changes the output:
-egress = format("%{hostname}: %{syslog_msg}")
+egress = format("%{workspace.hostname}: %{workspace.syslog_msg}")
 
 // This does NOT change the output:
 workspace.hostname = "new-host"
@@ -44,7 +44,7 @@ workspace.hostname = "new-host"
 process parse_kv                             // parse into workspace
 egress = to_json()                           // serialise all workspace values as JSON
 // or
-egress = format("%{srcip} -> %{dstip}")      // build a custom format
+egress = format("%{workspace.srcip} -> %{workspace.dstip}")      // build a custom format
 ```
 
 ### PRI rewriting
