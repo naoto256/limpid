@@ -29,7 +29,7 @@ use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
-use crate::modules::{FromProperties, HasMetrics, Output};
+use crate::modules::{HasMetrics, Module, ModuleSchema, Output};
 
 /// Shared state between write() and the flush timer task.
 struct Inner {
@@ -50,7 +50,11 @@ pub struct HttpOutput {
     metrics: Arc<OutputMetrics>,
 }
 
-impl FromProperties for HttpOutput {
+impl Module for HttpOutput {
+    fn schema() -> ModuleSchema {
+        ModuleSchema::default()
+    }
+
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
         let url = props::get_string(properties, "url")
             .ok_or_else(|| anyhow::anyhow!("output '{}': http requires 'url'", name))?;

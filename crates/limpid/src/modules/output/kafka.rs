@@ -23,7 +23,7 @@ use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
-use crate::modules::{FromProperties, HasMetrics, Output};
+use crate::modules::{HasMetrics, Module, ModuleSchema, Output};
 
 pub struct KafkaOutput {
     producer: FutureProducer,
@@ -42,7 +42,11 @@ enum KeyField {
     Field(String),
 }
 
-impl FromProperties for KafkaOutput {
+impl Module for KafkaOutput {
+    fn schema() -> ModuleSchema {
+        ModuleSchema::default()
+    }
+
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
         let brokers = props::get_string(properties, "brokers")
             .ok_or_else(|| anyhow::anyhow!("output '{}': kafka requires 'brokers'", name))?;

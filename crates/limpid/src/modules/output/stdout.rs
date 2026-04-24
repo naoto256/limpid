@@ -8,13 +8,17 @@ use anyhow::Result;
 use crate::dsl::ast::Property;
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
-use crate::modules::{FromProperties, HasMetrics, Output};
+use crate::modules::{HasMetrics, Module, ModuleSchema, Output};
 
 pub struct StdoutOutput {
     metrics: Arc<OutputMetrics>,
 }
 
-impl FromProperties for StdoutOutput {
+impl Module for StdoutOutput {
+    fn schema() -> ModuleSchema {
+        ModuleSchema::default()
+    }
+
     fn from_properties(_name: &str, _properties: &[Property]) -> Result<Self> {
         Ok(Self {
             metrics: Arc::new(OutputMetrics::default()),

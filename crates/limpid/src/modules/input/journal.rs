@@ -22,7 +22,7 @@ use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::event::Event;
 use crate::metrics::InputMetrics;
-use crate::modules::{FromProperties, HasMetrics, Input};
+use crate::modules::{HasMetrics, Input, Module, ModuleSchema};
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const JOURNAL_SOURCE: &str = "127.0.0.1:0";
@@ -34,7 +34,11 @@ pub struct JournalInput {
     metrics: Arc<InputMetrics>,
 }
 
-impl FromProperties for JournalInput {
+impl Module for JournalInput {
+    fn schema() -> ModuleSchema {
+        ModuleSchema::default()
+    }
+
     fn from_properties(_name: &str, properties: &[Property]) -> Result<Self> {
         let mut matches = Vec::new();
         if let Some(m) = props::get_string(properties, "match") {

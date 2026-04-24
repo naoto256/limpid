@@ -15,7 +15,7 @@ use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
-use crate::modules::{FromProperties, HasMetrics, Output};
+use crate::modules::{HasMetrics, Module, ModuleSchema, Output};
 
 pub struct TcpOutput {
     pub address: String,
@@ -30,7 +30,11 @@ pub enum TcpOutputFraming {
     NonTransparent,
 }
 
-impl FromProperties for TcpOutput {
+impl Module for TcpOutput {
+    fn schema() -> ModuleSchema {
+        ModuleSchema::default()
+    }
+
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
         let address = props::get_string(properties, "address")
             .or_else(|| {
