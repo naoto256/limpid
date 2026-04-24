@@ -267,7 +267,7 @@ pub fn register_builtins(reg: &mut FunctionRegistry, table_store: table::TableSt
             bail!("format() expects 1 argument (template string)");
         }
         let template = val_to_str(&args[0]);
-        Ok(Value::String(expand_format_template(&template, event)))
+        Ok(Value::String(expand_format_template(&template, event)?))
     });
 
     reg.register("strftime", |args, _event| {
@@ -340,11 +340,17 @@ fn parse_fixed_offset(s: &str) -> Option<chrono::FixedOffset> {
 
 /// Expand `%{name}` placeholders in a format template against an event.
 ///
-/// Supported placeholders:
+/// Supported placeholders (explicit only — no bare-name shorthand):
 /// - `%{source}`, `%{facility}`, `%{severity}`, `%{timestamp}`
 /// - `%{egress}`, `%{ingress}`
 /// - `%{workspace.xxx}`, `%{workspace.xxx.yyy}` (nested workspace access)
-fn expand_format_template(template: &str, event: &crate::event::Event) -> String {
+///
+/// A bare `%{pid}` used to be shorthand for `%{workspace.pid}`; that
+/// quietly papered over typos (a misspelled key rendered as an empty
+/// string) and conflicted with the `let` binding introduced alongside
+/// the workspace rename. The shorthand is now an error and the user is
+/// pointed at the explicit `%{workspace.xxx}` form.
+fn expand_format_template(template: &str, event: &crate::event::Event) -> Result<String> {
     let mut result = String::with_capacity(template.len());
     let mut chars = template.chars().peekable();
 
@@ -358,39 +364,35 @@ fn expand_format_template(template: &str, event: &crate::event::Event) -> String
                 }
                 var.push(c);
             }
-            result.push_str(&resolve_format_var(&var, event));
+            result.push_str(&resolve_format_var(&var, event)?);
         } else {
             result.push(ch);
         }
     }
 
-    result
+    Ok(result)
 }
 
-fn resolve_format_var(var: &str, event: &crate::event::Event) -> String {
+fn resolve_format_var(var: &str, event: &crate::event::Event) -> Result<String> {
     match var {
-        "source" => event.source.ip().to_string(),
-        "facility" => event.facility.map(|f| f.to_string()).unwrap_or_default(),
-        "severity" => event.severity.map(|s| s.to_string()).unwrap_or_default(),
-        "timestamp" => event.timestamp.to_rfc3339(),
-        "egress" => String::from_utf8_lossy(&event.egress).into_owned(),
-        "ingress" => String::from_utf8_lossy(&event.ingress).into_owned(),
+        "source" => Ok(event.source.ip().to_string()),
+        "facility" => Ok(event.facility.map(|f| f.to_string()).unwrap_or_default()),
+        "severity" => Ok(event.severity.map(|s| s.to_string()).unwrap_or_default()),
+        "timestamp" => Ok(event.timestamp.to_rfc3339()),
+        "egress" => Ok(String::from_utf8_lossy(&event.egress).into_owned()),
+        "ingress" => Ok(String::from_utf8_lossy(&event.ingress).into_owned()),
         v if v.starts_with("workspace.") => {
             let path: Vec<&str> = v["workspace.".len()..].split('.').collect();
-            resolve_format_workspace(&path, &event.workspace)
+            Ok(resolve_format_workspace(&path, &event.workspace))
         }
-        // Also try direct key name as shorthand for workspace.xxx
-        v => {
-            if let Some(val) = event.workspace.get(v) {
-                match val {
-                    serde_json::Value::String(s) => s.clone(),
-                    serde_json::Value::Null => String::new(),
-                    other => other.to_string(),
-                }
-            } else {
-                String::new()
-            }
-        }
+        // Anything else is a user error. The old shorthand silently did
+        // a workspace lookup here; we now refuse and point at the
+        // explicit form so typos don't turn into empty strings.
+        other => bail!(
+            "format(): unknown placeholder `%{{{}}}`; use `%{{workspace.{}}}` or one of the event-level names (source / facility / severity / timestamp / ingress / egress)",
+            other,
+            other
+        ),
     }
 }
 
@@ -582,5 +584,78 @@ mod tests {
         assert!(parse_fixed_offset("UTC").is_none());
         assert!(parse_fixed_offset("").is_none());
         assert!(parse_fixed_offset("09:00").is_none()); // missing sign
+    }
+
+    // ---- format() ---------------------------------------------------------
+
+    #[test]
+    fn format_expands_event_level_placeholders() {
+        let reg = make_registry();
+        let mut e = dummy_event();
+        e.severity = Some(3);
+        e.facility = Some(16);
+        let result = reg
+            .call(
+                "format",
+                &[Value::String("[%{severity}] %{egress}".into())],
+                &e,
+            )
+            .unwrap();
+        // egress defaults to the raw bytes ("test") in dummy_event
+        assert_eq!(result, Value::String("[3] test".into()));
+    }
+
+    #[test]
+    fn format_expands_explicit_workspace_placeholder() {
+        let reg = make_registry();
+        let mut e = dummy_event();
+        e.workspace
+            .insert("host".into(), serde_json::Value::String("web01".into()));
+        let result = reg
+            .call(
+                "format",
+                &[Value::String("host=%{workspace.host}".into())],
+                &e,
+            )
+            .unwrap();
+        assert_eq!(result, Value::String("host=web01".into()));
+    }
+
+    #[test]
+    fn format_rejects_bare_shorthand() {
+        // `%{pid}` used to silently fall back to workspace.pid. Now it
+        // must be an error so typos don't become empty strings.
+        let reg = make_registry();
+        let mut e = dummy_event();
+        e.workspace
+            .insert("pid".into(), serde_json::Value::String("42".into()));
+        let err = reg
+            .call("format", &[Value::String("pid=%{pid}".into())], &e)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown placeholder"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(
+            msg.contains("workspace.pid"),
+            "error should suggest `workspace.pid`, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn format_error_suggests_explicit_form_for_typos() {
+        let reg = make_registry();
+        let e = dummy_event();
+        let err = reg
+            .call(
+                "format",
+                &[Value::String("x=%{nope_not_a_thing}".into())],
+                &e,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("workspace.nope_not_a_thing"));
     }
 }

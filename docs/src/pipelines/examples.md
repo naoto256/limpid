@@ -144,6 +144,6 @@ def process enrich_fortigate {
         workspace.geo = geoip(workspace.srcip)
     }
 
-    egress = format("%{devname} %{srcip} -> %{dstip} %{action}")
+    egress = format("%{workspace.devname} %{workspace.srcip} -> %{workspace.dstip} %{workspace.action}")
 }
 ```
