@@ -117,6 +117,20 @@ impl Module for HttpOutput {
             );
         }
 
+        // Loud, unconditional warning when TLS verification is disabled on HTTPS.
+        // `verify false` is a config-level footgun — one line opens MITM. Emit
+        // the warning once at startup so ops can grep for it, regardless of
+        // whether a `tls { ca ... }` block is also present.
+        if is_https && !verify {
+            tracing::warn!(
+                "output '{}': TLS certificate verification is DISABLED (verify false) — \
+                 connections to {} are vulnerable to MITM. This is for debugging only; \
+                 never use in production.",
+                name,
+                url
+            );
+        }
+
         let mut client_builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
 
         if !verify {
