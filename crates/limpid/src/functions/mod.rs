@@ -44,6 +44,11 @@ use crate::modules::schema::{FieldSpec, FieldType};
 /// Functions are registered with a small, declarative signature so the
 /// analyzer can type-check call sites without re-implementing every
 /// function's hand-rolled arity logic.
+///
+/// A `Variadic` variant used to live here but was never populated by
+/// any built-in; it is deliberately omitted until a variadic function
+/// is actually needed, at which point reintroducing the arm is a
+/// non-breaking enum extension.
 #[derive(Debug, Clone)]
 pub enum Arity {
     /// Exactly `args.len()` positional args, all required. The signature's
@@ -53,10 +58,6 @@ pub enum Arity {
     /// signature's `args` slice declares types for every slot up to the
     /// maximum, including optional ones.
     Optional { required: usize },
-    /// All declared args required, then a variadic tail whose type is
-    /// the last entry of `args`. Unused by current built-ins; reserved.
-    #[allow(dead_code)]
-    Variadic,
 }
 
 /// Static signature for a built-in function. Threaded into the registry
@@ -312,7 +313,6 @@ fn validate_arity(
     let ok = match sig.arity {
         Arity::Fixed => actual == sig.args.len(),
         Arity::Optional { required } => actual >= required && actual <= sig.args.len(),
-        Arity::Variadic => actual >= sig.args.len(),
     };
     if ok {
         return Ok(());
@@ -337,9 +337,6 @@ fn validate_arity(
             } else {
                 format!("{} to {} arguments", required, max)
             }
-        }
-        Arity::Variadic => {
-            format!("at least {} arguments", sig.args.len())
         }
     };
     Err(anyhow::anyhow!(
