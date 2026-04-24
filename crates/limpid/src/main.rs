@@ -175,34 +175,62 @@ fn run_daemon(config_path: &str) -> Result<()> {
 
 /// --check: validate configuration and exit.
 ///
-/// Runs the parser + `CompiledConfig::from_config` (which surfaces syntax and
-/// structural errors via `anyhow::Error`), then hands the compiled config to
-/// the static analyzer in [`crate::check`]. Diagnostics are rendered with
-/// rustc-style source snippets and carets when the analyzer attached a
-/// span; spanless diagnostics fall back to a one-line `level: message`.
+/// Pipeline:
+/// 1. Load + parse the main config and recursively expand `include`
+///    directives via [`config::load_config_with_source_map`]. Each file
+///    (main + every included file) is registered with a distinct
+///    `file_id` so spans resolve to the correct physical file when the
+///    renderer draws snippet+caret.
+/// 2. Compute and emit the **summary header**: `checking <path>: N
+///    inputs, M outputs, …`. Counts come from the parsed AST so an
+///    include glob that matches zero files is visible (the analyzer
+///    won't report "OK" with 0 pipelines silently).
+/// 3. Compile + validate (surfaces syntax / structural errors).
+/// 4. Run the static analyzer; render every diagnostic with rustc-
+///    style snippet + caret + optional `help:` line.
+/// 5. Emit a footer:
+///    - clean: `<path>: Configuration OK (… ; dataflow check passed)`
+///    - warnings: `<path>: Configuration OK (… ; N warnings, dataflow check passed)`
+///    - errors: `error: N errors found`
 ///
 /// Exit codes:
-/// - `0` — analyzer is clean
+/// - `0` — analyzer is clean (warnings allowed unless `--strict-warnings`)
 /// - `1` — at least one error-level diagnostic
 /// - `2` — `--strict-warnings` set and at least one warning was emitted
 ///   (errors also exit 2 under `--strict-warnings` so CI sees a single
 ///   "non-zero means investigate" signal)
 fn run_check(config_path: &str, strict_warnings: bool) -> Result<()> {
     let path = Path::new(config_path);
-    let source = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read configuration file: {}", path.display()))?;
-    let config = config::load_config(path).context("configuration error")?;
+
+    // Step 1: load + expand includes, building the multi-file SourceMap
+    // alongside the parsed AST. Without this step include-based configs
+    // would be analyzed as the top-level file only, walking 0 pipelines.
+    let (config, source_map) = config::load_config_with_source_map(path)
+        .with_context(|| format!("failed to load {}", path.display()))?;
+
+    // Step 2: definition counts derived from the parsed AST. Emitted
+    // before any diagnostics so the operator sees the scope of what
+    // was checked even if errors follow.
+    let counts = check::DefCounts::from_config(&config);
+    let file_count = source_map.file_count();
+    println!(
+        "checking {}: {} file(s), {} input(s), {} output(s), {} process(es), {} pipeline(s)",
+        path.display(),
+        file_count,
+        counts.inputs,
+        counts.outputs,
+        counts.processes,
+        counts.pipelines,
+    );
+
+    // Step 3: compile + validate. Errors here are syntactic / structural
+    // and bubble up via anyhow; the analyzer only runs on a valid AST.
     let compiled = CompiledConfig::from_config(config)?;
     let mut registry = crate::modules::ModuleRegistry::new();
     crate::modules::register_builtins(&mut registry);
     compiled.validate(&registry)?;
 
-    // Build a single-file SourceMap so the renderer can resolve span
-    // → file:line:col + snippet. The parser tags every span with
-    // file_id = 0 (the only id we register here).
-    let mut source_map = crate::dsl::span::SourceMap::new();
-    source_map.add_file(path.to_path_buf(), source);
-
+    // Step 4: run analyzer + render diagnostics.
     let diagnostics = check::analyze(&compiled, &source_map);
 
     let mut errors = 0usize;
@@ -216,24 +244,43 @@ fn run_check(config_path: &str, strict_warnings: bool) -> Result<()> {
         check::render::render_diagnostic(diag, &source_map);
     }
 
+    // Step 5: footer. Error / warning / clean each have a distinct
+    // shape; the clean path always names the file path so a glob
+    // wrapper (`limpid --check etc/*.conf`) produces one verdict line
+    // per config without losing which one is which.
     if errors > 0 {
+        eprintln!(
+            "error: {}: {} error(s) found ({} warning(s))",
+            path.display(),
+            errors,
+            warnings,
+        );
         if strict_warnings {
             std::process::exit(2);
         }
         std::process::exit(1);
     }
     if strict_warnings && warnings > 0 {
+        eprintln!(
+            "{}: {} warning(s) (dataflow check passed)",
+            path.display(),
+            warnings,
+        );
         eprintln!("note: --strict-warnings is promoting warnings to errors");
         std::process::exit(2);
     }
 
-    println!("Configuration OK");
+    let warn_frag = if warnings > 0 {
+        format!("{} warning(s); ", warnings)
+    } else {
+        String::new()
+    };
     println!(
-        "  {} input(s), {} output(s), {} process(es), {} pipeline(s)",
-        compiled.inputs.len(),
-        compiled.outputs.len(),
-        compiled.processes.len(),
-        compiled.pipelines.len(),
+        "{}: Configuration OK ({} pipeline(s), {} process(es); {}dataflow check passed)",
+        path.display(),
+        counts.pipelines,
+        counts.processes,
+        warn_frag,
     );
 
     Ok(())

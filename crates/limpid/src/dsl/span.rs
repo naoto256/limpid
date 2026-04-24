@@ -98,6 +98,12 @@ impl SourceMap {
         self.add_file(PathBuf::from("<input>"), text)
     }
 
+    /// Number of registered files. Useful for sanity checks (e.g. test
+    /// assertions that include expansion did register every physical file).
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
     /// Look up a registered file's source text by id.
     #[allow(dead_code)]
     pub fn source(&self, file_id: u32) -> Option<&str> {
