@@ -4,6 +4,7 @@ pub mod file;
 pub mod http;
 #[cfg(feature = "kafka")]
 pub mod kafka;
+pub(crate) mod persistent_conn;
 pub mod stdout;
 pub mod tcp;
 pub mod udp;
