@@ -28,12 +28,36 @@
 use anyhow::{Result, bail};
 use serde_json::{Map, Value};
 
-use crate::functions::FunctionRegistry;
 use crate::functions::primitives::parse_json::{apply_defaults, type_name};
 use crate::functions::primitives::val_to_str;
+use crate::functions::{FunctionRegistry, ParserInfo};
+use crate::modules::schema::{FieldSpec, FieldType};
 
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register_in("cef", "parse", |args, _event| parse_impl(args));
+    // CEF header keys are statically known; the extension tail (`src=`
+    // / `dst=` / vendor-specific) is data-driven, so `wildcards = true`.
+    // `cef_severity` is emitted as Int when the field is well-formed
+    // and falls back to String on garbage input — modelled as a Union
+    // so type checks of `workspace.cef_severity == 5` stay silent while
+    // `== "5"` warns.
+    reg.register_parser(ParserInfo {
+        namespace: Some("cef"),
+        name: "parse",
+        produces: vec![
+            FieldSpec::new(&["workspace", "cef_version"], FieldType::String),
+            FieldSpec::new(&["workspace", "cef_device_vendor"], FieldType::String),
+            FieldSpec::new(&["workspace", "cef_device_product"], FieldType::String),
+            FieldSpec::new(&["workspace", "cef_device_version"], FieldType::String),
+            FieldSpec::new(&["workspace", "cef_signature_id"], FieldType::String),
+            FieldSpec::new(&["workspace", "cef_name"], FieldType::String),
+            FieldSpec::new(
+                &["workspace", "cef_severity"],
+                FieldType::Union(vec![FieldType::Int, FieldType::String]),
+            ),
+        ],
+        wildcards: true,
+    });
 }
 
 fn parse_impl(args: &[Value]) -> Result<Value> {
@@ -77,7 +101,15 @@ fn parse_impl(args: &[Value]) -> Result<Value> {
         Value::String(parts[4].to_string()),
     );
     map.insert("cef_name".into(), Value::String(parts[5].to_string()));
-    map.insert("cef_severity".into(), Value::String(parts[6].to_string()));
+    // CEF Severity is a number (0-10 per the spec). Emit as Int when
+    // the field parses cleanly; fall back to the raw string when the
+    // producer sent garbage so existing pipelines don't break, and the
+    // analyzer-side schema is `Union(Int, String)` to match.
+    let severity_value = parts[6]
+        .parse::<i64>()
+        .map(|n| Value::Number(n.into()))
+        .unwrap_or_else(|_| Value::String(parts[6].to_string()));
+    map.insert("cef_severity".into(), severity_value);
 
     parse_cef_extensions(remaining, &mut map);
 
@@ -185,9 +217,26 @@ mod tests {
         assert_eq!(m["cef_device_vendor"], Value::String("Fortinet".into()));
         assert_eq!(m["cef_device_product"], Value::String("FortiGate".into()));
         assert_eq!(m["cef_signature_id"], Value::String("1234".into()));
+        assert_eq!(m["cef_severity"], Value::Number(5.into()));
         assert_eq!(m["src"], Value::String("10.0.0.1".into()));
         assert_eq!(m["dst"], Value::String("10.0.0.2".into()));
         assert_eq!(m["act"], Value::String("deny".into()));
+    }
+
+    #[test]
+    fn severity_falls_back_to_string_on_garbage() {
+        let reg = make_reg();
+        let e = dummy_event();
+        let r = reg
+            .call(
+                Some("cef"),
+                "parse",
+                &[Value::String("CEF:0|V|P|1|1|N|High|".into())],
+                &e,
+            )
+            .unwrap();
+        let Value::Object(m) = r else { panic!() };
+        assert_eq!(m["cef_severity"], Value::String("High".into()));
     }
 
     #[test]

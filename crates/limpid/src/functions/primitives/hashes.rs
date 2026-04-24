@@ -8,10 +8,13 @@ use anyhow::bail;
 use serde_json::Value;
 
 use super::val_to_str;
-use crate::functions::FunctionRegistry;
+use crate::functions::{FunctionRegistry, FunctionSig};
+use crate::modules::schema::FieldType;
 
 pub fn register(reg: &mut FunctionRegistry) {
-    reg.register("md5", |args, _event| {
+    let sig = || FunctionSig::fixed(&[FieldType::String], FieldType::String);
+
+    reg.register_with_sig("md5", sig(), |args, _event| {
         if args.len() != 1 {
             bail!("md5() expects 1 argument");
         }
@@ -21,7 +24,7 @@ pub fn register(reg: &mut FunctionRegistry) {
         Ok(Value::String(format!("{:x}", hash)))
     });
 
-    reg.register("sha1", |args, _event| {
+    reg.register_with_sig("sha1", sig(), |args, _event| {
         if args.len() != 1 {
             bail!("sha1() expects 1 argument");
         }
@@ -31,7 +34,7 @@ pub fn register(reg: &mut FunctionRegistry) {
         Ok(Value::String(format!("{:x}", hash)))
     });
 
-    reg.register("sha256", |args, _event| {
+    reg.register_with_sig("sha256", sig(), |args, _event| {
         if args.len() != 1 {
             bail!("sha256() expects 1 argument");
         }
