@@ -40,6 +40,7 @@
 
 - [CLI](./operations/cli.md)
 - [Debug Tap](./operations/tap.md)
+- [Schema Validation](./operations/schema-validation.md)
 - [Metrics](./operations/metrics.md)
 - [Packaging](./operations/packaging.md)
 - [systemd](./operations/systemd.md)

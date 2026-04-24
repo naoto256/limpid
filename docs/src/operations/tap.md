@@ -132,6 +132,10 @@ jq -c 'select(.timestamp >= "2026-01-01T12:00:00Z" and .timestamp < "2026-01-01T
   replay.jsonl | limpidctl inject input fw_syslog --json --replay-timing
 ```
 
+## Schema validation
+
+limpid does not bundle a schema validator. Composing `tap --json` with an external validator is the supported pattern for CI gates and production schema-drift monitoring — see [Schema Validation](./schema-validation.md).
+
 ## Metrics
 
 ```bash
