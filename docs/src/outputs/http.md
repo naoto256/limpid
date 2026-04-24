@@ -74,6 +74,12 @@ On flush failure, events are returned to the buffer for retry by the queue.
 | `tls { ca "..." }` | Add custom CA for private PKI |
 | `verify false` | Skip all certificate validation |
 
+> **Warning**: `verify false` disables TLS certificate validation entirely — the
+> connection is vulnerable to MITM. limpid emits a loud `WARN` log at startup
+> when this is set. This setting is for debugging against self-signed test
+> endpoints only; **never use it in production**. For private PKI, use
+> `tls { ca "..." }` to trust an internal CA instead.
+
 ## Examples
 
 ### Splunk HEC
@@ -112,7 +118,7 @@ def output loki {
 }
 ```
 
-### Self-signed certificates
+### Self-signed certificates (debugging only)
 
 ```
 def output internal {
@@ -121,3 +127,7 @@ def output internal {
     verify false
 }
 ```
+
+`verify false` disables certificate validation entirely. Prefer pointing to an
+internal CA via `tls { ca "..." }` for private PKI — that keeps the connection
+authenticated.
