@@ -275,6 +275,27 @@ workspace.src_hash = sha256(workspace.src)
 
 Useful for event deduplication, fingerprinting, or anonymisation.
 
+## Type coercion
+
+### to_int(value)
+
+Coerces a value to a 64-bit signed integer. Returns `null` on unparseable input, matching the partial-data policy of `regex_extract` and `table_lookup`.
+
+```
+workspace.src_endpoint.port = to_int(workspace.spt)  // CEF ext: "54321" → 54321
+```
+
+| Input | Result |
+|-------|--------|
+| `Int` | Pass-through |
+| `Float` | Truncated toward zero |
+| `String` | `str::parse::<i64>` after trimming whitespace; otherwise `null` |
+| `Bool` | `1` or `0` |
+| `Null` | `Null` |
+| Array / Object | `Null` |
+
+Motivation: CEF extension values and CSV column values arrive as strings even when carrying numeric content. OCSF schemas commonly require `Integer` for those same fields (ports, session IDs, byte counts). `to_int` is the schema-agnostic cast used by SIEM parser snippets.
+
 ## Serialization
 
 ### to_json() / to_json(value)
