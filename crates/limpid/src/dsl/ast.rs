@@ -20,11 +20,6 @@ pub struct Config {
 #[derive(Debug, Clone)]
 pub struct GlobalBlock {
     pub name: String,
-    /// Source span of the definition's `name` token. Held for future
-    /// `--graph` and "duplicate definition" diagnostics; not yet read
-    /// by the analyzer at this commit.
-    #[allow(dead_code)]
-    pub name_span: Option<Span>,
     pub properties: Vec<Property>,
 }
 
@@ -44,52 +39,32 @@ pub enum Definition {
 #[derive(Debug, Clone)]
 pub struct InputDef {
     pub name: String,
-    /// Source span of the definition's `name` token. Held for future
-    /// `--graph` and "duplicate definition" diagnostics; not yet read
-    /// by the analyzer at this commit.
-    #[allow(dead_code)]
-    pub name_span: Option<Span>,
     pub properties: Vec<Property>,
 }
 
 #[derive(Debug, Clone)]
 pub struct OutputDef {
     pub name: String,
-    /// Source span of the definition's `name` token. Held for future
-    /// `--graph` and "duplicate definition" diagnostics; not yet read
-    /// by the analyzer at this commit.
-    #[allow(dead_code)]
-    pub name_span: Option<Span>,
     pub properties: Vec<Property>,
 }
 
 /// A key-value property or nested block inside input/output definitions.
 ///
-/// `key_span` points at the property key (used in
-/// `output 'o' property 'path'` diagnostics). `value_span` covers the
-/// whole value expression — the analyzer uses it to position a caret
-/// when a reference inside that value is unresolved. Both are
-/// `Option<Span>` so test code that hand-constructs AST nodes need not
-/// invent spans.
+/// `value_span` covers the whole value expression — the analyzer uses
+/// it to position a caret when a reference inside that value is
+/// unresolved. `Option<Span>` so test code that hand-constructs AST
+/// nodes need not invent spans.
 #[derive(Debug, Clone)]
 pub enum Property {
     /// `key value`  e.g. `type syslog_udp`, `bind "0.0.0.0:514"`
     KeyValue {
         key: String,
-        /// Source span of the property's key. Reserved for future
-        /// duplicate-key / unknown-key diagnostics.
-        #[allow(dead_code)]
-        key_span: Option<Span>,
         value: Expr,
         value_span: Option<Span>,
     },
     /// `key { ... }` e.g. `tls { cert "..." }`, `queue { type disk }`
     Block {
         key: String,
-        /// Source span of the block's key. Reserved for future
-        /// duplicate-key diagnostics.
-        #[allow(dead_code)]
-        key_span: Option<Span>,
         properties: Vec<Property>,
     },
 }
@@ -101,11 +76,6 @@ pub enum Property {
 #[derive(Debug, Clone)]
 pub struct ProcessDef {
     pub name: String,
-    /// Source span of the definition's `name` token. Held for future
-    /// `--graph` and "duplicate definition" diagnostics; not yet read
-    /// by the analyzer at this commit.
-    #[allow(dead_code)]
-    pub name_span: Option<Span>,
     pub body: Vec<ProcessStatement>,
 }
 
@@ -142,11 +112,6 @@ pub enum ProcessStatement {
 #[derive(Debug, Clone)]
 pub struct PipelineDef {
     pub name: String,
-    /// Source span of the definition's `name` token. Held for future
-    /// `--graph` and "duplicate definition" diagnostics; not yet read
-    /// by the analyzer at this commit.
-    #[allow(dead_code)]
-    pub name_span: Option<Span>,
     pub body: Vec<PipelineStatement>,
 }
 
