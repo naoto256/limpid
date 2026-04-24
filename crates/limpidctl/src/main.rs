@@ -119,6 +119,18 @@ enum TapKind {
 }
 
 fn main() {
+    // Restore the default SIGPIPE disposition so writes to a closed
+    // downstream pipe terminate the process via signal instead of
+    // panicking from the stdio writer. Rust installs `SIG_IGN` for
+    // SIGPIPE by default, which turns the broken-pipe condition into
+    // an `EPIPE` that the println!/print! infrastructure escalates to
+    // a panic — ugly for `limpidctl stats | head`. Matches what
+    // ripgrep / fd / bat do.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let cli = Cli::parse();
 
     match cli.command {

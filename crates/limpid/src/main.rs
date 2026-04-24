@@ -56,6 +56,17 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
+    // Restore the default SIGPIPE disposition for the CLI-style modes
+    // (`--check`, `--test-pipeline`) which write to stdout and may be
+    // piped through `head`/`less`. Daemon mode doesn't write structured
+    // stdout, so this is a no-op there. Without this, the Rust default
+    // (`SIG_IGN`) turns a closed downstream pipe into an `EPIPE` that
+    // the println! infrastructure escalates into a panic.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let cli = Cli::parse();
 
     // Initialize tracing
