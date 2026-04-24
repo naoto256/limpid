@@ -34,6 +34,7 @@ pub mod len;
 pub mod lower;
 pub mod parse_json;
 pub mod parse_kv;
+pub mod prepend;
 pub mod regex_extract;
 pub mod regex_match;
 pub mod regex_parse;
@@ -66,6 +67,7 @@ pub fn register(reg: &mut FunctionRegistry, table_store: TableStore) {
     strftime::register(reg);
     parse_json::register(reg);
     parse_kv::register(reg);
+    prepend::register(reg);
 }
 
 // ---------------------------------------------------------------------------
