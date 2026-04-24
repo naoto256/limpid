@@ -97,13 +97,30 @@ impl CompiledConfig {
 
     fn validate_pipeline_stmt(&self, pipeline_name: &str, stmt: &PipelineStatement) -> Result<()> {
         match stmt {
-            PipelineStatement::Input(input_name) => {
-                if !self.inputs.contains_key(input_name) {
+            PipelineStatement::Input(input_names) => {
+                if input_names.is_empty() {
                     bail!(
-                        "pipeline '{}': references unknown input '{}'",
-                        pipeline_name,
-                        input_name
+                        "pipeline '{}': input statement has no input names",
+                        pipeline_name
                     );
+                }
+                // Detect duplicate names within a single `input a, b, ...` statement.
+                let mut seen = std::collections::HashSet::new();
+                for input_name in input_names {
+                    if !self.inputs.contains_key(input_name) {
+                        bail!(
+                            "pipeline '{}': references unknown input '{}'",
+                            pipeline_name,
+                            input_name
+                        );
+                    }
+                    if !seen.insert(input_name.as_str()) {
+                        bail!(
+                            "pipeline '{}': input '{}' listed more than once",
+                            pipeline_name,
+                            input_name
+                        );
+                    }
                 }
             }
             PipelineStatement::Output(output_name) => {
@@ -505,4 +522,76 @@ fn exec_pipeline_branch_body(
         }
     }
     Ok((Some(event), PipelineTermination::Finished))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsl::parser::parse_config;
+
+    fn compile(src: &str) -> Result<CompiledConfig> {
+        CompiledConfig::from_config(parse_config(src)?)
+    }
+
+    #[test]
+    fn validate_rejects_unknown_input_in_fan_in() {
+        let src = r#"
+def input a { type syslog_udp bind "0.0.0.0:5140" }
+def output o { type file path "/tmp/x.log" }
+def pipeline p {
+    input a, missing
+    output o
+    drop
+}
+"#;
+        let cfg = compile(src).unwrap();
+        let err = cfg
+            .validate(&ModuleRegistry::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown input 'missing'"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_input_in_fan_in() {
+        let src = r#"
+def input a { type syslog_udp bind "0.0.0.0:5140" }
+def output o { type file path "/tmp/x.log" }
+def pipeline p {
+    input a, a
+    output o
+    drop
+}
+"#;
+        let cfg = compile(src).unwrap();
+        let err = cfg
+            .validate(&ModuleRegistry::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("listed more than once"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_accepts_fan_in_when_all_inputs_exist() {
+        let src = r#"
+def input a { type syslog_udp bind "0.0.0.0:5140" }
+def input b { type syslog_udp bind "0.0.0.0:5141" }
+def output o { type file path "/tmp/x.log" }
+def pipeline p {
+    input a, b
+    output o
+    drop
+}
+"#;
+        let cfg = compile(src).unwrap();
+        cfg.validate(&ModuleRegistry::new()).unwrap();
+    }
 }

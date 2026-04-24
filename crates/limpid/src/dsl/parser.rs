@@ -258,8 +258,11 @@ fn parse_pipeline_stmt(pair: Pair<Rule>) -> Result<PipelineStatement> {
         Rule::pipeline_drop => Ok(PipelineStatement::Drop),
         Rule::pipeline_finish => Ok(PipelineStatement::Finish),
         Rule::pipeline_input => {
-            let name = first_inner(inner)?.as_str().to_string();
-            Ok(PipelineStatement::Input(name))
+            let names: Vec<String> = inner.into_inner().map(|p| p.as_str().to_string()).collect();
+            if names.is_empty() {
+                bail!("pipeline input statement requires at least one input name");
+            }
+            Ok(PipelineStatement::Input(names))
         }
         Rule::pipeline_output => {
             let name = first_inner(inner)?.as_str().to_string();
@@ -886,6 +889,70 @@ def pipeline test {
                 _ => panic!("expected ProcessChain"),
             },
             _ => panic!("expected Pipeline definition"),
+        }
+    }
+
+    #[test]
+    fn test_parse_pipeline_single_input_backward_compat() {
+        // The legacy single-input form stays valid and lands as a 1-element Vec.
+        let src = r#"
+def pipeline p {
+    input a
+    drop
+}
+"#;
+        let config = parse_config(src).unwrap();
+        match &config.definitions[0] {
+            Definition::Pipeline(def) => match &def.body[0] {
+                PipelineStatement::Input(names) => {
+                    assert_eq!(names, &vec!["a".to_string()]);
+                }
+                _ => panic!("expected Input"),
+            },
+            _ => panic!("expected Pipeline"),
+        }
+    }
+
+    #[test]
+    fn test_parse_pipeline_fan_in_two_inputs() {
+        let src = r#"
+def pipeline ha {
+    input syslog_a, syslog_b
+    drop
+}
+"#;
+        let config = parse_config(src).unwrap();
+        match &config.definitions[0] {
+            Definition::Pipeline(def) => match &def.body[0] {
+                PipelineStatement::Input(names) => {
+                    assert_eq!(names, &vec!["syslog_a".to_string(), "syslog_b".to_string()]);
+                }
+                _ => panic!("expected Input"),
+            },
+            _ => panic!("expected Pipeline"),
+        }
+    }
+
+    #[test]
+    fn test_parse_pipeline_fan_in_three_inputs() {
+        let src = r#"
+def pipeline fanin3 {
+    input a, b, c
+    drop
+}
+"#;
+        let config = parse_config(src).unwrap();
+        match &config.definitions[0] {
+            Definition::Pipeline(def) => match &def.body[0] {
+                PipelineStatement::Input(names) => {
+                    assert_eq!(
+                        names,
+                        &vec!["a".to_string(), "b".to_string(), "c".to_string()]
+                    );
+                }
+                _ => panic!("expected Input"),
+            },
+            _ => panic!("expected Pipeline"),
         }
     }
 

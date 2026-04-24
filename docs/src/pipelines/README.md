@@ -25,6 +25,7 @@ def pipeline main {
 | Statement | Effect |
 |-----------|--------|
 | `input <name>` | Declares the input source |
+| `input <a>, <b>, ...` | Declares multiple input sources (fan-in) |
 | `process <name>` | Runs a process (or chain with `\|`) |
 | `process { ... }` | Inline (anonymous) process |
 | `output <name>` | Copies event to output queue (non-terminal) |
@@ -49,3 +50,24 @@ def pipeline forward {
     output siem
 }
 ```
+
+## Fan-in
+
+Symmetric to fan-out: a single pipeline can subscribe to multiple inputs. List them comma-separated on the `input` line. Events from every listed input are merged at the pipeline entrance and processed by the same body.
+
+```
+def pipeline ha_syslog {
+    input syslog_a, syslog_b        // both feed this pipeline
+    process normalize
+    output siem
+}
+```
+
+Typical use: HA syslog where two relays send the same events to `syslog_a` and `syslog_b`, and the pipeline deduplicates downstream (e.g. via a shared dedup table) — no need to duplicate the whole pipeline body per input.
+
+### Semantics
+
+- **Entrance only.** The `input a, b;` declaration must appear once, at the top of the pipeline. Merging events mid-pipeline is not supported — if you need that, use two pipelines writing to a shared output.
+- **No ordering guarantee.** Events from different inputs are delivered in arrival order on the merged stream. Ordering across inputs is not preserved.
+- **No per-input attribution inside the pipeline.** From the body's perspective, every event looks the same regardless of which input delivered it. If you need to tell inputs apart (for metrics, drops, token-bucket behaviour), do it at the input layer — pipeline metrics aggregate across all subscribed inputs.
+- **`inject` / `tap` stay input-scoped.** `inject input syslog_a` and `tap input syslog_a` still operate on a single input by name; fan-in does not change that contract.

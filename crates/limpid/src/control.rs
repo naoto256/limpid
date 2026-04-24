@@ -293,16 +293,32 @@ fn build_list_json(config: &CompiledConfig) -> String {
         let Some(pipeline_def) = config.pipelines.get(name) else {
             continue;
         };
-        let mut input = None;
+        let mut inputs: Vec<String> = Vec::new();
         let mut processes = Vec::new();
         let mut outputs = Vec::new();
 
-        collect_pipeline_tap_points(&pipeline_def.body, &mut input, &mut processes, &mut outputs);
+        collect_pipeline_tap_points(
+            &pipeline_def.body,
+            &mut inputs,
+            &mut processes,
+            &mut outputs,
+        );
 
         let mut p = Map::new();
         p.insert("name".into(), Value::String(name.clone()));
-        if let Some(inp) = input {
-            p.insert("input".into(), Value::String(inp));
+        // Keep scalar `input` for single-input pipelines (backward-compatible payload),
+        // emit `inputs` array when fan-in is in play.
+        match inputs.len() {
+            0 => {}
+            1 => {
+                p.insert("input".into(), Value::String(inputs.remove(0)));
+            }
+            _ => {
+                p.insert(
+                    "inputs".into(),
+                    Value::Array(inputs.into_iter().map(Value::String).collect()),
+                );
+            }
         }
         p.insert(
             "processes".into(),
@@ -321,14 +337,18 @@ fn build_list_json(config: &CompiledConfig) -> String {
 /// Recursively walk pipeline statements to collect tap points in order.
 fn collect_pipeline_tap_points(
     stmts: &[PipelineStatement],
-    input: &mut Option<String>,
+    inputs: &mut Vec<String>,
     processes: &mut Vec<String>,
     outputs: &mut Vec<String>,
 ) {
     for stmt in stmts {
         match stmt {
-            PipelineStatement::Input(name) => {
-                *input = Some(name.clone());
+            PipelineStatement::Input(names) => {
+                for name in names {
+                    if !inputs.contains(name) {
+                        inputs.push(name.clone());
+                    }
+                }
             }
             PipelineStatement::ProcessChain(chain) => {
                 for elem in chain {
@@ -358,7 +378,7 @@ fn collect_pipeline_tap_points(
                             _ => None,
                         })
                         .collect();
-                    collect_pipeline_tap_points(&stmts, input, processes, outputs);
+                    collect_pipeline_tap_points(&stmts, inputs, processes, outputs);
                 }
                 if let Some(else_body) = &chain.else_body {
                     let stmts: Vec<PipelineStatement> = else_body
@@ -368,7 +388,7 @@ fn collect_pipeline_tap_points(
                             _ => None,
                         })
                         .collect();
-                    collect_pipeline_tap_points(&stmts, input, processes, outputs);
+                    collect_pipeline_tap_points(&stmts, inputs, processes, outputs);
                 }
             }
             PipelineStatement::Switch(_, arms) => {
@@ -381,7 +401,7 @@ fn collect_pipeline_tap_points(
                             _ => None,
                         })
                         .collect();
-                    collect_pipeline_tap_points(&stmts, input, processes, outputs);
+                    collect_pipeline_tap_points(&stmts, inputs, processes, outputs);
                 }
             }
             PipelineStatement::Drop | PipelineStatement::Finish => {}
