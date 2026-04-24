@@ -29,6 +29,7 @@
   - [Expression Functions](./processing/functions.md)
   - [String Templates](./processing/templates.md)
   - [User-defined Processes](./processing/user-defined.md)
+  - [Process Design Guide](./processing/design-guide.md)
 - [Pipelines](./pipelines/README.md)
   - [Routing](./pipelines/routing.md)
   - [drop and finish](./pipelines/drop-finish.md)

@@ -16,6 +16,7 @@ Earlier 0.x releases shipped a handful of native process modules (`process parse
 | Available functions and their signatures | [Expression Functions](./functions.md) |
 | `${...}` interpolation in any string literal | [String Templates](./templates.md) |
 | Defining a process, control flow, `let`, `drop` | [User-defined Processes](./user-defined.md) |
+| Writing maintainable processes and snippet conventions | [Process Design Guide](./design-guide.md) |
 
 ## Process chains
 
