@@ -187,8 +187,31 @@ fn exec_process_stmt(
         }
 
         ProcessStatement::ExprStmt(expr) => {
-            // Evaluate for side effects, discard result
-            let _ = eval_expr_with_scope(expr, &event, funcs, scope)?;
+            // Bare expression statement.
+            //
+            // - Object return → merge top-level keys into event.workspace
+            //   (same semantic the old built-in parser processes had, now
+            //   delivered by pure DSL functions like `parse_json(egress)`
+            //   or `syslog.parse(ingress)`).
+            // - Null return → silently accepted (for side-effect-only
+            //   functions such as `table_upsert()` that don't produce a
+            //   meaningful value).
+            // - Anything else → error. Writing `to_json()` or
+            //   `contains(...)` as a bare statement discards the result
+            //   and is almost always a bug.
+            let result = eval_expr_with_scope(expr, &event, funcs, scope)?;
+            match result {
+                Value::Object(map) => {
+                    for (k, v) in map {
+                        event.workspace.insert(k, v);
+                    }
+                }
+                Value::Null => {}
+                other => bail!(
+                    "bare expression statement must return Object or Null; got {}",
+                    value_type_name(&other)
+                ),
+            }
             Ok(ExecResult::Continue(event))
         }
     }
@@ -347,6 +370,17 @@ fn set_workspace_path(
 
     if let Value::Object(map) = entry {
         set_object_path(map, &path[1..], value);
+    }
+}
+
+fn value_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "Null",
+        Value::Bool(_) => "Bool",
+        Value::Number(_) => "Number",
+        Value::String(_) => "String",
+        Value::Array(_) => "Array",
+        Value::Object(_) => "Object",
     }
 }
 
