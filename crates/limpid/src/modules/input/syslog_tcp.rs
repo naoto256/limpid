@@ -17,7 +17,7 @@ use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::event::Event;
 use crate::metrics::InputMetrics;
-use crate::modules::{FromProperties, HasMetrics, Input};
+use crate::modules::{HasMetrics, Input, Module, ModuleSchema};
 
 /// Maximum size of a single syslog message (bytes).
 /// RFC 5424 recommends supporting at least 2048; we allow up to 1 MiB.
@@ -61,7 +61,11 @@ pub struct SyslogTcpInput {
     metrics: Arc<InputMetrics>,
 }
 
-impl FromProperties for SyslogTcpInput {
+impl Module for SyslogTcpInput {
+    fn schema() -> ModuleSchema {
+        ModuleSchema::default()
+    }
+
     fn from_properties(_name: &str, properties: &[Property]) -> anyhow::Result<Self> {
         let bind =
             props::get_string(properties, "bind").unwrap_or_else(|| "0.0.0.0:514".to_string());

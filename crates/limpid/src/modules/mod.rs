@@ -10,6 +10,9 @@
 pub mod input;
 pub mod output;
 pub mod process;
+pub mod schema;
+
+pub use schema::ModuleSchema;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,8 +32,27 @@ pub enum ProcessError {
     Failed(String),
 }
 
-/// All modules must be constructable from DSL properties.
-pub trait FromProperties: Sized {
+/// Common trait for every limpid module (input, output).
+///
+/// Absorbs the old `FromProperties` so that construction and schema
+/// declaration live together: both are facets of "what this module is".
+///
+/// `schema()` is required — no default implementation. Every module must
+/// declare its data contract up front. This feeds the static dataflow
+/// checker under `crates/limpid/src/check/` (v0.4.0 Block 9).
+///
+/// Note: `schema()` currently has no in-tree consumer — it's invoked by
+/// the forthcoming analyzer. The `#[allow(dead_code)]` on the return
+/// type (in `schema.rs`) silences the dead-code warning until that
+/// lands.
+///
+/// Process modules are intentionally not included in this trait: native
+/// processes will be removed entirely in v0.3.0 Block 4 in favour of
+/// DSL functions (`syslog.parse` etc.), so a `Process` trait would be
+/// churn for no gain.
+pub trait Module: Sized {
+    #[allow(dead_code)]
+    fn schema() -> ModuleSchema;
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self>;
 }
 
@@ -41,7 +63,7 @@ pub trait HasMetrics {
 }
 
 #[async_trait::async_trait]
-pub trait Input: FromProperties + HasMetrics<Stats = InputMetrics> + Send + 'static {
+pub trait Input: Module + HasMetrics<Stats = InputMetrics> + Send + 'static {
     async fn run(
         self,
         tx: mpsc::Sender<Event>,
@@ -50,9 +72,7 @@ pub trait Input: FromProperties + HasMetrics<Stats = InputMetrics> + Send + 'sta
 }
 
 #[async_trait::async_trait]
-pub trait Output:
-    FromProperties + HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static
-{
+pub trait Output: Module + HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     async fn write(&self, event: &Event) -> Result<()>;
 }
 

@@ -33,7 +33,7 @@ use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
-use crate::modules::{FromProperties, HasMetrics, Output};
+use crate::modules::{HasMetrics, Module, ModuleSchema, Output};
 
 pub struct FileOutput {
     path_template: String,
@@ -46,7 +46,11 @@ pub struct FileOutput {
     metrics: Arc<OutputMetrics>,
 }
 
-impl FromProperties for FileOutput {
+impl Module for FileOutput {
+    fn schema() -> ModuleSchema {
+        ModuleSchema::default()
+    }
+
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
         let path = props::get_string(properties, "path")
             .ok_or_else(|| anyhow::anyhow!("output '{}': file requires 'path'", name))?;

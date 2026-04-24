@@ -25,7 +25,7 @@ use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::event::Event;
 use crate::metrics::InputMetrics;
-use crate::modules::{FromProperties, HasMetrics, Input};
+use crate::modules::{HasMetrics, Input, Module, ModuleSchema};
 
 /// Default poll interval.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -40,7 +40,11 @@ pub struct TailInput {
     metrics: Arc<InputMetrics>,
 }
 
-impl FromProperties for TailInput {
+impl Module for TailInput {
+    fn schema() -> ModuleSchema {
+        ModuleSchema::default()
+    }
+
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
         let path = props::get_string(properties, "path")
             .ok_or_else(|| anyhow::anyhow!("input '{}': tail requires 'path'", name))?;

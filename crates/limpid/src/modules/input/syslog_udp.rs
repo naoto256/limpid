@@ -15,7 +15,7 @@ use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::event::Event;
 use crate::metrics::InputMetrics;
-use crate::modules::{FromProperties, HasMetrics, Input};
+use crate::modules::{HasMetrics, Input, Module, ModuleSchema};
 
 pub struct SyslogUdpInput {
     pub bind_addr: String,
@@ -23,7 +23,11 @@ pub struct SyslogUdpInput {
     metrics: Arc<InputMetrics>,
 }
 
-impl FromProperties for SyslogUdpInput {
+impl Module for SyslogUdpInput {
+    fn schema() -> ModuleSchema {
+        ModuleSchema::default()
+    }
+
     fn from_properties(_name: &str, properties: &[Property]) -> Result<Self> {
         let bind =
             props::get_string(properties, "bind").unwrap_or_else(|| "0.0.0.0:514".to_string());
