@@ -200,6 +200,116 @@ fn check_expands_includes_in_summary() {
     assert!(stdout.contains("Configuration OK"), "stdout: {}", stdout);
 }
 
+// ---------------------------------------------------------------------------
+// --graph flag (Block 11-B)
+// ---------------------------------------------------------------------------
+
+fn run_check_with_graph(config: &std::path::Path, graph_arg: &str) -> std::process::Output {
+    let mut cmd = Command::new(limpid_bin());
+    cmd.arg("--check").arg("--config").arg(config);
+    if graph_arg == "--graph" {
+        cmd.arg("--graph");
+    } else {
+        cmd.arg(graph_arg);
+    }
+    cmd.output().expect("failed to spawn limpid")
+}
+
+fn graph_conf(dir: &TempDir) -> std::path::PathBuf {
+    let conf = dir.path().join("g.conf");
+    fs::write(
+        &conf,
+        r#"
+def input a { type tcp bind "0.0.0.0:514" }
+def input b { type udp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def process parse { workspace.x = "y" }
+def pipeline p {
+    input a, b
+    process parse
+    output o
+}
+"#,
+    )
+    .unwrap();
+    conf
+}
+
+#[test]
+fn graph_bare_flag_defaults_to_mermaid_on_stdout() {
+    let dir = TempDir::new().unwrap();
+    let conf = graph_conf(&dir);
+
+    let out = run_check_with_graph(&conf, "--graph");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    // Graph lands on stdout alongside the summary / footer.
+    assert!(stdout.contains("flowchart LR"), "stdout: {}", stdout);
+    assert!(
+        stdout.contains("subgraph p[\"pipeline p\"]"),
+        "stdout: {}",
+        stdout
+    );
+    assert!(stdout.contains("\"input a\""), "stdout: {}", stdout);
+    assert!(stdout.contains("\"input b\""), "stdout: {}", stdout);
+    assert!(stdout.contains("\"process parse\""), "stdout: {}", stdout);
+    assert!(stdout.contains("\"output o\""), "stdout: {}", stdout);
+}
+
+#[test]
+fn graph_dot_format() {
+    let dir = TempDir::new().unwrap();
+    let conf = graph_conf(&dir);
+
+    let out = run_check_with_graph(&conf, "--graph=dot");
+    assert!(out.status.success());
+
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("digraph {"), "stdout: {}", stdout);
+    assert!(stdout.contains("rankdir=LR;"), "stdout: {}", stdout);
+    assert!(
+        stdout.contains("subgraph cluster_p {"),
+        "stdout: {}",
+        stdout
+    );
+    assert!(stdout.contains(" -> "), "stdout: {}", stdout);
+}
+
+#[test]
+fn graph_ascii_format() {
+    let dir = TempDir::new().unwrap();
+    let conf = graph_conf(&dir);
+
+    let out = run_check_with_graph(&conf, "--graph=ascii");
+    assert!(out.status.success());
+
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("pipeline p"), "stdout: {}", stdout);
+    assert!(stdout.contains("inputs: a, b"), "stdout: {}", stdout);
+    assert!(stdout.contains("process parse"), "stdout: {}", stdout);
+    assert!(stdout.contains("└─ "), "stdout: {}", stdout);
+}
+
+#[test]
+fn graph_unknown_format_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let conf = graph_conf(&dir);
+
+    let out = run_check_with_graph(&conf, "--graph=svg");
+    assert!(!out.status.success(), "should fail");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("unknown graph format") && stderr.contains("mermaid, dot, ascii"),
+        "stderr: {}",
+        stderr
+    );
+}
+
 #[test]
 fn check_self_inclusion_is_rejected() {
     let dir = TempDir::new().unwrap();

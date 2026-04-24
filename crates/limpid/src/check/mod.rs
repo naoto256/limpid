@@ -34,6 +34,7 @@
 pub mod bindings;
 mod control_flow;
 pub mod expr_types;
+pub mod graph;
 mod outputs;
 mod parser_effects;
 pub mod render;
