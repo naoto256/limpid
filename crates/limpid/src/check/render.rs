@@ -16,27 +16,17 @@ use std::io::{self, Write};
 
 use crate::dsl::span::SourceMap;
 
-use super::{Diagnostic, Level};
+use super::{DiagKind, Diagnostic, Level};
 
 /// Categorical tag printed in square brackets after `error:` /
-/// `warning:`. A cheap message-content heuristic — the alternative
-/// (threading a `Kind` enum through every emission site) buys nothing
-/// for the handful of categories we actually distinguish.
+/// `warning:`. Derived from the structured [`DiagKind`] carried on every
+/// diagnostic, so adding a new message variant never requires touching
+/// this function.
 fn category_of(d: &Diagnostic) -> &'static str {
-    let m = d.message.as_str();
-    if m.contains("not produced by any upstream") || m.contains("never produced upstream") {
-        "dataflow"
-    } else if m.contains("comparison `")
-        || m.contains("ordering comparison")
-        || m.contains("arithmetic")
-        || m.contains(" between ")
-        || m.contains("function `")
-    {
-        "type"
-    } else if m.contains("overwrites an Object") {
-        "shape"
-    } else {
-        "check"
+    match d.kind {
+        DiagKind::UnknownIdent | DiagKind::Dataflow => "dataflow",
+        DiagKind::TypeMismatch => "type",
+        DiagKind::Other => "check",
     }
 }
 
@@ -226,7 +216,8 @@ mod tests {
 
     #[test]
     fn category_dataflow_for_workspace_ref() {
-        let d = Diagnostic::error(
+        let d = Diagnostic::error_kind(
+            DiagKind::UnknownIdent,
             "[pipeline p] output `o` references `workspace.x` which is not produced by any upstream module",
         );
         assert_eq!(category_of(&d), "dataflow");
@@ -234,17 +225,20 @@ mod tests {
 
     #[test]
     fn category_type_for_function_arg_warning() {
-        let d =
-            Diagnostic::warning("[pipeline p] function `lower` argument 1 expects String, got Int");
+        let d = Diagnostic::warning_kind(
+            DiagKind::TypeMismatch,
+            "[pipeline p] function `lower` argument 1 expects String, got Int",
+        );
         assert_eq!(category_of(&d), "type");
     }
 
     #[test]
-    fn category_shape_for_object_overwrite() {
-        let d = Diagnostic::warning(
+    fn category_dataflow_for_object_overwrite() {
+        let d = Diagnostic::warning_kind(
+            DiagKind::Dataflow,
             "[pipeline p] assignment to `workspace.geo` overwrites an Object with String; nested references will become dead",
         );
-        assert_eq!(category_of(&d), "shape");
+        assert_eq!(category_of(&d), "dataflow");
     }
 
     #[test]
@@ -252,7 +246,8 @@ mod tests {
         let src = "abc workspace.x def\n";
         let map = sm(src);
         // span over `workspace.x` (offsets 4..15)
-        let d = Diagnostic::error(
+        let d = Diagnostic::error_kind(
+            DiagKind::UnknownIdent,
             "[pipeline p] output `o` references `workspace.x` which is not produced by any upstream module",
         )
         .with_span(Some(Span::new(0, 4, 15)));
