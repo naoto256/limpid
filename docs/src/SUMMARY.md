@@ -35,6 +35,8 @@
   - [drop and finish](./pipelines/drop-finish.md)
   - [Examples](./pipelines/examples.md)
   - [Multi-host Pipeline Example](./pipelines/multi-host.md)
+- [Snippet Library](./snippets/README.md)
+  - [Authoring Conventions](./snippets/conventions.md)
 
 # Operations
 
