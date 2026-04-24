@@ -518,6 +518,146 @@ mod tests {
         assert!(err.to_string().contains("2 to 3 arguments"));
     }
 
+    // ---- central arity validation ----------------------------------------
+    //
+    // Every function with a registered `FunctionSig` goes through
+    // `validate_arity` before dispatch. These tests pin the behaviour of
+    // each Arity variant plus the error message format so the consolidated
+    // path cannot silently regress.
+
+    #[test]
+    fn arity_fixed_accepts_exact_arg_count() {
+        let reg = make_registry();
+        let e = dummy_event();
+        // `contains(String, String) -> Bool` is Arity::Fixed with 2 args.
+        let ok = reg.call(
+            None,
+            "contains",
+            &[Value::String("hello".into()), Value::String("ell".into())],
+            &e,
+        );
+        assert!(ok.is_ok(), "fixed arity with correct count should succeed");
+    }
+
+    #[test]
+    fn arity_fixed_rejects_too_few_args() {
+        let reg = make_registry();
+        let e = dummy_event();
+        let err = reg
+            .call(None, "contains", &[Value::String("hello".into())], &e)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("contains() expects 2 arguments, got 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn arity_fixed_rejects_too_many_args() {
+        let reg = make_registry();
+        let e = dummy_event();
+        let err = reg
+            .call(
+                None,
+                "contains",
+                &[
+                    Value::String("a".into()),
+                    Value::String("b".into()),
+                    Value::String("c".into()),
+                ],
+                &e,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("contains() expects 2 arguments, got 3"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn arity_fixed_singular_message_for_single_arg() {
+        // `to_int(x) -> Int` is Arity::Fixed with 1 arg — verify the
+        // message uses "1 argument" (singular) rather than "1 arguments".
+        let reg = make_registry();
+        let e = dummy_event();
+        let err = reg
+            .call(None, "to_int", &[], &e)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("to_int() expects 1 argument, got 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn arity_optional_accepts_min_and_max() {
+        // `strftime(value, fmt[, tz])` — Optional { required: 2 }, max 3.
+        let reg = make_registry();
+        let e = dummy_event();
+        let ts = Value::String("2026-04-19T10:30:45+00:00".into());
+        let fmt = Value::String("%H:%M".into());
+        let tz = Value::String("UTC".into());
+        // at minimum
+        assert!(reg.call(None, "strftime", &[ts.clone(), fmt.clone()], &e).is_ok());
+        // at maximum
+        assert!(reg.call(None, "strftime", &[ts, fmt, tz], &e).is_ok());
+    }
+
+    #[test]
+    fn arity_optional_rejects_below_min_and_above_max() {
+        let reg = make_registry();
+        let e = dummy_event();
+        let ts = Value::String("2026-04-19T10:30:45+00:00".into());
+        let fmt = Value::String("%H:%M".into());
+        let tz = Value::String("UTC".into());
+        let err_below = reg
+            .call(None, "strftime", &[ts.clone()], &e)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err_below.contains("2 to 3 arguments, got 1"),
+            "unexpected error: {err_below}"
+        );
+        let err_above = reg
+            .call(
+                None,
+                "strftime",
+                &[ts, fmt, tz.clone(), tz],
+                &e,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err_above.contains("2 to 3 arguments, got 4"),
+            "unexpected error: {err_above}"
+        );
+    }
+
+    #[test]
+    fn arity_check_applies_to_namespaced_functions() {
+        // Namespaced functions registered via `register_in_with_sig` must
+        // go through the same validation path. `syslog.strip_pri` takes 1
+        // argument (Arity::Fixed); too many should be rejected uniformly.
+        let reg = make_registry();
+        let e = dummy_event();
+        let err = reg
+            .call(
+                Some("syslog"),
+                "strip_pri",
+                &[Value::String("x".into()), Value::String("y".into())],
+                &e,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("syslog.strip_pri() expects 1 argument, got 2"),
+            "unexpected error: {err}"
+        );
+    }
+
     // ---- format() ---------------------------------------------------------
 
     #[test]
