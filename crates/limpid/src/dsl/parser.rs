@@ -20,6 +20,7 @@ pub struct LimpidParser;
 /// that need multi-file attribution (the include loader, eventually)
 /// should use [`parse_config_with_file_id`] and feed the matching id
 /// into the [`crate::dsl::span::SourceMap`].
+#[allow(dead_code)] // used extensively by tests; kept public for eventual lib surface
 pub fn parse_config(input: &str) -> Result<Config> {
     parse_config_with_file_id(input, 0)
 }
