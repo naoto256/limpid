@@ -114,11 +114,8 @@ type InputFactory = Box<
         + Sync,
 >;
 
-type OutputFactory = Box<
-    dyn Fn(&str, &[Property], Arc<FunctionRegistry>) -> Result<CreatedOutput>
-        + Send
-        + Sync,
->;
+type OutputFactory =
+    Box<dyn Fn(&str, &[Property], Arc<FunctionRegistry>) -> Result<CreatedOutput> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // Registry
@@ -160,7 +157,9 @@ impl ModuleRegistry {
     pub fn register_output<F>(&mut self, type_name: &str, factory: F)
     where
         F: Fn(&str, &[Property], Arc<FunctionRegistry>) -> Result<CreatedOutput>
-            + Send + Sync + 'static,
+            + Send
+            + Sync
+            + 'static,
     {
         self.outputs
             .insert(type_name.to_string(), Box::new(factory));

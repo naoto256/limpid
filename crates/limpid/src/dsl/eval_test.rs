@@ -212,10 +212,7 @@ mod tests {
             TemplateFragment::Literal("[".into()),
             TemplateFragment::Interp(Expr::Ident(vec!["severity".into()])),
             TemplateFragment::Literal("] from ".into()),
-            TemplateFragment::Interp(Expr::Ident(vec![
-                "fields".into(),
-                "src".into(),
-            ])),
+            TemplateFragment::Interp(Expr::Ident(vec!["fields".into(), "src".into()])),
         ]);
         assert_eq!(
             eval_expr(&expr, &e, &f).unwrap(),
@@ -229,10 +226,7 @@ mod tests {
         let f = make_funcs();
         let expr = Expr::Template(vec![
             TemplateFragment::Literal("prefix-".into()),
-            TemplateFragment::Interp(Expr::Ident(vec![
-                "fields".into(),
-                "missing".into(),
-            ])),
+            TemplateFragment::Interp(Expr::Ident(vec!["fields".into(), "missing".into()])),
             TemplateFragment::Literal("-suffix".into()),
         ]);
         assert_eq!(

@@ -290,8 +290,9 @@ pub fn register_builtins(reg: &mut FunctionRegistry, table_store: table::TableSt
         // does `now()`). Treat any parse failure as a loud error — silently
         // producing an empty string on bad input would violate the
         // zero-hidden-behaviour principle.
-        let dt = chrono::DateTime::parse_from_rfc3339(&value)
-            .map_err(|e| anyhow::anyhow!("strftime(): invalid RFC3339 timestamp '{}': {}", value, e))?;
+        let dt = chrono::DateTime::parse_from_rfc3339(&value).map_err(|e| {
+            anyhow::anyhow!("strftime(): invalid RFC3339 timestamp '{}': {}", value, e)
+        })?;
 
         let formatted = match tz.as_deref() {
             None => dt.format(&fmt).to_string(),
