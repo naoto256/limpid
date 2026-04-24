@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio_rustls::rustls::{self, ClientConfig, ServerConfig};
+use tokio_rustls::rustls::{self, ServerConfig};
 
 /// TLS settings parsed from DSL `tls { ... }` block.
 #[derive(Debug, Clone)]
@@ -43,25 +43,6 @@ pub fn build_server_config(tls: &TlsConfig) -> Result<Arc<ServerConfig>> {
             .with_single_cert(certs, key)
             .context("failed to build TLS server config")?
     };
-
-    Ok(Arc::new(config))
-}
-
-/// Build a rustls ClientConfig for a TLS-enabled TCP output.
-#[allow(dead_code)] // for future TLS output support
-pub fn build_client_config(ca_path: Option<&str>) -> Result<Arc<ClientConfig>> {
-    let mut root_store = rustls::RootCertStore::empty();
-
-    if let Some(path) = ca_path {
-        let certs = load_certs(path)?;
-        for cert in certs {
-            root_store.add(cert).context("failed to add CA cert")?;
-        }
-    }
-
-    let config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
 
     Ok(Arc::new(config))
 }
