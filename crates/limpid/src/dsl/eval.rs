@@ -225,8 +225,8 @@ fn resolve_workspace_path(parts: &[String], value: &Value) -> Result<Value> {
 
 fn eval_bin_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
     match op {
-        BinOp::Eq => Ok(Value::Bool(values_equal(left, right))),
-        BinOp::Ne => Ok(Value::Bool(!values_equal(left, right))),
+        BinOp::Eq => Ok(Value::Bool(values_match(left, right))),
+        BinOp::Ne => Ok(Value::Bool(!values_match(left, right))),
         BinOp::Lt => Ok(Value::Bool(
             compare_values(left, right) == Some(std::cmp::Ordering::Less),
         )),
@@ -280,6 +280,10 @@ fn eval_unary_op(op: UnaryOp, val: &Value) -> Result<Value> {
 // Value helpers
 // ---------------------------------------------------------------------------
 
+/// Value equality used for both the `==`/`!=` binary operators and
+/// `switch` pattern matching. Numbers compare by their `f64` value so
+/// `1` and `1.0` agree; strings and other shapes fall through to the
+/// structural `PartialEq` impl.
 pub fn values_match(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::String(a), Value::String(b)) => a == b,
@@ -313,14 +317,6 @@ fn value_to_f64(v: &Value) -> f64 {
         Value::String(s) => s.parse().unwrap_or(0.0),
         Value::Bool(true) => 1.0,
         _ => 0.0,
-    }
-}
-
-fn values_equal(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Number(a), Value::Number(b)) => a.as_f64() == b.as_f64(),
-        (Value::String(a), Value::String(b)) => a == b,
-        _ => left == right,
     }
 }
 
