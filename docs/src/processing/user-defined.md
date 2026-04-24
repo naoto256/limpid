@@ -8,11 +8,11 @@ You can define custom processes using the DSL. They compose built-in processes, 
 def process enrich {
     process parse_kv
 
-    if fields.srcip != null {
-        fields.geo = geoip(fields.srcip)
+    if workspace.srcip != null {
+        workspace.geo = geoip(workspace.srcip)
     }
 
-    message = format("%{devname} %{srcip} -> %{dstip} %{action}")
+    egress = format("%{devname} %{srcip} -> %{dstip} %{action}")
 }
 ```
 
@@ -20,40 +20,40 @@ def process enrich {
 
 | Target | Effect |
 |--------|--------|
-| `message = expr` | Replace message content |
-| `facility = expr` | Set facility (0-23) and rewrite `<PRI>` in message |
-| `severity = expr` | Set severity (0-7) and rewrite `<PRI>` in message |
-| `fields.xxx = expr` | Set a field (nested: `fields.geo.country = "JP"`) |
+| `egress = expr` | Replace the bytes the output will write |
+| `facility = expr` | Set facility (0-23) and rewrite `<PRI>` in `egress` |
+| `severity = expr` | Set severity (0-7) and rewrite `<PRI>` in `egress` |
+| `workspace.xxx = expr` | Set a workspace value (nested: `workspace.geo.country = "JP"`) |
 
 ### Important: what is and isn't reflected in output
 
-**`message`** is what gets written by output modules. If you want to change the output, you must change `message`:
+**`egress`** is the byte buffer that output modules write to the wire. If you want to change what gets sent, you must change `egress`:
 
 ```
 // This changes the output:
-message = format("%{hostname}: %{syslog_msg}")
+egress = format("%{hostname}: %{syslog_msg}")
 
 // This does NOT change the output:
-fields.hostname = "new-host"
-// ↑ sets a field value, but the message content is unchanged
+workspace.hostname = "new-host"
+// ↑ sets a workspace value, but `egress` is unchanged
 ```
 
-`fields` is a working space for intermediate values — parsed data, enrichment results, routing decisions. Fields are **not** automatically serialized into the output message. To include field values in the output, explicitly rebuild the message:
+`workspace` is a pipeline-local scratch area for intermediate values — parsed data, enrichment results, routing decisions. Workspace values are **not** automatically serialised into `egress`. To include them in the output, explicitly rebuild `egress`:
 
 ```
-process parse_kv                              // parse into fields
-message = to_json()                           // serialize all fields as JSON
+process parse_kv                             // parse into workspace
+egress = to_json()                           // serialise all workspace values as JSON
 // or
-message = format("%{srcip} -> %{dstip}")     // build a custom format
+egress = format("%{srcip} -> %{dstip}")      // build a custom format
 ```
 
 ### PRI rewriting
 
-`facility` and `severity` are special: assigning to them also rewrites the `<PRI>` header in the message (if one exists). This is the only case where a metadata assignment automatically modifies the message content.
+`facility` and `severity` are special: assigning to them also rewrites the `<PRI>` header in `egress` (if one exists). This is the only case where a metadata assignment automatically modifies `egress`.
 
 ```
 def process ama_rewrite {
-    if contains(raw, "CEF:") {
+    if contains(ingress, "CEF:") {
         facility = 16
     } else {
         facility = 17
@@ -68,18 +68,18 @@ def process ama_rewrite {
 
 ```
 if severity <= 3 {
-    fields.priority = "high"
+    workspace.priority = "high"
 } else if severity <= 5 {
-    fields.priority = "medium"
+    workspace.priority = "medium"
 } else {
-    fields.priority = "low"
+    workspace.priority = "low"
 }
 ```
 
 ### switch
 
 ```
-switch fields.device_vendor {
+switch workspace.device_vendor {
     "Fortinet" {
         process parse_kv
     }
@@ -100,17 +100,17 @@ Catches errors from process execution. The error message is available as `error`
 try {
     process parse_json
 } catch {
-    fields.parse_error = error
+    workspace.parse_error = error
 }
 ```
 
 ### foreach
 
-Iterates over an array field. The current item is available as `fields._item`.
+Iterates over an array value in `workspace`. The current item is available as `workspace._item`.
 
 ```
-foreach fields.items {
-    fields.count = fields.count + 1
+foreach workspace.items {
+    workspace.count = workspace.count + 1
 }
 ```
 
@@ -129,7 +129,7 @@ process regex_replace("\\d{3}-\\d{4}", "XXX-XXXX")
 Terminates the event immediately. The event is counted as `events_dropped`:
 
 ```
-if contains(raw, "healthcheck") {
+if contains(ingress, "healthcheck") {
     drop
 }
 ```
@@ -150,6 +150,6 @@ Or chain with built-in processes:
 
 ```
 process strip_pri | enrich | {
-    message = to_json()
+    egress = to_json()
 }
 ```

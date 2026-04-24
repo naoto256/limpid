@@ -30,7 +30,7 @@ def output events {
 | `topic` | yes | — | Target topic name |
 | `compression` | no | `none` | `none`, `gzip`, `snappy`, `lz4`, `zstd` |
 | `acks` | no | `all` | `0` (fire-and-forget), `1` (leader only), `all` (all replicas) |
-| `key` | no | none | Event field to use as partition key |
+| `key` | no | none | Event value to use as partition key |
 | `queue_timeout` | no | `5s` | Max wait when rdkafka's internal queue is full |
 
 ## Partition key
@@ -42,7 +42,7 @@ The `key` property determines which event field is used as the Kafka partition k
 | `source` | Source IP address |
 | `facility` | Facility number |
 | `severity` | Severity number |
-| `fields.xxx` or any name | Named field value (must be a string) |
+| `workspace.xxx` or any name | Named workspace value (must be a string) |
 
 If the specified field is missing or null, the event is sent without a key (round-robin across partitions).
 
@@ -66,7 +66,7 @@ def output siem_kafka {
 def pipeline forward {
     input syslog_udp
     process parse_cef | {
-        message = to_json()
+        egress = to_json()
     }
     output siem_kafka
 }

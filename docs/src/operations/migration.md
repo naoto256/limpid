@@ -39,16 +39,16 @@ sudo dpkg -i limpid_*.deb
 
 | rsyslog | limpid |
 |---------|--------|
-| `if $msg contains 'error' then ...` | `if contains(message, "error") { ... }` |
+| `if $msg contains 'error' then ...` | `if contains(egress, "error") { ... }` |
 | `if $syslogfacility-text == 'local0' then ...` | `if facility == 16 { ... }` |
 | `if $fromhost-ip == '10.0.0.1' then ...` | `if source == "10.0.0.1" { ... }` |
-| `:msg, contains, "DISCARD" stop` | `if contains(raw, "DISCARD") { drop }` |
+| `:msg, contains, "DISCARD" stop` | `if contains(ingress, "DISCARD") { drop }` |
 
 ### Templates
 
 | rsyslog | limpid |
 |---------|--------|
-| `template(name="t" type="string" string="%HOSTNAME% %msg%")` | `message = format("%{hostname} %{message}")` |
+| `template(name="t" type="string" string="%HOSTNAME% %msg%")` | `egress = format("%{hostname} %{egress}")` |
 
 ## Step 3: Stop rsyslog, start limpid
 

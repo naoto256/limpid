@@ -18,14 +18,14 @@ sudo limpidctl tap process parse_cef
 sudo limpidctl list
 ```
 
-By default, tap emits each event's `message` bytes as a line of text. Add `--json` to emit the full Event (timestamp, source, facility, severity, raw, message, fields) as one JSON object per line:
+By default, tap emits each event's `egress` bytes as a line of text. Add `--json` to emit the full Event (timestamp, source, facility, severity, ingress, egress, workspace) as one JSON object per line:
 
 ```bash
 # Full Event JSON, one per line — pipe to jq for inspection
 sudo limpidctl tap output ama --json | jq .
 
-# Extract just severity + message
-sudo limpidctl tap input splunk_udp --json | jq -r '[.severity, .message] | @tsv'
+# Extract just severity + egress
+sudo limpidctl tap input splunk_udp --json | jq -r '[.severity, .egress] | @tsv'
 ```
 
 ## How it works
@@ -42,7 +42,7 @@ Tap points are registered for every input, process, and output. When you connect
 # Only FortiGate events
 sudo limpidctl tap output ama | grep Fortinet
 
-# Only high-severity (raw PRI-prefixed text)
+# Only high-severity (PRI-prefixed text)
 sudo limpidctl tap input syslog | grep -E '<[0-3]>'
 
 # Structured filter via full-Event JSON
@@ -59,7 +59,7 @@ sudo limpidctl tap output siem --json | jq 'select(.severity <= 3)'
 Process injection is not supported: a process by itself has no pipeline context.
 
 ```bash
-# Raw mode — each stdin line becomes one event's message bytes.
+# Raw mode — each stdin line becomes one event's ingress bytes.
 # Source is set to 127.0.0.1:0 (same convention used by the `tail` and `journal` inputs).
 limpidctl inject input fw_syslog < raw.log
 limpidctl inject output ama < messages.log

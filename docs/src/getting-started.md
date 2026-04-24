@@ -100,7 +100,7 @@ limpid --check --config /etc/limpid/limpid.conf
 
 ```bash
 limpid --test-pipeline main --config /etc/limpid/limpid.conf \
-  --input '{"raw": "<134>Apr 15 10:30:00 myhost sshd[1234]: Accepted publickey"}'
+  --input '{"ingress": "<134>Apr 15 10:30:00 myhost sshd[1234]: Accepted publickey"}'
 ```
 
 ### 4. Start the daemon

@@ -9,7 +9,7 @@ def output archive {
 }
 
 def process tag {
-    message = "[${severity}] ${fields.hostname}: ${message}"
+    egress = "[${severity}] ${workspace.hostname}: ${egress}"
 }
 ```
 
@@ -17,7 +17,7 @@ def process tag {
 
 - `${expr}` — evaluate `expr` and splice the result (stringified) into the surrounding string.
 - `\${` — a literal `${`. The backslash escape only takes effect inside interpolated strings; it is harmless elsewhere.
-- `expr` can be anything that's valid in a DSL expression: identifiers, field paths (`fields.geo.country`), function calls (`lower(fields.host)`, `strftime(timestamp, "%Y")`), string concatenation with `+`, even nested string literals.
+- `expr` can be anything that's valid in a DSL expression: identifiers, workspace paths (`workspace.geo.country`), function calls (`lower(workspace.host)`, `strftime(timestamp, "%Y")`), string concatenation with `+`, even nested string literals.
 
 ## Available names
 
@@ -26,8 +26,8 @@ Inside `${...}` you have access to the full event:
 | Name | Meaning |
 |------|---------|
 | `source`, `facility`, `severity`, `timestamp` | Event metadata |
-| `message`, `raw` | Event body |
-| `fields.xxx`, `fields.xxx.yyy` | Named fields (nested lookup is supported) |
+| `egress`, `ingress` | Event byte buffers |
+| `workspace.xxx`, `workspace.xxx.yyy` | Named workspace values (nested lookup is supported) |
 
 All [expression functions](./functions.md) — `strftime`, `lower`, `regex_extract`, `to_json`, `geoip`, and the parsers — are callable from inside `${...}`.
 
@@ -47,17 +47,17 @@ For full control over structured values, wrap them in `to_json(...)` yourself.
 
 ## Sanitisation in file paths
 
-The `file` output's `path` property applies one extra rule on top of normal evaluation: interpolations that dereference `fields.*` directly (e.g. `${fields.hostname}`) have `/`, `\`, and `..` replaced with `_`. This prevents event-supplied field values from escaping the configured directory.
+The `file` output's `path` property applies one extra rule on top of normal evaluation: interpolations that dereference `workspace.*` directly (e.g. `${workspace.hostname}`) have `/`, `\`, and `..` replaced with `_`. This prevents event-supplied workspace values from escaping the configured directory.
 
 ```
 def output per_host {
     type file
-    // fields.hostname is sanitised; ${source} and ${strftime(...)} are not
-    path "/var/log/limpid/${fields.hostname}/${strftime(timestamp, "%Y-%m-%d")}.log"
+    // workspace.hostname is sanitised; ${source} and ${strftime(...)} are not
+    path "/var/log/limpid/${workspace.hostname}/${strftime(timestamp, "%Y-%m-%d")}.log"
 }
 ```
 
-Expressions that *compute* a value from fields (e.g. `${lower(fields.hostname)}`) are **not** auto-sanitised — the rule is deliberately conservative. If you transform a field and still want the guardrail, apply it explicitly (for example with `regex_replace`).
+Expressions that *compute* a value from `workspace` (e.g. `${lower(workspace.hostname)}`) are **not** auto-sanitised — the rule is deliberately conservative. If you transform a workspace value and still want the guardrail, apply it explicitly (for example with `regex_replace`).
 
 ## Relationship to `format()`
 
