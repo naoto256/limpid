@@ -17,6 +17,7 @@
 
 pub mod extract_pri;
 pub mod parse;
+pub(crate) mod pri;
 pub mod set_pri;
 pub mod strip_pri;
 

@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::functions::FunctionRegistry;
 use crate::functions::primitives::val_to_str;
+use crate::functions::syslog::pri::parse_leading_pri;
 
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register_in("syslog", "extract_pri", |args, _event| {
@@ -17,31 +18,10 @@ pub fn register(reg: &mut FunctionRegistry) {
             bail!("syslog.extract_pri() expects 1 argument (input string)");
         }
         let input = val_to_str(&args[0]);
-        Ok(extract(&input)
-            .map(|n| Value::Number(n.into()))
+        Ok(parse_leading_pri(&input)
+            .map(|(n, _)| Value::Number(n.into()))
             .unwrap_or(Value::Null))
     });
-}
-
-pub(crate) fn extract(s: &str) -> Option<u16> {
-    let bytes = s.as_bytes();
-    if bytes.first() != Some(&b'<') {
-        return None;
-    }
-    let limit = bytes.len().min(6);
-    let gt_pos = bytes[..limit].iter().position(|&b| b == b'>')?;
-    if gt_pos < 2 {
-        return None;
-    }
-    let digits = &bytes[1..gt_pos];
-    if !digits.iter().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let n: u16 = std::str::from_utf8(digits).ok()?.parse().ok()?;
-    if n > 191 {
-        return None;
-    }
-    Some(n)
 }
 
 #[cfg(test)]
