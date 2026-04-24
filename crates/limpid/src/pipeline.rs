@@ -9,10 +9,10 @@ use tracing::trace;
 
 use crate::dsl::ast::*;
 use crate::dsl::eval::{eval_expr, is_truthy, values_match};
-use crate::dsl::exec::{ExecResult, ProcessRegistry, exec_process_body};
+use crate::dsl::exec::{ExecResult, ProcessError, ProcessRegistry, exec_process_body};
 use crate::event::Event;
 use crate::functions::FunctionRegistry;
-use crate::modules::{ModuleRegistry, ProcessError};
+use crate::modules::ModuleRegistry;
 use crate::tap::TapRegistry;
 
 // ---------------------------------------------------------------------------
@@ -81,21 +81,21 @@ impl CompiledConfig {
     }
 
     /// Validate cross-references: all referenced inputs, outputs, and processes exist.
-    pub fn validate(&self, builtins: &ModuleRegistry) -> Result<()> {
+    ///
+    /// `_builtins` is kept in the signature for callers that want to
+    /// validate against registered inputs/outputs in the future; process
+    /// names are now resolved exclusively against user-defined DSL
+    /// processes (v0.3.0 Block 4 removed the native process layer).
+    pub fn validate(&self, _builtins: &ModuleRegistry) -> Result<()> {
         for (name, pipeline) in &self.pipelines {
             for stmt in &pipeline.body {
-                self.validate_pipeline_stmt(name, stmt, builtins)?;
+                self.validate_pipeline_stmt(name, stmt)?;
             }
         }
         Ok(())
     }
 
-    fn validate_pipeline_stmt(
-        &self,
-        pipeline_name: &str,
-        stmt: &PipelineStatement,
-        builtins: &ModuleRegistry,
-    ) -> Result<()> {
+    fn validate_pipeline_stmt(&self, pipeline_name: &str, stmt: &PipelineStatement) -> Result<()> {
         match stmt {
             PipelineStatement::Input(input_name) => {
                 if !self.inputs.contains_key(input_name) {
@@ -119,10 +119,12 @@ impl CompiledConfig {
                 for element in chain {
                     if let ProcessChainElement::Named(proc_name, _) = element
                         && !self.processes.contains_key(proc_name)
-                        && !builtins.is_builtin_process(proc_name)
                     {
                         bail!(
-                            "pipeline '{}': references unknown process '{}'",
+                            "pipeline '{}': references unknown process '{}'. \
+                             Built-in processes were removed in v0.3.0 — use a DSL \
+                             function (e.g. `syslog.parse(ingress)` as a statement) \
+                             or define your own with `def process {{ ... }}`.",
                             pipeline_name,
                             proc_name
                         );
@@ -133,14 +135,14 @@ impl CompiledConfig {
                 for (_, body) in &if_chain.branches {
                     for item in body {
                         if let BranchBody::Pipeline(s) = item {
-                            self.validate_pipeline_stmt(pipeline_name, s, builtins)?;
+                            self.validate_pipeline_stmt(pipeline_name, s)?;
                         }
                     }
                 }
                 if let Some(else_body) = &if_chain.else_body {
                     for item in else_body {
                         if let BranchBody::Pipeline(s) = item {
-                            self.validate_pipeline_stmt(pipeline_name, s, builtins)?;
+                            self.validate_pipeline_stmt(pipeline_name, s)?;
                         }
                     }
                 }
@@ -149,7 +151,7 @@ impl CompiledConfig {
                 for arm in arms {
                     for item in &arm.body {
                         if let BranchBody::Pipeline(s) = item {
-                            self.validate_pipeline_stmt(pipeline_name, s, builtins)?;
+                            self.validate_pipeline_stmt(pipeline_name, s)?;
                         }
                     }
                 }
@@ -189,9 +191,13 @@ pub struct PipelineRunResult {
 }
 
 /// A process registry backed by compiled DSL process definitions.
+///
+/// Only user-defined `def process { ... }` blocks resolve here.
+/// Built-in processes were removed in v0.3.0 Block 4 — former native
+/// transforms are now DSL functions (`syslog.parse`, `parse_json`,
+/// `regex_replace`, …) invoked via expression statements.
 struct DslProcessRegistry<'a> {
     processes: &'a HashMap<String, ProcessDef>,
-    builtins: &'a ModuleRegistry,
     funcs: &'a FunctionRegistry,
     tap: Option<&'a TapRegistry>,
 }
@@ -199,13 +205,11 @@ struct DslProcessRegistry<'a> {
 impl<'a> DslProcessRegistry<'a> {
     fn new(
         processes: &'a HashMap<String, ProcessDef>,
-        builtins: &'a ModuleRegistry,
         funcs: &'a FunctionRegistry,
         tap: Option<&'a TapRegistry>,
     ) -> Self {
         Self {
             processes,
-            builtins,
             funcs,
             tap,
         }
@@ -216,28 +220,9 @@ impl ProcessRegistry for DslProcessRegistry<'_> {
     fn call(
         &self,
         name: &str,
-        args: &[Value],
+        _args: &[Value],
         event: Event,
     ) -> std::result::Result<Option<Event>, ProcessError> {
-        // 1. Built-in process modules
-        if self.builtins.is_builtin_process(name) {
-            trace!("process '{}' (builtin): executing", name);
-            let result = self.builtins.call_process(name, args, event);
-            match &result {
-                Ok(e) => {
-                    trace!(
-                        "process '{}': ok, workspace={:?}",
-                        name,
-                        e.workspace.keys().collect::<Vec<_>>()
-                    );
-                    self.emit_tap(name, e);
-                }
-                Err(e) => trace!("process '{}': error: {}", name, e),
-            }
-            return result.map(Some);
-        }
-
-        // 2. User-defined DSL processes
         if let Some(process_def) = self.processes.get(name) {
             trace!("process '{}' (user-defined): executing", name);
             return match exec_process_body(&process_def.body, event, self, self.funcs) {
@@ -254,7 +239,9 @@ impl ProcessRegistry for DslProcessRegistry<'_> {
             };
         }
 
-        // 3. Unknown process — warn and pass through
+        // Unknown process — warn and pass through. Config validation in
+        // `CompiledConfig::validate` catches this up front; this branch
+        // is a safety net for paths that skip validation.
         tracing::warn!(
             "unknown process '{}', passing event through unchanged",
             name
@@ -277,11 +264,10 @@ pub fn run_pipeline(
     pipeline: &PipelineDef,
     event: Event,
     config: &CompiledConfig,
-    builtins: &ModuleRegistry,
     funcs: &FunctionRegistry,
     tap: Option<&TapRegistry>,
 ) -> Result<PipelineRunResult> {
-    let registry = DslProcessRegistry::new(&config.processes, builtins, funcs, tap);
+    let registry = DslProcessRegistry::new(&config.processes, funcs, tap);
     let mut trace_entries = Vec::new();
     let mut outputs = Vec::new();
 

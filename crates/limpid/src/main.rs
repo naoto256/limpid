@@ -198,15 +198,13 @@ fn run_test(config_path: &str, pipeline_name: &str, input_json: Option<&str>) ->
     let mut registry = crate::modules::ModuleRegistry::new();
     crate::modules::register_builtins(&mut registry);
 
+    // `registry` exists only so `compiled.validate` can be reused later
+    // if input/output validation grows — process lookup no longer needs
+    // it (Block 4 removed the native process layer).
+    let _ = &registry;
+
     let event = build_test_event(input_json)?;
-    let result = run_pipeline(
-        pipeline_def,
-        event,
-        &compiled,
-        &registry,
-        &func_registry,
-        None,
-    )?;
+    let result = run_pipeline(pipeline_def, event, &compiled, &func_registry, None)?;
 
     // Display trace
     println!("=== Pipeline: {} ===", pipeline_name);

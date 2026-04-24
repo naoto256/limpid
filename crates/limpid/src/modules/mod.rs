@@ -9,7 +9,6 @@
 
 pub mod input;
 pub mod output;
-pub mod process;
 pub mod schema;
 
 pub use schema::ModuleSchema;
@@ -18,7 +17,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
-use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::dsl::ast::Property;
@@ -26,12 +24,6 @@ use crate::event::Event;
 use crate::functions::FunctionRegistry;
 use crate::metrics::{InputMetrics, OutputMetrics};
 use crate::queue::OutputWriter;
-
-#[derive(Debug, Error)]
-pub enum ProcessError {
-    #[error("process failed: {0}")]
-    Failed(String),
-}
 
 /// Common trait for every limpid module (input, output).
 ///
@@ -47,10 +39,10 @@ pub enum ProcessError {
 /// type (in `schema.rs`) silences the dead-code warning until that
 /// lands.
 ///
-/// Process modules are intentionally not included in this trait: native
-/// processes will be removed entirely in v0.3.0 Block 4 in favour of
-/// DSL functions (`syslog.parse` etc.), so a `Process` trait would be
-/// churn for no gain.
+/// Processes are not modules: v0.3.0 Block 4 removed the native
+/// process layer entirely in favour of DSL functions (`syslog.parse`
+/// etc.) and user-defined `def process { ... }` blocks. Modules are
+/// only inputs and outputs.
 pub trait Module: Sized {
     #[allow(dead_code)]
     fn schema() -> ModuleSchema;
@@ -121,13 +113,9 @@ type OutputFactory =
 // Registry
 // ---------------------------------------------------------------------------
 
-type ProcessFn =
-    Box<dyn Fn(&[serde_json::Value], Event) -> Result<Event, ProcessError> + Send + Sync>;
-
 pub struct ModuleRegistry {
     inputs: HashMap<String, InputFactory>,
     outputs: HashMap<String, OutputFactory>,
-    processes: HashMap<String, ProcessFn>,
 }
 
 impl ModuleRegistry {
@@ -135,7 +123,6 @@ impl ModuleRegistry {
         Self {
             inputs: HashMap::new(),
             outputs: HashMap::new(),
-            processes: HashMap::new(),
         }
     }
 
@@ -180,34 +167,6 @@ impl ModuleRegistry {
         factory(name, properties, tx, shutdown)
     }
 
-    pub fn register_process<F>(&mut self, name: &str, f: F)
-    where
-        F: Fn(&[serde_json::Value], Event) -> Result<Event, ProcessError> + Send + Sync + 'static,
-    {
-        self.processes.insert(name.to_string(), Box::new(f));
-    }
-
-    pub fn is_builtin_process(&self, name: &str) -> bool {
-        self.processes.contains_key(name)
-    }
-
-    pub fn call_process(
-        &self,
-        name: &str,
-        args: &[serde_json::Value],
-        event: Event,
-    ) -> Result<Event, ProcessError> {
-        let f = self
-            .processes
-            .get(name)
-            .ok_or_else(|| ProcessError::Failed(format!("unknown builtin process: {}", name)))?;
-        f(args, event)
-    }
-
-    pub fn process_names(&self) -> Vec<&str> {
-        self.processes.keys().map(|s| s.as_str()).collect()
-    }
-
     pub fn create_output(
         &self,
         type_name: &str,
@@ -247,8 +206,11 @@ pub fn register_builtins(registry: &mut ModuleRegistry) {
     #[cfg(feature = "kafka")]
     register_output_type::<output::kafka::KafkaOutput>(registry, "kafka");
 
-    // Processes
-    process::register_builtins(registry);
+    // No built-in processes — v0.3.0 Block 4 removed the native process
+    // layer. Schema-specific parsers are DSL functions (`syslog.parse`,
+    // `cef.parse`), format primitives are flat functions (`parse_json`,
+    // `parse_kv`, `regex_replace`, …), and custom transforms are
+    // user-defined via `def process { ... }`.
 }
 
 fn register_input_type<T>(registry: &mut ModuleRegistry, type_name: &str)
