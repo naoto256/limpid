@@ -1,6 +1,7 @@
 # Summary
 
 [Introduction](./introduction.md)
+[Design Principles](./design-principles.md)
 
 # Getting Started
 

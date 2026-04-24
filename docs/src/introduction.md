@@ -9,7 +9,7 @@ limpid is a log pipeline daemon that replaces rsyslogd, syslog-ng, and fluentd w
 rsyslog configs are cryptic. syslog-ng is verbose. fluentd needs plugins for everything. limpid gives you:
 
 - **One DSL for everything** — inputs, routing, transforms, outputs, all in the same language
-- **Pipelines you can read** — no template strings, no regex escapes in config, no hidden behavior
+- **Pipelines you can read** — no template strings, no regex escapes in config, no hidden behavior (see [Design Principles](./design-principles.md))
 - **`--test-pipeline` mode** — validate your pipeline logic with sample data before deploying
 - **Non-terminal outputs** — send to multiple destinations without copy-plugin hacks
 - **Fan-out by design** — multiple pipelines can share the same input, each with independent processing
