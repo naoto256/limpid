@@ -296,6 +296,21 @@ workspace.src_endpoint.port = to_int(workspace.spt)  // CEF ext: "54321" → 543
 
 Motivation: CEF extension values and CSV column values arrive as strings even when carrying numeric content. OCSF schemas commonly require `Integer` for those same fields (ports, session IDs, byte counts). `to_int` is the schema-agnostic cast used by SIEM parser snippets.
 
+## Array helpers
+
+### find_by(array, key, value)
+
+Returns the first element of `array` that is an object whose `key` field equals `value`. Returns `null` when nothing matches, the input is not an array, or the key is not a string.
+
+```
+workspace.process = find_by(workspace.evidence, "entityType", "Process")
+workspace.user    = find_by(workspace.evidence, "entityType", "User")
+```
+
+Equality is value-level with no coercion: `find_by(arr, "n", "2")` does not match `{"n": 2}`. Callers who need coercion should cast the value first (`to_int`, string interpolation, etc.). Non-object elements inside the array are skipped silently, so mixed arrays do not cause errors.
+
+Designed for event schemas that carry arrays-of-objects (MDE evidence, OCSF observables, CEF ext lists) where the caller wants "pick the first item matching this type" as a scalar result rather than iterating with `foreach`.
+
 ## Serialization
 
 ### to_json() / to_json(value)
