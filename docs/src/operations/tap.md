@@ -12,20 +12,20 @@ sudo limpidctl tap output ama
 sudo limpidctl tap input splunk_udp
 
 # Stream events after a named process
-sudo limpidctl tap process parse_cef
+sudo limpidctl tap process enrich_fortigate
 
 # List all available tap points
 sudo limpidctl list
 ```
 
-By default, tap emits each event's `egress` bytes as a line of text. Add `--json` to emit the full Event (timestamp, source, facility, severity, ingress, egress, workspace) as one JSON object per line:
+By default, tap emits each event's `egress` bytes as a line of text. Add `--json` to emit the full Event (timestamp, source, ingress, egress, workspace) as one JSON object per line:
 
 ```bash
 # Full Event JSON, one per line — pipe to jq for inspection
 sudo limpidctl tap output ama --json | jq .
 
-# Extract just severity + egress
-sudo limpidctl tap input splunk_udp --json | jq -r '[.severity, .egress] | @tsv'
+# Extract just source + egress
+sudo limpidctl tap input splunk_udp --json | jq -r '[.source, .egress] | @tsv'
 ```
 
 ## How it works
@@ -45,8 +45,9 @@ sudo limpidctl tap output ama | grep Fortinet
 # Only high-severity (PRI-prefixed text)
 sudo limpidctl tap input syslog | grep -E '<[0-3]>'
 
-# Structured filter via full-Event JSON
-sudo limpidctl tap output siem --json | jq 'select(.severity <= 3)'
+# Structured filter via full-Event JSON (severity lives inside the egress bytes;
+# decode the leading <PRI> here, or rely on a workspace field set in your pipeline)
+sudo limpidctl tap output siem --json | jq 'select(.workspace.cef_severity != null and (.workspace.cef_severity | tonumber) <= 3)'
 ```
 
 ## Inject

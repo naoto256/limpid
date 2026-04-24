@@ -54,9 +54,9 @@ def output siem {
 
 def pipeline security {
     input fw
-    process parse_cef
+    process { cef.parse(ingress) }
     output archive
-    if severity <= 3 {
+    if workspace.cef_severity <= 3 {
         output siem
     }
 }

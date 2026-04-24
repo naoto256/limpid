@@ -72,7 +72,7 @@ def pipeline main {
 ```
 def pipeline archive {
     input syslog_udp
-    process strip_pri | filter_noise
+    process { egress = syslog.strip_pri(egress) } | filter_noise
 
     switch source {
         "192.0.2.1" {

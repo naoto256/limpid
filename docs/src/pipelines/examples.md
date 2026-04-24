@@ -16,6 +16,10 @@ def output fw01 { type file  path "/var/log/fw/fw01.log" }
 def output fw02 { type file  path "/var/log/fw/fw02.log" }
 def output fw03 { type file  path "/var/log/fw/fw03.log" }
 
+def process strip_headers {
+    egress = syslog.strip_pri(egress)
+}
+
 def process filter_noise {
     if source == "192.0.2.2" and contains(ingress, "CHARGEN") {
         drop
@@ -24,7 +28,7 @@ def process filter_noise {
 
 def pipeline archive {
     input syslog_udp
-    process strip_pri | filter_noise
+    process strip_headers | filter_noise
 
     switch source {
         "192.0.2.1" {
@@ -37,7 +41,7 @@ def pipeline archive {
             if contains(ingress, "type=\"traffic\"") {
                 drop
             }
-            process prepend_source | prepend_timestamp
+            process { egress = source + " " + strftime(timestamp, "%b %e %H:%M:%S") + " " + egress }
             output fw03
         }
         default {
@@ -46,6 +50,8 @@ def pipeline archive {
     }
 }
 ```
+
+The inline `process { ... }` block is the new home for what 0.2 expressed as the `prepend_source` and `prepend_timestamp` built-ins — there is no separate process layer any more, just DSL function calls and string concatenation.
 
 ## Azure Monitor Agent (AMA) forwarding
 
@@ -76,11 +82,10 @@ def process filter_fortinet_traffic {
 
 def process ama_rewrite {
     if contains(ingress, "CEF:") {
-        facility = 16
+        egress = syslog.set_pri(egress, 16, 6)   // local0.info for CEF → CommonSecurityLog
     } else {
-        facility = 17
+        egress = syslog.set_pri(egress, 17, 6)   // local1.info for everything else → Syslog
     }
-    severity = 6
 }
 
 def pipeline ama_forward {
@@ -123,7 +128,8 @@ def pipeline siem {
     output archive
 
     // Parse and enrich
-    process parse_cef | {
+    process {
+        cef.parse(ingress)
         if workspace.src != null {
             workspace.geo = geoip(workspace.src)
         }
@@ -138,7 +144,7 @@ def pipeline siem {
 
 ```
 def process enrich_fortigate {
-    process parse_kv
+    parse_kv(egress)
 
     if workspace.srcip != null {
         workspace.geo = geoip(workspace.srcip)

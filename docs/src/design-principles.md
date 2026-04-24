@@ -23,7 +23,7 @@ If a pipeline produces an event, you can point to the DSL line that produced it.
 
 Input and output modules do not touch the contents of an event. Parsing, transformation, and normalization happen exclusively in the `process` layer.
 
-- **Input** modules receive bytes, perform wire-level message framing (boundary detection, LF / octet-count), optionally sanity-check the wire format (e.g. `validate_pri` — shape only), and emit `Event::new(ingress, source)`. They do not extract PRI, do not parse timestamps, do not structure the message, do not populate `facility` / `severity`. The event enters the pipeline with `ingress` set, `egress = ingress.clone()`, and everything else empty or default.
+- **Input** modules receive bytes, perform wire-level message framing (boundary detection, LF / octet-count), optionally sanity-check the wire format (e.g. `validate_pri` — shape only), and emit `Event::new(ingress, source)`. They do not extract PRI, do not parse timestamps, do not structure the message. The event enters the pipeline with `ingress` set, `egress = ingress.clone()`, an empty workspace, and the source / receive-time metadata.
 - **Output** modules serialize the event's `egress` bytes to the wire. They do not rewrite, transform, lookup, or enrich. An output is a dumb transport.
 - **Process** modules do everything else. Parsing, PRI extraction, timestamp derivation, field normalization, OTLP/OCSF mapping, enrichment — all in `process`.
 
@@ -46,13 +46,13 @@ Typical parsing patterns — OTLP normalization, OCSF mapping, Windows Snare par
 
 ## Principle 4 — Only `egress` crosses hop boundaries
 
-In a multi-hop pipeline, the only thing that travels from one limpid daemon to the next is `egress` (the bytes written to the wire). Everything else — `source`, `facility`, `severity`, `timestamp`, `workspace`, `let` — is derived pipeline-local state that dies at the output.
+In a multi-hop pipeline, the only thing that travels from one limpid daemon to the next is `egress` (the bytes written to the wire). Everything else — `source`, `timestamp`, `workspace`, `let` — is derived pipeline-local state that dies at the output.
 
 - `ingress`: the current hop's immutable input. The next hop receives its own `ingress` (whatever it got on the wire, which was the previous hop's `egress`).
 - `egress`: the sole hop contract. Assembled in the process layer; serialized by the output.
 - `source`: set locally by the receiving input from the remote peer address. Not on the wire.
-- `facility` / `severity`: encoded in the `<PRI>` byte at the start of a syslog-framed `egress`. The next hop re-extracts them from the incoming bytes. They are not independent fields that travel.
-- `timestamp`: the wire-side timestamp, when present, lives inside `egress` (e.g. RFC 5424's TIMESTAMP field). `Event.timestamp` is pipeline-local.
+- syslog facility / severity: not Event fields at all in 0.3 — they are bytes inside the `<PRI>` header at the start of a syslog-framed `egress`. The next hop re-extracts them with `syslog.extract_pri(...)` if it cares; the previous hop set them with `syslog.set_pri(...)` if it needed to.
+- `timestamp`: the wire-side timestamp, when present, lives inside `egress` (e.g. RFC 5424's TIMESTAMP field). `Event.timestamp` is pipeline-local — the time at which this hop received the event.
 - `workspace` / `let`: pipeline-local scratch. See [Event Model](./processing/README.md).
 
 **Why:** this is the natural consequence of Principle 2. When the wire contract is just `egress` bytes, no metadata can silently drift between daemons, no schema can grow incompatible across versions, and no "attribute" can mean one thing on one hop and another thing on the next. Each hop re-derives what it needs from the bytes it received.
@@ -74,7 +74,7 @@ The judgement rule is a single question: **does the function's behavior follow a
 
 It also draws a clean line for Principle 3 (domain knowledge as DSL snippets). Schema-specific DSL snippets can be grouped under the namespace they describe; schema-agnostic primitives belong to the daemon. The namespace boundary is the same boundary as the "ships in Rust vs. ships in DSL" line, just made visible in the grammar.
 
-**Consequence:** v0.3.0 introduces the dot-namespace syntax but keeps the existing flat function names (`parse_syslog`, `parse_cef`, `strip_pri`, …) in place as a mechanical transition step. The schema-specific functions migrate to their namespaces in a later breaking change — pre-1.0, the rename is allowed because it aligns names with the principle that now governs them.
+**Consequence:** v0.3.0 completes the migration of the schema-specific helpers shipped with the daemon — `parse_syslog` / `parse_cef` / `strip_pri` are gone, replaced by `syslog.parse` / `cef.parse` / `syslog.strip_pri` / `syslog.set_pri` / `syslog.extract_pri`. The native process layer is removed at the same time, so a `process` body in 0.3 is purely DSL: function calls, assignments, control flow.
 
 ---
 

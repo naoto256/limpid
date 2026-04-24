@@ -6,9 +6,9 @@ Pipelines wire inputs, processes, and outputs together. They define the flow of 
 
 ```
 def pipeline main {
-    input syslog           // where events come from
-    process parse_cef      // transform
-    output archive          // where events go
+    input syslog                       // where events come from
+    process { cef.parse(ingress) }     // transform
+    output archive                     // where events go
 }
 ```
 

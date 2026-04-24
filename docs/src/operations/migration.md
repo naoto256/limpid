@@ -40,7 +40,7 @@ sudo dpkg -i limpid_*.deb
 | rsyslog | limpid |
 |---------|--------|
 | `if $msg contains 'error' then ...` | `if contains(egress, "error") { ... }` |
-| `if $syslogfacility-text == 'local0' then ...` | `if facility == 16 { ... }` |
+| `if $syslogfacility-text == 'local0' then ...` | `let pri = syslog.extract_pri(ingress)`<br>`if pri != null and pri / 8 == 16 { ... }` |
 | `if $fromhost-ip == '10.0.0.1' then ...` | `if source == "10.0.0.1" { ... }` |
 | `:msg, contains, "DISCARD" stop` | `if contains(ingress, "DISCARD") { drop }` |
 
@@ -48,7 +48,7 @@ sudo dpkg -i limpid_*.deb
 
 | rsyslog | limpid |
 |---------|--------|
-| `template(name="t" type="string" string="%HOSTNAME% %msg%")` | `egress = format("%{workspace.hostname} %{egress}")` |
+| `template(name="t" type="string" string="%HOSTNAME% %msg%")` | `egress = format("%{workspace.syslog_hostname} %{egress}")` |
 
 ## Step 3: Stop rsyslog, start limpid
 

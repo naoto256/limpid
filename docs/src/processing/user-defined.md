@@ -1,12 +1,12 @@
 # User-defined Processes
 
-You can define custom processes using the DSL. They compose built-in processes, expression functions, and control flow.
+You define a process with `def process <name> { ... }`. Inside the body you call functions, assign to event slots and workspace, branch with `if` / `switch` / `try`, iterate with `foreach`, and call other processes by name.
 
 ## Defining a process
 
 ```
-def process enrich {
-    process parse_kv
+def process enrich_fortigate {
+    parse_kv(egress)                                  // merge KV pairs into workspace
 
     if workspace.srcip != null {
         workspace.geo = geoip(workspace.srcip)
@@ -16,14 +16,19 @@ def process enrich {
 }
 ```
 
+`parse_kv(egress)` here is a bare function-call statement. Because it returns an object, the object's keys are merged into `workspace`. See [Expression Functions](./functions.md#bare-statements-vs-assignments) for the full rule.
+
 ## Assignments
 
 | Target | Effect |
 |--------|--------|
 | `egress = expr` | Replace the bytes the output will write |
-| `facility = expr` | Set facility (0-23) and rewrite `<PRI>` in `egress` |
-| `severity = expr` | Set severity (0-7) and rewrite `<PRI>` in `egress` |
 | `workspace.xxx = expr` | Set a workspace value (nested: `workspace.geo.country = "JP"`) |
+| `let name = expr` | Bind a process-local scratch value (visible only inside this process body) |
+
+Anything else on the left of `=` is rejected as an unknown assignment target.
+
+> **What about `facility = ...` / `severity = ...`?** Those metadata fields were removed from the Event core in 0.3. To set or rewrite the syslog `<PRI>` byte, use the explicit `syslog.set_pri(egress, facility, severity)` function. To read it back, use `syslog.extract_pri(egress)`. See [Upgrading to 0.3](../operations/upgrade-0.3.md#event-core-facility--severity-removed).
 
 ### Important: what is and isn't reflected in output
 
@@ -31,34 +36,31 @@ def process enrich {
 
 ```
 // This changes the output:
-egress = format("%{workspace.hostname}: %{workspace.syslog_msg}")
+egress = format("%{workspace.syslog_hostname}: %{workspace.syslog_msg}")
 
 // This does NOT change the output:
-workspace.hostname = "new-host"
+workspace.syslog_hostname = "new-host"
 // ↑ sets a workspace value, but `egress` is unchanged
 ```
 
 `workspace` is a pipeline-local scratch area for intermediate values — parsed data, enrichment results, routing decisions. Workspace values are **not** automatically serialised into `egress`. To include them in the output, explicitly rebuild `egress`:
 
 ```
-process parse_kv                             // parse into workspace
-egress = to_json()                           // serialise all workspace values as JSON
+parse_kv(egress)                              // parse into workspace
+egress = to_json()                            // serialise the whole event as JSON
 // or
-egress = format("%{workspace.srcip} -> %{workspace.dstip}")      // build a custom format
+egress = format("%{workspace.srcip} -> %{workspace.dstip}")
 ```
 
-### PRI rewriting
-
-`facility` and `severity` are special: assigning to them also rewrites the `<PRI>` header in `egress` (if one exists). This is the only case where a metadata assignment automatically modifies `egress`.
+### Rewriting the syslog PRI
 
 ```
 def process ama_rewrite {
     if contains(ingress, "CEF:") {
-        facility = 16
+        egress = syslog.set_pri(egress, 16, 6)   // local0.info for CEF
     } else {
-        facility = 17
+        egress = syslog.set_pri(egress, 17, 6)   // local1.info for everything else
     }
-    severity = 6
 }
 ```
 
@@ -67,6 +69,9 @@ def process ama_rewrite {
 ### if / else if / else
 
 ```
+let pri = syslog.extract_pri(ingress)
+let severity = pri % 8
+
 if severity <= 3 {
     workspace.priority = "high"
 } else if severity <= 5 {
@@ -79,12 +84,12 @@ if severity <= 3 {
 ### switch
 
 ```
-switch workspace.device_vendor {
+switch workspace.cef_device_vendor {
     "Fortinet" {
-        process parse_kv
+        parse_kv(egress)
     }
     "CheckPoint" {
-        process parse_cef
+        cef.parse(ingress)
     }
     default {
         drop
@@ -94,11 +99,11 @@ switch workspace.device_vendor {
 
 ### try / catch
 
-Catches errors from process execution. The error message is available as `error` inside the catch block.
+Catches errors raised inside the body. The error message is available as `error` inside the catch block.
 
 ```
 try {
-    process parse_json
+    parse_json(egress)
 } catch {
     workspace.parse_error = error
 }
@@ -116,12 +121,11 @@ foreach workspace.items {
 
 ### process call
 
-Calls another named process or a built-in process:
+Calls another named process:
 
 ```
-process parse_cef
+process enrich_fortigate
 process my_custom_enrichment
-process regex_replace("\\d{3}-\\d{4}", "XXX-XXXX")
 ```
 
 ### drop
@@ -141,15 +145,15 @@ Reference a user-defined process by name:
 ```
 def pipeline main {
     input syslog
-    process enrich             // calls the process defined above
+    process enrich_fortigate
     output archive
 }
 ```
 
-Or chain with built-in processes:
+Or chain with other processes (named or inline):
 
 ```
-process strip_pri | enrich | {
+process strip_headers | enrich_fortigate | {
     egress = to_json()
 }
 ```
