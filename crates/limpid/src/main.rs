@@ -49,6 +49,13 @@ struct Cli {
     #[arg(long)]
     strict_warnings: bool,
 
+    /// Render the pipeline flow graph to stdout after analysis.
+    /// Accepts `mermaid` (default), `dot`, or `ascii`. The analyzer's
+    /// diagnostics remain on stderr so the graph output can be piped
+    /// into a file or viewer without losing the check report.
+    #[arg(long, value_name = "FORMAT", num_args = 0..=1, default_missing_value = "mermaid")]
+    graph: Option<String>,
+
     /// Test a pipeline with sample input
     #[arg(long)]
     test_pipeline: Option<String>,
@@ -87,8 +94,8 @@ fn main() -> Result<()> {
             .init();
     }
 
-    if cli.check || cli.strict_warnings {
-        return run_check(&cli.config, cli.strict_warnings);
+    if cli.check || cli.strict_warnings || cli.graph.is_some() {
+        return run_check(&cli.config, cli.strict_warnings, cli.graph.as_deref());
     }
 
     if let Some(ref pipeline_name) = cli.test_pipeline {
@@ -199,8 +206,16 @@ fn run_daemon(config_path: &str) -> Result<()> {
 /// - `2` — `--strict-warnings` set and at least one warning was emitted
 ///   (errors also exit 2 under `--strict-warnings` so CI sees a single
 ///   "non-zero means investigate" signal)
-fn run_check(config_path: &str, strict_warnings: bool) -> Result<()> {
+fn run_check(config_path: &str, strict_warnings: bool, graph_format: Option<&str>) -> Result<()> {
     let path = Path::new(config_path);
+
+    // Resolve the graph format up front so a bad `--graph=foo` fails
+    // before we spend time parsing the config. The error message lists
+    // the accepted formats.
+    let graph_format = match graph_format {
+        Some(raw) => Some(check::graph::GraphFormat::parse(Some(raw))?),
+        None => None,
+    };
 
     // Step 1: load + expand includes, building the multi-file SourceMap
     // alongside the parsed AST. Without this step include-based configs
@@ -232,6 +247,15 @@ fn run_check(config_path: &str, strict_warnings: bool) -> Result<()> {
 
     // Step 4: run analyzer + render diagnostics.
     let diagnostics = check::analyze(&compiled, &source_map);
+
+    // If --graph was requested, emit the flow visualization to stdout
+    // before diagnostics/footer land on stderr/stdout. Doing this first
+    // keeps the graph self-contained: a pipe like `limpid --check
+    // --graph=mermaid foo.conf > flow.mmd` captures only the graph,
+    // with summary/analysis noise on the other streams.
+    if let Some(fmt) = graph_format {
+        print!("{}", check::graph::render_graph(&compiled, fmt));
+    }
 
     let mut errors = 0usize;
     let mut warnings = 0usize;
