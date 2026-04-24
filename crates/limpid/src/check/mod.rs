@@ -2,52 +2,53 @@
 //!
 //! Entry point for `limpid --check`. The pipeline:
 //!
-//! - **Bindings** (`bindings::Bindings`) — per-scope tracking of
+//! - **Bindings** ([`bindings::Bindings`]) — per-scope tracking of
 //!   workspace paths, `let` locals, and reserved event idents.
-//! - **Type inference** (`expr_types::infer`) — `Expr` → `FieldType`,
+//! - **Type inference** ([`expr_types::infer`]) — `Expr` → `FieldType`,
 //!   consulting the bindings and the function registry's signature
 //!   table.
-//! - **Type checks** (`expr_types::check_types`) — operator and
-//!   function-argument warnings (Int compared to String, `lower(Int)`,
-//!   etc.). Spans are threaded through so output-side warnings get
-//!   caret rendering; process-body warnings still fall back to the
-//!   one-line format until the AST grows per-statement spans.
-//! - **Parser effects** — bare `parse_*(text)` / `syslog.parse(...)` /
-//!   `cef.parse(...)` statements merge their `produces` schema into
-//!   the `workspace.*` bindings (or wildcard, when the parser's keys
-//!   are data-driven).
-//! - **Control flow** — `if` / `else if` / `else`, `switch`, and
-//!   `try`/`catch` use branch intersection to compute the bindings
-//!   guaranteed at the join. Catch bodies pre-bind `workspace._error`
-//!   as `String` (matching the runtime).
-//! - **Output reference checks** — output-side `${workspace.x}` /
-//!   `workspace.x` references must correspond to a workspace key
-//!   produced upstream; unresolved refs emit an Error with the
-//!   property's value span and a Levenshtein "did you mean" hint.
-//! - **Rendering** (`render::render_diagnostic`) — rustc-style multi-
-//!   line snippet + caret + optional `help:` line when a span is
-//!   attached, ANSI-coloured on TTY, plain otherwise.
+//! - **Type checks** ([`expr_types::check_types`]) — operator and
+//!   function-argument warnings.
+//! - **Parser effects** ([`parser_effects`]) — bare `parse_*(text)` /
+//!   `syslog.parse(...)` / `cef.parse(...)` statements merge their
+//!   `produces` schema into the `workspace.*` bindings.
+//! - **Control flow** ([`control_flow`]) — `if` / `else if` / `else`,
+//!   `switch`, `try/catch`, `for_each` use branch intersection to
+//!   compute the bindings guaranteed at the join.
+//! - **Output reference checks** ([`outputs`]) — output-side
+//!   `${workspace.x}` / `workspace.x` references must correspond to a
+//!   workspace key produced upstream.
+//! - **Rendering** ([`render::render_diagnostic`]) — rustc-style multi-
+//!   line snippet + caret + optional `help:` line.
 //!
-//! Things deliberately deferred to commit 5:
-//! - Submodule split (control_flow / outputs / parser_effects / types).
-//! - Include expansion, summary counts, `Configuration OK` dataflow
-//!   hint.
+//! Submodule layout (commit 5 split):
+//! - `bindings`        — workspace + let scope tracking, branch intersect
+//! - `control_flow`    — if/switch/try-catch/for-each branch handling
+//! - `expr_types`      — `Expr` → `FieldType` inference + arg-/op-checks
+//! - `outputs`         — output-side workspace reference checks
+//! - `parser_effects`  — parser `produces` → workspace merge
+//! - `render`          — rustc-style snippet+caret diagnostic emit
+//! - `suggestions`     — Levenshtein "did you mean" hint
+//! - `mod`             — pipeline walk + entry + Diagnostic / Level
 
 pub mod bindings;
+mod control_flow;
 pub mod expr_types;
+mod outputs;
+mod parser_effects;
 pub mod render;
 pub mod suggestions;
 
 use crate::dsl::ast::{
-    AssignTarget, BranchBody, Expr, IfChain, OutputDef, PipelineDef, PipelineStatement,
-    ProcessChainElement, ProcessDef, ProcessStatement, Property, SwitchArm, TemplateFragment,
+    AssignTarget, Config, Definition, Expr, PipelineDef, PipelineStatement, ProcessChainElement,
+    ProcessDef, ProcessStatement,
 };
 use crate::dsl::span::{SourceMap, Span};
 use crate::functions::FunctionRegistry;
 use crate::modules::schema::FieldType;
 use crate::pipeline::CompiledConfig;
 
-use bindings::{Bindings, intersect_branches};
+use bindings::Bindings;
 
 /// Severity of an analyzer diagnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +110,34 @@ impl Diagnostic {
     }
 }
 
+/// Definition counts derived from a parsed [`Config`]. Emitted in the
+/// `--check` summary header so operators see the scope of what was
+/// validated (a config that walks 0 pipelines because of a stale
+/// include glob is "OK" by default; the count makes that visible).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DefCounts {
+    pub inputs: usize,
+    pub outputs: usize,
+    pub processes: usize,
+    pub pipelines: usize,
+}
+
+impl DefCounts {
+    /// Walk a parsed [`Config`] and tally each definition kind.
+    pub fn from_config(config: &Config) -> Self {
+        let mut c = Self::default();
+        for def in &config.definitions {
+            match def {
+                Definition::Input(_) => c.inputs += 1,
+                Definition::Output(_) => c.outputs += 1,
+                Definition::Process(_) => c.processes += 1,
+                Definition::Pipeline(_) => c.pipelines += 1,
+            }
+        }
+        c
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -160,9 +189,6 @@ fn analyze_pipeline(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let mut bindings = Bindings::new();
-    // Pipelines have a single ambient `let` scope — locals introduced
-    // at pipeline-statement level (rare but legal) live here. Process
-    // bodies push their own scopes on top.
     bindings.push_let_scope();
 
     for stmt in &pipeline.body {
@@ -179,7 +205,7 @@ fn analyze_pipeline(
     bindings.pop_let_scope();
 }
 
-fn analyze_pipeline_stmt(
+pub(super) fn analyze_pipeline_stmt(
     stmt: &PipelineStatement,
     pipeline_name: &str,
     config: &CompiledConfig,
@@ -207,12 +233,12 @@ fn analyze_pipeline_stmt(
         }
         PipelineStatement::Output(name) => {
             if let Some(out) = config.outputs.get(name) {
-                analyze_output(out, pipeline_name, registry, bindings, diagnostics);
+                outputs::analyze_output(out, pipeline_name, registry, bindings, diagnostics);
             }
         }
         PipelineStatement::Drop | PipelineStatement::Finish => {}
         PipelineStatement::If(chain) => {
-            analyze_if_chain(
+            control_flow::analyze_if_chain(
                 chain,
                 pipeline_name,
                 config,
@@ -230,7 +256,14 @@ fn analyze_pipeline_stmt(
                 None,
                 diagnostics,
             );
-            analyze_switch(arms, pipeline_name, config, registry, bindings, diagnostics);
+            control_flow::analyze_switch(
+                arms,
+                pipeline_name,
+                config,
+                registry,
+                bindings,
+                diagnostics,
+            );
         }
     }
 }
@@ -253,8 +286,6 @@ fn analyze_chain_element(
             } else {
                 // Unknown user-defined process — pessimistic wildcard so
                 // we don't false-positive on workspace reads downstream.
-                // (Validate would have already errored if this name is
-                // truly unknown; we just guard the analyzer state.)
                 bindings.set_workspace_wildcard();
             }
         }
@@ -287,7 +318,7 @@ fn analyze_process_body(
 // Process statement walk
 // ---------------------------------------------------------------------------
 
-fn analyze_process_stmt(
+pub(super) fn analyze_process_stmt(
     stmt: &ProcessStatement,
     pipeline_name: &str,
     registry: &FunctionRegistry,
@@ -321,8 +352,7 @@ fn analyze_process_stmt(
                     bindings.bind_workspace(&full, new_ty);
                 }
                 AssignTarget::Egress => {
-                    // egress is a bytes sink — no workspace effect, but
-                    // the RHS was already type-checked above.
+                    // egress is a bytes sink — RHS already type-checked.
                 }
             }
         }
@@ -355,7 +385,13 @@ fn analyze_process_stmt(
                 None,
                 diagnostics,
             );
-            apply_parser_effects(namespace.as_deref(), name, args, registry, bindings);
+            parser_effects::apply_parser_effects(
+                namespace.as_deref(),
+                name,
+                args,
+                registry,
+                bindings,
+            );
         }
         ProcessStatement::ExprStmt(e) => {
             expr_types::check_types(e, pipeline_name, bindings, registry, None, diagnostics);
@@ -365,13 +401,11 @@ fn analyze_process_stmt(
                 expr_types::check_types(a, pipeline_name, bindings, registry, None, diagnostics);
             }
             // Process bodies were validated separately when the named
-            // process was defined; we don't recurse from here (the
-            // analyzer's pipeline-level walk hits user processes via
-            // ProcessChainElement::Named instead).
+            // process was defined; we don't recurse from here.
         }
         ProcessStatement::Drop => {}
         ProcessStatement::If(chain) => {
-            analyze_inline_if(chain, pipeline_name, registry, bindings, diagnostics);
+            control_flow::analyze_inline_if(chain, pipeline_name, registry, bindings, diagnostics);
         }
         ProcessStatement::Switch(scrutinee, arms) => {
             expr_types::check_types(
@@ -382,30 +416,23 @@ fn analyze_process_stmt(
                 None,
                 diagnostics,
             );
-            analyze_inline_switch(arms, pipeline_name, registry, bindings, diagnostics);
+            control_flow::analyze_inline_switch(
+                arms,
+                pipeline_name,
+                registry,
+                bindings,
+                diagnostics,
+            );
         }
         ProcessStatement::TryCatch(try_body, catch_body) => {
-            // Try and catch are alternate branches; bindings at the join
-            // are the intersection of both. The catch body starts with
-            // `workspace._error` pre-bound as String to match runtime.
-            let starting = bindings.clone();
-
-            let mut try_b = starting.clone();
-            try_b.push_let_scope();
-            for s in try_body {
-                analyze_process_stmt(s, pipeline_name, registry, &mut try_b, diagnostics);
-            }
-            try_b.pop_let_scope();
-
-            let mut catch_b = starting.clone();
-            catch_b.push_let_scope();
-            catch_b.bind_workspace(&["workspace".into(), "_error".into()], FieldType::String);
-            for s in catch_body {
-                analyze_process_stmt(s, pipeline_name, registry, &mut catch_b, diagnostics);
-            }
-            catch_b.pop_let_scope();
-
-            *bindings = intersect_branches(&[try_b, catch_b]);
+            control_flow::analyze_try_catch(
+                try_body,
+                catch_body,
+                pipeline_name,
+                registry,
+                bindings,
+                diagnostics,
+            );
         }
         ProcessStatement::ForEach(iterable, body) => {
             expr_types::check_types(
@@ -416,331 +443,8 @@ fn analyze_process_stmt(
                 None,
                 diagnostics,
             );
-            // Body may or may not run; treat it like an `if` without
-            // else for binding purposes — additions don't survive.
-            let starting = bindings.clone();
-            let mut iter_b = starting.clone();
-            iter_b.push_let_scope();
-            for s in body {
-                analyze_process_stmt(s, pipeline_name, registry, &mut iter_b, diagnostics);
-            }
-            iter_b.pop_let_scope();
-            *bindings = intersect_branches(&[iter_b, starting]);
+            control_flow::analyze_for_each(body, pipeline_name, registry, bindings, diagnostics);
         }
-    }
-}
-
-fn analyze_inline_if(
-    chain: &IfChain,
-    pipeline_name: &str,
-    registry: &FunctionRegistry,
-    bindings: &mut Bindings,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    let starting = bindings.clone();
-    let mut results: Vec<Bindings> = Vec::with_capacity(chain.branches.len() + 1);
-    for (cond, body) in &chain.branches {
-        expr_types::check_types(cond, pipeline_name, &starting, registry, None, diagnostics);
-        let mut b = starting.clone();
-        b.push_let_scope();
-        for item in body {
-            if let BranchBody::Process(s) = item {
-                analyze_process_stmt(s, pipeline_name, registry, &mut b, diagnostics);
-            }
-        }
-        b.pop_let_scope();
-        results.push(b);
-    }
-    if let Some(else_body) = &chain.else_body {
-        let mut b = starting.clone();
-        b.push_let_scope();
-        for item in else_body {
-            if let BranchBody::Process(s) = item {
-                analyze_process_stmt(s, pipeline_name, registry, &mut b, diagnostics);
-            }
-        }
-        b.pop_let_scope();
-        results.push(b);
-    } else {
-        results.push(starting);
-    }
-    *bindings = intersect_branches(&results);
-}
-
-fn analyze_inline_switch(
-    arms: &[SwitchArm],
-    pipeline_name: &str,
-    registry: &FunctionRegistry,
-    bindings: &mut Bindings,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    let starting = bindings.clone();
-    let mut results: Vec<Bindings> = Vec::with_capacity(arms.len() + 1);
-    let mut has_default = false;
-    for arm in arms {
-        if let Some(p) = &arm.pattern {
-            expr_types::check_types(p, pipeline_name, &starting, registry, None, diagnostics);
-        } else {
-            has_default = true;
-        }
-        let mut b = starting.clone();
-        b.push_let_scope();
-        for item in &arm.body {
-            if let BranchBody::Process(s) = item {
-                analyze_process_stmt(s, pipeline_name, registry, &mut b, diagnostics);
-            }
-        }
-        b.pop_let_scope();
-        results.push(b);
-    }
-    if !has_default {
-        results.push(starting);
-    }
-    *bindings = intersect_branches(&results);
-}
-
-fn analyze_if_chain(
-    chain: &IfChain,
-    pipeline_name: &str,
-    config: &CompiledConfig,
-    registry: &FunctionRegistry,
-    bindings: &mut Bindings,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    let starting = bindings.clone();
-    let mut results: Vec<Bindings> = Vec::with_capacity(chain.branches.len() + 1);
-    for (cond, body) in &chain.branches {
-        expr_types::check_types(cond, pipeline_name, &starting, registry, None, diagnostics);
-        let mut b = starting.clone();
-        for item in body {
-            match item {
-                BranchBody::Pipeline(p) => {
-                    analyze_pipeline_stmt(p, pipeline_name, config, registry, &mut b, diagnostics);
-                }
-                BranchBody::Process(s) => {
-                    analyze_process_stmt(s, pipeline_name, registry, &mut b, diagnostics);
-                }
-            }
-        }
-        results.push(b);
-    }
-    if let Some(else_body) = &chain.else_body {
-        let mut b = starting.clone();
-        for item in else_body {
-            match item {
-                BranchBody::Pipeline(p) => {
-                    analyze_pipeline_stmt(p, pipeline_name, config, registry, &mut b, diagnostics);
-                }
-                BranchBody::Process(s) => {
-                    analyze_process_stmt(s, pipeline_name, registry, &mut b, diagnostics);
-                }
-            }
-        }
-        results.push(b);
-    } else {
-        results.push(starting);
-    }
-    *bindings = intersect_branches(&results);
-}
-
-fn analyze_switch(
-    arms: &[SwitchArm],
-    pipeline_name: &str,
-    config: &CompiledConfig,
-    registry: &FunctionRegistry,
-    bindings: &mut Bindings,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    let starting = bindings.clone();
-    let mut results: Vec<Bindings> = Vec::with_capacity(arms.len() + 1);
-    let mut has_default = false;
-    for arm in arms {
-        if let Some(p) = &arm.pattern {
-            expr_types::check_types(p, pipeline_name, &starting, registry, None, diagnostics);
-        } else {
-            has_default = true;
-        }
-        let mut b = starting.clone();
-        for item in &arm.body {
-            match item {
-                BranchBody::Pipeline(p) => {
-                    analyze_pipeline_stmt(p, pipeline_name, config, registry, &mut b, diagnostics);
-                }
-                BranchBody::Process(s) => {
-                    analyze_process_stmt(s, pipeline_name, registry, &mut b, diagnostics);
-                }
-            }
-        }
-        results.push(b);
-    }
-    if !has_default {
-        results.push(starting);
-    }
-    *bindings = intersect_branches(&results);
-}
-
-// ---------------------------------------------------------------------------
-// Parser effects (workspace merge for bare parse_*(text) statements)
-// ---------------------------------------------------------------------------
-
-fn apply_parser_effects(
-    namespace: Option<&str>,
-    name: &str,
-    args: &[Expr],
-    registry: &FunctionRegistry,
-    bindings: &mut Bindings,
-) {
-    let Some(info) = registry.parser(namespace, name) else {
-        // Not a parser — nothing to merge into workspace. Side-effect-
-        // only functions (`table_upsert`, `table_delete`) return Null
-        // and contribute nothing; that's intentional silence.
-        return;
-    };
-
-    // Static produces: bind each declared `(workspace.key, type)` pair.
-    for spec in &info.produces {
-        bindings.bind_workspace(&spec.path, spec.ty.clone());
-    }
-
-    // Defaults arg (HashLit): every declared key becomes a workspace
-    // binding too, with type inferred from the literal value. This is
-    // the "user-declared schema" knob that lets parse_json / parse_kv
-    // narrow the wildcard to a precise key set.
-    if let Some(Expr::HashLit(entries)) = args.get(1) {
-        for (k, v) in entries {
-            let path = vec!["workspace".to_string(), k.clone()];
-            bindings.bind_workspace(&path, literal_type(v));
-        }
-    } else if info.wildcards {
-        // Data-driven parser called without explicit defaults — widen
-        // workspace to wildcard so downstream `workspace.*` reads are
-        // admitted (we no longer know which keys exist).
-        bindings.set_workspace_wildcard();
-    }
-}
-
-/// Best-effort type from a literal-shaped expression. Used for
-/// HashLit defaults inference in parser calls; non-literal entries
-/// fall through to `Any`.
-fn literal_type(e: &Expr) -> FieldType {
-    match e {
-        Expr::StringLit(_) | Expr::Template(_) => FieldType::String,
-        Expr::IntLit(_) => FieldType::Int,
-        Expr::FloatLit(_) => FieldType::Float,
-        Expr::BoolLit(_) => FieldType::Bool,
-        Expr::Null => FieldType::Null,
-        Expr::HashLit(_) => FieldType::Object,
-        _ => FieldType::Any,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Output reference checks
-// ---------------------------------------------------------------------------
-
-fn analyze_output(
-    output: &OutputDef,
-    pipeline_name: &str,
-    registry: &FunctionRegistry,
-    bindings: &Bindings,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    for prop in &output.properties {
-        if let Property::KeyValue {
-            value: expr,
-            value_span,
-            ..
-        } = prop
-        {
-            expr_types::check_types(
-                expr,
-                pipeline_name,
-                bindings,
-                registry,
-                *value_span,
-                diagnostics,
-            );
-            collect_workspace_refs(expr, &mut |path| {
-                check_workspace_reference(
-                    path,
-                    &output.name,
-                    pipeline_name,
-                    bindings,
-                    *value_span,
-                    diagnostics,
-                );
-            });
-        }
-    }
-}
-
-fn check_workspace_reference(
-    path: &[String],
-    output_name: &str,
-    pipeline_name: &str,
-    bindings: &Bindings,
-    span: Option<Span>,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    // Only `workspace.*` references with at least one segment under
-    // workspace are interesting — reserved idents (ingress / source /
-    // timestamp / error / egress) are always present.
-    if path.first().map(String::as_str) != Some("workspace") || path.len() < 2 {
-        return;
-    }
-    if !bindings.workspace_visible(path) {
-        let joined = path.join(".");
-        let mut diag = Diagnostic::error(format!(
-            "[pipeline {}] output `{}` references `{}` which is not produced by any upstream module",
-            pipeline_name, output_name, joined,
-        ))
-        .with_span(span);
-        if let Some(near) = suggestions::near_workspace_path(&joined, bindings) {
-            diag = diag.with_help(format!("did you mean `{}`?", near));
-        }
-        diagnostics.push(diag);
-    }
-}
-
-fn collect_workspace_refs(expr: &Expr, cb: &mut dyn FnMut(&[String])) {
-    match expr {
-        Expr::Ident(parts) => cb(parts),
-        Expr::PropertyAccess(base, suffix) => {
-            if let Expr::Ident(base_parts) = base.as_ref() {
-                let mut combined = base_parts.clone();
-                combined.extend(suffix.iter().cloned());
-                cb(&combined);
-            } else {
-                collect_workspace_refs(base, cb);
-            }
-        }
-        Expr::Template(fragments) => {
-            for f in fragments {
-                if let TemplateFragment::Interp(e) = f {
-                    collect_workspace_refs(e, cb);
-                }
-            }
-        }
-        Expr::FuncCall { args, .. } => {
-            for a in args {
-                collect_workspace_refs(a, cb);
-            }
-        }
-        Expr::BinOp(l, _, r) => {
-            collect_workspace_refs(l, cb);
-            collect_workspace_refs(r, cb);
-        }
-        Expr::UnaryOp(_, inner) => collect_workspace_refs(inner, cb),
-        Expr::HashLit(entries) => {
-            for (_k, v) in entries {
-                collect_workspace_refs(v, cb);
-            }
-        }
-        Expr::StringLit(_)
-        | Expr::IntLit(_)
-        | Expr::FloatLit(_)
-        | Expr::BoolLit(_)
-        | Expr::Null => {}
     }
 }
 
@@ -787,8 +491,6 @@ def pipeline p { input i; output o }
 
     #[test]
     fn syslog_parse_binds_known_workspace_keys() {
-        // After `syslog.parse(ingress)`, downstream `${workspace.syslog_msg}`
-        // resolves silently.
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
 def output o { type stdout template "${workspace.syslog_msg}" }
@@ -804,8 +506,6 @@ def pipeline p {
 
     #[test]
     fn parse_json_with_defaults_narrows_to_declared_keys() {
-        // Defaults narrow the wildcard — typos on undeclared keys are
-        // caught.
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
 def output o { type stdout template "${workspace.usr}" }
@@ -823,7 +523,6 @@ def pipeline p {
 
     #[test]
     fn parse_json_without_defaults_wildcards() {
-        // No defaults → wildcard, so any workspace.* read is admitted.
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
 def output o { type stdout template "${workspace.anything}" }
@@ -884,7 +583,6 @@ def pipeline p {
 
     #[test]
     fn eq_int_workspace_vs_string_warns() {
-        // workspace.port is bound as Int via HashLit defaults.
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
 def output o { type stdout template "x" }
@@ -1005,8 +703,6 @@ def pipeline p {
 
     #[test]
     fn try_catch_intersects_bindings() {
-        // try sets workspace.a only; catch sets workspace.b only — neither
-        // survives the intersection; output of workspace.a errors.
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
 def output o { type stdout template "${workspace.a}" }
@@ -1048,14 +744,10 @@ def pipeline p {
         assert!(warnings(&diags).is_empty(), "got: {:?}", diags);
     }
 
-    // ----- let bindings --------------------------------------------------
-
     // ----- Phase 3 UX: spans + suggestions ------------------------------
 
     #[test]
     fn output_unresolved_workspace_ref_carries_value_span() {
-        // The error should carry the span of the property's value
-        // expression (the template containing `${workspace.nope}`).
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
 def output o { type stdout template "${workspace.nope}" }
@@ -1065,9 +757,6 @@ def pipeline p { input i; output o }
         let errs = errors(&diags);
         assert_eq!(errs.len(), 1, "got: {:?}", diags);
         let span = errs[0].span.expect("error should carry a span");
-        // The span should cover the template literal — sanity-check it
-        // by resolving against a fresh source map and confirming it
-        // points at the offending output line.
         let mut sm = SourceMap::new();
         sm.add_anonymous(src);
         let resolved = sm.resolve(&span).expect("span should resolve");
@@ -1080,7 +769,6 @@ def pipeline p { input i; output o }
 
     #[test]
     fn unresolved_workspace_ref_suggests_near_match() {
-        // `workspace.synlog_msg` (one transposition off `syslog_msg`) → suggest.
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
 def output o { type stdout template "${workspace.synlog_msg}" }
@@ -1099,7 +787,6 @@ def pipeline p {
 
     #[test]
     fn unresolved_workspace_ref_silent_when_nothing_close() {
-        // No bindings exist that are within edit distance — no help.
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
 def output o { type stdout template "${workspace.completely_unrelated_zzz}" }
@@ -1131,5 +818,24 @@ def pipeline p {
 "#;
         let diags = analyze_str(src);
         assert!(warnings(&diags).is_empty(), "got: {:?}", diags);
+    }
+
+    // ----- DefCounts -----------------------------------------------------
+
+    #[test]
+    fn def_counts_aggregate_each_kind() {
+        let src = r#"
+def input i1 { type tcp bind "0.0.0.0:514" }
+def input i2 { type udp bind "0.0.0.0:514" }
+def output o1 { type stdout template "x" }
+def process p { workspace.a = "z" }
+def pipeline pl { input i1; output o1 }
+"#;
+        let cfg = parse_config(src).expect("parse");
+        let counts = DefCounts::from_config(&cfg);
+        assert_eq!(counts.inputs, 2);
+        assert_eq!(counts.outputs, 1);
+        assert_eq!(counts.processes, 1);
+        assert_eq!(counts.pipelines, 1);
     }
 }

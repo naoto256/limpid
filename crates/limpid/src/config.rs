@@ -9,7 +9,8 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 
 use crate::dsl::ast::Config;
-use crate::dsl::parser::parse_config;
+use crate::dsl::parser::{parse_config, parse_config_with_file_id};
+use crate::dsl::span::SourceMap;
 
 /// Load configuration from a main config file, resolving any `include` directives.
 ///
@@ -73,6 +74,73 @@ pub fn load_config(config_file: &Path) -> Result<Config> {
     }
 
     Ok(config)
+}
+
+/// Like [`load_config`] but also builds a [`SourceMap`] populated with
+/// every file that contributed to the AST. Each file gets a distinct
+/// `file_id` so spans recorded by the parser resolve to the correct
+/// physical file when `--check` renders snippet + caret.
+///
+/// `file_id` 0 is assigned to the main config; each included file gets
+/// a subsequent id.
+pub fn load_config_with_source_map(config_file: &Path) -> Result<(Config, SourceMap)> {
+    let mut source_map = SourceMap::new();
+    let main_content = std::fs::read_to_string(config_file)
+        .with_context(|| format!("failed to read {}", config_file.display()))?;
+    let main_id = source_map.add_file(config_file.to_path_buf(), main_content.clone());
+    let mut config = parse_config_with_file_id(&main_content, main_id)
+        .with_context(|| format!("failed to parse {}", config_file.display()))?;
+
+    if config.includes.is_empty() {
+        return Ok((config, source_map));
+    }
+
+    let base_dir = config_file.parent().unwrap_or(Path::new("."));
+    let canonical_main = std::fs::canonicalize(config_file)
+        .with_context(|| format!("failed to canonicalize {}", config_file.display()))?;
+
+    for include_pattern in std::mem::take(&mut config.includes) {
+        let full_pattern = base_dir.join(&include_pattern);
+        let pattern_str = full_pattern.to_str().ok_or_else(|| {
+            anyhow::anyhow!("include path is not valid UTF-8: {}", include_pattern)
+        })?;
+
+        let mut paths: Vec<_> = glob::glob(pattern_str)
+            .with_context(|| format!("invalid include pattern: {}", include_pattern))?
+            .collect::<Result<Vec<_>, _>>()
+            .with_context(|| format!("error reading include pattern: {}", include_pattern))?;
+        paths.sort();
+
+        for path in paths {
+            let canonical = std::fs::canonicalize(&path)
+                .with_context(|| format!("failed to canonicalize {}", path.display()))?;
+            if canonical == canonical_main {
+                bail!(
+                    "self-inclusion detected: {} includes itself",
+                    config_file.display()
+                );
+            }
+
+            let inc_content = std::fs::read_to_string(&path)
+                .with_context(|| format!("failed to read included file {}", path.display()))?;
+            let inc_id = source_map.add_file(path.clone(), inc_content.clone());
+            let inc_config = parse_config_with_file_id(&inc_content, inc_id)
+                .with_context(|| format!("failed to parse included file {}", path.display()))?;
+
+            if !inc_config.includes.is_empty() {
+                bail!(
+                    "nested include not allowed: {} contains include directives (included from {})",
+                    path.display(),
+                    config_file.display(),
+                );
+            }
+
+            config.definitions.extend(inc_config.definitions);
+            config.global_blocks.extend(inc_config.global_blocks);
+        }
+    }
+
+    Ok((config, source_map))
 }
 
 #[cfg(test)]
@@ -156,6 +224,23 @@ mod tests {
 
         let config = load_config(&main_conf).unwrap();
         assert!(config.definitions.is_empty());
+    }
+
+    #[test]
+    fn test_load_with_source_map_assigns_distinct_ids() {
+        let dir = TempDir::new().unwrap();
+        let main_conf = dir.path().join("main.conf");
+        let sub_file = dir.path().join("sub.limpid");
+        fs::write(
+            &sub_file,
+            r#"def input fw { type syslog_udp bind "0.0.0.0:514" }"#,
+        )
+        .unwrap();
+        fs::write(&main_conf, r#"include "sub.limpid""#).unwrap();
+        let (config, sm) = load_config_with_source_map(&main_conf).unwrap();
+        assert_eq!(config.definitions.len(), 1);
+        // Main + 1 included file → 2 distinct file ids registered.
+        assert!(sm.file_count() >= 2);
     }
 
     #[test]
