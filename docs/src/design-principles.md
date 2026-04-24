@@ -1,6 +1,6 @@
 # Design Principles
 
-limpid is built on four principles. They are non-negotiable and take precedence over feature requests. When a proposal conflicts with a principle, limpid does not take the proposal — even if it is convenient, common in other tools, or widely expected.
+limpid is built on five principles. They are non-negotiable and take precedence over feature requests. When a proposal conflicts with a principle, limpid does not take the proposal — even if it is convenient, common in other tools, or widely expected.
 
 These principles exist because the tools limpid replaces (rsyslog, syslog-ng, fluentd) did not fail from missing features — they collapsed under the accumulated weight of hidden behavior, convenience defaults, and special cases. limpid does not take that path.
 
@@ -58,6 +58,23 @@ In a multi-hop pipeline, the only thing that travels from one limpid daemon to t
 **Why:** this is the natural consequence of Principle 2. When the wire contract is just `egress` bytes, no metadata can silently drift between daemons, no schema can grow incompatible across versions, and no "attribute" can mean one thing on one hop and another thing on the next. Each hop re-derives what it needs from the bytes it received.
 
 **Consequence:** limpid multi-hop pipelines are simple to reason about. The contract is auditable — it's whatever you construct in `egress`. There is no hidden sidecar of "things that also travel".
+
+## Principle 5 — Schema identity is declared by namespace
+
+Functions that depend on a specific schema specification (syslog, CEF, OCSF, …) live under a dot namespace that names the schema: `syslog.parse`, `cef.parse`, `ocsf.map`. Schema-agnostic primitives — the ones that don't know or care what format the input is — stay flat: `parse_json`, `regex_extract`, `strftime`, `table_lookup`.
+
+The judgement rule is a single question: **does the function's behavior follow a specific schema specification?** If yes, the schema's name is part of the function's name. If no, it's a flat primitive.
+
+- `syslog.parse(x)` — behaves according to RFC 3164 / RFC 5424. Schema-specific.
+- `cef.parse(x)` — behaves according to the ArcSight CEF specification. Schema-specific.
+- `parse_json(x)` — extracts JSON structure. Doesn't care whether the JSON encodes an event, a metric, or a config blob. Primitive.
+- `regex_extract(x, pat)` — runs a regex. No schema awareness at all. Primitive.
+
+**Why:** reading a config should tell you exactly which specifications the pipeline is bound to. When a syslog parser hides behind a generic name like `parse()`, the reader has to know out-of-band which RFC is being followed; an upgrade that switches parsers is invisible at the call site. Putting the schema in the name makes the binding explicit and greppable — "what talks syslog?" becomes `rg 'syslog\\.'`.
+
+It also draws a clean line for Principle 3 (domain knowledge as DSL snippets). Schema-specific DSL snippets can be grouped under the namespace they describe; schema-agnostic primitives belong to the daemon. The namespace boundary is the same boundary as the "ships in Rust vs. ships in DSL" line, just made visible in the grammar.
+
+**Consequence:** v0.3.0 introduces the dot-namespace syntax but keeps the existing flat function names (`parse_syslog`, `parse_cef`, `strip_pri`, …) in place as a mechanical transition step. The schema-specific functions migrate to their namespaces in a later breaking change — pre-1.0, the rename is allowed because it aligns names with the principle that now governs them.
 
 ---
 

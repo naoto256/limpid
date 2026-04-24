@@ -193,13 +193,14 @@ mod tests {
     fn test_eval_contains() {
         let e = make_event();
         let f = make_funcs();
-        let expr = Expr::FuncCall(
-            "contains".into(),
-            vec![
+        let expr = Expr::FuncCall {
+            namespace: None,
+            name: "contains".into(),
+            args: vec![
                 Expr::Ident(vec!["ingress".into()]),
                 Expr::StringLit("test".into()),
             ],
-        );
+        };
         assert_eq!(eval_expr(&expr, &e, &f).unwrap(), Value::Bool(true));
     }
 
@@ -239,13 +240,21 @@ mod tests {
     fn test_eval_lower_upper() {
         let e = make_event();
         let f = make_funcs();
-        let lower = Expr::FuncCall("lower".into(), vec![Expr::StringLit("HELLO".into())]);
+        let lower = Expr::FuncCall {
+            namespace: None,
+            name: "lower".into(),
+            args: vec![Expr::StringLit("HELLO".into())],
+        };
         assert_eq!(
             eval_expr(&lower, &e, &f).unwrap(),
             Value::String("hello".into())
         );
 
-        let upper = Expr::FuncCall("upper".into(), vec![Expr::StringLit("hello".into())]);
+        let upper = Expr::FuncCall {
+            namespace: None,
+            name: "upper".into(),
+            args: vec![Expr::StringLit("hello".into())],
+        };
         assert_eq!(
             eval_expr(&upper, &e, &f).unwrap(),
             Value::String("HELLO".into())
@@ -256,7 +265,11 @@ mod tests {
     fn test_eval_to_json() {
         let e = make_event();
         let f = make_funcs();
-        let expr = Expr::FuncCall("to_json".into(), vec![]);
+        let expr = Expr::FuncCall {
+            namespace: None,
+            name: "to_json".into(),
+            args: vec![],
+        };
         let result = eval_expr(&expr, &e, &f).unwrap();
         let s = result.as_str().unwrap();
         assert!(s.contains("\"severity\":3"));

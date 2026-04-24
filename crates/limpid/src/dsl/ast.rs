@@ -194,8 +194,17 @@ pub enum Expr {
     Null,
     /// Identifier or dotted path: `severity`, `workspace.src`, `source`, `error`
     Ident(Vec<String>),
-    /// Function call: `contains(ingress, "CEF:")`, `to_json()`, `lower(workspace.name)`
-    FuncCall(String, Vec<Expr>),
+    /// Function call.
+    ///
+    /// `namespace = None` is the flat primitive form (`parse_json(x)`,
+    /// `lower(workspace.name)`). `namespace = Some("syslog")` is the
+    /// dot-namespaced form (`syslog.parse(ingress)`) introduced in
+    /// v0.3.0 Block 3; the registry dispatches on `(namespace, name)`.
+    FuncCall {
+        namespace: Option<String>,
+        name: String,
+        args: Vec<Expr>,
+    },
     /// Binary operation: `a == b`, `a and b`, `a + b`, etc.
     BinOp(Box<Expr>, BinOp, Box<Expr>),
     /// Unary operation: `not expr`

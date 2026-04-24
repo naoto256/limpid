@@ -22,8 +22,14 @@ use crate::event::Event;
 
 type ExprFn = Box<dyn Fn(&[Value], &Event) -> Result<Value> + Send + Sync>;
 
+/// Registry key: `(namespace, name)`. `namespace = None` is the flat
+/// primitive namespace (`parse_json`, `regex_*`, `strftime`, ...).
+/// `namespace = Some("syslog")` and friends are the dot-namespaced
+/// form introduced in v0.3.0 Block 3.
+type FnKey = (Option<String>, String);
+
 pub struct FunctionRegistry {
-    functions: HashMap<String, ExprFn>,
+    functions: HashMap<FnKey, ExprFn>,
 }
 
 impl FunctionRegistry {
@@ -33,18 +39,54 @@ impl FunctionRegistry {
         }
     }
 
+    /// Register a flat primitive function (no namespace).
+    /// Equivalent to `register_in(None, name, f)`, kept as the legacy API
+    /// so the existing built-in registration path is untouched.
     pub fn register<F>(&mut self, name: &str, f: F)
     where
         F: Fn(&[Value], &Event) -> Result<Value> + Send + Sync + 'static,
     {
-        self.functions.insert(name.to_string(), Box::new(f));
+        self.functions.insert((None, name.to_string()), Box::new(f));
     }
 
-    pub fn call(&self, name: &str, args: &[Value], event: &Event) -> Result<Value> {
-        let f = self
-            .functions
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("unknown function: {}", name))?;
+    /// Register a namespaced function, callable as `<namespace>.<name>(...)`
+    /// in the DSL. Block 3 introduces the dispatch path; Block 4 will
+    /// populate the real `syslog` / `cef` / `ocsf` namespaces.
+    ///
+    /// Currently only used by tests — the `dead_code` allow goes away
+    /// once Block 4 starts calling `register_in` from the built-in
+    /// registration path.
+    #[allow(dead_code)]
+    pub fn register_in<F>(&mut self, namespace: &str, name: &str, f: F)
+    where
+        F: Fn(&[Value], &Event) -> Result<Value> + Send + Sync + 'static,
+    {
+        self.functions
+            .insert((Some(namespace.to_string()), name.to_string()), Box::new(f));
+    }
+
+    /// Dispatch a function call. `namespace = None` hits the flat
+    /// primitive registry; `Some(ns)` hits the namespaced registry.
+    /// Missing entries produce distinct error messages so users can tell
+    /// "unknown namespace" from "unknown function in namespace".
+    pub fn call(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+        args: &[Value],
+        event: &Event,
+    ) -> Result<Value> {
+        let key = (namespace.map(str::to_string), name.to_string());
+        let f = self.functions.get(&key).ok_or_else(|| match namespace {
+            None => anyhow::anyhow!("unknown function: {}", name),
+            Some(ns) => {
+                if self.functions.keys().any(|(n, _)| n.as_deref() == Some(ns)) {
+                    anyhow::anyhow!("unknown function '{}.{}' in namespace '{}'", ns, name, ns)
+                } else {
+                    anyhow::anyhow!("unknown function namespace: '{}'", ns)
+                }
+            }
+        })?;
         f(args, event)
     }
 }
@@ -452,6 +494,7 @@ mod tests {
         let e = dummy_event();
         let result = reg
             .call(
+                None,
                 "strftime",
                 &[
                     Value::String("2026-04-19T10:30:45+00:00".into()),
@@ -470,6 +513,7 @@ mod tests {
         let e = dummy_event();
         let result = reg
             .call(
+                None,
                 "strftime",
                 &[
                     Value::String("2026-04-19T05:07:09+00:00".into()),
@@ -488,6 +532,7 @@ mod tests {
         // Input is +09:00; force to UTC.
         let result = reg
             .call(
+                None,
                 "strftime",
                 &[
                     Value::String("2026-04-19T10:30:45+09:00".into()),
@@ -506,6 +551,7 @@ mod tests {
         let e = dummy_event();
         let result = reg
             .call(
+                None,
                 "strftime",
                 &[
                     Value::String("2026-04-19T10:30:45+00:00".into()),
@@ -524,6 +570,7 @@ mod tests {
         let e = dummy_event();
         let err = reg
             .call(
+                None,
                 "strftime",
                 &[
                     Value::String("not-a-timestamp".into()),
@@ -541,6 +588,7 @@ mod tests {
         let e = dummy_event();
         let err = reg
             .call(
+                None,
                 "strftime",
                 &[
                     Value::String("2026-04-19T10:30:45+00:00".into()),
@@ -559,6 +607,7 @@ mod tests {
         let e = dummy_event();
         let err = reg
             .call(
+                None,
                 "strftime",
                 &[Value::String("2026-04-19T10:30:45+00:00".into())],
                 &e,
@@ -596,6 +645,7 @@ mod tests {
         e.facility = Some(16);
         let result = reg
             .call(
+                None,
                 "format",
                 &[Value::String("[%{severity}] %{egress}".into())],
                 &e,
@@ -613,6 +663,7 @@ mod tests {
             .insert("host".into(), serde_json::Value::String("web01".into()));
         let result = reg
             .call(
+                None,
                 "format",
                 &[Value::String("host=%{workspace.host}".into())],
                 &e,
@@ -630,7 +681,7 @@ mod tests {
         e.workspace
             .insert("pid".into(), serde_json::Value::String("42".into()));
         let err = reg
-            .call("format", &[Value::String("pid=%{pid}".into())], &e)
+            .call(None, "format", &[Value::String("pid=%{pid}".into())], &e)
             .unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -645,12 +696,97 @@ mod tests {
         );
     }
 
+    // ---- dot namespace dispatch (Block 3) -------------------------------
+
+    #[test]
+    fn register_in_and_dispatch_namespaced() {
+        // Block 3 mechanism check: a fake namespace + function registered
+        // via `register_in` should dispatch through `call(Some(ns), name)`.
+        let mut reg = FunctionRegistry::new();
+        reg.register_in("_test_block3", "passthrough", |args, _e| {
+            Ok(args.first().cloned().unwrap_or(Value::Null))
+        });
+        let e = dummy_event();
+        let result = reg
+            .call(
+                Some("_test_block3"),
+                "passthrough",
+                &[Value::String("hi".into())],
+                &e,
+            )
+            .unwrap();
+        assert_eq!(result, Value::String("hi".into()));
+    }
+
+    #[test]
+    fn unknown_namespace_error_message() {
+        let reg = make_registry();
+        let e = dummy_event();
+        let err = reg
+            .call(Some("syslog"), "parse", &[], &e)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown function namespace"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("syslog"), "expected ns name in error: {err}");
+    }
+
+    #[test]
+    fn unknown_function_in_existing_namespace() {
+        let mut reg = FunctionRegistry::new();
+        reg.register_in("_test_block3", "known", |_a, _e| Ok(Value::Null));
+        let e = dummy_event();
+        let err = reg
+            .call(Some("_test_block3"), "missing", &[], &e)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown function '_test_block3.missing'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn flat_primitive_regression_still_callable() {
+        // Regression: after the registry became (namespace, name)-keyed,
+        // existing flat primitives must still dispatch via `call(None, ...)`.
+        let reg = make_registry();
+        let e = dummy_event();
+        let result = reg
+            .call(None, "lower", &[Value::String("HELLO".into())], &e)
+            .unwrap();
+        assert_eq!(result, Value::String("hello".into()));
+    }
+
+    #[test]
+    fn namespace_and_flat_do_not_collide() {
+        // Same short name registered in two different namespaces should
+        // remain independently addressable.
+        let mut reg = FunctionRegistry::new();
+        reg.register("ping", |_a, _e| Ok(Value::String("flat".into())));
+        reg.register_in("_test_block3", "ping", |_a, _e| {
+            Ok(Value::String("namespaced".into()))
+        });
+        let e = dummy_event();
+        assert_eq!(
+            reg.call(None, "ping", &[], &e).unwrap(),
+            Value::String("flat".into())
+        );
+        assert_eq!(
+            reg.call(Some("_test_block3"), "ping", &[], &e).unwrap(),
+            Value::String("namespaced".into())
+        );
+    }
+
     #[test]
     fn format_error_suggests_explicit_form_for_typos() {
         let reg = make_registry();
         let e = dummy_event();
         let err = reg
             .call(
+                None,
                 "format",
                 &[Value::String("x=%{nope_not_a_thing}".into())],
                 &e,

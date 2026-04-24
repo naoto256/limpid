@@ -276,8 +276,13 @@ atom = {
   | ident_path
 }
 
+// Function call, with optional namespace prefix: `syslog.parse(x)` or `parse_json(x)`.
+// The namespace-prefixed alternative is tried first so that bare `ident(...)`
+// still matches the flat primitive form. Property access (`workspace.foo`
+// with no trailing `(`) falls through to `ident_path` via atom ordering.
 func_call = {
-    ident ~ "(" ~ func_args ~ ")"
+    ident ~ "." ~ ident ~ "(" ~ func_args ~ ")"
+  | ident ~ "(" ~ func_args ~ ")"
 }
 
 func_args = {

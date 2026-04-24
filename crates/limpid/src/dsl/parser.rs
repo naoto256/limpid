@@ -541,14 +541,48 @@ fn parse_atom(pair: Pair<Rule>) -> Result<Expr> {
 }
 
 fn parse_func_call_expr(pair: Pair<Rule>) -> Result<Expr> {
-    let mut inner = pair.into_inner();
-    let name = inner.next().unwrap().as_str().to_string();
-    let args = if let Some(args_pair) = inner.next() {
+    // Grammar has two alternatives:
+    //   ident "." ident "(" args ")"   — namespaced:  inner = [ns, name, args?]
+    //   ident "(" args ")"             — flat:        inner = [name, args?]
+    // We peek at how many leading `ident` pairs there are before the
+    // `func_args` child. This is simpler than threading a silent tag
+    // through the grammar.
+    let mut inner: Vec<Pair<Rule>> = pair.into_inner().collect();
+
+    // Last child (if present) is `func_args`. Strip it off first.
+    let args_pair = if inner
+        .last()
+        .map(|p| p.as_rule() == Rule::func_args)
+        .unwrap_or(false)
+    {
+        Some(inner.pop().unwrap())
+    } else {
+        None
+    };
+
+    let (namespace, name) = match inner.as_slice() {
+        [name_pair] => (None, name_pair.as_str().to_string()),
+        [ns_pair, name_pair] => (
+            Some(ns_pair.as_str().to_string()),
+            name_pair.as_str().to_string(),
+        ),
+        _ => bail!(
+            "malformed func_call: expected 1 or 2 ident pairs, got {}",
+            inner.len()
+        ),
+    };
+
+    let args = if let Some(args_pair) = args_pair {
         parse_func_args(args_pair)?
     } else {
         vec![]
     };
-    Ok(Expr::FuncCall(name, args))
+
+    Ok(Expr::FuncCall {
+        namespace,
+        name,
+        args,
+    })
 }
 
 fn parse_func_args(pair: Pair<Rule>) -> Result<Vec<Expr>> {
@@ -960,7 +994,15 @@ def process test {
             Definition::Process(def) => {
                 assert_eq!(def.body.len(), 3);
                 match &def.body[0] {
-                    ProcessStatement::Assign(AssignTarget::Egress, Expr::FuncCall(name, args)) => {
+                    ProcessStatement::Assign(
+                        AssignTarget::Egress,
+                        Expr::FuncCall {
+                            namespace,
+                            name,
+                            args,
+                        },
+                    ) => {
+                        assert!(namespace.is_none());
                         assert_eq!(name, "to_json");
                         assert_eq!(args.len(), 0);
                     }
@@ -1146,12 +1188,109 @@ def process p {
         let config = parse_config(input).unwrap();
         match &config.definitions[0] {
             Definition::Process(def) => match &def.body[0] {
-                ProcessStatement::LetBinding(name, Expr::FuncCall(fname, args)) => {
+                ProcessStatement::LetBinding(
+                    name,
+                    Expr::FuncCall {
+                        namespace,
+                        name: fname,
+                        args,
+                    },
+                ) => {
                     assert_eq!(name, "m");
+                    assert!(namespace.is_none());
                     assert_eq!(fname, "regex_extract");
                     assert_eq!(args.len(), 2);
                 }
                 other => panic!("expected LetBinding with FuncCall, got {:?}", other),
+            },
+            _ => panic!("expected process"),
+        }
+    }
+
+    // ---- dot namespace syntax (Block 3) --------------------------------
+
+    #[test]
+    fn test_parse_namespaced_func_call() {
+        // Grammar should accept `<ns>.<fn>(args)` and build a FuncCall
+        // with `namespace = Some("syslog")`. Block 3 only adds the
+        // syntax + registry — no syslog.* function is registered yet,
+        // which is fine because parsing is structural.
+        let input = r#"
+def process p {
+    let h = syslog.parse(ingress)
+    workspace.h = h
+}
+"#;
+        let config = parse_config(input).unwrap();
+        match &config.definitions[0] {
+            Definition::Process(def) => match &def.body[0] {
+                ProcessStatement::LetBinding(
+                    name,
+                    Expr::FuncCall {
+                        namespace,
+                        name: fname,
+                        args,
+                    },
+                ) => {
+                    assert_eq!(name, "h");
+                    assert_eq!(namespace.as_deref(), Some("syslog"));
+                    assert_eq!(fname, "parse");
+                    assert_eq!(args.len(), 1);
+                }
+                other => panic!("expected namespaced FuncCall, got {:?}", other),
+            },
+            _ => panic!("expected process"),
+        }
+    }
+
+    #[test]
+    fn test_parse_namespaced_func_call_no_args() {
+        // Zero-arg form: `foo.bar()`.
+        let input = r#"
+def process p {
+    let x = foo.bar()
+}
+"#;
+        let config = parse_config(input).unwrap();
+        match &config.definitions[0] {
+            Definition::Process(def) => match &def.body[0] {
+                ProcessStatement::LetBinding(
+                    _,
+                    Expr::FuncCall {
+                        namespace,
+                        name,
+                        args,
+                    },
+                ) => {
+                    assert_eq!(namespace.as_deref(), Some("foo"));
+                    assert_eq!(name, "bar");
+                    assert!(args.is_empty());
+                }
+                other => panic!("expected namespaced FuncCall, got {:?}", other),
+            },
+            _ => panic!("expected process"),
+        }
+    }
+
+    #[test]
+    fn test_namespace_prefix_does_not_break_property_access() {
+        // Regression: `workspace.foo` (no trailing `(`) must still parse
+        // as a property access / ident_path, not as a malformed func
+        // call. The grammar falls through to ident_path when there's
+        // no `(`.
+        let input = r#"
+def process p {
+    workspace.foo = workspace.bar
+}
+"#;
+        let config = parse_config(input).unwrap();
+        match &config.definitions[0] {
+            Definition::Process(def) => match &def.body[0] {
+                ProcessStatement::Assign(AssignTarget::Workspace(path), Expr::Ident(parts)) => {
+                    assert_eq!(path, &vec!["foo".to_string()]);
+                    assert_eq!(parts, &vec!["workspace".to_string(), "bar".to_string()]);
+                }
+                other => panic!("expected workspace assign, got {:?}", other),
             },
             _ => panic!("expected process"),
         }
