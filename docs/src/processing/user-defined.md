@@ -119,6 +119,66 @@ foreach workspace.items {
 }
 ```
 
+See also [Arrays](#arrays) for why `foreach` plus `find_by` are the only reads the DSL exposes for array elements.
+
+## Arrays
+
+limpid treats arrays as **positionless collections**. You construct them with `[a, b, c]` literals, and you can iterate with `foreach`, pick by identity with `find_by`, count with `len`, and add with `append` / `prepend`. What you can **not** do is refer to a numeric index — `arr[0]`, `arr[-1]`, and `arr[0] = v` are intentionally absent from the grammar.
+
+### Why no positional access
+
+A numeric index is a human convenience that drifts the moment anything else mutates the collection. If "evidence of type Process" happened to land at `arr[0]` in one event and `arr[1]` in the next because an extra entity was prepended upstream, positional code silently reads the wrong thing. Addressing by intrinsic identity is the fix:
+
+```
+// WRONG (position is an accident of construction order)
+workspace.process = workspace.evidence[0]
+
+// RIGHT (identity survives insertion / deletion)
+workspace.process = find_by(workspace.evidence, "entityType", "Process")
+```
+
+The library steers toward identity-based access so snippets stay correct under upstream evolution of vendor schemas.
+
+### What arrays can do
+
+| Operation | Form |
+|-----------|------|
+| Construction | `[a, b, c]`, `[]`, mixed types and nesting OK |
+| Iteration | `foreach workspace.items { ... }` — `workspace._item` is the current element |
+| Identity-keyed lookup | `find_by(arr, "key", "value")` — returns the element or `null` |
+| Cardinality | `len(arr)` |
+| Add to back / front | `workspace.x = append(workspace.x, v)`, `workspace.x = prepend(workspace.x, v)` |
+| Serialize to JSON | `to_json(workspace.arr)` — arrays pass through as JSON arrays |
+
+### Example: building an OCSF multi-value field
+
+```
+def process compose_types {
+    // Start with a fresh collection. Arrays are positionless — the order
+    // below is construction convenience, not an index consumers can rely on.
+    workspace.types = []
+
+    if workspace.cef_name != null {
+        workspace.types = append(workspace.types, workspace.cef_name)
+    }
+    if workspace.pan_threat_type != null {
+        workspace.types = append(workspace.types, workspace.pan_threat_type)
+    }
+}
+```
+
+### Example: picking specific evidence from an MDE alert
+
+```
+def process parse_mde_alert {
+    parse_json(ingress)
+    workspace.process_ev = find_by(workspace.evidence, "entityType", "Process")
+    workspace.user_ev    = find_by(workspace.evidence, "entityType", "User")
+}
+```
+
+Neither parser cares whether "the Process entity" appears first, last, or third in the evidence list. That independence is the point.
+
 ### process call
 
 Calls another named process:

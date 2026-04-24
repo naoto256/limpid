@@ -299,4 +299,171 @@ mod tests {
             err
         );
     }
+
+    // ------------------------------------------------------------------------
+    // Array literal + primitives E2E — these exercise the full evaluator
+    // path (ExprKind::ArrayLit through exec_process_body's Assign arm,
+    // function registry dispatch for len / append / prepend / find_by).
+    // ------------------------------------------------------------------------
+
+    fn call_fn(name: &str, args: Vec<Expr>) -> Expr {
+        e(ExprKind::FuncCall {
+            namespace: None,
+            name: name.into(),
+            args,
+        })
+    }
+
+    #[test]
+    fn test_exec_array_literal_into_workspace() {
+        let event = make_event();
+        let stmts = vec![ProcessStatement::Assign(
+            AssignTarget::Workspace(vec!["types".into()]),
+            e(ExprKind::ArrayLit(vec![
+                e(ExprKind::StringLit("sqli".into())),
+                e(ExprKind::StringLit("xss".into())),
+            ])),
+        )];
+        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+            ExecResult::Continue(ev) => {
+                assert_eq!(
+                    ev.workspace["types"],
+                    Value::Array(vec![
+                        Value::String("sqli".into()),
+                        Value::String("xss".into()),
+                    ])
+                );
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
+    }
+
+    #[test]
+    fn test_exec_len_over_array_literal() {
+        let event = make_event();
+        let stmts = vec![ProcessStatement::Assign(
+            AssignTarget::Workspace(vec!["n".into()]),
+            call_fn(
+                "len",
+                vec![e(ExprKind::ArrayLit(vec![
+                    e(ExprKind::IntLit(1)),
+                    e(ExprKind::IntLit(2)),
+                    e(ExprKind::IntLit(3)),
+                ]))],
+            ),
+        )];
+        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+            ExecResult::Continue(ev) => {
+                assert_eq!(ev.workspace["n"], Value::Number(3.into()));
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
+    }
+
+    #[test]
+    fn test_exec_append_grows_array() {
+        // workspace.xs = [1, 2]
+        // workspace.xs = append(workspace.xs, 3)
+        let event = make_event();
+        let stmts = vec![
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["xs".into()]),
+                e(ExprKind::ArrayLit(vec![
+                    e(ExprKind::IntLit(1)),
+                    e(ExprKind::IntLit(2)),
+                ])),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["xs".into()]),
+                call_fn(
+                    "append",
+                    vec![
+                        e(ExprKind::Ident(vec!["workspace".into(), "xs".into()])),
+                        e(ExprKind::IntLit(3)),
+                    ],
+                ),
+            ),
+        ];
+        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+            ExecResult::Continue(ev) => {
+                assert_eq!(
+                    ev.workspace["xs"],
+                    Value::Array(vec![
+                        Value::Number(1.into()),
+                        Value::Number(2.into()),
+                        Value::Number(3.into()),
+                    ])
+                );
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
+    }
+
+    #[test]
+    fn test_exec_prepend_grows_array_at_front() {
+        let event = make_event();
+        let stmts = vec![
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["xs".into()]),
+                e(ExprKind::ArrayLit(vec![
+                    e(ExprKind::IntLit(2)),
+                    e(ExprKind::IntLit(3)),
+                ])),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["xs".into()]),
+                call_fn(
+                    "prepend",
+                    vec![
+                        e(ExprKind::Ident(vec!["workspace".into(), "xs".into()])),
+                        e(ExprKind::IntLit(1)),
+                    ],
+                ),
+            ),
+        ];
+        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+            ExecResult::Continue(ev) => {
+                assert_eq!(
+                    ev.workspace["xs"],
+                    Value::Array(vec![
+                        Value::Number(1.into()),
+                        Value::Number(2.into()),
+                        Value::Number(3.into()),
+                    ])
+                );
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
+    }
+
+    #[test]
+    fn test_exec_find_by_over_literal_array_of_objects() {
+        // workspace.found = find_by([{t:"a", n:1}, {t:"b", n:2}], "t", "b")
+        let event = make_event();
+        let obj = |t: &str, n: i64| {
+            e(ExprKind::HashLit(vec![
+                ("t".into(), e(ExprKind::StringLit(t.into()))),
+                ("n".into(), e(ExprKind::IntLit(n))),
+            ]))
+        };
+        let stmts = vec![ProcessStatement::Assign(
+            AssignTarget::Workspace(vec!["found".into()]),
+            call_fn(
+                "find_by",
+                vec![
+                    e(ExprKind::ArrayLit(vec![obj("a", 1), obj("b", 2)])),
+                    e(ExprKind::StringLit("t".into())),
+                    e(ExprKind::StringLit("b".into())),
+                ],
+            ),
+        )];
+        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+            ExecResult::Continue(ev) => {
+                let found = &ev.workspace["found"];
+                assert_eq!(found.get("t"), Some(&Value::String("b".into())));
+                assert_eq!(found.get("n"), Some(&Value::Number(2.into())));
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
+    }
 }
