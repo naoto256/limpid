@@ -17,6 +17,7 @@ use serde_json::Value;
 
 use crate::functions::FunctionRegistry;
 use crate::functions::primitives::val_to_str;
+use crate::functions::syslog::pri::parse_leading_pri;
 
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register_in("syslog", "set_pri", |args, _event| set_pri_impl(args));
@@ -31,8 +32,8 @@ fn set_pri_impl(args: &[Value]) -> Result<Value> {
     let severity = arg_as_u8(&args[2], "severity", 7)?;
     let pri = (facility as u16) * 8 + (severity as u16);
 
-    let body = match strip_leading_pri(&text) {
-        Some(rest) => rest,
+    let body = match parse_leading_pri(&text) {
+        Some((_, offset)) => &text[offset..],
         None => &text,
     };
 
@@ -50,31 +51,6 @@ fn arg_as_u8(v: &Value, name: &str, max: u8) -> Result<u8> {
         bail!("syslog.set_pri(): {} must be 0-{}, got {}", name, max, n);
     }
     Ok(n as u8)
-}
-
-/// If `s` begins with a syntactically valid `<N>` header (1-3 digits,
-/// resulting value ≤ 191), return the remainder. Otherwise `None`.
-fn strip_leading_pri(s: &str) -> Option<&str> {
-    let bytes = s.as_bytes();
-    if bytes.first() != Some(&b'<') {
-        return None;
-    }
-    let limit = bytes.len().min(6);
-    let gt_pos = bytes[..limit].iter().position(|&b| b == b'>')?;
-    if gt_pos < 2 {
-        return None;
-    }
-    let digits = &bytes[1..gt_pos];
-    if !digits.iter().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    // Parse numeric value — reject out-of-range values rather than
-    // treating them as PRI.
-    let n: u16 = std::str::from_utf8(digits).ok()?.parse().ok()?;
-    if n > 191 {
-        return None;
-    }
-    Some(&s[gt_pos + 1..])
 }
 
 #[cfg(test)]

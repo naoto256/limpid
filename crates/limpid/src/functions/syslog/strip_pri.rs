@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use crate::functions::FunctionRegistry;
 use crate::functions::primitives::val_to_str;
+use crate::functions::syslog::pri::parse_leading_pri;
 
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register_in("syslog", "strip_pri", |args, _event| {
@@ -16,30 +17,12 @@ pub fn register(reg: &mut FunctionRegistry) {
             bail!("syslog.strip_pri() expects 1 argument (input string)");
         }
         let input = val_to_str(&args[0]);
-        let stripped = match strip_pri_prefix(&input) {
-            Some(rest) => rest.to_string(),
+        let stripped = match parse_leading_pri(&input) {
+            Some((_, body)) => input[body..].to_string(),
             None => input,
         };
         Ok(Value::String(stripped))
     });
-}
-
-/// If `s` starts with a valid `<PRI>` header (1-3 digits between '<'
-/// and '>'), return the remainder. Otherwise `None`.
-pub(crate) fn strip_pri_prefix(s: &str) -> Option<&str> {
-    let bytes = s.as_bytes();
-    if bytes.first() != Some(&b'<') {
-        return None;
-    }
-    let limit = bytes.len().min(6);
-    let gt_pos = bytes[..limit].iter().position(|&b| b == b'>')?;
-    if gt_pos < 2 {
-        return None;
-    }
-    if !bytes[1..gt_pos].iter().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    Some(&s[gt_pos + 1..])
 }
 
 #[cfg(test)]
