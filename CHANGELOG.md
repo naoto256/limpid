@@ -84,6 +84,18 @@ tooling on top of the DSL finalised in v0.3.0. No DSL breaking changes
   heuristics, so category rendering and `--ultra-strict` promotion
   share the same source of truth.
 
+### Security / hardening
+
+- Snippet renderer sanitises ASCII control bytes (0x00–0x1F minus `\t`,
+  and 0x7F) to `?` before writing the source line to stderr. Prevents
+  ANSI OSC/CSI injection through config contents displayed in a
+  reviewer's terminal.
+- `include "<glob>";` is now confined to the config's root directory.
+  Absolute paths and `..` traversal outside that root are rejected with
+  a clear error. Prevents an include line from silently pulling in
+  arbitrary files (`/etc/passwd`, `~/.ssh/*` etc.) or from leaking the
+  first bytes of such files via a pest parse error.
+
 ### Documentation fixes
 
 - `limpidctl check` references in operations / pipelines / processing
