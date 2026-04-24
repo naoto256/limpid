@@ -102,12 +102,16 @@ pub fn eval_expr_with_scope(
 
         Expr::Ident(parts) => resolve_ident(parts, event, scope),
 
-        Expr::FuncCall(name, args) => {
+        Expr::FuncCall {
+            namespace,
+            name,
+            args,
+        } => {
             let evaluated_args: Vec<Value> = args
                 .iter()
                 .map(|a| eval_expr_with_scope(a, event, funcs, scope))
                 .collect::<Result<Vec<_>>>()?;
-            funcs.call(name, &evaluated_args, event)
+            funcs.call(namespace.as_deref(), name, &evaluated_args, event)
         }
 
         Expr::BinOp(left, op, right) => {

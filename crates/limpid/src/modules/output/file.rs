@@ -426,9 +426,10 @@ mod tests {
         assert!(!is_workspace_reference(&Expr::Ident(vec!["source".into()])));
         // function calls always render without sanitisation (users
         // opt-in to their own sanitisation)
-        assert!(!is_workspace_reference(&Expr::FuncCall(
-            "lower".into(),
-            vec![Expr::Ident(vec!["workspace".into(), "host".into()])],
-        )));
+        assert!(!is_workspace_reference(&Expr::FuncCall {
+            namespace: None,
+            name: "lower".into(),
+            args: vec![Expr::Ident(vec!["workspace".into(), "host".into()])],
+        }));
     }
 }

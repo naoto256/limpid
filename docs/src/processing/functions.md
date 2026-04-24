@@ -2,6 +2,15 @@
 
 Expression functions return values and can be used in conditions, assignments, and inline process blocks.
 
+## Call syntax
+
+Functions are called in two forms:
+
+- **Flat primitive** — `name(args...)`. Schema-agnostic helpers that don't depend on any particular log format live here: `parse_json`, `regex_extract`, `regex_replace`, `strftime`, `lower`, `upper`, `contains`, `md5`, `sha256`, `table_lookup`, `geoip`, and so on. All of the functions documented on this page are flat primitives.
+- **Dot namespace** — `<namespace>.<name>(args...)`. Schema-specific helpers declare the schema they bind to in their name: `syslog.parse(ingress)`, `cef.parse(ingress)`, and so on. See [Design Principle 5](../design-principles.md#principle-5--schema-identity-is-declared-by-namespace) for the rationale.
+
+v0.3.0 introduces the dot-namespace grammar and the registry dispatch path, but does not yet register any namespaced functions. The existing schema-specific helpers (`parse_syslog`, `parse_cef`, `strip_pri`, …) still ship as flat process-layer modules and flat primitives; the migration to `syslog.*` / `cef.*` / `ocsf.*` lands in a later v0.3.0 step. Until then, calling a namespaced function will fail with `unknown function namespace: '...'`.
+
 ## String functions
 
 ### contains(haystack, needle)
