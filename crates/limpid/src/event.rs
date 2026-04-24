@@ -1,7 +1,8 @@
 //! Event: the internal message representation flowing through pipelines.
 //!
 //! Each event has an immutable `raw` (original message) and a mutable
-//! `message` (output target), plus typed metadata and free-form `fields`.
+//! `message` (output target), plus typed metadata and free-form
+//! `workspace` (pipeline-local scratch namespace).
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -17,7 +18,7 @@ pub struct Event {
     pub severity: Option<u8>,
     pub raw: Bytes,
     pub message: Bytes,
-    pub fields: HashMap<String, Value>,
+    pub workspace: HashMap<String, Value>,
 }
 
 impl Event {
@@ -29,7 +30,7 @@ impl Event {
             severity: None,
             message: raw.clone(),
             raw,
-            fields: HashMap::new(),
+            workspace: HashMap::new(),
         }
     }
 
@@ -55,10 +56,10 @@ impl Event {
             "message".into(),
             Value::String(String::from_utf8_lossy(&self.message).into_owned()),
         );
-        if !self.fields.is_empty() {
+        if !self.workspace.is_empty() {
             map.insert(
-                "fields".into(),
-                Value::Object(self.fields.clone().into_iter().collect()),
+                "workspace".into(),
+                Value::Object(self.workspace.clone().into_iter().collect()),
             );
         }
         Value::Object(map)
@@ -99,12 +100,12 @@ impl Event {
                     .unwrap_or(&raw)
                     .to_string(),
             ),
-            fields: HashMap::new(),
+            workspace: HashMap::new(),
         };
 
-        if let Some(fields) = v.get("fields").and_then(|v| v.as_object()) {
-            for (k, val) in fields {
-                event.fields.insert(k.clone(), val.clone());
+        if let Some(workspace) = v.get("workspace").and_then(|v| v.as_object()) {
+            for (k, val) in workspace {
+                event.workspace.insert(k.clone(), val.clone());
             }
         }
 

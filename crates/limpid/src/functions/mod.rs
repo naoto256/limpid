@@ -343,7 +343,7 @@ fn parse_fixed_offset(s: &str) -> Option<chrono::FixedOffset> {
 /// Supported placeholders:
 /// - `%{source}`, `%{facility}`, `%{severity}`, `%{timestamp}`
 /// - `%{message}`, `%{raw}`
-/// - `%{fields.xxx}`, `%{fields.xxx.yyy}` (nested field access)
+/// - `%{workspace.xxx}`, `%{workspace.xxx.yyy}` (nested workspace access)
 fn expand_format_template(template: &str, event: &crate::event::Event) -> String {
     let mut result = String::with_capacity(template.len());
     let mut chars = template.chars().peekable();
@@ -375,13 +375,13 @@ fn resolve_format_var(var: &str, event: &crate::event::Event) -> String {
         "timestamp" => event.timestamp.to_rfc3339(),
         "message" => String::from_utf8_lossy(&event.message).into_owned(),
         "raw" => String::from_utf8_lossy(&event.raw).into_owned(),
-        v if v.starts_with("fields.") => {
-            let path: Vec<&str> = v["fields.".len()..].split('.').collect();
-            resolve_format_fields(&path, &event.fields)
+        v if v.starts_with("workspace.") => {
+            let path: Vec<&str> = v["workspace.".len()..].split('.').collect();
+            resolve_format_workspace(&path, &event.workspace)
         }
-        // Also try direct field name as shorthand for fields.xxx
+        // Also try direct key name as shorthand for workspace.xxx
         v => {
-            if let Some(val) = event.fields.get(v) {
+            if let Some(val) = event.workspace.get(v) {
                 match val {
                     serde_json::Value::String(s) => s.clone(),
                     serde_json::Value::Null => String::new(),
@@ -394,11 +394,11 @@ fn resolve_format_var(var: &str, event: &crate::event::Event) -> String {
     }
 }
 
-fn resolve_format_fields(
+fn resolve_format_workspace(
     path: &[&str],
-    fields: &std::collections::HashMap<String, serde_json::Value>,
+    workspace: &std::collections::HashMap<String, serde_json::Value>,
 ) -> String {
-    let first = match fields.get(path[0]) {
+    let first = match workspace.get(path[0]) {
         Some(v) => v,
         None => return String::new(),
     };

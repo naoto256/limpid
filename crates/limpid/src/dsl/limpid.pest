@@ -66,7 +66,7 @@ kw_include  = _{ "include" }
 
 ident = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 
-// Dotted identifier path: `fields.src.country`
+// Dotted identifier path: `workspace.src.country`
 ident_path = { ident ~ ("." ~ ident)* }
 
 // -- Literals ----------------------------------------------------------------

@@ -153,7 +153,7 @@ impl KafkaOutput {
             KeyField::Facility => event.facility.map(|f| f.to_string())?,
             KeyField::Severity => event.severity.map(|s| s.to_string())?,
             KeyField::Field(name) => event
-                .fields
+                .workspace
                 .get(name)
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())?,

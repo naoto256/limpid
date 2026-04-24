@@ -1,4 +1,4 @@
-//! parse_kv: parses key=value pairs from the message into event fields.
+//! parse_kv: parses key=value pairs from the message into the event workspace.
 //!
 //! Handles common syslog key-value formats used by FortiGate, Palo Alto, etc.
 //!
@@ -7,7 +7,7 @@
 //! - `key="quoted value"` (quoted values with spaces)
 //! - `key=value1,value2` (comma in unquoted values is included)
 //!
-//! All parsed key-value pairs are stored under `fields.*`.
+//! All parsed key-value pairs are stored under `workspace.*`.
 //! The original message is preserved.
 
 use serde_json::Value;
@@ -20,7 +20,7 @@ pub fn apply(mut event: Event) -> Result<Event, ProcessError> {
     let pairs = parse_kv_pairs(&msg);
 
     for (key, value) in pairs {
-        event.fields.insert(key, Value::String(value));
+        event.workspace.insert(key, Value::String(value));
     }
 
     Ok(event)
@@ -124,17 +124,20 @@ mod tests {
     fn test_basic_kv() {
         let event = make_event("src=10.0.0.1 dst=192.168.1.1 action=accept");
         let result = apply(event).unwrap();
-        assert_eq!(result.fields["src"], Value::String("10.0.0.1".into()));
-        assert_eq!(result.fields["dst"], Value::String("192.168.1.1".into()));
-        assert_eq!(result.fields["action"], Value::String("accept".into()));
+        assert_eq!(result.workspace["src"], Value::String("10.0.0.1".into()));
+        assert_eq!(result.workspace["dst"], Value::String("192.168.1.1".into()));
+        assert_eq!(result.workspace["action"], Value::String("accept".into()));
     }
 
     #[test]
     fn test_quoted_value() {
         let event = make_event(r#"msg="login failed" user=admin src=10.0.0.1"#);
         let result = apply(event).unwrap();
-        assert_eq!(result.fields["msg"], Value::String("login failed".into()));
-        assert_eq!(result.fields["user"], Value::String("admin".into()));
+        assert_eq!(
+            result.workspace["msg"],
+            Value::String("login failed".into())
+        );
+        assert_eq!(result.workspace["user"], Value::String("admin".into()));
     }
 
     #[test]
@@ -143,25 +146,25 @@ mod tests {
             "date=2026-04-15 time=10:30:00 devname=FW01 srcip=10.0.0.1 dstip=192.168.1.1 action=deny",
         );
         let result = apply(event).unwrap();
-        assert_eq!(result.fields["date"], Value::String("2026-04-15".into()));
-        assert_eq!(result.fields["devname"], Value::String("FW01".into()));
-        assert_eq!(result.fields["action"], Value::String("deny".into()));
+        assert_eq!(result.workspace["date"], Value::String("2026-04-15".into()));
+        assert_eq!(result.workspace["devname"], Value::String("FW01".into()));
+        assert_eq!(result.workspace["action"], Value::String("deny".into()));
     }
 
     #[test]
     fn test_empty_value() {
         let event = make_event("key1= key2=value2");
         let result = apply(event).unwrap();
-        assert_eq!(result.fields["key1"], Value::String("".into()));
-        assert_eq!(result.fields["key2"], Value::String("value2".into()));
+        assert_eq!(result.workspace["key1"], Value::String("".into()));
+        assert_eq!(result.workspace["key2"], Value::String("value2".into()));
     }
 
     #[test]
     fn test_non_kv_tokens_skipped() {
         let event = make_event("garbage src=10.0.0.1 more_garbage dst=1.2.3.4");
         let result = apply(event).unwrap();
-        assert_eq!(result.fields["src"], Value::String("10.0.0.1".into()));
-        assert_eq!(result.fields["dst"], Value::String("1.2.3.4".into()));
-        assert!(!result.fields.contains_key("garbage"));
+        assert_eq!(result.workspace["src"], Value::String("10.0.0.1".into()));
+        assert_eq!(result.workspace["dst"], Value::String("1.2.3.4".into()));
+        assert!(!result.workspace.contains_key("garbage"));
     }
 }

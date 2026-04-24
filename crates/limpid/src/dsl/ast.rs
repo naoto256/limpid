@@ -68,7 +68,7 @@ pub struct ProcessDef {
 /// Statements that can appear inside a process body.
 #[derive(Debug, Clone)]
 pub enum ProcessStatement {
-    /// `fields.xxx = expr`, `message = expr`, `severity = expr`, etc.
+    /// `workspace.xxx = expr`, `message = expr`, `severity = expr`, etc.
     Assign(AssignTarget, Expr),
     /// `process name` or `process name(args...)`
     ProcessCall(String, Vec<Expr>),
@@ -164,8 +164,8 @@ pub enum AssignTarget {
     Severity,
     /// `facility`
     Facility,
-    /// `fields.xxx` or `fields.xxx.yyy`
-    Field(Vec<String>),
+    /// `workspace.xxx` or `workspace.xxx.yyy`
+    Workspace(Vec<String>),
 }
 
 // ---------------------------------------------------------------------------
@@ -188,9 +188,9 @@ pub enum Expr {
     BoolLit(bool),
     /// Null literal
     Null,
-    /// Identifier or dotted path: `severity`, `fields.src`, `source`, `error`
+    /// Identifier or dotted path: `severity`, `workspace.src`, `source`, `error`
     Ident(Vec<String>),
-    /// Function call: `contains(raw, "CEF:")`, `to_json()`, `lower(fields.name)`
+    /// Function call: `contains(raw, "CEF:")`, `to_json()`, `lower(workspace.name)`
     FuncCall(String, Vec<Expr>),
     /// Binary operation: `a == b`, `a and b`, `a + b`, etc.
     BinOp(Box<Expr>, BinOp, Box<Expr>),

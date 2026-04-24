@@ -183,8 +183,8 @@ fn parse_assign_target(pair: Pair<Rule>) -> Result<AssignTarget> {
         [single] if single == "message" => Ok(AssignTarget::Message),
         [single] if single == "severity" => Ok(AssignTarget::Severity),
         [single] if single == "facility" => Ok(AssignTarget::Facility),
-        [first, rest @ ..] if first == "fields" && !rest.is_empty() => {
-            Ok(AssignTarget::Field(rest.to_vec()))
+        [first, rest @ ..] if first == "workspace" && !rest.is_empty() => {
+            Ok(AssignTarget::Workspace(rest.to_vec()))
         }
         _ => bail!("invalid assign target: {:?}", parts),
     }
@@ -741,11 +741,11 @@ def output ama {
 def process parse_and_enrich {
     process parse_cef
 
-    if fields.src != null {
+    if workspace.src != null {
         process geoip("src")
     }
 
-    if fields.device_vendor == "HealthCheck" {
+    if workspace.device_vendor == "HealthCheck" {
         drop
     }
 }
@@ -877,8 +877,8 @@ def process strict_parse {
     fn test_parse_expressions() {
         let input = r#"
 def process test {
-    if severity <= 3 and fields.alert == true {
-        fields.priority = "critical"
+    if severity <= 3 and workspace.alert == true {
+        workspace.priority = "critical"
     }
 }
 "#;
@@ -890,9 +890,9 @@ def process test {
     fn test_parse_hash_literal() {
         let input = r#"
 def process test {
-    fields.location = {
-        ip: fields.src,
-        country: fields.geo_country
+    workspace.location = {
+        ip: workspace.src,
+        country: workspace.geo_country
     }
 }
 "#;
@@ -918,7 +918,7 @@ def input fw_syslog {
 
 def process tag_critical {
     if severity <= 3 {
-        fields.alert = true
+        workspace.alert = true
     }
 }
 
@@ -943,8 +943,8 @@ def pipeline firewall {
         let input = r#"
 def process test {
     message = to_json()
-    fields.name = lower(fields.name)
-    fields.src = regex_extract(raw, "src=(\S+)")
+    workspace.name = lower(workspace.name)
+    workspace.src = regex_extract(raw, "src=(\S+)")
 }
 "#;
         let config = parse_config(input).unwrap();
@@ -1014,7 +1014,7 @@ def output sink {
         let input = r#"
 def output sink {
     type file
-    path "/var/log/${source}/${fields.date}.log"
+    path "/var/log/${source}/${workspace.date}.log"
 }
 "#;
         let config = parse_config(input).unwrap();
@@ -1031,11 +1031,11 @@ def output sink {
                     ));
                     // /
                     assert!(matches!(&frags[2], TemplateFragment::Literal(s) if s == "/"));
-                    // ${fields.date}
+                    // ${workspace.date}
                     assert!(matches!(
                         &frags[3],
                         TemplateFragment::Interp(Expr::Ident(parts))
-                            if parts == &vec!["fields".to_string(), "date".to_string()]
+                            if parts == &vec!["workspace".to_string(), "date".to_string()]
                     ));
                     // .log
                     assert!(matches!(&frags[4], TemplateFragment::Literal(s) if s == ".log"));

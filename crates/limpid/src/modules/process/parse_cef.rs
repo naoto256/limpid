@@ -1,11 +1,11 @@
-//! parse_cef: parses CEF (Common Event Format) messages into event fields.
+//! parse_cef: parses CEF (Common Event Format) messages into the event workspace.
 
 use serde_json::Value;
 
 use crate::event::Event;
 use crate::modules::ProcessError;
 
-/// Parse CEF (Common Event Format) from `raw` and expand into `fields`.
+/// Parse CEF (Common Event Format) from `raw` and expand into `workspace`.
 ///
 /// CEF format:
 /// ```text
@@ -40,25 +40,25 @@ pub fn apply(mut event: Event) -> Result<Event, ProcessError> {
     // `remaining` is now the extensions string
 
     event
-        .fields
+        .workspace
         .insert("cef_version".into(), Value::String(parts[0].to_string()));
     event
-        .fields
+        .workspace
         .insert("device_vendor".into(), Value::String(parts[1].to_string()));
     event
-        .fields
+        .workspace
         .insert("device_product".into(), Value::String(parts[2].to_string()));
     event
-        .fields
+        .workspace
         .insert("device_version".into(), Value::String(parts[3].to_string()));
     event
-        .fields
+        .workspace
         .insert("signature_id".into(), Value::String(parts[4].to_string()));
     event
-        .fields
+        .workspace
         .insert("name".into(), Value::String(parts[5].to_string()));
     event
-        .fields
+        .workspace
         .insert("cef_severity".into(), Value::String(parts[6].to_string()));
 
     // Parse extensions: key=value pairs
@@ -135,7 +135,7 @@ fn parse_cef_extensions(extensions: &str, event: &mut Event) {
 
         let value = extensions[val_start..val_end].trim();
         event
-            .fields
+            .workspace
             .insert(key.clone(), Value::String(value.to_string()));
     }
 }
@@ -160,19 +160,22 @@ mod tests {
         );
         let result = apply(event).unwrap();
 
-        assert_eq!(result.fields["cef_version"], Value::String("0".into()));
+        assert_eq!(result.workspace["cef_version"], Value::String("0".into()));
         assert_eq!(
-            result.fields["device_vendor"],
+            result.workspace["device_vendor"],
             Value::String("Fortinet".into())
         );
         assert_eq!(
-            result.fields["device_product"],
+            result.workspace["device_product"],
             Value::String("FortiGate".into())
         );
-        assert_eq!(result.fields["signature_id"], Value::String("1234".into()));
-        assert_eq!(result.fields["src"], Value::String("10.0.0.1".into()));
-        assert_eq!(result.fields["dst"], Value::String("10.0.0.2".into()));
-        assert_eq!(result.fields["act"], Value::String("deny".into()));
+        assert_eq!(
+            result.workspace["signature_id"],
+            Value::String("1234".into())
+        );
+        assert_eq!(result.workspace["src"], Value::String("10.0.0.1".into()));
+        assert_eq!(result.workspace["dst"], Value::String("10.0.0.2".into()));
+        assert_eq!(result.workspace["act"], Value::String("deny".into()));
     }
 
     #[test]
@@ -181,10 +184,10 @@ mod tests {
         let result = apply(event).unwrap();
 
         assert_eq!(
-            result.fields["device_vendor"],
+            result.workspace["device_vendor"],
             Value::String("Security".into())
         );
-        assert_eq!(result.fields["src"], Value::String("192.168.1.1".into()));
+        assert_eq!(result.workspace["src"], Value::String("192.168.1.1".into()));
     }
 
     #[test]
@@ -192,8 +195,8 @@ mod tests {
         let event = make_event("CEF:0|A|B|1.0|1|Test|3|");
         let result = apply(event).unwrap();
 
-        assert_eq!(result.fields["device_vendor"], Value::String("A".into()));
-        assert!(!result.fields.contains_key("src"));
+        assert_eq!(result.workspace["device_vendor"], Value::String("A".into()));
+        assert!(!result.workspace.contains_key("src"));
     }
 
     #[test]

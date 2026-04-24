@@ -226,9 +226,9 @@ impl ProcessRegistry for DslProcessRegistry<'_> {
             match &result {
                 Ok(e) => {
                     trace!(
-                        "process '{}': ok, fields={:?}",
+                        "process '{}': ok, workspace={:?}",
                         name,
-                        e.fields.keys().collect::<Vec<_>>()
+                        e.workspace.keys().collect::<Vec<_>>()
                     );
                     self.emit_tap(name, e);
                 }

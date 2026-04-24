@@ -238,8 +238,8 @@ fn run_test(config_path: &str, pipeline_name: &str, input_json: Option<&str>) ->
             if let Some(s) = evt.severity {
                 print!("  severity: {}", s);
             }
-            if !evt.fields.is_empty() {
-                print!("  fields: {:?}", evt.fields);
+            if !evt.workspace.is_empty() {
+                print!("  workspace: {:?}", evt.workspace);
             }
             println!();
         }
@@ -287,9 +287,9 @@ fn build_test_event(input_json: Option<&str>) -> Result<Event> {
             }
             event.severity = Some(s as u8);
         }
-        if let Some(fields) = v.get("fields").and_then(|v| v.as_object()) {
-            for (k, val) in fields {
-                event.fields.insert(k.clone(), val.clone());
+        if let Some(workspace) = v.get("workspace").and_then(|v| v.as_object()) {
+            for (k, val) in workspace {
+                event.workspace.insert(k.clone(), val.clone());
             }
         }
 

@@ -16,7 +16,7 @@
 
 /// Describes the data contract of a module.
 ///
-/// - `produces`: fields the module adds to `event.fields`
+/// - `produces`: keys the module adds to `event.workspace`
 /// - `consumes`: fields the module reads from the event
 ///
 /// For Phase 0 most built-ins may return `ModuleSchema::default()`; the
@@ -38,7 +38,7 @@ impl ModuleSchema {
 
 #[derive(Debug, Clone)]
 pub struct FieldSpec {
-    /// Dotted path, e.g. `["fields", "hostname"]`.
+    /// Dotted path, e.g. `["workspace", "hostname"]`.
     pub path: Vec<String>,
     pub ty: FieldType,
 }

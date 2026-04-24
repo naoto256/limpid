@@ -447,7 +447,7 @@ mod tests {
         event.facility = Some(16);
         event.severity = Some(6);
         event
-            .fields
+            .workspace
             .insert("key".into(), serde_json::Value::String("val".into()));
 
         let json = event.to_json_value();
@@ -458,7 +458,7 @@ mod tests {
         assert_eq!(recovered.facility, Some(16));
         assert_eq!(recovered.severity, Some(6));
         assert_eq!(
-            recovered.fields["key"],
+            recovered.workspace["key"],
             serde_json::Value::String("val".into())
         );
     }

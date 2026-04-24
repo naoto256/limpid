@@ -18,9 +18,9 @@ mod tests {
         );
         e.severity = Some(3);
         e.facility = Some(16);
-        e.fields
+        e.workspace
             .insert("src".into(), Value::String("192.168.1.1".into()));
-        e.fields.insert("count".into(), Value::Number(42.into()));
+        e.workspace.insert("count".into(), Value::Number(42.into()));
         e
     }
 
@@ -51,7 +51,7 @@ mod tests {
     }
 
     #[test]
-    fn test_eval_ident_fields() {
+    fn test_eval_ident_workspace() {
         let e = make_event();
         let f = make_funcs();
         assert_eq!(
@@ -63,7 +63,7 @@ mod tests {
             Value::Number(16.into())
         );
         assert_eq!(
-            eval_expr(&Expr::Ident(vec!["fields".into(), "src".into()]), &e, &f).unwrap(),
+            eval_expr(&Expr::Ident(vec!["workspace".into(), "src".into()]), &e, &f).unwrap(),
             Value::String("192.168.1.1".into())
         );
     }
@@ -207,12 +207,12 @@ mod tests {
     fn test_eval_template() {
         let e = make_event();
         let f = make_funcs();
-        // "[${severity}] from ${fields.src}"
+        // "[${severity}] from ${workspace.src}"
         let expr = Expr::Template(vec![
             TemplateFragment::Literal("[".into()),
             TemplateFragment::Interp(Expr::Ident(vec!["severity".into()])),
             TemplateFragment::Literal("] from ".into()),
-            TemplateFragment::Interp(Expr::Ident(vec!["fields".into(), "src".into()])),
+            TemplateFragment::Interp(Expr::Ident(vec!["workspace".into(), "src".into()])),
         ]);
         assert_eq!(
             eval_expr(&expr, &e, &f).unwrap(),
@@ -226,7 +226,7 @@ mod tests {
         let f = make_funcs();
         let expr = Expr::Template(vec![
             TemplateFragment::Literal("prefix-".into()),
-            TemplateFragment::Interp(Expr::Ident(vec!["fields".into(), "missing".into()])),
+            TemplateFragment::Interp(Expr::Ident(vec!["workspace".into(), "missing".into()])),
             TemplateFragment::Literal("-suffix".into()),
         ]);
         assert_eq!(

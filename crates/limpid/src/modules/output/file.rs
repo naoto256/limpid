@@ -9,7 +9,7 @@
 //! Dynamic path templates use the DSL's native `${expr}` interpolation,
 //! e.g. `path "/var/log/${source}/${strftime(timestamp, "%Y-%m-%d")}.log"`.
 //! Any DSL expression works (identifiers, function calls, string concat).
-//! Interpolations that dereference `fields.*` are sanitised to strip
+//! Interpolations that dereference `workspace.*` are sanitised to strip
 //! `/`, `\`, and `..` so untrusted event data can't escape into sibling
 //! directories; other interpolations render verbatim.
 
@@ -171,7 +171,7 @@ impl FileOutput {
     /// fragments (used to decide whether to `mkdir -p` the parent).
     ///
     /// For `Template`, each `Interp` fragment is evaluated separately so
-    /// that values derived from `fields.*` can be sanitised without
+    /// that values derived from `workspace.*` can be sanitised without
     /// affecting literal path separators or server-owned interpolations
     /// like `${source}`.
     fn render_path(&self, event: &Event) -> Result<(String, bool)> {
@@ -190,7 +190,7 @@ impl FileOutput {
                         TemplateFragment::Literal(s) => out.push_str(s),
                         TemplateFragment::Interp(expr) => {
                             let rendered = value_to_string(&eval_expr(expr, event, funcs)?);
-                            if is_fields_reference(expr) {
+                            if is_workspace_reference(expr) {
                                 out.push_str(&sanitize_path_component(&rendered));
                             } else {
                                 out.push_str(&rendered);
@@ -208,15 +208,15 @@ impl FileOutput {
     }
 }
 
-/// Does `expr` dereference `fields.*` (i.e. user-controlled event data)?
-/// Conservative: only flags literal `fields.xxx[.yyy]` identifiers. Other
-/// expressions whose results happen to originate from fields (e.g.
-/// `lower(fields.host)`) are rendered without sanitisation — users who
+/// Does `expr` dereference `workspace.*` (i.e. user-controlled event data)?
+/// Conservative: only flags literal `workspace.xxx[.yyy]` identifiers. Other
+/// expressions whose results happen to originate from the workspace (e.g.
+/// `lower(workspace.host)`) are rendered without sanitisation — users who
 /// care should write their sanitisation explicitly.
-fn is_fields_reference(expr: &Expr) -> bool {
+fn is_workspace_reference(expr: &Expr) -> bool {
     match expr {
-        Expr::Ident(parts) => parts.first().is_some_and(|s| s == "fields") && parts.len() > 1,
-        Expr::PropertyAccess(base, _) => is_fields_reference(base),
+        Expr::Ident(parts) => parts.first().is_some_and(|s| s == "workspace") && parts.len() > 1,
+        Expr::PropertyAccess(base, _) => is_workspace_reference(base),
         _ => false,
     }
 }
@@ -322,17 +322,17 @@ mod tests {
         Arc::new(reg)
     }
 
-    fn event_with_fields() -> Event {
+    fn event_with_workspace() -> Event {
         let mut e = Event::new(
             Bytes::from("hello"),
             "192.168.1.10:514".parse::<SocketAddr>().unwrap(),
         );
         e.severity = Some(3);
         e.facility = Some(16);
-        e.fields
+        e.workspace
             .insert("host".into(), Value::String("web01".into()));
-        // field containing a path separator — must be sanitised
-        e.fields
+        // value containing a path separator — must be sanitised
+        e.workspace
             .insert("ip".into(), Value::String("10.0.0.1/24".into()));
         e
     }
@@ -352,7 +352,7 @@ mod tests {
     #[test]
     fn render_static_path() {
         let out = make_output(Expr::StringLit("/var/log/app.log".into()));
-        let (rendered, dynamic) = out.render_path(&event_with_fields()).unwrap();
+        let (rendered, dynamic) = out.render_path(&event_with_workspace()).unwrap();
         assert_eq!(rendered, "/var/log/app.log");
         assert!(!dynamic);
     }
@@ -365,27 +365,27 @@ mod tests {
             TemplateFragment::Interp(Expr::Ident(vec!["source".into()])),
             TemplateFragment::Literal(".log".into()),
         ]));
-        let (rendered, dynamic) = out.render_path(&event_with_fields()).unwrap();
+        let (rendered, dynamic) = out.render_path(&event_with_workspace()).unwrap();
         assert_eq!(rendered, "/var/log/192.168.1.10.log");
         assert!(dynamic);
     }
 
     #[test]
-    fn render_template_sanitizes_fields_reference() {
-        // "/var/log/${fields.ip}.log" — fields.ip contains "10.0.0.1/24",
+    fn render_template_sanitizes_workspace_reference() {
+        // "/var/log/${workspace.ip}.log" — workspace.ip contains "10.0.0.1/24",
         // the `/` must be replaced with `_`.
         let out = make_output(Expr::Template(vec![
             TemplateFragment::Literal("/var/log/".into()),
-            TemplateFragment::Interp(Expr::Ident(vec!["fields".into(), "ip".into()])),
+            TemplateFragment::Interp(Expr::Ident(vec!["workspace".into(), "ip".into()])),
             TemplateFragment::Literal(".log".into()),
         ]));
-        let (rendered, _) = out.render_path(&event_with_fields()).unwrap();
+        let (rendered, _) = out.render_path(&event_with_workspace()).unwrap();
         assert_eq!(rendered, "/var/log/10.0.0.1_24.log");
     }
 
     #[test]
-    fn render_template_does_not_sanitize_non_fields_interp() {
-        // `${source}` is a top-level ident (not fields.*), so its value
+    fn render_template_does_not_sanitize_non_workspace_interp() {
+        // `${source}` is a top-level ident (not workspace.*), so its value
         // is passed through even if it contains separators (IPv4 won't,
         // but the principle holds).
         let out = make_output(Expr::Template(vec![
@@ -393,7 +393,7 @@ mod tests {
             TemplateFragment::Interp(Expr::Ident(vec!["source".into()])),
             TemplateFragment::Literal("-b".into()),
         ]));
-        let (rendered, _) = out.render_path(&event_with_fields()).unwrap();
+        let (rendered, _) = out.render_path(&event_with_workspace()).unwrap();
         assert_eq!(rendered, "a-192.168.1.10-b");
     }
 
@@ -403,30 +403,32 @@ mod tests {
             vec!["source".into()],
         ))]));
         out.funcs = None;
-        let err = out.render_path(&event_with_fields()).unwrap_err();
+        let err = out.render_path(&event_with_workspace()).unwrap_err();
         assert!(err.to_string().contains("FunctionRegistry not attached"));
     }
 
     #[test]
-    fn is_fields_reference_detects_nested_paths() {
-        assert!(is_fields_reference(&Expr::Ident(vec![
-            "fields".into(),
+    fn is_workspace_reference_detects_nested_paths() {
+        assert!(is_workspace_reference(&Expr::Ident(vec![
+            "workspace".into(),
             "x".into()
         ])));
-        assert!(is_fields_reference(&Expr::Ident(vec![
-            "fields".into(),
+        assert!(is_workspace_reference(&Expr::Ident(vec![
+            "workspace".into(),
             "x".into(),
             "y".into()
         ])));
-        // `fields` alone is not a reference to a specific field
-        assert!(!is_fields_reference(&Expr::Ident(vec!["fields".into()])));
-        // non-fields idents don't count
-        assert!(!is_fields_reference(&Expr::Ident(vec!["source".into()])));
+        // `workspace` alone is not a reference to a specific key
+        assert!(!is_workspace_reference(&Expr::Ident(vec![
+            "workspace".into()
+        ])));
+        // non-workspace idents don't count
+        assert!(!is_workspace_reference(&Expr::Ident(vec!["source".into()])));
         // function calls always render without sanitisation (users
         // opt-in to their own sanitisation)
-        assert!(!is_fields_reference(&Expr::FuncCall(
+        assert!(!is_workspace_reference(&Expr::FuncCall(
             "lower".into(),
-            vec![Expr::Ident(vec!["fields".into(), "host".into()])],
+            vec![Expr::Ident(vec!["workspace".into(), "host".into()])],
         )));
     }
 }

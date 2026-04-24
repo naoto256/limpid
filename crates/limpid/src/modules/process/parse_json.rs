@@ -1,4 +1,4 @@
-//! parse_json: parses JSON messages and expands top-level keys into event fields.
+//! parse_json: parses JSON messages and expands top-level keys into the event workspace.
 
 use serde_json::Value;
 
@@ -6,7 +6,7 @@ use crate::event::Event;
 use crate::modules::ProcessError;
 
 /// Parse `message` (or `raw` if message is identical to raw) as JSON
-/// and expand top-level keys into `fields`.
+/// and expand top-level keys into `workspace`.
 pub fn apply(event: Event) -> Result<Event, ProcessError> {
     let text = String::from_utf8_lossy(&event.message);
     let parsed: Value = serde_json::from_str(&text)
@@ -15,11 +15,11 @@ pub fn apply(event: Event) -> Result<Event, ProcessError> {
     let mut event = event;
     if let Value::Object(map) = parsed {
         for (key, value) in map {
-            event.fields.insert(key, value);
+            event.workspace.insert(key, value);
         }
     } else {
         // Non-object JSON: store under "_json" key
-        event.fields.insert("_json".into(), parsed);
+        event.workspace.insert("_json".into(), parsed);
     }
 
     Ok(event)
@@ -43,9 +43,9 @@ mod tests {
         let event = make_event(r#"{"host":"web01","level":"error","msg":"timeout"}"#);
         let result = apply(event).unwrap();
 
-        assert_eq!(result.fields["host"], Value::String("web01".into()));
-        assert_eq!(result.fields["level"], Value::String("error".into()));
-        assert_eq!(result.fields["msg"], Value::String("timeout".into()));
+        assert_eq!(result.workspace["host"], Value::String("web01".into()));
+        assert_eq!(result.workspace["level"], Value::String("error".into()));
+        assert_eq!(result.workspace["msg"], Value::String("timeout".into()));
     }
 
     #[test]
@@ -53,8 +53,8 @@ mod tests {
         let event = make_event(r#"{"host":"web01","meta":{"region":"ap-northeast-1"}}"#);
         let result = apply(event).unwrap();
 
-        assert_eq!(result.fields["host"], Value::String("web01".into()));
-        assert!(result.fields["meta"].is_object());
+        assert_eq!(result.workspace["host"], Value::String("web01".into()));
+        assert!(result.workspace["meta"].is_object());
     }
 
     #[test]
@@ -62,8 +62,8 @@ mod tests {
         let event = make_event(r#"[1,2,3]"#);
         let result = apply(event).unwrap();
 
-        assert!(result.fields.contains_key("_json"));
-        assert!(result.fields["_json"].is_array());
+        assert!(result.workspace.contains_key("_json"));
+        assert!(result.workspace["_json"].is_array());
     }
 
     #[test]
