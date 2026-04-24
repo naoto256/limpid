@@ -29,7 +29,7 @@ use crate::dsl::props;
 use crate::event::Event;
 use crate::functions::FunctionRegistry;
 use crate::metrics::OutputMetrics;
-use crate::modules::{HasMetrics, Module, ModuleSchema, Output};
+use crate::modules::{HasMetrics, Module, Output};
 
 pub struct FileOutput {
     /// Parsed path expression. A plain `Expr::StringLit` means a static
@@ -45,10 +45,6 @@ pub struct FileOutput {
 }
 
 impl Module for FileOutput {
-    fn schema() -> ModuleSchema {
-        ModuleSchema::default()
-    }
-
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
         let path = props::get_expr(properties, "path")
             .ok_or_else(|| anyhow::anyhow!("output '{}': file requires 'path'", name))?

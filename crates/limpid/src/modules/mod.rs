@@ -11,8 +11,6 @@ pub mod input;
 pub mod output;
 pub mod schema;
 
-pub use schema::ModuleSchema;
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -27,25 +25,18 @@ use crate::queue::OutputWriter;
 
 /// Common trait for every limpid module (input, output).
 ///
-/// Absorbs the old `FromProperties` so that construction and schema
-/// declaration live together: both are facets of "what this module is".
-///
-/// `schema()` is required — no default implementation. Every module must
-/// declare its data contract up front. This feeds the static dataflow
-/// checker under `crates/limpid/src/check/` (v0.4.0 Block 9).
-///
-/// Note: `schema()` currently has no in-tree consumer — it's invoked by
-/// the forthcoming analyzer. The `#[allow(dead_code)]` on the return
-/// type (in `schema.rs`) silences the dead-code warning until that
-/// lands.
+/// Modules only need to know how to construct themselves from DSL
+/// properties. Schema information for the static analyzer is attached
+/// to parsers and function signatures (see `check::` and
+/// `functions::FunctionSig`), not to modules — inputs and outputs are
+/// I/O-pure (ingress bytes in, egress bytes out) and have no data
+/// contract to advertise.
 ///
 /// Processes are not modules: v0.3.0 Block 4 removed the native
 /// process layer entirely in favour of DSL functions (`syslog.parse`
 /// etc.) and user-defined `def process { ... }` blocks. Modules are
 /// only inputs and outputs.
 pub trait Module: Sized {
-    #[allow(dead_code)]
-    fn schema() -> ModuleSchema;
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self>;
 }
 

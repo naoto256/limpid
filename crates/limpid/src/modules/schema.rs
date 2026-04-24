@@ -4,42 +4,17 @@
 //! analyzer knows about — workspace keys, `let` locals, reserved event
 //! idents, parser outputs, function arguments and returns.
 //!
-//! `ModuleSchema` / `FieldSpec` describe a module's data contract
-//! (produces / consumes). `Module::schema()` is the seam the analyzer
-//! uses to discover those contracts. Some built-ins still return
-//! `ModuleSchema::default()` today; schemas are filled in incrementally.
+//! `FieldSpec` describes a single produced/consumed field (path + type)
+//! and is attached to parsers / function signatures rather than to
+//! modules: inputs and outputs are I/O-pure (ingress bytes in, egress
+//! bytes out) and have no schema to advertise. The old `ModuleSchema`
+//! struct and `Module::schema()` were removed in v0.4.0 Block 9
+//! (analyzer rebase).
 //!
-//! `Module::schema()` itself is planned for removal in a follow-up
-//! commit (Block 9 commit 3): inputs / outputs are I/O-pure (ingress
-//! bytes in, egress bytes out) and have no schema to advertise, and
-//! parser / function schemas are threaded through `FunctionSig` /
-//! `Parser` registration instead. For now the `FieldType` vocabulary
-//! remains here so it can be used from both `modules::*` and `check::*`
-//! without a cyclic include.
+//! The `FieldType` vocabulary lives here so it can be used from both
+//! `modules::*` and `check::*` without a cyclic include.
 
 #![allow(dead_code)]
-
-/// Describes the data contract of a module.
-///
-/// - `produces`: keys the module adds to `event.workspace`
-/// - `consumes`: fields the module reads from the event
-///
-/// For Phase 0 most built-ins may return `ModuleSchema::default()`; the
-/// schemas will be filled in as the analyzer is built out.
-#[derive(Debug, Clone, Default)]
-pub struct ModuleSchema {
-    pub produces: Vec<FieldSpec>,
-    pub consumes: Vec<FieldSpec>,
-}
-
-impl ModuleSchema {
-    pub const fn empty() -> Self {
-        Self {
-            produces: Vec::new(),
-            consumes: Vec::new(),
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct FieldSpec {

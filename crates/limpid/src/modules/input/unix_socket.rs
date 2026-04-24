@@ -18,7 +18,7 @@ use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::event::Event;
 use crate::metrics::InputMetrics;
-use crate::modules::{HasMetrics, Input, Module, ModuleSchema};
+use crate::modules::{HasMetrics, Input, Module};
 
 const UNIX_SOURCE: &str = "127.0.0.1:0";
 
@@ -28,10 +28,6 @@ pub struct UnixSocketInput {
 }
 
 impl Module for UnixSocketInput {
-    fn schema() -> ModuleSchema {
-        ModuleSchema::default()
-    }
-
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
         let path = props::get_string(properties, "path")
             .ok_or_else(|| anyhow::anyhow!("input '{}': unix_socket requires 'path'", name))?;

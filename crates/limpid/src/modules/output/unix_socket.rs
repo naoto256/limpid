@@ -14,7 +14,7 @@ use crate::dsl::props;
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::persistent_conn::{PersistentConn, write_with_reconnect};
-use crate::modules::{HasMetrics, Module, ModuleSchema, Output};
+use crate::modules::{HasMetrics, Module, Output};
 
 pub struct UnixSocketOutput {
     pub path: PathBuf,
@@ -23,10 +23,6 @@ pub struct UnixSocketOutput {
 }
 
 impl Module for UnixSocketOutput {
-    fn schema() -> ModuleSchema {
-        ModuleSchema::default()
-    }
-
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
         let path = props::get_string(properties, "path")
             .ok_or_else(|| anyhow::anyhow!("output '{}': unix_socket requires 'path'", name))?;
