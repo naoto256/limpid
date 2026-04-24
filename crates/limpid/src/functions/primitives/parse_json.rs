@@ -18,10 +18,18 @@ use anyhow::{Result, bail};
 use serde_json::{Map, Value};
 
 use super::val_to_str;
-use crate::functions::FunctionRegistry;
+use crate::functions::{FunctionRegistry, ParserInfo};
 
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register("parse_json", |args, _event| parse_json_impl(args));
+    // Output keys are data-driven; the analyzer falls back to wildcard
+    // unless the caller pins keys via the optional defaults HashLit.
+    reg.register_parser(ParserInfo {
+        namespace: None,
+        name: "parse_json",
+        produces: Vec::new(),
+        wildcards: true,
+    });
 }
 
 fn parse_json_impl(args: &[Value]) -> Result<Value> {

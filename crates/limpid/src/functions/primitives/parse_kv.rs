@@ -13,10 +13,16 @@ use serde_json::{Map, Value};
 
 use super::parse_json::{apply_defaults, type_name};
 use super::val_to_str;
-use crate::functions::FunctionRegistry;
+use crate::functions::{FunctionRegistry, ParserInfo};
 
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register("parse_kv", |args, _event| parse_kv_impl(args));
+    reg.register_parser(ParserInfo {
+        namespace: None,
+        name: "parse_kv",
+        produces: Vec::new(),
+        wildcards: true,
+    });
 }
 
 fn parse_kv_impl(args: &[Value]) -> Result<Value> {

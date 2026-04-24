@@ -9,25 +9,42 @@ use anyhow::bail;
 use serde_json::Value;
 
 use super::val_to_str;
-use crate::functions::FunctionRegistry;
 use crate::functions::table::TableStore;
+use crate::functions::{FunctionRegistry, FunctionSig};
+use crate::modules::schema::FieldType;
 
 pub fn register(reg: &mut FunctionRegistry, table_store: TableStore) {
     {
         let store = table_store.clone();
-        reg.register("table_lookup", move |args, _event| {
-            if args.len() != 2 {
-                bail!("table_lookup() expects 2 arguments (table, key)");
-            }
-            let table_name = val_to_str(&args[0]);
-            let key = val_to_str(&args[1]);
-            Ok(store.lookup(&table_name, &key))
-        });
+        reg.register_with_sig(
+            "table_lookup",
+            FunctionSig::fixed(&[FieldType::String, FieldType::String], FieldType::Any),
+            move |args, _event| {
+                if args.len() != 2 {
+                    bail!("table_lookup() expects 2 arguments (table, key)");
+                }
+                let table_name = val_to_str(&args[0]);
+                let key = val_to_str(&args[1]);
+                Ok(store.lookup(&table_name, &key))
+            },
+        );
     }
 
     {
         let store = table_store.clone();
-        reg.register("table_upsert", move |args, _event| {
+        reg.register_with_sig(
+            "table_upsert",
+            FunctionSig::optional(
+                &[
+                    FieldType::String,
+                    FieldType::String,
+                    FieldType::Any,
+                    FieldType::Int,
+                ],
+                3,
+                FieldType::Null,
+            ),
+            move |args, _event| {
             if args.len() < 3 || args.len() > 4 {
                 bail!("table_upsert() expects 3 or 4 arguments (table, key, value, expire?)");
             }
@@ -60,19 +77,24 @@ pub fn register(reg: &mut FunctionRegistry, table_store: TableStore) {
                 };
             }
             Ok(Value::Null)
-        });
+            },
+        );
     }
 
     {
         let store = table_store;
-        reg.register("table_delete", move |args, _event| {
-            if args.len() != 2 {
-                bail!("table_delete() expects 2 arguments (table, key)");
-            }
-            let table_name = val_to_str(&args[0]);
-            let key = val_to_str(&args[1]);
-            store.delete(&table_name, &key);
-            Ok(Value::Null)
-        });
+        reg.register_with_sig(
+            "table_delete",
+            FunctionSig::fixed(&[FieldType::String, FieldType::String], FieldType::Null),
+            move |args, _event| {
+                if args.len() != 2 {
+                    bail!("table_delete() expects 2 arguments (table, key)");
+                }
+                let table_name = val_to_str(&args[0]);
+                let key = val_to_str(&args[1]);
+                store.delete(&table_name, &key);
+                Ok(Value::Null)
+            },
+        );
     }
 }

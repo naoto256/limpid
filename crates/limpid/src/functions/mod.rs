@@ -33,6 +33,94 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::event::Event;
+use crate::modules::schema::{FieldSpec, FieldType};
+
+// ---------------------------------------------------------------------------
+// Function signatures
+// ---------------------------------------------------------------------------
+
+/// Argument arity shape for a built-in function.
+///
+/// Functions are registered with a small, declarative signature so the
+/// analyzer can type-check call sites without re-implementing every
+/// function's hand-rolled arity logic.
+#[derive(Debug, Clone)]
+pub enum Arity {
+    /// Exactly `args.len()` positional args, all required. The signature's
+    /// `args` slice length is the arity.
+    Fixed,
+    /// First `required` args mandatory; trailing args optional. The
+    /// signature's `args` slice declares types for every slot up to the
+    /// maximum, including optional ones.
+    Optional { required: usize },
+    /// All declared args required, then a variadic tail whose type is
+    /// the last entry of `args`. Unused by current built-ins; reserved.
+    #[allow(dead_code)]
+    Variadic,
+}
+
+/// Static signature for a built-in function. Threaded into the registry
+/// at registration time (alongside the implementation closure) so the
+/// analyzer can pull it back via [`FunctionRegistry::signature`] during
+/// type checking. Functions registered without a sig are treated as
+/// `Any -> Any` (no type checking; no false positives).
+#[derive(Debug, Clone)]
+pub struct FunctionSig {
+    pub args: Vec<FieldType>,
+    pub arity: Arity,
+    pub ret: FieldType,
+}
+
+impl FunctionSig {
+    /// Convenience: fixed positional signature `(arg1, arg2, ...) -> ret`.
+    pub fn fixed(args: &[FieldType], ret: FieldType) -> Self {
+        Self {
+            args: args.to_vec(),
+            arity: Arity::Fixed,
+            ret,
+        }
+    }
+
+    /// Convenience: `(required..optional) -> ret`. `args.len()` is the
+    /// maximum, `required` the minimum.
+    pub fn optional(args: &[FieldType], required: usize, ret: FieldType) -> Self {
+        Self {
+            args: args.to_vec(),
+            arity: Arity::Optional { required },
+            ret,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parser trait
+// ---------------------------------------------------------------------------
+
+/// Static metadata about a parser-style function (one that returns a
+/// `Value::Object` whose keys merge into `event.workspace`).
+///
+/// Parsers carry richer schema than ordinary functions: the analyzer
+/// needs to know *which keys* a bare `parse_xxx(text)` call contributes
+/// to workspace, with *what types*, so downstream `workspace.*` references
+/// type-check. `produces` is the static answer; `wildcards = true` means
+/// the key set is data-driven (e.g. `parse_json`) and the analyzer should
+/// fall back to wildcard unless the caller pins a schema via the
+/// optional defaults HashLit argument.
+///
+/// Parsers are registered alongside their implementation; the analyzer
+/// looks them up via [`FunctionRegistry::parser`].
+#[derive(Debug, Clone)]
+pub struct ParserInfo {
+    pub namespace: Option<&'static str>,
+    pub name: &'static str,
+    /// `(workspace key, type)` pairs the parser is known to emit. Empty
+    /// when `wildcards = true` and there's no static structure.
+    pub produces: Vec<FieldSpec>,
+    /// True when the output key set is determined by the input rather
+    /// than statically known (parse_json, parse_kv, parse_cef
+    /// extensions, etc.).
+    pub wildcards: bool,
+}
 
 // ---------------------------------------------------------------------------
 // Registry
@@ -48,12 +136,22 @@ type FnKey = (Option<String>, String);
 
 pub struct FunctionRegistry {
     functions: HashMap<FnKey, ExprFn>,
+    /// Optional signature alongside the function implementation. Populated
+    /// by `register_with_sig` / `register_in_with_sig`. Functions without
+    /// a signature here are treated as `Any -> Any` by the analyzer.
+    signatures: HashMap<FnKey, FunctionSig>,
+    /// Parser metadata for parser-style functions. Distinct from
+    /// `signatures` because parsers carry workspace-effect schema in
+    /// addition to argument types.
+    parsers: HashMap<FnKey, ParserInfo>,
 }
 
 impl FunctionRegistry {
     pub fn new() -> Self {
         Self {
             functions: HashMap::new(),
+            signatures: HashMap::new(),
+            parsers: HashMap::new(),
         }
     }
 
@@ -67,6 +165,19 @@ impl FunctionRegistry {
         self.functions.insert((None, name.to_string()), Box::new(f));
     }
 
+    /// Register a flat primitive function together with its static
+    /// signature. The analyzer consults the signature for arg / return
+    /// type checking; the implementation closure is identical to the
+    /// no-sig form.
+    pub fn register_with_sig<F>(&mut self, name: &str, sig: FunctionSig, f: F)
+    where
+        F: Fn(&[Value], &Event) -> Result<Value> + Send + Sync + 'static,
+    {
+        let key = (None, name.to_string());
+        self.functions.insert(key.clone(), Box::new(f));
+        self.signatures.insert(key, sig);
+    }
+
     /// Register a namespaced function, callable as `<namespace>.<name>(...)`
     /// in the DSL. Block 3 introduced the dispatch path; Block 4
     /// populated the first real namespaces (`syslog`, `cef`). Future
@@ -77,6 +188,60 @@ impl FunctionRegistry {
     {
         self.functions
             .insert((Some(namespace.to_string()), name.to_string()), Box::new(f));
+    }
+
+    /// Sig-aware namespaced registration. Mirrors `register_with_sig`
+    /// but for `ns.fn(...)` dispatch.
+    #[allow(dead_code)] // wired for future ns.fn registrations carrying sigs
+    pub fn register_in_with_sig<F>(&mut self, namespace: &str, name: &str, sig: FunctionSig, f: F)
+    where
+        F: Fn(&[Value], &Event) -> Result<Value> + Send + Sync + 'static,
+    {
+        let key = (Some(namespace.to_string()), name.to_string());
+        self.functions.insert(key.clone(), Box::new(f));
+        self.signatures.insert(key, sig);
+    }
+
+    /// Register parser metadata. Call after `register_*` so the
+    /// analyzer can find both the function and its schema. Parsers also
+    /// get a `FunctionSig` (`(String, Object?) -> Object`) registered
+    /// automatically so plain arg-type checks still apply.
+    pub fn register_parser(&mut self, info: ParserInfo) {
+        let key = (info.namespace.map(str::to_string), info.name.to_string());
+        // Parsers all share the same call shape: `(text[, defaults]) ->
+        // Object`. Defaults must be an Object literal at runtime; we
+        // accept either Object or Any here so callers can pass through
+        // a workspace-resolved value without analyzer churn.
+        let sig = FunctionSig::optional(
+            &[FieldType::String, FieldType::Object],
+            1,
+            FieldType::Object,
+        );
+        self.signatures.insert(key.clone(), sig);
+        self.parsers.insert(key, info);
+    }
+
+    /// Look up the static signature for a function. Returns `None` if
+    /// the function was registered without one (analyzer treats those
+    /// as fully wildcarded — no type checking).
+    pub fn signature(&self, namespace: Option<&str>, name: &str) -> Option<&FunctionSig> {
+        let key = (namespace.map(str::to_string), name.to_string());
+        self.signatures.get(&key)
+    }
+
+    /// Look up parser metadata. `Some` only for parser-style functions
+    /// (parse_json / parse_kv / cef.parse / syslog.parse etc.).
+    pub fn parser(&self, namespace: Option<&str>, name: &str) -> Option<&ParserInfo> {
+        let key = (namespace.map(str::to_string), name.to_string());
+        self.parsers.get(&key)
+    }
+
+    /// Iterate over every registered parser. Used by the analyzer to
+    /// drive the `process_expr_stmt` merge rule for bare `parse_*(text)`
+    /// statements.
+    #[allow(dead_code)] // exposed for future `--check --list-parsers` and Phase 3 UX
+    pub fn parsers(&self) -> impl Iterator<Item = &ParserInfo> {
+        self.parsers.values()
     }
 
     /// Dispatch a function call. `namespace = None` hits the flat

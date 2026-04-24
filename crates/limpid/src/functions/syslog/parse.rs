@@ -22,12 +22,29 @@
 use anyhow::{Result, bail};
 use serde_json::{Map, Value};
 
-use crate::functions::FunctionRegistry;
 use crate::functions::primitives::parse_json::{apply_defaults, type_name};
 use crate::functions::primitives::val_to_str;
+use crate::functions::{FunctionRegistry, ParserInfo};
+use crate::modules::schema::{FieldSpec, FieldType};
 
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register_in("syslog", "parse", |args, _event| parse_impl(args));
+    // syslog header fields are statically known (not data-driven), so
+    // declare them precisely. The analyzer uses these to type-check
+    // downstream `workspace.syslog_*` references after a bare
+    // `syslog.parse(ingress)` statement.
+    reg.register_parser(ParserInfo {
+        namespace: Some("syslog"),
+        name: "parse",
+        produces: vec![
+            FieldSpec::new(&["workspace", "syslog_hostname"], FieldType::String),
+            FieldSpec::new(&["workspace", "syslog_appname"], FieldType::String),
+            FieldSpec::new(&["workspace", "syslog_procid"], FieldType::String),
+            FieldSpec::new(&["workspace", "syslog_msgid"], FieldType::String),
+            FieldSpec::new(&["workspace", "syslog_msg"], FieldType::String),
+        ],
+        wildcards: false,
+    });
 }
 
 fn parse_impl(args: &[Value]) -> Result<Value> {
