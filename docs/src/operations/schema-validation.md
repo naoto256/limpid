@@ -10,7 +10,7 @@ This page explains why limpid takes that shape, how to assemble validation for c
 
 ## The problem
 
-A DSL field rename passes `limpidctl check`, passes unit tests, and still breaks production: Splunk drops the field, Sentinel ingests it into the wrong column, or an ECS-strict pipeline rejects the event entirely. The failure is silent at the limpid layer because limpid has no opinion about what the downstream considers "valid".
+A DSL field rename passes `limpid --check`, passes unit tests, and still breaks production: Splunk drops the field, Sentinel ingests it into the wrong column, or an ECS-strict pipeline rejects the event entirely. The failure is silent at the limpid layer because limpid has no opinion about what the downstream considers "valid".
 
 This is a real gap. It is worth closing in CI and — for high-stakes pipelines — in production. The question is where the validator lives.
 
@@ -175,7 +175,7 @@ Anything that reads JSONL from stdin and exits non-zero on failure works. The co
 - **One event per line.** Each line is a complete [Event JSON](./tap.md#usage) object.
 - **Exit code 0 = all good, non-zero = reject.** For streaming validators, prefer printing per-event diagnostics to stderr and keeping the process alive; let a supervising process aggregate.
 - **No assumptions about key order.** `tap --json` does not guarantee key order across versions; schema validators don't care, but ad-hoc `grep` pipelines might.
-- **Workspace keys.** Structured fields built by the pipeline live under `workspace.<key>`. Use the key names your DSL actually assigns; `limpidctl check --graph` shows which workspace keys each output observes.
+- **Workspace keys.** Structured fields built by the pipeline live under `workspace.<key>`. Use the key names your DSL actually assigns; `limpid --check --graph` shows which workspace keys each output observes.
 - **Non-JSON wire formats.** If the final wire format is protobuf, Avro, or similar, serialize with your existing producer and validate the bytes (e.g. `.egress` piped through `protoc --decode`).
 
 ## Related design decisions

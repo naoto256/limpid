@@ -57,7 +57,7 @@ The split config is longer. It is also easier to test, easier to tap between ste
 
 Every process has an implicit contract with its neighbours in the pipeline: *what do I expect to be present when I run, and what do I leave behind for the next stage?*
 
-Because the DSL does not (yet) check that contract statically, you document it in comments using a small, machine-parseable convention. limpid plans to grow a `limpidctl check --strict` pass that reads these tags and warns when a pipeline links a composer to a parser that does not produce the required fields. Writing them now costs nothing; pretending the contracts do not exist costs the first person who has to modify the snippet a year later.
+Because the DSL does not (yet) check that contract statically, you document it in comments using a small, machine-parseable convention. limpid plans to grow a `limpid --check --strict` pass that reads these tags and warns when a pipeline links a composer to a parser that does not produce the required fields. Writing them now costs nothing; pretending the contracts do not exist costs the first person who has to modify the snippet a year later.
 
 ### The `@requires` / `@produces` tag convention
 
