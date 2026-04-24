@@ -104,8 +104,10 @@ pub struct PipelineDef {
 /// Statements that can appear inside a pipeline body.
 #[derive(Debug, Clone)]
 pub enum PipelineStatement {
-    /// `input name`
-    Input(String),
+    /// `input name` or `input name1, name2, ...` — one or more inputs feed the pipeline.
+    /// Events from all listed inputs are merged (arrival order, no per-input attribution)
+    /// before the rest of the pipeline body executes.
+    Input(Vec<String>),
     /// `process name1 | name2 | { ... }` — a chain of process references and inline blocks
     ProcessChain(Vec<ProcessChainElement>),
     /// `output name`

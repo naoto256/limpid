@@ -122,16 +122,23 @@ impl Runtime {
         let output_senders = Arc::new(output_senders);
 
         // --- 2. Group pipelines by input ---
-        let mut input_pipelines: HashMap<String, Vec<PipelineWorker>> = HashMap::new();
+        //
+        // A pipeline with `input a, b;` (fan-in) is registered under every listed
+        // input. Events from each input are still fed into the pipeline's
+        // per-input worker dispatcher; since a single `PipelineWorker` instance
+        // is shared across inputs (wrapped in Arc at spawn time), its metrics
+        // aggregate across inputs without per-input attribution — by design.
+        let mut input_pipelines: HashMap<String, Vec<Arc<PipelineWorker>>> = HashMap::new();
 
         for pipeline_def in config.pipelines.values() {
-            let worker = PipelineWorker::new(pipeline_def.clone());
+            let worker = Arc::new(PipelineWorker::new(pipeline_def.clone()));
             metrics_registry.register_pipeline(&pipeline_def.name, worker.metrics());
-            if let Some(input_name) = get_pipeline_input(pipeline_def) {
+            let input_names = get_pipeline_inputs(pipeline_def);
+            for input_name in input_names {
                 input_pipelines
                     .entry(input_name.clone())
                     .or_default()
-                    .push(worker);
+                    .push(Arc::clone(&worker));
             }
         }
 
@@ -165,8 +172,12 @@ impl Runtime {
                 .unwrap_or(4096) as usize;
             let (event_tx, event_rx) = mpsc::channel::<Event>(queue_size);
 
-            // Pipeline workers
-            let workers = Arc::new(pipelines);
+            // Pipeline workers subscribed to this input. A pipeline with fan-in
+            // (`input a, b;`) appears in the worker list of both inputs — its
+            // merge semantics is implicit: two dispatcher tasks feeding the
+            // same `PipelineWorker`, serialized through its own `run_pipeline`
+            // call per event. No ordering guarantee between inputs.
+            let workers: Arc<Vec<Arc<PipelineWorker>>> = Arc::new(pipelines);
             let ctx = PipelineContext {
                 output_senders: Arc::clone(&output_senders),
                 config: Arc::clone(&config),
@@ -369,7 +380,7 @@ impl HasMetrics for PipelineWorker {
 
 async fn run_pipeline_workers(
     mut event_rx: mpsc::Receiver<Event>,
-    workers: &[PipelineWorker],
+    workers: &[Arc<PipelineWorker>],
     ctx: &PipelineContext,
     input_name: &str,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -434,7 +445,7 @@ async fn run_pipeline_with_outputs(
 
 async fn process_event(
     event: &Event,
-    workers: &[PipelineWorker],
+    workers: &[Arc<PipelineWorker>],
     ctx: &PipelineContext,
     input_tap_key: &str,
 ) {
@@ -478,11 +489,136 @@ async fn process_event(
     }
 }
 
-fn get_pipeline_input(pipeline: &PipelineDef) -> Option<&String> {
+/// Return the list of input names a pipeline subscribes to (fan-in).
+///
+/// Empty if no `input` statement is present. A pipeline declared with
+/// `input a, b;` returns `["a", "b"]`; the legacy single-input form
+/// `input a;` returns `["a"]`.
+fn get_pipeline_inputs(pipeline: &PipelineDef) -> &[String] {
     for stmt in &pipeline.body {
-        if let PipelineStatement::Input(name) = stmt {
-            return Some(name);
+        if let PipelineStatement::Input(names) = stmt {
+            return names;
         }
     }
-    None
+    &[]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsl::parser::parse_config;
+    use crate::event::Event;
+    use bytes::Bytes;
+    use std::net::SocketAddr;
+    use std::str::FromStr;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    fn pipeline_def(src: &str) -> PipelineDef {
+        let cfg = parse_config(src).unwrap();
+        for def in cfg.definitions {
+            if let Definition::Pipeline(p) = def {
+                return p;
+            }
+        }
+        panic!("no pipeline in src");
+    }
+
+    #[test]
+    fn get_pipeline_inputs_single() {
+        let def = pipeline_def("def pipeline p { input a; drop }");
+        assert_eq!(get_pipeline_inputs(&def), &["a".to_string()]);
+    }
+
+    #[test]
+    fn get_pipeline_inputs_fan_in() {
+        let def = pipeline_def("def pipeline p { input a, b, c; drop }");
+        assert_eq!(
+            get_pipeline_inputs(&def),
+            &["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn get_pipeline_inputs_missing_input_stmt() {
+        // Not valid per compiled-config validation, but the helper alone should
+        // still return an empty slice rather than panic.
+        let def = pipeline_def("def pipeline p { drop }");
+        assert!(get_pipeline_inputs(&def).is_empty());
+    }
+
+    /// End-to-end-ish fan-in runtime test: two independent mpsc channels
+    /// (simulating two input sources) both push events into a dispatcher
+    /// that shares a single `PipelineWorker`. Events from both sides land
+    /// on the same pipeline — we verify via the worker's own metrics.
+    #[tokio::test]
+    async fn fan_in_merges_two_inputs_into_single_worker() {
+        // Minimal pipeline with a single `drop` step; the body doesn't matter
+        // for this test — we only care that events flow through the worker.
+        let def = pipeline_def("def pipeline p { input a, b; drop }");
+        let worker = Arc::new(PipelineWorker::new(def));
+        let workers: Arc<Vec<Arc<PipelineWorker>>> = Arc::new(vec![Arc::clone(&worker)]);
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (tx_a, rx_a) = mpsc::channel::<Event>(16);
+        let (tx_b, rx_b) = mpsc::channel::<Event>(16);
+
+        let tap = TapRegistry::new();
+        tap.register("input a").await;
+        tap.register("input b").await;
+
+        // A throwaway compiled config is required by PipelineContext; an empty
+        // one suffices because the pipeline body is `drop` (no output lookup,
+        // no process lookup).
+        let cfg = CompiledConfig::from_config(parse_config("").unwrap()).unwrap();
+        let ctx_a = PipelineContext {
+            output_senders: Arc::new(HashMap::new()),
+            config: Arc::new(cfg.clone()),
+            funcs: Arc::new(FunctionRegistry::new()),
+            tap: tap.clone(),
+        };
+        let ctx_b = PipelineContext {
+            output_senders: Arc::clone(&ctx_a.output_senders),
+            config: Arc::clone(&ctx_a.config),
+            funcs: Arc::clone(&ctx_a.funcs),
+            tap: tap.clone(),
+        };
+
+        let workers_a = Arc::clone(&workers);
+        let workers_b = Arc::clone(&workers);
+        let sd_a = shutdown_rx.clone();
+        let sd_b = shutdown_rx.clone();
+        let h_a = tokio::spawn(async move {
+            run_pipeline_workers(rx_a, &workers_a, &ctx_a, "a", sd_a).await;
+        });
+        let h_b = tokio::spawn(async move {
+            run_pipeline_workers(rx_b, &workers_b, &ctx_b, "b", sd_b).await;
+        });
+
+        let addr = SocketAddr::from_str("127.0.0.1:0").unwrap();
+        for _ in 0..3 {
+            tx_a.send(Event::new(Bytes::from_static(b"from_a"), addr))
+                .await
+                .unwrap();
+        }
+        for _ in 0..5 {
+            tx_b.send(Event::new(Bytes::from_static(b"from_b"), addr))
+                .await
+                .unwrap();
+        }
+        drop(tx_a);
+        drop(tx_b);
+
+        // Wait for both dispatchers to drain (they exit when their senders drop).
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let _ = h_a.await;
+            let _ = h_b.await;
+        })
+        .await
+        .expect("dispatchers should drain promptly");
+
+        // All 8 events should have been attributed to the shared worker.
+        assert_eq!(worker.metrics.events_received.load(Ordering::Relaxed), 8);
+        assert_eq!(worker.metrics.events_dropped.load(Ordering::Relaxed), 8);
+    }
 }
