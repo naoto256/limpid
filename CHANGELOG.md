@@ -10,6 +10,87 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-24
+
+Testability release. Builds the static analyzer and observability
+tooling on top of the DSL finalised in v0.3.0. No DSL breaking changes
+— `limpid --check` does more, pipelines behave the same.
+
+### Added — `limpid --check` static analyzer
+
+- Full type-aware analyzer lives in `crates/limpid/src/check/` and
+  runs whenever `limpid --check <config>` is invoked. It replaces the
+  former "syntax OK" pass with real dataflow and type checking.
+- Phase 2 type checking: `FieldType` + `Bindings` thread structural
+  types through pipelines; function argument / return type signatures
+  (`FunctionSig`), assignment type conflicts, operator type checks, and
+  parser-function return shapes are all verified.
+- Parser functions (`parse_json`, `parse_kv`, `syslog.parse`,
+  `cef.parse`, `regex_parse`) declare the workspace keys they produce
+  via `ParserInfo`; downstream references to those keys are verified.
+- Phase 3 UX: diagnostics are rendered rustc-style with source snippet
+  + caret, "did you mean" Levenshtein suggestions for unknown
+  identifiers / functions, and clear summary + footer lines.
+- Expr-level span: diagnostics carry precise source spans from
+  expression nodes (not just statements), so the caret points at the
+  offending sub-expression (`lower(workspace.count)` → carets the arg).
+- `include "<glob>";` in configs is expanded by the analyzer with a
+  cycle-safe source map, and summary counts (input / output / process /
+  pipeline) are emitted per check.
+- Footer: clean configs end with
+  `<path>: Configuration OK (N pipeline(s), M process(es); dataflow check passed)`;
+  configs with warnings include the warning count; configs with errors
+  exit 1 with `error: N error(s) found`.
+
+### Added — CLI flags
+
+- `--strict-warnings`: promotes warning count to exit-2 (diagnostic
+  level stays warning). CI-friendly switch for "warnings are failures."
+- `--ultra-strict`: promotes **unknown-identifier** warnings to errors
+  (exit 1). Distinct axis from `--strict-warnings` — this one changes
+  the diagnostic level, not just the exit code. The two flags compose:
+  unknown idents become errors, other warnings can still trigger
+  exit-2. Category is tagged via `DiagKind`; `UnknownIdent` is the
+  currently promoted class.
+- `--graph[=<format>]`: emits a structural view of every pipeline to
+  stdout. Formats: `mermaid` (default, GitHub-renderable),
+  `dot` (Graphviz), `ascii` (terminal-only tree). Analyzer output stays
+  on stderr so `--graph | pbcopy` etc. works cleanly.
+
+### Added — documentation
+
+- `docs/src/operations/schema-validation.md` — operations guide for
+  schema validation. Covers the design decision to not ship an in-tree
+  validator, the `limpidctl tap --json | <validator>` recipe (OCSF /
+  ECS / custom JSON Schema), and the alternatives that were rejected
+  (in-tree validator, DSL schema annotations, runtime per-event
+  checking). Cross-linked from `operations/tap.md`.
+
+### Changed — internals
+
+- `Module::schema()` removed. Input / output modules no longer declare
+  a data contract: they are I/O-pure (bytes in / bytes out) and have
+  nothing to advertise. Schema information is carried by
+  `FunctionSig` / `ParserInfo` on the function registry, which is where
+  the analyzer looks. `modules/schema.rs` now only exports the
+  `FieldType` / `FieldSpec` vocabulary.
+- AST `Expr` became a wrapper struct (`Expr { kind: ExprKind, span }`)
+  to carry per-expression spans without rewriting every pattern match.
+- Unused `name_span` / `key_span` fields on def / property AST nodes
+  (left as `#[allow(dead_code)]` placeholders) were removed; they can
+  come back if a future analyzer phase needs them.
+- Diagnostic category is routed via `DiagKind` enum (`UnknownIdent` /
+  `TypeMismatch` / `Dataflow` / `Other`) instead of message-string
+  heuristics, so category rendering and `--ultra-strict` promotion
+  share the same source of truth.
+
+### Documentation fixes
+
+- `limpidctl check` references in operations / pipelines / processing
+  docs corrected to `limpid --check` (check lives in the daemon binary,
+  not the CLI tool — this was the Block 1 decision during v0.3.0
+  restructure, but the docs had drifted).
+
 ## [0.3.0] - 2026-04-24
 
 DSL stabilization release. This is a broad pre-1.0 breaking change that
@@ -233,7 +314,8 @@ with TTL, GeoIP; control socket (`limpidctl tap`, `stats`, `health`);
 hot reload via `SIGHUP` with automatic rollback; per-output disk-backed
 queues.
 
-[Unreleased]: https://github.com/naoto256/limpid/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/naoto256/limpid/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/naoto256/limpid/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/naoto256/limpid/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/naoto256/limpid/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/naoto256/limpid/compare/v0.2.0...v0.2.1
