@@ -13,7 +13,7 @@
 //! silence over noise; precision improves with each parser / function
 //! whose signature is registered.
 
-use crate::dsl::ast::{BinOp, Expr, TemplateFragment, UnaryOp};
+use crate::dsl::ast::{BinOp, Expr, ExprKind, TemplateFragment, UnaryOp};
 use crate::dsl::span::Span;
 use crate::functions::{Arity, FunctionRegistry, FunctionSig};
 use crate::modules::schema::{FieldType, type_compatible};
@@ -30,18 +30,18 @@ use super::{Diagnostic, Level};
 /// and the function `registry`. Anything the analyzer can't pin down
 /// falls back to `FieldType::Any`.
 pub fn infer(expr: &Expr, bindings: &Bindings, registry: &FunctionRegistry) -> FieldType {
-    match expr {
-        Expr::StringLit(_) | Expr::Template(_) => FieldType::String,
-        Expr::IntLit(_) => FieldType::Int,
-        Expr::FloatLit(_) => FieldType::Float,
-        Expr::BoolLit(_) => FieldType::Bool,
-        Expr::Null => FieldType::Null,
-        Expr::HashLit(_) => FieldType::Object,
-        Expr::Ident(parts) => ident_type(parts, bindings),
-        Expr::PropertyAccess(base, suffix) => {
+    match &expr.kind {
+        ExprKind::StringLit(_) | ExprKind::Template(_) => FieldType::String,
+        ExprKind::IntLit(_) => FieldType::Int,
+        ExprKind::FloatLit(_) => FieldType::Float,
+        ExprKind::BoolLit(_) => FieldType::Bool,
+        ExprKind::Null => FieldType::Null,
+        ExprKind::HashLit(_) => FieldType::Object,
+        ExprKind::Ident(parts) => ident_type(parts, bindings),
+        ExprKind::PropertyAccess(base, suffix) => {
             // `geoip(x).country.name` — collapse to a workspace lookup
             // when the base is a bare ident chain we can resolve.
-            if let Expr::Ident(base_parts) = base.as_ref() {
+            if let ExprKind::Ident(base_parts) = &base.kind {
                 let mut combined = base_parts.clone();
                 combined.extend(suffix.iter().cloned());
                 ident_type(&combined, bindings)
@@ -49,7 +49,7 @@ pub fn infer(expr: &Expr, bindings: &Bindings, registry: &FunctionRegistry) -> F
                 FieldType::Any
             }
         }
-        Expr::FuncCall {
+        ExprKind::FuncCall {
             namespace,
             name,
             args: _,
@@ -57,7 +57,7 @@ pub fn infer(expr: &Expr, bindings: &Bindings, registry: &FunctionRegistry) -> F
             .signature(namespace.as_deref(), name)
             .map(|s| s.ret.clone())
             .unwrap_or(FieldType::Any),
-        Expr::BinOp(_l, op, _r) => match op {
+        ExprKind::BinOp(_l, op, _r) => match op {
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 FieldType::Bool
             }
@@ -66,7 +66,7 @@ pub fn infer(expr: &Expr, bindings: &Bindings, registry: &FunctionRegistry) -> F
             // The dedicated operator check still flags illegal combos.
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => FieldType::Any,
         },
-        Expr::UnaryOp(op, inner) => match op {
+        ExprKind::UnaryOp(op, inner) => match op {
             UnaryOp::Not => FieldType::Bool,
             UnaryOp::Neg => infer(inner, bindings, registry),
         },
@@ -136,18 +136,44 @@ fn ident_type(parts: &[String], bindings: &Bindings) -> FieldType {
 /// Walk `expr` and emit warnings for operator and function-arg
 /// mismatches. Recurses into sub-expressions so nested calls are
 /// checked too.
+///
+/// The `fallback_span` parameter is used when the analyzer wants to
+/// anchor the whole tree to a coarser location (e.g. the `value_span`
+/// of an output property). Individual warnings still prefer the tight
+/// sub-expression span from the AST — carried on each [`Expr`] since
+/// Block 11 — and only fall back to this coarser span when the parser
+/// couldn't attribute a precise source range (e.g. synthesized AST
+/// rebuilds in the analyzer that use [`Expr::spanless`]).
 pub fn check_types(
     expr: &Expr,
     pipeline_name: &str,
     bindings: &Bindings,
     registry: &FunctionRegistry,
-    span: Option<Span>,
+    fallback_span: Option<Span>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    match expr {
-        Expr::BinOp(l, op, r) => {
-            check_types(l, pipeline_name, bindings, registry, span, diagnostics);
-            check_types(r, pipeline_name, bindings, registry, span, diagnostics);
+    match &expr.kind {
+        ExprKind::BinOp(l, op, r) => {
+            check_types(
+                l,
+                pipeline_name,
+                bindings,
+                registry,
+                fallback_span,
+                diagnostics,
+            );
+            check_types(
+                r,
+                pipeline_name,
+                bindings,
+                registry,
+                fallback_span,
+                diagnostics,
+            );
+            // Precise span for operator-type mismatches: the whole
+            // BinOp sub-tree covers `[l.span.start, r.span.end)` — the
+            // parser sets that on `expr` itself in `fold_by_precedence`.
+            let span = prefer_span(expr, fallback_span);
             check_binop(
                 l,
                 *op,
@@ -159,17 +185,36 @@ pub fn check_types(
                 diagnostics,
             );
         }
-        Expr::UnaryOp(_op, inner) => {
-            check_types(inner, pipeline_name, bindings, registry, span, diagnostics);
+        ExprKind::UnaryOp(_op, inner) => {
+            check_types(
+                inner,
+                pipeline_name,
+                bindings,
+                registry,
+                fallback_span,
+                diagnostics,
+            );
         }
-        Expr::FuncCall {
+        ExprKind::FuncCall {
             namespace,
             name,
             args,
         } => {
             for a in args {
-                check_types(a, pipeline_name, bindings, registry, span, diagnostics);
+                check_types(
+                    a,
+                    pipeline_name,
+                    bindings,
+                    registry,
+                    fallback_span,
+                    diagnostics,
+                );
             }
+            // Function-call-level diagnostic (unknown function, arg
+            // type mismatch) anchors to the call expression itself; the
+            // per-argument diagnostic below prefers the individual arg
+            // span for tight carets.
+            let call_span = prefer_span(expr, fallback_span);
             check_fn_call(
                 namespace.as_deref(),
                 name,
@@ -177,31 +222,65 @@ pub fn check_types(
                 pipeline_name,
                 bindings,
                 registry,
-                span,
+                call_span,
                 diagnostics,
             );
         }
-        Expr::Template(fragments) => {
+        ExprKind::Template(fragments) => {
             for f in fragments {
                 if let TemplateFragment::Interp(e) = f {
-                    check_types(e, pipeline_name, bindings, registry, span, diagnostics);
+                    check_types(
+                        e,
+                        pipeline_name,
+                        bindings,
+                        registry,
+                        fallback_span,
+                        diagnostics,
+                    );
                 }
             }
         }
-        Expr::HashLit(entries) => {
+        ExprKind::HashLit(entries) => {
             for (_k, v) in entries {
-                check_types(v, pipeline_name, bindings, registry, span, diagnostics);
+                check_types(
+                    v,
+                    pipeline_name,
+                    bindings,
+                    registry,
+                    fallback_span,
+                    diagnostics,
+                );
             }
         }
-        Expr::PropertyAccess(base, _) => {
-            check_types(base, pipeline_name, bindings, registry, span, diagnostics);
+        ExprKind::PropertyAccess(base, _) => {
+            check_types(
+                base,
+                pipeline_name,
+                bindings,
+                registry,
+                fallback_span,
+                diagnostics,
+            );
         }
-        Expr::StringLit(_)
-        | Expr::IntLit(_)
-        | Expr::FloatLit(_)
-        | Expr::BoolLit(_)
-        | Expr::Null
-        | Expr::Ident(_) => {}
+        ExprKind::StringLit(_)
+        | ExprKind::IntLit(_)
+        | ExprKind::FloatLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::Null
+        | ExprKind::Ident(_) => {}
+    }
+}
+
+/// Prefer the AST-carried span on `expr` when it isn't the
+/// [`Span::dummy`] placeholder; otherwise fall back to the caller-
+/// supplied coarser span. Keeps synthesized expressions (test fixtures,
+/// analyzer rebuilds) from emitting diagnostics anchored to garbage
+/// offsets.
+fn prefer_span(expr: &Expr, fallback: Option<Span>) -> Option<Span> {
+    if expr.span.file_id == u32::MAX {
+        fallback
+    } else {
+        Some(expr.span)
     }
 }
 
@@ -329,6 +408,10 @@ fn check_fn_call(
         let actual_ty = infer(actual, bindings, registry);
         if !type_compatible(expected, &actual_ty) {
             let display = qualified_name(namespace, name);
+            // Prefer the tight per-argument span from the AST; fall
+            // back to the call-level span only when the arg came from
+            // a synthesized rebuild (`Expr::spanless`).
+            let arg_span = prefer_span(actual, span);
             diagnostics.push(warning(
                 pipeline_name,
                 format!(
@@ -338,7 +421,7 @@ fn check_fn_call(
                     expected.display(),
                     actual_ty.display()
                 ),
-                span,
+                arg_span,
             ));
         }
     }

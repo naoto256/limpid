@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use anyhow::{Result, bail};
 use serde_json::Value;
 
-use super::ast::{BinOp, Expr, TemplateFragment, UnaryOp};
+use super::ast::{BinOp, Expr, ExprKind, TemplateFragment, UnaryOp};
 use crate::event::Event;
 use crate::functions::FunctionRegistry;
 
@@ -74,9 +74,9 @@ pub fn eval_expr_with_scope(
     funcs: &FunctionRegistry,
     scope: &LocalScope,
 ) -> Result<Value> {
-    match expr {
-        Expr::StringLit(s) => Ok(Value::String(s.clone())),
-        Expr::Template(fragments) => {
+    match &expr.kind {
+        ExprKind::StringLit(s) => Ok(Value::String(s.clone())),
+        ExprKind::Template(fragments) => {
             // Render template fragments against the current event.
             // Interpolated values are coerced to string via value_to_string
             // so that `${source}` (String) and `${workspace.foo}` (arbitrary)
@@ -93,16 +93,16 @@ pub fn eval_expr_with_scope(
             }
             Ok(Value::String(out))
         }
-        Expr::IntLit(n) => Ok(Value::Number((*n).into())),
-        Expr::FloatLit(f) => Ok(Value::Number(
+        ExprKind::IntLit(n) => Ok(Value::Number((*n).into())),
+        ExprKind::FloatLit(f) => Ok(Value::Number(
             serde_json::Number::from_f64(*f).unwrap_or(0.into()),
         )),
-        Expr::BoolLit(b) => Ok(Value::Bool(*b)),
-        Expr::Null => Ok(Value::Null),
+        ExprKind::BoolLit(b) => Ok(Value::Bool(*b)),
+        ExprKind::Null => Ok(Value::Null),
 
-        Expr::Ident(parts) => resolve_ident(parts, event, scope),
+        ExprKind::Ident(parts) => resolve_ident(parts, event, scope),
 
-        Expr::FuncCall {
+        ExprKind::FuncCall {
             namespace,
             name,
             args,
@@ -114,18 +114,18 @@ pub fn eval_expr_with_scope(
             funcs.call(namespace.as_deref(), name, &evaluated_args, event)
         }
 
-        Expr::BinOp(left, op, right) => {
+        ExprKind::BinOp(left, op, right) => {
             let lv = eval_expr_with_scope(left, event, funcs, scope)?;
             let rv = eval_expr_with_scope(right, event, funcs, scope)?;
             eval_bin_op(&lv, *op, &rv)
         }
 
-        Expr::UnaryOp(op, operand) => {
+        ExprKind::UnaryOp(op, operand) => {
             let v = eval_expr_with_scope(operand, event, funcs, scope)?;
             eval_unary_op(*op, &v)
         }
 
-        Expr::HashLit(entries) => {
+        ExprKind::HashLit(entries) => {
             let mut map = serde_json::Map::new();
             for (key, val_expr) in entries {
                 let val = eval_expr_with_scope(val_expr, event, funcs, scope)?;
@@ -134,7 +134,7 @@ pub fn eval_expr_with_scope(
             Ok(Value::Object(map))
         }
 
-        Expr::PropertyAccess(base, path) => {
+        ExprKind::PropertyAccess(base, path) => {
             let mut current = eval_expr_with_scope(base, event, funcs, scope)?;
             for field in path {
                 current = match current {

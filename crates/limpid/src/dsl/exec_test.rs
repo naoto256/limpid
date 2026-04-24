@@ -25,6 +25,11 @@ mod tests {
         reg
     }
 
+    /// Spanless [`Expr`] construction shortcut — see `eval_test::tests::e`.
+    fn e(kind: ExprKind) -> Expr {
+        Expr::spanless(kind)
+    }
+
     /// No-op registry that passes events through unchanged.
     struct NoopRegistry;
     impl ProcessRegistry for NoopRegistry {
@@ -56,11 +61,11 @@ mod tests {
         let event = make_event();
         let stmts = vec![ProcessStatement::Assign(
             AssignTarget::Workspace(vec!["tag".into()]),
-            Expr::StringLit("critical".into()),
+            e(ExprKind::StringLit("critical".into())),
         )];
         match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
-            ExecResult::Continue(e) => {
-                assert_eq!(e.workspace["tag"], Value::String("critical".into()));
+            ExecResult::Continue(ev) => {
+                assert_eq!(ev.workspace["tag"], Value::String("critical".into()));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -81,17 +86,17 @@ mod tests {
         let event = make_event();
         let stmts = vec![ProcessStatement::If(IfChain {
             branches: vec![(
-                Expr::BoolLit(true),
+                e(ExprKind::BoolLit(true)),
                 vec![BranchBody::Process(ProcessStatement::Assign(
                     AssignTarget::Workspace(vec!["hit".into()]),
-                    Expr::BoolLit(true),
+                    e(ExprKind::BoolLit(true)),
                 ))],
             )],
             else_body: None,
         })];
         match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
-            ExecResult::Continue(e) => {
-                assert_eq!(e.workspace["hit"], Value::Bool(true));
+            ExecResult::Continue(ev) => {
+                assert_eq!(ev.workspace["hit"], Value::Bool(true));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -102,20 +107,20 @@ mod tests {
         let event = make_event();
         let stmts = vec![ProcessStatement::If(IfChain {
             branches: vec![(
-                Expr::BoolLit(false),
+                e(ExprKind::BoolLit(false)),
                 vec![BranchBody::Process(ProcessStatement::Assign(
                     AssignTarget::Workspace(vec!["branch".into()]),
-                    Expr::StringLit("if".into()),
+                    e(ExprKind::StringLit("if".into())),
                 ))],
             )],
             else_body: Some(vec![BranchBody::Process(ProcessStatement::Assign(
                 AssignTarget::Workspace(vec!["branch".into()]),
-                Expr::StringLit("else".into()),
+                e(ExprKind::StringLit("else".into())),
             ))]),
         })];
         match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
-            ExecResult::Continue(e) => {
-                assert_eq!(e.workspace["branch"], Value::String("else".into()));
+            ExecResult::Continue(ev) => {
+                assert_eq!(ev.workspace["branch"], Value::String("else".into()));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -126,9 +131,9 @@ mod tests {
         let event = make_event();
         let stmts = vec![ProcessStatement::ProcessCall("failing".into(), vec![])];
         match exec_process_body(&stmts, event, &FailRegistry, &make_funcs()).unwrap() {
-            ExecResult::Continue(e) => {
+            ExecResult::Continue(ev) => {
                 // Event should pass through unchanged
-                assert_eq!(&*e.ingress, b"<134>test");
+                assert_eq!(&*ev.ingress, b"<134>test");
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -141,7 +146,7 @@ mod tests {
             vec![ProcessStatement::ProcessCall("failing".into(), vec![])],
             vec![ProcessStatement::Assign(
                 AssignTarget::Workspace(vec!["caught".into()]),
-                Expr::BoolLit(true),
+                e(ExprKind::BoolLit(true)),
             )],
         )];
         // Note: with FailRegistry, the process call returns Err but exec.rs
@@ -161,15 +166,15 @@ mod tests {
         // `let x = 7; workspace.y = x` — workspace.y becomes Number(7).
         let event = make_event();
         let stmts = vec![
-            ProcessStatement::LetBinding("x".into(), Expr::IntLit(7)),
+            ProcessStatement::LetBinding("x".into(), e(ExprKind::IntLit(7))),
             ProcessStatement::Assign(
                 AssignTarget::Workspace(vec!["y".into()]),
-                Expr::Ident(vec!["x".into()]),
+                e(ExprKind::Ident(vec!["x".into()])),
             ),
         ];
         match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
-            ExecResult::Continue(e) => {
-                assert_eq!(e.workspace["y"], Value::Number(7.into()));
+            ExecResult::Continue(ev) => {
+                assert_eq!(ev.workspace["y"], Value::Number(7.into()));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -180,16 +185,16 @@ mod tests {
         // `let x = 1; let x = 2; workspace.y = x` — workspace.y is 2.
         let event = make_event();
         let stmts = vec![
-            ProcessStatement::LetBinding("x".into(), Expr::IntLit(1)),
-            ProcessStatement::LetBinding("x".into(), Expr::IntLit(2)),
+            ProcessStatement::LetBinding("x".into(), e(ExprKind::IntLit(1))),
+            ProcessStatement::LetBinding("x".into(), e(ExprKind::IntLit(2))),
             ProcessStatement::Assign(
                 AssignTarget::Workspace(vec!["y".into()]),
-                Expr::Ident(vec!["x".into()]),
+                e(ExprKind::Ident(vec!["x".into()])),
             ),
         ];
         match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
-            ExecResult::Continue(e) => {
-                assert_eq!(e.workspace["y"], Value::Number(2.into()));
+            ExecResult::Continue(ev) => {
+                assert_eq!(ev.workspace["y"], Value::Number(2.into()));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -199,21 +204,21 @@ mod tests {
     fn let_is_visible_inside_if_branch_declared_above() {
         let event = make_event();
         let stmts = vec![
-            ProcessStatement::LetBinding("m".into(), Expr::StringLit("hit".into())),
+            ProcessStatement::LetBinding("m".into(), e(ExprKind::StringLit("hit".into()))),
             ProcessStatement::If(IfChain {
                 branches: vec![(
-                    Expr::BoolLit(true),
+                    e(ExprKind::BoolLit(true)),
                     vec![BranchBody::Process(ProcessStatement::Assign(
                         AssignTarget::Workspace(vec!["tag".into()]),
-                        Expr::Ident(vec!["m".into()]),
+                        e(ExprKind::Ident(vec!["m".into()])),
                     ))],
                 )],
                 else_body: None,
             }),
         ];
         match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
-            ExecResult::Continue(e) => {
-                assert_eq!(e.workspace["tag"], Value::String("hit".into()));
+            ExecResult::Continue(ev) => {
+                assert_eq!(ev.workspace["tag"], Value::String("hit".into()));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -226,12 +231,15 @@ mod tests {
         // the second — referencing `x` in the second body fails.
         let funcs = make_funcs();
         let event = make_event();
-        let first = vec![ProcessStatement::LetBinding("x".into(), Expr::IntLit(1))];
+        let first = vec![ProcessStatement::LetBinding(
+            "x".into(),
+            e(ExprKind::IntLit(1)),
+        )];
         let _ = exec_process_body(&first, event.clone(), &NoopRegistry, &funcs).unwrap();
 
         let second = vec![ProcessStatement::Assign(
             AssignTarget::Workspace(vec!["y".into()]),
-            Expr::Ident(vec!["x".into()]),
+            e(ExprKind::Ident(vec!["x".into()])),
         )];
         let err = exec_process_body(&second, event, &NoopRegistry, &funcs).unwrap_err();
         assert!(
@@ -245,18 +253,18 @@ mod tests {
     fn let_is_referenced_in_template_interpolation() {
         let event = make_event();
         let stmts = vec![
-            ProcessStatement::LetBinding("host".into(), Expr::StringLit("web01".into())),
+            ProcessStatement::LetBinding("host".into(), e(ExprKind::StringLit("web01".into()))),
             ProcessStatement::Assign(
                 AssignTarget::Egress,
-                Expr::Template(vec![
+                e(ExprKind::Template(vec![
                     TemplateFragment::Literal("hello ".into()),
-                    TemplateFragment::Interp(Expr::Ident(vec!["host".into()])),
-                ]),
+                    TemplateFragment::Interp(e(ExprKind::Ident(vec!["host".into()]))),
+                ])),
             ),
         ];
         match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
-            ExecResult::Continue(e) => {
-                assert_eq!(&*e.egress, b"hello web01");
+            ExecResult::Continue(ev) => {
+                assert_eq!(&*ev.egress, b"hello web01");
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -269,18 +277,18 @@ mod tests {
         let event = make_event();
         let stmts = vec![ProcessStatement::TryCatch(
             vec![
-                ProcessStatement::LetBinding("x".into(), Expr::IntLit(9)),
+                ProcessStatement::LetBinding("x".into(), e(ExprKind::IntLit(9))),
                 // Force an error: `unknown identifier` on bare `nope`
                 ProcessStatement::Assign(
                     AssignTarget::Workspace(vec!["y".into()]),
-                    Expr::Ident(vec!["nope".into()]),
+                    e(ExprKind::Ident(vec!["nope".into()])),
                 ),
             ],
             vec![
                 // x should NOT be in scope here because the try failed.
                 ProcessStatement::Assign(
                     AssignTarget::Workspace(vec!["recovered".into()]),
-                    Expr::Ident(vec!["x".into()]),
+                    e(ExprKind::Ident(vec!["x".into()])),
                 ),
             ],
         )];

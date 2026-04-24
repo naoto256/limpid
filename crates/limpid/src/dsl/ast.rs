@@ -223,8 +223,58 @@ pub enum AssignTarget {
 // Expressions
 // ---------------------------------------------------------------------------
 
+/// An expression node — kind plus the source span it covers.
+///
+/// Block 11 commit 11-A introduced the wrapper form (`{ kind, span }`)
+/// so the analyzer can emit precise `snippet + caret` diagnostics for
+/// type / operator / function-arg warnings that previously fell back to
+/// the statement-level span (or spanless output). The parser fills
+/// `span` from `pest`; code that hand-constructs AST nodes (tests, a
+/// few module-local rebuilds in `check/mod.rs`) can use
+/// [`Expr::spanless`] to elide the span.
 #[derive(Debug, Clone)]
-pub enum Expr {
+pub struct Expr {
+    pub kind: ExprKind,
+    /// Source span covering this expression. [`Span::dummy`] for nodes
+    /// that didn't come from the parser (test fixtures, synthesized
+    /// rebuilds); the renderer degrades gracefully — no file recorded
+    /// for `file_id` means no snippet is drawn.
+    pub span: Span,
+}
+
+impl Expr {
+    /// Wrap `kind` with the given `span`.
+    pub fn new(kind: ExprKind, span: Span) -> Self {
+        Self { kind, span }
+    }
+
+    /// Wrap `kind` with a placeholder span ([`Span::dummy`]). Used by
+    /// AST rebuilds and test fixtures where the original source location
+    /// isn't meaningful.
+    #[allow(dead_code)]
+    pub fn spanless(kind: ExprKind) -> Self {
+        Self {
+            kind,
+            span: Span::dummy(),
+        }
+    }
+}
+
+/// Wrap an [`ExprKind`] into a spanless [`Expr`]. Convenient for tests
+/// and AST rebuilds: `ExprKind::IntLit(7).into()` reads cleanly, and
+/// keeps `Expr::new(kind, span)` as the authoritative constructor for
+/// parser output where the span is meaningful.
+impl From<ExprKind> for Expr {
+    fn from(kind: ExprKind) -> Self {
+        Expr::spanless(kind)
+    }
+}
+
+/// The structural shape of an expression. Split out from [`Expr`] so
+/// the wrapper can carry a single `span` field without duplicating it
+/// across every variant.
+#[derive(Debug, Clone)]
+pub enum ExprKind {
     /// String literal without interpolation: `"hello"`
     StringLit(String),
     /// String literal with `${expr}` interpolation: `"/log/${source}.log"`.

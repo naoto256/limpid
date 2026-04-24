@@ -40,8 +40,8 @@ pub mod render;
 pub mod suggestions;
 
 use crate::dsl::ast::{
-    AssignTarget, Config, Definition, Expr, PipelineDef, PipelineStatement, ProcessChainElement,
-    ProcessDef, ProcessStatement,
+    AssignTarget, Config, Definition, Expr, ExprKind, PipelineDef, PipelineStatement,
+    ProcessChainElement, ProcessDef, ProcessStatement,
 };
 use crate::dsl::span::{SourceMap, Span};
 use crate::functions::FunctionRegistry;
@@ -339,14 +339,24 @@ pub(super) fn analyze_process_stmt(
                         && matches!(old_ty, FieldType::Object)
                         && !matches!(new_ty, FieldType::Object | FieldType::Any)
                     {
-                        diagnostics.push(Diagnostic::warning(format!(
-                            "[pipeline {}] assignment to `{}` overwrites an Object with {}; \
-                             nested references (e.g. `{}.*`) will become dead",
-                            pipeline_name,
-                            full.join("."),
-                            new_ty.display(),
-                            full.join("."),
-                        )));
+                        // Anchor to the RHS expression if it came from
+                        // the parser; otherwise leave spanless.
+                        let span = if expr.span.file_id == u32::MAX {
+                            None
+                        } else {
+                            Some(expr.span)
+                        };
+                        diagnostics.push(
+                            Diagnostic::warning(format!(
+                                "[pipeline {}] assignment to `{}` overwrites an Object with {}; \
+                                 nested references (e.g. `{}.*`) will become dead",
+                                pipeline_name,
+                                full.join("."),
+                                new_ty.display(),
+                                full.join("."),
+                            ))
+                            .with_span(span),
+                        );
                     }
 
                     bindings.bind_workspace(&full, new_ty);
@@ -361,30 +371,24 @@ pub(super) fn analyze_process_stmt(
             let ty = expr_types::infer(expr, bindings, registry);
             bindings.bind_let(name, ty);
         }
-        ProcessStatement::ExprStmt(Expr::FuncCall {
-            namespace,
-            name,
-            args,
-        }) => {
-            for a in args {
-                expr_types::check_types(a, pipeline_name, bindings, registry, None, diagnostics);
-            }
-            // Bare function-call statement: type-check the call as a
-            // value too (catches arg-type mismatches), then apply the
-            // parser merge effect into workspace if it's a parser.
-            let call_expr = Expr::FuncCall {
-                namespace: namespace.clone(),
-                name: name.clone(),
-                args: args.clone(),
-            };
-            expr_types::check_types(
-                &call_expr,
-                pipeline_name,
-                bindings,
-                registry,
-                None,
-                diagnostics,
-            );
+        ProcessStatement::ExprStmt(
+            call @ Expr {
+                kind:
+                    ExprKind::FuncCall {
+                        namespace,
+                        name,
+                        args,
+                    },
+                ..
+            },
+        ) => {
+            // Bare function-call statement: type-check the call
+            // expression (which recurses into args and checks arg-type
+            // compatibility against the signature), then apply the
+            // parser merge effect into workspace if it's a parser. No
+            // separate arg-only pass — `check_types(call, …)` already
+            // walks `args`.
+            expr_types::check_types(call, pipeline_name, bindings, registry, None, diagnostics);
             parser_effects::apply_parser_effects(
                 namespace.as_deref(),
                 name,
@@ -818,6 +822,84 @@ def pipeline p {
 "#;
         let diags = analyze_str(src);
         assert!(warnings(&diags).is_empty(), "got: {:?}", diags);
+    }
+
+    // ----- expr-level spans (Block 11-A) ---------------------------------
+
+    #[test]
+    fn lower_on_int_workspace_carries_arg_span() {
+        // Regression: before 11-A, type warnings inside process bodies
+        // were spanless and fell back to the one-line
+        // `warning: ...` format. After 11-A the arg's `ExprKind::Ident`
+        // span resolves to the `workspace.count` substring, so the
+        // diagnostic renders with a snippet + caret.
+        let src = r#"
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p {
+    input i
+    process { parse_json(ingress, {count: 0}) }
+    process { workspace.tag = lower(workspace.count) }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        let warn = warnings(&diags)
+            .into_iter()
+            .find(|w| w.message.contains("lower"))
+            .expect("expected a `lower` warning");
+        let span = warn.span.expect("expected expr-level span");
+        let mut sm = SourceMap::new();
+        sm.add_anonymous(src);
+        let resolved = sm.resolve(&span).expect("span should resolve");
+        assert!(
+            resolved
+                .line_text
+                .contains("workspace.tag = lower(workspace.count)"),
+            "unexpected line: {}",
+            resolved.line_text
+        );
+        assert!(
+            resolved.line_text[resolved.col as usize - 1..].starts_with("workspace.count"),
+            "caret should sit on `workspace.count` (col {}), line: {}",
+            resolved.col,
+            resolved.line_text
+        );
+    }
+
+    #[test]
+    fn operator_type_mismatch_carries_binop_span() {
+        // `workspace.port == "80"` where workspace.port is Int: the
+        // BinOp span should cover the comparison expression, which
+        // lives on the `if` line. Pre-11-A the warning was spanless.
+        let src = r#"
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p {
+    input i
+    process { parse_json(ingress, {port: 0}) }
+    process {
+        if workspace.port == "80" {
+            workspace.tag = "hot"
+        }
+    }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        let warn = warnings(&diags)
+            .into_iter()
+            .find(|w| w.message.contains("=="))
+            .expect("expected == warning");
+        let span = warn.span.expect("expected span for `==` warning");
+        let mut sm = SourceMap::new();
+        sm.add_anonymous(src);
+        let resolved = sm.resolve(&span).expect("span should resolve");
+        assert!(
+            resolved.line_text.contains("workspace.port == \"80\""),
+            "unexpected line: {}",
+            resolved.line_text
+        );
     }
 
     // ----- DefCounts -----------------------------------------------------

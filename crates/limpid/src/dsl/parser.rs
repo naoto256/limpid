@@ -161,7 +161,7 @@ fn parse_property(pair: Pair<Rule>, file_id: u32) -> Result<Property> {
         _ => {
             // key-value: key expr
             let value_span = Some(span_of(&second, file_id));
-            let value = parse_expr_from_pair(second)?;
+            let value = parse_expr_from_pair(second, file_id)?;
             Ok(Property::KeyValue {
                 key,
                 key_span,
@@ -182,7 +182,7 @@ fn parse_process_def(pair: Pair<Rule>, file_id: u32) -> Result<ProcessDef> {
     let name_span = Some(span_of(&name_pair, file_id));
     let name = name_pair.as_str().to_string();
     let body = inner
-        .map(|p| parse_process_stmt(p))
+        .map(|p| parse_process_stmt(p, file_id))
         .collect::<Result<Vec<_>>>()?;
     Ok(ProcessDef {
         name,
@@ -191,51 +191,51 @@ fn parse_process_def(pair: Pair<Rule>, file_id: u32) -> Result<ProcessDef> {
     })
 }
 
-fn parse_process_stmt(pair: Pair<Rule>) -> Result<ProcessStatement> {
+fn parse_process_stmt(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
     let inner = first_inner(pair)?;
     match inner.as_rule() {
         Rule::process_drop => Ok(ProcessStatement::Drop),
-        Rule::process_call => parse_process_call(inner),
-        Rule::process_assign => parse_process_assign(inner),
-        Rule::process_if => parse_process_if(inner),
-        Rule::process_switch => parse_process_switch(inner),
-        Rule::process_try_catch => parse_process_try_catch(inner),
-        Rule::process_foreach => parse_process_foreach(inner),
-        Rule::process_let => parse_process_let(inner),
-        Rule::process_expr_stmt => parse_process_expr_stmt(inner),
+        Rule::process_call => parse_process_call(inner, file_id),
+        Rule::process_assign => parse_process_assign(inner, file_id),
+        Rule::process_if => parse_process_if(inner, file_id),
+        Rule::process_switch => parse_process_switch(inner, file_id),
+        Rule::process_try_catch => parse_process_try_catch(inner, file_id),
+        Rule::process_foreach => parse_process_foreach(inner, file_id),
+        Rule::process_let => parse_process_let(inner, file_id),
+        Rule::process_expr_stmt => parse_process_expr_stmt(inner, file_id),
         _ => bail!("unexpected process statement: {:?}", inner.as_rule()),
     }
 }
 
-fn parse_process_call(pair: Pair<Rule>) -> Result<ProcessStatement> {
+fn parse_process_call(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
     let mut inner = pair.into_inner();
     let name = inner.next().unwrap().as_str().to_string();
     let args = if let Some(args_pair) = inner.next() {
-        parse_func_args(args_pair)?
+        parse_func_args(args_pair, file_id)?
     } else {
         vec![]
     };
     Ok(ProcessStatement::ProcessCall(name, args))
 }
 
-fn parse_process_let(pair: Pair<Rule>) -> Result<ProcessStatement> {
+fn parse_process_let(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
     let mut inner = pair.into_inner();
     let name = inner.next().unwrap().as_str().to_string();
-    let expr = parse_expr_from_pair(inner.next().unwrap())?;
+    let expr = parse_expr_from_pair(inner.next().unwrap(), file_id)?;
     Ok(ProcessStatement::LetBinding(name, expr))
 }
 
-fn parse_process_expr_stmt(pair: Pair<Rule>) -> Result<ProcessStatement> {
+fn parse_process_expr_stmt(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
     let inner = first_inner(pair)?;
-    let expr = parse_func_call_expr(inner)?;
+    let expr = parse_func_call_expr(inner, file_id)?;
     Ok(ProcessStatement::ExprStmt(expr))
 }
 
-fn parse_process_assign(pair: Pair<Rule>) -> Result<ProcessStatement> {
+fn parse_process_assign(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
     let mut inner = pair.into_inner();
     let target_pair = inner.next().unwrap();
     let target = parse_assign_target(target_pair)?;
-    let expr = parse_expr_from_pair(inner.next().unwrap())?;
+    let expr = parse_expr_from_pair(inner.next().unwrap(), file_id)?;
     Ok(ProcessStatement::Assign(target, expr))
 }
 
@@ -255,45 +255,47 @@ fn parse_assign_target(pair: Pair<Rule>) -> Result<AssignTarget> {
     }
 }
 
-fn parse_process_if(pair: Pair<Rule>) -> Result<ProcessStatement> {
-    let if_chain = parse_if_chain_generic(pair, |p| {
-        let stmt = parse_process_stmt(p)?;
+fn parse_process_if(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
+    let if_chain = parse_if_chain_generic(pair, file_id, |p, fid| {
+        let stmt = parse_process_stmt(p, fid)?;
         Ok(BranchBody::Process(stmt))
     })?;
     Ok(ProcessStatement::If(if_chain))
 }
 
-fn parse_process_switch(pair: Pair<Rule>) -> Result<ProcessStatement> {
+fn parse_process_switch(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
     let mut inner = pair.into_inner();
-    let discriminant = parse_expr_from_pair(inner.next().unwrap())?;
+    let discriminant = parse_expr_from_pair(inner.next().unwrap(), file_id)?;
     let arms = inner
         .map(|arm| {
-            parse_switch_arm_generic(arm, |p| Ok(BranchBody::Process(parse_process_stmt(p)?)))
+            parse_switch_arm_generic(arm, file_id, |p, fid| {
+                Ok(BranchBody::Process(parse_process_stmt(p, fid)?))
+            })
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(ProcessStatement::Switch(discriminant, arms))
 }
 
-fn parse_process_try_catch(pair: Pair<Rule>) -> Result<ProcessStatement> {
+fn parse_process_try_catch(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
     let mut inner = pair.into_inner();
     let try_pair = inner.next().unwrap();
     let catch_pair = inner.next().unwrap();
     let try_body = try_pair
         .into_inner()
-        .map(|p| parse_process_stmt(p))
+        .map(|p| parse_process_stmt(p, file_id))
         .collect::<Result<Vec<_>>>()?;
     let catch_body = catch_pair
         .into_inner()
-        .map(|p| parse_process_stmt(p))
+        .map(|p| parse_process_stmt(p, file_id))
         .collect::<Result<Vec<_>>>()?;
     Ok(ProcessStatement::TryCatch(try_body, catch_body))
 }
 
-fn parse_process_foreach(pair: Pair<Rule>) -> Result<ProcessStatement> {
+fn parse_process_foreach(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
     let mut inner = pair.into_inner();
-    let iterable = parse_expr_from_pair(inner.next().unwrap())?;
+    let iterable = parse_expr_from_pair(inner.next().unwrap(), file_id)?;
     let body = inner
-        .map(|p| parse_process_stmt(p))
+        .map(|p| parse_process_stmt(p, file_id))
         .collect::<Result<Vec<_>>>()?;
     Ok(ProcessStatement::ForEach(iterable, body))
 }
@@ -308,7 +310,7 @@ fn parse_pipeline_def(pair: Pair<Rule>, file_id: u32) -> Result<PipelineDef> {
     let name_span = Some(span_of(&name_pair, file_id));
     let name = name_pair.as_str().to_string();
     let body = inner
-        .map(|p| parse_pipeline_stmt(p))
+        .map(|p| parse_pipeline_stmt(p, file_id))
         .collect::<Result<Vec<_>>>()?;
     Ok(PipelineDef {
         name,
@@ -317,7 +319,7 @@ fn parse_pipeline_def(pair: Pair<Rule>, file_id: u32) -> Result<PipelineDef> {
     })
 }
 
-fn parse_pipeline_stmt(pair: Pair<Rule>) -> Result<PipelineStatement> {
+fn parse_pipeline_stmt(pair: Pair<Rule>, file_id: u32) -> Result<PipelineStatement> {
     let inner = first_inner(pair)?;
     match inner.as_rule() {
         Rule::pipeline_drop => Ok(PipelineStatement::Drop),
@@ -333,29 +335,29 @@ fn parse_pipeline_stmt(pair: Pair<Rule>) -> Result<PipelineStatement> {
             let name = first_inner(inner)?.as_str().to_string();
             Ok(PipelineStatement::Output(name))
         }
-        Rule::pipeline_process_chain => parse_pipeline_process_chain(inner),
-        Rule::pipeline_if => parse_pipeline_if(inner),
-        Rule::pipeline_switch => parse_pipeline_switch(inner),
+        Rule::pipeline_process_chain => parse_pipeline_process_chain(inner, file_id),
+        Rule::pipeline_if => parse_pipeline_if(inner, file_id),
+        Rule::pipeline_switch => parse_pipeline_switch(inner, file_id),
         _ => bail!("unexpected pipeline statement: {:?}", inner.as_rule()),
     }
 }
 
-fn parse_pipeline_process_chain(pair: Pair<Rule>) -> Result<PipelineStatement> {
+fn parse_pipeline_process_chain(pair: Pair<Rule>, file_id: u32) -> Result<PipelineStatement> {
     let elements = pair
         .into_inner()
-        .map(|p| parse_chain_element(p))
+        .map(|p| parse_chain_element(p, file_id))
         .collect::<Result<Vec<_>>>()?;
     Ok(PipelineStatement::ProcessChain(elements))
 }
 
-fn parse_chain_element(pair: Pair<Rule>) -> Result<ProcessChainElement> {
+fn parse_chain_element(pair: Pair<Rule>, file_id: u32) -> Result<ProcessChainElement> {
     let inner = first_inner(pair)?;
     match inner.as_rule() {
         Rule::process_ref => {
             let mut parts = inner.into_inner();
             let name = parts.next().unwrap().as_str().to_string();
             let args = if let Some(args_pair) = parts.next() {
-                parse_func_args(args_pair)?
+                parse_func_args(args_pair, file_id)?
             } else {
                 vec![]
             };
@@ -364,7 +366,7 @@ fn parse_chain_element(pair: Pair<Rule>) -> Result<ProcessChainElement> {
         Rule::inline_process => {
             let body = inner
                 .into_inner()
-                .map(|p| parse_process_stmt(p))
+                .map(|p| parse_process_stmt(p, file_id))
                 .collect::<Result<Vec<_>>>()?;
             Ok(ProcessChainElement::Inline(body))
         }
@@ -372,20 +374,22 @@ fn parse_chain_element(pair: Pair<Rule>) -> Result<ProcessChainElement> {
     }
 }
 
-fn parse_pipeline_if(pair: Pair<Rule>) -> Result<PipelineStatement> {
-    let if_chain = parse_if_chain_generic(pair, |p| {
-        let stmt = parse_pipeline_stmt(p)?;
+fn parse_pipeline_if(pair: Pair<Rule>, file_id: u32) -> Result<PipelineStatement> {
+    let if_chain = parse_if_chain_generic(pair, file_id, |p, fid| {
+        let stmt = parse_pipeline_stmt(p, fid)?;
         Ok(BranchBody::Pipeline(stmt))
     })?;
     Ok(PipelineStatement::If(if_chain))
 }
 
-fn parse_pipeline_switch(pair: Pair<Rule>) -> Result<PipelineStatement> {
+fn parse_pipeline_switch(pair: Pair<Rule>, file_id: u32) -> Result<PipelineStatement> {
     let mut inner = pair.into_inner();
-    let discriminant = parse_expr_from_pair(inner.next().unwrap())?;
+    let discriminant = parse_expr_from_pair(inner.next().unwrap(), file_id)?;
     let arms = inner
         .map(|arm| {
-            parse_switch_arm_generic(arm, |p| Ok(BranchBody::Pipeline(parse_pipeline_stmt(p)?)))
+            parse_switch_arm_generic(arm, file_id, |p, fid| {
+                Ok(BranchBody::Pipeline(parse_pipeline_stmt(p, fid)?))
+            })
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(PipelineStatement::Switch(discriminant, arms))
@@ -397,9 +401,9 @@ fn parse_pipeline_switch(pair: Pair<Rule>) -> Result<PipelineStatement> {
 
 /// Generic if/else-if/else parser.
 /// Inner pairs alternate: expr, block, expr, block, ..., and optionally a lone block for else.
-fn parse_if_chain_generic<F>(pair: Pair<Rule>, mut parse_body: F) -> Result<IfChain>
+fn parse_if_chain_generic<F>(pair: Pair<Rule>, file_id: u32, mut parse_body: F) -> Result<IfChain>
 where
-    F: FnMut(Pair<Rule>) -> Result<BranchBody>,
+    F: FnMut(Pair<Rule>, u32) -> Result<BranchBody>,
 {
     let inner: Vec<Pair<Rule>> = pair.into_inner().collect();
     let mut branches = Vec::new();
@@ -408,14 +412,14 @@ where
 
     while i < inner.len() {
         if inner[i].as_rule() == Rule::expr {
-            let condition = parse_expr_from_pair(inner[i].clone())?;
+            let condition = parse_expr_from_pair(inner[i].clone(), file_id)?;
             i += 1;
             // Next is a block (process_block or pipeline_block)
             let block = inner[i].clone();
             i += 1;
             let body = block
                 .into_inner()
-                .map(|p| parse_body(p))
+                .map(|p| parse_body(p, file_id))
                 .collect::<Result<Vec<_>>>()?;
             branches.push((condition, body));
         } else {
@@ -424,7 +428,7 @@ where
             i += 1;
             let body = block
                 .into_inner()
-                .map(|p| parse_body(p))
+                .map(|p| parse_body(p, file_id))
                 .collect::<Result<Vec<_>>>()?;
             else_body = Some(body);
         }
@@ -436,20 +440,26 @@ where
     })
 }
 
-fn parse_switch_arm_generic<F>(pair: Pair<Rule>, mut parse_body: F) -> Result<SwitchArm>
+fn parse_switch_arm_generic<F>(
+    pair: Pair<Rule>,
+    file_id: u32,
+    mut parse_body: F,
+) -> Result<SwitchArm>
 where
-    F: FnMut(Pair<Rule>) -> Result<BranchBody>,
+    F: FnMut(Pair<Rule>, u32) -> Result<BranchBody>,
 {
     let mut inner = pair.into_inner().peekable();
 
     // Check if first child is an expr (non-default arm) or a body stmt (default arm)
     let pattern = if inner.peek().map(|p| p.as_rule()) == Some(Rule::expr) {
-        Some(parse_expr_from_pair(inner.next().unwrap())?)
+        Some(parse_expr_from_pair(inner.next().unwrap(), file_id)?)
     } else {
         None
     };
 
-    let body = inner.map(|p| parse_body(p)).collect::<Result<Vec<_>>>()?;
+    let body = inner
+        .map(|p| parse_body(p, file_id))
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(SwitchArm { pattern, body })
 }
@@ -458,20 +468,20 @@ where
 // Expressions
 // ---------------------------------------------------------------------------
 
-fn parse_expr_from_pair(pair: Pair<Rule>) -> Result<Expr> {
+fn parse_expr_from_pair(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
     match pair.as_rule() {
-        Rule::expr => parse_expr(pair),
-        _ => parse_atom_or_unary(pair),
+        Rule::expr => parse_expr(pair, file_id),
+        _ => parse_atom_or_unary(pair, file_id),
     }
 }
 
 /// Parse an `expr` rule: `unary_expr (bin_op unary_expr)*`
 /// Uses a simple precedence climbing approach.
-fn parse_expr(pair: Pair<Rule>) -> Result<Expr> {
+fn parse_expr(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
     let mut inner: Vec<Pair<Rule>> = pair.into_inner().collect();
 
     if inner.len() == 1 {
-        return parse_atom_or_unary(inner.remove(0));
+        return parse_atom_or_unary(inner.remove(0), file_id);
     }
 
     // Build a flat list of (expr, op, expr, op, expr, ...)
@@ -485,7 +495,7 @@ fn parse_expr(pair: Pair<Rule>) -> Result<Expr> {
             operators.push(parse_bin_op(&inner[i])?);
             i += 1;
         } else {
-            operands.push(parse_atom_or_unary(inner[i].clone())?);
+            operands.push(parse_atom_or_unary(inner[i].clone(), file_id)?);
             i += 1;
         }
     }
@@ -532,10 +542,18 @@ fn fold_by_precedence(operands: &mut Vec<Expr>, operators: &mut Vec<BinOp>) -> R
     let left = fold_by_precedence(left_operands, left_operators)?;
     let right = fold_by_precedence(&mut right_operands, &mut right_operators)?;
 
-    Ok(Expr::BinOp(Box::new(left), op, Box::new(right)))
+    // The folded BinOp covers `[left.span.start, right.span.end)` on the
+    // left operand's file. In single-file parsing both spans share a
+    // file_id; we use the left's as authoritative.
+    let span = Span::new(left.span.file_id, left.span.start, right.span.end);
+    Ok(Expr::new(
+        ExprKind::BinOp(Box::new(left), op, Box::new(right)),
+        span,
+    ))
 }
 
-fn parse_atom_or_unary(pair: Pair<Rule>) -> Result<Expr> {
+fn parse_atom_or_unary(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
+    let span = span_of(&pair, file_id);
     match pair.as_rule() {
         Rule::unary_expr => {
             let mut inner = pair.into_inner();
@@ -546,36 +564,40 @@ fn parse_atom_or_unary(pair: Pair<Rule>) -> Result<Expr> {
                     "-" => UnaryOp::Neg,
                     other => bail!("unknown unary operator: {}", other),
                 };
-                let operand = parse_atom_or_unary(inner.next().unwrap())?;
-                Ok(Expr::UnaryOp(op, Box::new(operand)))
+                let operand = parse_atom_or_unary(inner.next().unwrap(), file_id)?;
+                Ok(Expr::new(ExprKind::UnaryOp(op, Box::new(operand)), span))
             } else {
                 // It's a postfix_expr (atom with optional .field access)
-                parse_postfix_expr(first)
+                parse_postfix_expr(first, file_id)
             }
         }
-        Rule::atom => parse_atom(pair),
-        Rule::expr => parse_expr(pair),
+        Rule::atom => parse_atom(pair, file_id),
+        Rule::expr => parse_expr(pair, file_id),
         // Direct literal/ident matches from property values etc.
-        Rule::string_lit => parse_string_lit_expr(&pair),
-        Rule::integer_lit => Ok(Expr::IntLit(pair.as_str().parse()?)),
-        Rule::float_lit => Ok(Expr::FloatLit(pair.as_str().parse()?)),
-        Rule::bool_lit => Ok(Expr::BoolLit(pair.as_str() == "true")),
-        Rule::null_lit => Ok(Expr::Null),
+        Rule::string_lit => parse_string_lit_expr(&pair, file_id),
+        Rule::integer_lit => Ok(Expr::new(ExprKind::IntLit(pair.as_str().parse()?), span)),
+        Rule::float_lit => Ok(Expr::new(ExprKind::FloatLit(pair.as_str().parse()?), span)),
+        Rule::bool_lit => Ok(Expr::new(ExprKind::BoolLit(pair.as_str() == "true"), span)),
+        Rule::null_lit => Ok(Expr::new(ExprKind::Null, span)),
         Rule::ident_path => {
             let parts: Vec<String> = pair.into_inner().map(|p| p.as_str().to_string()).collect();
-            Ok(Expr::Ident(parts))
+            Ok(Expr::new(ExprKind::Ident(parts), span))
         }
-        Rule::ident => Ok(Expr::Ident(vec![pair.as_str().to_string()])),
-        Rule::func_call => parse_func_call_expr(pair),
-        Rule::hash_lit => parse_hash_lit(pair),
+        Rule::ident => Ok(Expr::new(
+            ExprKind::Ident(vec![pair.as_str().to_string()]),
+            span,
+        )),
+        Rule::func_call => parse_func_call_expr(pair, file_id),
+        Rule::hash_lit => parse_hash_lit(pair, file_id),
         _ => bail!("unexpected expression rule: {:?}", pair.as_rule()),
     }
 }
 
-fn parse_postfix_expr(pair: Pair<Rule>) -> Result<Expr> {
+fn parse_postfix_expr(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
+    let span = span_of(&pair, file_id);
     let mut inner = pair.into_inner();
     let atom_pair = inner.next().unwrap();
-    let base = parse_atom(atom_pair)?;
+    let base = parse_atom(atom_pair, file_id)?;
 
     // Collect ".field" suffixes
     let suffixes: Vec<String> = inner.map(|p| p.as_str().to_string()).collect();
@@ -583,36 +605,41 @@ fn parse_postfix_expr(pair: Pair<Rule>) -> Result<Expr> {
     if suffixes.is_empty() {
         Ok(base)
     } else {
-        Ok(Expr::PropertyAccess(Box::new(base), suffixes))
+        Ok(Expr::new(
+            ExprKind::PropertyAccess(Box::new(base), suffixes),
+            span,
+        ))
     }
 }
 
-fn parse_atom(pair: Pair<Rule>) -> Result<Expr> {
+fn parse_atom(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
+    let span = span_of(&pair, file_id);
     let inner = first_inner(pair)?;
     match inner.as_rule() {
-        Rule::expr => parse_expr(inner),
-        Rule::func_call => parse_func_call_expr(inner),
-        Rule::hash_lit => parse_hash_lit(inner),
-        Rule::float_lit => Ok(Expr::FloatLit(inner.as_str().parse()?)),
-        Rule::integer_lit => Ok(Expr::IntLit(inner.as_str().parse()?)),
-        Rule::string_lit => parse_string_lit_expr(&inner),
-        Rule::bool_lit => Ok(Expr::BoolLit(inner.as_str() == "true")),
-        Rule::null_lit => Ok(Expr::Null),
+        Rule::expr => parse_expr(inner, file_id),
+        Rule::func_call => parse_func_call_expr(inner, file_id),
+        Rule::hash_lit => parse_hash_lit(inner, file_id),
+        Rule::float_lit => Ok(Expr::new(ExprKind::FloatLit(inner.as_str().parse()?), span)),
+        Rule::integer_lit => Ok(Expr::new(ExprKind::IntLit(inner.as_str().parse()?), span)),
+        Rule::string_lit => parse_string_lit_expr(&inner, file_id),
+        Rule::bool_lit => Ok(Expr::new(ExprKind::BoolLit(inner.as_str() == "true"), span)),
+        Rule::null_lit => Ok(Expr::new(ExprKind::Null, span)),
         Rule::ident_path => {
             let parts: Vec<String> = inner.into_inner().map(|p| p.as_str().to_string()).collect();
-            Ok(Expr::Ident(parts))
+            Ok(Expr::new(ExprKind::Ident(parts), span))
         }
         _ => bail!("unexpected atom: {:?}", inner.as_rule()),
     }
 }
 
-fn parse_func_call_expr(pair: Pair<Rule>) -> Result<Expr> {
+fn parse_func_call_expr(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
     // Grammar has two alternatives:
     //   ident "." ident "(" args ")"   — namespaced:  inner = [ns, name, args?]
     //   ident "(" args ")"             — flat:        inner = [name, args?]
     // We peek at how many leading `ident` pairs there are before the
     // `func_args` child. This is simpler than threading a silent tag
     // through the grammar.
+    let span = span_of(&pair, file_id);
     let mut inner: Vec<Pair<Rule>> = pair.into_inner().collect();
 
     // Last child (if present) is `func_args`. Strip it off first.
@@ -639,33 +666,39 @@ fn parse_func_call_expr(pair: Pair<Rule>) -> Result<Expr> {
     };
 
     let args = if let Some(args_pair) = args_pair {
-        parse_func_args(args_pair)?
+        parse_func_args(args_pair, file_id)?
     } else {
         vec![]
     };
 
-    Ok(Expr::FuncCall {
-        namespace,
-        name,
-        args,
-    })
+    Ok(Expr::new(
+        ExprKind::FuncCall {
+            namespace,
+            name,
+            args,
+        },
+        span,
+    ))
 }
 
-fn parse_func_args(pair: Pair<Rule>) -> Result<Vec<Expr>> {
-    pair.into_inner().map(|p| parse_expr_from_pair(p)).collect()
+fn parse_func_args(pair: Pair<Rule>, file_id: u32) -> Result<Vec<Expr>> {
+    pair.into_inner()
+        .map(|p| parse_expr_from_pair(p, file_id))
+        .collect()
 }
 
-fn parse_hash_lit(pair: Pair<Rule>) -> Result<Expr> {
+fn parse_hash_lit(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
+    let span = span_of(&pair, file_id);
     let entries = pair
         .into_inner()
         .map(|entry| {
             let mut inner = entry.into_inner();
             let key = inner.next().unwrap().as_str().to_string();
-            let value = parse_expr_from_pair(inner.next().unwrap())?;
+            let value = parse_expr_from_pair(inner.next().unwrap(), file_id)?;
             Ok((key, value))
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(Expr::HashLit(entries))
+    Ok(Expr::new(ExprKind::HashLit(entries), span))
 }
 
 /// Extract a string literal as a plain `String`.
@@ -693,7 +726,8 @@ fn parse_string_lit(pair: &Pair<Rule>) -> String {
 
 /// Parse a string literal as an expression, producing either a plain
 /// `StringLit` (no interpolation) or a `Template` (one or more `${expr}`).
-fn parse_string_lit_expr(pair: &Pair<Rule>) -> Result<Expr> {
+fn parse_string_lit_expr(pair: &Pair<Rule>, file_id: u32) -> Result<Expr> {
+    let span = span_of(pair, file_id);
     let mut fragments: Vec<TemplateFragment> = Vec::new();
     let mut current_literal = String::new();
 
@@ -710,7 +744,7 @@ fn parse_string_lit_expr(pair: &Pair<Rule>) -> Result<Expr> {
                     .into_inner()
                     .find(|p| p.as_rule() == Rule::expr)
                     .ok_or_else(|| anyhow::anyhow!("empty `${{}}` interpolation"))?;
-                let expr = parse_expr(expr_pair)?;
+                let expr = parse_expr(expr_pair, file_id)?;
                 fragments.push(TemplateFragment::Interp(expr));
             }
             _ => {}
@@ -721,12 +755,12 @@ fn parse_string_lit_expr(pair: &Pair<Rule>) -> Result<Expr> {
     }
 
     // If there's no interpolation, collapse to a plain StringLit so
-    // existing code that matches on Expr::StringLit stays ergonomic.
+    // existing code that matches on ExprKind::StringLit stays ergonomic.
     let has_interp = fragments
         .iter()
         .any(|f| matches!(f, TemplateFragment::Interp(_)));
     if has_interp {
-        Ok(Expr::Template(fragments))
+        Ok(Expr::new(ExprKind::Template(fragments), span))
     } else {
         let combined = fragments
             .into_iter()
@@ -735,7 +769,7 @@ fn parse_string_lit_expr(pair: &Pair<Rule>) -> Result<Expr> {
                 TemplateFragment::Interp(_) => None,
             })
             .collect::<String>();
-        Ok(Expr::StringLit(combined))
+        Ok(Expr::new(ExprKind::StringLit(combined), span))
     }
 }
 
@@ -1071,7 +1105,13 @@ def process test {
         let config = parse_config(input).unwrap();
         match &config.definitions[0] {
             Definition::Process(def) => match &def.body[0] {
-                ProcessStatement::Assign(_, Expr::HashLit(entries)) => {
+                ProcessStatement::Assign(
+                    _,
+                    Expr {
+                        kind: ExprKind::HashLit(entries),
+                        ..
+                    },
+                ) => {
                     assert_eq!(entries.len(), 2);
                 }
                 _ => panic!("expected Assign with HashLit"),
@@ -1126,10 +1166,14 @@ def process test {
                 match &def.body[0] {
                     ProcessStatement::Assign(
                         AssignTarget::Egress,
-                        Expr::FuncCall {
-                            namespace,
-                            name,
-                            args,
+                        Expr {
+                            kind:
+                                ExprKind::FuncCall {
+                                    namespace,
+                                    name,
+                                    args,
+                                },
+                            ..
                         },
                     ) => {
                         assert!(namespace.is_none());
@@ -1183,8 +1227,8 @@ def output sink {
 "#;
         let config = parse_config(input).unwrap();
         match &config.definitions[0] {
-            Definition::Output(def) => match property_value(&def.properties, "path") {
-                Expr::StringLit(s) => assert_eq!(s, "/var/log/app.log"),
+            Definition::Output(def) => match &property_value(&def.properties, "path").kind {
+                ExprKind::StringLit(s) => assert_eq!(s, "/var/log/app.log"),
                 other => panic!("expected StringLit, got {:?}", other),
             },
             _ => panic!("expected Output definition"),
@@ -1201,22 +1245,22 @@ def output sink {
 "#;
         let config = parse_config(input).unwrap();
         match &config.definitions[0] {
-            Definition::Output(def) => match property_value(&def.properties, "path") {
-                Expr::Template(frags) => {
+            Definition::Output(def) => match &property_value(&def.properties, "path").kind {
+                ExprKind::Template(frags) => {
                     assert_eq!(frags.len(), 5);
                     // /var/log/
                     assert!(matches!(&frags[0], TemplateFragment::Literal(s) if s == "/var/log/"));
                     // ${source}
                     assert!(matches!(
                         &frags[1],
-                        TemplateFragment::Interp(Expr::Ident(parts)) if parts == &vec!["source".to_string()]
+                        TemplateFragment::Interp(Expr { kind: ExprKind::Ident(parts), .. }) if parts == &vec!["source".to_string()]
                     ));
                     // /
                     assert!(matches!(&frags[2], TemplateFragment::Literal(s) if s == "/"));
                     // ${workspace.date}
                     assert!(matches!(
                         &frags[3],
-                        TemplateFragment::Interp(Expr::Ident(parts))
+                        TemplateFragment::Interp(Expr { kind: ExprKind::Ident(parts), .. })
                             if parts == &vec!["workspace".to_string(), "date".to_string()]
                     ));
                     // .log
@@ -1239,8 +1283,8 @@ def output sink {
 "#;
         let config = parse_config(input).unwrap();
         match &config.definitions[0] {
-            Definition::Output(def) => match property_value(&def.properties, "path") {
-                Expr::StringLit(s) => assert_eq!(s, "literal-${x}-here"),
+            Definition::Output(def) => match &property_value(&def.properties, "path").kind {
+                ExprKind::StringLit(s) => assert_eq!(s, "literal-${x}-here"),
                 other => panic!("expected StringLit, got {:?}", other),
             },
             _ => panic!("expected Output definition"),
@@ -1258,17 +1302,23 @@ def process annotate {
         let config = parse_config(input).unwrap();
         match &config.definitions[0] {
             Definition::Process(def) => match &def.body[0] {
-                ProcessStatement::Assign(AssignTarget::Egress, Expr::Template(frags)) => {
+                ProcessStatement::Assign(
+                    AssignTarget::Egress,
+                    Expr {
+                        kind: ExprKind::Template(frags),
+                        ..
+                    },
+                ) => {
                     assert_eq!(frags.len(), 4);
                     assert!(matches!(&frags[0], TemplateFragment::Literal(s) if s == "["));
                     assert!(matches!(
                         &frags[1],
-                        TemplateFragment::Interp(Expr::Ident(parts)) if parts == &vec!["source".to_string()]
+                        TemplateFragment::Interp(Expr { kind: ExprKind::Ident(parts), .. }) if parts == &vec!["source".to_string()]
                     ));
                     assert!(matches!(&frags[2], TemplateFragment::Literal(s) if s == "] "));
                     assert!(matches!(
                         &frags[3],
-                        TemplateFragment::Interp(Expr::Ident(parts)) if parts == &vec!["egress".to_string()]
+                        TemplateFragment::Interp(Expr { kind: ExprKind::Ident(parts), .. }) if parts == &vec!["egress".to_string()]
                     ));
                 }
                 other => panic!("expected template assignment, got {:?}", other),
@@ -1292,13 +1342,25 @@ def process p {
             Definition::Process(def) => {
                 assert_eq!(def.body.len(), 2);
                 match &def.body[0] {
-                    ProcessStatement::LetBinding(name, Expr::IntLit(7)) => {
+                    ProcessStatement::LetBinding(
+                        name,
+                        Expr {
+                            kind: ExprKind::IntLit(7),
+                            ..
+                        },
+                    ) => {
                         assert_eq!(name, "x");
                     }
                     other => panic!("expected LetBinding, got {:?}", other),
                 }
                 match &def.body[1] {
-                    ProcessStatement::Assign(AssignTarget::Workspace(path), Expr::Ident(parts)) => {
+                    ProcessStatement::Assign(
+                        AssignTarget::Workspace(path),
+                        Expr {
+                            kind: ExprKind::Ident(parts),
+                            ..
+                        },
+                    ) => {
                         assert_eq!(path, &vec!["y".to_string()]);
                         assert_eq!(parts, &vec!["x".to_string()]);
                     }
@@ -1322,10 +1384,14 @@ def process p {
             Definition::Process(def) => match &def.body[0] {
                 ProcessStatement::LetBinding(
                     name,
-                    Expr::FuncCall {
-                        namespace,
-                        name: fname,
-                        args,
+                    Expr {
+                        kind:
+                            ExprKind::FuncCall {
+                                namespace,
+                                name: fname,
+                                args,
+                            },
+                        ..
                     },
                 ) => {
                     assert_eq!(name, "m");
@@ -1358,10 +1424,14 @@ def process p {
             Definition::Process(def) => match &def.body[0] {
                 ProcessStatement::LetBinding(
                     name,
-                    Expr::FuncCall {
-                        namespace,
-                        name: fname,
-                        args,
+                    Expr {
+                        kind:
+                            ExprKind::FuncCall {
+                                namespace,
+                                name: fname,
+                                args,
+                            },
+                        ..
                     },
                 ) => {
                     assert_eq!(name, "h");
@@ -1388,10 +1458,14 @@ def process p {
             Definition::Process(def) => match &def.body[0] {
                 ProcessStatement::LetBinding(
                     _,
-                    Expr::FuncCall {
-                        namespace,
-                        name,
-                        args,
+                    Expr {
+                        kind:
+                            ExprKind::FuncCall {
+                                namespace,
+                                name,
+                                args,
+                            },
+                        ..
                     },
                 ) => {
                     assert_eq!(namespace.as_deref(), Some("foo"));
@@ -1418,7 +1492,13 @@ def process p {
         let config = parse_config(input).unwrap();
         match &config.definitions[0] {
             Definition::Process(def) => match &def.body[0] {
-                ProcessStatement::Assign(AssignTarget::Workspace(path), Expr::Ident(parts)) => {
+                ProcessStatement::Assign(
+                    AssignTarget::Workspace(path),
+                    Expr {
+                        kind: ExprKind::Ident(parts),
+                        ..
+                    },
+                ) => {
                     assert_eq!(path, &vec!["foo".to_string()]);
                     assert_eq!(parts, &vec!["workspace".to_string(), "bar".to_string()]);
                 }

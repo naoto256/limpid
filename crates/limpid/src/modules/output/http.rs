@@ -75,9 +75,9 @@ impl Module for HttpOutput {
                 if let Property::KeyValue {
                     key, value: expr, ..
                 } = prop
-                    && let Some(val) = match expr {
-                        crate::dsl::ast::Expr::StringLit(s) => Some(s.clone()),
-                        crate::dsl::ast::Expr::Ident(parts) => Some(parts.join(".")),
+                    && let Some(val) = match &expr.kind {
+                        crate::dsl::ast::ExprKind::StringLit(s) => Some(s.clone()),
+                        crate::dsl::ast::ExprKind::Ident(parts) => Some(parts.join(".")),
                         _ => None,
                     }
                 {
