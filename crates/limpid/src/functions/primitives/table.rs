@@ -1,0 +1,78 @@
+//! `table_lookup` / `table_upsert` / `table_delete` — key-value table
+//! primitives. The three functions share a backing [`TableStore`]
+//! (built from the `table { ... }` global blocks at startup) and are
+//! deliberately co-located in one file: splitting them into three
+//! near-identical shims would obscure the fact that they're facets of
+//! the same store.
+
+use anyhow::bail;
+use serde_json::Value;
+
+use super::val_to_str;
+use crate::functions::FunctionRegistry;
+use crate::functions::table::TableStore;
+
+pub fn register(reg: &mut FunctionRegistry, table_store: TableStore) {
+    {
+        let store = table_store.clone();
+        reg.register("table_lookup", move |args, _event| {
+            if args.len() != 2 {
+                bail!("table_lookup() expects 2 arguments (table, key)");
+            }
+            let table_name = val_to_str(&args[0]);
+            let key = val_to_str(&args[1]);
+            Ok(store.lookup(&table_name, &key))
+        });
+    }
+
+    {
+        let store = table_store.clone();
+        reg.register("table_upsert", move |args, _event| {
+            if args.len() < 3 || args.len() > 4 {
+                bail!("table_upsert() expects 3 or 4 arguments (table, key, value, expire?)");
+            }
+            let table_name = val_to_str(&args[0]);
+            let key = val_to_str(&args[1]);
+            let value = args[2].clone();
+            if args.len() == 3 {
+                store.upsert_with_default(&table_name, &key, value);
+            } else {
+                let secs = match &args[3] {
+                    Value::Number(n) => n.as_u64(),
+                    other => {
+                        tracing::warn!(
+                            "table_upsert: expire must be a number, got {} — using table default TTL",
+                            other
+                        );
+                        None
+                    }
+                };
+                match secs {
+                    // 0 means "no expiry" — explicit caller intent.
+                    Some(0) => store.upsert(&table_name, &key, value, None),
+                    Some(s) => store.upsert(
+                        &table_name,
+                        &key,
+                        value,
+                        Some(std::time::Duration::from_secs(s)),
+                    ),
+                    None => store.upsert_with_default(&table_name, &key, value),
+                };
+            }
+            Ok(Value::Null)
+        });
+    }
+
+    {
+        let store = table_store;
+        reg.register("table_delete", move |args, _event| {
+            if args.len() != 2 {
+                bail!("table_delete() expects 2 arguments (table, key)");
+            }
+            let table_name = val_to_str(&args[0]);
+            let key = val_to_str(&args[1]);
+            store.delete(&table_name, &key);
+            Ok(Value::Null)
+        });
+    }
+}
