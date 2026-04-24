@@ -53,6 +53,13 @@ pub enum FieldType {
     Null,
     /// Nested object (has children).
     Object,
+    /// Positionless collection. No element-type refinement in v0.5.0 —
+    /// every read that flows out of an array (via `foreach`, `find_by`,
+    /// element access) lands in `Any`. A typed `Array(Box<FieldType>)`
+    /// can be introduced later without breaking the external shape
+    /// because union / type_compatible already treat unknown variants
+    /// conservatively.
+    Array,
     /// Unknown / any; skips type checking for this field.
     Any,
     /// Disjunction of concrete types, produced at branch-join points.
@@ -136,6 +143,7 @@ impl FieldType {
             FieldType::Timestamp => "Timestamp".into(),
             FieldType::Null => "Null".into(),
             FieldType::Object => "Object".into(),
+            FieldType::Array => "Array".into(),
             FieldType::Any => "Any".into(),
             FieldType::Union(ms) => {
                 let parts: Vec<String> = ms.iter().map(|m| m.display()).collect();
@@ -208,5 +216,27 @@ mod tests {
             &FieldType::Union(vec![String, Int]),
             &String
         ));
+    }
+
+    #[test]
+    fn array_type_is_distinct_and_unionable() {
+        use FieldType::*;
+        assert_eq!(Array.display(), "Array");
+        // Array is its own slot — not compatible with Object or String.
+        assert!(!type_compatible(&Object, &Array));
+        assert!(!type_compatible(&String, &Array));
+        assert!(type_compatible(&Array, &Array));
+        // Any subsumes Array like every other concrete type.
+        assert!(type_compatible(&Any, &Array));
+        assert!(type_compatible(&Array, &Any));
+        // Union(Array, Object) should de-dupe cleanly like other types.
+        assert_eq!(
+            FieldType::union(Array, Array),
+            Array
+        );
+        assert_eq!(
+            FieldType::union(Array, Object),
+            FieldType::Union(vec![Array, Object])
+        );
     }
 }

@@ -37,11 +37,10 @@ pub fn infer(expr: &Expr, bindings: &Bindings, registry: &FunctionRegistry) -> F
         ExprKind::BoolLit(_) => FieldType::Bool,
         ExprKind::Null => FieldType::Null,
         ExprKind::HashLit(_) => FieldType::Object,
-        // Array support lands piecewise: the literal infers to `Array`
-        // in Commit 1 (lit is callable in every position `Object` is),
-        // element-type refinement is v0.5.x. For now treat contents as
-        // untyped so downstream consumers stay loose.
-        ExprKind::ArrayLit(_) => FieldType::Any,
+        // Array literal infers to `Array`. Element-type refinement
+        // (`Array<String>` etc.) is deferred to v0.5.x — the element
+        // type surfaced at every read site is `Any` for now.
+        ExprKind::ArrayLit(_) => FieldType::Array,
         ExprKind::Ident(parts) => ident_type(parts, bindings),
         ExprKind::PropertyAccess(base, suffix) => {
             // `geoip(x).country.name` — collapse to a workspace lookup
