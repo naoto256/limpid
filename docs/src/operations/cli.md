@@ -11,7 +11,7 @@ limpid --check --config /etc/limpid/limpid.conf
 
 # Test a pipeline with sample data
 limpid --test-pipeline <name> --config /etc/limpid/limpid.conf \
-  --input '{"raw": "<134>test message"}'
+  --input '{"ingress": "<134>test message"}'
 
 # Enable debug trace logging
 limpid --debug --config /etc/limpid/limpid.conf
@@ -31,17 +31,17 @@ limpid --debug --config /etc/limpid/limpid.conf
 
 ```json
 {
-  "raw": "<134>Apr 15 10:30:00 myhost sshd: test",
+  "ingress": "<134>Apr 15 10:30:00 myhost sshd: test",
   "source": "192.0.2.3:514",
   "facility": 16,
   "severity": 6,
-  "fields": {
+  "workspace": {
     "custom_field": "value"
   }
 }
 ```
 
-All fields except `raw` are optional. `source` can be `ip:port` or just `ip`.
+All keys except `ingress` are optional. `source` can be `ip:port` or just `ip`.
 
 ## limpidctl
 

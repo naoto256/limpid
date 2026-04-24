@@ -17,7 +17,7 @@ def output fw02 { type file  path "/var/log/fw/fw02.log" }
 def output fw03 { type file  path "/var/log/fw/fw03.log" }
 
 def process filter_noise {
-    if source == "192.0.2.2" and contains(raw, "CHARGEN") {
+    if source == "192.0.2.2" and contains(ingress, "CHARGEN") {
         drop
     }
 }
@@ -34,7 +34,7 @@ def pipeline archive {
             output fw02
         }
         "192.0.2.3" {
-            if contains(raw, "type=\"traffic\"") {
+            if contains(ingress, "type=\"traffic\"") {
                 drop
             }
             process prepend_source | prepend_timestamp
@@ -69,13 +69,13 @@ def output ama {
 }
 
 def process filter_fortinet_traffic {
-    if contains(raw, "Fortinet") and contains(raw, "cat=traffic:") {
+    if contains(ingress, "Fortinet") and contains(ingress, "cat=traffic:") {
         drop
     }
 }
 
 def process ama_rewrite {
-    if contains(raw, "CEF:") {
+    if contains(ingress, "CEF:") {
         facility = 16
     } else {
         facility = 17
@@ -124,10 +124,10 @@ def pipeline siem {
 
     // Parse and enrich
     process parse_cef | {
-        if fields.src != null {
-            fields.geo = geoip(fields.src)
+        if workspace.src != null {
+            workspace.geo = geoip(workspace.src)
         }
-        message = to_json()
+        egress = to_json()
     }
 
     output elasticsearch
@@ -140,10 +140,10 @@ def pipeline siem {
 def process enrich_fortigate {
     process parse_kv
 
-    if fields.srcip != null {
-        fields.geo = geoip(fields.srcip)
+    if workspace.srcip != null {
+        workspace.geo = geoip(workspace.srcip)
     }
 
-    message = format("%{devname} %{srcip} -> %{dstip} %{action}")
+    egress = format("%{devname} %{srcip} -> %{dstip} %{action}")
 }
 ```

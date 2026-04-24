@@ -32,7 +32,7 @@ def pipeline archive {
             output fw02
         }
         "192.0.2.3" {
-            if contains(raw, "type=\"traffic\"") {
+            if contains(ingress, "type=\"traffic\"") {
                 drop
             }
             process prepend_source | prepend_timestamp
@@ -58,8 +58,8 @@ def pipeline main {
 
     // Parse and enrich
     process parse_cef | {
-        fields.geo = geoip(fields.src)
-        message = to_json()
+        workspace.geo = geoip(workspace.src)
+        egress = to_json()
     }
 
     // Send enriched version to SIEM
@@ -67,7 +67,7 @@ def pipeline main {
 }
 ```
 
-The archive receives the raw message, the SIEM receives the enriched JSON — from the same pipeline.
+The archive receives the raw bytes, the SIEM receives the enriched JSON — from the same pipeline.
 
 ## Combining filtering and routing
 

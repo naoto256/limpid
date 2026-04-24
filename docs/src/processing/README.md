@@ -9,14 +9,14 @@ Processing in limpid has two layers:
 
 | | Process | Function |
 |---|---------|----------|
-| Syntax | `process parse_cef` | `geoip(fields.src)` |
-| Operates on | Entire event (message, fields, metadata) | Returns a value |
+| Syntax | `process parse_cef` | `geoip(workspace.src)` |
+| Operates on | Entire event (ingress, egress, workspace, metadata) | Returns a value |
 | Can drop events | Yes (`drop` inside process) | No |
 | Where used | Pipeline statements, process chains | Conditions, assignments, any expression |
 
 Some names exist in both:
 
-- `regex_replace("pat", "repl")` as a **process** — replaces in message
+- `regex_replace("pat", "repl")` as a **process** — replaces in `egress`
 - `regex_replace(str, "pat", "repl")` as a **function** — returns replaced string
 
 ## Process chains
@@ -25,7 +25,7 @@ In a pipeline, processes can be chained with `|`:
 
 ```
 process strip_pri | parse_cef | {
-    fields.geo = geoip(fields.src)
+    workspace.geo = geoip(workspace.src)
 }
 ```
 

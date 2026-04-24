@@ -8,10 +8,10 @@ Discards the event. Counted as `events_dropped` in metrics. Use for filtering.
 
 ```
 def process filter_noise {
-    if contains(raw, "healthcheck") {
+    if contains(ingress, "healthcheck") {
         drop
     }
-    if contains(raw, "CHARGEN") {
+    if contains(ingress, "CHARGEN") {
         drop
     }
 }
@@ -79,7 +79,7 @@ def pipeline archive {
             output fw01                    // implicit finish
         }
         "192.0.2.3" {
-            if contains(raw, "type=\"traffic\"") {
+            if contains(ingress, "type=\"traffic\"") {
                 drop                       // filter: events_dropped
             }
             output fw03                    // implicit finish
