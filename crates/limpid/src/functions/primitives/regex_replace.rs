@@ -1,0 +1,27 @@
+//! `regex_replace(target, pattern, replacement)` — replace all matches.
+//!
+//! Replacement strings support `$1`, `$2`, … capture-group backrefs
+//! (via `regex_lite`'s `replace_all` behaviour).
+
+use anyhow::bail;
+use serde_json::Value;
+
+use super::{get_cached_regex, val_to_str};
+use crate::functions::FunctionRegistry;
+
+pub fn register(reg: &mut FunctionRegistry) {
+    reg.register("regex_replace", |args, _event| {
+        if args.len() != 3 {
+            bail!("regex_replace() expects 3 arguments (target, pattern, replacement)");
+        }
+        let target = val_to_str(&args[0]);
+        let pattern = val_to_str(&args[1]);
+        let replacement = val_to_str(&args[2]);
+        match get_cached_regex(&pattern) {
+            Ok(re) => Ok(Value::String(
+                re.replace_all(&target, replacement.as_str()).into_owned(),
+            )),
+            Err(e) => bail!("invalid regex: {}", e),
+        }
+    });
+}
