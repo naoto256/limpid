@@ -107,15 +107,15 @@ fn exec_process_stmt(
             match exec_process_body(try_body, event, registry, funcs) {
                 Ok(result) => Ok(result),
                 Err(e) => {
-                    // Bind error message to `error` identifier (accessible via fields._error)
+                    // Bind error message to `error` identifier (accessible via workspace._error)
                     let mut recovered = event_backup;
                     recovered
-                        .fields
+                        .workspace
                         .insert("_error".into(), serde_json::Value::String(e.to_string()));
                     let mut result = exec_process_body(catch_body, recovered, registry, funcs);
                     // Clean up _error after catch body
                     if let Ok(ExecResult::Continue(ref mut evt)) = result {
-                        evt.fields.remove("_error");
+                        evt.workspace.remove("_error");
                     }
                     result
                 }
@@ -126,15 +126,15 @@ fn exec_process_stmt(
             let iterable = eval_expr(iterable_expr, &event, funcs)?;
             if let Value::Array(items) = iterable {
                 for item in &items {
-                    // Bind current item to `fields._item` for access in body
-                    event.fields.insert("_item".into(), item.clone());
+                    // Bind current item to `workspace._item` for access in body
+                    event.workspace.insert("_item".into(), item.clone());
                     match exec_process_body(body, event, registry, funcs)? {
                         ExecResult::Continue(e) => event = e,
                         ExecResult::Dropped => return Ok(ExecResult::Dropped),
                     }
                 }
                 // Clean up loop variable
-                event.fields.remove("_item");
+                event.workspace.remove("_item");
                 Ok(ExecResult::Continue(event))
             } else {
                 // Not an array, skip
@@ -232,8 +232,8 @@ fn apply_assign(event: &mut Event, target: &AssignTarget, value: Value) -> Resul
             sync_message_pri(event);
             Ok(())
         }
-        AssignTarget::Field(path) => {
-            set_fields_path(&mut event.fields, path, value);
+        AssignTarget::Workspace(path) => {
+            set_workspace_path(&mut event.workspace, path, value);
             Ok(())
         }
     }
@@ -282,18 +282,18 @@ fn sync_message_pri(event: &mut Event) {
     event.message = Bytes::from(buf);
 }
 
-fn set_fields_path(
-    fields: &mut std::collections::HashMap<String, Value>,
+fn set_workspace_path(
+    workspace: &mut std::collections::HashMap<String, Value>,
     path: &[String],
     value: Value,
 ) {
     if path.len() == 1 {
-        fields.insert(path[0].clone(), value);
+        workspace.insert(path[0].clone(), value);
         return;
     }
 
     // Nested path: ensure intermediate objects exist
-    let entry = fields
+    let entry = workspace
         .entry(path[0].clone())
         .or_insert_with(|| Value::Object(serde_json::Map::new()));
 

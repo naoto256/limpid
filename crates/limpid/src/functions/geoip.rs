@@ -1,7 +1,7 @@
 //! geoip: MaxMind GeoIP database lookup.
 //!
 //! Used as an expression function in DSL:
-//!   `fields.geo = geoip(fields.src_ip)`
+//!   `workspace.geo = geoip(workspace.src_ip)`
 //!
 //! Returns an object: `{ country, city, latitude, longitude }`
 

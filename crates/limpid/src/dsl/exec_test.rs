@@ -68,15 +68,15 @@ mod tests {
     }
 
     #[test]
-    fn test_exec_assign_field() {
+    fn test_exec_assign_workspace() {
         let event = make_event();
         let stmts = vec![ProcessStatement::Assign(
-            AssignTarget::Field(vec!["tag".into()]),
+            AssignTarget::Workspace(vec!["tag".into()]),
             Expr::StringLit("critical".into()),
         )];
         match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
             ExecResult::Continue(e) => {
-                assert_eq!(e.fields["tag"], Value::String("critical".into()));
+                assert_eq!(e.workspace["tag"], Value::String("critical".into()));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -99,7 +99,7 @@ mod tests {
             branches: vec![(
                 Expr::BoolLit(true),
                 vec![BranchBody::Process(ProcessStatement::Assign(
-                    AssignTarget::Field(vec!["hit".into()]),
+                    AssignTarget::Workspace(vec!["hit".into()]),
                     Expr::BoolLit(true),
                 ))],
             )],
@@ -107,7 +107,7 @@ mod tests {
         })];
         match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
             ExecResult::Continue(e) => {
-                assert_eq!(e.fields["hit"], Value::Bool(true));
+                assert_eq!(e.workspace["hit"], Value::Bool(true));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -120,18 +120,18 @@ mod tests {
             branches: vec![(
                 Expr::BoolLit(false),
                 vec![BranchBody::Process(ProcessStatement::Assign(
-                    AssignTarget::Field(vec!["branch".into()]),
+                    AssignTarget::Workspace(vec!["branch".into()]),
                     Expr::StringLit("if".into()),
                 ))],
             )],
             else_body: Some(vec![BranchBody::Process(ProcessStatement::Assign(
-                AssignTarget::Field(vec!["branch".into()]),
+                AssignTarget::Workspace(vec!["branch".into()]),
                 Expr::StringLit("else".into()),
             ))]),
         })];
         match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
             ExecResult::Continue(e) => {
-                assert_eq!(e.fields["branch"], Value::String("else".into()));
+                assert_eq!(e.workspace["branch"], Value::String("else".into()));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -156,7 +156,7 @@ mod tests {
         let stmts = vec![ProcessStatement::TryCatch(
             vec![ProcessStatement::ProcessCall("failing".into(), vec![])],
             vec![ProcessStatement::Assign(
-                AssignTarget::Field(vec!["caught".into()]),
+                AssignTarget::Workspace(vec!["caught".into()]),
                 Expr::BoolLit(true),
             )],
         )];

@@ -14,7 +14,7 @@ pub fn eval_expr(expr: &Expr, event: &Event, funcs: &FunctionRegistry) -> Result
         Expr::Template(fragments) => {
             // Render template fragments against the current event.
             // Interpolated values are coerced to string via value_to_string
-            // so that `${facility}` (Number) and `${fields.foo}` (arbitrary)
+            // so that `${facility}` (Number) and `${workspace.foo}` (arbitrary)
             // both interpolate cleanly.
             let mut out = String::new();
             for frag in fragments {
@@ -65,9 +65,9 @@ pub fn eval_expr(expr: &Expr, event: &Event, funcs: &FunctionRegistry) -> Result
             Ok(Value::Object(map))
         }
 
-        Expr::PropertyAccess(base, fields) => {
+        Expr::PropertyAccess(base, path) => {
             let mut current = eval_expr(base, event, funcs)?;
-            for field in fields {
+            for field in path {
                 current = match current {
                     Value::Object(ref map) => map.get(field).cloned().unwrap_or(Value::Null),
                     _ => Value::Null,
@@ -102,17 +102,21 @@ fn resolve_ident(parts: &[String], event: &Event) -> Result<Value> {
             None => Ok(Value::Null),
         },
         Some("error") => {
-            // `error` is available inside catch blocks, stored as fields._error
-            Ok(event.fields.get("_error").cloned().unwrap_or(Value::Null))
+            // `error` is available inside catch blocks, stored as workspace._error
+            Ok(event
+                .workspace
+                .get("_error")
+                .cloned()
+                .unwrap_or(Value::Null))
         }
-        Some("fields") if parts.len() == 1 => {
-            // `fields` alone — return the whole fields map
-            Ok(Value::Object(event.fields.clone().into_iter().collect()))
+        Some("workspace") if parts.len() == 1 => {
+            // `workspace` alone — return the whole workspace map
+            Ok(Value::Object(event.workspace.clone().into_iter().collect()))
         }
-        Some("fields") => {
-            // `fields.xxx.yyy` — direct lookup, no clone of entire map
+        Some("workspace") => {
+            // `workspace.xxx.yyy` — direct lookup, no clone of entire map
             let rest = &parts[1..];
-            resolve_fields_direct(rest, &event.fields)
+            resolve_workspace_direct(rest, &event.workspace)
         }
         _ => {
             bail!("unknown identifier: {}", parts.join("."))
@@ -120,26 +124,26 @@ fn resolve_ident(parts: &[String], event: &Event) -> Result<Value> {
     }
 }
 
-/// Direct lookup into event.fields HashMap — no clone.
-fn resolve_fields_direct(
+/// Direct lookup into event.workspace HashMap — no clone.
+fn resolve_workspace_direct(
     parts: &[String],
-    fields: &std::collections::HashMap<String, Value>,
+    workspace: &std::collections::HashMap<String, Value>,
 ) -> Result<Value> {
-    let first = fields.get(&parts[0]).unwrap_or(&Value::Null);
+    let first = workspace.get(&parts[0]).unwrap_or(&Value::Null);
     if parts.len() == 1 {
         return Ok(first.clone());
     }
-    resolve_fields_path(&parts[1..], first)
+    resolve_workspace_path(&parts[1..], first)
 }
 
-fn resolve_fields_path(parts: &[String], value: &Value) -> Result<Value> {
+fn resolve_workspace_path(parts: &[String], value: &Value) -> Result<Value> {
     if parts.is_empty() {
         return Ok(value.clone());
     }
     match value {
         Value::Object(map) => {
             let next = map.get(&parts[0]).unwrap_or(&Value::Null);
-            resolve_fields_path(&parts[1..], next)
+            resolve_workspace_path(&parts[1..], next)
         }
         _ => Ok(Value::Null),
     }

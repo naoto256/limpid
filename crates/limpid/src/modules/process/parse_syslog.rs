@@ -1,15 +1,15 @@
-//! parse_syslog: parses RFC 3164 (BSD) and RFC 5424 syslog headers into event fields.
+//! parse_syslog: parses RFC 3164 (BSD) and RFC 5424 syslog headers into the event workspace.
 //!
 //! Auto-detects format based on the byte after `<PRI>`:
 //! - Digit 1-9 followed by SP → RFC 5424 (versioned)
 //! - Otherwise → RFC 3164 (BSD traditional)
 //!
 //! Extracted fields:
-//!   fields.hostname     — originating host
-//!   fields.appname      — application name (RFC 5424) or tag (RFC 3164)
-//!   fields.procid       — process ID (if present)
-//!   fields.msgid        — message ID (RFC 5424 only)
-//!   fields.syslog_msg   — message body after header
+//!   workspace.hostname     — originating host
+//!   workspace.appname      — application name (RFC 5424) or tag (RFC 3164)
+//!   workspace.procid       — process ID (if present)
+//!   workspace.msgid        — message ID (RFC 5424 only)
+//!   workspace.syslog_msg   — message body after header
 //!
 //! Also sets `message` to the parsed message body.
 
@@ -73,7 +73,7 @@ fn parse_rfc5424(input: &str, event: &mut Event) {
     }
     if !msg.is_empty() {
         event
-            .fields
+            .workspace
             .insert("syslog_msg".into(), Value::String(msg.to_string()));
         event.message = bytes::Bytes::from(msg.to_string());
     }
@@ -113,7 +113,7 @@ fn parse_rfc3164(input: &str, event: &mut Event) {
     }
     if !msg.is_empty() {
         event
-            .fields
+            .workspace
             .insert("syslog_msg".into(), Value::String(msg.to_string()));
         event.message = bytes::Bytes::from(msg.to_string());
     }
@@ -178,7 +178,9 @@ fn skip_structured_data(input: &str) -> &str {
 
 fn set_field(event: &mut Event, key: &str, value: &str) {
     if value != "-" && !value.is_empty() {
-        event.fields.insert(key.into(), Value::String(value.into()));
+        event
+            .workspace
+            .insert(key.into(), Value::String(value.into()));
     }
 }
 
@@ -222,13 +224,13 @@ mod tests {
             make_event("<134>1 2026-04-15T10:30:00Z firewall01 sshd 1234 - - Failed password");
         let result = apply(event).unwrap();
         assert_eq!(
-            result.fields["hostname"],
+            result.workspace["hostname"],
             Value::String("firewall01".into())
         );
-        assert_eq!(result.fields["appname"], Value::String("sshd".into()));
-        assert_eq!(result.fields["procid"], Value::String("1234".into()));
+        assert_eq!(result.workspace["appname"], Value::String("sshd".into()));
+        assert_eq!(result.workspace["procid"], Value::String("1234".into()));
         assert_eq!(
-            result.fields["syslog_msg"],
+            result.workspace["syslog_msg"],
             Value::String("Failed password".into())
         );
     }
@@ -239,11 +241,11 @@ mod tests {
             "<134>1 2026-04-15T10:30:00Z host app 999 ID1 [meta src=\"10.0.0.1\"] Hello world",
         );
         let result = apply(event).unwrap();
-        assert_eq!(result.fields["hostname"], Value::String("host".into()));
-        assert_eq!(result.fields["appname"], Value::String("app".into()));
-        assert_eq!(result.fields["msgid"], Value::String("ID1".into()));
+        assert_eq!(result.workspace["hostname"], Value::String("host".into()));
+        assert_eq!(result.workspace["appname"], Value::String("app".into()));
+        assert_eq!(result.workspace["msgid"], Value::String("ID1".into()));
         assert_eq!(
-            result.fields["syslog_msg"],
+            result.workspace["syslog_msg"],
             Value::String("Hello world".into())
         );
     }
@@ -252,11 +254,11 @@ mod tests {
     fn test_rfc3164_with_pid() {
         let event = make_event("<134>Apr 15 10:30:00 myhost sshd[1234]: Failed password for root");
         let result = apply(event).unwrap();
-        assert_eq!(result.fields["hostname"], Value::String("myhost".into()));
-        assert_eq!(result.fields["appname"], Value::String("sshd".into()));
-        assert_eq!(result.fields["procid"], Value::String("1234".into()));
+        assert_eq!(result.workspace["hostname"], Value::String("myhost".into()));
+        assert_eq!(result.workspace["appname"], Value::String("sshd".into()));
+        assert_eq!(result.workspace["procid"], Value::String("1234".into()));
         assert_eq!(
-            result.fields["syslog_msg"],
+            result.workspace["syslog_msg"],
             Value::String("Failed password for root".into())
         );
     }
@@ -265,10 +267,10 @@ mod tests {
     fn test_rfc3164_without_pid() {
         let event = make_event("<134>Apr 15 10:30:00 myhost kernel: Out of memory");
         let result = apply(event).unwrap();
-        assert_eq!(result.fields["hostname"], Value::String("myhost".into()));
-        assert_eq!(result.fields["appname"], Value::String("kernel".into()));
+        assert_eq!(result.workspace["hostname"], Value::String("myhost".into()));
+        assert_eq!(result.workspace["appname"], Value::String("kernel".into()));
         assert_eq!(
-            result.fields["syslog_msg"],
+            result.workspace["syslog_msg"],
             Value::String("Out of memory".into())
         );
     }
