@@ -63,6 +63,13 @@ impl Bindings {
         self.workspace.get(&path.join("."))
     }
 
+    /// Iterate over every bound `workspace.*` key in dotted form
+    /// (`"workspace.foo.bar"`). Used by the suggestion engine to find
+    /// near-match candidates for unbound references.
+    pub fn workspace_keys(&self) -> impl Iterator<Item = &String> {
+        self.workspace.keys()
+    }
+
     /// True when `workspace.<path>` is either explicitly bound, bound
     /// via an ancestor (Object), or admitted by the wildcard flag.
     pub fn workspace_visible(&self, path: &[String]) -> bool {

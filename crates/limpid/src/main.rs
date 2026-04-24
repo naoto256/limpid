@@ -43,6 +43,12 @@ struct Cli {
     #[arg(long)]
     check: bool,
 
+    /// Treat analyzer warnings as errors. Implies `--check`. With this
+    /// flag set, any warning bumps the exit code to 2; without it,
+    /// warnings are reported but only errors fail the check.
+    #[arg(long)]
+    strict_warnings: bool,
+
     /// Test a pipeline with sample input
     #[arg(long)]
     test_pipeline: Option<String>,
@@ -81,8 +87,8 @@ fn main() -> Result<()> {
             .init();
     }
 
-    if cli.check {
-        return run_check(&cli.config);
+    if cli.check || cli.strict_warnings {
+        return run_check(&cli.config, cli.strict_warnings);
     }
 
     if let Some(ref pipeline_name) = cli.test_pipeline {
@@ -171,11 +177,17 @@ fn run_daemon(config_path: &str) -> Result<()> {
 ///
 /// Runs the parser + `CompiledConfig::from_config` (which surfaces syntax and
 /// structural errors via `anyhow::Error`), then hands the compiled config to
-/// the static analyzer in [`crate::check`]. Commit 1 of Block 9 keeps the
-/// analyzer as an empty skeleton, so the user-visible output is unchanged
-/// from the prior implementation: the historical "Configuration OK" line
-/// plus the input/output/process/pipeline summary.
-fn run_check(config_path: &str) -> Result<()> {
+/// the static analyzer in [`crate::check`]. Diagnostics are rendered with
+/// rustc-style source snippets and carets when the analyzer attached a
+/// span; spanless diagnostics fall back to a one-line `level: message`.
+///
+/// Exit codes:
+/// - `0` — analyzer is clean
+/// - `1` — at least one error-level diagnostic
+/// - `2` — `--strict-warnings` set and at least one warning was emitted
+///   (errors also exit 2 under `--strict-warnings` so CI sees a single
+///   "non-zero means investigate" signal)
+fn run_check(config_path: &str, strict_warnings: bool) -> Result<()> {
     let path = Path::new(config_path);
     let source = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read configuration file: {}", path.display()))?;
@@ -185,23 +197,34 @@ fn run_check(config_path: &str) -> Result<()> {
     crate::modules::register_builtins(&mut registry);
     compiled.validate(&registry)?;
 
-    let diagnostics = check::analyze(&compiled, &source);
+    // Build a single-file SourceMap so the renderer can resolve span
+    // → file:line:col + snippet. The parser tags every span with
+    // file_id = 0 (the only id we register here).
+    let mut source_map = crate::dsl::span::SourceMap::new();
+    source_map.add_file(path.to_path_buf(), source);
+
+    let diagnostics = check::analyze(&compiled, &source_map);
 
     let mut errors = 0usize;
+    let mut warnings = 0usize;
     for diag in &diagnostics {
-        let tag = match diag.level {
-            check::Level::Error => {
-                errors += 1;
-                "error"
-            }
-            check::Level::Warning => "warning",
-            check::Level::Info => "info",
-        };
-        eprintln!("{}: {}", tag, diag.message);
+        match diag.level {
+            check::Level::Error => errors += 1,
+            check::Level::Warning => warnings += 1,
+            check::Level::Info => {}
+        }
+        check::render::render_diagnostic(diag, &source_map);
     }
 
     if errors > 0 {
+        if strict_warnings {
+            std::process::exit(2);
+        }
         std::process::exit(1);
+    }
+    if strict_warnings && warnings > 0 {
+        eprintln!("note: --strict-warnings is promoting warnings to errors");
+        std::process::exit(2);
     }
 
     println!("Configuration OK");

@@ -1,6 +1,6 @@
 //! Static analyzer for limpid configurations.
 //!
-//! Entry point for `limpid --check`. Phase 2 (this commit) wires:
+//! Entry point for `limpid --check`. The pipeline:
 //!
 //! - **Bindings** (`bindings::Bindings`) — per-scope tracking of
 //!   workspace paths, `let` locals, and reserved event idents.
@@ -9,7 +9,9 @@
 //!   table.
 //! - **Type checks** (`expr_types::check_types`) — operator and
 //!   function-argument warnings (Int compared to String, `lower(Int)`,
-//!   etc.).
+//!   etc.). Spans are threaded through so output-side warnings get
+//!   caret rendering; process-body warnings still fall back to the
+//!   one-line format until the AST grows per-statement spans.
 //! - **Parser effects** — bare `parse_*(text)` / `syslog.parse(...)` /
 //!   `cef.parse(...)` statements merge their `produces` schema into
 //!   the `workspace.*` bindings (or wildcard, when the parser's keys
@@ -20,21 +22,27 @@
 //!   as `String` (matching the runtime).
 //! - **Output reference checks** — output-side `${workspace.x}` /
 //!   `workspace.x` references must correspond to a workspace key
-//!   produced upstream, otherwise an Error-level diagnostic fires.
+//!   produced upstream; unresolved refs emit an Error with the
+//!   property's value span and a Levenshtein "did you mean" hint.
+//! - **Rendering** (`render::render_diagnostic`) — rustc-style multi-
+//!   line snippet + caret + optional `help:` line when a span is
+//!   attached, ANSI-coloured on TTY, plain otherwise.
 //!
-//! Things deliberately deferred to later commits in Block 9:
-//! - `Module::schema()` removal (commit 3).
-//! - span-aware diagnostics, source-snippet rendering, Levenshtein
-//!   suggestions, `--strict-warnings` (commit 4 / Phase 3 UX).
-//! - Submodule split, include expansion, summary counts (commit 5).
+//! Things deliberately deferred to commit 5:
+//! - Submodule split (control_flow / outputs / parser_effects / types).
+//! - Include expansion, summary counts, `Configuration OK` dataflow
+//!   hint.
 
 pub mod bindings;
 pub mod expr_types;
+pub mod render;
+pub mod suggestions;
 
 use crate::dsl::ast::{
     AssignTarget, BranchBody, Expr, IfChain, OutputDef, PipelineDef, PipelineStatement,
     ProcessChainElement, ProcessDef, ProcessStatement, Property, SwitchArm, TemplateFragment,
 };
+use crate::dsl::span::{SourceMap, Span};
 use crate::functions::FunctionRegistry;
 use crate::modules::schema::FieldType;
 use crate::pipeline::CompiledConfig;
@@ -49,22 +57,16 @@ pub enum Level {
     Info,
 }
 
-/// Byte range into the original source text. Populated by Phase 3 UX
-/// (next commit); kept as a placeholder type today so call sites can
-/// already thread `Option<Span>` without churn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Span {
-    pub start: usize,
-    pub end: usize,
-}
-
 /// A single issue produced by the analyzer.
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
     pub level: Level,
     pub message: String,
-    #[allow(dead_code)]
     pub span: Option<Span>,
+    /// Optional `help: ...` line emitted under the caret. Used by the
+    /// suggestion engine to surface a near-match workspace key or
+    /// function name.
+    pub help: Option<String>,
 }
 
 impl Diagnostic {
@@ -73,6 +75,7 @@ impl Diagnostic {
             level: Level::Error,
             message: message.into(),
             span: None,
+            help: None,
         }
     }
 
@@ -81,6 +84,7 @@ impl Diagnostic {
             level: Level::Warning,
             message: message.into(),
             span: None,
+            help: None,
         }
     }
 
@@ -90,7 +94,18 @@ impl Diagnostic {
             level: Level::Info,
             message: message.into(),
             span: None,
+            help: None,
         }
+    }
+
+    pub fn with_span(mut self, span: Option<Span>) -> Self {
+        self.span = span;
+        self
+    }
+
+    pub fn with_help(mut self, help: impl Into<String>) -> Self {
+        self.help = Some(help.into());
+        self
     }
 }
 
@@ -105,9 +120,11 @@ impl Diagnostic {
 /// diagnostics for type errors, missing workspace produces, and
 /// operator / function-arg mismatches.
 ///
-/// `_source` is reserved for Phase 3 UX (source snippet rendering with
-/// caret); not used at this commit.
-pub fn analyze(config: &CompiledConfig, _source: &str) -> Vec<Diagnostic> {
+/// The [`SourceMap`] argument lets callers resolve diagnostic spans for
+/// snippet rendering. The analyzer itself never reads file text — it
+/// just propagates spans recorded in the AST. A no-op `SourceMap::new()`
+/// is fine when caret rendering isn't needed.
+pub fn analyze(config: &CompiledConfig, _source_map: &SourceMap) -> Vec<Diagnostic> {
     // Build a registry that mirrors what the runtime uses, so the
     // analyzer sees exactly the same function signatures and parser
     // effects as the executor. This keeps the type-check table from
@@ -205,7 +222,14 @@ fn analyze_pipeline_stmt(
             );
         }
         PipelineStatement::Switch(scrutinee, arms) => {
-            expr_types::check_types(scrutinee, pipeline_name, bindings, registry, diagnostics);
+            expr_types::check_types(
+                scrutinee,
+                pipeline_name,
+                bindings,
+                registry,
+                None,
+                diagnostics,
+            );
             analyze_switch(arms, pipeline_name, config, registry, bindings, diagnostics);
         }
     }
@@ -222,7 +246,7 @@ fn analyze_chain_element(
     match elem {
         ProcessChainElement::Named(name, args) => {
             for a in args {
-                expr_types::check_types(a, pipeline_name, bindings, registry, diagnostics);
+                expr_types::check_types(a, pipeline_name, bindings, registry, None, diagnostics);
             }
             if let Some(pdef) = config.processes.get(name) {
                 analyze_process_body(pdef, pipeline_name, registry, bindings, diagnostics);
@@ -272,7 +296,7 @@ fn analyze_process_stmt(
 ) {
     match stmt {
         ProcessStatement::Assign(target, expr) => {
-            expr_types::check_types(expr, pipeline_name, bindings, registry, diagnostics);
+            expr_types::check_types(expr, pipeline_name, bindings, registry, None, diagnostics);
             match target {
                 AssignTarget::Workspace(path) => {
                     let mut full = vec!["workspace".to_string()];
@@ -303,7 +327,7 @@ fn analyze_process_stmt(
             }
         }
         ProcessStatement::LetBinding(name, expr) => {
-            expr_types::check_types(expr, pipeline_name, bindings, registry, diagnostics);
+            expr_types::check_types(expr, pipeline_name, bindings, registry, None, diagnostics);
             let ty = expr_types::infer(expr, bindings, registry);
             bindings.bind_let(name, ty);
         }
@@ -313,7 +337,7 @@ fn analyze_process_stmt(
             args,
         }) => {
             for a in args {
-                expr_types::check_types(a, pipeline_name, bindings, registry, diagnostics);
+                expr_types::check_types(a, pipeline_name, bindings, registry, None, diagnostics);
             }
             // Bare function-call statement: type-check the call as a
             // value too (catches arg-type mismatches), then apply the
@@ -323,15 +347,22 @@ fn analyze_process_stmt(
                 name: name.clone(),
                 args: args.clone(),
             };
-            expr_types::check_types(&call_expr, pipeline_name, bindings, registry, diagnostics);
+            expr_types::check_types(
+                &call_expr,
+                pipeline_name,
+                bindings,
+                registry,
+                None,
+                diagnostics,
+            );
             apply_parser_effects(namespace.as_deref(), name, args, registry, bindings);
         }
         ProcessStatement::ExprStmt(e) => {
-            expr_types::check_types(e, pipeline_name, bindings, registry, diagnostics);
+            expr_types::check_types(e, pipeline_name, bindings, registry, None, diagnostics);
         }
         ProcessStatement::ProcessCall(_name, args) => {
             for a in args {
-                expr_types::check_types(a, pipeline_name, bindings, registry, diagnostics);
+                expr_types::check_types(a, pipeline_name, bindings, registry, None, diagnostics);
             }
             // Process bodies were validated separately when the named
             // process was defined; we don't recurse from here (the
@@ -343,7 +374,14 @@ fn analyze_process_stmt(
             analyze_inline_if(chain, pipeline_name, registry, bindings, diagnostics);
         }
         ProcessStatement::Switch(scrutinee, arms) => {
-            expr_types::check_types(scrutinee, pipeline_name, bindings, registry, diagnostics);
+            expr_types::check_types(
+                scrutinee,
+                pipeline_name,
+                bindings,
+                registry,
+                None,
+                diagnostics,
+            );
             analyze_inline_switch(arms, pipeline_name, registry, bindings, diagnostics);
         }
         ProcessStatement::TryCatch(try_body, catch_body) => {
@@ -370,7 +408,14 @@ fn analyze_process_stmt(
             *bindings = intersect_branches(&[try_b, catch_b]);
         }
         ProcessStatement::ForEach(iterable, body) => {
-            expr_types::check_types(iterable, pipeline_name, bindings, registry, diagnostics);
+            expr_types::check_types(
+                iterable,
+                pipeline_name,
+                bindings,
+                registry,
+                None,
+                diagnostics,
+            );
             // Body may or may not run; treat it like an `if` without
             // else for binding purposes — additions don't survive.
             let starting = bindings.clone();
@@ -395,7 +440,7 @@ fn analyze_inline_if(
     let starting = bindings.clone();
     let mut results: Vec<Bindings> = Vec::with_capacity(chain.branches.len() + 1);
     for (cond, body) in &chain.branches {
-        expr_types::check_types(cond, pipeline_name, &starting, registry, diagnostics);
+        expr_types::check_types(cond, pipeline_name, &starting, registry, None, diagnostics);
         let mut b = starting.clone();
         b.push_let_scope();
         for item in body {
@@ -434,7 +479,7 @@ fn analyze_inline_switch(
     let mut has_default = false;
     for arm in arms {
         if let Some(p) = &arm.pattern {
-            expr_types::check_types(p, pipeline_name, &starting, registry, diagnostics);
+            expr_types::check_types(p, pipeline_name, &starting, registry, None, diagnostics);
         } else {
             has_default = true;
         }
@@ -465,7 +510,7 @@ fn analyze_if_chain(
     let starting = bindings.clone();
     let mut results: Vec<Bindings> = Vec::with_capacity(chain.branches.len() + 1);
     for (cond, body) in &chain.branches {
-        expr_types::check_types(cond, pipeline_name, &starting, registry, diagnostics);
+        expr_types::check_types(cond, pipeline_name, &starting, registry, None, diagnostics);
         let mut b = starting.clone();
         for item in body {
             match item {
@@ -511,7 +556,7 @@ fn analyze_switch(
     let mut has_default = false;
     for arm in arms {
         if let Some(p) = &arm.pattern {
-            expr_types::check_types(p, pipeline_name, &starting, registry, diagnostics);
+            expr_types::check_types(p, pipeline_name, &starting, registry, None, diagnostics);
         } else {
             has_default = true;
         }
@@ -601,10 +646,29 @@ fn analyze_output(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     for prop in &output.properties {
-        if let Property::KeyValue(_key, expr) = prop {
-            expr_types::check_types(expr, pipeline_name, bindings, registry, diagnostics);
+        if let Property::KeyValue {
+            value: expr,
+            value_span,
+            ..
+        } = prop
+        {
+            expr_types::check_types(
+                expr,
+                pipeline_name,
+                bindings,
+                registry,
+                *value_span,
+                diagnostics,
+            );
             collect_workspace_refs(expr, &mut |path| {
-                check_workspace_reference(path, &output.name, pipeline_name, bindings, diagnostics);
+                check_workspace_reference(
+                    path,
+                    &output.name,
+                    pipeline_name,
+                    bindings,
+                    *value_span,
+                    diagnostics,
+                );
             });
         }
     }
@@ -615,6 +679,7 @@ fn check_workspace_reference(
     output_name: &str,
     pipeline_name: &str,
     bindings: &Bindings,
+    span: Option<Span>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     // Only `workspace.*` references with at least one segment under
@@ -624,12 +689,16 @@ fn check_workspace_reference(
         return;
     }
     if !bindings.workspace_visible(path) {
-        diagnostics.push(Diagnostic::error(format!(
+        let joined = path.join(".");
+        let mut diag = Diagnostic::error(format!(
             "[pipeline {}] output `{}` references `{}` which is not produced by any upstream module",
-            pipeline_name,
-            output_name,
-            path.join("."),
-        )));
+            pipeline_name, output_name, joined,
+        ))
+        .with_span(span);
+        if let Some(near) = suggestions::near_workspace_path(&joined, bindings) {
+            diag = diag.with_help(format!("did you mean `{}`?", near));
+        }
+        diagnostics.push(diag);
     }
 }
 
@@ -688,7 +757,9 @@ mod tests {
     fn analyze_str(src: &str) -> Vec<Diagnostic> {
         let cfg = parse_config(src).expect("config should parse");
         let compiled = CompiledConfig::from_config(cfg).expect("compile");
-        analyze(&compiled, src)
+        let mut sm = SourceMap::new();
+        sm.add_anonymous(src);
+        analyze(&compiled, &sm)
     }
 
     fn errors(diags: &[Diagnostic]) -> Vec<&Diagnostic> {
@@ -978,6 +1049,71 @@ def pipeline p {
     }
 
     // ----- let bindings --------------------------------------------------
+
+    // ----- Phase 3 UX: spans + suggestions ------------------------------
+
+    #[test]
+    fn output_unresolved_workspace_ref_carries_value_span() {
+        // The error should carry the span of the property's value
+        // expression (the template containing `${workspace.nope}`).
+        let src = r#"
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "${workspace.nope}" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "got: {:?}", diags);
+        let span = errs[0].span.expect("error should carry a span");
+        // The span should cover the template literal — sanity-check it
+        // by resolving against a fresh source map and confirming it
+        // points at the offending output line.
+        let mut sm = SourceMap::new();
+        sm.add_anonymous(src);
+        let resolved = sm.resolve(&span).expect("span should resolve");
+        assert!(
+            resolved.line_text.contains("template"),
+            "span line: {}",
+            resolved.line_text
+        );
+    }
+
+    #[test]
+    fn unresolved_workspace_ref_suggests_near_match() {
+        // `workspace.synlog_msg` (one transposition off `syslog_msg`) → suggest.
+        let src = r#"
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "${workspace.synlog_msg}" }
+def pipeline p {
+    input i
+    process { syslog.parse(ingress) }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "got: {:?}", diags);
+        let help = errs[0].help.as_deref().expect("should have help line");
+        assert!(help.contains("workspace.syslog_msg"), "help was: {}", help);
+    }
+
+    #[test]
+    fn unresolved_workspace_ref_silent_when_nothing_close() {
+        // No bindings exist that are within edit distance — no help.
+        let src = r#"
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "${workspace.completely_unrelated_zzz}" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "got: {:?}", diags);
+        assert!(
+            errs[0].help.is_none(),
+            "should not suggest when nothing close: help={:?}",
+            errs[0].help
+        );
+    }
 
     #[test]
     fn let_binding_visible_inside_process() {

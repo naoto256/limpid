@@ -221,6 +221,20 @@ impl FunctionRegistry {
         self.parsers.insert(key, info);
     }
 
+    /// Iterate every flat (un-namespaced) function name registered.
+    /// Used by the analyzer's suggestion engine for typo recovery; the
+    /// namespaced functions aren't included because those typos require
+    /// `ns.name`-aware matching that the suggester doesn't model yet.
+    pub fn flat_function_names(&self) -> impl Iterator<Item = String> + '_ {
+        self.functions.keys().filter_map(|(ns, name)| {
+            if ns.is_none() {
+                Some(name.clone())
+            } else {
+                None
+            }
+        })
+    }
+
     /// Look up the static signature for a function. Returns `None` if
     /// the function was registered without one (analyzer treats those
     /// as fully wildcarded — no type checking).

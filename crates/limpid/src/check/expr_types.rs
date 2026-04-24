@@ -14,10 +14,12 @@
 //! whose signature is registered.
 
 use crate::dsl::ast::{BinOp, Expr, TemplateFragment, UnaryOp};
+use crate::dsl::span::Span;
 use crate::functions::{Arity, FunctionRegistry, FunctionSig};
 use crate::modules::schema::{FieldType, type_compatible};
 
 use super::bindings::Bindings;
+use super::suggestions;
 use super::{Diagnostic, Level};
 
 // ---------------------------------------------------------------------------
@@ -139,16 +141,26 @@ pub fn check_types(
     pipeline_name: &str,
     bindings: &Bindings,
     registry: &FunctionRegistry,
+    span: Option<Span>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     match expr {
         Expr::BinOp(l, op, r) => {
-            check_types(l, pipeline_name, bindings, registry, diagnostics);
-            check_types(r, pipeline_name, bindings, registry, diagnostics);
-            check_binop(l, *op, r, pipeline_name, bindings, registry, diagnostics);
+            check_types(l, pipeline_name, bindings, registry, span, diagnostics);
+            check_types(r, pipeline_name, bindings, registry, span, diagnostics);
+            check_binop(
+                l,
+                *op,
+                r,
+                pipeline_name,
+                bindings,
+                registry,
+                span,
+                diagnostics,
+            );
         }
         Expr::UnaryOp(_op, inner) => {
-            check_types(inner, pipeline_name, bindings, registry, diagnostics);
+            check_types(inner, pipeline_name, bindings, registry, span, diagnostics);
         }
         Expr::FuncCall {
             namespace,
@@ -156,7 +168,7 @@ pub fn check_types(
             args,
         } => {
             for a in args {
-                check_types(a, pipeline_name, bindings, registry, diagnostics);
+                check_types(a, pipeline_name, bindings, registry, span, diagnostics);
             }
             check_fn_call(
                 namespace.as_deref(),
@@ -165,23 +177,24 @@ pub fn check_types(
                 pipeline_name,
                 bindings,
                 registry,
+                span,
                 diagnostics,
             );
         }
         Expr::Template(fragments) => {
             for f in fragments {
                 if let TemplateFragment::Interp(e) = f {
-                    check_types(e, pipeline_name, bindings, registry, diagnostics);
+                    check_types(e, pipeline_name, bindings, registry, span, diagnostics);
                 }
             }
         }
         Expr::HashLit(entries) => {
             for (_k, v) in entries {
-                check_types(v, pipeline_name, bindings, registry, diagnostics);
+                check_types(v, pipeline_name, bindings, registry, span, diagnostics);
             }
         }
         Expr::PropertyAccess(base, _) => {
-            check_types(base, pipeline_name, bindings, registry, diagnostics);
+            check_types(base, pipeline_name, bindings, registry, span, diagnostics);
         }
         Expr::StringLit(_)
         | Expr::IntLit(_)
@@ -200,6 +213,7 @@ fn check_binop(
     pipeline_name: &str,
     bindings: &Bindings,
     registry: &FunctionRegistry,
+    span: Option<Span>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let lt = infer(l, bindings, registry);
@@ -220,6 +234,7 @@ fn check_binop(
                         lt.display(),
                         rt.display()
                     ),
+                    span,
                 ));
             }
         }
@@ -235,6 +250,7 @@ fn check_binop(
                         lt.display(),
                         rt.display()
                     ),
+                    span,
                 ));
             }
         }
@@ -251,6 +267,7 @@ fn check_binop(
                         lt.display(),
                         rt.display()
                     ),
+                    span,
                 ));
             }
         }
@@ -264,6 +281,7 @@ fn check_binop(
                         lt.display(),
                         rt.display()
                     ),
+                    span,
                 ));
             }
         }
@@ -281,10 +299,25 @@ fn check_fn_call(
     pipeline_name: &str,
     bindings: &Bindings,
     registry: &FunctionRegistry,
+    span: Option<Span>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let Some(sig) = registry.signature(namespace, name) else {
-        return; // unsigned function — no checks
+        // Unknown function — emit a hint with a near-match if any
+        // registered name is close. Skipped for namespaced calls because
+        // user-defined namespaces aren't enumerable here yet.
+        if namespace.is_none()
+            && let Some(near) = suggestions::near_function_name(name, registry)
+        {
+            let mut diag = Diagnostic::warning(format!(
+                "[pipeline {}] call to unknown function `{}`",
+                pipeline_name, name
+            ))
+            .with_span(span);
+            diag = diag.with_help(format!("did you mean `{}`?", near));
+            diagnostics.push(diag);
+        }
+        return;
     };
     if !arity_in_range(sig, args.len()) {
         // Wrong-arity calls are caught loudly at runtime; double-flagging
@@ -305,6 +338,7 @@ fn check_fn_call(
                     expected.display(),
                     actual_ty.display()
                 ),
+                span,
             ));
         }
     }
@@ -356,10 +390,11 @@ fn binop_display(op: BinOp) -> &'static str {
     }
 }
 
-fn warning(pipeline: &str, message: String) -> Diagnostic {
+fn warning(pipeline: &str, message: String, span: Option<Span>) -> Diagnostic {
     Diagnostic {
         level: Level::Warning,
         message: format!("[pipeline {}] {}", pipeline, message),
-        span: None,
+        span,
+        help: None,
     }
 }

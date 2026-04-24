@@ -324,7 +324,12 @@ pub(crate) fn init_tables(config: &CompiledConfig) -> Result<crate::functions::t
 
     if let Some(props) = config.global_blocks.get("table") {
         for prop in props {
-            if let Property::Block(table_name, inner_props) = prop {
+            if let Property::Block {
+                key: table_name,
+                properties: inner_props,
+                ..
+            } = prop
+            {
                 let load_path = props::get_string(inner_props, "load").map(PathBuf::from);
                 let max = props::get_positive_int(inner_props, "max")?.map(|n| n as usize);
                 let ttl = props::get_positive_int(inner_props, "ttl")?.map(Duration::from_secs);
