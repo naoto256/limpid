@@ -21,7 +21,6 @@
 //! * `v` is any value, including `Null` — if the caller wants to record
 //!   "a slot with no value", that's a legitimate array element.
 
-use anyhow::bail;
 use serde_json::Value;
 
 use crate::functions::{FunctionRegistry, FunctionSig};
@@ -31,12 +30,7 @@ pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(
         "append",
         FunctionSig::fixed(&[FieldType::Array, FieldType::Any], FieldType::Array),
-        |args, _event| {
-            if args.len() != 2 {
-                bail!("append() expects 2 arguments (array, value)");
-            }
-            Ok(push_back(&args[0], &args[1]))
-        },
+        |args, _event| Ok(push_back(&args[0], &args[1])),
     );
 }
 

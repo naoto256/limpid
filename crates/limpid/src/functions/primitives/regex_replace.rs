@@ -18,9 +18,6 @@ pub fn register(reg: &mut FunctionRegistry) {
             FieldType::String,
         ),
         |args, _event| {
-            if args.len() != 3 {
-                bail!("regex_replace() expects 3 arguments (target, pattern, replacement)");
-            }
             let target = val_to_str(&args[0]);
             let pattern = val_to_str(&args[1]);
             let replacement = val_to_str(&args[2]);

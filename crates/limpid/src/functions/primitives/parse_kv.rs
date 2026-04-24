@@ -26,9 +26,8 @@ pub fn register(reg: &mut FunctionRegistry) {
 }
 
 fn parse_kv_impl(args: &[Value]) -> Result<Value> {
-    if !(args.len() == 1 || args.len() == 2) {
-        bail!("parse_kv() expects 1 or 2 arguments (text[, defaults])");
-    }
+    // Arity is validated centrally by the registry (register_parser installs
+    // the `(String, Object?) -> Object` signature). No manual check here.
     let text = val_to_str(&args[0]);
     let mut map = Map::new();
     for (k, v) in parse_kv_pairs(&text) {

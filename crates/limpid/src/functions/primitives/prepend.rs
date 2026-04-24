@@ -12,7 +12,6 @@
 //! * Any other non-array input → `Null`.
 //! * `v` may be any value, including `Null`.
 
-use anyhow::bail;
 use serde_json::Value;
 
 use crate::functions::{FunctionRegistry, FunctionSig};
@@ -22,12 +21,7 @@ pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(
         "prepend",
         FunctionSig::fixed(&[FieldType::Array, FieldType::Any], FieldType::Array),
-        |args, _event| {
-            if args.len() != 2 {
-                bail!("prepend() expects 2 arguments (array, value)");
-            }
-            Ok(push_front(&args[0], &args[1]))
-        },
+        |args, _event| Ok(push_front(&args[0], &args[1])),
     );
 }
 

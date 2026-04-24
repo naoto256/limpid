@@ -21,7 +21,6 @@
 //! partial data. Callers who want a hard failure can compare the result
 //! against `null` explicitly.
 
-use anyhow::bail;
 use serde_json::Value;
 
 use crate::functions::{FunctionRegistry, FunctionSig};
@@ -31,12 +30,7 @@ pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(
         "to_int",
         FunctionSig::fixed(&[FieldType::Any], FieldType::Int),
-        |args, _event| {
-            if args.len() != 1 {
-                bail!("to_int() expects 1 argument");
-            }
-            Ok(coerce(&args[0]))
-        },
+        |args, _event| Ok(coerce(&args[0])),
     );
 }
 
