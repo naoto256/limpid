@@ -318,6 +318,8 @@ Motivation: CEF extension values and CSV column values arrive as strings even wh
 
 ## Array helpers
 
+Arrays in limpid are **positionless collections** — you construct them with `[a, b, c]` literals, but the DSL deliberately omits positional access (`arr[n]`) and positional writes (`arr[n] = v`). Element identity, not position, is the addressing model; see [User-defined Processes → Arrays](./user-defined.md#arrays) for the rationale and `find_by` / `foreach` / `append` / `prepend` / `len` below.
+
 ### find_by(array, key, value)
 
 Returns the first element of `array` that is an object whose `key` field equals `value`. Returns `null` when nothing matches, the input is not an array, or the key is not a string.
@@ -330,6 +332,44 @@ workspace.user    = find_by(workspace.evidence, "entityType", "User")
 Equality is value-level with no coercion: `find_by(arr, "n", "2")` does not match `{"n": 2}`. Callers who need coercion should cast the value first (`to_int`, string interpolation, etc.). Non-object elements inside the array are skipped silently, so mixed arrays do not cause errors.
 
 Designed for event schemas that carry arrays-of-objects (MDE evidence, OCSF observables, CEF ext lists) where the caller wants "pick the first item matching this type" as a scalar result rather than iterating with `foreach`.
+
+### append(array, value) / prepend(array, value)
+
+Return a new array with `value` added at the back (`append`) or the front (`prepend`). The input array is not mutated — callers re-bind:
+
+```
+workspace.observables = append(workspace.observables, new_obs)
+workspace.high_prio_tags = prepend(workspace.high_prio_tags, "urgent")
+```
+
+| Input `array` | Result |
+|---------------|--------|
+| `Array` | New array with `value` added |
+| `Null` | `Null` |
+| Anything else (`String` / `Object` / scalar) | `Null` |
+
+`value` may be any type, including `null` — if the caller wants to record "a slot with no value", that's a legitimate element.
+
+These are the only mutation paths for arrays because they identify "where" by insertion-order semantics rather than a numeric index. Middle insertion / removal is out of scope for v0.5.0; use identity-based primitives (future `insert_after_by`, `remove_by`) when that need surfaces.
+
+### len(value)
+
+Cardinality primitive — works for every container-like type:
+
+| Input | Result |
+|-------|--------|
+| `Array` | Number of elements |
+| `String` | Number of Unicode characters (not bytes) |
+| `Object` | Number of top-level keys |
+| `Null` | `Null` |
+| Scalars (`Int` / `Float` / `Bool`) | `Null` |
+
+```
+workspace.n_observables = len(workspace.observables)
+workspace.msg_len = len(workspace.syslog_msg)
+```
+
+Returning `null` on scalars (rather than `0` or an error) keeps the "not applicable" signal distinguishable from a legitimately empty collection.
 
 ## Serialization
 
