@@ -23,7 +23,7 @@
 use serde_json::{Map, Value};
 
 use super::{get_cached_regex, val_to_str};
-use crate::functions::{FunctionRegistry, FunctionSig};
+use crate::functions::{FunctionRegistry, FunctionSig, ParserInfo};
 use crate::modules::schema::FieldType;
 
 const DOT_MARKER: &str = "__DOT__";
@@ -59,6 +59,19 @@ pub fn register(reg: &mut FunctionRegistry) {
         Ok(Value::Object(out))
         },
     );
+    // Register as parser so the analyzer knows that a bare
+    // `regex_parse(ingress, "(?P<src>...)")` statement merges its
+    // named-capture keys into workspace, matching the
+    // `parse_json` / `parse_kv` / `syslog.parse` family. Output keys are
+    // fully data-driven (each pattern names its own captures), so
+    // `wildcards = true` — the analyzer falls back to wildcard unless a
+    // downstream defaults-style schema pin emerges.
+    reg.register_parser(ParserInfo {
+        namespace: None,
+        name: "regex_parse",
+        produces: Vec::new(),
+        wildcards: true,
+    });
 }
 
 /// Replace `.` inside `(?P<…>)` / `(?<…>)` capture names with `__DOT__`

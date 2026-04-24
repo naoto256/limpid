@@ -204,21 +204,25 @@ impl FunctionRegistry {
     }
 
     /// Register parser metadata. Call after `register_*` so the
-    /// analyzer can find both the function and its schema. Parsers also
-    /// get a `FunctionSig` (`(String, Object?) -> Object`) registered
-    /// automatically so plain arg-type checks still apply.
+    /// analyzer can find both the function and its schema.
+    ///
+    /// If the caller has **not** already installed a `FunctionSig` via
+    /// `register_with_sig` / `register_in_with_sig`, this installs the
+    /// default parser shape `(String, Object?) -> Object` — the one
+    /// shared by `parse_json` / `parse_kv` / `syslog.parse` / `cef.parse`.
+    /// Parsers with a different call shape (e.g. `regex_parse(target,
+    /// pattern)` which takes `(String, String)`) should register their
+    /// own sig first and rely on this method's `entry().or_insert_with`
+    /// guard to keep it intact.
     pub fn register_parser(&mut self, info: ParserInfo) {
         let key = (info.namespace.map(str::to_string), info.name.to_string());
-        // Parsers all share the same call shape: `(text[, defaults]) ->
-        // Object`. Defaults must be an Object literal at runtime; we
-        // accept either Object or Any here so callers can pass through
-        // a workspace-resolved value without analyzer churn.
-        let sig = FunctionSig::optional(
-            &[FieldType::String, FieldType::Object],
-            1,
-            FieldType::Object,
-        );
-        self.signatures.insert(key.clone(), sig);
+        self.signatures.entry(key.clone()).or_insert_with(|| {
+            FunctionSig::optional(
+                &[FieldType::String, FieldType::Object],
+                1,
+                FieldType::Object,
+            )
+        });
         self.parsers.insert(key, info);
     }
 
