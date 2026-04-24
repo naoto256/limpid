@@ -15,7 +15,7 @@ use crate::dsl::props;
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::persistent_conn::{PersistentConn, write_with_reconnect};
-use crate::modules::{HasMetrics, Module, ModuleSchema, Output};
+use crate::modules::{HasMetrics, Module, Output};
 
 pub struct TcpOutput {
     pub address: String,
@@ -31,10 +31,6 @@ pub enum TcpOutputFraming {
 }
 
 impl Module for TcpOutput {
-    fn schema() -> ModuleSchema {
-        ModuleSchema::default()
-    }
-
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
         let address = props::get_string(properties, "address")
             .or_else(|| {

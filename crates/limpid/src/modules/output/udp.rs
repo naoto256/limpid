@@ -14,7 +14,7 @@ use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
-use crate::modules::{HasMetrics, Module, ModuleSchema, Output};
+use crate::modules::{HasMetrics, Module, Output};
 
 pub struct UdpOutput {
     address: String,
@@ -24,10 +24,6 @@ pub struct UdpOutput {
 }
 
 impl Module for UdpOutput {
-    fn schema() -> ModuleSchema {
-        ModuleSchema::default()
-    }
-
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
         let address = props::get_string(properties, "address")
             .ok_or_else(|| anyhow::anyhow!("output '{}': udp requires 'address'", name))?;

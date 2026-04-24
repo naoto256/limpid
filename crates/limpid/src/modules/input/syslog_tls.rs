@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::event::Event;
-use crate::modules::{HasMetrics, Input, Module, ModuleSchema};
+use crate::modules::{HasMetrics, Input, Module};
 use crate::tls::TlsConfig;
 
 use super::rate_limit::RateLimiter;
@@ -32,10 +32,6 @@ pub struct SyslogTlsInput {
 }
 
 impl Module for SyslogTlsInput {
-    fn schema() -> ModuleSchema {
-        ModuleSchema::default()
-    }
-
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
         let bind =
             props::get_string(properties, "bind").unwrap_or_else(|| "0.0.0.0:6514".to_string());
