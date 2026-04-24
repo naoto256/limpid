@@ -278,11 +278,7 @@ impl FileOutput {
                 if (uid.is_some() || gid.is_some())
                     && let Err(e) = std::os::unix::fs::chown(&path, uid, gid)
                 {
-                    tracing::warn!(
-                        "output file '{}': failed to chown: {}",
-                        path.display(),
-                        e
-                    );
+                    tracing::warn!("output file '{}': failed to chown: {}", path.display(), e);
                 }
             })
             .await
@@ -403,9 +399,9 @@ mod tests {
 
     #[test]
     fn render_template_errors_without_attached_funcs() {
-        let mut out = make_output(Expr::Template(vec![TemplateFragment::Interp(
-            Expr::Ident(vec!["source".into()]),
-        )]));
+        let mut out = make_output(Expr::Template(vec![TemplateFragment::Interp(Expr::Ident(
+            vec!["source".into()],
+        ))]));
         out.funcs = None;
         let err = out.render_path(&event_with_fields()).unwrap_err();
         assert!(err.to_string().contains("FunctionRegistry not attached"));
