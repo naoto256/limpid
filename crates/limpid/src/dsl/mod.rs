@@ -9,3 +9,4 @@ pub mod exec;
 mod exec_test;
 pub mod parser;
 pub mod props;
+pub mod span;

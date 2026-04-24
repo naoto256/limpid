@@ -8,13 +8,25 @@ use pest::iterators::Pair;
 use pest_derive::Parser;
 
 use super::ast::*;
+use super::span::Span;
 
 #[derive(Parser)]
 #[grammar = "dsl/limpid.pest"]
 pub struct LimpidParser;
 
 /// Parse a complete configuration string into a `Config` AST.
+///
+/// Spans in the resulting AST are tagged with `file_id = 0`. Callers
+/// that need multi-file attribution (the include loader, eventually)
+/// should use [`parse_config_with_file_id`] and feed the matching id
+/// into the [`crate::dsl::span::SourceMap`].
 pub fn parse_config(input: &str) -> Result<Config> {
+    parse_config_with_file_id(input, 0)
+}
+
+/// Parse a complete configuration string, tagging every span with the
+/// caller-supplied `file_id`.
+pub fn parse_config_with_file_id(input: &str, file_id: u32) -> Result<Config> {
     let mut pairs = LimpidParser::parse(Rule::config, input).context("failed to parse DSL")?;
 
     let config_pair = pairs.next().unwrap();
@@ -30,11 +42,17 @@ pub fn parse_config(input: &str) -> Result<Config> {
                     Rule::definition => {
                         let def_inner = first_inner(inner)?;
                         let def = match def_inner.as_rule() {
-                            Rule::def_input => Definition::Input(parse_input_def(def_inner)?),
-                            Rule::def_output => Definition::Output(parse_output_def(def_inner)?),
-                            Rule::def_process => Definition::Process(parse_process_def(def_inner)?),
+                            Rule::def_input => {
+                                Definition::Input(parse_input_def(def_inner, file_id)?)
+                            }
+                            Rule::def_output => {
+                                Definition::Output(parse_output_def(def_inner, file_id)?)
+                            }
+                            Rule::def_process => {
+                                Definition::Process(parse_process_def(def_inner, file_id)?)
+                            }
                             Rule::def_pipeline => {
-                                Definition::Pipeline(parse_pipeline_def(def_inner)?)
+                                Definition::Pipeline(parse_pipeline_def(def_inner, file_id)?)
                             }
                             _ => unreachable!(
                                 "unexpected definition rule: {:?}",
@@ -48,7 +66,7 @@ pub fn parse_config(input: &str) -> Result<Config> {
                         includes.push(parse_string_lit(&path_pair));
                     }
                     Rule::global_block => {
-                        global_blocks.push(parse_global_block(inner)?);
+                        global_blocks.push(parse_global_block(inner, file_id)?);
                     }
                     _ => {}
                 }
@@ -65,56 +83,91 @@ pub fn parse_config(input: &str) -> Result<Config> {
     })
 }
 
-fn parse_global_block(pair: Pair<Rule>) -> Result<GlobalBlock> {
+fn span_of(pair: &Pair<Rule>, file_id: u32) -> Span {
+    let s = pair.as_span();
+    Span::new(file_id, s.start(), s.end())
+}
+
+fn parse_global_block(pair: Pair<Rule>, file_id: u32) -> Result<GlobalBlock> {
     let mut inner = pair.into_inner();
-    let name = inner.next().unwrap().as_str().to_string();
+    let name_pair = inner.next().unwrap();
+    let name_span = Some(span_of(&name_pair, file_id));
+    let name = name_pair.as_str().to_string();
     let properties = inner
-        .map(|p| parse_property(p))
+        .map(|p| parse_property(p, file_id))
         .collect::<Result<Vec<_>>>()?;
-    Ok(GlobalBlock { name, properties })
+    Ok(GlobalBlock {
+        name,
+        name_span,
+        properties,
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Input / Output
 // ---------------------------------------------------------------------------
 
-fn parse_input_def(pair: Pair<Rule>) -> Result<InputDef> {
+fn parse_input_def(pair: Pair<Rule>, file_id: u32) -> Result<InputDef> {
     let mut inner = pair.into_inner();
-    let name = inner.next().unwrap().as_str().to_string();
+    let name_pair = inner.next().unwrap();
+    let name_span = Some(span_of(&name_pair, file_id));
+    let name = name_pair.as_str().to_string();
     let properties = inner
-        .map(|p| parse_property(p))
+        .map(|p| parse_property(p, file_id))
         .collect::<Result<Vec<_>>>()?;
-    Ok(InputDef { name, properties })
+    Ok(InputDef {
+        name,
+        name_span,
+        properties,
+    })
 }
 
-fn parse_output_def(pair: Pair<Rule>) -> Result<OutputDef> {
+fn parse_output_def(pair: Pair<Rule>, file_id: u32) -> Result<OutputDef> {
     let mut inner = pair.into_inner();
-    let name = inner.next().unwrap().as_str().to_string();
+    let name_pair = inner.next().unwrap();
+    let name_span = Some(span_of(&name_pair, file_id));
+    let name = name_pair.as_str().to_string();
     let properties = inner
-        .map(|p| parse_property(p))
+        .map(|p| parse_property(p, file_id))
         .collect::<Result<Vec<_>>>()?;
-    Ok(OutputDef { name, properties })
+    Ok(OutputDef {
+        name,
+        name_span,
+        properties,
+    })
 }
 
-fn parse_property(pair: Pair<Rule>) -> Result<Property> {
+fn parse_property(pair: Pair<Rule>, file_id: u32) -> Result<Property> {
     let mut inner = pair.into_inner();
-    let key = inner.next().unwrap().as_str().to_string();
+    let key_pair = inner.next().unwrap();
+    let key_span = Some(span_of(&key_pair, file_id));
+    let key = key_pair.as_str().to_string();
 
     let second = inner.next().unwrap();
     match second.as_rule() {
         Rule::property => {
             // nested block: key { property* }
             // We already consumed the key; remaining pairs are properties
-            let mut props = vec![parse_property(second)?];
+            let mut props = vec![parse_property(second, file_id)?];
             for p in inner {
-                props.push(parse_property(p)?);
+                props.push(parse_property(p, file_id)?);
             }
-            Ok(Property::Block(key, props))
+            Ok(Property::Block {
+                key,
+                key_span,
+                properties: props,
+            })
         }
         _ => {
             // key-value: key expr
+            let value_span = Some(span_of(&second, file_id));
             let value = parse_expr_from_pair(second)?;
-            Ok(Property::KeyValue(key, value))
+            Ok(Property::KeyValue {
+                key,
+                key_span,
+                value,
+                value_span,
+            })
         }
     }
 }
@@ -123,13 +176,19 @@ fn parse_property(pair: Pair<Rule>) -> Result<Property> {
 // Process definition
 // ---------------------------------------------------------------------------
 
-fn parse_process_def(pair: Pair<Rule>) -> Result<ProcessDef> {
+fn parse_process_def(pair: Pair<Rule>, file_id: u32) -> Result<ProcessDef> {
     let mut inner = pair.into_inner();
-    let name = inner.next().unwrap().as_str().to_string();
+    let name_pair = inner.next().unwrap();
+    let name_span = Some(span_of(&name_pair, file_id));
+    let name = name_pair.as_str().to_string();
     let body = inner
         .map(|p| parse_process_stmt(p))
         .collect::<Result<Vec<_>>>()?;
-    Ok(ProcessDef { name, body })
+    Ok(ProcessDef {
+        name,
+        name_span,
+        body,
+    })
 }
 
 fn parse_process_stmt(pair: Pair<Rule>) -> Result<ProcessStatement> {
@@ -243,13 +302,19 @@ fn parse_process_foreach(pair: Pair<Rule>) -> Result<ProcessStatement> {
 // Pipeline definition
 // ---------------------------------------------------------------------------
 
-fn parse_pipeline_def(pair: Pair<Rule>) -> Result<PipelineDef> {
+fn parse_pipeline_def(pair: Pair<Rule>, file_id: u32) -> Result<PipelineDef> {
     let mut inner = pair.into_inner();
-    let name = inner.next().unwrap().as_str().to_string();
+    let name_pair = inner.next().unwrap();
+    let name_span = Some(span_of(&name_pair, file_id));
+    let name = name_pair.as_str().to_string();
     let body = inner
         .map(|p| parse_pipeline_stmt(p))
         .collect::<Result<Vec<_>>>()?;
-    Ok(PipelineDef { name, body })
+    Ok(PipelineDef {
+        name,
+        name_span,
+        body,
+    })
 }
 
 fn parse_pipeline_stmt(pair: Pair<Rule>) -> Result<PipelineStatement> {
@@ -1097,7 +1162,9 @@ def pipeline test {
 
     fn property_value<'a>(props: &'a [Property], key: &str) -> &'a Expr {
         for p in props {
-            if let Property::KeyValue(k, v) = p
+            if let Property::KeyValue {
+                key: k, value: v, ..
+            } = p
                 && k == key
             {
                 return v;

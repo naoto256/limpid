@@ -72,7 +72,9 @@ impl Module for HttpOutput {
         let mut headers = Vec::new();
         if let Some(block) = props::get_block(properties, "headers") {
             for prop in block {
-                if let Property::KeyValue(key, expr) = prop
+                if let Property::KeyValue {
+                    key, value: expr, ..
+                } = prop
                     && let Some(val) = match expr {
                         crate::dsl::ast::Expr::StringLit(s) => Some(s.clone()),
                         crate::dsl::ast::Expr::Ident(parts) => Some(parts.join(".")),

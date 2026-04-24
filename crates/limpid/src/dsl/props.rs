@@ -14,7 +14,11 @@ use super::ast::{Expr, Property, TemplateFragment};
 /// `get_expr` and evaluate via `dsl::eval::eval_expr`.
 pub fn get_string(props: &[Property], key: &str) -> Option<String> {
     for prop in props {
-        if let Property::KeyValue(k, expr) = prop
+        if let Property::KeyValue {
+            key: k,
+            value: expr,
+            ..
+        } = prop
             && k == key
         {
             return match expr {
@@ -34,7 +38,11 @@ pub fn get_string(props: &[Property], key: &str) -> Option<String> {
 /// this rather than `get_string`.
 pub fn get_expr<'a>(props: &'a [Property], key: &str) -> Option<&'a Expr> {
     for prop in props {
-        if let Property::KeyValue(k, expr) = prop
+        if let Property::KeyValue {
+            key: k,
+            value: expr,
+            ..
+        } = prop
             && k == key
         {
             return Some(expr);
@@ -87,7 +95,11 @@ fn push_expr_source(out: &mut String, expr: &Expr) {
 /// Get an identifier value for a key (first segment of ident path).
 pub fn get_ident(props: &[Property], key: &str) -> Option<String> {
     for prop in props {
-        if let Property::KeyValue(k, Expr::Ident(parts)) = prop
+        if let Property::KeyValue {
+            key: k,
+            value: Expr::Ident(parts),
+            ..
+        } = prop
             && k == key
         {
             return parts.first().cloned();
@@ -99,7 +111,11 @@ pub fn get_ident(props: &[Property], key: &str) -> Option<String> {
 /// Get an integer value for a key.
 pub fn get_int(props: &[Property], key: &str) -> Option<i64> {
     for prop in props {
-        if let Property::KeyValue(k, Expr::IntLit(n)) = prop
+        if let Property::KeyValue {
+            key: k,
+            value: Expr::IntLit(n),
+            ..
+        } = prop
             && k == key
         {
             return Some(*n);
@@ -131,7 +147,11 @@ pub fn get_strictly_positive_int(props: &[Property], key: &str) -> anyhow::Resul
 /// Get a nested block's properties by key name.
 pub fn get_block<'a>(props: &'a [Property], key: &str) -> Option<&'a Vec<Property>> {
     for prop in props {
-        if let Property::Block(k, inner) = prop
+        if let Property::Block {
+            key: k,
+            properties: inner,
+            ..
+        } = prop
             && k == key
         {
             return Some(inner);
