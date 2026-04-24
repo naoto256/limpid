@@ -228,9 +228,9 @@ fn run_test(config_path: &str, pipeline_name: &str, input_json: Option<&str>) ->
         println!();
         for (name, evt) in &result.outputs {
             println!(
-                "[output]  → {}  message: {}",
+                "[output]  → {}  egress: {}",
                 name,
-                String::from_utf8_lossy(&evt.message)
+                String::from_utf8_lossy(&evt.egress)
             );
             if let Some(f) = evt.facility {
                 print!("  facility: {}", f);
@@ -255,8 +255,8 @@ fn build_test_event(input_json: Option<&str>) -> Result<Event> {
         let v: serde_json::Value =
             serde_json::from_str(json_str).context("failed to parse --input JSON")?;
 
-        let raw = v
-            .get("raw")
+        let ingress = v
+            .get("ingress")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
@@ -273,7 +273,7 @@ fn build_test_event(input_json: Option<&str>) -> Result<Event> {
             })
             .unwrap_or(default_addr);
 
-        let mut event = Event::new(Bytes::from(raw), source);
+        let mut event = Event::new(Bytes::from(ingress), source);
 
         if let Some(f) = v.get("facility").and_then(|v| v.as_u64()) {
             if f > 23 {

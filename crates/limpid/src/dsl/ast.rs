@@ -68,7 +68,7 @@ pub struct ProcessDef {
 /// Statements that can appear inside a process body.
 #[derive(Debug, Clone)]
 pub enum ProcessStatement {
-    /// `workspace.xxx = expr`, `message = expr`, `severity = expr`, etc.
+    /// `workspace.xxx = expr`, `egress = expr`, `severity = expr`, etc.
     Assign(AssignTarget, Expr),
     /// `process name` or `process name(args...)`
     ProcessCall(String, Vec<Expr>),
@@ -158,8 +158,8 @@ pub struct SwitchArm {
 
 #[derive(Debug, Clone)]
 pub enum AssignTarget {
-    /// `message`
-    Message,
+    /// `egress`
+    Egress,
     /// `severity`
     Severity,
     /// `facility`
@@ -190,7 +190,7 @@ pub enum Expr {
     Null,
     /// Identifier or dotted path: `severity`, `workspace.src`, `source`, `error`
     Ident(Vec<String>),
-    /// Function call: `contains(raw, "CEF:")`, `to_json()`, `lower(workspace.name)`
+    /// Function call: `contains(ingress, "CEF:")`, `to_json()`, `lower(workspace.name)`
     FuncCall(String, Vec<Expr>),
     /// Binary operation: `a == b`, `a and b`, `a + b`, etc.
     BinOp(Box<Expr>, BinOp, Box<Expr>),

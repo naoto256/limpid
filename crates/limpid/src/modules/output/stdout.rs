@@ -36,7 +36,7 @@ impl HasMetrics for StdoutOutput {
 #[async_trait::async_trait]
 impl Output for StdoutOutput {
     async fn write(&self, event: &Event) -> Result<()> {
-        let msg = String::from_utf8_lossy(&event.message);
+        let msg = String::from_utf8_lossy(&event.egress);
         println!("{}", msg);
         self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
         Ok(())

@@ -89,8 +89,8 @@ fn bytes_to_value(bytes: &[u8]) -> Value {
 
 fn resolve_ident(parts: &[String], event: &Event) -> Result<Value> {
     match parts.first().map(|s| s.as_str()) {
-        Some("raw") => Ok(bytes_to_value(&event.raw)),
-        Some("message") => Ok(bytes_to_value(&event.message)),
+        Some("ingress") => Ok(bytes_to_value(&event.ingress)),
+        Some("egress") => Ok(bytes_to_value(&event.egress)),
         Some("timestamp") => Ok(Value::String(event.timestamp.to_rfc3339())),
         Some("source") => Ok(Value::String(event.source.ip().to_string())),
         Some("severity") => match event.severity {

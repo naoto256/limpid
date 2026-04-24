@@ -196,7 +196,7 @@ mod tests {
         let expr = Expr::FuncCall(
             "contains".into(),
             vec![
-                Expr::Ident(vec!["raw".into()]),
+                Expr::Ident(vec!["ingress".into()]),
                 Expr::StringLit("test".into()),
             ],
         );

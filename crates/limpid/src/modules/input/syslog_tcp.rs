@@ -583,10 +583,10 @@ mod tests {
         assert!(matches!(reason, CloseReason::Eof));
 
         let e1 = rx.recv().await.unwrap();
-        assert_eq!(&*e1.raw, b"<134>hello");
+        assert_eq!(&*e1.ingress, b"<134>hello");
 
         let e2 = rx.recv().await.unwrap();
-        assert_eq!(&*e2.raw, b"<165>world message");
+        assert_eq!(&*e2.ingress, b"<165>world message");
 
         assert!(rx.recv().await.is_none());
     }
@@ -655,8 +655,8 @@ mod tests {
         drop(tx);
         assert!(matches!(reason, CloseReason::Eof));
 
-        assert_eq!(&*rx.recv().await.unwrap().raw, b"<134>hello");
-        assert_eq!(&*rx.recv().await.unwrap().raw, b"<165>world");
+        assert_eq!(&*rx.recv().await.unwrap().ingress, b"<134>hello");
+        assert_eq!(&*rx.recv().await.unwrap().ingress, b"<165>world");
         assert!(rx.recv().await.is_none());
     }
 
@@ -670,8 +670,8 @@ mod tests {
         drop(tx);
         assert!(matches!(reason, CloseReason::Eof));
 
-        assert_eq!(&*rx.recv().await.unwrap().raw, b"<134>msg1");
-        assert_eq!(&*rx.recv().await.unwrap().raw, b"<165>msg2");
+        assert_eq!(&*rx.recv().await.unwrap().ingress, b"<134>msg1");
+        assert_eq!(&*rx.recv().await.unwrap().ingress, b"<165>msg2");
     }
 
     #[tokio::test]
@@ -684,8 +684,8 @@ mod tests {
         drop(tx);
         assert!(matches!(reason, CloseReason::Eof));
 
-        assert_eq!(&*rx.recv().await.unwrap().raw, b"<134>msg1");
-        assert_eq!(&*rx.recv().await.unwrap().raw, b"<165>msg2");
+        assert_eq!(&*rx.recv().await.unwrap().ingress, b"<134>msg1");
+        assert_eq!(&*rx.recv().await.unwrap().ingress, b"<165>msg2");
     }
 
     #[tokio::test]
@@ -699,7 +699,7 @@ mod tests {
         drop(tx);
         assert!(matches!(reason, CloseReason::Eof));
 
-        assert_eq!(&*rx.recv().await.unwrap().raw, b"<134>unterminated");
+        assert_eq!(&*rx.recv().await.unwrap().ingress, b"<134>unterminated");
     }
 
     #[tokio::test]
@@ -712,7 +712,7 @@ mod tests {
         drop(tx);
         assert!(matches!(reason, CloseReason::Eof));
 
-        assert_eq!(&*rx.recv().await.unwrap().raw, b"<134>hello");
+        assert_eq!(&*rx.recv().await.unwrap().ingress, b"<134>hello");
         assert!(rx.recv().await.is_none());
     }
 

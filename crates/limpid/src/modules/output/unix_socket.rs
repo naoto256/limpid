@@ -77,7 +77,7 @@ impl Output for UnixSocketOutput {
 
 impl UnixSocketOutput {
     async fn write_to(&self, stream: &mut UnixStream, event: &Event) -> Result<()> {
-        let msg = String::from_utf8_lossy(&event.message);
+        let msg = String::from_utf8_lossy(&event.egress);
         stream.write_all(msg.as_bytes()).await?;
         stream.write_all(b"\n").await?;
         stream.flush().await?;

@@ -454,7 +454,7 @@ mod tests {
         let json_str = serde_json::to_string(&json).unwrap();
         let recovered = Event::from_json(&json_str).unwrap();
 
-        assert_eq!(String::from_utf8_lossy(&recovered.raw), "<134>test");
+        assert_eq!(String::from_utf8_lossy(&recovered.ingress), "<134>test");
         assert_eq!(recovered.facility, Some(16));
         assert_eq!(recovered.severity, Some(6));
         assert_eq!(
@@ -472,10 +472,10 @@ mod tests {
         tx.send(make_event("<134>msg2")).await;
 
         let e1 = rx.recv().await.unwrap();
-        assert_eq!(String::from_utf8_lossy(&e1.raw), "<134>msg1");
+        assert_eq!(String::from_utf8_lossy(&e1.ingress), "<134>msg1");
 
         let e2 = rx.recv().await.unwrap();
-        assert_eq!(String::from_utf8_lossy(&e2.raw), "<134>msg2");
+        assert_eq!(String::from_utf8_lossy(&e2.ingress), "<134>msg2");
     }
 
     #[test]
@@ -500,9 +500,9 @@ mod tests {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
                 let e1 = rx.recv().await.unwrap();
-                assert_eq!(String::from_utf8_lossy(&e1.raw), "<134>persist1");
+                assert_eq!(String::from_utf8_lossy(&e1.ingress), "<134>persist1");
                 let e2 = rx.recv().await.unwrap();
-                assert_eq!(String::from_utf8_lossy(&e2.raw), "<134>persist2");
+                assert_eq!(String::from_utf8_lossy(&e2.ingress), "<134>persist2");
             });
         }
     }

@@ -5,10 +5,9 @@ use serde_json::Value;
 use crate::event::Event;
 use crate::modules::ProcessError;
 
-/// Parse `message` (or `raw` if message is identical to raw) as JSON
-/// and expand top-level keys into `workspace`.
+/// Parse `egress` as JSON and expand top-level keys into `workspace`.
 pub fn apply(event: Event) -> Result<Event, ProcessError> {
-    let text = String::from_utf8_lossy(&event.message);
+    let text = String::from_utf8_lossy(&event.egress);
     let parsed: Value = serde_json::from_str(&text)
         .map_err(|e| ProcessError::Failed(format!("JSON parse error: {}", e)))?;
 

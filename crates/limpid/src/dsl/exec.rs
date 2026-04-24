@@ -194,8 +194,8 @@ fn exec_branch_body_process(
 
 fn apply_assign(event: &mut Event, target: &AssignTarget, value: Value) -> Result<()> {
     match target {
-        AssignTarget::Message => {
-            event.message = Bytes::from(value_to_string(&value));
+        AssignTarget::Egress => {
+            event.egress = Bytes::from(value_to_string(&value));
             Ok(())
         }
         AssignTarget::Severity => {
@@ -212,7 +212,7 @@ fn apply_assign(event: &mut Event, target: &AssignTarget, value: Value) -> Resul
                 Value::Null => None,
                 _ => bail!("severity must be a number"),
             };
-            sync_message_pri(event);
+            sync_egress_pri(event);
             Ok(())
         }
         AssignTarget::Facility => {
@@ -229,7 +229,7 @@ fn apply_assign(event: &mut Event, target: &AssignTarget, value: Value) -> Resul
                 Value::Null => None,
                 _ => bail!("facility must be a number"),
             };
-            sync_message_pri(event);
+            sync_egress_pri(event);
             Ok(())
         }
         AssignTarget::Workspace(path) => {
@@ -239,11 +239,11 @@ fn apply_assign(event: &mut Event, target: &AssignTarget, value: Value) -> Resul
     }
 }
 
-/// If event.message starts with a valid `<PRI>`, rewrite it to reflect
+/// If event.egress starts with a valid `<PRI>`, rewrite it to reflect
 /// the current facility/severity metadata.  Metadata fields that are
 /// None fall back to the value already encoded in the PRI.
-fn sync_message_pri(event: &mut Event) {
-    let msg = &event.message;
+fn sync_egress_pri(event: &mut Event) {
+    let msg = &event.egress;
 
     if msg.first() != Some(&b'<') {
         return;
@@ -279,7 +279,7 @@ fn sync_message_pri(event: &mut Event) {
     let mut buf = Vec::with_capacity(header.len() + rest.len());
     buf.extend_from_slice(header.as_bytes());
     buf.extend_from_slice(rest);
-    event.message = Bytes::from(buf);
+    event.egress = Bytes::from(buf);
 }
 
 fn set_workspace_path(

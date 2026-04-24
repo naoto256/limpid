@@ -622,7 +622,7 @@ mod tests {
 
     #[test]
     fn extract_timestamp_reads_rfc3339_field() {
-        let line = r#"{"timestamp":"2024-01-02T03:04:05Z","raw":"hi","source":"127.0.0.1:514","message":"hi"}"#;
+        let line = r#"{"timestamp":"2024-01-02T03:04:05Z","ingress":"hi","source":"127.0.0.1:514","egress":"hi"}"#;
         let ts = extract_timestamp(line).unwrap();
         assert_eq!(ts.to_rfc3339(), "2024-01-02T03:04:05+00:00");
     }
@@ -630,10 +630,10 @@ mod tests {
     #[test]
     fn extract_timestamp_rejects_missing_or_malformed() {
         // Missing field
-        let line = r#"{"raw":"hi","source":"127.0.0.1:514","message":"hi"}"#;
+        let line = r#"{"ingress":"hi","source":"127.0.0.1:514","egress":"hi"}"#;
         assert!(extract_timestamp(line).is_err());
         // Wrong type
-        let line = r#"{"timestamp":1234,"raw":"hi"}"#;
+        let line = r#"{"timestamp":1234,"ingress":"hi"}"#;
         assert!(extract_timestamp(line).is_err());
         // Bad format
         let line = r#"{"timestamp":"yesterday"}"#;

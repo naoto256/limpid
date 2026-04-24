@@ -5,7 +5,7 @@ use serde_json::Value;
 use crate::event::Event;
 use crate::modules::ProcessError;
 
-/// Parse CEF (Common Event Format) from `raw` and expand into `workspace`.
+/// Parse CEF (Common Event Format) from `ingress` and expand into `workspace`.
 ///
 /// CEF format:
 /// ```text
@@ -16,15 +16,15 @@ use crate::modules::ProcessError;
 /// the next recognized key (keys are sequences of alphanumeric/underscore chars
 /// followed by `=`).
 pub fn apply(mut event: Event) -> Result<Event, ProcessError> {
-    // Copy raw to owned String up front to avoid borrow conflict
-    let raw = String::from_utf8_lossy(&event.raw).into_owned();
+    // Copy ingress to owned String up front to avoid borrow conflict
+    let ingress = String::from_utf8_lossy(&event.ingress).into_owned();
 
     // Find "CEF:" prefix (may be preceded by syslog header)
-    let cef_start = raw
+    let cef_start = ingress
         .find("CEF:")
         .ok_or_else(|| ProcessError::Failed("no CEF header found".into()))?;
 
-    let cef_body = &raw[cef_start + 4..]; // skip "CEF:"
+    let cef_body = &ingress[cef_start + 4..]; // skip "CEF:"
 
     // Split header fields by '|' (first 7 pipes)
     let mut parts = Vec::new();

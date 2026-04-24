@@ -167,7 +167,7 @@ impl HasMetrics for HttpOutput {
 #[async_trait::async_trait]
 impl Output for HttpOutput {
     async fn write(&self, event: &Event) -> Result<()> {
-        let msg = String::from_utf8_lossy(&event.message).into_owned();
+        let msg = String::from_utf8_lossy(&event.egress).into_owned();
 
         if self.batch_size <= 1 {
             self.inner.send_batch(&[msg]).await?;

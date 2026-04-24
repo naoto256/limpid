@@ -190,7 +190,7 @@ mod tests {
             ExecResult::Continue(e) => {
                 assert_eq!(e.facility, Some(16));
                 // new PRI = 16*8 + 1(old severity) = 129
-                assert_eq!(&*e.message, b"<129>msg");
+                assert_eq!(&*e.egress, b"<129>msg");
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -214,7 +214,7 @@ mod tests {
             ExecResult::Continue(e) => {
                 assert_eq!(e.severity, Some(6));
                 // new PRI = 23(old facility)*8 + 6 = 190
-                assert_eq!(&*e.message, b"<190>msg");
+                assert_eq!(&*e.egress, b"<190>msg");
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -237,7 +237,7 @@ mod tests {
         match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
             ExecResult::Continue(e) => {
                 // 16*8 + 6 = 134
-                assert_eq!(&*e.message, b"<134>msg");
+                assert_eq!(&*e.egress, b"<134>msg");
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -257,7 +257,7 @@ mod tests {
         match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
             ExecResult::Continue(e) => {
                 assert_eq!(e.facility, Some(16));
-                assert_eq!(&*e.message, b"no-pri-msg");
+                assert_eq!(&*e.egress, b"no-pri-msg");
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
