@@ -273,6 +273,11 @@ pub enum ExprKind {
     UnaryOp(UnaryOp, Box<Expr>),
     /// Hash literal: `{ key: value, key2: value2 }`
     HashLit(Vec<(String, Expr)>),
+    /// Array literal: `[expr, expr, ...]`. Arrays are positionless
+    /// collections in limpid; literal order is construction-convenience
+    /// only. See `docs/src/processing/user-defined.md` for the rationale
+    /// (element identity, not position, is the addressing model).
+    ArrayLit(Vec<Expr>),
     /// Postfix property access: `geoip(x).country.name`
     PropertyAccess(Box<Expr>, Vec<String>),
 }

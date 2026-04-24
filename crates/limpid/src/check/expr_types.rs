@@ -37,6 +37,11 @@ pub fn infer(expr: &Expr, bindings: &Bindings, registry: &FunctionRegistry) -> F
         ExprKind::BoolLit(_) => FieldType::Bool,
         ExprKind::Null => FieldType::Null,
         ExprKind::HashLit(_) => FieldType::Object,
+        // Array support lands piecewise: the literal infers to `Array`
+        // in Commit 1 (lit is callable in every position `Object` is),
+        // element-type refinement is v0.5.x. For now treat contents as
+        // untyped so downstream consumers stay loose.
+        ExprKind::ArrayLit(_) => FieldType::Any,
         ExprKind::Ident(parts) => ident_type(parts, bindings),
         ExprKind::PropertyAccess(base, suffix) => {
             // `geoip(x).country.name` — collapse to a workspace lookup
@@ -244,6 +249,18 @@ pub fn check_types(
             for (_k, v) in entries {
                 check_types(
                     v,
+                    pipeline_name,
+                    bindings,
+                    registry,
+                    fallback_span,
+                    diagnostics,
+                );
+            }
+        }
+        ExprKind::ArrayLit(items) => {
+            for item in items {
+                check_types(
+                    item,
                     pipeline_name,
                     bindings,
                     registry,

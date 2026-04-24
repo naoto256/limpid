@@ -115,6 +115,11 @@ fn collect_workspace_refs(expr: &Expr, cb: &mut dyn FnMut(&[String])) {
                 collect_workspace_refs(v, cb);
             }
         }
+        ExprKind::ArrayLit(items) => {
+            for v in items {
+                collect_workspace_refs(v, cb);
+            }
+        }
         ExprKind::StringLit(_)
         | ExprKind::IntLit(_)
         | ExprKind::FloatLit(_)
