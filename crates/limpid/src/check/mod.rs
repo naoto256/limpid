@@ -59,10 +59,36 @@ pub enum Level {
     Info,
 }
 
+/// Category tag used by `--ultra-strict` to decide which warnings get
+/// promoted to errors. Keeping this orthogonal to [`Level`] lets the CLI
+/// filter on *what kind of problem* the diagnostic describes without
+/// reparsing the `message` string. Future `--strict=idents,types` or
+/// similar fine-grained flags can reuse this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagKind {
+    /// Unknown / unresolved identifier: workspace key not produced
+    /// upstream, function name typo, reserved-name misspelling. These
+    /// are the high-confidence "CI should catch this" signals that
+    /// `--ultra-strict` promotes from warning to error.
+    UnknownIdent,
+    /// Type mismatch between operator / function-arg and the inferred
+    /// operand/argument type. Intentionally left out of `--ultra-strict`
+    /// because borderline cases (Int vs String comparison, numeric +
+    /// string concat) are noisier.
+    TypeMismatch,
+    /// Dataflow shape problem (e.g. assignment that overwrites an
+    /// Object with a scalar and invalidates nested reads).
+    Dataflow,
+    /// Catch-all for diagnostics that don't fit the above buckets.
+    #[allow(dead_code)]
+    Other,
+}
+
 /// A single issue produced by the analyzer.
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
     pub level: Level,
+    pub kind: DiagKind,
     pub message: String,
     pub span: Option<Span>,
     /// Optional `help: ...` line emitted under the caret. Used by the
@@ -72,18 +98,48 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
+    /// Error with `DiagKind::Other`. Prefer [`Diagnostic::error_kind`]
+    /// when a specific category applies. Kept for render-layer test
+    /// ergonomics where the DiagKind isn't under test.
+    #[allow(dead_code)]
     pub fn error(message: impl Into<String>) -> Self {
         Self {
             level: Level::Error,
+            kind: DiagKind::Other,
             message: message.into(),
             span: None,
             help: None,
         }
     }
 
+    pub fn error_kind(kind: DiagKind, message: impl Into<String>) -> Self {
+        Self {
+            level: Level::Error,
+            kind,
+            message: message.into(),
+            span: None,
+            help: None,
+        }
+    }
+
+    /// Warning with `DiagKind::Other`. Prefer [`Diagnostic::warning_kind`]
+    /// so `--ultra-strict` can classify the diagnostic correctly. Kept
+    /// for render-layer test ergonomics.
+    #[allow(dead_code)]
     pub fn warning(message: impl Into<String>) -> Self {
         Self {
             level: Level::Warning,
+            kind: DiagKind::Other,
+            message: message.into(),
+            span: None,
+            help: None,
+        }
+    }
+
+    pub fn warning_kind(kind: DiagKind, message: impl Into<String>) -> Self {
+        Self {
+            level: Level::Warning,
+            kind,
             message: message.into(),
             span: None,
             help: None,
@@ -94,6 +150,7 @@ impl Diagnostic {
     pub fn info(message: impl Into<String>) -> Self {
         Self {
             level: Level::Info,
+            kind: DiagKind::Other,
             message: message.into(),
             span: None,
             help: None,
@@ -109,6 +166,23 @@ impl Diagnostic {
         self.help = Some(help.into());
         self
     }
+}
+
+/// Post-process diagnostics for `--ultra-strict`: promote every
+/// [`DiagKind::UnknownIdent`] warning to an error. Leaves other kinds
+/// untouched. Returns the transformed vector.
+///
+/// Kept separate from the analyzer so the transform is testable in
+/// isolation and so the analyzer itself stays policy-free — every
+/// diagnostic is emitted at the level the type-check logic believes,
+/// and the CLI layer decides whether to promote.
+pub fn promote_unknown_idents(mut diags: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    for d in &mut diags {
+        if d.level == Level::Warning && d.kind == DiagKind::UnknownIdent {
+            d.level = Level::Error;
+        }
+    }
+    diags
 }
 
 /// Definition counts derived from a parsed [`Config`]. Emitted in the
@@ -348,14 +422,17 @@ pub(super) fn analyze_process_stmt(
                             Some(expr.span)
                         };
                         diagnostics.push(
-                            Diagnostic::warning(format!(
-                                "[pipeline {}] assignment to `{}` overwrites an Object with {}; \
-                                 nested references (e.g. `{}.*`) will become dead",
-                                pipeline_name,
-                                full.join("."),
-                                new_ty.display(),
-                                full.join("."),
-                            ))
+                            Diagnostic::warning_kind(
+                                DiagKind::Dataflow,
+                                format!(
+                                    "[pipeline {}] assignment to `{}` overwrites an Object with {}; \
+                                     nested references (e.g. `{}.*`) will become dead",
+                                    pipeline_name,
+                                    full.join("."),
+                                    new_ty.display(),
+                                    full.join("."),
+                                ),
+                            )
                             .with_span(span),
                         );
                     }
@@ -900,6 +977,137 @@ def pipeline p {
             resolved.line_text.contains("workspace.port == \"80\""),
             "unexpected line: {}",
             resolved.line_text
+        );
+    }
+
+    // ----- DiagKind tagging / promotion (Block 11-C) --------------------
+
+    #[test]
+    fn unresolved_workspace_output_ref_tagged_unknown_ident() {
+        let src = r#"
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "${workspace.nope}" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].kind, DiagKind::UnknownIdent);
+    }
+
+    #[test]
+    fn unknown_function_tagged_unknown_ident() {
+        let src = r#"
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p {
+    input i
+    process { workspace.x = upperr(ingress) }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        let w = warnings(&diags)
+            .into_iter()
+            .find(|w| w.message.contains("unknown function"))
+            .expect("expected unknown function warning");
+        assert_eq!(w.kind, DiagKind::UnknownIdent);
+    }
+
+    #[test]
+    fn type_mismatch_tagged_type_mismatch() {
+        let src = r#"
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p {
+    input i
+    process { parse_json(ingress, {count: 0}) }
+    process { workspace.tag = lower(workspace.count) }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        let w = warnings(&diags)
+            .into_iter()
+            .find(|w| w.message.contains("lower"))
+            .expect("expected lower warning");
+        assert_eq!(w.kind, DiagKind::TypeMismatch);
+    }
+
+    #[test]
+    fn object_overwrite_tagged_dataflow() {
+        let src = r#"
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p {
+    input i
+    process {
+        workspace.geo = geoip(source)
+        workspace.geo = "unknown"
+    }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        let w = warnings(&diags)
+            .into_iter()
+            .find(|w| w.message.contains("overwrite"))
+            .expect("expected overwrite warning");
+        assert_eq!(w.kind, DiagKind::Dataflow);
+    }
+
+    #[test]
+    fn promote_unknown_idents_escalates_only_matching_warnings() {
+        // Mixed batch: an unknown function warning (UnknownIdent) and a
+        // type mismatch (TypeMismatch). `promote_unknown_idents` should
+        // escalate the first and leave the second alone.
+        let src = r#"
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p {
+    input i
+    process { parse_json(ingress, {count: 0}) }
+    process {
+        workspace.a = upperr(ingress)
+        workspace.b = lower(workspace.count)
+    }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        // Sanity: at least one UnknownIdent warning and one TypeMismatch
+        // warning before promotion.
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.level == Level::Warning && d.kind == DiagKind::UnknownIdent),
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.level == Level::Warning && d.kind == DiagKind::TypeMismatch),
+        );
+
+        let promoted = promote_unknown_idents(diags);
+        // UnknownIdent warnings all escalated.
+        assert!(
+            !promoted
+                .iter()
+                .any(|d| d.level == Level::Warning && d.kind == DiagKind::UnknownIdent),
+            "UnknownIdent warnings should be promoted"
+        );
+        assert!(
+            promoted
+                .iter()
+                .any(|d| d.level == Level::Error && d.kind == DiagKind::UnknownIdent),
+            "expected a promoted UnknownIdent error"
+        );
+        // TypeMismatch warnings still warnings.
+        assert!(
+            promoted
+                .iter()
+                .any(|d| d.level == Level::Warning && d.kind == DiagKind::TypeMismatch),
+            "TypeMismatch should not be promoted"
         );
     }
 

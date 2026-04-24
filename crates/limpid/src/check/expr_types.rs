@@ -20,7 +20,7 @@ use crate::modules::schema::{FieldType, type_compatible};
 
 use super::bindings::Bindings;
 use super::suggestions;
-use super::{Diagnostic, Level};
+use super::{DiagKind, Diagnostic, Level};
 
 // ---------------------------------------------------------------------------
 // Type inference
@@ -388,10 +388,13 @@ fn check_fn_call(
         if namespace.is_none()
             && let Some(near) = suggestions::near_function_name(name, registry)
         {
-            let mut diag = Diagnostic::warning(format!(
-                "[pipeline {}] call to unknown function `{}`",
-                pipeline_name, name
-            ))
+            let mut diag = Diagnostic::warning_kind(
+                DiagKind::UnknownIdent,
+                format!(
+                    "[pipeline {}] call to unknown function `{}`",
+                    pipeline_name, name
+                ),
+            )
             .with_span(span);
             diag = diag.with_help(format!("did you mean `{}`?", near));
             diagnostics.push(diag);
@@ -474,8 +477,13 @@ fn binop_display(op: BinOp) -> &'static str {
 }
 
 fn warning(pipeline: &str, message: String, span: Option<Span>) -> Diagnostic {
+    // All diagnostics produced by this helper come from
+    // `check_binop` / `check_fn_call` arg-type branches, both of which
+    // are type-mismatch findings. Tag accordingly so `--ultra-strict`
+    // leaves them as warnings (only UnknownIdent gets promoted).
     Diagnostic {
         level: Level::Warning,
+        kind: DiagKind::TypeMismatch,
         message: format!("[pipeline {}] {}", pipeline, message),
         span,
         help: None,

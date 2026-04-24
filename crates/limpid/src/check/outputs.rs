@@ -12,7 +12,7 @@ use crate::dsl::span::Span;
 use crate::functions::FunctionRegistry;
 
 use super::bindings::Bindings;
-use super::{Diagnostic, expr_types, suggestions};
+use super::{DiagKind, Diagnostic, expr_types, suggestions};
 
 pub(super) fn analyze_output(
     output: &OutputDef,
@@ -66,10 +66,13 @@ fn check_workspace_reference(
     }
     if !bindings.workspace_visible(path) {
         let joined = path.join(".");
-        let mut diag = Diagnostic::error(format!(
-            "[pipeline {}] output `{}` references `{}` which is not produced by any upstream module",
-            pipeline_name, output_name, joined,
-        ))
+        let mut diag = Diagnostic::error_kind(
+            DiagKind::UnknownIdent,
+            format!(
+                "[pipeline {}] output `{}` references `{}` which is not produced by any upstream module",
+                pipeline_name, output_name, joined,
+            ),
+        )
         .with_span(span);
         if let Some(near) = suggestions::near_workspace_path(&joined, bindings) {
             diag = diag.with_help(format!("did you mean `{}`?", near));
