@@ -155,6 +155,35 @@ Returns the first capture group (or full match if no groups). Returns `null` if 
 workspace.ip = regex_extract(egress, "(\\d+\\.\\d+\\.\\d+\\.\\d+)")
 ```
 
+### regex_parse(str, pattern)
+
+Runs `pattern` against `str` and returns a `Value::Object` with one key per **named capture** group (`(?P<name>...)` or `(?<name>...)`). Positional groups are ignored. Use this when one regex extracts several fields at once; `regex_extract` remains the right tool for a single scalar.
+
+Capture names containing `.` build a nested object, so `(?P<date.month>...)` populates `{ date: { month: "..." } }` and sibling dotted names merge under the same parent. Used as a bare statement, the returned object merges into `workspace` exactly like `parse_json` / `parse_kv` / `syslog.parse`.
+
+```
+// Bare-statement merge: parse a FortiGate-style header into workspace.
+regex_parse(ingress, "^(?P<date>\\S+) (?P<time>\\S+) (?P<host>\\S+) (?P<prog>\\w+):")
+
+// Dotted names build nested objects.
+regex_parse(ingress, "(?P<date.month>\\w{3}) (?P<date.day>\\d+)")
+// → workspace.date.month, workspace.date.day
+
+// Or capture explicitly.
+workspace.parts = regex_parse(egress, "(?P<head>\\S+)\\s+(?P<tail>.*)")
+```
+
+Returns:
+
+| Outcome | Result |
+|---------|--------|
+| Pattern matches | Object of named captures (positional groups dropped) |
+| Pattern compiles but does not match | `null` |
+| Pattern has zero named captures | Empty object (so a bare statement is a safe no-op) |
+| Pattern is invalid | Error |
+
+> **Implementation note.** `.` is not a legal capture-name character in the Rust regex engines, so the engine sees the name with `.` rewritten to the internal marker `__DOT__`. Capture names that literally contain `__DOT__` will be misinterpreted — avoid that token in your own names.
+
 ### regex_replace(str, pattern, replacement)
 
 Returns the string with all matches replaced. Supports capture group references (`$1`, `$2`).
