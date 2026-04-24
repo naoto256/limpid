@@ -4,7 +4,6 @@
 //! Maintains a persistent connection with automatic reconnection on failure.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
 use tokio::io::AsyncWriteExt;
@@ -15,6 +14,7 @@ use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
+use crate::modules::output::persistent_conn::{PersistentConn, write_with_reconnect};
 use crate::modules::{HasMetrics, Module, ModuleSchema, Output};
 
 pub struct TcpOutput {
@@ -68,36 +68,21 @@ impl HasMetrics for TcpOutput {
 #[async_trait::async_trait]
 impl Output for TcpOutput {
     async fn write(&self, event: &Event) -> Result<()> {
-        let mut guard = self.conn.lock().await;
-
-        // Try to write on existing connection
-        if guard.is_some() {
-            match self.write_to(guard.as_mut().unwrap(), event).await {
-                Ok(()) => {
-                    self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
-                    return Ok(());
-                }
-                Err(_) => {
-                    // Connection broken, drop and reconnect below
-                    *guard = None;
-                }
-            }
-        }
-
-        // (Re)connect and write
-        let stream = TcpStream::connect(&self.address)
-            .await
-            .with_context(|| format!("tcp connect to {}", self.address))?;
-        *guard = Some(stream);
-
-        self.write_to(guard.as_mut().unwrap(), event).await?;
-        self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        write_with_reconnect(self, &self.conn, &self.metrics, event).await
     }
 }
 
-impl TcpOutput {
-    async fn write_to(&self, stream: &mut TcpStream, event: &Event) -> Result<()> {
+#[async_trait::async_trait]
+impl PersistentConn for TcpOutput {
+    type Stream = TcpStream;
+
+    async fn connect(&self) -> Result<TcpStream> {
+        TcpStream::connect(&self.address)
+            .await
+            .with_context(|| format!("tcp connect to {}", self.address))
+    }
+
+    async fn write_frame(&self, stream: &mut TcpStream, event: &Event) -> Result<()> {
         let msg = &event.egress;
 
         match self.framing {

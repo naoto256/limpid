@@ -3,7 +3,6 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
 use tokio::io::AsyncWriteExt;
@@ -14,6 +13,7 @@ use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
+use crate::modules::output::persistent_conn::{PersistentConn, write_with_reconnect};
 use crate::modules::{HasMetrics, Module, ModuleSchema, Output};
 
 pub struct UnixSocketOutput {
@@ -48,35 +48,21 @@ impl HasMetrics for UnixSocketOutput {
 #[async_trait::async_trait]
 impl Output for UnixSocketOutput {
     async fn write(&self, event: &Event) -> Result<()> {
-        let mut guard = self.conn.lock().await;
-
-        // Try existing connection
-        if guard.is_some() {
-            match self.write_to(guard.as_mut().unwrap(), event).await {
-                Ok(()) => {
-                    self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
-                    return Ok(());
-                }
-                Err(_) => {
-                    *guard = None;
-                }
-            }
-        }
-
-        // (Re)connect and write
-        let stream = UnixStream::connect(&self.path)
-            .await
-            .with_context(|| format!("unix_socket connect to {}", self.path.display()))?;
-        *guard = Some(stream);
-
-        self.write_to(guard.as_mut().unwrap(), event).await?;
-        self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        write_with_reconnect(self, &self.conn, &self.metrics, event).await
     }
 }
 
-impl UnixSocketOutput {
-    async fn write_to(&self, stream: &mut UnixStream, event: &Event) -> Result<()> {
+#[async_trait::async_trait]
+impl PersistentConn for UnixSocketOutput {
+    type Stream = UnixStream;
+
+    async fn connect(&self) -> Result<UnixStream> {
+        UnixStream::connect(&self.path)
+            .await
+            .with_context(|| format!("unix_socket connect to {}", self.path.display()))
+    }
+
+    async fn write_frame(&self, stream: &mut UnixStream, event: &Event) -> Result<()> {
         let msg = String::from_utf8_lossy(&event.egress);
         stream.write_all(msg.as_bytes()).await?;
         stream.write_all(b"\n").await?;
