@@ -450,21 +450,11 @@ fn arity_in_range(sig: &FunctionSig, n: usize) -> bool {
     match sig.arity {
         Arity::Fixed => n == sig.args.len(),
         Arity::Optional { required } => n >= required && n <= sig.args.len(),
-        Arity::Variadic => n + 1 >= sig.args.len(), // declared - 1 are required positional, then variadic tail
     }
 }
 
 fn expected_arg_type(sig: &FunctionSig, i: usize) -> &FieldType {
-    match sig.arity {
-        Arity::Fixed | Arity::Optional { .. } => &sig.args[i.min(sig.args.len().saturating_sub(1))],
-        Arity::Variadic => {
-            if i < sig.args.len() - 1 {
-                &sig.args[i]
-            } else {
-                sig.args.last().unwrap()
-            }
-        }
-    }
+    &sig.args[i.min(sig.args.len().saturating_sub(1))]
 }
 
 fn qualified_name(namespace: Option<&str>, name: &str) -> String {
