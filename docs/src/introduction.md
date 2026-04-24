@@ -61,3 +61,5 @@ def pipeline security {
     }
 }
 ```
+
+For a larger walkthrough across two hops (edge hosts shipping to a central relay, then on to a SIEM), see [Multi-host Pipeline Example](./pipelines/multi-host.md).

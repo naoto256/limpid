@@ -34,6 +34,7 @@
   - [Routing](./pipelines/routing.md)
   - [drop and finish](./pipelines/drop-finish.md)
   - [Examples](./pipelines/examples.md)
+  - [Multi-host Pipeline Example](./pipelines/multi-host.md)
 
 # Operations
 
