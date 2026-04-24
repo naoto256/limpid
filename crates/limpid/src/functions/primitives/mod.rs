@@ -29,6 +29,7 @@ pub mod find_by;
 pub mod format;
 pub mod geoip;
 pub mod hashes;
+pub mod len;
 pub mod lower;
 pub mod parse_json;
 pub mod parse_kv;
@@ -58,6 +59,7 @@ pub fn register(reg: &mut FunctionRegistry, table_store: TableStore) {
     table::register(reg, table_store);
     geoip::register(reg);
     hashes::register(reg);
+    len::register(reg);
     format::register(reg);
     strftime::register(reg);
     parse_json::register(reg);
