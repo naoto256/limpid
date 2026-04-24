@@ -89,6 +89,21 @@ limpidctl health --json
 |------|-------------|
 | `--socket <path>` | Control socket path (default: `/var/run/limpid/control.sock`) |
 
+### Control socket limits
+
+The control socket is a local root-equivalent trust boundary (mode `0o660` in
+a root-owned directory), but limpid still enforces these limits as defense
+in depth:
+
+| Limit | Value | Behaviour on breach |
+|-------|-------|---------------------|
+| Concurrent connections | 8 | New connections receive `error: control socket busy (too many concurrent connections)` and are closed immediately. |
+| Inject payload size (per connection) | 16 MiB | Stream is cut off; response includes `"error"` field alongside the partial `"injected"` count. |
+| First-line command length | 4 KiB | Command is rejected with `error: command too long`. |
+
+For larger replay jobs, split the input into multiple `limpidctl inject`
+invocations.
+
 See [Debug Tap](./tap.md) for details.
 
 ## limpid-prometheus

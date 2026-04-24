@@ -22,7 +22,7 @@ use bytes::Bytes;
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::dsl::ast::*;
@@ -36,6 +36,23 @@ const DEFAULT_SOCKET_PATH: &str = "/var/run/limpid/control.sock";
 
 /// Maximum command line length (bytes). Prevents OOM from malicious clients.
 const MAX_COMMAND_LEN: usize = 4096;
+
+/// Maximum concurrent control-socket connections.
+///
+/// The control socket is a local, root-equivalent trust boundary (mode 0o660
+/// in a root-owned directory), but we still cap concurrent connections so
+/// that a misbehaving or compromised peer in the limpid group cannot starve
+/// the accept loop. 8 is ample for normal ops (`limpidctl` + a few taps).
+const MAX_CONTROL_CONNECTIONS: usize = 8;
+
+/// Maximum total bytes a single `inject` stream may consume before the
+/// connection is dropped. Prevents a trusted-but-buggy client from growing
+/// the downstream disk queue or memory channel without bound.
+///
+/// 16 MiB is large enough for reasonable replay batches (tens of thousands
+/// of syslog lines) while bounding worst-case per-connection memory/disk
+/// pressure.
+const MAX_INJECT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Per-input inject target: event channel + metrics handle (for events_injected).
 pub type InputInjectTarget = (mpsc::Sender<Event>, Arc<crate::metrics::InputMetrics>);
@@ -129,6 +146,7 @@ impl ControlServer {
         let output_senders = self.output_senders;
 
         let mut conn_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let conn_sem = Arc::new(Semaphore::new(MAX_CONTROL_CONNECTIONS));
 
         loop {
             conn_handles.retain(|h| !h.is_finished());
@@ -148,7 +166,24 @@ impl ControlServer {
 
                 result = listener.accept() => {
                     match result {
-                        Ok((stream, _addr)) => {
+                        Ok((mut stream, _addr)) => {
+                            // Cap concurrent connections. We try_acquire so the
+                            // accept loop never blocks; peers beyond the cap get
+                            // a short error line and are dropped immediately.
+                            let permit = match Arc::clone(&conn_sem).try_acquire_owned() {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    warn!(
+                                        "control socket: rejecting connection — \
+                                         {} concurrent connections already in flight",
+                                        MAX_CONTROL_CONNECTIONS
+                                    );
+                                    let _ = stream
+                                        .write_all(b"error: control socket busy (too many concurrent connections)\n")
+                                        .await;
+                                    continue;
+                                }
+                            };
                             let tap = Arc::clone(&tap);
                             let metrics_reg = Arc::clone(&metrics);
                             let config = Arc::clone(&config);
@@ -156,6 +191,7 @@ impl ControlServer {
                             let output_senders = Arc::clone(&output_senders);
                             conn_handles.push(tokio::spawn(async move {
                                 handle_connection(stream, tap, metrics_reg, config, input_senders, output_senders, started_at).await;
+                                drop(permit);
                             }));
                         }
                         Err(e) => {
@@ -220,10 +256,16 @@ async fn handle_connection(
                 return;
             }
         };
-        // Lift the per-connection byte cap — inject streams can be large.
-        // Any bytes buffered past the first line remain intact inside
-        // the BufReader and will be consumed by handle_inject.
-        reader.get_mut().set_limit(u64::MAX);
+        // Raise the per-connection byte cap for the inject payload, but keep
+        // a hard upper bound so a trusted-but-buggy client cannot grow the
+        // downstream queue without limit. Any bytes buffered past the first
+        // line remain intact inside the BufReader and count toward the cap.
+        //
+        // We add back the bytes already consumed by the command line so that
+        // the *remaining* budget reflects the payload itself.
+        let consumed = line.len() as u64;
+        let remaining = MAX_INJECT_BYTES.saturating_add(consumed);
+        reader.get_mut().set_limit(remaining);
         handle_inject(
             kind,
             &name,
@@ -454,11 +496,20 @@ async fn handle_inject(
     let default_source: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let mut injected: u64 = 0;
     let mut line = String::new();
+    let mut limit_exceeded = false;
 
     loop {
         line.clear();
         match reader.read_line(&mut line).await {
-            Ok(0) => break,
+            Ok(0) => {
+                // Distinguish true EOF from byte-cap exhaustion. When the
+                // underlying Take hits its limit, read_line also returns
+                // Ok(0) — but the limit will be 0.
+                if reader.get_ref().limit() == 0 {
+                    limit_exceeded = true;
+                }
+                break;
+            }
             Ok(_) => {}
             Err(e) => {
                 debug!("control socket: inject read error: {}", e);
@@ -510,7 +561,22 @@ async fn handle_inject(
         injected += 1;
     }
 
-    let response = json!({ "injected": injected }).to_string();
+    if limit_exceeded {
+        warn!(
+            "inject {} '{}': stream exceeded {} byte cap after {} events — connection dropped",
+            kind, name, MAX_INJECT_BYTES, injected
+        );
+    }
+
+    let response = if limit_exceeded {
+        json!({
+            "injected": injected,
+            "error": format!("inject payload exceeded {} byte cap", MAX_INJECT_BYTES),
+        })
+        .to_string()
+    } else {
+        json!({ "injected": injected }).to_string()
+    };
     let _ = writer.write_all(response.as_bytes()).await;
     let _ = writer.write_all(b"\n").await;
 }
