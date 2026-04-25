@@ -1,8 +1,7 @@
 //! `to_json()` / `to_json(value)` — serialize the whole event (no arg)
 //! or a single value (one arg) to a JSON string.
 //!
-//! Per Bytes design memo §5, this primitive errors on `Value::Bytes`
-//! anywhere in its input. The user-facing JSON form is "what JSON spec
+//! This primitive errors on `Value::Bytes` anywhere in its input. The user-facing JSON form is "what JSON spec
 //! says JSON is" (UTF-8 strings, numbers, etc); raw bytes need an
 //! explicit conversion via `to_string(b)` (UTF-8) or a transport-level
 //! encoding the user names. The internal `event::to_json_string` path

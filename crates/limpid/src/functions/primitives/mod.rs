@@ -83,7 +83,8 @@ pub fn register(reg: &mut FunctionRegistry, table_store: TableStore) {
 /// the [`crate::dsl::eval::value_to_string`] formatter. Exposed here
 /// because several primitive modules need the exact same coercion.
 /// Bytes values are not text, so they bail with an error — text-only
-/// primitives reject them up-front per Bytes design memo.
+/// primitives reject Bytes up-front; callers convert via `to_string()`
+/// when they really mean it.
 pub(crate) fn val_to_str(v: &crate::dsl::value::Value) -> Result<String> {
     use crate::dsl::value::Value;
     if matches!(v, Value::Bytes(_)) {
