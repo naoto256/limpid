@@ -94,7 +94,8 @@ The analyzer does type inference, dataflow analysis, and Levenshtein-based sugge
 - [Process Design Guide](docs/src/processing/design-guide.md) · [Expression Functions](docs/src/processing/functions.md) · [String Templates](docs/src/processing/templates.md) · [User-defined Processes](docs/src/processing/user-defined.md)
 - [Pipelines](docs/src/pipelines/README.md) · [Routing](docs/src/pipelines/routing.md) · [`drop` and `finish`](docs/src/pipelines/drop-finish.md) · [Examples](docs/src/pipelines/examples.md) · [Multi-host Pipeline Example](docs/src/pipelines/multi-host.md)
 - [CLI](docs/src/operations/cli.md) · [Debug Tap](docs/src/operations/tap.md) · [Schema Validation](docs/src/operations/schema-validation.md) · [Metrics](docs/src/operations/metrics.md) · [Packaging](docs/src/operations/packaging.md) · [systemd](docs/src/operations/systemd.md)
-- [Migrating from rsyslog](docs/src/operations/migration.md) · [Upgrading to 0.3](docs/src/operations/upgrade-0.3.md)
+- [OTLP — design rationale](docs/src/otlp.md)
+- [Migrating from rsyslog](docs/src/operations/migration.md) · [Upgrading to 0.3](docs/src/operations/upgrade-0.3.md) · [Upgrading to 0.5](docs/src/operations/upgrade-0.5.md)
 
 ## License
 
