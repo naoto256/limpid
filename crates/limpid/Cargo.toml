@@ -44,6 +44,7 @@ rdkafka = { version = "0.36", features = ["cmake-build"], optional = true }
 opentelemetry-proto = { version = "0.27", features = ["logs", "gen-tonic", "with-serde"] }
 tonic = { version = "0.12", features = ["tls", "tls-roots"] }
 prost = "0.13"
+axum = "0.7"
 
 [features]
 journal = ["dep:systemd"]
