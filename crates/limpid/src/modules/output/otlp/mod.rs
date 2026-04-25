@@ -479,7 +479,13 @@ async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<()> {
                 );
                 tokio::time::sleep(wait).await;
                 if matches!(cfg.backoff, BackoffStrategy::Exponential) {
-                    wait = (wait * 2).min(cfg.max_wait);
+                    // saturating_mul is the safe doubling: `Duration *
+                    // 2` panics on overflow (~584 years), and while
+                    // the practical reach of that limit is "never",
+                    // making the bound explicit is the defensive
+                    // choice — `.min(max_wait)` then clamps back to
+                    // the configured ceiling.
+                    wait = wait.saturating_mul(2).min(cfg.max_wait);
                 }
             }
         }
