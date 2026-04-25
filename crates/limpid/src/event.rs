@@ -8,9 +8,12 @@
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+
+use crate::dsl::value::Value;
+use crate::dsl::value_json::{json_to_value, value_to_json};
 
 #[derive(Debug, Clone)]
 pub struct Event {
@@ -38,29 +41,34 @@ impl Event {
         }
     }
 
-    /// Serialize the event to a JSON Value.
-    pub fn to_json_value(&self) -> Value {
+    /// Serialize the event to a JSON Value via the marker / escape
+    /// boundary rules in `dsl::value_json`. Non-UTF-8 `ingress` /
+    /// `egress` content surfaces as `Value::Bytes` and is encoded with
+    /// the `$bytes_b64` marker; UTF-8-clean content stays a plain JSON
+    /// string. Workspace values flow through the same boundary.
+    pub fn to_json_value(&self) -> JsonValue {
         let mut map = serde_json::Map::new();
         map.insert(
             "received_at".into(),
-            Value::String(self.received_at.to_rfc3339()),
+            JsonValue::String(self.received_at.to_rfc3339()),
         );
-        map.insert("source".into(), Value::String(self.source.to_string()));
-        map.insert(
-            "ingress".into(),
-            Value::String(String::from_utf8_lossy(&self.ingress).into_owned()),
-        );
-        map.insert(
-            "egress".into(),
-            Value::String(String::from_utf8_lossy(&self.egress).into_owned()),
-        );
+        map.insert("source".into(), JsonValue::String(self.source.to_string()));
+        map.insert("ingress".into(), bytes_to_json(&self.ingress));
+        map.insert("egress".into(), bytes_to_json(&self.egress));
         if !self.workspace.is_empty() {
-            map.insert(
-                "workspace".into(),
-                Value::Object(self.workspace.clone().into_iter().collect()),
-            );
+            let ws: crate::dsl::Map = self
+                .workspace
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            // Workspace serialization can fail only on non-finite floats;
+            // surface as an empty placeholder rather than panicking, the
+            // event itself stays diagnosable.
+            let ws_json = value_to_json(&Value::Object(ws))
+                .unwrap_or(JsonValue::Object(serde_json::Map::new()));
+            map.insert("workspace".into(), ws_json);
         }
-        Value::Object(map)
+        JsonValue::Object(map)
     }
 
     /// Serialize the event to a JSON string.
@@ -68,10 +76,13 @@ impl Event {
         serde_json::to_string(&self.to_json_value()).unwrap_or_default()
     }
 
-    /// Deserialize an event from a JSON string.
+    /// Deserialize an event from a JSON string. Inverse of
+    /// [`to_json_string`]. Workspace values pass back through the
+    /// JSON boundary so `$bytes_b64` markers rehydrate as
+    /// `Value::Bytes`.
     pub fn from_json(json_str: &str) -> Option<Self> {
-        let v: Value = serde_json::from_str(json_str).ok()?;
-        let ingress = v.get("ingress")?.as_str()?.to_string();
+        let v: JsonValue = serde_json::from_str(json_str).ok()?;
+        let ingress = json_to_bytes(v.get("ingress")?)?;
         let source_str = v.get("source")?.as_str()?;
         let source: SocketAddr = source_str.parse().ok()?;
         let received_at = v
@@ -79,26 +90,53 @@ impl Event {
             .and_then(|v| v.as_str())
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc))?;
+        let egress = v
+            .get("egress")
+            .and_then(json_to_bytes)
+            .unwrap_or_else(|| ingress.clone());
 
         let mut event = Self {
             received_at,
             source,
-            ingress: Bytes::from(ingress.clone()),
-            egress: Bytes::from(
-                v.get("egress")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&ingress)
-                    .to_string(),
-            ),
+            ingress,
+            egress,
             workspace: HashMap::new(),
         };
 
-        if let Some(workspace) = v.get("workspace").and_then(|v| v.as_object()) {
-            for (k, val) in workspace {
-                event.workspace.insert(k.clone(), val.clone());
+        if let Some(workspace) = v.get("workspace") {
+            if let Ok(Value::Object(map)) = json_to_value(workspace) {
+                for (k, val) in map {
+                    event.workspace.insert(k, val);
+                }
             }
         }
 
         Some(event)
     }
+}
+
+/// Serialize a byte buffer for the event's JSON form. UTF-8-clean
+/// payloads become plain JSON strings (the historical limpid shape);
+/// non-UTF-8 payloads surface as a `$bytes_b64` marker so binary
+/// `ingress` / `egress` round-trips through tap and persistence
+/// without corruption.
+fn bytes_to_json(b: &Bytes) -> JsonValue {
+    match std::str::from_utf8(b) {
+        Ok(s) => JsonValue::String(s.to_string()),
+        Err(_) => {
+            value_to_json(&Value::Bytes(b.clone())).unwrap_or(JsonValue::Null)
+        }
+    }
+}
+
+/// Inverse of [`bytes_to_json`]: accept either a plain JSON string
+/// (UTF-8-clean) or a `$bytes_b64` marker object.
+fn json_to_bytes(v: &JsonValue) -> Option<Bytes> {
+    if let Some(s) = v.as_str() {
+        return Some(Bytes::from(s.to_string()));
+    }
+    if let Ok(Value::Bytes(b)) = json_to_value(v) {
+        return Some(b);
+    }
+    None
 }

@@ -3,7 +3,7 @@
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use serde_json::Value;
+    use crate::dsl::value::Value;
     use std::net::SocketAddr;
 
     use crate::dsl::ast::*;
@@ -18,8 +18,8 @@ mod tests {
         );
         e.workspace
             .insert("src".into(), Value::String("192.168.1.1".into()));
-        e.workspace.insert("count".into(), Value::Number(42.into()));
-        e.workspace.insert("sev".into(), Value::Number(3.into()));
+        e.workspace.insert("count".into(), Value::Int(42));
+        e.workspace.insert("sev".into(), Value::Int(3));
         e
     }
 
@@ -48,7 +48,7 @@ mod tests {
         );
         assert_eq!(
             eval_expr(&e(ExprKind::IntLit(99)), &ev, &f).unwrap(),
-            Value::Number(99.into())
+            Value::Int(99)
         );
         assert_eq!(
             eval_expr(&e(ExprKind::BoolLit(true)), &ev, &f).unwrap(),
@@ -77,7 +77,7 @@ mod tests {
                 &f
             )
             .unwrap(),
-            Value::Number(42.into())
+            Value::Int(42)
         );
     }
 
@@ -302,8 +302,8 @@ mod tests {
         assert!(is_truthy(&Value::Bool(true)));
         assert!(!is_truthy(&Value::String(String::new())));
         assert!(is_truthy(&Value::String("x".into())));
-        assert!(!is_truthy(&Value::Number(0.into())));
-        assert!(is_truthy(&Value::Number(1.into())));
+        assert!(!is_truthy(&Value::Int(0)));
+        assert!(is_truthy(&Value::Int(1)));
     }
 
     #[test]
@@ -384,8 +384,8 @@ mod tests {
             &Value::String("b".into())
         ));
         assert!(values_match(
-            &Value::Number(42.into()),
-            &Value::Number(42.into())
+            &Value::Int(42),
+            &Value::Int(42)
         ));
     }
 
@@ -419,9 +419,9 @@ mod tests {
         assert_eq!(
             eval_expr(&expr, &ev, &f).unwrap(),
             Value::Array(vec![
-                Value::Number(1.into()),
-                Value::Number(2.into()),
-                Value::Number(3.into()),
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(3),
             ])
         );
     }
@@ -439,7 +439,7 @@ mod tests {
         assert_eq!(
             eval_expr(&expr, &ev, &f).unwrap(),
             Value::Array(vec![
-                Value::Number(1.into()),
+                Value::Int(1),
                 Value::String("two".into()),
                 Value::Bool(true),
                 Value::Null,
@@ -459,7 +459,7 @@ mod tests {
             eval_expr(&expr, &ev, &f).unwrap(),
             Value::Array(vec![
                 Value::String("192.168.1.1".into()),
-                Value::Number(42.into()),
+                Value::Int(42),
             ])
         );
     }
@@ -478,8 +478,8 @@ mod tests {
         assert_eq!(
             eval_expr(&grid, &ev, &f).unwrap(),
             Value::Array(vec![
-                Value::Array(vec![Value::Number(1.into()), Value::Number(2.into())]),
-                Value::Array(vec![Value::Number(3.into()), Value::Number(4.into())]),
+                Value::Array(vec![Value::Int(1), Value::Int(2)]),
+                Value::Array(vec![Value::Int(3), Value::Int(4)]),
             ])
         );
     }

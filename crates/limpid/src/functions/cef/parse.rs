@@ -26,7 +26,8 @@
 //! | `<ext>` (e.g. `src`, `dst`)| CEF extension key=value pairs|
 
 use anyhow::{Result, bail};
-use serde_json::{Map, Value};
+use crate::dsl::value::Map;
+use crate::dsl::value::Value;
 
 use crate::functions::primitives::parse_json::{apply_defaults, type_name};
 use crate::functions::primitives::val_to_str;
@@ -63,7 +64,7 @@ pub fn register(reg: &mut FunctionRegistry) {
 fn parse_impl(args: &[Value]) -> Result<Value> {
     // Arity is validated by the registry via the sig installed from
     // `register_parser` (1 to 2 arguments).
-    let text = val_to_str(&args[0]);
+    let text = val_to_str(&args[0])?;
 
     let cef_start = text
         .find("CEF:")
@@ -106,7 +107,7 @@ fn parse_impl(args: &[Value]) -> Result<Value> {
     // analyzer-side schema is `Union(Int, String)` to match.
     let severity_value = parts[6]
         .parse::<i64>()
-        .map(|n| Value::Number(n.into()))
+        .map(Value::Int)
         .unwrap_or_else(|_| Value::String(parts[6].to_string()));
     map.insert("cef_severity".into(), severity_value);
 
@@ -125,7 +126,7 @@ fn parse_impl(args: &[Value]) -> Result<Value> {
     Ok(Value::Object(map))
 }
 
-fn parse_cef_extensions(extensions: &str, map: &mut Map<String, Value>) {
+fn parse_cef_extensions(extensions: &str, map: &mut Map) {
     if extensions.is_empty() {
         return;
     }
@@ -216,7 +217,7 @@ mod tests {
         assert_eq!(m["cef_device_vendor"], Value::String("Fortinet".into()));
         assert_eq!(m["cef_device_product"], Value::String("FortiGate".into()));
         assert_eq!(m["cef_signature_id"], Value::String("1234".into()));
-        assert_eq!(m["cef_severity"], Value::Number(5.into()));
+        assert_eq!(m["cef_severity"], Value::Int(5));
         assert_eq!(m["src"], Value::String("10.0.0.1".into()));
         assert_eq!(m["dst"], Value::String("10.0.0.2".into()));
         assert_eq!(m["act"], Value::String("deny".into()));
