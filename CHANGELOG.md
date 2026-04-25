@@ -10,6 +10,64 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased]
 
+### Added — OpenTelemetry Protocol (OTLP) support
+
+OTLP becomes a first-class transport across both ingest and emit, with
+all three OTLP wire formats supported:
+
+- **Inputs**: [`otlp_http`](docs/src/inputs/otlp-http.md) (`POST /v1/logs`,
+  `application/x-protobuf` and `application/json`) and
+  [`otlp_grpc`](docs/src/inputs/otlp-grpc.md) (`opentelemetry.proto.collector.logs.v1.LogsService.Export`).
+  Each LogRecord becomes one Event with `ingress` set to a singleton
+  ResourceLogs (1 Resource + 1 Scope + 1 LogRecord), preserving full
+  upstream context per Principle 2.
+- **Output**: [`otlp`](docs/src/outputs/otlp.md) with
+  `protocol "http_json" | "http_protobuf" | "grpc"`, `batch_size`,
+  `batch_timeout`, `headers {}`, and TLS via system roots / custom CA.
+- **Primitives** (in the new `otlp.*` namespace):
+  `otlp.encode_resourcelog_protobuf` /
+  `otlp.decode_resourcelog_protobuf` /
+  `otlp.encode_resourcelog_json` /
+  `otlp.decode_resourcelog_json`. HashLit shape mirrors the proto3
+  tree with snake_case keys; JSON form applies the canonical OTLP/JSON
+  conventions (camelCase, u64-as-string, bytes-as-hex).
+
+The hop contract is "egress = singleton ResourceLogs proto bytes":
+the process layer owns semantic conversion (severity mapping,
+OCSF→OTLP shape) via DSL snippets; Rust ships only the mechanical
+wire encode / decode (Principle 3).
+
+Server-side TLS for the inputs and `batch_level=resource|scope`
+merging for the output are queued for v0.5.x.
+
+### Added — `Value::Bytes` variant in the DSL
+
+The DSL runtime value type gains a first-class `Bytes(bytes::Bytes)`
+arm, replacing the `serde_json::Value`-based representation that
+silently corrupted non-UTF-8 byte streams via `from_utf8_lossy` /
+`String::into_bytes()`. User-facing surface is preserved:
+
+- DSL syntax / semantics unchanged.
+- `ingress` / `egress` reads return `Value::String` for UTF-8-clean
+  data (the historical case) and only switch to `Value::Bytes` for
+  non-UTF-8 content (which the previous code was already mangling).
+- Existing primitives keep their return shapes.
+- `tap --json` / persistence still emit JSON; `Value::Bytes` is
+  encoded as `{"$bytes_b64": "..."}` with `$`-prefix key escaping
+  for round-trip safety. The marker is internal; `to_json` /
+  `parse_json` reject it.
+
+Cross-primitive Bytes rules: text-only primitives (`upper`, `lower`,
+`regex_*`, `contains`, `format`, `to_int`, `to_json`, template
+interpolation, property traversal) error on Bytes — the
+"気を利かせない" rule. Hash primitives (`md5`/`sha1`/`sha256`) and
+`len` accept Bytes natively. `Bytes + Bytes` concatenates byte-wise.
+
+New conversion primitives at the text/binary boundary:
+- **`to_bytes(s, encoding="utf8")`** — `utf8` (default) / `hex` / `base64`.
+- **`to_string(b, encoding="utf8", strict=true)`** — `utf8` strict (errors
+  on invalid UTF-8) or lossy, plus `hex` / `base64` printable forms.
+
 ### Breaking — `Event.timestamp` renamed to `Event.received_at`
 
 The `Event` struct field, the reserved DSL identifier, the `format()`
