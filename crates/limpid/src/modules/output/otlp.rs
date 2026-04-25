@@ -4,10 +4,10 @@
 //!
 //! Each Event's `egress` is expected to be the singleton ResourceLogs
 //! protobuf bytes produced by `otlp.encode_resourcelog_protobuf` —
-//! this is the v0.5.0 hop contract for OTLP (see
-//! `_DESIGN_V050_OTLP.md` §4.2). Output buffers the per-Event
-//! ResourceLogs, flushes on `batch_size` or `batch_timeout`, wraps the
-//! batch in an `ExportLogsServiceRequest`, and ships it.
+//! this is the v0.5.0 OTLP hop contract (1 Resource + 1 Scope + 1
+//! LogRecord per Event). Output buffers the per-Event ResourceLogs,
+//! flushes on `batch_size` or `batch_timeout`, wraps the batch in an
+//! `ExportLogsServiceRequest`, and ships it.
 //!
 //! ## Configuration
 //!
@@ -45,8 +45,7 @@
 //! merged message at the receiver, so a `none` batch is semantically
 //! valid OTLP — what changes with `resource` / `scope` levels is wire
 //! efficiency (fewer ResourceLogs / ScopeLogs entries), not the data
-//! itself. The merge logic is queued for v0.5.x; see the design memo
-//! §4.5.
+//! itself. The merge logic is queued for v0.5.x.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -467,7 +466,7 @@ async fn send_grpc(
         .with_context(|| format!("output otlp: gRPC export to {} failed", inner.endpoint))?;
     // The receiver may report a `partial_success` with rejected
     // records. Surface as a warning — retry / drop policy is queued
-    // for v0.5.x (see design memo §8 open issue #1 / #2).
+    // for v0.5.x.
     let inner_resp = response.into_inner();
     if let Some(partial) = inner_resp.partial_success
         && partial.rejected_log_records > 0
