@@ -11,7 +11,7 @@ A log pipeline daemon that replaces rsyslogd, syslog-ng, and fluentd with a sing
 - **Observability-first** — `tap`, `inject`, and `--test-pipeline` let you watch every hop of the pipeline
 - **Five [design principles](docs/src/design-principles.md)** — starting from *zero hidden behaviour*; codified in v0.3.0 and upheld by the analyzer
 - **Hot reload with rollback** — `SIGHUP` swaps configuration atomically; a failed reload keeps the old one running
-- **pre-1.0, shape-stable** — the DSL shape converged in v0.3.0 and has been breaking-change-free since
+- **pre-1.0, shape-stable** — the DSL shape has been converging since v0.3.0; v0.5.0 renames `Event.timestamp` → `Event.received_at` (one-line `sed` migration), no other breaking changes since v0.3.0
 
 ## Quick start
 
@@ -67,7 +67,7 @@ There is no separate "process layer": what v0.2 expressed as built-in processes 
 `file` · `http` · `kafka` · `tcp` · `udp` · `unix_socket` · `stdout` · `otlp`
 
 ### Expression primitives (flat)
-`parse_json` · `parse_kv` · `regex_extract` · `regex_match` · `regex_replace` · `regex_parse` · `strftime` · `format` · `contains` · `lower` · `upper` · `to_json` · `to_int` · `to_bytes` · `to_string` · `md5` · `sha1` · `sha256` · `table_lookup` · `table_upsert` · `table_delete` · `geoip`
+`parse_json` · `parse_kv` · `csv_parse` · `regex_extract` · `regex_match` · `regex_replace` · `regex_parse` · `strftime` · `format` · `contains` · `lower` · `upper` · `len` · `find_by` · `append` · `prepend` · `to_json` · `to_int` · `to_bytes` · `to_string` · `md5` · `sha1` · `sha256` · `table_lookup` · `table_upsert` · `table_delete` · `geoip`
 
 ### Schema-specific functions (dot-namespaced)
 `syslog.parse` · `syslog.strip_pri` · `syslog.set_pri` · `syslog.extract_pri` · `cef.parse` · `otlp.encode_resourcelog_protobuf` · `otlp.decode_resourcelog_protobuf` · `otlp.encode_resourcelog_json` · `otlp.decode_resourcelog_json`

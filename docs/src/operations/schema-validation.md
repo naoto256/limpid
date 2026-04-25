@@ -72,7 +72,7 @@ When a new downstream appears with a schema nobody has seen before, the integrat
 
 ## Recipes
 
-All recipes assume `limpidctl tap output <name> --json` is producing the pipeline's final serialized output — the same Event JSON described in [Debug Tap](./tap.md). Each event is one line, with `timestamp`, `source`, `ingress`, `egress`, and `workspace` top-level keys; structured output fields live under `workspace`.
+All recipes assume `limpidctl tap output <name> --json` is producing the pipeline's final serialized output — the same Event JSON described in [Debug Tap](./tap.md). Each event is one line, with `received_at`, `source`, `ingress`, `egress`, and `workspace` top-level keys; structured output fields live under `workspace`.
 
 ### OCSF (JSON Schema)
 

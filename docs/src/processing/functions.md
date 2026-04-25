@@ -350,7 +350,7 @@ Used as a bare statement, the returned object merges into `workspace` like other
 
 ### strftime(value, format[, timezone])
 
-Formats an RFC 3339 timestamp (such as the event's `timestamp` field) according to a [`chrono` strftime](https://docs.rs/chrono/latest/chrono/format/strftime/) format string.
+Formats an RFC 3339 timestamp (such as the event's `received_at` field) according to a [`chrono` strftime](https://docs.rs/chrono/latest/chrono/format/strftime/) format string.
 
 ```
 strftime(received_at, "%Y-%m-%d")          // 2026-04-19
