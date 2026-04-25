@@ -466,4 +466,261 @@ mod tests {
             ExecResult::Dropped => panic!("unexpected drop"),
         }
     }
+
+    // ------------------------------------------------------------------------
+    // Process-layer behaviour pin tests (added 2026-04-25 during the v0.5.0
+    // OTLP / Bytes refactor). Each test exercises one of the five process
+    // areas flagged for triage: try/catch error binding, drop chain
+    // semantics, Bytes-in-Object merge, let-scope hoisting, ForEach loop
+    // variable lifetime. The goal is not new behaviour but to pin the
+    // current shape so a later refactor cannot quietly drift.
+    // ------------------------------------------------------------------------
+
+    /// Concern 1: inside a `catch { ... }` body the bare `error` ident
+    /// must resolve to a string carrying the error that triggered the
+    /// recovery. The implementation routes this through
+    /// `workspace._error` (set in exec.rs before running the catch
+    /// body) and the resolver in eval.rs maps the bare `error` ident
+    /// onto that slot. This test pins the user-visible binding.
+    #[test]
+    fn catch_body_sees_error_message_via_bare_ident() {
+        let event = make_event();
+        let stmts = vec![ProcessStatement::TryCatch(
+            // try: force a runtime error by referencing an unknown
+            // identifier — eval.rs::resolve_ident bails with
+            // "unknown identifier".
+            vec![ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["x".into()]),
+                e(ExprKind::Ident(vec!["nope_not_a_thing".into()])),
+            )],
+            // catch: copy the bare `error` ident into workspace.captured
+            // so we can assert on the recovered message.
+            vec![ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["captured".into()]),
+                e(ExprKind::Ident(vec!["error".into()])),
+            )],
+        )];
+        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+            ExecResult::Continue(ev) => {
+                let msg = match ev.workspace.get("captured") {
+                    Some(Value::String(s)) => s.clone(),
+                    other => panic!("expected captured to be a string, got {:?}", other),
+                };
+                assert!(
+                    msg.contains("unknown identifier"),
+                    "catch should bind the original error message; got {msg:?}"
+                );
+                // Cleanup invariant: `_error` is removed before the
+                // event continues so a downstream `error` access does
+                // not see a stale message.
+                assert!(
+                    !ev.workspace.contains_key("_error"),
+                    "_error should be cleared after catch body"
+                );
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
+    }
+
+    /// Concern 2 (inline form): `drop` inside an inline body
+    /// short-circuits subsequent statements. The chain-level
+    /// `process A | B | C` form delegates each `Inline(body)` element
+    /// to `exec_process_body`, so this test covers the inline-element
+    /// path; the named-process path is exercised elsewhere via
+    /// `ProcessRegistry::call` returning `Ok(None)`.
+    #[test]
+    fn drop_short_circuits_inline_statements() {
+        let event = make_event();
+        let stmts = vec![
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["before".into()]),
+                e(ExprKind::IntLit(1)),
+            ),
+            ProcessStatement::Drop,
+            // This must NOT execute — if it did, the assertion would
+            // fail because the body returned ExecResult::Dropped (no
+            // Continue event) and we never see workspace.after.
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["after".into()]),
+                e(ExprKind::IntLit(2)),
+            ),
+        ];
+        let result = exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap();
+        assert!(matches!(result, ExecResult::Dropped));
+    }
+
+    /// Concern 3: a bare expression statement that yields a
+    /// `Value::Object` merges the top-level keys into `workspace`.
+    /// After the v0.5.0 Bytes refactor, Object values can carry
+    /// `Value::Bytes`, and the merge must not coerce or reject those
+    /// — workspace stores them verbatim. Subsequent text primitives
+    /// would error if they touched the bytes (per the design memo),
+    /// but storage itself is fine.
+    #[test]
+    fn expr_stmt_merges_bytes_value_into_workspace() {
+        let event = make_event();
+        // Build `{ payload: <bytes>, label: "ok" }` as an inline
+        // HashLit and run it as a bare expression statement.
+        let stmts = vec![ProcessStatement::ExprStmt(e(ExprKind::HashLit(vec![
+            (
+                "payload".into(),
+                // No DSL syntax for bytes literals, so route through
+                // `to_bytes(...)` which returns Value::Bytes.
+                e(ExprKind::FuncCall {
+                    namespace: None,
+                    name: "to_bytes".into(),
+                    args: vec![e(ExprKind::StringLit("hi".into()))],
+                }),
+            ),
+            ("label".into(), e(ExprKind::StringLit("ok".into()))),
+        ])))];
+        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+            ExecResult::Continue(ev) => {
+                match ev.workspace.get("payload") {
+                    Some(Value::Bytes(b)) => assert_eq!(&b[..], b"hi"),
+                    other => panic!("expected workspace.payload to be Bytes, got {:?}", other),
+                }
+                assert_eq!(ev.workspace["label"], Value::String("ok".into()));
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
+    }
+
+    /// Concern 4: a `let` introduced inside an `if` branch is hoisted
+    /// to the surrounding process body — there are no inner scopes.
+    /// Code reading top-to-bottom matches what executes, and this
+    /// matches the behaviour documented on `exec_stmts_with_scope`.
+    #[test]
+    fn let_inside_if_branch_leaks_to_outer_scope() {
+        let event = make_event();
+        let stmts = vec![
+            ProcessStatement::If(IfChain {
+                branches: vec![(
+                    e(ExprKind::BoolLit(true)),
+                    vec![BranchBody::Process(ProcessStatement::LetBinding(
+                        "x".into(),
+                        e(ExprKind::IntLit(7)),
+                    ))],
+                )],
+                else_body: None,
+            }),
+            // After the if, `x` is still in scope. If branches had
+            // their own inner scope this assignment would error.
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["y".into()]),
+                e(ExprKind::Ident(vec!["x".into()])),
+            ),
+        ];
+        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+            ExecResult::Continue(ev) => {
+                assert_eq!(ev.workspace["y"], Value::Int(7));
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
+    }
+
+    /// Concern 5 (normal exit): on natural ForEach termination the
+    /// loop variable `workspace._item` is removed before the event
+    /// continues. A downstream process must not be able to observe the
+    /// last iteration's item via that magic key.
+    #[test]
+    fn foreach_clears_item_after_normal_exit() {
+        let event = make_event();
+        let stmts = vec![ProcessStatement::ForEach(
+            e(ExprKind::ArrayLit(vec![
+                e(ExprKind::IntLit(1)),
+                e(ExprKind::IntLit(2)),
+            ])),
+            // Body: copy the current item into workspace.last so we
+            // know the loop ran. The cleanup assertion below targets
+            // _item, which is the implementation-defined loop key.
+            vec![ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["last".into()]),
+                e(ExprKind::Ident(vec!["workspace".into(), "_item".into()])),
+            )],
+        )];
+        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+            ExecResult::Continue(ev) => {
+                assert_eq!(ev.workspace["last"], Value::Int(2));
+                assert!(
+                    !ev.workspace.contains_key("_item"),
+                    "_item must be cleared after the loop body completes"
+                );
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
+    }
+
+    /// Concern 5 (drop path): when the ForEach body drops mid-iteration
+    /// the loop variable cleanup is not run, but the entire event is
+    /// discarded by the caller, so no observable leak escapes the
+    /// pipeline. This test pins that drop wins over cleanup; if the
+    /// implementation were ever changed to keep iterating after a drop
+    /// the test would break.
+    #[test]
+    fn foreach_drop_short_circuits_iteration() {
+        let event = make_event();
+        let stmts = vec![ProcessStatement::ForEach(
+            e(ExprKind::ArrayLit(vec![
+                e(ExprKind::IntLit(1)),
+                e(ExprKind::IntLit(2)),
+                e(ExprKind::IntLit(3)),
+            ])),
+            // First iteration drops; later iterations must not run.
+            vec![ProcessStatement::Drop],
+        )];
+        let result = exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap();
+        assert!(matches!(result, ExecResult::Dropped));
+    }
+
+    /// Concern 5 (let persistence): a `let` declared inside the
+    /// ForEach body persists across iterations because `exec.rs` runs
+    /// each iteration with the same outer scope (no inner scope per
+    /// iteration). The body sees the previous iteration's binding;
+    /// rebinding via `let x = ...` shadows. This is consistent with
+    /// the no-inner-scopes rule for `if` (concern 4) and is the
+    /// intended behaviour, but worth pinning so a future refactor
+    /// does not silently change it.
+    #[test]
+    fn let_inside_foreach_body_persists_across_iterations() {
+        let event = make_event();
+        let stmts = vec![
+            // Initial sentinel — `acc` exists in scope before the loop.
+            ProcessStatement::LetBinding("acc".into(), e(ExprKind::IntLit(0))),
+            ProcessStatement::ForEach(
+                e(ExprKind::ArrayLit(vec![
+                    e(ExprKind::IntLit(1)),
+                    e(ExprKind::IntLit(2)),
+                    e(ExprKind::IntLit(3)),
+                ])),
+                vec![
+                    // acc = acc + workspace._item — exercises both
+                    // cross-iteration persistence and the bare-ident
+                    // resolution into the let scope.
+                    ProcessStatement::LetBinding(
+                        "acc".into(),
+                        e(ExprKind::BinOp(
+                            Box::new(e(ExprKind::Ident(vec!["acc".into()]))),
+                            BinOp::Add,
+                            Box::new(e(ExprKind::Ident(vec![
+                                "workspace".into(),
+                                "_item".into(),
+                            ]))),
+                        )),
+                    ),
+                ],
+            ),
+            // After the loop, `acc` should be 0 + 1 + 2 + 3 = 6.
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["sum".into()]),
+                e(ExprKind::Ident(vec!["acc".into()])),
+            ),
+        ];
+        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+            ExecResult::Continue(ev) => {
+                assert_eq!(ev.workspace["sum"], Value::Int(6));
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
+    }
 }
