@@ -100,7 +100,7 @@ Free-form prose comments explaining "what this process does" are fine *in additi
 
 A process in isolation looks like code. A process in a pipeline is a node in a graph where the edges are workspace field names. When the graph is implicit, adding a new composer means reading every parser to see what fields happen to be populated; removing a parser means guessing whether anyone downstream depended on it. With explicit `@requires` / `@produces` you can answer both questions by grepping.
 
-This is the same motivation as Principle 5 (schema identity is declared by namespace), applied one level down: *contracts that the config reader must know should be visible in the config, not inferred from runtime behaviour.*
+This is the same motivation as the *schema namespace* operating rule, applied one level down: *contracts that the config reader must know should be visible in the config, not inferred from runtime behaviour.*
 
 ## Anti-patterns
 
