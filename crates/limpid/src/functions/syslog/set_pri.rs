@@ -15,18 +15,25 @@
 use anyhow::{Result, bail};
 use serde_json::Value;
 
-use crate::functions::FunctionRegistry;
 use crate::functions::primitives::val_to_str;
 use crate::functions::syslog::pri::parse_leading_pri;
+use crate::functions::{FunctionRegistry, FunctionSig};
+use crate::modules::schema::FieldType;
 
 pub fn register(reg: &mut FunctionRegistry) {
-    reg.register_in("syslog", "set_pri", |args, _event| set_pri_impl(args));
+    reg.register_in_with_sig(
+        "syslog",
+        "set_pri",
+        FunctionSig::fixed(
+            &[FieldType::String, FieldType::Int, FieldType::Int],
+            FieldType::String,
+        ),
+        |args, _event| set_pri_impl(args),
+    );
 }
 
 fn set_pri_impl(args: &[Value]) -> Result<Value> {
-    if args.len() != 3 {
-        bail!("syslog.set_pri() expects 3 arguments (text, facility, severity)");
-    }
+    // Arity check is centralised in the registry via FunctionSig.
     let text = val_to_str(&args[0]);
     let facility = arg_as_u8(&args[1], "facility", 23)?;
     let severity = arg_as_u8(&args[2], "severity", 7)?;

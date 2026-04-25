@@ -5,23 +5,25 @@
 //! for composing routing rules that depend on facility/severity without
 //! re-parsing the full header.
 
-use anyhow::bail;
 use serde_json::Value;
 
-use crate::functions::FunctionRegistry;
 use crate::functions::primitives::val_to_str;
 use crate::functions::syslog::pri::parse_leading_pri;
+use crate::functions::{FunctionRegistry, FunctionSig};
+use crate::modules::schema::FieldType;
 
 pub fn register(reg: &mut FunctionRegistry) {
-    reg.register_in("syslog", "extract_pri", |args, _event| {
-        if args.len() != 1 {
-            bail!("syslog.extract_pri() expects 1 argument (input string)");
-        }
-        let input = val_to_str(&args[0]);
-        Ok(parse_leading_pri(&input)
-            .map(|(n, _)| Value::Number(n.into()))
-            .unwrap_or(Value::Null))
-    });
+    reg.register_in_with_sig(
+        "syslog",
+        "extract_pri",
+        FunctionSig::fixed(&[FieldType::String], FieldType::Int),
+        |args, _event| {
+            let input = val_to_str(&args[0]);
+            Ok(parse_leading_pri(&input)
+                .map(|(n, _)| Value::Number(n.into()))
+                .unwrap_or(Value::Null))
+        },
+    );
 }
 
 #[cfg(test)]

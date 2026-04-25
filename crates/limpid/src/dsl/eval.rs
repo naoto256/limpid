@@ -134,6 +134,14 @@ pub fn eval_expr_with_scope(
             Ok(Value::Object(map))
         }
 
+        ExprKind::ArrayLit(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(eval_expr_with_scope(item, event, funcs, scope)?);
+            }
+            Ok(Value::Array(out))
+        }
+
         ExprKind::PropertyAccess(base, path) => {
             let mut current = eval_expr_with_scope(base, event, funcs, scope)?;
             for field in path {

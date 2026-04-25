@@ -10,6 +10,37 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased]
 
+### Added — DSL primitives
+
+- **`to_int(x)`** — coerce a value to `i64` (strings, floats, bools, nulls);
+  returns `null` on unparseable input. Primary use: casting CEF extension
+  values and CSV column strings to numeric OCSF fields (ports, session IDs).
+- **`find_by(array, key, value)`** — locate the first object in an array
+  whose `key` field equals `value`. No type coercion; `null` on no match.
+  Designed for identity-based access to schemas that ship arrays-of-objects
+  (MDE evidence, OCSF observables).
+- **`csv_parse(text, field_names)`** — parse a single CSV row into an object
+  keyed by the supplied field names, with RFC 4180 quoting. Replaces the
+  `regex_parse` workaround for vendors (most notably Palo Alto) that emit
+  100+-field positional CSV syslog records.
+- **`len(x)`** — cardinality for `Array` (elements), `String` (Unicode
+  characters), `Object` (top-level keys). Scalars return `null`.
+- **`append(arr, v)` / `prepend(arr, v)`** — return a new array with `v`
+  added at the back / front. Input is unchanged; callers re-bind.
+
+### Added — DSL arrays (positionless collections)
+
+- **Array literals** (`[a, b, c]`, `[]`, mixed types, nesting, trailing
+  commas) are now first-class expressions, evaluating to `Value::Array`
+  at runtime. Grammar, AST (`ExprKind::ArrayLit`), parser, evaluator, and
+  analyzer (`FieldType::Array`) all updated.
+- **No positional access.** `arr[n]` and `arr[n] = v` are intentionally
+  absent from the grammar. Arrays are addressed by identity (`find_by`,
+  `foreach`) and mutated by "back / front" semantics (`append`,
+  `prepend`). Numeric indexing drifts under insert / delete; identity
+  addressing survives. See
+  `docs/src/processing/user-defined.md#arrays` for the rationale.
+
 ## [0.4.0] - 2026-04-24
 
 Testability release. Builds the static analyzer and observability

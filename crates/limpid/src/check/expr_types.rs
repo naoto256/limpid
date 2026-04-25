@@ -37,6 +37,10 @@ pub fn infer(expr: &Expr, bindings: &Bindings, registry: &FunctionRegistry) -> F
         ExprKind::BoolLit(_) => FieldType::Bool,
         ExprKind::Null => FieldType::Null,
         ExprKind::HashLit(_) => FieldType::Object,
+        // Array literal infers to `Array`. Element-type refinement
+        // (`Array<String>` etc.) is deferred to v0.5.x — the element
+        // type surfaced at every read site is `Any` for now.
+        ExprKind::ArrayLit(_) => FieldType::Array,
         ExprKind::Ident(parts) => ident_type(parts, bindings),
         ExprKind::PropertyAccess(base, suffix) => {
             // `geoip(x).country.name` — collapse to a workspace lookup
@@ -252,6 +256,18 @@ pub fn check_types(
                 );
             }
         }
+        ExprKind::ArrayLit(items) => {
+            for item in items {
+                check_types(
+                    item,
+                    pipeline_name,
+                    bindings,
+                    registry,
+                    fallback_span,
+                    diagnostics,
+                );
+            }
+        }
         ExprKind::PropertyAccess(base, _) => {
             check_types(
                 base,
@@ -434,21 +450,11 @@ fn arity_in_range(sig: &FunctionSig, n: usize) -> bool {
     match sig.arity {
         Arity::Fixed => n == sig.args.len(),
         Arity::Optional { required } => n >= required && n <= sig.args.len(),
-        Arity::Variadic => n + 1 >= sig.args.len(), // declared - 1 are required positional, then variadic tail
     }
 }
 
 fn expected_arg_type(sig: &FunctionSig, i: usize) -> &FieldType {
-    match sig.arity {
-        Arity::Fixed | Arity::Optional { .. } => &sig.args[i.min(sig.args.len().saturating_sub(1))],
-        Arity::Variadic => {
-            if i < sig.args.len() - 1 {
-                &sig.args[i]
-            } else {
-                sig.args.last().unwrap()
-            }
-        }
-    }
+    &sig.args[i.min(sig.args.len().saturating_sub(1))]
 }
 
 fn qualified_name(namespace: Option<&str>, name: &str) -> String {
