@@ -2,9 +2,10 @@
 //!
 //! Listens for `POST /v1/logs` requests, accepts either
 //! `application/x-protobuf` (canonical) or `application/json`
-//! payloads, splits the incoming `ExportLogsServiceRequest` into one
-//! Event per LogRecord, and emits each as a singleton ResourceLogs
-//! (1 Resource + 1 Scope + 1 LogRecord — the v0.5.0 OTLP hop contract).
+//! payloads, and delegates request splitting to
+//! [`super::split_request`]. The shared helper is what every OTLP
+//! input transport runs through, so the per-Event shape stays
+//! identical across HTTP and gRPC.
 //!
 //! ## Configuration
 //!
@@ -39,15 +40,12 @@ use axum::{
     response::IntoResponse,
     routing::post,
 };
-use bytes::Bytes;
-use opentelemetry_proto::tonic::{
-    collector::logs::v1::ExportLogsServiceRequest, common::v1::InstrumentationScope,
-    logs::v1::{ResourceLogs, ScopeLogs}, resource::v1::Resource,
-};
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use prost::Message;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use super::split_request;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::event::Event;
@@ -117,7 +115,9 @@ impl Input for OtlpHttpInput {
     }
 }
 
-/// Handler for `POST /v1/logs`.
+/// Handler for `POST /v1/logs`. Decodes the wire body per
+/// `Content-Type`, then hands the parsed request off to
+/// [`split_request`] which is shared with [`super::grpc`].
 async fn handle_logs(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -126,9 +126,9 @@ async fn handle_logs(
 ) -> impl IntoResponse {
     state.metrics.events_received.fetch_add(1, Ordering::Relaxed);
 
-    // Decode the wire form. Default to protobuf when content-type is
-    // missing or unrecognised — that's the canonical OTLP form and
-    // matches what the `opentelemetry-collector` server does.
+    // Default to protobuf when Content-Type is missing or unrecognised
+    // — canonical OTLP form, matches what `opentelemetry-collector`
+    // does when clients omit the header.
     let content_type = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
@@ -146,9 +146,6 @@ async fn handle_logs(
                 return (StatusCode::BAD_REQUEST, "invalid OTLP/JSON payload").into_response();
             }
         },
-        // application/x-protobuf, application/protobuf, or empty:
-        // decode as proto. Empty content-type covers some clients that
-        // omit the header but ship protobuf.
         _ => match ExportLogsServiceRequest::decode(&*body) {
             Ok(r) => r,
             Err(e) => {
@@ -163,58 +160,15 @@ async fn handle_logs(
         },
     };
 
-    // Split into singleton ResourceLogs Events, one per LogRecord.
-    let count = req
-        .resource_logs
-        .iter()
-        .map(|rl| rl.scope_logs.iter().map(|sl| sl.log_records.len()).sum::<usize>())
-        .sum::<usize>();
-    if count == 0 {
-        return (StatusCode::OK, "").into_response();
+    let outcome = split_request(req, peer, &state.metrics, &state.tx, "otlp_http").await;
+    if outcome.aborted {
+        return (StatusCode::SERVICE_UNAVAILABLE, "pipeline closed").into_response();
     }
-
-    for rl in &req.resource_logs {
-        for sl in &rl.scope_logs {
-            for lr in &sl.log_records {
-                let singleton = build_singleton(rl.resource.clone(), sl.scope.clone(), lr.clone(),
-                    rl.schema_url.clone(), sl.schema_url.clone());
-                let mut buf = Vec::with_capacity(singleton.encoded_len());
-                if let Err(e) = singleton.encode(&mut buf) {
-                    warn!("otlp_http [{peer}]: re-encode failed: {e}");
-                    continue;
-                }
-                let bytes = Bytes::from(buf);
-                let event = Event::new(bytes, peer);
-                if state.tx.send(event).await.is_err() {
-                    // Receiver dropped — pipeline shutting down.
-                    return (StatusCode::SERVICE_UNAVAILABLE, "pipeline closed").into_response();
-                }
-            }
-        }
-    }
-
+    // OTLP/HTTP does not return `partial_success` on the wire — the
+    // gRPC variant does, but `application/x-protobuf` over HTTP would
+    // need an `ExportLogsServiceResponse` body which we omit for
+    // simplicity. `events_invalid` already counts the rejects.
     (StatusCode::OK, "").into_response()
-}
-
-/// Build a singleton ResourceLogs message (1 Resource, 1 Scope,
-/// exactly 1 LogRecord). This is the per-Event shape the rest of the
-/// pipeline receives.
-fn build_singleton(
-    resource: Option<Resource>,
-    scope: Option<InstrumentationScope>,
-    log_record: opentelemetry_proto::tonic::logs::v1::LogRecord,
-    resource_schema_url: String,
-    scope_schema_url: String,
-) -> ResourceLogs {
-    ResourceLogs {
-        resource,
-        scope_logs: vec![ScopeLogs {
-            scope,
-            log_records: vec![log_record],
-            schema_url: scope_schema_url,
-        }],
-        schema_url: resource_schema_url,
-    }
 }
 
 #[cfg(test)]
@@ -225,29 +179,5 @@ mod tests {
     fn defaults_bind_address() {
         let i = OtlpHttpInput::from_properties("o", &[]).unwrap();
         assert_eq!(i.bind_addr, "0.0.0.0:4318");
-    }
-
-    #[test]
-    fn build_singleton_yields_one_record_with_resource_and_scope() {
-        let resource = Some(Resource {
-            attributes: vec![],
-            dropped_attributes_count: 0,
-        });
-        let scope = Some(InstrumentationScope {
-            name: "test".into(),
-            version: "0".into(),
-            attributes: vec![],
-            dropped_attributes_count: 0,
-        });
-        let lr = opentelemetry_proto::tonic::logs::v1::LogRecord {
-            time_unix_nano: 42,
-            severity_number: 9,
-            severity_text: "INFO".into(),
-            ..Default::default()
-        };
-        let s = build_singleton(resource, scope, lr, String::new(), String::new());
-        assert_eq!(s.scope_logs.len(), 1);
-        assert_eq!(s.scope_logs[0].log_records.len(), 1);
-        assert_eq!(s.scope_logs[0].log_records[0].time_unix_nano, 42);
     }
 }
