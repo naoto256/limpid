@@ -61,16 +61,16 @@ There is no separate "process layer": what v0.2 expressed as built-in processes 
 ## What's in the box
 
 ### Inputs
-`syslog_udp` · `syslog_tcp` · `syslog_tls` · `tail` · `journal` · `unix_socket`
+`syslog_udp` · `syslog_tcp` · `syslog_tls` · `tail` · `journal` · `unix_socket` · `otlp_http` · `otlp_grpc`
 
 ### Outputs
-`file` · `http` · `kafka` · `tcp` · `udp` · `unix_socket` · `stdout`
+`file` · `http` · `kafka` · `tcp` · `udp` · `unix_socket` · `stdout` · `otlp`
 
 ### Expression primitives (flat)
-`parse_json` · `parse_kv` · `regex_extract` · `regex_match` · `regex_replace` · `regex_parse` · `strftime` · `format` · `contains` · `lower` · `upper` · `to_json` · `md5` · `sha1` · `sha256` · `table_lookup` · `table_upsert` · `table_delete` · `geoip`
+`parse_json` · `parse_kv` · `regex_extract` · `regex_match` · `regex_replace` · `regex_parse` · `strftime` · `format` · `contains` · `lower` · `upper` · `to_json` · `to_int` · `to_bytes` · `to_string` · `md5` · `sha1` · `sha256` · `table_lookup` · `table_upsert` · `table_delete` · `geoip`
 
 ### Schema-specific functions (dot-namespaced)
-`syslog.parse` · `syslog.strip_pri` · `syslog.set_pri` · `syslog.extract_pri` · `cef.parse`
+`syslog.parse` · `syslog.strip_pri` · `syslog.set_pri` · `syslog.extract_pri` · `cef.parse` · `otlp.encode_resourcelog_protobuf` · `otlp.decode_resourcelog_protobuf` · `otlp.encode_resourcelog_json` · `otlp.decode_resourcelog_json`
 
 Full reference: [Expression Functions](docs/src/processing/functions.md) · [String Templates](docs/src/processing/templates.md).
 
