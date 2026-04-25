@@ -53,6 +53,7 @@ kafka = ["dep:rdkafka"]
 
 [dev-dependencies]
 tempfile = "3"
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [package.metadata.deb]
 maintainer = "Naoto Morishima"
