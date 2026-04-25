@@ -21,8 +21,9 @@
 //! partial data. Callers who want a hard failure can compare the result
 //! against `null` explicitly.
 
-use serde_json::Value;
+use anyhow::{Result, bail};
 
+use crate::dsl::value::Value;
 use crate::functions::{FunctionRegistry, FunctionSig};
 use crate::modules::schema::FieldType;
 
@@ -30,79 +31,91 @@ pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(
         "to_int",
         FunctionSig::fixed(&[FieldType::Any], FieldType::Int),
-        |args, _event| Ok(coerce(&args[0])),
+        |args, _event| coerce(&args[0]),
     );
 }
 
-fn coerce(v: &Value) -> Value {
-    match v {
+fn coerce(v: &Value) -> Result<Value> {
+    Ok(match v {
         Value::Null => Value::Null,
-        Value::Bool(b) => Value::Number(serde_json::Number::from(if *b { 1i64 } else { 0 })),
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Value::Number(serde_json::Number::from(i))
-            } else if let Some(f) = n.as_f64() {
-                // truncate toward zero, matching C / Rust `as i64` semantics
-                Value::Number(serde_json::Number::from(f as i64))
-            } else {
-                Value::Null
-            }
+        Value::Bool(b) => Value::Int(if *b { 1 } else { 0 }),
+        Value::Int(n) => Value::Int(*n),
+        Value::Float(f) => {
+            // truncate toward zero, matching C / Rust `as i64` semantics
+            Value::Int(*f as i64)
         }
         Value::String(s) => {
             let t = s.trim();
             match t.parse::<i64>() {
-                Ok(i) => Value::Number(serde_json::Number::from(i)),
+                Ok(i) => Value::Int(i),
                 Err(_) => Value::Null,
             }
         }
+        // Per Bytes design §17: bytes have no standard numeric
+        // interpretation. User must convert explicitly via to_string().
+        Value::Bytes(_) => bail!("to_int() does not accept bytes (use to_string() first)"),
         Value::Array(_) | Value::Object(_) => Value::Null,
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dsl::value::Map;
+    use bytes::Bytes;
 
     fn n(i: i64) -> Value {
-        Value::Number(serde_json::Number::from(i))
+        Value::Int(i)
+    }
+
+    fn coerce_ok(v: &Value) -> Value {
+        coerce(v).expect("coerce should not error in this test")
     }
 
     #[test]
     fn string_numeric() {
-        assert_eq!(coerce(&Value::String("54321".into())), n(54321));
-        assert_eq!(coerce(&Value::String(" 42 ".into())), n(42));
-        assert_eq!(coerce(&Value::String("-7".into())), n(-7));
+        assert_eq!(coerce_ok(&Value::String("54321".into())), n(54321));
+        assert_eq!(coerce_ok(&Value::String(" 42 ".into())), n(42));
+        assert_eq!(coerce_ok(&Value::String("-7".into())), n(-7));
     }
 
     #[test]
     fn int_passthrough() {
-        assert_eq!(coerce(&n(123)), n(123));
+        assert_eq!(coerce_ok(&n(123)), n(123));
     }
 
     #[test]
     fn float_truncates() {
-        let f = Value::Number(serde_json::Number::from_f64(3.7).unwrap());
-        assert_eq!(coerce(&f), n(3));
-        let neg = Value::Number(serde_json::Number::from_f64(-3.7).unwrap());
-        assert_eq!(coerce(&neg), n(-3));
+        let f = Value::Float(3.7);
+        assert_eq!(coerce_ok(&f), n(3));
+        let neg = Value::Float(-3.7);
+        assert_eq!(coerce_ok(&neg), n(-3));
     }
 
     #[test]
     fn bool_maps_to_one_zero() {
-        assert_eq!(coerce(&Value::Bool(true)), n(1));
-        assert_eq!(coerce(&Value::Bool(false)), n(0));
+        assert_eq!(coerce_ok(&Value::Bool(true)), n(1));
+        assert_eq!(coerce_ok(&Value::Bool(false)), n(0));
     }
 
     #[test]
     fn null_passthrough() {
-        assert_eq!(coerce(&Value::Null), Value::Null);
+        assert_eq!(coerce_ok(&Value::Null), Value::Null);
     }
 
     #[test]
     fn unparseable_returns_null() {
-        assert_eq!(coerce(&Value::String("abc".into())), Value::Null);
-        assert_eq!(coerce(&Value::String("".into())), Value::Null);
-        assert_eq!(coerce(&Value::Array(vec![])), Value::Null);
-        assert_eq!(coerce(&Value::Object(serde_json::Map::new())), Value::Null);
+        assert_eq!(coerce_ok(&Value::String("abc".into())), Value::Null);
+        assert_eq!(coerce_ok(&Value::String("".into())), Value::Null);
+        assert_eq!(coerce_ok(&Value::Array(vec![])), Value::Null);
+        assert_eq!(coerce_ok(&Value::Object(Map::new())), Value::Null);
+    }
+
+    #[test]
+    fn bytes_errors() {
+        // Decision §17: bytes carry no numeric interpretation, must be
+        // converted explicitly via `to_string()` first.
+        let err = coerce(&Value::Bytes(Bytes::from_static(b"123"))).unwrap_err();
+        assert!(err.to_string().contains("to_int"));
     }
 }

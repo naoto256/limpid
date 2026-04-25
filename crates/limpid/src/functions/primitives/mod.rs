@@ -74,16 +74,18 @@ pub fn register(reg: &mut FunctionRegistry, table_store: TableStore) {
 // Shared helpers used by multiple primitive implementations.
 // ---------------------------------------------------------------------------
 
-/// Coerce a JSON value to a string the way DSL arithmetic / string
+/// Coerce a value to a string the way DSL arithmetic / string
 /// primitives expect: string-through, null-as-empty, everything else via
-/// Display. Exposed here because several primitive modules need the
-/// exact same coercion.
-pub(crate) fn val_to_str(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Null => String::new(),
-        other => other.to_string(),
+/// the [`crate::dsl::eval::value_to_string`] formatter. Exposed here
+/// because several primitive modules need the exact same coercion.
+/// Bytes values are not text, so they bail with an error — text-only
+/// primitives reject them up-front per Bytes design memo.
+pub(crate) fn val_to_str(v: &crate::dsl::value::Value) -> Result<String> {
+    use crate::dsl::value::Value;
+    if matches!(v, Value::Bytes(_)) {
+        anyhow::bail!("expected text value, got bytes");
     }
+    Ok(crate::dsl::eval::value_to_string(v))
 }
 
 /// Thread-local regex cache used by `regex_match` / `regex_extract` /

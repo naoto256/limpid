@@ -29,7 +29,8 @@
 //! quoting is intentionally omitted for v0.5.0; the `csv` crate can be
 //! re-exposed later if a vendor uses something else.
 
-use serde_json::{Map, Value};
+use crate::dsl::value::Map;
+use crate::dsl::value::Value;
 
 use crate::functions::{FunctionRegistry, FunctionSig};
 use crate::modules::schema::FieldType;
@@ -89,7 +90,7 @@ fn parse(text: &Value, field_names: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use crate::value;
 
     fn names(xs: &[&str]) -> Value {
         Value::Array(xs.iter().map(|s| Value::String((*s).to_string())).collect())
@@ -98,70 +99,70 @@ mod tests {
     #[test]
     fn simple_row() {
         let r = parse(
-            &json!("1,2026/04/25,192.168.1.1,THREAT"),
+            &value!("1,2026/04/25,192.168.1.1,THREAT"),
             &names(&["a", "b", "c", "d"]),
         );
         assert_eq!(
             r,
-            json!({"a": "1", "b": "2026/04/25", "c": "192.168.1.1", "d": "THREAT"})
+            value!({"a": "1", "b": "2026/04/25", "c": "192.168.1.1", "d": "THREAT"})
         );
     }
 
     #[test]
     fn quoted_comma_inside_field() {
         let r = parse(
-            &json!(r#"1,"a,b,c",3"#),
+            &value!(r#"1,"a,b,c",3"#),
             &names(&["x", "y", "z"]),
         );
-        assert_eq!(r, json!({"x": "1", "y": "a,b,c", "z": "3"}));
+        assert_eq!(r, value!({"x": "1", "y": "a,b,c", "z": "3"}));
     }
 
     #[test]
     fn empty_field_becomes_null() {
-        let r = parse(&json!("1,,3"), &names(&["a", "b", "c"]));
-        assert_eq!(r, json!({"a": "1", "b": null, "c": "3"}));
+        let r = parse(&value!("1,,3"), &names(&["a", "b", "c"]));
+        assert_eq!(r, value!({"a": "1", "b": null, "c": "3"}));
     }
 
     #[test]
     fn empty_name_skips_column() {
         // Field 2 has an empty name — pad position, not emitted.
-        let r = parse(&json!("1,2,3"), &names(&["a", "", "c"]));
-        assert_eq!(r, json!({"a": "1", "c": "3"}));
+        let r = parse(&value!("1,2,3"), &names(&["a", "", "c"]));
+        assert_eq!(r, value!({"a": "1", "c": "3"}));
     }
 
     #[test]
     fn extra_columns_dropped() {
-        let r = parse(&json!("1,2,3,4,5"), &names(&["a", "b"]));
-        assert_eq!(r, json!({"a": "1", "b": "2"}));
+        let r = parse(&value!("1,2,3,4,5"), &names(&["a", "b"]));
+        assert_eq!(r, value!({"a": "1", "b": "2"}));
     }
 
     #[test]
     fn missing_columns_become_null() {
-        let r = parse(&json!("1,2"), &names(&["a", "b", "c"]));
-        assert_eq!(r, json!({"a": "1", "b": "2", "c": null}));
+        let r = parse(&value!("1,2"), &names(&["a", "b", "c"]));
+        assert_eq!(r, value!({"a": "1", "b": "2", "c": null}));
     }
 
     #[test]
     fn escaped_quotes() {
         // Standard CSV: doubled double-quote inside a quoted cell.
-        let r = parse(&json!(r#""he said ""hi""","ok""#), &names(&["m", "s"]));
-        assert_eq!(r, json!({"m": "he said \"hi\"", "s": "ok"}));
+        let r = parse(&value!(r#""he said ""hi""","ok""#), &names(&["m", "s"]));
+        assert_eq!(r, value!({"m": "he said \"hi\"", "s": "ok"}));
     }
 
     #[test]
     fn non_string_text_returns_null() {
-        assert_eq!(parse(&json!(42), &names(&["a"])), Value::Null);
+        assert_eq!(parse(&value!(42), &names(&["a"])), Value::Null);
         assert_eq!(parse(&Value::Null, &names(&["a"])), Value::Null);
     }
 
     #[test]
     fn non_array_names_returns_null() {
-        assert_eq!(parse(&json!("a,b"), &json!({"a": 1})), Value::Null);
+        assert_eq!(parse(&value!("a,b"), &value!({"a": 1})), Value::Null);
     }
 
     #[test]
     fn empty_names_returns_empty_object() {
-        assert_eq!(parse(&json!("a,b"), &names(&[])), json!({}));
+        assert_eq!(parse(&value!("a,b"), &names(&[])), value!({}));
     }
 
     #[test]
@@ -169,7 +170,7 @@ mod tests {
         // A realistic PAN THREAT excerpt (first 10 fields).
         let line = r#"1,2026/04/25 10:00:00,001234567890,THREAT,vulnerability,,2026/04/25 10:00:00,192.168.1.100,10.0.0.5,0.0.0.0"#;
         let r = parse(
-            &json!(line),
+            &value!(line),
             &names(&[
                 "future1",
                 "receive_time",
@@ -185,7 +186,7 @@ mod tests {
         );
         assert_eq!(
             r,
-            json!({
+            value!({
                 "future1": "1",
                 "receive_time": "2026/04/25 10:00:00",
                 "serial": "001234567890",

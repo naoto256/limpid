@@ -20,7 +20,8 @@
 //! real use, and a future move to a regex engine that accepts dotted
 //! names removes the need entirely.
 
-use serde_json::{Map, Value};
+use crate::dsl::value::Map;
+use crate::dsl::value::Value;
 
 use super::{get_cached_regex, val_to_str};
 use crate::functions::{FunctionRegistry, FunctionSig, ParserInfo};
@@ -33,8 +34,8 @@ pub fn register(reg: &mut FunctionRegistry) {
         "regex_parse",
         FunctionSig::fixed(&[FieldType::String, FieldType::String], FieldType::Any),
         |args, _event| {
-        let target = val_to_str(&args[0]);
-        let pattern = val_to_str(&args[1]);
+        let target = val_to_str(&args[0])?;
+        let pattern = val_to_str(&args[1])?;
 
         let mangled = mangle_pattern(&pattern);
         let re = get_cached_regex(&mangled).map_err(|e| anyhow::anyhow!("invalid regex: {}", e))?;
@@ -119,7 +120,7 @@ fn demangle(s: &str) -> String {
 /// as needed. If an intermediate slot is currently a non-object, it is
 /// overwritten — this only happens when the caller wrote conflicting
 /// names like `(?P<a>…)(?P<a.b>…)`, which is malformed.
-fn set_nested(map: &mut Map<String, Value>, path: &str, value: Value) {
+fn set_nested(map: &mut Map, path: &str, value: Value) {
     let mut parts: Vec<&str> = path.split('.').collect();
     if parts.is_empty() {
         return;
