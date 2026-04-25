@@ -88,4 +88,4 @@ def pipeline otlp_relay {
 
 ## TLS
 
-Server-side TLS is not implemented in v0.5.0. Front the input with a reverse proxy (envoy, nginx, traefik) for TLS termination, or use the `otlp_grpc` input with a TLS-terminating sidecar. Native TLS support is queued for v0.5.x.
+Server-side TLS is **not** implemented for `otlp_http` as of v0.5.0. Front the input with a reverse proxy (envoy, nginx, traefik) for TLS termination, or use [`otlp_grpc`](./otlp-grpc.md) — its `tls { cert key ca }` block does ship in v0.5.0 and supports both plain TLS and mutual TLS. Native HTTPS support for `otlp_http` is queued for v0.5.x.

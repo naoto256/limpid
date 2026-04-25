@@ -10,6 +10,8 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-26
+
 ### Added — OpenTelemetry Protocol (OTLP) support
 
 OTLP becomes a first-class transport across both ingest and emit, with
@@ -37,8 +39,229 @@ the process layer owns semantic conversion (severity mapping,
 OCSF→OTLP shape) via DSL snippets; Rust ships only the mechanical
 wire encode / decode (Principle 3).
 
-Server-side TLS for the inputs and `batch_level=resource|scope`
-merging for the output are queued for v0.5.x.
+### Added — OTLP throughput controls
+
+Four orthogonal defense / throughput layers on the OTLP/HTTP input,
+each opt-in (default unlimited) so existing configs are unaffected:
+
+- **`body_limit`** *(default `16MB`)* — bytes per request. Larger
+  bodies are rejected with HTTP 413 *Payload Too Large* before any
+  decode work runs. axum's `DefaultBodyLimit` shows up in the layer
+  chain, replacing axum's own 2 MiB default which is too small for
+  collector-to-collector batches.
+- **`max_concurrent_requests`** — in-flight request cap (semaphore).
+  Worst-case decode memory becomes
+  `max_concurrent_requests × body_limit`, turning the open-ended
+  decode-amplification path into a known quantity. Excess requests
+  fail-fast with HTTP 503 *Service Unavailable* (OTLP senders retry,
+  so backpressuring the socket would amplify overload).
+- **`request_rate_limit`** — sustained req/sec (token bucket, reuses
+  the existing `RateLimiter`). Smooths burst above the configured
+  rate; pairs with the concurrency cap because a token bucket allows
+  full burst-equal-to-rate at idle.
+- **`rate_limit`** — sustained events/sec, per-emitted-LogRecord. Same
+  implementation as `syslog_*`, applied after request decode and
+  split, so it caps pipeline-send rate independent of how the events
+  arrived.
+
+`otlp_grpc` gets `rate_limit` on the same axis. Per-RPC throttling
+on the gRPC side relies on tonic's HTTP/2 stream limits and the
+existing `rate_limit` after split — no new property.
+
+### Added — `otlp_grpc` server-side TLS / mTLS
+
+Optional `tls { cert key ca }` block on the input. With `cert` + `key`
+the server presents a certificate; adding `ca` switches into mutual
+TLS mode where every client must present a certificate signed by that
+CA root. Mirrors the same block shape as `syslog_tls` (now parsed via
+a shared `TlsConfig::from_properties_block` helper). PEM files are
+loaded via `spawn_blocking` so a slow disk does not stall the tokio
+reactor at startup.
+
+For the output, gRPC client-side TLS already shipped in the initial
+OTLP push; this release closes the symmetric server-side gap.
+
+### Added — `otlp` output `batch_level` merging
+
+Three settings, all producing OTLP that is semantically identical at
+the receiver — they differ only in wire framing and CPU/wire-size
+trade-off:
+
+- **`none`** *(default)* — one ResourceLogs entry per buffered Event.
+  Cheapest CPU, largest wire. Suitable when `batch_size = 1` or the
+  collector tolerates redundancy.
+- **`resource`** — Events sharing a Resource collapse into a single
+  ResourceLogs entry; their ScopeLogs sit side-by-side under it.
+- **`scope`** — as `resource` plus Events sharing a Scope inside the
+  same Resource collapse into a single ScopeLogs whose
+  `log_records[]` accumulates everything. Smallest wire, slightly
+  higher CPU (Resource and Scope equality scans).
+
+Resource and Scope equality is order-insensitive on attribute lists
+because proto3 makes no canonical-order promise on the wire.
+
+### Added — `otlp` output retry with exponential backoff
+
+`retry { max_attempts initial_wait max_wait backoff }` block on the
+output, parsed via the same `RetryConfig` shared with the file / tcp
+/ http outputs. Internal retry is necessary specifically for the OTLP
+output because it batches Events from multiple `write()` calls into
+one request — without an internal retry, a single transient ship
+failure would lose the entire drained batch (the queue layer's
+per-event retry only re-pushes the most recent Event). Exhausted
+retries bubble the error up so the queue's secondary / drop policy
+still applies. Doubling under exponential backoff is `saturating_mul`
+for explicit overflow safety.
+
+### Added — `Value::Bytes` variant in the DSL
+
+The DSL runtime value type gains a first-class `Bytes(bytes::Bytes)`
+arm, replacing the `serde_json::Value`-based representation that
+silently corrupted non-UTF-8 byte streams via `from_utf8_lossy` /
+`String::into_bytes()`. User-facing surface is preserved:
+
+- DSL syntax / semantics unchanged.
+- `ingress` / `egress` reads return `Value::String` for UTF-8-clean
+  data (the historical case) and only switch to `Value::Bytes` for
+  non-UTF-8 content (which the previous code was already mangling).
+- Existing primitives keep their return shapes.
+- `tap --json` / persistence still emit JSON; `Value::Bytes` is
+  encoded as `{"$bytes_b64": "..."}` with `$`-prefix key escaping
+  for round-trip safety. The marker is internal; `to_json` /
+  `parse_json` reject it.
+
+Cross-primitive Bytes rules: text-only primitives (`upper`, `lower`,
+`regex_*`, `contains`, `format`, `to_int`, `to_json`, template
+interpolation, property traversal) error on Bytes — the
+"気を利かせない" rule. Hash primitives (`md5`/`sha1`/`sha256`) and
+`len` accept Bytes natively. `Bytes + Bytes` concatenates byte-wise.
+
+New conversion primitives at the text/binary boundary:
+- **`to_bytes(s, encoding="utf8")`** — `utf8` (default) / `hex` / `base64`.
+- **`to_string(b, encoding="utf8", strict=true)`** — `utf8` strict (errors
+  on invalid UTF-8) or lossy, plus `hex` / `base64` printable forms.
+
+### Breaking — `Event.timestamp` renamed to `Event.received_at`
+
+The `Event` struct field, the reserved DSL identifier, the `format()`
+template placeholder, and the JSON serialisation key are all renamed
+from `timestamp` to `received_at`. The semantic clarification is that
+this field is **strictly the wall-clock time at which this hop received
+the event** — input modules never overwrite it from payload contents
+(Principle 2: input is dumb transport). Source-claimed event times,
+when extractable from the wire, surface in workspace fields like
+`syslog_timestamp` / `cef_rt` / `pan_generated_time` via parser
+primitives.
+
+The old name was generic enough that some snippets and configs were
+treating it as if it carried the source-claimed event time, which it
+never reliably does.
+
+**Migration** (mechanical sed across configs and any captured `tap --json`
+files):
+
+```sh
+find /etc/limpid -name '*.limpid' -exec sed -i \
+    -e 's/\${timestamp}/\${received_at}/g' \
+    -e 's/%{timestamp}/%{received_at}/g' \
+    -e 's/strftime(timestamp,/strftime(received_at,/g' \
+    {} +
+
+# Captured tap --json files: rewrite the top-level key
+jq -c '.received_at = .timestamp | del(.timestamp)' \
+    old-capture.jsonl > new-capture.jsonl
+```
+
+There is no deprecation alias — `${timestamp}` and `%{timestamp}` are
+hard errors (analyzer / runtime) on v0.5.0+. The 0.5.0 release window
+is the right moment for the cut because pre-1.0 breaking changes are
+still expected.
+
+### Added — `syslog.parse` exposes header timestamp
+
+`syslog.parse` now writes the parsed RFC 5424 / RFC 3164 timestamp from
+the wire header into `workspace.syslog_timestamp` (previously dropped
+silently). Snippets that need the source-claimed event time, e.g. for
+the OCSF `time` field or the OTLP `time_unix_nano`, can read it
+directly. Behaviour is purely additive — existing configs continue to
+work.
+
+### Added — DSL primitives
+
+- **`to_int(x)`** — coerce a value to `i64` (strings, floats, bools, nulls);
+  returns `null` on unparseable input. Primary use: casting CEF extension
+  values and CSV column strings to numeric OCSF fields (ports, session IDs).
+- **`find_by(array, key, value)`** — locate the first object in an array
+  whose `key` field equals `value`. No type coercion; `null` on no match.
+  Designed for identity-based access to schemas that ship arrays-of-objects
+  (MDE evidence, OCSF observables).
+- **`csv_parse(text, field_names)`** — parse a single CSV row into an object
+  keyed by the supplied field names, with RFC 4180 quoting. Replaces the
+  `regex_parse` workaround for vendors (most notably Palo Alto) that emit
+  100+-field positional CSV syslog records.
+- **`len(x)`** — cardinality for `Array` (elements), `String` (Unicode
+  characters), `Object` (top-level keys). Scalars return `null`.
+- **`append(arr, v)` / `prepend(arr, v)`** — return a new array with `v`
+  added at the back / front. Input is unchanged; callers re-bind.
+
+### Added — DSL arrays (positionless collections)
+
+- **Array literals** (`[a, b, c]`, `[]`, mixed types, nesting, trailing
+  commas) are now first-class expressions, evaluating to `Value::Array`
+  at runtime. Grammar, AST (`ExprKind::ArrayLit`), parser, evaluator, and
+  analyzer (`FieldType::Array`) all updated.
+- **No positional access.** `arr[n]` and `arr[n] = v` are intentionally
+  absent from the grammar. Arrays are addressed by identity (`find_by`,
+  `foreach`) and mutated by "back / front" semantics (`append`,
+  `prepend`). Numeric indexing drifts under insert / delete; identity
+  addressing survives. See
+  `docs/src/processing/user-defined.md#arrays` for the rationale.
+
+### Fixed — security hardening from the v0.5.0 audit
+
+- **OTLP output: header values no longer logged on validation failure.**
+  The configured `headers { ... }` block typically holds bearer tokens
+  / API keys. Previously, a malformed value would produce a
+  `tracing::warn!` containing both key and value verbatim — leaking
+  the credential into the log stream on misconfiguration. Now logs
+  the key only, with explicit `value redacted`.
+- **OTLP output: graceful-shutdown buffer warning.** `OtlpOutput`
+  gained the `Drop` impl that `HttpOutput` already had: aborts the
+  pending deferred-flush task and warns operators about events still
+  in the buffer at shutdown. The events are not actually lost (the
+  queue layer re-delivers from spool), but the count is now visible.
+- **OTLP/HTTP: bounded decode-error log line.** `serde_json` /
+  `prost` error wording is capped at 256 characters in the warn log
+  to remove a pathological-payload log-amplification primitive.
+- **OTLP gRPC input: panic-free peer fallback.** The `remote_addr()`
+  fallback for non-TCP transports now constructs the unspecified
+  `SocketAddr` directly instead of parsing a constant — removes a
+  panic seed that any future refactor of the literal could revive.
+- **OTLP output retry: saturating doubling.** `wait * 2` under
+  exponential backoff is `saturating_mul(2)`. The realistic reach of
+  `Duration` overflow is "never" (~584 years) but the explicit bound
+  removes another panic seed.
+
+### Refactored — TLS helper centralization
+
+`crate::tls` now owns the `tls { cert key ca }` block parser
+(`TlsConfig::from_properties_block`) and the rustls `CryptoProvider`
+installer (`install_default_crypto_provider`), both of which were
+duplicated across `syslog_tls`, `otlp_grpc` (input), and `otlp`
+(output) after the OTLP push. Consolidation keeps error wording
+uniform across modules and removes the only direct duplication
+flagged by the v0.5.0 abstraction review.
+
+### Known limitations
+
+- **`otlp_http` server-side TLS** is not implemented; front the input
+  with a TLS-terminating proxy (envoy / nginx / traefik) or use
+  `otlp_grpc` for native TLS. Native HTTPS support is queued for
+  v0.5.x.
+- **Selective re-send of OTLP `partial_success.rejected_log_records`**
+  is logged as a warning only; the dedicated retry-just-the-rejects
+  path is queued for v0.5.x. Transport-level retry shipped in this
+  release covers hard failures (connection refused, 5xx, …).
 
 ### Added — `Value::Bytes` variant in the DSL
 
