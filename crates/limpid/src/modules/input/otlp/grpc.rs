@@ -22,22 +22,23 @@
 //! `partial_success` with `rejected_log_records` populated when
 //! re-encoding fails for some records (rare).
 //!
-//! TLS / mTLS for the server is queued for v0.5.x — currently the
-//! input runs plaintext. For TLS termination today, front it with a
-//! reverse proxy (nginx, envoy, traefik). The HTTP input has the same
-//! shape, so the topology is symmetric.
+//! TLS / mTLS for the server is configured with the same `tls { cert
+//! key ca }` block that other TLS-aware modules use. With no `tls`
+//! block the input listens plaintext, suitable for loopback or behind
+//! a TLS-terminating proxy.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
     logs_service_server::{LogsService, LogsServiceServer},
 };
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
+use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tracing::{info, warn};
 
 use super::split_request;
@@ -48,20 +49,47 @@ use crate::metrics::InputMetrics;
 use crate::modules::input::rate_limit::RateLimiter;
 use crate::modules::{HasMetrics, Input, Module};
 
+/// Server-side TLS material parsed from the optional `tls { … }` block.
+/// `cert` + `key` are required when the block is present; `ca` enables
+/// mutual TLS (client cert verification against the named root CA).
+struct TlsMaterial {
+    cert_path: String,
+    key_path: String,
+    ca_path: Option<String>,
+}
+
 pub struct OtlpGrpcInput {
     bind_addr: String,
     rate_limit: Option<u64>,
+    tls: Option<TlsMaterial>,
     metrics: Arc<InputMetrics>,
 }
 
 impl Module for OtlpGrpcInput {
-    fn from_properties(_name: &str, properties: &[Property]) -> Result<Self> {
+    fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
         let bind = props::get_string(properties, "bind")
             .unwrap_or_else(|| "0.0.0.0:4317".to_string());
         let rate_limit = props::get_strictly_positive_int(properties, "rate_limit")?;
+        let tls = if let Some(block) = props::get_block(properties, "tls") {
+            let cert_path = props::get_string(block, "cert").ok_or_else(|| {
+                anyhow::anyhow!("input '{}': tls block requires 'cert'", name)
+            })?;
+            let key_path = props::get_string(block, "key").ok_or_else(|| {
+                anyhow::anyhow!("input '{}': tls block requires 'key'", name)
+            })?;
+            let ca_path = props::get_string(block, "ca");
+            Some(TlsMaterial {
+                cert_path,
+                key_path,
+                ca_path,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             bind_addr: bind,
             rate_limit,
+            tls,
             metrics: Arc::new(InputMetrics::default()),
         })
     }
@@ -84,8 +112,19 @@ impl Input for OtlpGrpcInput {
         let addr: SocketAddr = self.bind_addr.parse().map_err(|e| {
             anyhow::anyhow!("otlp_grpc: invalid bind address '{}': {e}", self.bind_addr)
         })?;
-        info!("otlp_grpc listening on {}", addr);
+        let tls_config = match &self.tls {
+            Some(t) => {
+                install_default_crypto_provider();
+                Some(load_tls_config(t).await?)
+            }
+            None => None,
+        };
         let rate_limiter = self.rate_limit.map(|r| Arc::new(RateLimiter::new(r)));
+        info!(
+            "otlp_grpc listening on {} ({})",
+            addr,
+            if tls_config.is_some() { "TLS" } else { "plaintext" }
+        );
         if let Some(rate) = self.rate_limit {
             info!("otlp_grpc rate_limit: {} events/sec", rate);
         }
@@ -95,7 +134,13 @@ impl Input for OtlpGrpcInput {
             metrics: Arc::clone(&self.metrics),
             rate_limiter,
         };
-        let server = tonic::transport::Server::builder()
+        let mut builder = tonic::transport::Server::builder();
+        if let Some(tls) = tls_config {
+            builder = builder
+                .tls_config(tls)
+                .context("otlp_grpc: failed to install server TLS config")?;
+        }
+        let server = builder
             .add_service(LogsServiceServer::new(svc))
             .serve_with_shutdown(addr, async move {
                 let _ = shutdown.changed().await;
@@ -107,6 +152,43 @@ impl Input for OtlpGrpcInput {
         info!("otlp_grpc: shutting down");
         Ok(())
     }
+}
+
+/// Read cert / key / CA PEM files and assemble a `ServerTlsConfig`.
+/// File I/O is run on `spawn_blocking` so a slow disk does not stall
+/// the tokio reactor at startup (matches `crate::tls::build_server_config`).
+async fn load_tls_config(material: &TlsMaterial) -> Result<ServerTlsConfig> {
+    let cert_path = material.cert_path.clone();
+    let key_path = material.key_path.clone();
+    let ca_path = material.ca_path.clone();
+    tokio::task::spawn_blocking(move || -> Result<ServerTlsConfig> {
+        let cert_pem = std::fs::read(&cert_path)
+            .with_context(|| format!("tls: cannot read cert {}", cert_path))?;
+        let key_pem = std::fs::read(&key_path)
+            .with_context(|| format!("tls: cannot read key {}", key_path))?;
+        let identity = Identity::from_pem(cert_pem, key_pem);
+        let mut config = ServerTlsConfig::new().identity(identity);
+        if let Some(p) = ca_path {
+            let ca_pem = std::fs::read(&p)
+                .with_context(|| format!("tls: cannot read CA {}", p))?;
+            config = config.client_ca_root(Certificate::from_pem(ca_pem));
+        }
+        Ok(config)
+    })
+    .await
+    .context("otlp_grpc: TLS loader task panicked")?
+}
+
+/// rustls 0.23 requires explicit `CryptoProvider` selection — install once
+/// before the first TLS server is built. Mirrors the helper in
+/// `output::otlp` (which installs for the client side); both call sites
+/// are idempotent because `install_default` is gated by a `Once`.
+fn install_default_crypto_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
 }
 
 struct LogsServiceImpl {
@@ -176,10 +258,11 @@ mod tests {
     use prost::Message;
 
     #[test]
-    fn defaults_bind_address_and_no_rate_limit() {
+    fn defaults_bind_address_no_rate_limit_no_tls() {
         let i = OtlpGrpcInput::from_properties("o", &[]).unwrap();
         assert_eq!(i.bind_addr, "0.0.0.0:4317");
         assert_eq!(i.rate_limit, None);
+        assert!(i.tls.is_none());
     }
 
     #[test]
@@ -191,6 +274,75 @@ mod tests {
         };
         let i = OtlpGrpcInput::from_properties("o", &[prop]).unwrap();
         assert_eq!(i.rate_limit, Some(2500));
+    }
+
+    fn tls_block(cert: &str, key: &str, ca: Option<&str>) -> Property {
+        let mut props = vec![
+            Property::KeyValue {
+                key: "cert".into(),
+                value: crate::dsl::ast::Expr::spanless(crate::dsl::ast::ExprKind::StringLit(
+                    cert.into(),
+                )),
+                value_span: None,
+            },
+            Property::KeyValue {
+                key: "key".into(),
+                value: crate::dsl::ast::Expr::spanless(crate::dsl::ast::ExprKind::StringLit(
+                    key.into(),
+                )),
+                value_span: None,
+            },
+        ];
+        if let Some(c) = ca {
+            props.push(Property::KeyValue {
+                key: "ca".into(),
+                value: crate::dsl::ast::Expr::spanless(crate::dsl::ast::ExprKind::StringLit(
+                    c.into(),
+                )),
+                value_span: None,
+            });
+        }
+        Property::Block {
+            key: "tls".into(),
+            properties: props,
+        }
+    }
+
+    #[test]
+    fn tls_block_records_cert_key() {
+        let props = vec![tls_block("/c.pem", "/k.pem", None)];
+        let i = OtlpGrpcInput::from_properties("o", &props).unwrap();
+        let tls = i.tls.expect("tls present");
+        assert_eq!(tls.cert_path, "/c.pem");
+        assert_eq!(tls.key_path, "/k.pem");
+        assert!(tls.ca_path.is_none());
+    }
+
+    #[test]
+    fn tls_block_records_ca_for_mtls() {
+        let props = vec![tls_block("/c.pem", "/k.pem", Some("/ca.pem"))];
+        let i = OtlpGrpcInput::from_properties("o", &props).unwrap();
+        let tls = i.tls.expect("tls present");
+        assert_eq!(tls.ca_path.as_deref(), Some("/ca.pem"));
+    }
+
+    #[test]
+    fn tls_block_without_cert_is_rejected() {
+        let props = vec![Property::Block {
+            key: "tls".into(),
+            properties: vec![Property::KeyValue {
+                key: "key".into(),
+                value: crate::dsl::ast::Expr::spanless(crate::dsl::ast::ExprKind::StringLit(
+                    "/k.pem".into(),
+                )),
+                value_span: None,
+            }],
+        }];
+        let err = OtlpGrpcInput::from_properties("o", &props).err().unwrap();
+        assert!(
+            err.to_string().contains("tls block requires 'cert'"),
+            "unexpected: {err}"
+        );
     }
 
     #[tokio::test]
