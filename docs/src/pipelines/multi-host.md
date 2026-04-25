@@ -1,6 +1,6 @@
 # Multi-host Pipeline Example
 
-A small case study of a two-tier pipeline built entirely in limpid: two edge hosts (`edge01`, `edge02`, Ubuntu 24.04) ship journald logs to a central `relay`, which rewrites and relays them to the Azure Monitor Agent (AMA) for Log Analytics Workspace (LAW) ingestion.
+A small case study of a two-tier pipeline built entirely in limpid: two edge hosts (`edge01`, `edge02`, Ubuntu 24.04) ship journald logs to a central `relay` host, which rewrites and relays them to the Azure Monitor Agent (AMA) for Log Analytics Workspace (LAW) ingestion.
 
 The example is deliberately small — one service on the edge, one forwarding pipeline in the middle, one SIEM destination. The point is not the size; it is showing **how the design principles work across a hop boundary in practice.**
 
@@ -12,7 +12,7 @@ The example is deliberately small — one service on the edge, one forwarding pi
 |               |          |               |          |               |
 | journal input |          | journal input |          |               |
 |      |        |          |      |        |          |               |
-| wrap_app   |          | wrap_app   |          |               |
+| wrap_app      |          | wrap_app      |          |               |
 |      |        |          |      |        |          |               |
 | tcp output    |          | tcp output    |          |               |
 |  (RFC 5424)   |          |  (RFC 5424)   |          |               |
@@ -24,8 +24,8 @@ The example is deliberately small — one service on the edge, one forwarding pi
                     |
                     v
            +------------------+
-           |  relay   |
-           |  10.0.0.10    |
+           |     relay        |
+           |   10.0.0.10      |
            |                  |
            |  ama_tcp input   |
            |       |          |
@@ -53,7 +53,7 @@ The example is deliberately small — one service on the edge, one forwarding pi
 Three things to notice before looking at any DSL:
 
 1. Only RFC 5424 framed syslog crosses the wire between edge hosts and the relay. That is the hop contract.
-2. The relay never sees journal fields, never sees hostnames as separate metadata, never sees anything the edge hosts did not explicitly put into the bytes. Principle 4: only `egress` crosses hop boundaries.
+2. The relay never sees journal fields, never sees hostnames as separate metadata, never sees anything the edge hosts did not explicitly put into the bytes. Principle 3: only `egress` crosses hop boundaries.
 3. Each hop runs limpid with the same DSL. There are no vendor-specific config dialects in play (no rsyslog `omfwd`, no mdsd XML beside the AMA DCR itself).
 
 ## Edge host: edge01 / edge02
@@ -90,7 +90,7 @@ def output to_relay {
     framing non_transparent
     queue {
         type disk
-        path "/var/lib/limpid/queues/forwarder"
+        path "/var/lib/limpid/queues/relay"
         max_size "500MB"
     }
 }
@@ -104,7 +104,7 @@ def pipeline app_to_relay {
 
 Three design points worth calling out:
 
-- **PRI is deliberately neutral (`<14>` = user.info).** The edge host does not decide where the event ends up; it only guarantees a valid frame. The relay picks the final facility. This split — "upstream produces a shape, downstream picks the routing" — is only clean because Principle 4 says the contract is just bytes.
+- **PRI is deliberately neutral (`<14>` = user.info).** The edge host does not decide where the event ends up; it only guarantees a valid frame. The relay picks the final facility. This split — "upstream produces a shape, downstream picks the routing" — is only clean because Principle 3 says the contract is just bytes.
 - **No parsing on the edge.** The edge host does not run `parse_json` against the payload. If parsing is needed, the relay does it. Anything the edge parses becomes state that dies at the hop boundary anyway, so spending cycles on it would be wasted work and Principle 2 violation surface.
 - **Disk queue on the edge.** Network to the relay can blip; we do not want `wrap_app` blocking the journal cursor. The queue lets the output layer absorb the blip without pushing backpressure into the pipeline.
 
@@ -133,13 +133,13 @@ def output ama {
 
 def process app_drop_debug {
     // @requires: source       (set by syslog_tcp input from peer address)
-    // @requires: ingress      (RFC 5424 frame from a edge host)
-    // @produces: workspace.*  (parsed fields, if the event came from a edge host)
+    // @requires: ingress      (RFC 5424 frame from an edge host)
+    // @produces: workspace.*  (parsed fields, if the event came from an edge host)
     //
     // Only parse events from the known edge-host IPs. We do not parse traffic
     // from other peers — other pipelines in this file handle them.
 
-    if source == "10.0.0.11" or source == "10.0.0.12" {
+    if source == "10.0.0.21" or source == "10.0.0.22" {
         syslog.parse(ingress)
         try {
             parse_json(workspace.syslog_msg)
@@ -190,7 +190,7 @@ It could have been anything — raw journald lines, JSON, CEF, a custom framing.
 2. **PRI carries one bit of routing state cheaply.** `ama_rewrite` needs to set a facility so AMA's DCR routes correctly. Doing that with a PRI byte is a one-line operation; doing it with a JSON envelope would require a parse + rewrite + serialize cycle at every hop.
 3. **The contract is greppable.** If something goes wrong, `tcpdump` on port 514 or `limpidctl tap input ama_tcp` shows the exact bytes the receiver sees. There is no "metadata layer" to miss.
 
-This is Principle 4 (`Only egress crosses hop boundaries`) playing out. The edge host does not send the relay a sidecar map of journal fields, a "real" timestamp, or a source tag. It sends bytes. Everything the relay knows about the event, it reconstructs from those bytes with `syslog.parse`.
+This is Principle 3 (`Only egress crosses hop boundaries`) playing out. The edge host does not send the relay a sidecar map of journal fields, a "real" timestamp, or a source tag. It sends bytes. Everything the relay knows about the event, it reconstructs from those bytes with `syslog.parse`.
 
 ## Verifying the pipeline
 
@@ -210,7 +210,7 @@ sudo limpidctl tap input ama_tcp
 sudo limpidctl tap output ama --json | jq '.egress, .workspace'
 ```
 
-When we first deployed this, `app_drop_debug` was not actually dropping DEBUG events as intended — the `level` field was nested inside the parsed JSON and we had referenced `workspace.level` instead of the correct path. The four-point tap told us, in under a minute, that the event was present at `input ama_tcp`, still present at `output ama`, and that `workspace.level` was undefined. No guessing, no restart, no log-digging. This is Principle 1 (zero hidden behavior) paying rent.
+A common bug shape: `app_drop_debug` was supposed to drop DEBUG events but wasn't — the `level` field was nested inside the parsed JSON and the snippet referenced `workspace.level` instead of the correct path. The four-point tap finds this in under a minute: the event is present at `input ama_tcp`, still present at `output ama`, and `workspace.level` is undefined. No guessing, no restart, no log-digging. This is Principle 5 (safety and operational transparency) paying rent.
 
 ## End-to-end testing without real traffic
 
@@ -223,7 +223,7 @@ echo 'app[12345]: {"level":"INFO","msg":"user login","user":"alice"}' \
 
 # Stream the result at the edge output
 sudo limpidctl tap output to_relay
-# <14>1 2026-04-20T06:15:23.104Z edge01 second - - - app[12345]: {"level":"INFO","msg":"user login","user":"alice"}
+# <14>1 2026-04-20T06:15:23.104Z edge01 app - - - app[12345]: {"level":"INFO","msg":"user login","user":"alice"}
 ```
 
 Replaying captured traffic into a staging relay is the same pattern: `tap --json` on one daemon, `inject --json` on the other. See [Debug Tap](../operations/tap.md#replay-with-tap--inject) for the full workflow, including `--replay-timing` for cadence-sensitive tests.
@@ -241,7 +241,7 @@ Compare the equivalent assembly of tools a team would otherwise stitch together 
 - AMA's DCR-defined XML for the routing.
 - Three completely different configuration dialects, three different debuggers, three different ways to ask "where did the event go?".
 
-Replacing those with one DSL per hop is the concrete thing Principle 3 (`Domain knowledge ships as DSL snippets, not Rust`) buys at deployment time.
+Replacing those with one DSL per hop is what the *Domain knowledge in DSL* operating rule buys at deployment time.
 
 ## AMA-specific notes
 
@@ -254,7 +254,7 @@ The point of calling these out is the same as the point of the whole example: **
 
 ## Related
 
-- [Design Principles](../design-principles.md) — the principles this example exercises, especially Principle 1 (observability) and Principle 4 (hop boundaries).
+- [Design Principles](../design-principles.md) — the principles this example exercises, especially Principle 3 (hop boundaries), Principle 4 (atomic events), and Principle 5 (operational transparency).
 - [Process Design Guide](../processing/design-guide.md) — how `wrap_app`, `app_drop_debug`, and `ama_rewrite` fit the granularity and contract conventions.
 - [Debug Tap](../operations/tap.md) — the `tap` / `inject` workflow used throughout.
 - [Pipeline Examples](./examples.md) — smaller, single-host pipeline examples.

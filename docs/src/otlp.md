@@ -252,7 +252,8 @@ Some bespoke senders do pure concat (smallest CPU). limpid offers
 all three as `batch_level = none | resource | scope` and documents
 that they are semantically identical at the wire. See [§ batch_level
 on the output reference page](./outputs/otlp.md#batch_level) for the
-operational tradeoff.
+operational tradeoff and §5.1 above for the underlying wire ↔ CPU
+trade that motivates the choice.
 
 The reason this is in §4 (ambiguous) rather than §3 (clear) is that
 the spec does not *require* either form, but a strict reading of "a
@@ -268,13 +269,15 @@ Each position is named, defended, and cross-linked to where it shows
 up in the code or config. Readers who want to argue for a different
 position know exactly where to look.
 
-### 5.1 One LogRecord = one Event
+### 5.1 One LogRecord = one Event (Principle 4 in action)
 
 A wire request carrying *N* LogRecords becomes *N* Events on the
 limpid pipeline. The input splits along the LogRecord axis at the
 moment of receive; Resource and Scope context is preserved by
 constructing a *singleton* ResourceLogs (1 Resource + 1 Scope + 1
-LogRecord) per Event and writing it to `ingress`.
+LogRecord) per Event and writing it to `ingress`. This is
+[Principle 4 — atomic events through the pipeline](./design-principles.md#principle-4--atomic-events-through-the-pipeline)
+applied to OTLP.
 
 **Why one-record granularity.** Every other limpid input does the
 same: a syslog UDP packet is one Event, a CEF line is one Event, a
@@ -287,6 +290,26 @@ batching; `tap` would need to display ten records as one line. None
 of that is justified for a logs use case where per-record routing /
 filtering / enrichment is the common operation.
 
+**Why bundling exists at all (the wire ↔ CPU trade).** OTLP envelopes
+are not a fundamental property of the data — they are an
+optimization. Sending 10 records as one `ExportLogsServiceRequest`
+saves per-message header bytes, TLS handshake amortization, gRPC
+stream setup, and TCP roundtrips compared to 10 separate RPCs. That
+saving is real when wire is expensive (cross-WAN, metered links,
+high-fanout collector → SaaS hops). When wire is cheap (loopback,
+trusted LAN), bundling buys very little and you'd just send raw
+atomic units.
+
+This means **input bundling is a CPU-for-wire trade made by the
+upstream**. The right way for limpid to handle it is to undo the
+trade — pay CPU at receive to split back to atomic events — because
+the rest of the pipeline (process snippets, queue, replay, tap)
+operates on atomic events by design. Then, on emit, limpid pays CPU
+again to rebundle if and only if the *downstream* benefits from the
+wire saving. The split-then-rebundle round trip on a relay path is
+not waste; it is the cost of treating events as the pipeline's unit
+of meaning rather than treating wire envelopes as one.
+
 **Why not "envelope mode" as an option.** A relay use case ("forward
 unchanged") could in principle bypass the per-record split and pass
 the envelope through. The argument against: it doesn't pay off.
@@ -294,7 +317,8 @@ With per-record split *plus* a no-op pipeline, the envelope is
 reconstructed by the output's batch + `batch_level=scope` path with
 the same wire result. The cost is the per-record cycle through the
 queue, which for OTLP-relay traffic is a few microseconds per
-record. Not worth a second mode.
+record. The benefit of preserving Principle 4 across every input is
+keeping limpid one tool with one mental model, not two.
 
 ### 5.2 `egress` is the singleton ResourceLogs proto bytes
 
