@@ -34,6 +34,7 @@ def output otlp_out {
 | `headers` | no | — | HTTP headers (HTTP transports) / gRPC metadata (gRPC). Map keys are lower-cased for gRPC per HTTP/2 convention. |
 | `tls.ca` | no | system roots | Custom CA certificate file (PEM). |
 | `verify` | no | `true` | TLS verify (HTTP only — gRPC does not support `verify false`; use `http://` for plaintext). |
+| `retry { max_attempts initial_wait max_wait backoff }` | no | shared default (5 attempts, 1s → 60s exponential) | Per-batch retry policy. The OTLP output retries the **whole** ExportLogsServiceRequest internally so a transient failure does not lose buffered Events. Same `retry { … }` shape every other output uses. |
 
 ## Endpoint conventions
 
@@ -103,7 +104,7 @@ The merging modes are wire-efficiency optimisations; if your batch sizes are mod
 
 ## gRPC notes
 
-- `partial_success` on the response (rejected log records) is logged as a warning. Retry / drop policy is queued for v0.5.x.
+- `partial_success` on the response (rejected log records) is logged as a warning. The internal `retry { … }` block does not branch on `partial_success` — it retries the whole batch on transport failures only. A finer "retry just the rejects" policy is queued for v0.5.x.
 - Headers map to gRPC metadata. Tonic enforces lower-case keys; limpid lower-cases on the way through.
 - Server TLS uses rustls (aws-lc-rs provider). System root certificates are loaded via `tonic`'s `tls-roots`; supply `tls { ca }` to add a custom CA.
 

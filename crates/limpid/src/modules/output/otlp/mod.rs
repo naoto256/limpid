@@ -80,6 +80,7 @@ use crate::dsl::props;
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
 use crate::modules::{HasMetrics, Module, Output};
+use crate::queue::{BackoffStrategy, RetryConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BatchLevel {
@@ -158,6 +159,17 @@ struct Inner {
     headers: Vec<(String, String)>,
     batch_timeout: Duration,
     transport: Transport,
+    /// Per-batch retry policy. The shared `RetryConfig` parser used by
+    /// the file/tcp/http outputs reads `retry { max_attempts initial_wait
+    /// max_wait backoff }` from the output's properties; we re-use it
+    /// so every limpid output speaks the same retry vocabulary.
+    ///
+    /// Internal retry matters for the OTLP output specifically because
+    /// it batches Events from multiple `write()` calls — without an
+    /// internal retry, a single transient ship failure would lose the
+    /// whole drained batch (the queue layer's per-event retry only
+    /// re-pushes the most recent Event).
+    retry_config: RetryConfig,
     /// Buffered per-Event singleton ResourceLogs proto bytes. Each
     /// entry is exactly what `otlp.encode_resourcelog_protobuf`
     /// produced; flush wraps them per `batch_level` into one
@@ -273,6 +285,8 @@ impl Module for OtlpOutput {
             }
         };
 
+        let retry_config = RetryConfig::from_output_properties(properties)?;
+
         Ok(Self {
             inner: Arc::new(Inner {
                 endpoint,
@@ -281,6 +295,7 @@ impl Module for OtlpOutput {
                 headers,
                 batch_timeout,
                 transport,
+                retry_config,
                 batch: Mutex::new(Vec::new()),
             }),
             batch_size,
@@ -425,9 +440,41 @@ async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<()> {
         BatchLevel::Resource => merge_by_resource(decoded),
         BatchLevel::Scope => merge_by_scope(decoded),
     };
-    match &inner.transport {
-        Transport::Http(client) => send_http(inner, client, &req).await,
-        Transport::Grpc(channel) => send_grpc(inner, channel, req).await,
+
+    // Internal retry loop. The OTLP output batches Events from
+    // multiple `write()` calls into one request; if a transient
+    // failure happened *outside* this loop the whole drained batch
+    // would be lost (the queue layer's per-event retry only re-pushes
+    // the most recent Event). Retry inside `send_batch` keeps every
+    // buffered Event in play until either ship succeeds or
+    // `max_attempts` is exhausted.
+    let cfg = &inner.retry_config;
+    let max_attempts = cfg.max_attempts.max(1);
+    let mut attempt = 0u32;
+    let mut wait = cfg.initial_wait;
+    loop {
+        let result = match &inner.transport {
+            Transport::Http(client) => send_http(inner, client, &req).await,
+            Transport::Grpc(channel) => send_grpc(inner, channel, &req).await,
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt + 1 >= max_attempts => return Err(e),
+            Err(e) => {
+                attempt += 1;
+                tracing::warn!(
+                    "otlp output: ship attempt {}/{} failed: {} — retrying in {:?}",
+                    attempt,
+                    max_attempts,
+                    e,
+                    wait,
+                );
+                tokio::time::sleep(wait).await;
+                if matches!(cfg.backoff, BackoffStrategy::Exponential) {
+                    wait = (wait * 2).min(cfg.max_wait);
+                }
+            }
+        }
     }
 }
 
@@ -571,10 +618,10 @@ async fn send_http(
 async fn send_grpc(
     inner: &Inner,
     channel: &Channel,
-    req: ExportLogsServiceRequest,
+    req: &ExportLogsServiceRequest,
 ) -> Result<()> {
     let mut client = LogsServiceClient::new(channel.clone());
-    let mut request = tonic::Request::new(req);
+    let mut request = tonic::Request::new(req.clone());
     let metadata = request.metadata_mut();
     for (k, v) in &inner.headers {
         // Lower-case the metadata key per HTTP/2 / gRPC convention;
@@ -915,6 +962,46 @@ mod tests {
         assert_eq!(output.batch_size, 64);
     }
 
+    #[test]
+    fn retry_config_defaults_match_shared_default() {
+        let output = OtlpOutput::from_properties(
+            "o",
+            &[prop_str("endpoint", "http://x")],
+        )
+        .unwrap();
+        let default = RetryConfig::default();
+        assert_eq!(output.inner.retry_config.max_attempts, default.max_attempts);
+        assert_eq!(
+            output.inner.retry_config.initial_wait,
+            default.initial_wait
+        );
+    }
+
+    #[test]
+    fn retry_block_overrides_defaults() {
+        let props = vec![
+            prop_str("endpoint", "http://x"),
+            Property::Block {
+                key: "retry".into(),
+                properties: vec![
+                    prop_int("max_attempts", 2),
+                    prop_str("initial_wait", "100ms"),
+                    prop_str("max_wait", "500ms"),
+                ],
+            },
+        ];
+        let output = OtlpOutput::from_properties("o", &props).unwrap();
+        assert_eq!(output.inner.retry_config.max_attempts, 2);
+        assert_eq!(
+            output.inner.retry_config.initial_wait,
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            output.inner.retry_config.max_wait,
+            Duration::from_millis(500)
+        );
+    }
+
     // ------------------------------------------------------------------------
     // Wire-level round-trip tests: spin up a real receiver, point a real
     // OtlpOutput at it, write one Event, read what hit the wire. These
@@ -1145,6 +1232,131 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (addr, received, handle)
+    }
+
+    /// Functional retry — spin up a server that returns 503 for the
+    /// first N attempts, then 200. The output's internal retry loop
+    /// must exhaust the failures and ultimately deliver the request.
+    /// This proves the batched-Event preservation property: a single
+    /// transient failure does not silently lose the buffered batch.
+    #[tokio::test]
+    async fn http_output_retries_until_success() {
+        use axum::{
+            Router,
+            extract::State,
+            http::StatusCode,
+            response::IntoResponse,
+            routing::post,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        #[derive(Clone)]
+        struct AppState {
+            attempts: Arc<AtomicUsize>,
+            fail_until: usize,
+        }
+
+        async fn handle(State(state): State<AppState>, _body: axum::body::Bytes) -> impl IntoResponse {
+            let n = state.attempts.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            if n <= state.fail_until {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::OK
+            }
+        }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/v1/logs", post(handle)).with_state(AppState {
+            attempts: Arc::clone(&attempts),
+            fail_until: 2, // first two requests get 503, third succeeds
+        });
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let endpoint = format!("http://{}/v1/logs", addr);
+        let output = OtlpOutput::from_properties(
+            "test",
+            &[
+                prop_str("endpoint", &endpoint),
+                prop_str("protocol", "http_protobuf"),
+                prop_int("batch_size", 1),
+                Property::Block {
+                    key: "retry".into(),
+                    properties: vec![
+                        prop_int("max_attempts", 5),
+                        prop_str("initial_wait", "10ms"),
+                        prop_str("max_wait", "50ms"),
+                    ],
+                },
+            ],
+        )
+        .unwrap();
+
+        // The first ship 503s twice then succeeds; the call should
+        // return Ok overall thanks to the retry loop.
+        output
+            .write(&event_with_egress(singleton_bytes(123)))
+            .await
+            .unwrap();
+        // 2 failures + 1 success = 3 attempts.
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 3);
+        server.abort();
+    }
+
+    /// `max_attempts=N` with N consecutive failures bubbles the error
+    /// up — the queue layer can then route the event to its
+    /// `secondary` output or drop per its own policy.
+    #[tokio::test]
+    async fn http_output_gives_up_after_max_attempts() {
+        use axum::{
+            Router,
+            http::StatusCode,
+            response::IntoResponse,
+            routing::post,
+        };
+
+        async fn always_fail(_body: axum::body::Bytes) -> impl IntoResponse {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/v1/logs", post(always_fail));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let endpoint = format!("http://{}/v1/logs", addr);
+        let output = OtlpOutput::from_properties(
+            "test",
+            &[
+                prop_str("endpoint", &endpoint),
+                prop_str("protocol", "http_protobuf"),
+                prop_int("batch_size", 1),
+                Property::Block {
+                    key: "retry".into(),
+                    properties: vec![
+                        prop_int("max_attempts", 3),
+                        prop_str("initial_wait", "10ms"),
+                        prop_str("max_wait", "20ms"),
+                    ],
+                },
+            ],
+        )
+        .unwrap();
+        let err = output
+            .write(&event_with_egress(singleton_bytes(456)))
+            .await
+            .err()
+            .expect("send must fail after retries exhausted");
+        assert!(
+            err.to_string().contains("503") || err.to_string().contains("HTTP"),
+            "unexpected error after retry exhaustion: {err}"
+        );
+        server.abort();
     }
 
     #[tokio::test]
