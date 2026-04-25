@@ -601,4 +601,304 @@ mod tests {
         let output = OtlpOutput::from_properties("o", &props).unwrap();
         assert_eq!(output.batch_size, 64);
     }
+
+    // ------------------------------------------------------------------------
+    // Wire-level round-trip tests: spin up a real receiver, point a real
+    // OtlpOutput at it, write one Event, read what hit the wire. These
+    // catch content-type / framing / metadata bugs that the per-piece
+    // unit tests skip over because they short-circuit before the socket.
+    // ------------------------------------------------------------------------
+
+    use opentelemetry_proto::tonic::collector::logs::v1::{
+        ExportLogsServiceResponse,
+        logs_service_server::{LogsService, LogsServiceServer},
+    };
+    use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ScopeLogs};
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+    use std::net::SocketAddr;
+
+    /// Build the singleton ResourceLogs proto bytes that
+    /// `otlp.encode_resourcelog_protobuf` would have produced for the
+    /// test event.
+    fn singleton_bytes(time_unix_nano: u64) -> Bytes {
+        let rl = ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![],
+                dropped_attributes_count: 0,
+            }),
+            scope_logs: vec![ScopeLogs {
+                scope: Some(InstrumentationScope {
+                    name: "limpid-test".into(),
+                    version: "0.5.0".into(),
+                    attributes: vec![],
+                    dropped_attributes_count: 0,
+                }),
+                log_records: vec![LogRecord {
+                    time_unix_nano,
+                    severity_number: 9,
+                    severity_text: "INFO".into(),
+                    ..Default::default()
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        };
+        let mut buf = Vec::with_capacity(rl.encoded_len());
+        rl.encode(&mut buf).unwrap();
+        Bytes::from(buf)
+    }
+
+    fn event_with_egress(egress: Bytes) -> Event {
+        let mut e = Event::new(
+            egress.clone(),
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        );
+        e.egress = egress;
+        e
+    }
+
+    /// Wait up to `tries × 20ms` for `predicate` to become true.
+    /// Returns the matched value or panics on timeout. Lets us watch
+    /// the receiver without sleeping a fixed worst-case duration.
+    async fn wait_for<T>(mut probe: impl FnMut() -> Option<T>) -> T {
+        for _ in 0..50 {
+            if let Some(v) = probe() {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("timeout waiting for receiver to record the request");
+    }
+
+    // --- gRPC ----
+
+    struct RecordingLogs {
+        received: Arc<Mutex<Vec<ExportLogsServiceRequest>>>,
+    }
+
+    #[tonic::async_trait]
+    impl LogsService for RecordingLogs {
+        async fn export(
+            &self,
+            request: tonic::Request<ExportLogsServiceRequest>,
+        ) -> std::result::Result<tonic::Response<ExportLogsServiceResponse>, tonic::Status> {
+            self.received.lock().await.push(request.into_inner());
+            Ok(tonic::Response::new(ExportLogsServiceResponse {
+                partial_success: None,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn round_trip_grpc_to_recording_collector() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let svc = RecordingLogs {
+            received: Arc::clone(&received),
+        };
+        let server = tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(LogsServiceServer::new(svc))
+                .serve_with_incoming(incoming)
+                .await;
+        });
+
+        let endpoint = format!("http://{}", addr);
+        let output = OtlpOutput::from_properties(
+            "test",
+            &[
+                prop_str("endpoint", &endpoint),
+                prop_str("protocol", "grpc"),
+                prop_int("batch_size", 1),
+            ],
+        )
+        .unwrap();
+        output
+            .write(&event_with_egress(singleton_bytes(1_700_000_000_000_000_000)))
+            .await
+            .unwrap();
+
+        let probe = || {
+            let g = received.try_lock().ok()?;
+            if g.is_empty() {
+                None
+            } else {
+                Some(g.clone())
+            }
+        };
+        let got = wait_for(probe).await;
+        server.abort();
+
+        assert_eq!(got.len(), 1);
+        let lr = &got[0].resource_logs[0].scope_logs[0].log_records[0];
+        assert_eq!(lr.time_unix_nano, 1_700_000_000_000_000_000);
+        assert_eq!(
+            got[0].resource_logs[0].scope_logs[0]
+                .scope
+                .as_ref()
+                .unwrap()
+                .name,
+            "limpid-test"
+        );
+    }
+
+    // --- HTTP/protobuf ----
+
+    /// Spin up a tiny axum POST handler that decodes the request body
+    /// per content-type and stashes the result. Shared by the
+    /// http_protobuf and http_json round-trip tests because the wire
+    /// is the only thing that differs.
+    async fn run_http_collector(
+        protocol: &'static str,
+    ) -> (SocketAddr, Arc<Mutex<Vec<ExportLogsServiceRequest>>>, tokio::task::JoinHandle<()>)
+    {
+        use axum::{
+            Router,
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::post,
+        };
+
+        #[derive(Clone)]
+        struct AppState {
+            received: Arc<Mutex<Vec<ExportLogsServiceRequest>>>,
+            protocol: &'static str,
+        }
+
+        async fn handle(
+            State(state): State<AppState>,
+            headers: HeaderMap,
+            body: axum::body::Bytes,
+        ) -> impl IntoResponse {
+            let ct = headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let req: ExportLogsServiceRequest = match state.protocol {
+                "http_protobuf" => {
+                    if !ct.starts_with("application/x-protobuf") {
+                        return (
+                            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                            format!("expected protobuf, got {ct:?}"),
+                        )
+                            .into_response();
+                    }
+                    match ExportLogsServiceRequest::decode(&*body) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return (StatusCode::BAD_REQUEST, format!("decode: {e}"))
+                                .into_response();
+                        }
+                    }
+                }
+                "http_json" => {
+                    if !ct.starts_with("application/json") {
+                        return (
+                            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                            format!("expected json, got {ct:?}"),
+                        )
+                            .into_response();
+                    }
+                    match serde_json::from_slice(&body) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return (StatusCode::BAD_REQUEST, format!("json: {e}"))
+                                .into_response();
+                        }
+                    }
+                }
+                _ => unreachable!("test-only enumeration"),
+            };
+            state.received.lock().await.push(req);
+            (StatusCode::OK, "").into_response()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new().route("/v1/logs", post(handle)).with_state(AppState {
+            received: Arc::clone(&received),
+            protocol,
+        });
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, received, handle)
+    }
+
+    #[tokio::test]
+    async fn round_trip_http_protobuf_to_axum_handler() {
+        let (addr, received, server) = run_http_collector("http_protobuf").await;
+        let endpoint = format!("http://{}/v1/logs", addr);
+        let output = OtlpOutput::from_properties(
+            "test",
+            &[
+                prop_str("endpoint", &endpoint),
+                prop_str("protocol", "http_protobuf"),
+                prop_int("batch_size", 1),
+            ],
+        )
+        .unwrap();
+        output
+            .write(&event_with_egress(singleton_bytes(123)))
+            .await
+            .unwrap();
+        let probe = || {
+            let g = received.try_lock().ok()?;
+            if g.is_empty() {
+                None
+            } else {
+                Some(g.clone())
+            }
+        };
+        let got = wait_for(probe).await;
+        server.abort();
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].resource_logs[0].scope_logs[0].log_records[0].time_unix_nano,
+            123
+        );
+    }
+
+    #[tokio::test]
+    async fn round_trip_http_json_to_axum_handler() {
+        let (addr, received, server) = run_http_collector("http_json").await;
+        let endpoint = format!("http://{}/v1/logs", addr);
+        let output = OtlpOutput::from_properties(
+            "test",
+            &[
+                prop_str("endpoint", &endpoint),
+                prop_str("protocol", "http_json"),
+                prop_int("batch_size", 1),
+            ],
+        )
+        .unwrap();
+        output
+            .write(&event_with_egress(singleton_bytes(456)))
+            .await
+            .unwrap();
+        let probe = || {
+            let g = received.try_lock().ok()?;
+            if g.is_empty() {
+                None
+            } else {
+                Some(g.clone())
+            }
+        };
+        let got = wait_for(probe).await;
+        server.abort();
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].resource_logs[0].scope_logs[0].log_records[0].time_unix_nano,
+            456
+        );
+    }
 }
