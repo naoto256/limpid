@@ -14,6 +14,7 @@
 //! def input otlp_in {
 //!     type otlp_grpc
 //!     bind "0.0.0.0:4317"
+//!     rate_limit 10000      // optional, events/sec budget
 //! }
 //! ```
 //!
@@ -44,10 +45,12 @@ use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::event::Event;
 use crate::metrics::InputMetrics;
+use crate::modules::input::rate_limit::RateLimiter;
 use crate::modules::{HasMetrics, Input, Module};
 
 pub struct OtlpGrpcInput {
     bind_addr: String,
+    rate_limit: Option<u64>,
     metrics: Arc<InputMetrics>,
 }
 
@@ -55,8 +58,10 @@ impl Module for OtlpGrpcInput {
     fn from_properties(_name: &str, properties: &[Property]) -> Result<Self> {
         let bind = props::get_string(properties, "bind")
             .unwrap_or_else(|| "0.0.0.0:4317".to_string());
+        let rate_limit = props::get_strictly_positive_int(properties, "rate_limit")?;
         Ok(Self {
             bind_addr: bind,
+            rate_limit,
             metrics: Arc::new(InputMetrics::default()),
         })
     }
@@ -80,10 +85,15 @@ impl Input for OtlpGrpcInput {
             anyhow::anyhow!("otlp_grpc: invalid bind address '{}': {e}", self.bind_addr)
         })?;
         info!("otlp_grpc listening on {}", addr);
+        let rate_limiter = self.rate_limit.map(|r| Arc::new(RateLimiter::new(r)));
+        if let Some(rate) = self.rate_limit {
+            info!("otlp_grpc rate_limit: {} events/sec", rate);
+        }
 
         let svc = LogsServiceImpl {
             tx,
             metrics: Arc::clone(&self.metrics),
+            rate_limiter,
         };
         let server = tonic::transport::Server::builder()
             .add_service(LogsServiceServer::new(svc))
@@ -102,6 +112,7 @@ impl Input for OtlpGrpcInput {
 struct LogsServiceImpl {
     tx: mpsc::Sender<Event>,
     metrics: Arc<InputMetrics>,
+    rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 #[tonic::async_trait]
@@ -122,7 +133,15 @@ impl LogsService for LogsServiceImpl {
         });
         let req = request.into_inner();
 
-        let outcome = split_request(req, peer, &self.metrics, &self.tx, "otlp_grpc").await;
+        let outcome = split_request(
+            req,
+            peer,
+            &self.metrics,
+            &self.tx,
+            "otlp_grpc",
+            self.rate_limiter.as_deref(),
+        )
+        .await;
         if outcome.aborted {
             return Err(Status::unavailable("pipeline closed"));
         }
@@ -157,9 +176,21 @@ mod tests {
     use prost::Message;
 
     #[test]
-    fn defaults_bind_address() {
+    fn defaults_bind_address_and_no_rate_limit() {
         let i = OtlpGrpcInput::from_properties("o", &[]).unwrap();
         assert_eq!(i.bind_addr, "0.0.0.0:4317");
+        assert_eq!(i.rate_limit, None);
+    }
+
+    #[test]
+    fn rate_limit_property_round_trip() {
+        let prop = Property::KeyValue {
+            key: "rate_limit".into(),
+            value: crate::dsl::ast::Expr::spanless(crate::dsl::ast::ExprKind::IntLit(2500)),
+            value_span: None,
+        };
+        let i = OtlpGrpcInput::from_properties("o", &[prop]).unwrap();
+        assert_eq!(i.rate_limit, Some(2500));
     }
 
     #[tokio::test]
@@ -170,6 +201,7 @@ mod tests {
         let svc = LogsServiceImpl {
             tx,
             metrics: Arc::new(InputMetrics::default()),
+            rate_limiter: None,
         };
         let req = Request::new(ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
@@ -210,6 +242,7 @@ mod tests {
         let svc = LogsServiceImpl {
             tx,
             metrics: Arc::new(InputMetrics::default()),
+            rate_limiter: None,
         };
         let req = Request::new(ExportLogsServiceRequest {
             resource_logs: vec![],
@@ -226,6 +259,7 @@ mod tests {
         let svc = LogsServiceImpl {
             tx,
             metrics: Arc::new(InputMetrics::default()),
+            rate_limiter: None,
         };
         let lr = |t: u64| LogRecord {
             time_unix_nano: t,
