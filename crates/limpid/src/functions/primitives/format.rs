@@ -87,7 +87,7 @@ fn resolve_format_var(var: &str, event: &Event) -> Result<String> {
 /// expansion. UTF-8-clean payloads (the historical case) interpolate
 /// verbatim; non-UTF-8 payloads error rather than corrupt — the user
 /// must convert explicitly via `to_string(ingress)` etc. per Bytes
-/// design memo §3.
+/// the Bytes / String boundary rule for text primitives.
 fn bytes_field_to_string(name: &str, buf: &bytes::Bytes) -> Result<String> {
     std::str::from_utf8(buf)
         .map(|s| s.to_string())

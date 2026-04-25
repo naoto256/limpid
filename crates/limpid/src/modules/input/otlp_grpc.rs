@@ -3,11 +3,12 @@
 //! Hosts the `opentelemetry.proto.collector.logs.v1.LogsService`
 //! gRPC service. Each `Export` RPC arrives as an
 //! `ExportLogsServiceRequest`; the handler splits it into one Event
-//! per LogRecord and emits each as a singleton ResourceLogs (the
-//! v0.5.0 hop contract — `_DESIGN_V050_OTLP.md` §4.1, §5.2). The
-//! reply is an empty `ExportLogsServiceResponse` (no
-//! `partial_success`); v0.5.0 either accepts the whole batch or
-//! returns a gRPC error status.
+//! per LogRecord and emits each as a singleton ResourceLogs
+//! (1 Resource + 1 Scope + 1 LogRecord — the v0.5.0 OTLP hop contract,
+//! identical to `otlp_http`). The reply is an empty
+//! `ExportLogsServiceResponse` on success, or a `partial_success` with
+//! `rejected_log_records` populated when re-encoding fails for some
+//! records (rare).
 //!
 //! ## Configuration
 //!

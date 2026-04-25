@@ -4,7 +4,7 @@
 //! `application/x-protobuf` (canonical) or `application/json`
 //! payloads, splits the incoming `ExportLogsServiceRequest` into one
 //! Event per LogRecord, and emits each as a singleton ResourceLogs
-//! (the v0.5.0 hop contract — see `_DESIGN_V050_OTLP.md` §4.1, §5.2).
+//! (1 Resource + 1 Scope + 1 LogRecord — the v0.5.0 OTLP hop contract).
 //!
 //! ## Configuration
 //!

@@ -554,8 +554,8 @@ mod tests {
     /// After the v0.5.0 Bytes refactor, Object values can carry
     /// `Value::Bytes`, and the merge must not coerce or reject those
     /// — workspace stores them verbatim. Subsequent text primitives
-    /// would error if they touched the bytes (per the design memo),
-    /// but storage itself is fine.
+    /// would error if they touched the bytes, but storage itself is
+    /// fine.
     #[test]
     fn expr_stmt_merges_bytes_value_into_workspace() {
         let event = make_event();

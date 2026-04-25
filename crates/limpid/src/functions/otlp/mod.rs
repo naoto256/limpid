@@ -4,9 +4,11 @@
 //! mechanical wire-format encode/decode lives here; semantic conversions
 //! (severity mapping, OCSF→OTLP shape) live in DSL snippets.
 //!
-//! Four primitives, all on a singleton `ResourceLogs` (one Event = one
-//! LogRecord wrapped in one ScopeLogs wrapped in one ResourceLogs — see
-//! `_DESIGN_V050_OTLP.md` §4.2):
+//! Four primitives, all on a singleton `ResourceLogs` — one Event
+//! corresponds to one LogRecord, wrapped in one ScopeLogs, wrapped in
+//! one ResourceLogs. This shape is the v0.5.0 OTLP hop contract: the
+//! input modules emit it, the output module consumes it, and snippets
+//! produce it via the encode primitive below:
 //!
 //! - `otlp.encode_resourcelog_protobuf(hashlit) -> bytes`
 //! - `otlp.decode_resourcelog_protobuf(bytes)   -> hashlit`
