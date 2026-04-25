@@ -71,6 +71,24 @@ use crate::modules::{HasMetrics, Input, Module};
 /// by most production OTLP receivers.
 const DEFAULT_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
+/// Cap for the decode-error string we put in the `warn!` log. prost
+/// and serde_json error wording is bounded in practice, but a
+/// pathological payload (e.g. JSON whose `serde_json::Error` Display
+/// quotes a long unexpected literal) could otherwise let an attacker
+/// inflate log volume per failed RPC. 256 chars is generous enough
+/// for the diagnostic to remain useful without giving the attacker a
+/// log-amplification primitive.
+const DECODE_ERR_LOG_CAP: usize = 256;
+
+fn truncate_decode_err(s: &str) -> String {
+    if s.chars().count() <= DECODE_ERR_LOG_CAP {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(DECODE_ERR_LOG_CAP).collect();
+        format!("{head}… (truncated)")
+    }
+}
+
 pub struct OtlpHttpInput {
     bind_addr: String,
     body_limit: usize,
@@ -254,7 +272,10 @@ async fn handle_logs(
         "application/json" => match serde_json::from_slice::<ExportLogsServiceRequest>(&body) {
             Ok(r) => r,
             Err(e) => {
-                warn!("otlp_http [{peer}]: JSON decode failed: {e}");
+                warn!(
+                    "otlp_http [{peer}]: JSON decode failed: {}",
+                    truncate_decode_err(&e.to_string())
+                );
                 state
                     .metrics
                     .events_invalid
@@ -265,7 +286,10 @@ async fn handle_logs(
         _ => match ExportLogsServiceRequest::decode(&*body) {
             Ok(r) => r,
             Err(e) => {
-                warn!("otlp_http [{peer}]: protobuf decode failed: {e}");
+                warn!(
+                    "otlp_http [{peer}]: protobuf decode failed: {}",
+                    truncate_decode_err(&e.to_string())
+                );
                 state
                     .metrics
                     .events_invalid
