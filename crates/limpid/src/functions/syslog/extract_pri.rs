@@ -5,7 +5,7 @@
 //! for composing routing rules that depend on facility/severity without
 //! re-parsing the full header.
 
-use serde_json::Value;
+use crate::dsl::value::Value;
 
 use crate::functions::primitives::val_to_str;
 use crate::functions::syslog::pri::parse_leading_pri;
@@ -18,9 +18,9 @@ pub fn register(reg: &mut FunctionRegistry) {
         "extract_pri",
         FunctionSig::fixed(&[FieldType::String], FieldType::Int),
         |args, _event| {
-            let input = val_to_str(&args[0]);
+            let input = val_to_str(&args[0])?;
             Ok(parse_leading_pri(&input)
-                .map(|(n, _)| Value::Number(n.into()))
+                .map(|(n, _)| Value::Int(n as i64))
                 .unwrap_or(Value::Null))
         },
     );
@@ -58,7 +58,7 @@ mod tests {
                 &e,
             )
             .unwrap();
-        assert_eq!(r, Value::Number(134.into()));
+        assert_eq!(r, Value::Int(134));
     }
 
     #[test]
@@ -73,7 +73,7 @@ mod tests {
                 &e,
             )
             .unwrap();
-        assert_eq!(r, Value::Number(7.into()));
+        assert_eq!(r, Value::Int(7));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Result, bail};
-use serde_json::Value;
+use crate::dsl::value::Value;
 use tracing::trace;
 
 use crate::dsl::ast::*;

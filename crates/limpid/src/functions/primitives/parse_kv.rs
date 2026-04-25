@@ -9,7 +9,8 @@
 //! KV is a *format*, not a schema — flat primitive namespace.
 
 use anyhow::{Result, bail};
-use serde_json::{Map, Value};
+use crate::dsl::value::Map;
+use crate::dsl::value::Value;
 
 use super::parse_json::{apply_defaults, type_name};
 use super::val_to_str;
@@ -28,7 +29,7 @@ pub fn register(reg: &mut FunctionRegistry) {
 fn parse_kv_impl(args: &[Value]) -> Result<Value> {
     // Arity is validated centrally by the registry (register_parser installs
     // the `(String, Object?) -> Object` signature). No manual check here.
-    let text = val_to_str(&args[0]);
+    let text = val_to_str(&args[0])?;
     let mut map = Map::new();
     for (k, v) in parse_kv_pairs(&text) {
         map.insert(k, Value::String(v));

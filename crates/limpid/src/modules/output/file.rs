@@ -310,7 +310,7 @@ mod tests {
     use super::*;
     use crate::functions::table::TableStore;
     use bytes::Bytes;
-    use serde_json::Value;
+    use crate::dsl::value::Value;
     use std::net::SocketAddr;
 
     fn funcs() -> Arc<FunctionRegistry> {

@@ -16,7 +16,7 @@ pub fn register(reg: &mut FunctionRegistry) {
         "geoip",
         FunctionSig::fixed(&[FieldType::String], FieldType::Object),
         |args, _event| {
-            let ip_str = val_to_str(&args[0]);
+            let ip_str = val_to_str(&args[0])?;
             geoip::lookup(&ip_str)
         },
     );

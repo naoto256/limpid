@@ -39,7 +39,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use serde_json::Value;
+use crate::dsl::value::{Map, Value};
 use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------
@@ -298,8 +298,10 @@ fn load_file(path: &Path) -> Result<HashMap<String, Value>> {
 fn load_json(path: &Path) -> Result<HashMap<String, Value>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    let value: Value = serde_json::from_str(&content)
+    let json: serde_json::Value = serde_json::from_str(&content)
         .with_context(|| format!("failed to parse JSON from {}", path.display()))?;
+    let value = crate::dsl::value_json::json_to_value(&json)
+        .with_context(|| format!("invalid JSON shape in {}", path.display()))?;
 
     match value {
         Value::Object(map) => Ok(map.into_iter().collect()),
@@ -328,7 +330,7 @@ fn load_csv(path: &Path) -> Result<HashMap<String, Value>> {
         if headers.len() == 2 && cols.len() >= 2 {
             table.insert(key, Value::String(cols[1].to_string()));
         } else {
-            let mut obj = serde_json::Map::new();
+            let mut obj = Map::new();
             for (i, &header) in headers.iter().enumerate().skip(1) {
                 let val = cols.get(i).unwrap_or(&"");
                 obj.insert(header.to_string(), Value::String(val.to_string()));
