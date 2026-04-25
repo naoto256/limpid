@@ -2,6 +2,8 @@
 
 Receives OpenTelemetry logs over the OTLP/HTTP transport. Listens for `POST /v1/logs` and accepts both `application/x-protobuf` (canonical) and `application/json` request bodies.
 
+> Why limpid's OTLP behaves the way it does (Resource attributes are user-authored, `received_at` ≠ `time_unix_nano`, partial_success is not retried, …) is documented in [OTLP — design rationale](../otlp.md). Read that before opening an issue about a missing default.
+
 ## Configuration
 
 ```

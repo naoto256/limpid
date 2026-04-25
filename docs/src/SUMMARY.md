@@ -41,6 +41,10 @@
 - [Snippet Library](./snippets/README.md)
   - [Authoring Conventions](./snippets/conventions.md)
 
+# Protocol Notes
+
+- [OTLP — design rationale](./otlp.md)
+
 # Operations
 
 - [CLI](./operations/cli.md)
@@ -51,3 +55,4 @@
 - [systemd](./operations/systemd.md)
 - [Migrating from rsyslog](./operations/migration.md)
 - [Upgrading to 0.3](./operations/upgrade-0.3.md)
+- [Upgrading to 0.5](./operations/upgrade-0.5.md)
