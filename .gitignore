@@ -14,3 +14,6 @@ _*.md
 *.key
 *.p12
 *.crt
+
+# Audit receipts — local-only, never commit
+.audit/
