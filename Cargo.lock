@@ -1074,6 +1074,7 @@ dependencies = [
  "rdkafka",
  "regex-lite",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sha1",

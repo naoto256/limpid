@@ -184,6 +184,7 @@ pub fn register_builtins(registry: &mut ModuleRegistry) {
     register_input_type::<input::syslog_tls::SyslogTlsInput>(registry, "syslog_tls");
     register_input_type::<input::tail::TailInput>(registry, "tail");
     register_input_type::<input::otlp_http::OtlpHttpInput>(registry, "otlp_http");
+    register_input_type::<input::otlp_grpc::OtlpGrpcInput>(registry, "otlp_grpc");
     register_input_type::<input::unix_socket::UnixSocketInput>(registry, "unix_socket");
     #[cfg(feature = "journal")]
     register_input_type::<input::journal::JournalInput>(registry, "journal");
