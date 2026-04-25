@@ -12,6 +12,41 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [0.5.0] - 2026-04-26
 
+### Changed — design principles restructured (still five)
+
+The five design principles have been reorganised so each one carries
+its own architectural weight, rather than mixing principles with
+operating rules. The renumbered set:
+
+1. **Zero hidden behavior** *(unchanged)*
+2. **I/O is dumb transport** *(unchanged)*
+3. **Only `egress` crosses hop boundaries** *(was Principle 4)*
+4. **Atomic events through the pipeline** *(new)* — formalises the
+   invariant that the pipeline never operates on bundles or fans out:
+   inputs split wire-level batches into atomic Events, process snippets
+   are 1-in-1-out (or 0 via `drop` / `finish`), outputs rebundle at the
+   emit boundary. The OTLP envelope split, the `syslog_*` line split,
+   the `batch_level` mode on the OTLP output — all are this one
+   principle in different transports.
+5. **Safety and operational transparency** *(new)* — formalises the
+   software-construction stance that surfaces in every limpid feature:
+   `--check` static analysis, `tap`/`inject`/`--test-pipeline` for
+   verify-and-replay, `SIGHUP` atomic reload with rollback, retry +
+   secondary + disk-WAL on outputs, `Drop` hooks for shutdown
+   visibility. Principle 1 covers config-time transparency; Principle
+   5 covers runtime transparency and recoverability.
+
+What used to be Principles 3 (domain knowledge in DSL) and 5 (schema
+identity by namespace) are now under a new *Operating rules* section
+in the same document — they are concrete consequences of Principles 1
+and 2 rather than independent architectural commitments. Anything
+that previously cited *"per Principle 3"* should now cite *"per the
+Domain knowledge in DSL operating rule"* or, more usefully, the
+Principle the rule is derived from.
+
+This is a docs-only change in v0.5.0; no code is affected. Pre-1.0,
+this kind of clarification is expected.
+
 ### Added — OpenTelemetry Protocol (OTLP) support
 
 OTLP becomes a first-class transport across both ingest and emit, with
