@@ -41,8 +41,10 @@ pub mod regex_parse;
 pub mod regex_replace;
 pub mod strftime;
 pub mod table;
+pub mod to_bytes;
 pub mod to_int;
 pub mod to_json;
+pub mod to_string;
 pub mod upper;
 
 /// Register all flat-namespace primitives.
@@ -57,8 +59,10 @@ pub fn register(reg: &mut FunctionRegistry, table_store: TableStore) {
     regex_extract::register(reg);
     regex_parse::register(reg);
     regex_replace::register(reg);
+    to_bytes::register(reg);
     to_int::register(reg);
     to_json::register(reg);
+    to_string::register(reg);
     table::register(reg, table_store);
     geoip::register(reg);
     hashes::register(reg);
