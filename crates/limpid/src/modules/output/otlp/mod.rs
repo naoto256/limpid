@@ -40,12 +40,22 @@
 //!
 //! ### `batch_level`
 //!
-//! v0.5.0 only implements `none` (pure concat). The proto3 `repeated`
-//! field guarantees that concatenating wire bytes is equivalent to a
-//! merged message at the receiver, so a `none` batch is semantically
-//! valid OTLP — what changes with `resource` / `scope` levels is wire
-//! efficiency (fewer ResourceLogs / ScopeLogs entries), not the data
-//! itself. The merge logic is queued for v0.5.x.
+//! Three levels, each producing semantically identical OTLP at the
+//! receiver — they differ only in wire framing:
+//!
+//! - **`none`** (default): one ResourceLogs entry per buffered Event.
+//!   Cheapest CPU, largest wire, suitable when batch_size = 1 or the
+//!   collector tolerates redundancy.
+//! - **`resource`**: Events sharing a Resource collapse into a single
+//!   ResourceLogs entry; their ScopeLogs sit side-by-side under it.
+//! - **`scope`**: as `resource` plus Events sharing a Scope inside the
+//!   same Resource collapse into a single ScopeLogs whose
+//!   `log_records[]` accumulates everything. Smallest wire, slightly
+//!   higher CPU (Resource and Scope equality scans).
+//!
+//! All three modes are valid OTLP — the proto3 `repeated` field
+//! guarantees concat-equals-merge at the receiver, so picking a level
+//! is a compression / latency trade, not a correctness one.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -57,7 +67,9 @@ use opentelemetry_proto::tonic::{
     collector::logs::v1::{
         ExportLogsServiceRequest, logs_service_client::LogsServiceClient,
     },
-    logs::v1::ResourceLogs,
+    common::v1::{InstrumentationScope, KeyValue},
+    logs::v1::{ResourceLogs, ScopeLogs},
+    resource::v1::Resource,
 };
 use prost::Message;
 use tokio::sync::Mutex;
@@ -68,6 +80,35 @@ use crate::dsl::props;
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
 use crate::modules::{HasMetrics, Module, Output};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchLevel {
+    /// One ResourceLogs entry per buffered Event — pure concat, no
+    /// equality scans. Cheapest CPU.
+    None,
+    /// Group buffered Events by their Resource and merge each group
+    /// into a single ResourceLogs whose `scope_logs[]` accumulates the
+    /// inputs.
+    Resource,
+    /// `Resource` plus an inner pass that groups by Scope inside each
+    /// Resource, merging `log_records[]`. Smallest wire.
+    Scope,
+}
+
+impl BatchLevel {
+    fn parse(s: &str, output_name: &str) -> Result<Self> {
+        match s {
+            "none" => Ok(BatchLevel::None),
+            "resource" => Ok(BatchLevel::Resource),
+            "scope" => Ok(BatchLevel::Scope),
+            other => bail!(
+                "output '{}': unknown batch_level '{}' (expected none, resource, or scope)",
+                output_name,
+                other
+            ),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Protocol {
@@ -113,12 +154,13 @@ enum Transport {
 struct Inner {
     endpoint: String,
     protocol: Protocol,
+    batch_level: BatchLevel,
     headers: Vec<(String, String)>,
     batch_timeout: Duration,
     transport: Transport,
     /// Buffered per-Event singleton ResourceLogs proto bytes. Each
     /// entry is exactly what `otlp.encode_resourcelog_protobuf`
-    /// produced; flush concatenates them into one
+    /// produced; flush wraps them per `batch_level` into one
     /// ExportLogsServiceRequest.
     batch: Mutex<Vec<Bytes>>,
 }
@@ -143,16 +185,10 @@ impl Module for OtlpOutput {
             Some(s) => props::parse_duration(&s)?,
             None => Duration::from_secs(5),
         };
-        let batch_level = props::get_string(properties, "batch_level")
+        let batch_level_str = props::get_string(properties, "batch_level")
             .or_else(|| props::get_ident(properties, "batch_level"))
             .unwrap_or_else(|| "none".to_string());
-        if batch_level != "none" {
-            bail!(
-                "output '{}': batch_level '{}' is not implemented in v0.5.0 (only 'none' supported)",
-                name,
-                batch_level
-            );
-        }
+        let batch_level = BatchLevel::parse(&batch_level_str, name)?;
 
         let mut headers = Vec::new();
         if let Some(block) = props::get_block(properties, "headers") {
@@ -241,6 +277,7 @@ impl Module for OtlpOutput {
             inner: Arc::new(Inner {
                 endpoint,
                 protocol,
+                batch_level,
                 headers,
                 batch_timeout,
                 transport,
@@ -370,22 +407,121 @@ fn install_default_crypto_provider() {
 }
 
 /// Decode the per-Event ResourceLogs proto bytes, gather them into one
-/// `ExportLogsServiceRequest`, and ship it via the configured
-/// transport. Pulled out of `OtlpOutput` so the size-flush and
-/// timeout-flush paths can share one implementation.
+/// `ExportLogsServiceRequest` (merged per `batch_level`), and ship it
+/// via the configured transport. Pulled out of `OtlpOutput` so the
+/// size-flush and timeout-flush paths can share one implementation.
 async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<()> {
-    let mut req = ExportLogsServiceRequest::default();
-    req.resource_logs.reserve(drained.len());
+    let mut decoded: Vec<ResourceLogs> = Vec::with_capacity(drained.len());
     for proto in &drained {
         let rl = ResourceLogs::decode(&**proto).with_context(|| {
             "output otlp: pipeline egress is not a valid ResourceLogs proto (wire it through `otlp.encode_resourcelog_protobuf`)"
         })?;
-        req.resource_logs.push(rl);
+        decoded.push(rl);
     }
+    let req = match inner.batch_level {
+        BatchLevel::None => ExportLogsServiceRequest {
+            resource_logs: decoded,
+        },
+        BatchLevel::Resource => merge_by_resource(decoded),
+        BatchLevel::Scope => merge_by_scope(decoded),
+    };
     match &inner.transport {
         Transport::Http(client) => send_http(inner, client, &req).await,
         Transport::Grpc(channel) => send_grpc(inner, channel, req).await,
     }
+}
+
+/// Group ResourceLogs by their Resource (attribute set +
+/// dropped_attributes_count). Same-Resource entries collapse into one
+/// ResourceLogs whose `scope_logs[]` is the concat of the inputs'
+/// scope_logs. Order within each merged group preserves arrival order.
+fn merge_by_resource(decoded: Vec<ResourceLogs>) -> ExportLogsServiceRequest {
+    let mut out: Vec<ResourceLogs> = Vec::new();
+    for rl in decoded {
+        if let Some(idx) = out
+            .iter()
+            .position(|existing| resources_eq(&existing.resource, &rl.resource))
+        {
+            // Promote schema_url if the accumulator was empty and the
+            // incoming entry has one (rare but spec-allowed).
+            if out[idx].schema_url.is_empty() && !rl.schema_url.is_empty() {
+                out[idx].schema_url = rl.schema_url;
+            }
+            out[idx].scope_logs.extend(rl.scope_logs);
+        } else {
+            out.push(rl);
+        }
+    }
+    ExportLogsServiceRequest { resource_logs: out }
+}
+
+/// `merge_by_resource` plus an inner pass: within each Resource bucket,
+/// ScopeLogs sharing an InstrumentationScope (name + version +
+/// attributes + dropped_attributes_count) collapse into a single
+/// ScopeLogs whose `log_records[]` is the concat of the inputs.
+fn merge_by_scope(decoded: Vec<ResourceLogs>) -> ExportLogsServiceRequest {
+    let mut req = merge_by_resource(decoded);
+    for rl in &mut req.resource_logs {
+        let scope_logs = std::mem::take(&mut rl.scope_logs);
+        let mut grouped: Vec<ScopeLogs> = Vec::new();
+        for sl in scope_logs {
+            if let Some(idx) = grouped
+                .iter()
+                .position(|existing| scopes_eq(&existing.scope, &sl.scope))
+            {
+                if grouped[idx].schema_url.is_empty() && !sl.schema_url.is_empty() {
+                    grouped[idx].schema_url = sl.schema_url;
+                }
+                grouped[idx].log_records.extend(sl.log_records);
+            } else {
+                grouped.push(sl);
+            }
+        }
+        rl.scope_logs = grouped;
+    }
+    req
+}
+
+fn resources_eq(a: &Option<Resource>, b: &Option<Resource>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            x.dropped_attributes_count == y.dropped_attributes_count
+                && attrs_eq(&x.attributes, &y.attributes)
+        }
+        _ => false,
+    }
+}
+
+fn scopes_eq(a: &Option<InstrumentationScope>, b: &Option<InstrumentationScope>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            x.name == y.name
+                && x.version == y.version
+                && x.dropped_attributes_count == y.dropped_attributes_count
+                && attrs_eq(&x.attributes, &y.attributes)
+        }
+        _ => false,
+    }
+}
+
+/// Attribute-set equality up to ordering. proto3 does not guarantee a
+/// canonical attribute order on the wire, so we sort by `key` before
+/// comparing — otherwise two semantically identical Resources with
+/// attributes in different order would refuse to merge.
+fn attrs_eq(a: &[KeyValue], b: &[KeyValue]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut a_sorted: Vec<&KeyValue> = a.iter().collect();
+    let mut b_sorted: Vec<&KeyValue> = b.iter().collect();
+    a_sorted.sort_by(|x, y| x.key.cmp(&y.key));
+    b_sorted.sort_by(|x, y| x.key.cmp(&y.key));
+    a_sorted
+        .iter()
+        .zip(b_sorted.iter())
+        .all(|(x, y)| x.key == y.key && x.value == y.value)
 }
 
 async fn send_http(
@@ -568,13 +704,191 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_batch_level() {
-        let props = vec![
-            prop_str("endpoint", "http://x"),
-            prop_str("batch_level", "scope"),
+    fn batch_level_default_is_none() {
+        let output =
+            OtlpOutput::from_properties("o", &[prop_str("endpoint", "http://x")]).unwrap();
+        assert!(matches!(output.inner.batch_level, BatchLevel::None));
+    }
+
+    #[test]
+    fn batch_level_accepts_resource_and_scope() {
+        let r = OtlpOutput::from_properties(
+            "o",
+            &[
+                prop_str("endpoint", "http://x"),
+                prop_str("batch_level", "resource"),
+            ],
+        )
+        .unwrap();
+        assert!(matches!(r.inner.batch_level, BatchLevel::Resource));
+        let s = OtlpOutput::from_properties(
+            "o",
+            &[
+                prop_str("endpoint", "http://x"),
+                prop_str("batch_level", "scope"),
+            ],
+        )
+        .unwrap();
+        assert!(matches!(s.inner.batch_level, BatchLevel::Scope));
+    }
+
+    #[test]
+    fn rejects_unknown_batch_level() {
+        let err = OtlpOutput::from_properties(
+            "o",
+            &[
+                prop_str("endpoint", "http://x"),
+                prop_str("batch_level", "logrecord"),
+            ],
+        )
+        .err()
+        .unwrap();
+        assert!(
+            err.to_string().contains("unknown batch_level"),
+            "unexpected: {err}"
+        );
+    }
+
+    // ---- merge logic unit tests --------------------------------------
+
+    fn make_resource(svc: &str) -> Option<Resource> {
+        Some(Resource {
+            attributes: vec![KeyValue {
+                key: "service.name".into(),
+                value: Some(opentelemetry_proto::tonic::common::v1::AnyValue {
+                    value: Some(
+                        opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(
+                            svc.into(),
+                        ),
+                    ),
+                }),
+            }],
+            dropped_attributes_count: 0,
+        })
+    }
+
+    fn make_scope(name: &str) -> Option<InstrumentationScope> {
+        Some(InstrumentationScope {
+            name: name.into(),
+            version: "0".into(),
+            attributes: vec![],
+            dropped_attributes_count: 0,
+        })
+    }
+
+    fn make_record(t: u64) -> opentelemetry_proto::tonic::logs::v1::LogRecord {
+        opentelemetry_proto::tonic::logs::v1::LogRecord {
+            time_unix_nano: t,
+            ..Default::default()
+        }
+    }
+
+    /// One singleton per Event — the shape every `otlp.encode_*`
+    /// caller produces.
+    fn singleton(svc: &str, scope: &str, t: u64) -> ResourceLogs {
+        ResourceLogs {
+            resource: make_resource(svc),
+            scope_logs: vec![ScopeLogs {
+                scope: make_scope(scope),
+                log_records: vec![make_record(t)],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }
+    }
+
+    #[test]
+    fn merge_by_resource_collapses_same_resource() {
+        // Two events on the same Resource but different Scopes:
+        // resource-level merge keeps one ResourceLogs entry whose
+        // scope_logs[] holds both scopes.
+        let input = vec![singleton("svc-a", "scope-1", 1), singleton("svc-a", "scope-2", 2)];
+        let req = merge_by_resource(input);
+        assert_eq!(req.resource_logs.len(), 1);
+        assert_eq!(req.resource_logs[0].scope_logs.len(), 2);
+    }
+
+    #[test]
+    fn merge_by_resource_keeps_distinct_resources_separate() {
+        let input = vec![singleton("svc-a", "scope-1", 1), singleton("svc-b", "scope-1", 2)];
+        let req = merge_by_resource(input);
+        assert_eq!(req.resource_logs.len(), 2);
+    }
+
+    #[test]
+    fn merge_by_scope_collapses_same_resource_and_scope() {
+        // Two events on the same Resource AND same Scope:
+        // scope-level merge keeps one ScopeLogs whose log_records[]
+        // holds both records.
+        let input = vec![singleton("svc-a", "scope-1", 1), singleton("svc-a", "scope-1", 2)];
+        let req = merge_by_scope(input);
+        assert_eq!(req.resource_logs.len(), 1);
+        assert_eq!(req.resource_logs[0].scope_logs.len(), 1);
+        assert_eq!(req.resource_logs[0].scope_logs[0].log_records.len(), 2);
+        let times: Vec<u64> = req.resource_logs[0].scope_logs[0]
+            .log_records
+            .iter()
+            .map(|lr| lr.time_unix_nano)
+            .collect();
+        assert_eq!(times, vec![1, 2]);
+    }
+
+    #[test]
+    fn merge_by_scope_handles_three_levels() {
+        // Two Resources; under each, two Scopes; under each scope,
+        // two records. After scope-level merge: 2 Resources × 2 Scopes
+        // × 2 records, identical event count, minimum framing.
+        let input = vec![
+            singleton("svc-a", "scope-1", 1),
+            singleton("svc-a", "scope-1", 2),
+            singleton("svc-a", "scope-2", 3),
+            singleton("svc-a", "scope-2", 4),
+            singleton("svc-b", "scope-1", 5),
+            singleton("svc-b", "scope-1", 6),
+            singleton("svc-b", "scope-2", 7),
+            singleton("svc-b", "scope-2", 8),
         ];
-        let err = OtlpOutput::from_properties("o", &props).err().unwrap();
-        assert!(err.to_string().contains("not implemented"));
+        let req = merge_by_scope(input);
+        assert_eq!(req.resource_logs.len(), 2);
+        for rl in &req.resource_logs {
+            assert_eq!(rl.scope_logs.len(), 2);
+            for sl in &rl.scope_logs {
+                assert_eq!(sl.log_records.len(), 2);
+            }
+        }
+        // No record was lost.
+        let total_records: usize = req
+            .resource_logs
+            .iter()
+            .flat_map(|rl| rl.scope_logs.iter())
+            .map(|sl| sl.log_records.len())
+            .sum();
+        assert_eq!(total_records, 8);
+    }
+
+    #[test]
+    fn attrs_eq_is_order_insensitive() {
+        let a = vec![
+            KeyValue {
+                key: "k1".into(),
+                value: None,
+            },
+            KeyValue {
+                key: "k2".into(),
+                value: None,
+            },
+        ];
+        let b = vec![
+            KeyValue {
+                key: "k2".into(),
+                value: None,
+            },
+            KeyValue {
+                key: "k1".into(),
+                value: None,
+            },
+        ];
+        assert!(attrs_eq(&a, &b));
     }
 
     #[test]
