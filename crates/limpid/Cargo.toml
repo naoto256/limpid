@@ -36,6 +36,15 @@ indexmap = { version = "2", features = ["serde"] }
 systemd = { version = "0.10", optional = true }
 rdkafka = { version = "0.36", features = ["cmake-build"], optional = true }
 
+# OTLP (OpenTelemetry Protocol). Pre-generated message types from the
+# official OpenTelemetry-rust ecosystem. `gen-tonic` pulls in tonic +
+# generated gRPC client/server stubs; `with-serde` derives Serialize /
+# Deserialize so the same message types serialize as both protobuf
+# (binary, gRPC and HTTP/protobuf) and JSON (HTTP/JSON).
+opentelemetry-proto = { version = "0.27", features = ["logs", "gen-tonic", "with-serde"] }
+tonic = { version = "0.12", features = ["tls", "tls-roots"] }
+prost = "0.13"
+
 [features]
 journal = ["dep:systemd"]
 kafka = ["dep:rdkafka"]

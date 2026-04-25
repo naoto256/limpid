@@ -25,6 +25,7 @@
 
 pub mod cef;
 pub mod geoip;
+pub mod otlp;
 pub mod primitives;
 pub mod syslog;
 pub mod table;
@@ -367,6 +368,7 @@ pub fn register_builtins(reg: &mut FunctionRegistry, table_store: table::TableSt
     primitives::register(reg, table_store);
     syslog::register(reg);
     cef::register(reg);
+    otlp::register(reg);
 }
 
 #[cfg(test)]
