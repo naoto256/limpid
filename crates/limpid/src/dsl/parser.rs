@@ -20,6 +20,7 @@ pub struct LimpidParser;
 /// that need multi-file attribution (the include loader, eventually)
 /// should use [`parse_config_with_file_id`] and feed the matching id
 /// into the [`crate::dsl::span::SourceMap`].
+#[allow(dead_code)] // used extensively by tests; kept public for eventual lib surface
 pub fn parse_config(input: &str) -> Result<Config> {
     parse_config_with_file_id(input, 0)
 }
@@ -561,6 +562,7 @@ fn parse_atom_or_unary(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
         )),
         Rule::func_call => parse_func_call_expr(pair, file_id),
         Rule::hash_lit => parse_hash_lit(pair, file_id),
+        Rule::array_lit => parse_array_lit(pair, file_id),
         _ => bail!("unexpected expression rule: {:?}", pair.as_rule()),
     }
 }
@@ -591,6 +593,7 @@ fn parse_atom(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
         Rule::expr => parse_expr(inner, file_id),
         Rule::func_call => parse_func_call_expr(inner, file_id),
         Rule::hash_lit => parse_hash_lit(inner, file_id),
+        Rule::array_lit => parse_array_lit(inner, file_id),
         Rule::float_lit => Ok(Expr::new(ExprKind::FloatLit(inner.as_str().parse()?), span)),
         Rule::integer_lit => Ok(Expr::new(ExprKind::IntLit(inner.as_str().parse()?), span)),
         Rule::string_lit => parse_string_lit_expr(&inner, file_id),
@@ -671,6 +674,21 @@ fn parse_hash_lit(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Expr::new(ExprKind::HashLit(entries), span))
+}
+
+/// Parse an `array_lit` rule — `[a, b, c]`, `[]`, `[1, 2, 3,]`.
+///
+/// Each inner pair is an `expr`. Order of inner pairs follows source
+/// order, which we preserve in the resulting `Vec<Expr>`. Callers
+/// should treat this ordering as construction convenience only; the
+/// DSL model is positionless (no `arr[n]` syntax to expose the index).
+fn parse_array_lit(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
+    let span = span_of(&pair, file_id);
+    let items = pair
+        .into_inner()
+        .map(|p| parse_expr_from_pair(p, file_id))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Expr::new(ExprKind::ArrayLit(items), span))
 }
 
 /// Extract a string literal as a plain `String`.
@@ -1087,6 +1105,140 @@ def process test {
                     assert_eq!(entries.len(), 2);
                 }
                 _ => panic!("expected Assign with HashLit"),
+            },
+            _ => panic!("expected Process definition"),
+        }
+    }
+
+    #[test]
+    fn test_parse_array_literal_empty() {
+        let input = r#"
+def process test {
+    workspace.types = []
+}
+"#;
+        let config = parse_config(input).unwrap();
+        match &config.definitions[0] {
+            Definition::Process(def) => match &def.body[0] {
+                ProcessStatement::Assign(
+                    _,
+                    Expr {
+                        kind: ExprKind::ArrayLit(items),
+                        ..
+                    },
+                ) => {
+                    assert_eq!(items.len(), 0);
+                }
+                _ => panic!("expected Assign with ArrayLit"),
+            },
+            _ => panic!("expected Process definition"),
+        }
+    }
+
+    #[test]
+    fn test_parse_array_literal_items() {
+        let input = r#"
+def process test {
+    workspace.types = [1, "two", true, null, workspace.a]
+}
+"#;
+        let config = parse_config(input).unwrap();
+        match &config.definitions[0] {
+            Definition::Process(def) => match &def.body[0] {
+                ProcessStatement::Assign(
+                    _,
+                    Expr {
+                        kind: ExprKind::ArrayLit(items),
+                        ..
+                    },
+                ) => {
+                    assert_eq!(items.len(), 5);
+                    assert!(matches!(items[0].kind, ExprKind::IntLit(1)));
+                    assert!(matches!(items[1].kind, ExprKind::StringLit(ref s) if s == "two"));
+                    assert!(matches!(items[2].kind, ExprKind::BoolLit(true)));
+                    assert!(matches!(items[3].kind, ExprKind::Null));
+                    assert!(matches!(items[4].kind, ExprKind::Ident(_)));
+                }
+                _ => panic!("expected Assign with ArrayLit"),
+            },
+            _ => panic!("expected Process definition"),
+        }
+    }
+
+    #[test]
+    fn test_parse_array_literal_trailing_comma() {
+        let input = r#"
+def process test {
+    workspace.xs = [1, 2, 3,]
+}
+"#;
+        let config = parse_config(input).unwrap();
+        match &config.definitions[0] {
+            Definition::Process(def) => match &def.body[0] {
+                ProcessStatement::Assign(
+                    _,
+                    Expr {
+                        kind: ExprKind::ArrayLit(items),
+                        ..
+                    },
+                ) => {
+                    assert_eq!(items.len(), 3);
+                }
+                _ => panic!("expected Assign with ArrayLit"),
+            },
+            _ => panic!("expected Process definition"),
+        }
+    }
+
+    #[test]
+    fn test_parse_array_literal_nested() {
+        let input = r#"
+def process test {
+    workspace.grid = [[1, 2], [3, 4]]
+}
+"#;
+        let config = parse_config(input).unwrap();
+        match &config.definitions[0] {
+            Definition::Process(def) => match &def.body[0] {
+                ProcessStatement::Assign(
+                    _,
+                    Expr {
+                        kind: ExprKind::ArrayLit(rows),
+                        ..
+                    },
+                ) => {
+                    assert_eq!(rows.len(), 2);
+                    for row in rows {
+                        assert!(matches!(row.kind, ExprKind::ArrayLit(_)));
+                    }
+                }
+                _ => panic!("expected Assign with nested ArrayLit"),
+            },
+            _ => panic!("expected Process definition"),
+        }
+    }
+
+    #[test]
+    fn test_parse_array_literal_in_hash() {
+        let input = r#"
+def process test {
+    workspace.finding = { title: "x", types: ["sqli", "xss"] }
+}
+"#;
+        let config = parse_config(input).unwrap();
+        match &config.definitions[0] {
+            Definition::Process(def) => match &def.body[0] {
+                ProcessStatement::Assign(
+                    _,
+                    Expr {
+                        kind: ExprKind::HashLit(entries),
+                        ..
+                    },
+                ) => {
+                    let (_, types_expr) = entries.iter().find(|(k, _)| k == "types").unwrap();
+                    assert!(matches!(types_expr.kind, ExprKind::ArrayLit(ref xs) if xs.len() == 2));
+                }
+                _ => panic!("expected Assign with HashLit containing ArrayLit"),
             },
             _ => panic!("expected Process definition"),
         }

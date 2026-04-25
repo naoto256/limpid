@@ -388,4 +388,124 @@ mod tests {
             &Value::Number(42.into())
         ));
     }
+
+    // ----- Array literal -----------------------------------------------------
+    //
+    // The DSL models arrays as positionless collections (see
+    // docs/src/processing/user-defined.md). Literals are the one place
+    // where element order is visible; these tests pin down the
+    // order-preservation guarantee and confirm mixed types / nesting
+    // work.
+
+    #[test]
+    fn test_eval_array_literal_empty() {
+        let ev = make_event();
+        let f = make_funcs();
+        assert_eq!(
+            eval_expr(&e(ExprKind::ArrayLit(vec![])), &ev, &f).unwrap(),
+            Value::Array(vec![])
+        );
+    }
+
+    #[test]
+    fn test_eval_array_literal_scalars() {
+        let ev = make_event();
+        let f = make_funcs();
+        let expr = e(ExprKind::ArrayLit(vec![
+            e(ExprKind::IntLit(1)),
+            e(ExprKind::IntLit(2)),
+            e(ExprKind::IntLit(3)),
+        ]));
+        assert_eq!(
+            eval_expr(&expr, &ev, &f).unwrap(),
+            Value::Array(vec![
+                Value::Number(1.into()),
+                Value::Number(2.into()),
+                Value::Number(3.into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_eval_array_literal_mixed_types() {
+        let ev = make_event();
+        let f = make_funcs();
+        let expr = e(ExprKind::ArrayLit(vec![
+            e(ExprKind::IntLit(1)),
+            e(ExprKind::StringLit("two".into())),
+            e(ExprKind::BoolLit(true)),
+            e(ExprKind::Null),
+        ]));
+        assert_eq!(
+            eval_expr(&expr, &ev, &f).unwrap(),
+            Value::Array(vec![
+                Value::Number(1.into()),
+                Value::String("two".into()),
+                Value::Bool(true),
+                Value::Null,
+            ])
+        );
+    }
+
+    #[test]
+    fn test_eval_array_literal_resolves_workspace_refs() {
+        let ev = make_event();
+        let f = make_funcs();
+        let expr = e(ExprKind::ArrayLit(vec![
+            e(ExprKind::Ident(vec!["workspace".into(), "src".into()])),
+            e(ExprKind::Ident(vec!["workspace".into(), "count".into()])),
+        ]));
+        assert_eq!(
+            eval_expr(&expr, &ev, &f).unwrap(),
+            Value::Array(vec![
+                Value::String("192.168.1.1".into()),
+                Value::Number(42.into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_eval_array_literal_nested() {
+        let ev = make_event();
+        let f = make_funcs();
+        let row = |a, b| {
+            e(ExprKind::ArrayLit(vec![
+                e(ExprKind::IntLit(a)),
+                e(ExprKind::IntLit(b)),
+            ]))
+        };
+        let grid = e(ExprKind::ArrayLit(vec![row(1, 2), row(3, 4)]));
+        assert_eq!(
+            eval_expr(&grid, &ev, &f).unwrap(),
+            Value::Array(vec![
+                Value::Array(vec![Value::Number(1.into()), Value::Number(2.into())]),
+                Value::Array(vec![Value::Number(3.into()), Value::Number(4.into())]),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_eval_array_inside_hash_literal() {
+        let ev = make_event();
+        let f = make_funcs();
+        let expr = e(ExprKind::HashLit(vec![
+            ("title".into(), e(ExprKind::StringLit("finding".into()))),
+            (
+                "types".into(),
+                e(ExprKind::ArrayLit(vec![
+                    e(ExprKind::StringLit("sqli".into())),
+                    e(ExprKind::StringLit("xss".into())),
+                ])),
+            ),
+        ]));
+        let out = eval_expr(&expr, &ev, &f).unwrap();
+        let obj = out.as_object().unwrap();
+        assert_eq!(
+            obj.get("types").unwrap(),
+            &Value::Array(vec![
+                Value::String("sqli".into()),
+                Value::String("xss".into())
+            ])
+        );
+    }
 }

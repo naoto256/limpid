@@ -12,9 +12,6 @@ pub fn register(reg: &mut FunctionRegistry) {
         "regex_match",
         FunctionSig::fixed(&[FieldType::String, FieldType::String], FieldType::Bool),
         |args, _event| {
-            if args.len() != 2 {
-                bail!("regex_match() expects 2 arguments (target, pattern)");
-            }
             let target = val_to_str(&args[0]);
             let pattern = val_to_str(&args[1]);
             match get_cached_regex(&pattern) {

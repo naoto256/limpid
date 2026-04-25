@@ -267,6 +267,7 @@ bin_op = {
 atom = {
     "(" ~ expr ~ ")"
   | hash_lit
+  | array_lit
   | func_call
   | float_lit
   | integer_lit
@@ -291,6 +292,17 @@ func_args = {
 
 hash_lit = {
     "{" ~ (hash_entry ~ ("," ~ hash_entry)* ~ ","?)? ~ "}"
+}
+
+// Array literal: `[]`, `[1, 2, 3]`, `[1, 2, 3,]`, `[a, "two", true]`.
+// Arrays in limpid are positionless collections — literals are for
+// construction only. Access is via `find_by` / `foreach` / `len`;
+// mutation is via `append` / `prepend`. There is no positional read
+// (`arr[0]`) or write (`arr[0] = v`) by design — positions are a
+// human convenience that drift under insert/delete, so the DSL makes
+// element identity the only way to address.
+array_lit = {
+    "[" ~ (expr ~ ("," ~ expr)* ~ ","?)? ~ "]"
 }
 
 // Hash entries use newline-separation (no comma required) matching DSL examples

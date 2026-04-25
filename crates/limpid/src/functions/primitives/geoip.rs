@@ -6,8 +6,6 @@
 //! because it's initialized once from the runtime with the configured
 //! database path; this module just exposes the DSL registration.
 
-use anyhow::bail;
-
 use super::val_to_str;
 use crate::functions::geoip;
 use crate::functions::{FunctionRegistry, FunctionSig};
@@ -18,9 +16,6 @@ pub fn register(reg: &mut FunctionRegistry) {
         "geoip",
         FunctionSig::fixed(&[FieldType::String], FieldType::Object),
         |args, _event| {
-            if args.len() != 1 {
-                bail!("geoip() expects 1 argument (IP address string)");
-            }
             let ip_str = val_to_str(&args[0]);
             geoip::lookup(&ip_str)
         },

@@ -10,16 +10,18 @@
 //!
 //! - [`primitives`] — flat-namespace, schema-agnostic functions
 //!   (`contains`, `lower`, `regex_*`, `strftime`, `format`, `geoip`,
-//!   `table_*`, `md5`/`sha1`/`sha256`, `to_json`). One file per
-//!   function (or per tightly-related group) so `mod.rs` does not
-//!   become a megafile.
+//!   `table_*`, `md5`/`sha1`/`sha256`, `to_json`, `to_int`, `find_by`,
+//!   `csv_parse`, `len`, `append`, `prepend`). One file per function
+//!   (or per tightly-related group such as `hashes.rs`) so `mod.rs`
+//!   does not become a megafile.
+//! - [`syslog`] / [`cef`] — schema-specific namespaces (`syslog.*`,
+//!   `cef.*`). See Design Principle 5 in `design-principles.md`;
+//!   future schema namespaces (`ocsf.*` composers, etc.) follow the
+//!   same layout.
 //! - [`geoip`] / [`table`] — backing stores (DB reader, table store)
 //!   used by the corresponding primitives. These are *not* the DSL
 //!   registration; the registration lives in `primitives::geoip` /
 //!   `primitives::table`.
-//!
-//! Schema-specific namespaces (`syslog.*`, `cef.*`, …) will live as
-//! sibling modules to `primitives` once Block 4 introduces them.
 
 pub mod cef;
 pub mod geoip;
@@ -44,6 +46,11 @@ use crate::modules::schema::{FieldSpec, FieldType};
 /// Functions are registered with a small, declarative signature so the
 /// analyzer can type-check call sites without re-implementing every
 /// function's hand-rolled arity logic.
+///
+/// A `Variadic` variant used to live here but was never populated by
+/// any built-in; it is deliberately omitted until a variadic function
+/// is actually needed, at which point reintroducing the arm is a
+/// non-breaking enum extension.
 #[derive(Debug, Clone)]
 pub enum Arity {
     /// Exactly `args.len()` positional args, all required. The signature's
@@ -53,10 +60,6 @@ pub enum Arity {
     /// signature's `args` slice declares types for every slot up to the
     /// maximum, including optional ones.
     Optional { required: usize },
-    /// All declared args required, then a variadic tail whose type is
-    /// the last entry of `args`. Unused by current built-ins; reserved.
-    #[allow(dead_code)]
-    Variadic,
 }
 
 /// Static signature for a built-in function. Threaded into the registry
@@ -155,9 +158,14 @@ impl FunctionRegistry {
         }
     }
 
-    /// Register a flat primitive function (no namespace).
-    /// Equivalent to `register_in(None, name, f)`, kept as the legacy API
-    /// so the existing built-in registration path is untouched.
+    /// Register a flat primitive function without a stand-alone signature.
+    ///
+    /// Used by parser-style primitives (`parse_json`, `parse_kv`) that
+    /// pair this with `register_parser` — the parser registration
+    /// installs the `(String, Object?) -> Object` sig, so supplying one
+    /// here would be redundant. New primitives with fixed shapes should
+    /// prefer [`register_with_sig`](Self::register_with_sig) so the
+    /// central arity / arg-type check in [`call`](Self::call) kicks in.
     pub fn register<F>(&mut self, name: &str, f: F)
     where
         F: Fn(&[Value], &Event) -> Result<Value> + Send + Sync + 'static,
@@ -191,8 +199,9 @@ impl FunctionRegistry {
     }
 
     /// Sig-aware namespaced registration. Mirrors `register_with_sig`
-    /// but for `ns.fn(...)` dispatch.
-    #[allow(dead_code)] // wired for future ns.fn registrations carrying sigs
+    /// but for `ns.fn(...)` dispatch. All `syslog.*` / `cef.*` registrations
+    /// that have a fixed shape go through here so the registry's arity
+    /// check fires uniformly.
     pub fn register_in_with_sig<F>(&mut self, namespace: &str, name: &str, sig: FunctionSig, f: F)
     where
         F: Fn(&[Value], &Event) -> Result<Value> + Send + Sync + 'static,
@@ -203,21 +212,25 @@ impl FunctionRegistry {
     }
 
     /// Register parser metadata. Call after `register_*` so the
-    /// analyzer can find both the function and its schema. Parsers also
-    /// get a `FunctionSig` (`(String, Object?) -> Object`) registered
-    /// automatically so plain arg-type checks still apply.
+    /// analyzer can find both the function and its schema.
+    ///
+    /// If the caller has **not** already installed a `FunctionSig` via
+    /// `register_with_sig` / `register_in_with_sig`, this installs the
+    /// default parser shape `(String, Object?) -> Object` — the one
+    /// shared by `parse_json` / `parse_kv` / `syslog.parse` / `cef.parse`.
+    /// Parsers with a different call shape (e.g. `regex_parse(target,
+    /// pattern)` which takes `(String, String)`) should register their
+    /// own sig first and rely on this method's `entry().or_insert_with`
+    /// guard to keep it intact.
     pub fn register_parser(&mut self, info: ParserInfo) {
         let key = (info.namespace.map(str::to_string), info.name.to_string());
-        // Parsers all share the same call shape: `(text[, defaults]) ->
-        // Object`. Defaults must be an Object literal at runtime; we
-        // accept either Object or Any here so callers can pass through
-        // a workspace-resolved value without analyzer churn.
-        let sig = FunctionSig::optional(
-            &[FieldType::String, FieldType::Object],
-            1,
-            FieldType::Object,
-        );
-        self.signatures.insert(key.clone(), sig);
+        self.signatures.entry(key.clone()).or_insert_with(|| {
+            FunctionSig::optional(
+                &[FieldType::String, FieldType::Object],
+                1,
+                FieldType::Object,
+            )
+        });
         self.parsers.insert(key, info);
     }
 
@@ -262,6 +275,12 @@ impl FunctionRegistry {
     /// primitive registry; `Some(ns)` hits the namespaced registry.
     /// Missing entries produce distinct error messages so users can tell
     /// "unknown namespace" from "unknown function in namespace".
+    ///
+    /// Arity validation runs here (single source of truth) for every
+    /// function that has a registered [`FunctionSig`]. Functions without
+    /// a sig — only `parse_json` / `parse_kv` still go through `register`
+    /// today, and `register_parser` supplies a sig for them — skip the
+    /// check and keep their historical hand-rolled arity guards.
     pub fn call(
         &self,
         namespace: Option<&str>,
@@ -280,8 +299,59 @@ impl FunctionRegistry {
                 }
             }
         })?;
+        if let Some(sig) = self.signatures.get(&key) {
+            validate_arity(namespace, name, sig, args.len())?;
+        }
         f(args, event)
     }
+}
+
+/// Central arity check, shared by every function that has a `FunctionSig`.
+///
+/// Pulled out of `call` so individual primitives don't repeat the check —
+/// 20+ hand-rolled `if args.len() != N { bail!(...) }` blocks used to sit
+/// in each closure; the sig is the single source of truth now.
+fn validate_arity(
+    namespace: Option<&str>,
+    name: &str,
+    sig: &FunctionSig,
+    actual: usize,
+) -> Result<()> {
+    let ok = match sig.arity {
+        Arity::Fixed => actual == sig.args.len(),
+        Arity::Optional { required } => actual >= required && actual <= sig.args.len(),
+    };
+    if ok {
+        return Ok(());
+    }
+    let prefix = match namespace {
+        Some(ns) => format!("{}.{}", ns, name),
+        None => name.to_string(),
+    };
+    let expected = match sig.arity {
+        Arity::Fixed => {
+            let n = sig.args.len();
+            if n == 1 {
+                "1 argument".to_string()
+            } else {
+                format!("{} arguments", n)
+            }
+        }
+        Arity::Optional { required } => {
+            let max = sig.args.len();
+            if required == max {
+                format!("{} arguments", required)
+            } else {
+                format!("{} to {} arguments", required, max)
+            }
+        }
+    };
+    Err(anyhow::anyhow!(
+        "{}() expects {}, got {}",
+        prefix,
+        expected,
+        actual
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -445,7 +515,147 @@ mod tests {
                 &e,
             )
             .unwrap_err();
-        assert!(err.to_string().contains("2 or 3 arguments"));
+        assert!(err.to_string().contains("2 to 3 arguments"));
+    }
+
+    // ---- central arity validation ----------------------------------------
+    //
+    // Every function with a registered `FunctionSig` goes through
+    // `validate_arity` before dispatch. These tests pin the behaviour of
+    // each Arity variant plus the error message format so the consolidated
+    // path cannot silently regress.
+
+    #[test]
+    fn arity_fixed_accepts_exact_arg_count() {
+        let reg = make_registry();
+        let e = dummy_event();
+        // `contains(String, String) -> Bool` is Arity::Fixed with 2 args.
+        let ok = reg.call(
+            None,
+            "contains",
+            &[Value::String("hello".into()), Value::String("ell".into())],
+            &e,
+        );
+        assert!(ok.is_ok(), "fixed arity with correct count should succeed");
+    }
+
+    #[test]
+    fn arity_fixed_rejects_too_few_args() {
+        let reg = make_registry();
+        let e = dummy_event();
+        let err = reg
+            .call(None, "contains", &[Value::String("hello".into())], &e)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("contains() expects 2 arguments, got 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn arity_fixed_rejects_too_many_args() {
+        let reg = make_registry();
+        let e = dummy_event();
+        let err = reg
+            .call(
+                None,
+                "contains",
+                &[
+                    Value::String("a".into()),
+                    Value::String("b".into()),
+                    Value::String("c".into()),
+                ],
+                &e,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("contains() expects 2 arguments, got 3"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn arity_fixed_singular_message_for_single_arg() {
+        // `to_int(x) -> Int` is Arity::Fixed with 1 arg — verify the
+        // message uses "1 argument" (singular) rather than "1 arguments".
+        let reg = make_registry();
+        let e = dummy_event();
+        let err = reg
+            .call(None, "to_int", &[], &e)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("to_int() expects 1 argument, got 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn arity_optional_accepts_min_and_max() {
+        // `strftime(value, fmt[, tz])` — Optional { required: 2 }, max 3.
+        let reg = make_registry();
+        let e = dummy_event();
+        let ts = Value::String("2026-04-19T10:30:45+00:00".into());
+        let fmt = Value::String("%H:%M".into());
+        let tz = Value::String("UTC".into());
+        // at minimum
+        assert!(reg.call(None, "strftime", &[ts.clone(), fmt.clone()], &e).is_ok());
+        // at maximum
+        assert!(reg.call(None, "strftime", &[ts, fmt, tz], &e).is_ok());
+    }
+
+    #[test]
+    fn arity_optional_rejects_below_min_and_above_max() {
+        let reg = make_registry();
+        let e = dummy_event();
+        let ts = Value::String("2026-04-19T10:30:45+00:00".into());
+        let fmt = Value::String("%H:%M".into());
+        let tz = Value::String("UTC".into());
+        let err_below = reg
+            .call(None, "strftime", &[ts.clone()], &e)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err_below.contains("2 to 3 arguments, got 1"),
+            "unexpected error: {err_below}"
+        );
+        let err_above = reg
+            .call(
+                None,
+                "strftime",
+                &[ts, fmt, tz.clone(), tz],
+                &e,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err_above.contains("2 to 3 arguments, got 4"),
+            "unexpected error: {err_above}"
+        );
+    }
+
+    #[test]
+    fn arity_check_applies_to_namespaced_functions() {
+        // Namespaced functions registered via `register_in_with_sig` must
+        // go through the same validation path. `syslog.strip_pri` takes 1
+        // argument (Arity::Fixed); too many should be rejected uniformly.
+        let reg = make_registry();
+        let e = dummy_event();
+        let err = reg
+            .call(
+                Some("syslog"),
+                "strip_pri",
+                &[Value::String("x".into()), Value::String("y".into())],
+                &e,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("syslog.strip_pri() expects 1 argument, got 2"),
+            "unexpected error: {err}"
+        );
     }
 
     // ---- format() ---------------------------------------------------------

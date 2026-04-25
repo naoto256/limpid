@@ -48,9 +48,8 @@ pub fn register(reg: &mut FunctionRegistry) {
 }
 
 fn parse_impl(args: &[Value]) -> Result<Value> {
-    if !(args.len() == 1 || args.len() == 2) {
-        bail!("syslog.parse() expects 1 or 2 arguments (text[, defaults])");
-    }
+    // Arity is validated by the registry via the sig installed from
+    // `register_parser` (1 to 2 arguments).
     let text = val_to_str(&args[0]);
 
     let after_pri =
