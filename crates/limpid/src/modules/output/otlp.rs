@@ -1,6 +1,6 @@
 //! OTLP output: forwards Events to an OpenTelemetry collector / SaaS
-//! backend via the OTLP/HTTP transport family (and OTLP/gRPC in a
-//! follow-up commit).
+//! backend via OTLP's three transports (HTTP/JSON, HTTP/protobuf,
+//! gRPC).
 //!
 //! Each Event's `egress` is expected to be the singleton ResourceLogs
 //! protobuf bytes produced by `otlp.encode_resourcelog_protobuf` —
@@ -15,7 +15,7 @@
 //! def output otlp_out {
 //!     type otlp
 //!     endpoint "https://collector.example.com:4318"
-//!     protocol "http_protobuf"   // http_json | http_protobuf [| grpc — TODO]
+//!     protocol "http_protobuf"   // http_json | http_protobuf | grpc
 //!     batch_size 512
 //!     batch_timeout "5s"
 //!     headers {
@@ -26,6 +26,17 @@
 //!     }
 //! }
 //! ```
+//!
+//! ### Endpoint conventions
+//!
+//! - **HTTP transports** point at the full OTLP/HTTP path (typically
+//!   `:4318/v1/logs`). limpid does not append `/v1/logs`
+//!   automatically; collectors that mount the receiver elsewhere
+//!   (e.g. behind a path prefix) just work.
+//! - **gRPC** points at the gRPC server URL (typically `:4317`); the
+//!   service name (`opentelemetry.proto.collector.logs.v1.LogsService`)
+//!   is implicit in the generated client. `https://` and `http://`
+//!   schemes select TLS / plaintext respectively.
 //!
 //! ### `batch_level`
 //!
@@ -44,10 +55,14 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use opentelemetry_proto::tonic::{
-    collector::logs::v1::ExportLogsServiceRequest, logs::v1::ResourceLogs,
+    collector::logs::v1::{
+        ExportLogsServiceRequest, logs_service_client::LogsServiceClient,
+    },
+    logs::v1::ResourceLogs,
 };
 use prost::Message;
 use tokio::sync::Mutex;
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 use crate::dsl::ast::Property;
 use crate::dsl::props;
@@ -55,11 +70,11 @@ use crate::event::Event;
 use crate::metrics::OutputMetrics;
 use crate::modules::{HasMetrics, Module, Output};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Protocol {
     HttpJson,
     HttpProtobuf,
-    // Grpc deferred — see design memo §6.1 step ordering.
+    Grpc,
 }
 
 impl Protocol {
@@ -67,24 +82,33 @@ impl Protocol {
         match s {
             "http_json" => Ok(Protocol::HttpJson),
             "http_protobuf" => Ok(Protocol::HttpProtobuf),
-            "grpc" => bail!(
-                "output '{}': protocol 'grpc' is not implemented in v0.5.0 (use http_protobuf or http_json)",
-                output_name
-            ),
+            "grpc" => Ok(Protocol::Grpc),
             other => bail!(
-                "output '{}': unknown protocol '{}' (expected http_json or http_protobuf)",
+                "output '{}': unknown protocol '{}' (expected http_json, http_protobuf, or grpc)",
                 output_name,
                 other
             ),
         }
     }
 
-    fn content_type(self) -> &'static str {
+    fn content_type(self) -> Option<&'static str> {
         match self {
-            Protocol::HttpJson => "application/json",
-            Protocol::HttpProtobuf => "application/x-protobuf",
+            Protocol::HttpJson => Some("application/json"),
+            Protocol::HttpProtobuf => Some("application/x-protobuf"),
+            // gRPC sets its own framing and trailer-encoded
+            // content-type via tonic; the Inner.client field is unused
+            // on this path.
+            Protocol::Grpc => None,
         }
     }
+}
+
+/// Transport-specific client handles. HTTP transports share the
+/// reqwest client; gRPC owns a lazy tonic Channel that connects on
+/// first request and is reused thereafter.
+enum Transport {
+    Http(reqwest::Client),
+    Grpc(Channel),
 }
 
 struct Inner {
@@ -92,7 +116,7 @@ struct Inner {
     protocol: Protocol,
     headers: Vec<(String, String)>,
     batch_timeout: Duration,
-    client: reqwest::Client,
+    transport: Transport,
     /// Buffered per-Event singleton ResourceLogs proto bytes. Each
     /// entry is exactly what `otlp.encode_resourcelog_protobuf`
     /// produced; flush concatenates them into one
@@ -148,29 +172,71 @@ impl Module for OtlpOutput {
             }
         }
 
-        let mut client_builder = reqwest::Client::builder();
-        // TLS configuration — accept the same `tls { ca = "..." }` /
-        // `verify` shape that the http output uses, so users don't
-        // need to learn a second dialect.
+        // TLS / `verify` block parsing is shared across transports —
+        // both reqwest and tonic accept the same on-disk PEM, so we
+        // resolve once and apply per-transport below.
         let verify = props::get_ident(properties, "verify")
             .map(|s| s != "false")
             .unwrap_or(true);
-        if !verify {
-            client_builder = client_builder.danger_accept_invalid_certs(true);
-        }
-        if let Some(block) = props::get_block(properties, "tls")
-            && let Some(ca_path) = props::get_string(block, "ca")
-        {
-            let pem = std::fs::read(&ca_path)
-                .with_context(|| format!("output '{}': cannot read CA cert {}", name, ca_path))?;
-            let cert = reqwest::Certificate::from_pem(&pem).with_context(|| {
-                format!("output '{}': invalid CA cert PEM at {}", name, ca_path)
-            })?;
-            client_builder = client_builder.add_root_certificate(cert);
-        }
-        let client = client_builder
-            .build()
-            .with_context(|| format!("output '{}': failed to build HTTP client", name))?;
+        let ca_path = props::get_block(properties, "tls")
+            .and_then(|block| props::get_string(block, "ca"));
+        let ca_pem = ca_path
+            .as_ref()
+            .map(|p| {
+                std::fs::read(p).with_context(|| {
+                    format!("output '{}': cannot read CA cert {}", name, p)
+                })
+            })
+            .transpose()?;
+
+        let transport = match protocol {
+            Protocol::HttpJson | Protocol::HttpProtobuf => {
+                let mut builder = reqwest::Client::builder();
+                if !verify {
+                    builder = builder.danger_accept_invalid_certs(true);
+                }
+                if let Some(pem) = &ca_pem {
+                    let cert = reqwest::Certificate::from_pem(pem).with_context(|| {
+                        format!(
+                            "output '{}': invalid CA cert PEM at {}",
+                            name,
+                            ca_path.as_deref().unwrap_or("<inline>")
+                        )
+                    })?;
+                    builder = builder.add_root_certificate(cert);
+                }
+                let client = builder.build().with_context(|| {
+                    format!("output '{}': failed to build HTTP client", name)
+                })?;
+                Transport::Http(client)
+            }
+            Protocol::Grpc => {
+                let mut endpoint_builder = Endpoint::from_shared(endpoint.clone())
+                    .with_context(|| format!("output '{}': invalid gRPC endpoint", name))?;
+                if endpoint.starts_with("https://") || ca_pem.is_some() {
+                    install_default_crypto_provider();
+                    let mut tls = ClientTlsConfig::new().with_native_roots();
+                    if let Some(pem) = &ca_pem {
+                        tls = tls.ca_certificate(tonic::transport::Certificate::from_pem(pem));
+                    }
+                    endpoint_builder = endpoint_builder.tls_config(tls).with_context(|| {
+                        format!("output '{}': failed to configure gRPC TLS", name)
+                    })?;
+                }
+                if !verify {
+                    // tonic does not expose a "skip verify" knob the
+                    // way reqwest does; users that need it for dev
+                    // environments must run on plaintext (`http://`)
+                    // until rustls-on-tonic gains the equivalent.
+                    bail!(
+                        "output '{}': `verify false` is not supported on gRPC transport (use `http://` for plaintext or set up a real CA for TLS)",
+                        name
+                    );
+                }
+                let channel = endpoint_builder.connect_lazy();
+                Transport::Grpc(channel)
+            }
+        };
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -178,7 +244,7 @@ impl Module for OtlpOutput {
                 protocol,
                 headers,
                 batch_timeout,
-                client,
+                transport,
                 batch: Mutex::new(Vec::new()),
             }),
             batch_size,
@@ -230,73 +296,21 @@ impl OtlpOutput {
             return Ok(());
         }
         let count = drained.len();
-
-        // Decode each per-Event ResourceLogs and gather into the
-        // request envelope. v0.5.0 batch_level=none → no merging.
-        let mut req = ExportLogsServiceRequest::default();
-        req.resource_logs.reserve(drained.len());
-        for proto in &drained {
-            let rl = ResourceLogs::decode(&**proto).with_context(|| {
-                "output otlp: pipeline egress is not a valid ResourceLogs proto (wire it through `otlp.encode_resourcelog_protobuf`)"
-            })?;
-            req.resource_logs.push(rl);
-        }
-
-        let result = match self.inner.protocol {
-            Protocol::HttpProtobuf => self.send_http_protobuf(&req).await,
-            Protocol::HttpJson => self.send_http_json(&req).await,
-        };
-
+        let result = send_batch(&self.inner, drained).await;
         match result {
             Ok(()) => {
-                self.metrics.events_written.fetch_add(count as u64, Ordering::Relaxed);
+                self.metrics
+                    .events_written
+                    .fetch_add(count as u64, Ordering::Relaxed);
                 Ok(())
             }
             Err(e) => {
-                self.metrics.events_failed.fetch_add(count as u64, Ordering::Relaxed);
+                self.metrics
+                    .events_failed
+                    .fetch_add(count as u64, Ordering::Relaxed);
                 Err(e)
             }
         }
-    }
-
-    async fn send_http_protobuf(&self, req: &ExportLogsServiceRequest) -> Result<()> {
-        let mut buf = Vec::with_capacity(req.encoded_len());
-        req.encode(&mut buf)
-            .map_err(|e| anyhow!("output otlp: encode failed: {e}"))?;
-        self.send_http(buf).await
-    }
-
-    async fn send_http_json(&self, req: &ExportLogsServiceRequest) -> Result<()> {
-        let body = serde_json::to_vec(req)
-            .map_err(|e| anyhow!("output otlp: JSON encode failed: {e}"))?;
-        self.send_http(body).await
-    }
-
-    async fn send_http(&self, body: Vec<u8>) -> Result<()> {
-        let mut req = self
-            .inner
-            .client
-            .post(&self.inner.endpoint)
-            .header("Content-Type", self.inner.protocol.content_type())
-            .body(body);
-        for (k, v) in &self.inner.headers {
-            req = req.header(k, v);
-        }
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("output otlp: POST {} failed", self.inner.endpoint))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            bail!(
-                "output otlp: {} returned HTTP {} — {}",
-                self.inner.endpoint,
-                status.as_u16(),
-                text.chars().take(500).collect::<String>()
-            );
-        }
-        Ok(())
     }
 
     /// Schedule (or refresh) a deferred flush so events do not sit in
@@ -321,66 +335,14 @@ impl OtlpOutput {
                 return;
             }
             let count = drained.len();
-            let mut req = ExportLogsServiceRequest::default();
-            req.resource_logs.reserve(drained.len());
-            for proto in &drained {
-                match ResourceLogs::decode(&**proto) {
-                    Ok(rl) => req.resource_logs.push(rl),
-                    Err(e) => {
-                        tracing::warn!(
-                            "otlp flush timer: dropping malformed ResourceLogs ({})",
-                            e
-                        );
-                        metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                }
-            }
-            let body_result = match inner.protocol {
-                Protocol::HttpProtobuf => {
-                    let mut buf = Vec::with_capacity(req.encoded_len());
-                    req.encode(&mut buf).ok();
-                    Ok(buf)
-                }
-                Protocol::HttpJson => serde_json::to_vec(&req)
-                    .map_err(|e| anyhow!("OTLP/JSON encode: {e}")),
-            };
-            let body = match body_result {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!("otlp flush timer: encode failed ({})", e);
-                    metrics
-                        .events_failed
-                        .fetch_add(count as u64, Ordering::Relaxed);
-                    return;
-                }
-            };
-            let mut request = inner
-                .client
-                .post(&inner.endpoint)
-                .header("Content-Type", inner.protocol.content_type())
-                .body(body);
-            for (k, v) in &inner.headers {
-                request = request.header(k, v);
-            }
-            match request.send().await {
-                Ok(resp) if resp.status().is_success() => {
+            match send_batch(&inner, drained).await {
+                Ok(()) => {
                     metrics
                         .events_written
                         .fetch_add(count as u64, Ordering::Relaxed);
                 }
-                Ok(resp) => {
-                    tracing::warn!(
-                        "otlp flush timer: {} returned HTTP {}",
-                        inner.endpoint,
-                        resp.status().as_u16()
-                    );
-                    metrics
-                        .events_failed
-                        .fetch_add(count as u64, Ordering::Relaxed);
-                }
                 Err(e) => {
-                    tracing::warn!("otlp flush timer: POST failed ({})", e);
+                    tracing::warn!("otlp flush timer: send failed ({})", e);
                     metrics
                         .events_failed
                         .fetch_add(count as u64, Ordering::Relaxed);
@@ -389,6 +351,139 @@ impl OtlpOutput {
         });
         *handle = Some(new_handle);
     }
+}
+
+/// rustls 0.23 requires explicit `CryptoProvider` selection — call
+/// once before the first gRPC TLS endpoint is built. Uses aws-lc-rs
+/// (the OpenSSL-style provider, present transitively via tonic's
+/// tls-roots feature). Idempotent: subsequent calls observe the
+/// already-installed provider and silently no-op.
+fn install_default_crypto_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // `install_default` returns `Err` if a provider is already
+        // installed (which happens when reqwest set one up first).
+        // Either way we leave with a provider available, so swallow
+        // the error.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
+/// Decode the per-Event ResourceLogs proto bytes, gather them into one
+/// `ExportLogsServiceRequest`, and ship it via the configured
+/// transport. Pulled out of `OtlpOutput` so the size-flush and
+/// timeout-flush paths can share one implementation.
+async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<()> {
+    let mut req = ExportLogsServiceRequest::default();
+    req.resource_logs.reserve(drained.len());
+    for proto in &drained {
+        let rl = ResourceLogs::decode(&**proto).with_context(|| {
+            "output otlp: pipeline egress is not a valid ResourceLogs proto (wire it through `otlp.encode_resourcelog_protobuf`)"
+        })?;
+        req.resource_logs.push(rl);
+    }
+    match &inner.transport {
+        Transport::Http(client) => send_http(inner, client, &req).await,
+        Transport::Grpc(channel) => send_grpc(inner, channel, req).await,
+    }
+}
+
+async fn send_http(
+    inner: &Inner,
+    client: &reqwest::Client,
+    req: &ExportLogsServiceRequest,
+) -> Result<()> {
+    let body = match inner.protocol {
+        Protocol::HttpProtobuf => {
+            let mut buf = Vec::with_capacity(req.encoded_len());
+            req.encode(&mut buf)
+                .map_err(|e| anyhow!("output otlp: protobuf encode failed: {e}"))?;
+            buf
+        }
+        Protocol::HttpJson => serde_json::to_vec(req)
+            .map_err(|e| anyhow!("output otlp: JSON encode failed: {e}"))?,
+        Protocol::Grpc => unreachable!("send_http called for gRPC transport"),
+    };
+    let content_type = inner
+        .protocol
+        .content_type()
+        .expect("HTTP transport has a content type");
+    let mut http_req = client
+        .post(&inner.endpoint)
+        .header("Content-Type", content_type)
+        .body(body);
+    for (k, v) in &inner.headers {
+        http_req = http_req.header(k, v);
+    }
+    let resp = http_req
+        .send()
+        .await
+        .with_context(|| format!("output otlp: POST {} failed", inner.endpoint))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        bail!(
+            "output otlp: {} returned HTTP {} — {}",
+            inner.endpoint,
+            status.as_u16(),
+            text.chars().take(500).collect::<String>()
+        );
+    }
+    Ok(())
+}
+
+async fn send_grpc(
+    inner: &Inner,
+    channel: &Channel,
+    req: ExportLogsServiceRequest,
+) -> Result<()> {
+    let mut client = LogsServiceClient::new(channel.clone());
+    let mut request = tonic::Request::new(req);
+    let metadata = request.metadata_mut();
+    for (k, v) in &inner.headers {
+        // Lower-case the metadata key per HTTP/2 / gRPC convention;
+        // tonic enforces this and will refuse `Authorization` etc.
+        let key_lc = k.to_ascii_lowercase();
+        match (
+            tonic::metadata::MetadataKey::<tonic::metadata::Ascii>::from_bytes(key_lc.as_bytes()),
+            tonic::metadata::MetadataValue::try_from(v.as_str()),
+        ) {
+            (Ok(mk), Ok(mv)) => {
+                metadata.insert(mk, mv);
+            }
+            _ => {
+                tracing::warn!(
+                    "otlp gRPC: skipping malformed header {:?}={:?}",
+                    k,
+                    v
+                );
+            }
+        }
+    }
+    let response = client
+        .export(request)
+        .await
+        .with_context(|| format!("output otlp: gRPC export to {} failed", inner.endpoint))?;
+    // The receiver may report a `partial_success` with rejected
+    // records. Surface as a warning — retry / drop policy is queued
+    // for v0.5.x (see design memo §8 open issue #1 / #2).
+    let inner_resp = response.into_inner();
+    if let Some(partial) = inner_resp.partial_success
+        && partial.rejected_log_records > 0
+    {
+        tracing::warn!(
+            "otlp gRPC: {} rejected {} log record(s){}",
+            inner.endpoint,
+            partial.rejected_log_records,
+            if partial.error_message.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", partial.error_message)
+            }
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -418,14 +513,49 @@ mod tests {
         assert!(err.to_string().contains("endpoint"));
     }
 
-    #[test]
-    fn rejects_grpc_protocol_in_v050() {
+    #[tokio::test]
+    async fn accepts_grpc_protocol() {
         let props = vec![
-            prop_str("endpoint", "http://x"),
+            prop_str("endpoint", "http://localhost:4317"),
             prop_str("protocol", "grpc"),
         ];
+        let output = OtlpOutput::from_properties("o", &props).unwrap();
+        assert!(matches!(output.inner.protocol, Protocol::Grpc));
+        assert!(matches!(output.inner.transport, Transport::Grpc(_)));
+    }
+
+    #[tokio::test]
+    async fn grpc_with_https_uses_tls_channel() {
+        // The endpoint scheme drives TLS choice — `https://` triggers
+        // ClientTlsConfig.with_native_roots(). We can't observe the
+        // config from outside the channel, but construction not
+        // erroring is the contract here.
+        let props = vec![
+            prop_str("endpoint", "https://collector.example.com:4317"),
+            prop_str("protocol", "grpc"),
+        ];
+        let output = OtlpOutput::from_properties("o", &props).unwrap();
+        assert!(matches!(output.inner.transport, Transport::Grpc(_)));
+    }
+
+    #[tokio::test]
+    async fn grpc_rejects_verify_false() {
+        // tonic does not expose insecure-skip-verify; surface a clear
+        // error instead of silently accepting.
+        let props = vec![
+            prop_str("endpoint", "https://x:4317"),
+            prop_str("protocol", "grpc"),
+            Property::KeyValue {
+                key: "verify".into(),
+                value: Expr::spanless(ExprKind::Ident(vec!["false".into()])),
+                value_span: None,
+            },
+        ];
         let err = OtlpOutput::from_properties("o", &props).err().unwrap();
-        assert!(err.to_string().contains("not implemented"));
+        assert!(
+            err.to_string().contains("verify false"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -435,7 +565,7 @@ mod tests {
             prop_str("protocol", "carrier_pigeon"),
         ];
         let err = OtlpOutput::from_properties("o", &props).err().unwrap();
-        assert!(err.to_string().contains("unknown protocol"));
+        assert!(err.to_string().contains("unknown"));
     }
 
     #[test]

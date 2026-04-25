@@ -45,6 +45,7 @@ opentelemetry-proto = { version = "0.27", features = ["logs", "gen-tonic", "with
 tonic = { version = "0.12", features = ["tls", "tls-roots"] }
 prost = "0.13"
 axum = "0.7"
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 
 [features]
 journal = ["dep:systemd"]
