@@ -40,13 +40,8 @@ impl Module for SyslogTlsInput {
             Some("non_transparent") => TcpFraming::NonTransparent,
             _ => TcpFraming::Auto,
         };
-        let tls_block = props::get_block(properties, "tls")
+        let tls_config = TlsConfig::from_properties_block(&format!("input '{}'", name), properties)?
             .ok_or_else(|| anyhow::anyhow!("input '{}': syslog_tls requires 'tls' block", name))?;
-        let cert = props::get_string(tls_block, "cert")
-            .ok_or_else(|| anyhow::anyhow!("input '{}': tls requires 'cert'", name))?;
-        let key = props::get_string(tls_block, "key")
-            .ok_or_else(|| anyhow::anyhow!("input '{}': tls requires 'key'", name))?;
-        let ca = props::get_string(tls_block, "ca");
         let rate_limit = props::get_strictly_positive_int(properties, "rate_limit")?;
         let max_connections = props::get_positive_int(properties, "max_connections")?
             .unwrap_or(super::syslog_tcp::DEFAULT_MAX_CONNECTIONS)
@@ -55,11 +50,7 @@ impl Module for SyslogTlsInput {
         Ok(Self {
             bind_addr: bind,
             framing,
-            tls_config: TlsConfig {
-                cert_path: cert,
-                key_path: key,
-                ca_path: ca,
-            },
+            tls_config,
             rate_limit,
             max_connections,
             metrics: Arc::new(crate::metrics::InputMetrics::default()),

@@ -7,6 +7,9 @@ use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::{self, ServerConfig};
 
+use crate::dsl::ast::Property;
+use crate::dsl::props;
+
 /// TLS settings parsed from DSL `tls { ... }` block.
 #[derive(Debug, Clone)]
 pub struct TlsConfig {
@@ -14,6 +17,49 @@ pub struct TlsConfig {
     pub key_path: String,
     /// CA cert for client verification. None = no client auth.
     pub ca_path: Option<String>,
+}
+
+impl TlsConfig {
+    /// Parse the optional `tls { cert key ca }` block off a module's
+    /// property list. Returns `Ok(None)` when no block is present so
+    /// callers can branch on plaintext vs TLS, and a clear error when
+    /// the block exists but is missing required fields. The single
+    /// implementation keeps error wording consistent across every
+    /// module that accepts the same block (syslog_tls, otlp_grpc, …).
+    pub fn from_properties_block(
+        module_name: &str,
+        properties: &[Property],
+    ) -> Result<Option<Self>> {
+        let Some(block) = props::get_block(properties, "tls") else {
+            return Ok(None);
+        };
+        let cert_path = props::get_string(block, "cert").ok_or_else(|| {
+            anyhow::anyhow!("'{}': tls block requires 'cert'", module_name)
+        })?;
+        let key_path = props::get_string(block, "key").ok_or_else(|| {
+            anyhow::anyhow!("'{}': tls block requires 'key'", module_name)
+        })?;
+        let ca_path = props::get_string(block, "ca");
+        Ok(Some(TlsConfig {
+            cert_path,
+            key_path,
+            ca_path,
+        }))
+    }
+}
+
+/// Install the default rustls `CryptoProvider` (aws-lc-rs) once per
+/// process. rustls 0.23 forces explicit selection; both the OTLP gRPC
+/// input (server-side TLS) and output (client-side TLS) need it before
+/// the first handshake. Idempotent — gated by a `Once`, and
+/// `install_default` itself silently no-ops when a provider is already
+/// installed (e.g. by reqwest), so multiple call sites are safe.
+pub fn install_default_crypto_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
 }
 
 /// Build a rustls ServerConfig for a TLS-enabled TCP input.
