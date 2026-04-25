@@ -30,7 +30,7 @@ def output otlp_out {
 | `protocol` | no | `http_protobuf` | One of `http_json`, `http_protobuf`, `grpc`. |
 | `batch_size` | no | `1` | Flush after this many Events. `1` ships every Event immediately. |
 | `batch_timeout` | no | `5s` | Flush deferred Events after this duration. |
-| `batch_level` | no | `none` | v0.5.0 only supports `none` (pure concat). |
+| `batch_level` | no | `none` | One of `none` / `resource` / `scope`. See [§ batch_level](#batch_level). |
 | `headers` | no | — | HTTP headers (HTTP transports) / gRPC metadata (gRPC). Map keys are lower-cased for gRPC per HTTP/2 convention. |
 | `tls.ca` | no | system roots | Custom CA certificate file (PEM). |
 | `verify` | no | `true` | TLS verify (HTTP only — gRPC does not support `verify false`; use `http://` for plaintext). |
@@ -91,13 +91,15 @@ def pipeline otlp_relay {
 
 OTLP receivers accept an `ExportLogsServiceRequest` with multiple `ResourceLogs` entries, even when several share the same `Resource` or `(Resource, Scope)` pair. The proto3 `repeated` semantics make a "pure concat" batch (one entry per Event) and a merged batch (entries collapsed by Resource / Scope) **semantically identical** at the receiver — same set of LogRecords arrive, only the framing differs.
 
-| `batch_level` | Wire form | Status |
-|---------------|-----------|--------|
-| `none` (default) | one ResourceLogs entry per Event | **shipped in v0.5.0** |
-| `resource` | merge same-Resource Events into one ResourceLogs | queued for v0.5.x |
-| `scope` | merge same-(Resource, Scope) into one ScopeLogs | queued for v0.5.x |
+| `batch_level` | Wire form | CPU | Wire size |
+|---------------|-----------|-----|-----------|
+| `none` (default) | one ResourceLogs entry per Event | cheapest | largest |
+| `resource` | merge same-Resource Events into one ResourceLogs | + linear Resource scan | smaller |
+| `scope` | merge same-(Resource, Scope) into one ScopeLogs | + Scope scan inside each Resource | smallest |
 
-The merging modes are wire-efficiency optimisations; if your batch sizes are modest (hundreds of Events), `none` is fine.
+Resource / Scope equality is order-insensitive on attributes — proto3 does not promise a canonical attribute order on the wire, so attribute lists are sorted by key before comparison.
+
+The merging modes are wire-efficiency optimisations; if your batch sizes are modest (hundreds of Events), `none` is fine. For collector → SaaS hops where every byte counts, `scope` is usually the right choice.
 
 ## gRPC notes
 
