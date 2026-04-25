@@ -4,7 +4,7 @@
 //! `N` is 1-3 digits (the valid PRI range is 0..=191). Strictly
 //! byte-oriented — no allocation when nothing to strip.
 
-use serde_json::Value;
+use crate::dsl::value::Value;
 
 use crate::functions::primitives::val_to_str;
 use crate::functions::syslog::pri::parse_leading_pri;
@@ -17,7 +17,7 @@ pub fn register(reg: &mut FunctionRegistry) {
         "strip_pri",
         FunctionSig::fixed(&[FieldType::String], FieldType::String),
         |args, _event| {
-            let input = val_to_str(&args[0]);
+            let input = val_to_str(&args[0])?;
             let stripped = match parse_leading_pri(&input) {
                 Some((_, body)) => input[body..].to_string(),
                 None => input,

@@ -12,7 +12,7 @@
 //! * Any other non-array input → `Null`.
 //! * `v` may be any value, including `Null`.
 
-use serde_json::Value;
+use crate::dsl::value::Value;
 
 use crate::functions::{FunctionRegistry, FunctionSig};
 use crate::modules::schema::FieldType;
@@ -40,43 +40,43 @@ fn push_front(arr: &Value, v: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use crate::value;
 
     #[test]
     fn prepends_to_non_empty_array() {
-        assert_eq!(push_front(&json!([2, 3]), &json!(1)), json!([1, 2, 3]));
+        assert_eq!(push_front(&value!([2, 3]), &value!(1)), value!([1, 2, 3]));
     }
 
     #[test]
     fn prepends_to_empty_array() {
-        assert_eq!(push_front(&json!([]), &json!("first")), json!(["first"]));
+        assert_eq!(push_front(&value!([]), &value!("first")), value!(["first"]));
     }
 
     #[test]
     fn original_array_unchanged() {
-        let original = json!([2, 3]);
-        let result = push_front(&original, &json!(1));
-        assert_eq!(original, json!([2, 3]));
-        assert_eq!(result, json!([1, 2, 3]));
+        let original = value!([2, 3]);
+        let result = push_front(&original, &value!(1));
+        assert_eq!(original, value!([2, 3]));
+        assert_eq!(result, value!([1, 2, 3]));
     }
 
     #[test]
     fn prepending_any_value_type() {
-        assert_eq!(push_front(&json!([]), &json!(null)), json!([null]));
-        assert_eq!(push_front(&json!([]), &json!({"k": 1})), json!([{"k": 1}]));
-        assert_eq!(push_front(&json!([]), &json!([1, 2])), json!([[1, 2]]));
+        assert_eq!(push_front(&value!([]), &value!(null)), value!([null]));
+        assert_eq!(push_front(&value!([]), &value!({"k": 1})), value!([{"k": 1}]));
+        assert_eq!(push_front(&value!([]), &value!([1, 2])), value!([[1, 2]]));
     }
 
     #[test]
     fn null_array_returns_null() {
-        assert_eq!(push_front(&Value::Null, &json!(1)), Value::Null);
+        assert_eq!(push_front(&Value::Null, &value!(1)), Value::Null);
     }
 
     #[test]
     fn non_array_input_returns_null() {
-        assert_eq!(push_front(&json!("string"), &json!(1)), Value::Null);
-        assert_eq!(push_front(&json!({"k": 1}), &json!(1)), Value::Null);
-        assert_eq!(push_front(&json!(42), &json!(1)), Value::Null);
+        assert_eq!(push_front(&value!("string"), &value!(1)), Value::Null);
+        assert_eq!(push_front(&value!({"k": 1}), &value!(1)), Value::Null);
+        assert_eq!(push_front(&value!(42), &value!(1)), Value::Null);
     }
 
     #[test]
@@ -85,11 +85,11 @@ mod tests {
         use crate::functions::primitives::append;
         let _ = append::register; // ensure append module reachable; pure unit test logic below.
 
-        let middle = json!([2, 3]);
-        let prepended = push_front(&middle, &json!(1));
+        let middle = value!([2, 3]);
+        let prepended = push_front(&middle, &value!(1));
         // Manually append 4 for symmetric check.
         let mut with_back = prepended.as_array().unwrap().clone();
-        with_back.push(json!(4));
-        assert_eq!(Value::Array(with_back), json!([1, 2, 3, 4]));
+        with_back.push(value!(4));
+        assert_eq!(Value::Array(with_back), value!([1, 2, 3, 4]));
     }
 }

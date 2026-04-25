@@ -11,7 +11,8 @@ use std::sync::OnceLock;
 
 use anyhow::Result;
 use maxminddb::{Reader, geoip2};
-use serde_json::Value;
+
+use crate::dsl::value::{Map, Value};
 
 /// Global GeoIP database reader (initialized once at startup).
 static GEOIP_DB: OnceLock<Option<Reader<Vec<u8>>>> = OnceLock::new();
@@ -51,7 +52,7 @@ pub fn lookup(ip_str: &str) -> Result<Value> {
         .map_err(|e| anyhow::anyhow!("GeoIP decode failed: {}", e))?
         .ok_or_else(|| anyhow::anyhow!("GeoIP: no data for IP {}", ip_str))?;
 
-    let mut map = serde_json::Map::new();
+    let mut map = Map::new();
 
     if let Some(iso) = city.country.iso_code {
         map.insert("country".into(), Value::String(iso.to_string()));
@@ -62,14 +63,14 @@ pub fn lookup(ip_str: &str) -> Result<Value> {
     }
 
     if let Some(lat) = city.location.latitude
-        && let Some(n) = serde_json::Number::from_f64(lat)
+        && lat.is_finite()
     {
-        map.insert("latitude".into(), Value::Number(n));
+        map.insert("latitude".into(), Value::Float(lat));
     }
     if let Some(lon) = city.location.longitude
-        && let Some(n) = serde_json::Number::from_f64(lon)
+        && lon.is_finite()
     {
-        map.insert("longitude".into(), Value::Number(n));
+        map.insert("longitude".into(), Value::Float(lon));
     }
 
     Ok(Value::Object(map))

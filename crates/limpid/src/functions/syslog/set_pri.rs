@@ -13,7 +13,7 @@
 //! - `severity` must be in 0..=7 (emerg=0, alert=1, ..., debug=7).
 
 use anyhow::{Result, bail};
-use serde_json::Value;
+use crate::dsl::value::Value;
 
 use crate::functions::primitives::val_to_str;
 use crate::functions::syslog::pri::parse_leading_pri;
@@ -34,7 +34,7 @@ pub fn register(reg: &mut FunctionRegistry) {
 
 fn set_pri_impl(args: &[Value]) -> Result<Value> {
     // Arity check is centralised in the registry via FunctionSig.
-    let text = val_to_str(&args[0]);
+    let text = val_to_str(&args[0])?;
     let facility = arg_as_u8(&args[1], "facility", 23)?;
     let severity = arg_as_u8(&args[2], "severity", 7)?;
     let pri = (facility as u16) * 8 + (severity as u16);
@@ -49,10 +49,9 @@ fn set_pri_impl(args: &[Value]) -> Result<Value> {
 
 fn arg_as_u8(v: &Value, name: &str, max: u8) -> Result<u8> {
     let n = match v {
-        Value::Number(n) => n.as_u64().ok_or_else(|| {
-            anyhow::anyhow!("syslog.set_pri(): {} must be a non-negative integer", name)
-        })?,
-        _ => bail!("syslog.set_pri(): {} must be a number", name),
+        Value::Int(n) if *n >= 0 => *n as u64,
+        Value::Float(f) if f.is_finite() && *f >= 0.0 && f.fract() == 0.0 => *f as u64,
+        _ => bail!("syslog.set_pri(): {} must be a non-negative integer", name),
     };
     if n > max as u64 {
         bail!("syslog.set_pri(): {} must be 0-{}, got {}", name, max, n);
@@ -90,8 +89,8 @@ mod tests {
                 "set_pri",
                 &[
                     Value::String("hello".into()),
-                    Value::Number(16.into()),
-                    Value::Number(6.into()),
+                    Value::Int(16),
+                    Value::Int(6),
                 ],
                 &e,
             )
@@ -110,8 +109,8 @@ mod tests {
                 "set_pri",
                 &[
                     Value::String("<185>body".into()),
-                    Value::Number(16.into()),
-                    Value::Number(6.into()),
+                    Value::Int(16),
+                    Value::Int(6),
                 ],
                 &e,
             )
@@ -130,8 +129,8 @@ mod tests {
                 "set_pri",
                 &[
                     Value::String("<abc>body".into()),
-                    Value::Number(16.into()),
-                    Value::Number(6.into()),
+                    Value::Int(16),
+                    Value::Int(6),
                 ],
                 &e,
             )
@@ -149,8 +148,8 @@ mod tests {
                 "set_pri",
                 &[
                     Value::String("msg".into()),
-                    Value::Number(99.into()),
-                    Value::Number(0.into()),
+                    Value::Int(99),
+                    Value::Int(0),
                 ],
                 &e,
             )
@@ -168,8 +167,8 @@ mod tests {
                 "set_pri",
                 &[
                     Value::String("msg".into()),
-                    Value::Number(1.into()),
-                    Value::Number(8.into()),
+                    Value::Int(1),
+                    Value::Int(8),
                 ],
                 &e,
             )

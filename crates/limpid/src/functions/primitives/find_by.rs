@@ -19,7 +19,7 @@
 //!   element. Callers who need deeper matching can post-filter or call
 //!   `find_by` twice.
 
-use serde_json::Value;
+use crate::dsl::value::Value;
 
 use crate::functions::{FunctionRegistry, FunctionSig};
 use crate::modules::schema::FieldType;
@@ -57,69 +57,69 @@ fn find(array: &Value, key: &Value, value: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use crate::value;
 
     #[test]
     fn finds_first_matching_object() {
-        let arr = json!([
+        let arr = value!([
             {"entityType": "Process", "fileName": "ps.exe"},
             {"entityType": "User", "name": "alice"},
         ]);
-        let got = find(&arr, &json!("entityType"), &json!("User"));
-        assert_eq!(got, json!({"entityType": "User", "name": "alice"}));
+        let got = find(&arr, &value!("entityType"), &value!("User"));
+        assert_eq!(got, value!({"entityType": "User", "name": "alice"}));
     }
 
     #[test]
     fn returns_first_match_not_subsequent() {
-        let arr = json!([
+        let arr = value!([
             {"t": "a", "n": 1},
             {"t": "a", "n": 2},
         ]);
-        let got = find(&arr, &json!("t"), &json!("a"));
-        assert_eq!(got, json!({"t": "a", "n": 1}));
+        let got = find(&arr, &value!("t"), &value!("a"));
+        assert_eq!(got, value!({"t": "a", "n": 1}));
     }
 
     #[test]
     fn no_match_returns_null() {
-        let arr = json!([{"t": "a"}, {"t": "b"}]);
-        assert_eq!(find(&arr, &json!("t"), &json!("c")), Value::Null);
+        let arr = value!([{"t": "a"}, {"t": "b"}]);
+        assert_eq!(find(&arr, &value!("t"), &value!("c")), Value::Null);
     }
 
     #[test]
     fn non_array_input_returns_null() {
-        assert_eq!(find(&json!({"t": "a"}), &json!("t"), &json!("a")), Value::Null);
-        assert_eq!(find(&Value::Null, &json!("t"), &json!("a")), Value::Null);
-        assert_eq!(find(&json!("not an array"), &json!("t"), &json!("a")), Value::Null);
+        assert_eq!(find(&value!({"t": "a"}), &value!("t"), &value!("a")), Value::Null);
+        assert_eq!(find(&Value::Null, &value!("t"), &value!("a")), Value::Null);
+        assert_eq!(find(&value!("not an array"), &value!("t"), &value!("a")), Value::Null);
     }
 
     #[test]
     fn non_string_key_returns_null() {
-        let arr = json!([{"t": "a"}]);
-        assert_eq!(find(&arr, &json!(42), &json!("a")), Value::Null);
+        let arr = value!([{"t": "a"}]);
+        assert_eq!(find(&arr, &value!(42), &value!("a")), Value::Null);
     }
 
     #[test]
     fn skips_non_object_elements() {
-        let arr = json!(["scalar", 42, {"t": "a"}, null]);
-        assert_eq!(find(&arr, &json!("t"), &json!("a")), json!({"t": "a"}));
+        let arr = value!(["scalar", 42, {"t": "a"}, null]);
+        assert_eq!(find(&arr, &value!("t"), &value!("a")), value!({"t": "a"}));
     }
 
     #[test]
     fn matches_by_integer_value() {
-        let arr = json!([{"n": 1}, {"n": 2}, {"n": 3}]);
-        assert_eq!(find(&arr, &json!("n"), &json!(2)), json!({"n": 2}));
+        let arr = value!([{"n": 1}, {"n": 2}, {"n": 3}]);
+        assert_eq!(find(&arr, &value!("n"), &value!(2)), value!({"n": 2}));
     }
 
     #[test]
     fn no_coercion_between_types() {
         // "2" (string) should NOT match 2 (int). Callers cast explicitly.
-        let arr = json!([{"n": 2}]);
-        assert_eq!(find(&arr, &json!("n"), &json!("2")), Value::Null);
+        let arr = value!([{"n": 2}]);
+        assert_eq!(find(&arr, &value!("n"), &value!("2")), Value::Null);
     }
 
     #[test]
     fn empty_array_returns_null() {
-        let arr = json!([]);
-        assert_eq!(find(&arr, &json!("t"), &json!("a")), Value::Null);
+        let arr = value!([]);
+        assert_eq!(find(&arr, &value!("t"), &value!("a")), Value::Null);
     }
 }

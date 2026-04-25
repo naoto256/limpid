@@ -6,7 +6,7 @@
 //! value, not `src=...`. Patterns with no explicit group still work.
 
 use anyhow::bail;
-use serde_json::Value;
+use crate::dsl::value::Value;
 
 use super::{get_cached_regex, val_to_str};
 use crate::functions::{FunctionRegistry, FunctionSig};
@@ -17,8 +17,8 @@ pub fn register(reg: &mut FunctionRegistry) {
         "regex_extract",
         FunctionSig::fixed(&[FieldType::String, FieldType::String], FieldType::String),
         |args, _event| {
-            let target = val_to_str(&args[0]);
-            let pattern = val_to_str(&args[1]);
+            let target = val_to_str(&args[0])?;
+            let pattern = val_to_str(&args[1])?;
             match get_cached_regex(&pattern) {
                 Ok(re) => {
                     if let Some(caps) = re.captures(&target) {

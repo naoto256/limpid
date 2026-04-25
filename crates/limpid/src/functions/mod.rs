@@ -32,8 +32,8 @@ pub mod table;
 use std::collections::HashMap;
 
 use anyhow::Result;
-use serde_json::Value;
 
+use crate::dsl::value::Value;
 use crate::event::Event;
 use crate::modules::schema::{FieldSpec, FieldType};
 
@@ -683,7 +683,7 @@ mod tests {
         let reg = make_registry();
         let mut e = dummy_event();
         e.workspace
-            .insert("host".into(), serde_json::Value::String("web01".into()));
+            .insert("host".into(), Value::String("web01".into()));
         let result = reg
             .call(
                 None,
@@ -702,7 +702,7 @@ mod tests {
         let reg = make_registry();
         let mut e = dummy_event();
         e.workspace
-            .insert("pid".into(), serde_json::Value::String("42".into()));
+            .insert("pid".into(), Value::String("42".into()));
         let err = reg
             .call(None, "format", &[Value::String("pid=%{pid}".into())], &e)
             .unwrap_err();

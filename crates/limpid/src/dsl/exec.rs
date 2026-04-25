@@ -2,11 +2,11 @@
 
 use anyhow::{Result, bail};
 use bytes::Bytes;
-use serde_json::Value;
 use thiserror::Error;
 
 use super::ast::*;
-use super::eval::{LocalScope, eval_expr_with_scope, is_truthy, value_to_string, values_match};
+use super::eval::{LocalScope, eval_expr_with_scope, value_to_string, values_match};
+use super::value::{Map, Value};
 use crate::event::Event;
 use crate::functions::FunctionRegistry;
 
@@ -165,7 +165,7 @@ fn exec_process_stmt(
                     let mut recovered = event_backup;
                     recovered
                         .workspace
-                        .insert("_error".into(), serde_json::Value::String(e.to_string()));
+                        .insert("_error".into(), Value::String(e.to_string()));
                     let mut result =
                         exec_stmts_with_scope(catch_body, recovered, registry, funcs, scope);
                     // Clean up _error after catch body
@@ -220,7 +220,7 @@ fn exec_process_stmt(
                 Value::Null => {}
                 other => bail!(
                     "bare expression statement must return Object or Null; got {}",
-                    value_type_name(&other)
+                    other.type_name()
                 ),
             }
             Ok(ExecResult::Continue(event))
@@ -237,7 +237,7 @@ fn exec_if_chain_process(
 ) -> Result<ExecResult> {
     for (condition, body) in &if_chain.branches {
         let cond_val = eval_expr_with_scope(condition, &event, funcs, scope)?;
-        if is_truthy(&cond_val) {
+        if cond_val.is_truthy() {
             return exec_branch_body_process(body, event, registry, funcs, scope);
         }
     }
@@ -277,7 +277,15 @@ fn exec_branch_body_process(
 fn apply_assign(event: &mut Event, target: &AssignTarget, value: Value) -> Result<()> {
     match target {
         AssignTarget::Egress => {
-            event.egress = Bytes::from(value_to_string(&value));
+            // Bytes: written verbatim — this is the entire reason for
+            // the v0.5.0 Bytes value variant. UTF-8 round-trip via
+            // `String::into_bytes` would corrupt non-text payloads
+            // (protobuf, raw binary, etc).
+            event.egress = match value {
+                Value::Bytes(b) => b,
+                Value::String(s) => Bytes::from(s),
+                other => Bytes::from(value_to_string(&other)),
+            };
             Ok(())
         }
         AssignTarget::Workspace(path) => {
@@ -300,25 +308,14 @@ fn set_workspace_path(
     // Nested path: ensure intermediate objects exist
     let entry = workspace
         .entry(path[0].clone())
-        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        .or_insert_with(|| Value::Object(Map::new()));
 
     if let Value::Object(map) = entry {
         set_object_path(map, &path[1..], value);
     }
 }
 
-fn value_type_name(v: &Value) -> &'static str {
-    match v {
-        Value::Null => "Null",
-        Value::Bool(_) => "Bool",
-        Value::Number(_) => "Number",
-        Value::String(_) => "String",
-        Value::Array(_) => "Array",
-        Value::Object(_) => "Object",
-    }
-}
-
-fn set_object_path(map: &mut serde_json::Map<String, Value>, path: &[String], value: Value) {
+fn set_object_path(map: &mut Map, path: &[String], value: Value) {
     if path.len() == 1 {
         map.insert(path[0].clone(), value);
         return;
@@ -326,7 +323,7 @@ fn set_object_path(map: &mut serde_json::Map<String, Value>, path: &[String], va
 
     let entry = map
         .entry(path[0].clone())
-        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        .or_insert_with(|| Value::Object(Map::new()));
 
     if let Value::Object(inner) = entry {
         set_object_path(inner, &path[1..], value);

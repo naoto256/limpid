@@ -759,6 +759,8 @@ checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
  "hashbrown",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -859,6 +861,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "bytes",
  "chrono",
  "clap",
@@ -866,6 +869,7 @@ dependencies = [
  "digest",
  "flate2",
  "glob",
+ "indexmap",
  "libc",
  "maxminddb",
  "md-5",

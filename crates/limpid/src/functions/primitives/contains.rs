@@ -1,6 +1,6 @@
 //! `contains(haystack, needle)` — substring membership test.
 
-use serde_json::Value;
+use crate::dsl::value::Value;
 
 use super::val_to_str;
 use crate::functions::{FunctionRegistry, FunctionSig};
@@ -11,8 +11,8 @@ pub fn register(reg: &mut FunctionRegistry) {
         "contains",
         FunctionSig::fixed(&[FieldType::String, FieldType::String], FieldType::Bool),
         |args, _event| {
-            let haystack = val_to_str(&args[0]);
-            let needle = val_to_str(&args[1]);
+            let haystack = val_to_str(&args[0])?;
+            let needle = val_to_str(&args[1])?;
             Ok(Value::Bool(haystack.contains(&needle)))
         },
     );
