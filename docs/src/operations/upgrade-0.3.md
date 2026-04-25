@@ -10,8 +10,8 @@ Previous releases recognised fixed tokens (`${date}`, `${year}`, `${month}`, `${
 
 | Old | New |
 |-----|-----|
-| `path "/log/${date}.log"` | `path "/log/${strftime(timestamp, "%Y-%m-%d", "local")}.log"` |
-| `path "/log/${year}/${month}/${day}.log"` | `path "/log/${strftime(timestamp, "%Y/%m/%d", "local")}.log"` |
+| `path "/log/${date}.log"` | `path "/log/${strftime(received_at, "%Y-%m-%d", "local")}.log"` |
+| `path "/log/${year}/${month}/${day}.log"` | `path "/log/${strftime(received_at, "%Y/%m/%d", "local")}.log"` |
 
 `${source}`, `${severity}`, `${workspace.xxx}` continue to work because they are valid DSL expressions. `workspace.*` interpolations are still auto-sanitised.
 
@@ -58,7 +58,8 @@ and rewrite each DSL-concept hit (e.g. `contains(raw, ...)` → `contains(ingres
 
 ```bash
 jq -c '{
-  timestamp, source,
+  received_at: .timestamp,
+  source,
   ingress:   .raw,
   egress:    .message,
   workspace: .fields
@@ -111,7 +112,7 @@ The native `process <name>` modules are gone. Every transformation now happens i
 | `process strip_pri` | `process { egress = syslog.strip_pri(egress) }` |
 | `process regex_replace("pat", "repl")` | `process { egress = regex_replace(egress, "pat", "repl") }` |
 | `process prepend_source` | `process { egress = source + " " + egress }` |
-| `process prepend_timestamp` | `process { egress = strftime(timestamp, "%b %e %H:%M:%S") + " " + egress }` |
+| `process prepend_timestamp` | `process { egress = strftime(received_at, "%b %e %H:%M:%S") + " " + egress }` |
 
 Bare-statement function calls (`syslog.parse(ingress)`, `parse_kv(egress)`, `cef.parse(ingress)`) merge their returned object into `workspace` automatically — that is the same semantic the old parser processes had, now spelled in pure DSL. See [Expression Functions: Bare statements vs assignments](../processing/functions.md#bare-statements-vs-assignments) for the rule.
 

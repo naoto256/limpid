@@ -63,7 +63,7 @@ fn expand_format_template(template: &str, event: &Event) -> Result<String> {
 fn resolve_format_var(var: &str, event: &Event) -> Result<String> {
     match var {
         "source" => Ok(event.source.ip().to_string()),
-        "timestamp" => Ok(event.timestamp.to_rfc3339()),
+        "received_at" => Ok(event.received_at.to_rfc3339()),
         "egress" => Ok(String::from_utf8_lossy(&event.egress).into_owned()),
         "ingress" => Ok(String::from_utf8_lossy(&event.ingress).into_owned()),
         v if v.starts_with("workspace.") => {

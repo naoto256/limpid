@@ -206,7 +206,7 @@ Available placeholders:
 
 | Placeholder | Source |
 |-------------|--------|
-| `%{source}`, `%{timestamp}` | Event metadata |
+| `%{source}`, `%{received_at}` | Event metadata |
 | `%{egress}`, `%{ingress}` | Event byte buffers |
 | `%{workspace.xxx}` | Named workspace value (nested: `%{workspace.geo.country}`) |
 
@@ -264,16 +264,16 @@ Used as a bare statement, the returned object merges into `workspace` like other
 Formats an RFC 3339 timestamp (such as the event's `timestamp` field) according to a [`chrono` strftime](https://docs.rs/chrono/latest/chrono/format/strftime/) format string.
 
 ```
-strftime(timestamp, "%Y-%m-%d")          // 2026-04-19
-strftime(timestamp, "%b %e %H:%M:%S")    // Apr 19 10:30:45
-strftime(timestamp, "%Y-%m-%d", "local") // convert to local time first
-strftime(timestamp, "%H:%M", "UTC")      // force UTC
-strftime(timestamp, "%H:%M", "+09:00")   // fixed offset
+strftime(received_at, "%Y-%m-%d")          // 2026-04-19
+strftime(received_at, "%b %e %H:%M:%S")    // Apr 19 10:30:45
+strftime(received_at, "%Y-%m-%d", "local") // convert to local time first
+strftime(received_at, "%H:%M", "UTC")      // force UTC
+strftime(received_at, "%H:%M", "+09:00")   // fixed offset
 ```
 
 | Argument | Description |
 |----------|-------------|
-| `value` | RFC 3339 string (e.g. `"2026-04-19T10:30:45+00:00"`). `timestamp` always parses. |
+| `value` | RFC 3339 string (e.g. `"2026-04-19T10:30:45+00:00"`). `received_at` always parses. |
 | `format` | `chrono` strftime format. |
 | `timezone` *(optional)* | `"local"`, `"UTC"` (case-insensitive), or `±HH:MM` / `±HHMM`. If omitted, `value`'s own offset is used. |
 

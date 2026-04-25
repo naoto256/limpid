@@ -80,7 +80,7 @@ def process wrap_app {
     // decides the final PRI.
 
     egress = format(
-        "<14>1 %{strftime(timestamp, \"%Y-%m-%dT%H:%M:%S%.3fZ\", \"utc\")} %{hostname()} app - - - %{ingress}"
+        "<14>1 %{strftime(received_at, \"%Y-%m-%dT%H:%M:%S%.3fZ\", \"utc\")} %{hostname()} app - - - %{ingress}"
     )
 }
 

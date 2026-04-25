@@ -52,7 +52,7 @@ In a multi-hop pipeline, the only thing that travels from one limpid daemon to t
 - `egress`: the sole hop contract. Assembled in the process layer; serialized by the output.
 - `source`: set locally by the receiving input from the remote peer address. Not on the wire.
 - syslog facility / severity: not Event fields at all in 0.3 — they are bytes inside the `<PRI>` header at the start of a syslog-framed `egress`. The next hop re-extracts them with `syslog.extract_pri(...)` if it cares; the previous hop set them with `syslog.set_pri(...)` if it needed to.
-- `timestamp`: the wire-side timestamp, when present, lives inside `egress` (e.g. RFC 5424's TIMESTAMP field). `Event.timestamp` is pipeline-local — the time at which this hop received the event.
+- `received_at`: pipeline-local — the wall-clock time at which this hop received the event. The wire-side event timestamp, when present (e.g. RFC 5424's TIMESTAMP field), lives inside `egress` and is parsed into workspace by `process` snippets — never overwritten onto `Event.received_at` by inputs (Principle 2: input is dumb transport).
 - `workspace` / `let`: pipeline-local scratch. See [Event Model](./processing/README.md).
 
 **Why:** this is the natural consequence of Principle 2. When the wire contract is just `egress` bytes, no metadata can silently drift between daemons, no schema can grow incompatible across versions, and no "attribute" can mean one thing on one hop and another thing on the next. Each hop re-derives what it needs from the bytes it received.

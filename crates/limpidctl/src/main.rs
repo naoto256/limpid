@@ -509,20 +509,21 @@ fn parse_replay_factor(spec: &str) -> Result<f64, String> {
     Ok(v)
 }
 
-/// Pull the top-level `timestamp` field out of an Event JSON line and
-/// parse it as RFC3339. Returns a clear error so callers can abort —
-/// silently skipping would violate the "zero hidden behavior" principle.
+/// Pull the top-level `received_at` field out of an Event JSON line
+/// and parse it as RFC3339. Returns a clear error so callers can abort
+/// — silently skipping would violate the "zero hidden behavior"
+/// principle.
 fn extract_timestamp(line: &str) -> Result<DateTime<Utc>, String> {
     let v: serde_json::Value =
         serde_json::from_str(line).map_err(|e| format!("not valid JSON: {}", e))?;
     let ts = v
-        .get("timestamp")
-        .ok_or_else(|| "event has no top-level `timestamp` field".to_string())?
+        .get("received_at")
+        .ok_or_else(|| "event has no top-level `received_at` field".to_string())?
         .as_str()
-        .ok_or_else(|| "`timestamp` field is not a string".to_string())?;
+        .ok_or_else(|| "`received_at` field is not a string".to_string())?;
     DateTime::parse_from_rfc3339(ts)
         .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|e| format!("`timestamp` is not RFC3339 ({}): {:?}", e, ts))
+        .map_err(|e| format!("`received_at` is not RFC3339 ({}): {:?}", e, ts))
 }
 
 /// Tracks the wall-clock anchor used to gate replay sleeps.
@@ -634,7 +635,7 @@ mod tests {
 
     #[test]
     fn extract_timestamp_reads_rfc3339_field() {
-        let line = r#"{"timestamp":"2024-01-02T03:04:05Z","ingress":"hi","source":"127.0.0.1:514","egress":"hi"}"#;
+        let line = r#"{"received_at":"2024-01-02T03:04:05Z","ingress":"hi","source":"127.0.0.1:514","egress":"hi"}"#;
         let ts = extract_timestamp(line).unwrap();
         assert_eq!(ts.to_rfc3339(), "2024-01-02T03:04:05+00:00");
     }
@@ -645,10 +646,10 @@ mod tests {
         let line = r#"{"ingress":"hi","source":"127.0.0.1:514","egress":"hi"}"#;
         assert!(extract_timestamp(line).is_err());
         // Wrong type
-        let line = r#"{"timestamp":1234,"ingress":"hi"}"#;
+        let line = r#"{"received_at":1234,"ingress":"hi"}"#;
         assert!(extract_timestamp(line).is_err());
         // Bad format
-        let line = r#"{"timestamp":"yesterday"}"#;
+        let line = r#"{"received_at":"yesterday"}"#;
         assert!(extract_timestamp(line).is_err());
         // Not JSON
         assert!(extract_timestamp("not json at all").is_err());

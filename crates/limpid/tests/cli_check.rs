@@ -458,5 +458,7 @@ fn check_self_inclusion_is_rejected() {
     let out = run_check(&main);
     assert!(!out.status.success(), "self-inclusion must fail");
     let stderr = String::from_utf8(out.stderr).unwrap();
-    assert!(stderr.contains("self-inclusion"), "stderr: {}", stderr);
+    // a24de11 unified "self-inclusion" with general cycle detection;
+    // a file including itself is a cycle of length 1.
+    assert!(stderr.contains("cycle"), "stderr: {}", stderr);
 }

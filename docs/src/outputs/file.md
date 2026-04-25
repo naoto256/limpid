@@ -32,7 +32,7 @@ Permissions are applied only when the file is first created.
 ```
 def output per_source {
     type file
-    path "/var/log/limpid/${source}/${strftime(timestamp, "%Y-%m-%d", "local")}.log"
+    path "/var/log/limpid/${source}/${strftime(received_at, "%Y-%m-%d", "local")}.log"
 }
 
 def output per_host {
@@ -41,13 +41,13 @@ def output per_host {
 }
 ```
 
-Any DSL expression is allowed inside `${...}` — identifiers (`source`, `workspace.xxx`), function calls (`strftime`, `lower`, `regex_extract`), string concatenation with `+`, and so on. There are no hardcoded placeholders; for calendar components, call `strftime(timestamp, ...)` explicitly.
+Any DSL expression is allowed inside `${...}` — identifiers (`source`, `workspace.xxx`), function calls (`strftime`, `lower`, `regex_extract`), string concatenation with `+`, and so on. There are no hardcoded placeholders; for calendar components, call `strftime(received_at, ...)` explicitly.
 
 ### Sanitisation
 
 Interpolations that read `workspace.*` directly (e.g. `${workspace.hostname}`) have `/`, `\`, and `..` replaced with `_` before substitution, so a hostile or malformed workspace value cannot escape the configured directory. Interpolations that compute a value (including `${lower(workspace.host)}`) are **not** auto-sanitised; if you need the guardrail on a computed value, add it explicitly with `regex_replace`.
 
-Event metadata like `${source}` and results of functions like `${strftime(timestamp, ...)}` are substituted verbatim.
+Event metadata like `${source}` and results of functions like `${strftime(received_at, ...)}` are substituted verbatim.
 
 Parent directories are created automatically.
 

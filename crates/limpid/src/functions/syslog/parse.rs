@@ -90,7 +90,7 @@ fn skip_pri(ingress: &str) -> Option<&str> {
 fn parse_rfc5424(input: &str, map: &mut Map<String, Value>) {
     let mut parts = input.splitn(7, ' ');
     let _version = parts.next();
-    let _timestamp = parts.next();
+    let timestamp = parts.next().unwrap_or("-");
     let hostname = parts.next().unwrap_or("-");
     let appname = parts.next().unwrap_or("-");
     let procid = parts.next().unwrap_or("-");
@@ -99,6 +99,11 @@ fn parse_rfc5424(input: &str, map: &mut Map<String, Value>) {
 
     let msg = skip_structured_data(remainder);
 
+    // RFC 5424 timestamp is the source's claimed event time — surface
+    // it into workspace so snippets can compare against
+    // Event.timestamp (limpid's receipt time, kept independent per
+    // Principle 2: input is dumb transport).
+    set_field(map, "syslog_timestamp", timestamp);
     set_field(map, "syslog_hostname", hostname);
     set_field(map, "syslog_appname", appname);
     if procid != "-" {
@@ -114,12 +119,25 @@ fn parse_rfc5424(input: &str, map: &mut Map<String, Value>) {
 
 fn parse_rfc3164(input: &str, map: &mut Map<String, Value>) {
     let mut rest = input;
-    if let Some(idx) = nth_space(rest, 3) {
-        rest = &rest[idx..];
-    }
+    // RFC 3164 timestamp is 3 space-separated tokens: "Mon DD HH:MM:SS"
+    // (no year, no timezone). Capture them as a single string before
+    // advancing past the timestamp.
+    let timestamp_str = match nth_space(rest, 3) {
+        Some(idx) => {
+            let s = &rest[..idx];
+            rest = &rest[idx..];
+            Some(s.trim())
+        }
+        None => None,
+    };
     let (hostname, after_host) = next_token(rest);
     let (appname, procid, msg) = parse_tag_and_msg(after_host);
 
+    if let Some(ts) = timestamp_str {
+        if !ts.is_empty() {
+            set_field(map, "syslog_timestamp", ts);
+        }
+    }
     if !hostname.is_empty() {
         set_field(map, "syslog_hostname", hostname);
     }
@@ -244,6 +262,10 @@ mod tests {
             "<134>1 2026-04-15T10:30:00Z firewall01 sshd 1234 - - Failed password",
         )
         .unwrap();
+        assert_eq!(
+            m["syslog_timestamp"],
+            Value::String("2026-04-15T10:30:00Z".into())
+        );
         assert_eq!(m["syslog_hostname"], Value::String("firewall01".into()));
         assert_eq!(m["syslog_appname"], Value::String("sshd".into()));
         assert_eq!(m["syslog_procid"], Value::String("1234".into()));
@@ -272,6 +294,10 @@ mod tests {
             "<134>Apr 15 10:30:00 myhost sshd[1234]: Failed password",
         )
         .unwrap();
+        assert_eq!(
+            m["syslog_timestamp"],
+            Value::String("Apr 15 10:30:00".into())
+        );
         assert_eq!(m["syslog_hostname"], Value::String("myhost".into()));
         assert_eq!(m["syslog_appname"], Value::String("sshd".into()));
         assert_eq!(m["syslog_procid"], Value::String("1234".into()));
