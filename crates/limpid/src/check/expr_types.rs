@@ -97,7 +97,7 @@ fn ident_type(parts: &[String], bindings: &Bindings) -> FieldType {
         Some("ingress") if parts.len() == 1 => return FieldType::String,
         Some("egress") if parts.len() == 1 => return FieldType::String,
         Some("source") if parts.len() == 1 => return FieldType::String,
-        Some("timestamp") if parts.len() == 1 => return FieldType::Timestamp,
+        Some("received_at") if parts.len() == 1 => return FieldType::Timestamp,
         Some("error") if parts.len() == 1 => return FieldType::String,
         Some("workspace") => {
             // Direct workspace lookup. Try exact path; fall back to

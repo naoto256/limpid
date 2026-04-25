@@ -14,7 +14,13 @@ use std::net::SocketAddr;
 
 #[derive(Debug, Clone)]
 pub struct Event {
-    pub timestamp: DateTime<Utc>,
+    /// Wall-clock time at which this hop received the event. Set once
+    /// by the input layer (`Event::new` → `Utc::now()`); never overwritten
+    /// from payload contents (Principle 2: input is dumb transport).
+    /// Source-claimed event time, when extractable, lives in workspace
+    /// fields like `syslog_timestamp` / `cef_rt` / `pan_generated_time`
+    /// — `process` snippets surface them via the parser primitives.
+    pub received_at: DateTime<Utc>,
     pub source: SocketAddr,
     pub ingress: Bytes,
     pub egress: Bytes,
@@ -24,7 +30,7 @@ pub struct Event {
 impl Event {
     pub fn new(ingress: Bytes, source: SocketAddr) -> Self {
         Self {
-            timestamp: Utc::now(),
+            received_at: Utc::now(),
             source,
             egress: ingress.clone(),
             ingress,
@@ -36,8 +42,8 @@ impl Event {
     pub fn to_json_value(&self) -> Value {
         let mut map = serde_json::Map::new();
         map.insert(
-            "timestamp".into(),
-            Value::String(self.timestamp.to_rfc3339()),
+            "received_at".into(),
+            Value::String(self.received_at.to_rfc3339()),
         );
         map.insert("source".into(), Value::String(self.source.to_string()));
         map.insert(
@@ -68,14 +74,14 @@ impl Event {
         let ingress = v.get("ingress")?.as_str()?.to_string();
         let source_str = v.get("source")?.as_str()?;
         let source: SocketAddr = source_str.parse().ok()?;
-        let timestamp = v
-            .get("timestamp")
+        let received_at = v
+            .get("received_at")
             .and_then(|v| v.as_str())
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc))?;
 
         let mut event = Self {
-            timestamp,
+            received_at,
             source,
             ingress: Bytes::from(ingress.clone()),
             egress: Bytes::from(

@@ -166,7 +166,7 @@ def process compose_ocsf_network_activity {
         type_uid: 400100 + workspace.activity_id,
         activity_id: workspace.activity_id,
         severity_id: workspace.severity_id,
-        time: timestamp,
+        time: received_at,
         metadata: workspace.metadata,
 
         // --- Class-specific fields (pluck from canonical workspace) ---
