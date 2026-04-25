@@ -23,7 +23,7 @@ pub fn near_workspace_path(needle: &str, bindings: &Bindings) -> Option<String> 
     // Reserved event idents are always present — surface them too in
     // case the user wrote `workspace.ingress` etc. (a common pattern
     // confusion).
-    for r in ["ingress", "egress", "source", "timestamp", "error"] {
+    for r in ["ingress", "egress", "source", "received_at", "error"] {
         candidates.push(r.to_string());
     }
     pick_best(needle, &candidates)

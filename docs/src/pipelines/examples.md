@@ -41,7 +41,7 @@ def pipeline archive {
             if contains(ingress, "type=\"traffic\"") {
                 drop
             }
-            process { egress = source + " " + strftime(timestamp, "%b %e %H:%M:%S") + " " + egress }
+            process { egress = source + " " + strftime(received_at, "%b %e %H:%M:%S") + " " + egress }
             output fw03
         }
         default {
@@ -107,7 +107,7 @@ def input fw {
 
 def output archive {
     type file
-    path "/var/log/limpid/${source}/${strftime(timestamp, "%Y-%m-%d", "local")}.log"
+    path "/var/log/limpid/${source}/${strftime(received_at, "%Y-%m-%d", "local")}.log"
 }
 
 def output elasticsearch {

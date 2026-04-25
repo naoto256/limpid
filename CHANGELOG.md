@@ -10,6 +10,51 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased]
 
+### Breaking — `Event.timestamp` renamed to `Event.received_at`
+
+The `Event` struct field, the reserved DSL identifier, the `format()`
+template placeholder, and the JSON serialisation key are all renamed
+from `timestamp` to `received_at`. The semantic clarification is that
+this field is **strictly the wall-clock time at which this hop received
+the event** — input modules never overwrite it from payload contents
+(Principle 2: input is dumb transport). Source-claimed event times,
+when extractable from the wire, surface in workspace fields like
+`syslog_timestamp` / `cef_rt` / `pan_generated_time` via parser
+primitives.
+
+The old name was generic enough that some snippets and configs were
+treating it as if it carried the source-claimed event time, which it
+never reliably does.
+
+**Migration** (mechanical sed across configs and any captured `tap --json`
+files):
+
+```sh
+find /etc/limpid -name '*.limpid' -exec sed -i \
+    -e 's/\${timestamp}/\${received_at}/g' \
+    -e 's/%{timestamp}/%{received_at}/g' \
+    -e 's/strftime(timestamp,/strftime(received_at,/g' \
+    {} +
+
+# Captured tap --json files: rewrite the top-level key
+jq -c '.received_at = .timestamp | del(.timestamp)' \
+    old-capture.jsonl > new-capture.jsonl
+```
+
+There is no deprecation alias — `${timestamp}` and `%{timestamp}` are
+hard errors (analyzer / runtime) on v0.5.0+. The 0.5.0 release window
+is the right moment for the cut because pre-1.0 breaking changes are
+still expected.
+
+### Added — `syslog.parse` exposes header timestamp
+
+`syslog.parse` now writes the parsed RFC 5424 / RFC 3164 timestamp from
+the wire header into `workspace.syslog_timestamp` (previously dropped
+silently). Snippets that need the source-claimed event time, e.g. for
+the OCSF `time` field or the OTLP `time_unix_nano`, can read it
+directly. Behaviour is purely additive — existing configs continue to
+work.
+
 ### Added — DSL primitives
 
 - **`to_int(x)`** — coerce a value to `i64` (strings, floats, bools, nulls);
