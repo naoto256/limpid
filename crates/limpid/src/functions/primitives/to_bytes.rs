@@ -14,8 +14,8 @@
 //! - `"base64"`: standard base64 (RFC 4648) with padding. Whitespace
 //!   inside the input is *not* permitted.
 //!
-//! Anything else is an error. This matches the Bytes design memo §14
-//! "気を利かせない" rule.
+//! Anything else is an error — text-only primitives reject Bytes by
+//! default, so the conversion has to be explicit and named.
 
 use anyhow::{Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};

@@ -13,9 +13,7 @@
 //! whose data is UTF-8-clean see no behaviour change — `bytes_to_value`
 //! still produces `Value::String` when input is valid UTF-8 and only
 //! falls through to `Value::Bytes` for non-UTF-8 content (which the
-//! previous code would silently corrupt). See
-//! `_DESIGN_V050_VALUE_BYTES.md` for the full design memo and the
-//! cross-primitive decisions that follow from this split.
+//! previous code would silently corrupt).
 //!
 //! JSON serialization at the system boundary (tap `--json`, persistence)
 //! lives in [`super::value_json`]. JSON cannot carry raw bytes per
@@ -138,10 +136,11 @@ impl std::fmt::Display for Value {
 
 // --- Type predicates ------------------------------------------------------
 //
-// Used by primitive arg validation and the DSL evaluator. Keep these in
-// sync with `_DESIGN_V050_VALUE_BYTES.md` §1–§13: text-only primitives
-// reject Bytes via these predicates rather than reproducing the check
-// inline.
+// Used by primitive arg validation and the DSL evaluator: text-only
+// primitives (upper / lower / regex_* / contains / format / to_int /
+// to_json / template interpolation) reject Bytes via these predicates
+// or via the shared `val_to_str` helper rather than reproducing the
+// check inline.
 
 impl Value {
     pub fn is_null(&self) -> bool {
@@ -181,8 +180,8 @@ impl Value {
     }
 
     /// Truthiness used by `if` / `&&` / `||` / `!`. Non-empty Bytes
-    /// is truthy on the same rule as non-empty String — see decision
-    /// §12 in the design memo.
+    /// is truthy on the same rule as non-empty String (consistent with
+    /// non-empty Array / Object).
     pub fn is_truthy(&self) -> bool {
         match self {
             Value::Null => false,

@@ -103,6 +103,95 @@ let facility = pri / 8
 let severity = pri % 8
 ```
 
+## otlp.* — OpenTelemetry Protocol (logs signal)
+
+Mechanical wire-format encode / decode for the OTLP logs signal,
+operating on a singleton `ResourceLogs` (1 Resource + 1 Scope + 1
+LogRecord) — the v0.5.0 hop contract for OTLP. Composers and
+semantic mappings live in DSL snippets, not in Rust (Principle 3);
+these primitives are just the proto3 ↔ HashLit bridge.
+
+HashLit shape mirrors the proto3 message tree with snake_case keys
+so authors write directly against the OTLP spec. The JSON form
+applies the canonical OTLP/JSON conventions (camelCase, u64-as-string,
+bytes-as-hex) at the wire boundary.
+
+```
+workspace.otlp = {
+    resource: {
+        attributes: [
+            { key: "service.name", value: { string_value: "limpid" } },
+            { key: "host.name",    value: { string_value: hostname() } }
+        ]
+    },
+    scope_logs: [{
+        scope: { name: "limpid", version: "0.5.0" },
+        log_records: [{
+            time_unix_nano: workspace.event_time_ns,
+            severity_number: 9,                   // 9=INFO, 13=WARN, 17=ERROR, 21=FATAL
+            severity_text: "INFO",
+            body: { string_value: workspace.message },
+            attributes: [
+                { key: "source.address", value: { string_value: source } }
+            ]
+        }]
+    }]
+}
+egress = otlp.encode_resourcelog_protobuf(workspace.otlp)
+```
+
+`AnyValue` is tagged with the variant name: exactly one of
+`string_value`, `bool_value`, `int_value`, `double_value`,
+`array_value`, `kvlist_value`, `bytes_value`. Multiple variants on
+the same `AnyValue` are an error.
+
+### otlp.encode_resourcelog_protobuf(hashlit) → Bytes
+
+Encode the HashLit as a `ResourceLogs` proto3 message and return
+the raw wire bytes. Pair with the [`otlp` output](../outputs/otlp.md)'s
+`http_protobuf` or `grpc` protocol.
+
+### otlp.decode_resourcelog_protobuf(bytes) → Object
+
+Inverse of `encode_resourcelog_protobuf`. Used by snippets that
+need to inspect / transform an inbound OTLP record:
+
+```
+def process redact_pii {
+    workspace.otlp = otlp.decode_resourcelog_protobuf(ingress)
+    // ... edit workspace.otlp ...
+    egress = otlp.encode_resourcelog_protobuf(workspace.otlp)
+}
+```
+
+### otlp.encode_resourcelog_json(hashlit) → String
+
+Encode as canonical OTLP/JSON (camelCase, u64-as-string, bytes-as-hex).
+For the [`otlp` output](../outputs/otlp.md) `http_json` protocol.
+
+### otlp.decode_resourcelog_json(s) → Object
+
+Decode an OTLP/JSON-encoded `ResourceLogs` string (or UTF-8 bytes)
+back into the snake_case HashLit form.
+
+### SeverityNumber convention
+
+OTLP defines a 1..24 range, with the canonical level values used in
+practice:
+
+| Level | Number |
+|-------|--------|
+| TRACE | 1 |
+| DEBUG | 5 |
+| INFO  | 9 |
+| WARN  | 13 |
+| ERROR | 17 |
+| FATAL | 21 |
+
+The four slots within each level (`*2/*3/*4`) are for bridging
+finer-grained external systems (Windows Event etc.). limpid snippets
+typically only emit the canonical level value.
+
 ## cef.* — ArcSight Common Event Format
 
 ### cef.parse(text[, defaults])
@@ -296,6 +385,48 @@ workspace.src_hash = sha256(workspace.src)
 Useful for event deduplication, fingerprinting, or anonymisation.
 
 ## Type coercion
+
+### to_bytes(s, encoding="utf8")
+
+Convert a string to raw bytes. The DSL value system distinguishes
+`String` (always valid UTF-8) from `Bytes` (raw byte buffer); this
+primitive is the explicit text → binary boundary.
+
+| Encoding | Behaviour |
+|----------|-----------|
+| `"utf8"` (default) | The string's UTF-8 byte representation. Lossless. |
+| `"hex"` | Parse as hex (lowercase or upper, even length). `"deadBEEF"` → 4 bytes. |
+| `"base64"` | Decode standard RFC 4648 base64 with padding. |
+
+```
+workspace.signature = to_bytes(workspace.sig_hex, "hex")
+egress = to_bytes(workspace.payload_b64, "base64")
+```
+
+Errors on unknown encoding or malformed input (odd hex length,
+invalid hex digit, malformed base64). The default `utf8` form is
+lossless because Rust strings are always valid UTF-8.
+
+### to_string(b, encoding="utf8", strict=true)
+
+Convert raw bytes to a string. Counterpart of `to_bytes`.
+
+| Encoding | `strict` | Behaviour |
+|----------|----------|-----------|
+| `"utf8"` (default) | `true` (default) | Invalid UTF-8 errors. |
+| `"utf8"` | `false` | Invalid sequences become U+FFFD (lossy). |
+| `"hex"` | (ignored) | Lowercase hex pair per byte. |
+| `"base64"` | (ignored) | Standard RFC 4648 with padding. |
+
+```
+workspace.message = to_string(ingress)                       // strict UTF-8 — error on binary
+workspace.message = to_string(ingress, "utf8", false)        // lossy fallback
+workspace.signature_b64 = to_string(workspace.sig, "base64") // bytes → printable
+```
+
+Text-only primitives (`upper`, `regex_*`, `format`, `to_int`,
+`contains`, etc.) reject `Bytes` to keep failure modes explicit;
+`to_string` is the way to opt into a textual interpretation.
 
 ### to_int(value)
 
