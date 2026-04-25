@@ -261,7 +261,7 @@ impl Module for OtlpOutput {
                 let mut endpoint_builder = Endpoint::from_shared(endpoint.clone())
                     .with_context(|| format!("output '{}': invalid gRPC endpoint", name))?;
                 if endpoint.starts_with("https://") || ca_pem.is_some() {
-                    install_default_crypto_provider();
+                    crate::tls::install_default_crypto_provider();
                     let mut tls = ClientTlsConfig::new().with_native_roots();
                     if let Some(pem) = &ca_pem {
                         tls = tls.ca_certificate(tonic::transport::Certificate::from_pem(pem));
@@ -427,23 +427,6 @@ impl Drop for OtlpOutput {
             );
         }
     }
-}
-
-/// rustls 0.23 requires explicit `CryptoProvider` selection — call
-/// once before the first gRPC TLS endpoint is built. Uses aws-lc-rs
-/// (the OpenSSL-style provider, present transitively via tonic's
-/// tls-roots feature). Idempotent: subsequent calls observe the
-/// already-installed provider and silently no-op.
-fn install_default_crypto_provider() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        // `install_default` returns `Err` if a provider is already
-        // installed (which happens when reqwest set one up first).
-        // Either way we leave with a provider available, so swallow
-        // the error.
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    });
 }
 
 /// Decode the per-Event ResourceLogs proto bytes, gather them into one
@@ -676,9 +659,12 @@ async fn send_grpc(
         .export(request)
         .await
         .with_context(|| format!("output otlp: gRPC export to {} failed", inner.endpoint))?;
-    // The receiver may report a `partial_success` with rejected
-    // records. Surface as a warning — retry / drop policy is queued
-    // for v0.5.x.
+    // The receiver may report `partial_success.rejected_log_records`.
+    // Currently logged as a warning; selective re-send of *only* the
+    // rejected records is queued for v0.5.x. The transport-level retry
+    // loop in `send_batch` handles hard failures (connection refused,
+    // 5xx, …) but not partial-success deltas, since the rejected set
+    // is a strict subset of what already shipped.
     let inner_resp = response.into_inner();
     if let Some(partial) = inner_resp.partial_success
         && partial.rejected_log_records > 0
