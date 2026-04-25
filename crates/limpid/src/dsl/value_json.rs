@@ -19,11 +19,10 @@
 //! enough to be an escape is rejected — those forms are reserved for
 //! future markers and must not slip through silently.
 //!
-//! See `_DESIGN_V050_VALUE_BYTES.md` §5–§6 for the user-facing
-//! decisions: the marker form is **internal** (tap `--json`,
-//! persistence). User-facing primitives `to_json` / `parse_json` error
-//! on Bytes and on the marker respectively, so the marker never appears
-//! in pipeline-visible JSON.
+//! The marker form is **internal** (tap `--json`, persistence).
+//! User-facing primitives `to_json` / `parse_json` error on Bytes and
+//! on the marker respectively, so the marker never appears in
+//! pipeline-visible JSON.
 
 use anyhow::{Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
@@ -76,11 +75,6 @@ pub fn value_to_json(v: &Value) -> Result<JsonValue> {
             Ok(JsonValue::Object(out))
         }
     }
-}
-
-/// Convenience: same as [`value_to_json`] but returns a JSON string.
-pub fn value_to_json_string(v: &Value) -> Result<String> {
-    Ok(serde_json::to_string(&value_to_json(v)?)?)
 }
 
 // --- serde_json::Value → Value -------------------------------------------
@@ -139,12 +133,6 @@ pub fn json_to_value(v: &JsonValue) -> Result<Value> {
             Ok(Value::Object(out))
         }
     }
-}
-
-/// Convenience: parse a JSON string into a DSL [`Value`].
-pub fn json_str_to_value(s: &str) -> Result<Value> {
-    let json: JsonValue = serde_json::from_str(s)?;
-    json_to_value(&json)
 }
 
 // --- Key escape helpers --------------------------------------------------

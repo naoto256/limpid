@@ -13,6 +13,7 @@ Output modules write processed events to external destinations.
 | [`udp`](./udp.md) | UDP datagram |
 | [`unix_socket`](./unix-socket.md) | Unix stream socket |
 | [`stdout`](./stdout.md) | Standard output (debugging) |
+| [`otlp`](./otlp.md) | OTLP logs sender (HTTP/JSON, HTTP/protobuf, gRPC) |
 
 ## Queue and retry
 

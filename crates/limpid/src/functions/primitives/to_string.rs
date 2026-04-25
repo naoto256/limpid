@@ -3,9 +3,9 @@
 //!
 //! The other half of the text/binary boundary; counterpart to
 //! `to_bytes`. With Bytes a first-class DSL value (v0.5.0), text
-//! primitives reject Bytes by default (Bytes design memo principle:
-//! "気を利かせない"). `to_string` is the explicit conversion users opt
-//! into.
+//! primitives reject Bytes by default — `to_string` is the explicit
+//! conversion users opt into when they really do want a textual view
+//! of a byte buffer.
 //!
 //! Encodings:
 //! - `"utf8"` (default): treat the byte buffer as UTF-8.

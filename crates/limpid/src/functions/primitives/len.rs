@@ -12,7 +12,7 @@
 //! * `String` → number of Unicode *characters* (not bytes). `chars()`
 //!   counts scalar values, which is what users expect for log lines
 //!   mixing ASCII and multi-byte UTF-8.
-//! * `Bytes` → byte length (Bytes design memo §7).
+//! * `Bytes` → byte length.
 //! * `Object` → number of top-level keys.
 //! * `Null` → `Null` (pass-through, same partial-data convention as
 //!   `to_int`, `regex_extract`, `table_lookup`).
