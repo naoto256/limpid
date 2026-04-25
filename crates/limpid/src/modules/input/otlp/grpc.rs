@@ -14,7 +14,12 @@
 //! def input otlp_in {
 //!     type otlp_grpc
 //!     bind "0.0.0.0:4317"
-//!     rate_limit 10000      // optional, events/sec budget
+//!     rate_limit 10000          // optional, events/sec budget
+//!     tls {                      // optional; omit for plaintext
+//!         cert "/etc/limpid/server.crt"
+//!         key  "/etc/limpid/server.key"
+//!         ca   "/etc/limpid/clients-ca.crt"   // optional → mTLS
+//!     }
 //! }
 //! ```
 //!
@@ -22,10 +27,10 @@
 //! `partial_success` with `rejected_log_records` populated when
 //! re-encoding fails for some records (rare).
 //!
-//! TLS / mTLS for the server is configured with the same `tls { cert
-//! key ca }` block that other TLS-aware modules use. With no `tls`
-//! block the input listens plaintext, suitable for loopback or behind
-//! a TLS-terminating proxy.
+//! With no `tls` block the input listens plaintext, suitable for
+//! loopback or behind a TLS-terminating proxy. The `tls` block uses
+//! the same shape as every other TLS-aware module (parsed once via
+//! `crate::tls::TlsConfig::from_properties_block`).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -48,20 +53,12 @@ use crate::event::Event;
 use crate::metrics::InputMetrics;
 use crate::modules::input::rate_limit::RateLimiter;
 use crate::modules::{HasMetrics, Input, Module};
-
-/// Server-side TLS material parsed from the optional `tls { … }` block.
-/// `cert` + `key` are required when the block is present; `ca` enables
-/// mutual TLS (client cert verification against the named root CA).
-struct TlsMaterial {
-    cert_path: String,
-    key_path: String,
-    ca_path: Option<String>,
-}
+use crate::tls::TlsConfig;
 
 pub struct OtlpGrpcInput {
     bind_addr: String,
     rate_limit: Option<u64>,
-    tls: Option<TlsMaterial>,
+    tls: Option<TlsConfig>,
     metrics: Arc<InputMetrics>,
 }
 
@@ -70,22 +67,7 @@ impl Module for OtlpGrpcInput {
         let bind = props::get_string(properties, "bind")
             .unwrap_or_else(|| "0.0.0.0:4317".to_string());
         let rate_limit = props::get_strictly_positive_int(properties, "rate_limit")?;
-        let tls = if let Some(block) = props::get_block(properties, "tls") {
-            let cert_path = props::get_string(block, "cert").ok_or_else(|| {
-                anyhow::anyhow!("input '{}': tls block requires 'cert'", name)
-            })?;
-            let key_path = props::get_string(block, "key").ok_or_else(|| {
-                anyhow::anyhow!("input '{}': tls block requires 'key'", name)
-            })?;
-            let ca_path = props::get_string(block, "ca");
-            Some(TlsMaterial {
-                cert_path,
-                key_path,
-                ca_path,
-            })
-        } else {
-            None
-        };
+        let tls = TlsConfig::from_properties_block(&format!("input '{}'", name), properties)?;
         Ok(Self {
             bind_addr: bind,
             rate_limit,
@@ -114,8 +96,8 @@ impl Input for OtlpGrpcInput {
         })?;
         let tls_config = match &self.tls {
             Some(t) => {
-                install_default_crypto_provider();
-                Some(load_tls_config(t).await?)
+                crate::tls::install_default_crypto_provider();
+                Some(load_tonic_tls_config(t).await?)
             }
             None => None,
         };
@@ -154,10 +136,14 @@ impl Input for OtlpGrpcInput {
     }
 }
 
-/// Read cert / key / CA PEM files and assemble a `ServerTlsConfig`.
-/// File I/O is run on `spawn_blocking` so a slow disk does not stall
-/// the tokio reactor at startup (matches `crate::tls::build_server_config`).
-async fn load_tls_config(material: &TlsMaterial) -> Result<ServerTlsConfig> {
+/// Read cert / key / CA PEM files and assemble tonic's
+/// `ServerTlsConfig`. Parallels `crate::tls::build_server_config`
+/// (rustls-native loader used by `syslog_tls`) — both follow the same
+/// "spawn_blocking off the reactor" pattern, but the output types
+/// differ (tonic's wrapper vs raw `Arc<rustls::ServerConfig>`), so
+/// they cannot share the loader function. Code reuse stops at
+/// `TlsConfig`, which is the same struct in both call sites.
+async fn load_tonic_tls_config(material: &TlsConfig) -> Result<ServerTlsConfig> {
     let cert_path = material.cert_path.clone();
     let key_path = material.key_path.clone();
     let ca_path = material.ca_path.clone();
@@ -177,18 +163,6 @@ async fn load_tls_config(material: &TlsMaterial) -> Result<ServerTlsConfig> {
     })
     .await
     .context("otlp_grpc: TLS loader task panicked")?
-}
-
-/// rustls 0.23 requires explicit `CryptoProvider` selection — install once
-/// before the first TLS server is built. Mirrors the helper in
-/// `output::otlp` (which installs for the client side); both call sites
-/// are idempotent because `install_default` is gated by a `Once`.
-fn install_default_crypto_provider() {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    });
 }
 
 struct LogsServiceImpl {
