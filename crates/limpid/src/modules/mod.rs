@@ -183,6 +183,8 @@ pub fn register_builtins(registry: &mut ModuleRegistry) {
     register_input_type::<input::syslog_tcp::SyslogTcpInput>(registry, "syslog_tcp");
     register_input_type::<input::syslog_tls::SyslogTlsInput>(registry, "syslog_tls");
     register_input_type::<input::tail::TailInput>(registry, "tail");
+    register_input_type::<input::otlp::http::OtlpHttpInput>(registry, "otlp_http");
+    register_input_type::<input::otlp::grpc::OtlpGrpcInput>(registry, "otlp_grpc");
     register_input_type::<input::unix_socket::UnixSocketInput>(registry, "unix_socket");
     #[cfg(feature = "journal")]
     register_input_type::<input::journal::JournalInput>(registry, "journal");
@@ -192,6 +194,7 @@ pub fn register_builtins(registry: &mut ModuleRegistry) {
     register_output_type::<output::unix_socket::UnixSocketOutput>(registry, "unix_socket");
     register_output_type::<output::tcp::TcpOutput>(registry, "tcp");
     register_output_type::<output::http::HttpOutput>(registry, "http");
+    register_output_type::<output::otlp::OtlpOutput>(registry, "otlp");
     register_output_type::<output::udp::UdpOutput>(registry, "udp");
     register_output_type::<output::stdout::StdoutOutput>(registry, "stdout");
     #[cfg(feature = "kafka")]
