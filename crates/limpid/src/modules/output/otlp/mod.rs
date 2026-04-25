@@ -404,6 +404,31 @@ impl OtlpOutput {
     }
 }
 
+impl Drop for OtlpOutput {
+    fn drop(&mut self) {
+        // Abort any pending deferred-flush task so it does not race
+        // with the runtime shutting down.
+        if let Some(h) = self.flush_handle.get_mut().take() {
+            h.abort();
+        }
+        // Best-effort visibility into a buffer that did not flush
+        // before drop. The queue layer keeps the un-acked events on
+        // disk (each Event was written to the spool before write()
+        // was called), so they are *not* permanently lost — they
+        // come back through the queue on next start. The warning
+        // exists so operators know the count rather than wondering
+        // why a partial flush happened. Mirrors `HttpOutput::drop`.
+        if let Ok(buf) = self.inner.batch.try_lock()
+            && !buf.is_empty()
+        {
+            tracing::warn!(
+                "otlp output: {} events in buffer at shutdown (will be re-delivered from queue)",
+                buf.len()
+            );
+        }
+    }
+}
+
 /// rustls 0.23 requires explicit `CryptoProvider` selection — call
 /// once before the first gRPC TLS endpoint is built. Uses aws-lc-rs
 /// (the OpenSSL-style provider, present transitively via tonic's
@@ -635,10 +660,14 @@ async fn send_grpc(
                 metadata.insert(mk, mv);
             }
             _ => {
+                // Never log the value: typical contents are bearer
+                // tokens, API keys, or cookie material — the exact
+                // secret an OTLP backend authenticates with. The key
+                // alone is enough to diagnose a misconfiguration
+                // without leaking the credential.
                 tracing::warn!(
-                    "otlp gRPC: skipping malformed header {:?}={:?}",
-                    k,
-                    v
+                    "otlp gRPC: skipping header with invalid name or value (key={:?}); value redacted",
+                    k
                 );
             }
         }
@@ -1000,6 +1029,37 @@ mod tests {
             output.inner.retry_config.max_wait,
             Duration::from_millis(500)
         );
+    }
+
+    /// Drop must abort the deferred flush handle so the spawned
+    /// timer does not outlive the output. We cannot easily observe
+    /// "task aborted" from the outside, so the contract here is
+    /// behavioural: drop completes without panicking even when a
+    /// flush timer is in flight, and the handle stored in the output
+    /// is consumed (next ensure_flush_timer call would re-spawn).
+    #[tokio::test]
+    async fn drop_aborts_pending_flush_timer() {
+        let output = OtlpOutput::from_properties(
+            "test",
+            &[
+                prop_str("endpoint", "http://127.0.0.1:1"),
+                prop_int("batch_size", 1024), // big enough that write does not flush
+                prop_str("batch_timeout", "30s"),
+            ],
+        )
+        .unwrap();
+        // Push one event so ensure_flush_timer schedules a task.
+        output
+            .write(&event_with_egress(singleton_bytes(1)))
+            .await
+            .unwrap();
+        let handle_before = output.flush_handle.lock().await.is_some();
+        assert!(handle_before, "write must arm the flush timer");
+        // Drop runs; if it panics this test fails. We cannot inspect
+        // the JoinHandle after-the-fact (drop consumed self), but
+        // the abort path is exercised — tokio's runtime will reap the
+        // aborted task at shutdown without complaint.
+        drop(output);
     }
 
     // ------------------------------------------------------------------------
