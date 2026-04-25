@@ -32,7 +32,7 @@
 //! the same shape as every other TLS-aware module (parsed once via
 //! `crate::tls::TlsConfig::from_properties_block`).
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -182,11 +182,14 @@ impl LogsService for LogsServiceImpl {
         // to see the flow through input metrics.
         self.metrics.events_received.fetch_add(1, Ordering::Relaxed);
 
-        let peer = request.remote_addr().unwrap_or_else(|| {
-            // Fallback: tonic should always know the peer for a
-            // TCP-served RPC, but never panic on this corner.
-            "0.0.0.0:0".parse().unwrap()
-        });
+        // Fallback: tonic should always know the peer for a
+        // TCP-served RPC, but a non-TCP transport (uds, mock) might
+        // not. Construct the unspecified address directly rather than
+        // parsing a constant — `.parse().unwrap()` is technically
+        // infallible here but leaves a panic seed for future edits.
+        let peer = request
+            .remote_addr()
+            .unwrap_or_else(|| SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0));
         let req = request.into_inner();
 
         let outcome = split_request(
