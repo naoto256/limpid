@@ -111,6 +111,11 @@ LogRecord) — the v0.5.0 hop contract for OTLP. Composers and
 semantic mappings live in DSL snippets, not in Rust (Principle 3);
 these primitives are just the proto3 ↔ HashLit bridge.
 
+> The reasoning behind the singleton-ResourceLogs contract, the
+> bytes-on-the-hop choice, and the SeverityNumber convention is
+> in [OTLP — design rationale](../otlp.md). This section is the
+> reference for the four primitives only.
+
 HashLit shape mirrors the proto3 message tree with snake_case keys
 so authors write directly against the OTLP spec. The JSON form
 applies the canonical OTLP/JSON conventions (camelCase, u64-as-string,
