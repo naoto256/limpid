@@ -2,13 +2,11 @@
 //!
 //! Hosts the `opentelemetry.proto.collector.logs.v1.LogsService`
 //! gRPC service. Each `Export` RPC arrives as an
-//! `ExportLogsServiceRequest`; the handler splits it into one Event
-//! per LogRecord and emits each as a singleton ResourceLogs
-//! (1 Resource + 1 Scope + 1 LogRecord — the v0.5.0 OTLP hop contract,
-//! identical to `otlp_http`). The reply is an empty
-//! `ExportLogsServiceResponse` on success, or a `partial_success` with
-//! `rejected_log_records` populated when re-encoding fails for some
-//! records (rare).
+//! `ExportLogsServiceRequest`; request splitting is delegated to
+//! [`super::split_request`], the same helper that drives the
+//! [`super::http`] transport — so both inputs emit the identical
+//! per-Event shape (1 Resource + 1 Scope + 1 LogRecord, encoded as
+//! protobuf wire bytes).
 //!
 //! ## Configuration
 //!
@@ -18,6 +16,10 @@
 //!     bind "0.0.0.0:4317"
 //! }
 //! ```
+//!
+//! Reply: empty `ExportLogsServiceResponse` on success, or
+//! `partial_success` with `rejected_log_records` populated when
+//! re-encoding fails for some records (rare).
 //!
 //! TLS / mTLS for the server is queued for v0.5.x — currently the
 //! input runs plaintext. For TLS termination today, front it with a
@@ -29,21 +31,15 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::Result;
-use bytes::Bytes;
-use opentelemetry_proto::tonic::{
-    collector::logs::v1::{
-        ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
-        logs_service_server::{LogsService, LogsServiceServer},
-    },
-    common::v1::InstrumentationScope,
-    logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
-    resource::v1::Resource,
+use opentelemetry_proto::tonic::collector::logs::v1::{
+    ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
+    logs_service_server::{LogsService, LogsServiceServer},
 };
-use prost::Message;
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
+use super::split_request;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::event::Event;
@@ -126,58 +122,16 @@ impl LogsService for LogsServiceImpl {
         });
         let req = request.into_inner();
 
-        let total: usize = req
-            .resource_logs
-            .iter()
-            .map(|rl| {
-                rl.scope_logs
-                    .iter()
-                    .map(|sl| sl.log_records.len())
-                    .sum::<usize>()
-            })
-            .sum();
-        if total == 0 {
-            return Ok(Response::new(empty_response()));
+        let outcome = split_request(req, peer, &self.metrics, &self.tx, "otlp_grpc").await;
+        if outcome.aborted {
+            return Err(Status::unavailable("pipeline closed"));
         }
-
-        let mut sent = 0usize;
-        for rl in &req.resource_logs {
-            for sl in &rl.scope_logs {
-                for lr in &sl.log_records {
-                    let singleton = build_singleton(
-                        rl.resource.clone(),
-                        sl.scope.clone(),
-                        lr.clone(),
-                        rl.schema_url.clone(),
-                        sl.schema_url.clone(),
-                    );
-                    let mut buf = Vec::with_capacity(singleton.encoded_len());
-                    if let Err(e) = singleton.encode(&mut buf) {
-                        warn!("otlp_grpc [{peer}]: re-encode failed: {e}");
-                        self.metrics
-                            .events_invalid
-                            .fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    let event = Event::new(Bytes::from(buf), peer);
-                    if self.tx.send(event).await.is_err() {
-                        // Receiver dropped — pipeline shutting down.
-                        return Err(Status::unavailable("pipeline closed"));
-                    }
-                    sent += 1;
-                }
-            }
-        }
-
-        let rejected = total.saturating_sub(sent);
-        if rejected > 0 {
+        if outcome.rejected > 0 {
             // The collector spec encourages partial-success replies so
             // senders can decide whether to retry just the rejects.
-            // We only reject on encode failure (very rare); surface
-            // it.
             return Ok(Response::new(ExportLogsServiceResponse {
                 partial_success: Some(ExportLogsPartialSuccess {
-                    rejected_log_records: rejected as i64,
+                    rejected_log_records: outcome.rejected as i64,
                     error_message: "limpid: failed to re-encode some log records".into(),
                 }),
             }));
@@ -192,29 +146,15 @@ fn empty_response() -> ExportLogsServiceResponse {
     }
 }
 
-/// Same shape as the HTTP input's helper: collapse `(R, S, L)` into a
-/// singleton ResourceLogs (1 Resource + 1 Scope + 1 LogRecord).
-fn build_singleton(
-    resource: Option<Resource>,
-    scope: Option<InstrumentationScope>,
-    log_record: LogRecord,
-    resource_schema_url: String,
-    scope_schema_url: String,
-) -> ResourceLogs {
-    ResourceLogs {
-        resource,
-        scope_logs: vec![ScopeLogs {
-            scope,
-            log_records: vec![log_record],
-            schema_url: scope_schema_url,
-        }],
-        schema_url: resource_schema_url,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry_proto::tonic::{
+        common::v1::InstrumentationScope,
+        logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
+        resource::v1::Resource,
+    };
+    use prost::Message;
 
     #[test]
     fn defaults_bind_address() {
