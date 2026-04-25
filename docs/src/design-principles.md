@@ -46,7 +46,7 @@ Typical parsing patterns — OTLP normalization, OCSF mapping, Windows Snare par
 
 ## Principle 4 — Only `egress` crosses hop boundaries
 
-In a multi-hop pipeline, the only thing that travels from one limpid daemon to the next is `egress` (the bytes written to the wire). Everything else — `source`, `timestamp`, `workspace`, `let` — is derived pipeline-local state that dies at the output.
+In a multi-hop pipeline, the only thing that travels from one limpid daemon to the next is `egress` (the bytes written to the wire). Everything else — `source`, `received_at`, `workspace`, `let` — is derived pipeline-local state that dies at the output.
 
 - `ingress`: the current hop's immutable input. The next hop receives its own `ingress` (whatever it got on the wire, which was the previous hop's `egress`).
 - `egress`: the sole hop contract. Assembled in the process layer; serialized by the output.
