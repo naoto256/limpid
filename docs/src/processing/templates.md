@@ -5,7 +5,7 @@ Any string literal in a `.limpid` file can contain `${...}` interpolations. Each
 ```
 def output archive {
     type file
-    path "/var/log/limpid/${source}/${strftime(timestamp, "%Y-%m-%d", "local")}.log"
+    path "/var/log/limpid/${source}/${strftime(received_at, "%Y-%m-%d", "local")}.log"
 }
 
 def process tag {
@@ -17,7 +17,7 @@ def process tag {
 
 - `${expr}` — evaluate `expr` and splice the result (stringified) into the surrounding string.
 - `\${` — a literal `${`. The backslash escape only takes effect inside interpolated strings; it is harmless elsewhere.
-- `expr` can be anything that's valid in a DSL expression: identifiers, workspace paths (`workspace.geo.country`), function calls (`lower(workspace.host)`, `strftime(timestamp, "%Y")`), string concatenation with `+`, even nested string literals.
+- `expr` can be anything that's valid in a DSL expression: identifiers, workspace paths (`workspace.geo.country`), function calls (`lower(workspace.host)`, `strftime(received_at, "%Y")`), string concatenation with `+`, even nested string literals.
 
 ## Available names
 
@@ -25,7 +25,7 @@ Inside `${...}` you have access to the full event:
 
 | Name | Meaning |
 |------|---------|
-| `source`, `timestamp` | Event metadata |
+| `source`, `received_at` | Event metadata |
 | `egress`, `ingress` | Event byte buffers |
 | `workspace.xxx`, `workspace.xxx.yyy` | Named workspace values (nested lookup is supported) |
 
@@ -53,7 +53,7 @@ The `file` output's `path` property applies one extra rule on top of normal eval
 def output per_host {
     type file
     // workspace.hostname is sanitised; ${source} and ${strftime(...)} are not
-    path "/var/log/limpid/${workspace.hostname}/${strftime(timestamp, "%Y-%m-%d")}.log"
+    path "/var/log/limpid/${workspace.hostname}/${strftime(received_at, "%Y-%m-%d")}.log"
 }
 ```
 

@@ -36,7 +36,7 @@ def pipeline archive {
             if contains(ingress, "type=\"traffic\"") {
                 drop
             }
-            process { egress = source + " " + strftime(timestamp, "%b %e %H:%M:%S") + " " + egress }
+            process { egress = source + " " + strftime(received_at, "%b %e %H:%M:%S") + " " + egress }
             output fw03
         }
         default {
