@@ -7,9 +7,11 @@ Receives OpenTelemetry logs over the OTLP/HTTP transport. Listens for `POST /v1/
 ```
 def input otlp_in {
     type otlp_http
-    bind "0.0.0.0:4318"   // OTLP/HTTP default port
-    body_limit "16MB"     // optional per-request size cap
-    rate_limit 10000      // optional events/sec budget
+    bind "0.0.0.0:4318"            // OTLP/HTTP default port
+    body_limit "16MB"              // optional per-request size cap
+    rate_limit 10000               // optional events/sec budget
+    request_rate_limit 1000        // optional req/sec budget
+    max_concurrent_requests 64     // optional in-flight req cap
 }
 ```
 
@@ -19,7 +21,20 @@ def input otlp_in {
 |----------|----------|---------|-------------|
 | `bind` | no | `0.0.0.0:4318` | TCP listen address |
 | `body_limit` | no | `16MB` | Per-request body size cap. Larger requests are rejected with HTTP 413 *Payload Too Large* before any decode work runs. Accepts `KB` / `MB` / `GB` suffixes or a bare byte count. Tune up for OTLP collectors that batch tens of MB of logs per RPC, down for hostile-network ingest. |
-| `rate_limit` | no | unlimited | Sustained events-per-second cap (positive integer). Each emitted Event consumes 1 token; over-budget records `acquire().await` until the token bucket refills. Same implementation as the `syslog_*` inputs. |
+| `rate_limit` | no | unlimited | Sustained **events**-per-second cap (positive integer). Each emitted Event consumes 1 token; over-budget records `acquire().await` until the token bucket refills. Applied *after* request decode and split. Same implementation as the `syslog_*` inputs. |
+| `request_rate_limit` | no | unlimited | Sustained **requests**-per-second cap (positive integer). One token per RPC, applied *before* decode. Smooths sustained QPS without bounding peak concurrency — pair with `max_concurrent_requests` for memory protection. |
+| `max_concurrent_requests` | no | unlimited | In-flight request cap (positive integer). Worst-case decode memory becomes `max_concurrent_requests × body_limit`, turning the open-ended decode-amplification path into a known quantity. Excess requests are rejected with HTTP 503 *Service Unavailable* (fail-fast — OTLP senders typically retry, so backpressuring the socket would amplify overload). |
+
+The four budgets stack as orthogonal defense layers. A typical exposed-ingress preset:
+
+```
+body_limit "16MB"              # bytes per request
+max_concurrent_requests 64     # peak concurrency → ≤1 GiB worst-case decode
+request_rate_limit 1000        # sustained RPS, smooths bursts
+rate_limit 100000              # pipeline send rate (events/sec)
+```
+
+For a loopback / sidecar deployment you can typically omit all four — the four defaults (16 MiB body, no other cap) match what the OpenTelemetry collector itself does.
 
 ## Per-Event shape
 

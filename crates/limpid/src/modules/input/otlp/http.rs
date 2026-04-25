@@ -13,10 +13,20 @@
 //! def input otlp_in {
 //!     type otlp_http
 //!     bind "0.0.0.0:4318"
-//!     body_limit "16MB"     // optional, default 16 MiB
-//!     rate_limit 10000      // optional, events/sec budget
+//!     body_limit "16MB"            // optional, default 16 MiB
+//!     rate_limit 10000             // optional, events/sec budget
+//!     request_rate_limit 100       // optional, req/sec budget
+//!     max_concurrent_requests 32   // optional, in-flight req cap
 //! }
 //! ```
+//!
+//! The four budgets stack as orthogonal defense layers:
+//! - `body_limit` caps **bytes per single request** (axum body limit)
+//! - `max_concurrent_requests` caps **simultaneous in-flight requests**
+//!   — bounds worst-case decode memory to `permits × body_limit`
+//! - `request_rate_limit` caps **sustained req/sec** (burst-equal-to-rate)
+//! - `rate_limit` caps **emitted events/sec** to the pipeline
+//!   (per-LogRecord, applied after split — the same one as `syslog_*`)
 //!
 //! Per-Event shape (input writes only this much; payload semantics
 //! belong to the process layer per Principle 2):
@@ -44,7 +54,7 @@ use axum::{
 };
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use prost::Message;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tracing::{info, warn};
 
 use super::split_request;
@@ -65,6 +75,8 @@ pub struct OtlpHttpInput {
     bind_addr: String,
     body_limit: usize,
     rate_limit: Option<u64>,
+    request_rate_limit: Option<u64>,
+    max_concurrent_requests: Option<usize>,
     metrics: Arc<InputMetrics>,
 }
 
@@ -94,10 +106,17 @@ impl Module for OtlpHttpInput {
             None => DEFAULT_BODY_LIMIT_BYTES,
         };
         let rate_limit = props::get_strictly_positive_int(properties, "rate_limit")?;
+        let request_rate_limit =
+            props::get_strictly_positive_int(properties, "request_rate_limit")?;
+        let max_concurrent_requests =
+            props::get_strictly_positive_int(properties, "max_concurrent_requests")?
+                .map(|n| n as usize);
         Ok(Self {
             bind_addr: bind,
             body_limit,
             rate_limit,
+            request_rate_limit,
+            max_concurrent_requests,
             metrics: Arc::new(InputMetrics::default()),
         })
     }
@@ -115,6 +134,13 @@ struct AppState {
     tx: mpsc::Sender<Event>,
     metrics: Arc<InputMetrics>,
     rate_limiter: Option<Arc<RateLimiter>>,
+    request_limiter: Option<Arc<RateLimiter>>,
+    /// Bounds the number of in-flight `handle_logs` invocations.
+    /// Worst-case decode memory = `permits × body_limit`, so this
+    /// turns an open-ended decode-amplification path into a known
+    /// quantity. Pairs with `request_limiter` (smooths sustained QPS)
+    /// and the per-event `rate_limiter` (caps pipeline send rate).
+    concurrency: Option<Arc<Semaphore>>,
 }
 
 #[async_trait::async_trait]
@@ -128,10 +154,24 @@ impl Input for OtlpHttpInput {
         if let Some(rate) = self.rate_limit {
             info!("otlp_http rate_limit: {} events/sec", rate);
         }
+        let request_limiter = self
+            .request_rate_limit
+            .map(|r| Arc::new(RateLimiter::new(r)));
+        if let Some(rate) = self.request_rate_limit {
+            info!("otlp_http request_rate_limit: {} req/sec", rate);
+        }
+        let concurrency = self
+            .max_concurrent_requests
+            .map(|n| Arc::new(Semaphore::new(n)));
+        if let Some(n) = self.max_concurrent_requests {
+            info!("otlp_http max_concurrent_requests: {}", n);
+        }
         let state = AppState {
             tx,
             metrics: Arc::clone(&self.metrics),
             rate_limiter,
+            request_limiter,
+            concurrency,
         };
         let app = Router::new()
             .route("/v1/logs", post(handle_logs))
@@ -170,6 +210,37 @@ async fn handle_logs(
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
     state.metrics.events_received.fetch_add(1, Ordering::Relaxed);
+
+    // Concurrency cap (semaphore) bounds simultaneous decode work.
+    // Combined with body_limit, this turns the worst-case decode
+    // memory into a fixed `permits × body_limit` budget. Held for
+    // the entire handler lifetime via `_permit`.
+    //
+    // Failure mode is fail-fast (HTTP 503) rather than queue-and-wait
+    // because OTLP senders typically retry, so backpressuring the
+    // socket buffer would just amplify the problem under sustained
+    // overload. Returning a status lets the client back off.
+    let _permit = match &state.concurrency {
+        Some(sem) => match Arc::clone(sem).try_acquire_owned() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                warn!("otlp_http [{peer}]: concurrency cap reached, rejecting");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "otlp_http: max_concurrent_requests reached",
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+
+    // Per-request token bucket. Smooths sustained req/sec; pairs with
+    // (not replaces) the concurrency cap above. A burst-equal-to-rate
+    // bucket means the first N requests fire instantly when idle.
+    if let Some(rl) = &state.request_limiter {
+        rl.acquire().await;
+    }
 
     // Default to protobuf when Content-Type is missing or unrecognised
     // — canonical OTLP form, matches what `opentelemetry-collector`
@@ -246,11 +317,43 @@ mod tests {
     }
 
     #[test]
-    fn defaults_bind_address_body_limit_and_rate_limit() {
+    fn defaults_have_no_request_throttles() {
         let i = OtlpHttpInput::from_properties("o", &[]).unwrap();
         assert_eq!(i.bind_addr, "0.0.0.0:4318");
         assert_eq!(i.body_limit, DEFAULT_BODY_LIMIT_BYTES);
         assert_eq!(i.rate_limit, None);
+        assert_eq!(i.request_rate_limit, None);
+        assert_eq!(i.max_concurrent_requests, None);
+    }
+
+    #[test]
+    fn request_rate_limit_and_concurrency_round_trip() {
+        let i = OtlpHttpInput::from_properties(
+            "o",
+            &[
+                prop_int("request_rate_limit", 100),
+                prop_int("max_concurrent_requests", 32),
+            ],
+        )
+        .unwrap();
+        assert_eq!(i.request_rate_limit, Some(100));
+        assert_eq!(i.max_concurrent_requests, Some(32));
+    }
+
+    #[test]
+    fn zero_concurrency_is_rejected() {
+        // get_strictly_positive_int forbids 0; the property is
+        // documented as "off when absent", so 0 is meaningless.
+        let err = OtlpHttpInput::from_properties(
+            "o",
+            &[prop_int("max_concurrent_requests", 0)],
+        )
+        .err()
+        .unwrap();
+        assert!(
+            err.to_string().contains("max_concurrent_requests"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]
@@ -547,5 +650,122 @@ mod tests {
 
         let _ = shutdown_tx.send(true);
         let _ = server_task.await;
+    }
+
+    /// Wire-level: with `max_concurrent_requests = 1` and a slow
+    /// downstream (one event held in the channel via `request_rate_limit`),
+    /// the second concurrent POST must come back 503 — the semaphore
+    /// is held by the first handler which is throttled by the token
+    /// bucket.
+    ///
+    /// We use `request_rate_limit = 1 req/sec` to make the first
+    /// handler park inside `acquire().await` *after* it grabs the
+    /// permit but *before* it touches the channel. That avoids the
+    /// "handler stuck on a closed channel" cleanup hazard — when we
+    /// drop the receiver the throttle still ticks and the handler
+    /// completes naturally.
+    #[tokio::test]
+    async fn max_concurrent_requests_rejects_overflow_with_503() {
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let input = OtlpHttpInput::from_properties(
+            "test",
+            &[
+                prop_str("bind", &addr.to_string()),
+                prop_int("max_concurrent_requests", 1),
+                // 1 req/sec → bucket holds 1 token, second-of-burst
+                // waits ~1s. Plenty of time to fire the second
+                // request while the first is parked inside the
+                // `request_limiter.acquire().await` after it has
+                // taken the semaphore permit.
+                prop_int("request_rate_limit", 1),
+            ],
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server_task = tokio::spawn(async move {
+            let _ = input.run(tx, shutdown_rx).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Empty request body — minimum bytes, fast decode. The
+        // throttle is what makes the first handler block.
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![],
+        };
+        let mut body = Vec::with_capacity(req.encoded_len());
+        req.encode(&mut body).unwrap();
+
+        let url = format!("http://{}/v1/logs", addr);
+        let client = reqwest::Client::new();
+
+        // Burn the first token so subsequent requests must wait.
+        let _warmup = client
+            .post(&url)
+            .header("Content-Type", "application/x-protobuf")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+
+        // First parallel request: acquires the permit, parks on the
+        // empty token bucket. Held for ~1s.
+        let url_clone = url.clone();
+        let body_clone = body.clone();
+        let client_clone = client.clone();
+        let first = tokio::spawn(async move {
+            client_clone
+                .post(&url_clone)
+                .header("Content-Type", "application/x-protobuf")
+                .body(body_clone)
+                .send()
+                .await
+        });
+        // Let the first get past `try_acquire_owned`.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Second parallel request: permit refused → 503 immediate.
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/x-protobuf")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "second concurrent request must hit the cap"
+        );
+        let text = resp.text().await.unwrap_or_default();
+        assert!(
+            text.contains("max_concurrent_requests"),
+            "503 body should explain the cap: {text:?}"
+        );
+
+        // First request should eventually drain through the throttle
+        // and return 200; we wait it out (up to a few seconds)
+        // rather than abort, so the server task can shut down cleanly.
+        let first_resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            first,
+        )
+        .await
+        .expect("first request must complete once the bucket refills")
+        .expect("first task must not panic")
+        .expect("first request must return a response");
+        assert_eq!(first_resp.status(), reqwest::StatusCode::OK);
+
+        // Drain anything that did make it through (the warmup, etc.)
+        // so the channel close is not the cleanup bottleneck.
+        while rx.try_recv().is_ok() {}
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_task).await;
     }
 }
