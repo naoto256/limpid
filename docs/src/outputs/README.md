@@ -32,9 +32,9 @@ def output reliable {
     }
 
     retry {
-        max_attempts 10                    // default: 3
+        max_attempts 10                    // default: 5
         initial_wait "1s"                  // default: 1s
-        max_wait "5m"                      // default: 30s
+        max_wait "5m"                      // default: 60s
         backoff exponential                // exponential (default) | fixed
     }
 
