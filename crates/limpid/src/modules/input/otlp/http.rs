@@ -13,7 +13,8 @@
 //! def input otlp_in {
 //!     type otlp_http
 //!     bind "0.0.0.0:4318"
-//!     body_limit "16MB"      // optional, default 16 MiB
+//!     body_limit "16MB"     // optional, default 16 MiB
+//!     rate_limit 10000      // optional, events/sec budget
 //! }
 //! ```
 //!
@@ -51,6 +52,7 @@ use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::event::Event;
 use crate::metrics::InputMetrics;
+use crate::modules::input::rate_limit::RateLimiter;
 use crate::modules::{HasMetrics, Input, Module};
 
 /// Default body cap for OTLP/HTTP requests. axum 0.7 itself defaults
@@ -62,6 +64,7 @@ const DEFAULT_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 pub struct OtlpHttpInput {
     bind_addr: String,
     body_limit: usize,
+    rate_limit: Option<u64>,
     metrics: Arc<InputMetrics>,
 }
 
@@ -90,9 +93,11 @@ impl Module for OtlpHttpInput {
             }
             None => DEFAULT_BODY_LIMIT_BYTES,
         };
+        let rate_limit = props::get_strictly_positive_int(properties, "rate_limit")?;
         Ok(Self {
             bind_addr: bind,
             body_limit,
+            rate_limit,
             metrics: Arc::new(InputMetrics::default()),
         })
     }
@@ -109,6 +114,7 @@ impl HasMetrics for OtlpHttpInput {
 struct AppState {
     tx: mpsc::Sender<Event>,
     metrics: Arc<InputMetrics>,
+    rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 #[async_trait::async_trait]
@@ -118,9 +124,14 @@ impl Input for OtlpHttpInput {
         tx: mpsc::Sender<Event>,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
+        let rate_limiter = self.rate_limit.map(|r| Arc::new(RateLimiter::new(r)));
+        if let Some(rate) = self.rate_limit {
+            info!("otlp_http rate_limit: {} events/sec", rate);
+        }
         let state = AppState {
             tx,
             metrics: Arc::clone(&self.metrics),
+            rate_limiter,
         };
         let app = Router::new()
             .route("/v1/logs", post(handle_logs))
@@ -194,7 +205,15 @@ async fn handle_logs(
         },
     };
 
-    let outcome = split_request(req, peer, &state.metrics, &state.tx, "otlp_http").await;
+    let outcome = split_request(
+        req,
+        peer,
+        &state.metrics,
+        &state.tx,
+        "otlp_http",
+        state.rate_limiter.as_deref(),
+    )
+    .await;
     if outcome.aborted {
         return (StatusCode::SERVICE_UNAVAILABLE, "pipeline closed").into_response();
     }
@@ -218,11 +237,20 @@ mod tests {
         }
     }
 
+    fn prop_int(key: &str, val: i64) -> Property {
+        Property::KeyValue {
+            key: key.to_string(),
+            value: Expr::spanless(ExprKind::IntLit(val)),
+            value_span: None,
+        }
+    }
+
     #[test]
-    fn defaults_bind_address_and_body_limit() {
+    fn defaults_bind_address_body_limit_and_rate_limit() {
         let i = OtlpHttpInput::from_properties("o", &[]).unwrap();
         assert_eq!(i.bind_addr, "0.0.0.0:4318");
         assert_eq!(i.body_limit, DEFAULT_BODY_LIMIT_BYTES);
+        assert_eq!(i.rate_limit, None);
     }
 
     #[test]
@@ -400,6 +428,122 @@ mod tests {
         // Empty payload → no Events emitted (events_received still
         // bumped per RPC, but the channel stays clean).
         assert!(rx.try_recv().is_err());
+
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+    }
+
+    #[test]
+    fn rate_limit_is_parsed_as_positive_int() {
+        let i = OtlpHttpInput::from_properties("o", &[prop_int("rate_limit", 5000)]).unwrap();
+        assert_eq!(i.rate_limit, Some(5000));
+    }
+
+    #[test]
+    fn rate_limit_zero_is_rejected() {
+        let err = OtlpHttpInput::from_properties("o", &[prop_int("rate_limit", 0)])
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string().contains("rate_limit"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// Wire-level: with `rate_limit = 5` events/sec, posting one
+    /// request that carries 10 LogRecords must take *at least* one
+    /// second of wall-clock to fully drain — the bucket starts full
+    /// (capacity == rate), so the first 5 fire instantly, and the
+    /// remaining 5 each wait ~200ms.
+    ///
+    /// We deliberately use a single multi-record request (the very
+    /// shape `batch_level=scope` produces upstream) to confirm the
+    /// throttle is per-Event, not per-RPC.
+    #[tokio::test]
+    async fn rate_limit_throttles_per_event_not_per_rpc() {
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+        use opentelemetry_proto::tonic::common::v1::{
+            AnyValue, InstrumentationScope, KeyValue, any_value,
+        };
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+        use std::time::Instant;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let input = OtlpHttpInput::from_properties(
+            "test",
+            &[prop_str("bind", &addr.to_string()), prop_int("rate_limit", 5)],
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(64);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server_task = tokio::spawn(async move {
+            let _ = input.run(tx, shutdown_rx).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 10 LogRecords sharing one Resource + Scope (a real
+        // batch_level=scope shipper produces this shape).
+        let log_records: Vec<LogRecord> = (0..10u64)
+            .map(|i| LogRecord {
+                time_unix_nano: i,
+                ..Default::default()
+            })
+            .collect();
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".into(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("rate-test".into())),
+                        }),
+                    }],
+                    dropped_attributes_count: 0,
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: Some(InstrumentationScope {
+                        name: "test".into(),
+                        version: "0".into(),
+                        attributes: vec![],
+                        dropped_attributes_count: 0,
+                    }),
+                    log_records,
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let mut body = Vec::with_capacity(req.encoded_len());
+        req.encode(&mut body).unwrap();
+
+        let started = Instant::now();
+        let resp = reqwest::Client::new()
+            .post(format!("http://{}/v1/logs", addr))
+            .header("Content-Type", "application/x-protobuf")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        // Drain the channel — confirms 10 Events emerged in order.
+        for _ in 0..10 {
+            rx.recv()
+                .await
+                .expect("each LogRecord must surface as an Event");
+        }
+        let elapsed = started.elapsed();
+        // 5/sec budget, 10 events: first 5 free (full bucket), then
+        // 5 × ~200ms ≈ 1s. Allow a generous lower bound; an unlimited
+        // input would finish in tens of milliseconds.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(500),
+            "rate_limit must throttle 10 events under 5/sec budget (took {:?})",
+            elapsed
+        );
 
         let _ = shutdown_tx.send(true);
         let _ = server_task.await;

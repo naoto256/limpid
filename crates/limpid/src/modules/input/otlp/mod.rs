@@ -22,6 +22,7 @@ use prost::Message;
 use tokio::sync::mpsc;
 use tracing::warn;
 
+use super::rate_limit::RateLimiter;
 use crate::event::Event;
 use crate::metrics::InputMetrics;
 
@@ -53,12 +54,18 @@ pub struct SplitOutcome {
 ///
 /// `transport_name` is the literal `"otlp_http"` / `"otlp_grpc"` used
 /// in tracing output so log lines stay attributable.
+///
+/// `rate_limiter`, if present, is `acquire`d once per emitted Event
+/// (matching the syslog inputs' per-event policy). Re-encode failures
+/// do not consume tokens — only successfully dispatched events count
+/// against the budget.
 pub async fn split_request(
     req: ExportLogsServiceRequest,
     peer: SocketAddr,
     metrics: &Arc<InputMetrics>,
     tx: &mpsc::Sender<Event>,
     transport_name: &'static str,
+    rate_limiter: Option<&RateLimiter>,
 ) -> SplitOutcome {
     let mut rejected = 0usize;
 
@@ -78,6 +85,9 @@ pub async fn split_request(
                     metrics.events_invalid.fetch_add(1, Ordering::Relaxed);
                     rejected += 1;
                     continue;
+                }
+                if let Some(limiter) = rate_limiter {
+                    limiter.acquire().await;
                 }
                 let event = Event::new(Bytes::from(buf), peer);
                 if tx.send(event).await.is_err() {

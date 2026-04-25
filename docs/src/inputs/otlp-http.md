@@ -9,6 +9,7 @@ def input otlp_in {
     type otlp_http
     bind "0.0.0.0:4318"   // OTLP/HTTP default port
     body_limit "16MB"     // optional per-request size cap
+    rate_limit 10000      // optional events/sec budget
 }
 ```
 
@@ -18,6 +19,7 @@ def input otlp_in {
 |----------|----------|---------|-------------|
 | `bind` | no | `0.0.0.0:4318` | TCP listen address |
 | `body_limit` | no | `16MB` | Per-request body size cap. Larger requests are rejected with HTTP 413 *Payload Too Large* before any decode work runs. Accepts `KB` / `MB` / `GB` suffixes or a bare byte count. Tune up for OTLP collectors that batch tens of MB of logs per RPC, down for hostile-network ingest. |
+| `rate_limit` | no | unlimited | Sustained events-per-second cap (positive integer). Each emitted Event consumes 1 token; over-budget records `acquire().await` until the token bucket refills. Same implementation as the `syslog_*` inputs. |
 
 ## Per-Event shape
 

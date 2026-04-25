@@ -8,6 +8,7 @@ Receives OpenTelemetry logs over the OTLP/gRPC transport. Hosts the `opentelemet
 def input otlp_in {
     type otlp_grpc
     bind "0.0.0.0:4317"   // OTLP/gRPC default port
+    rate_limit 10000      // optional events/sec budget
 }
 ```
 
@@ -16,6 +17,7 @@ def input otlp_in {
 | Property | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `bind` | no | `0.0.0.0:4317` | TCP listen address |
+| `rate_limit` | no | unlimited | Sustained events-per-second cap (positive integer). Per-Event token-bucket throttle, identical to `otlp_http` and the `syslog_*` inputs. |
 
 ## Per-Event shape
 
