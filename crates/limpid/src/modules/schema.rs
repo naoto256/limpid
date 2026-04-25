@@ -60,6 +60,12 @@ pub enum FieldType {
     /// because union / type_compatible already treat unknown variants
     /// conservatively.
     Array,
+    /// Raw byte payload, distinct from `String`. Surfaces from binary
+    /// primitives (OTLP/protobuf encode, future raw payload primitives)
+    /// and the `Value::Bytes` variant added in v0.5.0. Text-only
+    /// primitives (`upper`, `regex_*`, etc.) reject this type at the
+    /// analyzer level rather than coercing.
+    Bytes,
     /// Unknown / any; skips type checking for this field.
     Any,
     /// Disjunction of concrete types, produced at branch-join points.
@@ -144,6 +150,7 @@ impl FieldType {
             FieldType::Null => "Null".into(),
             FieldType::Object => "Object".into(),
             FieldType::Array => "Array".into(),
+            FieldType::Bytes => "Bytes".into(),
             FieldType::Any => "Any".into(),
             FieldType::Union(ms) => {
                 let parts: Vec<String> = ms.iter().map(|m| m.display()).collect();

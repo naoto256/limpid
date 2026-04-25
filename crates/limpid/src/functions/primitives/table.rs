@@ -5,7 +5,7 @@
 //! near-identical shims would obscure the fact that they're facets of
 //! the same store.
 
-use serde_json::Value;
+use crate::dsl::value::Value;
 
 use super::val_to_str;
 use crate::functions::table::TableStore;
@@ -19,8 +19,8 @@ pub fn register(reg: &mut FunctionRegistry, table_store: TableStore) {
             "table_lookup",
             FunctionSig::fixed(&[FieldType::String, FieldType::String], FieldType::Any),
             move |args, _event| {
-                let table_name = val_to_str(&args[0]);
-                let key = val_to_str(&args[1]);
+                let table_name = val_to_str(&args[0])?;
+                let key = val_to_str(&args[1])?;
                 Ok(store.lookup(&table_name, &key))
             },
         );
@@ -41,14 +41,15 @@ pub fn register(reg: &mut FunctionRegistry, table_store: TableStore) {
                 FieldType::Null,
             ),
             move |args, _event| {
-            let table_name = val_to_str(&args[0]);
-            let key = val_to_str(&args[1]);
+            let table_name = val_to_str(&args[0])?;
+            let key = val_to_str(&args[1])?;
             let value = args[2].clone();
             if args.len() == 3 {
                 store.upsert_with_default(&table_name, &key, value);
             } else {
                 let secs = match &args[3] {
-                    Value::Number(n) => n.as_u64(),
+                    Value::Int(n) if *n >= 0 => Some(*n as u64),
+                    Value::Float(f) if f.is_finite() && *f >= 0.0 => Some(*f as u64),
                     other => {
                         tracing::warn!(
                             "table_upsert: expire must be a number, got {} — using table default TTL",
@@ -80,8 +81,8 @@ pub fn register(reg: &mut FunctionRegistry, table_store: TableStore) {
             "table_delete",
             FunctionSig::fixed(&[FieldType::String, FieldType::String], FieldType::Null),
             move |args, _event| {
-                let table_name = val_to_str(&args[0]);
-                let key = val_to_str(&args[1]);
+                let table_name = val_to_str(&args[0])?;
+                let key = val_to_str(&args[1])?;
                 store.delete(&table_name, &key);
                 Ok(Value::Null)
             },

@@ -31,6 +31,8 @@ sha2 = "0.10"
 sha1 = "0.10"
 md-5 = "0.10"
 digest = "0.10"
+base64 = "0.22"
+indexmap = { version = "2", features = ["serde"] }
 systemd = { version = "0.10", optional = true }
 rdkafka = { version = "0.36", features = ["cmake-build"], optional = true }
 

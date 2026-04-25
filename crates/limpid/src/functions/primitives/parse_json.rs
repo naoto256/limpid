@@ -15,7 +15,9 @@
 //! See Principle 5 in `design-principles.md`.
 
 use anyhow::{Result, bail};
-use serde_json::{Map, Value};
+
+use crate::dsl::value::{Map, Value};
+use crate::dsl::value_json::json_to_value;
 
 use super::val_to_str;
 use crate::functions::{FunctionRegistry, ParserInfo};
@@ -35,9 +37,11 @@ pub fn register(reg: &mut FunctionRegistry) {
 fn parse_json_impl(args: &[Value]) -> Result<Value> {
     // Arity is validated centrally by the registry (register_parser installs
     // the `(String, Object?) -> Object` signature). No manual check here.
-    let text = val_to_str(&args[0]);
-    let parsed: Value = serde_json::from_str(&text)
+    let text = val_to_str(&args[0])?;
+    let json: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| anyhow::anyhow!("parse_json(): JSON parse error: {}", e))?;
+    let parsed = json_to_value(&json)
+        .map_err(|e| anyhow::anyhow!("parse_json(): {}", e))?;
 
     let mut map = match parsed {
         Value::Object(m) => m,
@@ -57,7 +61,7 @@ fn parse_json_impl(args: &[Value]) -> Result<Value> {
 pub(crate) fn apply_defaults(
     name: &'static str,
     defaults: Option<&Value>,
-    map: &mut Map<String, Value>,
+    map: &mut Map,
 ) -> Result<()> {
     let Some(v) = defaults else { return Ok(()) };
     match v {
@@ -78,14 +82,7 @@ pub(crate) fn apply_defaults(
 }
 
 pub(crate) fn type_name(v: &Value) -> &'static str {
-    match v {
-        Value::Null => "null",
-        Value::Bool(_) => "bool",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
+    v.type_name()
 }
 
 #[cfg(test)]
@@ -124,7 +121,7 @@ mod tests {
         let Value::Object(m) = result else {
             panic!("expected Object")
         };
-        assert_eq!(m["a"], Value::Number(1.into()));
+        assert_eq!(m["a"], Value::Int(1));
         assert_eq!(m["b"], Value::String("x".into()));
     }
 

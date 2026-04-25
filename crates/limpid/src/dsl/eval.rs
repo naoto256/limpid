@@ -3,9 +3,9 @@
 use std::collections::HashMap;
 
 use anyhow::{Result, bail};
-use serde_json::Value;
 
 use super::ast::{BinOp, Expr, ExprKind, TemplateFragment, UnaryOp};
+use super::value::{Map, Value};
 use crate::event::Event;
 use crate::functions::FunctionRegistry;
 
@@ -66,7 +66,7 @@ pub fn eval_expr(expr: &Expr, event: &Event, funcs: &FunctionRegistry) -> Result
 /// identifier resolution. Bare `x` (not `workspace.x`) resolves to the
 /// `let x = ...` binding currently in scope; if there is no such
 /// binding, resolution falls through to Event metadata (`ingress`,
-/// `egress`, `source`, `timestamp`, `error`, `workspace`). Anything
+/// `egress`, `source`, `received_at`, `error`, `workspace`). Anything
 /// else produces an "unknown identifier" error.
 pub fn eval_expr_with_scope(
     expr: &Expr,
@@ -78,25 +78,26 @@ pub fn eval_expr_with_scope(
         ExprKind::StringLit(s) => Ok(Value::String(s.clone())),
         ExprKind::Template(fragments) => {
             // Render template fragments against the current event.
-            // Interpolated values are coerced to string via value_to_string
-            // so that `${source}` (String) and `${workspace.foo}` (arbitrary)
-            // both interpolate cleanly.
+            // Interpolated values are coerced to string via value_to_string;
+            // Bytes interpolation is rejected per Bytes design §3 — users
+            // must convert explicitly via `to_string()`.
             let mut out = String::new();
             for frag in fragments {
                 match frag {
                     TemplateFragment::Literal(s) => out.push_str(s),
                     TemplateFragment::Interp(expr) => {
                         let v = eval_expr_with_scope(expr, event, funcs, scope)?;
+                        if matches!(v, Value::Bytes(_)) {
+                            bail!("cannot interpolate bytes into a string template (use to_string() first)");
+                        }
                         out.push_str(&value_to_string(&v));
                     }
                 }
             }
             Ok(Value::String(out))
         }
-        ExprKind::IntLit(n) => Ok(Value::Number((*n).into())),
-        ExprKind::FloatLit(f) => Ok(Value::Number(
-            serde_json::Number::from_f64(*f).unwrap_or(0.into()),
-        )),
+        ExprKind::IntLit(n) => Ok(Value::Int(*n)),
+        ExprKind::FloatLit(f) => Ok(Value::Float(*f)),
         ExprKind::BoolLit(b) => Ok(Value::Bool(*b)),
         ExprKind::Null => Ok(Value::Null),
 
@@ -126,7 +127,7 @@ pub fn eval_expr_with_scope(
         }
 
         ExprKind::HashLit(entries) => {
-            let mut map = serde_json::Map::new();
+            let mut map = Map::new();
             for (key, val_expr) in entries {
                 let val = eval_expr_with_scope(val_expr, event, funcs, scope)?;
                 map.insert(key.clone(), val);
@@ -147,6 +148,15 @@ pub fn eval_expr_with_scope(
             for field in path {
                 current = match current {
                     Value::Object(ref map) => map.get(field).cloned().unwrap_or(Value::Null),
+                    // Per Bytes design §13, property traversal through a
+                    // scalar (Bytes / String / number / bool) is an error
+                    // — the analyzer flags it statically; at runtime we
+                    // surface the same condition so dynamic data shapes
+                    // don't silently return Null.
+                    Value::Bytes(_) => bail!(
+                        "cannot access field `{}` on a bytes value",
+                        field
+                    ),
                     _ => Value::Null,
                 };
             }
@@ -155,12 +165,16 @@ pub fn eval_expr_with_scope(
     }
 }
 
-/// Resolve a dotted identifier path against an Event.
-/// Convert Bytes to Value::String, avoiding allocation if already valid UTF-8.
+/// Convert raw bytes into a runtime [`Value`].
+///
+/// UTF-8-clean payloads surface as `Value::String` — this preserves the
+/// historical limpid behaviour for text-shaped data (syslog, CEF, JSON).
+/// Non-UTF-8 payloads now surface as `Value::Bytes` rather than being
+/// silently corrupted by `from_utf8_lossy` (the previous behaviour).
 fn bytes_to_value(bytes: &[u8]) -> Value {
     match std::str::from_utf8(bytes) {
         Ok(s) => Value::String(s.to_string()),
-        Err(_) => Value::String(String::from_utf8_lossy(bytes).into_owned()),
+        Err(_) => Value::Bytes(bytes::Bytes::copy_from_slice(bytes)),
     }
 }
 
@@ -189,7 +203,13 @@ fn resolve_ident(parts: &[String], event: &Event, scope: &LocalScope) -> Result<
         }
         Some("workspace") if parts.len() == 1 => {
             // `workspace` alone — return the whole workspace map
-            Ok(Value::Object(event.workspace.clone().into_iter().collect()))
+            Ok(Value::Object(
+                event
+                    .workspace
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ))
         }
         Some("workspace") => {
             // `workspace.xxx.yyy` — direct lookup, no clone of entire map
@@ -207,11 +227,11 @@ fn resolve_workspace_direct(
     parts: &[String],
     workspace: &std::collections::HashMap<String, Value>,
 ) -> Result<Value> {
-    let first = workspace.get(&parts[0]).unwrap_or(&Value::Null);
+    let first = workspace.get(&parts[0]).cloned().unwrap_or(Value::Null);
     if parts.len() == 1 {
-        return Ok(first.clone());
+        return Ok(first);
     }
-    resolve_workspace_path(&parts[1..], first)
+    resolve_workspace_path(&parts[1..], &first)
 }
 
 fn resolve_workspace_path(parts: &[String], value: &Value) -> Result<Value> {
@@ -220,9 +240,13 @@ fn resolve_workspace_path(parts: &[String], value: &Value) -> Result<Value> {
     }
     match value {
         Value::Object(map) => {
-            let next = map.get(&parts[0]).unwrap_or(&Value::Null);
-            resolve_workspace_path(&parts[1..], next)
+            let next = map.get(&parts[0]).cloned().unwrap_or(Value::Null);
+            resolve_workspace_path(&parts[1..], &next)
         }
+        Value::Bytes(_) => bail!(
+            "cannot access field `{}` on a bytes value",
+            parts[0]
+        ),
         _ => Ok(Value::Null),
     }
 }
@@ -249,37 +273,25 @@ fn eval_bin_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
             compare_values(left, right),
             Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
         ))),
-        BinOp::And => Ok(Value::Bool(is_truthy(left) && is_truthy(right))),
-        BinOp::Or => Ok(Value::Bool(is_truthy(left) || is_truthy(right))),
-        BinOp::Add => {
-            // If either side is a String, concatenate as strings. This gives
-            // the usual dynamic-language intuition for building messages like
-            // `"[" + tag + "] " + message`.
-            if matches!(left, Value::String(_)) || matches!(right, Value::String(_)) {
-                Ok(Value::String(format!(
-                    "{}{}",
-                    value_to_string(left),
-                    value_to_string(right)
-                )))
-            } else {
-                numeric_op(left, right, |a, b| a + b)
-            }
-        }
-        BinOp::Sub => numeric_op(left, right, |a, b| a - b),
-        BinOp::Mul => numeric_op(left, right, |a, b| a * b),
-        BinOp::Div => numeric_op(left, right, |a, b| if b != 0.0 { a / b } else { 0.0 }),
-        BinOp::Mod => numeric_op(left, right, |a, b| if b != 0.0 { a % b } else { 0.0 }),
+        BinOp::And => Ok(Value::Bool(left.is_truthy() && right.is_truthy())),
+        BinOp::Or => Ok(Value::Bool(left.is_truthy() || right.is_truthy())),
+        BinOp::Add => add_values(left, right),
+        BinOp::Sub => numeric_op("subtract", left, right, |a, b| a - b),
+        BinOp::Mul => numeric_op("multiply", left, right, |a, b| a * b),
+        BinOp::Div => numeric_op("divide", left, right, |a, b| if b != 0.0 { a / b } else { 0.0 }),
+        BinOp::Mod => numeric_op("modulo", left, right, |a, b| if b != 0.0 { a % b } else { 0.0 }),
     }
 }
 
 fn eval_unary_op(op: UnaryOp, val: &Value) -> Result<Value> {
     match op {
-        UnaryOp::Not => Ok(Value::Bool(!is_truthy(val))),
+        UnaryOp::Not => Ok(Value::Bool(!val.is_truthy())),
         UnaryOp::Neg => {
+            if matches!(val, Value::Bytes(_)) {
+                bail!("cannot negate a bytes value");
+            }
             let n = value_to_f64(val);
-            Ok(serde_json::Number::from_f64(-n)
-                .map(Value::Number)
-                .unwrap_or(Value::Null))
+            Ok(numeric_value_from_f64(-n))
         }
     }
 }
@@ -289,39 +301,84 @@ fn eval_unary_op(op: UnaryOp, val: &Value) -> Result<Value> {
 // ---------------------------------------------------------------------------
 
 /// Value equality used for both the `==`/`!=` binary operators and
-/// `switch` pattern matching. Numbers compare by their `f64` value so
-/// `1` and `1.0` agree; strings and other shapes fall through to the
-/// structural `PartialEq` impl.
+/// `switch` pattern matching. Numbers compare by their numeric value so
+/// `1 == 1.0` agrees; Bytes compares byte-wise but never matches a
+/// String of the same UTF-8 spelling (per Bytes design §1).
 pub fn values_match(left: &Value, right: &Value) -> bool {
     match (left, right) {
+        (Value::Int(a), Value::Int(b)) => a == b,
+        (Value::Float(a), Value::Float(b)) => a == b,
+        (Value::Int(a), Value::Float(b)) | (Value::Float(b), Value::Int(a)) => {
+            (*a as f64) == *b
+        }
         (Value::String(a), Value::String(b)) => a == b,
-        (Value::Number(a), Value::Number(b)) => a.as_f64() == b.as_f64(),
-        _ => left == right,
+        (Value::Bytes(a), Value::Bytes(b)) => a == b,
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        (Value::Null, Value::Null) => true,
+        (Value::Array(a), Value::Array(b)) => a == b,
+        (Value::Object(a), Value::Object(b)) => a == b,
+        _ => false,
     }
 }
 
+/// True if `v` is truthy under DSL rules. Re-exported for callers that
+/// previously imported this from `eval` directly; the canonical
+/// implementation lives on [`Value::is_truthy`].
 pub fn is_truthy(v: &Value) -> bool {
-    match v {
-        Value::Null => false,
-        Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().unwrap_or(0.0) != 0.0,
-        Value::String(s) => !s.is_empty(),
-        Value::Array(a) => !a.is_empty(),
-        Value::Object(m) => !m.is_empty(),
-    }
+    v.is_truthy()
 }
 
+/// String coercion used by templates, format() placeholders, and any
+/// other user-facing primitive that needs a printable representation.
+/// Bytes is not coerced — text helpers reject it upstream so we never
+/// reach here with a Bytes value, but the fallback returns a placeholder
+/// shape rather than a UTF-8-lossy string to make any bug surface
+/// loudly.
 pub fn value_to_string(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
-        other => other.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int(n) => n.to_string(),
+        Value::Float(n) => {
+            if n.fract() == 0.0 && n.is_finite() {
+                format!("{}", *n as i64)
+            } else {
+                n.to_string()
+            }
+        }
+        Value::Bytes(_) => "<bytes>".to_string(),
+        Value::Array(a) => {
+            let mut s = String::from("[");
+            for (i, item) in a.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                s.push_str(&value_to_string(item));
+            }
+            s.push(']');
+            s
+        }
+        Value::Object(m) => {
+            let mut s = String::from("{");
+            for (i, (k, v)) in m.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                s.push_str(k);
+                s.push_str(": ");
+                s.push_str(&value_to_string(v));
+            }
+            s.push('}');
+            s
+        }
     }
 }
 
 fn value_to_f64(v: &Value) -> f64 {
     match v {
-        Value::Number(n) => n.as_f64().unwrap_or(0.0),
+        Value::Int(n) => *n as f64,
+        Value::Float(n) => *n,
         Value::String(s) => s.parse().unwrap_or(0.0),
         Value::Bool(true) => 1.0,
         _ => 0.0,
@@ -330,20 +387,69 @@ fn value_to_f64(v: &Value) -> f64 {
 
 fn compare_values(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
     match (left, right) {
-        (Value::Number(a), Value::Number(b)) => {
-            let a = a.as_f64().unwrap_or(0.0);
-            let b = b.as_f64().unwrap_or(0.0);
-            a.partial_cmp(&b)
-        }
+        (Value::Int(a), Value::Int(b)) => a.partial_cmp(b),
+        (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
+        (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
+        (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)),
+        (Value::Bytes(a), Value::Bytes(b)) => Some(a.as_ref().cmp(b.as_ref())),
         _ => None,
     }
 }
 
-fn numeric_op(left: &Value, right: &Value, f: impl Fn(f64, f64) -> f64) -> Result<Value> {
+/// `+` operator. String concat (existing behaviour), Bytes concat (new
+/// for v0.5.0 Bytes design §2), numeric otherwise. Mixed-type Bytes
+/// participation is an error.
+fn add_values(left: &Value, right: &Value) -> Result<Value> {
+    if matches!(left, Value::Bytes(_)) || matches!(right, Value::Bytes(_)) {
+        return match (left, right) {
+            (Value::Bytes(a), Value::Bytes(b)) => {
+                let mut buf = Vec::with_capacity(a.len() + b.len());
+                buf.extend_from_slice(a);
+                buf.extend_from_slice(b);
+                Ok(Value::Bytes(bytes::Bytes::from(buf)))
+            }
+            _ => bail!(
+                "cannot concatenate {} and {} (only bytes + bytes is supported)",
+                left.type_name(),
+                right.type_name()
+            ),
+        };
+    }
+    if matches!(left, Value::String(_)) || matches!(right, Value::String(_)) {
+        return Ok(Value::String(format!(
+            "{}{}",
+            value_to_string(left),
+            value_to_string(right)
+        )));
+    }
+    numeric_op("add", left, right, |a, b| a + b)
+}
+
+fn numeric_op(
+    op: &str,
+    left: &Value,
+    right: &Value,
+    f: impl Fn(f64, f64) -> f64,
+) -> Result<Value> {
+    if matches!(left, Value::Bytes(_)) || matches!(right, Value::Bytes(_)) {
+        bail!("cannot {} a bytes value", op);
+    }
     let a = value_to_f64(left);
     let b = value_to_f64(right);
-    let result = f(a, b);
-    Ok(serde_json::Number::from_f64(result)
-        .map(Value::Number)
-        .unwrap_or(Value::Null))
+    Ok(numeric_value_from_f64(f(a, b)))
+}
+
+/// Convert an `f64` result back into a `Value`. Integer-valued finites
+/// land as `Value::Int` so subsequent equality / comparison agrees with
+/// the integer path — `numeric_op` collapses int and float arithmetic
+/// onto f64 internally for math, but the type that surfaces should
+/// match user expectations.
+fn numeric_value_from_f64(n: f64) -> Value {
+    if n.is_finite() && n.fract() == 0.0 && (i64::MIN as f64..=i64::MAX as f64).contains(&n) {
+        Value::Int(n as i64)
+    } else if n.is_finite() {
+        Value::Float(n)
+    } else {
+        Value::Null
+    }
 }

@@ -5,7 +5,7 @@
 //! accepts `"local"`, `"UTC"` (case-insensitive), or a literal offset
 //! like `+09:00` / `-0530`.
 
-use serde_json::Value;
+use crate::dsl::value::Value;
 
 use super::{parse_fixed_offset, val_to_str};
 use crate::functions::{FunctionRegistry, FunctionSig};
@@ -24,10 +24,10 @@ pub fn register(reg: &mut FunctionRegistry) {
             // strftime(value, fmt, "local")  — convert to local time, then format
             // strftime(value, fmt, "UTC")    — convert to UTC, then format
             // strftime(value, fmt, "+09:00") — convert to fixed offset, then format
-            let value = val_to_str(&args[0]);
-            let fmt = val_to_str(&args[1]);
+            let value = val_to_str(&args[0])?;
+            let fmt = val_to_str(&args[1])?;
             let tz = if args.len() == 3 {
-                Some(val_to_str(&args[2]))
+                Some(val_to_str(&args[2])?)
             } else {
                 None
             };

@@ -20,7 +20,8 @@
 //! behaviour write `egress = workspace.syslog_msg` on the next line.
 
 use anyhow::{Result, bail};
-use serde_json::{Map, Value};
+use crate::dsl::value::Map;
+use crate::dsl::value::Value;
 
 use crate::functions::primitives::parse_json::{apply_defaults, type_name};
 use crate::functions::primitives::val_to_str;
@@ -50,7 +51,7 @@ pub fn register(reg: &mut FunctionRegistry) {
 fn parse_impl(args: &[Value]) -> Result<Value> {
     // Arity is validated by the registry via the sig installed from
     // `register_parser` (1 to 2 arguments).
-    let text = val_to_str(&args[0]);
+    let text = val_to_str(&args[0])?;
 
     let after_pri =
         skip_pri(&text).ok_or_else(|| anyhow::anyhow!("syslog.parse(): no PRI header"))?;
@@ -87,7 +88,7 @@ fn skip_pri(ingress: &str) -> Option<&str> {
     Some(&ingress[end + 1..])
 }
 
-fn parse_rfc5424(input: &str, map: &mut Map<String, Value>) {
+fn parse_rfc5424(input: &str, map: &mut Map) {
     let mut parts = input.splitn(7, ' ');
     let _version = parts.next();
     let timestamp = parts.next().unwrap_or("-");
@@ -117,7 +118,7 @@ fn parse_rfc5424(input: &str, map: &mut Map<String, Value>) {
     }
 }
 
-fn parse_rfc3164(input: &str, map: &mut Map<String, Value>) {
+fn parse_rfc3164(input: &str, map: &mut Map) {
     let mut rest = input;
     // RFC 3164 timestamp is 3 space-separated tokens: "Mon DD HH:MM:SS"
     // (no year, no timezone). Capture them as a single string before
@@ -198,7 +199,7 @@ fn skip_structured_data(input: &str) -> &str {
     }
 }
 
-fn set_field(map: &mut Map<String, Value>, key: &str, value: &str) {
+fn set_field(map: &mut Map, key: &str, value: &str) {
     if value != "-" && !value.is_empty() {
         map.insert(key.into(), Value::String(value.into()));
     }
@@ -245,7 +246,7 @@ mod tests {
         reg
     }
 
-    fn call_syslog_parse(reg: &FunctionRegistry, s: &str) -> Result<Map<String, Value>> {
+    fn call_syslog_parse(reg: &FunctionRegistry, s: &str) -> Result<Map> {
         let e = dummy_event();
         let v = reg.call(Some("syslog"), "parse", &[Value::String(s.into())], &e)?;
         let Value::Object(m) = v else {

@@ -3,7 +3,7 @@
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use serde_json::Value;
+    use crate::dsl::value::Value;
     use std::net::SocketAddr;
 
     use crate::dsl::ast::*;
@@ -174,7 +174,7 @@ mod tests {
         ];
         match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
             ExecResult::Continue(ev) => {
-                assert_eq!(ev.workspace["y"], Value::Number(7.into()));
+                assert_eq!(ev.workspace["y"], Value::Int(7));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -194,7 +194,7 @@ mod tests {
         ];
         match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
             ExecResult::Continue(ev) => {
-                assert_eq!(ev.workspace["y"], Value::Number(2.into()));
+                assert_eq!(ev.workspace["y"], Value::Int(2));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -354,7 +354,7 @@ mod tests {
         )];
         match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
             ExecResult::Continue(ev) => {
-                assert_eq!(ev.workspace["n"], Value::Number(3.into()));
+                assert_eq!(ev.workspace["n"], Value::Int(3));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -389,9 +389,9 @@ mod tests {
                 assert_eq!(
                     ev.workspace["xs"],
                     Value::Array(vec![
-                        Value::Number(1.into()),
-                        Value::Number(2.into()),
-                        Value::Number(3.into()),
+                        Value::Int(1),
+                        Value::Int(2),
+                        Value::Int(3),
                     ])
                 );
             }
@@ -426,9 +426,9 @@ mod tests {
                 assert_eq!(
                     ev.workspace["xs"],
                     Value::Array(vec![
-                        Value::Number(1.into()),
-                        Value::Number(2.into()),
-                        Value::Number(3.into()),
+                        Value::Int(1),
+                        Value::Int(2),
+                        Value::Int(3),
                     ])
                 );
             }
@@ -461,7 +461,7 @@ mod tests {
             ExecResult::Continue(ev) => {
                 let found = &ev.workspace["found"];
                 assert_eq!(found.get("t"), Some(&Value::String("b".into())));
-                assert_eq!(found.get("n"), Some(&Value::Number(2.into())));
+                assert_eq!(found.get("n"), Some(&Value::Int(2)));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }

@@ -21,7 +21,7 @@
 //! * `v` is any value, including `Null` — if the caller wants to record
 //!   "a slot with no value", that's a legitimate array element.
 
-use serde_json::Value;
+use crate::dsl::value::Value;
 
 use crate::functions::{FunctionRegistry, FunctionSig};
 use crate::modules::schema::FieldType;
@@ -48,16 +48,16 @@ fn push_back(arr: &Value, v: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use crate::value;
 
     #[test]
     fn appends_to_non_empty_array() {
-        assert_eq!(push_back(&json!([1, 2]), &json!(3)), json!([1, 2, 3]));
+        assert_eq!(push_back(&value!([1, 2]), &value!(3)), value!([1, 2, 3]));
     }
 
     #[test]
     fn appends_to_empty_array() {
-        assert_eq!(push_back(&json!([]), &json!("first")), json!(["first"]));
+        assert_eq!(push_back(&value!([]), &value!("first")), value!(["first"]));
     }
 
     #[test]
@@ -65,28 +65,28 @@ mod tests {
         // The function returns a fresh array; callers must re-bind to
         // see the change. This test proves no mutation through the
         // cloned input.
-        let original = json!([1, 2]);
-        let result = push_back(&original, &json!(3));
-        assert_eq!(original, json!([1, 2]));
-        assert_eq!(result, json!([1, 2, 3]));
+        let original = value!([1, 2]);
+        let result = push_back(&original, &value!(3));
+        assert_eq!(original, value!([1, 2]));
+        assert_eq!(result, value!([1, 2, 3]));
     }
 
     #[test]
     fn appending_any_value_type() {
-        assert_eq!(push_back(&json!([]), &json!(null)), json!([null]));
-        assert_eq!(push_back(&json!([]), &json!({"k": 1})), json!([{"k": 1}]));
-        assert_eq!(push_back(&json!([]), &json!([1, 2])), json!([[1, 2]]));
+        assert_eq!(push_back(&value!([]), &value!(null)), value!([null]));
+        assert_eq!(push_back(&value!([]), &value!({"k": 1})), value!([{"k": 1}]));
+        assert_eq!(push_back(&value!([]), &value!([1, 2])), value!([[1, 2]]));
     }
 
     #[test]
     fn null_array_returns_null() {
-        assert_eq!(push_back(&Value::Null, &json!(1)), Value::Null);
+        assert_eq!(push_back(&Value::Null, &value!(1)), Value::Null);
     }
 
     #[test]
     fn non_array_input_returns_null() {
-        assert_eq!(push_back(&json!("string"), &json!(1)), Value::Null);
-        assert_eq!(push_back(&json!({"k": 1}), &json!(1)), Value::Null);
-        assert_eq!(push_back(&json!(42), &json!(1)), Value::Null);
+        assert_eq!(push_back(&value!("string"), &value!(1)), Value::Null);
+        assert_eq!(push_back(&value!({"k": 1}), &value!(1)), Value::Null);
+        assert_eq!(push_back(&value!(42), &value!(1)), Value::Null);
     }
 }
