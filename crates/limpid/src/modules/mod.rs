@@ -192,6 +192,7 @@ pub fn register_builtins(registry: &mut ModuleRegistry) {
     register_output_type::<output::unix_socket::UnixSocketOutput>(registry, "unix_socket");
     register_output_type::<output::tcp::TcpOutput>(registry, "tcp");
     register_output_type::<output::http::HttpOutput>(registry, "http");
+    register_output_type::<output::otlp::OtlpOutput>(registry, "otlp");
     register_output_type::<output::udp::UdpOutput>(registry, "udp");
     register_output_type::<output::stdout::StdoutOutput>(registry, "stdout");
     #[cfg(feature = "kafka")]
