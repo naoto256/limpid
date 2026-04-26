@@ -29,7 +29,7 @@
 //! Bytes); it is strictly an internal envelope.
 
 use bytes::Bytes;
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
 
 /// Map type backing `Value::Object`. Insertion order is preserved so
@@ -52,11 +52,12 @@ pub enum Value {
     Float(f64),
     String(String),
     Bytes(Bytes),
-    /// Wall-clock instant with offset preserved. Surface form (string
-    /// coercion, JSON serialization, `${received_at}` interpolation) is
-    /// always RFC3339; the typed value lets `strftime` / comparisons /
-    /// `received_at` consume timestamps without per-call RFC3339 parsing.
-    Timestamp(DateTime<FixedOffset>),
+    /// Wall-clock instant, normalised to UTC. Internally an epoch
+    /// position; no per-value offset metadata. Source-claimed timezone
+    /// information from `strptime` input is used to *decode* the wall
+    /// time correctly but is not stored. Render in a non-UTC offset by
+    /// passing the explicit `timezone` argument to `strftime`.
+    Timestamp(DateTime<Utc>),
     Array(Vec<Value>),
     Object(Map),
 }
@@ -264,7 +265,7 @@ impl Value {
         }
     }
 
-    pub fn as_timestamp(&self) -> Option<&DateTime<FixedOffset>> {
+    pub fn as_timestamp(&self) -> Option<&DateTime<Utc>> {
         if let Value::Timestamp(dt) = self {
             Some(dt)
         } else {
@@ -399,15 +400,15 @@ impl From<Bytes> for Value {
     }
 }
 
-impl From<DateTime<FixedOffset>> for Value {
-    fn from(dt: DateTime<FixedOffset>) -> Self {
+impl From<DateTime<Utc>> for Value {
+    fn from(dt: DateTime<Utc>) -> Self {
         Value::Timestamp(dt)
     }
 }
 
-impl From<chrono::DateTime<chrono::Utc>> for Value {
-    fn from(dt: chrono::DateTime<chrono::Utc>) -> Self {
-        Value::Timestamp(dt.fixed_offset())
+impl From<chrono::DateTime<chrono::FixedOffset>> for Value {
+    fn from(dt: chrono::DateTime<chrono::FixedOffset>) -> Self {
+        Value::Timestamp(dt.with_timezone(&Utc))
     }
 }
 

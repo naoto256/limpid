@@ -1,9 +1,11 @@
 //! `strftime(timestamp, format[, timezone])` — format a `Value::Timestamp`.
 //!
 //! First argument must be a `Value::Timestamp` (returned by
-//! `received_at`, `timestamp()`, `strptime`). The timezone argument
-//! accepts `"local"`, `"UTC"` (case-insensitive), or a literal offset
-//! like `+09:00` / `-0530`. An unknown timezone is a loud error.
+//! `received_at`, `timestamp()`, `strptime`). `Value::Timestamp` is
+//! UTC-normalised internally; without an explicit `timezone` argument
+//! the result is rendered in UTC. Pass `"local"`, `"UTC"`, or a
+//! literal offset (`+09:00` / `-0530`) to convert before rendering.
+//! An unknown timezone is a loud error.
 
 use anyhow::bail;
 
@@ -22,9 +24,10 @@ pub fn register(reg: &mut FunctionRegistry) {
             FieldType::String,
         ),
         |args, _event| {
-            // strftime(ts, fmt)           — format in ts's own timezone
+            // strftime(ts, fmt)           — render in UTC (the value's
+            //                                normalised offset)
             // strftime(ts, fmt, "local")  — convert to local time, then format
-            // strftime(ts, fmt, "UTC")    — convert to UTC, then format
+            // strftime(ts, fmt, "UTC")    — explicit UTC (same as no tz arg)
             // strftime(ts, fmt, "+09:00") — convert to fixed offset, then format
             let dt = match &args[0] {
                 Value::Timestamp(dt) => *dt,
