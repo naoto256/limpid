@@ -1,22 +1,24 @@
 //! `strptime(value, format[, timezone])` — parse a timestamp string
-//! into RFC3339.
+//! into a `Value::Timestamp` (UTC-normalised instant).
 //!
 //! Inverse of `strftime`. Takes an arbitrary timestamp string plus its
-//! `strftime`-style format, returns the canonical RFC3339 form that
-//! `received_at`, `now()`, and `strftime` all use.
+//! `strftime`-style format. The parsed timezone is used to *decode* the
+//! wall time correctly but is not stored: `Value::Timestamp` is
+//! UTC-normalised. To render in the original (or any other) offset,
+//! pass the explicit `timezone` argument to `strftime`.
 //!
-//! Timezone handling:
+//! Timezone handling on input:
 //! - If the format includes an offset (`%z`, `%:z`, `%#z`), the parsed
-//!   datetime carries that offset directly. The optional 3rd argument
+//!   datetime decodes against that offset. The optional 3rd argument
 //!   is rejected as conflicting.
 //! - If the format produces a naive datetime (no offset), the 3rd
-//!   argument supplies the timezone: `"local"`, `"UTC"`, or a literal
-//!   offset (`+09:00`, `-0530`).
+//!   argument supplies the timezone for decoding: `"local"`, `"UTC"`,
+//!   or a literal offset (`+09:00`, `-0530`).
 //! - A naive datetime with no 3rd argument is a loud error — limpid
 //!   never silently assumes UTC. Callers explicitly pick.
 
 use anyhow::{Result, bail};
-use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone};
+use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
 
 use crate::dsl::value::Value;
 use super::{parse_fixed_offset, val_to_str};
@@ -40,7 +42,7 @@ pub fn register(reg: &mut FunctionRegistry) {
                 None
             };
             let parsed = parse_with_tz(&value, &fmt, tz_arg.as_deref())?;
-            Ok(Value::Timestamp(parsed))
+            Ok(Value::Timestamp(parsed.with_timezone(&Utc)))
         },
     );
 }
@@ -121,13 +123,15 @@ mod tests {
     }
 
     #[test]
-    fn parses_with_offset_in_format() {
+    fn parses_with_offset_in_format_and_normalises_to_utc() {
+        // Input is +09:00; the offset is used to decode the wall time
+        // but is not stored — Value::Timestamp is UTC-normalised.
         let r = call(
             &make_reg(),
             &["2026-04-15T10:30:00+09:00", "%Y-%m-%dT%H:%M:%S%:z"],
         )
         .unwrap();
-        assert_eq!(r, "2026-04-15T10:30:00+09:00");
+        assert_eq!(r, "2026-04-15T01:30:00+00:00");
     }
 
     #[test]
@@ -141,13 +145,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_naive_with_fixed_offset_arg() {
+    fn parses_naive_with_fixed_offset_arg_normalises_to_utc() {
+        // 10:30 in +09:00 == 01:30 in UTC.
         let r = call(
             &make_reg(),
             &["2026-04-15 10:30:00", "%Y-%m-%d %H:%M:%S", "+09:00"],
         )
         .unwrap();
-        assert_eq!(r, "2026-04-15T10:30:00+09:00");
+        assert_eq!(r, "2026-04-15T01:30:00+00:00");
     }
 
     #[test]

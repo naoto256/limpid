@@ -191,7 +191,7 @@ fn resolve_ident(parts: &[String], event: &Event, scope: &LocalScope) -> Result<
     match parts.first().map(|s| s.as_str()) {
         Some("ingress") => Ok(bytes_to_value(&event.ingress)),
         Some("egress") => Ok(bytes_to_value(&event.egress)),
-        Some("received_at") => Ok(Value::Timestamp(event.received_at.fixed_offset())),
+        Some("received_at") => Ok(Value::Timestamp(event.received_at)),
         Some("source") => Ok(Value::String(event.source.ip().to_string())),
         Some("error") => {
             // `error` is available inside catch blocks, stored as workspace._error
