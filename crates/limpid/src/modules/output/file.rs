@@ -218,14 +218,23 @@ impl FileOutput {
                 // would be the kind of "helpful" hidden behaviour
                 // limpid Principle 1 forbids.
                 check_no_traversal(&out)?;
-                // Pass 3: a residual empty result means the template
-                // collapsed to nothing (e.g. a single empty literal).
-                // Trailing-slash and directory-target paths are left to
-                // the OS — `EISDIR` / `ENOTDIR` give the same diagnostic
-                // surface either way.
+                // Pass 3: reject empty results and trailing-slash
+                // results before the write attempt. Trailing slash is
+                // not just a "the OS will catch it" case — the parent-
+                // dir auto-mkdir runs before open(), so a path like
+                // `/foo/bar/` would silently create `/foo/bar` as a
+                // directory and *then* fail at open with `EISDIR`.
+                // Catching it here avoids the spurious mkdir side
+                // effect and gives a clear diagnostic.
                 if out.is_empty() {
                     anyhow::bail!(
                         "output file: rendered path is empty (template produced no content)"
+                    );
+                }
+                if out.ends_with('/') {
+                    anyhow::bail!(
+                        "output file: rendered path ends with `/` (no filename component): {:?}",
+                        out
                     );
                 }
                 Ok((out, true))
@@ -461,6 +470,27 @@ mod tests {
         let err = out.render_path(&e).unwrap_err();
         assert!(
             err.to_string().contains("evaluated to empty"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn render_template_errors_on_trailing_slash() {
+        // Template "/var/log/${workspace.empty}/" — empty value alone
+        // would already trip Pass 1b; here the template has trailing
+        // literal slash on a non-empty interp, producing a path that
+        // ends in `/`. Without Pass 3 catching this, the write path's
+        // `create_dir_all(parent)` would silently materialise an empty
+        // directory before open() fails with EISDIR.
+        let out = make_output(ek(ExprKind::Template(vec![
+            TemplateFragment::Literal("/var/log/".into()),
+            TemplateFragment::Interp(ek(ExprKind::Ident(vec!["workspace".into(), "host".into()]))),
+            TemplateFragment::Literal("/".into()),
+        ])));
+        let err = out.render_path(&event_with_workspace()).unwrap_err();
+        assert!(
+            err.to_string().contains("ends with `/`"),
             "unexpected error: {}",
             err
         );
