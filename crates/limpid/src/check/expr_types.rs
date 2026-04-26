@@ -83,7 +83,9 @@ pub fn infer(expr: &Expr, bindings: &Bindings, registry: &FunctionRegistry) -> F
 /// Reserved idents (always present, fixed type):
 /// - `ingress` / `egress` — String (raw bytes UTF-8-decoded)
 /// - `source` — String (peer IP)
-/// - `timestamp` — Timestamp
+/// - `received_at` — Timestamp (wall-clock at which this hop received
+///   the event; `timestamp` was the pre-0.5 name and is no longer
+///   reserved)
 /// - `error` — String (`workspace._error` shortcut inside catch)
 ///
 /// Single-segment idents that aren't reserved fall through to `let`
@@ -127,9 +129,11 @@ fn ident_type(parts: &[String], bindings: &Bindings) -> FieldType {
     {
         return t.clone();
     }
-    // Unknown — `Any` to avoid cascading false positives from the type
-    // checks. The dedicated "unknown identifier" diagnostic surfaces in
-    // a future commit (Phase 3 UX).
+    // Unknown — return `Any` to avoid cascading type-mismatch false
+    // positives. The dedicated "unknown identifier" diagnostic is
+    // emitted by `check_types` (see `check_unknown_ident` below) so
+    // each unresolved reference surfaces as a distinct warning instead
+    // of a chain of typed-operator complaints.
     FieldType::Any
 }
 
@@ -278,13 +282,95 @@ pub fn check_types(
                 diagnostics,
             );
         }
+        ExprKind::Ident(parts) => {
+            check_unknown_ident(
+                parts,
+                pipeline_name,
+                bindings,
+                prefer_span(expr, fallback_span),
+                diagnostics,
+            );
+        }
         ExprKind::StringLit(_)
         | ExprKind::IntLit(_)
         | ExprKind::FloatLit(_)
         | ExprKind::BoolLit(_)
-        | ExprKind::Null
-        | ExprKind::Ident(_) => {}
+        | ExprKind::Null => {}
     }
+}
+
+/// Emit a warning for an identifier reference that doesn't resolve to
+/// any reserved event ident, `let` binding, or `workspace.*` path.
+///
+/// Multi-segment idents starting with `workspace` are skipped here —
+/// the dataflow check (`outputs::check_workspace_visibility`) owns the
+/// "workspace key not produced upstream" diagnostic so we don't
+/// double-flag.
+///
+/// Special-case: bare `timestamp` was the reserved Event-time ident
+/// pre-0.5; surface a targeted hint pointing at the rename rather
+/// than a generic "did you mean" miss (the levenshtein distance from
+/// `timestamp` to `received_at` is too far for the suggestion engine
+/// to reach on its own).
+fn check_unknown_ident(
+    parts: &[String],
+    pipeline_name: &str,
+    bindings: &Bindings,
+    span: Option<Span>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if parts.is_empty() {
+        return;
+    }
+    let first = parts[0].as_str();
+    // Reserved single-segment idents.
+    if parts.len() == 1
+        && matches!(
+            first,
+            "ingress" | "egress" | "source" | "received_at" | "error"
+        )
+    {
+        return;
+    }
+    // `workspace.*` paths are handled by the dataflow visibility pass.
+    if first == "workspace" {
+        return;
+    }
+    // `let` bindings.
+    if parts.len() == 1 && bindings.get_let(first).is_some() {
+        return;
+    }
+    // Unresolved — emit a warning. Tailor the message for the most
+    // common 0.4→0.5 migration miss.
+    let dotted = parts.join(".");
+    let (message, help) = if parts.len() == 1 && first == "timestamp" {
+        (
+            format!(
+                "[pipeline {}] bare `timestamp` is no longer a reserved identifier (renamed in v0.5.0)",
+                pipeline_name
+            ),
+            Some(
+                "use `received_at` for the wall-clock event time, or `timestamp()` for the current instant"
+                    .to_string(),
+            ),
+        )
+    } else {
+        let near = if parts.len() == 1 {
+            suggestions::near_workspace_path(first, bindings)
+        } else {
+            None
+        };
+        (
+            format!("[pipeline {}] unknown identifier `{}`", pipeline_name, dotted),
+            near.map(|n| format!("did you mean `{}`?", n)),
+        )
+    };
+    let mut diag =
+        Diagnostic::warning_kind(DiagKind::UnknownIdent, message).with_span(span);
+    if let Some(h) = help {
+        diag = diag.with_help(h);
+    }
+    diagnostics.push(diag);
 }
 
 /// Prefer the AST-carried span on `expr` when it isn't the

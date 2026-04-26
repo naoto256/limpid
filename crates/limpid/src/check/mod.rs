@@ -996,6 +996,64 @@ def pipeline p { input i; output o }
     }
 
     #[test]
+    fn bare_timestamp_warns_with_rename_hint() {
+        // Regression: pre-0.5 configs that referenced `timestamp` as a
+        // bare identifier (Event field) silently broke at runtime when
+        // upgraded to 0.5 — the analyzer accepted the reference and
+        // the pipeline-runtime "process error → warn + skip" fallback
+        // forwarded events with the original ingress unchanged. Surface
+        // a targeted hint at `--check` time instead.
+        let src = r#"
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p {
+    input i
+    process { egress = strftime(timestamp, "%Y", "UTC") }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        let w = warnings(&diags)
+            .into_iter()
+            .find(|w| w.message.contains("bare `timestamp`"))
+            .expect("expected bare-timestamp rename warning");
+        assert_eq!(w.kind, DiagKind::UnknownIdent);
+        assert!(
+            w.help
+                .as_deref()
+                .is_some_and(|h| h.contains("received_at") && h.contains("timestamp()")),
+            "expected help to point at both received_at and timestamp(), got: {:?}",
+            w.help
+        );
+    }
+
+    #[test]
+    fn unknown_bare_ident_suggests_near_match() {
+        let src = r#"
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p {
+    input i
+    process { egress = ingres }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        let w = warnings(&diags)
+            .into_iter()
+            .find(|w| w.message.contains("unknown identifier"))
+            .expect("expected unknown identifier warning");
+        assert_eq!(w.kind, DiagKind::UnknownIdent);
+        assert!(
+            w.help
+                .as_deref()
+                .is_some_and(|h| h.contains("ingress")),
+            "expected near-match suggestion, got: {:?}",
+            w.help
+        );
+    }
+
+    #[test]
     fn unknown_function_tagged_unknown_ident() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
