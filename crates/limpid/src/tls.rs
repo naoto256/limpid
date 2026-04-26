@@ -33,12 +33,10 @@ impl TlsConfig {
         let Some(block) = props::get_block(properties, "tls") else {
             return Ok(None);
         };
-        let cert_path = props::get_string(block, "cert").ok_or_else(|| {
-            anyhow::anyhow!("'{}': tls block requires 'cert'", module_name)
-        })?;
-        let key_path = props::get_string(block, "key").ok_or_else(|| {
-            anyhow::anyhow!("'{}': tls block requires 'key'", module_name)
-        })?;
+        let cert_path = props::get_string(block, "cert")
+            .ok_or_else(|| anyhow::anyhow!("'{}': tls block requires 'cert'", module_name))?;
+        let key_path = props::get_string(block, "key")
+            .ok_or_else(|| anyhow::anyhow!("'{}': tls block requires 'key'", module_name))?;
         let ca_path = props::get_string(block, "ca");
         Ok(Some(TlsConfig {
             cert_path,

@@ -23,9 +23,9 @@ fn register_predicate(
 }
 
 pub fn register(reg: &mut FunctionRegistry) {
-    register_predicate(reg, "contains",    |h, n| h.contains(n));
+    register_predicate(reg, "contains", |h, n| h.contains(n));
     register_predicate(reg, "starts_with", |h, n| h.starts_with(n));
-    register_predicate(reg, "ends_with",   |h, n| h.ends_with(n));
+    register_predicate(reg, "ends_with", |h, n| h.ends_with(n));
 }
 
 #[cfg(test)]

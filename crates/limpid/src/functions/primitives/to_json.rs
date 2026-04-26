@@ -29,9 +29,9 @@ pub fn register(reg: &mut FunctionRegistry) {
 
 fn ensure_no_bytes(v: &Value) -> Result<()> {
     match v {
-        Value::Bytes(_) => bail!(
-            "to_json() does not accept bytes; convert explicitly via to_string()"
-        ),
+        Value::Bytes(_) => {
+            bail!("to_json() does not accept bytes; convert explicitly via to_string()")
+        }
         Value::Array(a) => {
             for item in a {
                 ensure_no_bytes(item)?;

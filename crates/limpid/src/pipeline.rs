@@ -3,8 +3,8 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Result, bail};
 use crate::dsl::value::Value;
+use anyhow::{Result, bail};
 use tracing::trace;
 
 use crate::dsl::ast::*;

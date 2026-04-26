@@ -20,8 +20,8 @@
 use anyhow::{Result, bail};
 use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
 
-use crate::dsl::value::Value;
 use super::{parse_fixed_offset, val_to_str};
+use crate::dsl::value::Value;
 use crate::functions::{FunctionRegistry, FunctionSig};
 use crate::modules::schema::FieldType;
 
@@ -51,9 +51,7 @@ fn parse_with_tz(value: &str, fmt: &str, tz: Option<&str>) -> Result<DateTime<Fi
     // Try tz-aware parse first.
     if let Ok(dt) = DateTime::parse_from_str(value, fmt) {
         if tz.is_some() {
-            bail!(
-                "strptime(): timezone argument conflicts with offset in format string"
-            );
+            bail!("strptime(): timezone argument conflicts with offset in format string");
         }
         return Ok(dt);
     }
@@ -112,7 +110,9 @@ mod tests {
         let e = dummy_event();
         let vals: Vec<Value> = args.iter().map(|s| Value::String((*s).into())).collect();
         let v = reg.call(None, "strptime", &vals, &e)?;
-        let Value::Timestamp(dt) = v else { panic!("expected Timestamp, got {:?}", v) };
+        let Value::Timestamp(dt) = v else {
+            panic!("expected Timestamp, got {:?}", v)
+        };
         Ok(dt.to_rfc3339())
     }
 
@@ -179,11 +179,7 @@ mod tests {
     fn errors_on_tz_conflict_with_format() {
         let err = call(
             &make_reg(),
-            &[
-                "2026-04-15T10:30:00+09:00",
-                "%Y-%m-%dT%H:%M:%S%:z",
-                "UTC",
-            ],
+            &["2026-04-15T10:30:00+09:00", "%Y-%m-%dT%H:%M:%S%:z", "UTC"],
         )
         .unwrap_err()
         .to_string();

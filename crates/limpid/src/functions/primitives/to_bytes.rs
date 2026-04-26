@@ -70,9 +70,7 @@ fn convert(s: &str, encoding: &str) -> Result<Bytes> {
             .decode(s.as_bytes())
             .map(Bytes::from)
             .map_err(|e| anyhow::anyhow!("to_bytes(base64): {e}")),
-        other => bail!(
-            "to_bytes(): unknown encoding {other:?} (expected utf8, hex, or base64)"
-        ),
+        other => bail!("to_bytes(): unknown encoding {other:?} (expected utf8, hex, or base64)"),
     }
 }
 
@@ -156,10 +154,7 @@ mod tests {
         let reg = make_reg();
         let err = call(
             &reg,
-            vec![
-                Value::String("zz".into()),
-                Value::String("hex".into()),
-            ],
+            vec![Value::String("zz".into()), Value::String("hex".into())],
         )
         .unwrap_err();
         assert!(err.to_string().contains("invalid hex digit"));
@@ -184,10 +179,7 @@ mod tests {
         let reg = make_reg();
         let err = call(
             &reg,
-            vec![
-                Value::String("x".into()),
-                Value::String("rot13".into()),
-            ],
+            vec![Value::String("x".into()), Value::String("rot13".into())],
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown encoding"));

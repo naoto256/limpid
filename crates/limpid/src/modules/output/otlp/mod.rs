@@ -64,9 +64,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use opentelemetry_proto::tonic::{
-    collector::logs::v1::{
-        ExportLogsServiceRequest, logs_service_client::LogsServiceClient,
-    },
+    collector::logs::v1::{ExportLogsServiceRequest, logs_service_client::LogsServiceClient},
     common::v1::{InstrumentationScope, KeyValue},
     logs::v1::{ResourceLogs, ScopeLogs},
     resource::v1::Resource,
@@ -225,14 +223,13 @@ impl Module for OtlpOutput {
         let verify = props::get_ident(properties, "verify")
             .map(|s| s != "false")
             .unwrap_or(true);
-        let ca_path = props::get_block(properties, "tls")
-            .and_then(|block| props::get_string(block, "ca"));
+        let ca_path =
+            props::get_block(properties, "tls").and_then(|block| props::get_string(block, "ca"));
         let ca_pem = ca_path
             .as_ref()
             .map(|p| {
-                std::fs::read(p).with_context(|| {
-                    format!("output '{}': cannot read CA cert {}", name, p)
-                })
+                std::fs::read(p)
+                    .with_context(|| format!("output '{}': cannot read CA cert {}", name, p))
             })
             .transpose()?;
 
@@ -252,9 +249,9 @@ impl Module for OtlpOutput {
                     })?;
                     builder = builder.add_root_certificate(cert);
                 }
-                let client = builder.build().with_context(|| {
-                    format!("output '{}': failed to build HTTP client", name)
-                })?;
+                let client = builder
+                    .build()
+                    .with_context(|| format!("output '{}': failed to build HTTP client", name))?;
                 Transport::Http(client)
             }
             Protocol::Grpc => {
@@ -597,8 +594,9 @@ async fn send_http(
                 .map_err(|e| anyhow!("output otlp: protobuf encode failed: {e}"))?;
             buf
         }
-        Protocol::HttpJson => serde_json::to_vec(req)
-            .map_err(|e| anyhow!("output otlp: JSON encode failed: {e}"))?,
+        Protocol::HttpJson => {
+            serde_json::to_vec(req).map_err(|e| anyhow!("output otlp: JSON encode failed: {e}"))?
+        }
         Protocol::Grpc => unreachable!("send_http called for gRPC transport"),
     };
     let content_type = inner
@@ -629,11 +627,7 @@ async fn send_http(
     Ok(())
 }
 
-async fn send_grpc(
-    inner: &Inner,
-    channel: &Channel,
-    req: &ExportLogsServiceRequest,
-) -> Result<()> {
+async fn send_grpc(inner: &Inner, channel: &Channel, req: &ExportLogsServiceRequest) -> Result<()> {
     let mut client = LogsServiceClient::new(channel.clone());
     let mut request = tonic::Request::new(req.clone());
     let metadata = request.metadata_mut();
@@ -773,8 +767,7 @@ mod tests {
 
     #[test]
     fn batch_level_default_is_none() {
-        let output =
-            OtlpOutput::from_properties("o", &[prop_str("endpoint", "http://x")]).unwrap();
+        let output = OtlpOutput::from_properties("o", &[prop_str("endpoint", "http://x")]).unwrap();
         assert!(matches!(output.inner.batch_level, BatchLevel::None));
     }
 
@@ -870,7 +863,10 @@ mod tests {
         // Two events on the same Resource but different Scopes:
         // resource-level merge keeps one ResourceLogs entry whose
         // scope_logs[] holds both scopes.
-        let input = vec![singleton("svc-a", "scope-1", 1), singleton("svc-a", "scope-2", 2)];
+        let input = vec![
+            singleton("svc-a", "scope-1", 1),
+            singleton("svc-a", "scope-2", 2),
+        ];
         let req = merge_by_resource(input);
         assert_eq!(req.resource_logs.len(), 1);
         assert_eq!(req.resource_logs[0].scope_logs.len(), 2);
@@ -878,7 +874,10 @@ mod tests {
 
     #[test]
     fn merge_by_resource_keeps_distinct_resources_separate() {
-        let input = vec![singleton("svc-a", "scope-1", 1), singleton("svc-b", "scope-1", 2)];
+        let input = vec![
+            singleton("svc-a", "scope-1", 1),
+            singleton("svc-b", "scope-1", 2),
+        ];
         let req = merge_by_resource(input);
         assert_eq!(req.resource_logs.len(), 2);
     }
@@ -888,7 +887,10 @@ mod tests {
         // Two events on the same Resource AND same Scope:
         // scope-level merge keeps one ScopeLogs whose log_records[]
         // holds both records.
-        let input = vec![singleton("svc-a", "scope-1", 1), singleton("svc-a", "scope-1", 2)];
+        let input = vec![
+            singleton("svc-a", "scope-1", 1),
+            singleton("svc-a", "scope-1", 2),
+        ];
         let req = merge_by_scope(input);
         assert_eq!(req.resource_logs.len(), 1);
         assert_eq!(req.resource_logs[0].scope_logs.len(), 1);
@@ -975,27 +977,17 @@ mod tests {
 
     #[test]
     fn batch_size_explicit() {
-        let props = vec![
-            prop_str("endpoint", "http://x"),
-            prop_int("batch_size", 64),
-        ];
+        let props = vec![prop_str("endpoint", "http://x"), prop_int("batch_size", 64)];
         let output = OtlpOutput::from_properties("o", &props).unwrap();
         assert_eq!(output.batch_size, 64);
     }
 
     #[test]
     fn retry_config_defaults_match_shared_default() {
-        let output = OtlpOutput::from_properties(
-            "o",
-            &[prop_str("endpoint", "http://x")],
-        )
-        .unwrap();
+        let output = OtlpOutput::from_properties("o", &[prop_str("endpoint", "http://x")]).unwrap();
         let default = RetryConfig::default();
         assert_eq!(output.inner.retry_config.max_attempts, default.max_attempts);
-        assert_eq!(
-            output.inner.retry_config.initial_wait,
-            default.initial_wait
-        );
+        assert_eq!(output.inner.retry_config.initial_wait, default.initial_wait);
     }
 
     #[test]
@@ -1102,10 +1094,7 @@ mod tests {
     }
 
     fn event_with_egress(egress: Bytes) -> Event {
-        let mut e = Event::new(
-            egress.clone(),
-            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-        );
+        let mut e = Event::new(egress.clone(), "127.0.0.1:0".parse::<SocketAddr>().unwrap());
         e.egress = egress;
         e
     }
@@ -1134,7 +1123,8 @@ mod tests {
         async fn export(
             &self,
             request: tonic::Request<ExportLogsServiceRequest>,
-        ) -> std::result::Result<tonic::Response<ExportLogsServiceResponse>, tonic::Status> {
+        ) -> std::result::Result<tonic::Response<ExportLogsServiceResponse>, tonic::Status>
+        {
             self.received.lock().await.push(request.into_inner());
             Ok(tonic::Response::new(ExportLogsServiceResponse {
                 partial_success: None,
@@ -1172,17 +1162,15 @@ mod tests {
         )
         .unwrap();
         output
-            .write(&event_with_egress(singleton_bytes(1_700_000_000_000_000_000)))
+            .write(&event_with_egress(singleton_bytes(
+                1_700_000_000_000_000_000,
+            )))
             .await
             .unwrap();
 
         let probe = || {
             let g = received.try_lock().ok()?;
-            if g.is_empty() {
-                None
-            } else {
-                Some(g.clone())
-            }
+            if g.is_empty() { None } else { Some(g.clone()) }
         };
         let got = wait_for(probe).await;
         server.abort();
@@ -1208,8 +1196,11 @@ mod tests {
     /// is the only thing that differs.
     async fn run_http_collector(
         protocol: &'static str,
-    ) -> (SocketAddr, Arc<Mutex<Vec<ExportLogsServiceRequest>>>, tokio::task::JoinHandle<()>)
-    {
+    ) -> (
+        SocketAddr,
+        Arc<Mutex<Vec<ExportLogsServiceRequest>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         use axum::{
             Router,
             extract::State,
@@ -1262,8 +1253,7 @@ mod tests {
                     match serde_json::from_slice(&body) {
                         Ok(r) => r,
                         Err(e) => {
-                            return (StatusCode::BAD_REQUEST, format!("json: {e}"))
-                                .into_response();
+                            return (StatusCode::BAD_REQUEST, format!("json: {e}")).into_response();
                         }
                     }
                 }
@@ -1276,10 +1266,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let received = Arc::new(Mutex::new(Vec::new()));
-        let app = Router::new().route("/v1/logs", post(handle)).with_state(AppState {
-            received: Arc::clone(&received),
-            protocol,
-        });
+        let app = Router::new()
+            .route("/v1/logs", post(handle))
+            .with_state(AppState {
+                received: Arc::clone(&received),
+                protocol,
+            });
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -1294,11 +1286,7 @@ mod tests {
     #[tokio::test]
     async fn http_output_retries_until_success() {
         use axum::{
-            Router,
-            extract::State,
-            http::StatusCode,
-            response::IntoResponse,
-            routing::post,
+            Router, extract::State, http::StatusCode, response::IntoResponse, routing::post,
         };
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -1308,7 +1296,10 @@ mod tests {
             fail_until: usize,
         }
 
-        async fn handle(State(state): State<AppState>, _body: axum::body::Bytes) -> impl IntoResponse {
+        async fn handle(
+            State(state): State<AppState>,
+            _body: axum::body::Bytes,
+        ) -> impl IntoResponse {
             let n = state.attempts.fetch_add(1, AtomicOrdering::SeqCst) + 1;
             if n <= state.fail_until {
                 StatusCode::SERVICE_UNAVAILABLE
@@ -1320,10 +1311,12 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = Router::new().route("/v1/logs", post(handle)).with_state(AppState {
-            attempts: Arc::clone(&attempts),
-            fail_until: 2, // first two requests get 503, third succeeds
-        });
+        let app = Router::new()
+            .route("/v1/logs", post(handle))
+            .with_state(AppState {
+                attempts: Arc::clone(&attempts),
+                fail_until: 2, // first two requests get 503, third succeeds
+            });
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -1363,12 +1356,7 @@ mod tests {
     /// `secondary` output or drop per its own policy.
     #[tokio::test]
     async fn http_output_gives_up_after_max_attempts() {
-        use axum::{
-            Router,
-            http::StatusCode,
-            response::IntoResponse,
-            routing::post,
-        };
+        use axum::{Router, http::StatusCode, response::IntoResponse, routing::post};
 
         async fn always_fail(_body: axum::body::Bytes) -> impl IntoResponse {
             StatusCode::SERVICE_UNAVAILABLE
@@ -1430,11 +1418,7 @@ mod tests {
             .unwrap();
         let probe = || {
             let g = received.try_lock().ok()?;
-            if g.is_empty() {
-                None
-            } else {
-                Some(g.clone())
-            }
+            if g.is_empty() { None } else { Some(g.clone()) }
         };
         let got = wait_for(probe).await;
         server.abort();
@@ -1464,11 +1448,7 @@ mod tests {
             .unwrap();
         let probe = || {
             let g = received.try_lock().ok()?;
-            if g.is_empty() {
-                None
-            } else {
-                Some(g.clone())
-            }
+            if g.is_empty() { None } else { Some(g.clone()) }
         };
         let got = wait_for(probe).await;
         server.abort();

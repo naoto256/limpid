@@ -25,9 +25,9 @@
 //!
 //! This function does **not** rewrite `event.egress` — it's pure.
 
-use anyhow::{Result, bail};
 use crate::dsl::value::Map;
 use crate::dsl::value::Value;
+use anyhow::{Result, bail};
 
 use crate::functions::primitives::parse_json::{apply_defaults, type_name};
 use crate::functions::primitives::val_to_str;
@@ -64,8 +64,8 @@ fn parse_impl(args: &[Value]) -> Result<Value> {
     // `register_parser` (1 to 2 arguments).
     let text = val_to_str(&args[0])?;
 
-    let (pri, body_offset) = parse_leading_pri(&text)
-        .ok_or_else(|| anyhow::anyhow!("syslog.parse(): no PRI header"))?;
+    let (pri, body_offset) =
+        parse_leading_pri(&text).ok_or_else(|| anyhow::anyhow!("syslog.parse(): no PRI header"))?;
     let after_pri = &text[body_offset..];
 
     let mut map = Map::new();
@@ -275,10 +275,7 @@ mod tests {
         assert_eq!(m["pri"], Value::Int(134));
         assert_eq!(m["facility"], Value::Int(16));
         assert_eq!(m["severity"], Value::Int(6));
-        assert_eq!(
-            m["timestamp"],
-            Value::String("2026-04-15T10:30:00Z".into())
-        );
+        assert_eq!(m["timestamp"], Value::String("2026-04-15T10:30:00Z".into()));
         assert_eq!(m["hostname"], Value::String("firewall01".into()));
         assert_eq!(m["appname"], Value::String("sshd".into()));
         assert_eq!(m["procid"], Value::String("1234".into()));
@@ -307,10 +304,7 @@ mod tests {
             "<134>Apr 15 10:30:00 myhost sshd[1234]: Failed password",
         )
         .unwrap();
-        assert_eq!(
-            m["timestamp"],
-            Value::String("Apr 15 10:30:00".into())
-        );
+        assert_eq!(m["timestamp"], Value::String("Apr 15 10:30:00".into()));
         assert_eq!(m["hostname"], Value::String("myhost".into()));
         assert_eq!(m["appname"], Value::String("sshd".into()));
         assert_eq!(m["procid"], Value::String("1234".into()));
@@ -346,12 +340,9 @@ mod tests {
     fn defaults_fill_missing_keys() {
         let reg = make_reg();
         let defaults = Value::Object(
-            [(
-                "appname".to_string(),
-                Value::String("unknown".into()),
-            )]
-            .into_iter()
-            .collect(),
+            [("appname".to_string(), Value::String("unknown".into()))]
+                .into_iter()
+                .collect(),
         );
         let e = dummy_event();
         // RFC 5424 with appname `-` (NILVALUE) — missing after parse
