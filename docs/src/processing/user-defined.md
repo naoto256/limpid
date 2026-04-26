@@ -124,9 +124,22 @@ def process safe_parse_json {
 }
 ```
 
-Without `try`, a primitive error aborts the entire process call (and ultimately propagates up as a pipeline-level event failure). `try` lets a process recover gracefully — typically by recording the failure on workspace, falling back to a default, or routing the event to a dead-letter output. The handler runs only on error; in the success case the `catch` block is skipped entirely.
-
 `error` inside `catch` is a `Value::String` containing the bail message. It is scoped to the immediate `catch` body — not visible after the block ends, not visible inside a nested process call.
+
+#### When to use `try` vs let the error propagate
+
+`try` is for **expected** failures the operator knows how to handle inline — typically a mixed stream where some events take one shape and others take another, and the process needs to record which is which on workspace and continue.
+
+When an error is **unexpected** (a bug in a wrap process, a parser hitting input it wasn't designed for, a typo'd workspace key), don't wrap it in `try`. Let it propagate: limpid sets the original event aside in the [error log](../operations/error-log.md) (DLQ) and increments `events_errored`. The operator audits the DLQ, fixes the cause, and replays via `jq | limpidctl inject --json`. Catching unexpected errors in `try` blocks would silently swallow the bug — the event would still flow downstream with whatever partial state the catch block put on workspace, and the failure signal would be lost.
+
+Rule of thumb: if the catch block has nothing useful to do besides stamp `workspace.failed = true`, you don't want `try` — you want the DLQ.
+
+| Situation | Use |
+|-----------|-----|
+| "Some events here are JSON, some are KV — record which is which" | `try { parse_json } catch { try { parse_kv } catch { ... } }` |
+| "Optional enrichment — fall back to a default when GeoIP misses" | `try { ... } catch { workspace.geo = {country: "??"} }` |
+| "An input I didn't anticipate broke my parser" | **No `try`** — let it land in the DLQ, fix the parser, replay. |
+| "I want to know which events failed" | **No `try`** — `events_errored` + DLQ is exactly that signal. |
 
 ### drop
 
