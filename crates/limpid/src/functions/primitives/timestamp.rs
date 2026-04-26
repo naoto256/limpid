@@ -1,9 +1,8 @@
-//! `timestamp()` — current wall-clock time as a `Value::Timestamp`.
+//! `timestamp()` — current wall-clock instant as a `Value::Timestamp`.
 //!
-//! Returns the current UTC instant as a typed `Value::Timestamp`,
-//! matching the type of `received_at` and the input shape `strftime`
-//! / `strptime` expect. So `strftime(timestamp(), "%Y-%m-%d", "local")`
-//! works without intermediate parsing.
+//! Returns the current UTC instant. `Value::Timestamp` carries no
+//! per-value timezone — render in a non-UTC offset by passing the
+//! explicit `timezone` argument to `strftime`.
 //!
 //! Resolved at every call (no caching) — successive calls within the
 //! same process body see successive instants.
@@ -16,7 +15,7 @@ pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(
         "timestamp",
         FunctionSig::fixed(&[], FieldType::Timestamp),
-        |_args, _event| Ok(Value::Timestamp(chrono::Utc::now().fixed_offset())),
+        |_args, _event| Ok(Value::Timestamp(chrono::Utc::now())),
     );
 }
 
