@@ -199,12 +199,70 @@ pub enum PipelineTermination {
     /// Explicit `drop` statement (event filtered out)
     Dropped,
     /// A `process` statement raised a runtime error (unknown identifier,
-    /// type mismatch, regex compile failure, …). The event is discarded
-    /// rather than forwarded with the original ingress unchanged — the
-    /// "warn and pass through" fallback that pre-0.5 used silently
-    /// turned wrap / enrichment bugs into data-shape regressions
-    /// downstream. `events_errored` counts these.
+    /// type mismatch, regex compile failure, …). The original event is
+    /// surfaced via [`PipelineRunResult::errored`] so the runtime layer
+    /// can route it to the dead-letter queue (operator-configured
+    /// `error_log` JSONL file, or `tracing::error!` fallback). The
+    /// downstream output stream is unaffected — only events that
+    /// finished cleanly reach the configured outputs.
     Errored,
+}
+
+/// Failure context surfaced when a pipeline terminates with [`PipelineTermination::Errored`].
+///
+/// The `event` carries the **original** ingress / source / received_at
+/// (egress and workspace are intentionally not snapshotted — at the
+/// point of failure they may hold partial state from earlier processes
+/// in the chain, which would confuse `inject --json` replay). Replay
+/// re-runs the pipeline from scratch on `event`.
+#[derive(Debug, Clone)]
+pub struct ErroredEventContext {
+    /// Wall-clock at which the error was raised.
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Pipeline name (from `def pipeline <name>`).
+    pub pipeline: String,
+    /// Failed process: a named `def process` invocation surfaces its
+    /// name; an inline `process { ... }` block surfaces `(inline)`.
+    pub process: String,
+    /// Stringified `ProcessError` / `anyhow::Error` from the failure.
+    pub reason: String,
+    /// Pre-failure event with original ingress / source / received_at.
+    pub event: Event,
+}
+
+impl ErroredEventContext {
+    /// Serialise as a single-line JSON record for the dead-letter queue.
+    ///
+    /// The `event` sub-object only carries `source` / `received_at` /
+    /// `ingress` — exactly the fields `Event::from_json` (and therefore
+    /// `limpidctl inject --json`) needs to reconstruct a fresh Event.
+    /// `egress` is omitted because at the failure point it may be a
+    /// partial result of earlier processes in the chain; `workspace`
+    /// is omitted for the same reason. Replay should rebuild both
+    /// from scratch.
+    ///
+    /// Format is operator-stable: pre-1.0 we may add new top-level
+    /// fields, but `timestamp` / `reason` / `process` / `pipeline` /
+    /// `event` keep their current shape so existing
+    /// `jq | inject` recipes survive.
+    pub fn to_jsonl(&self) -> String {
+        // Reuse `Event::to_json_value` so binary ingress survives via
+        // the `$bytes_b64` marker the rest of the JSON layer already
+        // uses for `tap --json` etc.
+        let mut event_json = self.event.to_json_value();
+        if let serde_json::Value::Object(ref mut map) = event_json {
+            map.remove("egress");
+            map.remove("workspace");
+        }
+        let record = serde_json::json!({
+            "timestamp": self.timestamp.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            "reason": self.reason,
+            "process": self.process,
+            "pipeline": self.pipeline,
+            "event": event_json,
+        });
+        record.to_string()
+    }
 }
 
 /// Result of running an event through a pipeline.
@@ -212,6 +270,11 @@ pub struct PipelineRunResult {
     pub trace: Vec<TraceEntry>,
     pub outputs: Vec<(String, Event)>,
     pub termination: PipelineTermination,
+    /// Populated iff `termination == Errored`. The runtime layer writes
+    /// this to the configured dead-letter queue (`error_log`) or, if
+    /// none is configured, emits a structured `tracing::error!` line
+    /// with the same payload.
+    pub errored: Option<ErroredEventContext>,
 }
 
 /// A process registry backed by compiled DSL process definitions.
@@ -302,20 +365,46 @@ pub fn run_pipeline(
         detail: format!("ingress: {}", String::from_utf8_lossy(&event.ingress)),
     });
 
-    let (_, termination) = exec_pipeline_body(
-        &pipeline.body,
-        event,
-        &registry,
+    let mut errored: Option<ErroredEventContext> = None;
+    let exec_ctx = PipelineExecCtx {
+        pipeline_name: &pipeline.name,
+        registry: &registry,
         funcs,
-        &mut trace_entries,
-        &mut outputs,
-    )?;
+    };
+    let mut exec_out = PipelineExecOut {
+        trace: &mut trace_entries,
+        outputs: &mut outputs,
+        errored: &mut errored,
+    };
+    let (_, termination) = exec_pipeline_body(&pipeline.body, event, &exec_ctx, &mut exec_out)?;
 
     Ok(PipelineRunResult {
         trace: trace_entries,
         outputs,
         termination,
+        errored,
     })
+}
+
+/// Immutable shared context threaded through the pipeline executor.
+///
+/// `pipeline_name` is here purely so a process-runtime error can
+/// populate the [`ErroredEventContext`] surfaced in [`PipelineExecOut::errored`].
+struct PipelineExecCtx<'a> {
+    pipeline_name: &'a str,
+    registry: &'a DslProcessRegistry<'a>,
+    funcs: &'a FunctionRegistry,
+}
+
+/// Mutable accumulators threaded through the pipeline executor:
+/// trace entries, output queue pushes, and the optional errored event
+/// context. Bundled together to keep the recursive helpers under
+/// clippy's `too_many_arguments` threshold and to make the executor's
+/// "what comes out" surface explicit.
+struct PipelineExecOut<'a> {
+    trace: &'a mut Vec<TraceEntry>,
+    outputs: &'a mut Vec<(String, Event)>,
+    errored: &'a mut Option<ErroredEventContext>,
 }
 
 /// Execute a pipeline body (sequence of pipeline statements).
@@ -323,13 +412,11 @@ pub fn run_pipeline(
 fn exec_pipeline_body(
     stmts: &[PipelineStatement],
     mut event: Event,
-    registry: &DslProcessRegistry,
-    funcs: &FunctionRegistry,
-    trace: &mut Vec<TraceEntry>,
-    outputs: &mut Vec<(String, Event)>,
+    ctx: &PipelineExecCtx,
+    out: &mut PipelineExecOut,
 ) -> Result<(Option<Event>, PipelineTermination)> {
     for stmt in stmts {
-        match exec_pipeline_stmt(stmt, event, registry, funcs, trace, outputs)? {
+        match exec_pipeline_stmt(stmt, event, ctx, out)? {
             (Some(e), _) => event = e,
             (None, term) => return Ok((None, term)),
         }
@@ -340,14 +427,11 @@ fn exec_pipeline_body(
 fn exec_pipeline_stmt(
     stmt: &PipelineStatement,
     event: Event,
-    registry: &DslProcessRegistry,
-    funcs: &FunctionRegistry,
-    trace: &mut Vec<TraceEntry>,
-    outputs: &mut Vec<(String, Event)>,
+    ctx: &PipelineExecCtx,
+    out: &mut PipelineExecOut,
 ) -> Result<(Option<Event>, PipelineTermination)> {
     let cont = |event| Ok((Some(event), PipelineTermination::Finished));
     let dropped = || Ok((None, PipelineTermination::Dropped));
-    let errored = || Ok((None, PipelineTermination::Errored));
     let finished = || Ok((None, PipelineTermination::Finished));
 
     match stmt {
@@ -360,12 +444,16 @@ fn exec_pipeline_stmt(
                     ProcessChainElement::Named(name, args) => {
                         let evaluated_args: Vec<Value> = args
                             .iter()
-                            .map(|a| eval_expr(a, &current, funcs))
+                            .map(|a| eval_expr(a, &current, ctx.funcs))
                             .collect::<Result<Vec<_>>>()?;
 
-                        match registry.call(name, &evaluated_args, current) {
+                        // Snapshot before consumption — registry.call
+                        // takes Event by value and the Err arm needs
+                        // the original to populate the DLQ context.
+                        let backup = current.clone();
+                        match ctx.registry.call(name, &evaluated_args, current) {
                             Ok(Some(e)) => {
-                                trace.push(TraceEntry {
+                                out.trace.push(TraceEntry {
                                     stage: "process".into(),
                                     label: if args.is_empty() {
                                         name.clone()
@@ -385,7 +473,7 @@ fn exec_pipeline_stmt(
                                 current = e;
                             }
                             Ok(None) => {
-                                trace.push(TraceEntry {
+                                out.trace.push(TraceEntry {
                                     stage: "process".into(),
                                     label: name.clone(),
                                     detail: "dropped".into(),
@@ -394,23 +482,31 @@ fn exec_pipeline_stmt(
                             }
                             Err(e) => {
                                 tracing::warn!(
-                                    "process '{}': {} — event discarded",
+                                    "process '{}': {} — event routed to error_log",
                                     name,
                                     e
                                 );
-                                trace.push(TraceEntry {
+                                out.trace.push(TraceEntry {
                                     stage: "process".into(),
                                     label: name.clone(),
-                                    detail: format!("error: {} (event discarded)", e),
+                                    detail: format!("error: {} (event → error_log)", e),
                                 });
-                                return errored();
+                                *out.errored = Some(ErroredEventContext {
+                                    timestamp: chrono::Utc::now(),
+                                    pipeline: ctx.pipeline_name.to_string(),
+                                    process: name.clone(),
+                                    reason: e.to_string(),
+                                    event: backup,
+                                });
+                                return Ok((None, PipelineTermination::Errored));
                             }
                         }
                     }
                     ProcessChainElement::Inline(body) => {
-                        match exec_process_body(body, current, registry, funcs) {
+                        let backup = current.clone();
+                        match exec_process_body(body, current, ctx.registry, ctx.funcs) {
                             Ok(ExecResult::Continue(e)) => {
-                                trace.push(TraceEntry {
+                                out.trace.push(TraceEntry {
                                     stage: "process".into(),
                                     label: "(inline)".into(),
                                     detail: "ok".into(),
@@ -418,7 +514,7 @@ fn exec_pipeline_stmt(
                                 current = e;
                             }
                             Ok(ExecResult::Dropped) => {
-                                trace.push(TraceEntry {
+                                out.trace.push(TraceEntry {
                                     stage: "process".into(),
                                     label: "(inline)".into(),
                                     detail: "dropped".into(),
@@ -427,15 +523,22 @@ fn exec_pipeline_stmt(
                             }
                             Err(e) => {
                                 tracing::warn!(
-                                    "inline process: {} — event discarded",
+                                    "inline process: {} — event routed to error_log",
                                     e
                                 );
-                                trace.push(TraceEntry {
+                                out.trace.push(TraceEntry {
                                     stage: "process".into(),
                                     label: "(inline)".into(),
-                                    detail: format!("error: {} (event discarded)", e),
+                                    detail: format!("error: {} (event → error_log)", e),
                                 });
-                                return errored();
+                                *out.errored = Some(ErroredEventContext {
+                                    timestamp: chrono::Utc::now(),
+                                    pipeline: ctx.pipeline_name.to_string(),
+                                    process: "(inline)".to_string(),
+                                    reason: e.to_string(),
+                                    event: backup,
+                                });
+                                return Ok((None, PipelineTermination::Errored));
                             }
                         }
                     }
@@ -446,18 +549,18 @@ fn exec_pipeline_stmt(
 
         PipelineStatement::Output(name) => {
             trace!(target: "limpid::pipeline", "output → {}", name);
-            trace.push(TraceEntry {
+            out.trace.push(TraceEntry {
                 stage: "output".into(),
                 label: format!("→ {}", name),
                 detail: String::new(),
             });
-            outputs.push((name.clone(), event.clone()));
+            out.outputs.push((name.clone(), event.clone()));
             cont(event)
         }
 
         PipelineStatement::Drop => {
             trace!(target: "limpid::pipeline", "drop");
-            trace.push(TraceEntry {
+            out.trace.push(TraceEntry {
                 stage: "drop".into(),
                 label: String::new(),
                 detail: String::new(),
@@ -467,7 +570,7 @@ fn exec_pipeline_stmt(
 
         PipelineStatement::Finish => {
             trace!(target: "limpid::pipeline", "finish");
-            trace.push(TraceEntry {
+            out.trace.push(TraceEntry {
                 stage: "finish".into(),
                 label: String::new(),
                 detail: String::new(),
@@ -475,23 +578,17 @@ fn exec_pipeline_stmt(
             finished()
         }
 
-        PipelineStatement::If(if_chain) => {
-            exec_pipeline_if(if_chain, event, registry, funcs, trace, outputs)
-        }
+        PipelineStatement::If(if_chain) => exec_pipeline_if(if_chain, event, ctx, out),
 
         PipelineStatement::Switch(discriminant, arms) => {
-            let disc_val = eval_expr(discriminant, &event, funcs)?;
+            let disc_val = eval_expr(discriminant, &event, ctx.funcs)?;
             for arm in arms {
                 if arm.pattern.is_none() {
-                    return exec_pipeline_branch_body(
-                        &arm.body, event, registry, funcs, trace, outputs,
-                    );
+                    return exec_pipeline_branch_body(&arm.body, event, ctx, out);
                 }
-                let pattern_val = eval_expr(arm.pattern.as_ref().unwrap(), &event, funcs)?;
+                let pattern_val = eval_expr(arm.pattern.as_ref().unwrap(), &event, ctx.funcs)?;
                 if values_match(&disc_val, &pattern_val) {
-                    return exec_pipeline_branch_body(
-                        &arm.body, event, registry, funcs, trace, outputs,
-                    );
+                    return exec_pipeline_branch_body(&arm.body, event, ctx, out);
                 }
             }
             cont(event)
@@ -502,19 +599,17 @@ fn exec_pipeline_stmt(
 fn exec_pipeline_if(
     if_chain: &IfChain,
     event: Event,
-    registry: &DslProcessRegistry,
-    funcs: &FunctionRegistry,
-    trace: &mut Vec<TraceEntry>,
-    outputs: &mut Vec<(String, Event)>,
+    ctx: &PipelineExecCtx,
+    out: &mut PipelineExecOut,
 ) -> Result<(Option<Event>, PipelineTermination)> {
     for (condition, body) in &if_chain.branches {
-        let cond_val = eval_expr(condition, &event, funcs)?;
+        let cond_val = eval_expr(condition, &event, ctx.funcs)?;
         if is_truthy(&cond_val) {
-            return exec_pipeline_branch_body(body, event, registry, funcs, trace, outputs);
+            return exec_pipeline_branch_body(body, event, ctx, out);
         }
     }
     if let Some(else_body) = &if_chain.else_body {
-        return exec_pipeline_branch_body(else_body, event, registry, funcs, trace, outputs);
+        return exec_pipeline_branch_body(else_body, event, ctx, out);
     }
     Ok((Some(event), PipelineTermination::Finished))
 }
@@ -522,19 +617,15 @@ fn exec_pipeline_if(
 fn exec_pipeline_branch_body(
     body: &[BranchBody],
     mut event: Event,
-    registry: &DslProcessRegistry,
-    funcs: &FunctionRegistry,
-    trace: &mut Vec<TraceEntry>,
-    outputs: &mut Vec<(String, Event)>,
+    ctx: &PipelineExecCtx,
+    out: &mut PipelineExecOut,
 ) -> Result<(Option<Event>, PipelineTermination)> {
     for item in body {
         match item {
-            BranchBody::Pipeline(stmt) => {
-                match exec_pipeline_stmt(stmt, event, registry, funcs, trace, outputs)? {
-                    (Some(e), _) => event = e,
-                    (None, term) => return Ok((None, term)),
-                }
-            }
+            BranchBody::Pipeline(stmt) => match exec_pipeline_stmt(stmt, event, ctx, out)? {
+                (Some(e), _) => event = e,
+                (None, term) => return Ok((None, term)),
+            },
             BranchBody::Process(_) => {
                 bail!("process statement found in pipeline context")
             }
@@ -596,6 +687,58 @@ def pipeline p {
             "unexpected error: {}",
             err
         );
+    }
+
+    #[test]
+    fn process_runtime_error_populates_errored_context() {
+        // bare `timestamp` is not a reserved ident in 0.5+; the runtime
+        // raises `unknown identifier: timestamp` which must surface as
+        // an ErroredEventContext on the run result, with the original
+        // ingress preserved for replay via `inject --json`.
+        use crate::event::Event;
+        use crate::functions::{FunctionRegistry, register_builtins, table::TableStore};
+        use bytes::Bytes;
+        use std::net::SocketAddr;
+
+        let src = r#"
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def process wrap {
+    egress = strftime(timestamp, "%Y", "UTC")
+}
+def pipeline p {
+    input i
+    process wrap
+    output o
+}
+"#;
+        let cfg = compile(src).unwrap();
+        let pipeline = cfg.pipelines.get("p").unwrap();
+        let mut funcs = FunctionRegistry::new();
+        let store = TableStore::from_configs(vec![]).unwrap();
+        register_builtins(&mut funcs, store);
+        let event = Event::new(
+            Bytes::from_static(b"original payload"),
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        );
+        let result = run_pipeline(pipeline, event, &cfg, &funcs, None).unwrap();
+        assert_eq!(result.termination, PipelineTermination::Errored);
+        let ctx = result.errored.expect("errored context must be populated");
+        assert_eq!(ctx.pipeline, "p");
+        assert_eq!(ctx.process, "wrap");
+        assert!(
+            ctx.reason.contains("unknown identifier"),
+            "unexpected reason: {}",
+            ctx.reason
+        );
+        assert_eq!(&ctx.event.ingress[..], b"original payload");
+        // Outputs must be empty — the failure path doesn't reach them.
+        assert!(result.outputs.is_empty());
+        // JSONL serialisation includes all the identifying fields.
+        let line = ctx.to_jsonl();
+        assert!(line.contains("\"pipeline\":\"p\""));
+        assert!(line.contains("\"process\":\"wrap\""));
+        assert!(line.contains("original payload"));
     }
 
     #[test]

@@ -10,6 +10,64 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased]
 
+### Changed — process runtime errors route to a dead-letter queue (revising 0.5.1)
+
+0.5.1 changed the pipeline so that a `process` runtime error caused
+the event to be **discarded** with a counter increment. That was
+appropriate for surfacing the silent corruption that 0.5.0's
+"warn-and-continue" produced, but for a log pipeline default-discard
+is itself a strong failure mode — security telemetry should not lose
+events to a config bug at the receiving SIEM.
+
+The 0.5.2 default sets the failed event aside in a **dead-letter
+queue** (DLQ) so the operator can audit, fix the offending config,
+and replay:
+
+- New `control { error_log "/var/log/limpid/errored.jsonl" }`
+  property opts in to a JSONL file. Each errored event becomes one
+  line:
+
+  ```json
+  {
+    "timestamp": "...",
+    "reason": "...",
+    "process": "wrap_journal",
+    "pipeline": "journal_forward",
+    "event": {"source": "...", "received_at": ..., "ingress": "..."}
+  }
+  ```
+
+  The `event` sub-object is exactly what `limpidctl inject --json`
+  needs to reconstruct a fresh Event, so replay is:
+
+  ```bash
+  jq -c '.event' /var/log/limpid/errored.jsonl \
+      | limpidctl inject input <name> --json
+  ```
+
+- When `error_log` is **unset**, the same record is emitted as a
+  structured `tracing::error!` line so the data is never silently
+  lost — it just lives in journald / stderr instead of a dedicated
+  file. Operators using the daemon under systemd can still recover
+  via `journalctl -u limpid -o json | jq …`.
+
+- New `events_errored_unwritable` counter (and
+  `limpid_pipeline_events_errored_unwritable_total` Prometheus
+  metric): subset of `events_errored` for which the DLQ write itself
+  failed (disk full, permissions, rotation race). The runtime falls
+  back to the tracing channel; alarm on this counter — non-zero
+  means the replay path may be incomplete.
+
+- The pipeline-runtime trace now reads `event → error_log` instead
+  of `event discarded`. `--test-pipeline` prints the would-be JSONL
+  record after the trace so operators can rehearse the replay
+  recipe without booting the daemon.
+
+The downstream behaviour is unchanged from 0.5.1: errored events
+still don't reach any output, so there is no shape regression in the
+production stream. What changes is that the events are now
+**recoverable**.
+
 ## [0.5.1] - 2026-04-27
 
 ### Breaking — process runtime errors discard the event

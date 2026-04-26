@@ -33,15 +33,21 @@ Rules:
 
 ### control
 
-Configures the Unix socket used by `limpidctl` and the Prometheus exporter.
+Configures the runtime control surface — the Unix socket used by `limpidctl` and the Prometheus exporter, plus the optional dead-letter queue file.
 
 ```
 control {
-    socket "/var/run/limpid/control.sock"
+    socket    "/var/run/limpid/control.sock"
+    error_log "/var/log/limpid/errored.jsonl"
 }
 ```
 
-Optional. If omitted, the daemon uses `/var/run/limpid/control.sock` by default.
+| Property | Default | Effect |
+|----------|---------|--------|
+| `socket` | `/var/run/limpid/control.sock` | Unix socket path consumed by `limpidctl` and `limpid-prometheus`. |
+| `error_log` | *(unset)* | JSONL file appended to when a `process` raises a runtime error. When unset, the runtime falls back to a structured `tracing::error!` line so the failure data is never silently lost. See [Error Log (DLQ)](./operations/error-log.md) for the record format and replay recipe. |
+
+The whole block is optional — daemon starts with the defaults if it's omitted.
 
 ### table
 

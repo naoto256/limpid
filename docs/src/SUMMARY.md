@@ -51,6 +51,7 @@
 - [Debug Tap](./operations/tap.md)
 - [Schema Validation](./operations/schema-validation.md)
 - [Metrics](./operations/metrics.md)
+- [Error Log (DLQ)](./operations/error-log.md)
 - [Packaging](./operations/packaging.md)
 - [systemd](./operations/systemd.md)
 - [Migrating from rsyslog](./operations/migration.md)

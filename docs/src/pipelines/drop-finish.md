@@ -64,11 +64,13 @@ def pipeline main {
 | `drop` | `events_dropped` |
 | `finish` or end of pipeline (with output) | `events_finished` |
 | `finish` or end of pipeline (no output) | `events_discarded` |
-| Process raised a runtime error | `events_errored` |
+| Process raised a runtime error | `events_errored` (+ DLQ write) |
 
 `events_discarded` indicates a possible misconfiguration — the event went through the pipeline but was never sent anywhere.
 
-`events_errored` indicates a pipeline-runtime failure: a `process` statement raised an error (unknown identifier, type mismatch, regex compile failure, …). The event is discarded rather than forwarded with the original `ingress` unchanged. Pre-0.5 the event was warn-logged and passed through, which silently turned wrap / enrichment bugs into data-shape regressions downstream; 0.5 makes the failure observable.
+`events_errored` indicates a pipeline-runtime failure: a `process` statement raised an error (unknown identifier, type mismatch, regex compile failure, …). The event is *not* forwarded downstream — at the failure point the runtime has no way to produce a correct egress, and the pre-0.5 behaviour of forwarding the original `ingress` silently turned wrap / enrichment bugs into data-shape regressions at the receiving SIEM. Instead, the event is routed to the [error log](../operations/error-log.md) so operators can inspect, fix the offending config, and replay.
+
+`events_errored_unwritable` is the subset where the DLQ write itself failed (disk full, permissions, rotation race). The runtime falls back to a structured `tracing::error!` line, but operators should alarm on this counter — a non-zero value means the replay path may be incomplete.
 
 ## Example: filtering + routing
 

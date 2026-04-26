@@ -34,11 +34,19 @@ pub struct PipelineMetrics {
     pub events_discarded: AtomicU64,
     /// Events for which a `process` statement raised a runtime error
     /// (unknown identifier, type mismatch, regex compile failure, …).
-    /// The event is discarded rather than forwarded with the original
-    /// ingress unchanged. Distinct from `events_discarded` so operators
-    /// can tell a config-bug-shaped routing miss apart from a logic-bug-
-    /// shaped runtime failure.
+    /// The event is routed to the dead-letter queue (configured
+    /// `error_log` JSONL file, or a structured `tracing::error!` line
+    /// when no DLQ is configured) rather than forwarded with the
+    /// original ingress unchanged. Distinct from `events_discarded`
+    /// so operators can tell a config-bug-shaped routing miss apart
+    /// from a logic-bug-shaped runtime failure.
     pub events_errored: AtomicU64,
+    /// Subset of `events_errored` for which the configured
+    /// `error_log` write itself failed (disk full, permissions,
+    /// rotation race). The runtime falls back to a structured
+    /// `tracing::error!` line, but operators should alarm on this
+    /// counter — it means the replay path may be incomplete.
+    pub events_errored_unwritable: AtomicU64,
 }
 
 impl Default for PipelineMetrics {
@@ -49,6 +57,7 @@ impl Default for PipelineMetrics {
             events_dropped: AtomicU64::new(0),
             events_discarded: AtomicU64::new(0),
             events_errored: AtomicU64::new(0),
+            events_errored_unwritable: AtomicU64::new(0),
         }
     }
 }
@@ -133,6 +142,10 @@ impl MetricsRegistry {
             p.insert(
                 "events_errored".into(),
                 m.events_errored.load(Ordering::Relaxed).into(),
+            );
+            p.insert(
+                "events_errored_unwritable".into(),
+                m.events_errored_unwritable.load(Ordering::Relaxed).into(),
             );
             pipelines.insert(name.clone(), serde_json::Value::Object(p));
         }
