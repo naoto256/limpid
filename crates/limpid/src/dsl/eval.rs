@@ -191,7 +191,7 @@ fn resolve_ident(parts: &[String], event: &Event, scope: &LocalScope) -> Result<
     match parts.first().map(|s| s.as_str()) {
         Some("ingress") => Ok(bytes_to_value(&event.ingress)),
         Some("egress") => Ok(bytes_to_value(&event.egress)),
-        Some("received_at") => Ok(Value::String(event.received_at.to_rfc3339())),
+        Some("received_at") => Ok(Value::Timestamp(event.received_at)),
         Some("source") => Ok(Value::String(event.source.ip().to_string())),
         Some("error") => {
             // `error` is available inside catch blocks, stored as workspace._error
@@ -348,6 +348,7 @@ pub fn value_to_string(v: &Value) -> String {
             }
         }
         Value::Bytes(_) => "<bytes>".to_string(),
+        Value::Timestamp(dt) => dt.to_rfc3339(),
         Value::Array(a) => {
             let mut s = String::from("[");
             for (i, item) in a.iter().enumerate() {
