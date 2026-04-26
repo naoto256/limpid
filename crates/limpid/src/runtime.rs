@@ -154,6 +154,16 @@ impl Runtime {
         let compiled_config = config.clone();
         let config = Arc::new(config);
 
+        // Optional dead-letter queue for events that fail in `process`.
+        // `control { error_log "..." }` opts in to file-based DLQ; when
+        // unset, the runtime falls back to a structured tracing line.
+        let error_log_path = config
+            .global_blocks
+            .get("control")
+            .and_then(|p| props::get_string(p, "error_log"));
+        let error_log = error_log_path
+            .map(|p| Arc::new(crate::error_log::ErrorLogWriter::new(PathBuf::from(p))));
+
         let mut input_senders: HashMap<
             String,
             (mpsc::Sender<Event>, Arc<crate::metrics::InputMetrics>),
@@ -183,6 +193,7 @@ impl Runtime {
                 config: Arc::clone(&config),
                 funcs: Arc::clone(&func_registry),
                 tap: tap.clone(),
+                error_log: error_log.as_ref().map(Arc::clone),
             };
             let iname = input_name.clone();
             let shutdown_for_worker = shutdown_rx.clone();
@@ -356,6 +367,10 @@ struct PipelineContext {
     config: Arc<CompiledConfig>,
     funcs: Arc<FunctionRegistry>,
     tap: TapRegistry,
+    /// Dead-letter queue writer for events that fail in `process`.
+    /// `None` when the operator hasn't configured `error_log` — the
+    /// runtime then falls back to a structured `tracing::error!` line.
+    error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -477,6 +492,48 @@ async fn process_event(
                             .metrics
                             .events_errored
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // Route the original event to the DLQ. The
+                        // pipeline guarantees `errored` is populated
+                        // when termination == Errored; defend with a
+                        // log if the contract somehow breaks.
+                        if let Some(err_ctx) = result.errored {
+                            match &ctx.error_log {
+                                Some(writer) => {
+                                    if let Err(e) = writer.write(&err_ctx).await {
+                                        worker
+                                            .metrics
+                                            .events_errored_unwritable
+                                            .fetch_add(
+                                                1,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                        error!(
+                                            event_record = %err_ctx.to_jsonl(),
+                                            "error_log: write failed: {} — record below for manual recovery",
+                                            e
+                                        );
+                                    }
+                                }
+                                None => {
+                                    // No DLQ configured — surface the
+                                    // record as a structured tracing
+                                    // line so the failure data is
+                                    // never silently lost. Operators
+                                    // can grep / `journalctl | jq` it.
+                                    error!(
+                                        event_record = %err_ctx.to_jsonl(),
+                                        "pipeline '{}': process '{}' errored; configure `control {{ error_log \"...\" }}` for file-based DLQ",
+                                        err_ctx.pipeline,
+                                        err_ctx.process
+                                    );
+                                }
+                            }
+                        } else {
+                            error!(
+                                "pipeline '{}': Errored termination without error context — bug",
+                                worker.def.name
+                            );
+                        }
                     }
                     PipelineTermination::Finished => {
                         if result.outputs.is_empty() {
@@ -587,12 +644,14 @@ mod tests {
             config: Arc::new(cfg.clone()),
             funcs: Arc::new(FunctionRegistry::new()),
             tap: tap.clone(),
+            error_log: None,
         };
         let ctx_b = PipelineContext {
             output_senders: Arc::clone(&ctx_a.output_senders),
             config: Arc::clone(&ctx_a.config),
             funcs: Arc::clone(&ctx_a.funcs),
             tap: tap.clone(),
+            error_log: None,
         };
 
         let workers_a = Arc::clone(&workers);

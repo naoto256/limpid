@@ -10,6 +10,7 @@ mod check;
 mod config;
 mod control;
 mod dsl;
+mod error_log;
 mod event;
 mod functions;
 mod metrics;
@@ -406,6 +407,16 @@ fn run_test(config_path: &str, pipeline_name: &str, input_json: Option<&str>) ->
             }
             println!();
         }
+    }
+
+    // Surface the dead-letter-queue record for operator inspection.
+    // The actual file write happens only inside the daemon's runtime
+    // layer (`process_event`); --test-pipeline prints the would-be
+    // JSONL line so the same recipe (`jq -c '.event' | inject`) can
+    // be rehearsed against the trace.
+    if let Some(ref err_ctx) = result.errored {
+        println!();
+        println!("[error_log]  {}", err_ctx.to_jsonl());
     }
 
     Ok(())
