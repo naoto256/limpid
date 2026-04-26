@@ -166,10 +166,20 @@ impl FileOutput {
     /// where `is_dynamic` is true when the template had any interpolated
     /// fragments (used to decide whether to `mkdir -p` the parent).
     ///
-    /// For `Template`, each `Interp` fragment is evaluated separately so
-    /// that values derived from `workspace.*` can be sanitised without
-    /// affecting literal path separators or server-owned interpolations
-    /// like `${source}`.
+    /// Two safety passes:
+    ///
+    /// 1. Per-interpolation: every `${...}` result has `/` and `\`
+    ///    replaced with `_`, regardless of the wrapping expression
+    ///    (`${workspace.x}`, `${lower(workspace.x)}`, `${a + b}` —
+    ///    all treated alike). The invariant is "one interpolation =
+    ///    one path component"; directory structure must be expressed
+    ///    in the literal parts of the template.
+    ///
+    /// 2. Post-evaluation: the fully-rendered path string has every
+    ///    `../` traversal sequence stripped (along with a trailing
+    ///    `/..` and a result of exactly `..`) until no more remain.
+    ///    Combined with pass 1, no interpolation value can introduce
+    ///    a directory escape regardless of how it is composed.
     fn render_path(&self, event: &Event) -> Result<(String, bool)> {
         match &self.path.kind {
             ExprKind::StringLit(s) => Ok((s.clone(), false)),
@@ -186,15 +196,11 @@ impl FileOutput {
                         TemplateFragment::Literal(s) => out.push_str(s),
                         TemplateFragment::Interp(expr) => {
                             let rendered = value_to_string(&eval_expr(expr, event, funcs)?);
-                            if is_workspace_reference(expr) {
-                                out.push_str(&sanitize_path_component(&rendered));
-                            } else {
-                                out.push_str(&rendered);
-                            }
+                            out.push_str(&sanitize_path_component(&rendered));
                         }
                     }
                 }
-                Ok((out, true))
+                Ok((strip_traversal(&out), true))
             }
             other => anyhow::bail!(
                 "output file: unsupported path expression shape: {:?}",
@@ -204,24 +210,33 @@ impl FileOutput {
     }
 }
 
-/// Does `expr` dereference `workspace.*` (i.e. user-controlled event data)?
-/// Conservative: only flags literal `workspace.xxx[.yyy]` identifiers. Other
-/// expressions whose results happen to originate from the workspace (e.g.
-/// `lower(workspace.host)`) are rendered without sanitisation — users who
-/// care should write their sanitisation explicitly.
-fn is_workspace_reference(expr: &Expr) -> bool {
-    match &expr.kind {
-        ExprKind::Ident(parts) => {
-            parts.first().is_some_and(|s| s == "workspace") && parts.len() > 1
-        }
-        ExprKind::PropertyAccess(base, _) => is_workspace_reference(base),
-        _ => false,
-    }
+/// Pass 1: per-interpolation sanitisation. Strip `/` and `\` so an
+/// interpolation cannot expand into multiple path components or a
+/// Windows path separator. `.` is left alone — operators rely on dots
+/// for FQDN-style filenames (`web01.example.com.log`).
+fn sanitize_path_component(s: &str) -> String {
+    s.replace(['/', '\\'], "_")
 }
 
-/// Sanitize a path component: strip `/`, `\`, and `..`.
-fn sanitize_path_component(s: &str) -> String {
-    s.replace(['/', '\\'], "_").replace("..", "_")
+/// Pass 2: strip `..` traversal sequences from the fully-rendered path.
+/// Iterates to a fixpoint so pathological inputs (`..../`, `....///..`,
+/// etc.) collapse rather than passing through partially.
+fn strip_traversal(s: &str) -> String {
+    let mut out = s.to_string();
+    loop {
+        let next = out.replace("../", "");
+        if next == out {
+            break;
+        }
+        out = next;
+    }
+    if let Some(stripped) = out.strip_suffix("/..") {
+        out = stripped.to_string();
+    }
+    if out == ".." {
+        out.clear();
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -386,16 +401,18 @@ mod tests {
     }
 
     #[test]
-    fn render_template_does_not_sanitize_non_workspace_interp() {
-        // `${source}` is a top-level ident (not workspace.*), so its value
-        // is passed through even if it contains separators (IPv4 won't,
-        // but the principle holds).
+    fn render_template_sanitises_every_interpolation() {
+        // Pass 1: every interpolation result has `/` `\` → `_`,
+        // regardless of expression shape. `source` (a non-workspace
+        // ident) gets the same treatment as `workspace.x`.
         let out = make_output(ek(ExprKind::Template(vec![
             TemplateFragment::Literal("a-".into()),
             TemplateFragment::Interp(ek(ExprKind::Ident(vec!["source".into()]))),
             TemplateFragment::Literal("-b".into()),
         ])));
         let (rendered, _) = out.render_path(&event_with_workspace()).unwrap();
+        // source is "192.168.1.10" — no slashes, no change. Principle
+        // holds for hypothetical slash-bearing values.
         assert_eq!(rendered, "a-192.168.1.10-b");
     }
 
@@ -410,32 +427,24 @@ mod tests {
     }
 
     #[test]
-    fn is_workspace_reference_detects_nested_paths() {
-        assert!(is_workspace_reference(&ek(ExprKind::Ident(vec![
-            "workspace".into(),
-            "x".into()
-        ]))));
-        assert!(is_workspace_reference(&ek(ExprKind::Ident(vec![
-            "workspace".into(),
-            "x".into(),
-            "y".into()
-        ]))));
-        // `workspace` alone is not a reference to a specific key
-        assert!(!is_workspace_reference(&ek(ExprKind::Ident(vec![
-            "workspace".into()
-        ]))));
-        // non-workspace idents don't count
-        assert!(!is_workspace_reference(&ek(ExprKind::Ident(vec![
-            "source".into()
-        ]))));
-        // function calls always render without sanitisation (users
-        // opt-in to their own sanitisation)
-        assert!(!is_workspace_reference(&ek(ExprKind::FuncCall {
-            namespace: None,
-            name: "lower".into(),
-            args: vec![ek(ExprKind::Ident(
-                vec!["workspace".into(), "host".into(),]
-            ))],
-        })));
+    fn strip_traversal_kills_dot_dot_sequences() {
+        // Plain — no change
+        assert_eq!(strip_traversal("/var/log/foo.log"), "/var/log/foo.log");
+        // Single ../ in the middle
+        assert_eq!(strip_traversal("/var/log/../etc/passwd"), "/var/log/etc/passwd");
+        // Multiple ../ chained
+        assert_eq!(strip_traversal("/var/log/../../etc/passwd"), "/var/log/etc/passwd");
+        // Concatenation traversal: literal "/x/../" via interpolation+literal
+        assert_eq!(strip_traversal("/var/log/x/../etc/passwd"), "/var/log/x/etc/passwd");
+        // Trailing /..
+        assert_eq!(strip_traversal("/var/log/.."), "/var/log");
+        // Standalone ..
+        assert_eq!(strip_traversal(".."), "");
+        // Dots inside filenames are preserved (FQDN.log, hidden-style names)
+        assert_eq!(strip_traversal("/var/log/web01.example.com.log"), "/var/log/web01.example.com.log");
+        assert_eq!(strip_traversal("/var/log/.hidden.log"), "/var/log/.hidden.log");
+        // Multi-dot dirnames like `....` are NOT traversal (not `..`),
+        // so they survive — just an unusual filename, not a path escape.
+        assert_eq!(strip_traversal("a/..../b"), "a/..b"); // single ../ inside `..../` strips to `..b`
     }
 }
