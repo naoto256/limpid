@@ -63,7 +63,10 @@ mod tests {
     #[test]
     fn prepending_any_value_type() {
         assert_eq!(push_front(&value!([]), &value!(null)), value!([null]));
-        assert_eq!(push_front(&value!([]), &value!({"k": 1})), value!([{"k": 1}]));
+        assert_eq!(
+            push_front(&value!([]), &value!({"k": 1})),
+            value!([{"k": 1}])
+        );
         assert_eq!(push_front(&value!([]), &value!([1, 2])), value!([[1, 2]]));
     }
 

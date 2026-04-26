@@ -85,9 +85,7 @@ fn convert(buf: &[u8], encoding: &str, strict: bool) -> Result<String> {
             Ok(out)
         }
         "base64" => Ok(B64.encode(buf)),
-        other => bail!(
-            "to_string(): unknown encoding {other:?} (expected utf8, hex, or base64)"
-        ),
+        other => bail!("to_string(): unknown encoding {other:?} (expected utf8, hex, or base64)"),
     }
 }
 
@@ -124,11 +122,7 @@ mod tests {
     #[test]
     fn utf8_strict_rejects_invalid() {
         let reg = make_reg();
-        let err = call(
-            &reg,
-            vec![Value::Bytes(Bytes::from_static(b"\xff\xfe"))],
-        )
-        .unwrap_err();
+        let err = call(&reg, vec![Value::Bytes(Bytes::from_static(b"\xff\xfe"))]).unwrap_err();
         assert!(err.to_string().contains("utf8"), "unexpected: {err}");
     }
 
@@ -194,10 +188,7 @@ mod tests {
         let reg = make_reg();
         let err = call(
             &reg,
-            vec![
-                Value::Bytes(Bytes::new()),
-                Value::String("rot13".into()),
-            ],
+            vec![Value::Bytes(Bytes::new()), Value::String("rot13".into())],
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown encoding"));

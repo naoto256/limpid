@@ -1,7 +1,7 @@
 //! `regex_match(target, pattern)` — boolean match test.
 
-use anyhow::bail;
 use crate::dsl::value::Value;
+use anyhow::bail;
 
 use super::{get_cached_regex, val_to_str};
 use crate::functions::{FunctionRegistry, FunctionSig};

@@ -88,7 +88,9 @@ pub fn eval_expr_with_scope(
                     TemplateFragment::Interp(expr) => {
                         let v = eval_expr_with_scope(expr, event, funcs, scope)?;
                         if matches!(v, Value::Bytes(_)) {
-                            bail!("cannot interpolate bytes into a string template (use to_string() first)");
+                            bail!(
+                                "cannot interpolate bytes into a string template (use to_string() first)"
+                            );
                         }
                         out.push_str(&value_to_string(&v));
                     }
@@ -153,10 +155,7 @@ pub fn eval_expr_with_scope(
                     // — the analyzer flags it statically; at runtime we
                     // surface the same condition so dynamic data shapes
                     // don't silently return Null.
-                    Value::Bytes(_) => bail!(
-                        "cannot access field `{}` on a bytes value",
-                        field
-                    ),
+                    Value::Bytes(_) => bail!("cannot access field `{}` on a bytes value", field),
                     _ => Value::Null,
                 };
             }
@@ -243,10 +242,7 @@ fn resolve_workspace_path(parts: &[String], value: &Value) -> Result<Value> {
             let next = map.get(&parts[0]).cloned().unwrap_or(Value::Null);
             resolve_workspace_path(&parts[1..], &next)
         }
-        Value::Bytes(_) => bail!(
-            "cannot access field `{}` on a bytes value",
-            parts[0]
-        ),
+        Value::Bytes(_) => bail!("cannot access field `{}` on a bytes value", parts[0]),
         _ => Ok(Value::Null),
     }
 }
@@ -278,8 +274,18 @@ fn eval_bin_op(left: &Value, op: BinOp, right: &Value) -> Result<Value> {
         BinOp::Add => add_values(left, right),
         BinOp::Sub => numeric_op("subtract", left, right, |a, b| a - b),
         BinOp::Mul => numeric_op("multiply", left, right, |a, b| a * b),
-        BinOp::Div => numeric_op("divide", left, right, |a, b| if b != 0.0 { a / b } else { 0.0 }),
-        BinOp::Mod => numeric_op("modulo", left, right, |a, b| if b != 0.0 { a % b } else { 0.0 }),
+        BinOp::Div => numeric_op(
+            "divide",
+            left,
+            right,
+            |a, b| if b != 0.0 { a / b } else { 0.0 },
+        ),
+        BinOp::Mod => numeric_op(
+            "modulo",
+            left,
+            right,
+            |a, b| if b != 0.0 { a % b } else { 0.0 },
+        ),
     }
 }
 
@@ -308,9 +314,7 @@ pub fn values_match(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Int(a), Value::Int(b)) => a == b,
         (Value::Float(a), Value::Float(b)) => a == b,
-        (Value::Int(a), Value::Float(b)) | (Value::Float(b), Value::Int(a)) => {
-            (*a as f64) == *b
-        }
+        (Value::Int(a), Value::Float(b)) | (Value::Float(b), Value::Int(a)) => (*a as f64) == *b,
         (Value::String(a), Value::String(b)) => a == b,
         (Value::Bytes(a), Value::Bytes(b)) => a == b,
         (Value::Bool(a), Value::Bool(b)) => a == b,
@@ -426,12 +430,7 @@ fn add_values(left: &Value, right: &Value) -> Result<Value> {
     numeric_op("add", left, right, |a, b| a + b)
 }
 
-fn numeric_op(
-    op: &str,
-    left: &Value,
-    right: &Value,
-    f: impl Fn(f64, f64) -> f64,
-) -> Result<Value> {
+fn numeric_op(op: &str, left: &Value, right: &Value, f: impl Fn(f64, f64) -> f64) -> Result<Value> {
     if matches!(left, Value::Bytes(_)) || matches!(right, Value::Bytes(_)) {
         bail!("cannot {} a bytes value", op);
     }

@@ -110,10 +110,7 @@ mod tests {
 
     #[test]
     fn quoted_comma_inside_field() {
-        let r = parse(
-            &value!(r#"1,"a,b,c",3"#),
-            &names(&["x", "y", "z"]),
-        );
+        let r = parse(&value!(r#"1,"a,b,c",3"#), &names(&["x", "y", "z"]));
         assert_eq!(r, value!({"x": "1", "y": "a,b,c", "z": "3"}));
     }
 

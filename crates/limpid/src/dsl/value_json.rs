@@ -290,10 +290,7 @@ mod tests {
     #[test]
     fn nested_object_with_bytes_inside() {
         let mut inner = Map::new();
-        inner.insert(
-            "blob".into(),
-            Value::Bytes(Bytes::from_static(b"\x00\xff")),
-        );
+        inner.insert("blob".into(), Value::Bytes(Bytes::from_static(b"\x00\xff")));
         let mut outer = Map::new();
         outer.insert("payload".into(), Value::Object(inner));
         let v = Value::Object(outer);

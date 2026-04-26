@@ -14,10 +14,10 @@
 //!
 //! KV is a *format*, not a schema — flat primitive namespace.
 
-use anyhow::{Result, bail};
 use crate::dsl::value::Map;
 use crate::dsl::value::Value;
 use crate::modules::schema::FieldType;
+use anyhow::{Result, bail};
 
 use super::parse_json::{apply_defaults, type_name};
 use super::val_to_str;
@@ -341,18 +341,11 @@ mod tests {
             .call(
                 None,
                 "parse_kv",
-                &[
-                    Value::String("a=1".into()),
-                    Value::String(",,".into()),
-                ],
+                &[Value::String("a=1".into()), Value::String(",,".into())],
                 &e,
             )
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("single ASCII byte"),
-            "got: {}",
-            err
-        );
+        assert!(err.contains("single ASCII byte"), "got: {}", err);
     }
 }

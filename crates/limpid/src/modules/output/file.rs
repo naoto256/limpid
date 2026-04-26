@@ -369,9 +369,9 @@ fn resolve_gid(name: &str) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dsl::value::Value;
     use crate::functions::table::TableStore;
     use bytes::Bytes;
-    use crate::dsl::value::Value;
     use std::net::SocketAddr;
 
     fn funcs() -> Arc<FunctionRegistry> {
@@ -473,7 +473,10 @@ mod tests {
         e.workspace.insert("empty".into(), Value::String("".into()));
         let out = make_output(ek(ExprKind::Template(vec![
             TemplateFragment::Literal("/var/log/".into()),
-            TemplateFragment::Interp(ek(ExprKind::Ident(vec!["workspace".into(), "empty".into()]))),
+            TemplateFragment::Interp(ek(ExprKind::Ident(vec![
+                "workspace".into(),
+                "empty".into(),
+            ]))),
             TemplateFragment::Literal(".log".into()),
         ])));
         let err = out.render_path(&e).unwrap_err();

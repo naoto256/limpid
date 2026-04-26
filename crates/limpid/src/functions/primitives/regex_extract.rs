@@ -5,8 +5,8 @@
 //! intentional: users writing `regex_extract(x, "src=(\S+)")` want the
 //! value, not `src=...`. Patterns with no explicit group still work.
 
-use anyhow::bail;
 use crate::dsl::value::Value;
+use anyhow::bail;
 
 use super::{get_cached_regex, val_to_str};
 use crate::functions::{FunctionRegistry, FunctionSig};

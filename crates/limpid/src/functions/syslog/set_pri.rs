@@ -12,8 +12,8 @@
 //! - `facility` must be in 0..=23 (local0..local7 live at 16..23).
 //! - `severity` must be in 0..=7 (emerg=0, alert=1, ..., debug=7).
 
-use anyhow::{Result, bail};
 use crate::dsl::value::Value;
+use anyhow::{Result, bail};
 
 use crate::functions::primitives::val_to_str;
 use crate::functions::syslog::pri::parse_leading_pri;
@@ -87,11 +87,7 @@ mod tests {
             .call(
                 Some("syslog"),
                 "set_pri",
-                &[
-                    Value::String("hello".into()),
-                    Value::Int(16),
-                    Value::Int(6),
-                ],
+                &[Value::String("hello".into()), Value::Int(16), Value::Int(6)],
                 &e,
             )
             .unwrap();
@@ -146,11 +142,7 @@ mod tests {
             .call(
                 Some("syslog"),
                 "set_pri",
-                &[
-                    Value::String("msg".into()),
-                    Value::Int(99),
-                    Value::Int(0),
-                ],
+                &[Value::String("msg".into()), Value::Int(99), Value::Int(0)],
                 &e,
             )
             .unwrap_err();
@@ -165,11 +157,7 @@ mod tests {
             .call(
                 Some("syslog"),
                 "set_pri",
-                &[
-                    Value::String("msg".into()),
-                    Value::Int(1),
-                    Value::Int(8),
-                ],
+                &[Value::String("msg".into()), Value::Int(1), Value::Int(8)],
                 &e,
             )
             .unwrap_err();

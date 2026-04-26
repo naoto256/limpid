@@ -74,7 +74,10 @@ mod tests {
     #[test]
     fn appending_any_value_type() {
         assert_eq!(push_back(&value!([]), &value!(null)), value!([null]));
-        assert_eq!(push_back(&value!([]), &value!({"k": 1})), value!([{"k": 1}]));
+        assert_eq!(
+            push_back(&value!([]), &value!({"k": 1})),
+            value!([{"k": 1}])
+        );
         assert_eq!(push_back(&value!([]), &value!([1, 2])), value!([[1, 2]]));
     }
 

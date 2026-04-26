@@ -40,8 +40,7 @@ fn parse_json_impl(args: &[Value]) -> Result<Value> {
     let text = val_to_str(&args[0])?;
     let json: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| anyhow::anyhow!("parse_json(): JSON parse error: {}", e))?;
-    let parsed = json_to_value(&json)
-        .map_err(|e| anyhow::anyhow!("parse_json(): {}", e))?;
+    let parsed = json_to_value(&json).map_err(|e| anyhow::anyhow!("parse_json(): {}", e))?;
 
     let mut map = match parsed {
         Value::Object(m) => m,

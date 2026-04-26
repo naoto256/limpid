@@ -3,8 +3,8 @@
 //! Replacement strings support `$1`, `$2`, … capture-group backrefs
 //! (via `regex_lite`'s `replace_all` behaviour).
 
-use anyhow::bail;
 use crate::dsl::value::Value;
+use anyhow::bail;
 
 use super::{get_cached_regex, val_to_str};
 use crate::functions::{FunctionRegistry, FunctionSig};

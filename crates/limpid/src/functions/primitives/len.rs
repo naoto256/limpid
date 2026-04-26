@@ -84,7 +84,10 @@ mod tests {
     #[test]
     fn counts_bytes_length() {
         assert_eq!(measure(&Value::Bytes(Bytes::new())), n(0));
-        assert_eq!(measure(&Value::Bytes(Bytes::from_static(b"\x00\xff\x10"))), n(3));
+        assert_eq!(
+            measure(&Value::Bytes(Bytes::from_static(b"\x00\xff\x10"))),
+            n(3)
+        );
     }
 
     #[test]

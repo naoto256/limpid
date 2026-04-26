@@ -237,10 +237,7 @@ mod tests {
         assert!(type_compatible(&Any, &Array));
         assert!(type_compatible(&Array, &Any));
         // Union(Array, Object) should de-dupe cleanly like other types.
-        assert_eq!(
-            FieldType::union(Array, Array),
-            Array
-        );
+        assert_eq!(FieldType::union(Array, Array), Array);
         assert_eq!(
             FieldType::union(Array, Object),
             FieldType::Union(vec![Array, Object])

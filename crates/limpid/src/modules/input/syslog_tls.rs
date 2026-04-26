@@ -40,8 +40,11 @@ impl Module for SyslogTlsInput {
             Some("non_transparent") => TcpFraming::NonTransparent,
             _ => TcpFraming::Auto,
         };
-        let tls_config = TlsConfig::from_properties_block(&format!("input '{}'", name), properties)?
-            .ok_or_else(|| anyhow::anyhow!("input '{}': syslog_tls requires 'tls' block", name))?;
+        let tls_config =
+            TlsConfig::from_properties_block(&format!("input '{}'", name), properties)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("input '{}': syslog_tls requires 'tls' block", name)
+                })?;
         let rate_limit = props::get_strictly_positive_int(properties, "rate_limit")?;
         let max_connections = props::get_positive_int(properties, "max_connections")?
             .unwrap_or(super::syslog_tcp::DEFAULT_MAX_CONNECTIONS)

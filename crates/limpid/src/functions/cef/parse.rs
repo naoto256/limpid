@@ -30,9 +30,9 @@
 //! | `severity`             | vendor severity (0-10)       |
 //! | `<ext>` (e.g. `src`, `dst`)| CEF extension key=value pairs|
 
-use anyhow::{Result, bail};
 use crate::dsl::value::Map;
 use crate::dsl::value::Value;
+use anyhow::{Result, bail};
 
 use crate::functions::primitives::parse_json::{apply_defaults, type_name};
 use crate::functions::primitives::val_to_str;
@@ -88,22 +88,10 @@ fn parse_impl(args: &[Value]) -> Result<Value> {
 
     let mut map = Map::new();
     map.insert("version".into(), Value::String(parts[0].to_string()));
-    map.insert(
-        "device_vendor".into(),
-        Value::String(parts[1].to_string()),
-    );
-    map.insert(
-        "device_product".into(),
-        Value::String(parts[2].to_string()),
-    );
-    map.insert(
-        "device_version".into(),
-        Value::String(parts[3].to_string()),
-    );
-    map.insert(
-        "signature_id".into(),
-        Value::String(parts[4].to_string()),
-    );
+    map.insert("device_vendor".into(), Value::String(parts[1].to_string()));
+    map.insert("device_product".into(), Value::String(parts[2].to_string()));
+    map.insert("device_version".into(), Value::String(parts[3].to_string()));
+    map.insert("signature_id".into(), Value::String(parts[4].to_string()));
     map.insert("name".into(), Value::String(parts[5].to_string()));
     // CEF Severity is a number (0-10 per the spec). Emit as Int when
     // the field parses cleanly; fall back to the raw string when the

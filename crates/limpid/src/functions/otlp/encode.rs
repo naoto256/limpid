@@ -39,9 +39,7 @@ use bytes::Bytes;
 use prost::Message;
 
 use opentelemetry_proto::tonic::{
-    common::v1::{
-        AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList, any_value,
-    },
+    common::v1::{AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList, any_value},
     logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
     resource::v1::Resource,
 };
@@ -175,8 +173,7 @@ fn hashlit_to_log_record(v: &Value) -> Result<LogRecord> {
 
 fn hashlit_to_keyvalue(v: &Value) -> Result<KeyValue> {
     let map = expect_object(v, "KeyValue")?;
-    let key = string_field(map, "key")
-        .ok_or_else(|| anyhow!("KeyValue: missing string `key`"))?;
+    let key = string_field(map, "key").ok_or_else(|| anyhow!("KeyValue: missing string `key`"))?;
     let value = opt_field(map, "value", hashlit_to_anyvalue)?;
     Ok(KeyValue { key, value })
 }
@@ -190,7 +187,9 @@ fn hashlit_to_anyvalue(v: &Value) -> Result<AnyValue> {
     let mut found: Option<any_value::Value> = None;
     let mut set_variant = |key: &str, val: any_value::Value| -> Result<()> {
         if found.is_some() {
-            bail!("AnyValue: multiple variant keys present (only one of string_value/int_value/.../bytes_value allowed; offending key: {key})");
+            bail!(
+                "AnyValue: multiple variant keys present (only one of string_value/int_value/.../bytes_value allowed; offending key: {key})"
+            );
         }
         found = Some(val);
         Ok(())
@@ -213,7 +212,10 @@ fn hashlit_to_anyvalue(v: &Value) -> Result<AnyValue> {
     if let Some(arr_v) = map.get("array_value") {
         let arr_map = expect_object(arr_v, "AnyValue.array_value")?;
         let values = array_field(arr_map, "values", hashlit_to_anyvalue)?;
-        set_variant("array_value", any_value::Value::ArrayValue(ArrayValue { values }))?;
+        set_variant(
+            "array_value",
+            any_value::Value::ArrayValue(ArrayValue { values }),
+        )?;
     }
     if let Some(kv_v) = map.get("kvlist_value") {
         let kv_map = expect_object(kv_v, "AnyValue.kvlist_value")?;
@@ -308,10 +310,7 @@ where
     match map.get(key) {
         None | Some(Value::Null) => Ok(Vec::new()),
         Some(Value::Array(items)) => items.iter().map(&mut f).collect(),
-        Some(other) => bail!(
-            "field `{key}`: expected array, got {}",
-            other.type_name()
-        ),
+        Some(other) => bail!("field `{key}`: expected array, got {}", other.type_name()),
     }
 }
 
@@ -432,10 +431,16 @@ fn log_record_to_hashlit(lr: &LogRecord) -> Value {
         map.insert("flags".into(), Value::Int(lr.flags as i64));
     }
     if !lr.trace_id.is_empty() {
-        map.insert("trace_id".into(), Value::Bytes(Bytes::from(lr.trace_id.clone())));
+        map.insert(
+            "trace_id".into(),
+            Value::Bytes(Bytes::from(lr.trace_id.clone())),
+        );
     }
     if !lr.span_id.is_empty() {
-        map.insert("span_id".into(), Value::Bytes(Bytes::from(lr.span_id.clone())));
+        map.insert(
+            "span_id".into(),
+            Value::Bytes(Bytes::from(lr.span_id.clone())),
+        );
     }
     Value::Object(map)
 }
@@ -514,7 +519,10 @@ mod tests {
 
     fn sample_hashlit() -> Value {
         let mut log_record = Map::new();
-        log_record.insert("time_unix_nano".into(), Value::Int(1_700_000_000_000_000_000));
+        log_record.insert(
+            "time_unix_nano".into(),
+            Value::Int(1_700_000_000_000_000_000),
+        );
         log_record.insert("severity_number".into(), Value::Int(9)); // INFO
         log_record.insert("severity_text".into(), Value::String("INFO".into()));
         let mut body = Map::new();

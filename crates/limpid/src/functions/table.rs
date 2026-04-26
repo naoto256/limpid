@@ -38,8 +38,8 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
 use crate::dsl::value::{Map, Value};
+use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------

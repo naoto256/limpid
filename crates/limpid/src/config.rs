@@ -178,13 +178,8 @@ fn load_recursive(
                 .with_context(|| format!("failed to canonicalize {}", inc_path.display()))?;
             ensure_permitted_location(&canonical_inc, canonical_root, &include_pattern)?;
 
-            let inc_config = load_recursive(
-                &inc_path,
-                canonical_root,
-                state,
-                depth + 1,
-                source_map,
-            )?;
+            let inc_config =
+                load_recursive(&inc_path, canonical_root, state, depth + 1, source_map)?;
             config.definitions.extend(inc_config.definitions);
             config.global_blocks.extend(inc_config.global_blocks);
         }
@@ -222,13 +217,7 @@ pub fn load_config_with_source_map(config_file: &Path) -> Result<(Config, Source
     let mut source_map = SourceMap::new();
     let mut state = IncludeState::default();
     let canonical_root = canonical_root(config_file)?;
-    let config = load_recursive(
-        config_file,
-        &canonical_root,
-        &mut state,
-        0,
-        &mut source_map,
-    )?;
+    let config = load_recursive(config_file, &canonical_root, &mut state, 0, &mut source_map)?;
     Ok((config, source_map))
 }
 
@@ -401,7 +390,10 @@ mod tests {
         fs::write(&main_conf, r#"include "/etc/hosts""#).unwrap();
 
         let err = load_config(&main_conf).unwrap_err().to_string();
-        assert!(err.contains("absolute paths are allowed only under"), "got: {err}");
+        assert!(
+            err.contains("absolute paths are allowed only under"),
+            "got: {err}"
+        );
         assert!(err.contains(SYSTEM_SNIPPET_DIR), "got: {err}");
     }
 

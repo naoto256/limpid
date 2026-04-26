@@ -42,8 +42,8 @@ use opentelemetry_proto::tonic::collector::logs::v1::{
     logs_service_server::{LogsService, LogsServiceServer},
 };
 use tokio::sync::mpsc;
-use tonic::{Request, Response, Status};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
+use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
 use super::split_request;
@@ -64,8 +64,8 @@ pub struct OtlpGrpcInput {
 
 impl Module for OtlpGrpcInput {
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
-        let bind = props::get_string(properties, "bind")
-            .unwrap_or_else(|| "0.0.0.0:4317".to_string());
+        let bind =
+            props::get_string(properties, "bind").unwrap_or_else(|| "0.0.0.0:4317".to_string());
         let rate_limit = props::get_strictly_positive_int(properties, "rate_limit")?;
         let tls = TlsConfig::from_properties_block(&format!("input '{}'", name), properties)?;
         Ok(Self {
@@ -105,7 +105,11 @@ impl Input for OtlpGrpcInput {
         info!(
             "otlp_grpc listening on {} ({})",
             addr,
-            if tls_config.is_some() { "TLS" } else { "plaintext" }
+            if tls_config.is_some() {
+                "TLS"
+            } else {
+                "plaintext"
+            }
         );
         if let Some(rate) = self.rate_limit {
             info!("otlp_grpc rate_limit: {} events/sec", rate);
@@ -155,8 +159,7 @@ async fn load_tonic_tls_config(material: &TlsConfig) -> Result<ServerTlsConfig> 
         let identity = Identity::from_pem(cert_pem, key_pem);
         let mut config = ServerTlsConfig::new().identity(identity);
         if let Some(p) = ca_path {
-            let ca_pem = std::fs::read(&p)
-                .with_context(|| format!("tls: cannot read CA {}", p))?;
+            let ca_pem = std::fs::read(&p).with_context(|| format!("tls: cannot read CA {}", p))?;
             config = config.client_ca_root(Certificate::from_pem(ca_pem));
         }
         Ok(config)

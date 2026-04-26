@@ -100,8 +100,8 @@ pub struct OtlpHttpInput {
 
 impl Module for OtlpHttpInput {
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
-        let bind = props::get_string(properties, "bind")
-            .unwrap_or_else(|| "0.0.0.0:4318".to_string());
+        let bind =
+            props::get_string(properties, "bind").unwrap_or_else(|| "0.0.0.0:4318".to_string());
         let body_limit = match props::get_string(properties, "body_limit") {
             Some(s) => {
                 let bytes = props::parse_size(&s)?;
@@ -227,7 +227,10 @@ async fn handle_logs(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    state.metrics.events_received.fetch_add(1, Ordering::Relaxed);
+    state
+        .metrics
+        .events_received
+        .fetch_add(1, Ordering::Relaxed);
 
     // Concurrency cap (semaphore) bounds simultaneous decode work.
     // Combined with body_limit, this turns the worst-case decode
@@ -276,10 +279,7 @@ async fn handle_logs(
                     "otlp_http [{peer}]: JSON decode failed: {}",
                     truncate_decode_err(&e.to_string())
                 );
-                state
-                    .metrics
-                    .events_invalid
-                    .fetch_add(1, Ordering::Relaxed);
+                state.metrics.events_invalid.fetch_add(1, Ordering::Relaxed);
                 return (StatusCode::BAD_REQUEST, "invalid OTLP/JSON payload").into_response();
             }
         },
@@ -290,12 +290,8 @@ async fn handle_logs(
                     "otlp_http [{peer}]: protobuf decode failed: {}",
                     truncate_decode_err(&e.to_string())
                 );
-                state
-                    .metrics
-                    .events_invalid
-                    .fetch_add(1, Ordering::Relaxed);
-                return (StatusCode::BAD_REQUEST, "invalid OTLP/protobuf payload")
-                    .into_response();
+                state.metrics.events_invalid.fetch_add(1, Ordering::Relaxed);
+                return (StatusCode::BAD_REQUEST, "invalid OTLP/protobuf payload").into_response();
             }
         },
     };
@@ -368,12 +364,9 @@ mod tests {
     fn zero_concurrency_is_rejected() {
         // get_strictly_positive_int forbids 0; the property is
         // documented as "off when absent", so 0 is meaningless.
-        let err = OtlpHttpInput::from_properties(
-            "o",
-            &[prop_int("max_concurrent_requests", 0)],
-        )
-        .err()
-        .unwrap();
+        let err = OtlpHttpInput::from_properties("o", &[prop_int("max_concurrent_requests", 0)])
+            .err()
+            .unwrap();
         assert!(
             err.to_string().contains("max_concurrent_requests"),
             "unexpected: {err}"
@@ -394,7 +387,8 @@ mod tests {
             .err()
             .unwrap();
         assert!(
-            err.to_string().contains("body_limit must be greater than 0"),
+            err.to_string()
+                .contains("body_limit must be greater than 0"),
             "unexpected: {err}"
         );
     }
@@ -405,7 +399,10 @@ mod tests {
         let err = OtlpHttpInput::from_properties("o", &[prop_str("body_limit", "huge")])
             .err()
             .unwrap();
-        assert!(err.to_string().contains("invalid size"), "unexpected: {err}");
+        assert!(
+            err.to_string().contains("invalid size"),
+            "unexpected: {err}"
+        );
     }
 
     /// Wire-level: bring up the input on an ephemeral port with a
@@ -571,10 +568,7 @@ mod tests {
         let err = OtlpHttpInput::from_properties("o", &[prop_int("rate_limit", 0)])
             .err()
             .unwrap();
-        assert!(
-            err.to_string().contains("rate_limit"),
-            "unexpected: {err}"
-        );
+        assert!(err.to_string().contains("rate_limit"), "unexpected: {err}");
     }
 
     /// Wire-level: with `rate_limit = 5` events/sec, posting one
@@ -602,7 +596,10 @@ mod tests {
 
         let input = OtlpHttpInput::from_properties(
             "test",
-            &[prop_str("bind", &addr.to_string()), prop_int("rate_limit", 5)],
+            &[
+                prop_str("bind", &addr.to_string()),
+                prop_int("rate_limit", 5),
+            ],
         )
         .unwrap();
         let (tx, mut rx) = mpsc::channel(64);
@@ -775,14 +772,11 @@ mod tests {
         // First request should eventually drain through the throttle
         // and return 200; we wait it out (up to a few seconds)
         // rather than abort, so the server task can shut down cleanly.
-        let first_resp = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            first,
-        )
-        .await
-        .expect("first request must complete once the bucket refills")
-        .expect("first task must not panic")
-        .expect("first request must return a response");
+        let first_resp = tokio::time::timeout(std::time::Duration::from_secs(5), first)
+            .await
+            .expect("first request must complete once the bucket refills")
+            .expect("first task must not panic")
+            .expect("first request must return a response");
         assert_eq!(first_resp.status(), reqwest::StatusCode::OK);
 
         // Drain anything that did make it through (the warmup, etc.)
