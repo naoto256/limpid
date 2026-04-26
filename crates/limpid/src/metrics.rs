@@ -32,6 +32,13 @@ pub struct PipelineMetrics {
     pub events_finished: AtomicU64,
     pub events_dropped: AtomicU64,
     pub events_discarded: AtomicU64,
+    /// Events for which a `process` statement raised a runtime error
+    /// (unknown identifier, type mismatch, regex compile failure, …).
+    /// The event is discarded rather than forwarded with the original
+    /// ingress unchanged. Distinct from `events_discarded` so operators
+    /// can tell a config-bug-shaped routing miss apart from a logic-bug-
+    /// shaped runtime failure.
+    pub events_errored: AtomicU64,
 }
 
 impl Default for PipelineMetrics {
@@ -41,6 +48,7 @@ impl Default for PipelineMetrics {
             events_finished: AtomicU64::new(0),
             events_dropped: AtomicU64::new(0),
             events_discarded: AtomicU64::new(0),
+            events_errored: AtomicU64::new(0),
         }
     }
 }
@@ -121,6 +129,10 @@ impl MetricsRegistry {
             p.insert(
                 "events_discarded".into(),
                 m.events_discarded.load(Ordering::Relaxed).into(),
+            );
+            p.insert(
+                "events_errored".into(),
+                m.events_errored.load(Ordering::Relaxed).into(),
             );
             pipelines.insert(name.clone(), serde_json::Value::Object(p));
         }

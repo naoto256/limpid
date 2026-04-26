@@ -64,8 +64,11 @@ def pipeline main {
 | `drop` | `events_dropped` |
 | `finish` or end of pipeline (with output) | `events_finished` |
 | `finish` or end of pipeline (no output) | `events_discarded` |
+| Process raised a runtime error | `events_errored` |
 
 `events_discarded` indicates a possible misconfiguration — the event went through the pipeline but was never sent anywhere.
+
+`events_errored` indicates a pipeline-runtime failure: a `process` statement raised an error (unknown identifier, type mismatch, regex compile failure, …). The event is discarded rather than forwarded with the original `ingress` unchanged. Pre-0.5 the event was warn-logged and passed through, which silently turned wrap / enrichment bugs into data-shape regressions downstream; 0.5 makes the failure observable.
 
 ## Example: filtering + routing
 
