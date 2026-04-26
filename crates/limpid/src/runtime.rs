@@ -472,6 +472,12 @@ async fn process_event(
                             .events_dropped
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
+                    PipelineTermination::Errored => {
+                        worker
+                            .metrics
+                            .events_errored
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     PipelineTermination::Finished => {
                         if result.outputs.is_empty() {
                             worker
