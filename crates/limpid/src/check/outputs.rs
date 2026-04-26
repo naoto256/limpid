@@ -23,11 +23,19 @@ pub(super) fn analyze_output(
 ) {
     for prop in &output.properties {
         if let Property::KeyValue {
+            key,
             value: expr,
             value_span,
             ..
         } = prop
         {
+            // `type` is a module-name reference resolved at config-load
+            // time, not a runtime expression — its bare-ident value
+            // (`stdout`, `tcp`, …) would otherwise trip the
+            // unknown-identifier diagnostic in `check_types`.
+            if key == "type" {
+                continue;
+            }
             expr_types::check_types(
                 expr,
                 pipeline_name,
