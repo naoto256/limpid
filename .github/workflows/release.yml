@@ -34,7 +34,20 @@ jobs:
           cargo deb -p limpid --no-build
           cargo deb -p limpid-prometheus --no-build
 
+      - name: Extract release notes from CHANGELOG
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v ver="$VERSION" '
+            $0 ~ "^## \\["ver"\\]" { found=1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "::warning::No CHANGELOG entry found for ${VERSION}; release body will be empty."
+          fi
+
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: target/debian/*.deb
+          body_path: RELEASE_NOTES.md
