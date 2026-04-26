@@ -9,7 +9,7 @@
 //! # Layout
 //!
 //! - [`primitives`] — flat-namespace, schema-agnostic functions
-//!   (`contains`, `lower`, `regex_*`, `strftime`, `format`, `geoip`,
+//!   (`contains`, `lower`, `regex_*`, `strftime`, `geoip`,
 //!   `table_*`, `md5`/`sha1`/`sha256`, `to_json`, `to_int`, `find_by`,
 //!   `csv_parse`, `len`, `append`, `prepend`). One file per function
 //!   (or per tightly-related group such as `hashes.rs`) so `mod.rs`
@@ -392,6 +392,14 @@ mod tests {
         )
     }
 
+    fn ts(s: &str) -> Value {
+        Value::Timestamp(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        )
+    }
+
     #[test]
     fn strftime_formats_rfc3339_input() {
         let reg = make_registry();
@@ -401,7 +409,7 @@ mod tests {
                 None,
                 "strftime",
                 &[
-                    Value::String("2026-04-19T10:30:45+00:00".into()),
+                    ts("2026-04-19T10:30:45+00:00"),
                     Value::String("%Y/%m/%d %H:%M:%S".into()),
                 ],
                 &e,
@@ -420,7 +428,7 @@ mod tests {
                 None,
                 "strftime",
                 &[
-                    Value::String("2026-04-19T05:07:09+00:00".into()),
+                    ts("2026-04-19T05:07:09+00:00"),
                     Value::String("%b %e %H:%M:%S".into()),
                 ],
                 &e,
@@ -439,7 +447,7 @@ mod tests {
                 None,
                 "strftime",
                 &[
-                    Value::String("2026-04-19T10:30:45+09:00".into()),
+                    ts("2026-04-19T10:30:45+09:00"),
                     Value::String("%Y-%m-%dT%H:%M:%S%z".into()),
                     Value::String("UTC".into()),
                 ],
@@ -458,7 +466,7 @@ mod tests {
                 None,
                 "strftime",
                 &[
-                    Value::String("2026-04-19T10:30:45+00:00".into()),
+                    ts("2026-04-19T10:30:45+00:00"),
                     Value::String("%H:%M".into()),
                     Value::String("+09:00".into()),
                 ],
@@ -469,7 +477,9 @@ mod tests {
     }
 
     #[test]
-    fn strftime_rejects_invalid_rfc3339() {
+    fn strftime_rejects_string_input() {
+        // Post-Value::Timestamp: strftime no longer parses RFC3339 from
+        // string; it requires a typed timestamp value.
         let reg = make_registry();
         let e = dummy_event();
         let err = reg
@@ -477,13 +487,17 @@ mod tests {
                 None,
                 "strftime",
                 &[
-                    Value::String("not-a-timestamp".into()),
+                    Value::String("2026-04-19T10:30:45+00:00".into()),
                     Value::String("%Y".into()),
                 ],
                 &e,
             )
             .unwrap_err();
-        assert!(err.to_string().contains("invalid RFC3339"));
+        assert!(
+            err.to_string().contains("must be a timestamp"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
@@ -495,7 +509,7 @@ mod tests {
                 None,
                 "strftime",
                 &[
-                    Value::String("2026-04-19T10:30:45+00:00".into()),
+                    ts("2026-04-19T10:30:45+00:00"),
                     Value::String("%Y".into()),
                     Value::String("bogus".into()),
                 ],
@@ -513,7 +527,7 @@ mod tests {
             .call(
                 None,
                 "strftime",
-                &[Value::String("2026-04-19T10:30:45+00:00".into())],
+                &[ts("2026-04-19T10:30:45+00:00")],
                 &e,
             )
             .unwrap_err();
@@ -599,24 +613,24 @@ mod tests {
         // `strftime(value, fmt[, tz])` — Optional { required: 2 }, max 3.
         let reg = make_registry();
         let e = dummy_event();
-        let ts = Value::String("2026-04-19T10:30:45+00:00".into());
+        let tsv = ts("2026-04-19T10:30:45+00:00");
         let fmt = Value::String("%H:%M".into());
         let tz = Value::String("UTC".into());
         // at minimum
-        assert!(reg.call(None, "strftime", &[ts.clone(), fmt.clone()], &e).is_ok());
+        assert!(reg.call(None, "strftime", &[tsv.clone(), fmt.clone()], &e).is_ok());
         // at maximum
-        assert!(reg.call(None, "strftime", &[ts, fmt, tz], &e).is_ok());
+        assert!(reg.call(None, "strftime", &[tsv, fmt, tz], &e).is_ok());
     }
 
     #[test]
     fn arity_optional_rejects_below_min_and_above_max() {
         let reg = make_registry();
         let e = dummy_event();
-        let ts = Value::String("2026-04-19T10:30:45+00:00".into());
+        let tsv = ts("2026-04-19T10:30:45+00:00");
         let fmt = Value::String("%H:%M".into());
         let tz = Value::String("UTC".into());
         let err_below = reg
-            .call(None, "strftime", &[ts.clone()], &e)
+            .call(None, "strftime", &[tsv.clone()], &e)
             .unwrap_err()
             .to_string();
         assert!(
@@ -627,7 +641,7 @@ mod tests {
             .call(
                 None,
                 "strftime",
-                &[ts, fmt, tz.clone(), tz],
+                &[tsv, fmt, tz.clone(), tz],
                 &e,
             )
             .unwrap_err()
@@ -657,67 +671,6 @@ mod tests {
         assert!(
             err.contains("syslog.strip_pri() expects 1 argument, got 2"),
             "unexpected error: {err}"
-        );
-    }
-
-    // ---- format() ---------------------------------------------------------
-
-    #[test]
-    fn format_expands_event_level_placeholders() {
-        let reg = make_registry();
-        let e = dummy_event();
-        let result = reg
-            .call(
-                None,
-                "format",
-                &[Value::String("[%{source}] %{egress}".into())],
-                &e,
-            )
-            .unwrap();
-        // egress defaults to the raw bytes ("test") in dummy_event
-        let s = result.as_str().unwrap().to_string();
-        assert!(s.ends_with("] test"));
-        assert!(s.starts_with("["));
-    }
-
-    #[test]
-    fn format_expands_explicit_workspace_placeholder() {
-        let reg = make_registry();
-        let mut e = dummy_event();
-        e.workspace
-            .insert("host".into(), Value::String("web01".into()));
-        let result = reg
-            .call(
-                None,
-                "format",
-                &[Value::String("host=%{workspace.host}".into())],
-                &e,
-            )
-            .unwrap();
-        assert_eq!(result, Value::String("host=web01".into()));
-    }
-
-    #[test]
-    fn format_rejects_bare_shorthand() {
-        // `%{pid}` used to silently fall back to workspace.pid. Now it
-        // must be an error so typos don't become empty strings.
-        let reg = make_registry();
-        let mut e = dummy_event();
-        e.workspace
-            .insert("pid".into(), Value::String("42".into()));
-        let err = reg
-            .call(None, "format", &[Value::String("pid=%{pid}".into())], &e)
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("unknown placeholder"),
-            "unexpected error: {}",
-            msg
-        );
-        assert!(
-            msg.contains("workspace.pid"),
-            "error should suggest `workspace.pid`, got: {}",
-            msg
         );
     }
 
@@ -808,18 +761,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn format_error_suggests_explicit_form_for_typos() {
-        let reg = make_registry();
-        let e = dummy_event();
-        let err = reg
-            .call(
-                None,
-                "format",
-                &[Value::String("x=%{nope_not_a_thing}".into())],
-                &e,
-            )
-            .unwrap_err();
-        assert!(err.to_string().contains("workspace.nope_not_a_thing"));
-    }
 }

@@ -39,7 +39,7 @@ fn measure(v: &Value) -> Value {
         Value::String(s) => Value::Int(s.chars().count() as i64),
         Value::Bytes(b) => Value::Int(b.len() as i64),
         Value::Object(m) => Value::Int(m.len() as i64),
-        Value::Bool(_) | Value::Int(_) | Value::Float(_) => Value::Null,
+        Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Timestamp(_) => Value::Null,
     }
 }
 

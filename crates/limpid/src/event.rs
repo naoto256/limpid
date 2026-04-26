@@ -48,10 +48,12 @@ impl Event {
     /// string. Workspace values flow through the same boundary.
     pub fn to_json_value(&self) -> JsonValue {
         let mut map = serde_json::Map::new();
-        map.insert(
-            "received_at".into(),
-            JsonValue::String(self.received_at.to_rfc3339()),
-        );
+        // Wire form is unix nanoseconds (i64) — matches OTLP
+        // `time_unix_nano` and is lossless against RFC3339. Receivers
+        // (`inject --json`, downstream tooling) parse the integer back
+        // into a `Value::Timestamp`.
+        let nanos = self.received_at.timestamp_nanos_opt().unwrap_or(0);
+        map.insert("received_at".into(), JsonValue::Number(nanos.into()));
         map.insert("source".into(), JsonValue::String(self.source.to_string()));
         map.insert("ingress".into(), bytes_to_json(&self.ingress));
         map.insert("egress".into(), bytes_to_json(&self.egress));
@@ -85,11 +87,12 @@ impl Event {
         let ingress = json_to_bytes(v.get("ingress")?)?;
         let source_str = v.get("source")?.as_str()?;
         let source: SocketAddr = source_str.parse().ok()?;
+        // i64 unix nanoseconds — the wire form documented in `to_json_value`.
+        // Pre-0.5 RFC3339 captures need to be migrated before replay.
         let received_at = v
             .get("received_at")
-            .and_then(|v| v.as_str())
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&Utc))?;
+            .and_then(|v| v.as_i64())
+            .map(chrono::DateTime::<Utc>::from_timestamp_nanos)?;
         let egress = v
             .get("egress")
             .and_then(json_to_bytes)

@@ -54,6 +54,10 @@ fn coerce(v: &Value) -> Result<Value> {
         // Per Bytes design §17: bytes have no standard numeric
         // interpretation. User must convert explicitly via to_string().
         Value::Bytes(_) => bail!("to_int() does not accept bytes (use to_string() first)"),
+        // Timestamps are nanos under the hood (matches OTLP); coerce to
+        // i64 unix nanoseconds so `to_int(received_at)` is the natural
+        // way to get a numeric epoch value.
+        Value::Timestamp(dt) => Value::Int(dt.timestamp_nanos_opt().unwrap_or(0)),
         Value::Array(_) | Value::Object(_) => Value::Null,
     })
 }

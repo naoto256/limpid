@@ -29,6 +29,7 @@
 //! Bytes); it is strictly an internal envelope.
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
 
 /// Map type backing `Value::Object`. Insertion order is preserved so
@@ -51,6 +52,12 @@ pub enum Value {
     Float(f64),
     String(String),
     Bytes(Bytes),
+    /// Wall-clock instant, normalised to UTC. Internally an epoch
+    /// position; no per-value offset metadata. Source-claimed timezone
+    /// information from `strptime` input is used to *decode* the wall
+    /// time correctly but is not stored. Render in a non-UTC offset by
+    /// passing the explicit `timezone` argument to `strftime`.
+    Timestamp(DateTime<Utc>),
     Array(Vec<Value>),
     Object(Map),
 }
@@ -90,6 +97,7 @@ impl PartialEq for Value {
             }
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Bytes(a), Value::Bytes(b)) => a == b,
+            (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
             (Value::Array(a), Value::Array(b)) => a == b,
             (Value::Object(a), Value::Object(b)) => {
                 a.len() == b.len() && a.iter().all(|(k, v)| b.get(k) == Some(v))
@@ -115,6 +123,7 @@ impl std::fmt::Display for Value {
             Value::Float(n) => write!(f, "{n}"),
             Value::String(s) => write!(f, "{s}"),
             Value::Bytes(b) => write!(f, "<bytes len={}>", b.len()),
+            Value::Timestamp(dt) => write!(f, "{}", dt.to_rfc3339()),
             Value::Array(a) => {
                 write!(f, "[")?;
                 for (i, item) in a.iter().enumerate() {
@@ -176,6 +185,10 @@ impl Value {
         matches!(self, Value::Bytes(_))
     }
 
+    pub fn is_timestamp(&self) -> bool {
+        matches!(self, Value::Timestamp(_))
+    }
+
     pub fn is_array(&self) -> bool {
         matches!(self, Value::Array(_))
     }
@@ -195,6 +208,7 @@ impl Value {
             Value::Float(n) => *n != 0.0 && !n.is_nan(),
             Value::String(s) => !s.is_empty(),
             Value::Bytes(b) => !b.is_empty(),
+            Value::Timestamp(_) => true,
             Value::Array(a) => !a.is_empty(),
             Value::Object(m) => !m.is_empty(),
         }
@@ -246,6 +260,14 @@ impl Value {
     pub fn as_bytes(&self) -> Option<&Bytes> {
         if let Value::Bytes(b) = self {
             Some(b)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_timestamp(&self) -> Option<&DateTime<Utc>> {
+        if let Value::Timestamp(dt) = self {
+            Some(dt)
         } else {
             None
         }
@@ -303,6 +325,7 @@ impl Value {
             Value::Float(_) => "float",
             Value::String(_) => "string",
             Value::Bytes(_) => "bytes",
+            Value::Timestamp(_) => "timestamp",
             Value::Array(_) => "array",
             Value::Object(_) => "object",
         }
@@ -374,6 +397,18 @@ impl From<String> for Value {
 impl From<Bytes> for Value {
     fn from(b: Bytes) -> Self {
         Value::Bytes(b)
+    }
+}
+
+impl From<DateTime<Utc>> for Value {
+    fn from(dt: DateTime<Utc>) -> Self {
+        Value::Timestamp(dt)
+    }
+}
+
+impl From<chrono::DateTime<chrono::FixedOffset>> for Value {
+    fn from(dt: chrono::DateTime<chrono::FixedOffset>) -> Self {
+        Value::Timestamp(dt.with_timezone(&Utc))
     }
 }
 
