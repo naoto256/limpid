@@ -1,14 +1,26 @@
 # Routing
 
-Pipelines support conditional routing with `if/else` and `switch` statements.
+Pipelines route events to outputs by sequencing `output`, `process`, `if`, `switch`, `drop`, and `finish` statements. The syntactic forms of `if` / `switch` / `drop` / `finish` are documented in [DSL Syntax Basics → Control flow](../dsl-syntax.md#control-flow); this page covers what they *do* inside a pipeline.
 
-## if / else if / else
+## What flows through a pipeline
+
+A pipeline body executes top-to-bottom for each event arriving on `input`. Statements have these effects:
+
+- **`process <name>`** (or inline `process { ... }`) — runs the named process body against the event, possibly mutating `workspace` / `egress`.
+- **`output <name>`** — hands a deep-copy of the event to the named output's queue. **Non-terminal**: execution continues to the next statement, so the same event can flow into multiple outputs in order.
+- **`if` / `switch`** — branches that conditionally execute the statements inside.
+- **`drop`** — terminates routing for this event. Subsequent `output` / `process` statements do not run, and the event is counted as `events_dropped`.
+- **`finish`** — terminates routing for this event without dropping. Subsequent statements do not run, but the event is counted as `events_finished` rather than dropped — use it when "we're done with this one, no error" rather than "we don't want this one".
+
+## Examples
+
+### Branch on workspace value
 
 ```
 def pipeline main {
     input syslog
 
-    process { let pri = syslog.extract_pri(ingress)  workspace.severity = pri % 8 }
+    process parse_severity   // sets workspace.severity
     if workspace.severity <= 3 {
         output alert
     }
@@ -16,9 +28,9 @@ def pipeline main {
 }
 ```
 
-## switch
+The `output alert` runs only when severity ≤ 3; `output siem` always runs (no `drop` / `finish` in the `if` body).
 
-Route events based on a value:
+### Switch on source
 
 ```
 def pipeline archive {
@@ -26,64 +38,39 @@ def pipeline archive {
     process { egress = syslog.strip_pri(egress) }
 
     switch source {
-        "192.0.2.1" {
-            output fw01
-        }
-        "192.0.2.2" {
-            output fw02
-        }
+        "192.0.2.1" { output fw01 }
+        "192.0.2.2" { output fw02 }
         "192.0.2.3" {
-            if contains(ingress, "type=\"traffic\"") {
-                drop
-            }
+            if contains(ingress, "type=\"traffic\"") { drop }
             process { egress = source + " " + strftime(received_at, "%b %e %H:%M:%S") + " " + egress }
             output fw03
         }
-        default {
-            drop
-        }
+        default { drop }
     }
 }
 ```
 
-## Multi-output
-
-Since `output` is non-terminal, you can send to multiple destinations:
+### Multi-output (non-terminal `output`)
 
 ```
 def pipeline main {
     input syslog
 
-    // Archive raw log first
+    // Archive raw bytes first
     output archive
 
-    // Parse and enrich
+    // Parse and rewrite egress
     process {
-        cef.parse(ingress)
-        workspace.geo = geoip(workspace.src)
-        egress = to_json()
+        workspace.cef = cef.parse(workspace.syslog.msg)
+        workspace.geo = geoip(workspace.cef.src)
+        egress = to_json(workspace)
     }
 
-    // Send enriched version to SIEM
+    // Send the enriched JSON downstream
     output siem
 }
 ```
 
-The archive receives the raw bytes, the SIEM receives the enriched JSON — from the same pipeline.
+The `output archive` receives the original wire bytes; `output siem` receives the rewritten JSON. Each output sees the event at the moment its statement ran — modifications after a deep-copy boundary do not affect earlier branches.
 
-## Combining filtering and routing
-
-```
-def pipeline ama_forward {
-    input ama_tcp
-
-    // Filter noise first
-    process filter_chargen | filter_fortinet_traffic
-
-    // Rewrite and forward
-    process ama_rewrite
-    output ama
-}
-```
-
-Filters at the top of the pipeline drop unwanted events before they reach any output.
+For longer end-to-end recipes (firewall archival with source-based routing, AMA forwarding with disk queue, SIEM ingest with enrichment, FortiGate KV reformatting), see [Examples](./examples.md).

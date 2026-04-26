@@ -40,7 +40,7 @@ The `key` property determines which event field is used as the Kafka partition k
 | Value | Key source |
 |-------|------------|
 | `source` | Source IP address |
-| any other identifier | Named workspace value (must be a string) — for example `workspace.cef_device_vendor` or a custom field set by an earlier process |
+| any other identifier | Named workspace value (must be a string) — for example `workspace.cef.device_vendor` or a custom field set by an earlier process |
 
 If the specified field is missing or null, the event is sent without a key (round-robin across partitions).
 

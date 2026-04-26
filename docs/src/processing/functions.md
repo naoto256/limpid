@@ -13,58 +13,73 @@ The judgement rule for whether a function is namespaced is a single question: do
 
 ### Bare statements vs assignments
 
-A function call can appear as a bare statement inside a process body:
+A parser function returns a `Value::Object` whose keys are taken from the parse — `hostname`, `appname`, `msg` for `syslog.parse`; `version`, `name`, `severity`, plus CEF extension keys (`src`, `dst`, `act`, …) for `cef.parse`; whatever the source JSON contains for `parse_json`. There are two ways to consume that object inside a process body.
+
+**Bare statement** — the returned object's top-level keys are merged directly into `workspace`:
 
 ```
-def process parse_fw {
-    syslog.parse(ingress)        // bare statement: object return → merged into workspace
-    cef.parse(ingress)           // same: extension keys flow into workspace
+def process parse_fw_flat {
+    syslog.parse(ingress)        // workspace.hostname, workspace.msg, ...
 }
 ```
 
-When the function returns an object, the object's top-level keys are inserted into `workspace`. When it returns `null` (e.g. `table_upsert(...)`), the bare statement is silently accepted. Any other return type as a bare statement is an error — it almost always means a value was discarded by mistake.
-
-To capture a returned value into a specific location, assign it explicitly:
+**Capture into a path** — the object lands as a single value at the assigned path:
 
 ```
-workspace.parsed = syslog.parse(ingress)         // single object under workspace.parsed
-let pri          = syslog.extract_pri(egress)    // process-local scratch
-egress           = syslog.strip_pri(egress)      // overwrite egress
-egress           = syslog.set_pri(egress, 16, 6) // rewrite the PRI byte
+def process parse_fw_namespaced {
+    workspace.syslog = syslog.parse(ingress)   // workspace.syslog.hostname, workspace.syslog.msg, ...
+    workspace.cef    = cef.parse(ingress)      // workspace.cef.version, workspace.cef.src, ...
+}
 ```
 
-### Workspace key naming convention
+> **Recommendation: always capture into a namespace.** The bare form is supported, but two parsers that emit overlapping key names (e.g. `syslog.parse` and `cef.parse` both producing a `version` field, or `parse_json` of an OCSF event clobbering `syslog.parse` output) will silently overwrite each other when merged flat into `workspace`. Capturing into `workspace.syslog` / `workspace.cef` / `workspace.ocsf` keeps each parser's output isolated and makes downstream references (`workspace.syslog.msg`, not `workspace.msg`) self-describing. Bare is fine for one-off scripts and tests; production processes should namespace.
 
-Schema parsers emit fields under a `<schema>_` prefix so a workspace dump stays self-describing even when several schemas have populated the same event:
+When a function returns `null` (e.g. `table_upsert(...)`), the bare statement is silently accepted. Any other return type as a bare statement is an error — it almost always means a value was discarded by mistake.
 
-| Function | Workspace keys produced |
-|----------|-------------------------|
-| `syslog.parse` | `syslog_hostname`, `syslog_appname`, `syslog_procid`, `syslog_msgid`, `syslog_msg` |
-| `cef.parse` | `cef_version`, `cef_device_vendor`, `cef_device_product`, `cef_device_version`, `cef_signature_id`, `cef_name`, `cef_severity` (plus CEF extension keys like `src`, `dst`, `act` copied verbatim — those names are part of the CEF spec) |
+Other assignment targets:
 
-Format primitives (`parse_json`, `parse_kv`) emit the keys exactly as they appear in the source — JSON / KV is a format, not a schema, so there is no convention name to prefix with.
+```
+let pri = syslog.extract_pri(egress)    // process-local scratch (scalar only)
+egress  = syslog.strip_pri(egress)      // overwrite egress
+egress  = syslog.set_pri(egress, 16, 6) // rewrite the PRI byte
+```
+
+## Reference
+
+The remaining sections describe each function — its signature, what it returns, and how to use it. Schema parsers (`syslog.parse`, `cef.parse`) and format primitives (`parse_json`, `parse_kv`) all return un-prefixed keys; namespacing is the operator's job, via `workspace.<name> = parser(...)`.
 
 ## syslog.* — RFC 3164 / RFC 5424
 
 ### syslog.parse(text[, defaults])
 
-Parses an RFC 3164 (BSD) or RFC 5424 (versioned) syslog header. Auto-detects the version by looking for a single digit followed by a space after `<PRI>`.
+Parses an RFC 3164 (BSD) or RFC 5424 (versioned) syslog header. Auto-detects the version by looking for a single digit followed by a space after `<PRI>`. Errors when no valid `<PRI>` header is present (1–3 ASCII digits, value 0–191, framed by `<` and `>` at the start of the input).
 
 ```
-syslog.parse(ingress)              // bare: merge fields into workspace
-workspace.s = syslog.parse(ingress) // capture object under workspace.s
+workspace.syslog = syslog.parse(ingress)   // recommended: capture under a namespace
+syslog.parse(ingress)                       // bare merge into workspace top-level (collision-prone)
 ```
 
-Returns a `Value::Object` with `syslog_hostname`, `syslog_appname`, `syslog_procid`, `syslog_msgid`, `syslog_msg` (each present only when the wire format provides a non-empty, non-`-` value).
+Returns a `Value::Object`:
+
+| key         | type   | meaning                                       |
+|-------------|--------|-----------------------------------------------|
+| `pri`       | Int    | raw `<PRI>` value (0..=191)                   |
+| `facility`  | Int    | `pri / 8` (0..=23)                            |
+| `severity`  | Int    | `pri % 8` (0..=7)                             |
+| `timestamp` | String | source-claimed event time (5424 / 3164 token) |
+| `hostname`  | String | originating host                              |
+| `appname`   | String | app-name (5424) / tag (3164)                  |
+| `procid`    | String | process id (when present)                     |
+| `msgid`     | String | message id (5424 only)                        |
+| `msg`       | String | body after header                             |
+
+`pri` / `facility` / `severity` are always present. String fields appear only when the wire format provides a non-empty, non-`-` value.
 
 The optional `defaults` argument is a hash literal whose keys fill in any field missing from the parse — handy for asserting an expected shape inline.
 
-This function does **not** rewrite `egress`. To replace the wire payload with the parsed MSG body, do it explicitly:
+This function does **not** rewrite `egress` — it only populates the workspace. The wire payload is whatever the next hop expects to receive, which is almost always still a syslog line; rewrites to `egress` are usually surgical (e.g. `syslog.set_pri(egress, 16, 6)` to renormalise the PRI byte), not wholesale replacements.
 
-```
-syslog.parse(ingress)
-egress = workspace.syslog_msg
-```
+If you only need the PRI value (e.g. to route on severity without tokenising the rest of the header), reach for the lighter [`syslog.extract_pri`](#syslog-extract_pri-text) instead.
 
 ### syslog.strip_pri(text)
 
@@ -81,8 +96,6 @@ Writes or rewrites the leading `<PRI>` header. `facility` must be 0-23, `severit
 ```
 egress = syslog.set_pri(egress, 16, 6)   // local0.info
 ```
-
-This function is the explicit replacement for the old `facility = N` / `severity = N` magic assignments. With facility / severity removed from the Event core, PRI is now a pure byte operation against `egress`.
 
 ### syslog.extract_pri(text)
 
@@ -103,11 +116,44 @@ let facility = pri / 8
 let severity = pri % 8
 ```
 
+## cef.* — ArcSight Common Event Format
+
+### cef.parse(text[, defaults])
+
+Parses CEF. The input must start with `CEF:` — syslog wrapper handling is the caller's responsibility, not the CEF parser's. The canonical pattern for CEF over syslog:
+
+```
+workspace.syslog = syslog.parse(ingress)
+workspace.cef    = cef.parse(workspace.syslog.msg)
+```
+
+When CEF arrives on transports without a syslog wrapper (HTTP body, file, …), call directly:
+
+```
+workspace.cef = cef.parse(ingress)
+```
+
+Returns a `Value::Object` with these header keys:
+
+| key              | type           | meaning                  |
+|------------------|----------------|--------------------------|
+| `version`        | String         | CEF version (usually `0`) |
+| `device_vendor`  | String         | device vendor            |
+| `device_product` | String         | device product           |
+| `device_version` | String         | device version           |
+| `signature_id`   | String         | vendor-specific event id |
+| `name`           | String         | human-readable event name |
+| `severity`       | Int \| String  | vendor severity (0–10), or the raw string when the producer sent garbage |
+
+Extension `key=value` pairs from the CEF tail (e.g. `src=10.0.0.1 dst=192.168.1.1 act=block`) are emitted alongside the header keys, under the names defined by the CEF spec (`src`, `dst`, `act`, …) — those names are part of CEF, not a limpid convention.
+
+The optional `defaults` argument behaves the same as in `syslog.parse`.
+
 ## otlp.* — OpenTelemetry Protocol (logs signal)
 
 Mechanical wire-format encode / decode for the OTLP logs signal,
 operating on a singleton `ResourceLogs` (1 Resource + 1 Scope + 1
-LogRecord) — the v0.5.0 hop contract for OTLP. Composers and
+LogRecord) — limpid's hop contract for OTLP. Composers and
 semantic mappings live in DSL snippets, not in Rust (per the *Domain
 knowledge in DSL* operating rule);
 these primitives are just the proto3 ↔ HashLit bridge.
@@ -198,29 +244,26 @@ The four slots within each level (`*2/*3/*4`) are for bridging
 finer-grained external systems (Windows Event etc.). limpid snippets
 typically only emit the canonical level value.
 
-## cef.* — ArcSight Common Event Format
-
-### cef.parse(text[, defaults])
-
-Parses CEF. The header is located by searching for `CEF:` anywhere in the input, so an optional syslog wrapper is tolerated.
-
-```
-cef.parse(ingress)                 // bare: merge cef_* and extension keys into workspace
-```
-
-Header keys: `cef_version`, `cef_device_vendor`, `cef_device_product`, `cef_device_version`, `cef_signature_id`, `cef_name`, `cef_severity`. Extension `key=value` pairs (e.g. `src=10.0.0.1 dst=192.168.1.1 act=block`) are emitted under the keys named by the CEF spec — they are not prefixed because CEF defines those names.
-
-The optional `defaults` argument behaves the same as in `syslog.parse`.
-
 ## String functions
 
 ### contains(haystack, needle)
 
-Returns `true` if `haystack` contains `needle`.
+Returns `true` if `haystack` contains `needle` anywhere.
 
 ```
-if contains(ingress, "CEF:") {
-    cef.parse(ingress)
+if contains(workspace.syslog.msg, "Failed password") {
+    output alerts
+}
+```
+
+### starts_with(haystack, needle) / ends_with(haystack, needle)
+
+Returns `true` if `haystack` starts (resp. ends) with `needle`. Use these when the position matters — for example, dispatching to the right parser based on the leading bytes:
+
+```
+workspace.syslog = syslog.parse(ingress)
+if starts_with(workspace.syslog.msg, "CEF:") {
+    workspace.cef = cef.parse(workspace.syslog.msg)
 }
 ```
 
@@ -229,7 +272,7 @@ if contains(ingress, "CEF:") {
 Returns the string in lowercase or uppercase.
 
 ```
-workspace.syslog_hostname = lower(workspace.syslog_hostname)
+workspace.syslog.hostname = lower(workspace.syslog.hostname)
 ```
 
 ### regex_match(str, pattern)
@@ -260,12 +303,13 @@ Capture names containing `.` build a nested object, so `(?P<date.month>...)` pop
 // Bare-statement merge: parse a FortiGate-style header into workspace.
 regex_parse(ingress, "^(?P<date>\\S+) (?P<time>\\S+) (?P<host>\\S+) (?P<prog>\\w+):")
 
-// Dotted names build nested objects.
+// Dotted names in the regex build nested objects on a bare merge.
 regex_parse(ingress, "(?P<date.month>\\w{3}) (?P<date.day>\\d+)")
 // → workspace.date.month, workspace.date.day
 
-// Or capture explicitly.
-workspace.parts = regex_parse(egress, "(?P<head>\\S+)\\s+(?P<tail>.*)")
+// Same result via capture (recommended — namespacing is explicit).
+workspace.date = regex_parse(ingress, "(?P<month>\\w{3}) (?P<day>\\d+)")
+// → workspace.date.month, workspace.date.day
 ```
 
 Returns:
@@ -289,24 +333,6 @@ egress = regex_replace(egress, "\\d{16}", "REDACTED")
 
 Regex patterns are cached per thread for performance.
 
-### format(template)
-
-Expands `%{...}` placeholders against the current event. Kept for backward compatibility and for callers who want an event-wide template in one argument; new code should prefer the [`${expr}` interpolation](./templates.md) that any string literal supports.
-
-```
-egress = format("%{workspace.syslog_hostname} %{workspace.syslog_appname}[%{workspace.syslog_procid}]: %{workspace.syslog_msg}")
-```
-
-Available placeholders:
-
-| Placeholder | Source |
-|-------------|--------|
-| `%{source}`, `%{received_at}` | Event metadata |
-| `%{egress}`, `%{ingress}` | Event byte buffers |
-| `%{workspace.xxx}` | Named workspace value (nested: `%{workspace.geo.country}`) |
-
-> **Note:** Workspace values must be referenced with the explicit `%{workspace.xxx}` form. A bare `%{xxx}` that isn't one of the event-level names above is an error — this avoids typos silently rendering as empty strings, and keeps the `%{}` resolution rules independent of any in-scope [`let`](./user-defined.md) bindings.
-
 ## Format parsers
 
 JSON and KV are *formats*, not schemas — they describe how bytes are arranged, not what fields mean. They live in the flat namespace.
@@ -316,21 +342,33 @@ JSON and KV are *formats*, not schemas — they describe how bytes are arranged,
 Parses `text` as JSON and returns the top-level object. Non-object JSON (arrays, scalars) is wrapped under the `_json` key so the return is always an object.
 
 ```
-parse_json(egress)                       // bare: merge top-level keys into workspace
-workspace.body = parse_json(egress)      // or capture under one workspace key
+workspace.body = parse_json(egress)      // recommended: capture under a namespace
+parse_json(egress)                       // bare merge top-level keys into workspace (collision-prone)
 ```
 
-### parse_kv(text)
+The returned object's keys are whatever the source JSON contains at the top level — limpid does not transform or filter them.
+
+### parse_kv(text[, separator][, defaults])
 
 Parses `key=value` pairs (handling quoted values). Tokens without `=` are skipped.
 
 ```
-parse_kv(egress)
+workspace.kv = parse_kv(egress)          // recommended: capture under a namespace
+parse_kv(egress)                          // bare merge into workspace
 // egress = `date=2026-04-15 srcip=10.0.0.1 action=deny msg="login failed"`
-// → workspace.date, workspace.srcip, workspace.action, workspace.msg
+// → workspace.kv.date, workspace.kv.srcip, workspace.kv.action, workspace.kv.msg
 ```
 
-Useful for FortiGate, Palo Alto, and similar firewall log formats.
+`separator` is a single ASCII byte (default `' '`). Comma-separated payloads (Cisco ASA, Microsoft Defender, OEM telemetry) pass an explicit separator:
+
+```
+workspace.kv = parse_kv(workspace.syslog.msg, ",")
+// "a=1,b=2,c=\"three,four\"" → {a: "1", b: "2", c: "three,four"}
+```
+
+The optional `defaults` hash literal fills missing keys (same shape as `parse_json` defaults). It can be the second argument when separator is the default space, or the third after an explicit separator.
+
+The returned object's keys come from the parsed input as-is. Useful for FortiGate, Palo Alto, and similar firewall log formats.
 
 ### csv_parse(text, field_names)
 
@@ -352,11 +390,15 @@ csv_parse(egress, ["future1", "receive_time", "serial", "log_type",
 
 Used as a bare statement, the returned object merges into `workspace` like other format parsers.
 
-## Timestamp formatting
+## Timestamps
 
-### strftime(value, format[, timezone])
+Timestamps are a first-class DSL value type (`Value::Timestamp`). `received_at`, `timestamp()`, and `strptime` all return one; `strftime` accepts one. String coercion (e.g. `${received_at}`) renders RFC3339; `to_int(timestamp)` returns unix nanoseconds (matching OTLP `time_unix_nano`); `tap --json` serialises timestamps as integer unix nanoseconds.
 
-Formats an RFC 3339 timestamp (such as the event's `received_at` field) according to a [`chrono` strftime](https://docs.rs/chrono/latest/chrono/format/strftime/) format string.
+Timestamps and strings are distinct types. `contains(received_at, "2026")` is a type error — to inspect the wire form, format it explicitly: `contains(strftime(received_at, "%Y", "UTC"), "2026")`.
+
+### strftime(timestamp, format[, timezone])
+
+Formats a `Value::Timestamp` (such as `received_at`) according to a [`chrono` strftime](https://docs.rs/chrono/latest/chrono/format/strftime/) format string.
 
 ```
 strftime(received_at, "%Y-%m-%d")          // 2026-04-19
@@ -368,11 +410,40 @@ strftime(received_at, "%H:%M", "+09:00")   // fixed offset
 
 | Argument | Description |
 |----------|-------------|
-| `value` | RFC 3339 string (e.g. `"2026-04-19T10:30:45+00:00"`). `received_at` always parses. |
+| `timestamp` | a `Value::Timestamp` (from `received_at`, `timestamp()`, or `strptime`). Passing a string is a type error. |
 | `format` | `chrono` strftime format. |
-| `timezone` *(optional)* | `"local"`, `"UTC"` (case-insensitive), or `±HH:MM` / `±HHMM`. If omitted, `value`'s own offset is used. |
+| `timezone` *(optional)* | `"local"`, `"UTC"` (case-insensitive), or `±HH:MM` / `±HHMM`. If omitted, the timestamp's own offset is used. |
 
-Both an invalid RFC 3339 input and an invalid timezone specifier are errors — `strftime` never silently returns an empty string.
+An invalid timezone specifier is a loud error — `strftime` never silently returns an empty string.
+
+### strptime(value, format[, timezone])
+
+Inverse of `strftime`. Parses an arbitrary timestamp string with a `strftime`-style format and returns a `Value::Timestamp`.
+
+```
+workspace.event_time = strptime(workspace.kv.date, "%Y-%m-%d %H:%M:%S", "UTC")
+strptime("2026-04-15T10:30:00+09:00", "%Y-%m-%dT%H:%M:%S%:z")  // tz in format → no third arg
+strptime("2026-04-15 10:30:00", "%Y-%m-%d %H:%M:%S", "local")  // naive + local
+```
+
+| Argument | Description |
+|----------|-------------|
+| `value` | timestamp string |
+| `format` | `chrono` strftime format |
+| `timezone` *(required when format produces a naive datetime)* | `"local"`, `"UTC"`, or `±HH:MM` / `±HHMM` |
+
+If the format includes an offset specifier (`%z`, `%:z`, `%#z`), the third argument is rejected as conflicting. If the format produces a naive datetime, the third argument is required — limpid never silently assumes UTC.
+
+### timestamp()
+
+Returns the current wall-clock instant as a `Value::Timestamp` (UTC). Matches the type of `received_at` and the input shape `strftime` / `strptime` expect.
+
+```
+workspace.processed_at = timestamp()
+egress = "${strftime(timestamp(), \"%Y-%m-%dT%H:%M:%S%:z\", \"local\")} ${egress}"
+```
+
+Resolved at every call (no caching) — successive calls within the same process body see successive instants.
 
 ## Hash functions
 
@@ -439,7 +510,7 @@ Text-only primitives (`upper`, `regex_*`, `format`, `to_int`,
 Coerces a value to a 64-bit signed integer. Returns `null` on unparseable input, matching the partial-data policy of `regex_extract` and `table_lookup`.
 
 ```
-workspace.src_endpoint.port = to_int(workspace.spt)  // CEF ext: "54321" → 54321
+workspace.limpid.src_endpoint.port = to_int(workspace.cef.spt)  // CEF ext: "54321" → 54321
 ```
 
 | Input | Result |
@@ -448,6 +519,7 @@ workspace.src_endpoint.port = to_int(workspace.spt)  // CEF ext: "54321" → 543
 | `Float` | Truncated toward zero |
 | `String` | `str::parse::<i64>` after trimming whitespace; otherwise `null` |
 | `Bool` | `1` or `0` |
+| `Timestamp` | unix nanoseconds (matches OTLP `time_unix_nano`). `to_int(received_at)` is the natural epoch-ns cast. |
 | `Null` | `Null` |
 | Array / Object | `Null` |
 
@@ -475,7 +547,7 @@ Designed for event schemas that carry arrays-of-objects (MDE evidence, OCSF obse
 Return a new array with `value` added at the back (`append`) or the front (`prepend`). The input array is not mutated — callers re-bind:
 
 ```
-workspace.observables = append(workspace.observables, new_obs)
+workspace.limpid.observables = append(workspace.limpid.observables, new_obs)
 workspace.high_prio_tags = prepend(workspace.high_prio_tags, "urgent")
 ```
 
@@ -502,24 +574,26 @@ Cardinality primitive — works for every container-like type:
 | Scalars (`Int` / `Float` / `Bool`) | `Null` |
 
 ```
-workspace.n_observables = len(workspace.observables)
-workspace.msg_len = len(workspace.syslog_msg)
+workspace.n_observables = len(workspace.limpid.observables)
+workspace.msg_len = len(workspace.syslog.msg)
 ```
 
 Returning `null` on scalars (rather than `0` or an error) keeps the "not applicable" signal distinguishable from a legitimately empty collection.
 
 ## Serialization
 
-### to_json() / to_json(value)
+### to_json(value)
 
-Without arguments, serializes the entire event as JSON. With one argument, serializes that value.
+Serializes a value to a JSON string. Errors if the value (or any nested value) contains `Value::Bytes` — convert explicitly via `to_string(b)` if you mean to embed bytes as text.
 
 ```
-// Serialize entire event
-egress = to_json()
-
-// Serialize a single value
+egress = to_json(workspace)               // common: ship workspace as JSON downstream
 workspace.geo_json = to_json(geoip(workspace.src))
+egress = to_json({                         // build any shape inline
+    received_at: received_at,
+    source: source,
+    parsed: workspace.cef,
+})
 ```
 
 ## Table functions
@@ -623,6 +697,26 @@ Access nested properties with postfix property access:
 workspace.country = geoip(workspace.src).country
 ```
 
+### hostname()
+
+Returns the hostname of the machine running the limpid daemon. Resolved at every call via `gethostname(2)`.
+
+```
+workspace.forwarded_by = hostname()
+```
+
+Useful for tagging events with the forwarder's identity (e.g. when several limpid hosts feed a central collector) or populating OTLP `host.name` resource attributes.
+
+### version()
+
+Returns the limpid daemon's version string, baked in at compile time (e.g. `"0.5.0"`).
+
+```
+workspace.processed_by_version = version()
+```
+
+Useful for provenance markers and OTLP `service.version` attributes.
+
 ## Operators
 
 Expressions support the following operators:
@@ -641,7 +735,7 @@ Expressions support the following operators:
 If either operand is a string, `+` concatenates after stringifying the other side:
 
 ```
-egress = "[" + workspace.syslog_hostname + "] " + egress
+egress = "[" + workspace.syslog.hostname + "] " + egress
 egress = source + " " + egress
 ```
 

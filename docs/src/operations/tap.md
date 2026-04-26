@@ -47,7 +47,7 @@ sudo limpidctl tap input syslog | grep -E '<[0-3]>'
 
 # Structured filter via full-Event JSON (severity lives inside the egress bytes;
 # decode the leading <PRI> here, or rely on a workspace field set in your pipeline)
-sudo limpidctl tap output siem --json | jq 'select(.workspace.cef_severity != null and (.workspace.cef_severity | tonumber) <= 3)'
+sudo limpidctl tap output siem --json | jq 'select(.workspace.cef.severity != null and (.workspace.cef.severity | tonumber) <= 3)'
 ```
 
 ## Inject
@@ -120,15 +120,22 @@ The first event is sent immediately and anchors the schedule. Each subsequent ev
 
 | Situation | Behaviour |
 |---|---|
-| Event has no `received_at`, or it does not parse as RFC 3339 | Abort with an error on that event |
+| Event has no `received_at`, or it is not an integer (unix nanoseconds) | Abort with an error on that event |
 | Invalid factor (e.g. `--replay-timing=bogus`, `0x`, negative) | Abort before connecting |
 | `received_at` goes backwards between events | Log a warning to stderr, send immediately, continue. Ordering follows the input JSONL — `inject` does **not** reorder |
 | Wall clock falls behind the schedule (slow stdin, backpressure) | Catch up by sending with zero delay. A single warning is logged on stderr the first time this happens |
 
-Filtering to a time range is intentionally not a flag — use `jq` before piping:
+Filtering to a time range is intentionally not a flag — use `jq` before piping. `received_at` is an i64 unix-nanoseconds value, so compare against integers (or convert with `fromdate`):
 
 ```bash
-jq -c 'select(.received_at >= "2026-01-01T12:00:00Z" and .received_at < "2026-01-01T13:00:00Z")' \
+# Range expressed as unix-nano integer literals
+jq -c 'select(.received_at >= 1767268800000000000 and .received_at < 1767272400000000000)' \
+  replay.jsonl | limpidctl inject input fw_syslog --json --replay-timing
+
+# Same range expressed via fromdate, which jq returns as seconds (×1e9 to nanos)
+jq -c --argjson lo "$(date -u -d '2026-01-01T12:00:00Z' +%s)000000000" \
+      --argjson hi "$(date -u -d '2026-01-01T13:00:00Z' +%s)000000000" \
+   'select(.received_at >= $lo and .received_at < $hi)' \
   replay.jsonl | limpidctl inject input fw_syslog --json --replay-timing
 ```
 
