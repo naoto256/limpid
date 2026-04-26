@@ -198,6 +198,13 @@ pub enum PipelineTermination {
     Finished,
     /// Explicit `drop` statement (event filtered out)
     Dropped,
+    /// A `process` statement raised a runtime error (unknown identifier,
+    /// type mismatch, regex compile failure, …). The event is discarded
+    /// rather than forwarded with the original ingress unchanged — the
+    /// "warn and pass through" fallback that pre-0.5 used silently
+    /// turned wrap / enrichment bugs into data-shape regressions
+    /// downstream. `events_errored` counts these.
+    Errored,
 }
 
 /// Result of running an event through a pipeline.
@@ -340,6 +347,7 @@ fn exec_pipeline_stmt(
 ) -> Result<(Option<Event>, PipelineTermination)> {
     let cont = |event| Ok((Some(event), PipelineTermination::Finished));
     let dropped = || Ok((None, PipelineTermination::Dropped));
+    let errored = || Ok((None, PipelineTermination::Errored));
     let finished = || Ok((None, PipelineTermination::Finished));
 
     match stmt {
@@ -355,7 +363,6 @@ fn exec_pipeline_stmt(
                             .map(|a| eval_expr(a, &current, funcs))
                             .collect::<Result<Vec<_>>>()?;
 
-                        let backup = current.clone();
                         match registry.call(name, &evaluated_args, current) {
                             Ok(Some(e)) => {
                                 trace.push(TraceEntry {
@@ -387,22 +394,22 @@ fn exec_pipeline_stmt(
                             }
                             Err(e) => {
                                 tracing::warn!(
-                                    "process '{}': {} — event passed through unchanged",
+                                    "process '{}': {} — event discarded",
                                     name,
                                     e
                                 );
                                 trace.push(TraceEntry {
                                     stage: "process".into(),
                                     label: name.clone(),
-                                    detail: format!("error: {} (ignored)", e),
+                                    detail: format!("error: {} (event discarded)", e),
                                 });
-                                current = backup;
+                                return errored();
                             }
                         }
                     }
                     ProcessChainElement::Inline(body) => {
-                        match exec_process_body(body, current, registry, funcs)? {
-                            ExecResult::Continue(e) => {
+                        match exec_process_body(body, current, registry, funcs) {
+                            Ok(ExecResult::Continue(e)) => {
                                 trace.push(TraceEntry {
                                     stage: "process".into(),
                                     label: "(inline)".into(),
@@ -410,13 +417,25 @@ fn exec_pipeline_stmt(
                                 });
                                 current = e;
                             }
-                            ExecResult::Dropped => {
+                            Ok(ExecResult::Dropped) => {
                                 trace.push(TraceEntry {
                                     stage: "process".into(),
                                     label: "(inline)".into(),
                                     detail: "dropped".into(),
                                 });
                                 return dropped();
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "inline process: {} — event discarded",
+                                    e
+                                );
+                                trace.push(TraceEntry {
+                                    stage: "process".into(),
+                                    label: "(inline)".into(),
+                                    detail: format!("error: {} (event discarded)", e),
+                                });
+                                return errored();
                             }
                         }
                     }

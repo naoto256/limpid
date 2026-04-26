@@ -10,8 +10,11 @@ limpid tracks metrics at every level of the pipeline. Each component counts its 
 | `finished` | Events that reached at least one output |
 | `dropped` | Events explicitly discarded by `drop` |
 | `discarded` | Events that completed without reaching any output |
+| `errored` | Events whose `process` raised a runtime error (unknown identifier, type mismatch, regex compile failure, …) — the event is discarded rather than forwarded with the original `ingress` |
 
 **`events_discarded`** is a signal of possible misconfiguration — the event went through the entire pipeline but was never sent anywhere.
+
+**`events_errored`** is a signal of a pipeline-runtime bug — a process statement raised an error. Pre-0.5 the event was warn-logged and passed through (silently propagating wrap / enrichment failures); 0.5 surfaces these explicitly. A non-zero counter usually means an upgrade missed a DSL rename or a parser snippet hit malformed input that wasn't anticipated.
 
 ## Input metrics
 
@@ -65,6 +68,7 @@ Exposed metrics:
 | `limpid_pipeline_events_finished_total` | counter | `pipeline` |
 | `limpid_pipeline_events_dropped_total` | counter | `pipeline` |
 | `limpid_pipeline_events_discarded_total` | counter | `pipeline` |
+| `limpid_pipeline_events_errored_total` | counter | `pipeline` |
 | `limpid_input_events_received_total` | counter | `input` |
 | `limpid_input_events_invalid_total` | counter | `input` |
 | `limpid_input_events_injected_total` | counter | `input` |

@@ -176,10 +176,18 @@ fn json_to_prometheus(json: &str) -> Result<String, String> {
         write_counter(
             &mut out,
             "limpid_pipeline_events_discarded_total",
-            "Total events discarded due to processing errors.",
+            "Total events that finished the pipeline without reaching any output (likely a routing misconfiguration).",
             "pipeline",
             pipelines,
             "events_discarded",
+        );
+        write_counter(
+            &mut out,
+            "limpid_pipeline_events_errored_total",
+            "Total events whose processing raised a runtime error (the event is discarded rather than forwarded with the original ingress).",
+            "pipeline",
+            pipelines,
+            "events_errored",
         );
     }
 

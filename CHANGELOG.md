@@ -10,6 +10,51 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased]
 
+### Breaking — process runtime errors discard the event
+
+When a `process` statement raises a runtime error (unknown identifier,
+type mismatch, regex compile failure, …) the pipeline now **discards**
+the event and increments a new `events_errored` counter, instead of
+emitting a `WARN` and forwarding the event with its original `ingress`
+unchanged.
+
+The previous fallback ("warn-and-pass-through") combined poorly with
+the analyzer gap that let unresolved bare identifiers slip past
+`--check`: a config that referenced a renamed Event field
+(e.g. pre-0.5 bare `timestamp`) loaded fine, then failed every event
+at runtime — but the original ingress was forwarded downstream, so
+the operator's wrap / enrichment process was silently bypassed.
+
+Operators now see the failure in `events_errored` (and via the new
+`limpid_pipeline_events_errored_total` Prometheus metric / per-trace
+`error: ... (event discarded)` line), rather than discovering it
+hours later at the receiving SIEM. Configs that intend partial
+processing should use `try { ... } catch { ... }` to express that
+intent explicitly.
+
+The same routing applies to inline `process { ... }` bodies, which
+previously bubbled the error up to the runtime as a Result and lost
+the event without incrementing any pipeline counter.
+
+### Added — analyzer flags unknown bare identifiers
+
+`--check` now warns when a `process` body or expression references an
+identifier that doesn't resolve to a reserved event ident
+(`ingress`, `egress`, `source`, `received_at`, `error`), a `let`
+binding, or a `workspace.*` path. The warning carries `DiagKind::UnknownIdent`
+so `--ultra-strict` promotes it to an error in CI.
+
+A bare `timestamp` reference — the most common 0.4→0.5 migration miss
+— gets a targeted help line pointing at both alternatives:
+`received_at` for the wall-clock event time, `timestamp()` for the
+current instant. Other unknown idents fall back to the levenshtein
+suggestion engine ("did you mean `ingress`?").
+
+The `type` property of an `output` block (its bare-ident value is a
+module-name reference resolved at config-load time, not a runtime
+expression) is exempt — flagging `stdout`, `tcp`, etc. as unknown
+would be a false positive.
+
 ## [0.5.0] - 2026-04-26
 
 ### Changed — design principles restructured (still five)
