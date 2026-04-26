@@ -200,7 +200,15 @@ impl FileOutput {
                         }
                     }
                 }
-                Ok((strip_traversal(&out), true))
+                let rendered = strip_traversal(&out);
+                if rendered.is_empty() || rendered.ends_with('/') {
+                    anyhow::bail!(
+                        "output file: rendered path has no filename component (interpolation \
+                         collapsed to empty / directory): template-eval result = {:?}",
+                        rendered
+                    );
+                }
+                Ok((rendered, true))
             }
             other => anyhow::bail!(
                 "output file: unsupported path expression shape: {:?}",
@@ -414,6 +422,52 @@ mod tests {
         // source is "192.168.1.10" — no slashes, no change. Principle
         // holds for hypothetical slash-bearing values.
         assert_eq!(rendered, "a-192.168.1.10-b");
+    }
+
+    #[test]
+    fn render_template_errors_when_path_has_no_filename() {
+        // Template that collapses to a directory-like path: literal `/var/log/` +
+        // interp value `..` → "/var/log/.." → strip `/..` → "/var/log".
+        // "/var/log" is fine as a path string but ends without slash so it
+        // doesn't trip the validator. The actually-bad case is when the
+        // collapsed result ends with `/` or is empty.
+        // Trip the validator with a workspace value that's exactly `..`.
+        let mut e = Event::new(
+            Bytes::from("hello"),
+            "192.168.1.10:514".parse::<SocketAddr>().unwrap(),
+        );
+        e.workspace.insert("v".into(), Value::String("..".into()));
+        let out = make_output(ek(ExprKind::Template(vec![TemplateFragment::Interp(ek(
+            ExprKind::Ident(vec!["workspace".into(), "v".into()]),
+        ))])));
+        let err = out.render_path(&e).unwrap_err();
+        assert!(
+            err.to_string().contains("no filename component"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn render_template_errors_when_path_ends_with_slash() {
+        // Template "/var/log/${workspace.empty}/" with empty value renders to
+        // "/var/log//" — ends with slash, no filename. Validator catches this.
+        let mut e = Event::new(
+            Bytes::from("hello"),
+            "192.168.1.10:514".parse::<SocketAddr>().unwrap(),
+        );
+        e.workspace.insert("empty".into(), Value::String("".into()));
+        let out = make_output(ek(ExprKind::Template(vec![
+            TemplateFragment::Literal("/var/log/".into()),
+            TemplateFragment::Interp(ek(ExprKind::Ident(vec!["workspace".into(), "empty".into()]))),
+            TemplateFragment::Literal("/".into()),
+        ])));
+        let err = out.render_path(&e).unwrap_err();
+        assert!(
+            err.to_string().contains("no filename component"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
