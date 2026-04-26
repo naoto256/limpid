@@ -438,13 +438,12 @@ fn build_test_event(input_json: Option<&str>) -> Result<Event> {
 
         let mut event = Event::new(Bytes::from(ingress), source);
 
-        if let Some(workspace) = v.get("workspace") {
-            if let Ok(crate::dsl::Value::Object(map)) =
+        if let Some(workspace) = v.get("workspace")
+            && let Ok(crate::dsl::Value::Object(map)) =
                 crate::dsl::value_json::json_to_value(workspace)
-            {
-                for (k, val) in map {
-                    event.workspace.insert(k, val);
-                }
+        {
+            for (k, val) in map {
+                event.workspace.insert(k, val);
             }
         }
 

@@ -103,11 +103,11 @@ impl Event {
             workspace: HashMap::new(),
         };
 
-        if let Some(workspace) = v.get("workspace") {
-            if let Ok(Value::Object(map)) = json_to_value(workspace) {
-                for (k, val) in map {
-                    event.workspace.insert(k, val);
-                }
+        if let Some(workspace) = v.get("workspace")
+            && let Ok(Value::Object(map)) = json_to_value(workspace)
+        {
+            for (k, val) in map {
+                event.workspace.insert(k, val);
             }
         }
 

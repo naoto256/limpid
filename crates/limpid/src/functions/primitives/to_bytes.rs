@@ -54,7 +54,7 @@ fn convert(s: &str, encoding: &str) -> Result<Bytes> {
     match encoding {
         "utf8" => Ok(Bytes::from(s.as_bytes().to_vec())),
         "hex" => {
-            if s.len() % 2 != 0 {
+            if !s.len().is_multiple_of(2) {
                 bail!("to_bytes(hex): input length must be even");
             }
             let mut out = Vec::with_capacity(s.len() / 2);

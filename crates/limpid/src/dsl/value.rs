@@ -1,3 +1,8 @@
+// `Value`'s API surface (constructors, predicates, accessors) mirrors
+// `serde_json::Value`'s shape so primitives migrating between the two
+// keep the same call sites. Several of those methods have no internal
+// caller yet — they are part of the contract, not dead code.
+#![allow(dead_code)]
 //! limpid DSL value type.
 //!
 //! Until v0.5.0 the DSL piggybacked on `serde_json::Value` for runtime
