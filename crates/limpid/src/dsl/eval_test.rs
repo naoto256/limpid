@@ -284,14 +284,15 @@ mod tests {
     fn test_eval_to_json() {
         let ev = make_event();
         let f = make_funcs();
+        // 0.5.0+: to_json requires an explicit value. Pass `workspace` to
+        // serialise the workspace map (the most common operator pattern).
         let expr = e(ExprKind::FuncCall {
             namespace: None,
             name: "to_json".into(),
-            args: vec![],
+            args: vec![e(ExprKind::Ident(vec!["workspace".into()]))],
         });
         let result = eval_expr(&expr, &ev, &f).unwrap();
         let s = result.as_str().unwrap();
-        assert!(s.contains("\"workspace\""));
         assert!(s.contains("\"src\":\"192.168.1.1\""));
     }
 
