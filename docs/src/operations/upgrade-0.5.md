@@ -1,12 +1,50 @@
 # Upgrading to 0.5
 
-This release ships first-class OpenTelemetry Protocol (OTLP) support for
-both ingest and emit, adds `Value::Bytes` to the DSL runtime, and
-introduces a single small breaking rename in the Event model. Configs
-written for 0.4 will load on 0.5 after one mechanical `sed`; nothing
-else in the DSL surface changed.
+> **Coming from 0.2 or earlier?** The DSL was rewritten substantially
+> between 0.2 and 0.3 — native process modules (`process parse_syslog`,
+> `process parse_cef`, `process strip_pri`, …) were removed in favour
+> of DSL function calls inside a `process` body, and several other
+> shapes shifted. There is no per-version upgrade recipe; the simplest
+> path is to read the [Tutorial](../tutorial.md) and rewrite. Apologies
+> for the breakage — this is what pre-1.0 means.
+
+This page lists everything that breaks when moving a 0.4.x (or earlier)
+config to 0.5.0. It is the upgrade-time reference, not a release-notes
+overview — for the additive surface (OTLP transport, new DSL primitives,
+array literals, `Value::Bytes`, …) see the [CHANGELOG](../../CHANGELOG.md).
+
+Most entries below come with a one-line `sed` or `grep` recipe.
 
 ## Breaking changes
+
+### Typed timestamps (`Value::Timestamp`)
+
+The DSL now has a first-class `Value::Timestamp` arm. `received_at`,
+the new `timestamp()` primitive, and `strptime` all return a
+`Value::Timestamp`; `strftime` accepts one as its first argument.
+Type-correct configs from 0.4 keep working byte-for-byte:
+
+```limpid
+egress = "${strftime(received_at, \"%Y-%m-%d\", \"local\")} ${egress}"
+```
+
+What changes:
+
+- **`now()` is gone** — rename call sites to `timestamp()`. The new
+  name reads consistently with `received_at` and matches the value
+  type it returns.
+- **String operations on `received_at` no longer compile**. Code like
+  `contains(received_at, "2026")` or `regex_match(received_at, ...)`
+  errors at the analyzer (`expected string, got timestamp`). These
+  were always meaningless on a timestamp; the analyzer just used to
+  miss them. To inspect the wire form of a timestamp, format it
+  explicitly: `contains(strftime(received_at, "%Y", "UTC"), "2026")`.
+- **`to_int(received_at)`** returns unix nanoseconds (`i64`) — matches
+  OTLP `time_unix_nano`. So `workspace.observed_unix_nano =
+  to_int(received_at)` is the natural way to get an epoch number.
+- **`tap --json`** emits `received_at` as `i64` unix nanoseconds
+  rather than an RFC3339 string. See *`tap --json` `received_at` is
+  now unix nanoseconds* below for capture-file migration.
 
 ### `Event.timestamp` renamed to `Event.received_at`
 
@@ -33,21 +71,9 @@ reason. The rename makes the limpid field's meaning unambiguous: this
 is the local hop's observation time, full stop.
 
 The source-claimed time, when extractable from the wire, lives in
-workspace fields populated by parser snippets:
-
-- `syslog.parse` writes `workspace.syslog_timestamp`
-- `cef.parse` writes `workspace.cef_rt`
-- vendor parsers (Palo Alto, FortiGate, …) write to whatever field
-  the snippet author chose
-
-A composer snippet that needs a "real" event time picks the workspace
-field with a fallback to `received_at`:
-
-```
-let event_ns = workspace.syslog_timestamp_ns
-            ?? workspace.cef_rt
-            ?? received_at_to_ns(received_at)
-```
+workspace fields populated by parser snippets — typically captured
+under a per-schema namespace, e.g. `workspace.syslog.timestamp` after
+`workspace.syslog = syslog.parse(ingress)`.
 
 There is **no deprecation alias** — `${timestamp}` and bare
 `timestamp` are hard errors on 0.5. Pre-1.0 breaking changes are
@@ -92,89 +118,164 @@ jq -c '.received_at = .timestamp | del(.timestamp)' \
 Fresh captures on 0.5 emit the new key directly — no conversion
 needed going forward.
 
-## New features
+### `tap --json` `received_at` is now unix nanoseconds
 
-### OTLP — first-class transport across ingest and emit
+Captured `*.jsonl` files from 0.4 hold `received_at` as RFC3339
+strings; 0.5 emits them as integers (unix nanoseconds, OTLP-shape).
+`inject --json` only accepts the new wire form. If you need to
+replay a 0.4 capture, convert it first:
 
-Three transports, both directions, full proto3 wire:
+```bash
+# Lossy conversion (drops sub-second precision); fine for most
+# replay use cases. For exact precision, write a small Python /
+# Rust script.
+jq -c '.received_at = ((.received_at | sub("\\.\\d+"; "")
+                                 | strptime("%Y-%m-%dT%H:%M:%S%z")
+                                 | mktime) * 1000000000)' \
+    old-capture.jsonl > new-capture.jsonl
+```
 
-- **Inputs**: [`otlp_http`](../inputs/otlp-http.md) (`POST /v1/logs`,
-  protobuf and JSON) and [`otlp_grpc`](../inputs/otlp-grpc.md)
-  (`LogsService.Export`, with optional server-side TLS / mTLS).
-- **Output**: [`otlp`](../outputs/otlp.md) — speaks
-  `http_json`, `http_protobuf`, or `grpc` per the `protocol`
-  property; supports per-batch retry with exponential backoff and
-  three batch-merging modes (`none` / `resource` / `scope`).
-- **Primitives**: `otlp.encode_resourcelog_protobuf`,
-  `otlp.decode_resourcelog_protobuf`, `otlp.encode_resourcelog_json`,
-  `otlp.decode_resourcelog_json` — the proto3 ↔ HashLit bridge.
-  Composers and semantic mappings live in DSL snippets.
+The new wire form aligns with OTLP's `time_unix_nano` and removes
+timezone string ambiguity from the on-the-wire interchange.
 
-The design decisions and the spec-reading they came from are in
-[OTLP — design rationale](../otlp.md). Reading that page before
-opening an issue will save everyone time.
+### `syslog.parse` returns more, and PRI parsing is strict
 
-### OTLP/HTTP throughput controls
+Two changes ship together.
 
-Four orthogonal defense layers on the input side, all opt-in:
+**Returned object grew.** Beyond the structural fields, `syslog.parse`
+now emits `pri` (Int 0–191), `facility` (Int 0–23), `severity` (Int
+0–7), and `timestamp` (the source-claimed wire timestamp from the
+header — previously dropped silently). Combined with the un-prefixed
+keys (see *Schema parsers no longer prefix workspace keys* below), the
+recommended pattern is:
 
-| Property | What it bounds |
-|---|---|
-| `body_limit` *(default `16MB`)* | Bytes per request (HTTP 413 on overflow) |
-| `max_concurrent_requests` | In-flight request count → worst-case decode memory = `permits × body_limit` |
-| `request_rate_limit` | Sustained req/sec (token bucket) |
-| `rate_limit` | Emitted events/sec (per-LogRecord, post-decode — same as `syslog_*`) |
+```limpid
+workspace.syslog = syslog.parse(ingress)
+// → workspace.syslog.pri / .facility / .severity / .timestamp
+//   .hostname / .appname / .procid / .msgid / .msg
+```
 
-For an exposed-ingress preset, see the example block on the
-[`otlp_http`](../inputs/otlp-http.md) reference page.
+The lighter `syslog.extract_pri` is unchanged and remains useful for
+callers that want the PRI byte without tokenising the rest of the
+header.
 
-### `Value::Bytes` in the DSL
+**PRI parsing is now strict.** `syslog.parse` validates the leading
+`<PRI>` exactly as RFC 5424 §6.2.1 specifies: 1–3 ASCII digits, value
+0–191, framed by `<` and `>` at the start of the input. Inputs the
+previous lax parser tolerated silently — `<malformed text>...`
+(non-digit content), `<999>...` (out-of-range), `<>...` (empty PRI) —
+now error with `syslog.parse(): no PRI header`. Sibling primitives
+(`syslog.strip_pri` / `syslog.set_pri` / `syslog.extract_pri`) already
+used the strict scanner; this aligns the family.
 
-The DSL runtime gains a `Bytes(bytes::Bytes)` value variant,
-replacing the prior `serde_json::Value`-based representation that
-silently corrupted non-UTF-8 byte streams via lossy conversion.
-User-facing surface is preserved — `ingress` / `egress` reads still
-return `Value::String` for UTF-8-clean data; only non-UTF-8 content
-(which used to be mangled) now surfaces as `Value::Bytes` and can be
-hashed (`md5`/`sha1`/`sha256`), measured (`len`), or converted
-explicitly via the new `to_bytes(s, encoding)` / `to_string(b,
-encoding, strict)` primitives.
+If you have a flow that depended on the old lax behaviour to ingest
+non-syslog payloads via `syslog.parse`, switch to a different parser
+(`parse_kv`, `regex_parse`, or a vendor-specific snippet) — calling
+`syslog.parse` on something that isn't syslog has no defined output
+anyway.
 
-Text-only primitives (`upper`, `lower`, `regex_*`, `format`,
-template interpolation, …) error on `Bytes` rather than silently
-coercing — the "気を利かせない" rule. See the
-[functions reference](../processing/functions.md) for the full
-cross-primitive table.
+### `cef.parse` is strict: requires `CEF:` at position 0
 
-### DSL primitives
+Previously `cef.parse` searched for `CEF:` anywhere in the input,
+silently skipping any leading `<PRI>` syslog wrapper. The parser now
+requires the input to start with `CEF:` and reports `cef.parse():
+input does not start with \`CEF:\`` otherwise. Syslog-wrapped CEF
+should be handled by composing the two parsers:
 
-Five new flat primitives:
+```limpid
+workspace.syslog = syslog.parse(ingress)
+workspace.cef    = cef.parse(workspace.syslog.msg)
+```
 
-- **`csv_parse(text, field_names)`** — RFC 4180 single-row CSV parser.
-- **`find_by(array, key, value)`** — locate the first object in an
-  array whose `key` field equals `value`. Identity-based array
-  access; pairs with the new array literals (`[a, b, c]`).
-- **`len(x)`** — cardinality for arrays, strings (Unicode characters),
-  or objects (top-level keys).
-- **`append(arr, v)` / `prepend(arr, v)`** — return a new array with
-  `v` added at the back / front. Arrays are positionless; this is
-  the supported mutation idiom.
-- **`to_int(x)`** — coerce to `i64` (strings, floats, bools, nulls).
+CEF that arrives on non-syslog transports (HTTP body, file tail, …)
+is unaffected.
 
-### DSL arrays
+### Schema parsers no longer prefix workspace keys
 
-Array literals (`[a, b, c]`, `[]`, mixed types, nesting) are now
-first-class expressions. Arrays are addressed by *identity*
-(`find_by`, `foreach`) and mutated by back/front semantics
-(`append`, `prepend`); positional access (`arr[n]`) is intentionally
-absent, because numeric indices drift under insert / delete and
-identity addressing survives. See
-[User-defined Processes — Arrays](../processing/user-defined.md#arrays)
-for the rationale.
+`syslog.parse` and `cef.parse` previously emitted keys with a
+`<schema>_` prefix (`syslog_hostname`, `cef_name`, …) on the rationale
+that bare invocation kept workspace dumps self-describing. In practice
+the prefix collided with the *capture* idiom — `workspace.s =
+syslog.parse(ingress)` produced `workspace.s.syslog_hostname`,
+double-prefixed — and made schema parsers behave inconsistently with
+format primitives (`parse_json`, `parse_kv`) which always emit raw
+keys.
 
-### `syslog.parse` exposes header timestamp
+Both schema parsers now return un-prefixed keys (`hostname`,
+`appname`, `version`, `name`, `severity`, …). Namespacing is the
+operator's job and is the recommended pattern:
 
-The parsed RFC 5424 / RFC 3164 timestamp from the syslog header now
-surfaces in `workspace.syslog_timestamp`. Snippets that need the
-source-claimed event time can read it directly. Behaviour is purely
-additive — existing configs continue to work.
+```limpid
+workspace.syslog = syslog.parse(ingress)   // workspace.syslog.hostname, ...
+workspace.cef    = cef.parse(ingress)      // workspace.cef.version, workspace.cef.src, ...
+```
+
+Bare invocation still works (keys merge flat into `workspace`) but is
+collision-prone and discouraged. CEF extension keys (`src`, `dst`,
+`act`, …) were never prefixed — those names are part of the CEF spec
+and continue verbatim.
+
+**Migration**:
+
+```bash
+# 1. capture once at the top of each process body that calls a schema parser:
+#      workspace.syslog = syslog.parse(ingress)
+#      workspace.cef    = cef.parse(ingress)
+# 2. rewrite the references:
+sed -i 's/workspace\.syslog_/workspace.syslog./g; s/workspace\.cef_/workspace.cef./g' \
+    /etc/limpid/**/*.limpid
+```
+
+### `to_json()` requires an argument
+
+`to_json()` (no argument) used to serialise the entire `Event` — a hidden default that almost no one wanted. Pass an explicit value now; `to_json(workspace)` is the typical replacement when shipping enriched events downstream.
+
+```limpid
+// before
+egress = to_json()
+
+// after
+egress = to_json(workspace)
+```
+
+For the rare case where you actually want the whole event, build it explicitly: `to_json({received_at: received_at, source: source, ingress: ingress, egress: egress, workspace: workspace})`.
+
+### `output file` path templates are stricter
+
+The `path` template renderer in the `file` output gained three guards
+that reject configs the previous lax renderer accepted silently. Each
+fires before any byte hits disk.
+
+- **Per-interpolation slash strip.** Every `${...}` result has
+  forward and back slashes replaced with `_`, so an interpolation
+  cannot smuggle a path separator into the rendered path.
+- **`..` rejected anywhere in the rendered path.** After all
+  interpolations resolve, the path is split on `/` and any component
+  exactly equal to `..` causes the write to error rather than being
+  silently rewritten.
+- **Empty interpolation rejected.** An interpolation that evaluates
+  to the empty string errors instead of producing surprise paths
+  (`/foo//bar`, `/foo/.log`).
+- **Trailing-slash rejected.** A rendered path that ends in `/` (no
+  filename component) errors rather than turning into a spurious
+  `mkdir`.
+
+Configs that depended on any of these silent rewrites should sanitise
+the inputs upstream (`regex_replace`, explicit fallbacks in a
+`process` block) and reference the cleaned workspace key from the
+template. The full rationale and worked examples are in the
+[`output file`](../outputs/file.md) reference.
+
+### `format()` primitive removed
+
+`format(template)` and the `%{...}` placeholder syntax are gone. The DSL has `${expr}` interpolation in any string literal, which is strictly more capable (any expression, not just a fixed set of placeholders) and parse-time checked. Rewrite call sites mechanically:
+
+```limpid
+// before
+egress = format("[%{source}] %{workspace.cef_name}: %{egress}")
+
+// after
+egress = "[${source}] ${workspace.cef.name}: ${egress}"
+```
+
+A grep for `format(` and `%{` over your config tree should surface every site to migrate.

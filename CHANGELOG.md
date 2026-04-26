@@ -212,14 +212,215 @@ hard errors (analyzer / runtime) on v0.5.0+. The 0.5.0 release window
 is the right moment for the cut because pre-1.0 breaking changes are
 still expected.
 
-### Added — `syslog.parse` exposes header timestamp
+### Breaking — schema parsers no longer prefix workspace keys
 
-`syslog.parse` now writes the parsed RFC 5424 / RFC 3164 timestamp from
-the wire header into `workspace.syslog_timestamp` (previously dropped
-silently). Snippets that need the source-claimed event time, e.g. for
-the OCSF `time` field or the OTLP `time_unix_nano`, can read it
-directly. Behaviour is purely additive — existing configs continue to
-work.
+`syslog.parse` and `cef.parse` previously emitted keys with a
+`<schema>_` prefix (`syslog_hostname`, `cef_name`, …) on the rationale
+that workspace dumps would stay self-describing when several parsers
+populated the same event. In practice the prefix collided with the
+*capture* idiom — `workspace.s = syslog.parse(ingress)` produced
+`workspace.s.syslog_hostname`, double-prefixed — and made schema
+parsers behave inconsistently with format primitives (`parse_json`,
+`parse_kv`) which always emit raw keys.
+
+Both schema parsers now return un-prefixed keys (`hostname`,
+`appname`, `version`, `name`, …). Namespacing is the operator's job
+and is the recommended pattern:
+
+```limpid
+workspace.syslog = syslog.parse(ingress)   // workspace.syslog.hostname, ...
+workspace.cef    = cef.parse(ingress)      // workspace.cef.version, workspace.cef.src, ...
+```
+
+Bare invocation still works (`syslog.parse(ingress)` merges keys flat
+into `workspace`) but is collision-prone and discouraged. CEF
+extension keys (`src`, `dst`, `act`, …) were never prefixed — those
+names are part of the CEF spec and continue verbatim.
+
+**Migration**: rewrite any references to `workspace.syslog_*` /
+`workspace.cef_*` in configs and snippets. The capture form is
+mechanically equivalent and clearer:
+
+```sh
+# 1. capture once at the top of each process body:
+#      workspace.syslog = syslog.parse(ingress)
+#      workspace.cef    = cef.parse(ingress)
+# 2. rewrite the references:
+sed -i 's/workspace\.syslog_/workspace.syslog./g; s/workspace\.cef_/workspace.cef./g' \
+    /etc/limpid/**/*.limpid
+```
+
+### Breaking — `cef.parse` requires `CEF:` at position 0
+
+Previously `cef.parse` located `CEF:` anywhere in the input (via
+`find`) so a `<PRI>` syslog wrapper was silently skipped. This
+overlapped responsibilities — header stripping is syslog's job, not
+CEF's — and could match the literal string `CEF:` if it appeared
+elsewhere in the payload.
+
+`cef.parse` now requires the input to start with `CEF:`, erroring
+with `cef.parse(): input does not start with \`CEF:\`` otherwise.
+The canonical pattern when CEF is transported over syslog is:
+
+```limpid
+workspace.syslog = syslog.parse(ingress)
+workspace.cef    = cef.parse(workspace.syslog.msg)
+```
+
+CEF arriving on transports without a syslog wrapper (HTTP, file
+tail, …) is unaffected — `CEF:` is at position 0 already.
+
+### Breaking — `syslog.parse` PRI parsing aligned with RFC 5424 §6.2.1
+
+`syslog.parse` now validates the leading `<PRI>` header strictly: 1–3
+ASCII digits, value 0–191, framed by `<` and `>` at the start of the
+input. Inputs the previous parser tolerated silently — `<malformed
+text>...` (non-digit content), `<999>...` (out-of-range), `<>...`
+(empty PRI) — now error with `syslog.parse(): no PRI header`,
+matching the behaviour of the sibling `syslog.strip_pri` /
+`syslog.set_pri` / `syslog.extract_pri` primitives which already used
+the strict scanner.
+
+If you have a flow that depended on the old lax behaviour to ingest
+non-syslog payloads via `syslog.parse`, switch to a different parser
+(`parse_kv`, `regex_parse`, or a snippet) — calling `syslog.parse` on
+something that isn't syslog has no defined output anyway.
+
+### Added — `syslog.parse` emits `pri`, `facility`, `severity`, `timestamp`
+
+Beyond the structural fields, `syslog.parse` now returns:
+
+- **`pri`** (Int, 0–191) — the raw `<PRI>` value
+- **`facility`** (Int, 0–23) — `pri / 8`
+- **`severity`** (Int, 0–7) — `pri % 8`
+- **`timestamp`** (String) — the source-claimed wire timestamp from
+  the RFC 5424 / RFC 3164 header (previously dropped silently)
+
+`pri` / `facility` / `severity` are always present (the parser errors
+when no valid PRI is found, per the breaking change above). The
+timestamp surfaces source-claimed event time for snippets that need
+it — e.g. for the OCSF `time` field or the OTLP `time_unix_nano` —
+without forcing a separate `extract_pri` + parse pass. The lighter
+`syslog.extract_pri` is still available for callers that only need
+the PRI byte without tokenising the rest of the header.
+
+### Breaking — `format()` primitive removed
+
+The `format(template)` primitive — which expanded `%{...}` placeholders against the current event — has been removed. The `${expr}` interpolation that any string literal supports is strictly more capable: it accepts any DSL expression rather than the limited `%{event.x}` / `%{workspace.x}` set, and it's resolved at parse time so typos are caught by `--check`.
+
+**Migration**: rewrite `format("...")` calls to interpolated string literals.
+
+```limpid
+// before
+egress = format("[%{source}] %{workspace.cef_name}: %{egress}")
+
+// after
+egress = "[${source}] ${workspace.cef.name}: ${egress}"
+```
+
+The `%{...}` syntax is gone entirely; `${expr}` is the single template form.
+
+### Breaking — `to_json()` requires an argument
+
+`to_json()` (no argument) used to serialise the entire `Event` (received_at + source + ingress + egress + workspace) as JSON — the same shape as `tap --json`. In practice operators almost always wanted the workspace alone (the parsed/enriched form to ship downstream), so the no-arg default was a hidden footgun.
+
+`to_json` now requires exactly one argument. The most common pattern:
+
+```limpid
+egress = to_json(workspace)
+```
+
+For the old whole-event behaviour, build the shape explicitly: `to_json({received_at: received_at, source: source, workspace: workspace})`.
+
+### Added — `parse_kv` separator argument
+
+`parse_kv(text, separator)` lets the caller pass a single-byte
+separator (default `' '`). Comma-separated KV payloads — common in
+Cisco ASA, Microsoft Defender, and various OEM telemetry — now
+parse without a regex pre-pass:
+
+```limpid
+workspace.kv = parse_kv(workspace.syslog.msg, ",")
+// "a=1,b=2,c=\"three,four\"" → {a: "1", b: "2", c: "three,four"}
+```
+
+Quoted values still work and may contain the separator (e.g. a comma
+inside a quoted string when separator is comma). The defaults hash
+literal can sit either as the second argument (when separator is the
+default space) or as the third (after an explicit separator).
+
+### Breaking / Added — `Value::Timestamp` first-class DSL type
+
+The DSL gains a typed `Value::Timestamp(DateTime<FixedOffset>)` value
+arm. Previously every timestamp travelled through the runtime as an
+RFC3339 `Value::String` — type-unsafe, repeated parse cost, and easy
+to typo into `contains(received_at, "2026")` (silently false because
+of substring semantics).
+
+Now:
+
+- **`received_at`** → `Value::Timestamp` (was `Value::String`)
+- **`timestamp()`** (new, replaces `now()`) → `Value::Timestamp`
+- **`strptime(value, fmt[, tz])`** → `Value::Timestamp` (was String)
+- **`strftime(timestamp, fmt[, tz])`** — first argument must be a
+  `Value::Timestamp` (was String, parsed RFC3339 internally).
+  Passing a string is a clear type error: `strftime(): first argument
+  must be a timestamp, got string`.
+- **`to_int(timestamp)`** → unix nanoseconds (`i64`), matching OTLP
+  `time_unix_nano`. So `to_int(received_at)` is the natural way to
+  get an epoch-nanos number.
+- **String coercion** of `Value::Timestamp` (e.g. `${received_at}`,
+  `to_string()`-style paths) renders RFC3339 — the user-visible
+  surface is unchanged from 0.4 for type-correct configs.
+
+DSL syntax does **not** change. Existing type-correct expressions
+(`strftime(received_at, "%Y-%m-%d", "local")`, `${received_at}`) keep
+working byte-for-byte. Only code that round-tripped timestamps
+through string operations (`contains(received_at, "...")`,
+`len(received_at)`, regex on `received_at`) errors at the analyzer or
+runtime — those were always meaningless on a timestamp and now fail
+loudly.
+
+`now()` is removed; rename call sites to `timestamp()`. The new name
+matches the value type it returns and reads consistently with
+`received_at`.
+
+### Breaking — `tap --json` and `inject --json` use unix nanoseconds for `received_at`
+
+`tap --json` previously emitted `received_at` as an RFC3339 string;
+it now emits an `i64` of unix nanoseconds, matching OTLP
+`time_unix_nano`. `inject --json` reads the same wire form.
+Pre-0.5 captures (`*.jsonl` files holding RFC3339 strings) need to
+be migrated before replay:
+
+```bash
+jq -c '.received_at = (.received_at | sub("\\.\\d+"; "") | strptime("%Y-%m-%dT%H:%M:%S%z") | mktime * 1000000000)' \
+    old-capture.jsonl > new-capture.jsonl
+```
+
+(For sub-second precision use a real script — `jq` doesn't carry
+nanos. The simpler migration is to discard old captures; nothing
+about pipeline correctness depends on replaying historical traffic
+through the new format.)
+
+### Added — host / version primitives
+
+- **`hostname()`** → `String` — the local machine's hostname, resolved at every call via `gethostname(2)`. Useful for tagging events with the forwarder's identity (`workspace.forwarded_by = hostname()`) and populating OTLP `host.name` resource attributes.
+- **`version()`** → `String` — the limpid daemon's version baked in at compile time (e.g. `"0.5.0"`). Useful for provenance markers and OTLP `service.version`.
+
+`hostname()` was previously referenced in the OTLP example block in the docs but was not actually implemented — that drift is closed.
+
+### Added — `starts_with` / `ends_with` string predicates
+
+Two new flat primitives complement `contains`:
+
+- **`starts_with(haystack, needle)`** — `true` if `haystack` begins with `needle`.
+- **`ends_with(haystack, needle)`** — `true` if `haystack` ends with `needle`.
+
+Use these when *position* matters — e.g. dispatching to the right
+parser based on a leading prefix (`starts_with(workspace.syslog.msg,
+"CEF:")`) — rather than `contains`, which matches anywhere and would
+fire on a literal `CEF:` string buried elsewhere in the payload.
 
 ### Added — DSL primitives
 
@@ -297,110 +498,6 @@ flagged by the v0.5.0 abstraction review.
   is logged as a warning only; the dedicated retry-just-the-rejects
   path is queued for v0.5.x. Transport-level retry shipped in this
   release covers hard failures (connection refused, 5xx, …).
-
-### Added — `Value::Bytes` variant in the DSL
-
-The DSL runtime value type gains a first-class `Bytes(bytes::Bytes)`
-arm, replacing the `serde_json::Value`-based representation that
-silently corrupted non-UTF-8 byte streams via `from_utf8_lossy` /
-`String::into_bytes()`. User-facing surface is preserved:
-
-- DSL syntax / semantics unchanged.
-- `ingress` / `egress` reads return `Value::String` for UTF-8-clean
-  data (the historical case) and only switch to `Value::Bytes` for
-  non-UTF-8 content (which the previous code was already mangling).
-- Existing primitives keep their return shapes.
-- `tap --json` / persistence still emit JSON; `Value::Bytes` is
-  encoded as `{"$bytes_b64": "..."}` with `$`-prefix key escaping
-  for round-trip safety. The marker is internal; `to_json` /
-  `parse_json` reject it.
-
-Cross-primitive Bytes rules: text-only primitives (`upper`, `lower`,
-`regex_*`, `contains`, `format`, `to_int`, `to_json`, template
-interpolation, property traversal) error on Bytes — the
-"気を利かせない" rule. Hash primitives (`md5`/`sha1`/`sha256`) and
-`len` accept Bytes natively. `Bytes + Bytes` concatenates byte-wise.
-
-New conversion primitives at the text/binary boundary:
-- **`to_bytes(s, encoding="utf8")`** — `utf8` (default) / `hex` / `base64`.
-- **`to_string(b, encoding="utf8", strict=true)`** — `utf8` strict (errors
-  on invalid UTF-8) or lossy, plus `hex` / `base64` printable forms.
-
-### Breaking — `Event.timestamp` renamed to `Event.received_at`
-
-The `Event` struct field, the reserved DSL identifier, the `format()`
-template placeholder, and the JSON serialisation key are all renamed
-from `timestamp` to `received_at`. The semantic clarification is that
-this field is **strictly the wall-clock time at which this hop received
-the event** — input modules never overwrite it from payload contents
-(Principle 2: input is dumb transport). Source-claimed event times,
-when extractable from the wire, surface in workspace fields like
-`syslog_timestamp` / `cef_rt` / `pan_generated_time` via parser
-primitives.
-
-The old name was generic enough that some snippets and configs were
-treating it as if it carried the source-claimed event time, which it
-never reliably does.
-
-**Migration** (mechanical sed across configs and any captured `tap --json`
-files):
-
-```sh
-find /etc/limpid -name '*.limpid' -exec sed -i \
-    -e 's/\${timestamp}/\${received_at}/g' \
-    -e 's/%{timestamp}/%{received_at}/g' \
-    -e 's/strftime(timestamp,/strftime(received_at,/g' \
-    {} +
-
-# Captured tap --json files: rewrite the top-level key
-jq -c '.received_at = .timestamp | del(.timestamp)' \
-    old-capture.jsonl > new-capture.jsonl
-```
-
-There is no deprecation alias — `${timestamp}` and `%{timestamp}` are
-hard errors (analyzer / runtime) on v0.5.0+. The 0.5.0 release window
-is the right moment for the cut because pre-1.0 breaking changes are
-still expected.
-
-### Added — `syslog.parse` exposes header timestamp
-
-`syslog.parse` now writes the parsed RFC 5424 / RFC 3164 timestamp from
-the wire header into `workspace.syslog_timestamp` (previously dropped
-silently). Snippets that need the source-claimed event time, e.g. for
-the OCSF `time` field or the OTLP `time_unix_nano`, can read it
-directly. Behaviour is purely additive — existing configs continue to
-work.
-
-### Added — DSL primitives
-
-- **`to_int(x)`** — coerce a value to `i64` (strings, floats, bools, nulls);
-  returns `null` on unparseable input. Primary use: casting CEF extension
-  values and CSV column strings to numeric OCSF fields (ports, session IDs).
-- **`find_by(array, key, value)`** — locate the first object in an array
-  whose `key` field equals `value`. No type coercion; `null` on no match.
-  Designed for identity-based access to schemas that ship arrays-of-objects
-  (MDE evidence, OCSF observables).
-- **`csv_parse(text, field_names)`** — parse a single CSV row into an object
-  keyed by the supplied field names, with RFC 4180 quoting. Replaces the
-  `regex_parse` workaround for vendors (most notably Palo Alto) that emit
-  100+-field positional CSV syslog records.
-- **`len(x)`** — cardinality for `Array` (elements), `String` (Unicode
-  characters), `Object` (top-level keys). Scalars return `null`.
-- **`append(arr, v)` / `prepend(arr, v)`** — return a new array with `v`
-  added at the back / front. Input is unchanged; callers re-bind.
-
-### Added — DSL arrays (positionless collections)
-
-- **Array literals** (`[a, b, c]`, `[]`, mixed types, nesting, trailing
-  commas) are now first-class expressions, evaluating to `Value::Array`
-  at runtime. Grammar, AST (`ExprKind::ArrayLit`), parser, evaluator, and
-  analyzer (`FieldType::Array`) all updated.
-- **No positional access.** `arr[n]` and `arr[n] = v` are intentionally
-  absent from the grammar. Arrays are addressed by identity (`find_by`,
-  `foreach`) and mutated by "back / front" semantics (`append`,
-  `prepend`). Numeric indexing drifts under insert / delete; identity
-  addressing survives. See
-  `docs/src/processing/user-defined.md#arrays` for the rationale.
 
 ## [0.4.0] - 2026-04-24
 

@@ -15,7 +15,7 @@ def output elasticsearch {
     batch_timeout "5s"
     compress gzip
     headers {
-        Authorization "Basic dXNlcjpwYXNz"
+        Authorization "Basic <base64(user:password)>"
     }
 }
 ```

@@ -73,7 +73,7 @@ enum InjectKind {
         /// Each stdin line is a full Event JSON (as emitted by `tap --json`)
         #[arg(long)]
         json: bool,
-        /// Replay events at their original timing using each event's `timestamp` field.
+        /// Replay events at their original timing using each event's `received_at` field.
         /// Accepts `realtime` (= `1x`) or a factor like `10x` / `0.2x`.
         /// Defaults to `1x` when given without a value. Requires `--json`.
         #[arg(long, value_name = "FACTOR", num_args = 0..=1, default_missing_value = "1x")]
@@ -85,7 +85,7 @@ enum InjectKind {
         /// Each stdin line is a full Event JSON (as emitted by `tap --json`)
         #[arg(long)]
         json: bool,
-        /// Replay events at their original timing using each event's `timestamp` field.
+        /// Replay events at their original timing using each event's `received_at` field.
         /// Accepts `realtime` (= `1x`) or a factor like `10x` / `0.2x`.
         /// Defaults to `1x` when given without a value. Requires `--json`.
         #[arg(long, value_name = "FACTOR", num_args = 0..=1, default_missing_value = "1x")]

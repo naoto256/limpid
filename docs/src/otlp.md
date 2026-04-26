@@ -157,7 +157,7 @@ come from somewhere. There are three popular sources:
 | Source | What it produces | Used by |
 |---|---|---|
 | Auto-detection | `host.name = $(hostname)`, `service.name` from a config or env | OTel Collector receivers, most SDKs |
-| Per-source mapping | `service.name = workspace.cef_device_vendor` (computed per Event) | bespoke pipelines, CEF/syslog forwarders |
+| Per-source mapping | `service.name = workspace.cef.device_vendor` (computed per Event) | bespoke pipelines, CEF/syslog forwarders |
 | Hand-authored | `resource { attributes [...] }` block in the config | this is uncommon, but it's what limpid expects |
 
 The OTel Collector's `host` and `resource` processors lean heavily on
@@ -341,30 +341,35 @@ Bytes on the hop, decode-on-demand in the snippet.
 faster, and is the canonical form in the spec. The output transport
 re-encodes on the way out if the configured protocol is `http_json`.
 
-### 5.3 `Event.received_at` is wall-clock, not source time
+### 5.3 Source time vs `received_at`: the composer's call
 
-`Event.received_at` is set by the input to `Utc::now()` at the moment
-the wire bytes arrived. The input does not parse the body to extract
-a source-claimed time and overwrite it. This is Principle 2 of
-limpid's design: input is dumb transport; payload semantics belong
-to the process layer.
+The answer to 4.3 is that limpid itself does not decide — the composer
+snippet does. The runtime cannot pick `time_unix_nano` vs
+`observed_time_unix_nano` on its own because, by Principle 2, the
+input never parses the body to extract a source-claimed time. The
+responsibility is split across three layers:
 
-Source-claimed times surface in the workspace through parser snippets:
+- **Input** sets `Event.received_at = Utc::now()` (wall-clock,
+  always present).
+- **Parser snippet** (`syslog.parse`, `cef.parse`, vendor-specific
+  parsers) extracts the source-claimed time and writes it to
+  workspace (`workspace.syslog.timestamp`, `workspace.cef.rt`, …).
+- **Composer snippet** maps both into the OTLP fields:
 
-- `syslog.parse` writes `workspace.syslog_timestamp`
-- `cef.parse` writes `workspace.cef_rt`
-- vendor-specific parsers (Palo Alto's CSV format etc.) write to
-  whatever workspace field the snippet author chooses
+  ```
+  time_unix_nano          ← source-claimed time, fallback received_at
+  observed_time_unix_nano ← received_at
+  ```
 
-A composer snippet then chooses what `LogRecord.time_unix_nano` should
-be — typically the source-claimed time, falling back to
-`received_at` when the source did not provide one.
+Standard `compose_otlp_*` snippets ship with this mapping. Sources
+that expose no usable source time (or where the source clock is
+known-bad and you want to ignore it) are handled in the composer by
+overriding the default — Rust never sees the decision.
 
-The semantic separation is the point: a forwarder does not silently
-rewrite `received_at` as if the wall clock and the source clock were
-interchangeable. This is the rename that v0.5.0 committed to (see
-the breaking change in [CHANGELOG.md](../../CHANGELOG.md) and
-the [v0.5 upgrade notes](./operations/upgrade-0.5.md)).
+This is also why `received_at` was renamed in v0.5.0: a forwarder
+must not silently conflate wall-clock and source-clock semantics. See
+the breaking change in [CHANGELOG.md](../../CHANGELOG.md) and the
+[v0.5 upgrade notes](./operations/upgrade-0.5.md).
 
 ### 5.4 Resource attributes are user-authored
 
@@ -490,7 +495,7 @@ ask; it is not v0.5.0.
 Because no snippet wrote it. limpid will not auto-detect or default
 the field. The composer snippet must include it in the Resource
 attributes, typically extracted from a parser field like
-`workspace.cef_device_vendor` or hand-coded in the config's
+`workspace.cef.device_vendor` or hand-coded in the config's
 `resource { ... }` block. See §5.4.
 
 ### *"Why is my body a JSON string instead of structured attributes?"*

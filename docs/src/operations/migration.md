@@ -48,7 +48,7 @@ sudo dpkg -i limpid_*.deb
 
 | rsyslog | limpid |
 |---------|--------|
-| `template(name="t" type="string" string="%HOSTNAME% %msg%")` | `egress = format("%{workspace.syslog_hostname} %{egress}")` |
+| `template(name="t" type="string" string="%HOSTNAME% %msg%")` | `workspace.syslog = syslog.parse(ingress)`<br>`egress = "${workspace.syslog.hostname} ${egress}"` |
 
 ## Step 3: Stop rsyslog, start limpid
 

@@ -6,11 +6,15 @@ Pipelines wire inputs, processes, and outputs together. They define the flow of 
 
 ```
 def pipeline main {
-    input syslog                       // where events come from
-    process { cef.parse(ingress) }     // transform
-    output archive                     // where events go
+    input syslog        // where events come from
+    process strip_pri   // transform — mutates egress (here: drop the <PRI> byte)
+    output archive      // where events go
 }
 ```
+
+`input` / `process` / `output` are the three primary pipeline statements. The process here actually changes what the output writes (`syslog.strip_pri` removes the leading `<PRI>` from `egress`, so the archived file holds plain text rather than wire-form syslog). A process that only reads ingress and populates `workspace` does not change what an output sees — only mutations to `egress` are visible on the wire.
+
+The inline anonymous form `process { ... }` is also available for one-off transformations and is documented in [Routing](./routing.md).
 
 ## Key rules
 
@@ -56,14 +60,14 @@ def pipeline forward {
 Symmetric to fan-out: a single pipeline can subscribe to multiple inputs. List them comma-separated on the `input` line. Events from every listed input are merged at the pipeline entrance and processed by the same body.
 
 ```
-def pipeline ha_syslog {
-    input syslog_a, syslog_b        // both feed this pipeline
+def pipeline syslog_ingest {
+    input syslog_udp, syslog_tcp, syslog_tls    // three transports, one pipeline
     process normalize
     output siem
 }
 ```
 
-Typical use: HA syslog where two relays send the same events to `syslog_a` and `syslog_b`, and the pipeline deduplicates downstream (e.g. via a shared dedup table) — no need to duplicate the whole pipeline body per input.
+Typical use: multiple **transport-distinct listeners** that should be processed by the same body — e.g. accepting syslog over UDP / TCP / TLS at the same time, or accepting both syslog and OTLP into a shared composer. (Same-port HA, where two relays send to one listening port, doesn't need fan-in — the single input module already receives both streams.)
 
 ### Semantics
 

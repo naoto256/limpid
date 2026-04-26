@@ -47,8 +47,8 @@ def process compose_ocsf_finding {
     workspace.ocsf = {
         category_uid: 2,                        // Findings
         class_uid:    200401,                   // Detection Finding
-        time:         workspace.cef_rt,
-        severity_id:  workspace.cef_severity_level,
+        time:         workspace.cef.rt,
+        severity_id:  workspace.cef.severity_level,
         // ...
     }
     egress = to_json(workspace.ocsf)
@@ -99,7 +99,7 @@ you live with a log pipeline:
   debugger.
 
   ```
-  $ limpidctl tap output security_lake --json | jq -c '{src: .source, sev: .workspace.cef_severity_level, class: .workspace.ocsf.class_uid}'
+  $ limpidctl tap output security_lake --json | jq -c '{src: .source, sev: .workspace.cef.severity_level, class: .workspace.ocsf.class_uid}'
   {"src":"10.0.0.21:51234","sev":3,"class":200401}
   {"src":"10.0.0.21:51234","sev":7,"class":200401}
   {"src":"10.0.0.22:42100","sev":2,"class":200401}
