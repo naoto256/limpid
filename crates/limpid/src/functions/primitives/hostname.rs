@@ -7,6 +7,13 @@
 //! Resolved at every call (cheap syscall on Linux/macOS via
 //! `gethostname(2)`), so a hostname change at runtime is picked up
 //! without restart.
+//!
+//! Failure mode: if the underlying `gethostname` crate panics (it
+//! does on syscall error in 0.5.x; vanishingly rare in practice but
+//! possible on chroot / namespace edge cases), we catch the unwind
+//! and return `Value::Null` rather than letting the daemon abort.
+
+use std::panic::AssertUnwindSafe;
 
 use crate::dsl::value::Value;
 use crate::functions::{FunctionRegistry, FunctionSig};
@@ -17,8 +24,13 @@ pub fn register(reg: &mut FunctionRegistry) {
         "hostname",
         FunctionSig::fixed(&[], FieldType::String),
         |_args, _event| {
-            let h = gethostname::gethostname().to_string_lossy().into_owned();
-            Ok(Value::String(h))
+            let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                gethostname::gethostname().to_string_lossy().into_owned()
+            }));
+            Ok(match result {
+                Ok(h) => Value::String(h),
+                Err(_) => Value::Null,
+            })
         },
     );
 }

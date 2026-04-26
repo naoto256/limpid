@@ -8,8 +8,11 @@
 //!
 //! Behaviour:
 //! * `Int` → itself (pass-through).
-//! * `Float` → truncated toward zero via `as i64` (matches C / Rust
-//!   cast semantics; saturating on overflow).
+//! * `Float` → finite values truncated toward zero via `as i64` (saturating
+//!   on overflow); `NaN` and `±∞` → `Null`. The non-finite case matches
+//!   the partial-data convention used by `regex_extract` / `table_lookup`
+//!   rather than silently producing `0` (NaN's default `as i64`) or
+//!   `i64::MIN`/`i64::MAX` (∞'s saturate).
 //! * `String` → `str::parse::<i64>` result, trimmed
 //!   (`"54321"` → `54321`, `" 42 "` → `42`).
 //! * `Bool` → `1` or `0`.
@@ -46,8 +49,14 @@ fn coerce(v: &Value) -> Result<Value> {
         Value::Bool(b) => Value::Int(if *b { 1 } else { 0 }),
         Value::Int(n) => Value::Int(*n),
         Value::Float(f) => {
-            // truncate toward zero, matching C / Rust `as i64` semantics
-            Value::Int(*f as i64)
+            if f.is_finite() {
+                // truncate toward zero, matching C / Rust `as i64` semantics
+                Value::Int(*f as i64)
+            } else {
+                // NaN / ±∞ have no defensible integer representation —
+                // fall through to the same Null partial-data signal.
+                Value::Null
+            }
         }
         Value::String(s) => {
             let t = s.trim();
@@ -99,6 +108,13 @@ mod tests {
         assert_eq!(coerce_ok(&f), n(3));
         let neg = Value::Float(-3.7);
         assert_eq!(coerce_ok(&neg), n(-3));
+    }
+
+    #[test]
+    fn float_non_finite_returns_null() {
+        assert_eq!(coerce_ok(&Value::Float(f64::NAN)), Value::Null);
+        assert_eq!(coerce_ok(&Value::Float(f64::INFINITY)), Value::Null);
+        assert_eq!(coerce_ok(&Value::Float(f64::NEG_INFINITY)), Value::Null);
     }
 
     #[test]
