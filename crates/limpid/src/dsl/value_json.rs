@@ -51,6 +51,15 @@ pub fn value_to_json(v: &Value) -> Result<JsonValue> {
             .map(JsonValue::Number)
             .ok_or_else(|| anyhow!("cannot serialize non-finite float to JSON: {n}")),
         Value::String(s) => Ok(JsonValue::String(s.clone())),
+        // Wire form for timestamps is unix nanoseconds (i64) — matches
+        // OTLP `time_unix_nano`, lossless round-trip vs RFC3339, no
+        // timezone ambiguity. RFC3339 remains the DSL Display form.
+        Value::Timestamp(dt) => {
+            let nanos = dt
+                .timestamp_nanos_opt()
+                .ok_or_else(|| anyhow!("timestamp out of i64 nanosecond range"))?;
+            Ok(JsonValue::Number(nanos.into()))
+        }
         Value::Bytes(b) => {
             let mut m = JsonMap::new();
             m.insert(

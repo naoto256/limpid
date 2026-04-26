@@ -40,7 +40,9 @@ pub mod regex_parse;
 pub mod regex_replace;
 pub mod string_predicates;
 pub mod strftime;
+pub mod strptime;
 pub mod table;
+pub mod timestamp;
 pub mod to_bytes;
 pub mod to_int;
 pub mod to_json;
@@ -70,9 +72,11 @@ pub fn register(reg: &mut FunctionRegistry, table_store: TableStore) {
     hostname::register(reg);
     len::register(reg);
     strftime::register(reg);
+    strptime::register(reg);
     parse_json::register(reg);
     parse_kv::register(reg);
     prepend::register(reg);
+    timestamp::register(reg);
     version::register(reg);
 }
 
