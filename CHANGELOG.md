@@ -304,6 +304,36 @@ without forcing a separate `extract_pri` + parse pass. The lighter
 `syslog.extract_pri` is still available for callers that only need
 the PRI byte without tokenising the rest of the header.
 
+### Breaking — `output file` path templates are stricter
+
+The `path` template renderer in the `file` output gained four guards
+that reject configs the previous lax renderer accepted silently. Each
+fires before any byte hits disk, per Principle 1 (zero hidden
+behaviour).
+
+- **Per-interpolation slash strip.** Every `${...}` result has
+  forward and back slashes replaced with `_`, so an interpolation
+  cannot smuggle a path separator into the rendered path. The
+  invariant is "one interpolation = one path component"; directory
+  structure has to live in the literal parts of the template.
+- **`..` rejected anywhere in the rendered path.** After all
+  interpolations resolve, the path is split on `/` and any component
+  exactly equal to `..` causes the write to error rather than being
+  silently rewritten.
+- **Empty interpolation rejected.** An interpolation that evaluates
+  to the empty string errors instead of producing surprise paths
+  like `/foo//bar` or `/foo/.log`.
+- **Trailing-slash / no-filename rejected.** A rendered path that
+  ends in `/` (no filename component) errors before the auto-mkdir
+  runs, so a stray template like `/var/log/${workspace.host}/`
+  cannot create empty directories silently.
+
+Configs that depended on any of these silent rewrites should
+sanitise the inputs upstream (`regex_replace`, explicit fallbacks in
+a `process` block) and reference the cleaned workspace key from the
+template. Worked examples are in the
+[`output file`](docs/src/outputs/file.md) reference.
+
 ### Breaking — `format()` primitive removed
 
 The `format(template)` primitive — which expanded `%{...}` placeholders against the current event — has been removed. The `${expr}` interpolation that any string literal supports is strictly more capable: it accepts any DSL expression rather than the limited `%{event.x}` / `%{workspace.x}` set, and it's resolved at parse time so typos are caught by `--check`.
@@ -351,8 +381,12 @@ default space) or as the third (after an explicit separator).
 
 ### Breaking / Added — `Value::Timestamp` first-class DSL type
 
-The DSL gains a typed `Value::Timestamp(DateTime<FixedOffset>)` value
-arm. Previously every timestamp travelled through the runtime as an
+The DSL gains a typed `Value::Timestamp(DateTime<Utc>)` value arm.
+Inputs in any timezone (RFC3339 with offset, naive + explicit `tz`
+argument, etc.) are normalised to UTC at the boundary, so the
+runtime never has to reason about mixed offsets.
+
+Previously every timestamp travelled through the runtime as an
 RFC3339 `Value::String` — type-unsafe, repeated parse cost, and easy
 to typo into `contains(received_at, "2026")` (silently false because
 of substring semantics).
@@ -477,6 +511,17 @@ fire on a literal `CEF:` string buried elsewhere in the payload.
   exponential backoff is `saturating_mul(2)`. The realistic reach of
   `Duration` overflow is "never" (~584 years) but the explicit bound
   removes another panic seed.
+- **`hostname()` panic-safe.** The `gethostname` 0.5.x crate panics
+  on `gethostname(2)` syscall failure (chroot / namespace edge
+  cases — vanishingly rare in practice). The primitive now wraps
+  the call in `catch_unwind` and degrades to `Value::Null` on
+  unwind, so a tokio task can't take the daemon down.
+- **`to_int(Float)` rejects non-finite values.** `NaN` and `±∞`
+  used to slip through `as i64` (NaN → 0, ∞ → `i64::MIN`/`i64::MAX`),
+  both of which violate Principle 1. Finite-but-out-of-range floats
+  still saturate (matching the documented `as`-cast semantics);
+  non-finite values fall through to the same partial-data `Null`
+  path as unparseable strings.
 
 ### Refactored — TLS helper centralization
 
