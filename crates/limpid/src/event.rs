@@ -21,8 +21,10 @@ pub struct Event {
     /// by the input layer (`Event::new` → `Utc::now()`); never overwritten
     /// from payload contents (Principle 2: input is dumb transport).
     /// Source-claimed event time, when extractable, lives in workspace
-    /// fields like `syslog_timestamp` / `cef_rt` / `pan_generated_time`
-    /// — `process` snippets surface them via the parser primitives.
+    /// fields populated by parser primitives — typically captured under
+    /// a per-schema namespace (`workspace.syslog = syslog.parse(ingress)`
+    /// then `workspace.syslog.timestamp`; CEF's `rt` extension surfaces
+    /// as `workspace.cef.rt` after `workspace.cef = cef.parse(...)`).
     pub received_at: DateTime<Utc>,
     pub source: SocketAddr,
     pub ingress: Bytes,

@@ -8,12 +8,17 @@
 //!
 //! # Layout
 //!
-//! - [`primitives`] — flat-namespace, schema-agnostic functions
-//!   (`contains`, `lower`, `regex_*`, `strftime`, `geoip`,
-//!   `table_*`, `md5`/`sha1`/`sha256`, `to_json`, `to_int`, `find_by`,
-//!   `csv_parse`, `len`, `append`, `prepend`). One file per function
-//!   (or per tightly-related group such as `hashes.rs`) so `mod.rs`
-//!   does not become a megafile.
+//! - [`primitives`] — flat-namespace, schema-agnostic functions,
+//!   grouped by concern: case (`lower`, `upper`), string predicates
+//!   (`contains`, `starts_with`, `ends_with`), regex (`regex_*`),
+//!   time (`timestamp`, `strftime`, `strptime`), env
+//!   (`hostname`, `version`), enrichment (`geoip`, `table_*`), hashing
+//!   (`md5` / `sha1` / `sha256`), serialisation (`to_json`, `to_bytes`,
+//!   `to_string`, `to_int`), parsers (`parse_json`, `parse_kv`,
+//!   `csv_parse`, `regex_parse`), arrays (`find_by`, `len`, `append`,
+//!   `prepend`). One file per function (or per tightly-related group
+//!   such as `hashes.rs` / `string_predicates.rs`) so `mod.rs` does
+//!   not become a megafile.
 //! - [`syslog`] / [`cef`] — schema-specific namespaces (`syslog.*`,
 //!   `cef.*`). See Design Principle 5 in `design-principles.md`;
 //!   future schema namespaces (`ocsf.*` composers, etc.) follow the
@@ -279,8 +284,8 @@ impl FunctionRegistry {
     ///
     /// Arity validation runs here (single source of truth) for every
     /// function that has a registered [`FunctionSig`]. Functions without
-    /// a sig — only `parse_json` / `parse_kv` still go through `register`
-    /// today, and `register_parser` supplies a sig for them — skip the
+    /// a sig — only `parse_json` still goes through bare `register`
+    /// today, and `register_parser` supplies a sig for it — skip the
     /// check and keep their historical hand-rolled arity guards.
     pub fn call(
         &self,

@@ -8,12 +8,17 @@
 //!
 //! Behaviour:
 //! * `Int` → itself (pass-through).
-//! * `Float` → truncated to `i64` (no rounding, no overflow check other
-//!   than what serde_json's `as_i64` performs).
-//! * `String` → `str::parse::<i64>` result, trimmed; also accepts a
-//!   numeric prefix for robustness (`"54321"` → `54321`, `" 42 "` → `42`).
+//! * `Float` → truncated toward zero via `as i64` (matches C / Rust
+//!   cast semantics; saturating on overflow).
+//! * `String` → `str::parse::<i64>` result, trimmed
+//!   (`"54321"` → `54321`, `" 42 "` → `42`).
 //! * `Bool` → `1` or `0`.
+//! * `Timestamp` → unix nanoseconds (`i64`), matching OTLP
+//!   `time_unix_nano`. So `to_int(received_at)` is the natural way to
+//!   get a numeric epoch value.
 //! * `Null` → `Null` pass-through (`to_int(null) = null`).
+//! * `Bytes` → error (no standard numeric interpretation; convert via
+//!   `to_string()` first when the bytes are decimal text).
 //! * Anything non-parseable (`"abc"`, arrays, objects) → `Null`.
 //!
 //! The "return `Null` on failure rather than error" policy matches
