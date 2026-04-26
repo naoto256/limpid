@@ -166,10 +166,20 @@ impl FileOutput {
     /// where `is_dynamic` is true when the template had any interpolated
     /// fragments (used to decide whether to `mkdir -p` the parent).
     ///
-    /// For `Template`, each `Interp` fragment is evaluated separately so
-    /// that values derived from `workspace.*` can be sanitised without
-    /// affecting literal path separators or server-owned interpolations
-    /// like `${source}`.
+    /// Two safety passes:
+    ///
+    /// 1. Per-interpolation: every `${...}` result has `/` and `\`
+    ///    replaced with `_`, regardless of the wrapping expression
+    ///    (`${workspace.x}`, `${lower(workspace.x)}`, `${a + b}` —
+    ///    all treated alike). The invariant is "one interpolation =
+    ///    one path component"; directory structure must be expressed
+    ///    in the literal parts of the template.
+    ///
+    /// 2. Post-evaluation: the fully-rendered path string has every
+    ///    `../` traversal sequence stripped (along with a trailing
+    ///    `/..` and a result of exactly `..`) until no more remain.
+    ///    Combined with pass 1, no interpolation value can introduce
+    ///    a directory escape regardless of how it is composed.
     fn render_path(&self, event: &Event) -> Result<(String, bool)> {
         match &self.path.kind {
             ExprKind::StringLit(s) => Ok((s.clone(), false)),
@@ -186,13 +196,46 @@ impl FileOutput {
                         TemplateFragment::Literal(s) => out.push_str(s),
                         TemplateFragment::Interp(expr) => {
                             let rendered = value_to_string(&eval_expr(expr, event, funcs)?);
-                            if is_workspace_reference(expr) {
-                                out.push_str(&sanitize_path_component(&rendered));
-                            } else {
-                                out.push_str(&rendered);
+                            // Pass 1: per-interp `/` `\` → `_` and reject empty.
+                            // An empty interp would silently produce paths like
+                            // `/foo//bar` or `/foo/.log` that almost never reflect
+                            // operator intent — usually a null workspace value or
+                            // a Pass-2 collapse of `${"..": something}`.
+                            if rendered.is_empty() {
+                                anyhow::bail!(
+                                    "output file: interpolation evaluated to empty string \
+                                     (would create surprise path like `/foo//bar` or `/foo/.log`)"
+                                );
                             }
+                            out.push_str(&sanitize_path_component(&rendered));
                         }
                     }
+                }
+                // Pass 2: reject (do not silently strip) any directory
+                // traversal sequence in the fully-rendered path. `..` in
+                // a path almost always reflects a config or data bug,
+                // and silently rewriting it to "the target one level up"
+                // would be the kind of "helpful" hidden behaviour
+                // limpid Principle 1 forbids.
+                check_no_traversal(&out)?;
+                // Pass 3: reject empty results and trailing-slash
+                // results before the write attempt. Trailing slash is
+                // not just a "the OS will catch it" case — the parent-
+                // dir auto-mkdir runs before open(), so a path like
+                // `/foo/bar/` would silently create `/foo/bar` as a
+                // directory and *then* fail at open with `EISDIR`.
+                // Catching it here avoids the spurious mkdir side
+                // effect and gives a clear diagnostic.
+                if out.is_empty() {
+                    anyhow::bail!(
+                        "output file: rendered path is empty (template produced no content)"
+                    );
+                }
+                if out.ends_with('/') {
+                    anyhow::bail!(
+                        "output file: rendered path ends with `/` (no filename component): {:?}",
+                        out
+                    );
                 }
                 Ok((out, true))
             }
@@ -204,24 +247,33 @@ impl FileOutput {
     }
 }
 
-/// Does `expr` dereference `workspace.*` (i.e. user-controlled event data)?
-/// Conservative: only flags literal `workspace.xxx[.yyy]` identifiers. Other
-/// expressions whose results happen to originate from the workspace (e.g.
-/// `lower(workspace.host)`) are rendered without sanitisation — users who
-/// care should write their sanitisation explicitly.
-fn is_workspace_reference(expr: &Expr) -> bool {
-    match &expr.kind {
-        ExprKind::Ident(parts) => {
-            parts.first().is_some_and(|s| s == "workspace") && parts.len() > 1
-        }
-        ExprKind::PropertyAccess(base, _) => is_workspace_reference(base),
-        _ => false,
-    }
+/// Pass 1: per-interpolation sanitisation. Strip `/` and `\` so an
+/// interpolation cannot expand into multiple path components or a
+/// Windows path separator. `.` is left alone — operators rely on dots
+/// for FQDN-style filenames (`web01.example.com.log`).
+fn sanitize_path_component(s: &str) -> String {
+    s.replace(['/', '\\'], "_")
 }
 
-/// Sanitize a path component: strip `/`, `\`, and `..`.
-fn sanitize_path_component(s: &str) -> String {
-    s.replace(['/', '\\'], "_").replace("..", "_")
+/// Pass 2: error if any path component (slash-separated segment) is
+/// exactly `..`. Per limpid Principle 1 (zero hidden behaviour), `..`
+/// in a path is loud-rejected rather than silently rewritten —
+/// almost always a config / data bug, and a silent collapse would
+/// quietly redirect writes to a different file.
+///
+/// The check is component-wise (`split('/')`) so unusual but harmless
+/// dirnames like `...` or `..foo` pass through cleanly — only the
+/// exact `..` token, in any path position, is rejected.
+fn check_no_traversal(s: &str) -> Result<()> {
+    if s.split('/').any(|c| c == "..") {
+        anyhow::bail!(
+            "output file: rendered path contains a `..` traversal component: {:?}. \
+             `..` is rejected rather than silently rewritten — sanitise upstream \
+             (regex_replace, a process body) or pin the value before interpolation.",
+            s
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -386,17 +438,83 @@ mod tests {
     }
 
     #[test]
-    fn render_template_does_not_sanitize_non_workspace_interp() {
-        // `${source}` is a top-level ident (not workspace.*), so its value
-        // is passed through even if it contains separators (IPv4 won't,
-        // but the principle holds).
+    fn render_template_sanitises_every_interpolation() {
+        // Pass 1: every interpolation result has `/` `\` → `_`,
+        // regardless of expression shape. `source` (a non-workspace
+        // ident) gets the same treatment as `workspace.x`.
         let out = make_output(ek(ExprKind::Template(vec![
             TemplateFragment::Literal("a-".into()),
             TemplateFragment::Interp(ek(ExprKind::Ident(vec!["source".into()]))),
             TemplateFragment::Literal("-b".into()),
         ])));
         let (rendered, _) = out.render_path(&event_with_workspace()).unwrap();
+        // source is "192.168.1.10" — no slashes, no change. Principle
+        // holds for hypothetical slash-bearing values.
         assert_eq!(rendered, "a-192.168.1.10-b");
+    }
+
+    #[test]
+    fn render_template_errors_on_empty_interpolation() {
+        // Template `/var/log/${workspace.empty}.log` with empty value would
+        // produce `/var/log/.log` — almost never the operator's intent.
+        let mut e = Event::new(
+            Bytes::from("hello"),
+            "192.168.1.10:514".parse::<SocketAddr>().unwrap(),
+        );
+        e.workspace.insert("empty".into(), Value::String("".into()));
+        let out = make_output(ek(ExprKind::Template(vec![
+            TemplateFragment::Literal("/var/log/".into()),
+            TemplateFragment::Interp(ek(ExprKind::Ident(vec!["workspace".into(), "empty".into()]))),
+            TemplateFragment::Literal(".log".into()),
+        ])));
+        let err = out.render_path(&e).unwrap_err();
+        assert!(
+            err.to_string().contains("evaluated to empty"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn render_template_errors_on_trailing_slash() {
+        // Template "/var/log/${workspace.empty}/" — empty value alone
+        // would already trip Pass 1b; here the template has trailing
+        // literal slash on a non-empty interp, producing a path that
+        // ends in `/`. Without Pass 3 catching this, the write path's
+        // `create_dir_all(parent)` would silently materialise an empty
+        // directory before open() fails with EISDIR.
+        let out = make_output(ek(ExprKind::Template(vec![
+            TemplateFragment::Literal("/var/log/".into()),
+            TemplateFragment::Interp(ek(ExprKind::Ident(vec!["workspace".into(), "host".into()]))),
+            TemplateFragment::Literal("/".into()),
+        ])));
+        let err = out.render_path(&event_with_workspace()).unwrap_err();
+        assert!(
+            err.to_string().contains("ends with `/`"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn render_template_errors_when_traversal_appears_in_path() {
+        // Template `${workspace.v}` with v=".." → Pass 1 leaves ".." as-is
+        // (no slash to strip) → Pass 2 rejects rather than silently
+        // collapsing.
+        let mut e = Event::new(
+            Bytes::from("hello"),
+            "192.168.1.10:514".parse::<SocketAddr>().unwrap(),
+        );
+        e.workspace.insert("v".into(), Value::String("..".into()));
+        let out = make_output(ek(ExprKind::Template(vec![TemplateFragment::Interp(ek(
+            ExprKind::Ident(vec!["workspace".into(), "v".into()]),
+        ))])));
+        let err = out.render_path(&e).unwrap_err();
+        assert!(
+            err.to_string().contains("traversal component"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -410,32 +528,27 @@ mod tests {
     }
 
     #[test]
-    fn is_workspace_reference_detects_nested_paths() {
-        assert!(is_workspace_reference(&ek(ExprKind::Ident(vec![
-            "workspace".into(),
-            "x".into()
-        ]))));
-        assert!(is_workspace_reference(&ek(ExprKind::Ident(vec![
-            "workspace".into(),
-            "x".into(),
-            "y".into()
-        ]))));
-        // `workspace` alone is not a reference to a specific key
-        assert!(!is_workspace_reference(&ek(ExprKind::Ident(vec![
-            "workspace".into()
-        ]))));
-        // non-workspace idents don't count
-        assert!(!is_workspace_reference(&ek(ExprKind::Ident(vec![
-            "source".into()
-        ]))));
-        // function calls always render without sanitisation (users
-        // opt-in to their own sanitisation)
-        assert!(!is_workspace_reference(&ek(ExprKind::FuncCall {
-            namespace: None,
-            name: "lower".into(),
-            args: vec![ek(ExprKind::Ident(
-                vec!["workspace".into(), "host".into(),]
-            ))],
-        })));
+    fn check_no_traversal_accepts_clean_paths() {
+        assert!(check_no_traversal("/var/log/foo.log").is_ok());
+        assert!(check_no_traversal("/var/log/web01.example.com.log").is_ok());
+        assert!(check_no_traversal("/var/log/.hidden.log").is_ok());
+        // Multi-dot dirnames are NOT `..` — `....` is just an unusual
+        // filename, not a traversal.
+        assert!(check_no_traversal("/var/log/.../foo.log").is_ok());
+        assert!(check_no_traversal("a/..../b").is_ok());
+    }
+
+    #[test]
+    fn check_no_traversal_rejects_dot_dot_sequences() {
+        // Single ../ in the middle
+        assert!(check_no_traversal("/var/log/../etc/passwd").is_err());
+        // Multiple ../ chained
+        assert!(check_no_traversal("/var/log/../../etc/passwd").is_err());
+        // Concatenation traversal: literal "/x/../" via interp+literal
+        assert!(check_no_traversal("/var/log/x/../etc/passwd").is_err());
+        // Trailing /..
+        assert!(check_no_traversal("/var/log/..").is_err());
+        // Standalone ..
+        assert!(check_no_traversal("..").is_err());
     }
 }
