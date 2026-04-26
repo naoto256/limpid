@@ -134,10 +134,10 @@ fn parse_rfc3164(input: &str, map: &mut Map) {
     let (hostname, after_host) = next_token(rest);
     let (appname, procid, msg) = parse_tag_and_msg(after_host);
 
-    if let Some(ts) = timestamp_str {
-        if !ts.is_empty() {
-            set_field(map, "syslog_timestamp", ts);
-        }
+    if let Some(ts) = timestamp_str
+        && !ts.is_empty()
+    {
+        set_field(map, "syslog_timestamp", ts);
     }
     if !hostname.is_empty() {
         set_field(map, "syslog_hostname", hostname);
