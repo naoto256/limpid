@@ -10,6 +10,8 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-04-27
+
 ### Breaking — process runtime errors discard the event
 
 When a `process` statement raises a runtime error (unknown identifier,
