@@ -34,30 +34,31 @@ pub fn register(reg: &mut FunctionRegistry) {
         "regex_parse",
         FunctionSig::fixed(&[FieldType::String, FieldType::String], FieldType::Any),
         |args, _event| {
-        let target = val_to_str(&args[0])?;
-        let pattern = val_to_str(&args[1])?;
+            let target = val_to_str(&args[0])?;
+            let pattern = val_to_str(&args[1])?;
 
-        let mangled = mangle_pattern(&pattern);
-        let re = get_cached_regex(&mangled).map_err(|e| anyhow::anyhow!("invalid regex: {}", e))?;
+            let mangled = mangle_pattern(&pattern);
+            let re =
+                get_cached_regex(&mangled).map_err(|e| anyhow::anyhow!("invalid regex: {}", e))?;
 
-        // No named captures at all → empty object so a bare statement is a no-op.
-        if re.capture_names().flatten().next().is_none() {
-            return Ok(Value::Object(Map::new()));
-        }
-
-        let caps = match re.captures(&target) {
-            Some(c) => c,
-            None => return Ok(Value::Null),
-        };
-
-        let mut out = Map::new();
-        for name in re.capture_names().flatten() {
-            let original = demangle(name);
-            if let Some(m) = caps.name(name) {
-                set_nested(&mut out, &original, Value::String(m.as_str().to_string()));
+            // No named captures at all → empty object so a bare statement is a no-op.
+            if re.capture_names().flatten().next().is_none() {
+                return Ok(Value::Object(Map::new()));
             }
-        }
-        Ok(Value::Object(out))
+
+            let caps = match re.captures(&target) {
+                Some(c) => c,
+                None => return Ok(Value::Null),
+            };
+
+            let mut out = Map::new();
+            for name in re.capture_names().flatten() {
+                let original = demangle(name);
+                if let Some(m) = caps.name(name) {
+                    set_nested(&mut out, &original, Value::String(m.as_str().to_string()));
+                }
+            }
+            Ok(Value::Object(out))
         },
     );
     // Register as parser so the analyzer knows that a bare

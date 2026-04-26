@@ -2,8 +2,8 @@
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
     use crate::dsl::value::Value;
+    use bytes::Bytes;
     use std::net::SocketAddr;
 
     use crate::dsl::ast::*;
@@ -384,10 +384,7 @@ mod tests {
             &Value::String("a".into()),
             &Value::String("b".into())
         ));
-        assert!(values_match(
-            &Value::Int(42),
-            &Value::Int(42)
-        ));
+        assert!(values_match(&Value::Int(42), &Value::Int(42)));
     }
 
     // ----- Array literal -----------------------------------------------------
@@ -419,11 +416,7 @@ mod tests {
         ]));
         assert_eq!(
             eval_expr(&expr, &ev, &f).unwrap(),
-            Value::Array(vec![
-                Value::Int(1),
-                Value::Int(2),
-                Value::Int(3),
-            ])
+            Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3),])
         );
     }
 
@@ -458,10 +451,7 @@ mod tests {
         ]));
         assert_eq!(
             eval_expr(&expr, &ev, &f).unwrap(),
-            Value::Array(vec![
-                Value::String("192.168.1.1".into()),
-                Value::Int(42),
-            ])
+            Value::Array(vec![Value::String("192.168.1.1".into()), Value::Int(42),])
         );
     }
 

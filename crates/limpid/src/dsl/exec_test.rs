@@ -2,8 +2,8 @@
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
     use crate::dsl::value::Value;
+    use bytes::Bytes;
     use std::net::SocketAddr;
 
     use crate::dsl::ast::*;
@@ -388,11 +388,7 @@ mod tests {
             ExecResult::Continue(ev) => {
                 assert_eq!(
                     ev.workspace["xs"],
-                    Value::Array(vec![
-                        Value::Int(1),
-                        Value::Int(2),
-                        Value::Int(3),
-                    ])
+                    Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3),])
                 );
             }
             ExecResult::Dropped => panic!("unexpected drop"),
@@ -425,11 +421,7 @@ mod tests {
             ExecResult::Continue(ev) => {
                 assert_eq!(
                     ev.workspace["xs"],
-                    Value::Array(vec![
-                        Value::Int(1),
-                        Value::Int(2),
-                        Value::Int(3),
-                    ])
+                    Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3),])
                 );
             }
             ExecResult::Dropped => panic!("unexpected drop"),
@@ -702,10 +694,7 @@ mod tests {
                         e(ExprKind::BinOp(
                             Box::new(e(ExprKind::Ident(vec!["acc".into()]))),
                             BinOp::Add,
-                            Box::new(e(ExprKind::Ident(vec![
-                                "workspace".into(),
-                                "_item".into(),
-                            ]))),
+                            Box::new(e(ExprKind::Ident(vec!["workspace".into(), "_item".into()]))),
                         )),
                     ),
                 ],

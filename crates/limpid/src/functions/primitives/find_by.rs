@@ -87,9 +87,15 @@ mod tests {
 
     #[test]
     fn non_array_input_returns_null() {
-        assert_eq!(find(&value!({"t": "a"}), &value!("t"), &value!("a")), Value::Null);
+        assert_eq!(
+            find(&value!({"t": "a"}), &value!("t"), &value!("a")),
+            Value::Null
+        );
         assert_eq!(find(&Value::Null, &value!("t"), &value!("a")), Value::Null);
-        assert_eq!(find(&value!("not an array"), &value!("t"), &value!("a")), Value::Null);
+        assert_eq!(
+            find(&value!("not an array"), &value!("t"), &value!("a")),
+            Value::Null
+        );
     }
 
     #[test]

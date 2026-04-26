@@ -128,9 +128,7 @@ impl Event {
 fn bytes_to_json(b: &Bytes) -> JsonValue {
     match std::str::from_utf8(b) {
         Ok(s) => JsonValue::String(s.to_string()),
-        Err(_) => {
-            value_to_json(&Value::Bytes(b.clone())).unwrap_or(JsonValue::Null)
-        }
+        Err(_) => value_to_json(&Value::Bytes(b.clone())).unwrap_or(JsonValue::Null),
     }
 }
 

@@ -529,12 +529,7 @@ mod tests {
         let reg = make_registry();
         let e = dummy_event();
         let err = reg
-            .call(
-                None,
-                "strftime",
-                &[ts("2026-04-19T10:30:45+00:00")],
-                &e,
-            )
+            .call(None, "strftime", &[ts("2026-04-19T10:30:45+00:00")], &e)
             .unwrap_err();
         assert!(err.to_string().contains("2 to 3 arguments"));
     }
@@ -603,10 +598,7 @@ mod tests {
         // message uses "1 argument" (singular) rather than "1 arguments".
         let reg = make_registry();
         let e = dummy_event();
-        let err = reg
-            .call(None, "to_int", &[], &e)
-            .unwrap_err()
-            .to_string();
+        let err = reg.call(None, "to_int", &[], &e).unwrap_err().to_string();
         assert!(
             err.contains("to_int() expects 1 argument, got 0"),
             "unexpected error: {err}"
@@ -622,7 +614,10 @@ mod tests {
         let fmt = Value::String("%H:%M".into());
         let tz = Value::String("UTC".into());
         // at minimum
-        assert!(reg.call(None, "strftime", &[tsv.clone(), fmt.clone()], &e).is_ok());
+        assert!(
+            reg.call(None, "strftime", &[tsv.clone(), fmt.clone()], &e)
+                .is_ok()
+        );
         // at maximum
         assert!(reg.call(None, "strftime", &[tsv, fmt, tz], &e).is_ok());
     }
@@ -643,12 +638,7 @@ mod tests {
             "unexpected error: {err_below}"
         );
         let err_above = reg
-            .call(
-                None,
-                "strftime",
-                &[tsv, fmt, tz.clone(), tz],
-                &e,
-            )
+            .call(None, "strftime", &[tsv, fmt, tz.clone(), tz], &e)
             .unwrap_err()
             .to_string();
         assert!(
@@ -765,5 +755,4 @@ mod tests {
             Value::String("namespaced".into())
         );
     }
-
 }
