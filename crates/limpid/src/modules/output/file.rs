@@ -211,21 +211,24 @@ impl FileOutput {
                         }
                     }
                 }
-                // Pass 2: strip `..` traversal across the fully-rendered string
-                // so that literal+interp concatenation can't smuggle in `../`.
-                let rendered = strip_traversal(&out);
-                // Pass 3: a residual empty result means Pass 2 nuked the whole
-                // path (template was a single `${".."} `-like interp). Anything
-                // that ends in `/` (trailing literal slash, or a directory-shaped
-                // path) is left to the OS to reject — dir-target opens fail with
-                // `EISDIR` / `ENOTDIR`, same diagnostic surface either way.
-                if rendered.is_empty() {
+                // Pass 2: reject (do not silently strip) any directory
+                // traversal sequence in the fully-rendered path. `..` in
+                // a path almost always reflects a config or data bug,
+                // and silently rewriting it to "the target one level up"
+                // would be the kind of "helpful" hidden behaviour
+                // limpid Principle 1 forbids.
+                check_no_traversal(&out)?;
+                // Pass 3: a residual empty result means the template
+                // collapsed to nothing (e.g. a single empty literal).
+                // Trailing-slash and directory-target paths are left to
+                // the OS — `EISDIR` / `ENOTDIR` give the same diagnostic
+                // surface either way.
+                if out.is_empty() {
                     anyhow::bail!(
-                        "output file: rendered path is empty after sanitisation \
-                         (interpolation collapsed to nothing)"
+                        "output file: rendered path is empty (template produced no content)"
                     );
                 }
-                Ok((rendered, true))
+                Ok((out, true))
             }
             other => anyhow::bail!(
                 "output file: unsupported path expression shape: {:?}",
@@ -243,25 +246,25 @@ fn sanitize_path_component(s: &str) -> String {
     s.replace(['/', '\\'], "_")
 }
 
-/// Pass 2: strip `..` traversal sequences from the fully-rendered path.
-/// Iterates to a fixpoint so pathological inputs (`..../`, `....///..`,
-/// etc.) collapse rather than passing through partially.
-fn strip_traversal(s: &str) -> String {
-    let mut out = s.to_string();
-    loop {
-        let next = out.replace("../", "");
-        if next == out {
-            break;
-        }
-        out = next;
+/// Pass 2: error if any path component (slash-separated segment) is
+/// exactly `..`. Per limpid Principle 1 (zero hidden behaviour), `..`
+/// in a path is loud-rejected rather than silently rewritten —
+/// almost always a config / data bug, and a silent collapse would
+/// quietly redirect writes to a different file.
+///
+/// The check is component-wise (`split('/')`) so unusual but harmless
+/// dirnames like `...` or `..foo` pass through cleanly — only the
+/// exact `..` token, in any path position, is rejected.
+fn check_no_traversal(s: &str) -> Result<()> {
+    if s.split('/').any(|c| c == "..") {
+        anyhow::bail!(
+            "output file: rendered path contains a `..` traversal component: {:?}. \
+             `..` is rejected rather than silently rewritten — sanitise upstream \
+             (regex_replace, a process body) or pin the value before interpolation.",
+            s
+        );
     }
-    if let Some(stripped) = out.strip_suffix("/..") {
-        out = stripped.to_string();
-    }
-    if out == ".." {
-        out.clear();
-    }
-    out
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -464,9 +467,10 @@ mod tests {
     }
 
     #[test]
-    fn render_template_errors_when_traversal_collapses_to_empty() {
-        // Template `${workspace.v}` with v=".." → Pass 1: ".." (no slash to
-        // strip) → Pass 2: standalone ".." → "" → Pass 3 rejects.
+    fn render_template_errors_when_traversal_appears_in_path() {
+        // Template `${workspace.v}` with v=".." → Pass 1 leaves ".." as-is
+        // (no slash to strip) → Pass 2 rejects rather than silently
+        // collapsing.
         let mut e = Event::new(
             Bytes::from("hello"),
             "192.168.1.10:514".parse::<SocketAddr>().unwrap(),
@@ -477,7 +481,7 @@ mod tests {
         ))])));
         let err = out.render_path(&e).unwrap_err();
         assert!(
-            err.to_string().contains("empty after sanitisation"),
+            err.to_string().contains("traversal component"),
             "unexpected error: {}",
             err
         );
@@ -494,24 +498,27 @@ mod tests {
     }
 
     #[test]
-    fn strip_traversal_kills_dot_dot_sequences() {
-        // Plain — no change
-        assert_eq!(strip_traversal("/var/log/foo.log"), "/var/log/foo.log");
+    fn check_no_traversal_accepts_clean_paths() {
+        assert!(check_no_traversal("/var/log/foo.log").is_ok());
+        assert!(check_no_traversal("/var/log/web01.example.com.log").is_ok());
+        assert!(check_no_traversal("/var/log/.hidden.log").is_ok());
+        // Multi-dot dirnames are NOT `..` — `....` is just an unusual
+        // filename, not a traversal.
+        assert!(check_no_traversal("/var/log/.../foo.log").is_ok());
+        assert!(check_no_traversal("a/..../b").is_ok());
+    }
+
+    #[test]
+    fn check_no_traversal_rejects_dot_dot_sequences() {
         // Single ../ in the middle
-        assert_eq!(strip_traversal("/var/log/../etc/passwd"), "/var/log/etc/passwd");
+        assert!(check_no_traversal("/var/log/../etc/passwd").is_err());
         // Multiple ../ chained
-        assert_eq!(strip_traversal("/var/log/../../etc/passwd"), "/var/log/etc/passwd");
-        // Concatenation traversal: literal "/x/../" via interpolation+literal
-        assert_eq!(strip_traversal("/var/log/x/../etc/passwd"), "/var/log/x/etc/passwd");
+        assert!(check_no_traversal("/var/log/../../etc/passwd").is_err());
+        // Concatenation traversal: literal "/x/../" via interp+literal
+        assert!(check_no_traversal("/var/log/x/../etc/passwd").is_err());
         // Trailing /..
-        assert_eq!(strip_traversal("/var/log/.."), "/var/log");
+        assert!(check_no_traversal("/var/log/..").is_err());
         // Standalone ..
-        assert_eq!(strip_traversal(".."), "");
-        // Dots inside filenames are preserved (FQDN.log, hidden-style names)
-        assert_eq!(strip_traversal("/var/log/web01.example.com.log"), "/var/log/web01.example.com.log");
-        assert_eq!(strip_traversal("/var/log/.hidden.log"), "/var/log/.hidden.log");
-        // Multi-dot dirnames like `....` are NOT traversal (not `..`),
-        // so they survive — just an unusual filename, not a path escape.
-        assert_eq!(strip_traversal("a/..../b"), "a/..b"); // single ../ inside `..../` strips to `..b`
+        assert!(check_no_traversal("..").is_err());
     }
 }
