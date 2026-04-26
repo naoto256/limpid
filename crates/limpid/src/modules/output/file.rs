@@ -196,16 +196,33 @@ impl FileOutput {
                         TemplateFragment::Literal(s) => out.push_str(s),
                         TemplateFragment::Interp(expr) => {
                             let rendered = value_to_string(&eval_expr(expr, event, funcs)?);
+                            // Pass 1: per-interp `/` `\` → `_` and reject empty.
+                            // An empty interp would silently produce paths like
+                            // `/foo//bar` or `/foo/.log` that almost never reflect
+                            // operator intent — usually a null workspace value or
+                            // a Pass-2 collapse of `${"..": something}`.
+                            if rendered.is_empty() {
+                                anyhow::bail!(
+                                    "output file: interpolation evaluated to empty string \
+                                     (would create surprise path like `/foo//bar` or `/foo/.log`)"
+                                );
+                            }
                             out.push_str(&sanitize_path_component(&rendered));
                         }
                     }
                 }
+                // Pass 2: strip `..` traversal across the fully-rendered string
+                // so that literal+interp concatenation can't smuggle in `../`.
                 let rendered = strip_traversal(&out);
-                if rendered.is_empty() || rendered.ends_with('/') {
+                // Pass 3: a residual empty result means Pass 2 nuked the whole
+                // path (template was a single `${".."} `-like interp). Anything
+                // that ends in `/` (trailing literal slash, or a directory-shaped
+                // path) is left to the OS to reject — dir-target opens fail with
+                // `EISDIR` / `ENOTDIR`, same diagnostic surface either way.
+                if rendered.is_empty() {
                     anyhow::bail!(
-                        "output file: rendered path has no filename component (interpolation \
-                         collapsed to empty / directory): template-eval result = {:?}",
-                        rendered
+                        "output file: rendered path is empty after sanitisation \
+                         (interpolation collapsed to nothing)"
                     );
                 }
                 Ok((rendered, true))
@@ -425,13 +442,31 @@ mod tests {
     }
 
     #[test]
-    fn render_template_errors_when_path_has_no_filename() {
-        // Template that collapses to a directory-like path: literal `/var/log/` +
-        // interp value `..` → "/var/log/.." → strip `/..` → "/var/log".
-        // "/var/log" is fine as a path string but ends without slash so it
-        // doesn't trip the validator. The actually-bad case is when the
-        // collapsed result ends with `/` or is empty.
-        // Trip the validator with a workspace value that's exactly `..`.
+    fn render_template_errors_on_empty_interpolation() {
+        // Template `/var/log/${workspace.empty}.log` with empty value would
+        // produce `/var/log/.log` — almost never the operator's intent.
+        let mut e = Event::new(
+            Bytes::from("hello"),
+            "192.168.1.10:514".parse::<SocketAddr>().unwrap(),
+        );
+        e.workspace.insert("empty".into(), Value::String("".into()));
+        let out = make_output(ek(ExprKind::Template(vec![
+            TemplateFragment::Literal("/var/log/".into()),
+            TemplateFragment::Interp(ek(ExprKind::Ident(vec!["workspace".into(), "empty".into()]))),
+            TemplateFragment::Literal(".log".into()),
+        ])));
+        let err = out.render_path(&e).unwrap_err();
+        assert!(
+            err.to_string().contains("evaluated to empty"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn render_template_errors_when_traversal_collapses_to_empty() {
+        // Template `${workspace.v}` with v=".." → Pass 1: ".." (no slash to
+        // strip) → Pass 2: standalone ".." → "" → Pass 3 rejects.
         let mut e = Event::new(
             Bytes::from("hello"),
             "192.168.1.10:514".parse::<SocketAddr>().unwrap(),
@@ -442,29 +477,7 @@ mod tests {
         ))])));
         let err = out.render_path(&e).unwrap_err();
         assert!(
-            err.to_string().contains("no filename component"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn render_template_errors_when_path_ends_with_slash() {
-        // Template "/var/log/${workspace.empty}/" with empty value renders to
-        // "/var/log//" — ends with slash, no filename. Validator catches this.
-        let mut e = Event::new(
-            Bytes::from("hello"),
-            "192.168.1.10:514".parse::<SocketAddr>().unwrap(),
-        );
-        e.workspace.insert("empty".into(), Value::String("".into()));
-        let out = make_output(ek(ExprKind::Template(vec![
-            TemplateFragment::Literal("/var/log/".into()),
-            TemplateFragment::Interp(ek(ExprKind::Ident(vec!["workspace".into(), "empty".into()]))),
-            TemplateFragment::Literal("/".into()),
-        ])));
-        let err = out.render_path(&e).unwrap_err();
-        assert!(
-            err.to_string().contains("no filename component"),
+            err.to_string().contains("empty after sanitisation"),
             "unexpected error: {}",
             err
         );
