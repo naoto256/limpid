@@ -106,8 +106,10 @@ impl Output for FileOutput {
         let (resolved, is_dynamic) = self.render_path(event)?;
         let path = PathBuf::from(&resolved);
 
-        // Defence in depth: reject path traversal components even after
-        // per-fragment sanitisation.
+        // Catch-all `..` reject. For Template paths this is redundant
+        // with `check_no_traversal` in `render_path`; for static
+        // `StringLit` paths (which skip render_path's safety passes)
+        // this is the sole defence.
         for component in path.components() {
             if matches!(component, std::path::Component::ParentDir) {
                 anyhow::bail!("path traversal rejected: {}", resolved);
@@ -166,20 +168,27 @@ impl FileOutput {
     /// where `is_dynamic` is true when the template had any interpolated
     /// fragments (used to decide whether to `mkdir -p` the parent).
     ///
-    /// Two safety passes:
+    /// Three safety passes (each rejects rather than silently rewrites,
+    /// per Principle 1):
     ///
     /// 1. Per-interpolation: every `${...}` result has `/` and `\`
     ///    replaced with `_`, regardless of the wrapping expression
     ///    (`${workspace.x}`, `${lower(workspace.x)}`, `${a + b}` —
-    ///    all treated alike). The invariant is "one interpolation =
+    ///    all treated alike). An empty interpolation result is
+    ///    rejected up front. The invariant is "one interpolation =
     ///    one path component"; directory structure must be expressed
     ///    in the literal parts of the template.
     ///
-    /// 2. Post-evaluation: the fully-rendered path string has every
-    ///    `../` traversal sequence stripped (along with a trailing
-    ///    `/..` and a result of exactly `..`) until no more remain.
-    ///    Combined with pass 1, no interpolation value can introduce
-    ///    a directory escape regardless of how it is composed.
+    /// 2. Post-evaluation traversal reject: the fully-rendered path
+    ///    is split on `/` and any component exactly equal to `..`
+    ///    causes the write to error. Combined with pass 1, no
+    ///    interpolation value can introduce a directory escape
+    ///    regardless of how it is composed.
+    ///
+    /// 3. Trailing-slash reject: a rendered path that ends in `/`
+    ///    (no filename component) errors before the auto-mkdir runs,
+    ///    so a stray template like `/var/log/${workspace.host}/`
+    ///    cannot create empty directories silently.
     fn render_path(&self, event: &Event) -> Result<(String, bool)> {
         match &self.path.kind {
             ExprKind::StringLit(s) => Ok((s.clone(), false)),

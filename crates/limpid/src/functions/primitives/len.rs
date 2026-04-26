@@ -16,9 +16,10 @@
 //! * `Object` → number of top-level keys.
 //! * `Null` → `Null` (pass-through, same partial-data convention as
 //!   `to_int`, `regex_extract`, `table_lookup`).
-//! * Any scalar (`Int` / `Float` / `Bool`) → `Null`. These have no
-//!   meaningful length and returning `0` or erroring would both
-//!   surprise; `Null` is the consistent "not applicable" signal.
+//! * Any scalar (`Int` / `Float` / `Bool` / `Timestamp`) → `Null`.
+//!   These have no meaningful length and returning `0` or erroring
+//!   would both surprise; `Null` is the consistent "not applicable"
+//!   signal. (For `Timestamp`-as-nanos, use `to_int` instead.)
 
 use crate::dsl::value::Value;
 use crate::functions::{FunctionRegistry, FunctionSig};
