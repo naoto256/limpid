@@ -1,0 +1,49 @@
+//! `hostname()` — local machine hostname.
+//!
+//! Returns the hostname of the host running limpid. Useful for tagging
+//! events with the forwarder's identity (e.g., `workspace.forwarded_by =
+//! hostname()`) or populating OTLP `host.name` resource attributes.
+//!
+//! Resolved at every call (cheap syscall on Linux/macOS via
+//! `gethostname(2)`), so a hostname change at runtime is picked up
+//! without restart.
+
+use crate::dsl::value::Value;
+use crate::functions::{FunctionRegistry, FunctionSig};
+use crate::modules::schema::FieldType;
+
+pub fn register(reg: &mut FunctionRegistry) {
+    reg.register_with_sig(
+        "hostname",
+        FunctionSig::fixed(&[], FieldType::String),
+        |_args, _event| {
+            let h = gethostname::gethostname().to_string_lossy().into_owned();
+            Ok(Value::String(h))
+        },
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::Event;
+    use bytes::Bytes;
+    use std::net::SocketAddr;
+
+    fn dummy_event() -> Event {
+        Event::new(
+            Bytes::from("test"),
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        )
+    }
+
+    #[test]
+    fn returns_non_empty_string() {
+        let mut reg = FunctionRegistry::new();
+        register(&mut reg);
+        let e = dummy_event();
+        let v = reg.call(None, "hostname", &[], &e).unwrap();
+        let Value::String(s) = v else { panic!() };
+        assert!(!s.is_empty(), "hostname() returned empty string");
+    }
+}
