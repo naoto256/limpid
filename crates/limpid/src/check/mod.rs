@@ -575,7 +575,7 @@ def pipeline p { input i; output o }
     fn syslog_parse_binds_known_workspace_keys() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "${workspace.syslog_msg}" }
+def output o { type stdout template "${workspace.msg}" }
 def pipeline p {
     input i
     process { syslog.parse(ingress) }
@@ -853,7 +853,7 @@ def pipeline p { input i; output o }
     fn unresolved_workspace_ref_suggests_near_match() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "${workspace.synlog_msg}" }
+def output o { type stdout template "${workspace.mssg}" }
 def pipeline p {
     input i
     process { syslog.parse(ingress) }
@@ -864,7 +864,7 @@ def pipeline p {
         let errs = errors(&diags);
         assert_eq!(errs.len(), 1, "got: {:?}", diags);
         let help = errs[0].help.as_deref().expect("should have help line");
-        assert!(help.contains("workspace.syslog_msg"), "help was: {}", help);
+        assert!(help.contains("workspace.msg"), "help was: {}", help);
     }
 
     #[test]

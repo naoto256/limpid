@@ -4,20 +4,26 @@
 //! `<PRI>` is treated as RFC 5424 (versioned), anything else as RFC
 //! 3164 (BSD traditional).
 //!
-//! Returns a `Value::Object` with the following keys (all string-valued
-//! when present, omitted otherwise):
+//! Returns a `Value::Object` with the following keys:
 //!
-//! | key                         | meaning                               |
-//! |-----------------------------|---------------------------------------|
-//! | `syslog_hostname`           | originating host                      |
-//! | `syslog_appname`            | app-name (5424) / tag (3164)          |
-//! | `syslog_procid`             | process id (when present)             |
-//! | `syslog_msgid`              | message id (5424 only)                |
-//! | `syslog_msg`                | body after header                     |
+//! | key         | type   | meaning                                       |
+//! |-------------|--------|-----------------------------------------------|
+//! | `pri`       | Int    | raw `<PRI>` value (0..=191)                   |
+//! | `facility`  | Int    | `pri / 8`                                     |
+//! | `severity`  | Int    | `pri % 8`                                     |
+//! | `timestamp` | String | source-claimed event time (5424 / 3164 token) |
+//! | `hostname`  | String | originating host                              |
+//! | `appname`   | String | app-name (5424) / tag (3164)                  |
+//! | `procid`    | String | process id (when present)                     |
+//! | `msgid`     | String | message id (5424 only)                        |
+//! | `msg`       | String | body after header                             |
 //!
-//! Unlike the old native `parse_syslog` process, this function does
-//! **not** rewrite `event.egress` — it's pure. Users who want the old
-//! behaviour write `egress = workspace.syslog_msg` on the next line.
+//! String fields are present only when the wire format provides a
+//! non-empty, non-`-` value. `pri` / `facility` / `severity` are
+//! always present — the parser errors when no valid `<PRI>` header
+//! is found.
+//!
+//! This function does **not** rewrite `event.egress` — it's pure.
 
 use anyhow::{Result, bail};
 use crate::dsl::value::Map;
@@ -25,6 +31,7 @@ use crate::dsl::value::Value;
 
 use crate::functions::primitives::parse_json::{apply_defaults, type_name};
 use crate::functions::primitives::val_to_str;
+use crate::functions::syslog::pri::parse_leading_pri;
 use crate::functions::{FunctionRegistry, ParserInfo};
 use crate::modules::schema::{FieldSpec, FieldType};
 
@@ -32,17 +39,21 @@ pub fn register(reg: &mut FunctionRegistry) {
     reg.register_in("syslog", "parse", |args, _event| parse_impl(args));
     // syslog header fields are statically known (not data-driven), so
     // declare them precisely. The analyzer uses these to type-check
-    // downstream `workspace.syslog_*` references after a bare
+    // downstream `workspace.*` references after a bare
     // `syslog.parse(ingress)` statement.
     reg.register_parser(ParserInfo {
         namespace: Some("syslog"),
         name: "parse",
         produces: vec![
-            FieldSpec::new(&["workspace", "syslog_hostname"], FieldType::String),
-            FieldSpec::new(&["workspace", "syslog_appname"], FieldType::String),
-            FieldSpec::new(&["workspace", "syslog_procid"], FieldType::String),
-            FieldSpec::new(&["workspace", "syslog_msgid"], FieldType::String),
-            FieldSpec::new(&["workspace", "syslog_msg"], FieldType::String),
+            FieldSpec::new(&["workspace", "pri"], FieldType::Int),
+            FieldSpec::new(&["workspace", "facility"], FieldType::Int),
+            FieldSpec::new(&["workspace", "severity"], FieldType::Int),
+            FieldSpec::new(&["workspace", "timestamp"], FieldType::String),
+            FieldSpec::new(&["workspace", "hostname"], FieldType::String),
+            FieldSpec::new(&["workspace", "appname"], FieldType::String),
+            FieldSpec::new(&["workspace", "procid"], FieldType::String),
+            FieldSpec::new(&["workspace", "msgid"], FieldType::String),
+            FieldSpec::new(&["workspace", "msg"], FieldType::String),
         ],
         wildcards: false,
     });
@@ -53,10 +64,15 @@ fn parse_impl(args: &[Value]) -> Result<Value> {
     // `register_parser` (1 to 2 arguments).
     let text = val_to_str(&args[0])?;
 
-    let after_pri =
-        skip_pri(&text).ok_or_else(|| anyhow::anyhow!("syslog.parse(): no PRI header"))?;
+    let (pri, body_offset) = parse_leading_pri(&text)
+        .ok_or_else(|| anyhow::anyhow!("syslog.parse(): no PRI header"))?;
+    let after_pri = &text[body_offset..];
 
     let mut map = Map::new();
+    map.insert("pri".into(), Value::Int(pri as i64));
+    map.insert("facility".into(), Value::Int((pri / 8) as i64));
+    map.insert("severity".into(), Value::Int((pri % 8) as i64));
+
     if after_pri.len() >= 2
         && after_pri.as_bytes()[0].is_ascii_digit()
         && after_pri.as_bytes()[1] == b' '
@@ -80,14 +96,6 @@ fn parse_impl(args: &[Value]) -> Result<Value> {
     Ok(Value::Object(map))
 }
 
-fn skip_pri(ingress: &str) -> Option<&str> {
-    if !ingress.starts_with('<') {
-        return None;
-    }
-    let end = ingress.find('>')?;
-    Some(&ingress[end + 1..])
-}
-
 fn parse_rfc5424(input: &str, map: &mut Map) {
     let mut parts = input.splitn(7, ' ');
     let _version = parts.next();
@@ -104,17 +112,17 @@ fn parse_rfc5424(input: &str, map: &mut Map) {
     // it into workspace so snippets can compare against
     // Event.timestamp (limpid's receipt time, kept independent per
     // Principle 2: input is dumb transport).
-    set_field(map, "syslog_timestamp", timestamp);
-    set_field(map, "syslog_hostname", hostname);
-    set_field(map, "syslog_appname", appname);
+    set_field(map, "timestamp", timestamp);
+    set_field(map, "hostname", hostname);
+    set_field(map, "appname", appname);
     if procid != "-" {
-        set_field(map, "syslog_procid", procid);
+        set_field(map, "procid", procid);
     }
     if msgid != "-" {
-        set_field(map, "syslog_msgid", msgid);
+        set_field(map, "msgid", msgid);
     }
     if !msg.is_empty() {
-        map.insert("syslog_msg".into(), Value::String(msg.to_string()));
+        map.insert("msg".into(), Value::String(msg.to_string()));
     }
 }
 
@@ -137,19 +145,19 @@ fn parse_rfc3164(input: &str, map: &mut Map) {
     if let Some(ts) = timestamp_str
         && !ts.is_empty()
     {
-        set_field(map, "syslog_timestamp", ts);
+        set_field(map, "timestamp", ts);
     }
     if !hostname.is_empty() {
-        set_field(map, "syslog_hostname", hostname);
+        set_field(map, "hostname", hostname);
     }
     if !appname.is_empty() {
-        set_field(map, "syslog_appname", appname);
+        set_field(map, "appname", appname);
     }
     if let Some(pid) = procid {
-        set_field(map, "syslog_procid", pid);
+        set_field(map, "procid", pid);
     }
     if !msg.is_empty() {
-        map.insert("syslog_msg".into(), Value::String(msg.to_string()));
+        map.insert("msg".into(), Value::String(msg.to_string()));
     }
 }
 
@@ -263,14 +271,18 @@ mod tests {
             "<134>1 2026-04-15T10:30:00Z firewall01 sshd 1234 - - Failed password",
         )
         .unwrap();
+        // PRI 134 = facility 16 (local0), severity 6 (info)
+        assert_eq!(m["pri"], Value::Int(134));
+        assert_eq!(m["facility"], Value::Int(16));
+        assert_eq!(m["severity"], Value::Int(6));
         assert_eq!(
-            m["syslog_timestamp"],
+            m["timestamp"],
             Value::String("2026-04-15T10:30:00Z".into())
         );
-        assert_eq!(m["syslog_hostname"], Value::String("firewall01".into()));
-        assert_eq!(m["syslog_appname"], Value::String("sshd".into()));
-        assert_eq!(m["syslog_procid"], Value::String("1234".into()));
-        assert_eq!(m["syslog_msg"], Value::String("Failed password".into()));
+        assert_eq!(m["hostname"], Value::String("firewall01".into()));
+        assert_eq!(m["appname"], Value::String("sshd".into()));
+        assert_eq!(m["procid"], Value::String("1234".into()));
+        assert_eq!(m["msg"], Value::String("Failed password".into()));
     }
 
     #[test]
@@ -281,10 +293,10 @@ mod tests {
             "<134>1 2026-04-15T10:30:00Z host app 999 ID1 [meta src=\"10.0.0.1\"] Hello world",
         )
         .unwrap();
-        assert_eq!(m["syslog_hostname"], Value::String("host".into()));
-        assert_eq!(m["syslog_appname"], Value::String("app".into()));
-        assert_eq!(m["syslog_msgid"], Value::String("ID1".into()));
-        assert_eq!(m["syslog_msg"], Value::String("Hello world".into()));
+        assert_eq!(m["hostname"], Value::String("host".into()));
+        assert_eq!(m["appname"], Value::String("app".into()));
+        assert_eq!(m["msgid"], Value::String("ID1".into()));
+        assert_eq!(m["msg"], Value::String("Hello world".into()));
     }
 
     #[test]
@@ -296,13 +308,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            m["syslog_timestamp"],
+            m["timestamp"],
             Value::String("Apr 15 10:30:00".into())
         );
-        assert_eq!(m["syslog_hostname"], Value::String("myhost".into()));
-        assert_eq!(m["syslog_appname"], Value::String("sshd".into()));
-        assert_eq!(m["syslog_procid"], Value::String("1234".into()));
-        assert_eq!(m["syslog_msg"], Value::String("Failed password".into()));
+        assert_eq!(m["hostname"], Value::String("myhost".into()));
+        assert_eq!(m["appname"], Value::String("sshd".into()));
+        assert_eq!(m["procid"], Value::String("1234".into()));
+        assert_eq!(m["msg"], Value::String("Failed password".into()));
     }
 
     #[test]
@@ -310,9 +322,9 @@ mod tests {
         let reg = make_reg();
         let m =
             call_syslog_parse(&reg, "<134>Apr 15 10:30:00 myhost kernel: Out of memory").unwrap();
-        assert_eq!(m["syslog_hostname"], Value::String("myhost".into()));
-        assert_eq!(m["syslog_appname"], Value::String("kernel".into()));
-        assert_eq!(m["syslog_msg"], Value::String("Out of memory".into()));
+        assert_eq!(m["hostname"], Value::String("myhost".into()));
+        assert_eq!(m["appname"], Value::String("kernel".into()));
+        assert_eq!(m["msg"], Value::String("Out of memory".into()));
     }
 
     #[test]
@@ -335,7 +347,7 @@ mod tests {
         let reg = make_reg();
         let defaults = Value::Object(
             [(
-                "syslog_appname".to_string(),
+                "appname".to_string(),
                 Value::String("unknown".into()),
             )]
             .into_iter()
@@ -355,6 +367,6 @@ mod tests {
             )
             .unwrap();
         let Value::Object(m) = result else { panic!() };
-        assert_eq!(m["syslog_appname"], Value::String("unknown".into()));
+        assert_eq!(m["appname"], Value::String("unknown".into()));
     }
 }
