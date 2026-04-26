@@ -9,7 +9,7 @@
 //! # Layout
 //!
 //! - [`primitives`] — flat-namespace, schema-agnostic functions
-//!   (`contains`, `lower`, `regex_*`, `strftime`, `format`, `geoip`,
+//!   (`contains`, `lower`, `regex_*`, `strftime`, `geoip`,
 //!   `table_*`, `md5`/`sha1`/`sha256`, `to_json`, `to_int`, `find_by`,
 //!   `csv_parse`, `len`, `append`, `prepend`). One file per function
 //!   (or per tightly-related group such as `hashes.rs`) so `mod.rs`
@@ -660,67 +660,6 @@ mod tests {
         );
     }
 
-    // ---- format() ---------------------------------------------------------
-
-    #[test]
-    fn format_expands_event_level_placeholders() {
-        let reg = make_registry();
-        let e = dummy_event();
-        let result = reg
-            .call(
-                None,
-                "format",
-                &[Value::String("[%{source}] %{egress}".into())],
-                &e,
-            )
-            .unwrap();
-        // egress defaults to the raw bytes ("test") in dummy_event
-        let s = result.as_str().unwrap().to_string();
-        assert!(s.ends_with("] test"));
-        assert!(s.starts_with("["));
-    }
-
-    #[test]
-    fn format_expands_explicit_workspace_placeholder() {
-        let reg = make_registry();
-        let mut e = dummy_event();
-        e.workspace
-            .insert("host".into(), Value::String("web01".into()));
-        let result = reg
-            .call(
-                None,
-                "format",
-                &[Value::String("host=%{workspace.host}".into())],
-                &e,
-            )
-            .unwrap();
-        assert_eq!(result, Value::String("host=web01".into()));
-    }
-
-    #[test]
-    fn format_rejects_bare_shorthand() {
-        // `%{pid}` used to silently fall back to workspace.pid. Now it
-        // must be an error so typos don't become empty strings.
-        let reg = make_registry();
-        let mut e = dummy_event();
-        e.workspace
-            .insert("pid".into(), Value::String("42".into()));
-        let err = reg
-            .call(None, "format", &[Value::String("pid=%{pid}".into())], &e)
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("unknown placeholder"),
-            "unexpected error: {}",
-            msg
-        );
-        assert!(
-            msg.contains("workspace.pid"),
-            "error should suggest `workspace.pid`, got: {}",
-            msg
-        );
-    }
-
     // ---- dot namespace dispatch (Block 3) -------------------------------
 
     #[test]
@@ -808,18 +747,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn format_error_suggests_explicit_form_for_typos() {
-        let reg = make_registry();
-        let e = dummy_event();
-        let err = reg
-            .call(
-                None,
-                "format",
-                &[Value::String("x=%{nope_not_a_thing}".into())],
-                &e,
-            )
-            .unwrap_err();
-        assert!(err.to_string().contains("workspace.nope_not_a_thing"));
-    }
 }
