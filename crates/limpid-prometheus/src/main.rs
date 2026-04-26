@@ -184,10 +184,18 @@ fn json_to_prometheus(json: &str) -> Result<String, String> {
         write_counter(
             &mut out,
             "limpid_pipeline_events_errored_total",
-            "Total events whose processing raised a runtime error (the event is discarded rather than forwarded with the original ingress).",
+            "Total events whose processing raised a runtime error; routed to the dead-letter queue (configured error_log file, or a structured tracing line).",
             "pipeline",
             pipelines,
             "events_errored",
+        );
+        write_counter(
+            &mut out,
+            "limpid_pipeline_events_errored_unwritable_total",
+            "Subset of events_errored where the configured error_log write itself failed; alarm on this — the replay path may be incomplete.",
+            "pipeline",
+            pipelines,
+            "events_errored_unwritable",
         );
     }
 
