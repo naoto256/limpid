@@ -6,23 +6,28 @@
 //! CEF:Version|Device Vendor|Device Product|Device Version|Signature ID|Name|Severity|Extensions
 //! ```
 //!
-//! An optional syslog header (`<PRI>…`) is tolerated — the parser
-//! locates `CEF:` anywhere in the input and parses from there.
+//! The input must start with `CEF:` — syslog wrapper handling is the
+//! caller's responsibility. The canonical pattern when CEF is
+//! transported over syslog is:
 //!
-//! Emitted keys (always prefixed with `cef_` for the header fields so
-//! workspace dumps stay self-describing; extension keys are copied
-//! as-is since CEF-defined keys like `src`, `dst`, `act` are themselves
-//! part of the CEF spec):
+//! ```limpid
+//! workspace.syslog = syslog.parse(ingress)
+//! workspace.cef    = cef.parse(workspace.syslog.msg)
+//! ```
+//!
+//! Emitted keys (CEF header fields verbatim; extension keys are copied
+//! as-is since CEF-defined keys like `src`, `dst`, `act` are part of
+//! the CEF spec):
 //!
 //! | key                        | meaning                      |
 //! |----------------------------|------------------------------|
-//! | `cef_version`              | CEF version (usually `0`)    |
-//! | `cef_device_vendor`        | device vendor                |
-//! | `cef_device_product`       | device product               |
-//! | `cef_device_version`       | device version               |
-//! | `cef_signature_id`         | vendor-specific event id     |
-//! | `cef_name`                 | human-readable event name    |
-//! | `cef_severity`             | vendor severity (0-10)       |
+//! | `version`              | CEF version (usually `0`)    |
+//! | `device_vendor`        | device vendor                |
+//! | `device_product`       | device product               |
+//! | `device_version`       | device version               |
+//! | `signature_id`         | vendor-specific event id     |
+//! | `name`                 | human-readable event name    |
+//! | `severity`             | vendor severity (0-10)       |
 //! | `<ext>` (e.g. `src`, `dst`)| CEF extension key=value pairs|
 
 use anyhow::{Result, bail};
@@ -38,22 +43,22 @@ pub fn register(reg: &mut FunctionRegistry) {
     reg.register_in("cef", "parse", |args, _event| parse_impl(args));
     // CEF header keys are statically known; the extension tail (`src=`
     // / `dst=` / vendor-specific) is data-driven, so `wildcards = true`.
-    // `cef_severity` is emitted as Int when the field is well-formed
+    // `severity` is emitted as Int when the field is well-formed
     // and falls back to String on garbage input — modelled as a Union
-    // so type checks of `workspace.cef_severity == 5` stay silent while
+    // so type checks of `workspace.severity == 5` stay silent while
     // `== "5"` warns.
     reg.register_parser(ParserInfo {
         namespace: Some("cef"),
         name: "parse",
         produces: vec![
-            FieldSpec::new(&["workspace", "cef_version"], FieldType::String),
-            FieldSpec::new(&["workspace", "cef_device_vendor"], FieldType::String),
-            FieldSpec::new(&["workspace", "cef_device_product"], FieldType::String),
-            FieldSpec::new(&["workspace", "cef_device_version"], FieldType::String),
-            FieldSpec::new(&["workspace", "cef_signature_id"], FieldType::String),
-            FieldSpec::new(&["workspace", "cef_name"], FieldType::String),
+            FieldSpec::new(&["workspace", "version"], FieldType::String),
+            FieldSpec::new(&["workspace", "device_vendor"], FieldType::String),
+            FieldSpec::new(&["workspace", "device_product"], FieldType::String),
+            FieldSpec::new(&["workspace", "device_version"], FieldType::String),
+            FieldSpec::new(&["workspace", "signature_id"], FieldType::String),
+            FieldSpec::new(&["workspace", "name"], FieldType::String),
             FieldSpec::new(
-                &["workspace", "cef_severity"],
+                &["workspace", "severity"],
                 FieldType::Union(vec![FieldType::Int, FieldType::String]),
             ),
         ],
@@ -66,10 +71,9 @@ fn parse_impl(args: &[Value]) -> Result<Value> {
     // `register_parser` (1 to 2 arguments).
     let text = val_to_str(&args[0])?;
 
-    let cef_start = text
-        .find("CEF:")
-        .ok_or_else(|| anyhow::anyhow!("cef.parse(): no CEF header found"))?;
-    let body = &text[cef_start + 4..];
+    let body = text
+        .strip_prefix("CEF:")
+        .ok_or_else(|| anyhow::anyhow!("cef.parse(): input does not start with `CEF:`"))?;
 
     let mut parts = Vec::new();
     let mut remaining = body;
@@ -83,24 +87,24 @@ fn parse_impl(args: &[Value]) -> Result<Value> {
     }
 
     let mut map = Map::new();
-    map.insert("cef_version".into(), Value::String(parts[0].to_string()));
+    map.insert("version".into(), Value::String(parts[0].to_string()));
     map.insert(
-        "cef_device_vendor".into(),
+        "device_vendor".into(),
         Value::String(parts[1].to_string()),
     );
     map.insert(
-        "cef_device_product".into(),
+        "device_product".into(),
         Value::String(parts[2].to_string()),
     );
     map.insert(
-        "cef_device_version".into(),
+        "device_version".into(),
         Value::String(parts[3].to_string()),
     );
     map.insert(
-        "cef_signature_id".into(),
+        "signature_id".into(),
         Value::String(parts[4].to_string()),
     );
-    map.insert("cef_name".into(), Value::String(parts[5].to_string()));
+    map.insert("name".into(), Value::String(parts[5].to_string()));
     // CEF Severity is a number (0-10 per the spec). Emit as Int when
     // the field parses cleanly; fall back to the raw string when the
     // producer sent garbage so existing pipelines don't break, and the
@@ -109,7 +113,7 @@ fn parse_impl(args: &[Value]) -> Result<Value> {
         .parse::<i64>()
         .map(Value::Int)
         .unwrap_or_else(|_| Value::String(parts[6].to_string()));
-    map.insert("cef_severity".into(), severity_value);
+    map.insert("severity".into(), severity_value);
 
     parse_cef_extensions(remaining, &mut map);
 
@@ -213,11 +217,11 @@ mod tests {
             )
             .unwrap();
         let Value::Object(m) = r else { panic!() };
-        assert_eq!(m["cef_version"], Value::String("0".into()));
-        assert_eq!(m["cef_device_vendor"], Value::String("Fortinet".into()));
-        assert_eq!(m["cef_device_product"], Value::String("FortiGate".into()));
-        assert_eq!(m["cef_signature_id"], Value::String("1234".into()));
-        assert_eq!(m["cef_severity"], Value::Int(5));
+        assert_eq!(m["version"], Value::String("0".into()));
+        assert_eq!(m["device_vendor"], Value::String("Fortinet".into()));
+        assert_eq!(m["device_product"], Value::String("FortiGate".into()));
+        assert_eq!(m["signature_id"], Value::String("1234".into()));
+        assert_eq!(m["severity"], Value::Int(5));
         assert_eq!(m["src"], Value::String("10.0.0.1".into()));
         assert_eq!(m["dst"], Value::String("10.0.0.2".into()));
         assert_eq!(m["act"], Value::String("deny".into()));
@@ -236,14 +240,16 @@ mod tests {
             )
             .unwrap();
         let Value::Object(m) = r else { panic!() };
-        assert_eq!(m["cef_severity"], Value::String("High".into()));
+        assert_eq!(m["severity"], Value::String("High".into()));
     }
 
     #[test]
-    fn tolerates_syslog_prefix() {
+    fn rejects_syslog_prefix() {
+        // CEF must be at position 0; syslog wrapper handling is the
+        // caller's responsibility (typically `cef.parse(workspace.syslog.msg)`).
         let reg = make_reg();
         let e = dummy_event();
-        let r = reg
+        let err = reg
             .call(
                 Some("cef"),
                 "parse",
@@ -252,10 +258,8 @@ mod tests {
                 )],
                 &e,
             )
-            .unwrap();
-        let Value::Object(m) = r else { panic!() };
-        assert_eq!(m["cef_device_vendor"], Value::String("Security".into()));
-        assert_eq!(m["src"], Value::String("192.168.1.1".into()));
+            .unwrap_err();
+        assert!(err.to_string().contains("does not start with `CEF:`"));
     }
 
     #[test]
@@ -270,7 +274,7 @@ mod tests {
                 &e,
             )
             .unwrap_err();
-        assert!(err.to_string().contains("no CEF header"));
+        assert!(err.to_string().contains("does not start with `CEF:`"));
     }
 
     #[test]
