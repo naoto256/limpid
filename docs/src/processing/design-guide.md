@@ -14,7 +14,7 @@ Good process names describe a single abstraction:
 
 - `strip_pri` — removes a syslog `<PRI>`.
 - `parse_fortigate_kv` — parses FortiGate KV payloads.
-- `enrich_with_geoip` — annotates `workspace.src` with GeoIP.
+- `enrich_with_geoip` — annotates `workspace.geo` with a GeoIP lookup of an IP from earlier parsing.
 - `drop_healthchecks` — filters LB noise.
 - `ama_rewrite` — rewrites the PRI byte for AMA facility routing.
 
@@ -29,24 +29,29 @@ Bad names give away the problem:
 If you catch yourself writing `and` in a process name, split it:
 
 ```
-// Don't: one process doing three things
+// Don't: one process doing three things — and parsing events you're
+// about to drop is wasted work.
 def process parse_and_enrich_fortigate {
-    syslog.parse(ingress)
-    parse_kv(workspace.syslog_msg)
-    workspace.geo = geoip(workspace.srcip)
-    if contains(egress, "healthcheck") {
+    if contains(ingress, "healthcheck") {
         drop
     }
+    workspace.syslog = syslog.parse(ingress)
+    workspace.kv     = parse_kv(workspace.syslog.msg)
+    workspace.geo    = geoip(workspace.kv.srcip)
 }
 
-// Do: three processes, each a single step, composed at the pipeline
-def process parse_fortigate  { syslog.parse(ingress); parse_kv(workspace.syslog_msg) }
-def process enrich_fortigate { workspace.geo = geoip(workspace.srcip) }
-def process drop_healthchecks { if contains(egress, "healthcheck") { drop } }
+// Do: three processes, each a single step, composed at the pipeline.
+// drop_healthchecks runs first so noise events never hit the parser.
+def process drop_healthchecks { if contains(ingress, "healthcheck") { drop } }
+def process parse_fortigate {
+    workspace.syslog = syslog.parse(ingress)
+    workspace.kv     = parse_kv(workspace.syslog.msg)
+}
+def process enrich_fortigate { workspace.geo = geoip(workspace.kv.srcip) }
 
 def pipeline fw {
     input fw_syslog
-    process parse_fortigate | drop_healthchecks | enrich_fortigate
+    process drop_healthchecks | parse_fortigate | enrich_fortigate
     output siem
 }
 ```
@@ -57,32 +62,27 @@ The split config is longer. It is also easier to test, easier to tap between ste
 
 Every process has an implicit contract with its neighbours in the pipeline: *what do I expect to be present when I run, and what do I leave behind for the next stage?*
 
-Because the DSL does not (yet) check that contract statically, you document it in comments using a small, machine-parseable convention. limpid plans to grow a `limpid --check --strict` pass that reads these tags and warns when a pipeline links a composer to a parser that does not produce the required fields. Writing them now costs nothing; pretending the contracts do not exist costs the first person who has to modify the snippet a year later.
+Because the DSL does not check that contract today, you document it in comments using a small, machine-parseable convention. The grammar is parseable enough that a future static-analysis pass could promote these tags to a real check (warning when a pipeline links a composer to a parser that does not produce the required fields), but limpid does not commit to that — write them because they help the next reader, not because the analyzer will catch you. Pretending the contracts do not exist costs the first person who has to modify the snippet a year later.
 
 ### The `@requires` / `@produces` tag convention
 
 Put tags in the first block of comments inside the process body. One tag per line. Each tag names a field path in `workspace.*` (or, less commonly, `egress`).
 
 ```
-def process ocsf_authentication_compose {
-    // @requires: workspace.syslog_hostname (required)
-    // @requires: workspace.cef_severity    (required)
-    // @requires: workspace.src             (recommended)
-    // @requires: workspace.suser           (recommended)
+def process compose_ocsf_authentication {
+    // @requires: workspace.limpid.severity_id          (required)
+    // @requires: workspace.limpid.src_endpoint.ip      (recommended)
+    // @requires: workspace.limpid.actor.user.name      (recommended)
     // @produces: egress  (OCSF Authentication Activity, JSON, one event per line)
     //
-    // Expects: the calling pipeline has already run a schema parser
-    // (syslog.parse + cef.parse) and the canonical fields below are in workspace.
+    // Expects: the calling pipeline has run a vendor parser that
+    // already mapped its raw fields into `workspace.limpid.*`
+    // canonical form. This composer is vendor-unaware — it does not
+    // read `workspace.cef.*` / `workspace.syslog.*` directly.
 
-    workspace.ocsf = {
-        "class_uid":    3002,
-        "activity_id":  1,
-        "severity_id":  workspace.cef_severity,
-        "src_endpoint": { "ip": workspace.src },
-        "actor":        { "user": { "name": workspace.suser } },
-        ...
-    }
-    egress = to_json(workspace.ocsf)
+    workspace.limpid.class_uid   = 3002
+    workspace.limpid.activity_id = 1
+    egress = to_json(workspace.limpid)
 }
 ```
 
@@ -118,14 +118,14 @@ If you need dedup, rate-limiting, or aggregation, use a primitive that limpid sh
 // Don't — one body, many shapes, none of which is clearly the contract.
 def process fw_dispatch {
     if workspace.vendor == "Fortinet" {
-        parse_kv(egress)
-        workspace.severity = workspace.level
+        workspace.kv = parse_kv(egress)
+        workspace.severity = workspace.kv.level
     } else if workspace.vendor == "PaloAlto" {
-        parse_csv(egress)
-        workspace.severity = workspace.sev
+        workspace.csv = csv_parse(egress, ["receive_time", "serial", "type", "subtype", "sev"])
+        workspace.severity = workspace.csv.sev
     } else if workspace.vendor == "Cisco" {
-        cef.parse(ingress)
-        workspace.severity = workspace.cef_severity
+        workspace.cef = cef.parse(ingress)
+        workspace.severity = workspace.cef.severity
     }
 }
 ```
@@ -145,10 +145,6 @@ def pipeline fw {
     output siem
 }
 ```
-
-### Processes that touch multiple schemas
-
-A single process body that runs `syslog.parse`, `cef.parse`, and `ocsf.map` is conflating three different abstractions. Each schema deserves its own process; the pipeline composes them. This is the same rule as "one responsibility", stated in the schema axis.
 
 ### Silent recovery inside a process
 
@@ -182,13 +178,75 @@ A snippet library (for example, a future `processes/ocsf/*.limpid` collection) i
 
 If your process is intended to ship in a library (vendor parsers, OCSF composers, normalizers), a few additional conventions apply. They do not matter for a private site-specific config; they matter a great deal when hundreds of snippets coexist in a single directory.
 
-### One concept per file
+### One schema per file
 
-`processes/fortigate/traffic.limpid` holds everything needed to parse FortiGate traffic logs — the `def process parse_fortigate_traffic` itself plus any helpers it calls, if those helpers are not generic enough to promote. Do not pack multiple unrelated vendors or event classes into a single file.
+The library's organising axis is the **schema** a snippet implements. For vendor parsers, a schema is a *(vendor, format)* pair — `parsers/fortigate_cef.limpid` is one schema (FortiGate's CEF field model), `parsers/fortigate_syslog.limpid` is another (FortiGate's KV-over-syslog field model). The two share a vendor name but their field shapes, dispatchers, and subtype handling are different enough that the FortiGate documentation itself splits them into separate references; the snippet library follows.
 
-### Stay close to the canonical schema
+For OCSF composers, the schema *is* the class — `composers/ocsf_network_activity.limpid`, `composers/ocsf_detection_finding.limpid`. OCSF is vendor- and format-independent on purpose, so per-class is the natural unit.
 
-Composers (the snippets that produce OCSF JSON, CEF, ECS, …) should read field names that match the canonical schema they target. If you parse FortiGate KV into `workspace.srcip`, the OCSF composer reads `workspace.srcip`; it does not rename. Each rename layer is a drift risk. The canonical name wins.
+The contents of one file:
+
+- The leaf parsers (or the per-class composer body).
+- The dispatcher (subtype dispatcher for parsers, the schema-level `compose_ocsf` for composers).
+- Helpers that are specific to this schema. Helpers shared across multiple schemas live under `_common/` and are included as needed.
+
+A vendor's "any format" entry point (e.g. `parse_fortigate` that detects format and routes to the right `(vendor, format)` parser) is a thin shim that includes both per-schema files and dispatches between them — that shim is the only place the vendor-without-format abstraction lives.
+
+Do not pack multiple unrelated schemas into a single file.
+
+### Use `workspace.limpid` as the canonical intermediate
+
+Pick one canonical intermediate shape and have every parser write into it; have every composer read from it. limpid's library uses the namespace `workspace.limpid` for this — OCSF-inspired in field shape, but explicitly *limpid's* canonical, not a strict OCSF spec binding. The chain has three responsibility layers:
+
+```
+ingress
+   │
+   ▼
+┌──────────────────────┐    workspace.syslog.*
+│  format primitives   │    workspace.cef.*       — raw, format-shaped
+│  syslog.parse,       │ ─► workspace.kv.*
+│  cef.parse, parse_kv,│    workspace.json.*
+│  parse_json, …       │    …
+└──────────────────────┘
+   │
+   ▼
+┌──────────────────────┐
+│  vendor parsers      │
+│  parse_fortigate_cef,│ ─► workspace.limpid.*    — canonical intermediate
+│  parse_paloalto_csv, │                            (OCSF-shaped, not strict)
+│  parse_mde_alert, …  │
+└──────────────────────┘
+   │
+   ▼
+┌──────────────────────────────┐
+│  composers                   │
+│  compose_ocsf_network_activity, │ ─► egress (JSON in target wire schema)
+│  compose_ecs_network, …      │
+└──────────────────────────────┘
+   │
+   ▼
+egress
+```
+
+- **Format primitives** (`syslog.parse`, `cef.parse`, `parse_kv`, `parse_json`, `csv_parse`) capture raw bytes into a format-specific namespace (`workspace.syslog`, `workspace.cef`, …). They know nothing about vendors or downstream schemas.
+- **Vendor parsers** (`parse_fortigate_cef`, `parse_paloalto_csv`, `parse_mde_alert`) read the format namespace and write canonical fields under `workspace.limpid.*`. This is the only layer that knows both the vendor's quirks and the canonical shape.
+- **Composers** (`compose_ocsf_network_activity`, `compose_ocsf_detection_finding`, `compose_ecs_network`, …) read `workspace.limpid.*` and serialise to `egress` in their target wire schema. They are vendor-unaware on purpose: they pluck `workspace.limpid.src_endpoint.ip` regardless of whether it came from a FortiGate or a Palo Alto event.
+
+The payoffs:
+
+- **Adding a new vendor** is a new parser; no composer change.
+- **Bumping a target wire schema** (OCSF v3 → v4, ECS minor bump) is a composer change; no parser change.
+- **Multiple vendors → one target** falls out for free — every parser drops its output into the same canonical workspace shape.
+- **Multiple targets from the same canonical** (one OCSF composer + one ECS composer reading the same `workspace.limpid.*`) is what makes the matrix manageable. The N-vendor × M-target multiplication never happens at the parser level.
+
+#### The parser / composer contract
+
+The two-sided rule of thumb for `workspace.limpid.*`:
+
+- **Parsers fill `workspace.limpid` as close to OCSF shape as possible — but they are not bound by OCSF.** Whenever a vendor field has a clean OCSF home, use the OCSF field name (`src_endpoint.ip`, `actor.user.name`). When it doesn't, carry it on `workspace.limpid` under a vendor-meaningful name; do not throw the data away just because OCSF has no slot.
+- **Composers may assume `workspace.limpid` is OCSF-shaped — but they must not assume strict OCSF compliance.** A composer reads the fields it needs and tolerates extras / absences. An OCSF composer maps `workspace.limpid.*` directly into OCSF JSON; an ECS composer translates the same `workspace.limpid.*` into ECS JSON, taking advantage of the OCSF-likeness without depending on it.
+
+A parser must not write vendor-specific format names that bleed into the composer (`workspace.cef.src`, `workspace.fgt_session_id` left at top level); a composer must not read vendor-specific format names directly (`workspace.cef.src`). The contract between them is `workspace.limpid.*`, full stop. Each rename or pass-through layer beyond that is a drift risk.
 
 ### Keep composers pure
 

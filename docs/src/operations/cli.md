@@ -39,7 +39,7 @@ limpid --debug --config /etc/limpid/limpid.conf
 }
 ```
 
-All keys except `ingress` are optional. `source` can be `ip:port` or just `ip`. There are no facility / severity fields on the Event in 0.3 — the `<PRI>` byte lives inside `ingress` / `egress`, and pipelines that need its numeric value call `syslog.extract_pri(...)`.
+All keys except `ingress` are optional. `source` can be `ip:port` or just `ip`. The Event has no facility / severity fields — the `<PRI>` byte lives inside `ingress` / `egress`, and pipelines that need its numeric value call `syslog.extract_pri(...)`.
 
 ## limpidctl
 

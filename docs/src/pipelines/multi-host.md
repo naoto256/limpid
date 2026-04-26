@@ -1,60 +1,61 @@
 # Multi-host Pipeline Example
 
-A small case study of a two-tier pipeline built entirely in limpid: two edge hosts (`edge01`, `edge02`, Ubuntu 24.04) ship journald logs to a central `relay` host, which rewrites and relays them to the Azure Monitor Agent (AMA) for Log Analytics Workspace (LAW) ingestion.
+A small case study of a two-tier pipeline built entirely in limpid: two edge hosts (`edge01`, `edge02`, Ubuntu 24.04) ship journald logs as RFC 5424 syslog to a central `relay` host. The relay also receives CEF events from a FortiGate firewall (`fortigate01`) on the same listener. It then rewrites the PRI and relays everything to the Azure Monitor Agent (AMA), which routes plain syslog to LAW's `Syslog` table and CEF to `CommonSecurityLog`.
 
-The example is deliberately small — one service on the edge, one forwarding pipeline in the middle, one SIEM destination. The point is not the size; it is showing **how the design principles work across a hop boundary in practice.**
+The example is deliberately small — one service on the edges, one CEF source, one forwarding pipeline in the middle, one SIEM destination. The point is not the size; it is showing **how the design principles work across a hop boundary in practice.**
 
 ## Topology
 
 ```
-+---------------+          +---------------+          +---------------+
-|    edge01     |          |    edge02     |          |     ...       |
-|               |          |               |          |               |
-| journal input |          | journal input |          |               |
-|      |        |          |      |        |          |               |
-| wrap_app      |          | wrap_app      |          |               |
-|      |        |          |      |        |          |               |
-| tcp output    |          | tcp output    |          |               |
-|  (RFC 5424)   |          |  (RFC 5424)   |          |               |
-+-------|-------+          +-------|-------+          +---------------+
-        |                          |
-        |    RFC 5424 framed       |
-        |    over TCP:514          |
-        +-----------+--------------+
-                    |
-                    v
-           +------------------+
-           |     relay        |
-           |   10.0.0.10      |
-           |                  |
-           |  ama_tcp input   |
-           |       |          |
-           |  filter / rewrite|
-           |       |          |
-           |  ama output      |
-           |  (tcp 127.0.0.1: |
-           |       28330)     |
-           +--------|---------+
-                    |
-                    v
-           +------------------+
-           |  Azure Monitor   |
-           |  Agent (mdsd)    |
-           |       |          |
-           |       v          |
-           |  Log Analytics   |
-           |  Workspace       |
-           |  (Syslog /       |
-           |  CommonSecurity- |
-           |  Log tables)     |
-           +------------------+
++---------------+   +---------------+   +-----------------+
+|    edge01     |   |    edge02     |   |   fortigate01   |
+|  10.0.0.21    |   |  10.0.0.22    |   |   10.0.0.30     |
+|               |   |               |   |                 |
+| journal input |   | journal input |   |  (CEF over      |
+|      |        |   |      |        |   |   syslog/TCP    |
+| wrap_app      |   | wrap_app      |   |   on 514)       |
+|      |        |   |      |        |   |                 |
+| tcp output    |   | tcp output    |   |                 |
+|  (RFC 5424)   |   |  (RFC 5424)   |   |                 |
++-------|-------+   +-------|-------+   +--------|--------+
+        |                   |                    |
+        |    RFC 5424       |     CEF over       |
+        |    over TCP:514   |     syslog/TCP:514 |
+        +---------+---------+--------------------+
+                  |
+                  v
+         +------------------+
+         |     relay        |
+         |   10.0.0.10      |
+         |                  |
+         |  tcp514 input     |
+         |       |          |
+         |  filter / rewrite|
+         |       |          |
+         |  ama output      |
+         |  (tcp 127.0.0.1: |
+         |       28330)     |
+         +--------|---------+
+                  |
+                  v
+         +------------------+
+         |  Azure Monitor   |
+         |  Agent (mdsd)    |
+         |       |          |
+         |       v          |
+         |  Log Analytics   |
+         |  Workspace       |
+         |  (Syslog /       |
+         |  CommonSecurity- |
+         |  Log tables)     |
+         +------------------+
 ```
 
 Three things to notice before looking at any DSL:
 
-1. Only RFC 5424 framed syslog crosses the wire between edge hosts and the relay. That is the hop contract.
-2. The relay never sees journal fields, never sees hostnames as separate metadata, never sees anything the edge hosts did not explicitly put into the bytes. Principle 3: only `egress` crosses hop boundaries.
-3. Each hop runs limpid with the same DSL. There are no vendor-specific config dialects in play (no rsyslog `omfwd`, no mdsd XML beside the AMA DCR itself).
+1. Only syslog-framed bytes cross the wire to the relay. RFC 5424 from the edges, CEF-over-syslog from FortiGate — both fit the `syslog_tcp` listener's framing rules. That is the hop contract.
+2. The relay never sees journal fields, never sees CEF parsed structure on the wire, never sees anything the senders did not explicitly put into the bytes. Principle 3: only `egress` crosses hop boundaries.
+3. Each hop that runs limpid runs the same binary with the same DSL. (FortiGate is a fixed appliance, not limpid, so it speaks CEF over its own syslog client — the relay's syslog_tcp input accepts that without special-casing.)
 
 ## Edge host: edge01 / edge02
 
@@ -79,9 +80,7 @@ def process wrap_app {
     // edge host does not take a position on routing — the relay
     // decides the final PRI.
 
-    egress = format(
-        "<14>1 %{strftime(received_at, \"%Y-%m-%dT%H:%M:%S%.3fZ\", \"utc\")} %{hostname()} app - - - %{ingress}"
-    )
+    egress = "<14>1 ${strftime(received_at, "%Y-%m-%dT%H:%M:%S%.3fZ", "utc")} ${hostname()} app - - - ${ingress}"
 }
 
 def output to_relay {
@@ -115,7 +114,7 @@ On the relay, the job is: accept RFC 5424 frames, drop noise, rewrite PRI so AMA
 ```limpid
 // /etc/limpid/relay.limpid  (extract — other pipelines omitted)
 
-def input ama_tcp {
+def input tcp514 {
     type syslog_tcp
     bind "0.0.0.0:514"
 }
@@ -132,37 +131,36 @@ def output ama {
 }
 
 def process app_drop_debug {
-    // @requires: source       (set by syslog_tcp input from peer address)
-    // @requires: ingress      (RFC 5424 frame from an edge host)
-    // @produces: workspace.*  (parsed fields, if the event came from an edge host)
+    // @requires: source              (set by syslog_tcp input from peer)
+    // @requires: workspace.syslog.*  (set by the inline syslog parser at the pipeline head)
+    // @produces: drops the event     (when the parsed JSON body says DEBUG)
     //
-    // Only parse events from the known edge-host IPs. We do not parse traffic
-    // from other peers — other pipelines in this file handle them.
+    // Only inspect events from the known edge-host IPs. FortiGate
+    // events flow past untouched.
 
     if source == "10.0.0.21" or source == "10.0.0.22" {
-        syslog.parse(ingress)
         try {
-            parse_json(workspace.syslog_msg)
+            workspace.json = parse_json(workspace.syslog.msg)
+            if workspace.json.level == "DEBUG" {
+                drop
+            }
         } catch {
             // Not every line is JSON (startup banners, etc). Keep the event.
             workspace.parse_error = error
-        }
-        if workspace.level == "DEBUG" {
-            drop
         }
     }
 }
 
 def process ama_rewrite {
-    // @requires: ingress   (any syslog frame)
-    // @produces: egress    (same bytes with PRI rewritten for DCR routing)
+    // @requires: workspace.syslog.msg  (set by the inline parser at the pipeline head)
+    // @produces: egress                (same bytes with PRI rewritten for DCR routing)
     //
     // AMA's DCRs route by facility:
     //   facility=16 (local0) -> CommonSecurityLog table (for CEF events)
     //   facility=17 (local1) -> Syslog table (everything else)
     // This process is the single place that makes that decision.
 
-    if contains(ingress, "CEF:") {
+    if starts_with(workspace.syslog.msg, "CEF:") {
         egress = syslog.set_pri(egress, 16, 6)
     } else {
         egress = syslog.set_pri(egress, 17, 6)
@@ -170,7 +168,12 @@ def process ama_rewrite {
 }
 
 def pipeline ama_forward {
-    input ama_tcp
+    input tcp514
+
+    // Parse once at the head so downstream processes can read
+    // workspace.syslog.* without re-parsing.
+    process { workspace.syslog = syslog.parse(ingress) }
+
     process app_drop_debug | ama_rewrite
     output ama
 }
@@ -178,19 +181,9 @@ def pipeline ama_forward {
 
 Note what the relay does *not* do:
 
-- It does not know or care that `edge01` and `edge02` exist by name. It knows two IPs.
-- It does not have a separate pipeline per edge host. The pipeline is keyed on the wire contract, not on the sender identity.
-- It does not reserialize the JSON payload. The edge host's MSG body passes through untouched to AMA, which in turn passes it to LAW as the `SyslogMessage` column. KQL at the SIEM side runs `extend j = parse_json(SyslogMessage)` to structure it at query time.
-
-## Why RFC 5424 is the hop contract
-
-It could have been anything — raw journald lines, JSON, CEF, a custom framing. RFC 5424 was chosen for three concrete reasons, and those reasons generalize to any multi-hop limpid topology:
-
-1. **The receiver already speaks it.** `syslog_tcp` input plus `syslog.parse` and `syslog.set_pri` are primitives the daemon ships. Picking a wire format with built-in primitives costs less DSL than inventing one.
-2. **PRI carries one bit of routing state cheaply.** `ama_rewrite` needs to set a facility so AMA's DCR routes correctly. Doing that with a PRI byte is a one-line operation; doing it with a JSON envelope would require a parse + rewrite + serialize cycle at every hop.
-3. **The contract is greppable.** If something goes wrong, `tcpdump` on port 514 or `limpidctl tap input ama_tcp` shows the exact bytes the receiver sees. There is no "metadata layer" to miss.
-
-This is Principle 3 (`Only egress crosses hop boundaries`) playing out. The edge host does not send the relay a sidecar map of journal fields, a "real" timestamp, or a source tag. It sends bytes. Everything the relay knows about the event, it reconstructs from those bytes with `syslog.parse`.
+- It does not know senders by name — only by IP. Its CEF / non-CEF distinction is made by inspecting `ingress`, not by routing on a sender attribute set elsewhere.
+- It does not have a separate pipeline per sender. One pipeline handles edge-host journald-RFC5424 traffic and FortiGate CEF traffic — the body's branches are keyed on the wire contract (`contains(ingress, "CEF:")`, source IP), not on a per-sender topology.
+- It does not reserialize the journald JSON payload. The edge host's MSG body passes through untouched to AMA, which in turn passes it to LAW as the `SyslogMessage` column. KQL at the SIEM side runs `extend j = parse_json(SyslogMessage)` to structure it at query time. CEF events take the parallel path — `ama_rewrite` sets PRI to local0.info so AMA writes them to the `CommonSecurityLog` table, where SIEM rules consume the parsed CEF directly.
 
 ## Verifying the pipeline
 
@@ -204,13 +197,13 @@ sudo limpidctl tap input app_journal
 sudo limpidctl tap output to_relay
 
 # On the relay — verify bytes arrived correctly
-sudo limpidctl tap input ama_tcp
+sudo limpidctl tap input tcp514
 
 # On the relay — verify PRI rewrite and parse results
 sudo limpidctl tap output ama --json | jq '.egress, .workspace'
 ```
 
-A common bug shape: `app_drop_debug` was supposed to drop DEBUG events but wasn't — the `level` field was nested inside the parsed JSON and the snippet referenced `workspace.level` instead of the correct path. The four-point tap finds this in under a minute: the event is present at `input ama_tcp`, still present at `output ama`, and `workspace.level` is undefined. No guessing, no restart, no log-digging. This is Principle 5 (safety and operational transparency) paying rent.
+A common bug shape: `app_drop_debug` was supposed to drop DEBUG events but wasn't — the `level` field was nested inside the parsed JSON and the snippet referenced `workspace.level` instead of the correct path. The four-point tap finds this in under a minute: the event is present at `input tcp514`, still present at `output ama`, and `workspace.level` is undefined. No guessing, no restart, no log-digging. This is Principle 5 (safety and operational transparency) paying rent.
 
 ## End-to-end testing without real traffic
 
@@ -236,21 +229,11 @@ The edge hosts and the relay run the same binary with different configs. The con
 
 Compare the equivalent assembly of tools a team would otherwise stitch together for this topology:
 
-- rsyslog on edge hosts (imjournal + omfwd + a Ruby-like template language for the frame).
+- rsyslog on edge hosts (imjournal input + omfwd output + RainerScript templates for the frame).
 - rsyslog or mdsd's native syslog receiver on the relay.
-- AMA's DCR-defined XML for the routing.
-- Three completely different configuration dialects, three different debuggers, three different ways to ask "where did the event go?".
+- AMA's DCR for the table routing (XML / JSON depending on the deployment shape).
 
-Replacing those with one DSL per hop is what the *Domain knowledge in DSL* operating rule buys at deployment time.
-
-## AMA-specific notes
-
-Two pieces of this are specific to Azure Monitor Agent and will look different for Splunk, Elasticsearch, or OpenSearch destinations:
-
-- **The `28330/tcp` mdsd socket and the facility routing rule (16 → CommonSecurityLog, 17 → Syslog) are AMA's contract.** limpid just writes bytes to it. If you are targeting Splunk HEC, the output becomes `type http`, the `ama_rewrite` process goes away, and whatever shaping Splunk wants takes its place.
-- **JSON payloads land in LAW as strings in the `SyslogMessage` column.** Structured access is a KQL-side `parse_json`. Getting structured columns on ingest requires a custom LAW table plus a DCR with a file-based data source, which is out of scope for a syslog relay and is not something limpid changes. This is a property of AMA / DCR, not of limpid.
-
-The point of calling these out is the same as the point of the whole example: **routing policy lives in one small, readable process (`ama_rewrite`), not scattered across the daemon.** If Azure changes the facility convention tomorrow, the fix is a two-line edit in one file.
+Three configuration languages, each with its own templating, conditionals, and observability tooling. None are bad in isolation; the operational cost is paid every time someone has to edit two of them in one change. Collapsing the topology onto one DSL per hop is what the *Domain knowledge in DSL* operating rule buys at deployment time.
 
 ## Related
 

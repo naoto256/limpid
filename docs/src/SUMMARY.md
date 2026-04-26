@@ -6,9 +6,11 @@
 # Getting Started
 
 - [Installation](./getting-started.md)
+- [Tutorial](./tutorial.md)
 
 # Configuration
 
+- [DSL Syntax Basics](./dsl-syntax.md)
 - [Main Configuration](./configuration.md)
 - [Inputs](./inputs/README.md)
   - [syslog_udp](./inputs/syslog-udp.md)
@@ -29,9 +31,8 @@
   - [stdout](./outputs/stdout.md)
   - [otlp](./outputs/otlp.md)
 - [Processing](./processing/README.md)
-  - [Expression Functions](./processing/functions.md)
-  - [String Templates](./processing/templates.md)
   - [User-defined Processes](./processing/user-defined.md)
+  - [Expression Functions](./processing/functions.md)
   - [Process Design Guide](./processing/design-guide.md)
 - [Pipelines](./pipelines/README.md)
   - [Routing](./pipelines/routing.md)
@@ -39,7 +40,6 @@
   - [Examples](./pipelines/examples.md)
   - [Multi-host Pipeline Example](./pipelines/multi-host.md)
 - [Snippet Library](./snippets/README.md)
-  - [Authoring Conventions](./snippets/conventions.md)
 
 # Protocol Notes
 
@@ -54,5 +54,4 @@
 - [Packaging](./operations/packaging.md)
 - [systemd](./operations/systemd.md)
 - [Migrating from rsyslog](./operations/migration.md)
-- [Upgrading to 0.3](./operations/upgrade-0.3.md)
 - [Upgrading to 0.5](./operations/upgrade-0.5.md)

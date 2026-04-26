@@ -27,7 +27,7 @@ Permissions are applied only when the file is first created.
 
 ## Dynamic path templates
 
-`path` can contain `${...}` interpolations that are evaluated per event against the full DSL. See [String Templates](../processing/templates.md) for the full syntax; the short version:
+`path` can contain `${...}` interpolations that are evaluated per event against the full DSL. See [DSL Syntax Basics → String interpolation](../dsl-syntax.md#string-interpolation) for the full syntax; the short version:
 
 ```
 def output per_source {

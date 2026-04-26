@@ -1,5 +1,7 @@
 # Main Configuration
 
+Reference for the main configuration file: include directives, global blocks, and DSL syntax. For a walked-through build-up of a working pipeline, see the [Tutorial](./tutorial.md).
+
 All limpid configuration is written in `.limpid` files using a custom DSL. No TOML, no YAML, no XML.
 
 ## limpid.conf
@@ -10,84 +12,36 @@ The main configuration file is specified via `--config`:
 limpid --config /etc/limpid/limpid.conf
 ```
 
-It contains `include` directives and global settings:
-
-```
-include "inputs/*.limpid"
-include "outputs/*.limpid"
-include "processes/*.limpid"
-include "pipelines/*.limpid"
-
-geoip {
-    database "/usr/share/GeoIP/GeoLite2-City.mmdb"
-}
-
-control {
-    socket "/var/run/limpid/control.sock"
-}
-
-table {
-    asset {
-        load "/etc/limpid/tables/asset.json"
-    }
-    seen {
-        max 100000
-        ttl 3600
-    }
-}
-```
+It contains `include` directives and global blocks (`geoip`, `control`, `table`). Module and pipeline definitions live in included files by convention, though nothing prevents putting them in the main file. The DSL surface for those definitions (literals, `def`, blocks, `${}` interpolation) is documented in [DSL Syntax Basics](./dsl-syntax.md).
 
 ## Include directives
 
-`include` loads additional `.limpid` files. Glob patterns are supported.
-
 ```
-include "inputs/*.limpid"          // all .limpid files in inputs/
-include "outputs/ama.limpid"       // a specific file
-```
-
-Paths are resolved relative to the main config file's directory. Include directives are only allowed in the main config file — included files cannot themselves include other files.
-
-## Directory layout
-
-```
-/etc/limpid/
-├── limpid.conf            # Main config: includes + global settings
-├── inputs/
-│   └── syslog.limpid      # Input definitions
-├── outputs/
-│   └── ama.limpid          # Output definitions
-├── processes/
-│   └── enrich.limpid       # Process definitions
-└── pipelines/
-    └── main.limpid         # Pipeline definitions
+include "inputs/*.limpid"          // glob
+include "outputs/ama.limpid"       // single file
+include "/usr/share/limpid/snippets/parsers/fortigate.limpid"   // shipped snippet
 ```
 
-This structure is a convention, not a requirement. You can organize files however you like — limpid just loads whatever the `include` directives point to.
+Rules:
+
+- Relative paths resolve against the **including file's** directory.
+- Absolute paths are rejected, **except** under `/usr/share/limpid/snippets/` (the shipped snippet library — see [Snippet Library](./snippets/README.md)).
+- Nested includes are supported — an included file may itself contain `include` directives. The same file is loaded only once even if multiple parents reference it (diamond-safe). Cycles are detected and reported as a parse error.
+- Glob patterns are supported.
 
 ## Global blocks
 
-### geoip
-
-Enables the `geoip()` expression function for IP geolocation.
-
-```
-geoip {
-    database "/usr/share/GeoIP/GeoLite2-City.mmdb"
-}
-```
-
-Requires a [MaxMind GeoLite2 City database](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data).
-
 ### control
 
-Configures the Unix socket for `limpidctl` and metrics.
+Configures the Unix socket used by `limpidctl` and the Prometheus exporter.
 
 ```
 control {
     socket "/var/run/limpid/control.sock"
 }
 ```
+
+Optional. If omitted, the daemon uses `/var/run/limpid/control.sock` by default.
 
 ### table
 
@@ -116,27 +70,16 @@ table {
 
 Tables are in-memory only. There is no `table_save` — files are initial seeds, and dynamic data is lost on restart.
 
-See [Table functions](./processing/functions.md#table-functions) for usage.
+See [table functions](./processing/functions.md#table-functions) for usage.
 
-## DSL syntax
+### geoip
 
-- `def` keyword defines inputs, outputs, processes, and pipelines
-- `//` for line comments
-- Semicolons are **optional** — use them to separate statements on one line
-- Strings use double quotes: `"hello"`
-- Strings support `${expr}` interpolation (any DSL expression); escape a literal `${` as `\${`. See [String Templates](./processing/templates.md).
-- Integers: `42`, `-1`
-- Booleans: `true`, `false`
-- Null: `null`
-- Nested blocks use `{ ... }`
+Enables the `geoip()` expression function for IP geolocation.
 
 ```
-// Multi-line — no semicolons needed
-def input fw {
-    type syslog_udp
-    bind "0.0.0.0:514"
+geoip {
+    database "/usr/share/GeoIP/GeoLite2-City.mmdb"
 }
-
-// One-liner — semicolons for readability
-def output fw01 { type file; path "/var/log/fw/fw01.log" }
 ```
+
+Requires a [MaxMind GeoLite2 City database](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data).

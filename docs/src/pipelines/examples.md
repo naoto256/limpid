@@ -12,9 +12,9 @@ def input syslog_udp {
     bind "0.0.0.0:514"
 }
 
-def output fw01 { type file  path "/var/log/fw/fw01.log" }
-def output fw02 { type file  path "/var/log/fw/fw02.log" }
-def output fw03 { type file  path "/var/log/fw/fw03.log" }
+def output fw01 { type file; path "/var/log/fw/fw01.log" }
+def output fw02 { type file; path "/var/log/fw/fw02.log" }
+def output fw03 { type file; path "/var/log/fw/fw03.log" }
 
 def process strip_headers {
     egress = syslog.strip_pri(egress)
@@ -50,8 +50,6 @@ def pipeline archive {
     }
 }
 ```
-
-The inline `process { ... }` block is the new home for what 0.2 expressed as the `prepend_source` and `prepend_timestamp` built-ins — there is no separate process layer any more, just DSL function calls and string concatenation.
 
 ## Azure Monitor Agent (AMA) forwarding
 
@@ -117,7 +115,7 @@ def output elasticsearch {
     batch_size 100
     batch_timeout "5s"
     headers {
-        Authorization "Basic dXNlcjpwYXNz"
+        Authorization "Basic <base64(user:password)>"
     }
 }
 
@@ -129,27 +127,14 @@ def pipeline siem {
 
     // Parse and enrich
     process {
-        cef.parse(ingress)
-        if workspace.src != null {
-            workspace.geo = geoip(workspace.src)
+        workspace.cef = cef.parse(ingress)
+        if workspace.cef.src != null {
+            workspace.geo = geoip(workspace.cef.src)
         }
-        egress = to_json()
+        egress = to_json(workspace)
     }
 
     output elasticsearch
 }
 ```
 
-## FortiGate KV parsing with format
-
-```
-def process enrich_fortigate {
-    parse_kv(egress)
-
-    if workspace.srcip != null {
-        workspace.geo = geoip(workspace.srcip)
-    }
-
-    egress = format("%{workspace.devname} %{workspace.srcip} -> %{workspace.dstip} %{workspace.action}")
-}
-```

@@ -1,22 +1,24 @@
 # User-defined Processes
 
+limpid is preparing a [Snippet Library](../snippets/README.md) of pre-built processes for common parsing / mapping work (landing in v0.6.0). Even once it ships, sooner or later you'll hit a situation the library doesn't cover — a vendor format we haven't shipped, a one-off enrichment, a dedup or rate-limit shape that's specific to your environment — and want to write your own. This page covers how.
+
 You define a process with `def process <name> { ... }`. Inside the body you call functions, assign to event slots and workspace, branch with `if` / `switch` / `try`, iterate with `foreach`, and call other processes by name.
 
 ## Defining a process
 
 ```
 def process enrich_fortigate {
-    parse_kv(egress)                                  // merge KV pairs into workspace
+    workspace.cef = cef.parse(workspace.syslog.msg)   // capture parser output
 
-    if workspace.srcip != null {
-        workspace.geo = geoip(workspace.srcip)
+    if workspace.cef.src != null {
+        workspace.geo = geoip(workspace.cef.src)
     }
 
-    egress = format("%{workspace.devname} %{workspace.srcip} -> %{workspace.dstip} %{workspace.action}")
+    egress = "${workspace.cef.device_product} ${workspace.cef.src} -> ${workspace.cef.dst} ${workspace.cef.act}"
 }
 ```
 
-`parse_kv(egress)` here is a bare function-call statement. Because it returns an object, the object's keys are merged into `workspace`. See [Expression Functions](./functions.md#bare-statements-vs-assignments) for the full rule.
+The CEF parser call captures into `workspace.cef`; the `${...}` interpolation in the final string assembles the egress line. See [Expression Functions](./functions.md) for the full function surface and [DSL Syntax Basics → String interpolation](../dsl-syntax.md#string-interpolation) for the template syntax.
 
 ## Assignments
 
@@ -28,28 +30,26 @@ def process enrich_fortigate {
 
 Anything else on the left of `=` is rejected as an unknown assignment target.
 
-> **What about `facility = ...` / `severity = ...`?** Those metadata fields were removed from the Event core in 0.3. To set or rewrite the syslog `<PRI>` byte, use the explicit `syslog.set_pri(egress, facility, severity)` function. To read it back, use `syslog.extract_pri(egress)`. See [Upgrading to 0.3](../operations/upgrade-0.3.md#event-core-facility--severity-removed).
-
 ### Important: what is and isn't reflected in output
 
 **`egress`** is the byte buffer that output modules write to the wire. If you want to change what gets sent, you must change `egress`:
 
 ```
 // This changes the output:
-egress = format("%{workspace.syslog_hostname}: %{workspace.syslog_msg}")
+egress = "${workspace.syslog.hostname}: ${workspace.syslog.msg}"
 
 // This does NOT change the output:
-workspace.syslog_hostname = "new-host"
+workspace.syslog.hostname = "new-host"
 // ↑ sets a workspace value, but `egress` is unchanged
 ```
 
 `workspace` is a pipeline-local scratch area for intermediate values — parsed data, enrichment results, routing decisions. Workspace values are **not** automatically serialised into `egress`. To include them in the output, explicitly rebuild `egress`:
 
 ```
-parse_kv(egress)                              // parse into workspace
-egress = to_json()                            // serialise the whole event as JSON
+workspace.kv = parse_kv(egress)               // capture into namespace
+egress = to_json(workspace)                   // serialise workspace as JSON
 // or
-egress = format("%{workspace.srcip} -> %{workspace.dstip}")
+egress = "${workspace.kv.srcip} -> ${workspace.kv.dstip}"
 ```
 
 ### Rewriting the syslog PRI
@@ -66,60 +66,71 @@ def process ama_rewrite {
 
 ## Control flow
 
-### if / else if / else
-
-```
-let pri = syslog.extract_pri(ingress)
-let severity = pri % 8
-
-if severity <= 3 {
-    workspace.priority = "high"
-} else if severity <= 5 {
-    workspace.priority = "medium"
-} else {
-    workspace.priority = "low"
-}
-```
-
-### switch
-
-```
-switch workspace.cef_device_vendor {
-    "Fortinet" {
-        parse_kv(egress)
-    }
-    "CheckPoint" {
-        cef.parse(ingress)
-    }
-    default {
-        drop
-    }
-}
-```
-
-### try / catch
-
-Catches errors raised inside the body. The error message is available as `error` inside the catch block.
-
-```
-try {
-    parse_json(egress)
-} catch {
-    workspace.parse_error = error
-}
-```
+`if` / `else` / `switch` are documented in full at [DSL Syntax Basics → Control flow](../dsl-syntax.md#control-flow); they work the same inside a process body, with the arms being process statements (function calls, assignments, nested control flow). The notes below cover what's *unique* to process-body control flow.
 
 ### foreach
 
-Iterates over an array value in `workspace`. The current item is available as `workspace._item`.
-
 ```
-foreach workspace.items {
-    workspace.count = workspace.count + 1
+foreach <array-path> {
+    // body — runs once per element
 }
 ```
 
-See also [Arrays](#arrays) for why `foreach` plus `find_by` are the only reads the DSL exposes for array elements.
+Iterates over an array, binding the current element to `workspace._item` for the duration of the body. `<array-path>` is any expression that evaluates to an array — typically a workspace key set by an upstream parser, sometimes an inline array literal.
+
+```
+def process count_evidence {
+    workspace.evidence_count = 0
+    foreach workspace.alert.evidence {
+        workspace.evidence_count = workspace.evidence_count + 1
+    }
+}
+```
+
+`workspace._item` is a real workspace key — visible to other primitives, accessible by dotted path (`workspace._item.entityType`), and survives until the next iteration overwrites it (or the loop ends and it is removed). Nested `foreach` re-binds `_item` to the inner element; if you need the outer one inside a nested loop, save it first:
+
+```
+foreach workspace.alerts {
+    let alert = workspace._item
+    foreach alert.evidence {
+        // workspace._item is now the inner evidence; `alert` still
+        // holds the outer alert.
+    }
+}
+```
+
+`foreach` is the read primitive for arrays; together with `find_by` (identity-keyed lookup) it covers the cases where positional indexing would otherwise be reached for. Arrays in limpid are positionless on purpose — see [Arrays](#arrays) for the rationale.
+
+### try / catch
+
+```
+try {
+    // body — may raise an error
+} catch {
+    // handler — runs only when the try body raised
+}
+```
+
+Catches errors raised inside the `try` body — an unparseable `parse_json` input, a `to_int` overflow, a regex compile failure, or any other primitive that bails. The error message is bound to the reserved name `error` inside the `catch` block.
+
+```
+def process safe_parse_json {
+    try {
+        workspace.body = parse_json(egress)
+    } catch {
+        workspace.parse_failed = true
+        workspace.parse_error = error
+    }
+}
+```
+
+Without `try`, a primitive error aborts the entire process call (and ultimately propagates up as a pipeline-level event failure). `try` lets a process recover gracefully — typically by recording the failure on workspace, falling back to a default, or routing the event to a dead-letter output. The handler runs only on error; in the success case the `catch` block is skipped entirely.
+
+`error` inside `catch` is a `Value::String` containing the bail message. It is scoped to the immediate `catch` body — not visible after the block ends, not visible inside a nested process call.
+
+### drop
+
+`drop` terminates the event immediately and counts it as `events_dropped`. It is fundamentally a routing decision and is documented in [Pipelines → Routing](../pipelines/routing.md); using it inside a process body is allowed as a concession (see [Processing → process vs routing](./README.md#process-vs-routing)).
 
 ## Arrays
 
@@ -158,8 +169,8 @@ def process compose_types {
     // below is construction convenience, not an index consumers can rely on.
     workspace.types = []
 
-    if workspace.cef_name != null {
-        workspace.types = append(workspace.types, workspace.cef_name)
+    if workspace.cef.name != null {
+        workspace.types = append(workspace.types, workspace.cef.name)
     }
     if workspace.pan_threat_type != null {
         workspace.types = append(workspace.types, workspace.pan_threat_type)
@@ -179,41 +190,17 @@ def process parse_mde_alert {
 
 Neither parser cares whether "the Process entity" appears first, last, or third in the evidence list. That independence is the point.
 
-### process call
+## process call
 
-Calls another named process:
-
-```
-process enrich_fortigate
-process my_custom_enrichment
-```
-
-### drop
-
-Terminates the event immediately. The event is counted as `events_dropped`:
+Inside a process body you can call another named process by name:
 
 ```
-if contains(ingress, "healthcheck") {
-    drop
-}
-```
-
-## Using in pipelines
-
-Reference a user-defined process by name:
-
-```
-def pipeline main {
-    input syslog
+def process enrich_and_tag {
     process enrich_fortigate
-    output archive
+    process my_custom_enrichment
+    workspace.tagged_at = timestamp()
 }
 ```
 
-Or chain with other processes (named or inline):
+Each call runs the named process's body against the same event in sequence. Only the named single-call form works here — the `|`-chain shape (`process strip_headers | enrich`) and inline anonymous processes (`process { ... }`) are pipeline-side composition primitives, not process-body statements. See [Pipelines → Routing](../pipelines/routing.md) for those.
 
-```
-process strip_headers | enrich_fortigate | {
-    egress = to_json()
-}
-```
