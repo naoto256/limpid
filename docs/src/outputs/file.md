@@ -45,9 +45,28 @@ Any DSL expression is allowed inside `${...}` — identifiers (`source`, `worksp
 
 ### Sanitisation
 
-Interpolations that read `workspace.*` directly (e.g. `${workspace.hostname}`) have `/`, `\`, and `..` replaced with `_` before substitution, so a hostile or malformed workspace value cannot escape the configured directory. Interpolations that compute a value (including `${lower(workspace.host)}`) are **not** auto-sanitised; if you need the guardrail on a computed value, add it explicitly with `regex_replace`.
+Path interpolation goes through two safety passes that together make directory escape impossible.
 
-Event metadata like `${source}` and results of functions like `${strftime(received_at, ...)}` are substituted verbatim.
+**Pass 1 — per-interpolation slash strip.** Every `${...}` interpolation in the path template — `${workspace.hostname}`, `${lower(workspace.host)}`, `${source}`, `${a + "-" + b}`, all of them — has `/` and `\` in the resulting string replaced with `_`. The wrapping expression shape doesn't matter; the rule is uniform.
+
+> The invariant is "**one interpolation = one path component**". Directory structure must be expressed in the literal parts of the template:
+>
+> ```
+> path "/var/log/${workspace.region}/${workspace.host}.log"   // OK — hierarchy is literal
+> ```
+>
+> If a workspace value happens to contain a slash (e.g. `workspace.path = "asia/tokyo"`), it becomes `_` rather than spawning subdirectories. To split into directories, parse the value into pieces explicitly and place each piece in its own interpolation slot.
+>
+> Dots are NOT stripped — interpolations contributing to FQDN-style filenames work as expected (`${workspace.host}.log` → `web01.example.com.log`).
+
+**Pass 2 — `..` traversal strip on the fully-rendered path.** After all interpolations resolve and the literal+interpolation parts are joined into a single path string, every `../` sequence is removed (iterated to a fixpoint), a trailing `/..` is stripped, and a result of exactly `..` is emptied. This catches traversal that arises from concatenation across literals and interpolations even when no single piece contains a slash:
+
+```
+path "/var/log/${workspace.parent}/x.log"   // parent="..", evaluated path="/var/log/../x.log"
+                                            // → Pass 2 strips "../" → "/var/log/x.log"
+```
+
+The two passes together guarantee that the final write path stays within the directory tree the operator declared in the template, regardless of what arrives in workspace.
 
 Parent directories are created automatically.
 
