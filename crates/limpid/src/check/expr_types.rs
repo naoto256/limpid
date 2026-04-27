@@ -13,7 +13,7 @@
 //! silence over noise; precision improves with each parser / function
 //! whose signature is registered.
 
-use crate::dsl::ast::{BinOp, Expr, ExprKind, TemplateFragment, UnaryOp};
+use crate::dsl::ast::{BinOp, Expr, ExprKind, UnaryOp, walk_children};
 use crate::dsl::span::Span;
 use crate::functions::{Arity, FunctionRegistry, FunctionSig};
 use crate::modules::schema::{FieldType, type_compatible};
@@ -185,22 +185,18 @@ pub fn check_types(
 ) {
     match &expr.kind {
         ExprKind::BinOp(l, op, r) => {
-            check_types(
-                l,
-                pipeline_name,
-                bindings,
-                registry,
-                fallback_span,
-                diagnostics,
-            );
-            check_types(
-                r,
-                pipeline_name,
-                bindings,
-                registry,
-                fallback_span,
-                diagnostics,
-            );
+            // Recurse into both sides via the generic walker, then run
+            // the BinOp-specific operator/operand check at this node.
+            walk_children(expr, |child| {
+                check_types(
+                    child,
+                    pipeline_name,
+                    bindings,
+                    registry,
+                    fallback_span,
+                    diagnostics,
+                )
+            });
             // Precise span for operator-type mismatches: the whole
             // BinOp sub-tree covers `[l.span.start, r.span.end)` — the
             // parser sets that on `expr` itself in `fold_by_precedence`.
@@ -216,31 +212,21 @@ pub fn check_types(
                 diagnostics,
             );
         }
-        ExprKind::UnaryOp(_op, inner) => {
-            check_types(
-                inner,
-                pipeline_name,
-                bindings,
-                registry,
-                fallback_span,
-                diagnostics,
-            );
-        }
         ExprKind::FuncCall {
             namespace,
             name,
             args,
         } => {
-            for a in args {
+            walk_children(expr, |child| {
                 check_types(
-                    a,
+                    child,
                     pipeline_name,
                     bindings,
                     registry,
                     fallback_span,
                     diagnostics,
-                );
-            }
+                )
+            });
             // Function-call-level diagnostic (unknown function, arg
             // type mismatch) anchors to the call expression itself; the
             // per-argument diagnostic below prefers the individual arg
@@ -257,54 +243,6 @@ pub fn check_types(
                 diagnostics,
             );
         }
-        ExprKind::Template(fragments) => {
-            for f in fragments {
-                if let TemplateFragment::Interp(e) = f {
-                    check_types(
-                        e,
-                        pipeline_name,
-                        bindings,
-                        registry,
-                        fallback_span,
-                        diagnostics,
-                    );
-                }
-            }
-        }
-        ExprKind::HashLit(entries) => {
-            for (_k, v) in entries {
-                check_types(
-                    v,
-                    pipeline_name,
-                    bindings,
-                    registry,
-                    fallback_span,
-                    diagnostics,
-                );
-            }
-        }
-        ExprKind::ArrayLit(items) => {
-            for item in items {
-                check_types(
-                    item,
-                    pipeline_name,
-                    bindings,
-                    registry,
-                    fallback_span,
-                    diagnostics,
-                );
-            }
-        }
-        ExprKind::PropertyAccess(base, _) => {
-            check_types(
-                base,
-                pipeline_name,
-                bindings,
-                registry,
-                fallback_span,
-                diagnostics,
-            );
-        }
         ExprKind::Ident(parts) => {
             check_unknown_ident(
                 parts,
@@ -314,41 +252,18 @@ pub fn check_types(
                 diagnostics,
             );
         }
-        ExprKind::SwitchExpr { scrutinee, arms } => {
+        // Everything else is plain recursion — no node-local check
+        // beyond visiting children.
+        _ => walk_children(expr, |child| {
             check_types(
-                scrutinee,
+                child,
                 pipeline_name,
                 bindings,
                 registry,
                 fallback_span,
                 diagnostics,
-            );
-            for arm in arms {
-                if let Some(pat) = &arm.pattern {
-                    check_types(
-                        pat,
-                        pipeline_name,
-                        bindings,
-                        registry,
-                        fallback_span,
-                        diagnostics,
-                    );
-                }
-                check_types(
-                    &arm.body,
-                    pipeline_name,
-                    bindings,
-                    registry,
-                    fallback_span,
-                    diagnostics,
-                );
-            }
-        }
-        ExprKind::StringLit(_)
-        | ExprKind::IntLit(_)
-        | ExprKind::FloatLit(_)
-        | ExprKind::BoolLit(_)
-        | ExprKind::Null => {}
+            )
+        }),
     }
 }
 
