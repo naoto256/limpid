@@ -157,12 +157,20 @@ impl Runtime {
         // Optional dead-letter queue for events that fail in `process`.
         // `control { error_log "..." }` opts in to file-based DLQ; when
         // unset, the runtime falls back to a structured tracing line.
+        // The path is validated at startup (parent dir reachable) so
+        // operator typos surface before the first failure event.
         let error_log_path = config
             .global_blocks
             .get("control")
             .and_then(|p| props::get_string(p, "error_log"));
-        let error_log = error_log_path
-            .map(|p| Arc::new(crate::error_log::ErrorLogWriter::new(PathBuf::from(p))));
+        let error_log = match error_log_path {
+            Some(p) => {
+                let writer = crate::error_log::ErrorLogWriter::new(PathBuf::from(p));
+                writer.validate_at_startup().await?;
+                Some(Arc::new(writer))
+            }
+            None => None,
+        };
 
         let mut input_senders: HashMap<
             String,
