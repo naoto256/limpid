@@ -30,6 +30,15 @@ pub enum Definition {
     Output(OutputDef),
     Process(ProcessDef),
     Pipeline(PipelineDef),
+    /// User-defined pure expression function: `def function name(params) { expr }`.
+    /// Registered into the same [`FunctionRegistry`] as built-in
+    /// primitives — call sites dispatch through the existing
+    /// `(namespace, name)` lookup. The body is evaluated with the
+    /// arguments bound into a local scope; reading the Event (ingress,
+    /// egress, source, received_at, error, workspace.*) is forbidden
+    /// at analyzer time, so functions are pure value-returning
+    /// expressions over their arguments.
+    Function(FunctionDef),
 }
 
 // ---------------------------------------------------------------------------
@@ -103,6 +112,31 @@ pub enum ProcessStatement {
     /// Expression statement: `table_upsert(...)`, `table_delete(...)`, etc.
     /// Evaluates the expression and discards the result.
     ExprStmt(Expr),
+}
+
+// ---------------------------------------------------------------------------
+// Function definition
+// ---------------------------------------------------------------------------
+
+/// `def function <name>(<params>) { <expr> }` — a pure expression
+/// function that gets registered alongside built-in primitives.
+///
+/// The body is a single expression. To express mapping tables, use
+/// the expression-form `switch` ([`ExprKind::SwitchExpr`]). The body
+/// must not reference any Event-bound identifier (`ingress`, `egress`,
+/// `source`, `received_at`, `error`, `workspace.*`) — that's checked
+/// at analyzer time so the runtime can evaluate the body in a
+/// closed-over scope without an Event in hand.
+///
+/// Recursion (direct or mutual) is rejected at analyzer time; this
+/// keeps the type-inference step a simple post-order traversal and
+/// avoids the small set of patterns where recursion would be useful
+/// (those belong in `def process`).
+#[derive(Debug, Clone)]
+pub struct FunctionDef {
+    pub name: String,
+    pub params: Vec<String>,
+    pub body: Expr,
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +314,29 @@ pub enum ExprKind {
     ArrayLit(Vec<Expr>),
     /// Postfix property access: `geoip(x).country.name`
     PropertyAccess(Box<Expr>, Vec<String>),
+    /// Expression-form switch — each arm body is one expression.
+    /// The matching arm's expression value is the switch's value.
+    /// `default` arm is optional; if absent and no arm matches, the
+    /// expression evaluates to `Null`.
+    ///
+    /// Distinct from the statement-form switch in
+    /// [`ProcessStatement::Switch`] / [`PipelineStatement::Switch`]:
+    /// those mutate workspace / route events as side effects; this
+    /// returns a value for use anywhere an expression goes.
+    SwitchExpr {
+        scrutinee: Box<Expr>,
+        arms: Vec<SwitchExprArm>,
+    },
+}
+
+/// One arm of a [`ExprKind::SwitchExpr`]. `pattern = None` is the
+/// `default` arm; otherwise the arm's pattern expression is compared
+/// against the scrutinee value (using the same equality semantics as
+/// statement-form switch).
+#[derive(Debug, Clone)]
+pub struct SwitchExprArm {
+    pub pattern: Option<Expr>,
+    pub body: Expr,
 }
 
 #[derive(Debug, Clone)]
