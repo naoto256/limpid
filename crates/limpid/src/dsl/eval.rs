@@ -240,7 +240,28 @@ fn resolve_ident(parts: &[String], event: &Event, scope: &LocalScope) -> Result<
         Some("ingress") => Ok(bytes_to_value(&event.ingress)),
         Some("egress") => Ok(bytes_to_value(&event.egress)),
         Some("received_at") => Ok(Value::Timestamp(event.received_at)),
-        Some("source") => Ok(Value::String(event.source.ip().to_string())),
+        // `source` is an Object with `.ip` (String) and `.port` (Int).
+        // Bare `source` returns the whole object so a renderer can write
+        // `${source.ip}:${source.port}` for inject-compatible output.
+        // Pre-0.5.6 this returned the IP as a flat String — operator
+        // configs comparing `source == "10.0.0.1"` need to migrate to
+        // `source.ip == "10.0.0.1"`.
+        Some("source") if parts.len() == 1 => {
+            let mut map = crate::dsl::value::Map::new();
+            map.insert("ip".into(), Value::String(event.source.ip().to_string()));
+            map.insert("port".into(), Value::Int(event.source.port() as i64));
+            Ok(Value::Object(map))
+        }
+        Some("source") if parts.len() == 2 && parts[1] == "ip" => {
+            Ok(Value::String(event.source.ip().to_string()))
+        }
+        Some("source") if parts.len() == 2 && parts[1] == "port" => {
+            Ok(Value::Int(event.source.port() as i64))
+        }
+        Some("source") => bail!(
+            "unknown ident path: source.{} — only source.ip / source.port are defined",
+            parts[1..].join(".")
+        ),
         Some("error") => {
             // `error` is available inside catch blocks, stored as workspace._error
             Ok(event

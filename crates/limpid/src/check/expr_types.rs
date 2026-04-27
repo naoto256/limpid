@@ -105,7 +105,9 @@ pub fn infer(expr: &Expr, bindings: &Bindings, registry: &FunctionRegistry) -> F
 ///
 /// Reserved idents (always present, fixed type):
 /// - `ingress` / `egress` — String (raw bytes UTF-8-decoded)
-/// - `source` — String (peer IP)
+/// - `source` — Object `{ ip: String, port: Int }` (since v0.5.6;
+///   pre-0.5.6 this was a flat String). `source.ip` and `source.port`
+///   are the canonical accessors.
 /// - `received_at` — Timestamp (wall-clock at which this hop received
 ///   the event; `timestamp` was the pre-0.5 name and is no longer
 ///   reserved)
@@ -121,9 +123,14 @@ fn ident_type(parts: &[String], bindings: &Bindings) -> FieldType {
     match parts.first().map(String::as_str) {
         Some("ingress") if parts.len() == 1 => return FieldType::String,
         Some("egress") if parts.len() == 1 => return FieldType::String,
-        Some("source") if parts.len() == 1 => return FieldType::String,
         Some("received_at") if parts.len() == 1 => return FieldType::Timestamp,
         Some("error") if parts.len() == 1 => return FieldType::String,
+        // `source` is an Object since v0.5.6 — `source.ip` (String) and
+        // `source.port` (Int) are the canonical accessors. Bare `source`
+        // returns the whole object so it can be passed around as a unit.
+        Some("source") if parts.len() == 1 => return FieldType::Object,
+        Some("source") if parts.len() == 2 && parts[1] == "ip" => return FieldType::String,
+        Some("source") if parts.len() == 2 && parts[1] == "port" => return FieldType::Int,
         Some("workspace") => {
             // Direct workspace lookup. Try exact path; fall back to
             // ancestor (Object); then wildcard.
@@ -298,6 +305,10 @@ fn check_unknown_ident(
             "ingress" | "egress" | "source" | "received_at" | "error"
         )
     {
+        return;
+    }
+    // `source.ip` and `source.port` are the canonical Object accessors.
+    if first == "source" && parts.len() == 2 && (parts[1] == "ip" || parts[1] == "port") {
         return;
     }
     // `workspace.*` paths are handled by the dataflow visibility pass.
