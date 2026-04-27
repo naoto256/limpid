@@ -29,6 +29,21 @@ def process parse_fortigate_cef_traffic {
 
 User-defined functions register into the same [`FunctionRegistry`](./functions.md) as built-in primitives — call sites dispatch through the same `(namespace, name)` lookup, the analyzer arity-checks them the same way, and a typo in the name surfaces the same way (`unknown function`, near-match suggestion).
 
+## Where they can be called from
+
+Anywhere an expression is evaluated — there's no callsite restriction:
+
+- **Process bodies**: `workspace.limpid.severity_id = normalize_severity(workspace.cef.severity)`.
+- **Pipeline-level conditions**: `if is_critical(workspace.limpid.severity_id) { output urgent }`.
+- **`output` templates**: `path "/var/log/limpid/${normalize_proto(workspace.cef.proto)}/events.log"`.
+- **HashLit values**: `workspace.limpid = { severity_id: normalize_severity(...), ... }`.
+- **Function arguments**: `lower(normalize_proto(workspace.cef.proto))`.
+- **Binary operands**: `if double_score(s) > threshold { ... }`.
+
+The purity contract restricts the **body** of the function (no Event reads, no side effects). The call site is unrestricted: it operates in the surrounding expression's evaluation context, which can read the Event normally and pass concrete values into the function.
+
+The mental model is the same as built-in primitives: `lower()` and `regex_match()` don't care where they're called from (pipeline `if` conditions, output `path` templates, process bodies — all valid). User-defined `normalize_proto()` is no different. Both are dispatched through `FunctionRegistry::call` with already-evaluated arguments. The only operator-visible difference is that `def function` lets you ship a vendor-agnostic mapping in the DSL itself, without touching Rust.
+
 ## When to reach for it
 
 `def function` is the right tool when you have a small, vendor-agnostic mapping or computation that:
