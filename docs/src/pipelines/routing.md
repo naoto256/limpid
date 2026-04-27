@@ -37,12 +37,12 @@ def pipeline archive {
     input syslog_udp
     process { egress = syslog.strip_pri(egress) }
 
-    switch source {
+    switch source.ip {
         "192.0.2.1" { output fw01 }
         "192.0.2.2" { output fw02 }
         "192.0.2.3" {
             if contains(ingress, "type=\"traffic\"") { drop }
-            process { egress = source + " " + strftime(received_at, "%b %e %H:%M:%S") + " " + egress }
+            process { egress = source.ip + " " + strftime(received_at, "%b %e %H:%M:%S") + " " + egress }
             output fw03
         }
         default { drop }
