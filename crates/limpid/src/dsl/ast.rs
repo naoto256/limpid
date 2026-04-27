@@ -101,10 +101,13 @@ pub enum ProcessStatement {
     ProcessCall(String, Vec<Expr>),
     /// `drop`
     Drop,
-    /// `error` / `error <expr>` — explicit failure routing. The optional
-    /// expression renders to a string and lands in `workspace._error`;
-    /// the event is then routed to the error_log (same path as runtime
-    /// process errors) and counted as `events_errored`. Use this in
+    /// `error` / `error <expr>` — explicit failure routing. The
+    /// optional expression renders to a string; the event is routed
+    /// to the error_log with that string as the DLQ entry's `reason`
+    /// field, the same path runtime process errors take. Counted as
+    /// `events_errored`. When executed inside a `try` block, the
+    /// rendered message is also exposed to the `catch` body via
+    /// `workspace._error` (same as any runtime error). Use this in
     /// snippet libraries when an upstream parse / dispatch contract
     /// fails — `drop` is for *intentional* discard, `error` is for
     /// "I cannot process this and the operator should know."
@@ -200,9 +203,11 @@ pub enum PipelineStatement {
     /// `finish` — explicit success termination (counted as events_finished)
     Finish,
     /// `error` / `error <expr>` — explicit failure routing. Routes the
-    /// event to the error_log (DLQ) with the rendered message stored in
-    /// `workspace._error`. Counted as `events_errored`, same metric as
-    /// runtime process errors.
+    /// event to the error_log (DLQ) with the rendered message as the
+    /// entry's `reason` field. Counted as `events_errored`, same metric
+    /// as runtime process errors. Pipeline-level `error` cannot be
+    /// caught (no `try`/`catch` at pipeline scope) — it always goes
+    /// to the DLQ.
     Error(Option<Expr>),
     /// `if cond { ... } else if cond { ... } else { ... }`
     If(IfChain),
