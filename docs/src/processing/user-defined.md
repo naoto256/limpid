@@ -18,7 +18,7 @@ def process enrich_fortigate {
 }
 ```
 
-The CEF parser call captures into `workspace.cef`; the `${...}` interpolation in the final string assembles the egress line. See [Expression Functions](./functions.md) for the full function surface and [DSL Syntax Basics → String interpolation](../dsl-syntax.md#string-interpolation) for the template syntax.
+The CEF parser call captures into `workspace.cef`; the `${...}` interpolation in the final string assembles the egress line. See [Built-in Functions](../functions/expression-functions.md) for the full function surface and [DSL Syntax Basics → String interpolation](../dsl-syntax.md#string-interpolation) for the template syntax.
 
 ## Assignments
 

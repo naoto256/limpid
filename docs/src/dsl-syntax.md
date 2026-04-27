@@ -114,7 +114,7 @@ Inside `${...}` you have access to the full event:
 | `egress`, `ingress` | Event byte buffers |
 | `workspace.xxx`, `workspace.xxx.yyy` | Named workspace values (nested lookup is supported) |
 
-All [expression functions](./processing/functions.md) — `strftime`, `lower`, `regex_extract`, `to_json`, `geoip`, and the parsers — are callable from inside `${...}`.
+All [built-in functions](./functions/expression-functions.md) — `strftime`, `lower`, `regex_extract`, `to_json`, `geoip`, and the parsers — are callable from inside `${...}`.
 
 Evaluated values are coerced to strings:
 

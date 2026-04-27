@@ -27,7 +27,9 @@ def process parse_fortigate_cef_traffic {
 }
 ```
 
-User-defined functions register into the same [`FunctionRegistry`](./functions.md) as built-in primitives — call sites dispatch through the same `(namespace, name)` lookup, the analyzer arity-checks them the same way, and a typo in the name surfaces the same way (`unknown function`, near-match suggestion).
+A call to `normalize_proto(x)` looks like any other function call — there's no marker at the call site that says "this is user-defined." The analyzer arity-checks it the same as a built-in, and a typo in the name surfaces the same way (`unknown function`, near-match suggestion).
+
+The name must be a bare identifier. `def function normalize_proto { ... }` is allowed; `def function foo.bar { ... }` is **not** — the dot namespace is reserved for schema-bound built-ins (`syslog.parse`, `cef.parse`, `otlp.encode_resourcelog_protobuf`, …) where the prefix names a specific schema specification (RFC 5424, ArcSight CEF, OCSF, …). User-defined functions are vendor-agnostic by design, so they always live in the flat namespace. See the [*Schema-specific functions live under a schema namespace*](../design-principles.md#schema-specific-functions-live-under-a-schema-namespace) operating rule for the rationale.
 
 ## Where they can be called from
 
@@ -63,11 +65,11 @@ Typical use cases:
 | Numeric clamp / range check | `def function clamp(x, lo, hi) { switch true { x < lo { lo } x > hi { hi } default { x } } }` |
 | String formatting helper | `def function host_label(h, p) { "${h}:${p}" }` |
 
-For anything with side effects (writing to `workspace.*`, mutating `egress`, calling `process foo`, dropping the event), use [`def process`](./user-defined.md) instead.
+For anything with side effects (writing to `workspace.*`, mutating `egress`, calling `process foo`, dropping the event), use [`def process`](../processing/user-defined.md) instead.
 
 ## Body shape
 
-The body is **a single expression**. To branch / map, use the expression-form `switch` ([DSL Syntax → switch](../dsl-syntax.md#switch)). Each arm body is one expression; the matching arm's value is the function's return value.
+The body is **zero or more `let` bindings followed by a required trailing expression** that becomes the return value:
 
 ```
 def function severity_id_from_label(s) {
@@ -82,28 +84,50 @@ def function severity_id_from_label(s) {
 }
 ```
 
-Anything an expression can do (binary ops, primitive calls, hash literals, array literals, nested function calls) the body can do:
+For non-trivial computations, factor intermediate values into `let` bindings:
+
+```
+def function normalize(s) {
+    let trimmed = trim(s)
+    let lowered = lower(trimmed)
+    regex_replace(lowered, "\\s+", " ")
+}
+```
+
+`let` is the **assignment form** for local-scope variables in limpid — not a separate "declaration" step. Re-assigning the same name is just another `let` line:
+
+```
+def function f(x) {
+    let v = x
+    let v = v * 3              // reassigns v in the same scope
+    v
+}
+```
+
+For branching, use the expression-form `switch` ([DSL Syntax → switch](../dsl-syntax.md#switch)) — every `switch` arm is itself an expression, so it composes inside `let` RHS, function arguments, or as the trailing return:
 
 ```
 def function endpoint_label(host, port) {
-    switch port {
-        443 { "https://${host}" }
-        80  { "http://${host}" }
-        default { "${host}:${port}" }
+    let scheme = switch port {
+        443 { "https" }
+        80  { "http" }
+        default { null }
+    }
+    switch scheme {
+        null    { "${host}:${port}" }
+        default { "${scheme}://${host}" }
     }
 }
-
-def function normalize(s) {
-    lower(regex_replace(s, "\\s+", " "))
-}
 ```
+
+Anything an expression can do (binary ops, primitive calls, hash literals, array literals, nested function calls) is fair game inside `let` RHS or the trailing expression. What you cannot do is write a *statement* — no assignments to anything, no `drop` / `finish` / `process foo` / `output foo`, no statement-form `if` / `switch` / `foreach` / `try-catch`. Use the expression-form alternatives.
 
 ## Restrictions (enforced at `--check` time)
 
 The body **may not**:
 
 - **read from the Event** — `ingress`, `egress`, `source`, `received_at`, `error`, and any `workspace.*` path are rejected. Functions are pure transformations of their arguments; coupling them to the surrounding pipeline context defeats the point.
-- **call user-defined `def process`** — process bodies have side effects (workspace writes, egress mutation, routing) that the function contract excludes.
+- **invoke any routing op** — `process foo`, `drop`, `finish`, `output` are all rejected. A function returns a value; routing decisions belong at pipeline level, and the side effects of a `def process` body don't fit the function contract.
 - **recurse**, directly or mutually. The analyzer detects cycles in the function-to-function call graph and rejects them at config-load time. If you genuinely need recursion, write a `def process` instead.
 
 ```
@@ -115,15 +139,15 @@ def function bad_recursion(n) {
     bad_recursion(n - 1)                       // ❌ self-recursion
 }
 def function bad_routing(x) {
-    drop                                        // ❌ routing keyword (parser rejects this)
+    drop                                        // ❌ routing keyword
 }
 def function bad_assignment(x) {
-    workspace.cached = x                       // ❌ assignment (parser rejects this)
+    workspace.cached = x                       // ❌ assignment
     x
 }
 ```
 
-The first one emits a warning (purity violation, `--ultra-strict` promotes to error). The cycle case is always an error. The last two are parser-level rejects — function body grammar doesn't allow `drop`, `finish`, `output`, `process`, or assignment statements.
+All four are hard errors at `--check` time — the config fails to load and the daemon won't start until they're fixed.
 
 ## Calling other functions
 
@@ -141,15 +165,13 @@ The analyzer's cycle check catches mutual recursion across any chain length.
 
 | Aspect | `def function` | `def process` |
 |--------|----------------|---------------|
-| Body shape | one expression | sequence of statements |
+| Body shape | `let` bindings + trailing return expression | sequence of statements |
 | Returns | a value | nothing (mutates Event) |
-| Reads `workspace.*` | ❌ rejected | ✅ allowed |
-| Writes `workspace.x = …` | ❌ parser-rejected | ✅ allowed |
-| Mutates `egress` | ❌ parser-rejected | ✅ allowed |
-| `drop` / `finish` | ❌ parser-rejected | ✅ allowed (drop) |
+| Reads `workspace.*` / `ingress` / `egress` / … | ❌ | ✅ allowed |
+| Any assignment (`x = …`) | ❌ | ✅ allowed |
+| `drop` / `finish` / `output foo` / `process foo` | ❌ | ✅ allowed |
 | Calls another `def function` | ✅ | ✅ |
-| Calls another `def process` | ❌ analyzer-rejected | ✅ |
-| Recursion | ❌ analyzer-rejected | ✅ allowed (operator-responsible) |
+| Recursion | ❌ | ✅ allowed (operator-responsible) |
 | Composable in expressions / HashLit | ✅ | ❌ (statement only) |
 
 Rule of thumb: **if the result is a single value the caller wants to embed somewhere**, write a function. **If the result is a side effect on the Event**, write a process.

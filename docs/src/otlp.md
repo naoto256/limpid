@@ -13,7 +13,7 @@ The reference docs for *how to use* OTLP in limpid are elsewhere:
 - [`otlp_http`](./inputs/otlp-http.md) and
   [`otlp_grpc`](./inputs/otlp-grpc.md) — input transports
 - [`otlp` output](./outputs/otlp.md) — three-protocol sender
-- [`otlp.*` functions](./processing/functions.md#otlp---opentelemetry-protocol-logs-signal) —
+- [`otlp.*` functions](./functions/expression-functions.md#otlp---opentelemetry-protocol-logs-signal) —
   encode / decode primitives
 
 The general design philosophy of limpid (the five principles) lives in
@@ -555,7 +555,7 @@ section reference and the wire trace.
 | Question | Source |
 |---|---|
 | How do I configure the input / output? | [otlp_http](./inputs/otlp-http.md), [otlp_grpc](./inputs/otlp-grpc.md), [otlp output](./outputs/otlp.md) |
-| What primitives are in the `otlp.*` namespace? | [Expression Functions](./processing/functions.md#otlp---opentelemetry-protocol-logs-signal) |
+| What primitives are in the `otlp.*` namespace? | [Built-in Functions](./functions/expression-functions.md#otlp---opentelemetry-protocol-logs-signal) |
 | How do I migrate from `Event.timestamp` to `Event.received_at`? | [v0.5 upgrade notes](./operations/upgrade-0.5.md) |
 | What are the design principles this builds on? | [Design Principles](./design-principles.md) |
 | What changed in v0.5.0 specifically? | [CHANGELOG](../../CHANGELOG.md) |
