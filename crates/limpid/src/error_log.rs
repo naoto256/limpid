@@ -15,12 +15,22 @@
 //! is negligible, and it keeps the writer compatible with logrotate's
 //! `copytruncate` / signal-less rotation flows without needing a
 //! `SIGHUP`-handled file-handle reset.
+//!
+//! Concurrency note: multiple pipeline workers may call `write()`
+//! concurrently when several pipelines hit a process error in the
+//! same instant. `O_APPEND` only guarantees atomic append for writes
+//! up to `PIPE_BUF` (Linux: 4 KiB), and DLQ records carrying
+//! base64-encoded binary ingress can easily exceed that. To keep
+//! lines from interleaving, every `write()` takes a process-local
+//! `tokio::sync::Mutex` before opening the file. The serialisation
+//! is inside the `error_log` boundary, not at the kernel layer.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 
 use crate::pipeline::ErroredEventContext;
 
@@ -32,11 +42,56 @@ use crate::pipeline::ErroredEventContext;
 /// line so the failure data is never silently lost.
 pub struct ErrorLogWriter {
     path: PathBuf,
+    /// Serialises concurrent `write()` calls so that records from
+    /// different pipeline workers cannot interleave when a single
+    /// JSONL line exceeds `PIPE_BUF`. The lock is held only across
+    /// the open + write_all sequence — not around `to_jsonl()` which
+    /// is pure CPU work.
+    write_lock: Mutex<()>,
 }
 
 impl ErrorLogWriter {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            write_lock: Mutex::new(()),
+        }
+    }
+
+    /// Validate that the `error_log` path is reachable at startup.
+    ///
+    /// Checks the parent directory exists and is writable by the
+    /// daemon user. Surfacing this at startup (rather than at first
+    /// failure) matches Principle 1 — operators see typo'd paths
+    /// before any event hits a process error.
+    ///
+    /// The file itself does not need to exist; `OpenOptions::create`
+    /// will materialise it on the first failure.
+    pub async fn validate_at_startup(&self) -> Result<()> {
+        let parent = self.path.parent().ok_or_else(|| {
+            anyhow::anyhow!(
+                "error_log path '{}' has no parent directory",
+                self.path.display()
+            )
+        })?;
+        let parent: &Path = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        let meta = tokio::fs::metadata(parent).await.with_context(|| {
+            format!(
+                "error_log: parent directory '{}' is not accessible (does it exist?)",
+                parent.display()
+            )
+        })?;
+        if !meta.is_dir() {
+            anyhow::bail!(
+                "error_log: '{}' exists but is not a directory",
+                parent.display()
+            );
+        }
+        Ok(())
     }
 
     /// Append one JSONL record for `ctx`. Errors here are surfaced to
@@ -45,6 +100,7 @@ impl ErrorLogWriter {
     pub async fn write(&self, ctx: &ErroredEventContext) -> Result<()> {
         let mut line = ctx.to_jsonl();
         line.push('\n');
+        let _guard = self.write_lock.lock().await;
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
@@ -119,5 +175,62 @@ mod tests {
         let w = ErrorLogWriter::new(path);
         let err = w.write(&ctx()).await.unwrap_err().to_string();
         assert!(err.contains("error_log"), "got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn validate_at_startup_passes_for_existing_parent() {
+        let dir = TempDir::new().unwrap();
+        let w = ErrorLogWriter::new(dir.path().join("errored.jsonl"));
+        w.validate_at_startup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn validate_at_startup_fails_for_missing_parent() {
+        let dir = TempDir::new().unwrap();
+        let w = ErrorLogWriter::new(dir.path().join("nope/errored.jsonl"));
+        let err = w.validate_at_startup().await.unwrap_err().to_string();
+        assert!(err.contains("not accessible"), "got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn concurrent_writes_do_not_interleave_lines() {
+        // Records carrying ~6 KiB of base64-encoded binary ingress would
+        // exceed POSIX PIPE_BUF (4 KiB) and could interleave under raw
+        // O_APPEND from independent file handles. The internal Mutex
+        // serialises writes so each line stays atomic.
+        use std::sync::Arc;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("errored.jsonl");
+        let w = Arc::new(ErrorLogWriter::new(path.clone()));
+
+        // Inflate the ingress to push the JSONL line past PIPE_BUF.
+        let big = vec![b'A'; 8192];
+        let big_event = Event::new(
+            Bytes::from(big),
+            "10.0.0.1:514".parse::<SocketAddr>().unwrap(),
+        );
+        let mut ctx = ctx();
+        ctx.event = big_event;
+        let ctx = Arc::new(ctx);
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let w = Arc::clone(&w);
+            let c = Arc::clone(&ctx);
+            handles.push(tokio::spawn(async move {
+                w.write(&c).await.unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let body = tokio::fs::read_to_string(&path).await.unwrap();
+        // Each line must parse as JSON — interleaving would split records.
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 16, "expected 16 records, got {}", lines.len());
+        for (i, line) in lines.iter().enumerate() {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|e| panic!("line {} is not valid JSON: {}\nline: {}", i, e, line));
+        }
     }
 }
