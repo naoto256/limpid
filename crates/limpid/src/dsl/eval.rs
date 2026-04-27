@@ -161,6 +161,43 @@ pub fn eval_expr_with_scope(
             }
             Ok(current)
         }
+        ExprKind::SwitchExpr { scrutinee, arms } => {
+            // Expression-form switch: evaluate scrutinee, walk arms in
+            // order, return the matching arm's body value. Default arm
+            // (pattern = None) acts as the fallthrough; if no match and
+            // no default, the expression's value is `Null` — mirrors
+            // the partial-data convention used by `regex_extract`,
+            // `table_lookup`, etc.
+            let target = eval_expr_with_scope(scrutinee, event, funcs, scope)?;
+            for arm in arms {
+                match &arm.pattern {
+                    None => return eval_expr_with_scope(&arm.body, event, funcs, scope),
+                    Some(pat) => {
+                        let pat_val = eval_expr_with_scope(pat, event, funcs, scope)?;
+                        if values_equal(&target, &pat_val) {
+                            return eval_expr_with_scope(&arm.body, event, funcs, scope);
+                        }
+                    }
+                }
+            }
+            Ok(Value::Null)
+        }
+    }
+}
+
+/// Equality check used by [`ExprKind::SwitchExpr`] arm matching. Mirrors
+/// the statement-form switch's match semantics: integer / float
+/// comparison normalised through `f64`, strings byte-equal, bools
+/// direct, null only matches null.
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, Value::Null) => true,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => x == y,
+        (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => (*x as f64) == *y,
+        (Value::String(x), Value::String(y)) => x == y,
+        _ => false,
     }
 }
 
