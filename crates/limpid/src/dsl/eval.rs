@@ -9,24 +9,30 @@ use super::value::{Map, Value};
 use crate::event::Event;
 use crate::functions::FunctionRegistry;
 
-/// Per-process scratch bindings introduced by `let <name> = expr`.
+/// Local-scope variable bindings introduced by `let <name> = expr`.
 ///
-/// `let` has process scope, not hop scope — it exists precisely because
-/// `workspace` is contract-ish (pipeline-local scratch that survives
-/// across process boundaries within the pipeline), whereas a `let`
-/// binding is "material for building a single workspace write" and is
-/// dropped when the process body returns.
+/// Used by both:
 ///
-/// The AST's [`super::ast::ProcessStatement::LetBinding`] calls
-/// [`LocalScope::bind`] as statements execute; expression evaluation
-/// ([`eval_expr_with_scope`]) consults the same scope when resolving
-/// bare identifiers.
+/// - **Process bodies**: each [`super::ast::ProcessStatement::LetBinding`]
+///   calls [`LocalScope::bind`] as statements execute; the scope lives
+///   for the duration of the process body and is dropped when the body
+///   returns. `let` has process scope (not hop scope), distinguishing
+///   it from `workspace` (pipeline-local scratch surviving across
+///   process boundaries).
+/// - **Function bodies**: [`FunctionRegistry::call`] constructs a
+///   fresh `LocalScope`, binds the call arguments to the declared
+///   parameters, then evaluates each `let` in [`super::ast::FuncBody`]
+///   in declaration order before the trailing return expression. The
+///   scope is discarded when the call returns.
 ///
-/// Call semantics: when a user-defined process calls another process,
-/// callers pass a *fresh* scope (or [`LocalScope::new`]). Locals do not
-/// leak across process calls. This matches the mental model of
-/// `workspace`-as-material and `let`-as-scratch — callee scratches are
-/// callee-only.
+/// Expression evaluation ([`eval_expr_with_scope`]) consults the same
+/// scope when resolving bare identifiers regardless of which kind of
+/// body it's running inside.
+///
+/// Call semantics: when a user-defined process or function calls
+/// another, the callee receives a *fresh* scope (or
+/// [`LocalScope::new`]). Locals do not leak across calls — callee
+/// scratches are callee-only.
 #[derive(Debug, Clone, Default)]
 pub struct LocalScope {
     bindings: HashMap<String, Value>,
@@ -37,9 +43,15 @@ impl LocalScope {
         Self::default()
     }
 
-    /// Bind (or shadow-rebind) `name` to `value`. The previous value, if
-    /// any, is discarded — by design this is the only way to "reassign"
-    /// a let (`let x = 1; let x = 2`), matching Rust's shadowing rules.
+    /// Bind `name` to `value`. The previous value, if any, is discarded.
+    ///
+    /// limpid models `let` as the **assignment form** for local-scope
+    /// variables (not as a separate "declaration" step). `let x = 1;
+    /// let x = 2` is two assignments to the same `x` — there is no
+    /// `let mut` / re-assign distinction, and no separate scope for
+    /// rebinding. Internally this is `HashMap::insert` overwriting the
+    /// prior value, but the user-facing semantics is "assignment to a
+    /// local-scope variable", not "shadowing".
     pub fn bind(&mut self, name: &str, value: Value) {
         self.bindings.insert(name.to_string(), value);
     }
@@ -161,6 +173,43 @@ pub fn eval_expr_with_scope(
             }
             Ok(current)
         }
+        ExprKind::SwitchExpr { scrutinee, arms } => {
+            // Expression-form switch: evaluate scrutinee, walk arms in
+            // order, return the matching arm's body value. Default arm
+            // (pattern = None) acts as the fallthrough; if no match and
+            // no default, the expression's value is `Null` — mirrors
+            // the partial-data convention used by `regex_extract`,
+            // `table_lookup`, etc.
+            let target = eval_expr_with_scope(scrutinee, event, funcs, scope)?;
+            for arm in arms {
+                match &arm.pattern {
+                    None => return eval_expr_with_scope(&arm.body, event, funcs, scope),
+                    Some(pat) => {
+                        let pat_val = eval_expr_with_scope(pat, event, funcs, scope)?;
+                        if values_equal(&target, &pat_val) {
+                            return eval_expr_with_scope(&arm.body, event, funcs, scope);
+                        }
+                    }
+                }
+            }
+            Ok(Value::Null)
+        }
+    }
+}
+
+/// Equality check used by [`ExprKind::SwitchExpr`] arm matching. Mirrors
+/// the statement-form switch's match semantics: integer / float
+/// comparison normalised through `f64`, strings byte-equal, bools
+/// direct, null only matches null.
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, Value::Null) => true,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Float(x), Value::Float(y)) => x == y,
+        (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => (*x as f64) == *y,
+        (Value::String(x), Value::String(y)) => x == y,
+        _ => false,
     }
 }
 
