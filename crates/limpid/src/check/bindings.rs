@@ -91,10 +91,10 @@ impl Bindings {
     }
 
     #[allow(dead_code)] // currently consulted only from tests; kept on the
-                        // public surface because the wildcard flag is part
-                        // of the binding-state contract (parser-effect
-                        // analysis flips it; downstream readers may grow
-                        // uses for it).
+    // public surface because the wildcard flag is part
+    // of the binding-state contract (parser-effect
+    // analysis flips it; downstream readers may grow
+    // uses for it).
     pub fn is_workspace_wildcard(&self) -> bool {
         self.wildcard
     }

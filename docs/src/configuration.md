@@ -76,7 +76,7 @@ table {
 
 Tables are in-memory only. There is no `table_save` — files are initial seeds, and dynamic data is lost on restart.
 
-See [table functions](./processing/functions.md#table-functions) for usage.
+See [table functions](./functions/expression-functions.md#table-functions) for usage.
 
 ### geoip
 

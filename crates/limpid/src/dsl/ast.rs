@@ -30,6 +30,15 @@ pub enum Definition {
     Output(OutputDef),
     Process(ProcessDef),
     Pipeline(PipelineDef),
+    /// User-defined pure expression function: `def function name(params) { expr }`.
+    /// Registered into the same [`FunctionRegistry`] as built-in
+    /// primitives — call sites dispatch through the existing
+    /// `(namespace, name)` lookup. The body is evaluated with the
+    /// arguments bound into a local scope; reading the Event (ingress,
+    /// egress, source, received_at, error, workspace.*) is forbidden
+    /// at analyzer time, so functions are pure value-returning
+    /// expressions over their arguments.
+    Function(FunctionDef),
 }
 
 // ---------------------------------------------------------------------------
@@ -103,6 +112,58 @@ pub enum ProcessStatement {
     /// Expression statement: `table_upsert(...)`, `table_delete(...)`, etc.
     /// Evaluates the expression and discards the result.
     ExprStmt(Expr),
+}
+
+// ---------------------------------------------------------------------------
+// Function definition
+// ---------------------------------------------------------------------------
+
+/// `def function <name>(<params>) { <body> }` — a pure expression
+/// function that gets registered alongside built-in primitives.
+///
+/// See [`FuncBody`] for body shape. The body must not reference any
+/// Event-bound identifier (`ingress`, `egress`, `source`,
+/// `received_at`, `error`, `workspace.*`) — that's checked at analyzer
+/// time so the runtime can evaluate the body in a closed-over scope
+/// without an Event in hand.
+///
+/// Recursion (direct or mutual) is rejected at analyzer time; this
+/// keeps the type-inference step a simple post-order traversal and
+/// avoids the small set of patterns where recursion would be useful
+/// (those belong in `def process`).
+#[derive(Debug, Clone)]
+pub struct FunctionDef {
+    pub name: String,
+    pub params: Vec<String>,
+    pub body: FuncBody,
+}
+
+/// Body of a `def function`: zero or more `let` bindings followed by a
+/// trailing return expression.
+///
+/// The trailing expression is required — a function must yield a value.
+/// `let` is the only statement form allowed; assignments, routing
+/// (`drop`, `finish`, `process foo`), and statement-form control flow
+/// (`if`, `switch`, `foreach`, `try-catch`) are all parser-rejected by
+/// the slim function-body grammar. Use the expression-form `switch` for
+/// branching.
+///
+/// Each `let` binds (or reassigns) a name in the same local scope; the
+/// trailing expression is evaluated with all bindings visible. Reading
+/// Event-bound identifiers (`ingress`, `egress`, `source`,
+/// `received_at`, `error`, `workspace.*`) anywhere in `lets` or `ret`
+/// is rejected at analyzer time — purity restricts the body to pure
+/// transformations of the function's parameters.
+#[derive(Debug, Clone)]
+pub struct FuncBody {
+    pub lets: Vec<FuncLet>,
+    pub ret: Expr,
+}
+
+#[derive(Debug, Clone)]
+pub struct FuncLet {
+    pub name: String,
+    pub value: Expr,
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +286,84 @@ impl Expr {
     }
 }
 
+/// Invoke `f` once per immediate child [`Expr`] of `expr`.
+///
+/// Visitor helper for the analyzer's tree-walking passes. Each
+/// [`ExprKind`] knows how to descend into its sub-expressions; callers
+/// only have to write the leaf-level logic for `Ident` / `FuncCall`
+/// (or whichever variant they care about) and delegate the rest of the
+/// recursion here:
+///
+/// ```ignore
+/// fn visit(expr: &Expr, ctx: &mut Ctx) {
+///     match &expr.kind {
+///         ExprKind::Ident(parts) => check_ident(parts, ctx),
+///         ExprKind::FuncCall { name, args, .. } => {
+///             check_call(name, ctx);
+///             for a in args { visit(a, ctx); }
+///         }
+///         _ => walk_children(expr, |child| visit(child, ctx)),
+///     }
+/// }
+/// ```
+///
+/// The point is that adding a new [`ExprKind`] variant (e.g. an `Index`
+/// or `Cast` form) requires updating this helper once instead of every
+/// walker in `check/`. Walkers that need leaf-level access to a few
+/// variants override those arms locally and use `walk_children` for the
+/// rest.
+///
+/// `f` is called on each direct child only — recursion into
+/// grandchildren is the caller's responsibility (typically by passing a
+/// closure that re-enters the walker).
+pub fn walk_children<'a, F: FnMut(&'a Expr)>(expr: &'a Expr, mut f: F) {
+    match &expr.kind {
+        ExprKind::FuncCall { args, .. } => {
+            for a in args {
+                f(a);
+            }
+        }
+        ExprKind::BinOp(l, _, r) => {
+            f(l);
+            f(r);
+        }
+        ExprKind::UnaryOp(_, inner) => f(inner),
+        ExprKind::PropertyAccess(base, _) => f(base),
+        ExprKind::Template(fragments) => {
+            for frag in fragments {
+                if let TemplateFragment::Interp(e) = frag {
+                    f(e);
+                }
+            }
+        }
+        ExprKind::HashLit(entries) => {
+            for (_, v) in entries {
+                f(v);
+            }
+        }
+        ExprKind::ArrayLit(items) => {
+            for v in items {
+                f(v);
+            }
+        }
+        ExprKind::SwitchExpr { scrutinee, arms } => {
+            f(scrutinee);
+            for arm in arms {
+                if let Some(p) = &arm.pattern {
+                    f(p);
+                }
+                f(&arm.body);
+            }
+        }
+        ExprKind::Ident(_)
+        | ExprKind::StringLit(_)
+        | ExprKind::IntLit(_)
+        | ExprKind::FloatLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::Null => {}
+    }
+}
+
 /// Wrap an [`ExprKind`] into a spanless [`Expr`]. Convenient for tests
 /// and AST rebuilds: `ExprKind::IntLit(7).into()` reads cleanly, and
 /// keeps `Expr::new(kind, span)` as the authoritative constructor for
@@ -280,6 +419,29 @@ pub enum ExprKind {
     ArrayLit(Vec<Expr>),
     /// Postfix property access: `geoip(x).country.name`
     PropertyAccess(Box<Expr>, Vec<String>),
+    /// Expression-form switch — each arm body is one expression.
+    /// The matching arm's expression value is the switch's value.
+    /// `default` arm is optional; if absent and no arm matches, the
+    /// expression evaluates to `Null`.
+    ///
+    /// Distinct from the statement-form switch in
+    /// [`ProcessStatement::Switch`] / [`PipelineStatement::Switch`]:
+    /// those mutate workspace / route events as side effects; this
+    /// returns a value for use anywhere an expression goes.
+    SwitchExpr {
+        scrutinee: Box<Expr>,
+        arms: Vec<SwitchExprArm>,
+    },
+}
+
+/// One arm of a [`ExprKind::SwitchExpr`]. `pattern = None` is the
+/// `default` arm; otherwise the arm's pattern expression is compared
+/// against the scrutinee value (using the same equality semantics as
+/// statement-form switch).
+#[derive(Debug, Clone)]
+pub struct SwitchExprArm {
+    pub pattern: Option<Expr>,
+    pub body: Expr,
 }
 
 #[derive(Debug, Clone)]

@@ -34,6 +34,7 @@
 pub mod bindings;
 mod control_flow;
 pub mod expr_types;
+mod function;
 pub mod graph;
 mod outputs;
 mod parser_effects;
@@ -195,6 +196,7 @@ pub struct DefCounts {
     pub outputs: usize,
     pub processes: usize,
     pub pipelines: usize,
+    pub functions: usize,
 }
 
 impl DefCounts {
@@ -207,6 +209,7 @@ impl DefCounts {
                 Definition::Output(_) => c.outputs += 1,
                 Definition::Process(_) => c.processes += 1,
                 Definition::Pipeline(_) => c.pipelines += 1,
+                Definition::Function(_) => c.functions += 1,
             }
         }
         c
@@ -244,8 +247,13 @@ pub fn analyze(config: &CompiledConfig, _source_map: &SourceMap) -> Vec<Diagnost
     };
     let mut registry = FunctionRegistry::new();
     crate::functions::register_builtins(&mut registry, table_store);
+    // Bodies are inspected separately for purity / cycle checks
+    // below — registration here is purely about making call sites
+    // in pipelines see the right arity / signature.
+    crate::functions::register_user_functions(&mut registry, config);
 
     let mut diagnostics = Vec::new();
+    function::check_all_functions(config, &mut diagnostics);
     for (name, pipeline) in &config.pipelines {
         analyze_pipeline(name, pipeline, config, &registry, &mut diagnostics);
     }
@@ -1045,9 +1053,7 @@ def pipeline p {
             .expect("expected unknown identifier warning");
         assert_eq!(w.kind, DiagKind::UnknownIdent);
         assert!(
-            w.help
-                .as_deref()
-                .is_some_and(|h| h.contains("ingress")),
+            w.help.as_deref().is_some_and(|h| h.contains("ingress")),
             "expected near-match suggestion, got: {:?}",
             w.help
         );
@@ -1185,6 +1191,329 @@ def pipeline pl { input i1; output o1 }
         assert_eq!(counts.inputs, 2);
         assert_eq!(counts.outputs, 1);
         assert_eq!(counts.processes, 1);
+        assert_eq!(counts.pipelines, 1);
+    }
+
+    // ----- def function -------------------------------------------------
+
+    #[test]
+    fn function_def_pure_body_passes() {
+        let src = r#"
+def function normalize_proto(num) {
+    switch num {
+        6  { "tcp" }
+        17 { "udp" }
+        default { null }
+    }
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        assert!(errors(&diags).is_empty(), "got errors: {:?}", diags);
+        assert!(warnings(&diags).is_empty(), "got warnings: {:?}", diags);
+    }
+
+    #[test]
+    fn function_referencing_workspace_errors() {
+        let src = r#"
+def function bad(x) {
+    x + len(workspace.foo)
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        let e = errors(&diags)
+            .into_iter()
+            .find(|e| e.message.contains("Event-bound identifier"))
+            .expect("expected purity error");
+        assert_eq!(e.kind, DiagKind::UnknownIdent);
+        assert!(
+            e.message.contains("workspace.foo"),
+            "expected workspace.foo in message, got: {}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn function_referencing_received_at_errors() {
+        let src = r#"
+def function bad() {
+    received_at
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            errors(&diags)
+                .iter()
+                .any(|e| e.message.contains("received_at")),
+            "expected received_at purity error, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn function_with_let_bindings_passes_checks() {
+        // let bindings + trailing return expression should parse and
+        // analyze cleanly. Each let RHS may reference earlier lets and
+        // parameters; the trailing expression sees all of them.
+        let src = r#"
+def function double_then_add_one(n) {
+    let doubled = n * 2
+    let result = doubled + 1
+    result
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            errors(&diags).is_empty(),
+            "expected clean analysis, got errors: {:?}",
+            errors(&diags)
+        );
+    }
+
+    #[test]
+    fn function_let_referencing_workspace_errors() {
+        // Event-bound idents are rejected even when buried inside a let
+        // RHS — the purity walk visits every binding.
+        let src = r#"
+def function bad(x) {
+    let v = x + len(workspace.foo)
+    v
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            errors(&diags)
+                .iter()
+                .any(|e| e.message.contains("Event-bound identifier")
+                    && e.message.contains("workspace.foo")),
+            "expected purity error for workspace.foo in let RHS, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn function_let_reassignment_parses_and_runs() {
+        // `let v = …` reassigns the same local-scope variable on the
+        // second occurrence. The analyzer treats both lines uniformly;
+        // there is no separate "redeclaration" diagnostic.
+        let src = r#"
+def function f(x) {
+    let v = x
+    let v = v * 3
+    v
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            errors(&diags).is_empty(),
+            "expected clean analysis, got: {:?}",
+            errors(&diags)
+        );
+    }
+
+    #[test]
+    fn function_missing_trailing_expression_fails_to_parse() {
+        // Function body grammar requires a trailing expression. A body
+        // consisting only of let statements is a parse error.
+        let src = r#"
+def function bad(x) {
+    let v = x
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let parsed = crate::dsl::parser::parse_config(src);
+        assert!(
+            parsed.is_err(),
+            "expected parse failure for function without trailing return expression"
+        );
+    }
+
+    #[test]
+    fn function_referencing_unknown_dotted_path_errors() {
+        // A multi-segment path whose head is neither a parameter nor an
+        // Event-bound identifier (`workspace`, `ingress`, `egress`,
+        // `source`, `received_at`, `error`) is a free variable. The
+        // analyzer must surface this — otherwise the call falls through
+        // to runtime where `eval::resolve_ident` fails to resolve the
+        // head and the event ends up in the error_log instead of
+        // failing config load.
+        let src = r#"
+def function bad(x) {
+    config.foo
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            errors(&diags)
+                .iter()
+                .any(|e| e.message.contains("unknown path")
+                    && e.message.contains("config.foo")
+                    && e.message.contains("config")),
+            "expected unknown-path error for `config.foo`, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn function_self_recursion_errors() {
+        let src = r#"
+def function rec(x) {
+    rec(x)
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            errors(&diags)
+                .iter()
+                .any(|e| e.message.contains("call cycle") && e.message.contains("rec")),
+            "expected self-recursion error, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn function_mutual_recursion_errors() {
+        let src = r#"
+def function a(x) { b(x) }
+def function b(x) { a(x) }
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        let cycle_errs: Vec<&Diagnostic> = errors(&diags)
+            .into_iter()
+            .filter(|e| e.message.contains("call cycle"))
+            .collect();
+        assert_eq!(
+            cycle_errs.len(),
+            1,
+            "expected exactly one cycle error, got {}: {:?}",
+            cycle_errs.len(),
+            diags
+        );
+        let m = &cycle_errs[0].message;
+        assert!(m.contains("a") && m.contains("b"), "got: {}", m);
+    }
+
+    #[test]
+    fn function_calling_process_errors() {
+        let src = r#"
+def process some_proc { workspace.x = 1 }
+def function bad(x) {
+    some_proc(x)
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            errors(&diags)
+                .iter()
+                .any(|e| e.message.contains("calls process")),
+            "expected process-call error, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn function_call_site_resolves() {
+        // Call sites referencing a user-defined function don't emit an
+        // "unknown function" warning — `register_user_function` made
+        // the analyzer aware of it. (Arity mismatches are deferred to
+        // runtime by design; the analyzer skips wrong-arity warnings
+        // to avoid double-flagging.)
+        let src = r#"
+def function takes_two(a, b) { a + b }
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p {
+    input i
+    process { workspace.x = takes_two(1, 2) }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            !warnings(&diags)
+                .iter()
+                .any(|w| w.message.contains("unknown function")),
+            "user function should resolve at the call site, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn function_call_in_hash_literal_resolves() {
+        // The OCSF / OCSF-shaped composer use case: function calls
+        // embedded as HashLit values. Should not flag any unknown
+        // identifier or function.
+        let src = r#"
+def function normalize_proto(num) {
+    switch num { 6 { "tcp" } 17 { "udp" } default { null } }
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p {
+    input i
+    process {
+        workspace.proto = 6
+        workspace.limpid = {
+            class_uid: 4001,
+            connection_info: { protocol_name: normalize_proto(workspace.proto) }
+        }
+    }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            errors(&diags).is_empty(),
+            "expected no errors, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn def_counts_includes_functions() {
+        let src = r#"
+def function f1(x) { x }
+def function f2(x) { x + 1 }
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let cfg = parse_config(src).unwrap();
+        let counts = DefCounts::from_config(&cfg);
+        assert_eq!(counts.functions, 2);
+        assert_eq!(counts.inputs, 1);
+        assert_eq!(counts.outputs, 1);
         assert_eq!(counts.pipelines, 1);
     }
 }
