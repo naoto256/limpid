@@ -1,9 +1,10 @@
 // Replayable-event composer
 //
-// Serialises the event into the canonical limpid Event JSON shape —
-// the same shape `limpidctl tap --json` emits and `limpidctl inject
-// --json` accepts. Pair with `output file` to capture a JSONL stream
-// that can be replayed later through any pipeline:
+// Serialises the event into the minimal "replay record" shape —
+// `{ received_at, source, ingress }` — the same three fields the
+// error_log (DLQ) preserves and `inject --json` consumes. Pair with
+// `output file` to capture a JSONL stream that can be replayed later
+// through any pipeline:
 //
 //   def output capture {
 //       type file
@@ -19,32 +20,28 @@
 //   # Replay later:
 //   #   cat /var/log/limpid/replay/.../*.jsonl | limpidctl inject input wire --json
 //
-// The captured shape includes everything `tap --json` carries:
+// `egress` and `workspace` are intentionally excluded — replay
+// re-runs the pipeline from the original `ingress`, so capturing
+// pipeline-derived state would just add bloat that is regenerated
+// on the replay side. This is the same reason the DLQ entry under
+// `error_log` keeps only the three replay-essential fields. If the
+// operator wants the post-process state for debugging, that's a
+// different concern (a separate snapshot composer would be the right
+// shape, not this one).
 //
-//   { received_at, source, ingress, egress, workspace }
-//
-// `egress` and `workspace` reflect the state of the event *at the
-// moment compose_replayable runs*, so position the process where the
-// snapshot semantics are right for your use case — usually right
-// after `input` (capture raw inflow) or right before `output`
-// (capture pipeline-final state, useful for debugging).
-//
-// Why bother when the error_log already preserves replayable events?
-// `error_log` only captures *failed* events. `compose_replayable` is
-// for the rest — production capture, parser regression fixtures,
-// snippet development. Same shape both directions, same `inject
-// --json` recipe, same operator mental model.
+// `compose_replayable` complements `error_log`: same record shape,
+// inverted population. error_log captures *failed* events; this
+// captures *all* events. Both round-trip through `inject --json`
+// without preprocessing.
 
 def process compose_replayable {
     // Since v0.5.6 the DSL `source` ident is the canonical
     // `{ip, port}` object — same shape `inject --json` expects — so
-    // the composer can pass it straight through. No string assembly,
-    // no port placeholder, no fidelity loss.
+    // the composer can pass it straight through with no string
+    // assembly and no port-placeholder fidelity loss.
     egress = to_json({
         received_at: received_at,
         source:      source,
-        ingress:     ingress,
-        egress:      egress,
-        workspace:   workspace
+        ingress:     ingress
     })
 }
