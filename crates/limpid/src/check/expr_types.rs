@@ -74,6 +74,29 @@ pub fn infer(expr: &Expr, bindings: &Bindings, registry: &FunctionRegistry) -> F
             UnaryOp::Not => FieldType::Bool,
             UnaryOp::Neg => infer(inner, bindings, registry),
         },
+        ExprKind::SwitchExpr { arms, .. } => {
+            // Switch expression's type is the union of all arm bodies'
+            // types. With no default arm, `Null` joins the union to
+            // cover the no-match case.
+            let mut has_default = false;
+            let mut joined: Option<FieldType> = None;
+            for arm in arms {
+                if arm.pattern.is_none() {
+                    has_default = true;
+                }
+                let arm_ty = infer(&arm.body, bindings, registry);
+                joined = Some(match joined {
+                    None => arm_ty,
+                    Some(prev) => FieldType::union(prev, arm_ty),
+                });
+            }
+            let result = joined.unwrap_or(FieldType::Null);
+            if has_default {
+                result
+            } else {
+                FieldType::union(result, FieldType::Null)
+            }
+        }
     }
 }
 
@@ -290,6 +313,36 @@ pub fn check_types(
                 prefer_span(expr, fallback_span),
                 diagnostics,
             );
+        }
+        ExprKind::SwitchExpr { scrutinee, arms } => {
+            check_types(
+                scrutinee,
+                pipeline_name,
+                bindings,
+                registry,
+                fallback_span,
+                diagnostics,
+            );
+            for arm in arms {
+                if let Some(pat) = &arm.pattern {
+                    check_types(
+                        pat,
+                        pipeline_name,
+                        bindings,
+                        registry,
+                        fallback_span,
+                        diagnostics,
+                    );
+                }
+                check_types(
+                    &arm.body,
+                    pipeline_name,
+                    bindings,
+                    registry,
+                    fallback_span,
+                    diagnostics,
+                );
+            }
         }
         ExprKind::StringLit(_)
         | ExprKind::IntLit(_)

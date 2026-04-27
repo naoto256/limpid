@@ -195,6 +195,7 @@ pub struct DefCounts {
     pub outputs: usize,
     pub processes: usize,
     pub pipelines: usize,
+    pub functions: usize,
 }
 
 impl DefCounts {
@@ -207,6 +208,7 @@ impl DefCounts {
                 Definition::Output(_) => c.outputs += 1,
                 Definition::Process(_) => c.processes += 1,
                 Definition::Pipeline(_) => c.pipelines += 1,
+                Definition::Function(_) => c.functions += 1,
             }
         }
         c

@@ -128,6 +128,15 @@ fn collect_workspace_refs(expr: &Expr, cb: &mut dyn FnMut(&[String])) {
                 collect_workspace_refs(v, cb);
             }
         }
+        ExprKind::SwitchExpr { scrutinee, arms } => {
+            collect_workspace_refs(scrutinee, cb);
+            for arm in arms {
+                if let Some(pat) = &arm.pattern {
+                    collect_workspace_refs(pat, cb);
+                }
+                collect_workspace_refs(&arm.body, cb);
+            }
+        }
         ExprKind::StringLit(_)
         | ExprKind::IntLit(_)
         | ExprKind::FloatLit(_)
