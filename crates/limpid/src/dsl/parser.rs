@@ -669,7 +669,10 @@ fn parse_switch_expr(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
                     body,
                 });
             }
-            n => bail!("malformed switch_expr_arm: expected 1 or 2 children, got {}", n),
+            n => bail!(
+                "malformed switch_expr_arm: expected 1 or 2 children, got {}",
+                n
+            ),
         }
     }
     Ok(Expr::new(

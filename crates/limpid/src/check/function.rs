@@ -215,7 +215,14 @@ fn check_function_cycles(config: &CompiledConfig, diagnostics: &mut Vec<Diagnost
     let names: Vec<&str> = adj.keys().copied().collect();
     for name in names {
         if color[&name] == 0 {
-            dfs_cycle(name, &adj, &mut color, &mut stack, &mut reported, diagnostics);
+            dfs_cycle(
+                name,
+                &adj,
+                &mut color,
+                &mut stack,
+                &mut reported,
+                diagnostics,
+            );
         }
     }
 }
@@ -304,11 +311,7 @@ fn dfs_cycle<'a>(
                         let path = if cycle.len() == 1 {
                             format!("`{}` calls itself", cycle[0])
                         } else {
-                            format!(
-                                "`{}` → `{}`",
-                                cycle.join("` → `"),
-                                cycle[0],
-                            )
+                            format!("`{}` → `{}`", cycle.join("` → `"), cycle[0],)
                         };
                         diagnostics.push(Diagnostic {
                             level: Level::Error,

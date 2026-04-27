@@ -535,10 +535,7 @@ fn exec_pipeline_stmt(
                                 return dropped();
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    "inline process: {} — event routed to error_log",
-                                    e
-                                );
+                                tracing::warn!("inline process: {} — event routed to error_log", e);
                                 out.trace.push(TraceEntry {
                                     stage: "process".into(),
                                     label: "(inline)".into(),
