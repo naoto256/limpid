@@ -32,6 +32,7 @@
   - [otlp](./outputs/otlp.md)
 - [Processing](./processing/README.md)
   - [User-defined Processes](./processing/user-defined.md)
+  - [User-defined Functions](./processing/user-defined-functions.md)
   - [Expression Functions](./processing/functions.md)
   - [Process Design Guide](./processing/design-guide.md)
 - [Pipelines](./pipelines/README.md)
