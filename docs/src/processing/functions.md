@@ -2,14 +2,17 @@
 
 Expression functions return values. They appear in conditions, on the right-hand side of assignments, inside `${...}` interpolations, and as bare statements inside a `process` body (where the returned object is merged into `workspace`).
 
+This page is the **reference for built-in functions**. Operators can also declare their own — see [User-defined Functions](./user-defined-functions.md) for `def function`. User-defined functions register into the same dispatch table as built-ins, so the call-site syntax is identical for both.
+
 ## Call syntax
 
-Functions come in two forms:
+Functions come in three forms:
 
 - **Flat primitive** — `name(args...)`. Schema-agnostic helpers that don't depend on any particular log format. JSON / KV format parsing, regex, hashing, timestamp formatting, table operations, GeoIP, and OS-level helpers all live here.
 - **Dot namespace** — `<schema>.<name>(args...)`. Schema-specific helpers declare the schema they bind to in their name: `syslog.parse(ingress)`, `cef.parse(ingress)`, `syslog.set_pri(egress, 16, 6)`. See the [*Schema-specific functions live under a schema namespace*](../design-principles.md#schema-specific-functions-live-under-a-schema-namespace) operating rule for the rationale.
+- **User-defined** — `name(args...)` declared via `def function name(args) { expr }`. Registered into the flat namespace alongside built-in primitives. Pure (no Event reads, no side effects); see [User-defined Functions](./user-defined-functions.md) for the full contract.
 
-The judgement rule for whether a function is namespaced is a single question: does its behavior follow a specific schema specification (RFC 3164/5424, ArcSight CEF, OCSF, …)? If yes, the schema's name is part of the function's name. If no, it is a flat primitive.
+The judgement rule for whether a function is namespaced is a single question: does its behavior follow a specific schema specification (RFC 3164/5424, ArcSight CEF, OCSF, …)? If yes, the schema's name is part of the function's name. If no, it is a flat primitive (or a user-defined function, which is also flat).
 
 ### Bare statements vs assignments
 
