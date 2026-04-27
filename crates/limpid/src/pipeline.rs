@@ -780,6 +780,93 @@ def pipeline p {
     }
 
     #[test]
+    fn explicit_error_keyword_in_process_routes_to_dlq() {
+        // `error "msg"` inside a def process body must surface the
+        // same way a runtime process error does — PipelineTermination::Errored,
+        // ErroredEventContext populated with the rendered message,
+        // and outputs empty.
+        use crate::event::Event;
+        use crate::functions::{FunctionRegistry, register_builtins, table::TableStore};
+        use bytes::Bytes;
+        use std::net::SocketAddr;
+
+        let src = r#"
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def process refuse {
+    error "I refuse"
+}
+def pipeline p {
+    input i
+    process refuse
+    output o
+}
+"#;
+        let cfg = compile(src).unwrap();
+        let pipeline = cfg.pipelines.get("p").unwrap();
+        let mut funcs = FunctionRegistry::new();
+        let store = TableStore::from_configs(vec![]).unwrap();
+        register_builtins(&mut funcs, store);
+        let event = Event::new(
+            Bytes::from_static(b"payload"),
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        );
+        let result = run_pipeline(pipeline, event, &cfg, &funcs, None).unwrap();
+        assert_eq!(result.termination, PipelineTermination::Errored);
+        let ctx = result.errored.expect("errored context must be populated");
+        assert_eq!(ctx.pipeline, "p");
+        assert_eq!(ctx.process, "refuse");
+        assert!(
+            ctx.reason.contains("I refuse"),
+            "unexpected reason: {}",
+            ctx.reason
+        );
+        assert!(result.outputs.is_empty());
+    }
+
+    #[test]
+    fn explicit_error_keyword_at_pipeline_level_routes_to_dlq() {
+        // `error "msg"` directly in the pipeline body must populate
+        // ErroredEventContext with `process = "(pipeline)"` so DLQ
+        // entries from pipeline-level routing are distinguishable
+        // from process-body failures.
+        use crate::event::Event;
+        use crate::functions::{FunctionRegistry, register_builtins, table::TableStore};
+        use bytes::Bytes;
+        use std::net::SocketAddr;
+
+        let src = r#"
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p {
+    input i
+    error "blocked at pipeline gate"
+    output o
+}
+"#;
+        let cfg = compile(src).unwrap();
+        let pipeline = cfg.pipelines.get("p").unwrap();
+        let mut funcs = FunctionRegistry::new();
+        let store = TableStore::from_configs(vec![]).unwrap();
+        register_builtins(&mut funcs, store);
+        let event = Event::new(
+            Bytes::from_static(b"payload"),
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        );
+        let result = run_pipeline(pipeline, event, &cfg, &funcs, None).unwrap();
+        assert_eq!(result.termination, PipelineTermination::Errored);
+        let ctx = result.errored.expect("errored context must be populated");
+        assert_eq!(ctx.pipeline, "p");
+        assert_eq!(ctx.process, "(pipeline)");
+        assert!(
+            ctx.reason.contains("blocked at pipeline gate"),
+            "unexpected reason: {}",
+            ctx.reason
+        );
+        assert!(result.outputs.is_empty());
+    }
+
+    #[test]
     fn validate_accepts_fan_in_when_all_inputs_exist() {
         let src = r#"
 def input a { type syslog_udp bind "0.0.0.0:5140" }
