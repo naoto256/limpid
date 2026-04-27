@@ -59,8 +59,8 @@ Strings are double-quoted only — no single-quote form. Strings support `${expr
 | Block in | Contains |
 |----------|----------|
 | `def input` / `def output` | property assignments (`type syslog_tcp`, `bind "..."`, …) |
-| `def process` | function calls, assignments to `egress` / `workspace` / `let`, `if` / `switch` / `drop` |
-| `def pipeline` | `input` / `output` references, `process` invocations, `if` / `switch` / `drop` / `finish` |
+| `def process` | function calls, assignments to `egress` / `workspace` / `let`, `if` / `switch` / `drop` / `error` |
+| `def pipeline` | `input` / `output` references, `process` invocations, `if` / `switch` / `drop` / `finish` / `error` |
 | `geoip {}`, `control {}`, `table {}` | global block properties (see [Main Configuration](./configuration.md#global-blocks)) |
 
 ## Identifier paths
@@ -143,6 +143,7 @@ The DSL has six control-flow constructs. The summary table maps each one to wher
 | **try / catch** | `try { ... } catch { ... }` (error message exposed as `error`) | yes | — |
 | **drop** | `drop` | yes (concession — see note) | yes (terminates routing for this event) |
 | **finish** | `finish` | — | yes (completes pipeline early without dropping) |
+| **error** | `error` or `error <expr>` | yes | yes (routes event to DLQ with optional message) |
 
 > **Note on `drop` inside a process body.** `drop` is fundamentally a routing decision (where the event goes — namely, nowhere) rather than a transformation, so in principle it belongs in a pipeline. The DSL allows it inside a process body anyway because in practice you sometimes recognise mid-transformation that the event isn't worth keeping (e.g., a parser snippet finds a malformed payload). Use it sparingly there; if a `drop` rule is reusable or its condition is independent of the surrounding transform, prefer expressing it at the pipeline level. See [Processing → process vs routing](./processing/README.md#process-vs-routing) for the full doctrine.
 
@@ -168,7 +169,7 @@ if expr { ... } else if expr { ... } else { ... }
 | `Null` | (never truthy) | always |
 | `Timestamp` | always | (never falsy) |
 
-Arms are statements valid in the surrounding body — pipeline statements at pipeline level (`output`, `process`, nested `if` / `switch`, `drop`, `finish`), process statements inside a `process` body (function calls, assignments, nested control flow). An empty arm (`if cond { }`) is allowed but rare.
+Arms are statements valid in the surrounding body — pipeline statements at pipeline level (`output`, `process`, nested `if` / `switch`, `drop`, `finish`, `error`), process statements inside a `process` body (function calls, assignments, nested control flow, `drop`, `error`). An empty arm (`if cond { }`) is allowed but rare.
 
 ```
 // pipeline body
@@ -240,12 +241,12 @@ The expression form has no side effects (no `workspace.x = …`, no `process foo
 The constructs not detailed above live on the page they semantically belong to:
 
 - **`foreach` / `try-catch`** — process-body only, transformations over per-event data. See [User-defined Processes → Control flow](./processing/user-defined.md#control-flow) for the syntax and the per-context details (`workspace._item` binding, the `error` name inside `catch`).
-- **`drop` / `finish`** — pipeline routing. `drop` terminates the event; `finish` ends the pipeline early without dropping. `drop` is also allowed inside a process body as a concession (the note above); `finish` is pipeline-only. See [Pipelines → Routing](./pipelines/routing.md) for the routing semantics (`events_dropped` vs `events_finished`, the deep-copy boundary at outputs).
+- **`drop` / `finish` / `error`** — pipeline routing. `drop` terminates the event silently (intended discard, counted as `events_dropped`); `finish` ends the pipeline early without dropping (counted as `events_finished`); `error <expr?>` routes the event to the [error log](./operations/error-log.md) with an operator-readable reason (counted as `events_errored`, same as a runtime process failure). `drop` and `error` are also allowed inside a process body; `finish` is pipeline-only. See [Pipelines → drop, finish, and error](./pipelines/drop-finish-error.md) for when to choose which.
 
 ## Reserved identifiers
 
 The following names are reserved and cannot be used as user identifiers:
 
 - Event metadata: `ingress`, `egress`, `received_at`, `source`, `error`, `workspace`
-- Keywords: `def`, `input`, `output`, `process`, `pipeline`, `if`, `else`, `switch`, `default`, `drop`, `finish`, `let`, `include`
+- Keywords: `def`, `input`, `output`, `process`, `pipeline`, `function`, `if`, `else`, `switch`, `default`, `drop`, `finish`, `error`, `let`, `include`
 - Literal markers: `true`, `false`, `null`

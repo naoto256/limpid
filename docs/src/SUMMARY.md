@@ -38,7 +38,7 @@
   - [User-defined Functions](./functions/user-defined.md)
 - [Pipelines](./pipelines/README.md)
   - [Routing](./pipelines/routing.md)
-  - [drop and finish](./pipelines/drop-finish.md)
+  - [drop, finish, and error](./pipelines/drop-finish-error.md)
   - [Examples](./pipelines/examples.md)
   - [Multi-host Pipeline Example](./pipelines/multi-host.md)
 - [Snippet Library](./snippets/README.md)

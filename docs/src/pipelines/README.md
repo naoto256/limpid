@@ -23,7 +23,7 @@ The inline anonymous form `process { ... }` is also available for one-off transf
 - **`finish`** terminates the pipeline successfully (counted as `events_finished`)
 - Reaching the **end** of a pipeline is an implicit `finish`
 - If a pipeline finishes without hitting any `output`, the event is counted as `events_discarded`
-- If a `process` statement raises a runtime error, the event is discarded and counted as `events_errored` (rather than forwarded with the original `ingress` unchanged — see [drop and finish](./drop-finish.md#metrics-impact) for the rationale)
+- If a `process` statement raises a runtime error, the event is discarded and counted as `events_errored` (rather than forwarded with the original `ingress` unchanged — see [drop and finish](./drop-finish-error.md#metrics-impact) for the rationale)
 
 ## Pipeline statements
 

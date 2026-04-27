@@ -50,6 +50,7 @@ kw_try      = _{ "try" }
 kw_catch    = _{ "catch" }
 kw_drop     = _{ "drop" }
 kw_finish   = _{ "finish" }
+kw_error    = _{ "error" }
 kw_foreach  = _{ "foreach" }
 kw_and      = _{ "and" }
 kw_or       = _{ "or" }
@@ -117,6 +118,7 @@ def_process = {
 
 process_stmt = {
     process_drop
+  | process_error
   | process_try_catch
   | process_if
   | process_switch
@@ -140,6 +142,12 @@ process_let = {
 process_expr_stmt = { func_call }
 
 process_drop = { kw_drop }
+
+// `error` / `error <expr>` — explicit failure routing. The event is
+// sent to the error_log (DLQ) with `workspace._error` set to the
+// rendered message expression (or a default if none was supplied).
+// Counted as `events_errored`, same metric as runtime process errors.
+process_error = { kw_error ~ expr? }
 
 process_try_catch = {
     kw_try ~ try_body ~ kw_catch ~ catch_body
@@ -216,6 +224,7 @@ def_pipeline = {
 pipeline_stmt = {
     pipeline_drop
   | pipeline_finish
+  | pipeline_error
   | pipeline_input
   | pipeline_process_chain
   | pipeline_output
@@ -225,6 +234,7 @@ pipeline_stmt = {
 
 pipeline_drop = { kw_drop }
 pipeline_finish = { kw_finish }
+pipeline_error = { kw_error ~ expr? }
 
 pipeline_input = {
     kw_input ~ ident ~ ("," ~ ident)*
