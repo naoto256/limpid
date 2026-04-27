@@ -8,7 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
-## [Unreleased]
+## [0.5.5] - 2026-04-27
+> `error` routing keyword for explicit DLQ routing
 
 ### Added — `error` routing keyword for explicit DLQ routing
 
