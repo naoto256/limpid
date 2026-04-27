@@ -2,7 +2,7 @@
 
 This page is for people writing processes — your own `def process` blocks in a production config, or snippets intended for wider reuse (OCSF composers, SIEM-specific parsers, vendor normalizers shipping under `processes/*.limpid`).
 
-It is a **style guide**, not a reference. The reference for what a process can express is [User-defined Processes](./user-defined.md); the reference for functions is [Expression Functions](./functions.md). The principles the guide rests on are in [Design Principles](../design-principles.md).
+It is a **style guide**, not a reference. The reference for what a process can express is [User-defined Processes](./user-defined.md); the reference for functions is [Built-in Functions](../functions/expression-functions.md). The principles the guide rests on are in [Design Principles](../design-principles.md).
 
 Everything here is about one thing: keeping processes small enough that a reader can hold one in their head, and composable enough that pipelines stay readable.
 
@@ -159,8 +159,8 @@ The rule of thumb: **a process should not make an event look successful when it 
 
 limpid has three layers of reusable logic:
 
-- **Built-in functions** (`parse_json`, `regex_extract`, `syslog.parse`, `cef.parse`, …) are primitives. Implemented in Rust, signature fixed, no pipeline context — no `ingress`, no `egress`, no `drop`. See [Expression Functions](./functions.md).
-- **User-defined functions** (`def function`) are pure value-returning helpers in the DSL. Body is one expression. No Event reads, no side effects, no recursion. Composable in any expression context — HashLit values, function args, binary operands. See [User-defined Functions](./user-defined-functions.md).
+- **Built-in functions** (`parse_json`, `regex_extract`, `syslog.parse`, `cef.parse`, …) are primitives. Implemented in Rust, signature fixed, no pipeline context — no `ingress`, no `egress`, no `drop`. See [Built-in Functions](../functions/expression-functions.md).
+- **User-defined functions** (`def function`) are pure value-returning helpers in the DSL. Body is one expression. No Event reads, no side effects, no recursion. Composable in any expression context — HashLit values, function args, binary operands. See [User-defined Functions](../functions/user-defined.md).
 - **User-defined processes** (`def process`) are the DSL's compositional unit *with* pipeline context: they can assign to `egress`, `drop`, `try`, branch, chain with `|`.
 
 The question "function or process?" has a clean answer:
