@@ -659,7 +659,7 @@ mod tests {
 
     #[test]
     fn extract_timestamp_reads_rfc3339_field() {
-        let line = r#"{"received_at":"2024-01-02T03:04:05Z","ingress":"hi","source":"127.0.0.1:514","egress":"hi"}"#;
+        let line = r#"{"received_at":"2024-01-02T03:04:05Z","ingress":"hi","source":{"ip":"127.0.0.1","port":514},"egress":"hi"}"#;
         let ts = extract_timestamp(line).unwrap();
         assert_eq!(ts.to_rfc3339(), "2024-01-02T03:04:05+00:00");
     }
@@ -667,7 +667,7 @@ mod tests {
     #[test]
     fn extract_timestamp_rejects_missing_or_malformed() {
         // Missing field
-        let line = r#"{"ingress":"hi","source":"127.0.0.1:514","egress":"hi"}"#;
+        let line = r#"{"ingress":"hi","source":{"ip":"127.0.0.1","port":514},"egress":"hi"}"#;
         assert!(extract_timestamp(line).is_err());
         // Wrong type
         let line = r#"{"received_at":1234,"ingress":"hi"}"#;

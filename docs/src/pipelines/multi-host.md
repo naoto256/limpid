@@ -138,7 +138,7 @@ def process app_drop_debug {
     // Only inspect events from the known edge-host IPs. FortiGate
     // events flow past untouched.
 
-    if source == "10.0.0.21" or source == "10.0.0.22" {
+    if source.ip == "10.0.0.21" or source.ip == "10.0.0.22" {
         try {
             workspace.json = parse_json(workspace.syslog.msg)
             if workspace.json.level == "DEBUG" {

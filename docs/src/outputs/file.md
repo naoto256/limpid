@@ -32,7 +32,7 @@ Permissions are applied only when the file is first created.
 ```
 def output per_source {
     type file
-    path "/var/log/limpid/${source}/${strftime(received_at, "%Y-%m-%d", "local")}.log"
+    path "/var/log/limpid/${source.ip}/${strftime(received_at, "%Y-%m-%d", "local")}.log"
 }
 
 def output per_host {
@@ -47,7 +47,7 @@ Any DSL expression is allowed inside `${...}` — identifiers (`source`, `worksp
 
 Path interpolation goes through two safety passes that together make directory escape impossible.
 
-**Pass 1 — per-interpolation slash strip + empty-result reject.** Every `${...}` interpolation in the path template — `${workspace.hostname}`, `${lower(workspace.host)}`, `${source}`, `${a + "-" + b}`, all of them — has `/` and `\` in the resulting string replaced with `_`. An interpolation that evaluates to the empty string is rejected with an error (it would silently produce surprise paths like `/foo//bar` or `/foo/.log`).
+**Pass 1 — per-interpolation slash strip + empty-result reject.** Every `${...}` interpolation in the path template — `${workspace.hostname}`, `${lower(workspace.host)}`, `${source.ip}`, `${a + "-" + b}`, all of them — has `/` and `\` in the resulting string replaced with `_`. An interpolation that evaluates to the empty string is rejected with an error (it would silently produce surprise paths like `/foo//bar` or `/foo/.log`).
 
 > The invariant is "**one interpolation = one non-empty path component**". Directory structure must be expressed in the literal parts of the template:
 >

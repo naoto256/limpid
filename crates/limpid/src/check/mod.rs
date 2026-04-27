@@ -1593,7 +1593,7 @@ def input i { type tcp bind "0.0.0.0:514" }
 def output o { type stdout template "x" }
 def pipeline p {
     input i
-    if source == "10.0.0.99" { error "rejected source" }
+    if source.ip == "10.0.0.99" { error "rejected source" }
     output o
 }
 "#;

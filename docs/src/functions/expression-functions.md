@@ -746,7 +746,7 @@ If either operand is a string, `+` concatenates after stringifying the other sid
 
 ```
 egress = "[" + workspace.syslog.hostname + "] " + egress
-egress = source + " " + egress
+egress = source.ip + " " + egress
 ```
 
 If both operands are numeric, `+` is ordinary addition. Mixing with `null`, arrays, or objects is an error — stringify explicitly with `to_json()` first if that is what you want.

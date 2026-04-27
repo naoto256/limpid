@@ -7,7 +7,7 @@
 //!   group  "adm"                       — file group (requires CAP_CHOWN or membership)
 //!
 //! Dynamic path templates use the DSL's native `${expr}` interpolation,
-//! e.g. `path "/var/log/${source}/${strftime(timestamp, "%Y-%m-%d")}.log"`.
+//! e.g. `path "/var/log/${source.ip}/${strftime(timestamp, "%Y-%m-%d")}.log"`.
 //! Any DSL expression works (identifiers, function calls, string concat).
 //! Interpolations that dereference `workspace.*` are sanitised to strip
 //! `/`, `\`, and `..` so untrusted event data can't escape into sibling
@@ -422,10 +422,11 @@ mod tests {
 
     #[test]
     fn render_template_with_ident_interp() {
-        // "/var/log/${source}.log"
+        // "/var/log/${source.ip}.log" — source is an Object since v0.5.6,
+        // `source.ip` is the canonical accessor for the peer IP string.
         let out = make_output(ek(ExprKind::Template(vec![
             TemplateFragment::Literal("/var/log/".into()),
-            TemplateFragment::Interp(ek(ExprKind::Ident(vec!["source".into()]))),
+            TemplateFragment::Interp(ek(ExprKind::Ident(vec!["source".into(), "ip".into()]))),
             TemplateFragment::Literal(".log".into()),
         ])));
         let (rendered, dynamic) = out.render_path(&event_with_workspace()).unwrap();
@@ -449,15 +450,15 @@ mod tests {
     #[test]
     fn render_template_sanitises_every_interpolation() {
         // Pass 1: every interpolation result has `/` `\` → `_`,
-        // regardless of expression shape. `source` (a non-workspace
-        // ident) gets the same treatment as `workspace.x`.
+        // regardless of expression shape. `source.ip` (a non-workspace
+        // path) gets the same treatment as `workspace.x`.
         let out = make_output(ek(ExprKind::Template(vec![
             TemplateFragment::Literal("a-".into()),
-            TemplateFragment::Interp(ek(ExprKind::Ident(vec!["source".into()]))),
+            TemplateFragment::Interp(ek(ExprKind::Ident(vec!["source".into(), "ip".into()]))),
             TemplateFragment::Literal("-b".into()),
         ])));
         let (rendered, _) = out.render_path(&event_with_workspace()).unwrap();
-        // source is "192.168.1.10" — no slashes, no change. Principle
+        // source.ip is "192.168.1.10" — no slashes, no change. Principle
         // holds for hypothetical slash-bearing values.
         assert_eq!(rendered, "a-192.168.1.10-b");
     }
