@@ -118,15 +118,14 @@ pub enum ProcessStatement {
 // Function definition
 // ---------------------------------------------------------------------------
 
-/// `def function <name>(<params>) { <expr> }` — a pure expression
+/// `def function <name>(<params>) { <body> }` — a pure expression
 /// function that gets registered alongside built-in primitives.
 ///
-/// The body is a single expression. To express mapping tables, use
-/// the expression-form `switch` ([`ExprKind::SwitchExpr`]). The body
-/// must not reference any Event-bound identifier (`ingress`, `egress`,
-/// `source`, `received_at`, `error`, `workspace.*`) — that's checked
-/// at analyzer time so the runtime can evaluate the body in a
-/// closed-over scope without an Event in hand.
+/// See [`FuncBody`] for body shape. The body must not reference any
+/// Event-bound identifier (`ingress`, `egress`, `source`,
+/// `received_at`, `error`, `workspace.*`) — that's checked at analyzer
+/// time so the runtime can evaluate the body in a closed-over scope
+/// without an Event in hand.
 ///
 /// Recursion (direct or mutual) is rejected at analyzer time; this
 /// keeps the type-inference step a simple post-order traversal and
@@ -284,6 +283,84 @@ impl Expr {
             kind,
             span: Span::dummy(),
         }
+    }
+}
+
+/// Invoke `f` once per immediate child [`Expr`] of `expr`.
+///
+/// Visitor helper for the analyzer's tree-walking passes. Each
+/// [`ExprKind`] knows how to descend into its sub-expressions; callers
+/// only have to write the leaf-level logic for `Ident` / `FuncCall`
+/// (or whichever variant they care about) and delegate the rest of the
+/// recursion here:
+///
+/// ```ignore
+/// fn visit(expr: &Expr, ctx: &mut Ctx) {
+///     match &expr.kind {
+///         ExprKind::Ident(parts) => check_ident(parts, ctx),
+///         ExprKind::FuncCall { name, args, .. } => {
+///             check_call(name, ctx);
+///             for a in args { visit(a, ctx); }
+///         }
+///         _ => walk_children(expr, |child| visit(child, ctx)),
+///     }
+/// }
+/// ```
+///
+/// The point is that adding a new [`ExprKind`] variant (e.g. an `Index`
+/// or `Cast` form) requires updating this helper once instead of every
+/// walker in `check/`. Walkers that need leaf-level access to a few
+/// variants override those arms locally and use `walk_children` for the
+/// rest.
+///
+/// `f` is called on each direct child only — recursion into
+/// grandchildren is the caller's responsibility (typically by passing a
+/// closure that re-enters the walker).
+pub fn walk_children<'a, F: FnMut(&'a Expr)>(expr: &'a Expr, mut f: F) {
+    match &expr.kind {
+        ExprKind::FuncCall { args, .. } => {
+            for a in args {
+                f(a);
+            }
+        }
+        ExprKind::BinOp(l, _, r) => {
+            f(l);
+            f(r);
+        }
+        ExprKind::UnaryOp(_, inner) => f(inner),
+        ExprKind::PropertyAccess(base, _) => f(base),
+        ExprKind::Template(fragments) => {
+            for frag in fragments {
+                if let TemplateFragment::Interp(e) = frag {
+                    f(e);
+                }
+            }
+        }
+        ExprKind::HashLit(entries) => {
+            for (_, v) in entries {
+                f(v);
+            }
+        }
+        ExprKind::ArrayLit(items) => {
+            for v in items {
+                f(v);
+            }
+        }
+        ExprKind::SwitchExpr { scrutinee, arms } => {
+            f(scrutinee);
+            for arm in arms {
+                if let Some(p) = &arm.pattern {
+                    f(p);
+                }
+                f(&arm.body);
+            }
+        }
+        ExprKind::Ident(_)
+        | ExprKind::StringLit(_)
+        | ExprKind::IntLit(_)
+        | ExprKind::FloatLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::Null => {}
     }
 }
 
