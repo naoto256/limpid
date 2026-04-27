@@ -8,6 +8,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
+## [Unreleased]
+
+### Added — `error` routing keyword for explicit DLQ routing
+
+Process and pipeline bodies now accept an `error` statement alongside
+`drop` and `finish`:
+
+```
+def process parse_fortigate_cef {
+    workspace.cef = cef.parse(workspace.syslog.msg)
+    switch workspace.cef.name {
+        "traffic" { process parse_fortigate_cef_traffic }
+        "utm"     { process parse_fortigate_cef_utm }
+        default   { error "unsupported FortiGate CEF subtype: ${workspace.cef.name}" }
+    }
+}
+```
+
+`error` takes an optional message expression — anything an `${...}`
+template can render — and routes the event to the [error log](./operations/error-log.md)
+exactly like a runtime process failure: counted as `events_errored`,
+written to `control { error_log "..." }` if configured, otherwise
+emitted as a structured `tracing::error!` line. The message lands in
+the DLQ entry's `reason` field so the operator sees *why* an event was
+rejected without reverse-engineering the bytes.
+
+This fills a gap that snippet libraries hit immediately: a parser
+dispatcher that can't recognise the input subtype previously had to
+choose between `drop` (silent loss, looks intentional) and a
+hand-rolled runtime panic. Neither matches the intent of "this event
+was supposed to be processable but I cannot — operator action needed."
+`error` makes that intent first-class.
+
+The keyword is rejected inside `def function` bodies (function body
+grammar is `let* + trailing expression`, no statement forms allowed) —
+pure expression functions stay pure.
+
 ## [0.5.4] - 2026-04-27
 > User-defined pure functions (`def function`) with let-form bodies
 

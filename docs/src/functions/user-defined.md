@@ -120,14 +120,14 @@ def function endpoint_label(host, port) {
 }
 ```
 
-Anything an expression can do (binary ops, primitive calls, hash literals, array literals, nested function calls) is fair game inside `let` RHS or the trailing expression. What you cannot do is write a *statement* — no assignments to anything, no `drop` / `finish` / `process foo` / `output foo`, no statement-form `if` / `switch` / `foreach` / `try-catch`. Use the expression-form alternatives.
+Anything an expression can do (binary ops, primitive calls, hash literals, array literals, nested function calls) is fair game inside `let` RHS or the trailing expression. What you cannot do is write a *statement* — no assignments to anything, no `drop` / `finish` / `error` / `process foo` / `output foo`, no statement-form `if` / `switch` / `foreach` / `try-catch`. Use the expression-form alternatives.
 
 ## Restrictions (enforced at `--check` time)
 
 The body **may not**:
 
 - **read from the Event** — `ingress`, `egress`, `source`, `received_at`, `error`, and any `workspace.*` path are rejected. Functions are pure transformations of their arguments; coupling them to the surrounding pipeline context defeats the point.
-- **invoke any routing op** — `process foo`, `drop`, `finish`, `output` are all rejected. A function returns a value; routing decisions belong at pipeline level, and the side effects of a `def process` body don't fit the function contract.
+- **invoke any routing op** — `process foo`, `drop`, `finish`, `error`, `output` are all rejected. A function returns a value; routing decisions belong at pipeline level, and the side effects of a `def process` body don't fit the function contract.
 - **recurse**, directly or mutually. The analyzer detects cycles in the function-to-function call graph and rejects them at config-load time. If you genuinely need recursion, write a `def process` instead.
 
 ```
@@ -169,7 +169,7 @@ The analyzer's cycle check catches mutual recursion across any chain length.
 | Returns | a value | nothing (mutates Event) |
 | Reads `workspace.*` / `ingress` / `egress` / … | ❌ | ✅ allowed |
 | Any assignment (`x = …`) | ❌ | ✅ allowed |
-| `drop` / `finish` / `output foo` / `process foo` | ❌ | ✅ allowed |
+| `drop` / `finish` / `error` / `output foo` / `process foo` | ❌ | ✅ allowed |
 | Calls another `def function` | ✅ | ✅ |
 | Recursion | ❌ | ✅ allowed (operator-responsible) |
 | Composable in expressions / HashLit | ✅ | ❌ (statement only) |
