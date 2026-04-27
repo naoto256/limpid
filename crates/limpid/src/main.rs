@@ -500,3 +500,73 @@ fn build_test_event(input_json: Option<&str>) -> Result<Event> {
         ))
     }
 }
+
+#[cfg(test)]
+mod build_test_event_tests {
+    use super::*;
+
+    fn run(input: &str) -> Result<Event> {
+        build_test_event(Some(input))
+    }
+
+    #[test]
+    fn omitted_source_uses_loopback_default() {
+        let ev = build_test_event(None).unwrap();
+        assert_eq!(ev.source.ip().to_string(), "127.0.0.1");
+        assert_eq!(ev.source.port(), 0);
+    }
+
+    #[test]
+    fn empty_object_source_uses_defaults() {
+        let ev = run(r#"{"ingress":"x","source":{}}"#).unwrap();
+        assert_eq!(ev.source.ip().to_string(), "127.0.0.1");
+        assert_eq!(ev.source.port(), 0);
+    }
+
+    #[test]
+    fn ip_only_defaults_port_to_zero() {
+        let ev = run(r#"{"ingress":"x","source":{"ip":"10.0.0.1"}}"#).unwrap();
+        assert_eq!(ev.source.ip().to_string(), "10.0.0.1");
+        assert_eq!(ev.source.port(), 0);
+    }
+
+    #[test]
+    fn port_only_defaults_ip_to_loopback() {
+        let ev = run(r#"{"ingress":"x","source":{"port":5140}}"#).unwrap();
+        assert_eq!(ev.source.ip().to_string(), "127.0.0.1");
+        assert_eq!(ev.source.port(), 5140);
+    }
+
+    #[test]
+    fn full_object_round_trips() {
+        let ev = run(r#"{"ingress":"x","source":{"ip":"192.0.2.10","port":5140}}"#).unwrap();
+        assert_eq!(ev.source.ip().to_string(), "192.0.2.10");
+        assert_eq!(ev.source.port(), 5140);
+    }
+
+    #[test]
+    fn legacy_string_source_errors_loudly() {
+        // The 0.5.5 flat-string form is intentionally not accepted —
+        // operators migrating should see the failure, not silently
+        // get a wrong default.
+        let err = run(r#"{"ingress":"x","source":"192.0.2.10:5140"}"#).unwrap_err();
+        let s = err.to_string();
+        assert!(
+            s.contains("must be an object") && s.contains("0.5.6"),
+            "got: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn ip_wrong_type_errors_loudly() {
+        let err = run(r#"{"ingress":"x","source":{"ip":42,"port":514}}"#).unwrap_err();
+        assert!(err.to_string().contains("must be a string"), "got: {}", err);
+    }
+
+    #[test]
+    fn port_out_of_range_errors_loudly() {
+        let err = run(r#"{"ingress":"x","source":{"ip":"127.0.0.1","port":99999}}"#).unwrap_err();
+        assert!(err.to_string().contains("out of range"), "got: {}", err);
+    }
+}
