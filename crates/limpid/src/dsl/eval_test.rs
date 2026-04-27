@@ -791,4 +791,65 @@ mod tests {
         let result = funcs.call(None, "f", &[Value::Int(7)], &ev).unwrap();
         assert_eq!(result, Value::Int(21));
     }
+
+    #[test]
+    fn source_ip_resolves_to_string() {
+        let ev = make_event(); // source = "10.0.0.1:514"
+        let funcs = make_funcs();
+        let v = eval_expr(
+            &e(ExprKind::Ident(vec!["source".into(), "ip".into()])),
+            &ev,
+            &funcs,
+        )
+        .unwrap();
+        assert_eq!(v, Value::String("10.0.0.1".into()));
+    }
+
+    #[test]
+    fn source_port_resolves_to_int() {
+        let ev = make_event(); // source = "10.0.0.1:514"
+        let funcs = make_funcs();
+        let v = eval_expr(
+            &e(ExprKind::Ident(vec!["source".into(), "port".into()])),
+            &ev,
+            &funcs,
+        )
+        .unwrap();
+        assert_eq!(v, Value::Int(514));
+    }
+
+    #[test]
+    fn bare_source_resolves_to_object() {
+        // Bare `source` returns the whole `{ ip, port }` map so it can
+        // be passed around or serialised as a unit. This is the breaking
+        // change from 0.5.5 (where bare `source` was a flat IP String).
+        let ev = make_event(); // source = "10.0.0.1:514"
+        let funcs = make_funcs();
+        let v = eval_expr(&e(ExprKind::Ident(vec!["source".into()])), &ev, &funcs).unwrap();
+        match v {
+            Value::Object(map) => {
+                assert_eq!(map.get("ip"), Some(&Value::String("10.0.0.1".into())));
+                assert_eq!(map.get("port"), Some(&Value::Int(514)));
+            }
+            other => panic!("expected Object for bare source, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn source_unknown_path_errors() {
+        // Only `source.ip` and `source.port` are defined paths.
+        let ev = make_event();
+        let funcs = make_funcs();
+        let err = eval_expr(
+            &e(ExprKind::Ident(vec!["source".into(), "host".into()])),
+            &ev,
+            &funcs,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("source.host") || err.to_string().contains("only source.ip"),
+            "expected helpful error, got: {}",
+            err
+        );
+    }
 }
