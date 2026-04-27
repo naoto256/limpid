@@ -10,6 +10,63 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased]
 
+### Added — `def function` for pure expression functions
+
+User-defined functions are now a top-level definition kind, alongside
+`def input` / `def output` / `def process` / `def pipeline`. The body
+is a single expression; the function returns its value. Designed for
+the small mapping / lookup helpers that vendor parsers reuse —
+protocol number → name, severity string → OCSF `severity_id`, action
+string → activity_id.
+
+```
+def function normalize_proto(num) {
+    switch num {
+        6  { "tcp" }
+        17 { "udp" }
+        1  { "icmp" }
+        default { null }
+    }
+}
+
+def process parse_fortigate_cef_traffic {
+    workspace.limpid = {
+        connection_info: {
+            protocol_num:  workspace.cef.proto,
+            protocol_name: normalize_proto(workspace.cef.proto)
+        },
+        ...
+    }
+}
+```
+
+User-defined functions register into the same `FunctionRegistry` as
+built-in primitives — call sites dispatch through the standard
+`(namespace, name)` lookup, the analyzer arity-checks them the same
+way, and they compose anywhere an expression goes (HashLit values,
+function arguments, binary operands).
+
+To keep functions pure, the analyzer rejects function bodies that:
+
+- read from the Event (`ingress`, `egress`, `source`, `received_at`,
+  `error`, any `workspace.*` path),
+- call into a user-defined `def process` (process bodies have side
+  effects functions can't tolerate), or
+- participate in a function-to-function call cycle (direct
+  self-recursion or mutual recursion through a chain). If recursion
+  is genuinely needed, use `def process` instead.
+
+Side effects (`workspace.x = …`, `egress = …`, `drop` / `finish` /
+`output` routing) are rejected at the parser level — function body
+grammar simply doesn't include them.
+
+A new expression-form `switch` lands at the same time. Each arm
+body is one expression; the matching arm's value is the value of
+the whole `switch`. Distinct from the statement-form `switch` in
+process / pipeline bodies (which routes events / mutates
+workspace). Use the expression form inside `def function` bodies
+and anywhere a value is expected.
+
 ## [0.5.3] - 2026-04-27
 > limpidctl stats surfaces errored counters
 
