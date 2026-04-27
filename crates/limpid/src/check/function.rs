@@ -23,7 +23,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::dsl::ast::{Expr, ExprKind, FunctionDef, TemplateFragment};
+use crate::dsl::ast::{Expr, ExprKind, FunctionDef, walk_children};
 use crate::pipeline::CompiledConfig;
 
 use super::{DiagKind, Diagnostic, Level};
@@ -158,47 +158,11 @@ fn walk_for_purity(
                 walk_for_purity(a, fn_name, params, config, diagnostics);
             }
         }
-        ExprKind::PropertyAccess(base, _) => {
-            walk_for_purity(base, fn_name, params, config, diagnostics);
-        }
-        ExprKind::BinOp(l, _, r) => {
-            walk_for_purity(l, fn_name, params, config, diagnostics);
-            walk_for_purity(r, fn_name, params, config, diagnostics);
-        }
-        ExprKind::UnaryOp(_, inner) => {
-            walk_for_purity(inner, fn_name, params, config, diagnostics);
-        }
-        ExprKind::Template(fragments) => {
-            for f in fragments {
-                if let TemplateFragment::Interp(e) = f {
-                    walk_for_purity(e, fn_name, params, config, diagnostics);
-                }
-            }
-        }
-        ExprKind::HashLit(entries) => {
-            for (_k, v) in entries {
-                walk_for_purity(v, fn_name, params, config, diagnostics);
-            }
-        }
-        ExprKind::ArrayLit(items) => {
-            for v in items {
-                walk_for_purity(v, fn_name, params, config, diagnostics);
-            }
-        }
-        ExprKind::SwitchExpr { scrutinee, arms } => {
-            walk_for_purity(scrutinee, fn_name, params, config, diagnostics);
-            for arm in arms {
-                if let Some(pat) = &arm.pattern {
-                    walk_for_purity(pat, fn_name, params, config, diagnostics);
-                }
-                walk_for_purity(&arm.body, fn_name, params, config, diagnostics);
-            }
-        }
-        ExprKind::StringLit(_)
-        | ExprKind::IntLit(_)
-        | ExprKind::FloatLit(_)
-        | ExprKind::BoolLit(_)
-        | ExprKind::Null => {}
+        // All other variants delegate recursion to `walk_children`;
+        // their own structure carries no purity-relevant signal.
+        _ => walk_children(expr, |child| {
+            walk_for_purity(child, fn_name, params, config, diagnostics)
+        }),
     }
 }
 
@@ -239,56 +203,23 @@ fn check_function_cycles(config: &CompiledConfig, diagnostics: &mut Vec<Diagnost
 }
 
 fn collect_user_callees<'a>(expr: &'a Expr, config: &'a CompiledConfig, out: &mut Vec<&'a str>) {
-    match &expr.kind {
-        ExprKind::FuncCall {
-            namespace,
-            name,
-            args,
-        } => {
-            if namespace.is_none()
-                && config.functions.contains_key(name)
-                && let Some((stored_name, _)) = config.functions.get_key_value(name)
-            {
-                out.push(stored_name.as_str());
-            }
-            for a in args {
-                collect_user_callees(a, config, out);
-            }
+    if let ExprKind::FuncCall {
+        namespace,
+        name,
+        args,
+    } = &expr.kind
+    {
+        if namespace.is_none()
+            && let Some((stored_name, _)) = config.functions.get_key_value(name)
+        {
+            out.push(stored_name.as_str());
         }
-        ExprKind::PropertyAccess(base, _) => collect_user_callees(base, config, out),
-        ExprKind::BinOp(l, _, r) => {
-            collect_user_callees(l, config, out);
-            collect_user_callees(r, config, out);
+        for a in args {
+            collect_user_callees(a, config, out);
         }
-        ExprKind::UnaryOp(_, inner) => collect_user_callees(inner, config, out),
-        ExprKind::Template(fragments) => {
-            for f in fragments {
-                if let TemplateFragment::Interp(e) = f {
-                    collect_user_callees(e, config, out);
-                }
-            }
-        }
-        ExprKind::HashLit(entries) => {
-            for (_k, v) in entries {
-                collect_user_callees(v, config, out);
-            }
-        }
-        ExprKind::ArrayLit(items) => {
-            for v in items {
-                collect_user_callees(v, config, out);
-            }
-        }
-        ExprKind::SwitchExpr { scrutinee, arms } => {
-            collect_user_callees(scrutinee, config, out);
-            for arm in arms {
-                if let Some(pat) = &arm.pattern {
-                    collect_user_callees(pat, config, out);
-                }
-                collect_user_callees(&arm.body, config, out);
-            }
-        }
-        _ => {}
+        return;
     }
+    walk_children(expr, |child| collect_user_callees(child, config, out));
 }
 
 fn dfs_cycle<'a>(

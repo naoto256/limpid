@@ -7,7 +7,7 @@
 //! and emits an Error per unresolved key. Levenshtein-based "did you
 //! mean" hints are attached when a near match exists.
 
-use crate::dsl::ast::{Expr, ExprKind, OutputDef, Property, TemplateFragment};
+use crate::dsl::ast::{Expr, ExprKind, OutputDef, Property, walk_children};
 use crate::dsl::span::Span;
 use crate::functions::FunctionRegistry;
 
@@ -93,6 +93,10 @@ fn collect_workspace_refs(expr: &Expr, cb: &mut dyn FnMut(&[String])) {
     match &expr.kind {
         ExprKind::Ident(parts) => cb(parts),
         ExprKind::PropertyAccess(base, suffix) => {
+            // Combine `Ident(["workspace", "x"]) . y . z` into a single
+            // path so the caller can match it against produced
+            // workspace keys; for non-Ident bases (e.g. `geoip(...)`),
+            // recurse normally.
             if let ExprKind::Ident(base_parts) = &base.kind {
                 let mut combined = base_parts.clone();
                 combined.extend(suffix.iter().cloned());
@@ -101,46 +105,8 @@ fn collect_workspace_refs(expr: &Expr, cb: &mut dyn FnMut(&[String])) {
                 collect_workspace_refs(base, cb);
             }
         }
-        ExprKind::Template(fragments) => {
-            for f in fragments {
-                if let TemplateFragment::Interp(e) = f {
-                    collect_workspace_refs(e, cb);
-                }
-            }
-        }
-        ExprKind::FuncCall { args, .. } => {
-            for a in args {
-                collect_workspace_refs(a, cb);
-            }
-        }
-        ExprKind::BinOp(l, _, r) => {
-            collect_workspace_refs(l, cb);
-            collect_workspace_refs(r, cb);
-        }
-        ExprKind::UnaryOp(_, inner) => collect_workspace_refs(inner, cb),
-        ExprKind::HashLit(entries) => {
-            for (_k, v) in entries {
-                collect_workspace_refs(v, cb);
-            }
-        }
-        ExprKind::ArrayLit(items) => {
-            for v in items {
-                collect_workspace_refs(v, cb);
-            }
-        }
-        ExprKind::SwitchExpr { scrutinee, arms } => {
-            collect_workspace_refs(scrutinee, cb);
-            for arm in arms {
-                if let Some(pat) = &arm.pattern {
-                    collect_workspace_refs(pat, cb);
-                }
-                collect_workspace_refs(&arm.body, cb);
-            }
-        }
-        ExprKind::StringLit(_)
-        | ExprKind::IntLit(_)
-        | ExprKind::FloatLit(_)
-        | ExprKind::BoolLit(_)
-        | ExprKind::Null => {}
+        // Generic recursion for the rest — sub-expressions carry no
+        // structural meaning beyond "look here for refs too".
+        _ => walk_children(expr, |child| collect_workspace_refs(child, cb)),
     }
 }
