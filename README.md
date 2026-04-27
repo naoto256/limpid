@@ -228,7 +228,7 @@ is built for a different default: pipelines that are *legible*,
   [User-defined Processes](docs/src/processing/user-defined.md)
 - [Pipelines](docs/src/pipelines/README.md) ·
   [Routing](docs/src/pipelines/routing.md) ·
-  [`drop` and `finish`](docs/src/pipelines/drop-finish.md) ·
+  [`drop` and `finish`](docs/src/pipelines/drop-finish-error.md) ·
   [Examples](docs/src/pipelines/examples.md) ·
   [Multi-host Pipeline Example](docs/src/pipelines/multi-host.md)
 - [CLI](docs/src/operations/cli.md) ·
