@@ -116,7 +116,7 @@ fn walk_for_purity(
                 );
                 return;
             }
-            // Single-segment non-parameter reference is also unknown
+            // Single-segment non-parameter reference is unknown
             // (function scope has no `let` bindings yet, so anything
             // unrecognised is a free variable).
             if parts.len() == 1 {
@@ -127,6 +127,28 @@ fn walk_for_purity(
                             "[function {}] body references unknown identifier `{}` — \
                              not a parameter",
                             fn_name, parts[0]
+                        ),
+                    )
+                    .with_span(Some(expr.span)),
+                );
+                return;
+            }
+            // Multi-segment path whose head is neither a parameter nor
+            // an Event-bound name is a free variable too — the head
+            // would fail to resolve at runtime (`config.foo`, `ctx.x`,
+            // …). Surface it now instead of letting the event end up
+            // in the error_log.
+            if !params.contains(&parts[0]) {
+                diagnostics.push(
+                    Diagnostic::error_kind(
+                        DiagKind::UnknownIdent,
+                        format!(
+                            "[function {}] body references unknown path `{}` — \
+                             head `{}` is neither a parameter nor an Event-bound \
+                             identifier",
+                            fn_name,
+                            parts.join("."),
+                            parts[0]
                         ),
                     )
                     .with_span(Some(expr.span)),

@@ -1348,6 +1348,35 @@ def pipeline p { input i; output o }
     }
 
     #[test]
+    fn function_referencing_unknown_dotted_path_errors() {
+        // A multi-segment path whose head is neither a parameter nor an
+        // Event-bound identifier (`workspace`, `ingress`, `egress`,
+        // `source`, `received_at`, `error`) is a free variable. The
+        // analyzer must surface this — otherwise the call falls through
+        // to runtime where `eval::resolve_ident` fails to resolve the
+        // head and the event ends up in the error_log instead of
+        // failing config load.
+        let src = r#"
+def function bad(x) {
+    config.foo
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            errors(&diags)
+                .iter()
+                .any(|e| e.message.contains("unknown path")
+                    && e.message.contains("config.foo")
+                    && e.message.contains("config")),
+            "expected unknown-path error for `config.foo`, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
     fn function_self_recursion_errors() {
         let src = r#"
 def function rec(x) {
