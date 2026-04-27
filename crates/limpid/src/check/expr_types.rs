@@ -414,12 +414,14 @@ fn check_unknown_ident(
             None
         };
         (
-            format!("[pipeline {}] unknown identifier `{}`", pipeline_name, dotted),
+            format!(
+                "[pipeline {}] unknown identifier `{}`",
+                pipeline_name, dotted
+            ),
             near.map(|n| format!("did you mean `{}`?", n)),
         )
     };
-    let mut diag =
-        Diagnostic::warning_kind(DiagKind::UnknownIdent, message).with_span(span);
+    let mut diag = Diagnostic::warning_kind(DiagKind::UnknownIdent, message).with_span(span);
     if let Some(h) = help {
         diag = diag.with_help(h);
     }
