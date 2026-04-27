@@ -96,7 +96,7 @@ Any string literal can contain `${...}` interpolations. Each `${expr}` is an ord
 ```
 def output archive {
     type file
-    path "/var/log/limpid/${source}/${strftime(received_at, "%Y-%m-%d", "local")}.log"
+    path "/var/log/limpid/${source.ip}/${strftime(received_at, "%Y-%m-%d", "local")}.log"
 }
 
 def process tag {
@@ -108,11 +108,13 @@ def process tag {
 
 Inside `${...}` you have access to the full event:
 
-| Name | Meaning |
-|------|---------|
-| `source`, `received_at` | Event metadata |
-| `egress`, `ingress` | Event byte buffers |
-| `workspace.xxx`, `workspace.xxx.yyy` | Named workspace values (nested lookup is supported) |
+| Name | Type | Meaning |
+|------|------|---------|
+| `received_at` | Timestamp | Wall-clock at which the event was received |
+| `source` | Object `{ ip: String, port: Int }` | Peer address. Use `source.ip` for the IP string and `source.port` for the integer port; bare `source` returns the whole object |
+| `egress`, `ingress` | String / Bytes | Event byte buffers |
+| `error` | String | Error message inside a `catch` body (otherwise null) |
+| `workspace.xxx`, `workspace.xxx.yyy` | (varies) | Named workspace values (nested lookup is supported) |
 
 All [built-in functions](./functions/expression-functions.md) — `strftime`, `lower`, `regex_extract`, `to_json`, `geoip`, and the parsers — are callable from inside `${...}`.
 
@@ -205,7 +207,7 @@ The discriminator after `switch` is any DSL expression, evaluated once. Each arm
 
 ```
 // pipeline body — route by source IP
-switch source {
+switch source.ip {
     "192.0.2.1" { output fw01 }
     "192.0.2.2" { output fw02 }
     default     { output archive }

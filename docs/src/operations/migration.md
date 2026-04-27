@@ -41,7 +41,7 @@ sudo dpkg -i limpid_*.deb
 |---------|--------|
 | `if $msg contains 'error' then ...` | `if contains(egress, "error") { ... }` |
 | `if $syslogfacility-text == 'local0' then ...` | `let pri = syslog.extract_pri(ingress)`<br>`if pri != null and pri / 8 == 16 { ... }` |
-| `if $fromhost-ip == '10.0.0.1' then ...` | `if source == "10.0.0.1" { ... }` |
+| `if $fromhost-ip == '10.0.0.1' then ...` | `if source.ip == "10.0.0.1" { ... }` |
 | `:msg, contains, "DISCARD" stop` | `if contains(ingress, "DISCARD") { drop }` |
 
 ### Templates

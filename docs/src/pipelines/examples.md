@@ -21,7 +21,7 @@ def process strip_headers {
 }
 
 def process filter_noise {
-    if source == "192.0.2.2" and contains(ingress, "CHARGEN") {
+    if source.ip == "192.0.2.2" and contains(ingress, "CHARGEN") {
         drop
     }
 }
@@ -30,7 +30,7 @@ def pipeline archive {
     input syslog_udp
     process strip_headers | filter_noise
 
-    switch source {
+    switch source.ip {
         "192.0.2.1" {
             output fw01
         }
@@ -41,7 +41,7 @@ def pipeline archive {
             if contains(ingress, "type=\"traffic\"") {
                 drop
             }
-            process { egress = source + " " + strftime(received_at, "%b %e %H:%M:%S") + " " + egress }
+            process { egress = source.ip + " " + strftime(received_at, "%b %e %H:%M:%S") + " " + egress }
             output fw03
         }
         default {
@@ -105,7 +105,7 @@ def input fw {
 
 def output archive {
     type file
-    path "/var/log/limpid/${source}/${strftime(received_at, "%Y-%m-%d", "local")}.log"
+    path "/var/log/limpid/${source.ip}/${strftime(received_at, "%Y-%m-%d", "local")}.log"
 }
 
 def output elasticsearch {
