@@ -55,6 +55,9 @@ pub fn parse_config_with_file_id(input: &str, file_id: u32) -> Result<Config> {
                             Rule::def_pipeline => {
                                 Definition::Pipeline(parse_pipeline_def(def_inner, file_id)?)
                             }
+                            Rule::def_function => {
+                                Definition::Function(parse_function_def(def_inner, file_id)?)
+                            }
                             _ => unreachable!(
                                 "unexpected definition rule: {:?}",
                                 def_inner.as_rule()
@@ -290,6 +293,59 @@ fn parse_pipeline_def(pair: Pair<Rule>, file_id: u32) -> Result<PipelineDef> {
         .map(|p| parse_pipeline_stmt(p, file_id))
         .collect::<Result<Vec<_>>>()?;
     Ok(PipelineDef { name, body })
+}
+
+/// Parse a `def function name(params) { expr }` definition.
+///
+/// Body grammar is `process_let* ~ expr` — zero or more `let`
+/// bindings followed by a required trailing return expression. For
+/// branching / mapping inside the trailing expression (or any let
+/// RHS), use the expression-form `switch` (parsed via
+/// [`parse_switch_expr`]).
+fn parse_function_def(pair: Pair<Rule>, file_id: u32) -> Result<FunctionDef> {
+    let mut inner = pair.into_inner();
+    let name_pair = inner.next().unwrap();
+    let name = name_pair.as_str().to_string();
+    let mut params = Vec::new();
+    let mut body: Option<FuncBody> = None;
+    for p in inner {
+        match p.as_rule() {
+            Rule::func_params => {
+                params = p
+                    .into_inner()
+                    .map(|param| param.as_str().to_string())
+                    .collect();
+            }
+            Rule::func_body => {
+                body = Some(parse_func_body(p, file_id)?);
+            }
+            _ => bail!("unexpected rule in def_function: {:?}", p.as_rule()),
+        }
+    }
+    let body = body.ok_or_else(|| anyhow::anyhow!("def function {} missing body", name))?;
+    Ok(FunctionDef { name, params, body })
+}
+
+fn parse_func_body(pair: Pair<Rule>, file_id: u32) -> Result<FuncBody> {
+    let mut lets: Vec<FuncLet> = Vec::new();
+    let mut ret: Option<Expr> = None;
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::process_let => {
+                let mut li = p.into_inner();
+                let name = li.next().unwrap().as_str().to_string();
+                let value = parse_expr_from_pair(li.next().unwrap(), file_id)?;
+                lets.push(FuncLet { name, value });
+            }
+            Rule::expr => {
+                ret = Some(parse_expr(p, file_id)?);
+            }
+            _ => bail!("unexpected rule in func_body: {:?}", p.as_rule()),
+        }
+    }
+    let ret =
+        ret.ok_or_else(|| anyhow::anyhow!("def function body missing trailing return expression"))?;
+    Ok(FuncBody { lets, ret })
 }
 
 fn parse_pipeline_stmt(pair: Pair<Rule>, file_id: u32) -> Result<PipelineStatement> {
@@ -591,6 +647,7 @@ fn parse_atom(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
     let inner = first_inner(pair)?;
     match inner.as_rule() {
         Rule::expr => parse_expr(inner, file_id),
+        Rule::switch_expr => parse_switch_expr(inner, file_id),
         Rule::func_call => parse_func_call_expr(inner, file_id),
         Rule::hash_lit => parse_hash_lit(inner, file_id),
         Rule::array_lit => parse_array_lit(inner, file_id),
@@ -605,6 +662,51 @@ fn parse_atom(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
         }
         _ => bail!("unexpected atom: {:?}", inner.as_rule()),
     }
+}
+
+/// Parse `switch expr { pattern { body } default { body } }` — the
+/// expression-form switch. Distinct from the statement-form switch
+/// inside process / pipeline bodies (which expect arm bodies to be
+/// statement lists, not single expressions).
+fn parse_switch_expr(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
+    let span = span_of(&pair, file_id);
+    let mut inner = pair.into_inner();
+    let scrutinee_pair = inner.next().unwrap();
+    let scrutinee = parse_expr(scrutinee_pair, file_id)?;
+    let mut arms = Vec::new();
+    for arm_pair in inner {
+        let arm_inner: Vec<Pair<Rule>> = arm_pair.into_inner().collect();
+        match arm_inner.len() {
+            // `default { expr }` — single expression child, no pattern
+            1 => {
+                arms.push(SwitchExprArm {
+                    pattern: None,
+                    body: parse_expr(arm_inner.into_iter().next().unwrap(), file_id)?,
+                });
+            }
+            // `pattern { expr }` — two expression children: pattern, body
+            2 => {
+                let mut iter = arm_inner.into_iter();
+                let pat = parse_expr(iter.next().unwrap(), file_id)?;
+                let body = parse_expr(iter.next().unwrap(), file_id)?;
+                arms.push(SwitchExprArm {
+                    pattern: Some(pat),
+                    body,
+                });
+            }
+            n => bail!(
+                "malformed switch_expr_arm: expected 1 or 2 children, got {}",
+                n
+            ),
+        }
+    }
+    Ok(Expr::new(
+        ExprKind::SwitchExpr {
+            scrutinee: Box::new(scrutinee),
+            arms,
+        },
+        span,
+    ))
 }
 
 fn parse_func_call_expr(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {

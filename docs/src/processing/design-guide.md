@@ -2,7 +2,7 @@
 
 This page is for people writing processes — your own `def process` blocks in a production config, or snippets intended for wider reuse (OCSF composers, SIEM-specific parsers, vendor normalizers shipping under `processes/*.limpid`).
 
-It is a **style guide**, not a reference. The reference for what a process can express is [User-defined Processes](./user-defined.md); the reference for functions is [Expression Functions](./functions.md). The principles the guide rests on are in [Design Principles](../design-principles.md).
+It is a **style guide**, not a reference. The reference for what a process can express is [User-defined Processes](./user-defined.md); the reference for functions is [Built-in Functions](../functions/expression-functions.md). The principles the guide rests on are in [Design Principles](../design-principles.md).
 
 Everything here is about one thing: keeping processes small enough that a reader can hold one in their head, and composable enough that pipelines stay readable.
 
@@ -155,24 +155,27 @@ Wrapping every call in `try { ... } catch { }` with an empty catch body swallows
 
 The rule of thumb: **a process should not make an event look successful when it was not.** The dropped/finished/discarded counts are the observability contract between limpid and the person running it.
 
-## User-defined processes vs. built-in DSL functions
+## Functions vs. processes
 
-limpid ships two layers of reusable logic:
+limpid has three layers of reusable logic:
 
-- **Functions** (`parse_json`, `regex_extract`, `syslog.parse`, `cef.parse`, …) are primitives. They are implemented in Rust, their call signature is fixed, and they have no pipeline context — no `ingress`, no `egress`, no `drop`. See [Expression Functions](./functions.md).
-- **User-defined processes** (`def process`) are the DSL's compositional unit. They have the pipeline context: they can assign to `egress`, `drop`, `try`, branch, chain with `|`.
+- **Built-in functions** (`parse_json`, `regex_extract`, `syslog.parse`, `cef.parse`, …) are primitives. Implemented in Rust, signature fixed, no pipeline context — no `ingress`, no `egress`, no `drop`. See [Built-in Functions](../functions/expression-functions.md).
+- **User-defined functions** (`def function`) are pure value-returning helpers in the DSL. Body is one expression. No Event reads, no side effects, no recursion. Composable in any expression context — HashLit values, function args, binary operands. See [User-defined Functions](../functions/user-defined.md).
+- **User-defined processes** (`def process`) are the DSL's compositional unit *with* pipeline context: they can assign to `egress`, `drop`, `try`, branch, chain with `|`.
 
-The question "should this be a function or a process?" has a clean answer:
+The question "function or process?" has a clean answer:
 
 | Situation | Write it as |
 |-----------|-------------|
-| Pure computation, no side effects, takes arguments → returns a value | A function (ideally, contribute it upstream) |
-| Depends on a specific schema spec (RFC 5424, CEF, OCSF, …) | A namespaced function (`syslog.xxx`) if shipping with the daemon, otherwise a `def process` in a snippet |
+| Pure computation, no side effects, takes arguments → returns a value, vendor-agnostic | **`def function`** in the DSL (or `_common/*.limpid`) |
+| Pure computation but the daemon should ship it (built-in availability, performance) | A built-in function in Rust (contribute upstream) |
+| Depends on a specific schema spec (RFC 5424, CEF, OCSF, …) | A namespaced built-in (`syslog.xxx`) if shipping with the daemon, otherwise a `def process` in a snippet |
 | Reads or writes `egress`, `workspace`, or `ingress` directly | A `def process` |
 | Can `drop`, or must run multiple statements in sequence | A `def process` |
+| Recursive | A `def process` (`def function` rejects recursion at `--check` time) |
 | Operator-specific policy (facility rewrite, vendor filter, site-specific routing) | Always a `def process`, defined close to the pipeline that uses it |
 
-A snippet library (for example, a future `processes/ocsf/*.limpid` collection) is entirely `def process` definitions. The functions they call — `syslog.parse`, `to_json`, `table_lookup` — are the primitives the daemon gives them to build on.
+A snippet library (for example, the v0.6.0 `_common/*.limpid` + `parsers/*.limpid` + `composers/*.limpid` collection) mixes the three: `def function` for vendor-agnostic mappings (severity, proto, action), `def process` for the parser / composer bodies that consume Event state and write to `workspace.limpid`, and built-in primitives (`syslog.parse`, `cef.parse`, `to_json`, `regex_*`) as the building blocks underneath.
 
 ## Writing for a snippet library
 

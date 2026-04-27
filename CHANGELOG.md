@@ -10,6 +10,96 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased]
 
+### Added — `def function` for pure expression functions
+
+User-defined functions are now a top-level definition kind, alongside
+`def input` / `def output` / `def process` / `def pipeline`. The body
+is zero or more `let` bindings followed by a required trailing
+expression that becomes the return value. Designed for the small
+mapping / lookup helpers that vendor parsers reuse — protocol number
+→ name, severity string → OCSF `severity_id`, action string →
+activity_id — and for the small chains of intermediate values that
+make those mappings readable.
+
+```
+def function normalize_proto(num) {
+    switch num {
+        6  { "tcp" }
+        17 { "udp" }
+        1  { "icmp" }
+        default { null }
+    }
+}
+
+def function severity_id_from_label(s) {
+    let lowered = lower(trim(s))
+    switch lowered {
+        "critical" { 5 }
+        "high"     { 4 }
+        "medium"   { 3 }
+        "low"      { 2 }
+        "info"     { 1 }
+        default    { 1 }
+    }
+}
+
+def process parse_fortigate_cef_traffic {
+    workspace.limpid = {
+        connection_info: {
+            protocol_num:  workspace.cef.proto,
+            protocol_name: normalize_proto(workspace.cef.proto)
+        },
+        severity_id: severity_id_from_label(workspace.cef.severity),
+        ...
+    }
+}
+```
+
+User-defined functions register into the same `FunctionRegistry` as
+built-in primitives — call sites dispatch through the standard
+`(namespace, name)` lookup, the analyzer arity-checks them the same
+way, and they compose anywhere an expression goes (HashLit values,
+function arguments, binary operands, output templates, pipeline-level
+`if` conditions). Function names must be bare identifiers; the dot
+namespace is reserved for schema-bound built-ins.
+
+`let` is the assignment form for local-scope variables in the body —
+each `let x = …` line binds (or reassigns) `x` in the same scope.
+Re-binding the same name simply overwrites the prior value; there is
+no separate declaration step, no `let mut`, and no `x = …`
+re-assignment syntax. Each let RHS sees parameters and earlier lets;
+the trailing expression sees everything.
+
+To keep functions pure, the analyzer rejects function bodies that:
+
+- read from the Event (`ingress`, `egress`, `source`, `received_at`,
+  `error`, any `workspace.*` path) — anywhere in the body, including
+  inside a `let` RHS;
+- reference a free variable that's neither a parameter nor an
+  Event-bound name (a `config.foo` or bare `result` typo surfaces at
+  `--check` time instead of failing at runtime);
+- call into a user-defined `def process` (process bodies have side
+  effects functions can't tolerate); or
+- participate in a function-to-function call cycle (direct
+  self-recursion or mutual recursion through a chain). If recursion
+  is genuinely needed, use `def process` instead.
+
+All four are hard errors at `--check` time — the config fails to load
+and the daemon won't start until they're fixed.
+
+Side effects (`workspace.x = …`, `egress = …`, `drop` / `finish` /
+`output` routing, statement-form `if` / `switch` / `foreach`
+/ `try-catch`) are rejected at the parser level — function body
+grammar accepts only `let` bindings and a trailing expression, so
+those statement forms simply aren't in the grammar.
+
+A new expression-form `switch` lands at the same time. Each arm
+body is one expression; the matching arm's value is the value of
+the whole `switch`. Distinct from the statement-form `switch` in
+process / pipeline bodies (which routes events / mutates
+workspace). Use the expression form inside `def function` bodies,
+inside `let` RHS, or anywhere a value is expected.
+
 ## [0.5.3] - 2026-04-27
 > limpidctl stats surfaces errored counters
 

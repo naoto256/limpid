@@ -26,6 +26,11 @@ pub struct CompiledConfig {
     pub outputs: HashMap<String, OutputDef>,
     pub processes: HashMap<String, ProcessDef>,
     pub pipelines: HashMap<String, PipelineDef>,
+    /// User-defined `def function` declarations, indexed by name.
+    /// Registered into the [`FunctionRegistry`] at runtime startup so
+    /// call sites dispatch through the same `(namespace, name)` path
+    /// as built-in primitives.
+    pub functions: HashMap<String, FunctionDef>,
     pub global_blocks: HashMap<String, Vec<Property>>,
 }
 
@@ -35,6 +40,7 @@ impl CompiledConfig {
         let mut outputs = HashMap::new();
         let mut processes = HashMap::new();
         let mut pipelines = HashMap::new();
+        let mut functions: HashMap<String, FunctionDef> = HashMap::new();
         let mut global_blocks = HashMap::new();
 
         for def in config.definitions {
@@ -63,6 +69,12 @@ impl CompiledConfig {
                     }
                     pipelines.insert(d.name.clone(), d);
                 }
+                Definition::Function(d) => {
+                    if functions.contains_key(&d.name) {
+                        bail!("duplicate function definition: {}", d.name);
+                    }
+                    functions.insert(d.name.clone(), d);
+                }
             }
         }
 
@@ -75,6 +87,7 @@ impl CompiledConfig {
             outputs,
             processes,
             pipelines,
+            functions,
             global_blocks,
         };
         Ok(compiled)
@@ -522,10 +535,7 @@ fn exec_pipeline_stmt(
                                 return dropped();
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    "inline process: {} — event routed to error_log",
-                                    e
-                                );
+                                tracing::warn!("inline process: {} — event routed to error_log", e);
                                 out.trace.push(TraceEntry {
                                     stage: "process".into(),
                                     label: "(inline)".into(),

@@ -1,15 +1,25 @@
-# Expression Functions
+# Built-in Functions
 
-Expression functions return values. They appear in conditions, on the right-hand side of assignments, inside `${...}` interpolations, and as bare statements inside a `process` body (where the returned object is merged into `workspace`).
+Built-in functions are primitives implemented in Rust and shipped with the daemon. They cover the parts that have to live close to the runtime — parsers, encoders, regex, hashing, GeoIP, table operations, OS helpers — and adding a new one means a Rust commit and a daemon rebuild.
 
-## Call syntax
+```
+def process parse_cef_line {
+    workspace.syslog = syslog.parse(ingress)
+    workspace.cef    = cef.parse(workspace.syslog.msg)
+    workspace.payload = parse_json(workspace.cef.msg)
+}
+```
 
-Functions come in two forms:
+Two call surfaces:
 
-- **Flat primitive** — `name(args...)`. Schema-agnostic helpers that don't depend on any particular log format. JSON / KV format parsing, regex, hashing, timestamp formatting, table operations, GeoIP, and OS-level helpers all live here.
+- **Flat primitive** — `name(args...)`. Schema-agnostic helpers that don't depend on any particular log format. JSON / KV parsing, regex, hashing, timestamp formatting, table operations, GeoIP, and OS-level helpers all live here.
 - **Dot namespace** — `<schema>.<name>(args...)`. Schema-specific helpers declare the schema they bind to in their name: `syslog.parse(ingress)`, `cef.parse(ingress)`, `syslog.set_pri(egress, 16, 6)`. See the [*Schema-specific functions live under a schema namespace*](../design-principles.md#schema-specific-functions-live-under-a-schema-namespace) operating rule for the rationale.
 
 The judgement rule for whether a function is namespaced is a single question: does its behavior follow a specific schema specification (RFC 3164/5424, ArcSight CEF, OCSF, …)? If yes, the schema's name is part of the function's name. If no, it is a flat primitive.
+
+This page is the reference for every built-in. Operators can also declare their own pure DSL helpers — see [User-defined Functions](./user-defined.md) for `def function`; both surfaces register into the same dispatch table, so the call-site syntax is identical.
+
+## Call syntax
 
 ### Bare statements vs assignments
 
@@ -527,7 +537,7 @@ Motivation: CEF extension values and CSV column values arrive as strings even wh
 
 ## Array helpers
 
-Arrays in limpid are **positionless collections** — you construct them with `[a, b, c]` literals, but the DSL deliberately omits positional access (`arr[n]`) and positional writes (`arr[n] = v`). Element identity, not position, is the addressing model; see [User-defined Processes → Arrays](./user-defined.md#arrays) for the rationale and `find_by` / `foreach` / `append` / `prepend` / `len` below.
+Arrays in limpid are **positionless collections** — you construct them with `[a, b, c]` literals, but the DSL deliberately omits positional access (`arr[n]`) and positional writes (`arr[n] = v`). Element identity, not position, is the addressing model; see [User-defined Processes → Arrays](../processing/user-defined.md#arrays) for the rationale and `find_by` / `foreach` / `append` / `prepend` / `len` below.
 
 ### find_by(array, key, value)
 

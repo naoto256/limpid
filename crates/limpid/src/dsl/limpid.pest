@@ -22,6 +22,7 @@ definition = {
   | def_output
   | def_process
   | def_pipeline
+  | def_function
 }
 
 // Global config block: `name { key value ... }` (no `def` keyword)
@@ -58,6 +59,7 @@ kw_false    = _{ "false" }
 kw_null     = _{ "null" }
 kw_include  = _{ "include" }
 kw_let      = _{ "let" }
+kw_function = _{ "function" }
 
 // Word boundary: keyword must not be followed by ident chars
 // We use pest's negative lookahead via the rules below
@@ -179,6 +181,32 @@ assign_target = {
     ident_path
 }
 
+// -- Function definition (pure expression function) -------------------------
+
+// `def function <name>(<params>) { <let_stmts...> <return_expr> }`
+//
+// Body is zero or more `let` bindings followed by a required trailing
+// expression that becomes the return value. `let` is the only
+// statement form allowed; assignments, routing (`drop`, `finish`,
+// `process foo`, `output foo`) and statement-form control flow are
+// all rejected here by virtue of not being in the grammar. Use the
+// expression-form `switch` (atom-level `switch_expr`) for branching.
+//
+// The body must not reference any Event-bound identifier (ingress,
+// egress, source, received_at, error, workspace.*) — checked at
+// analyzer time, not parser time.
+def_function = {
+    kw_def ~ kw_function ~ ident ~ "(" ~ func_params? ~ ")" ~ "{" ~ func_body ~ "}"
+}
+
+func_body = {
+    process_let* ~ expr
+}
+
+func_params = {
+    ident ~ ("," ~ ident)* ~ ","?
+}
+
 // -- Pipeline definition -----------------------------------------------------
 
 def_pipeline = {
@@ -266,6 +294,7 @@ bin_op = {
 
 atom = {
     "(" ~ expr ~ ")"
+  | switch_expr
   | hash_lit
   | array_lit
   | func_call
@@ -275,6 +304,27 @@ atom = {
   | bool_lit
   | null_lit
   | ident_path
+}
+
+// Expression-form switch — produces a value rather than running
+// statements. Each arm's body is a single expression.
+//
+//   switch lower(severity) {
+//       "critical" { 5 }
+//       "high"     { 4 }
+//       default    { 1 }
+//   }
+//
+// Distinct from `process_switch` / `pipeline_switch` (statement
+// forms). Used inside `def function` bodies and anywhere a value is
+// expected.
+switch_expr = {
+    kw_switch ~ expr ~ "{" ~ switch_expr_arm* ~ "}"
+}
+
+switch_expr_arm = {
+    kw_default ~ "{" ~ expr ~ "}"
+  | expr ~ "{" ~ expr ~ "}"
 }
 
 // Function call, with optional namespace prefix: `syslog.parse(x)` or `parse_json(x)`.

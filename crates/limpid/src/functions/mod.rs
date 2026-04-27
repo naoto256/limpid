@@ -39,6 +39,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
+use crate::dsl::ast::FunctionDef;
 use crate::dsl::value::Value;
 use crate::event::Event;
 use crate::modules::schema::{FieldSpec, FieldType};
@@ -153,6 +154,13 @@ pub struct FunctionRegistry {
     /// `signatures` because parsers carry workspace-effect schema in
     /// addition to argument types.
     parsers: HashMap<FnKey, ParserInfo>,
+    /// User-defined `def function` declarations. Stored separately from
+    /// `functions` (the closure table for built-ins) because their
+    /// bodies need to recurse through `eval_expr_with_scope`, which in
+    /// turn needs the registry — a closure that captured `&self` would
+    /// be self-referencing, so dispatch through `call()` resolves the
+    /// FunctionDef and evaluates the body in-place instead.
+    user_definitions: HashMap<String, FunctionDef>,
 }
 
 impl FunctionRegistry {
@@ -161,6 +169,7 @@ impl FunctionRegistry {
             functions: HashMap::new(),
             signatures: HashMap::new(),
             parsers: HashMap::new(),
+            user_definitions: HashMap::new(),
         }
     }
 
@@ -294,6 +303,14 @@ impl FunctionRegistry {
         args: &[Value],
         event: &Event,
     ) -> Result<Value> {
+        // User-defined `def function` declarations dispatch first. They
+        // live in the flat namespace only (no `ns.fn` form for now).
+        if namespace.is_none()
+            && let Some(fn_def) = self.user_definitions.get(name)
+        {
+            return self.call_user_function(fn_def, args, event);
+        }
+
         let key = (namespace.map(str::to_string), name.to_string());
         let f = self.functions.get(&key).ok_or_else(|| match namespace {
             None => anyhow::anyhow!("unknown function: {}", name),
@@ -309,6 +326,55 @@ impl FunctionRegistry {
             validate_arity(namespace, name, sig, args.len())?;
         }
         f(args, event)
+    }
+
+    /// Register a user-defined `def function` declaration. Both the
+    /// FunctionDef itself (consulted by [`call`] to evaluate the body)
+    /// and a synthesized `Any^arity -> Any` signature (consumed by the
+    /// analyzer's arity check) are stored. The body's purity check
+    /// happens elsewhere — see `check::function::check_function_def`.
+    pub fn register_user_function(&mut self, fn_def: FunctionDef) {
+        let arity = fn_def.params.len();
+        let sig = FunctionSig::fixed(&vec![FieldType::Any; arity], FieldType::Any);
+        let key = (None, fn_def.name.clone());
+        self.signatures.insert(key, sig);
+        self.user_definitions.insert(fn_def.name.clone(), fn_def);
+    }
+
+    /// Evaluate a user-defined function body with `args` bound to the
+    /// declared parameters. Called from [`call`] when dispatch hits a
+    /// user-defined function. The Event is threaded through so nested
+    /// expressions (which the analyzer guarantees don't read it
+    /// directly) can call into other primitives that do — e.g. a
+    /// `def function` that calls `regex_match` still routes through
+    /// the primitive's standard signature.
+    fn call_user_function(
+        &self,
+        fn_def: &FunctionDef,
+        args: &[Value],
+        event: &Event,
+    ) -> Result<Value> {
+        if args.len() != fn_def.params.len() {
+            anyhow::bail!(
+                "function {}() expects {} argument(s), got {}",
+                fn_def.name,
+                fn_def.params.len(),
+                args.len()
+            );
+        }
+        let mut scope = crate::dsl::eval::LocalScope::new();
+        for (param, val) in fn_def.params.iter().zip(args.iter()) {
+            scope.bind(param, val.clone());
+        }
+        // Execute let bindings in declaration order. Each `let x = expr`
+        // is a (re)assignment to `x` in the same local scope; `LocalScope::bind`
+        // overwrites any prior value, which is the only update mechanism
+        // available inside a function body.
+        for fl in &fn_def.body.lets {
+            let v = crate::dsl::eval::eval_expr_with_scope(&fl.value, event, self, &scope)?;
+            scope.bind(&fl.name, v);
+        }
+        crate::dsl::eval::eval_expr_with_scope(&fn_def.body.ret, event, self, &scope)
     }
 }
 
@@ -374,6 +440,20 @@ pub fn register_builtins(reg: &mut FunctionRegistry, table_store: table::TableSt
     syslog::register(reg);
     cef::register(reg);
     otlp::register(reg);
+}
+
+/// Install every `def function` declaration from a compiled config
+/// into `reg`. Mirrors [`register_builtins`] for user-authored DSL
+/// functions: callers (runtime startup, `--test-pipeline`, the
+/// analyzer's own registry) get a single call site instead of an
+/// open-coded loop.
+pub fn register_user_functions(
+    reg: &mut FunctionRegistry,
+    config: &crate::pipeline::CompiledConfig,
+) {
+    for fn_def in config.functions.values() {
+        reg.register_user_function(fn_def.clone());
+    }
 }
 
 #[cfg(test)]

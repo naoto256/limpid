@@ -4,13 +4,14 @@ Surface-level rules of the limpid DSL — keywords, literal forms, block structu
 
 ## Definitions
 
-The `def` keyword introduces a top-level definition. The four kinds are:
+The `def` keyword introduces a top-level definition. The five kinds are:
 
 ```
-def input <name> { ... }      // see Inputs
-def output <name> { ... }     // see Outputs
-def process <name> { ... }    // see Processing → User-defined Processes
-def pipeline <name> { ... }   // see Pipelines
+def input <name> { ... }              // see Inputs
+def output <name> { ... }             // see Outputs
+def process <name> { ... }            // see Processing → User-defined Processes
+def function <name>(<args>) { expr }  // see Processing → User-defined Functions
+def pipeline <name> { ... }           // see Pipelines
 ```
 
 A name is an identifier (`[A-Za-z_][A-Za-z0-9_]*`). Definitions can appear in any order and any file; cross-references between them are resolved at config-load time, not at parse time.
@@ -113,7 +114,7 @@ Inside `${...}` you have access to the full event:
 | `egress`, `ingress` | Event byte buffers |
 | `workspace.xxx`, `workspace.xxx.yyy` | Named workspace values (nested lookup is supported) |
 
-All [expression functions](./processing/functions.md) — `strftime`, `lower`, `regex_extract`, `to_json`, `geoip`, and the parsers — are callable from inside `${...}`.
+All [built-in functions](./functions/expression-functions.md) — `strftime`, `lower`, `regex_extract`, `to_json`, `geoip`, and the parsers — are callable from inside `${...}`.
 
 Evaluated values are coerced to strings:
 
@@ -218,6 +219,21 @@ switch workspace.cef.device_vendor {
 ```
 
 Arm bodies are statements valid in the surrounding body, same rule as `if`. There is no fall-through and no need for an explicit `break`.
+
+There is also an **expression form** of `switch` — each arm body is one expression rather than a statement list, and the matching arm's value is the value of the whole `switch`. Used inside `def function` bodies and anywhere a value is expected:
+
+```
+def function normalize_proto(num) {
+    switch num {
+        6  { "tcp" }
+        17 { "udp" }
+        1  { "icmp" }
+        default { null }    // optional; absent → null on no match
+    }
+}
+```
+
+The expression form has no side effects (no `workspace.x = …`, no `process foo`, no routing keywords). The statement form is what process and pipeline bodies use; the expression form is what `def function` bodies and HashLit values use.
 
 ### Where to use which
 

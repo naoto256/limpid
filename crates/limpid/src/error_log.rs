@@ -106,9 +106,7 @@ impl ErrorLogWriter {
             .append(true)
             .open(&self.path)
             .await
-            .with_context(|| {
-                format!("error_log: failed to open {}", self.path.display())
-            })?;
+            .with_context(|| format!("error_log: failed to open {}", self.path.display()))?;
         f.write_all(line.as_bytes())
             .await
             .with_context(|| format!("error_log: failed to write to {}", self.path.display()))?;
@@ -130,9 +128,10 @@ mod tests {
             Bytes::from_static(b"<134>raw payload"),
             "10.0.0.1:514".parse::<SocketAddr>().unwrap(),
         );
-        event
-            .workspace
-            .insert("partial".into(), Value::String("from earlier process".into()));
+        event.workspace.insert(
+            "partial".into(),
+            Value::String("from earlier process".into()),
+        );
         ErroredEventContext {
             timestamp: chrono::DateTime::from_timestamp_nanos(1_700_000_000_000_000_000),
             pipeline: "p".into(),

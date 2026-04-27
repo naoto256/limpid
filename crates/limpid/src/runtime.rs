@@ -44,6 +44,7 @@ impl Runtime {
 
         let mut func_registry = FunctionRegistry::new();
         crate::functions::register_builtins(&mut func_registry, table_store);
+        crate::functions::register_user_functions(&mut func_registry, &config);
         let func_registry = Arc::new(func_registry);
 
         config.validate(&registry)?;
@@ -511,10 +512,7 @@ async fn process_event(
                                         worker
                                             .metrics
                                             .events_errored_unwritable
-                                            .fetch_add(
-                                                1,
-                                                std::sync::atomic::Ordering::Relaxed,
-                                            );
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         error!(
                                             event_record = %err_ctx.to_jsonl(),
                                             "error_log: write failed: {} — record below for manual recovery",

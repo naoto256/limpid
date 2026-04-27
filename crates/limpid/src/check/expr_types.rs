@@ -13,7 +13,7 @@
 //! silence over noise; precision improves with each parser / function
 //! whose signature is registered.
 
-use crate::dsl::ast::{BinOp, Expr, ExprKind, TemplateFragment, UnaryOp};
+use crate::dsl::ast::{BinOp, Expr, ExprKind, UnaryOp, walk_children};
 use crate::dsl::span::Span;
 use crate::functions::{Arity, FunctionRegistry, FunctionSig};
 use crate::modules::schema::{FieldType, type_compatible};
@@ -74,6 +74,29 @@ pub fn infer(expr: &Expr, bindings: &Bindings, registry: &FunctionRegistry) -> F
             UnaryOp::Not => FieldType::Bool,
             UnaryOp::Neg => infer(inner, bindings, registry),
         },
+        ExprKind::SwitchExpr { arms, .. } => {
+            // Switch expression's type is the union of all arm bodies'
+            // types. With no default arm, `Null` joins the union to
+            // cover the no-match case.
+            let mut has_default = false;
+            let mut joined: Option<FieldType> = None;
+            for arm in arms {
+                if arm.pattern.is_none() {
+                    has_default = true;
+                }
+                let arm_ty = infer(&arm.body, bindings, registry);
+                joined = Some(match joined {
+                    None => arm_ty,
+                    Some(prev) => FieldType::union(prev, arm_ty),
+                });
+            }
+            let result = joined.unwrap_or(FieldType::Null);
+            if has_default {
+                result
+            } else {
+                FieldType::union(result, FieldType::Null)
+            }
+        }
     }
 }
 
@@ -162,22 +185,18 @@ pub fn check_types(
 ) {
     match &expr.kind {
         ExprKind::BinOp(l, op, r) => {
-            check_types(
-                l,
-                pipeline_name,
-                bindings,
-                registry,
-                fallback_span,
-                diagnostics,
-            );
-            check_types(
-                r,
-                pipeline_name,
-                bindings,
-                registry,
-                fallback_span,
-                diagnostics,
-            );
+            // Recurse into both sides via the generic walker, then run
+            // the BinOp-specific operator/operand check at this node.
+            walk_children(expr, |child| {
+                check_types(
+                    child,
+                    pipeline_name,
+                    bindings,
+                    registry,
+                    fallback_span,
+                    diagnostics,
+                )
+            });
             // Precise span for operator-type mismatches: the whole
             // BinOp sub-tree covers `[l.span.start, r.span.end)` — the
             // parser sets that on `expr` itself in `fold_by_precedence`.
@@ -193,31 +212,21 @@ pub fn check_types(
                 diagnostics,
             );
         }
-        ExprKind::UnaryOp(_op, inner) => {
-            check_types(
-                inner,
-                pipeline_name,
-                bindings,
-                registry,
-                fallback_span,
-                diagnostics,
-            );
-        }
         ExprKind::FuncCall {
             namespace,
             name,
             args,
         } => {
-            for a in args {
+            walk_children(expr, |child| {
                 check_types(
-                    a,
+                    child,
                     pipeline_name,
                     bindings,
                     registry,
                     fallback_span,
                     diagnostics,
-                );
-            }
+                )
+            });
             // Function-call-level diagnostic (unknown function, arg
             // type mismatch) anchors to the call expression itself; the
             // per-argument diagnostic below prefers the individual arg
@@ -234,54 +243,6 @@ pub fn check_types(
                 diagnostics,
             );
         }
-        ExprKind::Template(fragments) => {
-            for f in fragments {
-                if let TemplateFragment::Interp(e) = f {
-                    check_types(
-                        e,
-                        pipeline_name,
-                        bindings,
-                        registry,
-                        fallback_span,
-                        diagnostics,
-                    );
-                }
-            }
-        }
-        ExprKind::HashLit(entries) => {
-            for (_k, v) in entries {
-                check_types(
-                    v,
-                    pipeline_name,
-                    bindings,
-                    registry,
-                    fallback_span,
-                    diagnostics,
-                );
-            }
-        }
-        ExprKind::ArrayLit(items) => {
-            for item in items {
-                check_types(
-                    item,
-                    pipeline_name,
-                    bindings,
-                    registry,
-                    fallback_span,
-                    diagnostics,
-                );
-            }
-        }
-        ExprKind::PropertyAccess(base, _) => {
-            check_types(
-                base,
-                pipeline_name,
-                bindings,
-                registry,
-                fallback_span,
-                diagnostics,
-            );
-        }
         ExprKind::Ident(parts) => {
             check_unknown_ident(
                 parts,
@@ -291,11 +252,18 @@ pub fn check_types(
                 diagnostics,
             );
         }
-        ExprKind::StringLit(_)
-        | ExprKind::IntLit(_)
-        | ExprKind::FloatLit(_)
-        | ExprKind::BoolLit(_)
-        | ExprKind::Null => {}
+        // Everything else is plain recursion — no node-local check
+        // beyond visiting children.
+        _ => walk_children(expr, |child| {
+            check_types(
+                child,
+                pipeline_name,
+                bindings,
+                registry,
+                fallback_span,
+                diagnostics,
+            )
+        }),
     }
 }
 
@@ -361,12 +329,14 @@ fn check_unknown_ident(
             None
         };
         (
-            format!("[pipeline {}] unknown identifier `{}`", pipeline_name, dotted),
+            format!(
+                "[pipeline {}] unknown identifier `{}`",
+                pipeline_name, dotted
+            ),
             near.map(|n| format!("did you mean `{}`?", n)),
         )
     };
-    let mut diag =
-        Diagnostic::warning_kind(DiagKind::UnknownIdent, message).with_span(span);
+    let mut diag = Diagnostic::warning_kind(DiagKind::UnknownIdent, message).with_span(span);
     if let Some(h) = help {
         diag = diag.with_help(h);
     }
