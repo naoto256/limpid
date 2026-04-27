@@ -392,14 +392,38 @@ fn format_stats(json: &str) {
             println!("Pipelines:");
             for name in &names {
                 let m = &pipelines[*name];
-                println!(
-                    "  {:<24} {:>8} received  {:>8} finished  {:>8} dropped  {:>8} discarded",
-                    name,
-                    get(m, "events_received"),
-                    get(m, "events_finished"),
-                    get(m, "events_dropped"),
-                    get(m, "events_discarded"),
-                );
+                let errored = get(m, "events_errored");
+                let unwritable = get(m, "events_errored_unwritable");
+                // Default row keeps the human-eye scan compact. The
+                // errored / errored_unwritable columns only print when
+                // they're non-zero — they're alarm signals, not steady-
+                // state numbers, so a column of zeros across every
+                // pipeline would just be visual noise.
+                if errored == 0 && unwritable == 0 {
+                    println!(
+                        "  {:<24} {:>8} received  {:>8} finished  {:>8} dropped  {:>8} discarded",
+                        name,
+                        get(m, "events_received"),
+                        get(m, "events_finished"),
+                        get(m, "events_dropped"),
+                        get(m, "events_discarded"),
+                    );
+                } else {
+                    println!(
+                        "  {:<24} {:>8} received  {:>8} finished  {:>8} dropped  {:>8} discarded  {:>8} errored{}",
+                        name,
+                        get(m, "events_received"),
+                        get(m, "events_finished"),
+                        get(m, "events_dropped"),
+                        get(m, "events_discarded"),
+                        errored,
+                        if unwritable > 0 {
+                            format!("  {:>8} errored_unwritable", unwritable)
+                        } else {
+                            String::new()
+                        },
+                    );
+                }
             }
         }
     }
