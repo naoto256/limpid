@@ -115,7 +115,7 @@ def pipeline archive {
     input syslog_udp
     process { egress = syslog.strip_pri(egress) } | filter_noise
 
-    switch source {
+    switch source.ip {
         "192.0.2.1" {
             output fw01                    // implicit finish
         }

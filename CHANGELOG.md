@@ -8,6 +8,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
+## [Unreleased]
+
+### Changed (breaking) — `source` is now an Object with `.ip` and `.port`
+
+The reserved DSL identifier `source` previously resolved to a flat
+`String` containing only the peer IP. Starting in 0.5.6 it resolves
+to an `Object { ip: String, port: Int }`, mirroring how `workspace`
+is already structured. This unlocks two things the IP-only form
+couldn't:
+
+- Discriminating between two log originators bound to different
+  source ports on the same host (a common multi-tenant pattern):
+  `source.port == 5140` separates them.
+- Faithful event capture for replay: a composer can write
+  `${source.ip}:${source.port}` to produce a record `inject --json`
+  accepts without losing the port to a `:0` placeholder.
+
+```
+// Before (≤ 0.5.5):
+if source == "192.0.2.10" { drop }
+output file { path "/var/log/${source}/events.log" }
+
+// After (0.5.6+):
+if source.ip == "192.0.2.10" { drop }
+output file { path "/var/log/${source.ip}/events.log" }
+```
+
+Migration: every site that compares `source` to a String, interpolates
+`${source}` into a path/template, or concatenates `source` with `+`
+needs `.ip` appended. The analyzer surfaces the mismatch via the
+existing type-check pass — bare `source` is now `Object`, and an
+`Object == String` comparison or string-context interpolation flags as
+a type warning.
+
+### Changed (breaking) — wire format `source` matches the DSL shape
+
+`tap --json`, `inject --json`, the error_log (DLQ), and the
+`--test-pipeline --input` parser now emit and accept `source` as the
+same `{ip, port}` object the DSL ident exposes:
+
+```jsonc
+// Before (≤ 0.5.5):
+{ "source": "192.0.2.10:5140", ... }
+
+// After (0.5.6+):
+{ "source": { "ip": "192.0.2.10", "port": 5140 }, ... }
+```
+
+This eliminates the DSL/wire shape mismatch and lets a composer write
+`source: source` to round-trip cleanly. JSONL files captured by
+limpid 0.5.5 or earlier are no longer replayable on 0.5.6 without
+preprocessing — operators with archived captures can convert with
+`jq` (`'.source |= (split(":") | {ip:.[0], port:(.[1]|tonumber)})'`)
+before piping into `inject --json`.
+
+The breaking surface stays bounded: operator-facing DSL and the
+JSONL wire shape are the only two places `source` is exposed.
+Pre-1.0 lets us reshape both together while the snippet library is
+still being authored, rather than later when external configs and
+captures depend on the old form.
+
 ## [0.5.5] - 2026-04-27
 > `error` routing keyword for explicit DLQ routing
 

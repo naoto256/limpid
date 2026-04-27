@@ -43,7 +43,7 @@ def input fw {
 
 def output archive {
     type file
-    path "/var/log/limpid/${source}/${strftime(received_at, "%Y-%m-%d", "local")}.log"
+    path "/var/log/limpid/${source.ip}/${strftime(received_at, "%Y-%m-%d", "local")}.log"
 }
 
 def output siem {

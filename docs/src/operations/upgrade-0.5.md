@@ -275,7 +275,7 @@ template. The full rationale and worked examples are in the
 egress = format("[%{source}] %{workspace.cef_name}: %{egress}")
 
 // after
-egress = "[${source}] ${workspace.cef.name}: ${egress}"
+egress = "[${source.ip}] ${workspace.cef.name}: ${egress}"
 ```
 
 A grep for `format(` and `%{` over your config tree should surface every site to migrate.

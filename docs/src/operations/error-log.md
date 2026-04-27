@@ -86,7 +86,7 @@ One JSON object per line:
   "process": "wrap_journal",
   "pipeline": "journal_forward",
   "event": {
-    "source": "10.0.0.1:514",
+    "source": {"ip": "10.0.0.1", "port": 514},
     "received_at": 1745719719178046000,
     "ingress": "<134>1 2026-04-27T03:28:39Z host app 1234 - - hello"
   }
@@ -99,13 +99,13 @@ One JSON object per line:
 | `reason` | Stringified `ProcessError`. Stable enough for `grep` / classification but not a stable API. |
 | `process` | Failed process. A named `def process` invocation surfaces its name; an inline `process { ... }` block surfaces `(inline)`. |
 | `pipeline` | Pipeline name (`def pipeline <name>`). |
-| `event.source` | Originating peer, formatted as `ip:port`. Same shape as `tap --json`. |
+| `event.source` | Originating peer as `{ip, port}` object. Same shape as `tap --json` and as the DSL `source` ident. |
 | `event.received_at` | i64 unix nanoseconds (matches OTLP `time_unix_nano`). Same shape as `tap --json`. |
 | `event.ingress` | Original wire bytes. UTF-8-clean payloads serialise as a JSON string; non-UTF-8 payloads use the `$bytes_b64` marker the rest of the JSON layer already uses for `tap --json`. |
 
 `event.egress` and `event.workspace` are intentionally **not** included — at the failure point they may hold partial state from earlier processes in the chain, which would confuse `inject --json` replay. The replay path re-runs the pipeline from scratch on `ingress`.
 
-Format stability: pre-1.0 we may add new top-level fields, but the existing keys (`timestamp`, `reason`, `process`, `pipeline`, `event`, and the three sub-fields of `event`) keep their current names and shapes so existing `jq | inject` recipes survive.
+Format stability: pre-1.0 we may add new top-level fields, and existing keys may still be reshaped if the underlying DSL changes (the `event.source` field changed from a flat `"ip:port"` string to a `{ip, port}` object in v0.5.6, alongside the corresponding DSL change). After 1.0 the format will be locked.
 
 ## Replay
 
@@ -154,7 +154,7 @@ $ echo 'sample event' \
 [input] → ingress: <134>sample event
 [process]  wrap_journal → error: process failed: unknown identifier: timestamp (event → error_log)
 
-[error_log]  {"timestamp":"...","reason":"...","process":"wrap_journal","pipeline":"journal_forward","event":{"source":"127.0.0.1:0","received_at":...,"ingress":"<134>sample event"}}
+[error_log]  {"timestamp":"...","reason":"...","process":"wrap_journal","pipeline":"journal_forward","event":{"source":{"ip":"127.0.0.1","port":0},"received_at":...,"ingress":"<134>sample event"}}
 ```
 
 This is useful for confirming the JSONL shape, the `pipeline` / `process` labels, and that the original ingress is captured correctly — all without booting the daemon or touching any file.
