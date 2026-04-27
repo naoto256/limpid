@@ -93,8 +93,10 @@ fn exec_process_stmt(
             // Render the optional message expression to a string and
             // bubble up as `Err` — the pipeline-level ProcessChain arm
             // catches this and routes the event to the error_log
-            // exactly like a runtime process error. `workspace._error`
-            // is populated downstream by the same DLQ path.
+            // exactly like a runtime process error. If we're inside a
+            // `try` block, the catch body sees the message via
+            // `workspace._error` (same exposure as any runtime error);
+            // otherwise the message lands in the DLQ entry's `reason`.
             let msg = match msg_expr {
                 Some(e) => crate::dsl::eval::value_to_string(&eval_expr_with_scope(
                     e, &event, funcs, scope,
