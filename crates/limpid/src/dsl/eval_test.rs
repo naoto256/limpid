@@ -584,7 +584,10 @@ mod tests {
         funcs.register_user_function(FunctionDef {
             name: "double".into(),
             params: vec!["x".into()],
-            body,
+            body: crate::dsl::ast::FuncBody {
+                lets: vec![],
+                ret: body,
+            },
         });
 
         let ev = make_event();
@@ -600,7 +603,10 @@ mod tests {
         funcs.register_user_function(FunctionDef {
             name: "needs_two".into(),
             params: vec!["a".into(), "b".into()],
-            body: e(ExprKind::Ident(vec!["a".into()])),
+            body: crate::dsl::ast::FuncBody {
+                lets: vec![],
+                ret: e(ExprKind::Ident(vec!["a".into()])),
+            },
         });
 
         let ev = make_event();
@@ -644,7 +650,10 @@ mod tests {
         funcs.register_user_function(FunctionDef {
             name: "normalize_proto".into(),
             params: vec!["num".into()],
-            body,
+            body: crate::dsl::ast::FuncBody {
+                lets: vec![],
+                ret: body,
+            },
         });
 
         let ev = make_event();
@@ -676,24 +685,30 @@ mod tests {
         funcs.register_user_function(FunctionDef {
             name: "double".into(),
             params: vec!["x".into()],
-            body: e(ExprKind::BinOp(
-                Box::new(e(ExprKind::Ident(vec!["x".into()]))),
-                BinOp::Mul,
-                Box::new(e(ExprKind::IntLit(2))),
-            )),
+            body: crate::dsl::ast::FuncBody {
+                lets: vec![],
+                ret: e(ExprKind::BinOp(
+                    Box::new(e(ExprKind::Ident(vec!["x".into()]))),
+                    BinOp::Mul,
+                    Box::new(e(ExprKind::IntLit(2))),
+                )),
+            },
         });
         funcs.register_user_function(FunctionDef {
             name: "quadruple".into(),
             params: vec!["x".into()],
-            body: e(ExprKind::FuncCall {
-                namespace: None,
-                name: "double".into(),
-                args: vec![e(ExprKind::FuncCall {
+            body: crate::dsl::ast::FuncBody {
+                lets: vec![],
+                ret: e(ExprKind::FuncCall {
                     namespace: None,
                     name: "double".into(),
-                    args: vec![e(ExprKind::Ident(vec!["x".into()]))],
-                })],
-            }),
+                    args: vec![e(ExprKind::FuncCall {
+                        namespace: None,
+                        name: "double".into(),
+                        args: vec![e(ExprKind::Ident(vec!["x".into()]))],
+                    })],
+                }),
+            },
         });
 
         let ev = make_event();
@@ -703,5 +718,77 @@ mod tests {
                 .unwrap(),
             Value::Int(20)
         );
+    }
+
+    #[test]
+    fn user_function_with_let_bindings() {
+        use crate::dsl::ast::{FuncBody, FuncLet, FunctionDef};
+
+        let mut funcs = make_funcs();
+        // def function f(x) { let p = x * 2; let q = p + 1; q }
+        funcs.register_user_function(FunctionDef {
+            name: "f".into(),
+            params: vec!["x".into()],
+            body: FuncBody {
+                lets: vec![
+                    FuncLet {
+                        name: "p".into(),
+                        value: e(ExprKind::BinOp(
+                            Box::new(e(ExprKind::Ident(vec!["x".into()]))),
+                            BinOp::Mul,
+                            Box::new(e(ExprKind::IntLit(2))),
+                        )),
+                    },
+                    FuncLet {
+                        name: "q".into(),
+                        value: e(ExprKind::BinOp(
+                            Box::new(e(ExprKind::Ident(vec!["p".into()]))),
+                            BinOp::Add,
+                            Box::new(e(ExprKind::IntLit(1))),
+                        )),
+                    },
+                ],
+                ret: e(ExprKind::Ident(vec!["q".into()])),
+            },
+        });
+
+        let ev = make_event();
+        let result = funcs.call(None, "f", &[Value::Int(10)], &ev).unwrap();
+        assert_eq!(result, Value::Int(21)); // 10 * 2 + 1
+    }
+
+    #[test]
+    fn user_function_let_reassignment_overwrites() {
+        use crate::dsl::ast::{FuncBody, FuncLet, FunctionDef};
+
+        let mut funcs = make_funcs();
+        // def function f(x) { let v = x; let v = v * 3; v }
+        // The second `let v = ...` reassigns `v` in the same local
+        // scope (semantically: assignment to the same variable).
+        funcs.register_user_function(FunctionDef {
+            name: "f".into(),
+            params: vec!["x".into()],
+            body: FuncBody {
+                lets: vec![
+                    FuncLet {
+                        name: "v".into(),
+                        value: e(ExprKind::Ident(vec!["x".into()])),
+                    },
+                    FuncLet {
+                        name: "v".into(),
+                        value: e(ExprKind::BinOp(
+                            Box::new(e(ExprKind::Ident(vec!["v".into()]))),
+                            BinOp::Mul,
+                            Box::new(e(ExprKind::IntLit(3))),
+                        )),
+                    },
+                ],
+                ret: e(ExprKind::Ident(vec!["v".into()])),
+            },
+        });
+
+        let ev = make_event();
+        let result = funcs.call(None, "f", &[Value::Int(7)], &ev).unwrap();
+        assert_eq!(result, Value::Int(21));
     }
 }

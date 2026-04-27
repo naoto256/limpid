@@ -136,7 +136,35 @@ pub enum ProcessStatement {
 pub struct FunctionDef {
     pub name: String,
     pub params: Vec<String>,
-    pub body: Expr,
+    pub body: FuncBody,
+}
+
+/// Body of a `def function`: zero or more `let` bindings followed by a
+/// trailing return expression.
+///
+/// The trailing expression is required — a function must yield a value.
+/// `let` is the only statement form allowed; assignments, routing
+/// (`drop`, `finish`, `process foo`), and statement-form control flow
+/// (`if`, `switch`, `foreach`, `try-catch`) are all parser-rejected by
+/// the slim function-body grammar. Use the expression-form `switch` for
+/// branching.
+///
+/// Each `let` binds (or reassigns) a name in the same local scope; the
+/// trailing expression is evaluated with all bindings visible. Reading
+/// Event-bound identifiers (`ingress`, `egress`, `source`,
+/// `received_at`, `error`, `workspace.*`) anywhere in `lets` or `ret`
+/// is rejected at analyzer time — purity restricts the body to pure
+/// transformations of the function's parameters.
+#[derive(Debug, Clone)]
+pub struct FuncBody {
+    pub lets: Vec<FuncLet>,
+    pub ret: Expr,
+}
+
+#[derive(Debug, Clone)]
+pub struct FuncLet {
+    pub name: String,
+    pub value: Expr,
 }
 
 // ---------------------------------------------------------------------------
