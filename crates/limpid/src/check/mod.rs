@@ -1057,9 +1057,7 @@ def pipeline p {
             .expect("expected unknown identifier warning");
         assert_eq!(w.kind, DiagKind::UnknownIdent);
         assert!(
-            w.help
-                .as_deref()
-                .is_some_and(|h| h.contains("ingress")),
+            w.help.as_deref().is_some_and(|h| h.contains("ingress")),
             "expected near-match suggestion, got: {:?}",
             w.help
         );
@@ -1197,6 +1195,211 @@ def pipeline pl { input i1; output o1 }
         assert_eq!(counts.inputs, 2);
         assert_eq!(counts.outputs, 1);
         assert_eq!(counts.processes, 1);
+        assert_eq!(counts.pipelines, 1);
+    }
+
+    // ----- def function -------------------------------------------------
+
+    #[test]
+    fn function_def_pure_body_passes() {
+        let src = r#"
+def function normalize_proto(num) {
+    switch num {
+        6  { "tcp" }
+        17 { "udp" }
+        default { null }
+    }
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        assert!(errors(&diags).is_empty(), "got errors: {:?}", diags);
+        assert!(warnings(&diags).is_empty(), "got warnings: {:?}", diags);
+    }
+
+    #[test]
+    fn function_referencing_workspace_warns() {
+        let src = r#"
+def function bad(x) {
+    x + len(workspace.foo)
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        let w = warnings(&diags)
+            .into_iter()
+            .find(|w| w.message.contains("Event-bound identifier"))
+            .expect("expected purity warning");
+        assert_eq!(w.kind, DiagKind::UnknownIdent);
+        assert!(
+            w.message.contains("workspace.foo"),
+            "expected workspace.foo in message, got: {}",
+            w.message
+        );
+    }
+
+    #[test]
+    fn function_referencing_received_at_warns() {
+        let src = r#"
+def function bad() {
+    received_at
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            warnings(&diags)
+                .iter()
+                .any(|w| w.message.contains("received_at")),
+            "expected received_at purity warning, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn function_self_recursion_errors() {
+        let src = r#"
+def function rec(x) {
+    rec(x)
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            errors(&diags)
+                .iter()
+                .any(|e| e.message.contains("call cycle") && e.message.contains("rec")),
+            "expected self-recursion error, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn function_mutual_recursion_errors() {
+        let src = r#"
+def function a(x) { b(x) }
+def function b(x) { a(x) }
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        let cycle_errs: Vec<&Diagnostic> = errors(&diags)
+            .into_iter()
+            .filter(|e| e.message.contains("call cycle"))
+            .collect();
+        assert_eq!(
+            cycle_errs.len(),
+            1,
+            "expected exactly one cycle error, got {}: {:?}",
+            cycle_errs.len(),
+            diags
+        );
+        let m = &cycle_errs[0].message;
+        assert!(m.contains("a") && m.contains("b"), "got: {}", m);
+    }
+
+    #[test]
+    fn function_calling_process_errors() {
+        let src = r#"
+def process some_proc { workspace.x = 1 }
+def function bad(x) {
+    some_proc(x)
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            errors(&diags)
+                .iter()
+                .any(|e| e.message.contains("calls process")),
+            "expected process-call error, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn function_call_site_resolves() {
+        // Call sites referencing a user-defined function don't emit an
+        // "unknown function" warning — `register_user_function` made
+        // the analyzer aware of it. (Arity mismatches are deferred to
+        // runtime by design; the analyzer skips wrong-arity warnings
+        // to avoid double-flagging.)
+        let src = r#"
+def function takes_two(a, b) { a + b }
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p {
+    input i
+    process { workspace.x = takes_two(1, 2) }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            !warnings(&diags)
+                .iter()
+                .any(|w| w.message.contains("unknown function")),
+            "user function should resolve at the call site, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn function_call_in_hash_literal_resolves() {
+        // The OCSF / OCSF-shaped composer use case: function calls
+        // embedded as HashLit values. Should not flag any unknown
+        // identifier or function.
+        let src = r#"
+def function normalize_proto(num) {
+    switch num { 6 { "tcp" } 17 { "udp" } default { null } }
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p {
+    input i
+    process {
+        workspace.proto = 6
+        workspace.limpid = {
+            class_uid: 4001,
+            connection_info: { protocol_name: normalize_proto(workspace.proto) }
+        }
+    }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            errors(&diags).is_empty(),
+            "expected no errors, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn def_counts_includes_functions() {
+        let src = r#"
+def function f1(x) { x }
+def function f2(x) { x + 1 }
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let cfg = parse_config(src).unwrap();
+        let counts = DefCounts::from_config(&cfg);
+        assert_eq!(counts.functions, 2);
+        assert_eq!(counts.inputs, 1);
+        assert_eq!(counts.outputs, 1);
         assert_eq!(counts.pipelines, 1);
     }
 }

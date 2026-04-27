@@ -499,4 +499,209 @@ mod tests {
             ])
         );
     }
+
+    // ---- SwitchExpr -------------------------------------------------------
+
+    #[test]
+    fn switch_expr_picks_matching_arm() {
+        let ev = make_event();
+        let f = make_funcs();
+        // switch 6 { 6 { "tcp" } 17 { "udp" } default { null } }
+        let expr = e(ExprKind::SwitchExpr {
+            scrutinee: Box::new(e(ExprKind::IntLit(6))),
+            arms: vec![
+                crate::dsl::ast::SwitchExprArm {
+                    pattern: Some(e(ExprKind::IntLit(6))),
+                    body: e(ExprKind::StringLit("tcp".into())),
+                },
+                crate::dsl::ast::SwitchExprArm {
+                    pattern: Some(e(ExprKind::IntLit(17))),
+                    body: e(ExprKind::StringLit("udp".into())),
+                },
+                crate::dsl::ast::SwitchExprArm {
+                    pattern: None,
+                    body: e(ExprKind::Null),
+                },
+            ],
+        });
+        assert_eq!(
+            eval_expr(&expr, &ev, &f).unwrap(),
+            Value::String("tcp".into())
+        );
+    }
+
+    #[test]
+    fn switch_expr_falls_to_default() {
+        let ev = make_event();
+        let f = make_funcs();
+        let expr = e(ExprKind::SwitchExpr {
+            scrutinee: Box::new(e(ExprKind::IntLit(99))),
+            arms: vec![
+                crate::dsl::ast::SwitchExprArm {
+                    pattern: Some(e(ExprKind::IntLit(6))),
+                    body: e(ExprKind::StringLit("tcp".into())),
+                },
+                crate::dsl::ast::SwitchExprArm {
+                    pattern: None,
+                    body: e(ExprKind::StringLit("unknown".into())),
+                },
+            ],
+        });
+        assert_eq!(
+            eval_expr(&expr, &ev, &f).unwrap(),
+            Value::String("unknown".into())
+        );
+    }
+
+    #[test]
+    fn switch_expr_no_match_no_default_returns_null() {
+        let ev = make_event();
+        let f = make_funcs();
+        let expr = e(ExprKind::SwitchExpr {
+            scrutinee: Box::new(e(ExprKind::IntLit(99))),
+            arms: vec![crate::dsl::ast::SwitchExprArm {
+                pattern: Some(e(ExprKind::IntLit(6))),
+                body: e(ExprKind::StringLit("tcp".into())),
+            }],
+        });
+        assert_eq!(eval_expr(&expr, &ev, &f).unwrap(), Value::Null);
+    }
+
+    // ---- User-defined `def function` end-to-end --------------------------
+
+    #[test]
+    fn user_function_call_returns_body_value() {
+        // Register a user function `double(x) { x * 2 }` and call it
+        // via the same registry path the parser-built call sites use.
+        use crate::dsl::ast::FunctionDef;
+
+        let mut funcs = make_funcs();
+        let body = e(ExprKind::BinOp(
+            Box::new(e(ExprKind::Ident(vec!["x".into()]))),
+            BinOp::Mul,
+            Box::new(e(ExprKind::IntLit(2))),
+        ));
+        funcs.register_user_function(FunctionDef {
+            name: "double".into(),
+            params: vec!["x".into()],
+            body,
+        });
+
+        let ev = make_event();
+        let result = funcs.call(None, "double", &[Value::Int(21)], &ev).unwrap();
+        assert_eq!(result, Value::Int(42));
+    }
+
+    #[test]
+    fn user_function_arity_mismatch_at_call() {
+        use crate::dsl::ast::FunctionDef;
+
+        let mut funcs = make_funcs();
+        funcs.register_user_function(FunctionDef {
+            name: "needs_two".into(),
+            params: vec!["a".into(), "b".into()],
+            body: e(ExprKind::Ident(vec!["a".into()])),
+        });
+
+        let ev = make_event();
+        // The dispatch path is responsible for the central arity
+        // check (via the synthesized `Any^2 -> Any` signature). Pass
+        // 1 arg and expect a clear error.
+        let err = funcs
+            .call(None, "needs_two", &[Value::Int(1)], &ev)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("needs_two"),
+            "expected function name in arity error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn user_function_with_switch_body_maps_correctly() {
+        use crate::dsl::ast::{FunctionDef, SwitchExprArm};
+
+        let mut funcs = make_funcs();
+        // normalize_proto(num) — the canonical mapping use case.
+        let body = e(ExprKind::SwitchExpr {
+            scrutinee: Box::new(e(ExprKind::Ident(vec!["num".into()]))),
+            arms: vec![
+                SwitchExprArm {
+                    pattern: Some(e(ExprKind::IntLit(6))),
+                    body: e(ExprKind::StringLit("tcp".into())),
+                },
+                SwitchExprArm {
+                    pattern: Some(e(ExprKind::IntLit(17))),
+                    body: e(ExprKind::StringLit("udp".into())),
+                },
+                SwitchExprArm {
+                    pattern: None,
+                    body: e(ExprKind::Null),
+                },
+            ],
+        });
+        funcs.register_user_function(FunctionDef {
+            name: "normalize_proto".into(),
+            params: vec!["num".into()],
+            body,
+        });
+
+        let ev = make_event();
+        assert_eq!(
+            funcs
+                .call(None, "normalize_proto", &[Value::Int(6)], &ev)
+                .unwrap(),
+            Value::String("tcp".into())
+        );
+        assert_eq!(
+            funcs
+                .call(None, "normalize_proto", &[Value::Int(17)], &ev)
+                .unwrap(),
+            Value::String("udp".into())
+        );
+        assert_eq!(
+            funcs
+                .call(None, "normalize_proto", &[Value::Int(99)], &ev)
+                .unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn user_function_calling_user_function_works() {
+        use crate::dsl::ast::FunctionDef;
+
+        let mut funcs = make_funcs();
+        funcs.register_user_function(FunctionDef {
+            name: "double".into(),
+            params: vec!["x".into()],
+            body: e(ExprKind::BinOp(
+                Box::new(e(ExprKind::Ident(vec!["x".into()]))),
+                BinOp::Mul,
+                Box::new(e(ExprKind::IntLit(2))),
+            )),
+        });
+        funcs.register_user_function(FunctionDef {
+            name: "quadruple".into(),
+            params: vec!["x".into()],
+            body: e(ExprKind::FuncCall {
+                namespace: None,
+                name: "double".into(),
+                args: vec![e(ExprKind::FuncCall {
+                    namespace: None,
+                    name: "double".into(),
+                    args: vec![e(ExprKind::Ident(vec!["x".into()]))],
+                })],
+            }),
+        });
+
+        let ev = make_event();
+        assert_eq!(
+            funcs
+                .call(None, "quadruple", &[Value::Int(5)], &ev)
+                .unwrap(),
+            Value::Int(20)
+        );
+    }
 }

@@ -371,7 +371,6 @@ impl FunctionRegistry {
         }
         crate::dsl::eval::eval_expr_with_scope(&fn_def.body, event, self, &scope)
     }
-
 }
 
 /// Central arity check, shared by every function that has a `FunctionSig`.
