@@ -1,0 +1,50 @@
+// Replayable-event composer
+//
+// Serialises the event into the canonical limpid Event JSON shape —
+// the same shape `limpidctl tap --json` emits and `limpidctl inject
+// --json` accepts. Pair with `output file` to capture a JSONL stream
+// that can be replayed later through any pipeline:
+//
+//   def output capture {
+//       type file
+//       path "/var/log/limpid/replay/${source.ip}/${strftime(received_at, "%Y-%m-%d", "UTC")}.jsonl"
+//   }
+//
+//   def pipeline mirror {
+//       input wire
+//       process compose_replayable
+//       output capture
+//   }
+//
+//   # Replay later:
+//   #   cat /var/log/limpid/replay/.../*.jsonl | limpidctl inject input wire --json
+//
+// The captured shape includes everything `tap --json` carries:
+//
+//   { received_at, source, ingress, egress, workspace }
+//
+// `egress` and `workspace` reflect the state of the event *at the
+// moment compose_replayable runs*, so position the process where the
+// snapshot semantics are right for your use case — usually right
+// after `input` (capture raw inflow) or right before `output`
+// (capture pipeline-final state, useful for debugging).
+//
+// Why bother when the error_log already preserves replayable events?
+// `error_log` only captures *failed* events. `compose_replayable` is
+// for the rest — production capture, parser regression fixtures,
+// snippet development. Same shape both directions, same `inject
+// --json` recipe, same operator mental model.
+
+def process compose_replayable {
+    // Since v0.5.6 the DSL `source` ident is the canonical
+    // `{ip, port}` object — same shape `inject --json` expects — so
+    // the composer can pass it straight through. No string assembly,
+    // no port placeholder, no fidelity loss.
+    egress = to_json({
+        received_at: received_at,
+        source:      source,
+        ingress:     ingress,
+        egress:      egress,
+        workspace:   workspace
+    })
+}
