@@ -100,9 +100,9 @@ you live with a log pipeline:
 
   ```
   $ limpidctl tap output security_lake --json | jq -c '{src: .source, sev: .workspace.cef.severity_level, class: .workspace.ocsf.class_uid}'
-  {"src":"10.0.0.21:51234","sev":3,"class":200401}
-  {"src":"10.0.0.21:51234","sev":7,"class":200401}
-  {"src":"10.0.0.22:42100","sev":2,"class":200401}
+  {"src":{"ip":"10.0.0.21","port":51234},"sev":3,"class":200401}
+  {"src":{"ip":"10.0.0.21","port":51234},"sev":7,"class":200401}
+  {"src":{"ip":"10.0.0.22","port":42100},"sev":2,"class":200401}
   ...
   ```
 

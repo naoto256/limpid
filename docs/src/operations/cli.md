@@ -32,14 +32,24 @@ limpid --debug --config /etc/limpid/limpid.conf
 ```json
 {
   "ingress": "<134>Apr 15 10:30:00 myhost sshd: test",
-  "source": "192.0.2.3:514",
+  "source": {"ip": "192.0.2.3", "port": 514},
   "workspace": {
     "custom_field": "value"
   }
 }
 ```
 
-All keys except `ingress` are optional. `source` can be `ip:port` or just `ip`. The Event has no facility / severity fields — the `<PRI>` byte lives inside `ingress` / `egress`, and pipelines that need its numeric value call `syslog.extract_pri(...)`.
+All keys except `ingress` are optional. `source` is the canonical `{ip, port}` object — same shape `tap --json` emits and the DSL `source` ident exposes. Field-level defaults make smoke testing terse:
+
+| Input shape | Resulting `source` |
+|---|---|
+| `source` omitted entirely | `{ip: "127.0.0.1", port: 0}` |
+| `source: {}` | `{ip: "127.0.0.1", port: 0}` |
+| `source: {ip: "10.0.0.1"}` | `{ip: "10.0.0.1", port: 0}` |
+| `source: {port: 5140}` | `{ip: "127.0.0.1", port: 5140}` |
+| `source: {ip, port}` | exact |
+
+When `source` is present but malformed (legacy `"ip:port"` string, wrong types, port out of range), `--test-pipeline` errors out loudly — operators migrating from the 0.5.5 form should see the failure, not silently get a wrong default. The Event has no facility / severity fields — the `<PRI>` byte lives inside `ingress` / `egress`, and pipelines that need its numeric value call `syslog.extract_pri(...)`.
 
 ## limpidctl
 

@@ -436,17 +436,50 @@ fn build_test_event(input_json: Option<&str>) -> Result<Event> {
             .unwrap_or("")
             .to_string();
 
-        let source: SocketAddr = v
-            .get("source")
-            .and_then(|v| v.as_str())
-            .and_then(|s| {
-                if s.contains(':') {
-                    s.parse().ok()
-                } else {
-                    format!("{}:0", s).parse().ok()
+        // Source is the canonical v0.5.6+ object form `{ip, port}` —
+        // same shape `tap --json` emits and `Event::from_json` accepts.
+        // Field-level policies (smoke-test friendly partial spec):
+        //   * absent          → 127.0.0.1:0 default
+        //   * {ip: "..."}     → port = 0       (port not under test)
+        //   * {port: 514}     → ip = 127.0.0.1 (ip not under test)
+        //   * type mismatch   → hard error (catches 0.5.5 flat-string
+        //                      migration miss + typos)
+        let source: SocketAddr = match v.get("source") {
+            None => default_addr,
+            Some(val) => {
+                let obj = val.as_object().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--input `source` must be an object {{\"ip\": ..., \"port\": ...}} \
+                     (the 0.5.5 flat-string \"ip:port\" form was removed in 0.5.6); got {}",
+                        val
+                    )
+                })?;
+                let ip: String = match obj.get("ip") {
+                    None => "127.0.0.1".to_string(),
+                    Some(v) => v
+                        .as_str()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("--input `source.ip` must be a string, got {}", v)
+                        })?
+                        .to_string(),
+                };
+                let port: u64 = match obj.get("port") {
+                    None => 0,
+                    Some(v) => v.as_u64().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--input `source.port` must be a non-negative number, got {}",
+                            v
+                        )
+                    })?,
+                };
+                if port > u16::MAX as u64 {
+                    anyhow::bail!("--input `source.port` out of range (0-65535): {}", port);
                 }
-            })
-            .unwrap_or(default_addr);
+                format!("{}:{}", ip, port).parse().with_context(|| {
+                    format!("--input `source` not a valid address: {}:{}", ip, port)
+                })?
+            }
+        };
 
         let mut event = Event::new(Bytes::from(ingress), source);
 
@@ -465,5 +498,75 @@ fn build_test_event(input_json: Option<&str>) -> Result<Event> {
             Bytes::from_static(b"<134>sample syslog message"),
             default_addr,
         ))
+    }
+}
+
+#[cfg(test)]
+mod build_test_event_tests {
+    use super::*;
+
+    fn run(input: &str) -> Result<Event> {
+        build_test_event(Some(input))
+    }
+
+    #[test]
+    fn omitted_source_uses_loopback_default() {
+        let ev = build_test_event(None).unwrap();
+        assert_eq!(ev.source.ip().to_string(), "127.0.0.1");
+        assert_eq!(ev.source.port(), 0);
+    }
+
+    #[test]
+    fn empty_object_source_uses_defaults() {
+        let ev = run(r#"{"ingress":"x","source":{}}"#).unwrap();
+        assert_eq!(ev.source.ip().to_string(), "127.0.0.1");
+        assert_eq!(ev.source.port(), 0);
+    }
+
+    #[test]
+    fn ip_only_defaults_port_to_zero() {
+        let ev = run(r#"{"ingress":"x","source":{"ip":"10.0.0.1"}}"#).unwrap();
+        assert_eq!(ev.source.ip().to_string(), "10.0.0.1");
+        assert_eq!(ev.source.port(), 0);
+    }
+
+    #[test]
+    fn port_only_defaults_ip_to_loopback() {
+        let ev = run(r#"{"ingress":"x","source":{"port":5140}}"#).unwrap();
+        assert_eq!(ev.source.ip().to_string(), "127.0.0.1");
+        assert_eq!(ev.source.port(), 5140);
+    }
+
+    #[test]
+    fn full_object_round_trips() {
+        let ev = run(r#"{"ingress":"x","source":{"ip":"192.0.2.10","port":5140}}"#).unwrap();
+        assert_eq!(ev.source.ip().to_string(), "192.0.2.10");
+        assert_eq!(ev.source.port(), 5140);
+    }
+
+    #[test]
+    fn legacy_string_source_errors_loudly() {
+        // The 0.5.5 flat-string form is intentionally not accepted —
+        // operators migrating should see the failure, not silently
+        // get a wrong default.
+        let err = run(r#"{"ingress":"x","source":"192.0.2.10:5140"}"#).unwrap_err();
+        let s = err.to_string();
+        assert!(
+            s.contains("must be an object") && s.contains("0.5.6"),
+            "got: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn ip_wrong_type_errors_loudly() {
+        let err = run(r#"{"ingress":"x","source":{"ip":42,"port":514}}"#).unwrap_err();
+        assert!(err.to_string().contains("must be a string"), "got: {}", err);
+    }
+
+    #[test]
+    fn port_out_of_range_errors_loudly() {
+        let err = run(r#"{"ingress":"x","source":{"ip":"127.0.0.1","port":99999}}"#).unwrap_err();
+        assert!(err.to_string().contains("out of range"), "got: {}", err);
     }
 }
