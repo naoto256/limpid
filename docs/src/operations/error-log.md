@@ -35,13 +35,45 @@ When `error_log` is **unset**, the same record is emitted as a structured `traci
 
 The recommended deployment is the explicit file path: a dedicated DLQ file is easier to monitor, easier to rotate, and decouples replay volume from journald rate limits.
 
+### Startup validation
+
+At daemon start (and on `SIGHUP` reload), limpid stat()s the parent directory of `error_log` and refuses to start if it doesn't exist or isn't a directory. Operator typos surface before any event hits the failure path, not after the first runtime error. The file itself does not need to exist — the daemon creates it on the first failure.
+
+If the directory is reachable but the daemon can't *write* to it (wrong owner, read-only filesystem), startup still succeeds; the failure surfaces as `events_errored_unwritable` increments at runtime. See [When the DLQ write itself fails](#when-the-dlq-write-itself-fails) for the diagnosis path.
+
 ### Permissions and rotation
 
 The daemon opens the file with `OpenOptions::create(true).append(true)` per write, so:
 
-- The file is created on first failure if it doesn't exist (parent directory must exist and be writable by the daemon user).
+- The file is created on first failure if it doesn't exist (parent directory must exist and be writable by the daemon user — checked at startup).
 - `logrotate` with `copytruncate` works without a SIGHUP handshake — the daemon picks up the new inode on the next failure.
-- Concurrent failures from multiple pipeline workers serialise on the file's `O_APPEND` semantics; line atomicity is guaranteed by the kernel for writes shorter than `PIPE_BUF` (typically 4 KiB), which the JSONL records always satisfy.
+- Concurrent failures from multiple pipeline workers serialise through an in-process `Mutex` inside the writer. POSIX `O_APPEND` only guarantees atomic append for writes ≤ `PIPE_BUF` (Linux: 4 KiB), and DLQ records carrying base64-encoded binary ingress easily exceed that — so limpid does not rely on the kernel-level guarantee.
+
+### Recommended `logrotate` configuration
+
+The DLQ has no in-process size cap; sustained failures can fill the disk. Pair it with a `logrotate` entry:
+
+```
+/var/log/limpid/errored.jsonl {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    copytruncate
+    notifempty
+    missingok
+    create 0640 limpid adm
+    maxsize 1G
+}
+```
+
+Key choices:
+
+- `copytruncate` — limpid reopens the inode every write, so a normal rotate-and-rename works too, but `copytruncate` is the simplest setup that doesn't require any signal handshake.
+- `maxsize 1G` — caps the live file even when `daily` hasn't fired yet. A pipeline producing failures at 10k events/sec with 1 KiB records would fill 1 GiB in ~100 seconds; tune to your environment.
+- `rotate 14 + compress` — two weeks of rotated history is usually enough to catch and replay everything between an incident and the operator noticing it.
+
+Operators with stricter retention needs (compliance: hold N days of forensic-quality records) should size accordingly and consider shipping the rotated archives to long-term storage.
 
 ## Record format
 
