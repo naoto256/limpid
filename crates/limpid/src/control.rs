@@ -446,7 +446,7 @@ fn collect_pipeline_tap_points(
                     collect_pipeline_tap_points(&stmts, inputs, processes, outputs);
                 }
             }
-            PipelineStatement::Drop | PipelineStatement::Finish => {}
+            PipelineStatement::Drop | PipelineStatement::Finish | PipelineStatement::Error(_) => {}
         }
     }
 }

@@ -320,6 +320,14 @@ pub(super) fn analyze_pipeline_stmt(
             }
         }
         PipelineStatement::Drop | PipelineStatement::Finish => {}
+        PipelineStatement::Error(msg) => {
+            // Type-check the optional message expression — same checks
+            // as any expression, no special arity since `error` is a
+            // routing keyword not a function.
+            if let Some(e) = msg {
+                expr_types::check_types(e, pipeline_name, bindings, registry, None, diagnostics);
+            }
+        }
         PipelineStatement::If(chain) => {
             control_flow::analyze_if_chain(
                 chain,
@@ -494,6 +502,11 @@ pub(super) fn analyze_process_stmt(
             // process was defined; we don't recurse from here.
         }
         ProcessStatement::Drop => {}
+        ProcessStatement::Error(msg) => {
+            if let Some(e) = msg {
+                expr_types::check_types(e, pipeline_name, bindings, registry, None, diagnostics);
+            }
+        }
         ProcessStatement::If(chain) => {
             control_flow::analyze_inline_if(chain, pipeline_name, registry, bindings, diagnostics);
         }
@@ -1515,5 +1528,99 @@ def pipeline p { input i; output o }
         assert_eq!(counts.inputs, 1);
         assert_eq!(counts.outputs, 1);
         assert_eq!(counts.pipelines, 1);
+    }
+
+    #[test]
+    fn error_keyword_with_message_passes_check() {
+        // Bare `error` and `error "msg"` (incl. interpolated message)
+        // are routing statements; the analyzer only type-checks the
+        // optional message expression and otherwise leaves the routing
+        // to the runtime.
+        let src = r#"
+def process bad_subtype {
+    workspace.kind = "foo"
+    error "unknown subtype: ${workspace.kind}"
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p {
+    input i
+    process bad_subtype
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            errors(&diags).is_empty(),
+            "expected clean analysis, got: {:?}",
+            errors(&diags)
+        );
+    }
+
+    #[test]
+    fn error_keyword_message_goes_through_type_check() {
+        // The message expression is fed to the same expr_types pass as
+        // any other expression, so an unknown function inside the
+        // interpolation surfaces as a normal "unknown function"
+        // diagnostic — confirming the routing keyword doesn't bypass
+        // the analyzer.
+        let src = r#"
+def process bad {
+    error "computed: ${lowe("x")}"
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p {
+    input i
+    process bad
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("lowe") && d.message.contains("unknown function")),
+            "expected unknown-function diagnostic for `lowe`, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn error_keyword_at_pipeline_level_passes_check() {
+        let src = r#"
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p {
+    input i
+    if source == "10.0.0.99" { error "rejected source" }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            errors(&diags).is_empty(),
+            "expected clean analysis, got: {:?}",
+            errors(&diags)
+        );
+    }
+
+    #[test]
+    fn error_keyword_in_function_body_fails_to_parse() {
+        // Function body grammar is `process_let* ~ expr` — `error` is a
+        // statement, not an expression, so it can't appear there.
+        let src = r#"
+def function bad(x) {
+    error "no good"
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let parsed = crate::dsl::parser::parse_config(src);
+        assert!(
+            parsed.is_err(),
+            "expected parse failure for `error` inside function body"
+        );
     }
 }
