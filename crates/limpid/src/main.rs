@@ -436,17 +436,50 @@ fn build_test_event(input_json: Option<&str>) -> Result<Event> {
             .unwrap_or("")
             .to_string();
 
-        let source: SocketAddr = v
-            .get("source")
-            .and_then(|v| v.as_str())
-            .and_then(|s| {
-                if s.contains(':') {
-                    s.parse().ok()
-                } else {
-                    format!("{}:0", s).parse().ok()
+        // Source is the canonical v0.5.6+ object form `{ip, port}` —
+        // same shape `tap --json` emits and `Event::from_json` accepts.
+        // Field-level policies (smoke-test friendly partial spec):
+        //   * absent          → 127.0.0.1:0 default
+        //   * {ip: "..."}     → port = 0       (port not under test)
+        //   * {port: 514}     → ip = 127.0.0.1 (ip not under test)
+        //   * type mismatch   → hard error (catches 0.5.5 flat-string
+        //                      migration miss + typos)
+        let source: SocketAddr = match v.get("source") {
+            None => default_addr,
+            Some(val) => {
+                let obj = val.as_object().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--input `source` must be an object {{\"ip\": ..., \"port\": ...}} \
+                     (the 0.5.5 flat-string \"ip:port\" form was removed in 0.5.6); got {}",
+                        val
+                    )
+                })?;
+                let ip: String = match obj.get("ip") {
+                    None => "127.0.0.1".to_string(),
+                    Some(v) => v
+                        .as_str()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("--input `source.ip` must be a string, got {}", v)
+                        })?
+                        .to_string(),
+                };
+                let port: u64 = match obj.get("port") {
+                    None => 0,
+                    Some(v) => v.as_u64().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--input `source.port` must be a non-negative number, got {}",
+                            v
+                        )
+                    })?,
+                };
+                if port > u16::MAX as u64 {
+                    anyhow::bail!("--input `source.port` out of range (0-65535): {}", port);
                 }
-            })
-            .unwrap_or(default_addr);
+                format!("{}:{}", ip, port).parse().with_context(|| {
+                    format!("--input `source` not a valid address: {}:{}", ip, port)
+                })?
+            }
+        };
 
         let mut event = Event::new(Bytes::from(ingress), source);
 
