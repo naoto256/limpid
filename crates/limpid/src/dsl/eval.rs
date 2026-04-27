@@ -37,9 +37,15 @@ impl LocalScope {
         Self::default()
     }
 
-    /// Bind (or shadow-rebind) `name` to `value`. The previous value, if
-    /// any, is discarded — by design this is the only way to "reassign"
-    /// a let (`let x = 1; let x = 2`), matching Rust's shadowing rules.
+    /// Bind `name` to `value`. The previous value, if any, is discarded.
+    ///
+    /// limpid models `let` as the **assignment form** for local-scope
+    /// variables (not as a separate "declaration" step). `let x = 1;
+    /// let x = 2` is two assignments to the same `x` — there is no
+    /// `let mut` / re-assign distinction, and no separate scope for
+    /// rebinding. Internally this is `HashMap::insert` overwriting the
+    /// prior value, but the user-facing semantics is "assignment to a
+    /// local-scope variable", not "shadowing".
     pub fn bind(&mut self, name: &str, value: Value) {
         self.bindings.insert(name.to_string(), value);
     }

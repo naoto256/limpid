@@ -369,7 +369,15 @@ impl FunctionRegistry {
         for (param, val) in fn_def.params.iter().zip(args.iter()) {
             scope.bind(param, val.clone());
         }
-        crate::dsl::eval::eval_expr_with_scope(&fn_def.body, event, self, &scope)
+        // Execute let bindings in declaration order. Each `let x = expr`
+        // is a (re)assignment to `x` in the same local scope; `LocalScope::bind`
+        // overwrites any prior value, which is the only update mechanism
+        // available inside a function body.
+        for fl in &fn_def.body.lets {
+            let v = crate::dsl::eval::eval_expr_with_scope(&fl.value, event, self, &scope)?;
+            scope.bind(&fl.name, v);
+        }
+        crate::dsl::eval::eval_expr_with_scope(&fn_def.body.ret, event, self, &scope)
     }
 }
 

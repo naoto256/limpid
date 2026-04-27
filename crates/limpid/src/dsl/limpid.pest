@@ -183,14 +183,24 @@ assign_target = {
 
 // -- Function definition (pure expression function) -------------------------
 
-// `def function <name>(<params>) { <expr> }`
+// `def function <name>(<params>) { <let_stmts...> <return_expr> }`
 //
-// Body is a single expression. To express mapping tables / branching,
-// use the expression-form `switch` (atom-level `switch_expr`). The
-// body must not reference any Event-bound identifier (ingress, egress,
-// source, received_at, error, workspace.*) — checked at analyzer time.
+// Body is zero or more `let` bindings followed by a required trailing
+// expression that becomes the return value. `let` is the only
+// statement form allowed; assignments, routing (`drop`, `finish`,
+// `process foo`, `output foo`) and statement-form control flow are
+// all rejected here by virtue of not being in the grammar. Use the
+// expression-form `switch` (atom-level `switch_expr`) for branching.
+//
+// The body must not reference any Event-bound identifier (ingress,
+// egress, source, received_at, error, workspace.*) — checked at
+// analyzer time, not parser time.
 def_function = {
-    kw_def ~ kw_function ~ ident ~ "(" ~ func_params? ~ ")" ~ "{" ~ expr ~ "}"
+    kw_def ~ kw_function ~ ident ~ "(" ~ func_params? ~ ")" ~ "{" ~ func_body ~ "}"
+}
+
+func_body = {
+    process_let* ~ expr
 }
 
 func_params = {
