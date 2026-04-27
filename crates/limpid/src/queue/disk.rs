@@ -459,6 +459,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn source_with_nondefault_port_round_trips() {
+        // Source IP+port must survive `to_json_value` → `from_json`
+        // intact; otherwise compose_replayable / DLQ replay loses the
+        // port discriminator that distinguishes co-located originators
+        // (multi-tenant: same host, different bind ports).
+        let event = Event::new(
+            Bytes::from_static(b"<134>test"),
+            "192.0.2.10:5140".parse().unwrap(),
+        );
+        let json_str = serde_json::to_string(&event.to_json_value()).unwrap();
+        // Wire form is `{ip, port}` since v0.5.6.
+        assert!(
+            json_str.contains(r#""source":{"ip":"192.0.2.10","port":5140}"#),
+            "expected v0.5.6+ object form, got: {}",
+            json_str
+        );
+        let recovered = Event::from_json(&json_str).unwrap();
+        assert_eq!(recovered.source.ip().to_string(), "192.0.2.10");
+        assert_eq!(recovered.source.port(), 5140);
+    }
+
+    #[test]
+    fn from_json_rejects_legacy_string_source() {
+        // The 0.5.5 flat-string form is intentionally not accepted —
+        // breaking change documented in CHANGELOG. Operators with old
+        // captures must `jq` migrate before replay.
+        let json_str = r#"{"received_at":1234,"source":"192.0.2.10:5140","ingress":"x"}"#;
+        assert!(Event::from_json(json_str).is_none());
+    }
+
     #[tokio::test]
     async fn test_disk_queue_basic() {
         let dir = tempfile::tempdir().unwrap();
