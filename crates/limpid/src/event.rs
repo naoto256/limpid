@@ -56,7 +56,17 @@ impl Event {
         // into a `Value::Timestamp`.
         let nanos = self.received_at.timestamp_nanos_opt().unwrap_or(0);
         map.insert("received_at".into(), JsonValue::Number(nanos.into()));
-        map.insert("source".into(), JsonValue::String(self.source.to_string()));
+        // Wire form mirrors the DSL: `source` is an object with `ip`
+        // (String) and `port` (Int) since v0.5.6. The flat
+        // `"source": "ip:port"` form prior versions emitted is no
+        // longer accepted (`from_json` is strict to keep round-trip
+        // semantics simple). JSONL files captured by 0.5.5 or earlier
+        // need a one-shot `jq` migration before replay; see the
+        // 0.5.6 CHANGELOG entry for the recipe.
+        let mut source_obj = serde_json::Map::new();
+        source_obj.insert("ip".into(), JsonValue::String(self.source.ip().to_string()));
+        source_obj.insert("port".into(), JsonValue::Number(self.source.port().into()));
+        map.insert("source".into(), JsonValue::Object(source_obj));
         map.insert("ingress".into(), bytes_to_json(&self.ingress));
         map.insert("egress".into(), bytes_to_json(&self.egress));
         if !self.workspace.is_empty() {
@@ -87,8 +97,17 @@ impl Event {
     pub fn from_json(json_str: &str) -> Option<Self> {
         let v: JsonValue = serde_json::from_str(json_str).ok()?;
         let ingress = json_to_bytes(v.get("ingress")?)?;
-        let source_str = v.get("source")?.as_str()?;
-        let source: SocketAddr = source_str.parse().ok()?;
+        // Source is the v0.5.6+ object form `{ip, port}` — matches the
+        // DSL ident shape and what `to_json_value` emits. The legacy
+        // flat-string form `"ip:port"` from earlier limpid versions is
+        // not accepted; pre-1.0 breaking change documented in CHANGELOG.
+        let source_obj = v.get("source")?.as_object()?;
+        let ip_str = source_obj.get("ip")?.as_str()?;
+        let port = source_obj.get("port")?.as_u64()?;
+        if port > u16::MAX as u64 {
+            return None;
+        }
+        let source: SocketAddr = format!("{}:{}", ip_str, port).parse().ok()?;
         // i64 unix nanoseconds — the wire form documented in `to_json_value`.
         // Pre-0.5 RFC3339 captures need to be migrated before replay.
         let received_at = v
