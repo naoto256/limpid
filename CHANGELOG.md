@@ -8,7 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
-## [Unreleased]
+## [0.5.4] - 2026-04-27
+> User-defined pure functions (`def function`) with let-form bodies
 
 ### Added — `def function` for pure expression functions
 
