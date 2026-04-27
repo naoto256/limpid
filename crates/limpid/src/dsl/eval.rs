@@ -9,24 +9,30 @@ use super::value::{Map, Value};
 use crate::event::Event;
 use crate::functions::FunctionRegistry;
 
-/// Per-process scratch bindings introduced by `let <name> = expr`.
+/// Local-scope variable bindings introduced by `let <name> = expr`.
 ///
-/// `let` has process scope, not hop scope — it exists precisely because
-/// `workspace` is contract-ish (pipeline-local scratch that survives
-/// across process boundaries within the pipeline), whereas a `let`
-/// binding is "material for building a single workspace write" and is
-/// dropped when the process body returns.
+/// Used by both:
 ///
-/// The AST's [`super::ast::ProcessStatement::LetBinding`] calls
-/// [`LocalScope::bind`] as statements execute; expression evaluation
-/// ([`eval_expr_with_scope`]) consults the same scope when resolving
-/// bare identifiers.
+/// - **Process bodies**: each [`super::ast::ProcessStatement::LetBinding`]
+///   calls [`LocalScope::bind`] as statements execute; the scope lives
+///   for the duration of the process body and is dropped when the body
+///   returns. `let` has process scope (not hop scope), distinguishing
+///   it from `workspace` (pipeline-local scratch surviving across
+///   process boundaries).
+/// - **Function bodies**: [`FunctionRegistry::call`] constructs a
+///   fresh `LocalScope`, binds the call arguments to the declared
+///   parameters, then evaluates each `let` in [`super::ast::FuncBody`]
+///   in declaration order before the trailing return expression. The
+///   scope is discarded when the call returns.
 ///
-/// Call semantics: when a user-defined process calls another process,
-/// callers pass a *fresh* scope (or [`LocalScope::new`]). Locals do not
-/// leak across process calls. This matches the mental model of
-/// `workspace`-as-material and `let`-as-scratch — callee scratches are
-/// callee-only.
+/// Expression evaluation ([`eval_expr_with_scope`]) consults the same
+/// scope when resolving bare identifiers regardless of which kind of
+/// body it's running inside.
+///
+/// Call semantics: when a user-defined process or function calls
+/// another, the callee receives a *fresh* scope (or
+/// [`LocalScope::new`]). Locals do not leak across calls — callee
+/// scratches are callee-only.
 #[derive(Debug, Clone, Default)]
 pub struct LocalScope {
     bindings: HashMap<String, Value>,
