@@ -11,6 +11,7 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 ## [Unreleased]
 
 ## [0.5.3] - 2026-04-27
+> limpidctl stats surfaces errored counters
 
 ### Fixed — `limpidctl stats` shows `events_errored` / `events_errored_unwritable`
 
@@ -35,6 +36,7 @@ non-zero `events_errored_unwritable` adds a second column on top of
 `errored`.
 
 ## [0.5.2] - 2026-04-27
+> Dead-letter queue for process errors
 
 ### Changed — process runtime errors route to a dead-letter queue (revising 0.5.1)
 
@@ -113,6 +115,7 @@ production stream. What changes is that the events are now
   the realistic blast radius for v0.5.2.
 
 ## [0.5.1] - 2026-04-27
+> Analyzer strictness + pipeline error handling
 
 ### Breaking — process runtime errors discard the event
 
@@ -160,6 +163,7 @@ expression) is exempt — flagging `stdout`, `tcp`, etc. as unknown
 would be a false positive.
 
 ## [0.5.0] - 2026-04-26
+> OTLP transport + DSL surface freeze
 
 ### Changed — design principles restructured (still five)
 

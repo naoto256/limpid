@@ -38,6 +38,7 @@ jobs:
         id: notes
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          # Body: everything between this version's heading and the next.
           awk -v ver="$VERSION" '
             $0 ~ "^## \\["ver"\\]" { found=1; next }
             found && /^## \[/ { exit }
@@ -46,11 +47,26 @@ jobs:
           if [ ! -s RELEASE_NOTES.md ]; then
             echo "::warning::No CHANGELOG entry found for ${VERSION}; release body will be empty."
           fi
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          # Tagline (optional): a `> ...` blockquote line immediately
+          # following the version heading. Used as the second clause of
+          # the GitHub Release name (`limpid X.Y.Z — TAGLINE`). Absent →
+          # falls back to plain `limpid X.Y.Z`.
+          TAGLINE=$(awk -v ver="$VERSION" '
+            $0 ~ "^## \\["ver"\\]" { in_section=1; next }
+            in_section && /^>/ { sub(/^> ?/, ""); print; exit }
+            in_section && /^##/ { exit }
+            in_section && /^###/ { exit }
+          ' CHANGELOG.md)
+          if [ -n "$TAGLINE" ]; then
+            NAME="limpid ${VERSION} — ${TAGLINE}"
+          else
+            NAME="limpid ${VERSION}"
+          fi
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: limpid ${{ steps.notes.outputs.version }}
+          name: ${{ steps.notes.outputs.name }}
           files: target/debian/*.deb
           body_path: RELEASE_NOTES.md
