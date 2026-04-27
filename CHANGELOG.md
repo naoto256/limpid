@@ -10,6 +10,30 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-04-27
+
+### Fixed — `limpidctl stats` shows `events_errored` / `events_errored_unwritable`
+
+The 0.5.2 pipeline metrics gained `events_errored` and
+`events_errored_unwritable` but the human-readable `limpidctl stats`
+renderer wasn't updated — the JSON form (`limpidctl stats --json`,
+control socket, Prometheus) carried both, the default text form
+silently dropped them. Operators saw zero on `stats` while the
+real number was hiding in the JSON.
+
+The columns now render when they're non-zero:
+
+```
+Pipelines:
+  ama_forward         89 received  35 finished  23 dropped   0 discarded  31 errored
+  splunk_archive      62 received  38 finished  24 dropped   0 discarded
+```
+
+Steady-state pipelines (no errors) keep the compact row — a column
+of zeros across every pipeline in the common case is just noise. A
+non-zero `events_errored_unwritable` adds a second column on top of
+`errored`.
+
 ## [0.5.2] - 2026-04-27
 
 ### Changed — process runtime errors route to a dead-letter queue (revising 0.5.1)
