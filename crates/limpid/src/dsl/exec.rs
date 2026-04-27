@@ -89,6 +89,21 @@ fn exec_process_stmt(
     match stmt {
         ProcessStatement::Drop => Ok(ExecResult::Dropped),
 
+        ProcessStatement::Error(msg_expr) => {
+            // Render the optional message expression to a string and
+            // bubble up as `Err` — the pipeline-level ProcessChain arm
+            // catches this and routes the event to the error_log
+            // exactly like a runtime process error. `workspace._error`
+            // is populated downstream by the same DLQ path.
+            let msg = match msg_expr {
+                Some(e) => crate::dsl::eval::value_to_string(&eval_expr_with_scope(
+                    e, &event, funcs, scope,
+                )?),
+                None => "explicit error routing".to_string(),
+            };
+            anyhow::bail!("{}", msg);
+        }
+
         ProcessStatement::Assign(target, expr) => {
             let value = eval_expr_with_scope(expr, &event, funcs, scope)?;
             apply_assign(&mut event, target, value)?;

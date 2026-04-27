@@ -176,6 +176,7 @@ fn parse_process_stmt(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement
     let inner = first_inner(pair)?;
     match inner.as_rule() {
         Rule::process_drop => Ok(ProcessStatement::Drop),
+        Rule::process_error => parse_process_error(inner, file_id),
         Rule::process_call => parse_process_call(inner, file_id),
         Rule::process_assign => parse_process_assign(inner, file_id),
         Rule::process_if => parse_process_if(inner, file_id),
@@ -186,6 +187,15 @@ fn parse_process_stmt(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement
         Rule::process_expr_stmt => parse_process_expr_stmt(inner, file_id),
         _ => bail!("unexpected process statement: {:?}", inner.as_rule()),
     }
+}
+
+fn parse_process_error(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
+    let msg = pair
+        .into_inner()
+        .next()
+        .map(|p| parse_expr_from_pair(p, file_id))
+        .transpose()?;
+    Ok(ProcessStatement::Error(msg))
 }
 
 fn parse_process_call(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
@@ -353,6 +363,7 @@ fn parse_pipeline_stmt(pair: Pair<Rule>, file_id: u32) -> Result<PipelineStateme
     match inner.as_rule() {
         Rule::pipeline_drop => Ok(PipelineStatement::Drop),
         Rule::pipeline_finish => Ok(PipelineStatement::Finish),
+        Rule::pipeline_error => parse_pipeline_error(inner, file_id),
         Rule::pipeline_input => {
             let names: Vec<String> = inner.into_inner().map(|p| p.as_str().to_string()).collect();
             if names.is_empty() {
@@ -369,6 +380,15 @@ fn parse_pipeline_stmt(pair: Pair<Rule>, file_id: u32) -> Result<PipelineStateme
         Rule::pipeline_switch => parse_pipeline_switch(inner, file_id),
         _ => bail!("unexpected pipeline statement: {:?}", inner.as_rule()),
     }
+}
+
+fn parse_pipeline_error(pair: Pair<Rule>, file_id: u32) -> Result<PipelineStatement> {
+    let msg = pair
+        .into_inner()
+        .next()
+        .map(|p| parse_expr_from_pair(p, file_id))
+        .transpose()?;
+    Ok(PipelineStatement::Error(msg))
 }
 
 fn parse_pipeline_process_chain(pair: Pair<Rule>, file_id: u32) -> Result<PipelineStatement> {

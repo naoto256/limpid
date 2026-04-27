@@ -82,6 +82,64 @@ mod tests {
     }
 
     #[test]
+    fn test_exec_error_with_message_bubbles_up() {
+        // `error "msg"` should produce an Err whose Display contains the
+        // rendered message. The pipeline-level handler then turns this
+        // into a DLQ entry — same path as a runtime process error.
+        let event = make_event();
+        let stmts = vec![ProcessStatement::Error(Some(e(ExprKind::StringLit(
+            "explicit failure".into(),
+        ))))];
+        let res = exec_process_body(&stmts, event, &NoopRegistry, &make_funcs());
+        let err = res.expect_err("expected Err from error statement");
+        assert!(
+            err.to_string().contains("explicit failure"),
+            "expected message to surface, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_exec_error_without_message_uses_default() {
+        let event = make_event();
+        let stmts = vec![ProcessStatement::Error(None)];
+        let err = exec_process_body(&stmts, event, &NoopRegistry, &make_funcs())
+            .expect_err("expected Err from bare error statement");
+        // Default message is operator-readable; assert on a stable
+        // substring rather than the full string so cosmetic tweaks
+        // don't churn the test.
+        assert!(
+            err.to_string().contains("explicit error"),
+            "expected default message, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_exec_error_with_interpolated_message() {
+        // `error "subtype ${workspace.kind} unsupported"` must render the
+        // interpolation against the current event before bubbling.
+        use crate::dsl::ast::TemplateFragment;
+        let mut event = make_event();
+        event
+            .workspace
+            .insert("kind".into(), Value::String("foo".into()));
+        let template = e(ExprKind::Template(vec![
+            TemplateFragment::Literal("subtype ".into()),
+            TemplateFragment::Interp(e(ExprKind::Ident(vec!["workspace".into(), "kind".into()]))),
+            TemplateFragment::Literal(" unsupported".into()),
+        ]));
+        let stmts = vec![ProcessStatement::Error(Some(template))];
+        let err = exec_process_body(&stmts, event, &NoopRegistry, &make_funcs())
+            .expect_err("expected Err");
+        assert!(
+            err.to_string().contains("subtype foo unsupported"),
+            "expected interpolated message, got: {}",
+            err
+        );
+    }
+
+    #[test]
     fn test_exec_if_true_branch() {
         let event = make_event();
         let stmts = vec![ProcessStatement::If(IfChain {

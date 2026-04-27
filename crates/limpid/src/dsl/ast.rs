@@ -101,6 +101,14 @@ pub enum ProcessStatement {
     ProcessCall(String, Vec<Expr>),
     /// `drop`
     Drop,
+    /// `error` / `error <expr>` — explicit failure routing. The optional
+    /// expression renders to a string and lands in `workspace._error`;
+    /// the event is then routed to the error_log (same path as runtime
+    /// process errors) and counted as `events_errored`. Use this in
+    /// snippet libraries when an upstream parse / dispatch contract
+    /// fails — `drop` is for *intentional* discard, `error` is for
+    /// "I cannot process this and the operator should know."
+    Error(Option<Expr>),
     /// `if cond { ... } else if cond { ... } else { ... }`
     If(IfChain),
     /// `switch expr { "val" { ... } default { ... } }`
@@ -191,6 +199,11 @@ pub enum PipelineStatement {
     Drop,
     /// `finish` — explicit success termination (counted as events_finished)
     Finish,
+    /// `error` / `error <expr>` — explicit failure routing. Routes the
+    /// event to the error_log (DLQ) with the rendered message stored in
+    /// `workspace._error`. Counted as `events_errored`, same metric as
+    /// runtime process errors.
+    Error(Option<Expr>),
     /// `if cond { ... } else if cond { ... } else { ... }`
     If(IfChain),
     /// `switch expr { ... }`

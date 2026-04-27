@@ -186,7 +186,7 @@ impl CompiledConfig {
                     }
                 }
             }
-            PipelineStatement::Drop | PipelineStatement::Finish => {}
+            PipelineStatement::Drop | PipelineStatement::Finish | PipelineStatement::Error(_) => {}
         }
         Ok(())
     }
@@ -449,6 +449,34 @@ fn exec_pipeline_stmt(
 
     match stmt {
         PipelineStatement::Input(_) => cont(event),
+
+        PipelineStatement::Error(msg_expr) => {
+            // Render the optional message and route the event to the
+            // error_log via PipelineTermination::Errored, mirroring how
+            // a process-level Err lands in the DLQ.
+            let msg = match msg_expr {
+                Some(e) => crate::dsl::eval::value_to_string(&eval_expr(e, &event, ctx.funcs)?),
+                None => "explicit error routing".to_string(),
+            };
+            tracing::warn!(
+                "pipeline '{}': error '{}' — event routed to error_log",
+                ctx.pipeline_name,
+                msg
+            );
+            out.trace.push(TraceEntry {
+                stage: "error".into(),
+                label: msg.clone(),
+                detail: "event → error_log".into(),
+            });
+            *out.errored = Some(ErroredEventContext {
+                timestamp: chrono::Utc::now(),
+                pipeline: ctx.pipeline_name.to_string(),
+                process: "(pipeline)".to_string(),
+                reason: msg,
+                event,
+            });
+            Ok((None, PipelineTermination::Errored))
+        }
 
         PipelineStatement::ProcessChain(chain) => {
             let mut current = event;
