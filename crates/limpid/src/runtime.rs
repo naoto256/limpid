@@ -44,12 +44,7 @@ impl Runtime {
 
         let mut func_registry = FunctionRegistry::new();
         crate::functions::register_builtins(&mut func_registry, table_store);
-        // Install user-defined `def function` declarations alongside
-        // built-in primitives. The same registry path serves both at
-        // call time — see `FunctionRegistry::call`.
-        for fn_def in config.functions.values() {
-            func_registry.register_user_function(fn_def.clone());
-        }
+        crate::functions::register_user_functions(&mut func_registry, &config);
         let func_registry = Arc::new(func_registry);
 
         config.validate(&registry)?;

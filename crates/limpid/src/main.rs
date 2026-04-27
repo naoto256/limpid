@@ -367,12 +367,7 @@ fn run_test(config_path: &str, pipeline_name: &str, input_json: Option<&str>) ->
     let table_store = runtime::init_tables(&compiled)?;
     let mut func_registry = FunctionRegistry::new();
     functions::register_builtins(&mut func_registry, table_store);
-    // User-defined `def function` declarations participate in
-    // --test-pipeline dispatch the same way they do in the daemon
-    // runtime; register them here too.
-    for fn_def in compiled.functions.values() {
-        func_registry.register_user_function(fn_def.clone());
-    }
+    functions::register_user_functions(&mut func_registry, &compiled);
     let mut registry = crate::modules::ModuleRegistry::new();
     crate::modules::register_builtins(&mut registry);
 

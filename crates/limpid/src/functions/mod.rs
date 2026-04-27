@@ -39,8 +39,6 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
-use std::sync::Arc;
-
 use crate::dsl::ast::FunctionDef;
 use crate::dsl::value::Value;
 use crate::event::Event;
@@ -162,7 +160,7 @@ pub struct FunctionRegistry {
     /// turn needs the registry — a closure that captured `&self` would
     /// be self-referencing, so dispatch through `call()` resolves the
     /// FunctionDef and evaluates the body in-place instead.
-    user_definitions: HashMap<String, Arc<FunctionDef>>,
+    user_definitions: HashMap<String, FunctionDef>,
 }
 
 impl FunctionRegistry {
@@ -340,8 +338,7 @@ impl FunctionRegistry {
         let sig = FunctionSig::fixed(&vec![FieldType::Any; arity], FieldType::Any);
         let key = (None, fn_def.name.clone());
         self.signatures.insert(key, sig);
-        self.user_definitions
-            .insert(fn_def.name.clone(), Arc::new(fn_def));
+        self.user_definitions.insert(fn_def.name.clone(), fn_def);
     }
 
     /// Evaluate a user-defined function body with `args` bound to the
@@ -353,7 +350,7 @@ impl FunctionRegistry {
     /// the primitive's standard signature.
     fn call_user_function(
         &self,
-        fn_def: &Arc<FunctionDef>,
+        fn_def: &FunctionDef,
         args: &[Value],
         event: &Event,
     ) -> Result<Value> {
@@ -443,6 +440,20 @@ pub fn register_builtins(reg: &mut FunctionRegistry, table_store: table::TableSt
     syslog::register(reg);
     cef::register(reg);
     otlp::register(reg);
+}
+
+/// Install every `def function` declaration from a compiled config
+/// into `reg`. Mirrors [`register_builtins`] for user-authored DSL
+/// functions: callers (runtime startup, `--test-pipeline`, the
+/// analyzer's own registry) get a single call site instead of an
+/// open-coded loop.
+pub fn register_user_functions(
+    reg: &mut FunctionRegistry,
+    config: &crate::pipeline::CompiledConfig,
+) {
+    for fn_def in config.functions.values() {
+        reg.register_user_function(fn_def.clone());
+    }
 }
 
 #[cfg(test)]

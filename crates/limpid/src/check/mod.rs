@@ -247,14 +247,10 @@ pub fn analyze(config: &CompiledConfig, _source_map: &SourceMap) -> Vec<Diagnost
     };
     let mut registry = FunctionRegistry::new();
     crate::functions::register_builtins(&mut registry, table_store);
-
-    // Register user-defined `def function` declarations so call-site
-    // arity checks resolve them. The bodies are inspected separately
-    // for purity / cycle checks below — registration here is purely
-    // about making call sites in pipelines see the right signature.
-    for fn_def in config.functions.values() {
-        registry.register_user_function(fn_def.clone());
-    }
+    // Bodies are inspected separately for purity / cycle checks
+    // below — registration here is purely about making call sites
+    // in pipelines see the right arity / signature.
+    crate::functions::register_user_functions(&mut registry, config);
 
     let mut diagnostics = Vec::new();
     function::check_all_functions(config, &mut diagnostics);
