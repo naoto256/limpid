@@ -64,14 +64,22 @@ fn check_function_body(
     config: &CompiledConfig,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let params: HashSet<&str> = fn_def.params.iter().map(String::as_str).collect();
-    walk_for_purity(&fn_def.body, &fn_def.name, &params, config, diagnostics);
+    // `known` accumulates names that are valid single-segment
+    // references at this point in the body: parameters first, then each
+    // `let` name as it appears (let RHS sees only what's bound *before*
+    // it, so we extend after walking the RHS).
+    let mut known: HashSet<String> = fn_def.params.iter().cloned().collect();
+    for fl in &fn_def.body.lets {
+        walk_for_purity(&fl.value, &fn_def.name, &known, config, diagnostics);
+        known.insert(fl.name.clone());
+    }
+    walk_for_purity(&fn_def.body.ret, &fn_def.name, &known, config, diagnostics);
 }
 
 fn walk_for_purity(
     expr: &Expr,
     fn_name: &str,
-    params: &HashSet<&str>,
+    params: &HashSet<String>,
     config: &CompiledConfig,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -79,7 +87,7 @@ fn walk_for_purity(
         ExprKind::Ident(parts) => {
             // Bare ident may be a parameter — those are the only
             // single-segment names a function body can read.
-            if parts.len() == 1 && params.contains(parts[0].as_str()) {
+            if parts.len() == 1 && params.contains(&parts[0]) {
                 return;
             }
             // Otherwise, any reference whose head matches an Event
@@ -90,7 +98,7 @@ fn walk_for_purity(
                 && EVENT_IDENTS.contains(&h)
             {
                 diagnostics.push(
-                    Diagnostic::warning_kind(
+                    Diagnostic::error_kind(
                         DiagKind::UnknownIdent,
                         format!(
                             "[function {}] body references Event-bound identifier `{}` — \
@@ -113,7 +121,7 @@ fn walk_for_purity(
             // unrecognised is a free variable).
             if parts.len() == 1 {
                 diagnostics.push(
-                    Diagnostic::warning_kind(
+                    Diagnostic::error_kind(
                         DiagKind::UnknownIdent,
                         format!(
                             "[function {}] body references unknown identifier `{}` — \
@@ -203,7 +211,10 @@ fn check_function_cycles(config: &CompiledConfig, diagnostics: &mut Vec<Diagnost
     let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
     for (name, fn_def) in &config.functions {
         let mut callees = Vec::new();
-        collect_user_callees(&fn_def.body, config, &mut callees);
+        for fl in &fn_def.body.lets {
+            collect_user_callees(&fl.value, config, &mut callees);
+        }
+        collect_user_callees(&fn_def.body.ret, config, &mut callees);
         adj.insert(name.as_str(), callees);
     }
 

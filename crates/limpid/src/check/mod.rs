@@ -1220,7 +1220,7 @@ def pipeline p { input i; output o }
     }
 
     #[test]
-    fn function_referencing_workspace_warns() {
+    fn function_referencing_workspace_errors() {
         let src = r#"
 def function bad(x) {
     x + len(workspace.foo)
@@ -1230,20 +1230,20 @@ def output o { type stdout template "x" }
 def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
-        let w = warnings(&diags)
+        let e = errors(&diags)
             .into_iter()
-            .find(|w| w.message.contains("Event-bound identifier"))
-            .expect("expected purity warning");
-        assert_eq!(w.kind, DiagKind::UnknownIdent);
+            .find(|e| e.message.contains("Event-bound identifier"))
+            .expect("expected purity error");
+        assert_eq!(e.kind, DiagKind::UnknownIdent);
         assert!(
-            w.message.contains("workspace.foo"),
+            e.message.contains("workspace.foo"),
             "expected workspace.foo in message, got: {}",
-            w.message
+            e.message
         );
     }
 
     #[test]
-    fn function_referencing_received_at_warns() {
+    fn function_referencing_received_at_errors() {
         let src = r#"
 def function bad() {
     received_at
@@ -1254,11 +1254,100 @@ def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
         assert!(
-            warnings(&diags)
+            errors(&diags)
                 .iter()
-                .any(|w| w.message.contains("received_at")),
-            "expected received_at purity warning, got: {:?}",
+                .any(|e| e.message.contains("received_at")),
+            "expected received_at purity error, got: {:?}",
             diags
+        );
+    }
+
+    #[test]
+    fn function_with_let_bindings_passes_checks() {
+        // let bindings + trailing return expression should parse and
+        // analyze cleanly. Each let RHS may reference earlier lets and
+        // parameters; the trailing expression sees all of them.
+        let src = r#"
+def function double_then_add_one(n) {
+    let doubled = n * 2
+    let result = doubled + 1
+    result
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            errors(&diags).is_empty(),
+            "expected clean analysis, got errors: {:?}",
+            errors(&diags)
+        );
+    }
+
+    #[test]
+    fn function_let_referencing_workspace_errors() {
+        // Event-bound idents are rejected even when buried inside a let
+        // RHS — the purity walk visits every binding.
+        let src = r#"
+def function bad(x) {
+    let v = x + len(workspace.foo)
+    v
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            errors(&diags)
+                .iter()
+                .any(|e| e.message.contains("Event-bound identifier")
+                    && e.message.contains("workspace.foo")),
+            "expected purity error for workspace.foo in let RHS, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn function_let_reassignment_parses_and_runs() {
+        // `let v = …` reassigns the same local-scope variable on the
+        // second occurrence. The analyzer treats both lines uniformly;
+        // there is no separate "redeclaration" diagnostic.
+        let src = r#"
+def function f(x) {
+    let v = x
+    let v = v * 3
+    v
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            errors(&diags).is_empty(),
+            "expected clean analysis, got: {:?}",
+            errors(&diags)
+        );
+    }
+
+    #[test]
+    fn function_missing_trailing_expression_fails_to_parse() {
+        // Function body grammar requires a trailing expression. A body
+        // consisting only of let statements is a parse error.
+        let src = r#"
+def function bad(x) {
+    let v = x
+}
+def input i { type tcp bind "0.0.0.0:514" }
+def output o { type stdout template "x" }
+def pipeline p { input i; output o }
+"#;
+        let parsed = crate::dsl::parser::parse_config(src);
+        assert!(
+            parsed.is_err(),
+            "expected parse failure for function without trailing return expression"
         );
     }
 
