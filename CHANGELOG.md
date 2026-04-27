@@ -10,6 +10,8 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-04-27
+
 ### Changed — process runtime errors route to a dead-letter queue (revising 0.5.1)
 
 0.5.1 changed the pipeline so that a `process` runtime error caused
@@ -67,6 +69,24 @@ The downstream behaviour is unchanged from 0.5.1: errored events
 still don't reach any output, so there is no shape regression in the
 production stream. What changes is that the events are now
 **recoverable**.
+
+### Fixed — DLQ writer hardening (audit follow-up)
+
+- **Concurrent line interleave**: multiple pipeline workers calling
+  `ErrorLogWriter::write` no longer race. POSIX `O_APPEND` atomicity
+  only covers writes ≤ `PIPE_BUF` (Linux: 4 KiB), and DLQ records
+  carrying base64-encoded binary `ingress` easily exceed that. An
+  in-process `tokio::sync::Mutex` serialises the open + write
+  sequence so each JSONL line is written whole.
+- **Startup path validation**: `error_log` parent directory is
+  stat()'d at daemon start; a typo'd / missing path is rejected
+  before any event reaches the failure path. Previously the typo
+  surfaced as `events_errored_unwritable` ticks at first failure.
+- **Rotation guidance**: `operations/error-log.md` now ships a
+  recommended `logrotate` configuration (`copytruncate` + `maxsize
+  1G`) so the DLQ has a documented disk-fill ceiling. In-process
+  rotation is deferred to v0.6.0; operator-side `logrotate` covers
+  the realistic blast radius for v0.5.2.
 
 ## [0.5.1] - 2026-04-27
 
