@@ -56,20 +56,20 @@ pub fn lookup<'bump>(arena: &EventArena<'bump>, ip_str: &str) -> Result<Value<'b
     let mut builder = ObjectBuilder::with_capacity(arena, 4);
 
     if let Some(iso) = city.country.iso_code {
-        builder.push_str("country", Value::String(arena.alloc_str(iso)));
+        builder.push("country", Value::String(arena.alloc_str(iso)));
     }
     if let Some(name) = city.city.names.english {
-        builder.push_str("city", Value::String(arena.alloc_str(name)));
+        builder.push("city", Value::String(arena.alloc_str(name)));
     }
     if let Some(lat) = city.location.latitude
         && lat.is_finite()
     {
-        builder.push_str("latitude", Value::Float(lat));
+        builder.push("latitude", Value::Float(lat));
     }
     if let Some(lon) = city.location.longitude
         && lon.is_finite()
     {
-        builder.push_str("longitude", Value::Float(lon));
+        builder.push("longitude", Value::Float(lon));
     }
 
     Ok(builder.finish())
