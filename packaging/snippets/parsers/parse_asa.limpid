@@ -109,31 +109,40 @@ def process parse_asa {
         workspace.syslog.msg,
         "^(?:[^:]*: )?%ASA-(?P<level>\\d)-(?P<msg_id>\\d+): (?P<body>.*)$"
     )
-    // One flat switch covers both the regex-failure path and the
-    // per-message-ID dispatch. Nesting the dispatch inside a child
-    // `process` whose `default` arm calls `error` does not propagate
-    // the error back to the parent pipeline boundary, so the top-level
-    // switch must own every routing decision.
+    // Two-tier dispatch: the top-level guard rejects non-ASA syslog
+    // bodies, then `parse_asa_dispatch` routes by message ID. The
+    // nested form was historically broken (sub-process `error` was
+    // swallowed at the ProcessCall boundary, so unsupported message
+    // IDs would silently flow into compose_ocsf with an empty
+    // workspace.limpid); the v0.7.0 propagation fix
+    // (`fix/process-call-error-propagation`) made the nested form
+    // work as written.
     switch true {
-        workspace.asa == null            { error "parse_asa: not an ASA syslog body: ${workspace.syslog.msg}" }
+        workspace.asa == null { error "parse_asa: not an ASA syslog body: ${workspace.syslog.msg}" }
+        default               { process parse_asa_dispatch }
+    }
+}
+
+def process parse_asa_dispatch {
+    switch workspace.asa.msg_id {
         // Authentication (3002)
-        workspace.asa.msg_id == "605004" { process parse_asa_605004_login_denied }
-        workspace.asa.msg_id == "605005" { process parse_asa_605005_login_permitted }
-        workspace.asa.msg_id == "611101" { process parse_asa_611101_vpn_auth_succeeded }
-        workspace.asa.msg_id == "611102" { process parse_asa_611102_vpn_auth_failed }
-        workspace.asa.msg_id == "611103" { process parse_asa_611103_vpn_logout }
-        workspace.asa.msg_id == "109001" { process parse_asa_109001_aaa_auth_start }
-        workspace.asa.msg_id == "109005" { process parse_asa_109005_aaa_auth_succeeded }
-        workspace.asa.msg_id == "109017" { process parse_asa_109017_aaa_insufficient_resources }
-        workspace.asa.msg_id == "113012" { process parse_asa_113012_aaa_user_accept }
+        "605004" { process parse_asa_605004_login_denied }
+        "605005" { process parse_asa_605005_login_permitted }
+        "611101" { process parse_asa_611101_vpn_auth_succeeded }
+        "611102" { process parse_asa_611102_vpn_auth_failed }
+        "611103" { process parse_asa_611103_vpn_logout }
+        "109001" { process parse_asa_109001_aaa_auth_start }
+        "109005" { process parse_asa_109005_aaa_auth_succeeded }
+        "109017" { process parse_asa_109017_aaa_insufficient_resources }
+        "113012" { process parse_asa_113012_aaa_user_accept }
         // Network Activity (4001) — unverified against live data; see
         // NOTE on each leaf
-        workspace.asa.msg_id == "302013" { process parse_asa_302013_tcp_built }
-        workspace.asa.msg_id == "302014" { process parse_asa_302014_tcp_teardown }
-        workspace.asa.msg_id == "302015" { process parse_asa_302015_udp_built }
-        workspace.asa.msg_id == "302016" { process parse_asa_302016_udp_teardown }
-        workspace.asa.msg_id == "106023" { process parse_asa_106023_acl_deny }
-        default { error "parse_asa: unsupported message ID ${workspace.asa.msg_id}: ${workspace.asa.body}" }
+        "302013" { process parse_asa_302013_tcp_built }
+        "302014" { process parse_asa_302014_tcp_teardown }
+        "302015" { process parse_asa_302015_udp_built }
+        "302016" { process parse_asa_302016_udp_teardown }
+        "106023" { process parse_asa_106023_acl_deny }
+        default  { error "parse_asa: unsupported message ID ${workspace.asa.msg_id}: ${workspace.asa.body}" }
     }
 }
 
