@@ -1,0 +1,301 @@
+// Postfix mail server log parser
+//
+// Vendor:  The Postfix Project (Wietse Venema's MTA — covers Postfix
+//          on Linux / BSD / macOS, the dominant outbound MTA in
+//          modern unix mail stacks; not Sendmail, not Exim, not
+//          OpenSMTPD, each of which emits different line shapes and
+//          would land in their own parser file).
+// Wire:    syslog-wrapped Postfix messages —
+//          `<priority>timestamp host postfix/<program>[<pid>]: <body>`
+//          where `<program>` is the Postfix subcomponent (`smtp`,
+//          `smtpd`, `qmgr`, `cleanup`, `bounce`, `pickup`, `master`,
+//          `trivial-rewrite`, `error`, ...) and `<body>` is the
+//          program-specific message text.
+// Output:  OCSF Email Activity (class_uid 4009) records on
+//          `workspace.limpid` for the operational mail events
+//          (delivery attempts, queue events, bounces, SMTP
+//          connections). Daemon-control noise (master / pickup /
+//          trivial-rewrite startup / shutdown / warning lines) is
+//          routed to error_log via the per-program leaf's `error`
+//          arm — they are operationally meaningful but not Email
+//          Activity, and deserve a separate observability layer
+//          (6002 Application Activity if needed).
+//
+// Sample inputs (RFC 3164 syslog wrapper around Postfix body —
+// addresses anonymised to RFC 5321 / 5737 forms):
+//
+//   smtp delivery success:
+//   <22>Apr 27 10:00:00 mail01 postfix/smtp[1234]: ABCDEF1234: to=<alice@example.com>, relay=mx.example.net[198.51.100.5]:25, delay=1.2, delays=0.1/0/0.5/0.6, dsn=2.0.0, status=sent (250 2.0.0 OK)
+//
+//   smtp delivery deferred (recoverable failure):
+//   <22>Apr 27 10:00:00 mail01 postfix/smtp[1234]: ABCDEF1234: to=<alice@example.com>, relay=none, delay=92909, delays=92879/0.04/30/0, dsn=4.4.1, status=deferred (connect to mx.example.net[198.51.100.5]:25: Connection timed out)
+//
+//   smtp delivery bounced (permanent failure):
+//   <22>Apr 27 10:00:00 mail01 postfix/smtp[1234]: ABCDEF1234: to=<alice@example.com>, relay=mx.example.net[198.51.100.5]:25, delay=2.3, delays=..., dsn=5.1.1, status=bounced (host mx.example.net[198.51.100.5] said: 550 5.1.1 User unknown)
+//
+//   smtpd inbound connection:
+//   <22>Apr 27 10:00:00 mail01 postfix/smtpd[5678]: connect from unknown[192.0.2.10]
+//
+//   smtpd reject (NOQUEUE):
+//   <22>Apr 27 10:00:00 mail01 postfix/smtpd[5678]: NOQUEUE: reject: RCPT from unknown[192.0.2.10]: 554 5.7.1 <alice@example.com>: Relay access denied; from=<bob@example.org> to=<alice@example.com> proto=ESMTP helo=<spammer.example>
+//
+//   qmgr queue-active (envelope from sender, message accepted):
+//   <22>Apr 27 10:00:00 mail01 postfix/qmgr[1111]: ABCDEF1234: from=<bob@example.org>, size=3222, nrcpt=1 (queue active)
+//
+//   bounce (NDR generated):
+//   <22>Apr 27 10:00:00 mail01 postfix/bounce[2222]: ABCDEF1234: sender non-delivery notification: FFFFFF5678
+//
+// Direct call: dispatch is internal; call as `process parse_postfix`.
+//
+// Coverage scope: this snippet targets Postfix's mail-flow vocabulary
+// (smtp / smtpd / qmgr / bounce). Programs that exist for daemon
+// control (master / pickup / trivial-rewrite / error) emit
+// administrative warnings rather than email events, and `warning:` /
+// `fatal:` bodies inside the operational programs are likewise
+// daemon-control noise — both fall through to the dispatcher's /
+// per-program leaf's `error` arm.
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Postfix `status=...` from smtp delivery line → OCSF 4009 status_id.
+//   sent      → Success (1)
+//   bounced   → Failure (2)  — permanent rejection (5xx)
+//   deferred  → Failure (2)  — transient failure (4xx); will retry
+//   anything else → Other (99)
+def function postfix_status_id(s) {
+    switch s {
+        "sent"     { 1 }
+        "bounced"  { 2 }
+        "deferred" { 2 }
+        default    { 99 }
+    }
+}
+
+def function postfix_severity_for_status(s) {
+    switch s {
+        "sent"     { 1 }
+        "deferred" { 2 }
+        "bounced"  { 3 }
+        default    { 1 }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Top-level dispatcher
+// ---------------------------------------------------------------------------
+//
+// Two-tier dispatch: the top-level guard rejects non-Postfix syslog
+// bodies, then `parse_postfix_dispatch` routes by program name to a
+// per-program leaf. Each leaf re-parses `body` against its
+// program-specific shape; the leaf's `error` arm fires when the
+// expected shape doesn't match (e.g. `postfix/smtp[]: warning: ...`
+// instead of a delivery line) and propagates correctly to the
+// pipeline boundary thanks to the v0.7.0
+// process-call error-propagation fix.
+
+def process parse_postfix {
+    workspace.syslog = syslog.parse(ingress)
+    workspace.pf = regex_parse(
+        workspace.syslog.msg,
+        "^postfix/(?P<program>[a-z-]+)\\[(?P<pid>\\d+)\\]: (?P<body>.*)$"
+    )
+    switch true {
+        workspace.pf == null { error "parse_postfix: not a Postfix syslog body: ${workspace.syslog.msg}" }
+        default              { process parse_postfix_dispatch }
+    }
+}
+
+def process parse_postfix_dispatch {
+    switch workspace.pf.program {
+        "smtp"   { process parse_postfix_smtp }
+        "smtpd"  { process parse_postfix_smtpd }
+        "qmgr"   { process parse_postfix_qmgr }
+        "bounce" { process parse_postfix_bounce }
+        default  { error "parse_postfix: unsupported program postfix/${workspace.pf.program}: ${workspace.pf.body}" }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: postfix/smtp — outbound delivery attempt
+// → 4009 / Send / Success or Failure
+//
+// Body shape:
+//   <queue_id>: to=<<addr>>, relay=<host>[<ip>]:<port>, delay=N,
+//   delays=..., dsn=N.N.N, status=<state> (<response>)
+//
+// `relay` may be `none` when the connection failed before TCP open;
+// in that case the regex's relay capture stays null. `warning:` /
+// `fatal:` bodies inside postfix/smtp don't match this shape and
+// route to error_log via the leaf's `error` arm.
+// ---------------------------------------------------------------------------
+
+def process parse_postfix_smtp {
+    workspace.pf_smtp = regex_parse(
+        workspace.pf.body,
+        "^(?P<queue_id>[A-F0-9]+): to=<(?P<to>[^>]+)>(?:,\\s*relay=(?:none|(?P<relay_host>\\S+?)\\[(?P<relay_ip>[^\\]]+)\\](?::(?P<relay_port>\\d+))?))?,\\s*delay=(?P<delay>[0-9.]+),\\s*delays=(?P<delays>\\S+),\\s*dsn=(?P<dsn>[0-9.]+),\\s*status=(?P<status>\\w+)(?:\\s*\\((?P<response>.*)\\))?$"
+    )
+    switch true {
+        workspace.pf_smtp == null { error "parse_postfix_smtp: unrecognised body: ${workspace.pf.body}" }
+        default                   { process parse_postfix_smtp_record }
+    }
+}
+
+def process parse_postfix_smtp_record {
+    workspace.limpid = {
+        class_uid:    4009,
+        category_uid: 4,
+        activity_id:  1,
+        type_uid:     400901,
+        severity_id:  postfix_severity_for_status(workspace.pf_smtp.status),
+        status_id:    postfix_status_id(workspace.pf_smtp.status),
+        email: {
+            to:          [workspace.pf_smtp.to],
+            message_uid: workspace.pf_smtp.queue_id
+        },
+        dst_endpoint: { ip: workspace.pf_smtp.relay_ip },
+        message: "Postfix smtp delivery (status=${workspace.pf_smtp.status} dsn=${workspace.pf_smtp.dsn})",
+        metadata: {
+            product: { vendor_name: "The Postfix Project", name: "Postfix" },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: postfix/smtpd — inbound SMTP daemon
+// → 4009 / Receive (success) or Receive Failure (NOQUEUE reject)
+// ---------------------------------------------------------------------------
+
+def process parse_postfix_smtpd {
+    workspace.pf_connect = regex_parse(
+        workspace.pf.body,
+        "^connect from (?P<src_host>\\S+?)\\[(?P<src_ip>[^\\]]+)\\]$"
+    )
+    workspace.pf_reject = regex_parse(
+        workspace.pf.body,
+        "^NOQUEUE: reject: RCPT from (?P<src_host>\\S+?)\\[(?P<src_ip>[^\\]]+)\\]: (?P<reason>[^;]+); from=<(?P<from>[^>]*)> to=<(?P<to>[^>]+)>"
+    )
+    switch true {
+        workspace.pf_connect != null { process parse_postfix_smtpd_connect_record }
+        workspace.pf_reject != null  { process parse_postfix_smtpd_reject_record }
+        default { error "parse_postfix_smtpd: unrecognised body: ${workspace.pf.body}" }
+    }
+}
+
+def process parse_postfix_smtpd_connect_record {
+    workspace.limpid = {
+        class_uid:    4009,
+        category_uid: 4,
+        activity_id:  2,
+        type_uid:     400902,
+        severity_id:  1,
+        status_id:    1,
+        src_endpoint: {
+            ip:       workspace.pf_connect.src_ip,
+            hostname: workspace.pf_connect.src_host
+        },
+        message: "Postfix smtpd inbound connection",
+        metadata: {
+            product: { vendor_name: "The Postfix Project", name: "Postfix" },
+            version: "1.3.0"
+        }
+    }
+}
+
+def process parse_postfix_smtpd_reject_record {
+    workspace.limpid = {
+        class_uid:    4009,
+        category_uid: 4,
+        activity_id:  2,
+        type_uid:     400902,
+        severity_id:  3,
+        status_id:    2,
+        email: {
+            from: workspace.pf_reject.from,
+            to:   [workspace.pf_reject.to]
+        },
+        src_endpoint: {
+            ip:       workspace.pf_reject.src_ip,
+            hostname: workspace.pf_reject.src_host
+        },
+        message: "Postfix smtpd reject: ${workspace.pf_reject.reason}",
+        metadata: {
+            product: { vendor_name: "The Postfix Project", name: "Postfix" },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: postfix/qmgr — message accepted into queue (envelope from sender)
+// → 4009 / Send (queued)
+// ---------------------------------------------------------------------------
+
+def process parse_postfix_qmgr {
+    workspace.pf_qmgr = regex_parse(
+        workspace.pf.body,
+        "^(?P<queue_id>[A-F0-9]+): from=<(?P<from>[^>]*)>(?:,\\s*size=(?P<size>\\d+))?(?:,\\s*nrcpt=(?P<nrcpt>\\d+))?\\s*\\((?P<state>[^)]+)\\)$"
+    )
+    switch true {
+        workspace.pf_qmgr == null { error "parse_postfix_qmgr: unrecognised body: ${workspace.pf.body}" }
+        default                   { process parse_postfix_qmgr_record }
+    }
+}
+
+def process parse_postfix_qmgr_record {
+    workspace.limpid = {
+        class_uid:    4009,
+        category_uid: 4,
+        activity_id:  1,
+        type_uid:     400901,
+        severity_id:  1,
+        status_id:    1,
+        email: {
+            from:        workspace.pf_qmgr.from,
+            message_uid: workspace.pf_qmgr.queue_id,
+            size:        to_int(workspace.pf_qmgr.size)
+        },
+        message: "Postfix qmgr ${workspace.pf_qmgr.state}",
+        metadata: {
+            product: { vendor_name: "The Postfix Project", name: "Postfix" },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: postfix/bounce — non-delivery report generated
+// → 4009 / Send Failure
+// ---------------------------------------------------------------------------
+
+def process parse_postfix_bounce {
+    workspace.pf_bounce = regex_parse(
+        workspace.pf.body,
+        "^(?P<queue_id>[A-F0-9]+): sender non-delivery notification: (?P<bounce_id>[A-F0-9]+)$"
+    )
+    switch true {
+        workspace.pf_bounce == null { error "parse_postfix_bounce: unrecognised body: ${workspace.pf.body}" }
+        default                     { process parse_postfix_bounce_record }
+    }
+}
+
+def process parse_postfix_bounce_record {
+    workspace.limpid = {
+        class_uid:    4009,
+        category_uid: 4,
+        activity_id:  1,
+        type_uid:     400901,
+        severity_id:  3,
+        status_id:    2,
+        email: {
+            message_uid: workspace.pf_bounce.queue_id
+        },
+        message: "Postfix non-delivery notification (bounce_id=${workspace.pf_bounce.bounce_id})",
+        metadata: {
+            product: { vendor_name: "The Postfix Project", name: "Postfix" },
+            version: "1.3.0"
+        }
+    }
+}
