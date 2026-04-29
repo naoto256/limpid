@@ -82,6 +82,25 @@ impl TapRegistry {
         }
     }
 
+    /// Cheap subscriber check for hot-path callers. Returns `false` if
+    /// the registry lock is contended (tap is debug-only; missing the
+    /// occasional emit during a re-registration window is fine).
+    ///
+    /// Hot-path call sites (pipeline tap-emit on every event /
+    /// per-process tap) call this *before* paying for any
+    /// `BorrowedEvent::to_owned()` on the event, since the only point
+    /// of `to_owned` in those branches is to produce an arena-detached
+    /// `OwnedEvent` for the broadcast channel.
+    pub fn is_subscribed(&self, key: &str) -> bool {
+        if let Ok(map) = self.inner.try_read()
+            && let Some(channel) = map.get(key)
+        {
+            channel.subscriber_count.load(Ordering::Relaxed) > 0
+        } else {
+            false
+        }
+    }
+
     /// Non-async emit for use in synchronous contexts (e.g. process registry).
     /// Uses try_read to avoid blocking. If the lock is contended, the event is skipped.
     pub fn try_emit(&self, key: &str, event: &Event) {
