@@ -203,19 +203,27 @@ Lighter shapes scale up from there:
 
 | Pipeline shape                              | events/sec/core |
 |---------------------------------------------|----------------:|
-| passthrough                                 |             303k |
-| `syslog.parse(ingress)`                     |             282k |
-| parse + 2× regex + if/else                  |             112k |
+| passthrough                                 |             312k |
+| `syslog.parse(ingress)`                     |             305k |
+| parse + 2× regex + if/else                  |             115k |
 | **OCSF compose + to_json (heaviest)**       |         **168k** |
 
-The numbers come from the v0.6.0 perf milestone — a per-event bump
-arena, direct `serde::Serialize` for the runtime `Value` tree,
-static-literal hash-key interning, and a boundary refactor that
-eliminated the hot-path `BorrowedEvent::to_owned()` at every output
-sink. Real I/O (`__sendto`, ~18%) and tokio scheduling (~10%) are now
-the dominant categories on the flame graph; allocation collapsed from
-43% at v0.5.7 to 15%. See the [v0.6.0 CHANGELOG entry](CHANGELOG.md)
-for the cumulative breakdown.
+Multi-pipeline configurations scale across cores via Tokio's
+multi-thread runtime: 4 independent pipelines (each its own input,
+process chain, and output) reach ~459k events/sec aggregate on the
+OCSF compose workload — 2.7× the single-pipeline number on a 16-core
+host with no application-level work-stealing or pinning.
+
+The numbers come from the v0.6.0 perf milestone (per-event bump arena,
+direct `serde::Serialize` for the runtime `Value` tree, static-literal
+hash-key interning, and a boundary refactor that eliminated the
+hot-path `BorrowedEvent::to_owned()` at every output sink) and the
+v0.6.1 follow-up (per-worker bump-arena recycling, lifting the macOS
+`xzm` zone-lock contention that capped multi-pipeline scaling). Real
+I/O (`__sendto`) and tokio scheduling are now the dominant categories
+on the flame graph; allocation collapsed from 43% at v0.5.7 to 15% on
+the single-pipeline path. See the [CHANGELOG](CHANGELOG.md) for the
+cumulative breakdown.
 
 ## Compared to rsyslog / fluentd / Vector
 

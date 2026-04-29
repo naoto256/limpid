@@ -382,13 +382,15 @@ fn run_test(config_path: &str, pipeline_name: &str, input_json: Option<&str>) ->
     // back to `SinkInput::Owned` for every output statement.
     let sinks: std::collections::HashMap<String, std::sync::Arc<dyn crate::modules::Output>> =
         std::collections::HashMap::new();
+    let mut bump = bumpalo::Bump::new();
     let result = run_pipeline(
         pipeline_def,
-        event,
+        &event,
         &compiled,
         &func_registry,
         None,
         &sinks,
+        &mut bump,
     )?;
 
     // Display trace
