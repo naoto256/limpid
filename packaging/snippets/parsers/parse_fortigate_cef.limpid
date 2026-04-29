@@ -20,8 +20,8 @@
 //     `request`, `requestMethod`, `suser`, `duser`,
 //     `deviceExternalId`, `externalId`).
 //
-// Sample input (real, anonymised — IPS detection):
-//   <129>Apr 29 15:28:35 fortigate02 CEF:0|Fortinet|Fortigate|v7.4.11|16384|utm:ips signature|7|deviceExternalId=FG... cat=utm:ips FTNTFGTsubtype=ips FTNTFGTseverity=high src=... dst=... spt=... dpt=... proto=6 act=detected FTNTFGTattack=<sig> FTNTFGTattackid=<id> msg=<text>
+// Sample input (anonymised IPS detection):
+//   <129>Apr 27 10:00:00 fw01 CEF:0|Fortinet|Fortigate|v7.4.11|16384|utm:ips signature|7|deviceExternalId=FG-EXAMPLE cat=utm:ips FTNTFGTsubtype=ips FTNTFGTseverity=high src=192.0.2.10 spt=36208 dst=198.51.100.5 dpt=9100 proto=6 act=detected FTNTFGTattack=<sig> FTNTFGTattackid=<id> msg=<text>
 //
 // Output: workspace.limpid populated to OCSF-shape; compose_ocsf takes
 // it from there.
