@@ -18,7 +18,7 @@ use crate::dsl::props;
 use crate::event::Event;
 use crate::functions::FunctionRegistry;
 use crate::metrics::{MetricsRegistry, PipelineMetrics};
-use crate::modules::{self, HasMetrics, ModuleRegistry};
+use crate::modules::{self, HasMetrics, ModuleRegistry, Output};
 use crate::pipeline::CompiledConfig;
 use crate::queue::{self, QueueConfig, QueueSender, RetryConfig};
 use crate::tap::TapRegistry;
@@ -55,6 +55,7 @@ impl Runtime {
 
         // --- 1. Create outputs (each output owns its own OutputMetrics) ---
         let mut output_senders: HashMap<String, QueueSender> = HashMap::new();
+        let mut output_sinks: HashMap<String, Arc<dyn Output>> = HashMap::new();
         let mut output_receivers = Vec::new();
 
         for (name, output_def) in &config.outputs {
@@ -89,6 +90,7 @@ impl Runtime {
             // Attach metrics so QueueSender::send counts events_received.
             sender.attach_metrics(Arc::clone(&created.metrics));
             output_senders.insert(name.clone(), sender);
+            output_sinks.insert(name.clone(), Arc::clone(&created.output));
 
             // Collect metrics handle (output owns the data, we just hold a reference)
             let output_metrics = Arc::clone(&created.metrics);
@@ -121,6 +123,7 @@ impl Runtime {
         }
 
         let output_senders = Arc::new(output_senders);
+        let output_sinks = Arc::new(output_sinks);
 
         // --- 2. Group pipelines by input ---
         //
@@ -199,6 +202,7 @@ impl Runtime {
             let workers: Arc<Vec<Arc<PipelineWorker>>> = Arc::new(pipelines);
             let ctx = PipelineContext {
                 output_senders: Arc::clone(&output_senders),
+                output_sinks: Arc::clone(&output_sinks),
                 config: Arc::clone(&config),
                 funcs: Arc::clone(&func_registry),
                 tap: tap.clone(),
@@ -373,6 +377,9 @@ pub(crate) fn init_tables(config: &CompiledConfig) -> Result<crate::functions::t
 
 struct PipelineContext {
     output_senders: Arc<HashMap<String, QueueSender>>,
+    /// Output sinks, looked up by `run_pipeline` to render a payload
+    /// against the per-event arena (memory-queue hot path).
+    output_sinks: Arc<HashMap<String, Arc<dyn Output>>>,
     config: Arc<CompiledConfig>,
     funcs: Arc<FunctionRegistry>,
     tap: TapRegistry,
@@ -422,6 +429,17 @@ async fn run_pipeline_workers(
 
     let input_tap_key = format!("input {}", input_name);
 
+    // Per-worker arena. Bump-allocator state is owned by this task and
+    // recycled via `Bump::reset()` after each event, so the underlying
+    // chunk-group is malloc'd once at task startup and stays around as
+    // long as one event's working set fits in the initial chunk.
+    // 1 MiB comfortably fits the heaviest realistic OCSF compose (the
+    // D pipeline's measured workspace tree under load is well under
+    // 256 KiB). Without enough headroom, bumpalo grows the chunk
+    // chain mid-event and `reset` then frees the excess — defeating
+    // the whole purpose of pooling.
+    let mut bump = bumpalo::Bump::with_capacity(1024 * 1024);
+
     loop {
         let event = tokio::select! {
             biased;
@@ -430,7 +448,8 @@ async fn run_pipeline_workers(
                 if *shutdown.borrow() {
                     // Drain remaining events from channel before stopping
                     while let Ok(event) = event_rx.try_recv() {
-                        process_event(&event, workers, ctx, &input_tap_key).await;
+                        process_event(&event, workers, ctx, &input_tap_key, &mut bump).await;
+                        bump.reset();
                     }
                     break;
                 }
@@ -444,7 +463,8 @@ async fn run_pipeline_workers(
                 }
             }
         };
-        process_event(&event, workers, ctx, &input_tap_key).await;
+        process_event(&event, workers, ctx, &input_tap_key, &mut bump).await;
+        bump.reset();
     }
 
     info!("pipeline worker for input '{}' stopped", input_name);
@@ -452,15 +472,33 @@ async fn run_pipeline_workers(
 
 async fn run_pipeline_with_outputs(
     pipeline: &PipelineDef,
-    event: Event,
+    event: &Event,
     ctx: &PipelineContext,
+    bump: &mut bumpalo::Bump,
 ) -> Result<crate::pipeline::PipelineRunResult> {
-    let result =
-        crate::pipeline::run_pipeline(pipeline, event, &ctx.config, &ctx.funcs, Some(&ctx.tap))?;
+    let mut result = crate::pipeline::run_pipeline(
+        pipeline,
+        event,
+        &ctx.config,
+        &ctx.funcs,
+        Some(&ctx.tap),
+        &ctx.output_sinks,
+        bump,
+    )?;
 
-    for (output_name, output_event) in &result.outputs {
-        if let Some(sender) = ctx.output_senders.get(output_name) {
-            sender.send(output_event.clone()).await;
+    // Drain the per-event outputs vec into the queues. Each output is
+    // pre-routed to either `SinkInput::Rendered` (memory queue hot
+    // path) or `SinkInput::Owned` (disk persist path) by the pipeline
+    // executor at the `output` statement.
+    //
+    // `result.had_outputs` was set inside `run_pipeline` *before* the
+    // vec was moved out here, so the downstream
+    // `events_finished` / `events_discarded` decision still observes
+    // the original semantics (Finished AND emitted ≥1 output → finished).
+    let outputs = std::mem::take(&mut result.outputs);
+    for (output_name, sink_input) in outputs {
+        if let Some(sender) = ctx.output_senders.get(&output_name) {
+            sender.send(sink_input).await;
         } else {
             error!(
                 "pipeline '{}': output '{}' not found",
@@ -477,16 +515,29 @@ async fn process_event(
     workers: &[Arc<PipelineWorker>],
     ctx: &PipelineContext,
     input_tap_key: &str,
+    bump: &mut bumpalo::Bump,
 ) {
     ctx.tap.emit(input_tap_key, event).await;
-    for worker in workers {
+    for (i, worker) in workers.iter().enumerate() {
         worker
             .metrics
             .events_received
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let event_copy = event.clone();
-        match run_pipeline_with_outputs(&worker.def, event_copy, ctx).await {
+        // Pass the event by reference. `run_pipeline` views it into
+        // the arena (read-only on the input owned form) and any DLQ
+        // path constructs a fresh `OwnedEvent` via `to_owned()` from
+        // the arena view — so multiple fan-out workers can share the
+        // same input without cloning the workspace HashMap.
+        //
+        // Reset only between fan-out workers (skip before the first):
+        // the caller's outer reset already cleared the bump for this
+        // event; the redundant inner reset on single-worker fan-out
+        // would just thrash the chunk-chain pointer for nothing.
+        if i > 0 {
+            bump.reset();
+        }
+        match run_pipeline_with_outputs(&worker.def, event, ctx, bump).await {
             Ok(result) => {
                 use crate::pipeline::PipelineTermination;
                 match result.termination {
@@ -542,7 +593,7 @@ async fn process_event(
                         }
                     }
                     PipelineTermination::Finished => {
-                        if result.outputs.is_empty() {
+                        if !result.had_outputs {
                             worker
                                 .metrics
                                 .events_discarded
@@ -647,6 +698,7 @@ mod tests {
         let cfg = CompiledConfig::from_config(parse_config("").unwrap()).unwrap();
         let ctx_a = PipelineContext {
             output_senders: Arc::new(HashMap::new()),
+            output_sinks: Arc::new(HashMap::new()),
             config: Arc::new(cfg.clone()),
             funcs: Arc::new(FunctionRegistry::new()),
             tap: tap.clone(),
@@ -654,6 +706,7 @@ mod tests {
         };
         let ctx_b = PipelineContext {
             output_senders: Arc::clone(&ctx_a.output_senders),
+            output_sinks: Arc::clone(&ctx_a.output_sinks),
             config: Arc::clone(&ctx_a.config),
             funcs: Arc::clone(&ctx_a.funcs),
             tap: tap.clone(),

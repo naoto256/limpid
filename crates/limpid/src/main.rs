@@ -377,7 +377,21 @@ fn run_test(config_path: &str, pipeline_name: &str, input_json: Option<&str>) ->
     let _ = &registry;
 
     let event = build_test_event(input_json)?;
-    let result = run_pipeline(pipeline_def, event, &compiled, &func_registry, None)?;
+    // --test-pipeline runs without a live runtime, so there are no
+    // constructed sinks. The pipeline executor handles this by falling
+    // back to `SinkInput::Owned` for every output statement.
+    let sinks: std::collections::HashMap<String, std::sync::Arc<dyn crate::modules::Output>> =
+        std::collections::HashMap::new();
+    let mut bump = bumpalo::Bump::new();
+    let result = run_pipeline(
+        pipeline_def,
+        &event,
+        &compiled,
+        &func_registry,
+        None,
+        &sinks,
+        &mut bump,
+    )?;
 
     // Display trace
     println!("=== Pipeline: {} ===", pipeline_name);
@@ -397,16 +411,26 @@ fn run_test(config_path: &str, pipeline_name: &str, input_json: Option<&str>) ->
 
     if !result.outputs.is_empty() {
         println!();
-        for (name, evt) in &result.outputs {
-            println!(
-                "[output]  → {}  egress: {}",
-                name,
-                String::from_utf8_lossy(&evt.egress)
-            );
-            if !evt.workspace.is_empty() {
-                print!("  workspace: {:?}", evt.workspace);
+        for (name, sink_input) in &result.outputs {
+            // `--test-pipeline` skips sink wiring (see above), so the
+            // pipeline always emits the `Owned` form here. The
+            // `Rendered` arm prints a placeholder for completeness.
+            match sink_input {
+                crate::queue::SinkInput::Owned(evt) => {
+                    println!(
+                        "[output]  → {}  egress: {}",
+                        name,
+                        String::from_utf8_lossy(&evt.egress)
+                    );
+                    if !evt.workspace.is_empty() {
+                        print!("  workspace: {:?}", evt.workspace);
+                    }
+                    println!();
+                }
+                crate::queue::SinkInput::Rendered(_) => {
+                    println!("[output]  → {}  (rendered payload)", name);
+                }
             }
-            println!();
         }
     }
 
@@ -484,7 +508,7 @@ fn build_test_event(input_json: Option<&str>) -> Result<Event> {
         let mut event = Event::new(Bytes::from(ingress), source);
 
         if let Some(workspace) = v.get("workspace")
-            && let Ok(crate::dsl::Value::Object(map)) =
+            && let Ok(crate::dsl::value::OwnedValue::Object(map)) =
                 crate::dsl::value_json::json_to_value(workspace)
         {
             for (k, val) in map {

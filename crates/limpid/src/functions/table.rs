@@ -38,16 +38,22 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::dsl::value::{Map, Value};
+use crate::dsl::value::{Map, OwnedValue};
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------
 // Table entry
 // ---------------------------------------------------------------------------
+//
+// Tables outlive any single per-event arena (they are global, lock-protected,
+// and survive across events), so the stored payload must be heap-owned —
+// hence `OwnedValue` rather than `Value<'bump>`. DSL primitive call sites
+// view the stored value into the active arena on lookup and convert the
+// caller's `Value<'bump>` to `OwnedValue` on upsert.
 
 struct TableEntry {
-    value: Value,
+    value: OwnedValue,
     expires_at: Option<Instant>,
 }
 
@@ -95,7 +101,7 @@ impl Table {
         self.entries.remove(key);
     }
 
-    fn upsert(&mut self, key: String, value: Value, expire: Option<Duration>) {
+    fn upsert(&mut self, key: String, value: OwnedValue, expire: Option<Duration>) {
         let expires_at = expire.map(|d| Instant::now() + d);
 
         let is_new = !self.entries.contains_key(&key);
@@ -136,7 +142,7 @@ impl Table {
 }
 
 enum LookupResult {
-    Found(Value),
+    Found(OwnedValue),
     NotFound,
     Expired,
 }
@@ -202,12 +208,15 @@ impl TableStore {
         })
     }
 
-    pub fn lookup(&self, table_name: &str, key: &str) -> Value {
+    /// Look up `key` in `table_name`, returning the heap-owned form.
+    /// Callers that need a `Value<'bump>` view should immediately
+    /// `view_in(arena)` on the result (or use [`Self::lookup_view`]).
+    pub fn lookup(&self, table_name: &str, key: &str) -> OwnedValue {
         let table_lock = match self.tables.get(table_name) {
             Some(t) => t,
             None => {
                 warn!("table_lookup: unknown table '{}'", table_name);
-                return Value::Null;
+                return OwnedValue::Null;
             }
         };
 
@@ -216,7 +225,7 @@ impl TableStore {
             let table = table_lock.read().unwrap_or_else(|e| e.into_inner());
             match table.lookup_read(key) {
                 LookupResult::Found(v) => return v,
-                LookupResult::NotFound => return Value::Null,
+                LookupResult::NotFound => return OwnedValue::Null,
                 LookupResult::Expired => {} // fall through to write lock
             }
         }
@@ -226,16 +235,34 @@ impl TableStore {
         let mut table = table_lock.write().unwrap_or_else(|e| e.into_inner());
         match table.lookup_read(key) {
             LookupResult::Found(v) => v,
-            LookupResult::NotFound => Value::Null,
+            LookupResult::NotFound => OwnedValue::Null,
             LookupResult::Expired => {
                 table.evict_expired(key);
-                Value::Null
+                OwnedValue::Null
             }
         }
     }
 
+    /// Look up `key` and return an arena-backed view of the value.
+    /// Convenience wrapper over [`Self::lookup`] for the DSL primitive
+    /// path, which always wants `Value<'bump>`.
+    pub fn lookup_view<'bump>(
+        &self,
+        arena: &crate::dsl::arena::EventArena<'bump>,
+        table_name: &str,
+        key: &str,
+    ) -> crate::dsl::value::Value<'bump> {
+        self.lookup(table_name, key).view_in(arena)
+    }
+
     /// Upsert with an explicit TTL override (None = no expiry).
-    pub fn upsert(&self, table_name: &str, key: &str, value: Value, expire: Option<Duration>) {
+    pub fn upsert(
+        &self,
+        table_name: &str,
+        key: &str,
+        value: OwnedValue,
+        expire: Option<Duration>,
+    ) {
         let table_lock = match self.tables.get(table_name) {
             Some(t) => t,
             None => {
@@ -248,7 +275,7 @@ impl TableStore {
     }
 
     /// Upsert using the table's default TTL.
-    pub fn upsert_with_default(&self, table_name: &str, key: &str, value: Value) {
+    pub fn upsert_with_default(&self, table_name: &str, key: &str, value: OwnedValue) {
         let table_lock = match self.tables.get(table_name) {
             Some(t) => t,
             None => {
@@ -286,7 +313,7 @@ pub struct TableConfig {
 // File loading (reused from the old lookup module)
 // ---------------------------------------------------------------------------
 
-fn load_file(path: &Path) -> Result<HashMap<String, Value>> {
+fn load_file(path: &Path) -> Result<HashMap<String, OwnedValue>> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     match ext {
         "json" => load_json(path),
@@ -295,7 +322,7 @@ fn load_file(path: &Path) -> Result<HashMap<String, Value>> {
     }
 }
 
-fn load_json(path: &Path) -> Result<HashMap<String, Value>> {
+fn load_json(path: &Path) -> Result<HashMap<String, OwnedValue>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     let json: serde_json::Value = serde_json::from_str(&content)
@@ -304,12 +331,12 @@ fn load_json(path: &Path) -> Result<HashMap<String, Value>> {
         .with_context(|| format!("invalid JSON shape in {}", path.display()))?;
 
     match value {
-        Value::Object(map) => Ok(map.into_iter().collect()),
+        OwnedValue::Object(map) => Ok(map.into_iter().collect()),
         _ => anyhow::bail!("table file must be a JSON object: {}", path.display()),
     }
 }
 
-fn load_csv(path: &Path) -> Result<HashMap<String, Value>> {
+fn load_csv(path: &Path) -> Result<HashMap<String, OwnedValue>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
 
@@ -328,14 +355,14 @@ fn load_csv(path: &Path) -> Result<HashMap<String, Value>> {
         }
         let key = cols[0].to_string();
         if headers.len() == 2 && cols.len() >= 2 {
-            table.insert(key, Value::String(cols[1].to_string()));
+            table.insert(key, OwnedValue::String(cols[1].into()));
         } else {
             let mut obj = Map::new();
             for (i, &header) in headers.iter().enumerate().skip(1) {
                 let val = cols.get(i).unwrap_or(&"");
-                obj.insert(header.to_string(), Value::String(val.to_string()));
+                obj.insert(header.to_string(), OwnedValue::String((*val).into()));
             }
-            table.insert(key, Value::Object(obj));
+            table.insert(key, OwnedValue::Object(obj));
         }
     }
 

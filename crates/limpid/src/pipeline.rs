@@ -1,18 +1,33 @@
 //! Pipeline engine: compiles DSL definitions into an executable pipeline
 //! and runs events through process chains.
+//!
+//! The boundary between **owned** and **borrowed (arena)** event forms
+//! is drawn at [`run_pipeline`]: the function takes an [`OwnedEvent`]
+//! (which is what the input layer / channel hands over), creates a
+//! per-event [`bumpalo::Bump`], and views the event into the arena.
+//! Everything inside the pipeline executor — eval, exec, function
+//! dispatch — operates on [`BorrowedEvent<'bump>`]. At each output sink
+//! and at each error path we cross back to the heap by calling
+//! [`BorrowedEvent::to_owned`], so the post-pipeline code (channel
+//! sends, DLQ persistence) keeps the same `OwnedEvent` shape it had
+//! before v0.6.0.
 
 use std::collections::HashMap;
 
-use crate::dsl::value::Value;
 use anyhow::{Result, bail};
 use tracing::trace;
 
+use std::sync::Arc;
+
+use crate::dsl::arena::EventArena;
 use crate::dsl::ast::*;
-use crate::dsl::eval::{eval_expr, is_truthy, values_match};
+use crate::dsl::eval::{eval_expr, is_truthy, value_to_string, values_match};
 use crate::dsl::exec::{ExecResult, ProcessError, ProcessRegistry, exec_process_body};
-use crate::event::Event;
+use crate::dsl::value::Value;
+use crate::event::{BorrowedEvent, OwnedEvent};
 use crate::functions::FunctionRegistry;
-use crate::modules::ModuleRegistry;
+use crate::modules::{ModuleRegistry, Output};
+use crate::queue::{QueueKind, SinkInput};
 use crate::tap::TapRegistry;
 
 // ---------------------------------------------------------------------------
@@ -32,6 +47,11 @@ pub struct CompiledConfig {
     /// as built-in primitives.
     pub functions: HashMap<String, FunctionDef>,
     pub global_blocks: HashMap<String, Vec<Property>>,
+    /// Per-output queue kind, derived from each output's `queue { type }`.
+    /// Drives the pipeline's output-statement dispatch: `Memory` outputs
+    /// take the render hot path (`SinkInput::Rendered`), `Disk` outputs
+    /// take the owned-event persist path (`SinkInput::Owned`).
+    pub outputs_queue_kind: HashMap<String, QueueKind>,
 }
 
 impl CompiledConfig {
@@ -82,6 +102,13 @@ impl CompiledConfig {
             global_blocks.insert(block.name, block.properties);
         }
 
+        let mut outputs_queue_kind: HashMap<String, QueueKind> = HashMap::new();
+        for (name, output_def) in &outputs {
+            let kind =
+                crate::queue::QueueConfig::kind_from_output_properties(&output_def.properties);
+            outputs_queue_kind.insert(name.clone(), kind);
+        }
+
         let compiled = Self {
             inputs,
             outputs,
@@ -89,6 +116,7 @@ impl CompiledConfig {
             pipelines,
             functions,
             global_blocks,
+            outputs_queue_kind,
         };
         Ok(compiled)
     }
@@ -117,7 +145,6 @@ impl CompiledConfig {
                         pipeline_name
                     );
                 }
-                // Detect duplicate names within a single `input a, b, ...` statement.
                 let mut seen = std::collections::HashSet::new();
                 for input_name in input_names {
                     if !self.inputs.contains_key(input_name) {
@@ -240,28 +267,26 @@ pub struct ErroredEventContext {
     /// Stringified `ProcessError` / `anyhow::Error` from the failure.
     pub reason: String,
     /// Pre-failure event with original ingress / source / received_at.
-    pub event: Event,
+    /// Heap-owned so it can outlive the per-event arena that produced it.
+    pub event: OwnedEvent,
 }
 
 impl ErroredEventContext {
     /// Serialise as a single-line JSON record for the dead-letter queue.
     ///
     /// The `event` sub-object only carries `source` / `received_at` /
-    /// `ingress` — exactly the fields `Event::from_json` (and therefore
-    /// `limpidctl inject --json`) needs to reconstruct a fresh Event.
-    /// `egress` is omitted because at the failure point it may be a
-    /// partial result of earlier processes in the chain; `workspace`
-    /// is omitted for the same reason. Replay should rebuild both
-    /// from scratch.
+    /// `ingress` — exactly the fields `OwnedEvent::from_json` (and
+    /// therefore `limpidctl inject --json`) needs to reconstruct a fresh
+    /// event. `egress` is omitted because at the failure point it may
+    /// be a partial result of earlier processes in the chain;
+    /// `workspace` is omitted for the same reason. Replay should
+    /// rebuild both from scratch.
     ///
     /// Format is operator-stable: pre-1.0 we may add new top-level
     /// fields, but `timestamp` / `reason` / `process` / `pipeline` /
     /// `event` keep their current shape so existing
     /// `jq | inject` recipes survive.
     pub fn to_jsonl(&self) -> String {
-        // Reuse `Event::to_json_value` so binary ingress survives via
-        // the `$bytes_b64` marker the rest of the JSON layer already
-        // uses for `tap --json` etc.
         let mut event_json = self.event.to_json_value();
         if let serde_json::Value::Object(ref mut map) = event_json {
             map.remove("egress");
@@ -281,7 +306,16 @@ impl ErroredEventContext {
 /// Result of running an event through a pipeline.
 pub struct PipelineRunResult {
     pub trace: Vec<TraceEntry>,
-    pub outputs: Vec<(String, Event)>,
+    pub outputs: Vec<(String, SinkInput)>,
+    /// True iff at least one `output` statement was reached during
+    /// execution (i.e. `outputs` was non-empty *before* the runtime
+    /// drained it into the per-output queues). Needed because the
+    /// runtime moves `outputs` out of this struct on the way to the
+    /// queue senders, so a later `outputs.is_empty()` check would
+    /// always see `true`. Used to distinguish
+    /// `events_finished` (Finished AND emitted ≥1 output) from
+    /// `events_discarded` (Finished AND emitted nothing).
+    pub had_outputs: bool,
     pub termination: PipelineTermination,
     /// Populated iff `termination == Errored`. The runtime layer writes
     /// this to the configured dead-letter queue (`error_log`) or, if
@@ -317,15 +351,16 @@ impl<'a> DslProcessRegistry<'a> {
 }
 
 impl ProcessRegistry for DslProcessRegistry<'_> {
-    fn call(
+    fn call<'bump>(
         &self,
         name: &str,
-        _args: &[Value],
-        event: Event,
-    ) -> std::result::Result<Option<Event>, ProcessError> {
+        _args: &[Value<'bump>],
+        event: BorrowedEvent<'bump>,
+        arena: &'bump EventArena<'bump>,
+    ) -> std::result::Result<Option<BorrowedEvent<'bump>>, ProcessError> {
         if let Some(process_def) = self.processes.get(name) {
             trace!("process '{}' (user-defined): executing", name);
-            return match exec_process_body(&process_def.body, event, self, self.funcs) {
+            return match exec_process_body(&process_def.body, event, self, self.funcs, arena) {
                 Ok(ExecResult::Continue(e)) => {
                     trace!("process '{}': ok", name);
                     self.emit_tap(name, &e);
@@ -351,49 +386,84 @@ impl ProcessRegistry for DslProcessRegistry<'_> {
 }
 
 impl DslProcessRegistry<'_> {
-    fn emit_tap(&self, process_name: &str, event: &Event) {
+    fn emit_tap<'bump>(&self, process_name: &str, event: &BorrowedEvent<'bump>) {
         if let Some(tap) = self.tap {
             let key = format!("process {}", process_name);
-            tap.try_emit(&key, event);
+            // Avoid the per-event `to_owned()` workspace clone unless a
+            // tap subscriber is actually attached. `is_subscribed`
+            // collapses to a single relaxed atomic load on the hot path
+            // (no lock when the registry isn't being mutated).
+            if tap.is_subscribed(&key) {
+                let owned = event.to_owned();
+                tap.try_emit(&key, &owned);
+            }
         }
     }
 }
 
 /// Run a single event through a pipeline definition.
+///
+/// `output_sinks` maps output names to their concrete `Output` instances
+/// so the `output` statement can call `render` directly on the per-event
+/// arena (no `to_owned()` round-trip on the workspace). Outputs that
+/// aren't in the map (or that map to a disk queue) fall back to the
+/// owned-event path.
 pub fn run_pipeline(
     pipeline: &PipelineDef,
-    event: Event,
+    event: &OwnedEvent,
     config: &CompiledConfig,
     funcs: &FunctionRegistry,
     tap: Option<&TapRegistry>,
+    output_sinks: &HashMap<String, Arc<dyn Output>>,
+    bump: &mut bumpalo::Bump,
 ) -> Result<PipelineRunResult> {
     let registry = DslProcessRegistry::new(&config.processes, funcs, tap);
     let mut trace_entries = Vec::new();
     let mut outputs = Vec::new();
 
-    // Log initial state
+    // Log initial state — formatted from `event` while it's still in
+    // owned form, before we view it into the arena.
     trace_entries.push(TraceEntry {
         stage: "input".into(),
         label: String::new(),
         detail: format!("ingress: {}", String::from_utf8_lossy(&event.ingress)),
     });
 
+    // Per-event arena. The entire `Value` tree built during execution
+    // (HashLits, parser outputs, workspace mutations) lives in `bump`
+    // and is reset to offset zero by the caller after this function
+    // returns — see `runtime::run_pipeline_workers`. The `Bump` itself
+    // is owned by the per-input pipeline-worker task and reused
+    // across events, so the underlying chunk-group is malloc'd once
+    // at task startup and never again on the hot path. This
+    // eliminates the xzm-zone-lock contention that capped
+    // multi-pipeline scaling at ~2.4× / 4 cores on v0.6.0 (where
+    // every event called `Bump::new` and the system allocator
+    // serialised concurrent malloc/free across pipelines).
+    let arena = EventArena::new(bump);
+    let bevent = event.view_in(&arena);
+
     let mut errored: Option<ErroredEventContext> = None;
     let exec_ctx = PipelineExecCtx {
         pipeline_name: &pipeline.name,
         registry: &registry,
         funcs,
+        arena: &arena,
+        outputs_queue_kind: &config.outputs_queue_kind,
+        output_sinks,
     };
     let mut exec_out = PipelineExecOut {
         trace: &mut trace_entries,
         outputs: &mut outputs,
         errored: &mut errored,
     };
-    let (_, termination) = exec_pipeline_body(&pipeline.body, event, &exec_ctx, &mut exec_out)?;
+    let (_, termination) = exec_pipeline_body(&pipeline.body, bevent, &exec_ctx, &mut exec_out)?;
 
+    let had_outputs = !outputs.is_empty();
     Ok(PipelineRunResult {
         trace: trace_entries,
         outputs,
+        had_outputs,
         termination,
         errored,
     })
@@ -403,10 +473,22 @@ pub fn run_pipeline(
 ///
 /// `pipeline_name` is here purely so a process-runtime error can
 /// populate the [`ErroredEventContext`] surfaced in [`PipelineExecOut::errored`].
-struct PipelineExecCtx<'a> {
+///
+/// `arena` is the per-event bump arena — the same one
+/// `run_pipeline` opened on the stack. The reference itself is held at
+/// `'bump` so closures and primitive impls allocating into it can
+/// produce values that live for the rest of the pipeline body.
+struct PipelineExecCtx<'a, 'bump: 'a> {
     pipeline_name: &'a str,
     registry: &'a DslProcessRegistry<'a>,
     funcs: &'a FunctionRegistry,
+    arena: &'bump EventArena<'bump>,
+    /// Queue kind per output (Memory → render hot path,
+    /// Disk → owned-event persist path).
+    outputs_queue_kind: &'a HashMap<String, QueueKind>,
+    /// Concrete `Output` instances looked up at the `output` statement
+    /// to render a sink-specific payload from the borrowed event.
+    output_sinks: &'a HashMap<String, Arc<dyn Output>>,
 }
 
 /// Mutable accumulators threaded through the pipeline executor:
@@ -414,20 +496,23 @@ struct PipelineExecCtx<'a> {
 /// context. Bundled together to keep the recursive helpers under
 /// clippy's `too_many_arguments` threshold and to make the executor's
 /// "what comes out" surface explicit.
+///
+/// Outputs and errored contexts are heap-owned — they cross the
+/// per-event arena boundary on the way out of `run_pipeline`.
 struct PipelineExecOut<'a> {
     trace: &'a mut Vec<TraceEntry>,
-    outputs: &'a mut Vec<(String, Event)>,
+    outputs: &'a mut Vec<(String, SinkInput)>,
     errored: &'a mut Option<ErroredEventContext>,
 }
 
 /// Execute a pipeline body (sequence of pipeline statements).
 /// Returns (remaining event if any, how the pipeline terminated).
-fn exec_pipeline_body(
+fn exec_pipeline_body<'bump>(
     stmts: &[PipelineStatement],
-    mut event: Event,
-    ctx: &PipelineExecCtx,
-    out: &mut PipelineExecOut,
-) -> Result<(Option<Event>, PipelineTermination)> {
+    mut event: BorrowedEvent<'bump>,
+    ctx: &PipelineExecCtx<'_, 'bump>,
+    out: &mut PipelineExecOut<'_>,
+) -> Result<(Option<BorrowedEvent<'bump>>, PipelineTermination)> {
     for stmt in stmts {
         match exec_pipeline_stmt(stmt, event, ctx, out)? {
             (Some(e), _) => event = e,
@@ -437,12 +522,12 @@ fn exec_pipeline_body(
     Ok((Some(event), PipelineTermination::Finished))
 }
 
-fn exec_pipeline_stmt(
+fn exec_pipeline_stmt<'bump>(
     stmt: &PipelineStatement,
-    event: Event,
-    ctx: &PipelineExecCtx,
-    out: &mut PipelineExecOut,
-) -> Result<(Option<Event>, PipelineTermination)> {
+    event: BorrowedEvent<'bump>,
+    ctx: &PipelineExecCtx<'_, 'bump>,
+    out: &mut PipelineExecOut<'_>,
+) -> Result<(Option<BorrowedEvent<'bump>>, PipelineTermination)> {
     let cont = |event| Ok((Some(event), PipelineTermination::Finished));
     let dropped = || Ok((None, PipelineTermination::Dropped));
     let finished = || Ok((None, PipelineTermination::Finished));
@@ -455,7 +540,7 @@ fn exec_pipeline_stmt(
             // error_log via PipelineTermination::Errored, mirroring how
             // a process-level Err lands in the DLQ.
             let msg = match msg_expr {
-                Some(e) => crate::dsl::eval::value_to_string(&eval_expr(e, &event, ctx.funcs)?),
+                Some(e) => value_to_string(&eval_expr(e, &event, ctx.funcs, ctx.arena)?),
                 None => "explicit error routing".to_string(),
             };
             tracing::warn!(
@@ -468,12 +553,15 @@ fn exec_pipeline_stmt(
                 label: msg.clone(),
                 detail: "event → error_log".into(),
             });
+            // Cross to owned form for the DLQ context (which must
+            // outlive the per-event arena).
+            let owned = event.to_owned();
             *out.errored = Some(ErroredEventContext {
                 timestamp: chrono::Utc::now(),
                 pipeline: ctx.pipeline_name.to_string(),
                 process: "(pipeline)".to_string(),
                 reason: msg,
-                event,
+                event: owned,
             });
             Ok((None, PipelineTermination::Errored))
         }
@@ -483,31 +571,34 @@ fn exec_pipeline_stmt(
             for element in chain {
                 match element {
                     ProcessChainElement::Named(name, args) => {
-                        let evaluated_args: Vec<Value> = args
+                        let mut evaluated_args = bumpalo::collections::Vec::with_capacity_in(
+                            args.len(),
+                            ctx.arena.bump(),
+                        );
+                        for a in args {
+                            evaluated_args.push(eval_expr(a, &current, ctx.funcs, ctx.arena)?);
+                        }
+                        let arg_repr: Vec<String> = evaluated_args
                             .iter()
-                            .map(|a| eval_expr(a, &current, ctx.funcs))
-                            .collect::<Result<Vec<_>>>()?;
+                            .map(|v| v.to_string())
+                            .collect();
 
-                        // Snapshot before consumption — registry.call
-                        // takes Event by value and the Err arm needs
-                        // the original to populate the DLQ context.
-                        let backup = current.clone();
-                        match ctx.registry.call(name, &evaluated_args, current) {
+                        // Snapshot the heap-owned form before the
+                        // registry consumes the borrowed event — the
+                        // Err arm needs a stable, arena-independent
+                        // event for the DLQ context.
+                        let backup_owned = current.to_owned();
+                        match ctx
+                            .registry
+                            .call(name, &evaluated_args, current, ctx.arena)
+                        {
                             Ok(Some(e)) => {
                                 out.trace.push(TraceEntry {
                                     stage: "process".into(),
                                     label: if args.is_empty() {
                                         name.clone()
                                     } else {
-                                        format!(
-                                            "{}({})",
-                                            name,
-                                            evaluated_args
-                                                .iter()
-                                                .map(|a| a.to_string())
-                                                .collect::<Vec<_>>()
-                                                .join(", ")
-                                        )
+                                        format!("{}({})", name, arg_repr.join(", "))
                                     },
                                     detail: "ok".into(),
                                 });
@@ -537,15 +628,15 @@ fn exec_pipeline_stmt(
                                     pipeline: ctx.pipeline_name.to_string(),
                                     process: name.clone(),
                                     reason: e.to_string(),
-                                    event: backup,
+                                    event: backup_owned,
                                 });
                                 return Ok((None, PipelineTermination::Errored));
                             }
                         }
                     }
                     ProcessChainElement::Inline(body) => {
-                        let backup = current.clone();
-                        match exec_process_body(body, current, ctx.registry, ctx.funcs) {
+                        let backup_owned = current.to_owned();
+                        match exec_process_body(body, current, ctx.registry, ctx.funcs, ctx.arena) {
                             Ok(ExecResult::Continue(e)) => {
                                 out.trace.push(TraceEntry {
                                     stage: "process".into(),
@@ -574,7 +665,7 @@ fn exec_pipeline_stmt(
                                     pipeline: ctx.pipeline_name.to_string(),
                                     process: "(inline)".to_string(),
                                     reason: e.to_string(),
-                                    event: backup,
+                                    event: backup_owned,
                                 });
                                 return Ok((None, PipelineTermination::Errored));
                             }
@@ -592,7 +683,40 @@ fn exec_pipeline_stmt(
                 label: format!("→ {}", name),
                 detail: String::new(),
             });
-            out.outputs.push((name.clone(), event.clone()));
+            // Pick render hot-path or owned persist-path based on the
+            // output's queue type. Memory queues take a sink-specific
+            // `RenderedPayload` built against the per-event arena;
+            // disk-persist queues take an `OwnedEvent` because the
+            // payload must outlive the arena and survive a process
+            // restart via JSONL serialisation.
+            let kind = ctx
+                .outputs_queue_kind
+                .get(name)
+                .copied()
+                .unwrap_or(QueueKind::Memory);
+            let sink_input = match kind {
+                QueueKind::Disk => SinkInput::Owned(event.to_owned()),
+                QueueKind::Memory => match ctx.output_sinks.get(name) {
+                    Some(sink) => match sink.render(&event, ctx.arena) {
+                        Ok(payload) => SinkInput::Rendered(payload),
+                        Err(e) => {
+                            tracing::warn!(
+                                "output '{}': render failed ({}); falling back to owned-event path",
+                                name,
+                                e
+                            );
+                            SinkInput::Owned(event.to_owned())
+                        }
+                    },
+                    None => {
+                        // No registered sink (e.g. tests, --test-pipeline,
+                        // or --check). Fall back to the owned-event form
+                        // so callers can still inspect outputs.
+                        SinkInput::Owned(event.to_owned())
+                    }
+                },
+            };
+            out.outputs.push((name.clone(), sink_input));
             cont(event)
         }
 
@@ -619,12 +743,17 @@ fn exec_pipeline_stmt(
         PipelineStatement::If(if_chain) => exec_pipeline_if(if_chain, event, ctx, out),
 
         PipelineStatement::Switch(discriminant, arms) => {
-            let disc_val = eval_expr(discriminant, &event, ctx.funcs)?;
+            let disc_val = eval_expr(discriminant, &event, ctx.funcs, ctx.arena)?;
             for arm in arms {
                 if arm.pattern.is_none() {
                     return exec_pipeline_branch_body(&arm.body, event, ctx, out);
                 }
-                let pattern_val = eval_expr(arm.pattern.as_ref().unwrap(), &event, ctx.funcs)?;
+                let pattern_val = eval_expr(
+                    arm.pattern.as_ref().unwrap(),
+                    &event,
+                    ctx.funcs,
+                    ctx.arena,
+                )?;
                 if values_match(&disc_val, &pattern_val) {
                     return exec_pipeline_branch_body(&arm.body, event, ctx, out);
                 }
@@ -634,14 +763,14 @@ fn exec_pipeline_stmt(
     }
 }
 
-fn exec_pipeline_if(
+fn exec_pipeline_if<'bump>(
     if_chain: &IfChain,
-    event: Event,
-    ctx: &PipelineExecCtx,
-    out: &mut PipelineExecOut,
-) -> Result<(Option<Event>, PipelineTermination)> {
+    event: BorrowedEvent<'bump>,
+    ctx: &PipelineExecCtx<'_, 'bump>,
+    out: &mut PipelineExecOut<'_>,
+) -> Result<(Option<BorrowedEvent<'bump>>, PipelineTermination)> {
     for (condition, body) in &if_chain.branches {
-        let cond_val = eval_expr(condition, &event, ctx.funcs)?;
+        let cond_val = eval_expr(condition, &event, ctx.funcs, ctx.arena)?;
         if is_truthy(&cond_val) {
             return exec_pipeline_branch_body(body, event, ctx, out);
         }
@@ -652,12 +781,12 @@ fn exec_pipeline_if(
     Ok((Some(event), PipelineTermination::Finished))
 }
 
-fn exec_pipeline_branch_body(
+fn exec_pipeline_branch_body<'bump>(
     body: &[BranchBody],
-    mut event: Event,
-    ctx: &PipelineExecCtx,
-    out: &mut PipelineExecOut,
-) -> Result<(Option<Event>, PipelineTermination)> {
+    mut event: BorrowedEvent<'bump>,
+    ctx: &PipelineExecCtx<'_, 'bump>,
+    out: &mut PipelineExecOut<'_>,
+) -> Result<(Option<BorrowedEvent<'bump>>, PipelineTermination)> {
     for item in body {
         match item {
             BranchBody::Pipeline(stmt) => match exec_pipeline_stmt(stmt, event, ctx, out)? {
@@ -733,7 +862,7 @@ def pipeline p {
         // raises `unknown identifier: timestamp` which must surface as
         // an ErroredEventContext on the run result, with the original
         // ingress preserved for replay via `inject --json`.
-        use crate::event::Event;
+        use crate::event::OwnedEvent;
         use crate::functions::{FunctionRegistry, register_builtins, table::TableStore};
         use bytes::Bytes;
         use std::net::SocketAddr;
@@ -755,11 +884,12 @@ def pipeline p {
         let mut funcs = FunctionRegistry::new();
         let store = TableStore::from_configs(vec![]).unwrap();
         register_builtins(&mut funcs, store);
-        let event = Event::new(
+        let event = OwnedEvent::new(
             Bytes::from_static(b"original payload"),
             "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         );
-        let result = run_pipeline(pipeline, event, &cfg, &funcs, None).unwrap();
+        let sinks: HashMap<String, Arc<dyn Output>> = HashMap::new();
+        let result = run_pipeline(pipeline, &event, &cfg, &funcs, None, &sinks, &mut bumpalo::Bump::new()).unwrap();
         assert_eq!(result.termination, PipelineTermination::Errored);
         let ctx = result.errored.expect("errored context must be populated");
         assert_eq!(ctx.pipeline, "p");
@@ -770,9 +900,7 @@ def pipeline p {
             ctx.reason
         );
         assert_eq!(&ctx.event.ingress[..], b"original payload");
-        // Outputs must be empty — the failure path doesn't reach them.
         assert!(result.outputs.is_empty());
-        // JSONL serialisation includes all the identifying fields.
         let line = ctx.to_jsonl();
         assert!(line.contains("\"pipeline\":\"p\""));
         assert!(line.contains("\"process\":\"wrap\""));
@@ -785,7 +913,7 @@ def pipeline p {
         // same way a runtime process error does — PipelineTermination::Errored,
         // ErroredEventContext populated with the rendered message,
         // and outputs empty.
-        use crate::event::Event;
+        use crate::event::OwnedEvent;
         use crate::functions::{FunctionRegistry, register_builtins, table::TableStore};
         use bytes::Bytes;
         use std::net::SocketAddr;
@@ -807,11 +935,12 @@ def pipeline p {
         let mut funcs = FunctionRegistry::new();
         let store = TableStore::from_configs(vec![]).unwrap();
         register_builtins(&mut funcs, store);
-        let event = Event::new(
+        let event = OwnedEvent::new(
             Bytes::from_static(b"payload"),
             "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         );
-        let result = run_pipeline(pipeline, event, &cfg, &funcs, None).unwrap();
+        let sinks: HashMap<String, Arc<dyn Output>> = HashMap::new();
+        let result = run_pipeline(pipeline, &event, &cfg, &funcs, None, &sinks, &mut bumpalo::Bump::new()).unwrap();
         assert_eq!(result.termination, PipelineTermination::Errored);
         let ctx = result.errored.expect("errored context must be populated");
         assert_eq!(ctx.pipeline, "p");
@@ -830,7 +959,7 @@ def pipeline p {
         // ErroredEventContext with `process = "(pipeline)"` so DLQ
         // entries from pipeline-level routing are distinguishable
         // from process-body failures.
-        use crate::event::Event;
+        use crate::event::OwnedEvent;
         use crate::functions::{FunctionRegistry, register_builtins, table::TableStore};
         use bytes::Bytes;
         use std::net::SocketAddr;
@@ -849,11 +978,12 @@ def pipeline p {
         let mut funcs = FunctionRegistry::new();
         let store = TableStore::from_configs(vec![]).unwrap();
         register_builtins(&mut funcs, store);
-        let event = Event::new(
+        let event = OwnedEvent::new(
             Bytes::from_static(b"payload"),
             "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         );
-        let result = run_pipeline(pipeline, event, &cfg, &funcs, None).unwrap();
+        let sinks: HashMap<String, Arc<dyn Output>> = HashMap::new();
+        let result = run_pipeline(pipeline, &event, &cfg, &funcs, None, &sinks, &mut bumpalo::Bump::new()).unwrap();
         assert_eq!(result.termination, PipelineTermination::Errored);
         let ctx = result.errored.expect("errored context must be populated");
         assert_eq!(ctx.pipeline, "p");

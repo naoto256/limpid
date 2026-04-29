@@ -10,6 +10,9 @@ pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(
         "lower",
         FunctionSig::fixed(&[FieldType::String], FieldType::String),
-        |args, _event| Ok(Value::String(val_to_str(&args[0])?.to_lowercase())),
+        |arena, args, _event| {
+            let s = val_to_str(&args[0])?.to_lowercase();
+            Ok(Value::String(arena.alloc_str(&s)))
+        },
     );
 }

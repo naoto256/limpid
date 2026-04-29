@@ -25,11 +25,16 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::sync::Mutex;
 
+use crate::dsl::arena::EventArena;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
-use crate::event::Event;
+use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
-use crate::modules::{HasMetrics, Module, Output};
+use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
+
+struct HttpPayload {
+    msg: String,
+}
 
 /// Shared state between write() and the flush timer task.
 struct Inner {
@@ -178,8 +183,22 @@ impl HasMetrics for HttpOutput {
 
 #[async_trait::async_trait]
 impl Output for HttpOutput {
-    async fn write(&self, event: &Event) -> Result<()> {
+    fn render(
+        &self,
+        event: &BorrowedEvent<'_>,
+        _arena: &EventArena<'_>,
+    ) -> Result<RenderedPayload> {
+        // The HTTP body is text — building the `String` here (a small,
+        // unavoidable allocation for the request body) keeps the
+        // serialisation cost on the pipeline thread instead of the
+        // sink consumer thread, but does not duplicate any work.
         let msg = String::from_utf8_lossy(&event.egress).into_owned();
+        Ok(RenderedPayload::new(HttpPayload { msg }))
+    }
+
+    async fn write(&self, payload: RenderedPayload) -> Result<()> {
+        let payload: HttpPayload = payload.downcast()?;
+        let msg = payload.msg;
 
         if self.batch_size <= 1 {
             self.inner.send_batch(&[msg]).await?;
