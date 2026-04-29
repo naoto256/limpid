@@ -169,17 +169,22 @@ mod tests {
     fn call(target: &str, pattern: &str) -> Value {
         let reg = make_reg();
         let e = dummy_event();
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         reg.call(
             None,
             "regex_parse",
             &[Value::String(target.into()), Value::String(pattern.into())],
             &e,
+            &arena,
         )
         .unwrap()
     }
 
     #[test]
     fn regex_parse_single_named_capture() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let v = call("hello", r"(?P<h>\w+)");
         let Value::Object(m) = v else { panic!() };
         assert_eq!(m["h"], Value::String("hello".into()));
@@ -187,6 +192,8 @@ mod tests {
 
     #[test]
     fn regex_parse_multiple_flat_names() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let v = call("foo bar", r"(?P<a>\w+)\s+(?P<b>\w+)");
         let Value::Object(m) = v else { panic!() };
         assert_eq!(m["a"], Value::String("foo".into()));
@@ -195,6 +202,8 @@ mod tests {
 
     #[test]
     fn regex_parse_dotted_creates_nested() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let v = call("Apr", r"(?P<date.month>\w{3})");
         let Value::Object(m) = v else { panic!() };
         let Value::Object(date) = &m["date"] else {
@@ -205,6 +214,8 @@ mod tests {
 
     #[test]
     fn regex_parse_deep_nested() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let v = call("xyz", r"(?P<a.b.c>\w+)");
         let Value::Object(m) = v else { panic!() };
         let Value::Object(a) = &m["a"] else { panic!() };
@@ -214,6 +225,8 @@ mod tests {
 
     #[test]
     fn regex_parse_sibling_nested() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let v = call("Apr 24", r"(?P<date.month>\w{3})\s+(?P<date.day>\d+)");
         let Value::Object(m) = v else { panic!() };
         let Value::Object(date) = &m["date"] else {
@@ -225,12 +238,16 @@ mod tests {
 
     #[test]
     fn regex_parse_no_match_returns_null() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let v = call("nothing here", r"(?P<n>\d+)");
         assert_eq!(v, Value::Null);
     }
 
     #[test]
     fn regex_parse_no_named_captures_returns_empty_object() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // Only positional groups → empty object (bare statement no-op).
         let v = call("hello world", r"(\w+)\s+(\w+)");
         let Value::Object(m) = v else {
@@ -241,6 +258,8 @@ mod tests {
 
     #[test]
     fn regex_parse_ignores_positional_groups() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let v = call("foo-42", r"(?P<named>\w+)-(\d+)");
         let Value::Object(m) = v else { panic!() };
         assert_eq!(m["named"], Value::String("foo".into()));
@@ -249,6 +268,8 @@ mod tests {
 
     #[test]
     fn regex_parse_rejects_invalid_regex() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let err = reg
@@ -257,6 +278,7 @@ mod tests {
                 "regex_parse",
                 &[Value::String("x".into()), Value::String("(?P<bad>".into())],
                 &e,
+                &arena,
             )
             .unwrap_err();
         assert!(err.to_string().contains("invalid regex"));
@@ -264,6 +286,8 @@ mod tests {
 
     #[test]
     fn regex_parse_accepts_angle_bracket_form() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // `(?<name>…)` (no `P`) is accepted by regex / regex-lite and
         // must be mangled the same way.
         let v = call("hi", r"(?<g.h>\w+)");

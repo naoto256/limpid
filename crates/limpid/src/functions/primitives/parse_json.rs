@@ -107,6 +107,8 @@ mod tests {
 
     #[test]
     fn parses_object() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let result = reg
@@ -115,6 +117,7 @@ mod tests {
                 "parse_json",
                 &[Value::String(r#"{"a":1,"b":"x"}"#.into())],
                 &e,
+                &arena,
             )
             .unwrap();
         let Value::Object(m) = result else {
@@ -126,10 +129,18 @@ mod tests {
 
     #[test]
     fn wraps_non_object_under_underscore_json() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let result = reg
-            .call(None, "parse_json", &[Value::String("[1,2,3]".into())], &e)
+            .call(
+                None,
+                "parse_json",
+                &[Value::String("[1,2,3]".into())],
+                &e,
+                &arena,
+            )
             .unwrap();
         let Value::Object(m) = result else {
             panic!("expected Object")
@@ -139,16 +150,26 @@ mod tests {
 
     #[test]
     fn rejects_invalid_json() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let err = reg
-            .call(None, "parse_json", &[Value::String("not json".into())], &e)
+            .call(
+                None,
+                "parse_json",
+                &[Value::String("not json".into())],
+                &e,
+                &arena,
+            )
             .unwrap_err();
         assert!(err.to_string().contains("JSON parse error"));
     }
 
     #[test]
     fn defaults_fill_missing_keys() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let defaults = Value::Object(
@@ -165,6 +186,7 @@ mod tests {
                 "parse_json",
                 &[Value::String(r#"{"user":"alice"}"#.into()), defaults],
                 &e,
+                &arena,
             )
             .unwrap();
         let Value::Object(m) = result else {
@@ -178,6 +200,8 @@ mod tests {
 
     #[test]
     fn defaults_null_is_ok() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let result = reg
@@ -186,6 +210,7 @@ mod tests {
                 "parse_json",
                 &[Value::String(r#"{"x":1}"#.into()), Value::Null],
                 &e,
+                &arena,
             )
             .unwrap();
         assert!(result.is_object());
@@ -193,8 +218,10 @@ mod tests {
 
     #[test]
     fn rejects_wrong_arity() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
-        assert!(reg.call(None, "parse_json", &[], &e).is_err());
+        assert!(reg.call(None, "parse_json", &[], &e, &arena).is_err());
     }
 }

@@ -81,6 +81,8 @@ mod tests {
 
     #[test]
     fn prepends_pri_when_missing() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let r = reg
@@ -89,6 +91,7 @@ mod tests {
                 "set_pri",
                 &[Value::String("hello".into()), Value::Int(16), Value::Int(6)],
                 &e,
+                &arena,
             )
             .unwrap();
         // 16*8+6 = 134
@@ -97,6 +100,8 @@ mod tests {
 
     #[test]
     fn rewrites_existing_pri() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let r = reg
@@ -109,6 +114,7 @@ mod tests {
                     Value::Int(6),
                 ],
                 &e,
+                &arena,
             )
             .unwrap();
         assert_eq!(r, Value::String("<134>body".into()));
@@ -116,6 +122,8 @@ mod tests {
 
     #[test]
     fn leaves_invalid_pri_as_body() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // `<abc>` is not a real PRI — treat the whole string as body.
         let reg = make_reg();
         let e = dummy_event();
@@ -129,6 +137,7 @@ mod tests {
                     Value::Int(6),
                 ],
                 &e,
+                &arena,
             )
             .unwrap();
         assert_eq!(r, Value::String("<134><abc>body".into()));
@@ -136,6 +145,8 @@ mod tests {
 
     #[test]
     fn rejects_out_of_range_facility() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let err = reg
@@ -144,6 +155,7 @@ mod tests {
                 "set_pri",
                 &[Value::String("msg".into()), Value::Int(99), Value::Int(0)],
                 &e,
+                &arena,
             )
             .unwrap_err();
         assert!(err.to_string().contains("facility must be 0-23"));
@@ -151,6 +163,8 @@ mod tests {
 
     #[test]
     fn rejects_out_of_range_severity() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let err = reg
@@ -159,6 +173,7 @@ mod tests {
                 "set_pri",
                 &[Value::String("msg".into()), Value::Int(1), Value::Int(8)],
                 &e,
+                &arena,
             )
             .unwrap_err();
         assert!(err.to_string().contains("severity must be 0-7"));

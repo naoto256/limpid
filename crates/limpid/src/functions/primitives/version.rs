@@ -28,13 +28,15 @@ mod tests {
 
     #[test]
     fn returns_compile_time_version() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let mut reg = FunctionRegistry::new();
         register(&mut reg);
         let e = Event::new(
             Bytes::from("test"),
             "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         );
-        let v = reg.call(None, "version", &[], &e).unwrap();
+        let v = reg.call(None, "version", &[], &e, &arena).unwrap();
         let Value::String(s) = v else { panic!() };
         assert_eq!(s, env!("CARGO_PKG_VERSION"));
     }

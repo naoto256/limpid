@@ -192,6 +192,8 @@ mod tests {
 
     #[test]
     fn parses_basic_cef() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let r = reg
@@ -202,7 +204,8 @@ mod tests {
                     "CEF:0|Fortinet|FortiGate|7.0|1234|Firewall event|5|src=10.0.0.1 dst=10.0.0.2 act=deny".into(),
                 )],
                 &e,
-            )
+            &arena,
+        )
             .unwrap();
         let Value::Object(m) = r else { panic!() };
         assert_eq!(m["version"], Value::String("0".into()));
@@ -217,6 +220,8 @@ mod tests {
 
     #[test]
     fn severity_falls_back_to_string_on_garbage() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let r = reg
@@ -225,6 +230,7 @@ mod tests {
                 "parse",
                 &[Value::String("CEF:0|V|P|1|1|N|High|".into())],
                 &e,
+                &arena,
             )
             .unwrap();
         let Value::Object(m) = r else { panic!() };
@@ -233,6 +239,8 @@ mod tests {
 
     #[test]
     fn rejects_syslog_prefix() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // CEF must be at position 0; syslog wrapper handling is the
         // caller's responsibility (typically `cef.parse(workspace.syslog.msg)`).
         let reg = make_reg();
@@ -245,6 +253,7 @@ mod tests {
                     "<134>CEF:0|Security|IDS|1.0|100|Attack|8|src=192.168.1.1".into(),
                 )],
                 &e,
+                &arena,
             )
             .unwrap_err();
         assert!(err.to_string().contains("does not start with `CEF:`"));
@@ -252,6 +261,8 @@ mod tests {
 
     #[test]
     fn errors_on_missing_header() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let err = reg
@@ -260,6 +271,7 @@ mod tests {
                 "parse",
                 &[Value::String("not a CEF message".into())],
                 &e,
+                &arena,
             )
             .unwrap_err();
         assert!(err.to_string().contains("does not start with `CEF:`"));
@@ -267,6 +279,8 @@ mod tests {
 
     #[test]
     fn errors_on_incomplete_header() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let err = reg
@@ -275,6 +289,7 @@ mod tests {
                 "parse",
                 &[Value::String("CEF:0|only|two".into())],
                 &e,
+                &arena,
             )
             .unwrap_err();
         assert!(err.to_string().contains("incomplete CEF header"));
@@ -282,6 +297,8 @@ mod tests {
 
     #[test]
     fn defaults_fill_missing_keys() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let defaults = Value::Object(
@@ -298,6 +315,7 @@ mod tests {
                     defaults,
                 ],
                 &e,
+                &arena,
             )
             .unwrap();
         let Value::Object(m) = r else { panic!() };

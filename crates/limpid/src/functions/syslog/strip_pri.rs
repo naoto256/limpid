@@ -49,6 +49,8 @@ mod tests {
 
     #[test]
     fn removes_valid_header() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let r = reg
@@ -57,6 +59,7 @@ mod tests {
                 "strip_pri",
                 &[Value::String("<185>hello".into())],
                 &e,
+                &arena,
             )
             .unwrap();
         assert_eq!(r, Value::String("hello".into()));
@@ -64,6 +67,8 @@ mod tests {
 
     #[test]
     fn passthrough_when_no_pri() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let r = reg
@@ -72,6 +77,7 @@ mod tests {
                 "strip_pri",
                 &[Value::String("hello".into())],
                 &e,
+                &arena,
             )
             .unwrap();
         assert_eq!(r, Value::String("hello".into()));
@@ -79,6 +85,8 @@ mod tests {
 
     #[test]
     fn rejects_non_digit_pri() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // `<abc>` is not valid — leave unchanged
         let reg = make_reg();
         let e = dummy_event();
@@ -88,6 +96,7 @@ mod tests {
                 "strip_pri",
                 &[Value::String("<abc>hi".into())],
                 &e,
+                &arena,
             )
             .unwrap();
         assert_eq!(r, Value::String("<abc>hi".into()));
@@ -95,8 +104,13 @@ mod tests {
 
     #[test]
     fn rejects_wrong_arity() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
-        assert!(reg.call(Some("syslog"), "strip_pri", &[], &e).is_err());
+        assert!(
+            reg.call(Some("syslog"), "strip_pri", &[], &e, &arena)
+                .is_err()
+        );
     }
 }

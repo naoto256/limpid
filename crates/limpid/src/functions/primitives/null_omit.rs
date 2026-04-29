@@ -109,6 +109,8 @@ mod tests {
 
     #[test]
     fn flat_object_strips_null_keys() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let input = obj(&[
             ("a", Value::Int(1)),
@@ -116,20 +118,22 @@ mod tests {
             ("c", Value::Int(3)),
         ]);
         let out = reg
-            .call(None, "null_omit", &[input], &dummy_event())
+            .call(None, "null_omit", &[input], &dummy_event(), &arena)
             .unwrap();
         assert_eq!(out, obj(&[("a", Value::Int(1)), ("c", Value::Int(3))]));
     }
 
     #[test]
     fn nested_object_strips_null_at_every_depth() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let input = obj(&[
             ("a", Value::Int(1)),
             ("b", obj(&[("c", Value::Null), ("d", Value::Int(2))])),
         ]);
         let out = reg
-            .call(None, "null_omit", &[input], &dummy_event())
+            .call(None, "null_omit", &[input], &dummy_event(), &arena)
             .unwrap();
         assert_eq!(
             out,
@@ -139,6 +143,8 @@ mod tests {
 
     #[test]
     fn array_keeps_null_elements_intact() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // Arrays are not compacted: a `Null` element survives so the
         // array length and the parser's intent stay visible. The
         // function name advertises "omit null *keys*", not "compact
@@ -150,7 +156,7 @@ mod tests {
             Value::Array(vec![Value::Int(1), Value::Null, Value::Int(3)]),
         )]);
         let out = reg
-            .call(None, "null_omit", &[input], &dummy_event())
+            .call(None, "null_omit", &[input], &dummy_event(), &arena)
             .unwrap();
         assert_eq!(
             out,
@@ -163,6 +169,8 @@ mod tests {
 
     #[test]
     fn empty_object_after_strip_is_kept() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // `{a: 1, b: {c: null}}` → `{a: 1, b: {}}`: the inner Object
         // becomes empty after stripping `c`, but it stays as `{}` rather
         // than being recursively dropped. Operators may have intentional
@@ -171,19 +179,21 @@ mod tests {
         let reg = make_reg();
         let input = obj(&[("a", Value::Int(1)), ("b", obj(&[("c", Value::Null)]))]);
         let out = reg
-            .call(None, "null_omit", &[input], &dummy_event())
+            .call(None, "null_omit", &[input], &dummy_event(), &arena)
             .unwrap();
         assert_eq!(out, obj(&[("a", Value::Int(1)), ("b", obj(&[]))]));
     }
 
     #[test]
     fn array_of_only_nulls_is_unchanged() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // `[null, null]` does not become `[]` — `null_omit` strips
         // null *keys* from objects, not null *elements* from arrays.
         let reg = make_reg();
         let input = obj(&[("list", Value::Array(vec![Value::Null, Value::Null]))]);
         let out = reg
-            .call(None, "null_omit", &[input], &dummy_event())
+            .call(None, "null_omit", &[input], &dummy_event(), &arena)
             .unwrap();
         assert_eq!(
             out,
@@ -193,15 +203,19 @@ mod tests {
 
     #[test]
     fn top_level_null_returns_null() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let out = reg
-            .call(None, "null_omit", &[Value::Null], &dummy_event())
+            .call(None, "null_omit", &[Value::Null], &dummy_event(), &arena)
             .unwrap();
         assert_eq!(out, Value::Null);
     }
 
     #[test]
     fn scalar_passes_through_unchanged() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         for v in [
             Value::Int(42),
@@ -210,7 +224,7 @@ mod tests {
             Value::Bool(true),
         ] {
             let out = reg
-                .call(None, "null_omit", &[v.clone()], &dummy_event())
+                .call(None, "null_omit", &[v.clone()], &dummy_event(), &arena)
                 .unwrap();
             assert_eq!(out, v);
         }
@@ -218,6 +232,8 @@ mod tests {
 
     #[test]
     fn array_of_objects_recurses_into_each() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let input = obj(&[(
             "evidences",
@@ -233,7 +249,7 @@ mod tests {
             ]),
         )]);
         let out = reg
-            .call(None, "null_omit", &[input], &dummy_event())
+            .call(None, "null_omit", &[input], &dummy_event(), &arena)
             .unwrap();
         assert_eq!(
             out,
@@ -249,6 +265,8 @@ mod tests {
 
     #[test]
     fn idempotent_on_already_stripped() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // Calling `null_omit` on a value that has no nulls leaves it
         // unchanged. Important for chained pipelines where the same
         // composer might run twice or for downstream re-processing.
@@ -258,10 +276,10 @@ mod tests {
             ("nested", obj(&[("k", Value::String("v".into()))])),
         ]);
         let once = reg
-            .call(None, "null_omit", &[input.clone()], &dummy_event())
+            .call(None, "null_omit", &[input.clone()], &dummy_event(), &arena)
             .unwrap();
         let twice = reg
-            .call(None, "null_omit", &[once.clone()], &dummy_event())
+            .call(None, "null_omit", &[once.clone()], &dummy_event(), &arena)
             .unwrap();
         assert_eq!(once, input);
         assert_eq!(twice, once);

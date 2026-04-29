@@ -51,10 +51,12 @@ mod tests {
 
     #[test]
     fn returns_non_empty_string() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let mut reg = FunctionRegistry::new();
         register(&mut reg);
         let e = dummy_event();
-        let v = reg.call(None, "hostname", &[], &e).unwrap();
+        let v = reg.call(None, "hostname", &[], &e, &arena).unwrap();
         let Value::String(s) = v else { panic!() };
         assert!(!s.is_empty(), "hostname() returned empty string");
     }
