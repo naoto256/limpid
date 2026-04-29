@@ -1,0 +1,414 @@
+// Windows Security Event Log (JSON-shipped) parser
+//
+// Vendor:  Microsoft Corporation (Windows Event Log channels —
+//          Security, System, Application, plus operational-channel
+//          siblings like Sysmon's Microsoft-Windows-Sysmon/Operational
+//          which this snippet does NOT cover; Sysmon has its own
+//          parser file.)
+// Wire:    JSON — one event record per `ingress`. The de facto
+//          shipping path on modern deployments is one of:
+//            - NXLog `im_msvistalog` → `om_*` JSON
+//            - Winlogbeat → ECS-shaped JSON
+//            - Vector `windows_event_log` source → JSON
+//            - Azure Monitor Agent (AMA) `WindowsEvent` table extract
+//          The field naming convention this snippet targets is the
+//          NXLog form (also used by the OTRF / Mordor public dataset),
+//          which is closest to ETW raw names: `EventID`, `Channel`,
+//          `TargetUserName`, `SubjectUserName`, `LogonType`,
+//          `IpAddress`, `IpPort`, etc.
+//          Snare Enterprise Agent's tab-separated `MSWinEventLog`
+//          format is the legacy syslog-only path — that has its own
+//          parser file (`parse_winevent_snare.limpid`, future) so
+//          this one stays JSON-only.
+// Output:  OCSF records on `workspace.limpid`. The class depends on
+//          the EventID:
+//            - 4624 / 4625 (Logon success / failure)  → 3002 Authentication
+//            - 4634 / 4647 (Logoff)                   → 3002 (Logoff)
+//            - 4688 / 4689 (Process create / exit)    → 1007 Process Activity
+//            - 4720 (User account created)            → 3001 Account Change (Create)
+//            - 4722 (Account enabled)                 → 3001 (Enable)
+//            - 4725 (Account disabled)                → 3001 (Disable)
+//            - 4724 (Password reset by admin)         → 3001 (Modify)
+//            - 4726 (User account deleted)            → 3001 (Delete)
+//            - 4732 / 4756 (Group member add)         → 3006 Group Management
+//            - 4733 / 4757 (Group member remove)      → 3006
+//            - everything else → error_log via the default arm
+//
+// Sample input (4624 logon success, abridged):
+//   {"EventID":4624,"Channel":"Security",
+//    "SourceName":"Microsoft-Windows-Security-Auditing",
+//    "Hostname":"WORKSTATION1","EventTime":"2026-04-29 10:00:00",
+//    "TargetUserName":"alice","TargetDomainName":"CORP",
+//    "TargetUserSid":"S-1-5-21-...-1001",
+//    "SubjectUserName":"-","SubjectDomainName":"-",
+//    "LogonType":"3","IpAddress":"192.0.2.10","IpPort":"54321",
+//    "LogonProcessName":"Kerberos","AuthenticationPackageName":"Kerberos",
+//    "TargetLogonId":"0x12345","Message":"An account was successfully ..."}
+//
+// LogonType meaning (Windows Security Audit, used by 4624/4625):
+//   2  Interactive (console)        7  Unlock
+//   3  Network                      8  NetworkCleartext
+//   4  Batch                        9  NewCredentials (RunAs)
+//   5  Service                      10 RemoteInteractive (RDP)
+//   11 CachedInteractive            -  unknown / not applicable
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Windows EventTime is `YYYY-MM-DD HH:MM:SS` (UTC, no timezone in the
+// string itself). NXLog passes through ETW's UTC timestamp; if the
+// shipper's timezone is different, fix at the shipper, not here.
+def function winevent_time(s) {
+    switch true {
+        s == null { null }
+        default   { to_int(strptime(s, "%Y-%m-%d %H:%M:%S", "UTC")) }
+    }
+}
+
+// Map LogonType (string, 2..11) to OCSF logon_type_id.
+//   OCSF 1.3.0 logon_type_id matches Windows LogonType numerically for
+//   2-11. We pass the int through (after to_int) so unknown values
+//   don't drop into a hardcoded enum.
+def function winevent_logon_type_id(t) {
+    switch true {
+        t == null { null }
+        default   { to_int(t) }
+    }
+}
+
+// Build the actor identity from SubjectUserName + SubjectDomainName
+// (the principal that performed the action — for logon events this is
+// the system context account; for account-management events it is the
+// admin who made the change). NXLog emits `-` for the no-subject case
+// (the system-context Logon/Subject pair on type-3 logons).
+def function winevent_actor_user(name, domain) {
+    switch true {
+        name == null { null }
+        name == "-"  { null }
+        default      {
+            switch true {
+                domain == null { name }
+                domain == "-"  { name }
+                default        { "${domain}\\${name}" }
+            }
+        }
+    }
+}
+
+// Best-effort device hostname: the Hostname field NXLog populates is
+// the FQDN of the originating Windows host. AMA / Winlogbeat / Vector
+// often emit `host.name` instead; downstream pipelines that re-parse
+// those should populate `workspace.winevent.Hostname` before calling
+// this snippet, or extend the field list here.
+
+// ---------------------------------------------------------------------------
+// Top-level dispatcher
+// ---------------------------------------------------------------------------
+
+def process parse_winevent_json {
+    // parse_json always returns a `Value::Object` (non-object JSON
+    // is wrapped under a `_json` key per the primitive's contract);
+    // a malformed JSON body fails inside parse_json itself and routes
+    // the event to error_log via the standard pipeline error policy,
+    // so no explicit null-check arm is needed here.
+    workspace.winevent = parse_json(ingress)
+    let eid = workspace.winevent.EventID
+    switch true {
+        // Authentication (3002)
+        eid == 4624 { process parse_winevent_4624_logon_success }
+        eid == 4625 { process parse_winevent_4625_logon_failure }
+        eid == 4634 { process parse_winevent_4634_logoff }
+        eid == 4647 { process parse_winevent_4634_logoff }
+        // Process Activity (1007)
+        eid == 4688 { process parse_winevent_4688_process_create }
+        eid == 4689 { process parse_winevent_4689_process_terminate }
+        // Account Change (3001)
+        eid == 4720 { process parse_winevent_4720_account_create }
+        eid == 4722 { process parse_winevent_account_enable }
+        eid == 4725 { process parse_winevent_account_disable }
+        eid == 4724 { process parse_winevent_account_modify }
+        eid == 4726 { process parse_winevent_account_delete }
+        // Group Management (3006)
+        eid == 4732 { process parse_winevent_group_member_add }
+        eid == 4756 { process parse_winevent_group_member_add }
+        eid == 4733 { process parse_winevent_group_member_remove }
+        eid == 4757 { process parse_winevent_group_member_remove }
+        default { error "parse_winevent_json: unsupported EventID ${eid} on Channel ${workspace.winevent.Channel}" }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers used by the per-EventID leaves
+// ---------------------------------------------------------------------------
+
+def function winevent_authentication_record(activity_id, status_id, severity_id, time, target_user, actor_user, src_ip, src_port, logon_type, message, hostname) {
+    {
+        class_uid:    3002,
+        category_uid: 3,
+        activity_id:  activity_id,
+        type_uid:     3002 * 100 + activity_id,
+        severity_id:  severity_id,
+        status_id:    status_id,
+        time:         time,
+        user:         { name: target_user },
+        actor:        { user: { name: actor_user } },
+        src_endpoint: { ip: src_ip, port: src_port },
+        logon_type_id: logon_type,
+        device:       { name: hostname },
+        message:      message,
+        metadata: {
+            product: {
+                vendor_name: "Microsoft Corporation",
+                name:        "Windows Event Log"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+def function winevent_process_activity_record(activity_id, severity_id, time, process_name, command_line, parent_name, actor_user, hostname, message) {
+    {
+        class_uid:    1007,
+        category_uid: 1,
+        activity_id:  activity_id,
+        type_uid:     1007 * 100 + activity_id,
+        severity_id:  severity_id,
+        time:         time,
+        process: {
+            name:         process_name,
+            cmd_line:     command_line,
+            parent_process: { name: parent_name }
+        },
+        actor:  { user: { name: actor_user } },
+        device: { name: hostname },
+        message: message,
+        metadata: {
+            product: {
+                vendor_name: "Microsoft Corporation",
+                name:        "Windows Event Log"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+def function winevent_account_change_record(activity_id, severity_id, time, target_user, actor_user, hostname, message) {
+    {
+        class_uid:    3001,
+        category_uid: 3,
+        activity_id:  activity_id,
+        type_uid:     3001 * 100 + activity_id,
+        severity_id:  severity_id,
+        time:         time,
+        user:   { name: target_user },
+        actor:  { user: { name: actor_user } },
+        device: { name: hostname },
+        message: message,
+        metadata: {
+            product: {
+                vendor_name: "Microsoft Corporation",
+                name:        "Windows Event Log"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+def function winevent_group_management_record(activity_id, severity_id, time, group_name, member, actor_user, hostname, message) {
+    {
+        class_uid:    3006,
+        category_uid: 3,
+        activity_id:  activity_id,
+        type_uid:     3006 * 100 + activity_id,
+        severity_id:  severity_id,
+        time:         time,
+        group:  { name: group_name },
+        user:   { name: member },
+        actor:  { user: { name: actor_user } },
+        device: { name: hostname },
+        message: message,
+        metadata: {
+            product: {
+                vendor_name: "Microsoft Corporation",
+                name:        "Windows Event Log"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Authentication leaves (3002)
+// ---------------------------------------------------------------------------
+
+def process parse_winevent_4624_logon_success {
+    let we = workspace.winevent
+    workspace.limpid = winevent_authentication_record(
+        1, 1, 1,
+        winevent_time(we.EventTime),
+        winevent_actor_user(we.TargetUserName, we.TargetDomainName),
+        winevent_actor_user(we.SubjectUserName, we.SubjectDomainName),
+        switch we.IpAddress { "-" { null } default { we.IpAddress } },
+        switch we.IpPort { "-" { null } default { to_int(we.IpPort) } },
+        winevent_logon_type_id(we.LogonType),
+        "Windows logon success",
+        we.Hostname
+    )
+}
+
+def process parse_winevent_4625_logon_failure {
+    let we = workspace.winevent
+    workspace.limpid = winevent_authentication_record(
+        1, 2, 3,
+        winevent_time(we.EventTime),
+        winevent_actor_user(we.TargetUserName, we.TargetDomainName),
+        winevent_actor_user(we.SubjectUserName, we.SubjectDomainName),
+        switch we.IpAddress { "-" { null } default { we.IpAddress } },
+        switch we.IpPort { "-" { null } default { to_int(we.IpPort) } },
+        winevent_logon_type_id(we.LogonType),
+        "Windows logon failure (status=${we.Status} substatus=${we.SubStatus})",
+        we.Hostname
+    )
+}
+
+def process parse_winevent_4634_logoff {
+    let we = workspace.winevent
+    workspace.limpid = winevent_authentication_record(
+        2, 1, 1,
+        winevent_time(we.EventTime),
+        winevent_actor_user(we.TargetUserName, we.TargetDomainName),
+        null,
+        null,
+        null,
+        winevent_logon_type_id(we.LogonType),
+        "Windows logoff",
+        we.Hostname
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Process Activity leaves (1007)
+// ---------------------------------------------------------------------------
+
+def process parse_winevent_4688_process_create {
+    let we = workspace.winevent
+    workspace.limpid = winevent_process_activity_record(
+        1, 1,
+        winevent_time(we.EventTime),
+        we.NewProcessName,
+        we.CommandLine,
+        we.ParentProcessName,
+        winevent_actor_user(we.SubjectUserName, we.SubjectDomainName),
+        we.Hostname,
+        "Process created"
+    )
+}
+
+def process parse_winevent_4689_process_terminate {
+    let we = workspace.winevent
+    workspace.limpid = winevent_process_activity_record(
+        4, 1,
+        winevent_time(we.EventTime),
+        we.ProcessName,
+        null,
+        null,
+        winevent_actor_user(we.SubjectUserName, we.SubjectDomainName),
+        we.Hostname,
+        "Process terminated (status=${we.Status})"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Account Change leaves (3001)
+// ---------------------------------------------------------------------------
+
+def process parse_winevent_4720_account_create {
+    let we = workspace.winevent
+    workspace.limpid = winevent_account_change_record(
+        1, 2,
+        winevent_time(we.EventTime),
+        winevent_actor_user(we.TargetUserName, we.TargetDomainName),
+        winevent_actor_user(we.SubjectUserName, we.SubjectDomainName),
+        we.Hostname,
+        "User account created"
+    )
+}
+
+def process parse_winevent_account_enable {
+    let we = workspace.winevent
+    workspace.limpid = winevent_account_change_record(
+        2, 2,
+        winevent_time(we.EventTime),
+        winevent_actor_user(we.TargetUserName, we.TargetDomainName),
+        winevent_actor_user(we.SubjectUserName, we.SubjectDomainName),
+        we.Hostname,
+        "User account enabled"
+    )
+}
+
+def process parse_winevent_account_disable {
+    let we = workspace.winevent
+    workspace.limpid = winevent_account_change_record(
+        3, 2,
+        winevent_time(we.EventTime),
+        winevent_actor_user(we.TargetUserName, we.TargetDomainName),
+        winevent_actor_user(we.SubjectUserName, we.SubjectDomainName),
+        we.Hostname,
+        "User account disabled"
+    )
+}
+
+def process parse_winevent_account_modify {
+    let we = workspace.winevent
+    workspace.limpid = winevent_account_change_record(
+        99, 2,
+        winevent_time(we.EventTime),
+        winevent_actor_user(we.TargetUserName, we.TargetDomainName),
+        winevent_actor_user(we.SubjectUserName, we.SubjectDomainName),
+        we.Hostname,
+        "User account password reset by admin"
+    )
+}
+
+def process parse_winevent_account_delete {
+    let we = workspace.winevent
+    workspace.limpid = winevent_account_change_record(
+        4, 2,
+        winevent_time(we.EventTime),
+        winevent_actor_user(we.TargetUserName, we.TargetDomainName),
+        winevent_actor_user(we.SubjectUserName, we.SubjectDomainName),
+        we.Hostname,
+        "User account deleted"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Group Management leaves (3006)
+// ---------------------------------------------------------------------------
+
+def process parse_winevent_group_member_add {
+    let we = workspace.winevent
+    workspace.limpid = winevent_group_management_record(
+        1, 2,
+        winevent_time(we.EventTime),
+        we.TargetUserName,
+        we.MemberName,
+        winevent_actor_user(we.SubjectUserName, we.SubjectDomainName),
+        we.Hostname,
+        "Group member added"
+    )
+}
+
+def process parse_winevent_group_member_remove {
+    let we = workspace.winevent
+    workspace.limpid = winevent_group_management_record(
+        2, 2,
+        winevent_time(we.EventTime),
+        we.TargetUserName,
+        we.MemberName,
+        winevent_actor_user(we.SubjectUserName, we.SubjectDomainName),
+        we.Hostname,
+        "Group member removed"
+    )
+}
