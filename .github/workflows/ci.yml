@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+# Minimum required for `actions/checkout` (read the repo). Cache via
+# `actions/cache@v4` works in read-only fallback without an explicit
+# `actions: write` grant — fine for a solo-dev workflow where the
+# cache hit rate is acceptable. No GitHub API writes from this job.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
