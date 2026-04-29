@@ -43,7 +43,7 @@ fn strip<'bump>(
             let mut builder = ObjectBuilder::with_capacity(arena, entries.len());
             for (k, v) in entries.iter() {
                 if let Some(stripped) = strip(arena, v) {
-                    builder.push(*k, stripped);
+                    builder.push(k, stripped);
                 }
             }
             Some(builder.finish())

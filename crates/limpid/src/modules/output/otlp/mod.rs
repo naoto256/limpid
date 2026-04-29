@@ -1390,8 +1390,7 @@ mod tests {
         let err = output
             .write(&event_with_egress(singleton_bytes(456)))
             .await
-            .err()
-            .expect("send must fail after retries exhausted");
+            .expect_err("send must fail after retries exhausted");
         assert!(
             err.to_string().contains("503") || err.to_string().contains("HTTP"),
             "unexpected error after retry exhaustion: {err}"

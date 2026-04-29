@@ -299,7 +299,7 @@ fn resolve_ident<'bump>(
             // order so the caller can introspect the snapshot.
             let mut builder = ObjectBuilder::with_capacity(arena, event.workspace.len());
             for (k, v) in event.workspace.iter() {
-                builder.push(*k, *v);
+                builder.push(k, *v);
             }
             Ok(builder.finish())
         }
