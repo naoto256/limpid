@@ -104,6 +104,17 @@ def function fortigate_cef_proto_name(num) {
     }
 }
 
+// Common metadata builder — used by every leaf below. CEF carries
+// vendor / product / version as header fields populated by `cef.parse`,
+// so the leaf passes them in explicitly (def function bodies are pure
+// and cannot read workspace).
+def function fortigate_cef_metadata(vendor, product, version) {
+    {
+        product: { vendor_name: vendor, name: product, version: version },
+        version: "1.3.0"
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Dispatcher: parse syslog wrapper + CEF body, dispatch by cef.name
 // ---------------------------------------------------------------------------
@@ -198,14 +209,11 @@ def process parse_fortigate_cef_utm_ips {
             port: to_int(workspace.cef.dpt)
         },
         message:  workspace.cef.msg,
-        metadata: {
-            product: {
-                vendor_name: workspace.cef.device_vendor,
-                name:        workspace.cef.device_product,
-                version:     workspace.cef.device_version
-            },
-            version: "1.3.0"
-        }
+        metadata: fortigate_cef_metadata(
+            workspace.cef.device_vendor,
+            workspace.cef.device_product,
+            workspace.cef.device_version
+        )
     }
 }
 
@@ -263,14 +271,11 @@ def process parse_fortigate_cef_utm_webfilter {
             user: { name: workspace.cef.cs6 }
         },
         message:  workspace.cef.msg,
-        metadata: {
-            product: {
-                vendor_name: workspace.cef.device_vendor,
-                name:        workspace.cef.device_product,
-                version:     workspace.cef.device_version
-            },
-            version: "1.3.0"
-        }
+        metadata: fortigate_cef_metadata(
+            workspace.cef.device_vendor,
+            workspace.cef.device_product,
+            workspace.cef.device_version
+        )
     }
 }
 
@@ -322,14 +327,11 @@ def process parse_fortigate_cef_utm_antivirus {
             port: to_int(workspace.cef.dpt)
         },
         message:  workspace.cef.msg,
-        metadata: {
-            product: {
-                vendor_name: workspace.cef.device_vendor,
-                name:        workspace.cef.device_product,
-                version:     workspace.cef.device_version
-            },
-            version: "1.3.0"
-        }
+        metadata: fortigate_cef_metadata(
+            workspace.cef.device_vendor,
+            workspace.cef.device_product,
+            workspace.cef.device_version
+        )
     }
 }
 
@@ -378,14 +380,11 @@ def process parse_fortigate_cef_utm_dlp {
             port: to_int(workspace.cef.dpt)
         },
         message:  workspace.cef.msg,
-        metadata: {
-            product: {
-                vendor_name: workspace.cef.device_vendor,
-                name:        workspace.cef.device_product,
-                version:     workspace.cef.device_version
-            },
-            version: "1.3.0"
-        }
+        metadata: fortigate_cef_metadata(
+            workspace.cef.device_vendor,
+            workspace.cef.device_product,
+            workspace.cef.device_version
+        )
     }
 }
 
@@ -431,14 +430,11 @@ def process parse_fortigate_cef_utm_appctrl {
             port: to_int(workspace.cef.dpt)
         },
         message:  workspace.cef.msg,
-        metadata: {
-            product: {
-                vendor_name: workspace.cef.device_vendor,
-                name:        workspace.cef.device_product,
-                version:     workspace.cef.device_version
-            },
-            version: "1.3.0"
-        }
+        metadata: fortigate_cef_metadata(
+            workspace.cef.device_vendor,
+            workspace.cef.device_product,
+            workspace.cef.device_version
+        )
     }
 }
 
@@ -487,14 +483,11 @@ def process parse_fortigate_cef_event_user {
             ip: workspace.cef.src
         },
         message:  workspace.cef.msg,
-        metadata: {
-            product: {
-                vendor_name: workspace.cef.device_vendor,
-                name:        workspace.cef.device_product,
-                version:     workspace.cef.device_version
-            },
-            version: "1.3.0"
-        }
+        metadata: fortigate_cef_metadata(
+            workspace.cef.device_vendor,
+            workspace.cef.device_product,
+            workspace.cef.device_version
+        )
     }
 }
 
@@ -532,14 +525,11 @@ def process parse_fortigate_cef_event_vpn {
             ip: workspace.cef.src
         },
         message:  workspace.cef.msg,
-        metadata: {
-            product: {
-                vendor_name: workspace.cef.device_vendor,
-                name:        workspace.cef.device_product,
-                version:     workspace.cef.device_version
-            },
-            version: "1.3.0"
-        }
+        metadata: fortigate_cef_metadata(
+            workspace.cef.device_vendor,
+            workspace.cef.device_product,
+            workspace.cef.device_version
+        )
     }
 }
 
@@ -587,14 +577,11 @@ def process parse_fortigate_cef_utm_dns {
             type:     workspace.cef.cs1
         },
         message:  workspace.cef.msg,
-        metadata: {
-            product: {
-                vendor_name: workspace.cef.device_vendor,
-                name:        workspace.cef.device_product,
-                version:     workspace.cef.device_version
-            },
-            version: "1.3.0"
-        }
+        metadata: fortigate_cef_metadata(
+            workspace.cef.device_vendor,
+            workspace.cef.device_product,
+            workspace.cef.device_version
+        )
     }
 }
 
@@ -635,14 +622,11 @@ def process parse_fortigate_cef_utm_emailfilter {
             message_uid: workspace.cef.cs5
         },
         message:  workspace.cef.msg,
-        metadata: {
-            product: {
-                vendor_name: workspace.cef.device_vendor,
-                name:        workspace.cef.device_product,
-                version:     workspace.cef.device_version
-            },
-            version: "1.3.0"
-        }
+        metadata: fortigate_cef_metadata(
+            workspace.cef.device_vendor,
+            workspace.cef.device_product,
+            workspace.cef.device_version
+        )
     }
 }
 
@@ -694,14 +678,11 @@ def process parse_fortigate_cef_utm_waf {
             port: to_int(workspace.cef.dpt)
         },
         message:  workspace.cef.msg,
-        metadata: {
-            product: {
-                vendor_name: workspace.cef.device_vendor,
-                name:        workspace.cef.device_product,
-                version:     workspace.cef.device_version
-            },
-            version: "1.3.0"
-        }
+        metadata: fortigate_cef_metadata(
+            workspace.cef.device_vendor,
+            workspace.cef.device_product,
+            workspace.cef.device_version
+        )
     }
 }
 
@@ -734,14 +715,11 @@ def process parse_fortigate_cef_event_system {
             user: { name: workspace.cef.suser }
         },
         message:  workspace.cef.msg,
-        metadata: {
-            product: {
-                vendor_name: workspace.cef.device_vendor,
-                name:        workspace.cef.device_product,
-                version:     workspace.cef.device_version
-            },
-            version: "1.3.0"
-        }
+        metadata: fortigate_cef_metadata(
+            workspace.cef.device_vendor,
+            workspace.cef.device_product,
+            workspace.cef.device_version
+        )
     }
 }
 
@@ -774,14 +752,11 @@ def process parse_fortigate_cef_event_wireless {
             mac: workspace.cef.dmac
         },
         message:  workspace.cef.msg,
-        metadata: {
-            product: {
-                vendor_name: workspace.cef.device_vendor,
-                name:        workspace.cef.device_product,
-                version:     workspace.cef.device_version
-            },
-            version: "1.3.0"
-        }
+        metadata: fortigate_cef_metadata(
+            workspace.cef.device_vendor,
+            workspace.cef.device_product,
+            workspace.cef.device_version
+        )
     }
 }
 
@@ -811,13 +786,10 @@ def process parse_fortigate_cef_traffic {
             bytes_in:  to_int(workspace.cef.in),
             bytes_out: to_int(workspace.cef.out)
         },
-        metadata: {
-            product: {
-                vendor_name: workspace.cef.device_vendor,
-                name:        workspace.cef.device_product,
-                version:     workspace.cef.device_version
-            },
-            version: "1.3.0"
-        }
+        metadata: fortigate_cef_metadata(
+            workspace.cef.device_vendor,
+            workspace.cef.device_product,
+            workspace.cef.device_version
+        )
     }
 }
