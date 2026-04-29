@@ -206,12 +206,19 @@ impl FileOutput {
                 // owned `Value`s; a local arena is all we need.
                 let bump = bumpalo::Bump::new();
                 let arena = EventArena::new(&bump);
+                // Output runs after `run_pipeline` has dropped its
+                // per-event arena; the event we hold is heap-owned. Build
+                // a transient `BorrowedEvent` view in the local arena
+                // here so eval_expr can speak the same shape it does on
+                // the hot path.
+                let bevent = event.view_in(&arena);
                 let mut out = String::new();
                 for frag in fragments {
                     match frag {
                         TemplateFragment::Literal(s) => out.push_str(s),
                         TemplateFragment::Interp(expr) => {
-                            let rendered = value_to_string(&eval_expr(expr, event, funcs, &arena)?);
+                            let rendered =
+                                value_to_string(&eval_expr(expr, &bevent, funcs, &arena)?);
                             // Pass 1: per-interp `/` `\` → `_` and reject empty.
                             // An empty interp would silently produce paths like
                             // `/foo//bar` or `/foo/.log` that almost never reflect
@@ -376,7 +383,7 @@ fn resolve_gid(name: &str) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dsl::value::Value;
+    use crate::dsl::value::OwnedValue;
     use crate::functions::table::TableStore;
     use bytes::Bytes;
     use std::net::SocketAddr;
@@ -394,10 +401,10 @@ mod tests {
             "192.168.1.10:514".parse::<SocketAddr>().unwrap(),
         );
         e.workspace
-            .insert("host".into(), Value::String("web01".into()));
+            .insert("host".into(), OwnedValue::String("web01".into()));
         // value containing a path separator — must be sanitised
         e.workspace
-            .insert("ip".into(), Value::String("10.0.0.1/24".into()));
+            .insert("ip".into(), OwnedValue::String("10.0.0.1/24".into()));
         e
     }
 
@@ -478,7 +485,7 @@ mod tests {
             Bytes::from("hello"),
             "192.168.1.10:514".parse::<SocketAddr>().unwrap(),
         );
-        e.workspace.insert("empty".into(), Value::String("".into()));
+        e.workspace.insert("empty".into(), OwnedValue::String("".into()));
         let out = make_output(ek(ExprKind::Template(vec![
             TemplateFragment::Literal("/var/log/".into()),
             TemplateFragment::Interp(ek(ExprKind::Ident(vec![
@@ -525,7 +532,7 @@ mod tests {
             Bytes::from("hello"),
             "192.168.1.10:514".parse::<SocketAddr>().unwrap(),
         );
-        e.workspace.insert("v".into(), Value::String("..".into()));
+        e.workspace.insert("v".into(), OwnedValue::String("..".into()));
         let out = make_output(ek(ExprKind::Template(vec![TemplateFragment::Interp(ek(
             ExprKind::Ident(vec!["workspace".into(), "v".into()]),
         ))])));

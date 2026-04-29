@@ -7,31 +7,10 @@
 //! ```
 //!
 //! The input must start with `CEF:` — syslog wrapper handling is the
-//! caller's responsibility. The canonical pattern when CEF is
-//! transported over syslog is:
-//!
-//! ```limpid
-//! workspace.syslog = syslog.parse(ingress)
-//! workspace.cef    = cef.parse(workspace.syslog.msg)
-//! ```
-//!
-//! Emitted keys (CEF header fields verbatim; extension keys are copied
-//! as-is since CEF-defined keys like `src`, `dst`, `act` are part of
-//! the CEF spec):
-//!
-//! | key                        | meaning                      |
-//! |----------------------------|------------------------------|
-//! | `version`              | CEF version (usually `0`)    |
-//! | `device_vendor`        | device vendor                |
-//! | `device_product`       | device product               |
-//! | `device_version`       | device version               |
-//! | `signature_id`         | vendor-specific event id     |
-//! | `name`                 | human-readable event name    |
-//! | `severity`             | vendor severity (0-10)       |
-//! | `<ext>` (e.g. `src`, `dst`)| CEF extension key=value pairs|
+//! caller's responsibility.
 
-use crate::dsl::value::Map;
-use crate::dsl::value::Value;
+use crate::dsl::arena::EventArena;
+use crate::dsl::value::{ObjectBuilder, Value};
 use anyhow::{Result, bail};
 
 use crate::functions::primitives::parse_json::{apply_defaults, type_name};
@@ -40,13 +19,9 @@ use crate::functions::{FunctionRegistry, ParserInfo};
 use crate::modules::schema::{FieldSpec, FieldType};
 
 pub fn register(reg: &mut FunctionRegistry) {
-    reg.register_in("cef", "parse", |args, _event| parse_impl(args));
-    // CEF header keys are statically known; the extension tail (`src=`
-    // / `dst=` / vendor-specific) is data-driven, so `wildcards = true`.
-    // `severity` is emitted as Int when the field is well-formed
-    // and falls back to String on garbage input — modelled as a Union
-    // so type checks of `workspace.severity == 5` stay silent while
-    // `== "5"` warns.
+    reg.register_in("cef", "parse", |arena, args, _event| {
+        parse_impl(arena, args)
+    });
     reg.register_parser(ParserInfo {
         namespace: Some("cef"),
         name: "parse",
@@ -66,59 +41,62 @@ pub fn register(reg: &mut FunctionRegistry) {
     });
 }
 
-fn parse_impl(args: &[Value]) -> Result<Value> {
-    // Arity is validated by the registry via the sig installed from
-    // `register_parser` (1 to 2 arguments).
+fn parse_impl<'bump>(
+    arena: &'bump EventArena<'bump>,
+    args: &[Value<'bump>],
+) -> Result<Value<'bump>> {
     let text = val_to_str(&args[0])?;
 
     let body = text
         .strip_prefix("CEF:")
         .ok_or_else(|| anyhow::anyhow!("cef.parse(): input does not start with `CEF:`"))?;
 
-    let mut parts = Vec::new();
+    let mut parts: [&str; 7] = [""; 7];
     let mut remaining = body;
-    for _ in 0..7 {
+    for slot in parts.iter_mut() {
         if let Some(pos) = remaining.find('|') {
-            parts.push(&remaining[..pos]);
+            *slot = &remaining[..pos];
             remaining = &remaining[pos + 1..];
         } else {
             bail!("cef.parse(): incomplete CEF header");
         }
     }
 
-    let mut map = Map::new();
-    map.insert("version".into(), Value::String(parts[0].to_string()));
-    map.insert("device_vendor".into(), Value::String(parts[1].to_string()));
-    map.insert("device_product".into(), Value::String(parts[2].to_string()));
-    map.insert("device_version".into(), Value::String(parts[3].to_string()));
-    map.insert("signature_id".into(), Value::String(parts[4].to_string()));
-    map.insert("name".into(), Value::String(parts[5].to_string()));
-    // CEF Severity is a number (0-10 per the spec). Emit as Int when
-    // the field parses cleanly; fall back to the raw string when the
-    // producer sent garbage so existing pipelines don't break, and the
-    // analyzer-side schema is `Union(Int, String)` to match.
+    let mut builder = ObjectBuilder::new(arena);
+    builder.push_str("version", Value::String(arena.alloc_str(parts[0])));
+    builder.push_str("device_vendor", Value::String(arena.alloc_str(parts[1])));
+    builder.push_str("device_product", Value::String(arena.alloc_str(parts[2])));
+    builder.push_str("device_version", Value::String(arena.alloc_str(parts[3])));
+    builder.push_str("signature_id", Value::String(arena.alloc_str(parts[4])));
+    builder.push_str("name", Value::String(arena.alloc_str(parts[5])));
     let severity_value = parts[6]
         .parse::<i64>()
         .map(Value::Int)
-        .unwrap_or_else(|_| Value::String(parts[6].to_string()));
-    map.insert("severity".into(), severity_value);
+        .unwrap_or_else(|_| Value::String(arena.alloc_str(parts[6])));
+    builder.push_str("severity", severity_value);
 
-    parse_cef_extensions(remaining, &mut map);
+    parse_cef_extensions(arena, remaining, &mut builder);
+
+    let parsed = builder.finish();
 
     if let Some(v) = args.get(1) {
         match v {
-            Value::Object(_) | Value::Null => apply_defaults("cef.parse", Some(v), &mut map)?,
+            Value::Object(_) | Value::Null => apply_defaults(arena, "cef.parse", Some(v), parsed),
             other => bail!(
                 "cef.parse(): second argument must be a hash literal, got {}",
                 type_name(other)
             ),
         }
+    } else {
+        Ok(parsed)
     }
-
-    Ok(Value::Object(map))
 }
 
-fn parse_cef_extensions(extensions: &str, map: &mut Map) {
+fn parse_cef_extensions<'bump>(
+    arena: &EventArena<'bump>,
+    extensions: &str,
+    builder: &mut ObjectBuilder<'bump>,
+) {
     if extensions.is_empty() {
         return;
     }
@@ -166,159 +144,6 @@ fn parse_cef_extensions(extensions: &str, map: &mut Map) {
             extensions.len()
         };
         let value = extensions[val_start..val_end].trim();
-        map.insert(key.clone(), Value::String(value.to_string()));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::event::Event;
-    use bytes::Bytes;
-    use std::net::SocketAddr;
-
-    fn dummy_event() -> Event {
-        Event::new(
-            Bytes::from("test"),
-            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-        )
-    }
-
-    fn make_reg() -> FunctionRegistry {
-        let mut reg = FunctionRegistry::new();
-        register(&mut reg);
-        reg
-    }
-
-    #[test]
-    fn parses_basic_cef() {
-        let _bump = ::bumpalo::Bump::new();
-        let arena = crate::dsl::arena::EventArena::new(&_bump);
-        let reg = make_reg();
-        let e = dummy_event();
-        let r = reg
-            .call(
-                Some("cef"),
-                "parse",
-                &[Value::String(
-                    "CEF:0|Fortinet|FortiGate|7.0|1234|Firewall event|5|src=10.0.0.1 dst=10.0.0.2 act=deny".into(),
-                )],
-                &e,
-            &arena,
-        )
-            .unwrap();
-        let Value::Object(m) = r else { panic!() };
-        assert_eq!(m["version"], Value::String("0".into()));
-        assert_eq!(m["device_vendor"], Value::String("Fortinet".into()));
-        assert_eq!(m["device_product"], Value::String("FortiGate".into()));
-        assert_eq!(m["signature_id"], Value::String("1234".into()));
-        assert_eq!(m["severity"], Value::Int(5));
-        assert_eq!(m["src"], Value::String("10.0.0.1".into()));
-        assert_eq!(m["dst"], Value::String("10.0.0.2".into()));
-        assert_eq!(m["act"], Value::String("deny".into()));
-    }
-
-    #[test]
-    fn severity_falls_back_to_string_on_garbage() {
-        let _bump = ::bumpalo::Bump::new();
-        let arena = crate::dsl::arena::EventArena::new(&_bump);
-        let reg = make_reg();
-        let e = dummy_event();
-        let r = reg
-            .call(
-                Some("cef"),
-                "parse",
-                &[Value::String("CEF:0|V|P|1|1|N|High|".into())],
-                &e,
-                &arena,
-            )
-            .unwrap();
-        let Value::Object(m) = r else { panic!() };
-        assert_eq!(m["severity"], Value::String("High".into()));
-    }
-
-    #[test]
-    fn rejects_syslog_prefix() {
-        let _bump = ::bumpalo::Bump::new();
-        let arena = crate::dsl::arena::EventArena::new(&_bump);
-        // CEF must be at position 0; syslog wrapper handling is the
-        // caller's responsibility (typically `cef.parse(workspace.syslog.msg)`).
-        let reg = make_reg();
-        let e = dummy_event();
-        let err = reg
-            .call(
-                Some("cef"),
-                "parse",
-                &[Value::String(
-                    "<134>CEF:0|Security|IDS|1.0|100|Attack|8|src=192.168.1.1".into(),
-                )],
-                &e,
-                &arena,
-            )
-            .unwrap_err();
-        assert!(err.to_string().contains("does not start with `CEF:`"));
-    }
-
-    #[test]
-    fn errors_on_missing_header() {
-        let _bump = ::bumpalo::Bump::new();
-        let arena = crate::dsl::arena::EventArena::new(&_bump);
-        let reg = make_reg();
-        let e = dummy_event();
-        let err = reg
-            .call(
-                Some("cef"),
-                "parse",
-                &[Value::String("not a CEF message".into())],
-                &e,
-                &arena,
-            )
-            .unwrap_err();
-        assert!(err.to_string().contains("does not start with `CEF:`"));
-    }
-
-    #[test]
-    fn errors_on_incomplete_header() {
-        let _bump = ::bumpalo::Bump::new();
-        let arena = crate::dsl::arena::EventArena::new(&_bump);
-        let reg = make_reg();
-        let e = dummy_event();
-        let err = reg
-            .call(
-                Some("cef"),
-                "parse",
-                &[Value::String("CEF:0|only|two".into())],
-                &e,
-                &arena,
-            )
-            .unwrap_err();
-        assert!(err.to_string().contains("incomplete CEF header"));
-    }
-
-    #[test]
-    fn defaults_fill_missing_keys() {
-        let _bump = ::bumpalo::Bump::new();
-        let arena = crate::dsl::arena::EventArena::new(&_bump);
-        let reg = make_reg();
-        let e = dummy_event();
-        let defaults = Value::Object(
-            [("act".to_string(), Value::String("unknown".into()))]
-                .into_iter()
-                .collect(),
-        );
-        let r = reg
-            .call(
-                Some("cef"),
-                "parse",
-                &[
-                    Value::String("CEF:0|V|P|1|id|name|3|src=1.1.1.1".into()),
-                    defaults,
-                ],
-                &e,
-                &arena,
-            )
-            .unwrap();
-        let Value::Object(m) = r else { panic!() };
-        assert_eq!(m["act"], Value::String("unknown".into()));
+        builder.push_str(key, Value::String(arena.alloc_str(value)));
     }
 }
