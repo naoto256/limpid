@@ -49,7 +49,7 @@ When a function returns `null` (e.g. `table_upsert(...)`), the bare statement is
 Other assignment targets:
 
 ```
-let pri = syslog.extract_pri(egress)    // process-local scratch (scalar only)
+let pri = syslog.extract_pri(egress)    // process-local scratch
 egress  = syslog.strip_pri(egress)      // overwrite egress
 egress  = syslog.set_pri(egress, 16, 6) // rewrite the PRI byte
 ```

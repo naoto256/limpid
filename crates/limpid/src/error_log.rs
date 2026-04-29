@@ -117,7 +117,7 @@ impl ErrorLogWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dsl::value::Value;
+    use crate::dsl::value::OwnedValue;
     use crate::event::Event;
     use bytes::Bytes;
     use std::net::SocketAddr;
@@ -130,7 +130,7 @@ mod tests {
         );
         event.workspace.insert(
             "partial".into(),
-            Value::String("from earlier process".into()),
+            OwnedValue::String("from earlier process".into()),
         );
         ErroredEventContext {
             timestamp: chrono::DateTime::from_timestamp_nanos(1_700_000_000_000_000_000),

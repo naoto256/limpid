@@ -446,7 +446,7 @@ mod tests {
         let mut event = make_event("<134>test");
         event
             .workspace
-            .insert("key".into(), crate::dsl::Value::String("val".into()));
+            .insert("key".into(), crate::dsl::OwnedValue::String("val".into()));
 
         let json = event.to_json_value();
         let json_str = serde_json::to_string(&json).unwrap();
@@ -455,7 +455,7 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&recovered.ingress), "<134>test");
         assert_eq!(
             recovered.workspace["key"],
-            crate::dsl::Value::String("val".into())
+            crate::dsl::OwnedValue::String("val".into())
         );
     }
 
