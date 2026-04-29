@@ -1,0 +1,448 @@
+// Palo Alto Networks PAN-OS CEF parser
+//
+// Vendor:  Palo Alto Networks
+// Product: PAN-OS (Next-Generation Firewalls — PA-series, VM-series)
+// Wire:    syslog-wrapped CEF — `<priority>timestamp host CEF:0|Palo Alto Networks|PAN-OS|...`
+// Schema:  ArcSight CEF (header) + PAN-OS-specific extension keys
+//
+// PAN-OS encodes the log type in the CEF `name` field:
+//   "TRAFFIC"        — connection start/end (OCSF Network Activity 4001)
+//   "THREAT"         — IPS / vulnerability / spyware (OCSF Detection Finding 2004)
+//   "URL"            — URL filtering (OCSF Web Resource Access 6004)
+//   "WILDFIRE"       — malware sandbox verdict (OCSF Detection Finding 2004)
+//   "GLOBALPROTECT"  — VPN session events (OCSF Authentication 3002)
+//   "AUTHENTICATION" — admin / user authentication (OCSF Authentication 3002)
+//   "SYSTEM"         — device events (OCSF Application Activity)
+//   "CONFIG"         — configuration changes
+//   "USERID"         — user-ID mapping events
+//   "HIPMATCH"       — Host Information Profile match
+//
+// Sample input (RFC 3164 syslog wrapper around CEF, TRAFFIC subtype):
+//   <134>Apr 27 10:00:00 fw-pan01 CEF:0|Palo Alto Networks|PAN-OS|10.2.0|end|TRAFFIC|3|src=192.0.2.10 spt=54321 dst=198.51.100.5 dpt=443 proto=tcp act=allow in=2048 out=1024 app=ssl suser=alice
+//
+// Direct call (skip syslog wrapper, supply raw CEF in `ingress`):
+//   def pipeline x {
+//     input bare_cef
+//     process { workspace.cef = cef.parse(ingress) } | parse_paloalto_cef_traffic | compose_ocsf
+//     output ...
+//   }
+
+// ---------------------------------------------------------------------------
+// Vendor-specific mapping helpers (PAN-OS CEF dialect)
+// ---------------------------------------------------------------------------
+
+// PAN-OS CEF emits severity on a 1-5 scale (NOT the ArcSight CEF
+// 0-10 spec — verified against `$number-of-severity` template token in
+// the device's CEF format string and live samples). Direct passthrough
+// to OCSF severity_id (which uses the same 1-5 enum):
+//   1 Informational → 1
+//   2 Low           → 2
+//   3 Medium        → 3
+//   4 High          → 4
+//   5 Critical      → 5
+def function paloalto_cef_severity_id(sev) {
+    switch sev {
+        1       { 1 }
+        2       { 2 }
+        3       { 3 }
+        4       { 4 }
+        5       { 5 }
+        default { 0 }
+    }
+}
+
+// PAN-OS TRAFFIC `act` extension carries the firewall action. OCSF
+// Network Activity (4001) activity_id values:
+//   0 Unknown / 1 Open / 2 Close / 3 Reset / 4 Fail / 5 Refuse /
+//   6 Traffic / 99 Other.
+def function paloalto_cef_traffic_action_to_activity_id(act) {
+    switch act {
+        "allow"      { 6 }
+        "drop"       { 5 }
+        "deny"       { 5 }
+        "block"      { 5 }
+        "reset-both" { 3 }
+        "reset-server" { 3 }
+        "reset-client" { 3 }
+        default      { 0 }
+    }
+}
+
+// PAN-OS THREAT / URL `act` extension. OCSF Detection Finding (2004)
+// disposition_id values:
+//   0 Unknown / 1 Allowed / 2 Blocked / 3 Quarantined / 4 Modified /
+//   5 Dropped / 6 Detected / 7 No Action / 8 Identified / 99 Other.
+def function paloalto_cef_threat_disposition_id(act) {
+    switch act {
+        "alert"        { 6 }
+        "allow"        { 1 }
+        "block"        { 2 }
+        "block-url"    { 2 }
+        "block-ip"     { 2 }
+        "drop"         { 5 }
+        "deny"         { 2 }
+        "reset-both"   { 2 }
+        "reset-server" { 2 }
+        "reset-client" { 2 }
+        "default"      { 0 }
+        "continue"     { 1 }
+        "override"     { 1 }
+        default        { 0 }
+    }
+}
+
+// IANA proto name (lowercase) → number. PAN-OS emits the protocol as a
+// name string ("tcp" / "udp" / "icmp") rather than a number.
+def function paloalto_cef_proto_num(name) {
+    switch lower(name) {
+        "icmp"   { 1 }
+        "tcp"    { 6 }
+        "udp"    { 17 }
+        "gre"    { 47 }
+        "esp"    { 50 }
+        "icmpv6" { 58 }
+        default  { null }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dispatcher: parse syslog wrapper + CEF body, dispatch by cef.name
+// ---------------------------------------------------------------------------
+
+def process parse_paloalto_cef {
+    workspace.syslog = syslog.parse(ingress)
+    workspace.cef    = cef.parse(workspace.syslog.msg)
+    switch workspace.cef.name {
+        "TRAFFIC"        { process parse_paloalto_cef_traffic }
+        "THREAT"         { process parse_paloalto_cef_threat }
+        "URL"            { process parse_paloalto_cef_url }
+        "WILDFIRE"       { process parse_paloalto_cef_wildfire }
+        "GLOBALPROTECT"  { process parse_paloalto_cef_globalprotect }
+        "AUTHENTICATION" { process parse_paloalto_cef_authentication }
+        // SYSTEM / CONFIG / USERID / HIPMATCH follow when concrete
+        // mappings stabilise.
+        default { error "unsupported PAN-OS CEF name: ${workspace.cef.name}" }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: TRAFFIC → OCSF Network Activity (4001)
+// ---------------------------------------------------------------------------
+//
+// PAN-OS TRAFFIC log fields (CEF ext):
+//   src / dst        — endpoints (string IPs)
+//   spt / dpt        — ports
+//   proto            — protocol name (lowercase: tcp / udp / icmp)
+//   act              — firewall action (allow / drop / deny / reset-*)
+//   in / out         — bytes in / out
+//   app              — application name (ssl, web-browsing, dns, etc.)
+//   suser            — source user (when User-ID populated)
+//   duser            — destination user
+//   externalId       — session id
+//
+// Precondition (contract; not runtime-checked):
+//   workspace.cef populated by `parse_paloalto_cef` dispatcher or an
+//   inline `cef.parse(...)` upstream of this process.
+def process parse_paloalto_cef_traffic {
+    workspace.limpid = {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  paloalto_cef_traffic_action_to_activity_id(workspace.cef.act),
+        severity_id:  paloalto_cef_severity_id(workspace.cef.severity),
+        src_endpoint: {
+            ip:   workspace.cef.src,
+            port: to_int(workspace.cef.spt)
+        },
+        dst_endpoint: {
+            ip:   workspace.cef.dst,
+            port: to_int(workspace.cef.dpt)
+        },
+        connection_info: {
+            protocol_num:  paloalto_cef_proto_num(workspace.cef.proto),
+            protocol_name: lower(workspace.cef.proto)
+        },
+        traffic: {
+            bytes_in:  to_int(workspace.cef.in),
+            bytes_out: to_int(workspace.cef.out)
+        },
+        app_name: workspace.cef.app,
+        actor: {
+            user: { name: workspace.cef.suser }
+        },
+        metadata: {
+            product: {
+                vendor_name: workspace.cef.device_vendor,
+                name:        workspace.cef.device_product,
+                version:     workspace.cef.device_version
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: THREAT → OCSF Detection Finding (2004)
+// ---------------------------------------------------------------------------
+//
+// PAN-OS THREAT log fields:
+//   CEF header signature_id    — threat / signature name (e.g.
+//                                "SMB DoublePulsar Ping Detection(39592)").
+//                                NOT in extensions — comes from the 5th
+//                                bar-delimited CEF header field.
+//   src / dst / spt / dpt / proto — same as TRAFFIC
+//   act              — verdict (alert / block / drop / reset-* / continue)
+//   cs1Label="Rule"            cs1=<firewall rule name>
+//   cs2Label="URL Category"    cs2=<URL category, "any" when N/A>
+//   cs3Label="Virtual System"  cs3=<vsys>
+//   cs4Label="Source Zone"     cs4=<zone>
+//   cs5Label="Destination Zone" cs5=<zone>
+//   cs6Label="LogProfile"      cs6=<log forwarding profile>
+//   cn1Label="SessionID"       cn1=<session id>
+//   deviceExternalId — firewall serial number (NOT a threat id)
+//   request          — URL when applicable
+//   suser            — source user
+//   app              — application
+def process parse_paloalto_cef_threat {
+    workspace.limpid = {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:    1,
+        severity_id:    paloalto_cef_severity_id(workspace.cef.severity),
+        disposition_id: paloalto_cef_threat_disposition_id(workspace.cef.act),
+        finding_info: {
+            title: workspace.cef.signature_id,
+            types: ["Threat"]
+        },
+        attack: {
+            technique: { name: workspace.cef.signature_id }
+        },
+        src_endpoint: {
+            ip:   workspace.cef.src,
+            port: to_int(workspace.cef.spt)
+        },
+        dst_endpoint: {
+            ip:   workspace.cef.dst,
+            port: to_int(workspace.cef.dpt)
+        },
+        actor: {
+            user: { name: workspace.cef.suser }
+        },
+        metadata: {
+            product: {
+                vendor_name: workspace.cef.device_vendor,
+                name:        workspace.cef.device_product,
+                version:     workspace.cef.device_version
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: URL → OCSF Web Resource Access (6004)
+// ---------------------------------------------------------------------------
+//
+// PAN-OS URL filtering log fields (CEF ext, verified against this
+// deployment's CEF format string at /config/shared/log-settings):
+//   CEF header signature_id — URL category ($threatid template token
+//                              for URL logs renders as the matched
+//                              URL category, e.g. "social-networking")
+//   src / dst / spt / dpt   — endpoints
+//   act                     — verdict (alert / block-url / continue / override / etc.)
+//   request                 — full URL ($misc)
+//   requestMethod           — HTTP method ($http_method)
+//   cs1Label="Rule"            cs1=<firewall rule name>
+//   cs2Label="URL Category"    cs2=<URL category, same as signature_id>
+//   suser                   — source user
+//   app                     — application context
+def process parse_paloalto_cef_url {
+    let activity = switch workspace.cef.act {
+        "block-url" { 2 }
+        "block"     { 2 }
+        "deny"      { 2 }
+        "drop"      { 2 }
+        "alert"     { 1 }
+        "allow"     { 1 }
+        "continue"  { 1 }
+        "override"  { 1 }
+        default     { 0 }
+    }
+    workspace.limpid = {
+        class_uid:    6004,
+        category_uid: 6,
+        activity_id:  activity,
+        severity_id:  paloalto_cef_severity_id(workspace.cef.severity),
+        src_endpoint: {
+            ip:   workspace.cef.src,
+            port: to_int(workspace.cef.spt)
+        },
+        dst_endpoint: {
+            ip:   workspace.cef.dst,
+            port: to_int(workspace.cef.dpt)
+        },
+        http_request: {
+            url:         { url_string: workspace.cef.request },
+            http_method: workspace.cef.requestMethod
+        },
+        web_resources: [
+            {
+                url:      { url_string: workspace.cef.request },
+                category: workspace.cef.cs2
+            }
+        ],
+        actor: {
+            user: { name: workspace.cef.suser }
+        },
+        metadata: {
+            product: {
+                vendor_name: workspace.cef.device_vendor,
+                name:        workspace.cef.device_product,
+                version:     workspace.cef.device_version
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: WILDFIRE → OCSF Detection Finding (2004)
+// ---------------------------------------------------------------------------
+//
+// NOTE: cs1/cs2 mapping below is from legacy PAN-OS CEF docs and has
+// NOT been verified against captured WildFire events. Verify before
+// trusting in production.
+//
+// PAN-OS WildFire log fields (CEF ext):
+//   src / dst              — endpoints
+//   fileHash               — sample SHA256
+//   fname                  — filename
+//   cs1Label="Verdict"     cs1=<malicious|grayware|phishing|benign>
+//   cs2Label="ReportID"    cs2=<wildfire report id>
+//   externalId             — sample id
+//   request                — fetch URL when HTTP-delivered
+def process parse_paloalto_cef_wildfire {
+    let disposition = switch workspace.cef.cs1 {
+        "malicious" { 2 }
+        "phishing"  { 2 }
+        "grayware"  { 6 }
+        "benign"    { 1 }
+        default     { 0 }
+    }
+    workspace.limpid = {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:    1,
+        severity_id:    paloalto_cef_severity_id(workspace.cef.severity),
+        disposition_id: disposition,
+        finding_info: {
+            title: workspace.cef.cs1,
+            uid:   workspace.cef.cs2,
+            types: ["Malware"]
+        },
+        malware: [
+            {
+                name:               workspace.cef.cs1,
+                classification_ids: [1]
+            }
+        ],
+        evidences: [
+            {
+                file: {
+                    name:   workspace.cef.fname,
+                    hashes: [{ value: workspace.cef.fileHash }]
+                }
+            }
+        ],
+        src_endpoint: { ip: workspace.cef.src },
+        dst_endpoint: { ip: workspace.cef.dst },
+        metadata: {
+            product: {
+                vendor_name: workspace.cef.device_vendor,
+                name:        workspace.cef.device_product,
+                version:     workspace.cef.device_version
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: GLOBALPROTECT → OCSF Authentication (3002)
+// ---------------------------------------------------------------------------
+//
+// PAN-OS GlobalProtect (VPN) log fields (CEF ext):
+//   act              — gateway action (login / logout / connected / disconnected / failed)
+//   src              — client public IP
+//   suser            — username
+//   externalId       — session id
+//   cs1Label="GatewayName"
+//   reason           — failure reason (when applicable)
+def process parse_paloalto_cef_globalprotect {
+    let activity = switch workspace.cef.act {
+        "login"        { 1 }
+        "connected"    { 1 }
+        "logout"       { 2 }
+        "disconnected" { 2 }
+        "failed"       { 1 }
+        default        { 0 }
+    }
+    let status = switch workspace.cef.act {
+        "failed" { 2 }
+        default  { 1 }
+    }
+    workspace.limpid = {
+        class_uid:    3002,
+        category_uid: 3,
+        activity_id:  activity,
+        severity_id:  paloalto_cef_severity_id(workspace.cef.severity),
+        status_id:    status,
+        time:         received_at,
+        user: { name: workspace.cef.suser },
+        src_endpoint: { ip: workspace.cef.src },
+        message:      workspace.cef.reason,
+        metadata: {
+            product: {
+                vendor_name: workspace.cef.device_vendor,
+                name:        workspace.cef.device_product,
+                version:     workspace.cef.device_version
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: AUTHENTICATION → OCSF Authentication (3002)
+// ---------------------------------------------------------------------------
+//
+// PAN-OS authentication-event log (admin login, captive portal,
+// authentication policy match). Fields:
+//   act     — action (success / failure)
+//   suser   — username
+//   src     — source IP
+//   reason  — failure reason
+def process parse_paloalto_cef_authentication {
+    let status = switch workspace.cef.act {
+        "success" { 1 }
+        "failure" { 2 }
+        default   { 0 }
+    }
+    workspace.limpid = {
+        class_uid:    3002,
+        category_uid: 3,
+        activity_id:  1,
+        severity_id:  paloalto_cef_severity_id(workspace.cef.severity),
+        status_id:    status,
+        user:         { name: workspace.cef.suser },
+        src_endpoint: { ip: workspace.cef.src },
+        message:      workspace.cef.reason,
+        metadata: {
+            product: {
+                vendor_name: workspace.cef.device_vendor,
+                name:        workspace.cef.device_product,
+                version:     workspace.cef.device_version
+            },
+            version: "1.3.0"
+        }
+    }
+}
