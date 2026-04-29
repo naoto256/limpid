@@ -112,7 +112,7 @@ def process parse_paloalto_syslog {
         "AUTHENTICATION" { process parse_paloalto_syslog_authentication }
         // SYSTEM / CONFIG / USERID / HIPMATCH follow when concrete
         // mappings stabilise.
-        default { error "unsupported PAN-OS log Type: ${workspace.pan_header.Type}" }
+        default { error "parse_paloalto_syslog: unsupported PAN-OS log Type: ${workspace.pan_header.Type}" }
     }
 }
 
@@ -318,7 +318,7 @@ def process parse_paloalto_syslog_threat {
         "data"           { process parse_paloalto_syslog_threat_generic }
         "scan"           { process parse_paloalto_syslog_threat_generic }
         "flood"          { process parse_paloalto_syslog_threat_generic }
-        default { error "unsupported PAN-OS THREAT subtype: ${workspace.pan.Subtype}" }
+        default { error "parse_paloalto_syslog: unsupported PAN-OS THREAT subtype: ${workspace.pan.Subtype}" }
     }
 }
 

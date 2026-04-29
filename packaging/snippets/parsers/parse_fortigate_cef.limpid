@@ -154,7 +154,7 @@ def process parse_fortigate_cef {
         "event:system"           { process parse_fortigate_cef_event_system }
         "event:wireless"         { process parse_fortigate_cef_event_wireless }
         "event:security-rating"  { process parse_fortigate_cef_event_security_rating }
-        default { error "unsupported FortiGate CEF cat: ${workspace.cef.cat}" }
+        default { error "parse_fortigate_cef: unsupported FortiGate CEF cat: ${workspace.cef.cat}" }
     }
 }
 

@@ -143,7 +143,7 @@ def process parse_fortigate_syslog {
         "event:system"           { process parse_fortigate_syslog_event_system }
         "event:wireless"         { process parse_fortigate_syslog_event_wireless }
         "event:security-rating"  { process parse_fortigate_syslog_event_security_rating }
-        default { error "unsupported FortiGate syslog type:subtype: ${cat}" }
+        default { error "parse_fortigate_syslog: unsupported FortiGate syslog type:subtype: ${cat}" }
     }
 }
 

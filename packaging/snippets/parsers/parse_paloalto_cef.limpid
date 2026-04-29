@@ -121,7 +121,7 @@ def process parse_paloalto_cef {
         "AUTHENTICATION" { process parse_paloalto_cef_authentication }
         // SYSTEM / CONFIG / USERID / HIPMATCH follow when concrete
         // mappings stabilise.
-        default { error "unsupported PAN-OS CEF name: ${workspace.cef.name}" }
+        default { error "parse_paloalto_cef: unsupported PAN-OS CEF name: ${workspace.cef.name}" }
     }
 }
 
