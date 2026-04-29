@@ -1,0 +1,823 @@
+// FortiGate CEF parser
+//
+// Vendor:  Fortinet
+// Product: FortiGate (FortiOS 6.x / 7.x via FortiAnalyzer or direct CEF export)
+// Wire:    syslog-wrapped CEF — `<priority>timestamp host CEF:0|Fortinet|FortiGate|...`
+// Schema:  ArcSight CEF (header) + FortiGate-specific extension keys
+//
+// Sample input (RFC 3164 syslog wrapper around CEF):
+//   <134>Apr 27 10:00:00 fw01 CEF:0|Fortinet|FortiGate|7.0.0|0001|traffic|3|act=accept src=192.0.2.10 spt=54321 dst=198.51.100.5 dpt=443 proto=6 in=1024 out=512
+//
+// Output (workspace.limpid, OCSF Network Activity 4001 shape):
+//   workspace.limpid = {
+//     class_uid: 4001, category_uid: 4, activity_id: 6, severity_id: 3,
+//     src_endpoint: { ip: "192.0.2.10", port: 54321 },
+//     dst_endpoint: { ip: "198.51.100.5", port: 443 },
+//     connection_info: { protocol_num: 6, protocol_name: "tcp" },
+//     traffic: { bytes_in: 1024, bytes_out: 512 },
+//     metadata: { product: { vendor_name: "Fortinet", name: "FortiGate", version: "7.0.0" }, version: "1.3.0" }
+//   }
+//
+// Direct call (skip syslog wrapper, supply raw CEF in `ingress`):
+//   def pipeline x {
+//     input bare_cef
+//     process { workspace.cef = cef.parse(ingress) } | parse_fortigate_cef_traffic | compose_ocsf
+//     output ...
+//   }
+
+// ---------------------------------------------------------------------------
+// Vendor-specific mapping helpers (FortiGate CEF dialect)
+// ---------------------------------------------------------------------------
+
+// CEF Severity field is Int 0-10 (ArcSight CEF spec); FortiGate maps its
+// internal log priority (emergency..debug) into this range. OCSF severity_id
+// is 1-6 + 99 Other + 0 Unknown. Mapping uses the de-facto CEF→OCSF table:
+//   0-3   → Informational (1)
+//   4-6   → Medium        (3)
+//   7-8   → High          (4)
+//   9-10  → Critical      (5)
+def function fortigate_cef_severity_id(sev) {
+    switch true {
+        sev == null     { 0 }
+        sev <= 3        { 1 }
+        sev <= 6        { 3 }
+        sev <= 8        { 4 }
+        sev <= 10       { 5 }
+        default         { 99 }
+    }
+}
+
+// FortiGate CEF traffic logs put one of {accept, deny, close, start,
+// client-rst, server-rst, timeout, ip-conn, dns} in the `act` extension.
+// OCSF Network Activity (4001) activity_id values:
+//   0 Unknown / 1 Open / 2 Close / 3 Reset / 4 Fail / 5 Refuse / 6 Traffic / 99 Other
+// "accept" maps to Traffic (6) rather than Open (1) because FortiGate
+// emits one log per session lifecycle stage; the catchall traffic event
+// is the most informative bucket.
+def function fortigate_cef_action_to_activity_id(act) {
+    switch act {
+        "accept"     { 6 }
+        "start"      { 1 }
+        "close"      { 2 }
+        "client-rst" { 3 }
+        "server-rst" { 3 }
+        "timeout"    { 4 }
+        "deny"       { 5 }
+        "block"      { 5 }
+        default      { 0 }
+    }
+}
+
+// FortiGate UTM logs use `act` to record the engine's verdict.
+// OCSF Detection Finding (2004) `disposition_id` values:
+//   0 Unknown / 1 Allowed / 2 Blocked / 3 Quarantined / 4 Modified /
+//   5 Dropped / 6 Detected / 7 No Action / 8 Identified / 99 Other
+def function fortigate_cef_utm_disposition_id(act) {
+    switch act {
+        "passthrough" { 1 }
+        "allowed"     { 1 }
+        "pass"        { 1 }
+        "blocked"     { 2 }
+        "block"       { 2 }
+        "quarantined" { 3 }
+        "modified"    { 4 }
+        "dropped"     { 5 }
+        "drop"        { 5 }
+        "detected"    { 6 }
+        "monitor"     { 6 }
+        default       { 0 }
+    }
+}
+
+// IANA proto number → name. Limited to the handful FortiGate routinely
+// emits in `proto=`. Anything else returns null and the composer keeps
+// the numeric protocol_num without a protocol_name.
+def function fortigate_cef_proto_name(num) {
+    switch num {
+        1  { "icmp" }
+        6  { "tcp" }
+        17 { "udp" }
+        47 { "gre" }
+        50 { "esp" }
+        58 { "icmpv6" }
+        default { null }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dispatcher: parse syslog wrapper + CEF body, dispatch by cef.name
+// ---------------------------------------------------------------------------
+
+def process parse_fortigate_cef {
+    workspace.syslog = syslog.parse(ingress)
+    workspace.cef    = cef.parse(workspace.syslog.msg)
+    switch workspace.cef.name {
+        "traffic" { process parse_fortigate_cef_traffic }
+        "utm"     { process parse_fortigate_cef_utm }
+        "event"   { process parse_fortigate_cef_event }
+        default { error "unsupported FortiGate CEF name: ${workspace.cef.name}" }
+    }
+}
+
+// UTM dispatcher: secondary switch on `subtype` ext (FortiGate emits
+// the UTM engine type — ips / webfilter / antivirus / dlp / etc. — in
+// a separate ext key alongside the primary `name=utm`).
+def process parse_fortigate_cef_utm {
+    switch workspace.cef.subtype {
+        "ips"          { process parse_fortigate_cef_utm_ips }
+        "anomaly"      { process parse_fortigate_cef_utm_ips }
+        "webfilter"    { process parse_fortigate_cef_utm_webfilter }
+        "virus"        { process parse_fortigate_cef_utm_antivirus }
+        "dlp"          { process parse_fortigate_cef_utm_dlp }
+        "app-ctrl"     { process parse_fortigate_cef_utm_appctrl }
+        "application"  { process parse_fortigate_cef_utm_appctrl }
+        "dns"          { process parse_fortigate_cef_utm_dns }
+        "emailfilter"  { process parse_fortigate_cef_utm_emailfilter }
+        "waf"          { process parse_fortigate_cef_utm_waf }
+        default { error "unsupported FortiGate UTM subtype: ${workspace.cef.subtype}" }
+    }
+}
+
+// Event dispatcher: secondary switch on `subtype` ext for non-traffic
+// administrative / session events.
+def process parse_fortigate_cef_event {
+    switch workspace.cef.subtype {
+        "user"      { process parse_fortigate_cef_event_user }
+        "vpn"       { process parse_fortigate_cef_event_vpn }
+        "system"    { process parse_fortigate_cef_event_system }
+        "wireless"  { process parse_fortigate_cef_event_wireless }
+        default { error "unsupported FortiGate event subtype: ${workspace.cef.subtype}" }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: traffic → OCSF Network Activity (4001)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: utm:ips → OCSF Detection Finding (2004)
+// ---------------------------------------------------------------------------
+//
+// FortiGate IPS log fields (CEF ext):
+//   act        — verdict (blocked / passthrough / detected / dropped)
+//   src / spt  — source IP / port
+//   dst / dpt  — destination IP / port
+//   proto      — IP protocol number
+//   cs1Label="Attack Name"  cs1=<signature name>
+//   cs2Label="Severity"     cs2=<info|low|medium|high|critical>
+//   cs5Label="Attack ID"    cs5=<numeric signature id>
+//   msg        — human-readable description
+//
+// Precondition (contract; not runtime-checked):
+//   workspace.cef populated by `parse_fortigate_cef_utm` dispatcher
+//   (which itself runs the cef.parse via `parse_fortigate_cef`).
+def process parse_fortigate_cef_utm_ips {
+    workspace.limpid = {
+        class_uid:    2004,
+        category_uid: 2,
+        // Detection Finding activity_id 1=Create — every UTM event is
+        // a fresh observation; close/update flows aren't surfaced by
+        // FortiGate at this layer.
+        activity_id:    1,
+        severity_id:    fortigate_cef_severity_id(workspace.cef.severity),
+        disposition_id: fortigate_cef_utm_disposition_id(workspace.cef.act),
+        finding_info: {
+            title: workspace.cef.cs1,
+            uid:   workspace.cef.cs5,
+            types: ["IDS/IPS"]
+        },
+        attack: {
+            technique: { name: workspace.cef.cs1 }
+        },
+        src_endpoint: {
+            ip:   workspace.cef.src,
+            port: to_int(workspace.cef.spt)
+        },
+        dst_endpoint: {
+            ip:   workspace.cef.dst,
+            port: to_int(workspace.cef.dpt)
+        },
+        message:  workspace.cef.msg,
+        metadata: {
+            product: {
+                vendor_name: workspace.cef.device_vendor,
+                name:        workspace.cef.device_product,
+                version:     workspace.cef.device_version
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: utm:webfilter → OCSF Web Resource Access (6004)
+// ---------------------------------------------------------------------------
+//
+// FortiGate webfilter log fields (CEF ext):
+//   act        — verdict (blocked / passthrough / monitor)
+//   src / spt  — source IP / port (the user's machine)
+//   dst / dpt  — destination IP / port (the web server)
+//   request    — full URL (or `requestUrl`, `cs5` depending on FortiOS)
+//   requestMethod — GET / POST / etc.
+//   cs1Label="Category Description" cs1=<category name>
+//   cs2Label="Category"             cs2=<numeric category id>
+//   cs6Label="User"                 cs6=<authenticated username>
+//   msg        — human-readable description (often "URL was blocked")
+//
+// OCSF Web Resource Access activity_id values:
+//   0 Unknown / 1 Access Granted / 2 Access Denied / 99 Other
+def process parse_fortigate_cef_utm_webfilter {
+    let activity = switch workspace.cef.act {
+        "blocked"     { 2 }
+        "block"       { 2 }
+        "passthrough" { 1 }
+        "allowed"     { 1 }
+        "pass"        { 1 }
+        "monitor"     { 1 }
+        default       { 0 }
+    }
+    workspace.limpid = {
+        class_uid:    6004,
+        category_uid: 6,
+        activity_id:  activity,
+        severity_id:  fortigate_cef_severity_id(workspace.cef.severity),
+        src_endpoint: {
+            ip:   workspace.cef.src,
+            port: to_int(workspace.cef.spt)
+        },
+        dst_endpoint: {
+            ip:   workspace.cef.dst,
+            port: to_int(workspace.cef.dpt)
+        },
+        http_request: {
+            url:        { url_string: workspace.cef.request },
+            http_method: workspace.cef.requestMethod
+        },
+        web_resources: [
+            {
+                url:        { url_string: workspace.cef.request },
+                category:   workspace.cef.cs1
+            }
+        ],
+        actor: {
+            user: { name: workspace.cef.cs6 }
+        },
+        message:  workspace.cef.msg,
+        metadata: {
+            product: {
+                vendor_name: workspace.cef.device_vendor,
+                name:        workspace.cef.device_product,
+                version:     workspace.cef.device_version
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: utm:virus → OCSF Detection Finding (2004)
+// ---------------------------------------------------------------------------
+//
+// FortiGate antivirus log fields (CEF ext):
+//   act         — verdict (blocked / quarantined / detected / monitored)
+//   src / dst   — endpoints
+//   fname       — infected filename
+//   fileHash    — file hash (sometimes `filehash`, sometimes in cs6)
+//   cs1Label="Virus Name"  cs1=<malware family/signature>
+//   cs5Label="Virus ID"    cs5=<numeric signature id>
+//   request     — URL the file was fetched from (HTTP / SMTP)
+//   msg         — human-readable
+def process parse_fortigate_cef_utm_antivirus {
+    workspace.limpid = {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:    1,
+        severity_id:    fortigate_cef_severity_id(workspace.cef.severity),
+        disposition_id: fortigate_cef_utm_disposition_id(workspace.cef.act),
+        finding_info: {
+            title: workspace.cef.cs1,
+            uid:   workspace.cef.cs5,
+            types: ["Malware"]
+        },
+        malware: [
+            {
+                name:       workspace.cef.cs1,
+                classification_ids: [1]
+            }
+        ],
+        evidences: [
+            {
+                file: {
+                    name: workspace.cef.fname,
+                    hashes: [{ value: workspace.cef.fileHash }]
+                }
+            }
+        ],
+        src_endpoint: {
+            ip:   workspace.cef.src,
+            port: to_int(workspace.cef.spt)
+        },
+        dst_endpoint: {
+            ip:   workspace.cef.dst,
+            port: to_int(workspace.cef.dpt)
+        },
+        message:  workspace.cef.msg,
+        metadata: {
+            product: {
+                vendor_name: workspace.cef.device_vendor,
+                name:        workspace.cef.device_product,
+                version:     workspace.cef.device_version
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: utm:dlp → OCSF Detection Finding (2004)
+// ---------------------------------------------------------------------------
+//
+// FortiGate DLP log fields (CEF ext):
+//   act        — verdict (blocked / allowed / monitored)
+//   src / dst  — endpoints
+//   fname      — file that matched
+//   filesize   — file size in bytes
+//   cs1Label="Filter Name" cs1=<DLP rule name>
+//   cs5Label="Filter ID"   cs5=<rule id>
+//   cs6Label="User"        cs6=<authenticated username>
+//   msg        — human-readable
+def process parse_fortigate_cef_utm_dlp {
+    workspace.limpid = {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:    1,
+        severity_id:    fortigate_cef_severity_id(workspace.cef.severity),
+        disposition_id: fortigate_cef_utm_disposition_id(workspace.cef.act),
+        finding_info: {
+            title: workspace.cef.cs1,
+            uid:   workspace.cef.cs5,
+            types: ["Data Loss"]
+        },
+        evidences: [
+            {
+                file: {
+                    name: workspace.cef.fname,
+                    size: to_int(workspace.cef.filesize)
+                }
+            }
+        ],
+        actor: {
+            user: { name: workspace.cef.cs6 }
+        },
+        src_endpoint: {
+            ip:   workspace.cef.src,
+            port: to_int(workspace.cef.spt)
+        },
+        dst_endpoint: {
+            ip:   workspace.cef.dst,
+            port: to_int(workspace.cef.dpt)
+        },
+        message:  workspace.cef.msg,
+        metadata: {
+            product: {
+                vendor_name: workspace.cef.device_vendor,
+                name:        workspace.cef.device_product,
+                version:     workspace.cef.device_version
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: utm:app-ctrl → OCSF Detection Finding (2004)
+// ---------------------------------------------------------------------------
+//
+// FortiGate Application Control log fields (CEF ext):
+//   act         — verdict (blocked / passed / detected)
+//   src / dst   — endpoints
+//   app         — application name (e.g. "Facebook")
+//   appcat      — application category
+//   cs1Label="App Risk" cs1=<low|medium|high|critical>
+//   cs5Label="App ID"   cs5=<numeric app id>
+//   cs6Label="User"     cs6=<authenticated username>
+//   msg         — human-readable
+def process parse_fortigate_cef_utm_appctrl {
+    workspace.limpid = {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:    1,
+        severity_id:    fortigate_cef_severity_id(workspace.cef.severity),
+        disposition_id: fortigate_cef_utm_disposition_id(workspace.cef.act),
+        finding_info: {
+            title: workspace.cef.app,
+            uid:   workspace.cef.cs5,
+            types: ["Application"]
+        },
+        evidences: [
+            {
+                process: { name: workspace.cef.app }
+            }
+        ],
+        actor: {
+            user: { name: workspace.cef.cs6 }
+        },
+        src_endpoint: {
+            ip:   workspace.cef.src,
+            port: to_int(workspace.cef.spt)
+        },
+        dst_endpoint: {
+            ip:   workspace.cef.dst,
+            port: to_int(workspace.cef.dpt)
+        },
+        message:  workspace.cef.msg,
+        metadata: {
+            product: {
+                vendor_name: workspace.cef.device_vendor,
+                name:        workspace.cef.device_product,
+                version:     workspace.cef.device_version
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: event:user → OCSF Authentication (3002)
+// ---------------------------------------------------------------------------
+//
+// FortiGate user-event log fields (CEF ext):
+//   act      — login-event-style action (login / logout / failed-login)
+//   src      — source IP (the user's machine)
+//   suser    — username
+//   msg      — human-readable
+//
+// OCSF Authentication activity_id values:
+//   0 Unknown / 1 Logon / 2 Logoff / 3 Authentication Ticket / 4 Service Ticket Request /
+//   5 Service Ticket Renew / 6 Preauth / 99 Other
+def process parse_fortigate_cef_event_user {
+    let activity = switch workspace.cef.act {
+        "login"           { 1 }
+        "logon"           { 1 }
+        "auth-logon"      { 1 }
+        "logout"          { 2 }
+        "logoff"          { 2 }
+        "auth-logoff"     { 2 }
+        "auth-fail"       { 1 }
+        "failed-login"    { 1 }
+        "login-failed"    { 1 }
+        default           { 0 }
+    }
+    let status = switch workspace.cef.act {
+        "auth-fail"       { 2 }
+        "failed-login"    { 2 }
+        "login-failed"    { 2 }
+        default           { 1 }
+    }
+    workspace.limpid = {
+        class_uid:    3002,
+        category_uid: 3,
+        activity_id:  activity,
+        severity_id:  fortigate_cef_severity_id(workspace.cef.severity),
+        status_id:    status,
+        user: {
+            name: workspace.cef.suser
+        },
+        src_endpoint: {
+            ip: workspace.cef.src
+        },
+        message:  workspace.cef.msg,
+        metadata: {
+            product: {
+                vendor_name: workspace.cef.device_vendor,
+                name:        workspace.cef.device_product,
+                version:     workspace.cef.device_version
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: event:vpn → OCSF Authentication (3002)
+// ---------------------------------------------------------------------------
+//
+// VPN tunnel events (SSL VPN / IPsec) — modelled as authentication
+// because the security-relevant signal is "user X established session
+// from IP Y", not the underlying tunnel mechanics. Tunnel up/down state
+// surfaces via activity_id (Logon/Logoff).
+def process parse_fortigate_cef_event_vpn {
+    let activity = switch workspace.cef.act {
+        "tunnel-up"       { 1 }
+        "ssl-login-fail"  { 1 }
+        "ssl-new-con"     { 1 }
+        "tunnel-down"     { 2 }
+        "ssl-disconnect"  { 2 }
+        default           { 0 }
+    }
+    let status = switch workspace.cef.act {
+        "ssl-login-fail"  { 2 }
+        default           { 1 }
+    }
+    workspace.limpid = {
+        class_uid:    3002,
+        category_uid: 3,
+        activity_id:  activity,
+        severity_id:  fortigate_cef_severity_id(workspace.cef.severity),
+        status_id:    status,
+        user: {
+            name: workspace.cef.suser
+        },
+        src_endpoint: {
+            ip: workspace.cef.src
+        },
+        message:  workspace.cef.msg,
+        metadata: {
+            product: {
+                vendor_name: workspace.cef.device_vendor,
+                name:        workspace.cef.device_product,
+                version:     workspace.cef.device_version
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: utm:dns → OCSF DNS Activity (4003)
+// ---------------------------------------------------------------------------
+//
+// FortiGate DNS filter log fields (CEF ext):
+//   act     — verdict (blocked / passthrough / redirected)
+//   src     — source IP (querying client)
+//   dst     — destination IP (resolver)
+//   request — queried hostname (or `qname`, `dnsquery`)
+//   cs1     — query type (A / AAAA / CNAME / etc.)
+//   cs2     — response code (NOERROR / NXDOMAIN / etc.)
+//   msg     — human-readable
+//
+// OCSF DNS Activity activity_id values:
+//   0 Unknown / 1 Query / 2 Response / 6 Traffic / 99 Other
+def process parse_fortigate_cef_utm_dns {
+    let activity = switch workspace.cef.act {
+        "blocked"     { 1 }
+        "redirected"  { 1 }
+        "passthrough" { 6 }
+        default       { 6 }
+    }
+    let rcode = switch workspace.cef.cs2 {
+        "NOERROR"  { 0 }
+        "FORMERR"  { 1 }
+        "SERVFAIL" { 2 }
+        "NXDOMAIN" { 3 }
+        "NOTIMP"   { 4 }
+        "REFUSED"  { 5 }
+        default    { 0 }
+    }
+    workspace.limpid = {
+        class_uid:    4003,
+        category_uid: 4,
+        activity_id:  activity,
+        severity_id:  fortigate_cef_severity_id(workspace.cef.severity),
+        rcode_id:     rcode,
+        src_endpoint: { ip: workspace.cef.src },
+        dst_endpoint: { ip: workspace.cef.dst },
+        query: {
+            hostname: workspace.cef.request,
+            type:     workspace.cef.cs1
+        },
+        message:  workspace.cef.msg,
+        metadata: {
+            product: {
+                vendor_name: workspace.cef.device_vendor,
+                name:        workspace.cef.device_product,
+                version:     workspace.cef.device_version
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: utm:emailfilter → OCSF Email Activity (4009)
+// ---------------------------------------------------------------------------
+//
+// FortiGate email filter log fields (CEF ext):
+//   act      — verdict (blocked / quarantined / passthrough)
+//   src/dst  — source / destination IPs (mail relay path)
+//   suser    — sender (envelope From / RCPT FROM)
+//   duser    — recipient (envelope To / RCPT TO)
+//   cs1Label="Subject" cs1=<subject>
+//   cs5Label="Message ID" cs5=<RFC 5322 Message-ID>
+//   msg      — human-readable
+//
+// OCSF Email Activity direction_id values:
+//   0 Unknown / 1 Inbound / 2 Outbound / 99 Other
+def process parse_fortigate_cef_utm_emailfilter {
+    let activity = switch workspace.cef.act {
+        "blocked"     { 6 }
+        "quarantined" { 6 }
+        "passthrough" { 6 }
+        default       { 0 }
+    }
+    workspace.limpid = {
+        class_uid:    4009,
+        category_uid: 4,
+        activity_id:  activity,
+        severity_id:  fortigate_cef_severity_id(workspace.cef.severity),
+        direction_id: 0,
+        src_endpoint: { ip: workspace.cef.src },
+        dst_endpoint: { ip: workspace.cef.dst },
+        email: {
+            from:       workspace.cef.suser,
+            to:         [workspace.cef.duser],
+            subject:    workspace.cef.cs1,
+            message_uid: workspace.cef.cs5
+        },
+        message:  workspace.cef.msg,
+        metadata: {
+            product: {
+                vendor_name: workspace.cef.device_vendor,
+                name:        workspace.cef.device_product,
+                version:     workspace.cef.device_version
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: utm:waf → OCSF Detection Finding (2004)
+// ---------------------------------------------------------------------------
+//
+// FortiGate Web Application Firewall log fields (CEF ext):
+//   act       — verdict (blocked / detected / passthrough)
+//   src/dst   — endpoints
+//   request   — full URL (request URL)
+//   requestMethod — HTTP method
+//   cs1Label="Rule Name"  cs1=<rule name>
+//   cs5Label="Rule ID"    cs5=<numeric rule id>
+//   cs6Label="User"       cs6=<authenticated username>
+//   msg       — human-readable
+def process parse_fortigate_cef_utm_waf {
+    workspace.limpid = {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:    1,
+        severity_id:    fortigate_cef_severity_id(workspace.cef.severity),
+        disposition_id: fortigate_cef_utm_disposition_id(workspace.cef.act),
+        finding_info: {
+            title: workspace.cef.cs1,
+            uid:   workspace.cef.cs5,
+            types: ["WAF"]
+        },
+        attack: {
+            technique: { name: workspace.cef.cs1 }
+        },
+        evidences: [
+            {
+                http_request: {
+                    url:         { url_string: workspace.cef.request },
+                    http_method: workspace.cef.requestMethod
+                }
+            }
+        ],
+        actor: {
+            user: { name: workspace.cef.cs6 }
+        },
+        src_endpoint: {
+            ip:   workspace.cef.src,
+            port: to_int(workspace.cef.spt)
+        },
+        dst_endpoint: {
+            ip:   workspace.cef.dst,
+            port: to_int(workspace.cef.dpt)
+        },
+        message:  workspace.cef.msg,
+        metadata: {
+            product: {
+                vendor_name: workspace.cef.device_vendor,
+                name:        workspace.cef.device_product,
+                version:     workspace.cef.device_version
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: event:system → OCSF Compliance Finding (2003)
+// ---------------------------------------------------------------------------
+//
+// FortiGate system events: HA failover, configuration changes, license
+// expiry, hardware status. Mapped to Compliance Finding (2003) because
+// they're posture / configuration signals rather than direct
+// detections, with `act` carrying the specific event name (e.g.
+// "ha-failover", "config-change", "system-restart").
+//
+// FortiGate fields:
+//   act       — system event name
+//   suser     — admin user (for config-change events)
+//   cs1       — event description
+//   msg       — human-readable
+def process parse_fortigate_cef_event_system {
+    workspace.limpid = {
+        class_uid:    2003,
+        category_uid: 2,
+        activity_id:  1,
+        severity_id:  fortigate_cef_severity_id(workspace.cef.severity),
+        finding_info: {
+            title: workspace.cef.act,
+            types: ["System Event"]
+        },
+        actor: {
+            user: { name: workspace.cef.suser }
+        },
+        message:  workspace.cef.msg,
+        metadata: {
+            product: {
+                vendor_name: workspace.cef.device_vendor,
+                name:        workspace.cef.device_product,
+                version:     workspace.cef.device_version
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: event:wireless → OCSF Network Activity (4001)
+// ---------------------------------------------------------------------------
+//
+// FortiGate wireless events: client connect / disconnect / roam.
+// Modelled as Network Activity (4001) because the security signal is
+// "device X joined SSID Y from MAC Z".
+def process parse_fortigate_cef_event_wireless {
+    let activity = switch workspace.cef.act {
+        "client-connect"    { 1 }
+        "client-associate"  { 1 }
+        "client-disconnect" { 2 }
+        "client-roam"       { 6 }
+        default             { 0 }
+    }
+    workspace.limpid = {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  activity,
+        severity_id:  fortigate_cef_severity_id(workspace.cef.severity),
+        src_endpoint: {
+            ip:  workspace.cef.src,
+            mac: workspace.cef.smac
+        },
+        dst_endpoint: {
+            ip:  workspace.cef.dst,
+            mac: workspace.cef.dmac
+        },
+        message:  workspace.cef.msg,
+        metadata: {
+            product: {
+                vendor_name: workspace.cef.device_vendor,
+                name:        workspace.cef.device_product,
+                version:     workspace.cef.device_version
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// Precondition (contract; not runtime-checked):
+//   workspace.cef populated by `parse_fortigate_cef` dispatcher or an
+//   inline `cef.parse(...)` upstream of this process.
+def process parse_fortigate_cef_traffic {
+    let proto_num = to_int(workspace.cef.proto)
+    workspace.limpid = {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  fortigate_cef_action_to_activity_id(workspace.cef.act),
+        severity_id:  fortigate_cef_severity_id(workspace.cef.severity),
+        src_endpoint: {
+            ip:   workspace.cef.src,
+            port: to_int(workspace.cef.spt)
+        },
+        dst_endpoint: {
+            ip:   workspace.cef.dst,
+            port: to_int(workspace.cef.dpt)
+        },
+        connection_info: {
+            protocol_num:  proto_num,
+            protocol_name: fortigate_cef_proto_name(proto_num)
+        },
+        traffic: {
+            bytes_in:  to_int(workspace.cef.in),
+            bytes_out: to_int(workspace.cef.out)
+        },
+        metadata: {
+            product: {
+                vendor_name: workspace.cef.device_vendor,
+                name:        workspace.cef.device_product,
+                version:     workspace.cef.device_version
+            },
+            version: "1.3.0"
+        }
+    }
+}

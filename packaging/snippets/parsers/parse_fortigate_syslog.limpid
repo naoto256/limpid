@@ -1,0 +1,616 @@
+// FortiGate native syslog parser (KV format)
+//
+// Vendor:  Fortinet
+// Product: FortiGate (FortiOS 6.x / 7.x — native syslog output, not CEF)
+// Wire:    syslog-wrapped key=value — `<priority>timestamp host date=... time=... type=... ...`
+// Schema:  FortiGate FortiOS native log format (key=value pairs)
+//
+// Sample input (RFC 3164 syslog wrapper around the KV body):
+//   <134>Apr 27 10:00:00 fw01 date=2026-04-27 time=10:00:00 devname="fw01" type="traffic" subtype="forward" srcip=192.0.2.10 srcport=54321 dstip=198.51.100.5 dstport=443 proto=6 action="accept" sentbyte=1024 rcvdbyte=512
+//
+// Output: same `workspace.limpid` shape as `parse_fortigate_cef.limpid`
+// (the canonical OCSF-shape contract is format-agnostic — both
+// FortiGate CEF and native syslog land at the same OCSF class).
+//
+// Direct call (skip syslog wrapper, supply raw KV in `ingress`):
+//   process { workspace.kv = parse_kv(ingress) } | parse_fortigate_syslog_traffic
+//
+// Why a separate file from parse_fortigate_cef.limpid:
+//   FortiGate's native syslog and its CEF export are different schemas
+//   (different field names: `srcip` vs `src`, `sentbyte` vs `in`,
+//   `subtype` ext vs `subtype` field, etc.). Per the v0.6.0 plan,
+//   schema = vendor × format, and FortiGate has two formats so it gets
+//   two parser files.
+//
+// Vendor-specific def function helpers in this file have a `_syslog_`
+// segment in their name so they can coexist with the `_cef_` versions
+// in the same global function namespace if both files are included by
+// the same config (a single FortiGate device emitting both formats is
+// uncommon but valid).
+
+// ---------------------------------------------------------------------------
+// Vendor-specific mapping helpers (FortiGate native syslog dialect)
+// ---------------------------------------------------------------------------
+
+// FortiGate native syslog `level` field is one of:
+//   emergency / alert / critical / error / warning / notice / information / debug
+// Map to OCSF severity_id (1-6 + 99 Other + 0 Unknown).
+def function fortigate_syslog_severity_id(level) {
+    switch level {
+        "emergency"   { 6 }
+        "alert"       { 5 }
+        "critical"    { 5 }
+        "error"       { 4 }
+        "warning"     { 3 }
+        "notice"      { 2 }
+        "information" { 1 }
+        "debug"       { 1 }
+        default       { 0 }
+    }
+}
+
+// FortiGate traffic `action` → OCSF Network Activity activity_id.
+// Same dialect as the CEF version but kept name-distinct so both files
+// can coexist (Rule of Three: 2 instances acceptable; 3rd → extract).
+def function fortigate_syslog_action_to_activity_id(act) {
+    switch act {
+        "accept"      { 6 }
+        "start"       { 1 }
+        "close"       { 2 }
+        "client-rst"  { 3 }
+        "server-rst"  { 3 }
+        "timeout"     { 4 }
+        "deny"        { 5 }
+        "block"       { 5 }
+        default       { 0 }
+    }
+}
+
+// UTM `action` → OCSF Detection Finding disposition_id.
+def function fortigate_syslog_utm_disposition_id(act) {
+    switch act {
+        "passthrough" { 1 }
+        "allowed"     { 1 }
+        "pass"        { 1 }
+        "blocked"     { 2 }
+        "block"       { 2 }
+        "quarantined" { 3 }
+        "modified"    { 4 }
+        "dropped"     { 5 }
+        "drop"        { 5 }
+        "detected"    { 6 }
+        "monitor"     { 6 }
+        default       { 0 }
+    }
+}
+
+// IANA proto number → name. Same table as the CEF version.
+def function fortigate_syslog_proto_name(num) {
+    switch num {
+        1  { "icmp" }
+        6  { "tcp" }
+        17 { "udp" }
+        47 { "gre" }
+        50 { "esp" }
+        58 { "icmpv6" }
+        default { null }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Top-level dispatcher: syslog wrapper + KV body, dispatch by `type`
+// ---------------------------------------------------------------------------
+
+def process parse_fortigate_syslog {
+    workspace.syslog = syslog.parse(ingress)
+    workspace.kv     = parse_kv(workspace.syslog.msg)
+    switch workspace.kv.type {
+        "traffic" { process parse_fortigate_syslog_traffic }
+        "utm"     { process parse_fortigate_syslog_utm }
+        "event"   { process parse_fortigate_syslog_event }
+        default { error "unsupported FortiGate syslog type: ${workspace.kv.type}" }
+    }
+}
+
+// UTM dispatcher: secondary switch on `subtype` field.
+def process parse_fortigate_syslog_utm {
+    switch workspace.kv.subtype {
+        "ips"          { process parse_fortigate_syslog_utm_ips }
+        "anomaly"      { process parse_fortigate_syslog_utm_ips }
+        "webfilter"    { process parse_fortigate_syslog_utm_webfilter }
+        "virus"        { process parse_fortigate_syslog_utm_antivirus }
+        "dlp"          { process parse_fortigate_syslog_utm_dlp }
+        "app-ctrl"     { process parse_fortigate_syslog_utm_appctrl }
+        "application"  { process parse_fortigate_syslog_utm_appctrl }
+        "dns"          { process parse_fortigate_syslog_utm_dns }
+        "emailfilter"  { process parse_fortigate_syslog_utm_emailfilter }
+        "waf"          { process parse_fortigate_syslog_utm_waf }
+        default { error "unsupported FortiGate UTM subtype: ${workspace.kv.subtype}" }
+    }
+}
+
+// Event dispatcher: secondary switch on `subtype` field.
+def process parse_fortigate_syslog_event {
+    switch workspace.kv.subtype {
+        "user"      { process parse_fortigate_syslog_event_user }
+        "vpn"       { process parse_fortigate_syslog_event_vpn }
+        "system"    { process parse_fortigate_syslog_event_system }
+        "wireless"  { process parse_fortigate_syslog_event_wireless }
+        default { error "unsupported FortiGate event subtype: ${workspace.kv.subtype}" }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Common metadata builder — used by every leaf below
+// ---------------------------------------------------------------------------
+
+def function fortigate_syslog_metadata(devname, version_hint) {
+    {
+        product: {
+            vendor_name: "Fortinet",
+            name:        "FortiGate",
+            version:     version_hint
+        },
+        version: "1.3.0"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: traffic → OCSF Network Activity (4001)
+// ---------------------------------------------------------------------------
+//
+// Precondition (contract; not runtime-checked):
+//   workspace.kv populated by `parse_fortigate_syslog` dispatcher or an
+//   inline `parse_kv(...)` upstream of this process.
+def process parse_fortigate_syslog_traffic {
+    let proto_num = to_int(workspace.kv.proto)
+    workspace.limpid = {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  fortigate_syslog_action_to_activity_id(workspace.kv.action),
+        severity_id:  fortigate_syslog_severity_id(workspace.kv.level),
+        src_endpoint: {
+            ip:   workspace.kv.srcip,
+            port: to_int(workspace.kv.srcport)
+        },
+        dst_endpoint: {
+            ip:   workspace.kv.dstip,
+            port: to_int(workspace.kv.dstport)
+        },
+        connection_info: {
+            protocol_num:  proto_num,
+            protocol_name: fortigate_syslog_proto_name(proto_num)
+        },
+        traffic: {
+            bytes_in:  to_int(workspace.kv.rcvdbyte),
+            bytes_out: to_int(workspace.kv.sentbyte)
+        },
+        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: utm:ips → OCSF Detection Finding (2004)
+// ---------------------------------------------------------------------------
+//
+// FortiGate IPS native fields:
+//   action      — verdict
+//   srcip / srcport / dstip / dstport / proto
+//   attack      — signature name
+//   attackid    — numeric signature id
+//   severity    — severity label (informational/low/medium/high/critical)
+//   msg         — human-readable
+def process parse_fortigate_syslog_utm_ips {
+    workspace.limpid = {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:    1,
+        severity_id:    fortigate_syslog_severity_id(workspace.kv.level),
+        disposition_id: fortigate_syslog_utm_disposition_id(workspace.kv.action),
+        finding_info: {
+            title: workspace.kv.attack,
+            uid:   workspace.kv.attackid,
+            types: ["IDS/IPS"]
+        },
+        attack: {
+            technique: { name: workspace.kv.attack }
+        },
+        src_endpoint: {
+            ip:   workspace.kv.srcip,
+            port: to_int(workspace.kv.srcport)
+        },
+        dst_endpoint: {
+            ip:   workspace.kv.dstip,
+            port: to_int(workspace.kv.dstport)
+        },
+        message:  workspace.kv.msg,
+        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: utm:webfilter → OCSF Web Resource Access (6004)
+// ---------------------------------------------------------------------------
+def process parse_fortigate_syslog_utm_webfilter {
+    let activity = switch workspace.kv.action {
+        "blocked"     { 2 }
+        "block"       { 2 }
+        "passthrough" { 1 }
+        "allowed"     { 1 }
+        "pass"        { 1 }
+        "monitor"     { 1 }
+        default       { 0 }
+    }
+    workspace.limpid = {
+        class_uid:    6004,
+        category_uid: 6,
+        activity_id:  activity,
+        severity_id:  fortigate_syslog_severity_id(workspace.kv.level),
+        src_endpoint: {
+            ip:   workspace.kv.srcip,
+            port: to_int(workspace.kv.srcport)
+        },
+        dst_endpoint: {
+            ip:   workspace.kv.dstip,
+            port: to_int(workspace.kv.dstport)
+        },
+        http_request: {
+            url:         { url_string: workspace.kv.url },
+            http_method: workspace.kv.method
+        },
+        web_resources: [
+            {
+                url:      { url_string: workspace.kv.url },
+                category: workspace.kv.catdesc
+            }
+        ],
+        actor: {
+            user: { name: workspace.kv.user }
+        },
+        message:  workspace.kv.msg,
+        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: utm:virus → OCSF Detection Finding (2004)
+// ---------------------------------------------------------------------------
+//
+// FortiGate antivirus native fields:
+//   action / srcip / dstip
+//   filename — infected filename
+//   checksum — file hash
+//   virus    — malware family / signature
+//   virusid  — numeric signature id
+def process parse_fortigate_syslog_utm_antivirus {
+    workspace.limpid = {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:    1,
+        severity_id:    fortigate_syslog_severity_id(workspace.kv.level),
+        disposition_id: fortigate_syslog_utm_disposition_id(workspace.kv.action),
+        finding_info: {
+            title: workspace.kv.virus,
+            uid:   workspace.kv.virusid,
+            types: ["Malware"]
+        },
+        malware: [
+            {
+                name:               workspace.kv.virus,
+                classification_ids: [1]
+            }
+        ],
+        evidences: [
+            {
+                file: {
+                    name: workspace.kv.filename,
+                    hashes: [{ value: workspace.kv.checksum }]
+                }
+            }
+        ],
+        src_endpoint: {
+            ip:   workspace.kv.srcip,
+            port: to_int(workspace.kv.srcport)
+        },
+        dst_endpoint: {
+            ip:   workspace.kv.dstip,
+            port: to_int(workspace.kv.dstport)
+        },
+        message:  workspace.kv.msg,
+        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: utm:dlp → OCSF Detection Finding (2004)
+// ---------------------------------------------------------------------------
+def process parse_fortigate_syslog_utm_dlp {
+    workspace.limpid = {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:    1,
+        severity_id:    fortigate_syslog_severity_id(workspace.kv.level),
+        disposition_id: fortigate_syslog_utm_disposition_id(workspace.kv.action),
+        finding_info: {
+            title: workspace.kv.filtername,
+            uid:   workspace.kv.filteridx,
+            types: ["Data Loss"]
+        },
+        evidences: [
+            {
+                file: {
+                    name: workspace.kv.filename,
+                    size: to_int(workspace.kv.filesize)
+                }
+            }
+        ],
+        actor: {
+            user: { name: workspace.kv.user }
+        },
+        src_endpoint: {
+            ip:   workspace.kv.srcip,
+            port: to_int(workspace.kv.srcport)
+        },
+        dst_endpoint: {
+            ip:   workspace.kv.dstip,
+            port: to_int(workspace.kv.dstport)
+        },
+        message:  workspace.kv.msg,
+        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: utm:app-ctrl → OCSF Detection Finding (2004)
+// ---------------------------------------------------------------------------
+def process parse_fortigate_syslog_utm_appctrl {
+    workspace.limpid = {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:    1,
+        severity_id:    fortigate_syslog_severity_id(workspace.kv.level),
+        disposition_id: fortigate_syslog_utm_disposition_id(workspace.kv.action),
+        finding_info: {
+            title: workspace.kv.app,
+            uid:   workspace.kv.appid,
+            types: ["Application"]
+        },
+        evidences: [
+            { process: { name: workspace.kv.app } }
+        ],
+        actor: {
+            user: { name: workspace.kv.user }
+        },
+        src_endpoint: {
+            ip:   workspace.kv.srcip,
+            port: to_int(workspace.kv.srcport)
+        },
+        dst_endpoint: {
+            ip:   workspace.kv.dstip,
+            port: to_int(workspace.kv.dstport)
+        },
+        message:  workspace.kv.msg,
+        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: utm:dns → OCSF DNS Activity (4003)
+// ---------------------------------------------------------------------------
+def process parse_fortigate_syslog_utm_dns {
+    let activity = switch workspace.kv.action {
+        "blocked"     { 1 }
+        "redirected"  { 1 }
+        "passthrough" { 6 }
+        default       { 6 }
+    }
+    let rcode = switch workspace.kv.error {
+        "NOERROR"  { 0 }
+        "FORMERR"  { 1 }
+        "SERVFAIL" { 2 }
+        "NXDOMAIN" { 3 }
+        "NOTIMP"   { 4 }
+        "REFUSED"  { 5 }
+        default    { 0 }
+    }
+    workspace.limpid = {
+        class_uid:    4003,
+        category_uid: 4,
+        activity_id:  activity,
+        severity_id:  fortigate_syslog_severity_id(workspace.kv.level),
+        rcode_id:     rcode,
+        src_endpoint: { ip: workspace.kv.srcip },
+        dst_endpoint: { ip: workspace.kv.dstip },
+        query: {
+            hostname: workspace.kv.qname,
+            type:     workspace.kv.qtype
+        },
+        message:  workspace.kv.msg,
+        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: utm:emailfilter → OCSF Email Activity (4009)
+// ---------------------------------------------------------------------------
+def process parse_fortigate_syslog_utm_emailfilter {
+    let activity = switch workspace.kv.action {
+        "blocked"     { 6 }
+        "quarantined" { 6 }
+        "passthrough" { 6 }
+        default       { 0 }
+    }
+    workspace.limpid = {
+        class_uid:    4009,
+        category_uid: 4,
+        activity_id:  activity,
+        severity_id:  fortigate_syslog_severity_id(workspace.kv.level),
+        direction_id: 0,
+        src_endpoint: { ip: workspace.kv.srcip },
+        dst_endpoint: { ip: workspace.kv.dstip },
+        email: {
+            from:        workspace.kv.from,
+            to:          [workspace.kv.to],
+            subject:     workspace.kv.subject,
+            message_uid: workspace.kv.msgid
+        },
+        message:  workspace.kv.msg,
+        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: utm:waf → OCSF Detection Finding (2004)
+// ---------------------------------------------------------------------------
+def process parse_fortigate_syslog_utm_waf {
+    workspace.limpid = {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:    1,
+        severity_id:    fortigate_syslog_severity_id(workspace.kv.level),
+        disposition_id: fortigate_syslog_utm_disposition_id(workspace.kv.action),
+        finding_info: {
+            title: workspace.kv.signature,
+            uid:   workspace.kv.signatureid,
+            types: ["WAF"]
+        },
+        attack: {
+            technique: { name: workspace.kv.signature }
+        },
+        evidences: [
+            {
+                http_request: {
+                    url:         { url_string: workspace.kv.url },
+                    http_method: workspace.kv.method
+                }
+            }
+        ],
+        actor: {
+            user: { name: workspace.kv.user }
+        },
+        src_endpoint: {
+            ip:   workspace.kv.srcip,
+            port: to_int(workspace.kv.srcport)
+        },
+        dst_endpoint: {
+            ip:   workspace.kv.dstip,
+            port: to_int(workspace.kv.dstport)
+        },
+        message:  workspace.kv.msg,
+        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: event:user → OCSF Authentication (3002)
+// ---------------------------------------------------------------------------
+def process parse_fortigate_syslog_event_user {
+    let activity = switch workspace.kv.action {
+        "login"           { 1 }
+        "logon"           { 1 }
+        "auth-logon"      { 1 }
+        "logout"          { 2 }
+        "logoff"          { 2 }
+        "auth-logoff"     { 2 }
+        "auth-fail"       { 1 }
+        "failed-login"    { 1 }
+        "login-failed"    { 1 }
+        default           { 0 }
+    }
+    let status = switch workspace.kv.action {
+        "auth-fail"       { 2 }
+        "failed-login"    { 2 }
+        "login-failed"    { 2 }
+        default           { 1 }
+    }
+    workspace.limpid = {
+        class_uid:    3002,
+        category_uid: 3,
+        activity_id:  activity,
+        severity_id:  fortigate_syslog_severity_id(workspace.kv.level),
+        status_id:    status,
+        user: { name: workspace.kv.user },
+        src_endpoint: { ip: workspace.kv.srcip },
+        message:  workspace.kv.msg,
+        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: event:vpn → OCSF Authentication (3002)
+// ---------------------------------------------------------------------------
+def process parse_fortigate_syslog_event_vpn {
+    let activity = switch workspace.kv.action {
+        "tunnel-up"       { 1 }
+        "ssl-login-fail"  { 1 }
+        "ssl-new-con"     { 1 }
+        "tunnel-down"     { 2 }
+        "ssl-disconnect"  { 2 }
+        default           { 0 }
+    }
+    let status = switch workspace.kv.action {
+        "ssl-login-fail"  { 2 }
+        default           { 1 }
+    }
+    workspace.limpid = {
+        class_uid:    3002,
+        category_uid: 3,
+        activity_id:  activity,
+        severity_id:  fortigate_syslog_severity_id(workspace.kv.level),
+        status_id:    status,
+        user: { name: workspace.kv.user },
+        src_endpoint: { ip: workspace.kv.srcip },
+        message:  workspace.kv.msg,
+        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: event:system → OCSF Compliance Finding (2003)
+// ---------------------------------------------------------------------------
+def process parse_fortigate_syslog_event_system {
+    workspace.limpid = {
+        class_uid:    2003,
+        category_uid: 2,
+        activity_id:  1,
+        severity_id:  fortigate_syslog_severity_id(workspace.kv.level),
+        finding_info: {
+            title: workspace.kv.action,
+            types: ["System Event"]
+        },
+        actor: {
+            user: { name: workspace.kv.user }
+        },
+        message:  workspace.kv.msg,
+        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: event:wireless → OCSF Network Activity (4001)
+// ---------------------------------------------------------------------------
+def process parse_fortigate_syslog_event_wireless {
+    let activity = switch workspace.kv.action {
+        "client-connect"    { 1 }
+        "client-associate"  { 1 }
+        "client-disconnect" { 2 }
+        "client-roam"       { 6 }
+        default             { 0 }
+    }
+    workspace.limpid = {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  activity,
+        severity_id:  fortigate_syslog_severity_id(workspace.kv.level),
+        src_endpoint: {
+            ip:  workspace.kv.srcip,
+            mac: workspace.kv.srcmac
+        },
+        dst_endpoint: {
+            ip:  workspace.kv.dstip,
+            mac: workspace.kv.apmac
+        },
+        message:  workspace.kv.msg,
+        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+    }
+}
