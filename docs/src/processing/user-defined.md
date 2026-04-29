@@ -26,9 +26,25 @@ The CEF parser call captures into `workspace.cef`; the `${...}` interpolation in
 |--------|--------|
 | `egress = expr` | Replace the bytes the output will write |
 | `workspace.xxx = expr` | Set a workspace value (nested: `workspace.geo.country = "JP"`) |
-| `let name = expr` | Bind a process-local scratch value (visible only inside this process body) |
+| `let name = expr` | Bind a process-local scratch value (visible only inside this process body); the binding name is a single identifier — `let foo.bar = ...` is rejected |
 
 Anything else on the left of `=` is rejected as an unknown assignment target.
+
+A `let` binding can hold any value type — scalar, Object, or Array. When the bound value is an Object, dot-access reads through the binding the same way `workspace.x.y` does:
+
+```
+def process parse_xxx {
+    let f = regex_parse(workspace.body, "(?P<user>\\S+) (?P<host>\\S+)")
+    workspace.limpid = {
+        user: f.user,                    // read from the let-bound Object
+        host: f.host
+    }
+    let alert = workspace._item
+    workspace.first_evidence = alert.evidence[0].file_hash
+}
+```
+
+Read-side dot-access on a `let` binding is the same path-walk used for `workspace.*`: missing keys yield `null` (so `coalesce(f.maybe_missing, fallback)` works), and Array index access (`f.list[0]`) is supported. The restriction is only on the write side: `let f = obj` followed by `let f.x = 1` is not legal — write into `workspace.*` if you need to mutate a structure.
 
 ### Important: what is and isn't reflected in output
 
