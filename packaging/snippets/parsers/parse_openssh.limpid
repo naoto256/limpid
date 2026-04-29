@@ -1,0 +1,301 @@
+// OpenSSH sshd parser
+//
+// Vendor:  OpenSSH (the OpenBSD project's reference implementation of SSH —
+//          most Linux / BSD distros use this; not Tectia, not Dropbear,
+//          not Bitvise, each of which emits different message strings
+//          and would land in their own `parse_<vendor>.limpid` file).
+// Wire:    syslog-wrapped sshd messages —
+//          `<priority>timestamp host sshd[<pid>]: <body>`
+//          OpenSSH effectively has one wire format (text → syslog or
+//          journald, both with the same body); per the snippet plan
+//          rule, single-format vendors omit the format suffix.
+// Output:  OCSF Authentication (class_uid 3002) records on `workspace.limpid`
+//
+// Sample inputs (RFC 3164 syslog wrapper around sshd body):
+//   <38>Apr 27 10:00:00 host sshd[12345]: Accepted publickey for alice from 192.0.2.10 port 54321 ssh2: RSA SHA256:abcd
+//   <38>Apr 27 10:00:00 host sshd[12345]: Failed password for alice from 192.0.2.10 port 54321 ssh2
+//   <38>Apr 27 10:00:00 host sshd[12345]: Failed password for invalid user mallory from 192.0.2.10 port 54321 ssh2
+//   <38>Apr 27 10:00:00 host sshd[12345]: Invalid user mallory from 192.0.2.10 port 54321
+//   <38>Apr 27 10:00:00 host sshd[12345]: Disconnected from authenticating user alice 192.0.2.10 port 54321 [preauth]
+//   <38>Apr 27 10:00:00 host sshd[12345]: Connection closed by 192.0.2.10 port 54321 [preauth]
+//
+// Each pattern populates workspace.limpid as an OCSF Authentication
+// (3002) record. Login attempts (success / failure) → activity_id=1;
+// session teardown → activity_id=2.
+//
+// Direct call (skip syslog wrapper, supply raw sshd body in `egress` /
+// `ingress`): replace `workspace.syslog.msg` below with the source of
+// the body in your own dispatcher.
+//
+// Upstream filtering: when sshd events are sourced from systemd
+// journald (`_SYSTEMD_UNIT=ssh.service`), the stream also contains
+// non-sshd lines that ride sshd's syslogtag because PAM and other
+// stacks are invoked from inside the sshd process (e.g.
+// `pam_unix(sshd:session): session opened ...`). Those messages are
+// not part of the sshd vocabulary and will land in this parser's
+// error route. Run [`filter_openssh_journal`](../filters/filter_openssh_journal.limpid)
+// ahead of `parse_openssh` to drop them before they reach this
+// classifier.
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Common Authentication record skeleton — used by every sshd event so
+// the leaves only carry their pattern-specific deviations (status_id,
+// activity_id, severity_id). `port_str` is the port as captured by
+// regex_parse (always a String); `to_int` is applied here so leaves
+// don't repeat the conversion.
+def function openssh_auth_record(activity_id, status_id, severity_id, user, ip, port_str) {
+    {
+        class_uid:        3002,
+        category_uid:     3,
+        activity_id:      activity_id,
+        severity_id:      severity_id,
+        status_id:        status_id,
+        // OCSF auth_protocol_id enum has no SSH slot; 99 = Other.
+        // The string form `auth_protocol` carries the human-readable
+        // name so consumers don't have to reverse-map.
+        auth_protocol_id: 99,
+        auth_protocol:    "SSH",
+        user: {
+            name: user
+        },
+        src_endpoint: {
+            ip:   ip,
+            port: to_int(port_str)
+        },
+        service: {
+            name: "ssh"
+        },
+        metadata: {
+            product: {
+                vendor_name: "OpenBSD",
+                name:        "OpenSSH"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Top-level dispatcher: parse syslog wrapper, classify the sshd message,
+// route to the matching leaf.
+// ---------------------------------------------------------------------------
+
+def process parse_openssh {
+    workspace.syslog = syslog.parse(ingress)
+    workspace.ssh    = parse_openssh_message(workspace.syslog.msg)
+    switch workspace.ssh.kind {
+        "accepted"            { process parse_openssh_accepted }
+        "failed"              { process parse_openssh_failed }
+        "invalid_user"        { process parse_openssh_invalid_user }
+        "disconnected"        { process parse_openssh_disconnected }
+        "connection_closed"   { process parse_openssh_disconnected }
+        "no_ident"            { process parse_openssh_no_ident }
+        "banner_exchange"     { process parse_openssh_no_ident }
+        // sshd emits a `Received disconnect from ...` line for the
+        // SSH-protocol DISCONNECT message, immediately followed by its
+        // own `Disconnected from ...` line for the same session
+        // teardown. Keeping both would double-count Logoff in OCSF, so
+        // we recognise this kind only to drop it; `disconnected` is
+        // the canonical Logoff source.
+        "received_disconnect" { drop }
+        // `error: kex_exchange_identification: ...` — sshd hit an I/O
+        // error while reading the peer's SSH banner during key
+        // exchange. The message carries no IP / port (the connection
+        // failed before sshd captured peer identity), so emitting an
+        // OCSF Authentication record would be uninformative. Drop.
+        "kex_error" { drop }
+        default { error "unsupported sshd message: ${workspace.syslog.msg}" }
+    }
+}
+
+// Classify a raw sshd message body. Returns an Object with at least
+// `kind` (one of the case labels in `parse_openssh`) plus the
+// captured fields the leaf will consume. Returning a structured
+// classification (rather than running each leaf's regex twice — once
+// to dispatch, once to extract) keeps each event a single regex pass.
+//
+// The patterns below cover the vocabulary an out-of-the-box OpenSSH
+// emits via `LogLevel INFO` (the operating default). Verbose-mode
+// messages (`LogLevel VERBOSE` / `DEBUG*`) carry session cipher /
+// MAC / fingerprint detail not modelled here — they would land in
+// `default` and route to the error_log, signalling the operator that
+// either their LogLevel is over-verbose for this parser or a new
+// message shape needs adding.
+def function parse_openssh_message(msg) {
+    let accepted = regex_parse(
+        msg,
+        "^Accepted (?P<method>\\S+) for (?P<user>\\S+) from (?P<ip>\\S+) port (?P<port>\\d+)"
+    )
+    let failed = regex_parse(
+        msg,
+        "^Failed (?P<method>\\S+) for (?:invalid user (?P<user_invalid>\\S+)|(?P<user>\\S+)) from (?P<ip>\\S+) port (?P<port>\\d+)"
+    )
+    let invalid_user = regex_parse(
+        msg,
+        "^Invalid user (?P<user>\\S+) from (?P<ip>\\S+) port (?P<port>\\d+)"
+    )
+    let disconnected = regex_parse(
+        msg,
+        "^Disconnected from (?:(?:authenticating |invalid )?user (?P<user>\\S+) )?(?P<ip>\\S+) port (?P<port>\\d+)"
+    )
+    // `Connection closed by ...` and `Connection reset by ...` both signal
+    // a TCP teardown by the remote side; sshd phrases them differently
+    // (closed = orderly FIN, reset = RST) but for OCSF Authentication
+    // purposes they are the same Logoff event, so a single regex with
+    // alternation routes both to the `connection_closed` leaf below.
+    let connection_closed = regex_parse(
+        msg,
+        "^Connection (?:closed by|reset by) (?:(?:authenticating |invalid )?user (?P<user>\\S+) )?(?P<ip>\\S+) port (?P<port>\\d+)"
+    )
+    let no_ident = regex_parse(
+        msg,
+        "^Did not receive identification string from (?P<ip>\\S+) port (?P<port>\\d+)"
+    )
+    // `banner exchange: Connection from <ip> port <p>: invalid format`
+    // — peer sent something that does not look like an SSH version
+    // banner (scanners, TLS-on-port-22, junk traffic). Functionally a
+    // pre-protocol failure equivalent to `no_ident`, so the leaf for
+    // it reuses the same OCSF mapping.
+    let banner_exchange = regex_parse(
+        msg,
+        "^banner exchange: Connection from (?P<ip>\\S+) port (?P<port>\\d+): invalid format"
+    )
+    // `Received disconnect from <ip> port <p>:<reason_code>: <reason>
+    // [preauth]` — the SSH-protocol DISCONNECT message. sshd emits it
+    // alongside its own `Disconnected from ...` line for the same
+    // session, so we classify it here only so the dispatcher can drop
+    // it explicitly (see comment on the `received_disconnect` arm).
+    // `regex_match` is enough — the dispatcher does not extract
+    // fields from this kind.
+    let received_disconnect = regex_match(
+        msg,
+        "^Received disconnect from \\S+ port \\d+:\\d+: "
+    )
+    // `error: kex_exchange_identification: ...` — pre-banner I/O
+    // failure during key exchange. No peer IP / port in the message,
+    // so the dispatcher can only drop these (recognised here to keep
+    // them out of the error route).
+    let kex_error = regex_match(
+        msg,
+        "^error: kex_exchange_identification: "
+    )
+    switch true {
+        accepted != null          { { kind: "accepted",          fields: accepted } }
+        failed != null            { { kind: "failed",            fields: failed } }
+        invalid_user != null      { { kind: "invalid_user",      fields: invalid_user } }
+        disconnected != null      { { kind: "disconnected",      fields: disconnected } }
+        connection_closed != null { { kind: "connection_closed", fields: connection_closed } }
+        no_ident != null          { { kind: "no_ident",          fields: no_ident } }
+        banner_exchange != null   { { kind: "banner_exchange",   fields: banner_exchange } }
+        received_disconnect       { { kind: "received_disconnect" } }
+        kex_error                 { { kind: "kex_error" } }
+        default                   { { kind: "unknown" } }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: "Accepted <method> for <user> from <ip> port <port>"
+// → OCSF Authentication 3002 / activity=Logon / status=Success
+// ---------------------------------------------------------------------------
+
+def process parse_openssh_accepted {
+    workspace.limpid = openssh_auth_record(
+        1,                              // activity_id: Logon
+        1,                              // status_id:   Success
+        1,                              // severity_id: Informational
+        workspace.ssh.fields.user,
+        workspace.ssh.fields.ip,
+        workspace.ssh.fields.port
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: "Failed <method> for [invalid user ]<user> from <ip> port <port>"
+// → OCSF Authentication 3002 / activity=Logon / status=Failure
+//
+// `Failed password for invalid user mallory ...` is captured into
+// `user_invalid`; `Failed password for alice ...` into `user`. The leaf
+// coalesces them and bumps the severity for the invalid-user variant
+// because that's the brute-force-probe signal operators usually act on.
+// ---------------------------------------------------------------------------
+
+def process parse_openssh_failed {
+    let invalid = workspace.ssh.fields.user_invalid
+    let user = switch true {
+        invalid != null { invalid }
+        default         { workspace.ssh.fields.user }
+    }
+    let severity = switch true {
+        invalid != null { 3 }   // Medium — invalid-user attempt
+        default         { 2 }   // Low — failed auth on a known account
+    }
+    workspace.limpid = openssh_auth_record(
+        1,                              // activity_id: Logon
+        2,                              // status_id:   Failure
+        severity,
+        user,
+        workspace.ssh.fields.ip,
+        workspace.ssh.fields.port
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: "Invalid user <user> from <ip> port <port>"
+// → OCSF Authentication 3002 / activity=Logon / status=Failure (probing)
+// ---------------------------------------------------------------------------
+
+def process parse_openssh_invalid_user {
+    workspace.limpid = openssh_auth_record(
+        1,                              // activity_id: Logon
+        2,                              // status_id:   Failure
+        3,                              // severity_id: Medium (probe)
+        workspace.ssh.fields.user,
+        workspace.ssh.fields.ip,
+        workspace.ssh.fields.port
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: "Disconnected from [...] <ip> port <port>" /
+//       "Connection closed by [...] <ip> port <port>"
+// → OCSF Authentication 3002 / activity=Logoff
+//
+// Status is left as `1 Success` — these are nominal session teardowns
+// even when accompanied by `[preauth]`. A later refinement could split
+// "preauth disconnect on the third attempt" out as a Failure variant,
+// but that needs cross-event correlation which doesn't belong in a
+// single-event parser.
+// ---------------------------------------------------------------------------
+
+def process parse_openssh_disconnected {
+    workspace.limpid = openssh_auth_record(
+        2,                              // activity_id: Logoff
+        1,                              // status_id:   Success
+        1,                              // severity_id: Informational
+        workspace.ssh.fields.user,      // may be null when no user was authenticated
+        workspace.ssh.fields.ip,
+        workspace.ssh.fields.port
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: "Did not receive identification string from <ip> port <port>"
+// → OCSF Authentication 3002 / activity=Other / status=Failure
+//
+// Connection arrived but the client never sent the SSH version banner.
+// Almost always a TCP scan / nmap probe. No user, low confidence.
+// ---------------------------------------------------------------------------
+
+def process parse_openssh_no_ident {
+    workspace.limpid = openssh_auth_record(
+        99,                             // activity_id: Other
+        2,                              // status_id:   Failure
+        2,                              // severity_id: Low
+        null,                           // no user
+        workspace.ssh.fields.ip,
+        workspace.ssh.fields.port
+    )
+}

@@ -1,0 +1,45 @@
+// Strip non-sshd noise from a journal-sourced sshd stream.
+//
+// systemd-journald groups log lines by `_SYSTEMD_UNIT`, so subscribing
+// to `_SYSTEMD_UNIT=ssh.service` collects every line emitted by the
+// sshd process — which includes lines from PAM modules and other
+// stacks invoked from inside sshd. Those lines are NOT sshd protocol
+// vocabulary; feeding them straight into [`parse_openssh`](../parsers/parse_openssh.limpid)
+// would land them in its error route on every login.
+//
+// This filter drops journal-source noise that travels under sshd's
+// syslogtag but is not produced by sshd itself. Run it ahead of
+// `parse_openssh` only when the upstream input is journald (or
+// anything else that aggregates by Unix process / cgroup); for native
+// syslog feeds (where each daemon has its own syslogtag) this filter
+// is a no-op and can be omitted.
+//
+// Usage:
+//
+//   def pipeline ssh {
+//       input ssh_in
+//       process filter_openssh_journal | parse_openssh | compose_ocsf
+//       output sink
+//   }
+//
+// Filter scope (drops; keep growing this list as new noise sources
+// surface):
+//
+//   - `pam_unix(sshd:auth|session|account|password): ...`
+//     PAM stack lifecycle events. The matching sshd-side messages
+//     (`Accepted`, `Failed`, `Disconnected`) carry the same
+//     authentication outcome with richer fields, so the PAM lines are
+//     redundant for OCSF Authentication purposes.
+//
+// What is NOT filtered: anything starting with sshd's own vocabulary
+// (`Accepted`, `Failed`, `Invalid user`, `Disconnected`, `Connection
+// closed by`, `Connection reset by`, `Did not receive identification
+// string`, …). Those flow through unchanged for `parse_openssh` to
+// classify.
+
+def process filter_openssh_journal {
+    let body = syslog.parse(ingress).msg
+    if regex_match(body, "^pam_unix\\(sshd:[a-z]+\\):") {
+        drop
+    }
+}

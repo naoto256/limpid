@@ -375,7 +375,11 @@ def process compose_ocsf_authentication {
         user:         workspace.limpid.user,
         src_endpoint: workspace.limpid.src_endpoint,
         dst_endpoint: workspace.limpid.dst_endpoint,
+        auth_protocol:    workspace.limpid.auth_protocol,
         auth_protocol_id: workspace.limpid.auth_protocol_id,
+        service:      workspace.limpid.service,
+        session:      workspace.limpid.session,
+        logon_type_id: workspace.limpid.logon_type_id,
         message:      workspace.limpid.message,
         metadata:     workspace.limpid.metadata
     }))
