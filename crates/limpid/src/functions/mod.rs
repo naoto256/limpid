@@ -434,11 +434,8 @@ fn validate_arity(
             }
         }
         Arity::Variadic { min } => {
-            if min <= 1 {
-                format!("at least {} argument", min.max(1))
-            } else {
-                format!("at least {} arguments", min)
-            }
+            let label = if min == 1 { "argument" } else { "arguments" };
+            format!("at least {} {}", min, label)
         }
     };
     Err(anyhow::anyhow!(
