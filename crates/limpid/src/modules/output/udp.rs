@@ -7,14 +7,20 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use tokio::net::UdpSocket;
 use tokio::sync::OnceCell;
 
+use crate::dsl::arena::EventArena;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
-use crate::event::Event;
+use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
-use crate::modules::{HasMetrics, Module, Output};
+use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
+
+struct UdpPayload {
+    egress: Bytes,
+}
 
 pub struct UdpOutput {
     address: String,
@@ -44,7 +50,18 @@ impl HasMetrics for UdpOutput {
 
 #[async_trait::async_trait]
 impl Output for UdpOutput {
-    async fn write(&self, event: &Event) -> Result<()> {
+    fn render(
+        &self,
+        event: &BorrowedEvent<'_>,
+        _arena: &EventArena<'_>,
+    ) -> Result<RenderedPayload> {
+        Ok(RenderedPayload::new(UdpPayload {
+            egress: event.egress.clone(),
+        }))
+    }
+
+    async fn write(&self, payload: RenderedPayload) -> Result<()> {
+        let payload: UdpPayload = payload.downcast()?;
         let socket = self
             .socket
             .get_or_try_init(|| async {
@@ -59,7 +76,7 @@ impl Output for UdpOutput {
             .await?;
 
         socket
-            .send(&event.egress)
+            .send(&payload.egress)
             .await
             .with_context(|| format!("udp output: send to {}", self.address))?;
 

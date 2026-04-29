@@ -18,7 +18,7 @@ use crate::dsl::props;
 use crate::event::Event;
 use crate::functions::FunctionRegistry;
 use crate::metrics::{MetricsRegistry, PipelineMetrics};
-use crate::modules::{self, HasMetrics, ModuleRegistry};
+use crate::modules::{self, HasMetrics, ModuleRegistry, Output};
 use crate::pipeline::CompiledConfig;
 use crate::queue::{self, QueueConfig, QueueSender, RetryConfig};
 use crate::tap::TapRegistry;
@@ -55,6 +55,7 @@ impl Runtime {
 
         // --- 1. Create outputs (each output owns its own OutputMetrics) ---
         let mut output_senders: HashMap<String, QueueSender> = HashMap::new();
+        let mut output_sinks: HashMap<String, Arc<dyn Output>> = HashMap::new();
         let mut output_receivers = Vec::new();
 
         for (name, output_def) in &config.outputs {
@@ -89,6 +90,7 @@ impl Runtime {
             // Attach metrics so QueueSender::send counts events_received.
             sender.attach_metrics(Arc::clone(&created.metrics));
             output_senders.insert(name.clone(), sender);
+            output_sinks.insert(name.clone(), Arc::clone(&created.output));
 
             // Collect metrics handle (output owns the data, we just hold a reference)
             let output_metrics = Arc::clone(&created.metrics);
@@ -121,6 +123,7 @@ impl Runtime {
         }
 
         let output_senders = Arc::new(output_senders);
+        let output_sinks = Arc::new(output_sinks);
 
         // --- 2. Group pipelines by input ---
         //
@@ -199,6 +202,7 @@ impl Runtime {
             let workers: Arc<Vec<Arc<PipelineWorker>>> = Arc::new(pipelines);
             let ctx = PipelineContext {
                 output_senders: Arc::clone(&output_senders),
+                output_sinks: Arc::clone(&output_sinks),
                 config: Arc::clone(&config),
                 funcs: Arc::clone(&func_registry),
                 tap: tap.clone(),
@@ -373,6 +377,9 @@ pub(crate) fn init_tables(config: &CompiledConfig) -> Result<crate::functions::t
 
 struct PipelineContext {
     output_senders: Arc<HashMap<String, QueueSender>>,
+    /// Output sinks, looked up by `run_pipeline` to render a payload
+    /// against the per-event arena (memory-queue hot path).
+    output_sinks: Arc<HashMap<String, Arc<dyn Output>>>,
     config: Arc<CompiledConfig>,
     funcs: Arc<FunctionRegistry>,
     tap: TapRegistry,
@@ -455,12 +462,28 @@ async fn run_pipeline_with_outputs(
     event: Event,
     ctx: &PipelineContext,
 ) -> Result<crate::pipeline::PipelineRunResult> {
-    let result =
-        crate::pipeline::run_pipeline(pipeline, event, &ctx.config, &ctx.funcs, Some(&ctx.tap))?;
+    let mut result = crate::pipeline::run_pipeline(
+        pipeline,
+        event,
+        &ctx.config,
+        &ctx.funcs,
+        Some(&ctx.tap),
+        &ctx.output_sinks,
+    )?;
 
-    for (output_name, output_event) in &result.outputs {
-        if let Some(sender) = ctx.output_senders.get(output_name) {
-            sender.send(output_event.clone()).await;
+    // Drain the per-event outputs vec into the queues. Each output is
+    // pre-routed to either `SinkInput::Rendered` (memory queue hot
+    // path) or `SinkInput::Owned` (disk persist path) by the pipeline
+    // executor at the `output` statement.
+    //
+    // `result.had_outputs` was set inside `run_pipeline` *before* the
+    // vec was moved out here, so the downstream
+    // `events_finished` / `events_discarded` decision still observes
+    // the original semantics (Finished AND emitted ≥1 output → finished).
+    let outputs = std::mem::take(&mut result.outputs);
+    for (output_name, sink_input) in outputs {
+        if let Some(sender) = ctx.output_senders.get(&output_name) {
+            sender.send(sink_input).await;
         } else {
             error!(
                 "pipeline '{}': output '{}' not found",
@@ -542,7 +565,7 @@ async fn process_event(
                         }
                     }
                     PipelineTermination::Finished => {
-                        if result.outputs.is_empty() {
+                        if !result.had_outputs {
                             worker
                                 .metrics
                                 .events_discarded
@@ -647,6 +670,7 @@ mod tests {
         let cfg = CompiledConfig::from_config(parse_config("").unwrap()).unwrap();
         let ctx_a = PipelineContext {
             output_senders: Arc::new(HashMap::new()),
+            output_sinks: Arc::new(HashMap::new()),
             config: Arc::new(cfg.clone()),
             funcs: Arc::new(FunctionRegistry::new()),
             tap: tap.clone(),
@@ -654,6 +678,7 @@ mod tests {
         };
         let ctx_b = PipelineContext {
             output_senders: Arc::clone(&ctx_a.output_senders),
+            output_sinks: Arc::clone(&ctx_a.output_sinks),
             config: Arc::clone(&ctx_a.config),
             funcs: Arc::clone(&ctx_a.funcs),
             tap: tap.clone(),

@@ -15,17 +15,18 @@
 //! reconnect + metric-increment loop so that a third persistent-conn
 //! output (e.g. TLS) can plug in without reimplementing the dance.
 //!
-//! Extracted as a Prepare-level refactor (see abstraction review
-//! finding 3-1c); dispatch stays hardcoded per-output because there
-//! are currently only two implementations.
+//! Dispatch stays hardcoded per-output (TCP, Unix socket) because
+//! there are currently only two implementations; if a third
+//! persistent-conn sink lands (e.g. TLS), promote to a registry.
 //!
-//! Kept `pub(crate)` — this is an internal implementation detail of
-//! the output layer, not part of the module contract.
+//! Kept `pub(crate)` — internal implementation detail of the output
+//! layer, not part of the module contract.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::Result;
+use bytes::Bytes;
 use tokio::sync::Mutex;
 
 use crate::metrics::OutputMetrics;
@@ -47,12 +48,11 @@ pub(crate) trait PersistentConn: Sync {
     /// pipe detection.
     async fn connect(&self) -> Result<Self::Stream>;
 
-    /// Write one framed message over a live stream.
-    async fn write_frame(
-        &self,
-        stream: &mut Self::Stream,
-        event: &crate::event::Event,
-    ) -> Result<()>;
+    /// Write one framed message over a live stream. The caller has
+    /// already extracted the egress bytes from the rendered payload —
+    /// this is the boundary where sink-specific framing wraps the
+    /// payload bytes for the wire.
+    async fn write_frame(&self, stream: &mut Self::Stream, payload: &Bytes) -> Result<()>;
 }
 
 /// Write `event` through a persistent stream, reconnecting once if the
@@ -65,7 +65,7 @@ pub(crate) async fn write_with_reconnect<P>(
     policy: &P,
     conn: &Mutex<Option<P::Stream>>,
     metrics: &Arc<OutputMetrics>,
-    event: &crate::event::Event,
+    payload: &Bytes,
 ) -> Result<()>
 where
     P: PersistentConn + ?Sized,
@@ -74,7 +74,7 @@ where
 
     // Fast path: reuse an existing connection.
     if guard.is_some() {
-        match policy.write_frame(guard.as_mut().unwrap(), event).await {
+        match policy.write_frame(guard.as_mut().unwrap(), payload).await {
             Ok(()) => {
                 metrics.events_written.fetch_add(1, Ordering::Relaxed);
                 return Ok(());
@@ -89,7 +89,7 @@ where
     // (Re)connect and write once.
     let stream = policy.connect().await?;
     *guard = Some(stream);
-    policy.write_frame(guard.as_mut().unwrap(), event).await?;
+    policy.write_frame(guard.as_mut().unwrap(), payload).await?;
     metrics.events_written.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }

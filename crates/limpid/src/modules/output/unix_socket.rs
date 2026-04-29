@@ -5,16 +5,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
+use crate::dsl::arena::EventArena;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
-use crate::event::Event;
+use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::persistent_conn::{PersistentConn, write_with_reconnect};
-use crate::modules::{HasMetrics, Module, Output};
+use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
+
+struct UnixSocketPayload {
+    egress: Bytes,
+}
 
 pub struct UnixSocketOutput {
     pub path: PathBuf,
@@ -43,8 +49,19 @@ impl HasMetrics for UnixSocketOutput {
 
 #[async_trait::async_trait]
 impl Output for UnixSocketOutput {
-    async fn write(&self, event: &Event) -> Result<()> {
-        write_with_reconnect(self, &self.conn, &self.metrics, event).await
+    fn render(
+        &self,
+        event: &BorrowedEvent<'_>,
+        _arena: &EventArena<'_>,
+    ) -> Result<RenderedPayload> {
+        Ok(RenderedPayload::new(UnixSocketPayload {
+            egress: event.egress.clone(),
+        }))
+    }
+
+    async fn write(&self, payload: RenderedPayload) -> Result<()> {
+        let payload: UnixSocketPayload = payload.downcast()?;
+        write_with_reconnect(self, &self.conn, &self.metrics, &payload.egress).await
     }
 }
 
@@ -58,8 +75,8 @@ impl PersistentConn for UnixSocketOutput {
             .with_context(|| format!("unix_socket connect to {}", self.path.display()))
     }
 
-    async fn write_frame(&self, stream: &mut UnixStream, event: &Event) -> Result<()> {
-        let msg = String::from_utf8_lossy(&event.egress);
+    async fn write_frame(&self, stream: &mut UnixStream, payload: &Bytes) -> Result<()> {
+        let msg = String::from_utf8_lossy(payload);
         stream.write_all(msg.as_bytes()).await?;
         stream.write_all(b"\n").await?;
         stream.flush().await?;

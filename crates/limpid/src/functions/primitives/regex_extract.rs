@@ -16,16 +16,16 @@ pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(
         "regex_extract",
         FunctionSig::fixed(&[FieldType::String, FieldType::String], FieldType::String),
-        |args, _event| {
+        |arena, args, _event| {
             let target = val_to_str(&args[0])?;
             let pattern = val_to_str(&args[1])?;
             match get_cached_regex(&pattern) {
                 Ok(re) => {
                     if let Some(caps) = re.captures(&target) {
                         if let Some(m) = caps.get(1) {
-                            Ok(Value::String(m.as_str().to_string()))
+                            Ok(Value::String(arena.alloc_str(m.as_str())))
                         } else if let Some(m) = caps.get(0) {
-                            Ok(Value::String(m.as_str().to_string()))
+                            Ok(Value::String(arena.alloc_str(m.as_str())))
                         } else {
                             Ok(Value::Null)
                         }
