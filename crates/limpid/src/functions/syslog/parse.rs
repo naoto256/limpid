@@ -163,19 +163,42 @@ fn parse_rfc3164(input: &str, map: &mut Map) {
 
 fn parse_tag_and_msg(input: &str) -> (&str, Option<&str>, &str) {
     let input = input.trim_start();
-    if let Some(colon_pos) = input.find(": ") {
-        let tag_part = &input[..colon_pos];
-        let msg = &input[colon_pos + 2..];
-        if let Some(bracket_start) = tag_part.find('[')
-            && let Some(bracket_end) = tag_part.find(']')
-        {
-            let appname = &tag_part[..bracket_start];
-            let procid = &tag_part[bracket_start + 1..bracket_end];
-            return (appname, Some(procid), msg);
-        }
-        return (tag_part, None, msg);
+    let bytes = input.as_bytes();
+
+    // RFC 3164 §4.1.3: the TAG is a leading run of alphanumerics (max
+    // 32 chars), terminated by the first non-alphanumeric character.
+    // We additionally require the terminator to look like `: ` (or
+    // `[pid]: `, or a bare trailing `:`) — otherwise the body itself
+    // contains the colon-space token (e.g. CEF extensions like
+    // `msg=applications3: Shenzhen...`) and a permissive `find(": ")`
+    // would split the TAG mid-payload.
+    const TAG_MAX: usize = 32;
+    let mut tag_end = 0;
+    while tag_end < bytes.len() && tag_end < TAG_MAX && bytes[tag_end].is_ascii_alphanumeric() {
+        tag_end += 1;
     }
-    ("", None, input)
+    if tag_end == 0 {
+        return ("", None, input);
+    }
+    let tag = &input[..tag_end];
+    let after_tag = &input[tag_end..];
+
+    let (procid, after_pid) = if let Some(rest) = after_tag.strip_prefix('[') {
+        match rest.find(']') {
+            Some(close) => (Some(&rest[..close]), &rest[close + 1..]),
+            None => return ("", None, input),
+        }
+    } else {
+        (None, after_tag)
+    };
+
+    if let Some(msg) = after_pid.strip_prefix(": ") {
+        (tag, procid, msg)
+    } else if after_pid == ":" {
+        (tag, procid, "")
+    } else {
+        ("", None, input)
+    }
 }
 
 fn skip_structured_data(input: &str) -> &str {
@@ -319,6 +342,31 @@ mod tests {
         assert_eq!(m["hostname"], Value::String("myhost".into()));
         assert_eq!(m["appname"], Value::String("kernel".into()));
         assert_eq!(m["msg"], Value::String("Out of memory".into()));
+    }
+
+    #[test]
+    fn rfc3164_cef_payload_not_split_on_inner_colon_space() {
+        // CEF extensions can carry `key=value: ...` patterns (e.g.
+        // `msg=applications3: Shenzhen...`). The TAG/MSG split must
+        // not greedily consume the body up to that inner `": "` —
+        // otherwise downstream `cef.parse(workspace.syslog.msg)`
+        // receives a tail fragment instead of the CEF prefix.
+        let reg = make_reg();
+        let m = call_syslog_parse(
+            &reg,
+            "<134>Apr 15 10:30:00 fwhost CEF:0|Fortinet|FortiGate|7.0|13056|app-ctrl|3|msg=applications3: Shenzhen.TVT",
+        )
+        .unwrap();
+        assert_eq!(m["hostname"], Value::String("fwhost".into()));
+        // No syntactic TAG ahead of the CEF payload — appname must
+        // not be set, and the entire CEF string must reach `msg`.
+        assert!(!m.contains_key("appname"));
+        let Value::String(msg) = &m["msg"] else { panic!() };
+        assert!(
+            msg.starts_with("CEF:0|Fortinet|FortiGate"),
+            "msg should retain the CEF prefix, got {msg:?}",
+        );
+        assert!(msg.ends_with("Shenzhen.TVT"));
     }
 
     #[test]
