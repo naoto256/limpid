@@ -1,0 +1,804 @@
+// OCSF composer
+//
+// Reads `workspace.limpid` (the canonical OCSF-shape produced by parsers)
+// and writes the corresponding OCSF JSON to `egress`. Class-specific
+// shaping lives in `compose_ocsf_<class>` leaves; the top-level
+// `compose_ocsf` dispatches on `workspace.limpid.class_uid`.
+//
+// Contract — workspace.limpid is the parser ↔ composer 紳士協定:
+//   * parsers populate `workspace.limpid.*` only with OCSF-canonical
+//     fields. Vendor intermediates (`workspace.cef`, `workspace.syslog`)
+//     are NOT read by the composer.
+//   * composer reads `workspace.limpid.*` only.
+//   * unknown `class_uid` is routed to the error_log via `error` —
+//     leaving an event with no egress would silently disappear into the
+//     output stage's "no payload" branch, which is the wrong default.
+//
+// OCSF version: targeting **1.3.0**. The composer emits
+// `metadata.version = "1.3.0"` so receivers can dispatch by schema
+// version. Parsers populate `workspace.limpid.metadata` with at least
+// `{ product: { vendor_name, name, version }, version: "1.3.0" }`.
+//
+// Class coverage (OCSF 1.3.0 priority classes):
+//
+//   System Activity (1xxx):
+//     1001 File System Activity
+//     1007 Process Activity
+//     1008 Registry Key Activity
+//     1009 Registry Value Activity
+//
+//   Findings (2xxx):
+//     2002 Vulnerability Finding
+//     2003 Compliance Finding
+//     2004 Detection Finding
+//     2005 Incident Finding
+//
+//   Identity & Access Management (3xxx):
+//     3001 Account Change
+//     3002 Authentication
+//     3003 Authorize Session
+//     3005 User Access Management
+//     3006 Group Management
+//
+//   Network Activity (4xxx):
+//     4001 Network Activity
+//     4002 HTTP Activity
+//     4003 DNS Activity
+//     4004 DHCP Activity
+//     4005 RDP Activity
+//     4006 SMB Activity
+//     4007 SSH Activity
+//     4008 FTP Activity
+//     4009 Email Activity
+//     4010 Network File Activity
+//
+//   Application Activity (6xxx):
+//     6003 API Activity
+//     6004 Web Resource Access
+//     6005 Datastore Activity
+//     6007 Scan Activity
+//
+// Each leaf assumes the dispatcher has already verified `class_uid` and
+// reads only the fields its OCSF class defines, plucking from
+// `workspace.limpid.*`. Common envelope fields (`class_uid`,
+// `category_uid`, `activity_id`, `type_uid`, `severity_id`, `time`,
+// `metadata`) are emitted uniformly.
+//
+// Output:
+//   egress = OCSF JSON (one object per event)
+
+// ---------------------------------------------------------------------------
+// Top-level dispatcher
+// ---------------------------------------------------------------------------
+
+def process compose_ocsf {
+    switch workspace.limpid.class_uid {
+        // System Activity (category 1)
+        1001 { process compose_ocsf_file_system_activity }
+        1007 { process compose_ocsf_process_activity }
+        1008 { process compose_ocsf_registry_key_activity }
+        1009 { process compose_ocsf_registry_value_activity }
+        // Findings (category 2)
+        2002 { process compose_ocsf_vulnerability_finding }
+        2003 { process compose_ocsf_compliance_finding }
+        2004 { process compose_ocsf_detection_finding }
+        2005 { process compose_ocsf_incident_finding }
+        // IAM (category 3)
+        3001 { process compose_ocsf_account_change }
+        3002 { process compose_ocsf_authentication }
+        3003 { process compose_ocsf_authorize_session }
+        3005 { process compose_ocsf_user_access_management }
+        3006 { process compose_ocsf_group_management }
+        // Network Activity (category 4)
+        4001 { process compose_ocsf_network_activity }
+        4002 { process compose_ocsf_http_activity }
+        4003 { process compose_ocsf_dns_activity }
+        4004 { process compose_ocsf_dhcp_activity }
+        4005 { process compose_ocsf_rdp_activity }
+        4006 { process compose_ocsf_smb_activity }
+        4007 { process compose_ocsf_ssh_activity }
+        4008 { process compose_ocsf_ftp_activity }
+        4009 { process compose_ocsf_email_activity }
+        4010 { process compose_ocsf_network_file_activity }
+        // Application Activity (category 6)
+        6003 { process compose_ocsf_api_activity }
+        6004 { process compose_ocsf_web_resource_access }
+        6005 { process compose_ocsf_datastore_activity }
+        6007 { process compose_ocsf_scan_activity }
+        default { error "compose_ocsf: unsupported class_uid ${workspace.limpid.class_uid}" }
+    }
+}
+
+// ===========================================================================
+// System Activity (category 1)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// File System Activity (class_uid 1001)
+// ---------------------------------------------------------------------------
+//
+// File create / read / update / delete / rename / etc. — typically from
+// EDR / file-integrity-monitoring sources (Sysmon FileCreate, Falco fs
+// rules, Defender ATP, Windows Security 4663). Parsers populate
+// `workspace.limpid.file` (the affected file), `workspace.limpid.actor`
+// (the process that performed the action), and `workspace.limpid.user`
+// for the executing user.
+def process compose_ocsf_file_system_activity {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:    1001,
+        category_uid: 1,
+        activity_id:  activity,
+        type_uid:     1001 * 100 + activity,
+        severity_id:  workspace.limpid.severity_id,
+        time:         received_at,
+        file:         workspace.limpid.file,
+        actor:        workspace.limpid.actor,
+        device:       workspace.limpid.device,
+        user:         workspace.limpid.user,
+        message:      workspace.limpid.message,
+        metadata:     workspace.limpid.metadata
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Process Activity (class_uid 1007)
+// ---------------------------------------------------------------------------
+//
+// Process launch / terminate / inject / set-uid — Sysmon ProcessCreate
+// (event id 1), Linux audit execve, EDR process events. Parsers populate
+// `workspace.limpid.process` (the process being acted on),
+// `workspace.limpid.actor.process` (the parent / initiator), and
+// `workspace.limpid.actor.user`.
+def process compose_ocsf_process_activity {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:    1007,
+        category_uid: 1,
+        activity_id:  activity,
+        type_uid:     1007 * 100 + activity,
+        severity_id:  workspace.limpid.severity_id,
+        time:         received_at,
+        process:      workspace.limpid.process,
+        actor:        workspace.limpid.actor,
+        device:       workspace.limpid.device,
+        message:      workspace.limpid.message,
+        metadata:     workspace.limpid.metadata
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Registry Key Activity (class_uid 1008)
+// ---------------------------------------------------------------------------
+//
+// Windows registry key create / delete / rename. Parsers populate
+// `workspace.limpid.reg_key` (path) and `workspace.limpid.actor.process`
+// (the process that touched it).
+def process compose_ocsf_registry_key_activity {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:    1008,
+        category_uid: 1,
+        activity_id:  activity,
+        type_uid:     1008 * 100 + activity,
+        severity_id:  workspace.limpid.severity_id,
+        time:         received_at,
+        reg_key:      workspace.limpid.reg_key,
+        actor:        workspace.limpid.actor,
+        device:       workspace.limpid.device,
+        message:      workspace.limpid.message,
+        metadata:     workspace.limpid.metadata
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Registry Value Activity (class_uid 1009)
+// ---------------------------------------------------------------------------
+//
+// Windows registry value set / delete / modify. Parsers populate
+// `workspace.limpid.reg_value` (path + data) and
+// `workspace.limpid.actor.process`.
+def process compose_ocsf_registry_value_activity {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:    1009,
+        category_uid: 1,
+        activity_id:  activity,
+        type_uid:     1009 * 100 + activity,
+        severity_id:  workspace.limpid.severity_id,
+        time:         received_at,
+        reg_value:    workspace.limpid.reg_value,
+        actor:        workspace.limpid.actor,
+        device:       workspace.limpid.device,
+        message:      workspace.limpid.message,
+        metadata:     workspace.limpid.metadata
+    })
+}
+
+// ===========================================================================
+// Findings (category 2)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Vulnerability Finding (class_uid 2002)
+// ---------------------------------------------------------------------------
+//
+// Vulnerability scanner output (Tenable, Qualys, OpenVAS). Parsers
+// populate `workspace.limpid.finding_info`,
+// `workspace.limpid.vulnerabilities` (array of CVE / CVSS / etc.),
+// `workspace.limpid.affected_packages`, and `workspace.limpid.resources`.
+def process compose_ocsf_vulnerability_finding {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:         2002,
+        category_uid:      2,
+        activity_id:       activity,
+        type_uid:          2002 * 100 + activity,
+        severity_id:       workspace.limpid.severity_id,
+        time:              received_at,
+        finding_info:      workspace.limpid.finding_info,
+        vulnerabilities:   workspace.limpid.vulnerabilities,
+        affected_packages: workspace.limpid.affected_packages,
+        resources:         workspace.limpid.resources,
+        message:           workspace.limpid.message,
+        metadata:          workspace.limpid.metadata
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Compliance Finding (class_uid 2003)
+// ---------------------------------------------------------------------------
+//
+// Configuration / posture compliance violation (CIS, AWS Config rules,
+// SOC 2 control failures). Parsers populate `workspace.limpid.compliance`
+// (control / standards) and `workspace.limpid.resource`.
+def process compose_ocsf_compliance_finding {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:    2003,
+        category_uid: 2,
+        activity_id:  activity,
+        type_uid:     2003 * 100 + activity,
+        severity_id:  workspace.limpid.severity_id,
+        time:         received_at,
+        finding_info: workspace.limpid.finding_info,
+        compliance:   workspace.limpid.compliance,
+        resource:     workspace.limpid.resource,
+        remediation:  workspace.limpid.remediation,
+        message:      workspace.limpid.message,
+        metadata:     workspace.limpid.metadata
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Detection Finding (class_uid 2004)
+// ---------------------------------------------------------------------------
+//
+// Used by IDS/IPS, antivirus, web filter, DLP, and other detection-type
+// events. Parsers populate `workspace.limpid.finding_info` (title /
+// types / uid), `workspace.limpid.disposition_id` (Allowed / Blocked /
+// Detected / Quarantined / etc.), and optionally `attack` / `malware` /
+// `evidences` objects with engine-specific detail.
+def process compose_ocsf_detection_finding {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:      2004,
+        category_uid:   2,
+        activity_id:    activity,
+        type_uid:       2004 * 100 + activity,
+        severity_id:    workspace.limpid.severity_id,
+        time:           received_at,
+        finding_info:   workspace.limpid.finding_info,
+        disposition_id: workspace.limpid.disposition_id,
+        src_endpoint:   workspace.limpid.src_endpoint,
+        dst_endpoint:   workspace.limpid.dst_endpoint,
+        actor:          workspace.limpid.actor,
+        attack:         workspace.limpid.attack,
+        malware:        workspace.limpid.malware,
+        evidences:      workspace.limpid.evidences,
+        message:        workspace.limpid.message,
+        metadata:       workspace.limpid.metadata
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Incident Finding (class_uid 2005)
+// ---------------------------------------------------------------------------
+//
+// Higher-level incident records emitted by SOAR / SIEM correlation
+// engines. Carries finding metadata plus assignment / status_id and
+// optional links to underlying findings.
+def process compose_ocsf_incident_finding {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:    2005,
+        category_uid: 2,
+        activity_id:  activity,
+        type_uid:     2005 * 100 + activity,
+        severity_id:  workspace.limpid.severity_id,
+        status_id:    workspace.limpid.status_id,
+        time:         received_at,
+        finding_info: workspace.limpid.finding_info,
+        assignee:     workspace.limpid.assignee,
+        priority:     workspace.limpid.priority,
+        impact_id:    workspace.limpid.impact_id,
+        message:      workspace.limpid.message,
+        metadata:     workspace.limpid.metadata
+    })
+}
+
+// ===========================================================================
+// Identity & Access Management (category 3)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Account Change (class_uid 3001)
+// ---------------------------------------------------------------------------
+//
+// Account create / delete / disable / enable / password-change. Parsers
+// populate `workspace.limpid.user` (the account being changed) and
+// `workspace.limpid.actor.user` (the actor performing the change).
+def process compose_ocsf_account_change {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:    3001,
+        category_uid: 3,
+        activity_id:  activity,
+        type_uid:     3001 * 100 + activity,
+        severity_id:  workspace.limpid.severity_id,
+        time:         received_at,
+        user:         workspace.limpid.user,
+        actor:        workspace.limpid.actor,
+        src_endpoint: workspace.limpid.src_endpoint,
+        message:      workspace.limpid.message,
+        metadata:     workspace.limpid.metadata
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Authentication (class_uid 3002)
+// ---------------------------------------------------------------------------
+//
+// Login / logout / failed-auth events. Parsers populate
+// `workspace.limpid.user`, `workspace.limpid.src_endpoint`, and
+// `workspace.limpid.status_id` (1 Success / 2 Failure).
+def process compose_ocsf_authentication {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:    3002,
+        category_uid: 3,
+        activity_id:  activity,
+        type_uid:     3002 * 100 + activity,
+        severity_id:  workspace.limpid.severity_id,
+        status_id:    workspace.limpid.status_id,
+        time:         received_at,
+        user:         workspace.limpid.user,
+        src_endpoint: workspace.limpid.src_endpoint,
+        dst_endpoint: workspace.limpid.dst_endpoint,
+        auth_protocol_id: workspace.limpid.auth_protocol_id,
+        message:      workspace.limpid.message,
+        metadata:     workspace.limpid.metadata
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Authorize Session (class_uid 3003)
+// ---------------------------------------------------------------------------
+//
+// Session authorization (sudo, su, RBAC role-elevation). Parsers populate
+// `workspace.limpid.user`, `workspace.limpid.session`, and
+// `workspace.limpid.privileges`.
+def process compose_ocsf_authorize_session {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:    3003,
+        category_uid: 3,
+        activity_id:  activity,
+        type_uid:     3003 * 100 + activity,
+        severity_id:  workspace.limpid.severity_id,
+        time:         received_at,
+        user:         workspace.limpid.user,
+        session:      workspace.limpid.session,
+        src_endpoint: workspace.limpid.src_endpoint,
+        privileges:   workspace.limpid.privileges,
+        message:      workspace.limpid.message,
+        metadata:     workspace.limpid.metadata
+    })
+}
+
+// ---------------------------------------------------------------------------
+// User Access Management (class_uid 3005)
+// ---------------------------------------------------------------------------
+//
+// Privilege grant / revoke / role-assignment operations.
+def process compose_ocsf_user_access_management {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:    3005,
+        category_uid: 3,
+        activity_id:  activity,
+        type_uid:     3005 * 100 + activity,
+        severity_id:  workspace.limpid.severity_id,
+        time:         received_at,
+        user:         workspace.limpid.user,
+        actor:        workspace.limpid.actor,
+        privileges:   workspace.limpid.privileges,
+        resource:     workspace.limpid.resource,
+        message:      workspace.limpid.message,
+        metadata:     workspace.limpid.metadata
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Group Management (class_uid 3006)
+// ---------------------------------------------------------------------------
+//
+// Group create / delete / membership change.
+def process compose_ocsf_group_management {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:    3006,
+        category_uid: 3,
+        activity_id:  activity,
+        type_uid:     3006 * 100 + activity,
+        severity_id:  workspace.limpid.severity_id,
+        time:         received_at,
+        group:        workspace.limpid.group,
+        user:         workspace.limpid.user,
+        actor:        workspace.limpid.actor,
+        message:      workspace.limpid.message,
+        metadata:     workspace.limpid.metadata
+    })
+}
+
+// ===========================================================================
+// Network Activity (category 4)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Network Activity (class_uid 4001)
+// ---------------------------------------------------------------------------
+//
+// Generic network connection (firewall traffic logs, NetFlow, packet
+// captures). Parsers populate `workspace.limpid.src_endpoint`,
+// `workspace.limpid.dst_endpoint`, `workspace.limpid.connection_info`,
+// and optionally `workspace.limpid.traffic` (bytes_in/out).
+def process compose_ocsf_network_activity {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:       4001,
+        category_uid:    4,
+        activity_id:     activity,
+        type_uid:        4001 * 100 + activity,
+        severity_id:     workspace.limpid.severity_id,
+        time:            received_at,
+        src_endpoint:    workspace.limpid.src_endpoint,
+        dst_endpoint:    workspace.limpid.dst_endpoint,
+        connection_info: workspace.limpid.connection_info,
+        traffic:         workspace.limpid.traffic,
+        message:         workspace.limpid.message,
+        metadata:        workspace.limpid.metadata
+    })
+}
+
+// ---------------------------------------------------------------------------
+// HTTP Activity (class_uid 4002)
+// ---------------------------------------------------------------------------
+//
+// HTTP request/response cycle (web servers, reverse proxies, WAFs).
+// Parsers populate `workspace.limpid.http_request` (method / url /
+// headers / body_length) and `workspace.limpid.http_response` (status /
+// headers / body_length).
+def process compose_ocsf_http_activity {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:     4002,
+        category_uid:  4,
+        activity_id:   activity,
+        type_uid:      4002 * 100 + activity,
+        severity_id:   workspace.limpid.severity_id,
+        time:          received_at,
+        src_endpoint:  workspace.limpid.src_endpoint,
+        dst_endpoint:  workspace.limpid.dst_endpoint,
+        http_request:  workspace.limpid.http_request,
+        http_response: workspace.limpid.http_response,
+        traffic:       workspace.limpid.traffic,
+        message:       workspace.limpid.message,
+        metadata:      workspace.limpid.metadata
+    })
+}
+
+// ---------------------------------------------------------------------------
+// DNS Activity (class_uid 4003)
+// ---------------------------------------------------------------------------
+//
+// DNS query / response (BIND, Unbound, Windows DNS, passive DNS taps).
+// Parsers populate `workspace.limpid.query` (question name + type) and
+// `workspace.limpid.answers` (resolved records).
+def process compose_ocsf_dns_activity {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:    4003,
+        category_uid: 4,
+        activity_id:  activity,
+        type_uid:     4003 * 100 + activity,
+        severity_id:  workspace.limpid.severity_id,
+        rcode_id:     workspace.limpid.rcode_id,
+        time:         received_at,
+        src_endpoint: workspace.limpid.src_endpoint,
+        dst_endpoint: workspace.limpid.dst_endpoint,
+        query:        workspace.limpid.query,
+        answers:      workspace.limpid.answers,
+        message:      workspace.limpid.message,
+        metadata:     workspace.limpid.metadata
+    })
+}
+
+// ---------------------------------------------------------------------------
+// DHCP Activity (class_uid 4004)
+// ---------------------------------------------------------------------------
+//
+// DHCP lease lifecycle (discover / offer / request / ack / release).
+def process compose_ocsf_dhcp_activity {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:    4004,
+        category_uid: 4,
+        activity_id:  activity,
+        type_uid:     4004 * 100 + activity,
+        severity_id:  workspace.limpid.severity_id,
+        time:         received_at,
+        src_endpoint: workspace.limpid.src_endpoint,
+        dst_endpoint: workspace.limpid.dst_endpoint,
+        is_renewal:   workspace.limpid.is_renewal,
+        lease_dur:    workspace.limpid.lease_dur,
+        message:      workspace.limpid.message,
+        metadata:     workspace.limpid.metadata
+    })
+}
+
+// ---------------------------------------------------------------------------
+// RDP Activity (class_uid 4005)
+// ---------------------------------------------------------------------------
+def process compose_ocsf_rdp_activity {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:    4005,
+        category_uid: 4,
+        activity_id:  activity,
+        type_uid:     4005 * 100 + activity,
+        severity_id:  workspace.limpid.severity_id,
+        time:         received_at,
+        src_endpoint: workspace.limpid.src_endpoint,
+        dst_endpoint: workspace.limpid.dst_endpoint,
+        protocol_ver: workspace.limpid.protocol_ver,
+        capabilities: workspace.limpid.capabilities,
+        device:       workspace.limpid.device,
+        user:         workspace.limpid.user,
+        message:      workspace.limpid.message,
+        metadata:     workspace.limpid.metadata
+    })
+}
+
+// ---------------------------------------------------------------------------
+// SMB Activity (class_uid 4006)
+// ---------------------------------------------------------------------------
+def process compose_ocsf_smb_activity {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:    4006,
+        category_uid: 4,
+        activity_id:  activity,
+        type_uid:     4006 * 100 + activity,
+        severity_id:  workspace.limpid.severity_id,
+        time:         received_at,
+        src_endpoint: workspace.limpid.src_endpoint,
+        dst_endpoint: workspace.limpid.dst_endpoint,
+        share:        workspace.limpid.share,
+        share_type_id: workspace.limpid.share_type_id,
+        file:         workspace.limpid.file,
+        command:      workspace.limpid.command,
+        message:      workspace.limpid.message,
+        metadata:     workspace.limpid.metadata
+    })
+}
+
+// ---------------------------------------------------------------------------
+// SSH Activity (class_uid 4007)
+// ---------------------------------------------------------------------------
+def process compose_ocsf_ssh_activity {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:    4007,
+        category_uid: 4,
+        activity_id:  activity,
+        type_uid:     4007 * 100 + activity,
+        severity_id:  workspace.limpid.severity_id,
+        time:         received_at,
+        src_endpoint: workspace.limpid.src_endpoint,
+        dst_endpoint: workspace.limpid.dst_endpoint,
+        protocol_ver: workspace.limpid.protocol_ver,
+        client_hassh: workspace.limpid.client_hassh,
+        server_hassh: workspace.limpid.server_hassh,
+        auth_type:    workspace.limpid.auth_type,
+        user:         workspace.limpid.user,
+        message:      workspace.limpid.message,
+        metadata:     workspace.limpid.metadata
+    })
+}
+
+// ---------------------------------------------------------------------------
+// FTP Activity (class_uid 4008)
+// ---------------------------------------------------------------------------
+def process compose_ocsf_ftp_activity {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:    4008,
+        category_uid: 4,
+        activity_id:  activity,
+        type_uid:     4008 * 100 + activity,
+        severity_id:  workspace.limpid.severity_id,
+        time:         received_at,
+        src_endpoint: workspace.limpid.src_endpoint,
+        dst_endpoint: workspace.limpid.dst_endpoint,
+        command:      workspace.limpid.command,
+        codes:        workspace.limpid.codes,
+        port:         workspace.limpid.port,
+        file:         workspace.limpid.file,
+        message:      workspace.limpid.message,
+        metadata:     workspace.limpid.metadata
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Email Activity (class_uid 4009)
+// ---------------------------------------------------------------------------
+def process compose_ocsf_email_activity {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:    4009,
+        category_uid: 4,
+        activity_id:  activity,
+        type_uid:     4009 * 100 + activity,
+        severity_id:  workspace.limpid.severity_id,
+        direction_id: workspace.limpid.direction_id,
+        time:         received_at,
+        src_endpoint: workspace.limpid.src_endpoint,
+        dst_endpoint: workspace.limpid.dst_endpoint,
+        email:        workspace.limpid.email,
+        smtp_hello:   workspace.limpid.smtp_hello,
+        message:      workspace.limpid.message,
+        metadata:     workspace.limpid.metadata
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Network File Activity (class_uid 4010)
+// ---------------------------------------------------------------------------
+//
+// Cross-host file access over network protocols (NFS, SMB-as-FS, etc.).
+def process compose_ocsf_network_file_activity {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:    4010,
+        category_uid: 4,
+        activity_id:  activity,
+        type_uid:     4010 * 100 + activity,
+        severity_id:  workspace.limpid.severity_id,
+        time:         received_at,
+        src_endpoint: workspace.limpid.src_endpoint,
+        dst_endpoint: workspace.limpid.dst_endpoint,
+        file:         workspace.limpid.file,
+        share:        workspace.limpid.share,
+        actor:        workspace.limpid.actor,
+        message:      workspace.limpid.message,
+        metadata:     workspace.limpid.metadata
+    })
+}
+
+// ===========================================================================
+// Application Activity (category 6)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// API Activity (class_uid 6003)
+// ---------------------------------------------------------------------------
+//
+// API call records (CloudTrail, k8s audit log, internal API gateway).
+// Parsers populate `workspace.limpid.api` (operation / version / service)
+// and `workspace.limpid.actor` (the calling principal).
+def process compose_ocsf_api_activity {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:    6003,
+        category_uid: 6,
+        activity_id:  activity,
+        type_uid:     6003 * 100 + activity,
+        severity_id:  workspace.limpid.severity_id,
+        time:         received_at,
+        api:          workspace.limpid.api,
+        actor:        workspace.limpid.actor,
+        src_endpoint: workspace.limpid.src_endpoint,
+        dst_endpoint: workspace.limpid.dst_endpoint,
+        resources:    workspace.limpid.resources,
+        message:      workspace.limpid.message,
+        metadata:     workspace.limpid.metadata
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Web Resource Access (class_uid 6004)
+// ---------------------------------------------------------------------------
+//
+// Used by web-filter and similar URL-allow/deny events. Parsers
+// populate `workspace.limpid.http_request` (url + method),
+// `workspace.limpid.web_resources` (categorisation), and
+// `workspace.limpid.actor.user` for the requesting user.
+def process compose_ocsf_web_resource_access {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:     6004,
+        category_uid:  6,
+        activity_id:   activity,
+        type_uid:      6004 * 100 + activity,
+        severity_id:   workspace.limpid.severity_id,
+        time:          received_at,
+        src_endpoint:  workspace.limpid.src_endpoint,
+        dst_endpoint:  workspace.limpid.dst_endpoint,
+        http_request:  workspace.limpid.http_request,
+        http_response: workspace.limpid.http_response,
+        web_resources: workspace.limpid.web_resources,
+        actor:         workspace.limpid.actor,
+        message:       workspace.limpid.message,
+        metadata:      workspace.limpid.metadata
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Datastore Activity (class_uid 6005)
+// ---------------------------------------------------------------------------
+//
+// Database / S3 / object-store access events.
+def process compose_ocsf_datastore_activity {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:    6005,
+        category_uid: 6,
+        activity_id:  activity,
+        type_uid:     6005 * 100 + activity,
+        severity_id:  workspace.limpid.severity_id,
+        time:         received_at,
+        actor:        workspace.limpid.actor,
+        src_endpoint: workspace.limpid.src_endpoint,
+        database:     workspace.limpid.database,
+        databucket:   workspace.limpid.databucket,
+        table:        workspace.limpid.table,
+        query_info:   workspace.limpid.query_info,
+        message:      workspace.limpid.message,
+        metadata:     workspace.limpid.metadata
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Scan Activity (class_uid 6007)
+// ---------------------------------------------------------------------------
+//
+// Vulnerability / asset / config scan job records (the orchestration
+// layer; individual findings are class 2002 / 2003).
+def process compose_ocsf_scan_activity {
+    let activity = workspace.limpid.activity_id
+    egress = to_json({
+        class_uid:    6007,
+        category_uid: 6,
+        activity_id:  activity,
+        type_uid:     6007 * 100 + activity,
+        severity_id:  workspace.limpid.severity_id,
+        time:         received_at,
+        scan:         workspace.limpid.scan,
+        actor:        workspace.limpid.actor,
+        devices:      workspace.limpid.devices,
+        policy:       workspace.limpid.policy,
+        message:      workspace.limpid.message,
+        metadata:     workspace.limpid.metadata
+    })
+}
