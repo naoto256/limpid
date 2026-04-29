@@ -54,12 +54,6 @@ impl<'bump> EventArena<'bump> {
         self.bump.alloc_str(s)
     }
 
-    /// Copy a `Copy` slice into the arena.
-    #[inline]
-    pub fn alloc_slice_copy<T: Copy>(&self, s: &[T]) -> &'bump [T] {
-        self.bump.alloc_slice_copy(s)
-    }
-
     /// Copy `b` into the arena as raw bytes.
     #[inline]
     pub fn alloc_bytes(&self, b: &[u8]) -> &'bump [u8] {

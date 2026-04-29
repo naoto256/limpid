@@ -260,7 +260,7 @@ fn exec_process_stmt<'bump>(
                         // builder that produced this object) and `v`
                         // (arena-backed `Value`) ride straight into
                         // the workspace slot list.
-                        event.workspace_set(*k, *v);
+                        event.workspace_set(k, *v);
                     }
                 }
                 Value::Null => {}
@@ -399,10 +399,10 @@ fn set_object_path<'bump>(
     for (k, v) in existing_entries.iter() {
         if *k == head {
             let next = set_object_path(Some(*v), &path[1..], value, arena);
-            builder.push(*k, next);
+            builder.push(k, next);
             placed = true;
         } else {
-            builder.push(*k, *v);
+            builder.push(k, *v);
         }
     }
     if !placed {
