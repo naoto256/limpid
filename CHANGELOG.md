@@ -8,6 +8,153 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
+## [0.7.0] - 2026-04-30
+> snippet library v1 — 11 vendor parsers, OCSF 27-class composer; DSL fix for sub-process error propagation
+
+The snippet library debut. Eleven vendor / format parsers ship,
+covering the operational vocabulary of the dominant unix and
+network-device log sources, plus a 27-class OCSF composer that maps
+the parser-canonical `workspace.limpid.*` shape to OCSF 1.3.0 JSON
+on `egress`. Operators can drop a single `include` into their
+config and immediately ship vendor logs into a SIEM / data lake
+in OCSF form.
+
+Plus a DSL runtime fix that turned out to be load-bearing for the
+nested-dispatch parsers in this library: `error` from inside a
+sub-process now propagates correctly to the pipeline boundary
+instead of being swallowed at the `process` call.
+
+### Added — Snippet library
+
+Eleven parsers in `packaging/snippets/parsers/` (installed under
+`/usr/share/limpid/snippets/parsers/`):
+
+| Parser | Source | OCSF class(es) emitted |
+|---|---|---|
+| **Security devices / cloud audit** | | |
+| `parse_fortigate_cef` | FortiGate (CEF wrap) | 4001 / 2004 / 3002 / 6002 |
+| `parse_fortigate_syslog` | FortiGate (native KV syslog) | (same as CEF) |
+| `parse_paloalto_cef` | PAN-OS (CEF wrap) | 4001 / 2004 / 6004 / 3002 |
+| `parse_paloalto_syslog` | PAN-OS (native CSV syslog) | (same as CEF) |
+| `parse_asa` | Cisco ASA / FTD-in-ASA-mode (syslog) | 3002 / 4001 |
+| `parse_cloudtrail` | AWS CloudTrail (JSON) | 6003 API Activity |
+| **Server / host systems** | | |
+| `parse_openssh` | OpenSSH `sshd` (syslog / journald) | 3002 Authentication |
+| `parse_sudo` | sudo (syslog / journald) | 3003 Authorize Session |
+| `parse_combined_log` | Apache / Nginx access log (combined format) | 4002 HTTP Activity |
+| `parse_postfix` | Postfix MTA (syslog) | 4009 Email Activity |
+| `parse_winevent_json` | Windows Security event log (NXLog / Vector / Winlogbeat JSON) | 3002 / 1007 / 3001 / 3006 |
+| **Vendor-neutral** | | |
+| `parse_ocsf` | OCSF JSON inbound (any vendor's prior compose_ocsf output) | passthrough (any class) |
+
+Two composers in `packaging/snippets/composers/`:
+
+- `compose_ocsf` — dispatches by `workspace.limpid.class_uid` to per-class
+  leaves, covering the OCSF 1.3.0 priority set (27 classes: 1001 /
+  1007 / 1008 / 1009 / 2002 / 2003 / 2004 / 2005 / 3001 / 3002 / 3003 /
+  3005 / 3006 / 4001 / 4002 / 4003 / 4004 / 4005 / 4006 / 4007 / 4008 /
+  4009 / 4010 / 6003 / 6004 / 6005 / 6007). Reads only
+  `workspace.limpid.*` per the parser ↔ composer contract; vendor
+  intermediates (`workspace.cef`, `workspace.syslog`) are not
+  composer-visible.
+- `compose_replayable` — minimal `{received_at, source, ingress}`
+  shape that round-trips through `inject --json` for parser
+  regression / replay capture.
+
+One filter in `packaging/snippets/filters/`:
+
+- `filter_openssh_journal` — drops `pam_unix(sshd:session): session
+  opened/closed` PAM noise that journald sources before they reach
+  `parse_openssh` (sshd already emits its own `Accepted ...` /
+  `Disconnected ...` lines that cover the same authentication
+  fact, so the PAM duplicate would double-count).
+
+Field naming follows the parser ↔ composer contract:
+`workspace.limpid.<canonical-OCSF-field>` — the parser picks vendor
+fields off the wire and writes them to a single canonical scratch
+namespace, the composer reads only that namespace and emits OCSF
+JSON. Vendor intermediates (`workspace.cef`, `workspace.syslog`,
+`workspace.pf`, etc.) are parser-private.
+
+Verified against real / public test corpora where available
+(playground sshd, FLAWS CloudTrail dataset, OTRF Mordor Windows
+event JSON, miroslav-siklosi Cisco ASA syslog generator, real
+Postfix mail.log slice). Each parser's docstring records the
+specific dataset and its parse-rate, plus `NOTE`-flagged subtypes
+that are documented but not yet exercised against live data.
+
+### Fixed — sub-process `error` propagates past the `ProcessCall` boundary
+
+`error` from inside a sub-process (`def process A { ... process B }`
+where `B` fires `error`) was being swallowed at the caller's
+`ProcessCall` arm in `crates/limpid/src/dsl/exec.rs`. Pre-fix the
+caller restored the event from a workspace snapshot and continued
+the pipeline as if nothing happened — making the operator-explicit
+DLQ routing invisible at the pipeline boundary. Downstream
+processes (typically `compose_ocsf`) then ran on the half-populated
+workspace and produced a confusing secondary error like
+`compose_ocsf: unsupported class_uid` that shadowed the original.
+
+The fix removes the swallow: the sub-process Err propagates up
+through `exec_process_body` to the pipeline-level handler, which
+routes the event to the configured `error_log` (DLQ) exactly once
+with the operator's original message intact, and the rest of the
+pipe is skipped.
+
+`try { process foo } catch { ... }` continues to work as before
+for fail-soft on a specific call — the catch body now actually
+runs after the sub-process error (pre-fix the swallow happened
+before `try`/`catch` could see the Err).
+
+The bug shipped in v0.5.5 (the release that introduced the `error`
+keyword) and was present in v0.5.6 / v0.5.7 / v0.5.8 / v0.6.0 /
+v0.6.1. None of those releases routed sub-process errors to the
+DLQ correctly. Operators upgrading should expect their dispatcher-
+style parsers (`switch ... default { error "..." }` with `process X`
+in non-default arms) to start emitting DLQ entries that pre-fix
+were silently absorbed; configure `control { error_log "..." }`
+if you haven't already to capture them.
+
+### Changed — compose_ocsf class leaves extended
+
+Per-class `compose_ocsf_<class>` leaves grew the field set they
+forward from `workspace.limpid.*`, driven by the parser additions
+above. The leaves still strip `null` keys via `null_omit` so
+parsers that don't populate a slot don't emit a noisy `"key":
+null` in the output.
+
+| Class | Newly forwarded fields |
+|---|---|
+| 3002 Authentication | (was already comprehensive — no change) |
+| 3003 Authorize Session | `status_id`, `actor` |
+| 4002 HTTP Activity | `status_id`, `actor` |
+| 4009 Email Activity | `status_id` |
+| 6003 API Activity | `status_id`, `actor`, `http_request`, `cloud`, `unmapped` |
+
+Other class leaves (1001 / 1007 / 1008 / 1009 / 2002 / 2003 / 2004 /
+2005 / 3001 / 3005 / 3006 / 4001 / 4003 / 4004 / 4005 / 4006 / 4007 /
+4008 / 4010 / 6004 / 6005 / 6007) are at the same field set as v0.6.0
+— they ship populated by the existing leaf shape, and parsers added
+in this release happened not to touch them.
+
+### Notes
+
+- DSL syntax: unchanged.
+- Public Rust API: unchanged. The fix is internal to `exec.rs`'s
+  ProcessCall arm — no signature changes, no trait extensions.
+- 361 tests pass (`cargo test --workspace`), `cargo build --release`
+  green.
+- Snippet library installation path: `/usr/share/limpid/snippets/`
+  (the `_smoke-*.limpid` scaffolding under the repo root is the
+  consumer-side `tail` config used to verify each parser locally;
+  not packaged).
+- Two regression tests added covering the sub-process error
+  propagation contract: `test_exec_process_error_propagates_to_caller`
+  (single-tier propagation) and `test_exec_try_catch_on_error`
+  (try/catch still catches a sub-process Err post-fix).
+
+---
+
 ## [0.6.1] - 2026-04-30
 > perf: multi-pipeline scaling — 4-pipeline D-pipeline aggregate 374k → 459k events/sec (+23%, scaling 2.27× → 2.73×)
 
