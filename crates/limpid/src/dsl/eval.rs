@@ -227,13 +227,23 @@ fn bytes_to_value(bytes: &[u8]) -> Value {
 }
 
 fn resolve_ident(parts: &[String], event: &Event, scope: &LocalScope) -> Result<Value> {
-    // Single-segment idents: check let scope first, then Event metadata.
+    // Idents whose first segment is a let-bound name resolve through
+    // the local scope first. For multi-segment paths like `f.a.b`, the
+    // scope produces the root value and the remaining segments walk
+    // into it via the same `resolve_workspace_path` Object / Array
+    // walker used for `workspace.x.y.z` — so `let f = regex_parse(...)`
+    // followed by `f.user` reads the named capture group from the
+    // returned Object.
+    //
     // `workspace.*` must always be written explicitly — there is no
-    // "bare field lookup" fallback into workspace.
-    if parts.len() == 1
-        && let Some(v) = scope.get(&parts[0])
-    {
-        return Ok(v.clone());
+    // "bare field lookup" fallback into the workspace map; this scope
+    // path only fires when the first segment matches a `let`-bound
+    // name in the current process / function scope.
+    if let Some(root) = scope.get(&parts[0]) {
+        if parts.len() == 1 {
+            return Ok(root.clone());
+        }
+        return resolve_workspace_path(&parts[1..], root);
     }
 
     match parts.first().map(|s| s.as_str()) {
