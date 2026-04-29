@@ -256,7 +256,15 @@ mod tests {
 
     fn call_syslog_parse(reg: &FunctionRegistry, s: &str) -> Result<Map> {
         let e = dummy_event();
-        let v = reg.call(Some("syslog"), "parse", &[Value::String(s.into())], &e)?;
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
+        let v = reg.call(
+            Some("syslog"),
+            "parse",
+            &[Value::String(s.into())],
+            &e,
+            &arena,
+        )?;
         let Value::Object(m) = v else {
             panic!("expected Object")
         };
@@ -265,6 +273,8 @@ mod tests {
 
     #[test]
     fn rfc5424_basic() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let m = call_syslog_parse(
             &reg,
@@ -284,6 +294,8 @@ mod tests {
 
     #[test]
     fn rfc5424_with_structured_data() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let m = call_syslog_parse(
             &reg,
@@ -298,6 +310,8 @@ mod tests {
 
     #[test]
     fn rfc3164_with_pid() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let m = call_syslog_parse(
             &reg,
@@ -313,6 +327,8 @@ mod tests {
 
     #[test]
     fn rfc3164_without_pid() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let m =
             call_syslog_parse(&reg, "<134>Apr 15 10:30:00 myhost kernel: Out of memory").unwrap();
@@ -323,6 +339,8 @@ mod tests {
 
     #[test]
     fn no_pri_errors() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let err = reg
@@ -331,6 +349,7 @@ mod tests {
                 "parse",
                 &[Value::String("no pri header".into())],
                 &e,
+                &arena,
             )
             .unwrap_err();
         assert!(err.to_string().contains("no PRI header"));
@@ -338,6 +357,8 @@ mod tests {
 
     #[test]
     fn defaults_fill_missing_keys() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let defaults = Value::Object(
             [("appname".to_string(), Value::String("unknown".into()))]
@@ -355,6 +376,7 @@ mod tests {
                     defaults,
                 ],
                 &e,
+                &arena,
             )
             .unwrap();
         let Value::Object(m) = result else { panic!() };

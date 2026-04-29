@@ -39,6 +39,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
+use crate::dsl::arena::EventArena;
 use crate::dsl::ast::FunctionDef;
 use crate::dsl::value::Value;
 use crate::event::Event;
@@ -302,13 +303,14 @@ impl FunctionRegistry {
         name: &str,
         args: &[Value],
         event: &Event,
+        arena: &EventArena<'_>,
     ) -> Result<Value> {
         // User-defined `def function` declarations dispatch first. They
         // live in the flat namespace only (no `ns.fn` form for now).
         if namespace.is_none()
             && let Some(fn_def) = self.user_definitions.get(name)
         {
-            return self.call_user_function(fn_def, args, event);
+            return self.call_user_function(fn_def, args, event, arena);
         }
 
         let key = (namespace.map(str::to_string), name.to_string());
@@ -353,6 +355,7 @@ impl FunctionRegistry {
         fn_def: &FunctionDef,
         args: &[Value],
         event: &Event,
+        arena: &EventArena<'_>,
     ) -> Result<Value> {
         if args.len() != fn_def.params.len() {
             anyhow::bail!(
@@ -371,10 +374,10 @@ impl FunctionRegistry {
         // overwrites any prior value, which is the only update mechanism
         // available inside a function body.
         for fl in &fn_def.body.lets {
-            let v = crate::dsl::eval::eval_expr_with_scope(&fl.value, event, self, &scope)?;
+            let v = crate::dsl::eval::eval_expr_with_scope(&fl.value, event, self, &scope, arena)?;
             scope.bind(&fl.name, v);
         }
-        crate::dsl::eval::eval_expr_with_scope(&fn_def.body.ret, event, self, &scope)
+        crate::dsl::eval::eval_expr_with_scope(&fn_def.body.ret, event, self, &scope, arena)
     }
 }
 
@@ -487,6 +490,8 @@ mod tests {
 
     #[test]
     fn strftime_formats_rfc3339_input() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_registry();
         let e = dummy_event();
         let result = reg
@@ -498,6 +503,7 @@ mod tests {
                     Value::String("%Y/%m/%d %H:%M:%S".into()),
                 ],
                 &e,
+                &arena,
             )
             .unwrap();
         assert_eq!(result, Value::String("2026/04/19 10:30:45".into()));
@@ -505,6 +511,8 @@ mod tests {
 
     #[test]
     fn strftime_bsd_syslog_format() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // Reproduce the old `prepend_timestamp` default format.
         let reg = make_registry();
         let e = dummy_event();
@@ -517,6 +525,7 @@ mod tests {
                     Value::String("%b %e %H:%M:%S".into()),
                 ],
                 &e,
+                &arena,
             )
             .unwrap();
         assert_eq!(result, Value::String("Apr 19 05:07:09".into()));
@@ -524,6 +533,8 @@ mod tests {
 
     #[test]
     fn strftime_utc_timezone() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_registry();
         let e = dummy_event();
         // Input is +09:00; force to UTC.
@@ -537,6 +548,7 @@ mod tests {
                     Value::String("UTC".into()),
                 ],
                 &e,
+                &arena,
             )
             .unwrap();
         assert_eq!(result, Value::String("2026-04-19T01:30:45+0000".into()));
@@ -544,6 +556,8 @@ mod tests {
 
     #[test]
     fn strftime_fixed_offset() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_registry();
         let e = dummy_event();
         let result = reg
@@ -556,6 +570,7 @@ mod tests {
                     Value::String("+09:00".into()),
                 ],
                 &e,
+                &arena,
             )
             .unwrap();
         assert_eq!(result, Value::String("19:30".into()));
@@ -563,6 +578,8 @@ mod tests {
 
     #[test]
     fn strftime_rejects_string_input() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // Post-Value::Timestamp: strftime no longer parses RFC3339 from
         // string; it requires a typed timestamp value.
         let reg = make_registry();
@@ -576,6 +593,7 @@ mod tests {
                     Value::String("%Y".into()),
                 ],
                 &e,
+                &arena,
             )
             .unwrap_err();
         assert!(
@@ -587,6 +605,8 @@ mod tests {
 
     #[test]
     fn strftime_rejects_bad_timezone() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_registry();
         let e = dummy_event();
         let err = reg
@@ -599,6 +619,7 @@ mod tests {
                     Value::String("bogus".into()),
                 ],
                 &e,
+                &arena,
             )
             .unwrap_err();
         assert!(err.to_string().contains("invalid timezone"));
@@ -606,10 +627,18 @@ mod tests {
 
     #[test]
     fn strftime_rejects_wrong_arity() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_registry();
         let e = dummy_event();
         let err = reg
-            .call(None, "strftime", &[ts("2026-04-19T10:30:45+00:00")], &e)
+            .call(
+                None,
+                "strftime",
+                &[ts("2026-04-19T10:30:45+00:00")],
+                &e,
+                &arena,
+            )
             .unwrap_err();
         assert!(err.to_string().contains("2 to 3 arguments"));
     }
@@ -623,6 +652,8 @@ mod tests {
 
     #[test]
     fn arity_fixed_accepts_exact_arg_count() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_registry();
         let e = dummy_event();
         // `contains(String, String) -> Bool` is Arity::Fixed with 2 args.
@@ -631,16 +662,25 @@ mod tests {
             "contains",
             &[Value::String("hello".into()), Value::String("ell".into())],
             &e,
+            &arena,
         );
         assert!(ok.is_ok(), "fixed arity with correct count should succeed");
     }
 
     #[test]
     fn arity_fixed_rejects_too_few_args() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_registry();
         let e = dummy_event();
         let err = reg
-            .call(None, "contains", &[Value::String("hello".into())], &e)
+            .call(
+                None,
+                "contains",
+                &[Value::String("hello".into())],
+                &e,
+                &arena,
+            )
             .unwrap_err()
             .to_string();
         assert!(
@@ -651,6 +691,8 @@ mod tests {
 
     #[test]
     fn arity_fixed_rejects_too_many_args() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_registry();
         let e = dummy_event();
         let err = reg
@@ -663,6 +705,7 @@ mod tests {
                     Value::String("c".into()),
                 ],
                 &e,
+                &arena,
             )
             .unwrap_err()
             .to_string();
@@ -674,11 +717,16 @@ mod tests {
 
     #[test]
     fn arity_fixed_singular_message_for_single_arg() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // `to_int(x) -> Int` is Arity::Fixed with 1 arg — verify the
         // message uses "1 argument" (singular) rather than "1 arguments".
         let reg = make_registry();
         let e = dummy_event();
-        let err = reg.call(None, "to_int", &[], &e).unwrap_err().to_string();
+        let err = reg
+            .call(None, "to_int", &[], &e, &arena)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("to_int() expects 1 argument, got 0"),
             "unexpected error: {err}"
@@ -687,6 +735,8 @@ mod tests {
 
     #[test]
     fn arity_optional_accepts_min_and_max() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // `strftime(value, fmt[, tz])` — Optional { required: 2 }, max 3.
         let reg = make_registry();
         let e = dummy_event();
@@ -695,22 +745,27 @@ mod tests {
         let tz = Value::String("UTC".into());
         // at minimum
         assert!(
-            reg.call(None, "strftime", &[tsv.clone(), fmt.clone()], &e)
+            reg.call(None, "strftime", &[tsv.clone(), fmt.clone()], &e, &arena)
                 .is_ok()
         );
         // at maximum
-        assert!(reg.call(None, "strftime", &[tsv, fmt, tz], &e).is_ok());
+        assert!(
+            reg.call(None, "strftime", &[tsv, fmt, tz], &e, &arena)
+                .is_ok()
+        );
     }
 
     #[test]
     fn arity_optional_rejects_below_min_and_above_max() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_registry();
         let e = dummy_event();
         let tsv = ts("2026-04-19T10:30:45+00:00");
         let fmt = Value::String("%H:%M".into());
         let tz = Value::String("UTC".into());
         let err_below = reg
-            .call(None, "strftime", &[tsv.clone()], &e)
+            .call(None, "strftime", &[tsv.clone()], &e, &arena)
             .unwrap_err()
             .to_string();
         assert!(
@@ -718,7 +773,7 @@ mod tests {
             "unexpected error: {err_below}"
         );
         let err_above = reg
-            .call(None, "strftime", &[tsv, fmt, tz.clone(), tz], &e)
+            .call(None, "strftime", &[tsv, fmt, tz.clone(), tz], &e, &arena)
             .unwrap_err()
             .to_string();
         assert!(
@@ -729,6 +784,8 @@ mod tests {
 
     #[test]
     fn arity_check_applies_to_namespaced_functions() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // Namespaced functions registered via `register_in_with_sig` must
         // go through the same validation path. `syslog.strip_pri` takes 1
         // argument (Arity::Fixed); too many should be rejected uniformly.
@@ -740,6 +797,7 @@ mod tests {
                 "strip_pri",
                 &[Value::String("x".into()), Value::String("y".into())],
                 &e,
+                &arena,
             )
             .unwrap_err()
             .to_string();
@@ -753,6 +811,8 @@ mod tests {
 
     #[test]
     fn register_in_and_dispatch_namespaced() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // Block 3 mechanism check: a fake namespace + function registered
         // via `register_in` should dispatch through `call(Some(ns), name)`.
         let mut reg = FunctionRegistry::new();
@@ -766,6 +826,7 @@ mod tests {
                 "passthrough",
                 &[Value::String("hi".into())],
                 &e,
+                &arena,
             )
             .unwrap();
         assert_eq!(result, Value::String("hi".into()));
@@ -773,10 +834,12 @@ mod tests {
 
     #[test]
     fn unknown_namespace_error_message() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_registry();
         let e = dummy_event();
         let err = reg
-            .call(Some("not_a_real_namespace"), "parse", &[], &e)
+            .call(Some("not_a_real_namespace"), "parse", &[], &e, &arena)
             .unwrap_err()
             .to_string();
         assert!(
@@ -791,11 +854,13 @@ mod tests {
 
     #[test]
     fn unknown_function_in_existing_namespace() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let mut reg = FunctionRegistry::new();
         reg.register_in("_test_block3", "known", |_a, _e| Ok(Value::Null));
         let e = dummy_event();
         let err = reg
-            .call(Some("_test_block3"), "missing", &[], &e)
+            .call(Some("_test_block3"), "missing", &[], &e, &arena)
             .unwrap_err()
             .to_string();
         assert!(
@@ -806,18 +871,22 @@ mod tests {
 
     #[test]
     fn flat_primitive_regression_still_callable() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // Regression: after the registry became (namespace, name)-keyed,
         // existing flat primitives must still dispatch via `call(None, ...)`.
         let reg = make_registry();
         let e = dummy_event();
         let result = reg
-            .call(None, "lower", &[Value::String("HELLO".into())], &e)
+            .call(None, "lower", &[Value::String("HELLO".into())], &e, &arena)
             .unwrap();
         assert_eq!(result, Value::String("hello".into()));
     }
 
     #[test]
     fn namespace_and_flat_do_not_collide() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // Same short name registered in two different namespaces should
         // remain independently addressable.
         let mut reg = FunctionRegistry::new();
@@ -827,11 +896,12 @@ mod tests {
         });
         let e = dummy_event();
         assert_eq!(
-            reg.call(None, "ping", &[], &e).unwrap(),
+            reg.call(None, "ping", &[], &e, &arena).unwrap(),
             Value::String("flat".into())
         );
         assert_eq!(
-            reg.call(Some("_test_block3"), "ping", &[], &e).unwrap(),
+            reg.call(Some("_test_block3"), "ping", &[], &e, &arena)
+                .unwrap(),
             Value::String("namespaced".into())
         );
     }

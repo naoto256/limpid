@@ -40,32 +40,40 @@ mod tests {
 
     #[test]
     fn test_eval_literals() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
         assert_eq!(
-            eval_expr(&e(ExprKind::StringLit("hello".into())), &ev, &f).unwrap(),
+            eval_expr(&e(ExprKind::StringLit("hello".into())), &ev, &f, &arena).unwrap(),
             Value::String("hello".into())
         );
         assert_eq!(
-            eval_expr(&e(ExprKind::IntLit(99)), &ev, &f).unwrap(),
+            eval_expr(&e(ExprKind::IntLit(99)), &ev, &f, &arena).unwrap(),
             Value::Int(99)
         );
         assert_eq!(
-            eval_expr(&e(ExprKind::BoolLit(true)), &ev, &f).unwrap(),
+            eval_expr(&e(ExprKind::BoolLit(true)), &ev, &f, &arena).unwrap(),
             Value::Bool(true)
         );
-        assert_eq!(eval_expr(&e(ExprKind::Null), &ev, &f).unwrap(), Value::Null);
+        assert_eq!(
+            eval_expr(&e(ExprKind::Null), &ev, &f, &arena).unwrap(),
+            Value::Null
+        );
     }
 
     #[test]
     fn test_eval_ident_workspace() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
         assert_eq!(
             eval_expr(
                 &e(ExprKind::Ident(vec!["workspace".into(), "src".into()])),
                 &ev,
-                &f
+                &f,
+                &arena
             )
             .unwrap(),
             Value::String("192.168.1.1".into())
@@ -74,7 +82,8 @@ mod tests {
             eval_expr(
                 &e(ExprKind::Ident(vec!["workspace".into(), "count".into()])),
                 &ev,
-                &f
+                &f,
+                &arena
             )
             .unwrap(),
             Value::Int(42)
@@ -83,13 +92,25 @@ mod tests {
 
     #[test]
     fn test_eval_unknown_ident_errors() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
-        assert!(eval_expr(&e(ExprKind::Ident(vec!["typo_field".into()])), &ev, &f).is_err());
+        assert!(
+            eval_expr(
+                &e(ExprKind::Ident(vec!["typo_field".into()])),
+                &ev,
+                &f,
+                &arena
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn test_eval_binop_comparison() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
         // workspace.sev (3) <= 3 → true
@@ -98,7 +119,10 @@ mod tests {
             BinOp::Le,
             Box::new(e(ExprKind::IntLit(3))),
         ));
-        assert_eq!(eval_expr(&expr, &ev, &f).unwrap(), Value::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &ev, &f, &arena).unwrap(),
+            Value::Bool(true)
+        );
 
         // workspace.sev (3) > 5 → false
         let expr = e(ExprKind::BinOp(
@@ -106,11 +130,16 @@ mod tests {
             BinOp::Gt,
             Box::new(e(ExprKind::IntLit(5))),
         ));
-        assert_eq!(eval_expr(&expr, &ev, &f).unwrap(), Value::Bool(false));
+        assert_eq!(
+            eval_expr(&expr, &ev, &f, &arena).unwrap(),
+            Value::Bool(false)
+        );
     }
 
     #[test]
     fn test_eval_add_string_concat() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
 
@@ -121,7 +150,7 @@ mod tests {
             Box::new(e(ExprKind::StringLit("world".into()))),
         ));
         assert_eq!(
-            eval_expr(&expr, &ev, &f).unwrap(),
+            eval_expr(&expr, &ev, &f, &arena).unwrap(),
             Value::String("hello world".into())
         );
 
@@ -132,7 +161,7 @@ mod tests {
             Box::new(e(ExprKind::IntLit(42))),
         ));
         assert_eq!(
-            eval_expr(&expr, &ev, &f).unwrap(),
+            eval_expr(&expr, &ev, &f, &arena).unwrap(),
             Value::String("count=42".into())
         );
 
@@ -143,7 +172,7 @@ mod tests {
             Box::new(e(ExprKind::StringLit(" ms".into()))),
         ));
         assert_eq!(
-            eval_expr(&expr, &ev, &f).unwrap(),
+            eval_expr(&expr, &ev, &f, &arena).unwrap(),
             Value::String("42 ms".into())
         );
 
@@ -154,7 +183,7 @@ mod tests {
             BinOp::Add,
             Box::new(e(ExprKind::IntLit(4))),
         ));
-        let result = eval_expr(&expr, &ev, &f).unwrap();
+        let result = eval_expr(&expr, &ev, &f, &arena).unwrap();
         assert_eq!(result.as_f64(), Some(7.0));
 
         // Chained: "a" + "b" + "c" (left-associative)
@@ -168,13 +197,15 @@ mod tests {
             Box::new(e(ExprKind::StringLit("c".into()))),
         ));
         assert_eq!(
-            eval_expr(&expr, &ev, &f).unwrap(),
+            eval_expr(&expr, &ev, &f, &arena).unwrap(),
             Value::String("abc".into())
         );
     }
 
     #[test]
     fn test_eval_binop_logical() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
         // true and false → false
@@ -183,7 +214,10 @@ mod tests {
             BinOp::And,
             Box::new(e(ExprKind::BoolLit(false))),
         ));
-        assert_eq!(eval_expr(&expr, &ev, &f).unwrap(), Value::Bool(false));
+        assert_eq!(
+            eval_expr(&expr, &ev, &f, &arena).unwrap(),
+            Value::Bool(false)
+        );
 
         // true or false → true
         let expr = e(ExprKind::BinOp(
@@ -191,22 +225,32 @@ mod tests {
             BinOp::Or,
             Box::new(e(ExprKind::BoolLit(false))),
         ));
-        assert_eq!(eval_expr(&expr, &ev, &f).unwrap(), Value::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &ev, &f, &arena).unwrap(),
+            Value::Bool(true)
+        );
     }
 
     #[test]
     fn test_eval_not() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
         let expr = e(ExprKind::UnaryOp(
             UnaryOp::Not,
             Box::new(e(ExprKind::BoolLit(true))),
         ));
-        assert_eq!(eval_expr(&expr, &ev, &f).unwrap(), Value::Bool(false));
+        assert_eq!(
+            eval_expr(&expr, &ev, &f, &arena).unwrap(),
+            Value::Bool(false)
+        );
     }
 
     #[test]
     fn test_eval_contains() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
         let expr = e(ExprKind::FuncCall {
@@ -217,11 +261,16 @@ mod tests {
                 e(ExprKind::StringLit("test".into())),
             ],
         });
-        assert_eq!(eval_expr(&expr, &ev, &f).unwrap(), Value::Bool(true));
+        assert_eq!(
+            eval_expr(&expr, &ev, &f, &arena).unwrap(),
+            Value::Bool(true)
+        );
     }
 
     #[test]
     fn test_eval_template() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
         // "[${workspace.sev}] from ${workspace.src}"
@@ -232,13 +281,15 @@ mod tests {
             TemplateFragment::Interp(e(ExprKind::Ident(vec!["workspace".into(), "src".into()]))),
         ]));
         assert_eq!(
-            eval_expr(&expr, &ev, &f).unwrap(),
+            eval_expr(&expr, &ev, &f, &arena).unwrap(),
             Value::String("[3] from 192.168.1.1".into())
         );
     }
 
     #[test]
     fn test_eval_template_missing_interp_empty() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
         let expr = e(ExprKind::Template(vec![
@@ -250,13 +301,15 @@ mod tests {
             TemplateFragment::Literal("-suffix".into()),
         ]));
         assert_eq!(
-            eval_expr(&expr, &ev, &f).unwrap(),
+            eval_expr(&expr, &ev, &f, &arena).unwrap(),
             Value::String("prefix--suffix".into())
         );
     }
 
     #[test]
     fn test_eval_lower_upper() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
         let lower = e(ExprKind::FuncCall {
@@ -265,7 +318,7 @@ mod tests {
             args: vec![e(ExprKind::StringLit("HELLO".into()))],
         });
         assert_eq!(
-            eval_expr(&lower, &ev, &f).unwrap(),
+            eval_expr(&lower, &ev, &f, &arena).unwrap(),
             Value::String("hello".into())
         );
 
@@ -275,13 +328,15 @@ mod tests {
             args: vec![e(ExprKind::StringLit("hello".into()))],
         });
         assert_eq!(
-            eval_expr(&upper, &ev, &f).unwrap(),
+            eval_expr(&upper, &ev, &f, &arena).unwrap(),
             Value::String("HELLO".into())
         );
     }
 
     #[test]
     fn test_eval_to_json() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
         // 0.5.0+: to_json requires an explicit value. Pass `workspace` to
@@ -291,13 +346,15 @@ mod tests {
             name: "to_json".into(),
             args: vec![e(ExprKind::Ident(vec!["workspace".into()]))],
         });
-        let result = eval_expr(&expr, &ev, &f).unwrap();
+        let result = eval_expr(&expr, &ev, &f, &arena).unwrap();
         let s = result.as_str().unwrap();
         assert!(s.contains("\"src\":\"192.168.1.1\""));
     }
 
     #[test]
     fn test_is_truthy() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         assert!(!is_truthy(&Value::Null));
         assert!(!is_truthy(&Value::Bool(false)));
         assert!(is_truthy(&Value::Bool(true)));
@@ -309,6 +366,8 @@ mod tests {
 
     #[test]
     fn test_non_numeric_comparison_returns_false() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
         // "hello" < "world" should be false (non-numeric)
@@ -317,11 +376,16 @@ mod tests {
             BinOp::Lt,
             Box::new(e(ExprKind::StringLit("world".into()))),
         ));
-        assert_eq!(eval_expr(&expr, &ev, &f).unwrap(), Value::Bool(false));
+        assert_eq!(
+            eval_expr(&expr, &ev, &f, &arena).unwrap(),
+            Value::Bool(false)
+        );
     }
 
     #[test]
     fn test_property_access_on_hash() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
         // { country: "JP", city: "Tokyo" }.country → "JP"
@@ -334,13 +398,15 @@ mod tests {
             vec!["country".into()],
         ));
         assert_eq!(
-            eval_expr(&expr, &ev, &f).unwrap(),
+            eval_expr(&expr, &ev, &f, &arena).unwrap(),
             Value::String("JP".into())
         );
     }
 
     #[test]
     fn test_property_access_chained() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
         // { geo: { country: "JP" } }.geo.country → "JP"
@@ -354,13 +420,15 @@ mod tests {
             vec!["geo".into(), "country".into()],
         ));
         assert_eq!(
-            eval_expr(&expr, &ev, &f).unwrap(),
+            eval_expr(&expr, &ev, &f, &arena).unwrap(),
             Value::String("JP".into())
         );
     }
 
     #[test]
     fn test_property_access_missing_field() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
         let hash = e(ExprKind::HashLit(vec![(
@@ -371,11 +439,13 @@ mod tests {
             Box::new(hash),
             vec!["missing".into()],
         ));
-        assert_eq!(eval_expr(&expr, &ev, &f).unwrap(), Value::Null);
+        assert_eq!(eval_expr(&expr, &ev, &f, &arena).unwrap(), Value::Null);
     }
 
     #[test]
     fn test_values_match_fn() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         assert!(values_match(
             &Value::String("a".into()),
             &Value::String("a".into())
@@ -397,16 +467,20 @@ mod tests {
 
     #[test]
     fn test_eval_array_literal_empty() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
         assert_eq!(
-            eval_expr(&e(ExprKind::ArrayLit(vec![])), &ev, &f).unwrap(),
+            eval_expr(&e(ExprKind::ArrayLit(vec![])), &ev, &f, &arena).unwrap(),
             Value::Array(vec![])
         );
     }
 
     #[test]
     fn test_eval_array_literal_scalars() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
         let expr = e(ExprKind::ArrayLit(vec![
@@ -415,13 +489,15 @@ mod tests {
             e(ExprKind::IntLit(3)),
         ]));
         assert_eq!(
-            eval_expr(&expr, &ev, &f).unwrap(),
+            eval_expr(&expr, &ev, &f, &arena).unwrap(),
             Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3),])
         );
     }
 
     #[test]
     fn test_eval_array_literal_mixed_types() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
         let expr = e(ExprKind::ArrayLit(vec![
@@ -431,7 +507,7 @@ mod tests {
             e(ExprKind::Null),
         ]));
         assert_eq!(
-            eval_expr(&expr, &ev, &f).unwrap(),
+            eval_expr(&expr, &ev, &f, &arena).unwrap(),
             Value::Array(vec![
                 Value::Int(1),
                 Value::String("two".into()),
@@ -443,6 +519,8 @@ mod tests {
 
     #[test]
     fn test_eval_array_literal_resolves_workspace_refs() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
         let expr = e(ExprKind::ArrayLit(vec![
@@ -450,13 +528,15 @@ mod tests {
             e(ExprKind::Ident(vec!["workspace".into(), "count".into()])),
         ]));
         assert_eq!(
-            eval_expr(&expr, &ev, &f).unwrap(),
+            eval_expr(&expr, &ev, &f, &arena).unwrap(),
             Value::Array(vec![Value::String("192.168.1.1".into()), Value::Int(42),])
         );
     }
 
     #[test]
     fn test_eval_array_literal_nested() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
         let row = |a, b| {
@@ -467,7 +547,7 @@ mod tests {
         };
         let grid = e(ExprKind::ArrayLit(vec![row(1, 2), row(3, 4)]));
         assert_eq!(
-            eval_expr(&grid, &ev, &f).unwrap(),
+            eval_expr(&grid, &ev, &f, &arena).unwrap(),
             Value::Array(vec![
                 Value::Array(vec![Value::Int(1), Value::Int(2)]),
                 Value::Array(vec![Value::Int(3), Value::Int(4)]),
@@ -477,6 +557,8 @@ mod tests {
 
     #[test]
     fn test_eval_array_inside_hash_literal() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
         let expr = e(ExprKind::HashLit(vec![
@@ -489,7 +571,7 @@ mod tests {
                 ])),
             ),
         ]));
-        let out = eval_expr(&expr, &ev, &f).unwrap();
+        let out = eval_expr(&expr, &ev, &f, &arena).unwrap();
         let obj = out.as_object().unwrap();
         assert_eq!(
             obj.get("types").unwrap(),
@@ -504,6 +586,8 @@ mod tests {
 
     #[test]
     fn switch_expr_picks_matching_arm() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
         // switch 6 { 6 { "tcp" } 17 { "udp" } default { null } }
@@ -525,13 +609,15 @@ mod tests {
             ],
         });
         assert_eq!(
-            eval_expr(&expr, &ev, &f).unwrap(),
+            eval_expr(&expr, &ev, &f, &arena).unwrap(),
             Value::String("tcp".into())
         );
     }
 
     #[test]
     fn switch_expr_falls_to_default() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
         let expr = e(ExprKind::SwitchExpr {
@@ -548,13 +634,15 @@ mod tests {
             ],
         });
         assert_eq!(
-            eval_expr(&expr, &ev, &f).unwrap(),
+            eval_expr(&expr, &ev, &f, &arena).unwrap(),
             Value::String("unknown".into())
         );
     }
 
     #[test]
     fn switch_expr_no_match_no_default_returns_null() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event();
         let f = make_funcs();
         let expr = e(ExprKind::SwitchExpr {
@@ -564,13 +652,15 @@ mod tests {
                 body: e(ExprKind::StringLit("tcp".into())),
             }],
         });
-        assert_eq!(eval_expr(&expr, &ev, &f).unwrap(), Value::Null);
+        assert_eq!(eval_expr(&expr, &ev, &f, &arena).unwrap(), Value::Null);
     }
 
     // ---- User-defined `def function` end-to-end --------------------------
 
     #[test]
     fn user_function_call_returns_body_value() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // Register a user function `double(x) { x * 2 }` and call it
         // via the same registry path the parser-built call sites use.
         use crate::dsl::ast::FunctionDef;
@@ -591,12 +681,16 @@ mod tests {
         });
 
         let ev = make_event();
-        let result = funcs.call(None, "double", &[Value::Int(21)], &ev).unwrap();
+        let result = funcs
+            .call(None, "double", &[Value::Int(21)], &ev, &arena)
+            .unwrap();
         assert_eq!(result, Value::Int(42));
     }
 
     #[test]
     fn user_function_arity_mismatch_at_call() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         use crate::dsl::ast::FunctionDef;
 
         let mut funcs = make_funcs();
@@ -614,7 +708,7 @@ mod tests {
         // check (via the synthesized `Any^2 -> Any` signature). Pass
         // 1 arg and expect a clear error.
         let err = funcs
-            .call(None, "needs_two", &[Value::Int(1)], &ev)
+            .call(None, "needs_two", &[Value::Int(1)], &ev, &arena)
             .unwrap_err()
             .to_string();
         assert!(
@@ -626,6 +720,8 @@ mod tests {
 
     #[test]
     fn user_function_with_switch_body_maps_correctly() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         use crate::dsl::ast::{FunctionDef, SwitchExprArm};
 
         let mut funcs = make_funcs();
@@ -659,19 +755,19 @@ mod tests {
         let ev = make_event();
         assert_eq!(
             funcs
-                .call(None, "normalize_proto", &[Value::Int(6)], &ev)
+                .call(None, "normalize_proto", &[Value::Int(6)], &ev, &arena)
                 .unwrap(),
             Value::String("tcp".into())
         );
         assert_eq!(
             funcs
-                .call(None, "normalize_proto", &[Value::Int(17)], &ev)
+                .call(None, "normalize_proto", &[Value::Int(17)], &ev, &arena)
                 .unwrap(),
             Value::String("udp".into())
         );
         assert_eq!(
             funcs
-                .call(None, "normalize_proto", &[Value::Int(99)], &ev)
+                .call(None, "normalize_proto", &[Value::Int(99)], &ev, &arena)
                 .unwrap(),
             Value::Null
         );
@@ -679,6 +775,8 @@ mod tests {
 
     #[test]
     fn user_function_calling_user_function_works() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         use crate::dsl::ast::FunctionDef;
 
         let mut funcs = make_funcs();
@@ -714,7 +812,7 @@ mod tests {
         let ev = make_event();
         assert_eq!(
             funcs
-                .call(None, "quadruple", &[Value::Int(5)], &ev)
+                .call(None, "quadruple", &[Value::Int(5)], &ev, &arena)
                 .unwrap(),
             Value::Int(20)
         );
@@ -722,6 +820,8 @@ mod tests {
 
     #[test]
     fn user_function_with_let_bindings() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         use crate::dsl::ast::{FuncBody, FuncLet, FunctionDef};
 
         let mut funcs = make_funcs();
@@ -753,12 +853,16 @@ mod tests {
         });
 
         let ev = make_event();
-        let result = funcs.call(None, "f", &[Value::Int(10)], &ev).unwrap();
+        let result = funcs
+            .call(None, "f", &[Value::Int(10)], &ev, &arena)
+            .unwrap();
         assert_eq!(result, Value::Int(21)); // 10 * 2 + 1
     }
 
     #[test]
     fn user_function_let_reassignment_overwrites() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         use crate::dsl::ast::{FuncBody, FuncLet, FunctionDef};
 
         let mut funcs = make_funcs();
@@ -788,18 +892,23 @@ mod tests {
         });
 
         let ev = make_event();
-        let result = funcs.call(None, "f", &[Value::Int(7)], &ev).unwrap();
+        let result = funcs
+            .call(None, "f", &[Value::Int(7)], &ev, &arena)
+            .unwrap();
         assert_eq!(result, Value::Int(21));
     }
 
     #[test]
     fn source_ip_resolves_to_string() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event(); // source = "10.0.0.1:514"
         let funcs = make_funcs();
         let v = eval_expr(
             &e(ExprKind::Ident(vec!["source".into(), "ip".into()])),
             &ev,
             &funcs,
+            &arena,
         )
         .unwrap();
         assert_eq!(v, Value::String("10.0.0.1".into()));
@@ -807,12 +916,15 @@ mod tests {
 
     #[test]
     fn source_port_resolves_to_int() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let ev = make_event(); // source = "10.0.0.1:514"
         let funcs = make_funcs();
         let v = eval_expr(
             &e(ExprKind::Ident(vec!["source".into(), "port".into()])),
             &ev,
             &funcs,
+            &arena,
         )
         .unwrap();
         assert_eq!(v, Value::Int(514));
@@ -820,12 +932,20 @@ mod tests {
 
     #[test]
     fn bare_source_resolves_to_object() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // Bare `source` returns the whole `{ ip, port }` map so it can
         // be passed around or serialised as a unit. This is the breaking
         // change from 0.5.5 (where bare `source` was a flat IP String).
         let ev = make_event(); // source = "10.0.0.1:514"
         let funcs = make_funcs();
-        let v = eval_expr(&e(ExprKind::Ident(vec!["source".into()])), &ev, &funcs).unwrap();
+        let v = eval_expr(
+            &e(ExprKind::Ident(vec!["source".into()])),
+            &ev,
+            &funcs,
+            &arena,
+        )
+        .unwrap();
         match v {
             Value::Object(map) => {
                 assert_eq!(map.get("ip"), Some(&Value::String("10.0.0.1".into())));
@@ -837,6 +957,8 @@ mod tests {
 
     #[test]
     fn source_unknown_path_errors() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // Only `source.ip` and `source.port` are defined paths.
         let ev = make_event();
         let funcs = make_funcs();
@@ -844,6 +966,7 @@ mod tests {
             &e(ExprKind::Ident(vec!["source".into(), "host".into()])),
             &ev,
             &funcs,
+            &arena,
         )
         .unwrap_err();
         assert!(

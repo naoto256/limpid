@@ -108,8 +108,10 @@ mod tests {
 
     fn call(reg: &FunctionRegistry, args: &[&str]) -> anyhow::Result<String> {
         let e = dummy_event();
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let vals: Vec<Value> = args.iter().map(|s| Value::String((*s).into())).collect();
-        let v = reg.call(None, "strptime", &vals, &e)?;
+        let v = reg.call(None, "strptime", &vals, &e, &arena)?;
         let Value::Timestamp(dt) = v else {
             panic!("expected Timestamp, got {:?}", v)
         };
@@ -124,6 +126,8 @@ mod tests {
 
     #[test]
     fn parses_with_offset_in_format_and_normalises_to_utc() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // Input is +09:00; the offset is used to decode the wall time
         // but is not stored — Value::Timestamp is UTC-normalised.
         let r = call(
@@ -136,6 +140,8 @@ mod tests {
 
     #[test]
     fn parses_naive_with_utc_arg() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let r = call(
             &make_reg(),
             &["2026-04-15 10:30:00", "%Y-%m-%d %H:%M:%S", "UTC"],
@@ -146,6 +152,8 @@ mod tests {
 
     #[test]
     fn parses_naive_with_fixed_offset_arg_normalises_to_utc() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // 10:30 in +09:00 == 01:30 in UTC.
         let r = call(
             &make_reg(),
@@ -157,6 +165,8 @@ mod tests {
 
     #[test]
     fn errors_on_naive_without_tz_arg() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let err = call(&make_reg(), &["2026-04-15 10:30:00", "%Y-%m-%d %H:%M:%S"])
             .unwrap_err()
             .to_string();
@@ -169,6 +179,8 @@ mod tests {
 
     #[test]
     fn errors_on_unparseable_input() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let err = call(&make_reg(), &["not a date", "%Y-%m-%d"])
             .unwrap_err()
             .to_string();
@@ -177,6 +189,8 @@ mod tests {
 
     #[test]
     fn errors_on_tz_conflict_with_format() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let err = call(
             &make_reg(),
             &["2026-04-15T10:30:00+09:00", "%Y-%m-%dT%H:%M:%S%:z", "UTC"],

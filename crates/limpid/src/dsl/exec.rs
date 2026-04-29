@@ -4,6 +4,7 @@ use anyhow::{Result, bail};
 use bytes::Bytes;
 use thiserror::Error;
 
+use super::arena::EventArena;
 use super::ast::*;
 use super::eval::{LocalScope, eval_expr_with_scope, value_to_string, values_match};
 use super::value::{Map, Value};
@@ -37,6 +38,7 @@ pub trait ProcessRegistry {
         name: &str,
         args: &[Value],
         event: Event,
+        arena: &EventArena<'_>,
     ) -> std::result::Result<Option<Event>, ProcessError>;
 }
 
@@ -52,9 +54,10 @@ pub fn exec_process_body(
     event: Event,
     registry: &dyn ProcessRegistry,
     funcs: &FunctionRegistry,
+    arena: &EventArena<'_>,
 ) -> Result<ExecResult> {
     let mut scope = LocalScope::new();
-    exec_stmts_with_scope(stmts, event, registry, funcs, &mut scope)
+    exec_stmts_with_scope(stmts, event, registry, funcs, &mut scope, arena)
 }
 
 /// Run statements with the given local scope. `let` bindings mutate
@@ -69,9 +72,10 @@ fn exec_stmts_with_scope(
     registry: &dyn ProcessRegistry,
     funcs: &FunctionRegistry,
     scope: &mut LocalScope,
+    arena: &EventArena<'_>,
 ) -> Result<ExecResult> {
     for stmt in stmts {
-        match exec_process_stmt(stmt, event, registry, funcs, scope)? {
+        match exec_process_stmt(stmt, event, registry, funcs, scope, arena)? {
             ExecResult::Continue(e) => event = e,
             ExecResult::Dropped => return Ok(ExecResult::Dropped),
         }
@@ -85,6 +89,7 @@ fn exec_process_stmt(
     registry: &dyn ProcessRegistry,
     funcs: &FunctionRegistry,
     scope: &mut LocalScope,
+    arena: &EventArena<'_>,
 ) -> Result<ExecResult> {
     match stmt {
         ProcessStatement::Drop => Ok(ExecResult::Dropped),
@@ -99,7 +104,7 @@ fn exec_process_stmt(
             // otherwise the message lands in the DLQ entry's `reason`.
             let msg = match msg_expr {
                 Some(e) => crate::dsl::eval::value_to_string(&eval_expr_with_scope(
-                    e, &event, funcs, scope,
+                    e, &event, funcs, scope, arena,
                 )?),
                 None => "explicit error routing".to_string(),
             };
@@ -107,13 +112,13 @@ fn exec_process_stmt(
         }
 
         ProcessStatement::Assign(target, expr) => {
-            let value = eval_expr_with_scope(expr, &event, funcs, scope)?;
+            let value = eval_expr_with_scope(expr, &event, funcs, scope, arena)?;
             apply_assign(&mut event, target, value)?;
             Ok(ExecResult::Continue(event))
         }
 
         ProcessStatement::LetBinding(name, expr) => {
-            let value = eval_expr_with_scope(expr, &event, funcs, scope)?;
+            let value = eval_expr_with_scope(expr, &event, funcs, scope, arena)?;
             scope.bind(name, value);
             Ok(ExecResult::Continue(event))
         }
@@ -121,7 +126,7 @@ fn exec_process_stmt(
         ProcessStatement::ProcessCall(name, args) => {
             let evaluated_args: Vec<Value> = args
                 .iter()
-                .map(|a| eval_expr_with_scope(a, &event, funcs, scope))
+                .map(|a| eval_expr_with_scope(a, &event, funcs, scope, arena))
                 .collect::<Result<Vec<_>>>()?;
 
             // Clone before calling — required because registry.call takes ownership.
@@ -132,7 +137,7 @@ fn exec_process_stmt(
             // above). Our `scope` here belongs to the caller and is
             // unaffected by the callee.
             let backup = event.clone();
-            match registry.call(name, &evaluated_args, event) {
+            match registry.call(name, &evaluated_args, event, arena) {
                 Ok(Some(e)) => Ok(ExecResult::Continue(e)),
                 Ok(None) => Ok(ExecResult::Dropped),
                 Err(e) => {
@@ -147,20 +152,29 @@ fn exec_process_stmt(
         }
 
         ProcessStatement::If(if_chain) => {
-            exec_if_chain_process(if_chain, event, registry, funcs, scope)
+            exec_if_chain_process(if_chain, event, registry, funcs, scope, arena)
         }
 
         ProcessStatement::Switch(discriminant, arms) => {
-            let disc_val = eval_expr_with_scope(discriminant, &event, funcs, scope)?;
+            let disc_val = eval_expr_with_scope(discriminant, &event, funcs, scope, arena)?;
             for arm in arms {
                 if arm.pattern.is_none() {
                     // default arm
-                    return exec_branch_body_process(&arm.body, event, registry, funcs, scope);
+                    return exec_branch_body_process(
+                        &arm.body, event, registry, funcs, scope, arena,
+                    );
                 }
-                let pattern_val =
-                    eval_expr_with_scope(arm.pattern.as_ref().unwrap(), &event, funcs, scope)?;
+                let pattern_val = eval_expr_with_scope(
+                    arm.pattern.as_ref().unwrap(),
+                    &event,
+                    funcs,
+                    scope,
+                    arena,
+                )?;
                 if values_match(&disc_val, &pattern_val) {
-                    return exec_branch_body_process(&arm.body, event, registry, funcs, scope);
+                    return exec_branch_body_process(
+                        &arm.body, event, registry, funcs, scope, arena,
+                    );
                 }
             }
             // No arm matched, pass through
@@ -174,7 +188,7 @@ fn exec_process_stmt(
             // scope the try started with.
             let event_backup = event.clone();
             let scope_backup = scope.clone();
-            match exec_stmts_with_scope(try_body, event, registry, funcs, scope) {
+            match exec_stmts_with_scope(try_body, event, registry, funcs, scope, arena) {
                 Ok(result) => Ok(result),
                 Err(e) => {
                     *scope = scope_backup;
@@ -184,7 +198,7 @@ fn exec_process_stmt(
                         .workspace
                         .insert("_error".into(), Value::String(e.to_string()));
                     let mut result =
-                        exec_stmts_with_scope(catch_body, recovered, registry, funcs, scope);
+                        exec_stmts_with_scope(catch_body, recovered, registry, funcs, scope, arena);
                     // Clean up _error after catch body
                     if let Ok(ExecResult::Continue(ref mut evt)) = result {
                         evt.workspace.remove("_error");
@@ -195,12 +209,12 @@ fn exec_process_stmt(
         }
 
         ProcessStatement::ForEach(iterable_expr, body) => {
-            let iterable = eval_expr_with_scope(iterable_expr, &event, funcs, scope)?;
+            let iterable = eval_expr_with_scope(iterable_expr, &event, funcs, scope, arena)?;
             if let Value::Array(items) = iterable {
                 for item in &items {
                     // Bind current item to `workspace._item` for access in body
                     event.workspace.insert("_item".into(), item.clone());
-                    match exec_stmts_with_scope(body, event, registry, funcs, scope)? {
+                    match exec_stmts_with_scope(body, event, registry, funcs, scope, arena)? {
                         ExecResult::Continue(e) => event = e,
                         ExecResult::Dropped => return Ok(ExecResult::Dropped),
                     }
@@ -227,7 +241,7 @@ fn exec_process_stmt(
             // - Anything else → error. Writing `to_json()` or
             //   `contains(...)` as a bare statement discards the result
             //   and is almost always a bug.
-            let result = eval_expr_with_scope(expr, &event, funcs, scope)?;
+            let result = eval_expr_with_scope(expr, &event, funcs, scope, arena)?;
             match result {
                 Value::Object(map) => {
                     for (k, v) in map {
@@ -251,15 +265,16 @@ fn exec_if_chain_process(
     registry: &dyn ProcessRegistry,
     funcs: &FunctionRegistry,
     scope: &mut LocalScope,
+    arena: &EventArena<'_>,
 ) -> Result<ExecResult> {
     for (condition, body) in &if_chain.branches {
-        let cond_val = eval_expr_with_scope(condition, &event, funcs, scope)?;
+        let cond_val = eval_expr_with_scope(condition, &event, funcs, scope, arena)?;
         if cond_val.is_truthy() {
-            return exec_branch_body_process(body, event, registry, funcs, scope);
+            return exec_branch_body_process(body, event, registry, funcs, scope, arena);
         }
     }
     if let Some(else_body) = &if_chain.else_body {
-        return exec_branch_body_process(else_body, event, registry, funcs, scope);
+        return exec_branch_body_process(else_body, event, registry, funcs, scope, arena);
     }
     Ok(ExecResult::Continue(event))
 }
@@ -270,11 +285,12 @@ fn exec_branch_body_process(
     registry: &dyn ProcessRegistry,
     funcs: &FunctionRegistry,
     scope: &mut LocalScope,
+    arena: &EventArena<'_>,
 ) -> Result<ExecResult> {
     for item in body {
         match item {
             BranchBody::Process(stmt) => {
-                match exec_process_stmt(stmt, event, registry, funcs, scope)? {
+                match exec_process_stmt(stmt, event, registry, funcs, scope, arena)? {
                     ExecResult::Continue(e) => event = e,
                     ExecResult::Dropped => return Ok(ExecResult::Dropped),
                 }

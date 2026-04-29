@@ -48,6 +48,8 @@ mod tests {
 
     #[test]
     fn extracts_valid_pri() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let r = reg
@@ -56,6 +58,7 @@ mod tests {
                 "extract_pri",
                 &[Value::String("<134>body".into())],
                 &e,
+                &arena,
             )
             .unwrap();
         assert_eq!(r, Value::Int(134));
@@ -63,6 +66,8 @@ mod tests {
 
     #[test]
     fn extracts_single_digit_pri() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let r = reg
@@ -71,6 +76,7 @@ mod tests {
                 "extract_pri",
                 &[Value::String("<7>debug".into())],
                 &e,
+                &arena,
             )
             .unwrap();
         assert_eq!(r, Value::Int(7));
@@ -78,6 +84,8 @@ mod tests {
 
     #[test]
     fn returns_null_when_no_pri() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let r = reg
@@ -86,6 +94,7 @@ mod tests {
                 "extract_pri",
                 &[Value::String("hello".into())],
                 &e,
+                &arena,
             )
             .unwrap();
         assert_eq!(r, Value::Null);
@@ -93,6 +102,8 @@ mod tests {
 
     #[test]
     fn returns_null_when_out_of_range() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // <999> exceeds max valid PRI (191)
         let reg = make_reg();
         let e = dummy_event();
@@ -102,6 +113,7 @@ mod tests {
                 "extract_pri",
                 &[Value::String("<999>body".into())],
                 &e,
+                &arena,
             )
             .unwrap();
         assert_eq!(r, Value::Null);
@@ -109,6 +121,8 @@ mod tests {
 
     #[test]
     fn returns_null_on_non_digit_pri() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let r = reg
@@ -117,6 +131,7 @@ mod tests {
                 "extract_pri",
                 &[Value::String("<abc>body".into())],
                 &e,
+                &arena,
             )
             .unwrap();
         assert_eq!(r, Value::Null);

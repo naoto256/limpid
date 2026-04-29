@@ -23,6 +23,7 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
+use crate::dsl::arena::EventArena;
 use crate::dsl::ast::{Expr, ExprKind, Property, TemplateFragment};
 use crate::dsl::eval::{eval_expr, value_to_string};
 use crate::dsl::props;
@@ -199,12 +200,18 @@ impl FileOutput {
                          dynamic path template requires attach_funcs() before write"
                     )
                 })?;
+                // The pipeline's per-event arena has already dropped by
+                // the time the output runs. Templating against `event`
+                // here just evaluates a small expression and produces
+                // owned `Value`s; a local arena is all we need.
+                let bump = bumpalo::Bump::new();
+                let arena = EventArena::new(&bump);
                 let mut out = String::new();
                 for frag in fragments {
                     match frag {
                         TemplateFragment::Literal(s) => out.push_str(s),
                         TemplateFragment::Interp(expr) => {
-                            let rendered = value_to_string(&eval_expr(expr, event, funcs)?);
+                            let rendered = value_to_string(&eval_expr(expr, event, funcs, &arena)?);
                             // Pass 1: per-interp `/` `\` → `_` and reject empty.
                             // An empty interp would silently produce paths like
                             // `/foo//bar` or `/foo/.log` that almost never reflect

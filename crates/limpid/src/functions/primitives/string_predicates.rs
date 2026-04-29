@@ -44,12 +44,15 @@ mod tests {
 
     fn call_pred(reg: &FunctionRegistry, name: &str, h: &str, n: &str) -> bool {
         let e = dummy_event();
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let v = reg
             .call(
                 None,
                 name,
                 &[Value::String(h.into()), Value::String(n.into())],
                 &e,
+                &arena,
             )
             .unwrap();
         let Value::Bool(b) = v else { panic!() };
@@ -64,6 +67,8 @@ mod tests {
 
     #[test]
     fn contains_matches_anywhere() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         assert!(call_pred(&reg, "contains", "hello world", "lo wo"));
         assert!(call_pred(&reg, "contains", "abc", ""));
@@ -72,6 +77,8 @@ mod tests {
 
     #[test]
     fn starts_with_matches_prefix_only() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         assert!(call_pred(&reg, "starts_with", "CEF:0|Vendor", "CEF:"));
         assert!(call_pred(&reg, "starts_with", "abc", ""));
@@ -81,6 +88,8 @@ mod tests {
 
     #[test]
     fn ends_with_matches_suffix_only() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         assert!(call_pred(&reg, "ends_with", "/var/log/foo.log", ".log"));
         assert!(call_pred(&reg, "ends_with", "abc", ""));

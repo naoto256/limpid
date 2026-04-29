@@ -7,6 +7,7 @@ use crate::dsl::value::Value;
 use anyhow::{Result, bail};
 use tracing::trace;
 
+use crate::dsl::arena::EventArena;
 use crate::dsl::ast::*;
 use crate::dsl::eval::{eval_expr, is_truthy, values_match};
 use crate::dsl::exec::{ExecResult, ProcessError, ProcessRegistry, exec_process_body};
@@ -322,10 +323,11 @@ impl ProcessRegistry for DslProcessRegistry<'_> {
         name: &str,
         _args: &[Value],
         event: Event,
+        arena: &EventArena<'_>,
     ) -> std::result::Result<Option<Event>, ProcessError> {
         if let Some(process_def) = self.processes.get(name) {
             trace!("process '{}' (user-defined): executing", name);
-            return match exec_process_body(&process_def.body, event, self, self.funcs) {
+            return match exec_process_body(&process_def.body, event, self, self.funcs, arena) {
                 Ok(ExecResult::Continue(e)) => {
                     trace!("process '{}': ok", name);
                     self.emit_tap(name, &e);
@@ -378,11 +380,20 @@ pub fn run_pipeline(
         detail: format!("ingress: {}", String::from_utf8_lossy(&event.ingress)),
     });
 
+    // Per-event arena. Step 1c will start allocating the `Value` tree
+    // (HashLits, parser outputs, workspace mutations) into this `Bump`
+    // and reset it implicitly when `bump` drops at function return.
+    // Today (Step 1b) the arena is threaded through call sites but not
+    // yet used — `Value` still owns its data on the global heap.
+    let bump = bumpalo::Bump::new();
+    let arena = EventArena::new(&bump);
+
     let mut errored: Option<ErroredEventContext> = None;
     let exec_ctx = PipelineExecCtx {
         pipeline_name: &pipeline.name,
         registry: &registry,
         funcs,
+        arena: &arena,
     };
     let mut exec_out = PipelineExecOut {
         trace: &mut trace_entries,
@@ -403,10 +414,17 @@ pub fn run_pipeline(
 ///
 /// `pipeline_name` is here purely so a process-runtime error can
 /// populate the [`ErroredEventContext`] surfaced in [`PipelineExecOut::errored`].
+///
+/// `arena` is the per-event bump arena. Held through the executor so
+/// callees that build or evaluate `Value` trees can allocate into it.
+/// In Step 1b the field is plumbed but unused — `Value` is still
+/// owned. Step 1c flips `Value` to `Value<'bump>` and starts using
+/// the arena.
 struct PipelineExecCtx<'a> {
     pipeline_name: &'a str,
     registry: &'a DslProcessRegistry<'a>,
     funcs: &'a FunctionRegistry,
+    arena: &'a EventArena<'a>,
 }
 
 /// Mutable accumulators threaded through the pipeline executor:
@@ -455,7 +473,9 @@ fn exec_pipeline_stmt(
             // error_log via PipelineTermination::Errored, mirroring how
             // a process-level Err lands in the DLQ.
             let msg = match msg_expr {
-                Some(e) => crate::dsl::eval::value_to_string(&eval_expr(e, &event, ctx.funcs)?),
+                Some(e) => {
+                    crate::dsl::eval::value_to_string(&eval_expr(e, &event, ctx.funcs, ctx.arena)?)
+                }
                 None => "explicit error routing".to_string(),
             };
             tracing::warn!(
@@ -485,14 +505,14 @@ fn exec_pipeline_stmt(
                     ProcessChainElement::Named(name, args) => {
                         let evaluated_args: Vec<Value> = args
                             .iter()
-                            .map(|a| eval_expr(a, &current, ctx.funcs))
+                            .map(|a| eval_expr(a, &current, ctx.funcs, ctx.arena))
                             .collect::<Result<Vec<_>>>()?;
 
                         // Snapshot before consumption — registry.call
                         // takes Event by value and the Err arm needs
                         // the original to populate the DLQ context.
                         let backup = current.clone();
-                        match ctx.registry.call(name, &evaluated_args, current) {
+                        match ctx.registry.call(name, &evaluated_args, current, ctx.arena) {
                             Ok(Some(e)) => {
                                 out.trace.push(TraceEntry {
                                     stage: "process".into(),
@@ -545,7 +565,7 @@ fn exec_pipeline_stmt(
                     }
                     ProcessChainElement::Inline(body) => {
                         let backup = current.clone();
-                        match exec_process_body(body, current, ctx.registry, ctx.funcs) {
+                        match exec_process_body(body, current, ctx.registry, ctx.funcs, ctx.arena) {
                             Ok(ExecResult::Continue(e)) => {
                                 out.trace.push(TraceEntry {
                                     stage: "process".into(),
@@ -619,12 +639,13 @@ fn exec_pipeline_stmt(
         PipelineStatement::If(if_chain) => exec_pipeline_if(if_chain, event, ctx, out),
 
         PipelineStatement::Switch(discriminant, arms) => {
-            let disc_val = eval_expr(discriminant, &event, ctx.funcs)?;
+            let disc_val = eval_expr(discriminant, &event, ctx.funcs, ctx.arena)?;
             for arm in arms {
                 if arm.pattern.is_none() {
                     return exec_pipeline_branch_body(&arm.body, event, ctx, out);
                 }
-                let pattern_val = eval_expr(arm.pattern.as_ref().unwrap(), &event, ctx.funcs)?;
+                let pattern_val =
+                    eval_expr(arm.pattern.as_ref().unwrap(), &event, ctx.funcs, ctx.arena)?;
                 if values_match(&disc_val, &pattern_val) {
                     return exec_pipeline_branch_body(&arm.body, event, ctx, out);
                 }
@@ -641,7 +662,7 @@ fn exec_pipeline_if(
     out: &mut PipelineExecOut,
 ) -> Result<(Option<Event>, PipelineTermination)> {
     for (condition, body) in &if_chain.branches {
-        let cond_val = eval_expr(condition, &event, ctx.funcs)?;
+        let cond_val = eval_expr(condition, &event, ctx.funcs, ctx.arena)?;
         if is_truthy(&cond_val) {
             return exec_pipeline_branch_body(body, event, ctx, out);
         }
