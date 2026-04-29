@@ -355,12 +355,12 @@ fn load_csv(path: &Path) -> Result<HashMap<String, OwnedValue>> {
         }
         let key = cols[0].to_string();
         if headers.len() == 2 && cols.len() >= 2 {
-            table.insert(key, OwnedValue::String(cols[1].to_string()));
+            table.insert(key, OwnedValue::String(cols[1].into()));
         } else {
             let mut obj = Map::new();
             for (i, &header) in headers.iter().enumerate().skip(1) {
                 let val = cols.get(i).unwrap_or(&"");
-                obj.insert(header.to_string(), OwnedValue::String(val.to_string()));
+                obj.insert(header.to_string(), OwnedValue::String((*val).into()));
             }
             table.insert(key, OwnedValue::Object(obj));
         }

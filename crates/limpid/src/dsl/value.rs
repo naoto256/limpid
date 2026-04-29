@@ -41,6 +41,7 @@
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use compact_str::CompactString;
 use indexmap::IndexMap;
 
 use super::arena::EventArena;
@@ -56,15 +57,23 @@ use super::arena::EventArena;
 pub type Map = IndexMap<String, OwnedValue>;
 
 /// Heap-owned boundary form of the runtime value. Mirrors the variant
-/// shape of [`Value`] but every payload is owned (`String`, `Bytes`,
-/// `Vec`, `IndexMap`) so it survives outside the per-event arena.
+/// shape of [`Value`] but every payload is owned (`CompactString`,
+/// `Bytes`, `Vec`, `IndexMap`) so it survives outside the per-event
+/// arena.
+///
+/// `String` payload uses [`CompactString`] (24-byte inline budget on
+/// 64-bit) so typical OCSF / syslog field values (`"INFO"`, `"sshd"`,
+/// IPv4 strings) cross the `BorrowedEvent::to_owned()` boundary
+/// without a heap allocation. Strings longer than 24 bytes fall back
+/// to a heap pointer transparently — same `Display` / `Deref<str>`
+/// surface as `String`, so callers continue to see a `&str` view.
 #[derive(Debug, Clone)]
 pub enum OwnedValue {
     Null,
     Bool(bool),
     Int(i64),
     Float(f64),
-    String(String),
+    String(CompactString),
     Bytes(Bytes),
     /// Wall-clock instant, normalised to UTC. Internally an epoch
     /// position; no per-value offset metadata. Source-claimed timezone
@@ -97,7 +106,7 @@ impl OwnedValue {
             OwnedValue::Bool(b) => Value::Bool(*b),
             OwnedValue::Int(n) => Value::Int(*n),
             OwnedValue::Float(n) => Value::Float(*n),
-            OwnedValue::String(s) => Value::String(arena.alloc_str(s)),
+            OwnedValue::String(s) => Value::String(arena.alloc_str(s.as_str())),
             OwnedValue::Bytes(b) => Value::Bytes(arena.alloc_bytes(b)),
             OwnedValue::Timestamp(dt) => Value::Timestamp(*dt),
             OwnedValue::Array(items) => {
@@ -218,12 +227,18 @@ impl From<f64> for OwnedValue {
 
 impl From<&str> for OwnedValue {
     fn from(s: &str) -> Self {
-        OwnedValue::String(s.to_string())
+        OwnedValue::String(CompactString::from(s))
     }
 }
 
 impl From<String> for OwnedValue {
     fn from(s: String) -> Self {
+        OwnedValue::String(CompactString::from(s))
+    }
+}
+
+impl From<CompactString> for OwnedValue {
+    fn from(s: CompactString) -> Self {
         OwnedValue::String(s)
     }
 }
@@ -330,7 +345,7 @@ impl<'bump> Value<'bump> {
             Value::Bool(b) => OwnedValue::Bool(*b),
             Value::Int(n) => OwnedValue::Int(*n),
             Value::Float(n) => OwnedValue::Float(*n),
-            Value::String(s) => OwnedValue::String(s.to_string()),
+            Value::String(s) => OwnedValue::String(CompactString::from(*s)),
             Value::Bytes(b) => OwnedValue::Bytes(Bytes::copy_from_slice(b)),
             Value::Timestamp(dt) => OwnedValue::Timestamp(*dt),
             Value::Array(items) => {
