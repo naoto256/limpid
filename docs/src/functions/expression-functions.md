@@ -457,6 +457,43 @@ Resolved at every call (no caching) — successive calls within the same process
 
 ## Object / Array shaping
 
+### coalesce(a, b, c, ...)
+
+Return the leftmost argument that is not `null`; if every argument is
+`null`, return `null`. Variadic: accepts ≥ 1 argument. Designed for the
+"prefer parsed value, fall back to environment" pattern that recurs
+throughout composers and parsers.
+
+```
+// Composer: prefer parsed event time, fall back to received_at
+let event_time = coalesce(workspace.limpid.time, received_at)
+
+// Parser: pick first source IP that is populated
+workspace.limpid.src_endpoint.ip = coalesce(
+    workspace.cef.src,
+    workspace.cef.sourceTranslatedAddress,
+    workspace.syslog.hostname
+)
+```
+
+| Input | Output |
+|-------|--------|
+| `coalesce(null, 42, 99)` | `42` |
+| `coalesce(1, 2, 3)` | `1` |
+| `coalesce(null, null, null)` | `null` |
+| `coalesce("", "fallback")` | `""` (empty string is a present value) |
+| `coalesce(0, 99)` | `0` (zero is a present value) |
+| `coalesce()` | rejected by analyzer / runtime (≥ 1 arg required) |
+
+Only `null` is "passed over". Empty strings, zero, empty objects, and
+empty arrays are real present-but-empty values and are returned as-is.
+Callers who want "blank string is also absent" express that condition
+explicitly (`switch true { x != "" { x } default { y } }`).
+
+All arguments are evaluated (DSL has no short-circuit at call sites).
+Since DSL identifiers and built-ins are pure, eager evaluation has no
+observable difference from short-circuit at the user level.
+
 ### null_omit(value)
 
 Recursively strip `null` **keys** from objects, recursing into the

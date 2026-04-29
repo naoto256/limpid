@@ -8,6 +8,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
+## [0.5.8] - 2026-04-29
+> `coalesce(...)` built-in for first-non-null fallback chains
+
+### Added — `coalesce(a, b, c, ...)` built-in (variadic)
+
+A flat primitive that returns the leftmost non-null argument, or
+`null` when every argument is null. Designed to replace the verbose
+`switch true { x != null { x } default { y } }` pattern that snippet
+composers had to repeat per OCSF leaf for the "use the parsed value
+when present, fall back to an environment value otherwise" idiom:
+
+```
+// before — per leaf, 4 lines plus indentation:
+let event_time = switch true {
+    workspace.limpid.time != null { workspace.limpid.time }
+    default { received_at }
+}
+// after:
+let event_time = coalesce(workspace.limpid.time, received_at)
+```
+
+Semantics:
+
+- accepts ≥ 1 argument; the analyzer rejects zero-arg calls and the
+  runtime returns the same arity error
+- all arguments are evaluated (DSL has no short-circuit at call
+  sites); since DSL identifiers and built-ins are pure, eager
+  evaluation has no observable difference from short-circuit
+- only `null` is "passed over" — empty strings, zero, empty objects,
+  and empty arrays are real present-but-empty values and are
+  returned as-is. Callers who want "blank string is also absent"
+  express that explicitly
+
+Implementation note: this is the first variadic built-in. The
+`Arity::Variadic { min }` enum variant was reintroduced (it had been
+removed earlier as unused). Adding the variant is a non-breaking
+extension — every existing built-in continues to use `Fixed` or
+`Optional`. The analyzer's argument type-check uses the single
+declared element type for every actual argument slot.
+
+This is the fourth DSL gap surfaced and fixed mid-snippet-library
+work — alongside `error` (v0.5.5), the `source` reshape (v0.5.6),
+and `null_omit` (v0.5.7).
+
+### Notes
+
+- No DSL syntax change. `coalesce` is a regular flat primitive call
+- No breaking changes
+- No behaviour change in any other built-in or pipeline path
+
+---
+
 ## [0.5.7] - 2026-04-29
 > `null_omit` built-in to drop `null` keys from HashLit composer output
 
