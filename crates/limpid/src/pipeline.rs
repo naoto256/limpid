@@ -410,11 +410,12 @@ impl DslProcessRegistry<'_> {
 /// owned-event path.
 pub fn run_pipeline(
     pipeline: &PipelineDef,
-    event: OwnedEvent,
+    event: &OwnedEvent,
     config: &CompiledConfig,
     funcs: &FunctionRegistry,
     tap: Option<&TapRegistry>,
     output_sinks: &HashMap<String, Arc<dyn Output>>,
+    bump: &mut bumpalo::Bump,
 ) -> Result<PipelineRunResult> {
     let registry = DslProcessRegistry::new(&config.processes, funcs, tap);
     let mut trace_entries = Vec::new();
@@ -429,14 +430,17 @@ pub fn run_pipeline(
     });
 
     // Per-event arena. The entire `Value` tree built during execution
-    // (HashLits, parser outputs, workspace mutations) lives in this
-    // `Bump` and is freed in a single chunk-group `dealloc` when the
-    // arena drops at end of function. This is the v0.6.0 perf win:
-    // the per-allocation `drop_in_place<Value>` chain (~23% of
-    // allocator samples on the v0.5.7 D pipeline baseline) collapses
-    // into one bump-allocator release.
-    let bump = bumpalo::Bump::new();
-    let arena = EventArena::new(&bump);
+    // (HashLits, parser outputs, workspace mutations) lives in `bump`
+    // and is reset to offset zero by the caller after this function
+    // returns — see `runtime::run_pipeline_workers`. The `Bump` itself
+    // is owned by the per-input pipeline-worker task and reused
+    // across events, so the underlying chunk-group is malloc'd once
+    // at task startup and never again on the hot path. This
+    // eliminates the xzm-zone-lock contention that capped
+    // multi-pipeline scaling at ~2.4× / 4 cores on v0.6.0 (where
+    // every event called `Bump::new` and the system allocator
+    // serialised concurrent malloc/free across pipelines).
+    let arena = EventArena::new(bump);
     let bevent = event.view_in(&arena);
 
     let mut errored: Option<ErroredEventContext> = None;
@@ -885,7 +889,7 @@ def pipeline p {
             "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         );
         let sinks: HashMap<String, Arc<dyn Output>> = HashMap::new();
-        let result = run_pipeline(pipeline, event, &cfg, &funcs, None, &sinks).unwrap();
+        let result = run_pipeline(pipeline, &event, &cfg, &funcs, None, &sinks, &mut bumpalo::Bump::new()).unwrap();
         assert_eq!(result.termination, PipelineTermination::Errored);
         let ctx = result.errored.expect("errored context must be populated");
         assert_eq!(ctx.pipeline, "p");
@@ -936,7 +940,7 @@ def pipeline p {
             "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         );
         let sinks: HashMap<String, Arc<dyn Output>> = HashMap::new();
-        let result = run_pipeline(pipeline, event, &cfg, &funcs, None, &sinks).unwrap();
+        let result = run_pipeline(pipeline, &event, &cfg, &funcs, None, &sinks, &mut bumpalo::Bump::new()).unwrap();
         assert_eq!(result.termination, PipelineTermination::Errored);
         let ctx = result.errored.expect("errored context must be populated");
         assert_eq!(ctx.pipeline, "p");
@@ -979,7 +983,7 @@ def pipeline p {
             "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         );
         let sinks: HashMap<String, Arc<dyn Output>> = HashMap::new();
-        let result = run_pipeline(pipeline, event, &cfg, &funcs, None, &sinks).unwrap();
+        let result = run_pipeline(pipeline, &event, &cfg, &funcs, None, &sinks, &mut bumpalo::Bump::new()).unwrap();
         assert_eq!(result.termination, PipelineTermination::Errored);
         let ctx = result.errored.expect("errored context must be populated");
         assert_eq!(ctx.pipeline, "p");
