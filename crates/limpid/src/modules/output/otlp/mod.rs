@@ -73,12 +73,17 @@ use prost::Message;
 use tokio::sync::Mutex;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
+use crate::dsl::arena::EventArena;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
-use crate::event::Event;
+use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
-use crate::modules::{HasMetrics, Module, Output};
+use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
 use crate::queue::{BackoffStrategy, RetryConfig};
+
+struct OtlpPayload {
+    egress: Bytes,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BatchLevel {
@@ -311,13 +316,22 @@ impl HasMetrics for OtlpOutput {
 
 #[async_trait::async_trait]
 impl Output for OtlpOutput {
-    async fn write(&self, event: &Event) -> Result<()> {
+    fn render(
+        &self,
+        event: &BorrowedEvent<'_>,
+        _arena: &EventArena<'_>,
+    ) -> Result<RenderedPayload> {
         // Egress must be the singleton ResourceLogs proto bytes
         // produced by `otlp.encode_resourcelog_protobuf`. We do not
-        // re-encode here — that's the process layer's job. If the user
-        // wired the pipeline differently (e.g. forgot the encode), the
-        // collector will see malformed wire and reject the batch.
-        let proto = event.egress.clone();
+        // re-encode here — that's the process layer's job.
+        Ok(RenderedPayload::new(OtlpPayload {
+            egress: event.egress.clone(),
+        }))
+    }
+
+    async fn write(&self, payload: RenderedPayload) -> Result<()> {
+        let payload: OtlpPayload = payload.downcast()?;
+        let proto = payload.egress;
         let mut batch = self.inner.batch.lock().await;
         batch.push(proto);
         let should_flush = batch.len() >= self.batch_size;
@@ -687,6 +701,7 @@ async fn send_grpc(inner: &Inner, channel: &Channel, req: &ExportLogsServiceRequ
 mod tests {
     use super::*;
     use crate::dsl::ast::{Expr, ExprKind};
+    use crate::event::Event;
 
     fn prop_str(key: &str, val: &str) -> Property {
         Property::KeyValue {
@@ -1034,7 +1049,7 @@ mod tests {
         .unwrap();
         // Push one event so ensure_flush_timer schedules a task.
         output
-            .write(&event_with_egress(singleton_bytes(1)))
+            .write_owned(&event_with_egress(singleton_bytes(1)))
             .await
             .unwrap();
         let handle_before = output.flush_handle.lock().await.is_some();
@@ -1162,7 +1177,7 @@ mod tests {
         )
         .unwrap();
         output
-            .write(&event_with_egress(singleton_bytes(
+            .write_owned(&event_with_egress(singleton_bytes(
                 1_700_000_000_000_000_000,
             )))
             .await
@@ -1343,7 +1358,7 @@ mod tests {
         // The first ship 503s twice then succeeds; the call should
         // return Ok overall thanks to the retry loop.
         output
-            .write(&event_with_egress(singleton_bytes(123)))
+            .write_owned(&event_with_egress(singleton_bytes(123)))
             .await
             .unwrap();
         // 2 failures + 1 success = 3 attempts.
@@ -1388,7 +1403,7 @@ mod tests {
         )
         .unwrap();
         let err = output
-            .write(&event_with_egress(singleton_bytes(456)))
+            .write_owned(&event_with_egress(singleton_bytes(456)))
             .await
             .expect_err("send must fail after retries exhausted");
         assert!(
@@ -1412,7 +1427,7 @@ mod tests {
         )
         .unwrap();
         output
-            .write(&event_with_egress(singleton_bytes(123)))
+            .write_owned(&event_with_egress(singleton_bytes(123)))
             .await
             .unwrap();
         let probe = || {
@@ -1442,7 +1457,7 @@ mod tests {
         )
         .unwrap();
         output
-            .write(&event_with_egress(singleton_bytes(456)))
+            .write_owned(&event_with_egress(singleton_bytes(456)))
             .await
             .unwrap();
         let probe = || {

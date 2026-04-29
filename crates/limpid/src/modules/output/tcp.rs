@@ -6,16 +6,22 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
+use crate::dsl::arena::EventArena;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
-use crate::event::Event;
+use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::persistent_conn::{PersistentConn, write_with_reconnect};
-use crate::modules::{HasMetrics, Module, Output};
+use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
+
+struct TcpPayload {
+    egress: Bytes,
+}
 
 pub struct TcpOutput {
     pub address: String,
@@ -63,8 +69,19 @@ impl HasMetrics for TcpOutput {
 
 #[async_trait::async_trait]
 impl Output for TcpOutput {
-    async fn write(&self, event: &Event) -> Result<()> {
-        write_with_reconnect(self, &self.conn, &self.metrics, event).await
+    fn render(
+        &self,
+        event: &BorrowedEvent<'_>,
+        _arena: &EventArena<'_>,
+    ) -> Result<RenderedPayload> {
+        Ok(RenderedPayload::new(TcpPayload {
+            egress: event.egress.clone(),
+        }))
+    }
+
+    async fn write(&self, payload: RenderedPayload) -> Result<()> {
+        let payload: TcpPayload = payload.downcast()?;
+        write_with_reconnect(self, &self.conn, &self.metrics, &payload.egress).await
     }
 }
 
@@ -78,17 +95,15 @@ impl PersistentConn for TcpOutput {
             .with_context(|| format!("tcp connect to {}", self.address))
     }
 
-    async fn write_frame(&self, stream: &mut TcpStream, event: &Event) -> Result<()> {
-        let msg = &event.egress;
-
+    async fn write_frame(&self, stream: &mut TcpStream, payload: &Bytes) -> Result<()> {
         match self.framing {
             TcpOutputFraming::OctetCounting => {
-                let header = format!("{} ", msg.len());
+                let header = format!("{} ", payload.len());
                 stream.write_all(header.as_bytes()).await?;
-                stream.write_all(msg).await?;
+                stream.write_all(payload).await?;
             }
             TcpOutputFraming::NonTransparent => {
-                stream.write_all(msg).await?;
+                stream.write_all(payload).await?;
                 stream.write_all(b"\n").await?;
             }
         }
