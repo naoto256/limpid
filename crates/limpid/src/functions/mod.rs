@@ -54,10 +54,10 @@ use crate::modules::schema::{FieldSpec, FieldType};
 /// analyzer can type-check call sites without re-implementing every
 /// function's hand-rolled arity logic.
 ///
-/// A `Variadic` variant used to live here but was never populated by
-/// any built-in; it is deliberately omitted until a variadic function
-/// is actually needed, at which point reintroducing the arm is a
-/// non-breaking enum extension.
+/// `Variadic` was reintroduced in v0.5.8 for `coalesce(a, b, c, ...)`,
+/// the first built-in that genuinely accepts an unbounded run of
+/// same-typed args. Adding it as a new enum variant is non-breaking:
+/// every existing built-in still uses `Fixed` or `Optional`.
 #[derive(Debug, Clone)]
 pub enum Arity {
     /// Exactly `args.len()` positional args, all required. The signature's
@@ -67,6 +67,11 @@ pub enum Arity {
     /// signature's `args` slice declares types for every slot up to the
     /// maximum, including optional ones.
     Optional { required: usize },
+    /// At least `min` positional args, no upper bound. Every arg is
+    /// type-checked against `args[0]` (the only declared slot). Used
+    /// for built-ins that accept an unbounded run of same-typed values
+    /// (currently just `coalesce`).
+    Variadic { min: usize },
 }
 
 /// Static signature for a built-in function. Threaded into the registry
@@ -97,6 +102,16 @@ impl FunctionSig {
         Self {
             args: args.to_vec(),
             arity: Arity::Optional { required },
+            ret,
+        }
+    }
+
+    /// Convenience: `(elem, elem, ...) -> ret` with at least `min` args.
+    /// Every actual argument is type-checked against `elem`.
+    pub fn variadic(elem: FieldType, min: usize, ret: FieldType) -> Self {
+        Self {
+            args: vec![elem],
+            arity: Arity::Variadic { min },
             ret,
         }
     }
@@ -392,6 +407,7 @@ fn validate_arity(
     let ok = match sig.arity {
         Arity::Fixed => actual == sig.args.len(),
         Arity::Optional { required } => actual >= required && actual <= sig.args.len(),
+        Arity::Variadic { min } => actual >= min,
     };
     if ok {
         return Ok(());
@@ -415,6 +431,13 @@ fn validate_arity(
                 format!("{} arguments", required)
             } else {
                 format!("{} to {} arguments", required, max)
+            }
+        }
+        Arity::Variadic { min } => {
+            if min <= 1 {
+                format!("at least {} argument", min.max(1))
+            } else {
+                format!("at least {} arguments", min)
             }
         }
     };
