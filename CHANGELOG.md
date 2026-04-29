@@ -8,6 +8,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
+## [Unreleased]
+
+### Added — `null_omit(value)` built-in for HashLit cleanup
+
+A flat primitive that recursively strips `null` from objects and
+arrays. Designed for the OCSF-shape composer pattern (build a HashLit
+from parser-populated workspace fields, then `to_json` for `egress`).
+Without it, every absent field renders as `"key": null` in the output
+— OCSF schema validation in Sentinel / Splunk DM often chokes on
+that.
+
+```
+workspace.limpid = {
+    class_uid: 4001,
+    src_endpoint: { ip: workspace.cef.src, port: to_int(workspace.cef.spt) },
+    dst_endpoint: workspace.cef.dst_endpoint,   // may be null on this event
+    traffic: workspace.cef.traffic              // may be null on this event
+}
+egress = to_json(null_omit(workspace.limpid))
+//  → {"class_uid":4001,"src_endpoint":{"ip":"...","port":...}}
+//    (dst_endpoint and traffic dropped cleanly)
+```
+
+Semantics (recursive, single pass):
+
+- `null` keys are dropped from objects (or top-level `null` returns
+  `null`); the function recurses into the remaining values
+- arrays are **not** compacted — a `null` slot in an array survives
+  unchanged, because that's often the parser's placeholder ("this
+  slot was unknown") and silently dropping it would hide the signal.
+  The function recurses into non-null elements only. Use a dedicated
+  array primitive when array compaction is the goal
+- empty containers (`{}` / `[]`) are kept — the function strips
+  `null` keys, it doesn't collapse a structure that just became empty
+- scalars (`String`, `Int`, `Float`, `Bool`, `Bytes`, `Timestamp`)
+  pass through unchanged
+
+This is the third DSL gap surfaced and fixed mid-snippet-library
+work — alongside `error` (v0.5.5) and the `source` reshape (v0.5.6).
+The pattern is "implement broadly across vendors, surface DSL gaps,
+fix in 0.5.x patches before locking 0.6.0", and it's working as
+intended.
+
 ## [0.5.6] - 2026-04-27
 > `source` reshaped to `{ip, port}` across DSL, wire, and tooling
 
