@@ -134,28 +134,37 @@ fn exec_process_stmt<'bump>(
                 evaluated_args.push(eval_expr_with_scope(a, &event, funcs, scope, arena)?);
             }
 
-            // Snapshot the workspace before consumption — registry.call
-            // takes the event by value, so the Err arm needs to
-            // restore from a backup. We snapshot only what the catch
-            // path actually inspects (workspace contents) plus the
-            // metadata identity; ingress / egress are `Bytes` (cheap
-            // refcount clone). Callee processes start with their own
-            // fresh LocalScope inside the registry implementation
-            // (see `exec_process_body` above). Our `scope` here belongs
-            // to the caller and is unaffected by the callee.
-            let backup = clone_borrowed_event(&event, arena);
-            match registry.call(name, &evaluated_args, event, arena) {
-                Ok(Some(e)) => Ok(ExecResult::Continue(e)),
-                Ok(None) => Ok(ExecResult::Dropped),
-                Err(e) => {
-                    tracing::debug!(
-                        "process '{}' failed: {} — passing event through unchanged",
-                        name,
-                        e
-                    );
-                    Ok(ExecResult::Continue(backup))
-                }
-            }
+            // Callee processes start with their own fresh LocalScope
+            // inside the registry implementation (see `exec_process_body`
+            // above). Our `scope` here belongs to the caller and is
+            // unaffected by the callee.
+            //
+            // Propagation: a sub-process error (explicit `error`
+            // keyword OR runtime evaluation error) bubbles up so the
+            // pipeline-level handler routes the event to error_log,
+            // and the rest of the pipeline (including downstream
+            // `process X | compose_ocsf` stages) does NOT run on the
+            // half-failed event. Pre-fix this arm swallowed the Err
+            // and continued the event with a snapshot, which made
+            // `error` from inside a sub-process invisible to the
+            // pipeline boundary — downstream stages would then run
+            // on whatever workspace state the sub-process had set
+            // before erroring (typically empty), producing
+            // confusing secondary errors like
+            // `compose_ocsf: unsupported class_uid`.
+            //
+            // Operators who want fail-soft on a particular call
+            // wrap it in `try { process foo } catch { ... }`; the
+            // `try`/`catch` arm below catches Err and runs the
+            // recovery body with the original error message exposed
+            // via `workspace._error`.
+            registry
+                .call(name, &evaluated_args, event, arena)
+                .map(|opt_event| match opt_event {
+                    Some(e) => ExecResult::Continue(e),
+                    None => ExecResult::Dropped,
+                })
+                .map_err(|e| anyhow::anyhow!(e))
         }
 
         ProcessStatement::If(if_chain) => {
