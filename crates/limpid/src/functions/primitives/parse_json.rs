@@ -41,7 +41,7 @@ fn parse_json_impl<'bump>(
         // workspace-merge rule doesn't silently drop the value.
         other => {
             let mut wrap = ObjectBuilder::with_capacity(arena, 1);
-            wrap.push_str("_json", other);
+            wrap.push("_json", other);
             wrap.finish()
         }
     };

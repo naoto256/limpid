@@ -317,15 +317,15 @@ fn resourcelog_to_hashlit<'bump>(
 ) -> Value<'bump> {
     let mut b = ObjectBuilder::new(arena);
     if let Some(r) = &rl.resource {
-        b.push_str("resource", resource_to_hashlit(arena, r));
+        b.push("resource", resource_to_hashlit(arena, r));
     }
     let mut sl_arr = bumpalo::collections::Vec::with_capacity_in(rl.scope_logs.len(), arena.bump());
     for sl in &rl.scope_logs {
         sl_arr.push(scope_logs_to_hashlit(arena, sl));
     }
-    b.push_str("scope_logs", Value::Array(sl_arr.into_bump_slice()));
+    b.push("scope_logs", Value::Array(sl_arr.into_bump_slice()));
     if !rl.schema_url.is_empty() {
-        b.push_str("schema_url", Value::String(arena.alloc_str(&rl.schema_url)));
+        b.push("schema_url", Value::String(arena.alloc_str(&rl.schema_url)));
     }
     b.finish()
 }
@@ -336,7 +336,7 @@ fn resource_to_hashlit<'bump>(arena: &EventArena<'bump>, r: &Resource) -> Value<
     for kv in &r.attributes {
         attrs.push(keyvalue_to_hashlit(arena, kv));
     }
-    b.push_str("attributes", Value::Array(attrs.into_bump_slice()));
+    b.push("attributes", Value::Array(attrs.into_bump_slice()));
     if r.dropped_attributes_count != 0 {
         b.push_str(
             "dropped_attributes_count",
@@ -349,15 +349,15 @@ fn resource_to_hashlit<'bump>(arena: &EventArena<'bump>, r: &Resource) -> Value<
 fn scope_logs_to_hashlit<'bump>(arena: &EventArena<'bump>, sl: &ScopeLogs) -> Value<'bump> {
     let mut b = ObjectBuilder::new(arena);
     if let Some(s) = &sl.scope {
-        b.push_str("scope", scope_to_hashlit(arena, s));
+        b.push("scope", scope_to_hashlit(arena, s));
     }
     let mut lrs = bumpalo::collections::Vec::with_capacity_in(sl.log_records.len(), arena.bump());
     for lr in &sl.log_records {
         lrs.push(log_record_to_hashlit(arena, lr));
     }
-    b.push_str("log_records", Value::Array(lrs.into_bump_slice()));
+    b.push("log_records", Value::Array(lrs.into_bump_slice()));
     if !sl.schema_url.is_empty() {
-        b.push_str("schema_url", Value::String(arena.alloc_str(&sl.schema_url)));
+        b.push("schema_url", Value::String(arena.alloc_str(&sl.schema_url)));
     }
     b.finish()
 }
@@ -368,10 +368,10 @@ fn scope_to_hashlit<'bump>(
 ) -> Value<'bump> {
     let mut b = ObjectBuilder::new(arena);
     if !s.name.is_empty() {
-        b.push_str("name", Value::String(arena.alloc_str(&s.name)));
+        b.push("name", Value::String(arena.alloc_str(&s.name)));
     }
     if !s.version.is_empty() {
-        b.push_str("version", Value::String(arena.alloc_str(&s.version)));
+        b.push("version", Value::String(arena.alloc_str(&s.version)));
     }
     if !s.attributes.is_empty() {
         let mut attrs =
@@ -379,7 +379,7 @@ fn scope_to_hashlit<'bump>(
         for kv in &s.attributes {
             attrs.push(keyvalue_to_hashlit(arena, kv));
         }
-        b.push_str("attributes", Value::Array(attrs.into_bump_slice()));
+        b.push("attributes", Value::Array(attrs.into_bump_slice()));
     }
     if s.dropped_attributes_count != 0 {
         b.push_str(
@@ -393,7 +393,7 @@ fn scope_to_hashlit<'bump>(
 fn log_record_to_hashlit<'bump>(arena: &EventArena<'bump>, lr: &LogRecord) -> Value<'bump> {
     let mut b = ObjectBuilder::new(arena);
     if lr.time_unix_nano != 0 {
-        b.push_str("time_unix_nano", Value::Int(lr.time_unix_nano as i64));
+        b.push("time_unix_nano", Value::Int(lr.time_unix_nano as i64));
     }
     if lr.observed_time_unix_nano != 0 {
         b.push_str(
@@ -402,7 +402,7 @@ fn log_record_to_hashlit<'bump>(arena: &EventArena<'bump>, lr: &LogRecord) -> Va
         );
     }
     if lr.severity_number != 0 {
-        b.push_str("severity_number", Value::Int(lr.severity_number as i64));
+        b.push("severity_number", Value::Int(lr.severity_number as i64));
     }
     if !lr.severity_text.is_empty() {
         b.push_str(
@@ -411,7 +411,7 @@ fn log_record_to_hashlit<'bump>(arena: &EventArena<'bump>, lr: &LogRecord) -> Va
         );
     }
     if let Some(body) = &lr.body {
-        b.push_str("body", anyvalue_to_hashlit(arena, body));
+        b.push("body", anyvalue_to_hashlit(arena, body));
     }
     if !lr.attributes.is_empty() {
         let mut attrs =
@@ -419,7 +419,7 @@ fn log_record_to_hashlit<'bump>(arena: &EventArena<'bump>, lr: &LogRecord) -> Va
         for kv in &lr.attributes {
             attrs.push(keyvalue_to_hashlit(arena, kv));
         }
-        b.push_str("attributes", Value::Array(attrs.into_bump_slice()));
+        b.push("attributes", Value::Array(attrs.into_bump_slice()));
     }
     if lr.dropped_attributes_count != 0 {
         b.push_str(
@@ -428,22 +428,22 @@ fn log_record_to_hashlit<'bump>(arena: &EventArena<'bump>, lr: &LogRecord) -> Va
         );
     }
     if lr.flags != 0 {
-        b.push_str("flags", Value::Int(lr.flags as i64));
+        b.push("flags", Value::Int(lr.flags as i64));
     }
     if !lr.trace_id.is_empty() {
-        b.push_str("trace_id", Value::Bytes(arena.alloc_bytes(&lr.trace_id)));
+        b.push("trace_id", Value::Bytes(arena.alloc_bytes(&lr.trace_id)));
     }
     if !lr.span_id.is_empty() {
-        b.push_str("span_id", Value::Bytes(arena.alloc_bytes(&lr.span_id)));
+        b.push("span_id", Value::Bytes(arena.alloc_bytes(&lr.span_id)));
     }
     b.finish()
 }
 
 fn keyvalue_to_hashlit<'bump>(arena: &EventArena<'bump>, kv: &KeyValue) -> Value<'bump> {
     let mut b = ObjectBuilder::with_capacity(arena, 2);
-    b.push_str("key", Value::String(arena.alloc_str(&kv.key)));
+    b.push("key", Value::String(arena.alloc_str(&kv.key)));
     if let Some(v) = &kv.value {
-        b.push_str("value", anyvalue_to_hashlit(arena, v));
+        b.push("value", anyvalue_to_hashlit(arena, v));
     }
     b.finish()
 }
@@ -453,16 +453,16 @@ fn anyvalue_to_hashlit<'bump>(arena: &EventArena<'bump>, av: &AnyValue) -> Value
     match &av.value {
         None => {}
         Some(any_value::Value::StringValue(s)) => {
-            b.push_str("string_value", Value::String(arena.alloc_str(s)));
+            b.push("string_value", Value::String(arena.alloc_str(s)));
         }
         Some(any_value::Value::BoolValue(bv)) => {
-            b.push_str("bool_value", Value::Bool(*bv));
+            b.push("bool_value", Value::Bool(*bv));
         }
         Some(any_value::Value::IntValue(n)) => {
-            b.push_str("int_value", Value::Int(*n));
+            b.push("int_value", Value::Int(*n));
         }
         Some(any_value::Value::DoubleValue(f)) => {
-            b.push_str("double_value", Value::Float(*f));
+            b.push("double_value", Value::Float(*f));
         }
         Some(any_value::Value::ArrayValue(arr)) => {
             let mut inner = ObjectBuilder::with_capacity(arena, 1);
@@ -471,8 +471,8 @@ fn anyvalue_to_hashlit<'bump>(arena: &EventArena<'bump>, av: &AnyValue) -> Value
             for vv in &arr.values {
                 vals.push(anyvalue_to_hashlit(arena, vv));
             }
-            inner.push_str("values", Value::Array(vals.into_bump_slice()));
-            b.push_str("array_value", inner.finish());
+            inner.push("values", Value::Array(vals.into_bump_slice()));
+            b.push("array_value", inner.finish());
         }
         Some(any_value::Value::KvlistValue(kvl)) => {
             let mut inner = ObjectBuilder::with_capacity(arena, 1);
@@ -481,11 +481,11 @@ fn anyvalue_to_hashlit<'bump>(arena: &EventArena<'bump>, av: &AnyValue) -> Value
             for kv in &kvl.values {
                 vals.push(keyvalue_to_hashlit(arena, kv));
             }
-            inner.push_str("values", Value::Array(vals.into_bump_slice()));
-            b.push_str("kvlist_value", inner.finish());
+            inner.push("values", Value::Array(vals.into_bump_slice()));
+            b.push("kvlist_value", inner.finish());
         }
         Some(any_value::Value::BytesValue(bytes)) => {
-            b.push_str("bytes_value", Value::Bytes(arena.alloc_bytes(bytes)));
+            b.push("bytes_value", Value::Bytes(arena.alloc_bytes(bytes)));
         }
     }
     b.finish()

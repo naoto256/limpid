@@ -66,9 +66,9 @@ fn parse_impl<'bump>(
     let after_pri = &text[body_offset..];
 
     let mut builder = ObjectBuilder::with_capacity(arena, 9);
-    builder.push_str("pri", Value::Int(pri as i64));
-    builder.push_str("facility", Value::Int((pri / 8) as i64));
-    builder.push_str("severity", Value::Int((pri % 8) as i64));
+    builder.push("pri", Value::Int(pri as i64));
+    builder.push("facility", Value::Int((pri / 8) as i64));
+    builder.push("severity", Value::Int((pri % 8) as i64));
 
     if after_pri.len() >= 2
         && after_pri.as_bytes()[0].is_ascii_digit()
@@ -120,7 +120,7 @@ fn parse_rfc5424<'bump>(
         set_field(arena, builder, "msgid", msgid);
     }
     if !msg.is_empty() {
-        builder.push_str("msg", Value::String(arena.alloc_str(msg)));
+        builder.push("msg", Value::String(arena.alloc_str(msg)));
     }
 }
 
@@ -156,7 +156,7 @@ fn parse_rfc3164<'bump>(
         set_field(arena, builder, "procid", pid);
     }
     if !msg.is_empty() {
-        builder.push_str("msg", Value::String(arena.alloc_str(msg)));
+        builder.push("msg", Value::String(arena.alloc_str(msg)));
     }
 }
 

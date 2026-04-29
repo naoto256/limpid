@@ -274,8 +274,8 @@ fn resolve_ident<'bump>(
         Some("source") if parts.len() == 1 => {
             let mut builder = ObjectBuilder::with_capacity(arena, 2);
             let ip_str = arena.alloc_str(&event.source.ip().to_string());
-            builder.push_str("ip", Value::String(ip_str));
-            builder.push_str("port", Value::Int(event.source.port() as i64));
+            builder.push("ip", Value::String(ip_str));
+            builder.push("port", Value::Int(event.source.port() as i64));
             Ok(builder.finish())
         }
         Some("source") if parts.len() == 2 && parts[1] == "ip" => {
