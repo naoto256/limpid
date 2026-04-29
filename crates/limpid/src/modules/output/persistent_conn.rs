@@ -15,12 +15,12 @@
 //! reconnect + metric-increment loop so that a third persistent-conn
 //! output (e.g. TLS) can plug in without reimplementing the dance.
 //!
-//! Extracted as a Prepare-level refactor (see abstraction review
-//! finding 3-1c); dispatch stays hardcoded per-output because there
-//! are currently only two implementations.
+//! Dispatch stays hardcoded per-output (TCP, Unix socket) because
+//! there are currently only two implementations; if a third
+//! persistent-conn sink lands (e.g. TLS), promote to a registry.
 //!
-//! Kept `pub(crate)` — this is an internal implementation detail of
-//! the output layer, not part of the module contract.
+//! Kept `pub(crate)` — internal implementation detail of the output
+//! layer, not part of the module contract.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
