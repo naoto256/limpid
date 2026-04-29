@@ -293,6 +293,65 @@ mod tests {
     }
 
     #[test]
+    fn let_binding_object_value_supports_dot_access() {
+        // `let f = { a: 7, b: 9 }; workspace.x = f.a; workspace.y = f.b`
+        // — dot-access on a let-bound Object resolves through the
+        // local scope and walks into the Object the same way
+        // workspace.x.y would. Regression test for the gap that made
+        // `let f = regex_parse(...); f.user` fail at runtime with
+        // "unknown identifier: f.user".
+        let event = make_event();
+        let obj = e(ExprKind::HashLit(vec![
+            ("a".into(), e(ExprKind::IntLit(7))),
+            ("b".into(), e(ExprKind::IntLit(9))),
+        ]));
+        let stmts = vec![
+            ProcessStatement::LetBinding("f".into(), obj),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["x".into()]),
+                e(ExprKind::Ident(vec!["f".into(), "a".into()])),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["y".into()]),
+                e(ExprKind::Ident(vec!["f".into(), "b".into()])),
+            ),
+        ];
+        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+            ExecResult::Continue(ev) => {
+                assert_eq!(ev.workspace["x"], Value::Int(7));
+                assert_eq!(ev.workspace["y"], Value::Int(9));
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
+    }
+
+    #[test]
+    fn let_binding_object_dot_access_missing_key_yields_null() {
+        // `let f = { a: 1 }; workspace.miss = f.nonexistent` — the
+        // walker should yield Null (not error) so callers can treat
+        // missing keys with coalesce / explicit null comparisons,
+        // matching the workspace.* path-walker contract.
+        let event = make_event();
+        let obj = e(ExprKind::HashLit(vec![(
+            "a".into(),
+            e(ExprKind::IntLit(1)),
+        )]));
+        let stmts = vec![
+            ProcessStatement::LetBinding("f".into(), obj),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["miss".into()]),
+                e(ExprKind::Ident(vec!["f".into(), "nonexistent".into()])),
+            ),
+        ];
+        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+            ExecResult::Continue(ev) => {
+                assert_eq!(ev.workspace["miss"], Value::Null);
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
+    }
+
+    #[test]
     fn let_shadows_prior_binding_with_same_name() {
         let _bump = ::bumpalo::Bump::new();
         let arena = crate::dsl::arena::EventArena::new(&_bump);

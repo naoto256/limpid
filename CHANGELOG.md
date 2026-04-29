@@ -8,6 +8,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
+## [0.5.9] - 2026-04-30
+> bug fix: dot-access on a `let`-bound Object value now resolves through the local scope
+
+### Fixed — `let f = <Object>; f.x.y` resolves correctly
+
+`let f = regex_parse(...); f.user` was failing at runtime with
+`unknown identifier: f.user`. The local-scope path-resolver in
+`crates/limpid/src/dsl/eval.rs` only consulted let bindings for
+single-segment idents (`parts.len() == 1`), so any multi-segment
+access whose root happened to be let-bound (`f.user`, `f.a.b`,
+`f.list[0].kind`) skipped scope lookup entirely and fell through to
+the catch-all "unknown identifier" arm. The analyzer's UnknownIdent
+warning had the same gap.
+
+The fix extends both code paths: when the first segment matches a
+let binding, the runtime walks the bound value via the same
+`resolve_workspace_path` Object/Array walker used for
+`workspace.x.y.z`, and the analyzer suppresses the warning for the
+whole path. Missing keys yield `Null` to match the workspace
+path-walker contract — callers handle absence via `coalesce` or
+explicit null comparison.
+
+```
+// before — runtime "unknown identifier: f.user":
+def process parse_xxx {
+    let f = regex_parse(workspace.body, "(?P<user>\\S+)")
+    workspace.limpid = { user: f.user }     // ← runtime error
+}
+// after — works as written:
+def process parse_xxx {
+    let f = regex_parse(workspace.body, "(?P<user>\\S+)")
+    workspace.limpid = { user: f.user }     // ✅ "alice"
+}
+```
+
+Surfaced while writing parse_asa (Cisco ASA syslog parser, 5th
+snippet release) — every per-message-ID leaf does
+`let f = regex_parse(workspace.asa.body, "...")` and reads the named
+captures via `f.user` / `f.src_ip` / etc. The pre-fix workaround was
+to use `workspace.body` as the scratch slot, which works but bloats
+workspace and conflates per-leaf scratch with the parser/composer
+contract.
+
+### Notes
+
+- No DSL syntax change. The behaviour change is in path resolution
+  semantics: before, `f.x` failed; after, it walks into the Object.
+- Two regression tests added covering the happy path and the
+  missing-key (Null) path.
+
+---
+
 ## [0.5.8] - 2026-04-29
 > `coalesce(...)` built-in for first-non-null fallback chains
 
