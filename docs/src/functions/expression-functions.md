@@ -455,6 +455,58 @@ egress = "${strftime(timestamp(), \"%Y-%m-%dT%H:%M:%S%:z\", \"local\")} ${egress
 
 Resolved at every call (no caching) — successive calls within the same process body see successive instants.
 
+## Object / Array shaping
+
+### null_omit(value)
+
+Recursively strip `null` **keys** from objects, recursing into the
+remaining values (and into array elements). Arrays themselves are not
+compacted — a `null` element survives, because that's often the
+parser's placeholder ("this slot was unknown") and silently dropping
+it would hide the signal.
+
+```
+workspace.payload = {
+    src: workspace.cef.src,
+    dst: workspace.cef.dst,
+    user: workspace.cef.suser,        // may be null on machine-only events
+    evidences: [
+        { file: workspace.cef.fname, hash: workspace.cef.fhash }
+    ]
+}
+egress = to_json(null_omit(workspace.payload))
+//   → {"src":"...","dst":"...","evidences":[{"file":"..."}]}
+//   (user dropped because it was null; evidences[0].hash dropped
+//   because it was null; the array slot stayed)
+```
+
+| Input | Output |
+|-------|--------|
+| `{a: 1, b: null, c: 3}` | `{a: 1, c: 3}` |
+| `{a: 1, b: {c: null, d: 2}}` | `{a: 1, b: {d: 2}}` |
+| `{a: 1, b: [null, 2, null]}` | `{a: 1, b: [null, 2, null]}` (array unchanged) |
+| `{list: [{x: null, y: 2}]}` | `{list: [{y: 2}]}` (recurse into Object elements) |
+| `{a: 1, b: {}}` | `{a: 1, b: {}}` (empty container kept) |
+| `null` | `null` |
+| `42` | `42` (scalar pass-through) |
+
+Designed for the OCSF-shape composer pattern (build a HashLit from
+parser-populated workspace fields, then `to_json` for `egress`).
+Without `null_omit`, every absent field renders as `"key": null` in
+the output — not strictly invalid, but consumers that strictly
+validate against OCSF schema (Microsoft Sentinel, Splunk DM) often
+choke on it. Pipe through `null_omit` before `to_json` and the
+output stays clean without the parser having to conditionally
+populate every field.
+
+Why arrays are not compacted: the function name advertises "omit
+null *keys*", not "compact arrays". A `null` slot in an array is
+often a parser's intentional placeholder, and dropping it would
+change the array length silently — which can carry meaning even
+though limpid arrays are [positionless](../processing/user-defined.md#arrays).
+When array compaction is what you want, use a dedicated array
+primitive instead.
+
 ## Hash functions
 
 ### md5(str) / sha1(str) / sha256(str)

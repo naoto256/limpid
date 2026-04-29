@@ -179,6 +179,7 @@ inside a `process` body:
   `strftime`
 - **Type coercion** — `to_int` · `to_json` · `to_bytes` · `to_string`
 - **Collections** — `len` · `find_by` · `append` · `prepend`
+- **Object / Array shaping** — `null_omit`
 - **Hashing** — `md5` · `sha1` · `sha256`
 - **Tables / enrichment** — `table_lookup` · `table_upsert` ·
   `table_delete` · `geoip`
