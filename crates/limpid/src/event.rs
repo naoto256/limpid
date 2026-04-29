@@ -189,11 +189,12 @@ impl OwnedEvent {
     }
 }
 
-/// Backwards-compatible alias. The previous (pre-v0.6.0) public name
-/// `Event` referred to what is now [`OwnedEvent`]; the alias keeps
-/// downstream module paths working while the rest of the avalanche
-/// commit lands. Once everything compiles against the new names this
-/// alias can be removed in a follow-up cleanup commit.
+/// Backwards-compatible alias for the pre-v0.6.0 public name. Most
+/// internal call sites have migrated to the [`OwnedEvent`] /
+/// [`BorrowedEvent`] split, but disk-queue replay, control-plane
+/// inject, error_log, and tap subscribers still operate on the owned
+/// form via this alias — kept for ergonomic continuity at those
+/// boundary points rather than as a transitional shim.
 pub type Event = OwnedEvent;
 
 // ===========================================================================
