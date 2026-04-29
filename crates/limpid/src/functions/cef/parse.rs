@@ -63,17 +63,17 @@ fn parse_impl<'bump>(
     }
 
     let mut builder = ObjectBuilder::new(arena);
-    builder.push_str("version", Value::String(arena.alloc_str(parts[0])));
-    builder.push_str("device_vendor", Value::String(arena.alloc_str(parts[1])));
-    builder.push_str("device_product", Value::String(arena.alloc_str(parts[2])));
-    builder.push_str("device_version", Value::String(arena.alloc_str(parts[3])));
-    builder.push_str("signature_id", Value::String(arena.alloc_str(parts[4])));
-    builder.push_str("name", Value::String(arena.alloc_str(parts[5])));
+    builder.push("version", Value::String(arena.alloc_str(parts[0])));
+    builder.push("device_vendor", Value::String(arena.alloc_str(parts[1])));
+    builder.push("device_product", Value::String(arena.alloc_str(parts[2])));
+    builder.push("device_version", Value::String(arena.alloc_str(parts[3])));
+    builder.push("signature_id", Value::String(arena.alloc_str(parts[4])));
+    builder.push("name", Value::String(arena.alloc_str(parts[5])));
     let severity_value = parts[6]
         .parse::<i64>()
         .map(Value::Int)
         .unwrap_or_else(|_| Value::String(arena.alloc_str(parts[6])));
-    builder.push_str("severity", severity_value);
+    builder.push("severity", severity_value);
 
     parse_cef_extensions(arena, remaining, &mut builder);
 
