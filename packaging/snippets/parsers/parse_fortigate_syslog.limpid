@@ -2,11 +2,12 @@
 //
 // Vendor:  Fortinet
 // Product: FortiGate (FortiOS 6.x / 7.x — native syslog output, not CEF)
-// Wire:    syslog-wrapped key=value — `<priority>timestamp host date=... time=... type=... ...`
-// Schema:  FortiGate FortiOS native log format (key=value pairs)
+// Wire:    syslog priority + KV body — `<priority>date=... time=... type=... ...`
+// Schema:  FortiGate FortiOS native log "default" format (key=value pairs)
 //
-// Sample input (RFC 3164 syslog wrapper around the KV body):
-//   <134>Apr 27 10:00:00 fw01 date=2026-04-27 time=10:00:00 devname="fw01" type="traffic" subtype="forward" srcip=192.0.2.10 srcport=54321 dstip=198.51.100.5 dstport=443 proto=6 action="accept" sentbyte=1024 rcvdbyte=512
+// Sample input (FortiOS "default" format — no RFC 3164 header between
+// the <PRI> and the KV body; date/time/devname live inside the body):
+//   <134>date=2026-04-27 time=10:00:00 devname="fw01" type="traffic" subtype="forward" srcip=192.0.2.10 srcport=54321 dstip=198.51.100.5 dstport=443 proto=6 action="accept" sentbyte=1024 rcvdbyte=512
 //
 // Output: same `workspace.limpid` shape as `parse_fortigate_cef.limpid`
 // (the canonical OCSF-shape contract is format-agnostic — both
@@ -80,6 +81,8 @@ def function fortigate_syslog_utm_disposition_id(act) {
         "drop"        { 5 }
         "detected"    { 6 }
         "monitor"     { 6 }
+        "monitored"   { 6 }
+        "info"        { 6 }
         default       { 0 }
     }
 }
@@ -98,45 +101,49 @@ def function fortigate_syslog_proto_name(num) {
 }
 
 // ---------------------------------------------------------------------------
-// Top-level dispatcher: syslog wrapper + KV body, dispatch by `type`
+// Top-level dispatcher: strip <PRI>, parse KV body, dispatch on type:subtype
 // ---------------------------------------------------------------------------
+//
+// FortiGate's "default" syslog format emits `<PRI>date=... time=... type=...`
+// directly — there is no RFC 3164 timestamp/host header between the priority
+// and the KV body. So we cannot use `syslog.parse(ingress)`; we strip just
+// the leading `<PRI>` and feed the rest straight into `parse_kv`. The body
+// itself carries `date` and `time` as KV fields, plus `devname` for host.
+//
+// Verified against real FortiGate v7.x captures (see
+// /Users/naotomorishima/.local/share/limpid-fortigate-corpus/initial-30s.jsonl).
+//
+// Dispatch is flat on `type:subtype` (synthesized) so there's only one
+// switch site per format — mirrors the CEF parser shape (which dispatches
+// on `cat`, the CEF field that already carries `type:subtype`).
 
 def process parse_fortigate_syslog {
-    workspace.syslog = syslog.parse(ingress)
-    workspace.kv     = parse_kv(workspace.syslog.msg)
-    switch workspace.kv.type {
-        "traffic" { process parse_fortigate_syslog_traffic }
-        "utm"     { process parse_fortigate_syslog_utm }
-        "event"   { process parse_fortigate_syslog_event }
-        default { error "unsupported FortiGate syslog type: ${workspace.kv.type}" }
-    }
-}
-
-// UTM dispatcher: secondary switch on `subtype` field.
-def process parse_fortigate_syslog_utm {
-    switch workspace.kv.subtype {
-        "ips"          { process parse_fortigate_syslog_utm_ips }
-        "anomaly"      { process parse_fortigate_syslog_utm_ips }
-        "webfilter"    { process parse_fortigate_syslog_utm_webfilter }
-        "virus"        { process parse_fortigate_syslog_utm_antivirus }
-        "dlp"          { process parse_fortigate_syslog_utm_dlp }
-        "app-ctrl"     { process parse_fortigate_syslog_utm_appctrl }
-        "application"  { process parse_fortigate_syslog_utm_appctrl }
-        "dns"          { process parse_fortigate_syslog_utm_dns }
-        "emailfilter"  { process parse_fortigate_syslog_utm_emailfilter }
-        "waf"          { process parse_fortigate_syslog_utm_waf }
-        default { error "unsupported FortiGate UTM subtype: ${workspace.kv.subtype}" }
-    }
-}
-
-// Event dispatcher: secondary switch on `subtype` field.
-def process parse_fortigate_syslog_event {
-    switch workspace.kv.subtype {
-        "user"      { process parse_fortigate_syslog_event_user }
-        "vpn"       { process parse_fortigate_syslog_event_vpn }
-        "system"    { process parse_fortigate_syslog_event_system }
-        "wireless"  { process parse_fortigate_syslog_event_wireless }
-        default { error "unsupported FortiGate event subtype: ${workspace.kv.subtype}" }
+    workspace.kv = parse_kv(syslog.strip_pri(ingress))
+    let cat = workspace.kv.type + ":" + workspace.kv.subtype
+    switch cat {
+        "traffic:forward"    { process parse_fortigate_syslog_traffic }
+        "traffic:local"      { process parse_fortigate_syslog_traffic }
+        "traffic:multicast"  { process parse_fortigate_syslog_traffic }
+        "traffic:sniffer"    { process parse_fortigate_syslog_traffic }
+        "traffic:other"      { process parse_fortigate_syslog_traffic }
+        "utm:ips"            { process parse_fortigate_syslog_utm_ips }
+        "utm:anomaly"        { process parse_fortigate_syslog_utm_ips }
+        "utm:webfilter"      { process parse_fortigate_syslog_utm_webfilter }
+        "utm:virus"          { process parse_fortigate_syslog_utm_antivirus }
+        "utm:dlp"            { process parse_fortigate_syslog_utm_dlp }
+        "utm:app-ctrl"       { process parse_fortigate_syslog_utm_appctrl }
+        "utm:application"    { process parse_fortigate_syslog_utm_appctrl }
+        "utm:dns"            { process parse_fortigate_syslog_utm_dns }
+        "utm:emailfilter"    { process parse_fortigate_syslog_utm_emailfilter }
+        "utm:waf"            { process parse_fortigate_syslog_utm_waf }
+        "utm:ssl"            { process parse_fortigate_syslog_utm_ssl }
+        "utm:voip"           { process parse_fortigate_syslog_utm_voip }
+        "event:user"             { process parse_fortigate_syslog_event_user }
+        "event:vpn"              { process parse_fortigate_syslog_event_vpn }
+        "event:system"           { process parse_fortigate_syslog_event_system }
+        "event:wireless"         { process parse_fortigate_syslog_event_wireless }
+        "event:security-rating"  { process parse_fortigate_syslog_event_security_rating }
+        default { error "unsupported FortiGate syslog type:subtype: ${cat}" }
     }
 }
 
@@ -295,9 +302,10 @@ def process parse_fortigate_syslog_utm_antivirus {
         severity_id:    fortigate_syslog_severity_id(workspace.kv.level),
         disposition_id: fortigate_syslog_utm_disposition_id(workspace.kv.action),
         finding_info: {
-            title: workspace.kv.virus,
-            uid:   workspace.kv.virusid,
-            types: ["Malware"]
+            title:   workspace.kv.virus,
+            uid:     workspace.kv.virusid,
+            types:   ["Malware"],
+            src_url: { url_string: workspace.kv.ref }
         },
         malware: [
             {
@@ -305,12 +313,17 @@ def process parse_fortigate_syslog_utm_antivirus {
                 classification_ids: [1]
             }
         ],
+        // Real wire fields verified from captured EICAR detection (native):
+        //   filename       — file name
+        //   analyticscksum — file hash (SHA256)
+        //   url            — full request URL (FortiOS native, not `request`)
         evidences: [
             {
                 file: {
-                    name: workspace.kv.filename,
-                    hashes: [{ value: workspace.kv.checksum }]
-                }
+                    name:   workspace.kv.filename,
+                    hashes: [{ value: workspace.kv.analyticscksum }]
+                },
+                url: { url_string: workspace.kv.url }
             }
         ],
         src_endpoint: {
@@ -507,6 +520,93 @@ def process parse_fortigate_syslog_utm_waf {
 }
 
 // ---------------------------------------------------------------------------
+// Subtype leaf: utm:ssl → OCSF Detection Finding (2004)
+// ---------------------------------------------------------------------------
+//
+// SSL/TLS inspection anomalies (matches the CEF utm:ssl leaf). Native fields
+// verified against captured `subtype="ssl" eventtype="ssl-anomaly"` events:
+//
+//   eventsubtype  — anomaly class (e.g. `certificate-anomaly`)
+//   tlsver        — `tls1.2` / `tls1.3` / ...
+//   sni           — Server Name Indication
+//   profile       — SSL/SSH profile name applied
+//   hostname      — server hostname (CN or expected SNI)
+//   action        — engine verdict (`info` / `block`)
+def process parse_fortigate_syslog_utm_ssl {
+    workspace.limpid = {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:    1,
+        severity_id:    fortigate_syslog_severity_id(workspace.kv.level),
+        disposition_id: fortigate_syslog_utm_disposition_id(workspace.kv.action),
+        finding_info: {
+            title: workspace.kv.eventsubtype,
+            desc:  workspace.kv.msg,
+            types: ["TLS Anomaly"]
+        },
+        tls: {
+            version: workspace.kv.tlsver,
+            sni:     workspace.kv.sni
+        },
+        src_endpoint: {
+            ip:   workspace.kv.srcip,
+            port: to_int(workspace.kv.srcport)
+        },
+        dst_endpoint: {
+            ip:       workspace.kv.dstip,
+            port:     to_int(workspace.kv.dstport),
+            hostname: workspace.kv.hostname
+        },
+        message:  workspace.kv.msg,
+        metadata: fortigate_syslog_metadata(workspace.kv.osname)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: utm:voip → OCSF Network Activity (4001)
+// ---------------------------------------------------------------------------
+//
+// SIP / SCCP signalling observed by the FortiGate voipd engine.
+// Tap-mode emits `action=permit status=start|end` with no inline blocking.
+// OCSF 1.3.0 has no telephony class, so we map to Network Activity (4001)
+// with SIP-specific identifiers passed as message context.
+//
+// Real fields:
+//   voip_proto / kind / action / status — SIP semantics
+//   call_id / from / to                 — SIP identifiers
+//   srcip / src_port / dstip / dst_port — endpoints (5060 typical)
+//   proto                               — IP proto (17 UDP / 6 TCP)
+def process parse_fortigate_syslog_utm_voip {
+    let activity = switch workspace.kv.status {
+        "start"  { 1 }
+        "end"    { 2 }
+        default  { 6 }
+    }
+    let proto_num = to_int(workspace.kv.proto)
+    workspace.limpid = {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  activity,
+        severity_id:  fortigate_syslog_severity_id(workspace.kv.level),
+        src_endpoint: {
+            ip:   workspace.kv.srcip,
+            port: to_int(workspace.kv.src_port)
+        },
+        dst_endpoint: {
+            ip:   workspace.kv.dstip,
+            port: to_int(workspace.kv.dst_port)
+        },
+        connection_info: {
+            protocol_num:  proto_num,
+            protocol_name: fortigate_syslog_proto_name(proto_num)
+        },
+        app_name: workspace.kv.voip_proto,
+        message:  "VoIP " + workspace.kv.kind + " " + workspace.kv.from + " -> " + workspace.kv.to + " (call_id=" + workspace.kv.call_id + ")",
+        metadata: fortigate_syslog_metadata(workspace.kv.osname)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Subtype leaf: event:user → OCSF Authentication (3002)
 // ---------------------------------------------------------------------------
 def process parse_fortigate_syslog_event_user {
@@ -581,6 +681,7 @@ def process parse_fortigate_syslog_event_system {
         severity_id:  fortigate_syslog_severity_id(workspace.kv.level),
         finding_info: {
             title: workspace.kv.action,
+            desc:  workspace.kv.logdesc,
             types: ["System Event"]
         },
         actor: {
@@ -616,6 +717,44 @@ def process parse_fortigate_syslog_event_wireless {
             mac: workspace.kv.apmac
         },
         message:  workspace.kv.msg,
+        metadata: fortigate_syslog_metadata(workspace.kv.osname)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: event:security-rating → OCSF Compliance Finding (2003)
+// ---------------------------------------------------------------------------
+//
+// Native-format counterpart to the CEF event:security-rating leaf — same
+// audit summary semantics, unprefixed FortiOS native field names verified
+// from real captures:
+//
+//   logdesc          — "Security Rating summary"
+//   auditid          — audit run identifier
+//   audittime        — epoch when the audit ran
+//   auditscore       — score string (e.g. "44.1")
+//   auditreporttype  — "CoverageReport" / "OptimizationReport" / ...
+//   criticalcount, highcount, mediumcount, lowcount, passedcount
+def process parse_fortigate_syslog_event_security_rating {
+    workspace.limpid = {
+        class_uid:    2003,
+        category_uid: 2,
+        activity_id:  1,
+        severity_id:  fortigate_syslog_severity_id(workspace.kv.level),
+        finding_info: {
+            title: "Security Rating " + workspace.kv.auditreporttype,
+            uid:   workspace.kv.auditid,
+            desc:  workspace.kv.logdesc,
+            types: ["Security Audit"]
+        },
+        unmapped: {
+            audit_score:    workspace.kv.auditscore,
+            critical_count: to_int(workspace.kv.criticalcount),
+            high_count:     to_int(workspace.kv.highcount),
+            medium_count:   to_int(workspace.kv.mediumcount),
+            low_count:      to_int(workspace.kv.lowcount),
+            passed_count:   to_int(workspace.kv.passedcount)
+        },
         metadata: fortigate_syslog_metadata(workspace.kv.osname)
     }
 }
