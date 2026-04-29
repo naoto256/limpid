@@ -87,7 +87,16 @@ def process tag {
 }
 ```
 
-`let <name> = expr` introduces a process-local scratch binding (scalar only, not a path). See [User-defined Processes](./processing/user-defined.md) for the full statement set.
+`let <name> = expr` introduces a process-local scratch binding. The
+binding can hold any value type (scalar, Object, or Array): if the
+expression returns an Object, dot-access reads through the binding
+the same way `workspace.x.y` does — for example
+`let f = regex_parse(...)` followed by `f.user`, or
+`let alert = workspace._item` followed by `alert.evidence[0].file`.
+The binding name itself, however, is not a path target on the left
+of `=`: writes go to `egress` or `workspace.*` (`let f.x = ...` is
+rejected). See [User-defined Processes](./processing/user-defined.md)
+for the full statement set.
 
 ## String interpolation
 
