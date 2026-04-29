@@ -125,7 +125,7 @@ def process compose_ocsf {
 // for the executing user.
 def process compose_ocsf_file_system_activity {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:    1001,
         category_uid: 1,
         activity_id:  activity,
@@ -138,7 +138,7 @@ def process compose_ocsf_file_system_activity {
         user:         workspace.limpid.user,
         message:      workspace.limpid.message,
         metadata:     workspace.limpid.metadata
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -152,7 +152,7 @@ def process compose_ocsf_file_system_activity {
 // `workspace.limpid.actor.user`.
 def process compose_ocsf_process_activity {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:    1007,
         category_uid: 1,
         activity_id:  activity,
@@ -164,7 +164,7 @@ def process compose_ocsf_process_activity {
         device:       workspace.limpid.device,
         message:      workspace.limpid.message,
         metadata:     workspace.limpid.metadata
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -176,7 +176,7 @@ def process compose_ocsf_process_activity {
 // (the process that touched it).
 def process compose_ocsf_registry_key_activity {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:    1008,
         category_uid: 1,
         activity_id:  activity,
@@ -188,7 +188,7 @@ def process compose_ocsf_registry_key_activity {
         device:       workspace.limpid.device,
         message:      workspace.limpid.message,
         metadata:     workspace.limpid.metadata
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +200,7 @@ def process compose_ocsf_registry_key_activity {
 // `workspace.limpid.actor.process`.
 def process compose_ocsf_registry_value_activity {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:    1009,
         category_uid: 1,
         activity_id:  activity,
@@ -212,7 +212,7 @@ def process compose_ocsf_registry_value_activity {
         device:       workspace.limpid.device,
         message:      workspace.limpid.message,
         metadata:     workspace.limpid.metadata
-    })
+    }))
 }
 
 // ===========================================================================
@@ -229,7 +229,7 @@ def process compose_ocsf_registry_value_activity {
 // `workspace.limpid.affected_packages`, and `workspace.limpid.resources`.
 def process compose_ocsf_vulnerability_finding {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:         2002,
         category_uid:      2,
         activity_id:       activity,
@@ -242,7 +242,7 @@ def process compose_ocsf_vulnerability_finding {
         resources:         workspace.limpid.resources,
         message:           workspace.limpid.message,
         metadata:          workspace.limpid.metadata
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -254,7 +254,7 @@ def process compose_ocsf_vulnerability_finding {
 // (control / standards) and `workspace.limpid.resource`.
 def process compose_ocsf_compliance_finding {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:    2003,
         category_uid: 2,
         activity_id:  activity,
@@ -267,7 +267,7 @@ def process compose_ocsf_compliance_finding {
         remediation:  workspace.limpid.remediation,
         message:      workspace.limpid.message,
         metadata:     workspace.limpid.metadata
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -281,7 +281,7 @@ def process compose_ocsf_compliance_finding {
 // `evidences` objects with engine-specific detail.
 def process compose_ocsf_detection_finding {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:      2004,
         category_uid:   2,
         activity_id:    activity,
@@ -298,7 +298,7 @@ def process compose_ocsf_detection_finding {
         evidences:      workspace.limpid.evidences,
         message:        workspace.limpid.message,
         metadata:       workspace.limpid.metadata
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -310,7 +310,7 @@ def process compose_ocsf_detection_finding {
 // optional links to underlying findings.
 def process compose_ocsf_incident_finding {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:    2005,
         category_uid: 2,
         activity_id:  activity,
@@ -324,7 +324,7 @@ def process compose_ocsf_incident_finding {
         impact_id:    workspace.limpid.impact_id,
         message:      workspace.limpid.message,
         metadata:     workspace.limpid.metadata
-    })
+    }))
 }
 
 // ===========================================================================
@@ -340,7 +340,7 @@ def process compose_ocsf_incident_finding {
 // `workspace.limpid.actor.user` (the actor performing the change).
 def process compose_ocsf_account_change {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:    3001,
         category_uid: 3,
         activity_id:  activity,
@@ -352,7 +352,7 @@ def process compose_ocsf_account_change {
         src_endpoint: workspace.limpid.src_endpoint,
         message:      workspace.limpid.message,
         metadata:     workspace.limpid.metadata
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -364,7 +364,7 @@ def process compose_ocsf_account_change {
 // `workspace.limpid.status_id` (1 Success / 2 Failure).
 def process compose_ocsf_authentication {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:    3002,
         category_uid: 3,
         activity_id:  activity,
@@ -378,7 +378,7 @@ def process compose_ocsf_authentication {
         auth_protocol_id: workspace.limpid.auth_protocol_id,
         message:      workspace.limpid.message,
         metadata:     workspace.limpid.metadata
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -390,7 +390,7 @@ def process compose_ocsf_authentication {
 // `workspace.limpid.privileges`.
 def process compose_ocsf_authorize_session {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:    3003,
         category_uid: 3,
         activity_id:  activity,
@@ -403,7 +403,7 @@ def process compose_ocsf_authorize_session {
         privileges:   workspace.limpid.privileges,
         message:      workspace.limpid.message,
         metadata:     workspace.limpid.metadata
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -413,7 +413,7 @@ def process compose_ocsf_authorize_session {
 // Privilege grant / revoke / role-assignment operations.
 def process compose_ocsf_user_access_management {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:    3005,
         category_uid: 3,
         activity_id:  activity,
@@ -426,7 +426,7 @@ def process compose_ocsf_user_access_management {
         resource:     workspace.limpid.resource,
         message:      workspace.limpid.message,
         metadata:     workspace.limpid.metadata
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -436,7 +436,7 @@ def process compose_ocsf_user_access_management {
 // Group create / delete / membership change.
 def process compose_ocsf_group_management {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:    3006,
         category_uid: 3,
         activity_id:  activity,
@@ -448,7 +448,7 @@ def process compose_ocsf_group_management {
         actor:        workspace.limpid.actor,
         message:      workspace.limpid.message,
         metadata:     workspace.limpid.metadata
-    })
+    }))
 }
 
 // ===========================================================================
@@ -465,7 +465,7 @@ def process compose_ocsf_group_management {
 // and optionally `workspace.limpid.traffic` (bytes_in/out).
 def process compose_ocsf_network_activity {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:       4001,
         category_uid:    4,
         activity_id:     activity,
@@ -478,7 +478,7 @@ def process compose_ocsf_network_activity {
         traffic:         workspace.limpid.traffic,
         message:         workspace.limpid.message,
         metadata:        workspace.limpid.metadata
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -491,7 +491,7 @@ def process compose_ocsf_network_activity {
 // headers / body_length).
 def process compose_ocsf_http_activity {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:     4002,
         category_uid:  4,
         activity_id:   activity,
@@ -505,7 +505,7 @@ def process compose_ocsf_http_activity {
         traffic:       workspace.limpid.traffic,
         message:       workspace.limpid.message,
         metadata:      workspace.limpid.metadata
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -517,7 +517,7 @@ def process compose_ocsf_http_activity {
 // `workspace.limpid.answers` (resolved records).
 def process compose_ocsf_dns_activity {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:    4003,
         category_uid: 4,
         activity_id:  activity,
@@ -531,7 +531,7 @@ def process compose_ocsf_dns_activity {
         answers:      workspace.limpid.answers,
         message:      workspace.limpid.message,
         metadata:     workspace.limpid.metadata
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -541,7 +541,7 @@ def process compose_ocsf_dns_activity {
 // DHCP lease lifecycle (discover / offer / request / ack / release).
 def process compose_ocsf_dhcp_activity {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:    4004,
         category_uid: 4,
         activity_id:  activity,
@@ -554,7 +554,7 @@ def process compose_ocsf_dhcp_activity {
         lease_dur:    workspace.limpid.lease_dur,
         message:      workspace.limpid.message,
         metadata:     workspace.limpid.metadata
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -562,7 +562,7 @@ def process compose_ocsf_dhcp_activity {
 // ---------------------------------------------------------------------------
 def process compose_ocsf_rdp_activity {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:    4005,
         category_uid: 4,
         activity_id:  activity,
@@ -577,7 +577,7 @@ def process compose_ocsf_rdp_activity {
         user:         workspace.limpid.user,
         message:      workspace.limpid.message,
         metadata:     workspace.limpid.metadata
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -585,7 +585,7 @@ def process compose_ocsf_rdp_activity {
 // ---------------------------------------------------------------------------
 def process compose_ocsf_smb_activity {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:    4006,
         category_uid: 4,
         activity_id:  activity,
@@ -600,7 +600,7 @@ def process compose_ocsf_smb_activity {
         command:      workspace.limpid.command,
         message:      workspace.limpid.message,
         metadata:     workspace.limpid.metadata
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -608,7 +608,7 @@ def process compose_ocsf_smb_activity {
 // ---------------------------------------------------------------------------
 def process compose_ocsf_ssh_activity {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:    4007,
         category_uid: 4,
         activity_id:  activity,
@@ -624,7 +624,7 @@ def process compose_ocsf_ssh_activity {
         user:         workspace.limpid.user,
         message:      workspace.limpid.message,
         metadata:     workspace.limpid.metadata
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -632,7 +632,7 @@ def process compose_ocsf_ssh_activity {
 // ---------------------------------------------------------------------------
 def process compose_ocsf_ftp_activity {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:    4008,
         category_uid: 4,
         activity_id:  activity,
@@ -647,7 +647,7 @@ def process compose_ocsf_ftp_activity {
         file:         workspace.limpid.file,
         message:      workspace.limpid.message,
         metadata:     workspace.limpid.metadata
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -655,7 +655,7 @@ def process compose_ocsf_ftp_activity {
 // ---------------------------------------------------------------------------
 def process compose_ocsf_email_activity {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:    4009,
         category_uid: 4,
         activity_id:  activity,
@@ -669,7 +669,7 @@ def process compose_ocsf_email_activity {
         smtp_hello:   workspace.limpid.smtp_hello,
         message:      workspace.limpid.message,
         metadata:     workspace.limpid.metadata
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -679,7 +679,7 @@ def process compose_ocsf_email_activity {
 // Cross-host file access over network protocols (NFS, SMB-as-FS, etc.).
 def process compose_ocsf_network_file_activity {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:    4010,
         category_uid: 4,
         activity_id:  activity,
@@ -693,7 +693,7 @@ def process compose_ocsf_network_file_activity {
         actor:        workspace.limpid.actor,
         message:      workspace.limpid.message,
         metadata:     workspace.limpid.metadata
-    })
+    }))
 }
 
 // ===========================================================================
@@ -709,7 +709,7 @@ def process compose_ocsf_network_file_activity {
 // and `workspace.limpid.actor` (the calling principal).
 def process compose_ocsf_api_activity {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:    6003,
         category_uid: 6,
         activity_id:  activity,
@@ -723,7 +723,7 @@ def process compose_ocsf_api_activity {
         resources:    workspace.limpid.resources,
         message:      workspace.limpid.message,
         metadata:     workspace.limpid.metadata
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -736,7 +736,7 @@ def process compose_ocsf_api_activity {
 // `workspace.limpid.actor.user` for the requesting user.
 def process compose_ocsf_web_resource_access {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:     6004,
         category_uid:  6,
         activity_id:   activity,
@@ -751,7 +751,7 @@ def process compose_ocsf_web_resource_access {
         actor:         workspace.limpid.actor,
         message:       workspace.limpid.message,
         metadata:      workspace.limpid.metadata
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -761,7 +761,7 @@ def process compose_ocsf_web_resource_access {
 // Database / S3 / object-store access events.
 def process compose_ocsf_datastore_activity {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:    6005,
         category_uid: 6,
         activity_id:  activity,
@@ -776,7 +776,7 @@ def process compose_ocsf_datastore_activity {
         query_info:   workspace.limpid.query_info,
         message:      workspace.limpid.message,
         metadata:     workspace.limpid.metadata
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -787,7 +787,7 @@ def process compose_ocsf_datastore_activity {
 // layer; individual findings are class 2002 / 2003).
 def process compose_ocsf_scan_activity {
     let activity = workspace.limpid.activity_id
-    egress = to_json({
+    egress = to_json(null_omit({
         class_uid:    6007,
         category_uid: 6,
         activity_id:  activity,
@@ -800,5 +800,5 @@ def process compose_ocsf_scan_activity {
         policy:       workspace.limpid.policy,
         message:      workspace.limpid.message,
         metadata:     workspace.limpid.metadata
-    })
+    }))
 }
