@@ -23,7 +23,7 @@ pub fn register(reg: &mut FunctionRegistry) {
             2,
             FieldType::String,
         ),
-        |args, _event| {
+        |arena, args, _event| {
             // strftime(ts, fmt)           — render in UTC (the value's
             //                                normalised offset)
             // strftime(ts, fmt, "local")  — convert to local time, then format
@@ -60,7 +60,7 @@ pub fn register(reg: &mut FunctionRegistry) {
                 }
             };
 
-            Ok(Value::String(formatted))
+            Ok(Value::String(arena.alloc_str(&formatted)))
         },
     );
 }

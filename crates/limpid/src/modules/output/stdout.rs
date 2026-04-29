@@ -4,14 +4,21 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::Result;
+use bytes::Bytes;
 
+use crate::dsl::arena::EventArena;
 use crate::dsl::ast::Property;
-use crate::event::Event;
+use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
-use crate::modules::{HasMetrics, Module, Output};
+use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
 
 pub struct StdoutOutput {
     metrics: Arc<OutputMetrics>,
+}
+
+/// Per-event payload: just the egress bytes (refcounted clone).
+struct StdoutPayload {
+    egress: Bytes,
 }
 
 impl Module for StdoutOutput {
@@ -31,8 +38,19 @@ impl HasMetrics for StdoutOutput {
 
 #[async_trait::async_trait]
 impl Output for StdoutOutput {
-    async fn write(&self, event: &Event) -> Result<()> {
-        let msg = String::from_utf8_lossy(&event.egress);
+    fn render(
+        &self,
+        event: &BorrowedEvent<'_>,
+        _arena: &EventArena<'_>,
+    ) -> Result<RenderedPayload> {
+        Ok(RenderedPayload::new(StdoutPayload {
+            egress: event.egress.clone(),
+        }))
+    }
+
+    async fn write(&self, payload: RenderedPayload) -> Result<()> {
+        let payload: StdoutPayload = payload.downcast()?;
+        let msg = String::from_utf8_lossy(&payload.egress);
         println!("{}", msg);
         self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
         Ok(())

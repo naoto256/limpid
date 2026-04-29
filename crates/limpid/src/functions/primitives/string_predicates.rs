@@ -14,7 +14,7 @@ fn register_predicate(
     reg.register_with_sig(
         name,
         FunctionSig::fixed(&[FieldType::String, FieldType::String], FieldType::Bool),
-        move |args, _event| {
+        move |_arena, args, _event| {
             let haystack = val_to_str(&args[0])?;
             let needle = val_to_str(&args[1])?;
             Ok(Value::Bool(pred(&haystack, &needle)))
@@ -31,25 +31,33 @@ pub fn register(reg: &mut FunctionRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::Event;
+    use crate::dsl::arena::EventArena;
+    use crate::event::OwnedEvent;
     use bytes::Bytes;
     use std::net::SocketAddr;
 
-    fn dummy_event() -> Event {
-        Event::new(
+    fn dummy_owned() -> OwnedEvent {
+        OwnedEvent::new(
             Bytes::from("test"),
             "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         )
     }
 
     fn call_pred(reg: &FunctionRegistry, name: &str, h: &str, n: &str) -> bool {
-        let e = dummy_event();
+        let bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = dummy_owned();
+        let bevent = owned.view_in(&arena);
         let v = reg
             .call(
                 None,
                 name,
-                &[Value::String(h.into()), Value::String(n.into())],
-                &e,
+                &[
+                    Value::String(arena.alloc_str(h)),
+                    Value::String(arena.alloc_str(n)),
+                ],
+                &bevent,
+                &arena,
             )
             .unwrap();
         let Value::Bool(b) = v else { panic!() };

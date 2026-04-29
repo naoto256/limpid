@@ -39,8 +39,8 @@ output is achieved by freely combining `process`es.
 
 A reusable chunk of pipeline logic — small, named, drop-in. You write
 them yourself, or you include them from a snippet library (a curated
-collection shipping from v0.6.0). Here is what `compose_ocsf_finding`
-looks like under the hood:
+collection shipping with the 0.7 series). Here is what
+`compose_ocsf_finding` looks like under the hood:
 
 ```limpid
 def process compose_ocsf_finding {
@@ -175,14 +175,15 @@ inside a `process` body:
 - **Generic parsers** — `parse_json` · `parse_kv` · `csv_parse`
 - **Regex** — `regex_match` · `regex_extract` · `regex_parse` ·
   `regex_replace`
-- **String manipulation** — `contains` · `lower` · `upper` · `format` ·
-  `strftime`
+- **String predicates** — `contains` · `starts_with` · `ends_with`
+- **String manipulation** — `lower` · `upper` · `strftime` · `strptime`
 - **Type coercion** — `to_int` · `to_json` · `to_bytes` · `to_string`
+- **Fallback / shaping** — `coalesce` · `null_omit`
 - **Collections** — `len` · `find_by` · `append` · `prepend`
-- **Object / Array shaping** — `null_omit`
 - **Hashing** — `md5` · `sha1` · `sha256`
 - **Tables / enrichment** — `table_lookup` · `table_upsert` ·
   `table_delete` · `geoip`
+- **Environment** — `hostname` · `version` · `timestamp`
 - **Syslog** — `syslog.parse` · `syslog.strip_pri` · `syslog.set_pri` ·
   `syslog.extract_pri`
 - **CEF** — `cef.parse`
@@ -192,6 +193,29 @@ inside a `process` body:
 
 Full reference: [Built-in Functions](docs/src/functions/expression-functions.md)
 · [String interpolation](docs/src/dsl-syntax.md#string-interpolation).
+
+## Performance
+
+A single core handles **~168k events/sec** on the heaviest realistic
+DSL workload — full OCSF Authentication compose with `to_json`
+serialization, single-pipeline single-input, channel-direct injection.
+Lighter shapes scale up from there:
+
+| Pipeline shape                              | events/sec/core |
+|---------------------------------------------|----------------:|
+| passthrough                                 |             303k |
+| `syslog.parse(ingress)`                     |             282k |
+| parse + 2× regex + if/else                  |             112k |
+| **OCSF compose + to_json (heaviest)**       |         **168k** |
+
+The numbers come from the v0.6.0 perf milestone — a per-event bump
+arena, direct `serde::Serialize` for the runtime `Value` tree,
+static-literal hash-key interning, and a boundary refactor that
+eliminated the hot-path `BorrowedEvent::to_owned()` at every output
+sink. Real I/O (`__sendto`, ~18%) and tokio scheduling (~10%) are now
+the dominant categories on the flame graph; allocation collapsed from
+43% at v0.5.7 to 15%. See the [v0.6.0 CHANGELOG entry](CHANGELOG.md)
+for the cumulative breakdown.
 
 ## Compared to rsyslog / fluentd / Vector
 
@@ -241,8 +265,7 @@ is built for a different default: pipelines that are *legible*,
   [systemd](docs/src/operations/systemd.md)
 - [OTLP — design rationale](docs/src/otlp.md)
 - [Migrating from rsyslog](docs/src/operations/migration.md) ·
-  [Upgrading to 0.3](docs/src/operations/upgrade-0.3.md) ·
-  [Upgrading to 0.5](docs/src/operations/upgrade-0.5.md)
+  [Upgrading to 0.3](docs/src/operations/upgrade-0.3.md)
 
 ## License
 

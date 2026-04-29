@@ -2,13 +2,13 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::dsl::value::Value;
+    use crate::dsl::value::{OwnedValue, Value};
     use bytes::Bytes;
     use std::net::SocketAddr;
 
     use crate::dsl::ast::*;
     use crate::dsl::exec::*;
-    use crate::event::Event;
+    use crate::event::{BorrowedEvent, Event};
     use crate::functions::FunctionRegistry;
 
     fn make_event() -> Event {
@@ -30,15 +30,27 @@ mod tests {
         Expr::spanless(kind)
     }
 
+    /// Test helper: assert that `exec_process_body` returned `Err` and
+    /// return that error. `ExecResult` does not implement `Debug`, so the
+    /// usual `unwrap_err` / `expect_err` shortcuts don't apply — pattern
+    /// matching is the equivalent.
+    fn expect_exec_err(res: anyhow::Result<ExecResult<'_>>) -> anyhow::Error {
+        match res {
+            Ok(_) => panic!("expected Err from exec_process_body"),
+            Err(e) => e,
+        }
+    }
+
     /// No-op registry that passes events through unchanged.
     struct NoopRegistry;
     impl ProcessRegistry for NoopRegistry {
-        fn call(
+        fn call<'bump>(
             &self,
             _name: &str,
-            _args: &[Value],
-            event: Event,
-        ) -> Result<Option<Event>, ProcessError> {
+            _args: &[Value<'bump>],
+            event: BorrowedEvent<'bump>,
+            _arena: &'bump crate::dsl::arena::EventArena<'bump>,
+        ) -> Result<Option<BorrowedEvent<'bump>>, ProcessError> {
             Ok(Some(event))
         }
     }
@@ -46,26 +58,30 @@ mod tests {
     /// Registry that always fails.
     struct FailRegistry;
     impl ProcessRegistry for FailRegistry {
-        fn call(
+        fn call<'bump>(
             &self,
             _name: &str,
-            _args: &[Value],
-            _event: Event,
-        ) -> Result<Option<Event>, ProcessError> {
+            _args: &[Value<'bump>],
+            _event: BorrowedEvent<'bump>,
+            _arena: &'bump crate::dsl::arena::EventArena<'bump>,
+        ) -> Result<Option<BorrowedEvent<'bump>>, ProcessError> {
             Err(ProcessError::Failed("test error".into()))
         }
     }
 
     #[test]
     fn test_exec_assign_workspace() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let stmts = vec![ProcessStatement::Assign(
             AssignTarget::Workspace(vec!["tag".into()]),
             e(ExprKind::StringLit("critical".into())),
         )];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
-                assert_eq!(ev.workspace["tag"], Value::String("critical".into()));
+                assert_eq!(ev.workspace_get("tag"), Some(Value::String("critical")));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -73,9 +89,12 @@ mod tests {
 
     #[test]
     fn test_exec_drop() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let stmts = vec![ProcessStatement::Drop];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(_) => panic!("expected drop"),
             ExecResult::Dropped => {} // ok
         }
@@ -83,15 +102,18 @@ mod tests {
 
     #[test]
     fn test_exec_error_with_message_bubbles_up() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // `error "msg"` should produce an Err whose Display contains the
         // rendered message. The pipeline-level handler then turns this
         // into a DLQ entry — same path as a runtime process error.
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let stmts = vec![ProcessStatement::Error(Some(e(ExprKind::StringLit(
             "explicit failure".into(),
         ))))];
-        let res = exec_process_body(&stmts, event, &NoopRegistry, &make_funcs());
-        let err = res.expect_err("expected Err from error statement");
+        let res = exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena);
+        let err = expect_exec_err(res);
         assert!(
             err.to_string().contains("explicit failure"),
             "expected message to surface, got: {}",
@@ -101,10 +123,18 @@ mod tests {
 
     #[test]
     fn test_exec_error_without_message_uses_default() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let stmts = vec![ProcessStatement::Error(None)];
-        let err = exec_process_body(&stmts, event, &NoopRegistry, &make_funcs())
-            .expect_err("expected Err from bare error statement");
+        let err = expect_exec_err(exec_process_body(
+            &stmts,
+            bevent,
+            &NoopRegistry,
+            &make_funcs(),
+            &arena,
+        ));
         // Default message is operator-readable; assert on a stable
         // substring rather than the full string so cosmetic tweaks
         // don't churn the test.
@@ -117,21 +147,29 @@ mod tests {
 
     #[test]
     fn test_exec_error_with_interpolated_message() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // `error "subtype ${workspace.kind} unsupported"` must render the
         // interpolation against the current event before bubbling.
         use crate::dsl::ast::TemplateFragment;
         let mut event = make_event();
         event
             .workspace
-            .insert("kind".into(), Value::String("foo".into()));
+            .insert("kind".into(), OwnedValue::String("foo".into()));
+        let bevent = event.view_in(&arena);
         let template = e(ExprKind::Template(vec![
             TemplateFragment::Literal("subtype ".into()),
             TemplateFragment::Interp(e(ExprKind::Ident(vec!["workspace".into(), "kind".into()]))),
             TemplateFragment::Literal(" unsupported".into()),
         ]));
         let stmts = vec![ProcessStatement::Error(Some(template))];
-        let err = exec_process_body(&stmts, event, &NoopRegistry, &make_funcs())
-            .expect_err("expected Err");
+        let err = expect_exec_err(exec_process_body(
+            &stmts,
+            bevent,
+            &NoopRegistry,
+            &make_funcs(),
+            &arena,
+        ));
         assert!(
             err.to_string().contains("subtype foo unsupported"),
             "expected interpolated message, got: {}",
@@ -141,7 +179,10 @@ mod tests {
 
     #[test]
     fn test_exec_if_true_branch() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let stmts = vec![ProcessStatement::If(IfChain {
             branches: vec![(
                 e(ExprKind::BoolLit(true)),
@@ -152,9 +193,9 @@ mod tests {
             )],
             else_body: None,
         })];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
-                assert_eq!(ev.workspace["hit"], Value::Bool(true));
+                assert_eq!(ev.workspace_get("hit"), Some(Value::Bool(true)));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -162,7 +203,10 @@ mod tests {
 
     #[test]
     fn test_exec_if_else_branch() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let stmts = vec![ProcessStatement::If(IfChain {
             branches: vec![(
                 e(ExprKind::BoolLit(false)),
@@ -176,9 +220,9 @@ mod tests {
                 e(ExprKind::StringLit("else".into())),
             ))]),
         })];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
-                assert_eq!(ev.workspace["branch"], Value::String("else".into()));
+                assert_eq!(ev.workspace_get("branch"), Some(Value::String("else")));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -186,9 +230,12 @@ mod tests {
 
     #[test]
     fn test_exec_process_error_passes_through() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let stmts = vec![ProcessStatement::ProcessCall("failing".into(), vec![])];
-        match exec_process_body(&stmts, event, &FailRegistry, &make_funcs()).unwrap() {
+        match exec_process_body(&stmts, bevent, &FailRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
                 // Event should pass through unchanged
                 assert_eq!(&*ev.ingress, b"<134>test");
@@ -199,7 +246,10 @@ mod tests {
 
     #[test]
     fn test_exec_try_catch_on_error() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let stmts = vec![ProcessStatement::TryCatch(
             vec![ProcessStatement::ProcessCall("failing".into(), vec![])],
             vec![ProcessStatement::Assign(
@@ -213,7 +263,8 @@ mod tests {
         // individual process calls (which are handled gracefully).
         // This is correct: try/catch wraps a body, process errors within
         // that body are handled individually.
-        let result = exec_process_body(&stmts, event, &FailRegistry, &make_funcs()).unwrap();
+        let result =
+            exec_process_body(&stmts, bevent, &FailRegistry, &make_funcs(), &arena).unwrap();
         assert!(matches!(result, ExecResult::Continue(_)));
     }
 
@@ -221,8 +272,11 @@ mod tests {
 
     #[test]
     fn let_binding_resolves_via_bare_ident_in_same_body() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // `let x = 7; workspace.y = x` — workspace.y becomes Number(7).
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let stmts = vec![
             ProcessStatement::LetBinding("x".into(), e(ExprKind::IntLit(7))),
             ProcessStatement::Assign(
@@ -230,9 +284,9 @@ mod tests {
                 e(ExprKind::Ident(vec!["x".into()])),
             ),
         ];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
-                assert_eq!(ev.workspace["y"], Value::Int(7));
+                assert_eq!(ev.workspace_get("y"), Some(Value::Int(7)));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -246,7 +300,10 @@ mod tests {
         // workspace.x.y would. Regression test for the gap that made
         // `let f = regex_parse(...); f.user` fail at runtime with
         // "unknown identifier: f.user".
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let obj = e(ExprKind::HashLit(vec![
             ("a".into(), e(ExprKind::IntLit(7))),
             ("b".into(), e(ExprKind::IntLit(9))),
@@ -262,10 +319,10 @@ mod tests {
                 e(ExprKind::Ident(vec!["f".into(), "b".into()])),
             ),
         ];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
-                assert_eq!(ev.workspace["x"], Value::Int(7));
-                assert_eq!(ev.workspace["y"], Value::Int(9));
+                assert_eq!(ev.workspace_get("x"), Some(Value::Int(7)));
+                assert_eq!(ev.workspace_get("y"), Some(Value::Int(9)));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -277,7 +334,10 @@ mod tests {
         // walker should yield Null (not error) so callers can treat
         // missing keys with coalesce / explicit null comparisons,
         // matching the workspace.* path-walker contract.
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let obj = e(ExprKind::HashLit(vec![(
             "a".into(),
             e(ExprKind::IntLit(1)),
@@ -289,9 +349,9 @@ mod tests {
                 e(ExprKind::Ident(vec!["f".into(), "nonexistent".into()])),
             ),
         ];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
-                assert_eq!(ev.workspace["miss"], Value::Null);
+                assert_eq!(ev.workspace_get("miss"), Some(Value::Null));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -302,7 +362,10 @@ mod tests {
         // `let f = { a: { b: 7 } }; workspace.x = f.a.b` — multi-segment
         // path access (>2 segments) walks into a nested Object the
         // same way `workspace.x.y.z` does.
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let inner = e(ExprKind::HashLit(vec![(
             "b".into(),
             e(ExprKind::IntLit(7)),
@@ -319,9 +382,9 @@ mod tests {
                 ])),
             ),
         ];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
-                assert_eq!(ev.workspace["x"], Value::Int(7));
+                assert_eq!(ev.workspace_get("x"), Some(Value::Int(7)));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -334,7 +397,10 @@ mod tests {
         // for Object values as for scalars (covered by
         // `let_shadows_prior_binding_with_same_name`); dot-access on
         // the latest binding sees the new Object.
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let obj1 = e(ExprKind::HashLit(vec![(
             "a".into(),
             e(ExprKind::IntLit(1)),
@@ -351,9 +417,9 @@ mod tests {
                 e(ExprKind::Ident(vec!["f".into(), "a".into()])),
             ),
         ];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
-                assert_eq!(ev.workspace["x"], Value::Int(2));
+                assert_eq!(ev.workspace_get("x"), Some(Value::Int(2)));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -361,8 +427,11 @@ mod tests {
 
     #[test]
     fn let_shadows_prior_binding_with_same_name() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // `let x = 1; let x = 2; workspace.y = x` — workspace.y is 2.
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let stmts = vec![
             ProcessStatement::LetBinding("x".into(), e(ExprKind::IntLit(1))),
             ProcessStatement::LetBinding("x".into(), e(ExprKind::IntLit(2))),
@@ -371,9 +440,9 @@ mod tests {
                 e(ExprKind::Ident(vec!["x".into()])),
             ),
         ];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
-                assert_eq!(ev.workspace["y"], Value::Int(2));
+                assert_eq!(ev.workspace_get("y"), Some(Value::Int(2)));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -381,7 +450,10 @@ mod tests {
 
     #[test]
     fn let_is_visible_inside_if_branch_declared_above() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let stmts = vec![
             ProcessStatement::LetBinding("m".into(), e(ExprKind::StringLit("hit".into()))),
             ProcessStatement::If(IfChain {
@@ -395,9 +467,9 @@ mod tests {
                 else_body: None,
             }),
         ];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
-                assert_eq!(ev.workspace["tag"], Value::String("hit".into()));
+                assert_eq!(ev.workspace_get("tag"), Some(Value::String("hit")));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -405,6 +477,8 @@ mod tests {
 
     #[test]
     fn let_scope_does_not_leak_between_top_level_bodies() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // `exec_process_body` starts a fresh scope each call. Running
         // two bodies back-to-back must not carry x from the first into
         // the second — referencing `x` in the second body fails.
@@ -414,13 +488,21 @@ mod tests {
             "x".into(),
             e(ExprKind::IntLit(1)),
         )];
-        let _ = exec_process_body(&first, event.clone(), &NoopRegistry, &funcs).unwrap();
+        let _ =
+            exec_process_body(&first, event.view_in(&arena), &NoopRegistry, &funcs, &arena)
+                .unwrap();
 
         let second = vec![ProcessStatement::Assign(
             AssignTarget::Workspace(vec!["y".into()]),
             e(ExprKind::Ident(vec!["x".into()])),
         )];
-        let err = exec_process_body(&second, event, &NoopRegistry, &funcs).unwrap_err();
+        let err = expect_exec_err(exec_process_body(
+            &second,
+            event.view_in(&arena),
+            &NoopRegistry,
+            &funcs,
+            &arena,
+        ));
         assert!(
             err.to_string().contains("unknown identifier"),
             "unexpected error: {}",
@@ -430,7 +512,10 @@ mod tests {
 
     #[test]
     fn let_is_referenced_in_template_interpolation() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let stmts = vec![
             ProcessStatement::LetBinding("host".into(), e(ExprKind::StringLit("web01".into()))),
             ProcessStatement::Assign(
@@ -441,7 +526,7 @@ mod tests {
                 ])),
             ),
         ];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
                 assert_eq!(&*ev.egress, b"hello web01");
             }
@@ -451,9 +536,12 @@ mod tests {
 
     #[test]
     fn let_does_not_survive_try_catch_failure() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // let bindings introduced inside a try that later fails are
         // discarded before the catch runs.
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let stmts = vec![ProcessStatement::TryCatch(
             vec![
                 ProcessStatement::LetBinding("x".into(), e(ExprKind::IntLit(9))),
@@ -471,7 +559,13 @@ mod tests {
                 ),
             ],
         )];
-        let err = exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap_err();
+        let err = expect_exec_err(exec_process_body(
+            &stmts,
+            bevent,
+            &NoopRegistry,
+            &make_funcs(),
+            &arena,
+        ));
         assert!(
             err.to_string().contains("unknown identifier"),
             "expected catch to fail resolving x, got: {}",
@@ -495,7 +589,10 @@ mod tests {
 
     #[test]
     fn test_exec_array_literal_into_workspace() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let stmts = vec![ProcessStatement::Assign(
             AssignTarget::Workspace(vec!["types".into()]),
             e(ExprKind::ArrayLit(vec![
@@ -503,13 +600,13 @@ mod tests {
                 e(ExprKind::StringLit("xss".into())),
             ])),
         )];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
                 assert_eq!(
-                    ev.workspace["types"],
-                    Value::Array(vec![
-                        Value::String("sqli".into()),
-                        Value::String("xss".into()),
+                    ev.workspace_get("types").unwrap().to_owned_value(),
+                    OwnedValue::Array(vec![
+                        OwnedValue::String("sqli".into()),
+                        OwnedValue::String("xss".into()),
                     ])
                 );
             }
@@ -519,7 +616,10 @@ mod tests {
 
     #[test]
     fn test_exec_len_over_array_literal() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let stmts = vec![ProcessStatement::Assign(
             AssignTarget::Workspace(vec!["n".into()]),
             call_fn(
@@ -531,9 +631,9 @@ mod tests {
                 ]))],
             ),
         )];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
-                assert_eq!(ev.workspace["n"], Value::Int(3));
+                assert_eq!(ev.workspace_get("n"), Some(Value::Int(3)));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -541,9 +641,12 @@ mod tests {
 
     #[test]
     fn test_exec_append_grows_array() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // workspace.xs = [1, 2]
         // workspace.xs = append(workspace.xs, 3)
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let stmts = vec![
             ProcessStatement::Assign(
                 AssignTarget::Workspace(vec!["xs".into()]),
@@ -563,11 +666,15 @@ mod tests {
                 ),
             ),
         ];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
                 assert_eq!(
-                    ev.workspace["xs"],
-                    Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3),])
+                    ev.workspace_get("xs").unwrap().to_owned_value(),
+                    OwnedValue::Array(vec![
+                        OwnedValue::Int(1),
+                        OwnedValue::Int(2),
+                        OwnedValue::Int(3),
+                    ])
                 );
             }
             ExecResult::Dropped => panic!("unexpected drop"),
@@ -576,7 +683,10 @@ mod tests {
 
     #[test]
     fn test_exec_prepend_grows_array_at_front() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let stmts = vec![
             ProcessStatement::Assign(
                 AssignTarget::Workspace(vec!["xs".into()]),
@@ -596,11 +706,15 @@ mod tests {
                 ),
             ),
         ];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
                 assert_eq!(
-                    ev.workspace["xs"],
-                    Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3),])
+                    ev.workspace_get("xs").unwrap().to_owned_value(),
+                    OwnedValue::Array(vec![
+                        OwnedValue::Int(1),
+                        OwnedValue::Int(2),
+                        OwnedValue::Int(3),
+                    ])
                 );
             }
             ExecResult::Dropped => panic!("unexpected drop"),
@@ -609,8 +723,11 @@ mod tests {
 
     #[test]
     fn test_exec_find_by_over_literal_array_of_objects() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // workspace.found = find_by([{t:"a", n:1}, {t:"b", n:2}], "t", "b")
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let obj = |t: &str, n: i64| {
             e(ExprKind::HashLit(vec![
                 ("t".into(), e(ExprKind::StringLit(t.into()))),
@@ -628,11 +745,11 @@ mod tests {
                 ],
             ),
         )];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
-                let found = &ev.workspace["found"];
-                assert_eq!(found.get("t"), Some(&Value::String("b".into())));
-                assert_eq!(found.get("n"), Some(&Value::Int(2)));
+                let found = ev.workspace_get("found").unwrap();
+                assert_eq!(found.get("t"), Some(Value::String("b")));
+                assert_eq!(found.get("n"), Some(Value::Int(2)));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -655,7 +772,10 @@ mod tests {
     /// onto that slot. This test pins the user-visible binding.
     #[test]
     fn catch_body_sees_error_message_via_bare_ident() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let stmts = vec![ProcessStatement::TryCatch(
             // try: force a runtime error by referencing an unknown
             // identifier — eval.rs::resolve_ident bails with
@@ -671,10 +791,10 @@ mod tests {
                 e(ExprKind::Ident(vec!["error".into()])),
             )],
         )];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
-                let msg = match ev.workspace.get("captured") {
-                    Some(Value::String(s)) => s.clone(),
+                let msg = match ev.workspace_get("captured") {
+                    Some(Value::String(s)) => s.to_string(),
                     other => panic!("expected captured to be a string, got {:?}", other),
                 };
                 assert!(
@@ -685,7 +805,7 @@ mod tests {
                 // event continues so a downstream `error` access does
                 // not see a stale message.
                 assert!(
-                    !ev.workspace.contains_key("_error"),
+                    ev.workspace_get("_error").is_none(),
                     "_error should be cleared after catch body"
                 );
             }
@@ -701,7 +821,10 @@ mod tests {
     /// `ProcessRegistry::call` returning `Ok(None)`.
     #[test]
     fn drop_short_circuits_inline_statements() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let stmts = vec![
             ProcessStatement::Assign(
                 AssignTarget::Workspace(vec!["before".into()]),
@@ -716,7 +839,8 @@ mod tests {
                 e(ExprKind::IntLit(2)),
             ),
         ];
-        let result = exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap();
+        let result =
+            exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap();
         assert!(matches!(result, ExecResult::Dropped));
     }
 
@@ -729,7 +853,10 @@ mod tests {
     /// fine.
     #[test]
     fn expr_stmt_merges_bytes_value_into_workspace() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
+        let bevent = event.view_in(&arena);
         // Build `{ payload: <bytes>, label: "ok" }` as an inline
         // HashLit and run it as a bare expression statement.
         let stmts = vec![ProcessStatement::ExprStmt(e(ExprKind::HashLit(vec![
@@ -745,13 +872,13 @@ mod tests {
             ),
             ("label".into(), e(ExprKind::StringLit("ok".into()))),
         ])))];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
-                match ev.workspace.get("payload") {
-                    Some(Value::Bytes(b)) => assert_eq!(&b[..], b"hi"),
+                match ev.workspace_get("payload") {
+                    Some(Value::Bytes(b)) => assert_eq!(b, b"hi"),
                     other => panic!("expected workspace.payload to be Bytes, got {:?}", other),
                 }
-                assert_eq!(ev.workspace["label"], Value::String("ok".into()));
+                assert_eq!(ev.workspace_get("label"), Some(Value::String("ok")));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -763,7 +890,10 @@ mod tests {
     /// matches the behaviour documented on `exec_stmts_with_scope`.
     #[test]
     fn let_inside_if_branch_leaks_to_outer_scope() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let stmts = vec![
             ProcessStatement::If(IfChain {
                 branches: vec![(
@@ -782,9 +912,9 @@ mod tests {
                 e(ExprKind::Ident(vec!["x".into()])),
             ),
         ];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
-                assert_eq!(ev.workspace["y"], Value::Int(7));
+                assert_eq!(ev.workspace_get("y"), Some(Value::Int(7)));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
@@ -796,7 +926,10 @@ mod tests {
     /// last iteration's item via that magic key.
     #[test]
     fn foreach_clears_item_after_normal_exit() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let stmts = vec![ProcessStatement::ForEach(
             e(ExprKind::ArrayLit(vec![
                 e(ExprKind::IntLit(1)),
@@ -810,11 +943,11 @@ mod tests {
                 e(ExprKind::Ident(vec!["workspace".into(), "_item".into()])),
             )],
         )];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
-                assert_eq!(ev.workspace["last"], Value::Int(2));
+                assert_eq!(ev.workspace_get("last"), Some(Value::Int(2)));
                 assert!(
-                    !ev.workspace.contains_key("_item"),
+                    ev.workspace_get("_item").is_none(),
                     "_item must be cleared after the loop body completes"
                 );
             }
@@ -830,7 +963,10 @@ mod tests {
     /// the test would break.
     #[test]
     fn foreach_drop_short_circuits_iteration() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let stmts = vec![ProcessStatement::ForEach(
             e(ExprKind::ArrayLit(vec![
                 e(ExprKind::IntLit(1)),
@@ -840,7 +976,8 @@ mod tests {
             // First iteration drops; later iterations must not run.
             vec![ProcessStatement::Drop],
         )];
-        let result = exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap();
+        let result =
+            exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap();
         assert!(matches!(result, ExecResult::Dropped));
     }
 
@@ -854,7 +991,10 @@ mod tests {
     /// does not silently change it.
     #[test]
     fn let_inside_foreach_body_persists_across_iterations() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
+        let bevent = event.view_in(&arena);
         let stmts = vec![
             // Initial sentinel — `acc` exists in scope before the loop.
             ProcessStatement::LetBinding("acc".into(), e(ExprKind::IntLit(0))),
@@ -884,9 +1024,9 @@ mod tests {
                 e(ExprKind::Ident(vec!["acc".into()])),
             ),
         ];
-        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
-                assert_eq!(ev.workspace["sum"], Value::Int(6));
+                assert_eq!(ev.workspace_get("sum"), Some(Value::Int(6)));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }

@@ -11,7 +11,7 @@ pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(
         "regex_match",
         FunctionSig::fixed(&[FieldType::String, FieldType::String], FieldType::Bool),
-        |args, _event| {
+        |_arena, args, _event| {
             let target = val_to_str(&args[0])?;
             let pattern = val_to_str(&args[1])?;
             match get_cached_regex(&pattern) {

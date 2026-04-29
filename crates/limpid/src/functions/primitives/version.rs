@@ -15,26 +15,30 @@ pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(
         "version",
         FunctionSig::fixed(&[], FieldType::String),
-        |_args, _event| Ok(Value::String(VERSION.into())),
+        |_arena, _args, _event| Ok(Value::String(VERSION)),
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::Event;
+    use crate::dsl::arena::EventArena;
+    use crate::event::OwnedEvent;
     use bytes::Bytes;
     use std::net::SocketAddr;
 
     #[test]
     fn returns_compile_time_version() {
+        let bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
         let mut reg = FunctionRegistry::new();
         register(&mut reg);
-        let e = Event::new(
+        let owned = OwnedEvent::new(
             Bytes::from("test"),
             "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         );
-        let v = reg.call(None, "version", &[], &e).unwrap();
+        let bevent = owned.view_in(&arena);
+        let v = reg.call(None, "version", &[], &bevent, &arena).unwrap();
         let Value::String(s) = v else { panic!() };
         assert_eq!(s, env!("CARGO_PKG_VERSION"));
     }
