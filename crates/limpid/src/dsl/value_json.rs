@@ -60,7 +60,7 @@ pub fn value_to_json(v: &OwnedValue) -> Result<JsonValue> {
         OwnedValue::Float(n) => JsonNumber::from_f64(*n)
             .map(JsonValue::Number)
             .ok_or_else(|| anyhow!("cannot serialize non-finite float to JSON: {n}")),
-        OwnedValue::String(s) => Ok(JsonValue::String(s.clone())),
+        OwnedValue::String(s) => Ok(JsonValue::String(s.to_string())),
         // Wire form for timestamps is unix nanoseconds (i64) — matches
         // OTLP `time_unix_nano`, lossless round-trip vs RFC3339, no
         // timezone ambiguity. RFC3339 remains the DSL Display form.
@@ -115,7 +115,7 @@ pub fn json_to_value(v: &JsonValue) -> Result<OwnedValue> {
                 Ok(OwnedValue::Float(n.as_f64().unwrap_or(0.0)))
             }
         }
-        JsonValue::String(s) => Ok(OwnedValue::String(s.clone())),
+        JsonValue::String(s) => Ok(OwnedValue::String(s.into())),
         JsonValue::Array(a) => {
             let mut out = Vec::with_capacity(a.len());
             for item in a {

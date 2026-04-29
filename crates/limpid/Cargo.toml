@@ -41,6 +41,15 @@ indexmap = { version = "2", features = ["serde"] }
 # (~23% of allocator samples on v0.5.7 D pipeline) with a single
 # pointer reset. See `_PLAN_V060_PERF.md`.
 bumpalo = { version = "3", features = ["collections"] }
+# Small-string optimisation for the boundary `OwnedValue::String` form.
+# Strings up to 24 bytes (the inline budget on 64-bit targets) live in
+# the variant itself with no heap allocation; longer strings fall back
+# to a heap pointer. The DSL hot path uses arena-backed `&'bump str`
+# already, so this targets the heap allocations on the
+# `BorrowedEvent::to_owned()` boundary (workspace + outputs queue) where
+# typical OCSF / syslog field values (`"INFO"`, `"sshd"`, IPv4
+# strings, …) sit comfortably under the inline budget.
+compact_str = { version = "0.9", features = ["serde"] }
 systemd = { version = "0.10", optional = true }
 rdkafka = { version = "0.36", features = ["cmake-build"], optional = true }
 
