@@ -8,6 +8,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
+## [0.6.1] - 2026-04-30
+> perf: multi-pipeline scaling — 4-pipeline D-pipeline aggregate 374k → 459k events/sec (+23%, scaling 2.27× → 2.73×)
+
+A short follow-up to v0.6.0 closing the multi-pipeline scaling gap
+that the perf-milestone profile surfaced after release. Three small
+changes that compound:
+
+1. **Per-worker bump-arena recycling** — the per-event
+   `bumpalo::Bump::new()` introduced in v0.6.0 became a contention
+   point on the macOS xzm allocator's per-zone lock once multiple
+   pipelines ran concurrently. Hoist the `Bump` into the per-input
+   pipeline-worker task's local state and recycle via `Bump::reset()`
+   between events. Steady state: zero allocations on the hot path.
+2. **Pass the input event by reference through fan-out** — when
+   multiple pipelines fan out from one input, the dispatcher used to
+   `Event::clone()` per worker (workspace `HashMap` rebuild). The
+   input event is read-only after `view_in` copies it into the
+   per-event arena, so a `&Event` borrow is sufficient.
+3. **`tracing/release_max_level_info`** — `trace!` / `debug!` macros
+   compile to no-ops in release builds, eliminating per-event
+   instrumentation cost (roughly half a percent of on-CPU on the
+   multi-pipeline profile traced back to `mach_absolute_time` calls
+   from tracing-event timestamps). Operators relying on `trace!` /
+   `debug!` output need a debug build; `info!` / `warn!` / `error!`
+   continue to fire.
+
+### Changed — `pipeline::run_pipeline` signature
+
+- New trailing parameter `bump: &mut bumpalo::Bump` — caller-supplied
+  arena, reused across events. In-tree callers (`runtime`,
+  `--test-pipeline` in `main`, unit tests) are migrated. Out-of-tree
+  code that calls `run_pipeline` directly (rare; this is an internal
+  API) passes `&mut bumpalo::Bump::new()`.
+- `event` is now `&OwnedEvent` instead of `OwnedEvent`. Read-only
+  access — `view_in` copies into the arena, the DLQ path constructs
+  a fresh `OwnedEvent` from the borrowed view via `to_owned()`.
+
+### Performance — single + multi pipeline (D pipeline, OCSF compose)
+
+Same harness as v0.6.0. macOS, 16 physical cores. 3 reps each.
+
+| Pipeline shape         | v0.5.7 | v0.6.0 | **v0.6.1** | Δ vs v0.6.0 |
+|------------------------|-------:|-------:|-----------:|------------:|
+| A passthrough          | 306k   | 303k   | **312k**   | +3%         |
+| B `syslog.parse`       | 181k   | 282k   | **305k**   | +8%         |
+| C parse + regex + if   | 73k    | 112k   | **115k**   | +3%         |
+| D OCSF compose (UDP)   | 46.3k  | 168k   | **168k**   | ±0%         |
+| D OCSF compose (TCP)   | n/a    | 170k   | **168k**   | ±0%         |
+| **D 4-pipeline aggr.** | n/a    | 374k   | **459k**   | **+23%**    |
+
+(eps/core for single-pipeline rows; eps aggregate for the
+4-pipeline row. 4-pipeline is 4× independent inputs / pipelines /
+outputs sharing one process.)
+
+Scaling on the 4-pipeline configuration improves from 2.27× the
+single-pipeline number on v0.6.0 to **2.73×** on v0.6.1.
+Single-pipeline throughput is essentially unchanged — there's no
+concurrency to expose the contention this patch removes, and the
+remaining levers are noise-magnitude individually. The lift comes
+when the daemon is actually running multiple pipelines, which is
+the production deployment shape.
+
+The remaining 4-pipeline gap to true linear scaling (~3.5–4× of
+single-pipeline) is dominated by allocator activity in
+`OwnedEvent::clone` and HashMap operations in workspace handling
+that the per-event arena doesn't reach (event metadata between
+input task and pipeline worker, queue boundaries, etc). Closing it
+is a multi-day refactor — Linux native bench + `Arc<Event>` between
+input and pipeline worker — and not in scope for this patch.
+
+### Notes
+
+- DSL surface, config surface, and CLI surface: unchanged.
+- The `Output` plugin trait is unchanged; out-of-tree output sinks
+  written against v0.6.0 work without modification.
+- 384 tests pass. `cargo build / clippy --release` green.
+- Operators with genuinely high pipeline counts (≥ 16) can still
+  override the default tokio worker thread count via
+  `TOKIO_WORKER_THREADS=…` if their workload benefits — this release
+  does not cap it (an earlier draft did, and it backfired in benches
+  that had > 8 active tokio tasks).
+
 ## [0.6.0] - 2026-04-30
 > perf milestone — D pipeline 46.3k → 168k eps/core (+263%); per-event arena, direct serializer, key interning, `CompactString`, and the `Output` boundary refactor
 

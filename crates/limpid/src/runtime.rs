@@ -429,6 +429,17 @@ async fn run_pipeline_workers(
 
     let input_tap_key = format!("input {}", input_name);
 
+    // Per-worker arena. Bump-allocator state is owned by this task and
+    // recycled via `Bump::reset()` after each event, so the underlying
+    // chunk-group is malloc'd once at task startup and stays around as
+    // long as one event's working set fits in the initial chunk.
+    // 1 MiB comfortably fits the heaviest realistic OCSF compose (the
+    // D pipeline's measured workspace tree under load is well under
+    // 256 KiB). Without enough headroom, bumpalo grows the chunk
+    // chain mid-event and `reset` then frees the excess — defeating
+    // the whole purpose of pooling.
+    let mut bump = bumpalo::Bump::with_capacity(1024 * 1024);
+
     loop {
         let event = tokio::select! {
             biased;
@@ -437,7 +448,8 @@ async fn run_pipeline_workers(
                 if *shutdown.borrow() {
                     // Drain remaining events from channel before stopping
                     while let Ok(event) = event_rx.try_recv() {
-                        process_event(&event, workers, ctx, &input_tap_key).await;
+                        process_event(&event, workers, ctx, &input_tap_key, &mut bump).await;
+                        bump.reset();
                     }
                     break;
                 }
@@ -451,7 +463,8 @@ async fn run_pipeline_workers(
                 }
             }
         };
-        process_event(&event, workers, ctx, &input_tap_key).await;
+        process_event(&event, workers, ctx, &input_tap_key, &mut bump).await;
+        bump.reset();
     }
 
     info!("pipeline worker for input '{}' stopped", input_name);
@@ -459,8 +472,9 @@ async fn run_pipeline_workers(
 
 async fn run_pipeline_with_outputs(
     pipeline: &PipelineDef,
-    event: Event,
+    event: &Event,
     ctx: &PipelineContext,
+    bump: &mut bumpalo::Bump,
 ) -> Result<crate::pipeline::PipelineRunResult> {
     let mut result = crate::pipeline::run_pipeline(
         pipeline,
@@ -469,6 +483,7 @@ async fn run_pipeline_with_outputs(
         &ctx.funcs,
         Some(&ctx.tap),
         &ctx.output_sinks,
+        bump,
     )?;
 
     // Drain the per-event outputs vec into the queues. Each output is
@@ -500,16 +515,29 @@ async fn process_event(
     workers: &[Arc<PipelineWorker>],
     ctx: &PipelineContext,
     input_tap_key: &str,
+    bump: &mut bumpalo::Bump,
 ) {
     ctx.tap.emit(input_tap_key, event).await;
-    for worker in workers {
+    for (i, worker) in workers.iter().enumerate() {
         worker
             .metrics
             .events_received
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let event_copy = event.clone();
-        match run_pipeline_with_outputs(&worker.def, event_copy, ctx).await {
+        // Pass the event by reference. `run_pipeline` views it into
+        // the arena (read-only on the input owned form) and any DLQ
+        // path constructs a fresh `OwnedEvent` via `to_owned()` from
+        // the arena view — so multiple fan-out workers can share the
+        // same input without cloning the workspace HashMap.
+        //
+        // Reset only between fan-out workers (skip before the first):
+        // the caller's outer reset already cleared the bump for this
+        // event; the redundant inner reset on single-worker fan-out
+        // would just thrash the chunk-chain pointer for nothing.
+        if i > 0 {
+            bump.reset();
+        }
+        match run_pipeline_with_outputs(&worker.def, event, ctx, bump).await {
             Ok(result) => {
                 use crate::pipeline::PipelineTermination;
                 match result.termination {
