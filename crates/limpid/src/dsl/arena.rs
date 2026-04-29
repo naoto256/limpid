@@ -3,19 +3,13 @@
 //! Every event entering [`crate::pipeline::run_pipeline`] gets a fresh
 //! `EventArena` whose lifetime ends when the event finishes processing.
 //! All transient `Value::Object` / `Value::Array` / `Value::String` /
-//! `Value::Bytes` payloads will be allocated from this arena once the
-//! Step 1 avalanche commit lands; the per-allocation
-//! `drop_in_place<Value>` chain (~23% of allocator samples on the
-//! v0.5.7 D pipeline baseline) collapses into a single chunk-group
-//! free at event end.
+//! `Value::Bytes` payloads allocate from this arena, so the
+//! per-allocation `drop_in_place<Value>` chain (~23% of allocator
+//! samples on the v0.5.7 D pipeline baseline) collapses into a single
+//! chunk-group free at event end.
 //!
-//! Step 1b (this commit) introduces the type and threads it through
-//! the eval / exec / pipeline call sites so the type-system surface is
-//! in place. The `Value` enum still owns its data; the arena is
-//! instantiated but unused. Step 1c flips `Value` to `Value<'bump>`
-//! and starts allocating into the arena.
-//!
-//! See `_PLAN_V060_PERF.md` for the full milestone plan.
+//! D pipeline: 46.3k → 168k eps/core across the v0.6.0 perf milestone
+//! (see CHANGELOG entry for the breakdown).
 
 pub use bumpalo::Bump;
 
