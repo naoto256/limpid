@@ -1,0 +1,464 @@
+// Cisco ASA syslog parser
+//
+// Vendor:  Cisco Systems
+// Product: Adaptive Security Appliance (ASA) — also covers Cisco
+//          Firepower Threat Defense (FTD) running in ASA-syslog-
+//          compatibility mode. Pure FTD eStreamer / Snort-3 / FMC
+//          syslog has its own format and would land in a separate
+//          parser file (`parse_firepower_*.limpid`).
+// Wire:    syslog-wrapped ASA messages —
+//          `<priority>timestamp host : %ASA-<level>-<msg_id>: <body>`
+//          The colon between host and `%ASA-...` is part of ASA's
+//          syslog server output; the same body text is emitted whether
+//          ASA is using `logging host`, `logging buffered`, or
+//          `logging trap`. Logging level prefix `%ASA-<n>-` is the
+//          numeric severity (0 emergency .. 7 debug); the message ID
+//          is a 6-digit Cisco-assigned identifier whose meaning is
+//          fixed across ASA / FTD versions.
+// Output:  OCSF records on `workspace.limpid`. The class depends on
+//          the message ID:
+//            - 605004 / 605005 (admin login fail / permit)
+//              → 3002 Authentication
+//            - 611101 / 611102 (VPN user auth succeeded / failed)
+//              → 3002 Authentication
+//            - 611103 (VPN user logout)
+//              → 3002 Authentication (Logoff)
+//            - 109001 / 109005 / 109017 (AAA auth start / success /
+//              insufficient-resources)
+//              → 3002 Authentication
+//            - 113012 (AAA user accept)
+//              → 3002 Authentication
+//            - 302013 / 302014 (TCP connection built / teardown)
+//              → 4001 Network Activity (Open / Close)
+//            - 302015 / 302016 (UDP connection built / teardown)
+//              → 4001 Network Activity (Open / Close)
+//            - 106023 (Deny by ACL)
+//              → 4001 Network Activity (Refuse)
+//            - everything else → error_log via the default arm. The
+//              ASA Syslog Messages Guide documents thousands of IDs;
+//              this snippet covers the operationally meaningful subset
+//              and routes the long tail to the dispatcher's `error`
+//              arm, which is the right loud-fail-fast behaviour.
+//
+// Sample inputs (RFC 3164 syslog wrapper around ASA body — note the
+// `: ` between host and `%ASA-...` which is part of ASA's syslog
+// output template):
+//
+//   605005 (admin login permitted):
+//   <165>Apr 27 10:00:00 fw-asa01 : %ASA-6-605005: Login permitted from 192.0.2.10/54321 to outside:198.51.100.5/SSH for user admin
+//
+//   605004 (admin login denied):
+//   <165>Apr 27 10:00:00 fw-asa01 : %ASA-6-605004: Login denied from 192.0.2.10/54321 to outside:198.51.100.5/SSH for user admin
+//
+//   611101 (VPN user authentication succeeded):
+//   <165>Apr 27 10:00:00 fw-asa01 : %ASA-6-611101: User authentication succeeded: IP, 192.0.2.10 : Uname: alice
+//
+//   611103 (VPN user logged out):
+//   <165>Apr 27 10:00:00 fw-asa01 : %ASA-5-611103: User logged out: Uname: alice
+//
+//   109001 (AAA auth start):
+//   <165>Apr 27 10:00:00 fw-asa01 : %ASA-6-109001: Auth start for user alice from 10.0.0.5/54321 to 198.51.100.5/443
+//
+//   109005 (AAA auth succeeded):
+//   <165>Apr 27 10:00:00 fw-asa01 : %ASA-6-109005: Authentication succeeded for user alice from 10.0.0.5/54321 to 198.51.100.5/443 on interface inside.
+//
+//   302013 (TCP connection built — NOT exercised in current test
+//   corpus; mapping is from the Cisco ASA Syslog Messages Guide):
+//   <166>Apr 27 10:00:00 fw-asa01 : %ASA-6-302013: Built outbound TCP connection 12345 for outside:198.51.100.5/443 (198.51.100.5/443) to inside:10.0.0.5/54321 (10.0.0.5/54321)
+//
+//   106023 (deny by ACL — also unverified against live data):
+//   <164>Apr 27 10:00:00 fw-asa01 : %ASA-4-106023: Deny tcp src outside:192.0.2.10/12345 dst inside:10.0.0.5/22 by access-group "outside_access_in"
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// ASA `%ASA-<n>-...` level → OCSF severity_id.
+//   0 emergency / 1 alert    → Critical (5)
+//   2 critical               → Critical (5)
+//   3 error                  → High (4)
+//   4 warning                → Medium (3)
+//   5 notification           → Low (2)
+//   6 informational          → Informational (1)
+//   7 debug                  → Informational (1)
+def function asa_severity_id(level) {
+    switch level {
+        0       { 5 }
+        1       { 5 }
+        2       { 5 }
+        3       { 4 }
+        4       { 3 }
+        5       { 2 }
+        6       { 1 }
+        7       { 1 }
+        default { 0 }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Top-level dispatcher
+// ---------------------------------------------------------------------------
+//
+// The body's prefix `%ASA-<level>-<msg_id>:` is parsed off so the
+// switch can dispatch by message ID. Each leaf re-parses the
+// remaining body text against its message-ID-specific shape.
+
+def process parse_asa {
+    workspace.syslog = syslog.parse(ingress)
+    workspace.asa = regex_parse(
+        workspace.syslog.msg,
+        "^(?:[^:]*: )?%ASA-(?P<level>\\d)-(?P<msg_id>\\d+): (?P<body>.*)$"
+    )
+    // One flat switch covers both the regex-failure path and the
+    // per-message-ID dispatch. Nesting the dispatch inside a child
+    // `process` whose `default` arm calls `error` does not propagate
+    // the error back to the parent pipeline boundary, so the top-level
+    // switch must own every routing decision.
+    switch true {
+        workspace.asa == null            { error "parse_asa: not an ASA syslog body: ${workspace.syslog.msg}" }
+        // Authentication (3002)
+        workspace.asa.msg_id == "605004" { process parse_asa_605004_login_denied }
+        workspace.asa.msg_id == "605005" { process parse_asa_605005_login_permitted }
+        workspace.asa.msg_id == "611101" { process parse_asa_611101_vpn_auth_succeeded }
+        workspace.asa.msg_id == "611102" { process parse_asa_611102_vpn_auth_failed }
+        workspace.asa.msg_id == "611103" { process parse_asa_611103_vpn_logout }
+        workspace.asa.msg_id == "109001" { process parse_asa_109001_aaa_auth_start }
+        workspace.asa.msg_id == "109005" { process parse_asa_109005_aaa_auth_succeeded }
+        workspace.asa.msg_id == "109017" { process parse_asa_109017_aaa_insufficient_resources }
+        workspace.asa.msg_id == "113012" { process parse_asa_113012_aaa_user_accept }
+        // Network Activity (4001) — unverified against live data; see
+        // NOTE on each leaf
+        workspace.asa.msg_id == "302013" { process parse_asa_302013_tcp_built }
+        workspace.asa.msg_id == "302014" { process parse_asa_302014_tcp_teardown }
+        workspace.asa.msg_id == "302015" { process parse_asa_302015_udp_built }
+        workspace.asa.msg_id == "302016" { process parse_asa_302016_udp_teardown }
+        workspace.asa.msg_id == "106023" { process parse_asa_106023_acl_deny }
+        default { error "parse_asa: unsupported message ID ${workspace.asa.msg_id}: ${workspace.asa.body}" }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers used by the auth leaves below
+// ---------------------------------------------------------------------------
+
+def function asa_authentication_record(activity_id, status_id, severity_id, user, src_ip, message) {
+    {
+        class_uid:    3002,
+        category_uid: 3,
+        activity_id:  activity_id,
+        type_uid:     3002 * 100 + activity_id,
+        severity_id:  severity_id,
+        status_id:    status_id,
+        user:         { name: user },
+        src_endpoint: { ip: src_ip },
+        message:      message,
+        metadata: {
+            product: {
+                vendor_name: "Cisco Systems",
+                name:        "ASA"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+def function asa_network_activity_record(activity_id, severity_id, src_ip, src_port, dst_ip, dst_port, protocol_name, protocol_num, message) {
+    {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  activity_id,
+        type_uid:     4001 * 100 + activity_id,
+        severity_id:  severity_id,
+        src_endpoint: { ip: src_ip, port: src_port },
+        dst_endpoint: { ip: dst_ip, port: dst_port },
+        connection_info: {
+            protocol_name: protocol_name,
+            protocol_num:  protocol_num
+        },
+        message:      message,
+        metadata: {
+            product: {
+                vendor_name: "Cisco Systems",
+                name:        "ASA"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: 605005 — Login permitted (admin / management)
+// → 3002 / Logon / Success
+// Format: `Login permitted from <src_ip>/<src_port> to <iface>:<dst_ip>/<service> for user <user>`
+// ---------------------------------------------------------------------------
+
+def process parse_asa_605005_login_permitted {
+    let f = regex_parse(
+        workspace.asa.body,
+        "^Login permitted from (?P<src_ip>\\S+?)/(?P<src_port>\\d+) to (?P<iface>[^:]+):(?P<dst_ip>\\S+?)/(?P<service>\\S+) for user (?P<user>\\S+)$"
+    )
+    workspace.limpid = asa_authentication_record(
+        1, 1, asa_severity_id(to_int(workspace.asa.level)),
+        f.user, f.src_ip,
+        "ASA admin login permitted (service=${f.service})"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: 605004 — Login denied (admin / management)
+// → 3002 / Logon / Failure (Medium)
+// ---------------------------------------------------------------------------
+
+def process parse_asa_605004_login_denied {
+    let f = regex_parse(
+        workspace.asa.body,
+        "^Login denied from (?P<src_ip>\\S+?)/(?P<src_port>\\d+) to (?P<iface>[^:]+):(?P<dst_ip>\\S+?)/(?P<service>\\S+) for user (?P<user>\\S+)$"
+    )
+    workspace.limpid = asa_authentication_record(
+        1, 2, 3,
+        f.user, f.src_ip,
+        "ASA admin login denied (service=${f.service})"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: 611101 — VPN user authentication succeeded
+// → 3002 / Logon / Success
+// Format: `User authentication succeeded: IP, <ip> : Uname: <user>`
+// ---------------------------------------------------------------------------
+
+def process parse_asa_611101_vpn_auth_succeeded {
+    let f = regex_parse(
+        workspace.asa.body,
+        "^User authentication succeeded: IP, (?P<src_ip>\\S+) : Uname: (?P<user>\\S+)$"
+    )
+    workspace.limpid = asa_authentication_record(
+        1, 1, asa_severity_id(to_int(workspace.asa.level)),
+        f.user, f.src_ip,
+        "ASA VPN user auth succeeded"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: 611102 — VPN user authentication failed
+// → 3002 / Logon / Failure (Medium)
+//
+// NOTE: not present in the syslog generator test corpus; format is
+// from the ASA Syslog Messages Guide. Verify against live data.
+// ---------------------------------------------------------------------------
+
+def process parse_asa_611102_vpn_auth_failed {
+    let f = regex_parse(
+        workspace.asa.body,
+        "^User authentication failed: IP, (?P<src_ip>\\S+) : Uname: (?P<user>\\S+)$"
+    )
+    workspace.limpid = asa_authentication_record(
+        1, 2, 3,
+        f.user, f.src_ip,
+        "ASA VPN user auth failed"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: 611103 — VPN user logged out
+// → 3002 / Logoff / Success
+// Format: `User logged out: Uname: <user>`
+// ---------------------------------------------------------------------------
+
+def process parse_asa_611103_vpn_logout {
+    let f = regex_parse(
+        workspace.asa.body,
+        "^User logged out: Uname: (?P<user>\\S+)$"
+    )
+    workspace.limpid = asa_authentication_record(
+        2, 1, asa_severity_id(to_int(workspace.asa.level)),
+        f.user, null,
+        "ASA VPN user logged out"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: 109001 — AAA auth start
+// → 3002 / Logon / Success (auth in progress; sudo's "session" model
+//   doesn't cleanly map, so use Success + Informational severity to
+//   represent "auth attempt initiated").
+// Format: `Auth start for user <user> from <src_ip>/<src_port> to <dst_ip>/<dst_port>`
+// ---------------------------------------------------------------------------
+
+def process parse_asa_109001_aaa_auth_start {
+    let f = regex_parse(
+        workspace.asa.body,
+        "^Auth start for user (?P<user>\\S+) from (?P<src_ip>\\S+?)/(?P<src_port>\\d+) to (?P<dst_ip>\\S+?)/(?P<dst_port>\\d+)$"
+    )
+    workspace.limpid = asa_authentication_record(
+        1, 1, asa_severity_id(to_int(workspace.asa.level)),
+        f.user, f.src_ip,
+        "ASA AAA auth start"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: 109005 — AAA authentication succeeded
+// → 3002 / Logon / Success
+// Format: `Authentication succeeded for user <user> from <src_ip>/<src_port> to <dst_ip>/<dst_port> on interface <iface>.`
+// ---------------------------------------------------------------------------
+
+def process parse_asa_109005_aaa_auth_succeeded {
+    let f = regex_parse(
+        workspace.asa.body,
+        "^Authentication succeeded for user (?P<user>\\S+) from (?P<src_ip>\\S+?)/(?P<src_port>\\d+) to (?P<dst_ip>\\S+?)/(?P<dst_port>\\d+) on interface (?P<iface>\\S+)\\.?$"
+    )
+    workspace.limpid = asa_authentication_record(
+        1, 1, asa_severity_id(to_int(workspace.asa.level)),
+        f.user, f.src_ip,
+        "ASA AAA auth succeeded (iface=${f.iface})"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: 109017 — AAA insufficient resources
+// → 3002 / Logon / Other (auth could not be evaluated)
+// Format: `User user <user>: insufficient resources` (varies; treat
+// the body as a free-text message and pull out the user when present)
+// ---------------------------------------------------------------------------
+
+def process parse_asa_109017_aaa_insufficient_resources {
+    let f = regex_parse(workspace.asa.body, "user (?P<user>\\S+)")
+    workspace.limpid = asa_authentication_record(
+        1, 99, 3,
+        coalesce(f.user, null),
+        null,
+        "ASA AAA insufficient resources: ${workspace.asa.body}"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: 113012 — AAA user authentication accept
+// → 3002 / Logon / Success
+//
+// NOTE: not present in the syslog generator test corpus; format is
+// from the ASA Syslog Messages Guide. Verify against live data.
+// ---------------------------------------------------------------------------
+
+def process parse_asa_113012_aaa_user_accept {
+    let f = regex_parse(
+        workspace.asa.body,
+        "^AAA user authentication Successful : server = (?P<server>\\S+) : user = (?P<user>\\S+)$"
+    )
+    workspace.limpid = asa_authentication_record(
+        1, 1, asa_severity_id(to_int(workspace.asa.level)),
+        f.user, null,
+        "ASA AAA user accept (server=${f.server})"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: 302013 — TCP connection built
+// → 4001 Network Activity / Open
+//
+// NOTE: not present in the syslog generator test corpus. Format is
+// from the ASA Syslog Messages Guide; the message body has many
+// optional segments (NAT addresses, user identity, original/translated
+// addresses) so production deployments may need additional regex
+// alternatives. Verify against live data.
+// ---------------------------------------------------------------------------
+
+def process parse_asa_302013_tcp_built {
+    let f = regex_parse(
+        workspace.asa.body,
+        "^Built (?P<direction>\\S+) TCP connection (?P<conn_id>\\d+) for (?P<src_iface>[^:]+):(?P<src_ip>\\S+?)/(?P<src_port>\\d+) .* to (?P<dst_iface>[^:]+):(?P<dst_ip>\\S+?)/(?P<dst_port>\\d+)"
+    )
+    workspace.limpid = asa_network_activity_record(
+        1, asa_severity_id(to_int(workspace.asa.level)),
+        f.src_ip, to_int(f.src_port),
+        f.dst_ip, to_int(f.dst_port),
+        "tcp", 6,
+        "ASA TCP connection built (id=${f.conn_id}, direction=${f.direction})"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: 302014 — TCP connection teardown
+// → 4001 Network Activity / Close
+//
+// NOTE: see 302013 caveat above.
+// ---------------------------------------------------------------------------
+
+def process parse_asa_302014_tcp_teardown {
+    let f = regex_parse(
+        workspace.asa.body,
+        "^Teardown TCP connection (?P<conn_id>\\d+) for (?P<src_iface>[^:]+):(?P<src_ip>\\S+?)/(?P<src_port>\\d+) to (?P<dst_iface>[^:]+):(?P<dst_ip>\\S+?)/(?P<dst_port>\\d+)"
+    )
+    workspace.limpid = asa_network_activity_record(
+        2, asa_severity_id(to_int(workspace.asa.level)),
+        f.src_ip, to_int(f.src_port),
+        f.dst_ip, to_int(f.dst_port),
+        "tcp", 6,
+        "ASA TCP connection teardown (id=${f.conn_id})"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: 302015 — UDP connection built
+// → 4001 Network Activity / Open
+//
+// NOTE: see 302013 caveat above.
+// ---------------------------------------------------------------------------
+
+def process parse_asa_302015_udp_built {
+    let f = regex_parse(
+        workspace.asa.body,
+        "^Built (?P<direction>\\S+) UDP connection (?P<conn_id>\\d+) for (?P<src_iface>[^:]+):(?P<src_ip>\\S+?)/(?P<src_port>\\d+) .* to (?P<dst_iface>[^:]+):(?P<dst_ip>\\S+?)/(?P<dst_port>\\d+)"
+    )
+    workspace.limpid = asa_network_activity_record(
+        1, asa_severity_id(to_int(workspace.asa.level)),
+        f.src_ip, to_int(f.src_port),
+        f.dst_ip, to_int(f.dst_port),
+        "udp", 17,
+        "ASA UDP connection built (id=${f.conn_id}, direction=${f.direction})"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: 302016 — UDP connection teardown
+// → 4001 Network Activity / Close
+//
+// NOTE: see 302013 caveat above.
+// ---------------------------------------------------------------------------
+
+def process parse_asa_302016_udp_teardown {
+    let f = regex_parse(
+        workspace.asa.body,
+        "^Teardown UDP connection (?P<conn_id>\\d+) for (?P<src_iface>[^:]+):(?P<src_ip>\\S+?)/(?P<src_port>\\d+) to (?P<dst_iface>[^:]+):(?P<dst_ip>\\S+?)/(?P<dst_port>\\d+)"
+    )
+    workspace.limpid = asa_network_activity_record(
+        2, asa_severity_id(to_int(workspace.asa.level)),
+        f.src_ip, to_int(f.src_port),
+        f.dst_ip, to_int(f.dst_port),
+        "udp", 17,
+        "ASA UDP connection teardown (id=${f.conn_id})"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: 106023 — Deny by ACL
+// → 4001 Network Activity / Refuse (Medium)
+//
+// NOTE: not present in the syslog generator test corpus. Format is
+// from the ASA Syslog Messages Guide; production deployments often
+// have NAT translation and access-list group context appended.
+// ---------------------------------------------------------------------------
+
+def process parse_asa_106023_acl_deny {
+    let f = regex_parse(
+        workspace.asa.body,
+        "^Deny (?P<proto>\\S+) src (?P<src_iface>[^:]+):(?P<src_ip>\\S+?)/(?P<src_port>\\d+) dst (?P<dst_iface>[^:]+):(?P<dst_ip>\\S+?)/(?P<dst_port>\\d+) by access-group \"(?P<acl>[^\"]+)\""
+    )
+    workspace.limpid = asa_network_activity_record(
+        5, 3,
+        f.src_ip, to_int(f.src_port),
+        f.dst_ip, to_int(f.dst_port),
+        f.proto, null,
+        "ASA ACL deny (acl=${f.acl})"
+    )
+}
