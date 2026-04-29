@@ -190,8 +190,8 @@ inside a `process` body:
   `otlp.decode_resourcelog_protobuf` · `otlp.encode_resourcelog_json` ·
   `otlp.decode_resourcelog_json`
 
-Full reference: [Expression Functions](docs/src/processing/functions.md)
-· [String Templates](docs/src/processing/templates.md).
+Full reference: [Built-in Functions](docs/src/functions/expression-functions.md)
+· [String interpolation](docs/src/dsl-syntax.md#string-interpolation).
 
 ## Compared to rsyslog / fluentd / Vector
 
@@ -224,12 +224,13 @@ is built for a different default: pipelines that are *legible*,
   [Outputs](docs/src/outputs/README.md) ·
   [Processing](docs/src/processing/README.md)
 - [Process Design Guide](docs/src/processing/design-guide.md) ·
-  [Expression Functions](docs/src/processing/functions.md) ·
-  [String Templates](docs/src/processing/templates.md) ·
   [User-defined Processes](docs/src/processing/user-defined.md)
+- [Functions](docs/src/functions/README.md) ·
+  [Built-in Functions](docs/src/functions/expression-functions.md) ·
+  [User-defined Functions](docs/src/functions/user-defined.md)
 - [Pipelines](docs/src/pipelines/README.md) ·
   [Routing](docs/src/pipelines/routing.md) ·
-  [`drop` and `finish`](docs/src/pipelines/drop-finish-error.md) ·
+  [`drop`, `finish`, and `error`](docs/src/pipelines/drop-finish-error.md) ·
   [Examples](docs/src/pipelines/examples.md) ·
   [Multi-host Pipeline Example](docs/src/pipelines/multi-host.md)
 - [CLI](docs/src/operations/cli.md) ·
