@@ -61,7 +61,7 @@ contract.
 ---
 
 ## [0.5.8] - 2026-04-29
-> `coalesce(...)` built-in for first-non-null fallback chains
+> `coalesce(...)` built-in for first-non-null fallback chains, plus a follow-up fix for dot-access on `let`-bound Object values
 
 ### Added — `coalesce(a, b, c, ...)` built-in (variadic)
 
@@ -104,11 +104,53 @@ This is the fourth DSL gap surfaced and fixed mid-snippet-library
 work — alongside `error` (v0.5.5), the `source` reshape (v0.5.6),
 and `null_omit` (v0.5.7).
 
+### Fixed — `let f = <Object>; f.x.y` resolves correctly
+
+`let f = regex_parse(...); f.user` was failing at runtime with
+`unknown identifier: f.user`. The local-scope path-resolver in
+`crates/limpid/src/dsl/eval.rs` only consulted let bindings for
+single-segment idents (`parts.len() == 1`), so any multi-segment
+access whose root happened to be let-bound (`f.user`, `f.a.b`,
+`f.list[0].kind`) skipped scope lookup entirely and fell through to
+the catch-all "unknown identifier" arm. The analyzer's UnknownIdent
+warning had the same gap.
+
+The fix extends both code paths: when the first segment matches a
+let binding, the runtime walks the bound value via the same
+`resolve_workspace_path` Object/Array walker used for
+`workspace.x.y.z`, and the analyzer suppresses the warning for the
+whole path. Missing keys yield `Null` to match the workspace
+path-walker contract — callers handle absence via `coalesce` or
+explicit null comparison.
+
+```
+// before — runtime "unknown identifier: f.user":
+def process parse_xxx {
+    let f = regex_parse(workspace.body, "(?P<user>\\S+)")
+    workspace.limpid = { user: f.user }     // ← runtime error
+}
+// after — works as written:
+def process parse_xxx {
+    let f = regex_parse(workspace.body, "(?P<user>\\S+)")
+    workspace.limpid = { user: f.user }     // ✅ "alice"
+}
+```
+
+Surfaced while writing parse_asa (Cisco ASA syslog parser) — every
+per-message-ID leaf does `let f = regex_parse(workspace.asa.body,
+"...")` and reads named captures via `f.user` / `f.src_ip` / etc.
+
+Two regression tests added covering the happy path and the
+missing-key (Null) path.
+
 ### Notes
 
-- No DSL syntax change. `coalesce` is a regular flat primitive call
-- No breaking changes
-- No behaviour change in any other built-in or pipeline path
+- No DSL syntax change. `coalesce` is a regular flat primitive call.
+  The let-bound dot-access fix is a behaviour change in path
+  resolution semantics: before, `f.x` failed; after, it walks into
+  the bound Object.
+- No breaking changes (the only behaviour shift is the previously-
+  failing case starting to work).
 
 ---
 
