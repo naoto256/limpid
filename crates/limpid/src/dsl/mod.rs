@@ -14,7 +14,15 @@ pub mod span;
 pub mod value;
 pub mod value_json;
 
-pub use value::{Map, OwnedValue, Value};
+// `OwnedValue` is re-exported here so the rest of the crate (and any
+// future external consumers of the DSL surface) can spell
+// `crate::dsl::OwnedValue` rather than the more verbose
+// `crate::dsl::value::OwnedValue`. The unused-import warning fires
+// only on builds where no module spells the short form; current
+// callers (`queue::disk` etc.) do, so the lint is silenced here in
+// case future cleanups inline those references.
+#[allow(unused_imports)]
+pub use value::OwnedValue;
 
 /// Construct an [`OwnedValue`] from a JSON-literal-shaped expression.
 ///

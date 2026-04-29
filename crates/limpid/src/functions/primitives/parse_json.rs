@@ -86,12 +86,12 @@ pub(crate) fn apply_defaults<'bump>(
 
     let mut builder = ObjectBuilder::with_capacity(arena, entries.len() + defaults_entries.len());
     for (k, v) in entries.iter() {
-        builder.push(*k, *v);
+        builder.push(k, *v);
     }
     for (k, v) in defaults_entries.iter() {
         let already = entries.iter().any(|(ek, _)| *ek == *k);
         if !already {
-            builder.push(*k, *v);
+            builder.push(k, *v);
         }
     }
     Ok(builder.finish())

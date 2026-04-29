@@ -339,21 +339,25 @@ impl<'bump> Value<'bump> {
 
     /// Heap-allocate a fresh [`OwnedValue`] from this borrowed view.
     /// Used at `run_pipeline` exit to hand the result to the channel.
-    pub fn to_owned_value(&self) -> OwnedValue {
+    ///
+    /// Takes `self` by value because `Value<'bump>` is `Copy` — passing
+    /// it through avoids the `&Value` reference layer at the call site
+    /// without changing semantics.
+    pub fn to_owned_value(self) -> OwnedValue {
         match self {
             Value::Null => OwnedValue::Null,
-            Value::Bool(b) => OwnedValue::Bool(*b),
-            Value::Int(n) => OwnedValue::Int(*n),
-            Value::Float(n) => OwnedValue::Float(*n),
-            Value::String(s) => OwnedValue::String(CompactString::from(*s)),
+            Value::Bool(b) => OwnedValue::Bool(b),
+            Value::Int(n) => OwnedValue::Int(n),
+            Value::Float(n) => OwnedValue::Float(n),
+            Value::String(s) => OwnedValue::String(CompactString::from(s)),
             Value::Bytes(b) => OwnedValue::Bytes(Bytes::copy_from_slice(b)),
-            Value::Timestamp(dt) => OwnedValue::Timestamp(*dt),
-            Value::Array(items) => {
-                OwnedValue::Array(items.iter().map(|v| v.to_owned_value()).collect())
-            }
+            Value::Timestamp(dt) => OwnedValue::Timestamp(dt),
+            Value::Array(items) => OwnedValue::Array(
+                items.iter().map(|v| v.to_owned_value()).collect(),
+            ),
             Value::Object(entries) => {
                 let mut map = Map::with_capacity(entries.len());
-                for (k, v) in *entries {
+                for (k, v) in entries {
                     map.insert((*k).to_string(), v.to_owned_value());
                 }
                 OwnedValue::Object(map)
