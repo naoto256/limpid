@@ -107,7 +107,7 @@ def process parse_openssh {
         // failed before sshd captured peer identity), so emitting an
         // OCSF Authentication record would be uninformative. Drop.
         "kex_error" { drop }
-        default { error "unsupported sshd message: ${workspace.syslog.msg}" }
+        default { error "parse_openssh: unsupported sshd message: ${workspace.syslog.msg}" }
     }
 }
 
