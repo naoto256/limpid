@@ -229,23 +229,46 @@ mod tests {
     }
 
     #[test]
-    fn test_exec_process_error_passes_through() {
+    fn test_exec_process_error_propagates_to_caller() {
+        // A sub-process error MUST propagate up to the caller's
+        // pipeline boundary so the event routes to error_log and the
+        // rest of the pipe (`process X | compose_Y`) is skipped.
+        // Pre-fix this returned `Ok(Continue(backup))` and silently
+        // continued the event through the pipeline with a snapshot of
+        // its workspace, which made `error` from inside a sub-process
+        // invisible at the pipeline boundary — downstream stages then
+        // ran on whatever workspace state the sub-process had set
+        // before erroring (typically empty), producing confusing
+        // secondary errors like `compose_ocsf: unsupported class_uid`.
+        // Operators who want fail-soft on a particular call wrap it
+        // in `try { process foo } catch { ... }` (covered by
+        // `test_exec_try_catch_on_error` below).
         let _bump = ::bumpalo::Bump::new();
         let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
         let bevent = event.view_in(&arena);
         let stmts = vec![ProcessStatement::ProcessCall("failing".into(), vec![])];
-        match exec_process_body(&stmts, bevent, &FailRegistry, &make_funcs(), &arena).unwrap() {
-            ExecResult::Continue(ev) => {
-                // Event should pass through unchanged
-                assert_eq!(&*ev.ingress, b"<134>test");
-            }
-            ExecResult::Dropped => panic!("unexpected drop"),
+        let result = exec_process_body(&stmts, bevent, &FailRegistry, &make_funcs(), &arena);
+        match result {
+            Err(e) => assert!(
+                e.to_string().contains("test error"),
+                "expected propagated error to mention `test error`, got: {}",
+                e
+            ),
+            Ok(_) => panic!("sub-process error should propagate as Err"),
         }
     }
 
     #[test]
     fn test_exec_try_catch_on_error() {
+        // `try { process failing } catch { workspace.caught = true }`
+        // — the failing sub-process's error propagates up to the
+        // surrounding try/catch, which runs the recovery body.
+        // Pre-fix the sub-process error was swallowed at the
+        // ProcessCall arm so the catch body never ran (the test
+        // pre-fix asserted only `Continue(_)` because of that, which
+        // hid the bug); post-fix the catch body runs and sets
+        // `workspace.caught = true`.
         let _bump = ::bumpalo::Bump::new();
         let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
@@ -257,15 +280,16 @@ mod tests {
                 e(ExprKind::BoolLit(true)),
             )],
         )];
-        // Note: with FailRegistry, the process call returns Err but exec.rs
-        // handles it by passing through unchanged (not entering catch).
-        // try/catch only catches errors from exec_process_body, not from
-        // individual process calls (which are handled gracefully).
-        // This is correct: try/catch wraps a body, process errors within
-        // that body are handled individually.
-        let result =
-            exec_process_body(&stmts, bevent, &FailRegistry, &make_funcs(), &arena).unwrap();
-        assert!(matches!(result, ExecResult::Continue(_)));
+        match exec_process_body(&stmts, bevent, &FailRegistry, &make_funcs(), &arena).unwrap() {
+            ExecResult::Continue(ev) => {
+                assert_eq!(
+                    ev.workspace_get("caught"),
+                    Some(Value::Bool(true)),
+                    "catch body should have run after sub-process error"
+                );
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
     }
 
     // ---- let bindings --------------------------------------------------
