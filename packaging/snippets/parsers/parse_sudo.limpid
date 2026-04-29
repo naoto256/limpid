@@ -121,6 +121,16 @@ def function parse_sudo_message(msg) {
         msg,
         "^\\s*(?P<actor>\\S+) : command not allowed ; (?:TTY=(?P<tty>\\S+) ; )?PWD=(?P<pwd>\\S+) ; USER=(?P<target>\\S+) ; (?:ENV=(?P<env>[^;]*) ; )?COMMAND=(?P<command>.*)$"
     )
+    // `<actor> : a password is required ; ...` — sudo emits this when
+    // the invocation tried to run without authenticating (typical
+    // path: a script or non-interactive context where sudo cannot
+    // prompt) but sudoers requires a password for this user/command.
+    // Functionally an authentication failure: sudo refused to grant
+    // privileges because no password was provided.
+    let password_required = regex_parse(
+        msg,
+        "^\\s*(?P<actor>\\S+) : a password is required ; (?:TTY=(?P<tty>\\S+) ; )?PWD=(?P<pwd>\\S+) ; USER=(?P<target>\\S+) ; (?:ENV=(?P<env>[^;]*) ; )?COMMAND=(?P<command>.*)$"
+    )
     let invocation = regex_parse(
         msg,
         "^\\s*(?P<actor>\\S+) : (?:TTY=(?P<tty>\\S+) ; )?PWD=(?P<pwd>\\S+) ; USER=(?P<target>\\S+) ; (?:ENV=(?P<env>[^;]*) ; )?COMMAND=(?P<command>.*)$"
@@ -170,16 +180,29 @@ def function parse_sudo_message(msg) {
         msg,
         "^pam_unix\\(sudo:auth\\): conversation failed$"
     )
+    // sudo splits a COMMAND= value that overflows syslog's 1024-byte
+    // line limit across multiple `(command continued) <rest>` lines.
+    // These are artefacts of the wire format, not standalone events —
+    // the original invocation line already carried the start of the
+    // command. Recognise them so the dispatcher can drop them
+    // explicitly rather than route them to error_log as unrecognised
+    // vocabulary.
+    let command_continued = regex_match(
+        msg,
+        "^\\s*\\S+ : \\(command continued\\) "
+    )
     switch true {
         auth_failed != null                  { { kind: "auth_failed",                 fields: auth_failed } }
         denied_sudoers != null               { { kind: "denied_sudoers",              fields: denied_sudoers } }
         denied_command != null               { { kind: "denied_command",              fields: denied_command } }
+        password_required != null            { { kind: "password_required",           fields: password_required } }
         invocation != null                   { { kind: "invocation",                  fields: invocation } }
         pam_session_open != null             { { kind: "pam_session_open",            fields: pam_session_open } }
         pam_session_close != null            { { kind: "pam_session_close",           fields: pam_session_close } }
         pam_auth_failure_classic != null     { { kind: "pam_auth_failure_classic",    fields: pam_auth_failure_classic } }
         pam_auth_lookup_failed != null       { { kind: "pam_auth_lookup_failed",      fields: pam_auth_lookup_failed } }
         pam_auth_conversation_failed         { { kind: "pam_auth_conversation_failed" } }
+        command_continued                    { { kind: "command_continued" } }
         default                              { { kind: "unknown" } }
     }
 }
@@ -196,11 +219,19 @@ def process parse_sudo {
         "auth_failed"       { process parse_sudo_auth_failed }
         "denied_sudoers"    { process parse_sudo_denied_sudoers }
         "denied_command"       { process parse_sudo_denied_command }
+        "password_required"    { process parse_sudo_password_required }
         "pam_session_open"            { process parse_sudo_pam_session_open }
         "pam_session_close"           { process parse_sudo_pam_session_close }
         "pam_auth_failure_classic"    { process parse_sudo_pam_auth_failure_classic }
         "pam_auth_lookup_failed"      { process parse_sudo_pam_auth_lookup_failed }
         "pam_auth_conversation_failed" { process parse_sudo_pam_auth_conversation_failed }
+        // `(command continued) ...` lines are wire-format
+        // continuations of the previous invocation; the original line
+        // already captured the operationally meaningful fact.
+        // Dropping them is the right behaviour — emitting them as
+        // separate 3003 records would create duplicate / fragmented
+        // entries downstream.
+        "command_continued" { drop }
         default             { error "parse_sudo: unrecognised body: ${workspace.syslog.msg}" }
     }
 }
@@ -277,6 +308,28 @@ def process parse_sudo_denied_command {
 // Leaf: PAM session opened (elevated session start)
 // → 3003 / Activate Privileges / Success
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Leaf: password is required (sudo could not prompt or no auth provided)
+// → 3003 / Assign Privileges / Failure (Medium severity)
+//
+// Modern sudo emits this when sudoers requires a password for the
+// user/command but the invocation didn't authenticate (script /
+// non-interactive context, no terminal to prompt on, no ticket
+// cached). Functionally equivalent to an auth failure from the
+// privilege-grant perspective.
+// ---------------------------------------------------------------------------
+
+def process parse_sudo_password_required {
+    workspace.limpid = sudo_authorize_session_record(
+        1,  // activity_id: Assign Privileges (denied)
+        2,  // status_id:   Failure
+        3,  // severity_id: Medium
+        workspace.sudo.fields.target,
+        workspace.sudo.fields.actor,
+        "a password is required; command was ${workspace.sudo.fields.command}"
+    )
+}
 
 def process parse_sudo_pam_session_open {
     workspace.limpid = sudo_authorize_session_record(
