@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use anyhow::{Result, bail};
 
+use super::arena::EventArena;
 use super::ast::{BinOp, Expr, ExprKind, TemplateFragment, UnaryOp};
 use super::value::{Map, Value};
 use crate::event::Event;
@@ -69,9 +70,14 @@ impl LocalScope {
 /// file-output templates, tests). The evaluator treats an unbound bare
 /// identifier as an error regardless of scope; this wrapper merely
 /// saves callers from constructing an empty scope.
-pub fn eval_expr(expr: &Expr, event: &Event, funcs: &FunctionRegistry) -> Result<Value> {
+pub fn eval_expr(
+    expr: &Expr,
+    event: &Event,
+    funcs: &FunctionRegistry,
+    arena: &EventArena<'_>,
+) -> Result<Value> {
     let scope = LocalScope::new();
-    eval_expr_with_scope(expr, event, funcs, &scope)
+    eval_expr_with_scope(expr, event, funcs, &scope, arena)
 }
 
 /// Evaluate an expression against an Event, consulting `scope` for bare
@@ -85,6 +91,7 @@ pub fn eval_expr_with_scope(
     event: &Event,
     funcs: &FunctionRegistry,
     scope: &LocalScope,
+    arena: &EventArena<'_>,
 ) -> Result<Value> {
     match &expr.kind {
         ExprKind::StringLit(s) => Ok(Value::String(s.clone())),
@@ -98,7 +105,7 @@ pub fn eval_expr_with_scope(
                 match frag {
                     TemplateFragment::Literal(s) => out.push_str(s),
                     TemplateFragment::Interp(expr) => {
-                        let v = eval_expr_with_scope(expr, event, funcs, scope)?;
+                        let v = eval_expr_with_scope(expr, event, funcs, scope, arena)?;
                         if matches!(v, Value::Bytes(_)) {
                             bail!(
                                 "cannot interpolate bytes into a string template (use to_string() first)"
@@ -124,26 +131,26 @@ pub fn eval_expr_with_scope(
         } => {
             let evaluated_args: Vec<Value> = args
                 .iter()
-                .map(|a| eval_expr_with_scope(a, event, funcs, scope))
+                .map(|a| eval_expr_with_scope(a, event, funcs, scope, arena))
                 .collect::<Result<Vec<_>>>()?;
-            funcs.call(namespace.as_deref(), name, &evaluated_args, event)
+            funcs.call(namespace.as_deref(), name, &evaluated_args, event, arena)
         }
 
         ExprKind::BinOp(left, op, right) => {
-            let lv = eval_expr_with_scope(left, event, funcs, scope)?;
-            let rv = eval_expr_with_scope(right, event, funcs, scope)?;
+            let lv = eval_expr_with_scope(left, event, funcs, scope, arena)?;
+            let rv = eval_expr_with_scope(right, event, funcs, scope, arena)?;
             eval_bin_op(&lv, *op, &rv)
         }
 
         ExprKind::UnaryOp(op, operand) => {
-            let v = eval_expr_with_scope(operand, event, funcs, scope)?;
+            let v = eval_expr_with_scope(operand, event, funcs, scope, arena)?;
             eval_unary_op(*op, &v)
         }
 
         ExprKind::HashLit(entries) => {
             let mut map = Map::new();
             for (key, val_expr) in entries {
-                let val = eval_expr_with_scope(val_expr, event, funcs, scope)?;
+                let val = eval_expr_with_scope(val_expr, event, funcs, scope, arena)?;
                 map.insert(key.clone(), val);
             }
             Ok(Value::Object(map))
@@ -152,13 +159,13 @@ pub fn eval_expr_with_scope(
         ExprKind::ArrayLit(items) => {
             let mut out = Vec::with_capacity(items.len());
             for item in items {
-                out.push(eval_expr_with_scope(item, event, funcs, scope)?);
+                out.push(eval_expr_with_scope(item, event, funcs, scope, arena)?);
             }
             Ok(Value::Array(out))
         }
 
         ExprKind::PropertyAccess(base, path) => {
-            let mut current = eval_expr_with_scope(base, event, funcs, scope)?;
+            let mut current = eval_expr_with_scope(base, event, funcs, scope, arena)?;
             for field in path {
                 current = match current {
                     Value::Object(ref map) => map.get(field).cloned().unwrap_or(Value::Null),
@@ -180,14 +187,14 @@ pub fn eval_expr_with_scope(
             // no default, the expression's value is `Null` — mirrors
             // the partial-data convention used by `regex_extract`,
             // `table_lookup`, etc.
-            let target = eval_expr_with_scope(scrutinee, event, funcs, scope)?;
+            let target = eval_expr_with_scope(scrutinee, event, funcs, scope, arena)?;
             for arm in arms {
                 match &arm.pattern {
-                    None => return eval_expr_with_scope(&arm.body, event, funcs, scope),
+                    None => return eval_expr_with_scope(&arm.body, event, funcs, scope, arena),
                     Some(pat) => {
-                        let pat_val = eval_expr_with_scope(pat, event, funcs, scope)?;
+                        let pat_val = eval_expr_with_scope(pat, event, funcs, scope, arena)?;
                         if values_equal(&target, &pat_val) {
-                            return eval_expr_with_scope(&arm.body, event, funcs, scope);
+                            return eval_expr_with_scope(&arm.body, event, funcs, scope, arena);
                         }
                     }
                 }

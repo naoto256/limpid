@@ -570,6 +570,8 @@ mod tests {
 
     #[test]
     fn protobuf_round_trip() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let hashlit = sample_hashlit();
@@ -579,11 +581,18 @@ mod tests {
                 "encode_resourcelog_protobuf",
                 &[hashlit.clone()],
                 &e,
+                &arena,
             )
             .unwrap();
         assert!(matches!(bytes, Value::Bytes(_)));
         let decoded = reg
-            .call(Some("otlp"), "decode_resourcelog_protobuf", &[bytes], &e)
+            .call(
+                Some("otlp"),
+                "decode_resourcelog_protobuf",
+                &[bytes],
+                &e,
+                &arena,
+            )
             .unwrap();
         // Round-trip: reconstructing from the same hashlit must yield
         // the same hashlit (modulo unset-default fields, which the
@@ -593,6 +602,8 @@ mod tests {
 
     #[test]
     fn json_round_trip() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let hashlit = sample_hashlit();
@@ -602,6 +613,7 @@ mod tests {
                 "encode_resourcelog_json",
                 &[hashlit.clone()],
                 &e,
+                &arena,
             )
             .unwrap();
         let s_str = match &s {
@@ -616,13 +628,15 @@ mod tests {
             "expected camelCase scopeLogs in: {s_str}"
         );
         let decoded = reg
-            .call(Some("otlp"), "decode_resourcelog_json", &[s], &e)
+            .call(Some("otlp"), "decode_resourcelog_json", &[s], &e, &arena)
             .unwrap();
         assert_eq!(decoded, hashlit);
     }
 
     #[test]
     fn protobuf_and_json_describe_same_message() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // Same HashLit through both wire formats must decode back to
         // the same HashLit shape — sanity that the manual mappers do
         // not diverge from serde's view.
@@ -635,6 +649,7 @@ mod tests {
                 "encode_resourcelog_protobuf",
                 &[hashlit.clone()],
                 &e,
+                &arena,
             )
             .unwrap();
         let js = reg
@@ -643,19 +658,28 @@ mod tests {
                 "encode_resourcelog_json",
                 &[hashlit.clone()],
                 &e,
+                &arena,
             )
             .unwrap();
         let from_pb = reg
-            .call(Some("otlp"), "decode_resourcelog_protobuf", &[pb], &e)
+            .call(
+                Some("otlp"),
+                "decode_resourcelog_protobuf",
+                &[pb],
+                &e,
+                &arena,
+            )
             .unwrap();
         let from_js = reg
-            .call(Some("otlp"), "decode_resourcelog_json", &[js], &e)
+            .call(Some("otlp"), "decode_resourcelog_json", &[js], &e, &arena)
             .unwrap();
         assert_eq!(from_pb, from_js);
     }
 
     #[test]
     fn anyvalue_rejects_multiple_variants() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let mut body = Map::new();
@@ -679,6 +703,7 @@ mod tests {
                 "encode_resourcelog_protobuf",
                 &[Value::Object(top)],
                 &e,
+                &arena,
             )
             .unwrap_err();
         assert!(
@@ -689,6 +714,8 @@ mod tests {
 
     #[test]
     fn missing_required_object_shape_errors() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let err = reg
@@ -697,6 +724,7 @@ mod tests {
                 "encode_resourcelog_protobuf",
                 &[Value::String("not an object".into())],
                 &e,
+                &arena,
             )
             .unwrap_err();
         assert!(
@@ -707,6 +735,8 @@ mod tests {
 
     #[test]
     fn bytes_input_to_decode_protobuf() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // Pure decode path: empty bytes is a legal "no-content"
         // ResourceLogs. The decoded HashLit should have an empty
         // `scope_logs` array (the builder zero-suppresses) — this
@@ -719,6 +749,7 @@ mod tests {
                 "decode_resourcelog_protobuf",
                 &[Value::Bytes(Bytes::new())],
                 &e,
+                &arena,
             )
             .unwrap();
         assert!(matches!(v, Value::Object(_)));

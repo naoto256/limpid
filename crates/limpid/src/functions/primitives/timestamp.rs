@@ -28,13 +28,15 @@ mod tests {
 
     #[test]
     fn returns_timestamp_value() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let mut reg = FunctionRegistry::new();
         register(&mut reg);
         let e = Event::new(
             Bytes::from("test"),
             "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         );
-        let v = reg.call(None, "timestamp", &[], &e).unwrap();
+        let v = reg.call(None, "timestamp", &[], &e, &arena).unwrap();
         let Value::Timestamp(_) = v else {
             panic!("expected Value::Timestamp, got {:?}", v);
         };

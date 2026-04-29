@@ -109,11 +109,15 @@ mod tests {
     }
 
     fn call(reg: &FunctionRegistry, args: Vec<Value>) -> Result<Value> {
-        reg.call(None, "to_string", &args, &dummy_event())
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
+        reg.call(None, "to_string", &args, &dummy_event(), &arena)
     }
 
     #[test]
     fn utf8_strict_default_returns_string() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let v = call(&reg, vec![Value::Bytes(Bytes::from_static(b"hi"))]).unwrap();
         assert_eq!(v, Value::String("hi".into()));
@@ -121,6 +125,8 @@ mod tests {
 
     #[test]
     fn utf8_strict_rejects_invalid() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let err = call(&reg, vec![Value::Bytes(Bytes::from_static(b"\xff\xfe"))]).unwrap_err();
         assert!(err.to_string().contains("utf8"), "unexpected: {err}");
@@ -128,6 +134,8 @@ mod tests {
 
     #[test]
     fn utf8_lossy_replaces_invalid() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let v = call(
             &reg,
@@ -144,6 +152,8 @@ mod tests {
 
     #[test]
     fn hex_encodes_lowercase() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let v = call(
             &reg,
@@ -158,6 +168,8 @@ mod tests {
 
     #[test]
     fn base64_round_trip_with_to_bytes() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // to_string(b64) → to_bytes(b64) ⇒ identity.
         let reg = make_reg();
         let mut to_bytes_reg = FunctionRegistry::new();
@@ -170,6 +182,7 @@ mod tests {
                 "to_string",
                 &[original.clone(), Value::String("base64".into())],
                 &dummy_event(),
+                &arena,
             )
             .unwrap();
         let back = to_bytes_reg
@@ -178,6 +191,7 @@ mod tests {
                 "to_bytes",
                 &[s, Value::String("base64".into())],
                 &dummy_event(),
+                &arena,
             )
             .unwrap();
         assert_eq!(back, original);
@@ -185,6 +199,8 @@ mod tests {
 
     #[test]
     fn unknown_encoding_errors() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let err = call(
             &reg,
@@ -196,6 +212,8 @@ mod tests {
 
     #[test]
     fn accepts_string_input_for_convenience() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         // Callers that already have UTF-8 String can hand it in as-is
         // without going through `to_bytes` first; the conversion is
         // a no-op for utf8 strict.

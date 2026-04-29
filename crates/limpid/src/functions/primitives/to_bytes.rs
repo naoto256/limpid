@@ -103,11 +103,15 @@ mod tests {
     }
 
     fn call(reg: &FunctionRegistry, args: Vec<Value>) -> Result<Value> {
-        reg.call(None, "to_bytes", &args, &dummy_event())
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
+        reg.call(None, "to_bytes", &args, &dummy_event(), &arena)
     }
 
     #[test]
     fn utf8_default_passes_string_bytes_through() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let v = call(&reg, vec![Value::String("hello".into())]).unwrap();
         assert_eq!(v, Value::Bytes(Bytes::from_static(b"hello")));
@@ -115,6 +119,8 @@ mod tests {
 
     #[test]
     fn utf8_explicit_matches_default() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let v = call(
             &reg,
@@ -126,6 +132,8 @@ mod tests {
 
     #[test]
     fn hex_round_trip_lower_and_upper() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let v = call(
             &reg,
@@ -140,6 +148,8 @@ mod tests {
 
     #[test]
     fn hex_rejects_odd_length() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let err = call(
             &reg,
@@ -151,6 +161,8 @@ mod tests {
 
     #[test]
     fn hex_rejects_invalid_digit() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let err = call(
             &reg,
@@ -162,6 +174,8 @@ mod tests {
 
     #[test]
     fn base64_decodes_standard_form() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let v = call(
             &reg,
@@ -176,6 +190,8 @@ mod tests {
 
     #[test]
     fn unknown_encoding_errors() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let err = call(
             &reg,
@@ -187,6 +203,8 @@ mod tests {
 
     #[test]
     fn non_string_first_arg_errors() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let err = call(&reg, vec![Value::Int(42)]).unwrap_err();
         assert!(err.to_string().contains("must be a string"));

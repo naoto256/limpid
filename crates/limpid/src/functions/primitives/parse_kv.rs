@@ -190,6 +190,8 @@ mod tests {
 
     #[test]
     fn basic_pairs() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let result = reg
@@ -198,6 +200,7 @@ mod tests {
                 "parse_kv",
                 &[Value::String("src=10.0.0.1 dst=1.2.3.4 act=deny".into())],
                 &e,
+                &arena,
             )
             .unwrap();
         let Value::Object(m) = result else { panic!() };
@@ -208,6 +211,8 @@ mod tests {
 
     #[test]
     fn quoted_values() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let result = reg
@@ -216,6 +221,7 @@ mod tests {
                 "parse_kv",
                 &[Value::String(r#"msg="login failed" user=admin"#.into())],
                 &e,
+                &arena,
             )
             .unwrap();
         let Value::Object(m) = result else { panic!() };
@@ -225,6 +231,8 @@ mod tests {
 
     #[test]
     fn non_kv_tokens_skipped() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let result = reg
@@ -235,6 +243,7 @@ mod tests {
                     "junk src=10.0.0.1 more_junk dst=5.6.7.8".into(),
                 )],
                 &e,
+                &arena,
             )
             .unwrap();
         let Value::Object(m) = result else { panic!() };
@@ -245,6 +254,8 @@ mod tests {
 
     #[test]
     fn defaults_fill_missing() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let defaults = Value::Object(
@@ -258,6 +269,7 @@ mod tests {
                 "parse_kv",
                 &[Value::String("dst=1.2.3.4".into()), defaults],
                 &e,
+                &arena,
             )
             .unwrap();
         let Value::Object(m) = result else { panic!() };
@@ -267,6 +279,8 @@ mod tests {
 
     #[test]
     fn comma_separator() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let result = reg
@@ -278,6 +292,7 @@ mod tests {
                     Value::String(",".into()),
                 ],
                 &e,
+                &arena,
             )
             .unwrap();
         let Value::Object(m) = result else { panic!() };
@@ -288,6 +303,8 @@ mod tests {
 
     #[test]
     fn comma_separator_with_quoted_value_containing_comma() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let result = reg
@@ -299,6 +316,7 @@ mod tests {
                     Value::String(",".into()),
                 ],
                 &e,
+                &arena,
             )
             .unwrap();
         let Value::Object(m) = result else { panic!() };
@@ -309,6 +327,8 @@ mod tests {
 
     #[test]
     fn separator_with_defaults() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let defaults = Value::Object(
@@ -326,6 +346,7 @@ mod tests {
                     defaults,
                 ],
                 &e,
+                &arena,
             )
             .unwrap();
         let Value::Object(m) = result else { panic!() };
@@ -335,6 +356,8 @@ mod tests {
 
     #[test]
     fn separator_must_be_single_ascii_byte() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
         let reg = make_reg();
         let e = dummy_event();
         let err = reg
@@ -343,6 +366,7 @@ mod tests {
                 "parse_kv",
                 &[Value::String("a=1".into()), Value::String(",,".into())],
                 &e,
+                &arena,
             )
             .unwrap_err()
             .to_string();
