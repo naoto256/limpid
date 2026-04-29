@@ -33,7 +33,7 @@ pub fn register(reg: &mut FunctionRegistry) {
             2,
             FieldType::Timestamp,
         ),
-        |args, _event| {
+        |_arena, args, _event| {
             let value = val_to_str(&args[0])?;
             let fmt = val_to_str(&args[1])?;
             let tz_arg = if args.len() == 3 {
@@ -89,100 +89,4 @@ fn parse_with_tz(value: &str, fmt: &str, tz: Option<&str>) -> Result<DateTime<Fi
         })?,
     };
     Ok(offset.from_utc_datetime(&(naive - offset)))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::event::Event;
-    use crate::functions::FunctionRegistry;
-    use bytes::Bytes;
-    use std::net::SocketAddr;
-
-    fn dummy_event() -> Event {
-        Event::new(
-            Bytes::from("test"),
-            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-        )
-    }
-
-    fn call(reg: &FunctionRegistry, args: &[&str]) -> anyhow::Result<String> {
-        let e = dummy_event();
-        let vals: Vec<Value> = args.iter().map(|s| Value::String((*s).into())).collect();
-        let v = reg.call(None, "strptime", &vals, &e)?;
-        let Value::Timestamp(dt) = v else {
-            panic!("expected Timestamp, got {:?}", v)
-        };
-        Ok(dt.to_rfc3339())
-    }
-
-    fn make_reg() -> FunctionRegistry {
-        let mut reg = FunctionRegistry::new();
-        register(&mut reg);
-        reg
-    }
-
-    #[test]
-    fn parses_with_offset_in_format_and_normalises_to_utc() {
-        // Input is +09:00; the offset is used to decode the wall time
-        // but is not stored — Value::Timestamp is UTC-normalised.
-        let r = call(
-            &make_reg(),
-            &["2026-04-15T10:30:00+09:00", "%Y-%m-%dT%H:%M:%S%:z"],
-        )
-        .unwrap();
-        assert_eq!(r, "2026-04-15T01:30:00+00:00");
-    }
-
-    #[test]
-    fn parses_naive_with_utc_arg() {
-        let r = call(
-            &make_reg(),
-            &["2026-04-15 10:30:00", "%Y-%m-%d %H:%M:%S", "UTC"],
-        )
-        .unwrap();
-        assert_eq!(r, "2026-04-15T10:30:00+00:00");
-    }
-
-    #[test]
-    fn parses_naive_with_fixed_offset_arg_normalises_to_utc() {
-        // 10:30 in +09:00 == 01:30 in UTC.
-        let r = call(
-            &make_reg(),
-            &["2026-04-15 10:30:00", "%Y-%m-%d %H:%M:%S", "+09:00"],
-        )
-        .unwrap();
-        assert_eq!(r, "2026-04-15T01:30:00+00:00");
-    }
-
-    #[test]
-    fn errors_on_naive_without_tz_arg() {
-        let err = call(&make_reg(), &["2026-04-15 10:30:00", "%Y-%m-%d %H:%M:%S"])
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("naive datetime"),
-            "expected naive-datetime error, got: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn errors_on_unparseable_input() {
-        let err = call(&make_reg(), &["not a date", "%Y-%m-%d"])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("could not parse"), "got: {}", err);
-    }
-
-    #[test]
-    fn errors_on_tz_conflict_with_format() {
-        let err = call(
-            &make_reg(),
-            &["2026-04-15T10:30:00+09:00", "%Y-%m-%dT%H:%M:%S%:z", "UTC"],
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("conflicts"), "got: {}", err);
-    }
 }

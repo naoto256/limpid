@@ -368,8 +368,7 @@ overriding the default — Rust never sees the decision.
 
 This is also why `received_at` was renamed in v0.5.0: a forwarder
 must not silently conflate wall-clock and source-clock semantics. See
-the breaking change in [CHANGELOG.md](../../CHANGELOG.md) and the
-[v0.5 upgrade notes](./operations/upgrade-0.5.md).
+the breaking change entry in [CHANGELOG.md](../../CHANGELOG.md).
 
 ### 5.4 Resource attributes are user-authored
 
@@ -525,7 +524,7 @@ being a per-record concern.
 Because the event time is what the source claimed, not what the
 forwarder observed. The two are not the same thing, and conflating
 them was the v0.5.0 breaking change that motivated the rename. See
-§5.3 and the [v0.5 upgrade notes](./operations/upgrade-0.5.md).
+§5.3 and the [CHANGELOG entry](../../CHANGELOG.md) for v0.5.0.
 
 ### *"Can I send Resource attributes from the input layer?"*
 
@@ -556,6 +555,5 @@ section reference and the wire trace.
 |---|---|
 | How do I configure the input / output? | [otlp_http](./inputs/otlp-http.md), [otlp_grpc](./inputs/otlp-grpc.md), [otlp output](./outputs/otlp.md) |
 | What primitives are in the `otlp.*` namespace? | [Built-in Functions](./functions/expression-functions.md#otlp---opentelemetry-protocol-logs-signal) |
-| How do I migrate from `Event.timestamp` to `Event.received_at`? | [v0.5 upgrade notes](./operations/upgrade-0.5.md) |
 | What are the design principles this builds on? | [Design Principles](./design-principles.md) |
-| What changed in v0.5.0 specifically? | [CHANGELOG](../../CHANGELOG.md) |
+| What changed in v0.5.0 specifically? | [CHANGELOG](../../CHANGELOG.md) (covers the `Event.timestamp` → `Event.received_at` migration) |

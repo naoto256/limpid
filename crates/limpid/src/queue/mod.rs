@@ -13,6 +13,37 @@ use tracing::{error, info, warn};
 use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::event::Event;
+use crate::modules::RenderedPayload;
+
+// ---------------------------------------------------------------------------
+// SinkInput — what flows over the per-output queue
+// ---------------------------------------------------------------------------
+//
+// v0.6.0 Step B: pipeline → output sink transport carries either a
+// pre-rendered, sink-specific payload (memory-queue hot path) or an
+// `OwnedEvent` (disk-queue persist, control-socket inject — cold paths
+// where the event must be serializable). The pipeline picks at the
+// output statement based on each output's queue type.
+
+/// Item carried by an output queue.
+pub enum SinkInput {
+    /// Disk-queue persist / inject path. Serialisable, outlives the
+    /// pipeline's per-event arena.
+    Owned(Event),
+    /// Memory-queue hot path. Type-erased payload built by
+    /// `Output::render`; the matching `Output::write` downcasts it.
+    Rendered(RenderedPayload),
+}
+
+
+/// Memory-vs-disk queue discriminator surfaced on `CompiledConfig` so
+/// the pipeline can pick `SinkInput::Owned` (disk persist) vs
+/// `SinkInput::Rendered` (memory hot path) at the `output` statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueKind {
+    Memory,
+    Disk,
+}
 
 /// Configuration for an output queue.
 #[derive(Debug, Clone)]
@@ -44,6 +75,20 @@ impl Default for QueueConfig {
 }
 
 impl QueueConfig {
+    /// Light-weight scan: peek at an output's properties and return
+    /// the queue kind without parsing capacities or paths. Used at
+    /// `CompiledConfig` build time to populate the per-output queue
+    /// kind map driving pipeline output dispatch.
+    pub fn kind_from_output_properties(output_props: &[Property]) -> QueueKind {
+        if let Some(block) = props::get_block(output_props, "queue")
+            && matches!(props::get_ident(block, "type").as_deref(), Some("disk"))
+        {
+            QueueKind::Disk
+        } else {
+            QueueKind::Memory
+        }
+    }
+
     /// Parse from an output definition's `queue { ... }` block.
     pub fn from_output_properties(
         output_name: &str,
@@ -87,8 +132,9 @@ pub enum OverflowStrategy {
 #[derive(Clone)]
 pub struct QueueSender {
     inner: SenderInner,
-    #[allow(dead_code)]
     name: Arc<String>,
+    #[allow(dead_code)] // surfaced via `kind()` for future memory/disk-aware callers
+    kind: QueueKind,
     /// Optional metrics — if set, `send()` increments `events_received` on success.
     /// Set by the runtime after the output module's metrics handle is available.
     metrics: Option<Arc<crate::metrics::OutputMetrics>>,
@@ -96,21 +142,54 @@ pub struct QueueSender {
 
 #[derive(Clone)]
 enum SenderInner {
-    Memory(tokio::sync::mpsc::Sender<Event>),
+    Memory(tokio::sync::mpsc::Sender<SinkInput>),
     Disk(disk::DiskQueueSender),
 }
 
 impl QueueSender {
-    pub async fn send(&self, event: Event) -> bool {
-        let ok = match &self.inner {
-            SenderInner::Memory(tx) => tx.send(event).await.is_ok(),
-            SenderInner::Disk(tx) => tx.send(event).await,
+    /// Memory or disk discriminator. The pipeline reads this to decide
+    /// between the render hot-path (memory) and the owned/serialise
+    /// path (disk).
+    #[allow(dead_code)] // currently consumed via the `kind` map on CompiledConfig
+    pub fn kind(&self) -> QueueKind {
+        self.kind
+    }
+
+    /// Send a `SinkInput` into the queue.
+    ///
+    /// Disk queues only accept `SinkInput::Owned(...)` because the
+    /// `Rendered` variant holds a `Box<dyn Any>` payload which has no
+    /// serialisable shape. Pipeline-output dispatch (`pipeline.rs`)
+    /// already gates this by inspecting `kind()` at the output
+    /// statement; the `Rendered`-on-Disk arm here is a defence-in-depth
+    /// log+drop so a programmer mistake elsewhere doesn't silently
+    /// corrupt the persist path.
+    pub async fn send(&self, input: SinkInput) -> bool {
+        let ok = match (&self.inner, input) {
+            (SenderInner::Memory(tx), input) => tx.send(input).await.is_ok(),
+            (SenderInner::Disk(tx), SinkInput::Owned(ev)) => tx.send(ev).await,
+            (SenderInner::Disk(_), SinkInput::Rendered(_)) => {
+                error!(
+                    "queue '{}': pipeline routed a Rendered payload to a disk-persist queue \
+                     — this is a programmer bug; dropping event",
+                    self.name
+                );
+                false
+            }
         };
         if ok && let Some(m) = &self.metrics {
             m.events_received
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         ok
+    }
+
+    /// Convenience: send an `OwnedEvent` regardless of queue kind.
+    /// Used by the cold paths (control-socket inject, retry secondary)
+    /// that already hold an owned event and don't go through the
+    /// render path.
+    pub async fn send_owned(&self, event: Event) -> bool {
+        self.send(SinkInput::Owned(event)).await
     }
 
     /// Attach output metrics so subsequent `send()` calls count `events_received`.
@@ -131,22 +210,22 @@ pub struct QueueReceiver {
 }
 
 enum ReceiverInner {
-    Memory(tokio::sync::mpsc::Receiver<Event>),
+    Memory(tokio::sync::mpsc::Receiver<SinkInput>),
     Disk(disk::DiskQueueReceiver),
 }
 
 impl QueueReceiver {
-    pub async fn recv(&mut self) -> Option<Event> {
+    pub async fn recv(&mut self) -> Option<SinkInput> {
         match &mut self.inner {
             ReceiverInner::Memory(rx) => rx.recv().await,
-            ReceiverInner::Disk(rx) => rx.recv().await,
+            ReceiverInner::Disk(rx) => rx.recv().await.map(SinkInput::Owned),
         }
     }
 
-    pub fn try_recv(&mut self) -> Option<Event> {
+    pub fn try_recv(&mut self) -> Option<SinkInput> {
         match &mut self.inner {
             ReceiverInner::Memory(rx) => rx.try_recv().ok(),
-            ReceiverInner::Disk(rx) => rx.try_recv(),
+            ReceiverInner::Disk(rx) => rx.try_recv().map(SinkInput::Owned),
         }
     }
 }
@@ -165,6 +244,7 @@ pub fn create_queue(
                 QueueSender {
                     inner: SenderInner::Memory(tx),
                     name: Arc::clone(&name),
+                    kind: QueueKind::Memory,
                     metrics: None,
                 },
                 QueueReceiver {
@@ -179,6 +259,7 @@ pub fn create_queue(
                 QueueSender {
                     inner: SenderInner::Disk(tx),
                     name: Arc::clone(&name),
+                    kind: QueueKind::Disk,
                     metrics: None,
                 },
                 QueueReceiver {
@@ -248,10 +329,16 @@ pub enum BackoffStrategy {
 }
 
 /// Trait for output writers usable in queue consumers.
+///
+/// The queue carries `SinkInput`, which is either a `Rendered` payload
+/// (built by the pipeline via `Output::render`) or an `Owned` event
+/// (disk-queue replay, control-socket inject — paths that bypass
+/// pipeline rendering). Implementors dispatch on the variant.
+///
 /// Uses `async_trait` for dyn compatibility (required by plugin registry).
 #[async_trait::async_trait]
 pub trait OutputWriter: Send + Sync + 'static {
-    async fn write(&self, event: &Event) -> anyhow::Result<()>;
+    async fn consume(&self, input: SinkInput) -> anyhow::Result<()>;
 }
 
 /// Run a queue consumer that drains events and writes them to an output.
@@ -274,18 +361,15 @@ pub async fn run_queue_consumer(
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     info!("output '{}': shutting down, draining queue", name);
-                    drain_remaining(&mut receiver, writer.as_ref(), &retry_config, &secondary_sender, &name, &metrics).await;
+                    drain_remaining(&mut receiver, writer.as_ref(), &retry_config, &secondary_sender, &name, &metrics, tap.as_ref()).await;
                     break;
                 }
             }
 
-            event = receiver.recv() => {
-                match event {
-                    Some(evt) => {
-                        if let Some(ref tap) = tap {
-                            tap.emit(&format!("output {}", name), &evt).await;
-                        }
-                        write_with_retry(writer.as_ref(), &evt, &retry_config, &secondary_sender, &name, &metrics).await;
+            input = receiver.recv() => {
+                match input {
+                    Some(input) => {
+                        write_with_retry(writer.as_ref(), input, &retry_config, &secondary_sender, &name, &metrics, tap.as_ref()).await;
                     }
                     None => {
                         info!("output '{}': queue closed", name);
@@ -306,16 +390,18 @@ async fn drain_remaining(
     secondary_sender: &Option<QueueSender>,
     name: &str,
     metrics: &crate::metrics::OutputMetrics,
+    tap: Option<&crate::tap::TapRegistry>,
 ) {
     let mut count = 0u64;
-    while let Some(event) = receiver.try_recv() {
+    while let Some(input) = receiver.try_recv() {
         write_with_retry(
             writer,
-            &event,
+            input,
             retry_config,
             secondary_sender,
             name,
             metrics,
+            tap,
         )
         .await;
         count += 1;
@@ -329,35 +415,79 @@ async fn drain_remaining(
 }
 
 /// Returns true on success, false if event was dropped/sent to secondary.
+///
+/// Retry semantics:
+/// - `SinkInput::Owned(event)` is cloneable, so each attempt re-runs the
+///   write with the same event up to `max_attempts`.
+/// - `SinkInput::Rendered(payload)` consumes the (`Box<dyn Any>`)
+///   payload on the first call into `OutputWriter::consume` and is not
+///   re-buildable from the consumer, so on failure we fall through
+///   to the secondary path immediately. Operators who need full retry
+///   semantics on a sink should configure a disk queue (which always
+///   carries `SinkInput::Owned`).
 async fn write_with_retry(
     writer: &dyn OutputWriter,
-    event: &Event,
+    input: SinkInput,
     config: &RetryConfig,
     secondary_sender: &Option<QueueSender>,
     name: &str,
     metrics: &crate::metrics::OutputMetrics,
+    tap: Option<&crate::tap::TapRegistry>,
 ) -> bool {
     use std::sync::atomic::Ordering;
 
+    // Fast-split: extract the optional Owned event (used for tap emit
+    // and retry/secondary fallback) without consuming the input we
+    // hand to the writer on the first attempt.
+    let mut owned_for_retry: Option<Event> = match &input {
+        SinkInput::Owned(ev) => Some(ev.clone()),
+        SinkInput::Rendered(_) => None,
+    };
+
+    if let Some(tap) = tap
+        && let Some(ev) = &owned_for_retry
+    {
+        tap.emit(&format!("output {}", name), ev).await;
+    }
+
+    let mut next_attempt: Option<SinkInput> = Some(input);
     let mut attempt = 0u32;
     let mut wait = config.initial_wait;
 
     loop {
-        match writer.write(event).await {
+        let this = match next_attempt.take() {
+            Some(i) => i,
+            None => break,
+        };
+        let is_owned = matches!(this, SinkInput::Owned(_));
+        match writer.consume(this).await {
             Ok(()) => return true,
             Err(e) => {
                 attempt += 1;
                 metrics.retries.fetch_add(1, Ordering::Relaxed);
-                if attempt >= config.max_attempts {
-                    error!(
-                        "output '{}': write failed after {} attempts: {}",
-                        name, attempt, e
-                    );
+                if attempt >= config.max_attempts || !is_owned {
+                    if !is_owned {
+                        warn!(
+                            "output '{}': write failed (rendered payload, no retry): {}",
+                            name, e
+                        );
+                    } else {
+                        error!(
+                            "output '{}': write failed after {} attempts: {}",
+                            name, attempt, e
+                        );
+                    }
                     metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-                    // Send to secondary output if configured
                     if let Some(secondary) = secondary_sender {
-                        if !secondary.send(event.clone()).await {
-                            error!("output '{}': secondary output also failed", name);
+                        if let Some(ev) = owned_for_retry.take() {
+                            if !secondary.send(SinkInput::Owned(ev)).await {
+                                error!("output '{}': secondary output also failed", name);
+                            }
+                        } else {
+                            error!(
+                                "output '{}': cannot route to secondary — original payload was Rendered (memory queue)",
+                                name
+                            );
                         }
                     } else {
                         error!("output '{}': dropping event (no secondary)", name);
@@ -373,7 +503,15 @@ async fn write_with_retry(
                     BackoffStrategy::Exponential => (wait * 2).min(config.max_wait),
                     BackoffStrategy::Fixed => wait,
                 };
+                // Rebuild the next-attempt input from the cloned owned
+                // event we kept aside.
+                if let Some(ev) = owned_for_retry.as_ref() {
+                    next_attempt = Some(SinkInput::Owned(ev.clone()));
+                } else {
+                    break;
+                }
             }
         }
     }
+    false
 }

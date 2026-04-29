@@ -10,6 +10,9 @@ pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(
         "upper",
         FunctionSig::fixed(&[FieldType::String], FieldType::String),
-        |args, _event| Ok(Value::String(val_to_str(&args[0])?.to_uppercase())),
+        |arena, args, _event| {
+            let s = val_to_str(&args[0])?.to_uppercase();
+            Ok(Value::String(arena.alloc_str(&s)))
+        },
     );
 }

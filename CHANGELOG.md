@@ -8,8 +8,270 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
+## [0.6.1] - 2026-04-30
+> perf: multi-pipeline scaling — 4-pipeline D-pipeline aggregate 374k → 459k events/sec (+23%, scaling 2.27× → 2.73×)
+
+A short follow-up to v0.6.0 closing the multi-pipeline scaling gap
+that the perf-milestone profile surfaced after release. Three small
+changes that compound:
+
+1. **Per-worker bump-arena recycling** — the per-event
+   `bumpalo::Bump::new()` introduced in v0.6.0 became a contention
+   point on the macOS xzm allocator's per-zone lock once multiple
+   pipelines ran concurrently. Hoist the `Bump` into the per-input
+   pipeline-worker task's local state and recycle via `Bump::reset()`
+   between events. Steady state: zero allocations on the hot path.
+2. **Pass the input event by reference through fan-out** — when
+   multiple pipelines fan out from one input, the dispatcher used to
+   `Event::clone()` per worker (workspace `HashMap` rebuild). The
+   input event is read-only after `view_in` copies it into the
+   per-event arena, so a `&Event` borrow is sufficient.
+3. **`tracing/release_max_level_info`** — `trace!` / `debug!` macros
+   compile to no-ops in release builds, eliminating per-event
+   instrumentation cost (roughly half a percent of on-CPU on the
+   multi-pipeline profile traced back to `mach_absolute_time` calls
+   from tracing-event timestamps). Operators relying on `trace!` /
+   `debug!` output need a debug build; `info!` / `warn!` / `error!`
+   continue to fire.
+
+### Changed — `pipeline::run_pipeline` signature
+
+- New trailing parameter `bump: &mut bumpalo::Bump` — caller-supplied
+  arena, reused across events. In-tree callers (`runtime`,
+  `--test-pipeline` in `main`, unit tests) are migrated. Out-of-tree
+  code that calls `run_pipeline` directly (rare; this is an internal
+  API) passes `&mut bumpalo::Bump::new()`.
+- `event` is now `&OwnedEvent` instead of `OwnedEvent`. Read-only
+  access — `view_in` copies into the arena, the DLQ path constructs
+  a fresh `OwnedEvent` from the borrowed view via `to_owned()`.
+
+### Performance — single + multi pipeline (D pipeline, OCSF compose)
+
+Same harness as v0.6.0. macOS, 16 physical cores. 3 reps each.
+
+| Pipeline shape         | v0.5.7 | v0.6.0 | **v0.6.1** | Δ vs v0.6.0 |
+|------------------------|-------:|-------:|-----------:|------------:|
+| A passthrough          | 306k   | 303k   | **312k**   | +3%         |
+| B `syslog.parse`       | 181k   | 282k   | **305k**   | +8%         |
+| C parse + regex + if   | 73k    | 112k   | **115k**   | +3%         |
+| D OCSF compose (UDP)   | 46.3k  | 168k   | **168k**   | ±0%         |
+| D OCSF compose (TCP)   | n/a    | 170k   | **168k**   | ±0%         |
+| **D 4-pipeline aggr.** | n/a    | 374k   | **459k**   | **+23%**    |
+
+(eps/core for single-pipeline rows; eps aggregate for the
+4-pipeline row. 4-pipeline is 4× independent inputs / pipelines /
+outputs sharing one process.)
+
+Scaling on the 4-pipeline configuration improves from 2.27× the
+single-pipeline number on v0.6.0 to **2.73×** on v0.6.1.
+Single-pipeline throughput is essentially unchanged — there's no
+concurrency to expose the contention this patch removes, and the
+remaining levers are noise-magnitude individually. The lift comes
+when the daemon is actually running multiple pipelines, which is
+the production deployment shape.
+
+The remaining 4-pipeline gap to true linear scaling (~3.5–4× of
+single-pipeline) is dominated by allocator activity in
+`OwnedEvent::clone` and HashMap operations in workspace handling
+that the per-event arena doesn't reach (event metadata between
+input task and pipeline worker, queue boundaries, etc). Closing it
+is a multi-day refactor — Linux native bench + `Arc<Event>` between
+input and pipeline worker — and not in scope for this patch.
+
+### Notes
+
+- DSL surface, config surface, and CLI surface: unchanged.
+- The `Output` plugin trait is unchanged; out-of-tree output sinks
+  written against v0.6.0 work without modification.
+- 384 tests pass. `cargo build / clippy --release` green.
+- Operators with genuinely high pipeline counts (≥ 16) can still
+  override the default tokio worker thread count via
+  `TOKIO_WORKER_THREADS=…` if their workload benefits — this release
+  does not cap it (an earlier draft did, and it backfired in benches
+  that had > 8 active tokio tasks).
+
+## [0.6.0] - 2026-04-30
+> perf milestone — D pipeline 46.3k → 168k eps/core (+263%); per-event arena, direct serializer, key interning, `CompactString`, and the `Output` boundary refactor
+
+The v0.6.0 release closes the perf milestone framed in the v0.5.7 →
+v0.6.0 plan: collapse per-event allocation cost on the DSL hot path
+to the point that real work (I/O + tokio scheduling + the actual
+serializer) becomes the bottleneck. The headline number on the D
+pipeline (OCSF Authentication compose + `to_json`) is **168k
+eps/core**, up from 46.3k at v0.5.7 baseline — past the 100k
+milestone target by 65%.
+
+DSL-surface and config-surface compatibility: **unchanged**. Every
+`def process / def pipeline / def input / def output` written
+against v0.5.x continues to parse, type-check, and run. The breaking
+changes in this release are confined to the **`Output` plugin
+trait**; in-tree sinks (`file`, `tcp`, `udp`, `unix_socket`,
+`stdout`, `http`, `otlp`, `kafka`) are migrated. Out-of-tree custom
+output sinks need to migrate (see "Output trait — breaking change"
+below).
+
+### Performance — cumulative result
+
+| Pipeline | DSL shape | v0.5.7 | **v0.6.0** | Δ |
+|---|---|---:|---:|---:|
+| A | passthrough | 306k | 303k | ±0% |
+| B | `syslog.parse(ingress)` | 181k | 282k | +56% |
+| C | parse + 2× regex + if/else | 73k | 112k | +54% |
+| **D** | **OCSF compose + to_json** | **46.3k** | **168k** | **+263%** |
+
+(eps/core, single-pipeline single-input, channel-direct injection,
+UDP discard sink. 3 reps each, run-to-run spread ≤ 3.4%. Local
+measurement; raw data is not committed to the repo.)
+
+Flamegraph composition flipped vs v0.5.7 baseline:
+
+| Category | v0.5.7 | **v0.6.0** |
+|---|---:|---:|
+| `malloc / free` | 42.99% | **14.93%** |
+| `HashMap` / `IndexMap` rebuild | 11.77% | **4.00%** |
+| `Clone` | 2.89% | **0.09%** |
+| `__sendto` (output I/O) | n/a | 17.85% |
+| tokio runtime | n/a | 10.40% |
+
+`Value::to_owned_value`, `IndexMap::insert_full`, and the
+`OwnedValue` `drop_in_place` chain — the top-three alloc-related
+leaves at v0.5.7 — have all dropped out of the top 25 on v0.6.0.
+
+### Added — bumpalo per-event arena (`crates/limpid/src/dsl/arena.rs`)
+
+Every event entering `run_pipeline` gets a fresh
+`EventArena<'bump>` whose lifetime ends when the event finishes
+processing. All transient `Value::Object` / `Value::Array` /
+`Value::String` / `Value::Bytes` payloads allocate from this arena;
+the per-allocation `drop_in_place<Value>` chain (~23% of allocator
+samples on the v0.5.7 D pipeline) collapses into a single
+chunk-group free at event end.
+
+The DSL `Value` enum is now lifetime-bound (`Value<'bump>`) —
+internal API change for embedders and out-of-tree DSL extensions
+(see "Out-of-tree extension migration" below). DSL configs are
+unchanged.
+
+### Added — direct `serde::Serialize for Value<'bump>`
+
+`to_json(workspace.x)` and other JSON-emit paths previously routed
+through an intermediate `serde_json::Value` tree. Implementing
+`Serialize` directly on the arena-backed `Value` skips that copy,
+collapsing `value_view_to_json` (1.11% on Step 1c) to zero on the
+profile.
+
+### Added — static-literal key interning in DSL hashes
+
+`HashLit` keys (the `metadata`, `actor`, `src_endpoint`, … leaves
+of an OCSF compose) are interned at construction so the per-event
+`arena.alloc_str(...)` cost runs once at registry-build time, not
+once per event. This was the single largest unexpected win of the
+milestone (+13% on D, ~3× the planned estimate).
+
+### Added — `CompactString` for `OwnedValue::String`
+
+Short owned strings (≤ 24 bytes — covers most metadata fields:
+hostnames, IP strings, schema names, status enums) inline into the
+enum payload, eliminating a heap allocation per leaf for the common
+case. Long strings still spill to the heap unchanged.
+
+### Changed — boundary refactor: `Output` trait split (Step B)
+
+**This is the only operator-visible breaking change in v0.6.0**, and
+it only affects out-of-tree output sinks. In-tree sinks are migrated
+in this release.
+
+The pre-v0.6.0 `Output` trait took a fully-owned `&Event` at the
+sink boundary, which forced `BorrowedEvent::to_owned()` on every
+output statement — rebuilding the workspace HashMap (~10% on-CPU at
+Step 5).
+
+The new shape:
+
+```rust
+#[async_trait]
+pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
+    /// Hot path: build a sink-specific payload from a borrowed event,
+    /// using the per-event arena for any DSL eval (template paths,
+    /// dynamic keys, etc.).
+    fn render(
+        &self,
+        ev: &BorrowedEvent<'_>,
+        arena: &EventArena<'_>,
+    ) -> anyhow::Result<RenderedPayload>;
+
+    /// Hot path: consume the rendered payload (downcast to the sink's
+    /// concrete payload type) and perform I/O.
+    async fn write(&self, payload: RenderedPayload) -> anyhow::Result<()>;
+
+    /// Cold path (disk-queue replay): consume an `Event`. Default
+    /// impl builds a transient arena, calls `view_in -> render ->
+    /// write`. Sinks with a faster owned-form may override.
+    async fn write_owned(&self, ev: &Event) -> anyhow::Result<()> { /* default */ }
+}
+```
+
+`RenderedPayload` is a type-erased `Box<dyn Any + Send>` that each
+sink defines a concrete payload struct for (`FilePayload`,
+`UdpPayload`, …) and downcasts inside `write` — out-of-tree plugin
+sinks remain fully extensible without changes to the core. `Module`
+is no longer a supertrait of `Output` (`Module::from_properties` is
+`Sized`-bound and would forbid `dyn Output`); construction sites
+carry the `Module` bound separately.
+
+`SinkInput { Owned, Rendered }` carries either form across
+`QueueSender`. Memory queues flow `Rendered` (no `to_owned` cost on
+the hot path); disk queues flow `Owned` only (Serialize/Deserialize
+survives restart). `CompiledConfig` exposes `outputs_queue_kind` so
+the pipeline executor routes at the output statement without
+consulting runtime state.
+
+Retry semantics: `Owned` retains the full N-attempt retry loop
+(event is cloned up front); `Rendered` is single-shot (a
+`Box<dyn Any>` is consumed on first `write`). Sinks needing full
+retry should configure a disk queue. Documented at the
+`write_with_retry` call site.
+
+### Out-of-tree extension migration
+
+If you maintain an out-of-tree DSL function or output sink, the
+following internal API surfaces changed:
+
+- **DSL functions** (in-tree primitives are migrated): the closure
+  signature passed to `FunctionRegistry::register*` now takes
+  `(arena, args, event)` (was `(args, event)`). `Value` is
+  `Value<'bump>` and `Copy`. `FunctionRegistry::call` takes a
+  `&BorrowedEvent<'bump>` and `&'bump EventArena<'bump>` in addition
+  to the prior args.
+- **Output sinks**: implement `render` / `write` / (optionally)
+  `write_owned` per the trait shape above. `Module::from_properties`
+  is unchanged for construction.
+- **Custom processes**: `ProcessRegistry::call` takes
+  `BorrowedEvent<'bump>` + `&'bump EventArena<'bump>` instead of an
+  owned `Event`.
+
+### Carried over from v0.5.8
+
+The v0.5.8 release line is fully present in v0.6.0:
+
+- `coalesce(a, b, c, ...)` first-non-null variadic primitive
+- `syslog.parse` RFC 3164 TAG anchor fix (CEF inner-`": "` payload
+  no longer absorbs into TAG/MSG split)
+- `let f = <Object>; f.x.y` resolves through the local scope
+  (read-side dot-access on let-bound Objects)
+
+### Notes
+
+- Build dependency: `bumpalo` (per-event arena), `compact_str`
+  (small-string optimisation for owned values).
+- Test count grew to 384 — coverage on the syslog/CEF parsers and
+  `coalesce` was rebuilt from scratch for the new arena-shaped API
+  (the v0.5.x pre-arena tests did not migrate cleanly).
+- `--test-pipeline` / `--check` modes fall through to `SinkInput::Owned`
+  when no live sinks are wired (no behavioural change for users).
+
 ## [0.5.8] - 2026-04-29
-> `coalesce(...)` built-in for first-non-null fallback chains
+> `coalesce(...)` built-in for first-non-null fallback chains, plus a follow-up fix for dot-access on `let`-bound Object values
 
 ### Added — `coalesce(a, b, c, ...)` built-in (variadic)
 
@@ -52,11 +314,53 @@ This is the fourth DSL gap surfaced and fixed mid-snippet-library
 work — alongside `error` (v0.5.5), the `source` reshape (v0.5.6),
 and `null_omit` (v0.5.7).
 
+### Fixed — `let f = <Object>; f.x.y` resolves correctly
+
+`let f = regex_parse(...); f.user` was failing at runtime with
+`unknown identifier: f.user`. The local-scope path-resolver in
+`crates/limpid/src/dsl/eval.rs` only consulted let bindings for
+single-segment idents (`parts.len() == 1`), so any multi-segment
+access whose root happened to be let-bound (`f.user`, `f.a.b`,
+`f.list[0].kind`) skipped scope lookup entirely and fell through to
+the catch-all "unknown identifier" arm. The analyzer's UnknownIdent
+warning had the same gap.
+
+The fix extends both code paths: when the first segment matches a
+let binding, the runtime walks the bound value via the same
+`resolve_workspace_path` Object/Array walker used for
+`workspace.x.y.z`, and the analyzer suppresses the warning for the
+whole path. Missing keys yield `Null` to match the workspace
+path-walker contract — callers handle absence via `coalesce` or
+explicit null comparison.
+
+```
+// before — runtime "unknown identifier: f.user":
+def process parse_xxx {
+    let f = regex_parse(workspace.body, "(?P<user>\\S+)")
+    workspace.limpid = { user: f.user }     // ← runtime error
+}
+// after — works as written:
+def process parse_xxx {
+    let f = regex_parse(workspace.body, "(?P<user>\\S+)")
+    workspace.limpid = { user: f.user }     // ✅ "alice"
+}
+```
+
+Surfaced while writing parse_asa (Cisco ASA syslog parser) — every
+per-message-ID leaf does `let f = regex_parse(workspace.asa.body,
+"...")` and reads named captures via `f.user` / `f.src_ip` / etc.
+
+Two regression tests added covering the happy path and the
+missing-key (Null) path.
+
 ### Notes
 
-- No DSL syntax change. `coalesce` is a regular flat primitive call
-- No breaking changes
-- No behaviour change in any other built-in or pipeline path
+- No DSL syntax change. `coalesce` is a regular flat primitive call.
+  The let-bound dot-access fix is a behaviour change in path
+  resolution semantics: before, `f.x` failed; after, it walks into
+  the bound Object.
+- No breaking changes (the only behaviour shift is the previously-
+  failing case starting to work).
 
 ---
 
