@@ -1,0 +1,657 @@
+// Palo Alto Networks PAN-OS syslog (CSV) parser
+//
+// Vendor:  Palo Alto Networks
+// Product: PAN-OS (Next-Generation Firewalls — PA-series, VM-series)
+// Wire:    syslog-wrapped CSV — `<priority>timestamp host FUTURE_USE,RecvTime,Serial,Type,Subtype,...`
+// Schema:  PAN-OS native CSV log format (positional, ~60-117 fields per Type)
+//
+// PAN-OS encodes the log Type at position 4 in the CSV row:
+//   "TRAFFIC"        — connection start/end (OCSF Network Activity 4001)
+//   "THREAT"         — IPS / vulnerability / spyware / virus
+//                      (OCSF Detection Finding 2004; also URL via
+//                       Subtype="url" → OCSF Web Resource Access 6004,
+//                       and WILDFIRE via Subtype="wildfire" → 2004)
+//   "GLOBALPROTECT"  — VPN session events (OCSF Authentication 3002)
+//   "AUTHENTICATION" — admin / user authentication (OCSF Authentication 3002)
+//   "SYSTEM"         — device events
+//   "CONFIG"         — configuration changes
+//   "USERID"         — user-ID mapping
+//   "HIPMATCH"       — Host Information Profile match
+//
+// Two-pass parse:
+//   1. Lightweight csv_parse with a header-only schema to extract
+//      `Type` (and `Subtype` for THREAT routing) — keeps the dispatcher
+//      cheap, single-row parse skips most of the field array.
+//   2. The matched leaf re-runs csv_parse with the type-specific full
+//      schema and maps to canonical workspace.limpid.
+//
+// Sample input (RFC 3164 syslog wrapper around CSV, TRAFFIC):
+//   <134>Apr 27 10:00:00 fw-pan01 1,2026-04-27 10:00:00,012345678,TRAFFIC,end,2049,2026-04-27 10:00:00,192.0.2.10,198.51.100.5,...
+
+// ---------------------------------------------------------------------------
+// Vendor-specific mapping helpers (PAN-OS dialect)
+// ---------------------------------------------------------------------------
+
+// PAN-OS Severity is an enum string in the syslog format (informational
+// / low / medium / high / critical). Map to OCSF severity_id (1-6).
+def function paloalto_syslog_severity_id(sev) {
+    switch lower(sev) {
+        "informational" { 1 }
+        "low"           { 2 }
+        "medium"        { 3 }
+        "high"          { 4 }
+        "critical"      { 5 }
+        default         { 0 }
+    }
+}
+
+// PAN-OS TRAFFIC `Action` field. OCSF Network Activity (4001)
+// activity_id values: 0 Unknown / 1 Open / 2 Close / 3 Reset /
+// 4 Fail / 5 Refuse / 6 Traffic / 99 Other.
+def function paloalto_syslog_traffic_action_to_activity_id(act) {
+    switch act {
+        "allow"        { 6 }
+        "drop"         { 5 }
+        "deny"         { 5 }
+        "reset-both"   { 3 }
+        "reset-server" { 3 }
+        "reset-client" { 3 }
+        default        { 0 }
+    }
+}
+
+// PAN-OS THREAT/URL `Action` field → OCSF disposition_id.
+def function paloalto_syslog_threat_disposition_id(act) {
+    switch act {
+        "alert"        { 6 }
+        "allow"        { 1 }
+        "block"        { 2 }
+        "block-url"    { 2 }
+        "block-ip"     { 2 }
+        "drop"         { 5 }
+        "deny"         { 2 }
+        "reset-both"   { 2 }
+        "reset-server" { 2 }
+        "reset-client" { 2 }
+        "default"      { 0 }
+        "continue"     { 1 }
+        "override"     { 1 }
+        default        { 0 }
+    }
+}
+
+// IANA proto name → number. PAN-OS emits the protocol name string.
+def function paloalto_syslog_proto_num(name) {
+    switch lower(name) {
+        "icmp"   { 1 }
+        "tcp"    { 6 }
+        "udp"    { 17 }
+        "gre"    { 47 }
+        "esp"    { 50 }
+        "icmpv6" { 58 }
+        default  { null }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dispatcher: parse syslog wrapper, extract Type+Subtype for routing
+// ---------------------------------------------------------------------------
+//
+// The header schema names only the fields we need to dispatch:
+// position 4 = Type, position 5 = Subtype. Everything before / after is
+// ignored at this stage; the matched leaf re-parses the full row with
+// its own schema.
+
+def process parse_paloalto_syslog {
+    workspace.syslog = syslog.parse(ingress)
+    workspace.pan_header = csv_parse(workspace.syslog.msg, ["", "", "", "Type", "Subtype"])
+    switch workspace.pan_header.Type {
+        "TRAFFIC"        { process parse_paloalto_syslog_traffic }
+        "THREAT"         { process parse_paloalto_syslog_threat }
+        "GLOBALPROTECT"  { process parse_paloalto_syslog_globalprotect }
+        "AUTHENTICATION" { process parse_paloalto_syslog_authentication }
+        // SYSTEM / CONFIG / USERID / HIPMATCH follow when concrete
+        // mappings stabilise.
+        default { error "unsupported PAN-OS log Type: ${workspace.pan_header.Type}" }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: TRAFFIC → OCSF Network Activity (4001)
+// ---------------------------------------------------------------------------
+//
+// PAN-OS TRAFFIC field schema (positions 1-49 cover the OCSF-relevant
+// surface; later fields like SD-WAN / device profiles / Pod metadata
+// are skipped via empty-name padding because they don't have a clean
+// OCSF home in 1.3.0).
+//
+// Precondition (contract; not runtime-checked):
+//   workspace.syslog.msg is the raw CSV row of a PAN-OS TRAFFIC log.
+def process parse_paloalto_syslog_traffic {
+    workspace.pan = csv_parse(workspace.syslog.msg, [
+        "",                  // 1  FUTURE_USE
+        "ReceiveTime",       // 2
+        "Serial",            // 3
+        "Type",              // 4
+        "Subtype",           // 5  start / end / drop / deny
+        "",                  // 6  FUTURE_USE / ConfigVersion
+        "GenerateTime",      // 7
+        "SourceAddress",     // 8
+        "DestinationAddress",// 9
+        "NATSourceIP",       // 10
+        "NATDestinationIP",  // 11
+        "RuleName",          // 12
+        "SourceUser",        // 13
+        "DestinationUser",   // 14
+        "Application",       // 15
+        "VirtualSystem",     // 16
+        "SourceZone",        // 17
+        "DestinationZone",   // 18
+        "InboundInterface",  // 19
+        "OutboundInterface", // 20
+        "LogForwardingProfile", // 21
+        "",                  // 22 FUTURE_USE
+        "SessionID",         // 23
+        "RepeatCount",       // 24
+        "SourcePort",        // 25
+        "DestinationPort",   // 26
+        "NATSourcePort",     // 27
+        "NATDestinationPort",// 28
+        "Flags",             // 29
+        "IPProtocol",        // 30
+        "Action",            // 31
+        "Bytes",             // 32
+        "BytesSent",         // 33
+        "BytesReceived",     // 34
+        "Packets",           // 35
+        "StartTime",         // 36
+        "ElapsedTime",       // 37
+        "Category",          // 38
+        "",                  // 39 FUTURE_USE
+        "SequenceNumber",    // 40
+        "ActionFlags",       // 41
+        "SourceLocation",    // 42
+        "DestinationLocation",// 43
+        "",                  // 44 FUTURE_USE
+        "PacketsSent",       // 45
+        "PacketsReceived",   // 46
+        "SessionEndReason",  // 47
+        "",                  // 48 DeviceGroupHierarchyL1
+        "",                  // 49 DeviceGroupHierarchyL2
+        "",                  // 50 DeviceGroupHierarchyL3
+        "",                  // 51 DeviceGroupHierarchyL4
+        "VirtualSystemName", // 52
+        "DeviceName"         // 53
+    ])
+    workspace.limpid = {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  paloalto_syslog_traffic_action_to_activity_id(workspace.pan.Action),
+        severity_id:  1,
+        src_endpoint: {
+            ip:       workspace.pan.SourceAddress,
+            port:     to_int(workspace.pan.SourcePort),
+            location: { country: workspace.pan.SourceLocation }
+        },
+        dst_endpoint: {
+            ip:       workspace.pan.DestinationAddress,
+            port:     to_int(workspace.pan.DestinationPort),
+            location: { country: workspace.pan.DestinationLocation }
+        },
+        connection_info: {
+            protocol_num:  paloalto_syslog_proto_num(workspace.pan.IPProtocol),
+            protocol_name: lower(workspace.pan.IPProtocol)
+        },
+        traffic: {
+            bytes_in:    to_int(workspace.pan.BytesReceived),
+            bytes_out:   to_int(workspace.pan.BytesSent),
+            packets_in:  to_int(workspace.pan.PacketsReceived),
+            packets_out: to_int(workspace.pan.PacketsSent)
+        },
+        app_name: workspace.pan.Application,
+        actor: {
+            user: { name: workspace.pan.SourceUser }
+        },
+        session_uid: workspace.pan.SessionID,
+        rule:        workspace.pan.RuleName,
+        device:      { name: workspace.pan.DeviceName },
+        metadata: {
+            product: {
+                vendor_name: "Palo Alto Networks",
+                name:        "PAN-OS"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: THREAT → routes by Subtype
+// ---------------------------------------------------------------------------
+//
+// THREAT records share a base schema but the Subtype determines OCSF
+// class:
+//   "url"          → Web Resource Access (6004)
+//   "wildfire"     → Detection Finding (2004), Malware
+//   "wildfire-virus" → Detection Finding (2004), Malware
+//   "virus"        → Detection Finding (2004), Malware
+//   "vulnerability"/ "spyware" / "file" / "data" / "scan" / "flood"
+//                  → Detection Finding (2004), generic
+//
+// We re-parse with the THREAT schema once, then route by Subtype.
+def process parse_paloalto_syslog_threat {
+    workspace.pan = csv_parse(workspace.syslog.msg, [
+        "",                  // 1
+        "ReceiveTime",       // 2
+        "Serial",            // 3
+        "Type",              // 4
+        "Subtype",           // 5  url / vulnerability / virus / wildfire / etc.
+        "",                  // 6
+        "GenerateTime",      // 7
+        "SourceAddress",     // 8
+        "DestinationAddress",// 9
+        "NATSourceIP",       // 10
+        "NATDestinationIP",  // 11
+        "RuleName",          // 12
+        "SourceUser",        // 13
+        "DestinationUser",   // 14
+        "Application",       // 15
+        "VirtualSystem",     // 16
+        "SourceZone",        // 17
+        "DestinationZone",   // 18
+        "InboundInterface",  // 19
+        "OutboundInterface", // 20
+        "LogForwardingProfile", // 21
+        "",                  // 22
+        "SessionID",         // 23
+        "RepeatCount",       // 24
+        "SourcePort",        // 25
+        "DestinationPort",   // 26
+        "NATSourcePort",     // 27
+        "NATDestinationPort",// 28
+        "Flags",             // 29
+        "IPProtocol",        // 30
+        "Action",            // 31
+        "URLFilename",       // 32  URL or filename for THREAT
+        "ThreatName",        // 33  e.g. "SuperVirus.A" or signature name
+        "Category",          // 34  URL category for url subtype
+        "Severity",          // 35  informational/low/medium/high/critical
+        "Direction",         // 36  client-to-server / server-to-client
+        "SequenceNumber",    // 37
+        "ActionFlags",       // 38
+        "SourceLocation",    // 39
+        "DestinationLocation",// 40
+        "",                  // 41
+        "ContentType",       // 42  HTTP content-type for URL subtype
+        "PCAPID",            // 43
+        "FileHash",          // 44  MD5/SHA256 for virus / wildfire
+        "Cloud",              // 45
+        "URLIndex",          // 46
+        "UserAgent",         // 47
+        "FileType",          // 48
+        "XForwardedFor",     // 49
+        "Referer",           // 50
+        "Sender",            // 51
+        "Subject",           // 52
+        "Recipient",         // 53
+        "ReportID",          // 54  WildFire report id
+        "",                  // 55 DeviceGroupHierarchyL1
+        "",                  // 56 DeviceGroupHierarchyL2
+        "",                  // 57 DeviceGroupHierarchyL3
+        "",                  // 58 DeviceGroupHierarchyL4
+        "VirtualSystemName", // 59
+        "DeviceName",        // 60
+        "",                  // 61 FUTURE_USE
+        "SourceVMUUID",      // 62
+        "DestinationVMUUID"  // 63
+    ])
+    switch workspace.pan.Subtype {
+        "url"            { process parse_paloalto_syslog_threat_url }
+        "wildfire"       { process parse_paloalto_syslog_threat_wildfire }
+        "wildfire-virus" { process parse_paloalto_syslog_threat_wildfire }
+        "virus"          { process parse_paloalto_syslog_threat_virus }
+        // vulnerability / spyware / file / data / scan / flood share
+        // the generic detection mapping below.
+        "vulnerability"  { process parse_paloalto_syslog_threat_generic }
+        "spyware"        { process parse_paloalto_syslog_threat_generic }
+        "file"           { process parse_paloalto_syslog_threat_generic }
+        "data"           { process parse_paloalto_syslog_threat_generic }
+        "scan"           { process parse_paloalto_syslog_threat_generic }
+        "flood"          { process parse_paloalto_syslog_threat_generic }
+        default { error "unsupported PAN-OS THREAT subtype: ${workspace.pan.Subtype}" }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: THREAT/url → OCSF Web Resource Access (6004)
+// ---------------------------------------------------------------------------
+def process parse_paloalto_syslog_threat_url {
+    let activity = switch workspace.pan.Action {
+        "block-url"    { 2 }
+        "block"        { 2 }
+        "deny"         { 2 }
+        "drop"         { 2 }
+        "reset-both"   { 2 }
+        "reset-server" { 2 }
+        "reset-client" { 2 }
+        "alert"        { 1 }
+        "allow"        { 1 }
+        "continue"     { 1 }
+        "override"     { 1 }
+        default        { 0 }
+    }
+    workspace.limpid = {
+        class_uid:    6004,
+        category_uid: 6,
+        activity_id:  activity,
+        severity_id:  paloalto_syslog_severity_id(workspace.pan.Severity),
+        src_endpoint: {
+            ip:   workspace.pan.SourceAddress,
+            port: to_int(workspace.pan.SourcePort)
+        },
+        dst_endpoint: {
+            ip:   workspace.pan.DestinationAddress,
+            port: to_int(workspace.pan.DestinationPort)
+        },
+        http_request: {
+            url:        { url_string: workspace.pan.URLFilename },
+            user_agent: workspace.pan.UserAgent,
+            referrer:   workspace.pan.Referer
+        },
+        web_resources: [
+            {
+                url:      { url_string: workspace.pan.URLFilename },
+                category: workspace.pan.Category
+            }
+        ],
+        actor: {
+            user: { name: workspace.pan.SourceUser }
+        },
+        metadata: {
+            product: {
+                vendor_name: "Palo Alto Networks",
+                name:        "PAN-OS"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: THREAT/wildfire → OCSF Detection Finding (2004) Malware
+// ---------------------------------------------------------------------------
+def process parse_paloalto_syslog_threat_wildfire {
+    workspace.limpid = {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:    1,
+        severity_id:    paloalto_syslog_severity_id(workspace.pan.Severity),
+        disposition_id: paloalto_syslog_threat_disposition_id(workspace.pan.Action),
+        finding_info: {
+            title: workspace.pan.ThreatName,
+            uid:   workspace.pan.ReportID,
+            types: ["Malware"]
+        },
+        malware: [
+            {
+                name:               workspace.pan.ThreatName,
+                classification_ids: [1]
+            }
+        ],
+        evidences: [
+            {
+                file: {
+                    name:   workspace.pan.URLFilename,
+                    hashes: [{ value: workspace.pan.FileHash }]
+                }
+            }
+        ],
+        src_endpoint: {
+            ip:   workspace.pan.SourceAddress,
+            port: to_int(workspace.pan.SourcePort)
+        },
+        dst_endpoint: {
+            ip:   workspace.pan.DestinationAddress,
+            port: to_int(workspace.pan.DestinationPort)
+        },
+        actor: { user: { name: workspace.pan.SourceUser } },
+        metadata: {
+            product: {
+                vendor_name: "Palo Alto Networks",
+                name:        "PAN-OS"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: THREAT/virus → OCSF Detection Finding (2004) Malware
+// ---------------------------------------------------------------------------
+def process parse_paloalto_syslog_threat_virus {
+    workspace.limpid = {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:    1,
+        severity_id:    paloalto_syslog_severity_id(workspace.pan.Severity),
+        disposition_id: paloalto_syslog_threat_disposition_id(workspace.pan.Action),
+        finding_info: {
+            title: workspace.pan.ThreatName,
+            types: ["Malware"]
+        },
+        malware: [
+            {
+                name:               workspace.pan.ThreatName,
+                classification_ids: [1]
+            }
+        ],
+        evidences: [
+            {
+                file: {
+                    name:   workspace.pan.URLFilename,
+                    hashes: [{ value: workspace.pan.FileHash }]
+                }
+            }
+        ],
+        src_endpoint: {
+            ip:   workspace.pan.SourceAddress,
+            port: to_int(workspace.pan.SourcePort)
+        },
+        dst_endpoint: {
+            ip:   workspace.pan.DestinationAddress,
+            port: to_int(workspace.pan.DestinationPort)
+        },
+        actor: { user: { name: workspace.pan.SourceUser } },
+        metadata: {
+            product: {
+                vendor_name: "Palo Alto Networks",
+                name:        "PAN-OS"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: THREAT/{vulnerability,spyware,file,data,scan,flood}
+//             → OCSF Detection Finding (2004) generic
+// ---------------------------------------------------------------------------
+def process parse_paloalto_syslog_threat_generic {
+    workspace.limpid = {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:    1,
+        severity_id:    paloalto_syslog_severity_id(workspace.pan.Severity),
+        disposition_id: paloalto_syslog_threat_disposition_id(workspace.pan.Action),
+        finding_info: {
+            title: workspace.pan.ThreatName,
+            types: [workspace.pan.Subtype]
+        },
+        attack: {
+            technique: { name: workspace.pan.ThreatName }
+        },
+        src_endpoint: {
+            ip:   workspace.pan.SourceAddress,
+            port: to_int(workspace.pan.SourcePort)
+        },
+        dst_endpoint: {
+            ip:   workspace.pan.DestinationAddress,
+            port: to_int(workspace.pan.DestinationPort)
+        },
+        actor: { user: { name: workspace.pan.SourceUser } },
+        metadata: {
+            product: {
+                vendor_name: "Palo Alto Networks",
+                name:        "PAN-OS"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: GLOBALPROTECT → OCSF Authentication (3002)
+// ---------------------------------------------------------------------------
+//
+// GlobalProtect (VPN) sessions and authentication. PAN-OS 9.x+ uses a
+// dedicated GLOBALPROTECT log type with Stage / EventID / Description
+// fields rather than a generic THREAT-style schema.
+def process parse_paloalto_syslog_globalprotect {
+    workspace.pan = csv_parse(workspace.syslog.msg, [
+        "",                 // 1
+        "ReceiveTime",      // 2
+        "Serial",           // 3
+        "Type",             // 4
+        "",                 // 5
+        "",                 // 6
+        "GenerateTime",     // 7
+        "VirtualSystem",    // 8
+        "EventID",          // 9   gateway-connected / portal-prelogin / etc.
+        "Stage",            // 10  before-login / login / tunnel / disconnected
+        "AuthMethod",       // 11
+        "TunnelType",       // 12
+        "SourceUser",       // 13
+        "SourceRegion",     // 14
+        "MachineName",      // 15
+        "PublicIP",         // 16
+        "PublicIPv6",       // 17
+        "PrivateIP",        // 18
+        "PrivateIPv6",      // 19
+        "HostID",           // 20
+        "SerialNumber",     // 21
+        "ClientVersion",    // 22
+        "ClientOS",         // 23
+        "ClientOSVersion",  // 24
+        "RepeatCount",      // 25
+        "Reason",           // 26  failure reason / disconnect reason
+        "ErrorCode",        // 27
+        "Description"       // 28
+    ])
+    let activity = switch workspace.pan.Stage {
+        "before-login"  { 1 }
+        "login"         { 1 }
+        "tunnel"        { 1 }
+        "disconnected"  { 2 }
+        default         { 0 }
+    }
+    let status = switch workspace.pan.EventID {
+        "gateway-auth-failed"      { 2 }
+        "portal-auth-failed"       { 2 }
+        "gateway-connect-failed"   { 2 }
+        "tunnel-establish-failed"  { 2 }
+        default                    { 1 }
+    }
+    workspace.limpid = {
+        class_uid:    3002,
+        category_uid: 3,
+        activity_id:  activity,
+        severity_id:  1,
+        status_id:    status,
+        user: {
+            name: workspace.pan.SourceUser
+        },
+        src_endpoint: {
+            ip: workspace.pan.PublicIP
+        },
+        device: {
+            name: workspace.pan.MachineName,
+            uid:  workspace.pan.HostID,
+            os:   {
+                name:    workspace.pan.ClientOS,
+                version: workspace.pan.ClientOSVersion
+            }
+        },
+        message:  workspace.pan.Description,
+        metadata: {
+            product: {
+                vendor_name: "Palo Alto Networks",
+                name:        "PAN-OS"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtype leaf: AUTHENTICATION → OCSF Authentication (3002)
+// ---------------------------------------------------------------------------
+//
+// Admin / captive portal / authentication-policy-match events.
+def process parse_paloalto_syslog_authentication {
+    workspace.pan = csv_parse(workspace.syslog.msg, [
+        "",                  // 1
+        "ReceiveTime",       // 2
+        "Serial",            // 3
+        "Type",              // 4
+        "Subtype",           // 5  e.g. "auth-success" / "auth-fail"
+        "",                  // 6
+        "GenerateTime",      // 7
+        "VirtualSystem",     // 8
+        "SourceUser",        // 9
+        "NormalizedUser",    // 10
+        "ObjectName",        // 11
+        "AuthenticationPolicy", // 12
+        "RepeatCount",       // 13
+        "AuthenticationID",  // 14
+        "Vendor",            // 15  authentication server vendor
+        "LogAction",         // 16
+        "ServerProfile",     // 17
+        "Description",       // 18
+        "ClientType",        // 19
+        "EventType",         // 20  success / failure
+        "FactorNumber",      // 21
+        "SequenceNumber",    // 22
+        "ActionFlags",       // 23
+        "",                  // 24
+        "",                  // 25
+        "",                  // 26
+        "",                  // 27
+        "VirtualSystemName", // 28
+        "DeviceName",        // 29
+        "SourceAddress"      // 30
+    ])
+    let status = switch workspace.pan.EventType {
+        "success" { 1 }
+        "failure" { 2 }
+        default   { 0 }
+    }
+    workspace.limpid = {
+        class_uid:    3002,
+        category_uid: 3,
+        activity_id:  1,
+        severity_id:  1,
+        status_id:    status,
+        user: {
+            name: workspace.pan.SourceUser
+        },
+        src_endpoint: { ip: workspace.pan.SourceAddress },
+        message:      workspace.pan.Description,
+        metadata: {
+            product: {
+                vendor_name: "Palo Alto Networks",
+                name:        "PAN-OS"
+            },
+            version: "1.3.0"
+        }
+    }
+}
