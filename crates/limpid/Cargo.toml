@@ -1,6 +1,6 @@
 [package]
 name = "limpid"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 description = "Log pipelines, limpid as intent."
 license = "MIT OR Apache-2.0"
@@ -15,7 +15,12 @@ pest = "2"
 pest_derive = "2"
 anyhow = "1"
 thiserror = "2"
-tracing = "0.1"
+# `release_max_level_info` makes `trace!` / `debug!` macros compile to
+# no-ops in release builds, eliminating per-event tracing instrumentation
+# from the hot path (mach_absolute_time was 12% of on-CPU on multi-pipeline
+# v0.6.0 profiles). Operators relying on `trace!` / `debug!` output need
+# a debug build; `info!` / `warn!` / `error!` continue to fire.
+tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 regex-lite = "0.1"
