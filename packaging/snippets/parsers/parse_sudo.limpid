@@ -1,0 +1,429 @@
+// sudo parser
+//
+// Vendor:  sudo (the Sudo Project — sudo/sudoedit; not pfexec, not
+//          doas, not /bin/su; each of those would land in their own
+//          parser file).
+// Wire:    syslog-wrapped sudo messages —
+//          `<priority>timestamp host sudo[<pid>]: <body>`
+//          sudo on Linux can emit via syslog, journald, or its own
+//          log file. journald and syslog both carry the same body, so
+//          a single parser handles both — strip the wrapper with
+//          `syslog.parse(ingress)` and feed `workspace.syslog.msg`
+//          into this snippet. (For raw journald JSON-style ingress,
+//          replace `workspace.syslog.msg` below with the body source.)
+// Output:  OCSF Authorize Session (class_uid 3003) records on
+//          `workspace.limpid`.
+//
+// Sample inputs (RFC 3164 syslog wrapper around the sudo body):
+//
+//   Successful invocation (TTY-bearing terminal):
+//   <85>Apr 27 10:00:00 host sudo[12345]:    alice : TTY=pts/0 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/apt update
+//
+//   Successful invocation (no TTY — the journald-via-systemd path
+//   often omits TTY when the invoker has no controlling terminal):
+//   <85>Apr 27 10:00:00 host sudo[12345]:    alice : PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/ls
+//
+//   Auth failure (incorrect password):
+//   <85>Apr 27 10:00:00 host sudo[12345]:    alice : 3 incorrect password attempts ; TTY=pts/0 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/ls
+//
+//   Authorization denied (user not in sudoers):
+//   <85>Apr 27 10:00:00 host sudo[12345]:    mallory : user NOT in sudoers ; TTY=pts/0 ; PWD=/home/mallory ; USER=root ; COMMAND=/usr/bin/ls
+//
+//   Authorization denied (command not in the user's allowed list):
+//   <85>Apr 27 10:00:00 host sudo[12345]:    alice : command not allowed ; TTY=pts/0 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/sbin/reboot
+//
+//   PAM session opened (privilege activation marker):
+//   <85>Apr 27 10:00:00 host sudo[12345]: pam_unix(sudo:session): session opened for user root(uid=0) by alice(uid=1000)
+//
+//   PAM session closed (privilege deactivation marker):
+//   <85>Apr 27 10:00:00 host sudo[12345]: pam_unix(sudo:session): session closed for user root
+//
+// Each pattern populates `workspace.limpid` as an OCSF Authorize
+// Session (3003) record. Invocation lines map to activity_id=1
+// "Assign Privileges" (status=Success on a clean invocation,
+// status=Failure on auth or authorization denial). PAM session
+// open/close lines map to activity_id=2 "Activate Privileges" — they
+// mark the moment the elevated session starts/ends, which OCSF
+// "Activate" is the closest fit for among the 3003 enum values.
+//
+// Direct call (skip syslog wrapper, supply raw sudo body in
+// `ingress`): replace `workspace.syslog.msg` below with the source of
+// the body in your own dispatcher.
+//
+// Upstream filtering: PAM-pam_unix events from sudo are NOT noise the
+// way `pam_unix(sshd:session): ...` lines are for OpenSSH (the OpenSSH
+// parser uses `filter_openssh_journal` to drop those because sshd
+// already emits its own `Accepted` / `Disconnected` lines that cover
+// the same fact). For sudo the PAM session open/close ARE the only
+// markers of the elevated session lifetime, so we keep them and emit
+// 3003 records with activity_id=2.
+
+// ---------------------------------------------------------------------------
+// Vendor-specific helper: build the OCSF Authorize Session record so
+// each leaf below stays a 3-line dispatcher result rather than
+// repeating the 3003 envelope per pattern.
+// ---------------------------------------------------------------------------
+
+def function sudo_authorize_session_record(activity_id, status_id, severity_id, target_user, actor_user, message) {
+    {
+        class_uid:    3003,
+        category_uid: 3,
+        activity_id:  activity_id,
+        type_uid:     3003 * 100 + activity_id,
+        severity_id:  severity_id,
+        status_id:    status_id,
+        // OCSF 3003 Authorize Session models the privilege grant.
+        // sudo (without explicit privilege restrictions) effectively
+        // grants the full target user's authority — we list "ALL" so
+        // downstream sees a stable, non-empty privilege description
+        // rather than null.
+        privileges: ["ALL"],
+        user: { name: target_user },
+        actor: { user: { name: actor_user } },
+        message: message,
+        metadata: {
+            product: {
+                vendor_name: "Sudo Project",
+                name:        "sudo"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dispatcher: classify the sudo body and route to a leaf.
+//
+// Pattern matching is regex-based, like parse_openssh. The dispatcher
+// returns `{kind, fields}` and the top-level `parse_sudo` switches on
+// `kind`. Whitespace at the start of invocation lines (real-world
+// journald output indents the actor name by 2-4 spaces) is consumed
+// by the pattern so PRE/POST normalisation isn't needed.
+// ---------------------------------------------------------------------------
+
+def function parse_sudo_message(msg) {
+    // Auth failure precedes the regular invocation pattern in the
+    // dispatcher because both share the trailing `; TTY=... ; PWD=...
+    // ; USER=... ; COMMAND=...` shape; the failure variant is the
+    // longer, more specific match and must be tried first.
+    // sudo says `1 incorrect password attempt` (singular) and `2+
+    // incorrect password attempts` (plural). The trailing `s?` keeps
+    // both variants in one pattern.
+    let auth_failed = regex_parse(
+        msg,
+        "^\\s*(?P<actor>\\S+) : (?P<attempts>\\d+) incorrect password attempts? ; (?:TTY=(?P<tty>\\S+) ; )?PWD=(?P<pwd>\\S+) ; USER=(?P<target>\\S+) ; (?:ENV=(?P<env>[^;]*) ; )?COMMAND=(?P<command>.*)$"
+    )
+    let denied_sudoers = regex_parse(
+        msg,
+        "^\\s*(?P<actor>\\S+) : user NOT in sudoers ; (?:TTY=(?P<tty>\\S+) ; )?PWD=(?P<pwd>\\S+) ; USER=(?P<target>\\S+) ; (?:ENV=(?P<env>[^;]*) ; )?COMMAND=(?P<command>.*)$"
+    )
+    let denied_command = regex_parse(
+        msg,
+        "^\\s*(?P<actor>\\S+) : command not allowed ; (?:TTY=(?P<tty>\\S+) ; )?PWD=(?P<pwd>\\S+) ; USER=(?P<target>\\S+) ; (?:ENV=(?P<env>[^;]*) ; )?COMMAND=(?P<command>.*)$"
+    )
+    // `<actor> : a password is required ; ...` — sudo emits this when
+    // the invocation tried to run without authenticating (typical
+    // path: a script or non-interactive context where sudo cannot
+    // prompt) but sudoers requires a password for this user/command.
+    // Functionally an authentication failure: sudo refused to grant
+    // privileges because no password was provided.
+    let password_required = regex_parse(
+        msg,
+        "^\\s*(?P<actor>\\S+) : a password is required ; (?:TTY=(?P<tty>\\S+) ; )?PWD=(?P<pwd>\\S+) ; USER=(?P<target>\\S+) ; (?:ENV=(?P<env>[^;]*) ; )?COMMAND=(?P<command>.*)$"
+    )
+    let invocation = regex_parse(
+        msg,
+        "^\\s*(?P<actor>\\S+) : (?:TTY=(?P<tty>\\S+) ; )?PWD=(?P<pwd>\\S+) ; USER=(?P<target>\\S+) ; (?:ENV=(?P<env>[^;]*) ; )?COMMAND=(?P<command>.*)$"
+    )
+    // pam:session opened comes in three flavours across distros / pam
+    // versions:
+    //   modern:  `for user X(uid=N) by Y(uid=M)`         — both uids
+    //   older:   `for user X by Y(uid=N)`                — only the
+    //                                                      trailing uid
+    //                                                      (which carries
+    //                                                      the TARGET uid,
+    //                                                      not the actor's)
+    //   no-tty:  `for user X by (uid=N)`                 — actor name
+    //                                                      omitted (sudo
+    //                                                      invoked from a
+    //                                                      non-interactive
+    //                                                      context: cron,
+    //                                                      systemd unit,
+    //                                                      user= directive)
+    // Make uid groups optional and allow the actor to be empty.
+    let pam_session_open = regex_parse(
+        msg,
+        "^pam_unix\\(sudo:session\\): session opened for user (?P<target>\\S+)(?:\\(uid=(?P<target_uid>\\d+)\\))? by (?P<actor>\\S*)\\(uid=(?P<by_uid>\\d+)\\)$"
+    )
+    let pam_session_close = regex_parse(
+        msg,
+        "^pam_unix\\(sudo:session\\): session closed for user (?P<target>\\S+)$"
+    )
+    // pam:auth carries three distinct failure shapes that older sudo +
+    // pam_unix emit, often paired (same pid, several lines for a single
+    // bad attempt). All three are auth failures from OCSF's vantage —
+    // emit a 3003 record per line and let downstream correlation join
+    // by (host, pid).
+    //   classic: `authentication failure; logname=A uid=N euid=N tty=...
+    //             ruser=R rhost= user=U`
+    //   lookup:  `auth could not identify password for [user]`
+    //   convo:   `conversation failed`
+    let pam_auth_failure_classic = regex_parse(
+        msg,
+        "^pam_unix\\(sudo:auth\\): authentication failure; logname=(?P<logname>\\S*) uid=(?P<uid>\\d+) euid=(?P<euid>\\d+) tty=(?P<tty>\\S*) ruser=(?P<ruser>\\S*) rhost=(?P<rhost>\\S*) +user=(?P<user>\\S+)$"
+    )
+    let pam_auth_lookup_failed = regex_parse(
+        msg,
+        "^pam_unix\\(sudo:auth\\): auth could not identify password for \\[(?P<user>[^\\]]+)\\]$"
+    )
+    let pam_auth_conversation_failed = regex_match(
+        msg,
+        "^pam_unix\\(sudo:auth\\): conversation failed$"
+    )
+    // sudo splits a COMMAND= value that overflows syslog's 1024-byte
+    // line limit across multiple `(command continued) <rest>` lines.
+    // These are artefacts of the wire format, not standalone events —
+    // the original invocation line already carried the start of the
+    // command. Recognise them so the dispatcher can drop them
+    // explicitly rather than route them to error_log as unrecognised
+    // vocabulary.
+    let command_continued = regex_match(
+        msg,
+        "^\\s*\\S+ : \\(command continued\\) "
+    )
+    switch true {
+        auth_failed != null                  { { kind: "auth_failed",                 fields: auth_failed } }
+        denied_sudoers != null               { { kind: "denied_sudoers",              fields: denied_sudoers } }
+        denied_command != null               { { kind: "denied_command",              fields: denied_command } }
+        password_required != null            { { kind: "password_required",           fields: password_required } }
+        invocation != null                   { { kind: "invocation",                  fields: invocation } }
+        pam_session_open != null             { { kind: "pam_session_open",            fields: pam_session_open } }
+        pam_session_close != null            { { kind: "pam_session_close",           fields: pam_session_close } }
+        pam_auth_failure_classic != null     { { kind: "pam_auth_failure_classic",    fields: pam_auth_failure_classic } }
+        pam_auth_lookup_failed != null       { { kind: "pam_auth_lookup_failed",      fields: pam_auth_lookup_failed } }
+        pam_auth_conversation_failed         { { kind: "pam_auth_conversation_failed" } }
+        command_continued                    { { kind: "command_continued" } }
+        default                              { { kind: "unknown" } }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Top-level dispatcher
+// ---------------------------------------------------------------------------
+
+def process parse_sudo {
+    workspace.syslog = syslog.parse(ingress)
+    workspace.sudo   = parse_sudo_message(workspace.syslog.msg)
+    switch workspace.sudo.kind {
+        "invocation"        { process parse_sudo_invocation }
+        "auth_failed"       { process parse_sudo_auth_failed }
+        "denied_sudoers"    { process parse_sudo_denied_sudoers }
+        "denied_command"       { process parse_sudo_denied_command }
+        "password_required"    { process parse_sudo_password_required }
+        "pam_session_open"            { process parse_sudo_pam_session_open }
+        "pam_session_close"           { process parse_sudo_pam_session_close }
+        "pam_auth_failure_classic"    { process parse_sudo_pam_auth_failure_classic }
+        "pam_auth_lookup_failed"      { process parse_sudo_pam_auth_lookup_failed }
+        "pam_auth_conversation_failed" { process parse_sudo_pam_auth_conversation_failed }
+        // `(command continued) ...` lines are wire-format
+        // continuations of the previous invocation; the original line
+        // already captured the operationally meaningful fact.
+        // Dropping them is the right behaviour — emitting them as
+        // separate 3003 records would create duplicate / fragmented
+        // entries downstream.
+        "command_continued" { drop }
+        default             { error "parse_sudo: unrecognised body: ${workspace.syslog.msg}" }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: invocation success
+// → 3003 / Assign Privileges / Success
+// ---------------------------------------------------------------------------
+
+def process parse_sudo_invocation {
+    workspace.limpid = sudo_authorize_session_record(
+        1,  // activity_id: Assign Privileges
+        1,  // status_id:   Success
+        1,  // severity_id: Informational
+        workspace.sudo.fields.target,
+        workspace.sudo.fields.actor,
+        workspace.sudo.fields.command
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: auth failure (3 incorrect password attempts)
+// → 3003 / Assign Privileges / Failure (Medium severity — interactive
+//   brute-force probe signal)
+// ---------------------------------------------------------------------------
+
+def process parse_sudo_auth_failed {
+    workspace.limpid = sudo_authorize_session_record(
+        1,  // activity_id: Assign Privileges (denied)
+        2,  // status_id:   Failure
+        3,  // severity_id: Medium
+        workspace.sudo.fields.target,
+        workspace.sudo.fields.actor,
+        "${workspace.sudo.fields.attempts} incorrect password attempts; command was ${workspace.sudo.fields.command}"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: invoker not in sudoers (authorization denial — escalation
+//       attempt by an unprivileged user)
+// → 3003 / Assign Privileges / Failure (Medium severity)
+// ---------------------------------------------------------------------------
+
+def process parse_sudo_denied_sudoers {
+    workspace.limpid = sudo_authorize_session_record(
+        1,  // activity_id: Assign Privileges (denied)
+        2,  // status_id:   Failure
+        3,  // severity_id: Medium — non-sudoer attempting privilege
+        workspace.sudo.fields.target,
+        workspace.sudo.fields.actor,
+        "user NOT in sudoers; command was ${workspace.sudo.fields.command}"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: command not in the user's allowed list (authorization denial
+//       within sudoers — user has SOME privileges but not THIS one)
+// → 3003 / Assign Privileges / Failure (Low severity — authorised
+//   user hitting a guard rail; expected operational noise)
+// ---------------------------------------------------------------------------
+
+def process parse_sudo_denied_command {
+    workspace.limpid = sudo_authorize_session_record(
+        1,  // activity_id: Assign Privileges (denied)
+        2,  // status_id:   Failure
+        2,  // severity_id: Low
+        workspace.sudo.fields.target,
+        workspace.sudo.fields.actor,
+        "command not allowed; command was ${workspace.sudo.fields.command}"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: PAM session opened (elevated session start)
+// → 3003 / Activate Privileges / Success
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Leaf: password is required (sudo could not prompt or no auth provided)
+// → 3003 / Assign Privileges / Failure (Medium severity)
+//
+// Modern sudo emits this when sudoers requires a password for the
+// user/command but the invocation didn't authenticate (script /
+// non-interactive context, no terminal to prompt on, no ticket
+// cached). Functionally equivalent to an auth failure from the
+// privilege-grant perspective.
+// ---------------------------------------------------------------------------
+
+def process parse_sudo_password_required {
+    workspace.limpid = sudo_authorize_session_record(
+        1,  // activity_id: Assign Privileges (denied)
+        2,  // status_id:   Failure
+        3,  // severity_id: Medium
+        workspace.sudo.fields.target,
+        workspace.sudo.fields.actor,
+        "a password is required; command was ${workspace.sudo.fields.command}"
+    )
+}
+
+def process parse_sudo_pam_session_open {
+    workspace.limpid = sudo_authorize_session_record(
+        2,  // activity_id: Activate Privileges
+        1,  // status_id:   Success
+        1,  // severity_id: Informational
+        workspace.sudo.fields.target,
+        workspace.sudo.fields.actor,
+        "pam:session opened"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: PAM session closed (elevated session end)
+// → 3003 / Activate Privileges / Success — same activity_id as open;
+//   "Deactivate" is not in the OCSF 1.3.0 3003 enum, so the session
+//   close is modelled as the closing edge of the same Activate event.
+//   Operators distinguish open vs close via the `message` field below.
+// ---------------------------------------------------------------------------
+
+def process parse_sudo_pam_session_close {
+    workspace.limpid = sudo_authorize_session_record(
+        2,  // activity_id: Activate Privileges (closing edge)
+        1,  // status_id:   Success
+        1,  // severity_id: Informational
+        workspace.sudo.fields.target,
+        // pam:session close lines do NOT carry the actor — sudo
+        // emits only `for user X`, no `by Y`. Use null for the actor
+        // and let downstream correlation join close-to-open events.
+        null,
+        "pam:session closed"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: classic pam_unix(sudo:auth): authentication failure
+// → 3003 / Assign Privileges / Failure (Medium severity)
+//
+// Older sudo + pam_unix emit a verbose KV-style line on each failed
+// password attempt:
+//   `authentication failure; logname=A uid=N euid=N tty=T ruser=R
+//    rhost= user=U`
+// `user=` is the principal whose password was checked (= the actor),
+// not the target user — sudo's invocation line carries the target.
+// ---------------------------------------------------------------------------
+
+def process parse_sudo_pam_auth_failure_classic {
+    workspace.limpid = sudo_authorize_session_record(
+        1,    // activity_id: Assign Privileges (denied)
+        2,    // status_id:   Failure
+        3,    // severity_id: Medium
+        null, // target unknown at this PAM line; correlate by pid
+        workspace.sudo.fields.user,
+        "pam:auth authentication failure (uid=${workspace.sudo.fields.uid}, tty=${workspace.sudo.fields.tty})"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: pam_unix(sudo:auth): auth could not identify password for [user]
+// → 3003 / Assign Privileges / Failure (Medium severity)
+//
+// Emitted when the PAM module cannot match the supplied password
+// against the user's hash. Often paired with the classic
+// `authentication failure` line in the same sudo[pid] sequence.
+// ---------------------------------------------------------------------------
+
+def process parse_sudo_pam_auth_lookup_failed {
+    workspace.limpid = sudo_authorize_session_record(
+        1,    // activity_id: Assign Privileges (denied)
+        2,    // status_id:   Failure
+        3,    // severity_id: Medium
+        null,
+        workspace.sudo.fields.user,
+        "pam:auth could not identify password"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: pam_unix(sudo:auth): conversation failed
+// → 3003 / Assign Privileges / Failure (Low severity)
+//
+// PAM conversation between sudo and the user broke (Ctrl-C at the
+// password prompt, terminal closed, EOF on stdin). No actor / target
+// in the message itself; downstream correlation by (host, pid, time)
+// joins these to the surrounding pam:auth / invocation lines.
+// ---------------------------------------------------------------------------
+
+def process parse_sudo_pam_auth_conversation_failed {
+    workspace.limpid = sudo_authorize_session_record(
+        1,    // activity_id: Assign Privileges (denied)
+        2,    // status_id:   Failure
+        2,    // severity_id: Low — usually benign abort
+        null,
+        null,
+        "pam:auth conversation failed"
+    )
+}
