@@ -23,12 +23,12 @@ pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(
         "hostname",
         FunctionSig::fixed(&[], FieldType::String),
-        |_args, _event| {
+        |arena, _args, _event| {
             let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 gethostname::gethostname().to_string_lossy().into_owned()
             }));
             Ok(match result {
-                Ok(h) => Value::String(h),
+                Ok(h) => Value::String(arena.alloc_str(&h)),
                 Err(_) => Value::Null,
             })
         },
@@ -38,12 +38,13 @@ pub fn register(reg: &mut FunctionRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::Event;
+    use crate::dsl::arena::EventArena;
+    use crate::event::OwnedEvent;
     use bytes::Bytes;
     use std::net::SocketAddr;
 
-    fn dummy_event() -> Event {
-        Event::new(
+    fn dummy_owned() -> OwnedEvent {
+        OwnedEvent::new(
             Bytes::from("test"),
             "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         )
@@ -51,10 +52,13 @@ mod tests {
 
     #[test]
     fn returns_non_empty_string() {
+        let bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
         let mut reg = FunctionRegistry::new();
         register(&mut reg);
-        let e = dummy_event();
-        let v = reg.call(None, "hostname", &[], &e).unwrap();
+        let owned = dummy_owned();
+        let bevent = owned.view_in(&arena);
+        let v = reg.call(None, "hostname", &[], &bevent, &arena).unwrap();
         let Value::String(s) = v else { panic!() };
         assert!(!s.is_empty(), "hostname() returned empty string");
     }

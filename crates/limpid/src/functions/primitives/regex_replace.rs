@@ -17,14 +17,15 @@ pub fn register(reg: &mut FunctionRegistry) {
             &[FieldType::String, FieldType::String, FieldType::String],
             FieldType::String,
         ),
-        |args, _event| {
+        |arena, args, _event| {
             let target = val_to_str(&args[0])?;
             let pattern = val_to_str(&args[1])?;
             let replacement = val_to_str(&args[2])?;
             match get_cached_regex(&pattern) {
-                Ok(re) => Ok(Value::String(
-                    re.replace_all(&target, replacement.as_str()).into_owned(),
-                )),
+                Ok(re) => {
+                    let out = re.replace_all(&target, replacement.as_str()).into_owned();
+                    Ok(Value::String(arena.alloc_str(&out)))
+                }
                 Err(e) => bail!("invalid regex: {}", e),
             }
         },

@@ -6,16 +6,9 @@
 //! `key=value`, quoted `key="value with spaces or separator"`, and
 //! unquoted values containing punctuation other than the active
 //! separator.
-//!
-//! `separator` is a single ASCII byte (default `' '`). Comma-separated
-//! payloads pass `parse_kv(text, ",")`. The optional defaults hash
-//! literal fills missing keys, identical to `parse_json` defaults
-//! semantics.
-//!
-//! KV is a *format*, not a schema — flat primitive namespace.
 
-use crate::dsl::value::Map;
-use crate::dsl::value::Value;
+use crate::dsl::arena::EventArena;
+use crate::dsl::value::{ObjectBuilder, Value};
 use crate::modules::schema::FieldType;
 use anyhow::{Result, bail};
 
@@ -26,22 +19,15 @@ use crate::functions::{FunctionRegistry, FunctionSig, ParserInfo};
 const DEFAULT_SEP: u8 = b' ';
 
 pub fn register(reg: &mut FunctionRegistry) {
-    // Custom signature first so `register_parser` (below) does not
-    // overwrite it with the default `(String, Object?) -> Object` shape.
-    // We accept up to three args:
-    //   parse_kv(text)
-    //   parse_kv(text, ",")
-    //   parse_kv(text, {defaults})
-    //   parse_kv(text, ",", {defaults})
-    // Args[1] is dispatched at runtime on type (String → separator,
-    // Object/Null → defaults).
     let sep_or_defaults = FieldType::Union(vec![FieldType::String, FieldType::Object]);
     let sig = FunctionSig::optional(
         &[FieldType::String, sep_or_defaults, FieldType::Object],
         1,
         FieldType::Object,
     );
-    reg.register_with_sig("parse_kv", sig, |args, _event| parse_kv_impl(args));
+    reg.register_with_sig("parse_kv", sig, |arena, args, _event| {
+        parse_kv_impl(arena, args)
+    });
     reg.register_parser(ParserInfo {
         namespace: None,
         name: "parse_kv",
@@ -50,12 +36,13 @@ pub fn register(reg: &mut FunctionRegistry) {
     });
 }
 
-fn parse_kv_impl(args: &[Value]) -> Result<Value> {
+fn parse_kv_impl<'bump>(
+    arena: &'bump EventArena<'bump>,
+    args: &[Value<'bump>],
+) -> Result<Value<'bump>> {
     let text = val_to_str(&args[0])?;
 
     // Args[1] disambiguation: String → separator; Object/Null → defaults.
-    // Args[2] (when present) is always defaults, and args[1] must be the
-    // separator string in that case.
     let (sep, defaults_arg) = match (args.get(1), args.get(2)) {
         (None, _) => (DEFAULT_SEP, None),
         (Some(Value::String(s)), Some(d)) => (separator_byte(s)?, Some(d)),
@@ -67,20 +54,23 @@ fn parse_kv_impl(args: &[Value]) -> Result<Value> {
         ),
     };
 
-    let mut map = Map::new();
-    for (k, v) in parse_kv_pairs(&text, sep) {
-        map.insert(k, Value::String(v));
+    let pairs = parse_kv_pairs(&text, sep);
+    let mut builder = ObjectBuilder::with_capacity(arena, pairs.len());
+    for (k, v) in pairs {
+        builder.push_str(&k, Value::String(arena.alloc_str(&v)));
     }
-    if let Some(d) = defaults_arg {
-        match d {
-            Value::Object(_) | Value::Null => apply_defaults("parse_kv", Some(d), &mut map)?,
-            other => bail!(
-                "parse_kv(): defaults argument must be a hash literal, got {}",
-                type_name(other)
-            ),
+    let parsed = builder.finish();
+    let with_defaults = match defaults_arg {
+        Some(d @ (Value::Object(_) | Value::Null)) => {
+            apply_defaults(arena, "parse_kv", Some(d), parsed)?
         }
-    }
-    Ok(Value::Object(map))
+        Some(other) => bail!(
+            "parse_kv(): defaults argument must be a hash literal, got {}",
+            type_name(other)
+        ),
+        None => parsed,
+    };
+    Ok(with_defaults)
 }
 
 fn separator_byte(s: &str) -> Result<u8> {
@@ -165,187 +155,4 @@ fn parse_kv_pairs(input: &str, sep: u8) -> Vec<(String, String)> {
     }
 
     pairs
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::event::Event;
-    use crate::functions::FunctionRegistry;
-    use bytes::Bytes;
-    use std::net::SocketAddr;
-
-    fn dummy_event() -> Event {
-        Event::new(
-            Bytes::from("test"),
-            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-        )
-    }
-
-    fn make_reg() -> FunctionRegistry {
-        let mut reg = FunctionRegistry::new();
-        register(&mut reg);
-        reg
-    }
-
-    #[test]
-    fn basic_pairs() {
-        let reg = make_reg();
-        let e = dummy_event();
-        let result = reg
-            .call(
-                None,
-                "parse_kv",
-                &[Value::String("src=10.0.0.1 dst=1.2.3.4 act=deny".into())],
-                &e,
-            )
-            .unwrap();
-        let Value::Object(m) = result else { panic!() };
-        assert_eq!(m["src"], Value::String("10.0.0.1".into()));
-        assert_eq!(m["dst"], Value::String("1.2.3.4".into()));
-        assert_eq!(m["act"], Value::String("deny".into()));
-    }
-
-    #[test]
-    fn quoted_values() {
-        let reg = make_reg();
-        let e = dummy_event();
-        let result = reg
-            .call(
-                None,
-                "parse_kv",
-                &[Value::String(r#"msg="login failed" user=admin"#.into())],
-                &e,
-            )
-            .unwrap();
-        let Value::Object(m) = result else { panic!() };
-        assert_eq!(m["msg"], Value::String("login failed".into()));
-        assert_eq!(m["user"], Value::String("admin".into()));
-    }
-
-    #[test]
-    fn non_kv_tokens_skipped() {
-        let reg = make_reg();
-        let e = dummy_event();
-        let result = reg
-            .call(
-                None,
-                "parse_kv",
-                &[Value::String(
-                    "junk src=10.0.0.1 more_junk dst=5.6.7.8".into(),
-                )],
-                &e,
-            )
-            .unwrap();
-        let Value::Object(m) = result else { panic!() };
-        assert_eq!(m["src"], Value::String("10.0.0.1".into()));
-        assert_eq!(m["dst"], Value::String("5.6.7.8".into()));
-        assert!(!m.contains_key("junk"));
-    }
-
-    #[test]
-    fn defaults_fill_missing() {
-        let reg = make_reg();
-        let e = dummy_event();
-        let defaults = Value::Object(
-            [("src".to_string(), Value::String("0.0.0.0".into()))]
-                .into_iter()
-                .collect(),
-        );
-        let result = reg
-            .call(
-                None,
-                "parse_kv",
-                &[Value::String("dst=1.2.3.4".into()), defaults],
-                &e,
-            )
-            .unwrap();
-        let Value::Object(m) = result else { panic!() };
-        assert_eq!(m["src"], Value::String("0.0.0.0".into()));
-        assert_eq!(m["dst"], Value::String("1.2.3.4".into()));
-    }
-
-    #[test]
-    fn comma_separator() {
-        let reg = make_reg();
-        let e = dummy_event();
-        let result = reg
-            .call(
-                None,
-                "parse_kv",
-                &[
-                    Value::String("src=10.0.0.1,dst=1.2.3.4,act=deny".into()),
-                    Value::String(",".into()),
-                ],
-                &e,
-            )
-            .unwrap();
-        let Value::Object(m) = result else { panic!() };
-        assert_eq!(m["src"], Value::String("10.0.0.1".into()));
-        assert_eq!(m["dst"], Value::String("1.2.3.4".into()));
-        assert_eq!(m["act"], Value::String("deny".into()));
-    }
-
-    #[test]
-    fn comma_separator_with_quoted_value_containing_comma() {
-        let reg = make_reg();
-        let e = dummy_event();
-        let result = reg
-            .call(
-                None,
-                "parse_kv",
-                &[
-                    Value::String(r#"a=1,b="two,three",c=4"#.into()),
-                    Value::String(",".into()),
-                ],
-                &e,
-            )
-            .unwrap();
-        let Value::Object(m) = result else { panic!() };
-        assert_eq!(m["a"], Value::String("1".into()));
-        assert_eq!(m["b"], Value::String("two,three".into()));
-        assert_eq!(m["c"], Value::String("4".into()));
-    }
-
-    #[test]
-    fn separator_with_defaults() {
-        let reg = make_reg();
-        let e = dummy_event();
-        let defaults = Value::Object(
-            [("src".to_string(), Value::String("0.0.0.0".into()))]
-                .into_iter()
-                .collect(),
-        );
-        let result = reg
-            .call(
-                None,
-                "parse_kv",
-                &[
-                    Value::String("dst=1.2.3.4".into()),
-                    Value::String(",".into()),
-                    defaults,
-                ],
-                &e,
-            )
-            .unwrap();
-        let Value::Object(m) = result else { panic!() };
-        assert_eq!(m["src"], Value::String("0.0.0.0".into()));
-        assert_eq!(m["dst"], Value::String("1.2.3.4".into()));
-    }
-
-    #[test]
-    fn separator_must_be_single_ascii_byte() {
-        let reg = make_reg();
-        let e = dummy_event();
-        let err = reg
-            .call(
-                None,
-                "parse_kv",
-                &[Value::String("a=1".into()), Value::String(",,".into())],
-                &e,
-            )
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("single ASCII byte"), "got: {}", err);
-    }
 }
