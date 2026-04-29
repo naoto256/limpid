@@ -115,28 +115,6 @@ in non-default arms) to start emitting DLQ entries that pre-fix
 were silently absorbed; configure `control { error_log "..." }`
 if you haven't already to capture them.
 
-### Changed — compose_ocsf class leaves extended
-
-Per-class `compose_ocsf_<class>` leaves grew the field set they
-forward from `workspace.limpid.*`, driven by the parser additions
-above. The leaves still strip `null` keys via `null_omit` so
-parsers that don't populate a slot don't emit a noisy `"key":
-null` in the output.
-
-| Class | Newly forwarded fields |
-|---|---|
-| 3002 Authentication | (was already comprehensive — no change) |
-| 3003 Authorize Session | `status_id`, `actor` |
-| 4002 HTTP Activity | `status_id`, `actor` |
-| 4009 Email Activity | `status_id` |
-| 6003 API Activity | `status_id`, `actor`, `http_request`, `cloud`, `unmapped` |
-
-Other class leaves (1001 / 1007 / 1008 / 1009 / 2002 / 2003 / 2004 /
-2005 / 3001 / 3005 / 3006 / 4001 / 4003 / 4004 / 4005 / 4006 / 4007 /
-4008 / 4010 / 6004 / 6005 / 6007) are at the same field set as v0.6.0
-— they ship populated by the existing leaf shape, and parsers added
-in this release happened not to touch them.
-
 ### Notes
 
 - DSL syntax: unchanged.

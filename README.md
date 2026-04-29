@@ -169,6 +169,30 @@ installation, .deb packaging, and systemd integration.
 `file` · `http` · `kafka` · `tcp` · `udp` · `unix_socket` · `stdout` ·
 `otlp`
 
+### Snippets
+
+Curated parser / composer / filter library, installed under
+`/usr/share/limpid/snippets/` and `include`-able by absolute path.
+Debuts in **v0.7.0**:
+
+- **Parsers (11)** — security devices / cloud audit:
+  `parse_fortigate_cef` · `parse_fortigate_syslog` ·
+  `parse_paloalto_cef` · `parse_paloalto_syslog` · `parse_asa` ·
+  `parse_cloudtrail`. Server / host: `parse_openssh` · `parse_sudo` ·
+  `parse_combined_log` (Apache / Nginx) · `parse_postfix` ·
+  `parse_winevent_json`. Vendor-neutral: `parse_ocsf`.
+- **Composers (2)** — `compose_ocsf` (OCSF 1.3.0 priority set, 27
+  classes, dispatched by `workspace.limpid.class_uid`) ·
+  `compose_replayable` (replay-shape capture).
+- **Filters (1)** — `filter_openssh_journal` (drops PAM session
+  double-count noise from journald sshd streams).
+
+Each parser writes to the canonical `workspace.limpid.*`
+intermediate; `compose_ocsf` reads from it and emits OCSF JSON to
+`egress`. Two `include` lines + a two-stage pipeline gets vendor
+logs into a SIEM / data lake in OCSF form. Full reference:
+[Snippet Library](docs/src/snippets/README.md).
+
 ### Functions
 
 There are several types of expression functions you can call from
