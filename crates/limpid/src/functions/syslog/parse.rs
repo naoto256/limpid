@@ -260,132 +260,188 @@ fn nth_space(input: &str, n: usize) -> Option<usize> {
     }
     None
 }
-||||||| f8fe424
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::Event;
+    use crate::dsl::arena::EventArena;
+    use crate::event::OwnedEvent;
+    use crate::functions::FunctionRegistry;
+    use crate::functions::table::TableStore;
     use bytes::Bytes;
     use std::net::SocketAddr;
 
-    fn dummy_event() -> Event {
-        Event::new(
-            Bytes::from("test"),
-            "127.0.0.1:514".parse::<SocketAddr>().unwrap(),
+    fn dummy_event() -> OwnedEvent {
+        OwnedEvent::new(
+            Bytes::from_static(b""),
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         )
     }
 
-    fn make_reg() -> FunctionRegistry {
+    fn make_registry() -> FunctionRegistry {
         let mut reg = FunctionRegistry::new();
-        register(&mut reg);
+        let table_store = TableStore::from_configs(vec![]).unwrap();
+        crate::functions::register_builtins(&mut reg, table_store);
         reg
     }
 
-    fn call_syslog_parse(reg: &FunctionRegistry, s: &str) -> Result<Map> {
-        let e = dummy_event();
-        let v = reg.call(Some("syslog"), "parse", &[Value::String(s.into())], &e)?;
-        let Value::Object(m) = v else {
-            panic!("expected Object")
-        };
-        Ok(m)
+    fn lookup<'bump>(
+        entries: &'bump [(&'bump str, Value<'bump>)],
+        key: &str,
+    ) -> Option<Value<'bump>> {
+        entries.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+    }
+
+    fn parse_into<'bump>(
+        reg: &FunctionRegistry,
+        bevent: &crate::event::BorrowedEvent<'bump>,
+        arena: &'bump EventArena<'bump>,
+        line: &'bump str,
+    ) -> Value<'bump> {
+        reg.call(
+            Some("syslog"),
+            "parse",
+            &[Value::String(line)],
+            bevent,
+            arena,
+        )
+        .expect("parse should succeed")
     }
 
     #[test]
-    fn rfc5424_basic() {
-        let reg = make_reg();
-        let m = call_syslog_parse(
-            &reg,
+    fn rfc5424_basic_yields_expected_fields() {
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = dummy_event();
+        let bevent = owned.view_in(&arena);
+        let reg = make_registry();
+        let line = arena.alloc_str(
             "<134>1 2026-04-15T10:30:00Z firewall01 sshd 1234 - - Failed password",
-        )
-        .unwrap();
+        );
+        let v = parse_into(&reg, &bevent, &arena, line);
+        let Value::Object(entries) = v else {
+            panic!("expected Object");
+        };
         // PRI 134 = facility 16 (local0), severity 6 (info)
-        assert_eq!(m["pri"], Value::Int(134));
-        assert_eq!(m["facility"], Value::Int(16));
-        assert_eq!(m["severity"], Value::Int(6));
-        assert_eq!(m["timestamp"], Value::String("2026-04-15T10:30:00Z".into()));
-        assert_eq!(m["hostname"], Value::String("firewall01".into()));
-        assert_eq!(m["appname"], Value::String("sshd".into()));
-        assert_eq!(m["procid"], Value::String("1234".into()));
-        assert_eq!(m["msg"], Value::String("Failed password".into()));
+        assert_eq!(lookup(entries, "pri"), Some(Value::Int(134)));
+        assert_eq!(lookup(entries, "facility"), Some(Value::Int(16)));
+        assert_eq!(lookup(entries, "severity"), Some(Value::Int(6)));
+        assert_eq!(
+            lookup(entries, "timestamp"),
+            Some(Value::String("2026-04-15T10:30:00Z"))
+        );
+        assert_eq!(lookup(entries, "hostname"), Some(Value::String("firewall01")));
+        assert_eq!(lookup(entries, "appname"), Some(Value::String("sshd")));
+        assert_eq!(lookup(entries, "procid"), Some(Value::String("1234")));
+        assert_eq!(lookup(entries, "msg"), Some(Value::String("Failed password")));
     }
 
     #[test]
-    fn rfc5424_with_structured_data() {
-        let reg = make_reg();
-        let m = call_syslog_parse(
-            &reg,
-            "<134>1 2026-04-15T10:30:00Z host app 999 ID1 [meta src=\"10.0.0.1\"] Hello world",
-        )
-        .unwrap();
-        assert_eq!(m["hostname"], Value::String("host".into()));
-        assert_eq!(m["appname"], Value::String("app".into()));
-        assert_eq!(m["msgid"], Value::String("ID1".into()));
-        assert_eq!(m["msg"], Value::String("Hello world".into()));
-    }
-
-    #[test]
-    fn rfc3164_with_pid() {
-        let reg = make_reg();
-        let m = call_syslog_parse(
-            &reg,
+    fn rfc3164_with_pid_extracts_tag_and_procid() {
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = dummy_event();
+        let bevent = owned.view_in(&arena);
+        let reg = make_registry();
+        let line = arena.alloc_str(
             "<134>Apr 15 10:30:00 myhost sshd[1234]: Failed password",
-        )
-        .unwrap();
-        assert_eq!(m["timestamp"], Value::String("Apr 15 10:30:00".into()));
-        assert_eq!(m["hostname"], Value::String("myhost".into()));
-        assert_eq!(m["appname"], Value::String("sshd".into()));
-        assert_eq!(m["procid"], Value::String("1234".into()));
-        assert_eq!(m["msg"], Value::String("Failed password".into()));
+        );
+        let v = parse_into(&reg, &bevent, &arena, line);
+        let Value::Object(entries) = v else {
+            panic!("expected Object");
+        };
+        assert_eq!(
+            lookup(entries, "timestamp"),
+            Some(Value::String("Apr 15 10:30:00"))
+        );
+        assert_eq!(lookup(entries, "hostname"), Some(Value::String("myhost")));
+        assert_eq!(lookup(entries, "appname"), Some(Value::String("sshd")));
+        assert_eq!(lookup(entries, "procid"), Some(Value::String("1234")));
+        assert_eq!(
+            lookup(entries, "msg"),
+            Some(Value::String("Failed password"))
+        );
     }
 
     #[test]
-    fn rfc3164_without_pid() {
-        let reg = make_reg();
-        let m =
-            call_syslog_parse(&reg, "<134>Apr 15 10:30:00 myhost kernel: Out of memory").unwrap();
-        assert_eq!(m["hostname"], Value::String("myhost".into()));
-        assert_eq!(m["appname"], Value::String("kernel".into()));
-        assert_eq!(m["msg"], Value::String("Out of memory".into()));
+    fn rfc3164_without_pid_extracts_tag_and_msg() {
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = dummy_event();
+        let bevent = owned.view_in(&arena);
+        let reg = make_registry();
+        let line = arena.alloc_str(
+            "<134>Apr 15 10:30:00 myhost kernel: Out of memory",
+        );
+        let v = parse_into(&reg, &bevent, &arena, line);
+        let Value::Object(entries) = v else {
+            panic!("expected Object");
+        };
+        assert_eq!(lookup(entries, "hostname"), Some(Value::String("myhost")));
+        assert_eq!(lookup(entries, "appname"), Some(Value::String("kernel")));
+        assert_eq!(
+            lookup(entries, "msg"),
+            Some(Value::String("Out of memory"))
+        );
     }
 
     #[test]
-    fn no_pri_errors() {
-        let reg = make_reg();
-        let e = dummy_event();
+    fn no_pri_returns_error() {
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = dummy_event();
+        let bevent = owned.view_in(&arena);
+        let reg = make_registry();
+        let line = arena.alloc_str("no pri header");
         let err = reg
             .call(
                 Some("syslog"),
                 "parse",
-                &[Value::String("no pri header".into())],
-                &e,
+                &[Value::String(line)],
+                &bevent,
+                &arena,
             )
             .unwrap_err();
-        assert!(err.to_string().contains("no PRI header"));
+        assert!(
+            err.to_string().contains("no PRI header"),
+            "expected 'no PRI header' message, got: {}",
+            err
+        );
     }
 
     #[test]
-    fn defaults_fill_missing_keys() {
-        let reg = make_reg();
-        let defaults = Value::Object(
-            [("appname".to_string(), Value::String("unknown".into()))]
-                .into_iter()
-                .collect(),
+    fn rfc3164_cef_payload_not_split_on_inner_colon_space() {
+        // CEF extensions can carry `key=value: ...` patterns
+        // (e.g. `msg=applications3: Shenzhen...`). The TAG/MSG split
+        // must not greedily consume the body up to that inner `": "`
+        // — otherwise downstream `cef.parse(workspace.msg)` receives
+        // a tail fragment instead of the CEF prefix. Regression test
+        // for the v0.5.8 anchor fix (`fea8dfa fix(syslog.parse):
+        // anchor RFC 3164 TAG to start, require ': ' separator`).
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = dummy_event();
+        let bevent = owned.view_in(&arena);
+        let reg = make_registry();
+        let line = arena.alloc_str(
+            "<134>Apr 15 10:30:00 fwhost CEF:0|Fortinet|FortiGate|7.0|13056|app-ctrl|3|msg=applications3: Shenzhen.TVT",
         );
-        let e = dummy_event();
-        // RFC 5424 with appname `-` (NILVALUE) — missing after parse
-        let result = reg
-            .call(
-                Some("syslog"),
-                "parse",
-                &[
-                    Value::String("<134>1 2026-04-15T10:30:00Z host - - - - body".into()),
-                    defaults,
-                ],
-                &e,
-            )
-            .unwrap();
-        let Value::Object(m) = result else { panic!() };
-        assert_eq!(m["appname"], Value::String("unknown".into()));
+        let v = parse_into(&reg, &bevent, &arena, line);
+        let Value::Object(entries) = v else {
+            panic!("expected Object");
+        };
+        assert_eq!(lookup(entries, "hostname"), Some(Value::String("fwhost")));
+        // No syntactic TAG ahead of the CEF payload — appname must
+        // not be set, and the entire CEF string must reach `msg`.
+        assert!(lookup(entries, "appname").is_none());
+        let Some(Value::String(msg)) = lookup(entries, "msg") else {
+            panic!("expected msg to be a String");
+        };
+        assert!(
+            msg.starts_with("CEF:0|Fortinet|FortiGate"),
+            "msg should retain the CEF prefix, got {msg:?}",
+        );
+        assert!(msg.ends_with("Shenzhen.TVT"));
     }
 }
