@@ -38,9 +38,11 @@ output is achieved by freely combining `process`es.
 ### So what is a `process`?
 
 A reusable chunk of pipeline logic — small, named, drop-in. You write
-them yourself, or you include them from a snippet library (a curated
-collection shipping with the 0.7 series). Here is what
-`compose_ocsf_finding` looks like under the hood:
+them yourself, or you include them from the snippet library (a curated
+collection that debuts in **v0.7.0**: 11 vendor parsers, the OCSF
+1.3.0 27-class composer, and the replay-shape composer; full list in
+[Snippet Library](docs/src/snippets/README.md)). Here is what an OCSF
+Detection Finding composer leaf looks like under the hood:
 
 ```limpid
 def process compose_ocsf_finding {

@@ -10,87 +10,148 @@ prefix.
 
 ```
 /usr/share/limpid/snippets/
-├─ _common/          shared helpers (format detection, CEF header,
-│                    proto / severity normalisers, vendor dispatcher)
-├─ parsers/          per-vendor parsers (FortiGate, Check Point,
-│                    Palo Alto, MDE, Azure WAF in v0.5.0)
-└─ composers/        OCSF class-specific composers
-                     (Network Activity 4001, Detection Finding 2004
-                     in v0.5.0; more to follow)
+├─ parsers/      per-vendor / per-format parsers writing to
+│                workspace.limpid.* (the parser ↔ composer
+│                canonical intermediate)
+├─ composers/    target-schema composers reading from
+│                workspace.limpid.* (currently OCSF 1.3.0;
+│                also the replay-shape composer for parser
+│                regression capture)
+└─ filters/      pre-parser noise filters (drop / pass-through
+                 by content predicate)
 ```
+
+## What's included (v0.7.0)
+
+### Parsers (11)
+
+| File | Source | OCSF class(es) emitted |
+|---|---|---|
+| **Security devices / cloud audit** | | |
+| `parsers/parse_fortigate_cef.limpid` | FortiGate (CEF wrap) | 4001 / 2004 / 3002 / 6002 |
+| `parsers/parse_fortigate_syslog.limpid` | FortiGate (native KV syslog) | (same as CEF) |
+| `parsers/parse_paloalto_cef.limpid` | PAN-OS (CEF wrap) | 4001 / 2004 / 6004 / 3002 |
+| `parsers/parse_paloalto_syslog.limpid` | PAN-OS (native CSV syslog) | (same as CEF) |
+| `parsers/parse_asa.limpid` | Cisco ASA / FTD-in-ASA-mode (syslog) | 3002 / 4001 |
+| `parsers/parse_cloudtrail.limpid` | AWS CloudTrail (JSON) | 6003 API Activity |
+| **Server / host systems** | | |
+| `parsers/parse_openssh.limpid` | OpenSSH `sshd` (syslog / journald) | 3002 Authentication |
+| `parsers/parse_sudo.limpid` | sudo (syslog / journald) | 3003 Authorize Session |
+| `parsers/parse_combined_log.limpid` | Apache / Nginx access log (combined format) | 4002 HTTP Activity |
+| `parsers/parse_postfix.limpid` | Postfix MTA (syslog) | 4009 Email Activity |
+| `parsers/parse_winevent_json.limpid` | Windows Security event log (NXLog / Vector / Winlogbeat JSON) | 3002 / 1007 / 3001 / 3006 |
+| **Vendor-neutral** | | |
+| `parsers/parse_ocsf.limpid` | OCSF JSON inbound (any vendor's prior compose_ocsf output) | passthrough (any class) |
+
+Each parser's docstring records:
+- the wire format and any wrapper assumptions (RFC 3164 syslog, JSON
+  framing, etc.);
+- per-message-ID / per-subtype OCSF mappings;
+- the test corpus the parser was verified against (real / public /
+  synthetic) and per-shape parse-rate;
+- `NOTE`-flagged subtypes that are documented from the vendor's spec
+  but not yet exercised against live data — verify before relying on
+  them in production.
+
+### Composers (2)
+
+- `composers/compose_ocsf.limpid` — dispatches by
+  `workspace.limpid.class_uid` to per-class leaves, covering the
+  OCSF 1.3.0 priority set (27 classes). Each leaf strips `null`
+  keys via `null_omit` and writes OCSF JSON to `egress`.
+- `composers/compose_replayable.limpid` — minimal `{received_at,
+  source, ingress}` shape that round-trips through `inject --json`
+  for parser regression / replay capture.
+
+### Filters (1)
+
+- `filters/filter_openssh_journal.limpid` — drops `pam_unix(sshd:session):
+  session opened/closed` PAM noise from journald-sourced sshd
+  streams. sshd already emits its own `Accepted ...` /
+  `Disconnected ...` lines that cover the same authentication fact;
+  the PAM duplicate would double-count.
 
 ## Quick start
 
 Drop a snippet into your `/etc/limpid/limpid.conf`:
 
 ```limpid
-include "/usr/share/limpid/snippets/parsers/fortigate.limpid"
-include "/usr/share/limpid/snippets/composers/ocsf_network_activity.limpid"
+include "/usr/share/limpid/snippets/parsers/parse_fortigate_cef.limpid"
+include "/usr/share/limpid/snippets/composers/compose_ocsf.limpid"
 
 def input fw_syslog {
-    type syslog_udp
+    type syslog_tcp
     bind "0.0.0.0:514"
 }
 
 def output ama {
     type tcp
-    addr "127.0.0.1:28330"
+    address "127.0.0.1:28330"
 }
 
 def pipeline fw_to_ocsf {
     input fw_syslog
-    process parse_fortigate | compose_ocsf_network_activity
+    process parse_fortigate_cef | compose_ocsf
     output ama
 }
 ```
 
-That's it. The parser snippet declares its own dependencies on shared
-helpers (`_common/cef.limpid`, `_common/proto.limpid`); the loader
-resolves them recursively, so the user only includes the **entry
-points** they actually want.
+That's it. The parser writes to `workspace.limpid.*` (canonical
+OCSF-shape intermediate); the composer reads from `workspace.limpid.*`
+and writes OCSF JSON to `egress`. Add `output` to your SIEM /
+data-lake destination (Sentinel, Splunk, Security Lake, OTLP, …)
+and you're shipping OCSF.
 
 ## Design principles
 
-The library follows three conventions, documented at length in
-`docs/src/processing/user-defined.md` and `_PLAN_V050_SNIPPET_LIBRARY.md`:
+The library follows two contracts, documented at length in
+`docs/src/processing/user-defined.md`:
 
-1. **Re-entrant self-healing** — every parser / composer can be called
-   at any layer (leaf, vendor dispatcher, format dispatcher) and
-   produces the same egress. Each layer null-checks its prerequisites
-   and pulls them in via `process` calls if absent. Helpers run
-   exactly once thanks to the workspace-state guard.
-2. **Positionless collections** — arrays in the DSL have no `arr[n]`
-   syntax. Element identity (via `find_by` / `foreach`) is the only
-   addressing model; mutation is `append` / `prepend` only. The
-   library never relies on element position.
-3. **Schema knowledge in DSL, not Rust** — vendor-specific quirks
-   (FortiGate vs Check Point CEF protocol numbering, severity
-   string variants) live in `_common/*.limpid` helpers, not in
-   the limpid runtime. New vendors are pure-DSL additions.
+1. **`workspace.limpid` is the parser ↔ composer canonical
+   intermediate.** Parsers populate `workspace.limpid.*` only with
+   OCSF-canonical fields. Vendor intermediates (`workspace.cef`,
+   `workspace.syslog`, `workspace.pf`, `workspace.ct`, etc.) are
+   parser-private and the composer never reads them. This keeps the
+   composer schema-aware (it knows OCSF) without it being
+   vendor-aware (it never sees CEF / FortiGate quirks).
+2. **Loud-fail-fast on unsupported vocabulary.** Each parser's
+   dispatcher routes events with shapes / subtypes / message IDs
+   the snippet does not handle to `error_log` (DLQ) via the `error`
+   keyword, with an operator-readable message. Silent zero-mapping
+   is forbidden — if a vendor adds a field or a new subtype, the
+   operator sees it in the DLQ on day one and decides whether to
+   extend the snippet or update the upstream allow-list.
 
-## Pipeline granularity
+## Pipeline shape
 
-Every parser exposes three entry points; pick whichever matches your
-event stream:
+Parsers expect to receive raw events on `ingress` and produce
+canonical OCSF-shape on `workspace.limpid.*`. The typical pipeline
+is two stages:
 
-| Granularity | Example | When to use |
-|-------------|---------|-------------|
-| **Leaf** (zero dispatch cost) | `parse_fortigate_cef_traffic` | You know the format and subtype |
-| **Vendor** (subtype auto-detect) | `parse_fortigate` | You know the vendor; format / subtype vary per event |
-| **All-CEF** (vendor auto-detect) | `parse_cef` | Mixed-vendor CEF stream from a single collector |
+```
+process <vendor_parser> | compose_ocsf
+```
 
-All three produce identical OCSF output for a given input. Composers
-work the same way — `compose_ocsf` dispatches on `workspace.class_uid`,
-or you can call `compose_ocsf_<class>` directly.
+For mixed-vendor / mixed-format inputs, dispatch upstream of the
+parser with a `switch contains(ingress, "...")` block, calling the
+appropriate parser per branch. (See the test scaffolding under
+`_check_*.limpid` in the repo root for working examples.)
 
 ## Authoring conventions
 
-If you contribute a new snippet, see the internal style guide in
-`_PLAN_V050_SNIPPET_LIBRARY.md`. Highlights:
+If you contribute a new snippet, see the per-file headers for
+the canonical shape:
 
-- One file per vendor (parsers) / per OCSF class (composers).
-- File header: vendor / source description, link to spec, sample event.
-- Every `def process` carries `@requires` / `@produces` doc comments.
-- Helpers go in `_common/`, prefixed with `_` to signal "internal".
-- Use `include` only at the top of the file; the loader resolves the
-  graph recursively (no manual ordering required).
+- File header: `// Vendor: ...` / `// Wire: ...` / `// Output: ...`
+  block at the top, followed by per-shape sample lines (anonymised
+  to RFC 5321 / 5737 forms — `example.com`, `192.0.2.x`,
+  `198.51.100.x`).
+- Each `def process` body is single-responsibility (header parse,
+  dispatch, per-leaf record build); the dispatcher handles
+  unsupported vocabulary with `error "<operator-readable msg>"`.
+- Helpers (`def function ...`) carry their per-vendor mapping
+  tables (severity → OCSF severity_id, action → activity_id, etc.).
+- Files are one per (vendor, format). FortiGate has two files
+  (`parse_fortigate_cef` + `parse_fortigate_syslog`) because CEF
+  and native KV are different wire shapes; OpenSSH is one file
+  because sshd's wire is one shape across syslog and journald.
