@@ -144,7 +144,12 @@ def process parse_fortigate_syslog_event {
 // Common metadata builder — used by every leaf below
 // ---------------------------------------------------------------------------
 
-def function fortigate_syslog_metadata(devname, version_hint) {
+// FortiGate native syslog only flows from FortiGate appliances, so
+// vendor / product are constants. `version_hint` is the firmware
+// version from the syslog body's `osname` field when populated; older
+// firmware that doesn't emit `osname` falls back to null and the
+// composer's null-handling decides whether to keep the key.
+def function fortigate_syslog_metadata(version_hint) {
     {
         product: {
             vendor_name: "Fortinet",
@@ -185,7 +190,7 @@ def process parse_fortigate_syslog_traffic {
             bytes_in:  to_int(workspace.kv.rcvdbyte),
             bytes_out: to_int(workspace.kv.sentbyte)
         },
-        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+        metadata: fortigate_syslog_metadata(workspace.kv.osname)
     }
 }
 
@@ -224,7 +229,7 @@ def process parse_fortigate_syslog_utm_ips {
             port: to_int(workspace.kv.dstport)
         },
         message:  workspace.kv.msg,
-        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+        metadata: fortigate_syslog_metadata(workspace.kv.osname)
     }
 }
 
@@ -268,7 +273,7 @@ def process parse_fortigate_syslog_utm_webfilter {
             user: { name: workspace.kv.user }
         },
         message:  workspace.kv.msg,
-        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+        metadata: fortigate_syslog_metadata(workspace.kv.osname)
     }
 }
 
@@ -317,7 +322,7 @@ def process parse_fortigate_syslog_utm_antivirus {
             port: to_int(workspace.kv.dstport)
         },
         message:  workspace.kv.msg,
-        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+        metadata: fortigate_syslog_metadata(workspace.kv.osname)
     }
 }
 
@@ -356,7 +361,7 @@ def process parse_fortigate_syslog_utm_dlp {
             port: to_int(workspace.kv.dstport)
         },
         message:  workspace.kv.msg,
-        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+        metadata: fortigate_syslog_metadata(workspace.kv.osname)
     }
 }
 
@@ -390,7 +395,7 @@ def process parse_fortigate_syslog_utm_appctrl {
             port: to_int(workspace.kv.dstport)
         },
         message:  workspace.kv.msg,
-        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+        metadata: fortigate_syslog_metadata(workspace.kv.osname)
     }
 }
 
@@ -426,7 +431,7 @@ def process parse_fortigate_syslog_utm_dns {
             type:     workspace.kv.qtype
         },
         message:  workspace.kv.msg,
-        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+        metadata: fortigate_syslog_metadata(workspace.kv.osname)
     }
 }
 
@@ -455,7 +460,7 @@ def process parse_fortigate_syslog_utm_emailfilter {
             message_uid: workspace.kv.msgid
         },
         message:  workspace.kv.msg,
-        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+        metadata: fortigate_syslog_metadata(workspace.kv.osname)
     }
 }
 
@@ -497,7 +502,7 @@ def process parse_fortigate_syslog_utm_waf {
             port: to_int(workspace.kv.dstport)
         },
         message:  workspace.kv.msg,
-        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+        metadata: fortigate_syslog_metadata(workspace.kv.osname)
     }
 }
 
@@ -532,7 +537,7 @@ def process parse_fortigate_syslog_event_user {
         user: { name: workspace.kv.user },
         src_endpoint: { ip: workspace.kv.srcip },
         message:  workspace.kv.msg,
-        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+        metadata: fortigate_syslog_metadata(workspace.kv.osname)
     }
 }
 
@@ -561,7 +566,7 @@ def process parse_fortigate_syslog_event_vpn {
         user: { name: workspace.kv.user },
         src_endpoint: { ip: workspace.kv.srcip },
         message:  workspace.kv.msg,
-        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+        metadata: fortigate_syslog_metadata(workspace.kv.osname)
     }
 }
 
@@ -582,7 +587,7 @@ def process parse_fortigate_syslog_event_system {
             user: { name: workspace.kv.user }
         },
         message:  workspace.kv.msg,
-        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+        metadata: fortigate_syslog_metadata(workspace.kv.osname)
     }
 }
 
@@ -611,6 +616,6 @@ def process parse_fortigate_syslog_event_wireless {
             mac: workspace.kv.apmac
         },
         message:  workspace.kv.msg,
-        metadata: fortigate_syslog_metadata(workspace.kv.devname, workspace.kv.osname)
+        metadata: fortigate_syslog_metadata(workspace.kv.osname)
     }
 }
