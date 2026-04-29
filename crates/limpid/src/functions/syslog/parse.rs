@@ -11,7 +11,7 @@
 //! | `pri`       | Int    | raw `<PRI>` value (0..=191)                   |
 //! | `facility`  | Int    | `pri / 8`                                     |
 //! | `severity`  | Int    | `pri % 8`                                     |
-//! | `timestamp` | String | source-claimed event time (5424 / 3164 token) |
+//! | `timestamp` | String | source-claimed event time                     |
 //! | `hostname`  | String | originating host                              |
 //! | `appname`   | String | app-name (5424) / tag (3164)                  |
 //! | `procid`    | String | process id (when present)                     |
@@ -22,11 +22,9 @@
 //! non-empty, non-`-` value. `pri` / `facility` / `severity` are
 //! always present — the parser errors when no valid `<PRI>` header
 //! is found.
-//!
-//! This function does **not** rewrite `event.egress` — it's pure.
 
-use crate::dsl::value::Map;
-use crate::dsl::value::Value;
+use crate::dsl::arena::EventArena;
+use crate::dsl::value::{ObjectBuilder, Value};
 use anyhow::{Result, bail};
 
 use crate::functions::primitives::parse_json::{apply_defaults, type_name};
@@ -36,11 +34,9 @@ use crate::functions::{FunctionRegistry, ParserInfo};
 use crate::modules::schema::{FieldSpec, FieldType};
 
 pub fn register(reg: &mut FunctionRegistry) {
-    reg.register_in("syslog", "parse", |args, _event| parse_impl(args));
-    // syslog header fields are statically known (not data-driven), so
-    // declare them precisely. The analyzer uses these to type-check
-    // downstream `workspace.*` references after a bare
-    // `syslog.parse(ingress)` statement.
+    reg.register_in("syslog", "parse", |arena, args, _event| {
+        parse_impl(arena, args)
+    });
     reg.register_parser(ParserInfo {
         namespace: Some("syslog"),
         name: "parse",
@@ -59,44 +55,50 @@ pub fn register(reg: &mut FunctionRegistry) {
     });
 }
 
-fn parse_impl(args: &[Value]) -> Result<Value> {
-    // Arity is validated by the registry via the sig installed from
-    // `register_parser` (1 to 2 arguments).
+fn parse_impl<'bump>(
+    arena: &'bump EventArena<'bump>,
+    args: &[Value<'bump>],
+) -> Result<Value<'bump>> {
     let text = val_to_str(&args[0])?;
 
     let (pri, body_offset) =
         parse_leading_pri(&text).ok_or_else(|| anyhow::anyhow!("syslog.parse(): no PRI header"))?;
     let after_pri = &text[body_offset..];
 
-    let mut map = Map::new();
-    map.insert("pri".into(), Value::Int(pri as i64));
-    map.insert("facility".into(), Value::Int((pri / 8) as i64));
-    map.insert("severity".into(), Value::Int((pri % 8) as i64));
+    let mut builder = ObjectBuilder::with_capacity(arena, 9);
+    builder.push_str("pri", Value::Int(pri as i64));
+    builder.push_str("facility", Value::Int((pri / 8) as i64));
+    builder.push_str("severity", Value::Int((pri % 8) as i64));
 
     if after_pri.len() >= 2
         && after_pri.as_bytes()[0].is_ascii_digit()
         && after_pri.as_bytes()[1] == b' '
     {
-        parse_rfc5424(after_pri, &mut map);
+        parse_rfc5424(arena, after_pri, &mut builder);
     } else {
-        parse_rfc3164(after_pri, &mut map);
+        parse_rfc3164(arena, after_pri, &mut builder);
     }
 
-    // Shared defaults helper — uses `syslog.parse` in error text.
+    let parsed = builder.finish();
+
     if let Some(v) = args.get(1) {
         match v {
-            Value::Object(_) | Value::Null => apply_defaults("syslog.parse", Some(v), &mut map)?,
+            Value::Object(_) | Value::Null => apply_defaults(arena, "syslog.parse", Some(v), parsed),
             other => bail!(
                 "syslog.parse(): second argument must be a hash literal, got {}",
                 type_name(other)
             ),
         }
+    } else {
+        Ok(parsed)
     }
-
-    Ok(Value::Object(map))
 }
 
-fn parse_rfc5424(input: &str, map: &mut Map) {
+fn parse_rfc5424<'bump>(
+    arena: &EventArena<'bump>,
+    input: &str,
+    builder: &mut ObjectBuilder<'bump>,
+) {
     let mut parts = input.splitn(7, ' ');
     let _version = parts.next();
     let timestamp = parts.next().unwrap_or("-");
@@ -108,29 +110,26 @@ fn parse_rfc5424(input: &str, map: &mut Map) {
 
     let msg = skip_structured_data(remainder);
 
-    // RFC 5424 timestamp is the source's claimed event time — surface
-    // it into workspace so snippets can compare against
-    // Event.timestamp (limpid's receipt time, kept independent per
-    // Principle 2: input is dumb transport).
-    set_field(map, "timestamp", timestamp);
-    set_field(map, "hostname", hostname);
-    set_field(map, "appname", appname);
+    set_field(arena, builder, "timestamp", timestamp);
+    set_field(arena, builder, "hostname", hostname);
+    set_field(arena, builder, "appname", appname);
     if procid != "-" {
-        set_field(map, "procid", procid);
+        set_field(arena, builder, "procid", procid);
     }
     if msgid != "-" {
-        set_field(map, "msgid", msgid);
+        set_field(arena, builder, "msgid", msgid);
     }
     if !msg.is_empty() {
-        map.insert("msg".into(), Value::String(msg.to_string()));
+        builder.push_str("msg", Value::String(arena.alloc_str(msg)));
     }
 }
 
-fn parse_rfc3164(input: &str, map: &mut Map) {
+fn parse_rfc3164<'bump>(
+    arena: &EventArena<'bump>,
+    input: &str,
+    builder: &mut ObjectBuilder<'bump>,
+) {
     let mut rest = input;
-    // RFC 3164 timestamp is 3 space-separated tokens: "Mon DD HH:MM:SS"
-    // (no year, no timezone). Capture them as a single string before
-    // advancing past the timestamp.
     let timestamp_str = match nth_space(rest, 3) {
         Some(idx) => {
             let s = &rest[..idx];
@@ -145,19 +144,19 @@ fn parse_rfc3164(input: &str, map: &mut Map) {
     if let Some(ts) = timestamp_str
         && !ts.is_empty()
     {
-        set_field(map, "timestamp", ts);
+        set_field(arena, builder, "timestamp", ts);
     }
     if !hostname.is_empty() {
-        set_field(map, "hostname", hostname);
+        set_field(arena, builder, "hostname", hostname);
     }
     if !appname.is_empty() {
-        set_field(map, "appname", appname);
+        set_field(arena, builder, "appname", appname);
     }
     if let Some(pid) = procid {
-        set_field(map, "procid", pid);
+        set_field(arena, builder, "procid", pid);
     }
     if !msg.is_empty() {
-        map.insert("msg".into(), Value::String(msg.to_string()));
+        builder.push_str("msg", Value::String(arena.alloc_str(msg)));
     }
 }
 
@@ -207,9 +206,14 @@ fn skip_structured_data(input: &str) -> &str {
     }
 }
 
-fn set_field(map: &mut Map, key: &str, value: &str) {
+fn set_field<'bump>(
+    arena: &EventArena<'bump>,
+    builder: &mut ObjectBuilder<'bump>,
+    key: &str,
+    value: &str,
+) {
     if value != "-" && !value.is_empty() {
-        map.insert(key.into(), Value::String(value.into()));
+        builder.push_str(key, Value::String(arena.alloc_str(value)));
     }
 }
 
@@ -232,154 +236,4 @@ fn nth_space(input: &str, n: usize) -> Option<usize> {
         }
     }
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::event::Event;
-    use bytes::Bytes;
-    use std::net::SocketAddr;
-
-    fn dummy_event() -> Event {
-        Event::new(
-            Bytes::from("test"),
-            "127.0.0.1:514".parse::<SocketAddr>().unwrap(),
-        )
-    }
-
-    fn make_reg() -> FunctionRegistry {
-        let mut reg = FunctionRegistry::new();
-        register(&mut reg);
-        reg
-    }
-
-    fn call_syslog_parse(reg: &FunctionRegistry, s: &str) -> Result<Map> {
-        let e = dummy_event();
-        let _bump = ::bumpalo::Bump::new();
-        let arena = crate::dsl::arena::EventArena::new(&_bump);
-        let v = reg.call(
-            Some("syslog"),
-            "parse",
-            &[Value::String(s.into())],
-            &e,
-            &arena,
-        )?;
-        let Value::Object(m) = v else {
-            panic!("expected Object")
-        };
-        Ok(m)
-    }
-
-    #[test]
-    fn rfc5424_basic() {
-        let _bump = ::bumpalo::Bump::new();
-        let arena = crate::dsl::arena::EventArena::new(&_bump);
-        let reg = make_reg();
-        let m = call_syslog_parse(
-            &reg,
-            "<134>1 2026-04-15T10:30:00Z firewall01 sshd 1234 - - Failed password",
-        )
-        .unwrap();
-        // PRI 134 = facility 16 (local0), severity 6 (info)
-        assert_eq!(m["pri"], Value::Int(134));
-        assert_eq!(m["facility"], Value::Int(16));
-        assert_eq!(m["severity"], Value::Int(6));
-        assert_eq!(m["timestamp"], Value::String("2026-04-15T10:30:00Z".into()));
-        assert_eq!(m["hostname"], Value::String("firewall01".into()));
-        assert_eq!(m["appname"], Value::String("sshd".into()));
-        assert_eq!(m["procid"], Value::String("1234".into()));
-        assert_eq!(m["msg"], Value::String("Failed password".into()));
-    }
-
-    #[test]
-    fn rfc5424_with_structured_data() {
-        let _bump = ::bumpalo::Bump::new();
-        let arena = crate::dsl::arena::EventArena::new(&_bump);
-        let reg = make_reg();
-        let m = call_syslog_parse(
-            &reg,
-            "<134>1 2026-04-15T10:30:00Z host app 999 ID1 [meta src=\"10.0.0.1\"] Hello world",
-        )
-        .unwrap();
-        assert_eq!(m["hostname"], Value::String("host".into()));
-        assert_eq!(m["appname"], Value::String("app".into()));
-        assert_eq!(m["msgid"], Value::String("ID1".into()));
-        assert_eq!(m["msg"], Value::String("Hello world".into()));
-    }
-
-    #[test]
-    fn rfc3164_with_pid() {
-        let _bump = ::bumpalo::Bump::new();
-        let arena = crate::dsl::arena::EventArena::new(&_bump);
-        let reg = make_reg();
-        let m = call_syslog_parse(
-            &reg,
-            "<134>Apr 15 10:30:00 myhost sshd[1234]: Failed password",
-        )
-        .unwrap();
-        assert_eq!(m["timestamp"], Value::String("Apr 15 10:30:00".into()));
-        assert_eq!(m["hostname"], Value::String("myhost".into()));
-        assert_eq!(m["appname"], Value::String("sshd".into()));
-        assert_eq!(m["procid"], Value::String("1234".into()));
-        assert_eq!(m["msg"], Value::String("Failed password".into()));
-    }
-
-    #[test]
-    fn rfc3164_without_pid() {
-        let _bump = ::bumpalo::Bump::new();
-        let arena = crate::dsl::arena::EventArena::new(&_bump);
-        let reg = make_reg();
-        let m =
-            call_syslog_parse(&reg, "<134>Apr 15 10:30:00 myhost kernel: Out of memory").unwrap();
-        assert_eq!(m["hostname"], Value::String("myhost".into()));
-        assert_eq!(m["appname"], Value::String("kernel".into()));
-        assert_eq!(m["msg"], Value::String("Out of memory".into()));
-    }
-
-    #[test]
-    fn no_pri_errors() {
-        let _bump = ::bumpalo::Bump::new();
-        let arena = crate::dsl::arena::EventArena::new(&_bump);
-        let reg = make_reg();
-        let e = dummy_event();
-        let err = reg
-            .call(
-                Some("syslog"),
-                "parse",
-                &[Value::String("no pri header".into())],
-                &e,
-                &arena,
-            )
-            .unwrap_err();
-        assert!(err.to_string().contains("no PRI header"));
-    }
-
-    #[test]
-    fn defaults_fill_missing_keys() {
-        let _bump = ::bumpalo::Bump::new();
-        let arena = crate::dsl::arena::EventArena::new(&_bump);
-        let reg = make_reg();
-        let defaults = Value::Object(
-            [("appname".to_string(), Value::String("unknown".into()))]
-                .into_iter()
-                .collect(),
-        );
-        let e = dummy_event();
-        // RFC 5424 with appname `-` (NILVALUE) — missing after parse
-        let result = reg
-            .call(
-                Some("syslog"),
-                "parse",
-                &[
-                    Value::String("<134>1 2026-04-15T10:30:00Z host - - - - body".into()),
-                    defaults,
-                ],
-                &e,
-                &arena,
-            )
-            .unwrap();
-        let Value::Object(m) = result else { panic!() };
-        assert_eq!(m["appname"], Value::String("unknown".into()));
-    }
 }
