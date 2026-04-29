@@ -16,14 +16,21 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 
+use crate::dsl::arena::EventArena;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
-use crate::event::Event;
+use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
-use crate::modules::{HasMetrics, Module, Output};
+use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
+
+struct KafkaPayload {
+    egress: Bytes,
+    key: Option<String>,
+}
 
 pub struct KafkaOutput {
     producer: FutureProducer,
@@ -109,13 +116,22 @@ impl HasMetrics for KafkaOutput {
 
 #[async_trait::async_trait]
 impl Output for KafkaOutput {
-    async fn write(&self, event: &Event) -> Result<()> {
-        let payload = &event.egress;
+    fn render(
+        &self,
+        event: &BorrowedEvent<'_>,
+        _arena: &EventArena<'_>,
+    ) -> Result<RenderedPayload> {
+        let key = self.resolve_key_borrowed(event);
+        Ok(RenderedPayload::new(KafkaPayload {
+            egress: event.egress.clone(),
+            key,
+        }))
+    }
 
-        let key = self.resolve_key(event);
-
-        let mut record = FutureRecord::to(&self.topic).payload(payload.as_ref());
-        if let Some(ref k) = key {
+    async fn write(&self, payload: RenderedPayload) -> Result<()> {
+        let payload: KafkaPayload = payload.downcast()?;
+        let mut record = FutureRecord::to(&self.topic).payload(payload.egress.as_ref());
+        if let Some(ref k) = payload.key {
             record = record.key(k);
         }
 
@@ -138,15 +154,13 @@ impl Drop for KafkaOutput {
 }
 
 impl KafkaOutput {
-    fn resolve_key(&self, event: &Event) -> Option<String> {
+    fn resolve_key_borrowed(&self, event: &BorrowedEvent<'_>) -> Option<String> {
         let kf = self.key_field.as_ref()?;
         let value = match kf {
             KeyField::Source => event.source.ip().to_string(),
             KeyField::Field(name) => event
-                .workspace
-                .get(name)
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())?,
+                .workspace_get(name)
+                .and_then(|v| v.as_str().map(|s| s.to_string()))?,
         };
         Some(value)
     }

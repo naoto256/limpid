@@ -23,14 +23,26 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
+use bytes::Bytes;
+
 use crate::dsl::arena::EventArena;
 use crate::dsl::ast::{Expr, ExprKind, Property, TemplateFragment};
 use crate::dsl::eval::{eval_expr, value_to_string};
 use crate::dsl::props;
-use crate::event::Event;
+use crate::event::BorrowedEvent;
 use crate::functions::FunctionRegistry;
 use crate::metrics::OutputMetrics;
-use crate::modules::{HasMetrics, Module, Output};
+use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
+
+/// Per-event payload built by `FileOutput::render`. The expensive work
+/// (template eval against the per-event arena) lives in `render`; the
+/// async `write` path is left with a static `path` string and the
+/// refcounted `egress` bytes.
+struct FilePayload {
+    egress: Bytes,
+    path: String,
+    is_dynamic: bool,
+}
 
 pub struct FileOutput {
     /// Parsed path expression. A plain `Expr::StringLit` means a static
@@ -103,12 +115,27 @@ impl Output for FileOutput {
         self.funcs = Some(funcs);
     }
 
-    async fn write(&self, event: &Event) -> Result<()> {
-        let (resolved, is_dynamic) = self.render_path(event)?;
+    fn render(
+        &self,
+        event: &BorrowedEvent<'_>,
+        arena: &EventArena<'_>,
+    ) -> Result<RenderedPayload> {
+        let (resolved, is_dynamic) = self.render_path_in(event, arena)?;
+        Ok(RenderedPayload::new(FilePayload {
+            egress: event.egress.clone(),
+            path: resolved,
+            is_dynamic,
+        }))
+    }
+
+    async fn write(&self, payload: RenderedPayload) -> Result<()> {
+        let payload: FilePayload = payload.downcast()?;
+        let resolved = payload.path;
+        let is_dynamic = payload.is_dynamic;
         let path = PathBuf::from(&resolved);
 
         // Catch-all `..` reject. For Template paths this is redundant
-        // with `check_no_traversal` in `render_path`; for static
+        // with `check_no_traversal` in `render_path_in`; for static
         // `StringLit` paths (which skip render_path's safety passes)
         // this is the sole defence.
         for component in path.components() {
@@ -145,7 +172,7 @@ impl Output for FileOutput {
             .open(&path)
             .await?;
 
-        let msg = String::from_utf8_lossy(&event.egress);
+        let msg = String::from_utf8_lossy(&payload.egress);
         let mut buf = Vec::with_capacity(msg.len() + 1);
         buf.extend_from_slice(msg.as_bytes());
         buf.push(b'\n');
@@ -190,35 +217,27 @@ impl FileOutput {
     ///    (no filename component) errors before the auto-mkdir runs,
     ///    so a stray template like `/var/log/${workspace.host}/`
     ///    cannot create empty directories silently.
-    fn render_path(&self, event: &Event) -> Result<(String, bool)> {
+    fn render_path_in(
+        &self,
+        bevent: &BorrowedEvent<'_>,
+        arena: &EventArena<'_>,
+    ) -> Result<(String, bool)> {
         match &self.path.kind {
             ExprKind::StringLit(s) => Ok((s.clone(), false)),
             ExprKind::Template(fragments) => {
                 let funcs = self.funcs.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "output file: FunctionRegistry not attached — \
-                         dynamic path template requires attach_funcs() before write"
+                         dynamic path template requires attach_funcs() before render"
                     )
                 })?;
-                // The pipeline's per-event arena has already dropped by
-                // the time the output runs. Templating against `event`
-                // here just evaluates a small expression and produces
-                // owned `Value`s; a local arena is all we need.
-                let bump = bumpalo::Bump::new();
-                let arena = EventArena::new(&bump);
-                // Output runs after `run_pipeline` has dropped its
-                // per-event arena; the event we hold is heap-owned. Build
-                // a transient `BorrowedEvent` view in the local arena
-                // here so eval_expr can speak the same shape it does on
-                // the hot path.
-                let bevent = event.view_in(&arena);
                 let mut out = String::new();
                 for frag in fragments {
                     match frag {
                         TemplateFragment::Literal(s) => out.push_str(s),
                         TemplateFragment::Interp(expr) => {
                             let rendered =
-                                value_to_string(&eval_expr(expr, &bevent, funcs, &arena)?);
+                                value_to_string(&eval_expr(expr, bevent, funcs, arena)?);
                             // Pass 1: per-interp `/` `\` → `_` and reject empty.
                             // An empty interp would silently produce paths like
                             // `/foo//bar` or `/foo/.log` that almost never reflect
@@ -384,9 +403,19 @@ fn resolve_gid(name: &str) -> Result<u32> {
 mod tests {
     use super::*;
     use crate::dsl::value::OwnedValue;
+    use crate::event::Event;
     use crate::functions::table::TableStore;
-    use bytes::Bytes;
     use std::net::SocketAddr;
+
+    /// Test helper: resolve a path against an OwnedEvent without
+    /// duplicating arena boilerplate at every call site. Mirrors what
+    /// the old (pre-Step-B) `render_path(&Event)` did.
+    fn render_path_owned(out: &FileOutput, event: &Event) -> Result<(String, bool)> {
+        let bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let bevent = event.view_in(&arena);
+        out.render_path_in(&bevent, &arena)
+    }
 
     fn funcs() -> Arc<FunctionRegistry> {
         let mut reg = FunctionRegistry::new();
@@ -429,7 +458,11 @@ mod tests {
     #[test]
     fn render_static_path() {
         let out = make_output(ek(ExprKind::StringLit("/var/log/app.log".into())));
-        let (rendered, dynamic) = out.render_path(&event_with_workspace()).unwrap();
+        let bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = event_with_workspace();
+        let bevent = owned.view_in(&arena);
+        let (rendered, dynamic) = out.render_path_in(&bevent, &arena).unwrap();
         assert_eq!(rendered, "/var/log/app.log");
         assert!(!dynamic);
     }
@@ -443,7 +476,11 @@ mod tests {
             TemplateFragment::Interp(ek(ExprKind::Ident(vec!["source".into(), "ip".into()]))),
             TemplateFragment::Literal(".log".into()),
         ])));
-        let (rendered, dynamic) = out.render_path(&event_with_workspace()).unwrap();
+        let bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = event_with_workspace();
+        let bevent = owned.view_in(&arena);
+        let (rendered, dynamic) = out.render_path_in(&bevent, &arena).unwrap();
         assert_eq!(rendered, "/var/log/192.168.1.10.log");
         assert!(dynamic);
     }
@@ -457,7 +494,7 @@ mod tests {
             TemplateFragment::Interp(ek(ExprKind::Ident(vec!["workspace".into(), "ip".into()]))),
             TemplateFragment::Literal(".log".into()),
         ])));
-        let (rendered, _) = out.render_path(&event_with_workspace()).unwrap();
+        let (rendered, _) = render_path_owned(&out, &event_with_workspace()).unwrap();
         assert_eq!(rendered, "/var/log/10.0.0.1_24.log");
     }
 
@@ -471,7 +508,7 @@ mod tests {
             TemplateFragment::Interp(ek(ExprKind::Ident(vec!["source".into(), "ip".into()]))),
             TemplateFragment::Literal("-b".into()),
         ])));
-        let (rendered, _) = out.render_path(&event_with_workspace()).unwrap();
+        let (rendered, _) = render_path_owned(&out, &event_with_workspace()).unwrap();
         // source.ip is "192.168.1.10" — no slashes, no change. Principle
         // holds for hypothetical slash-bearing values.
         assert_eq!(rendered, "a-192.168.1.10-b");
@@ -494,7 +531,7 @@ mod tests {
             ]))),
             TemplateFragment::Literal(".log".into()),
         ])));
-        let err = out.render_path(&e).unwrap_err();
+        let err = render_path_owned(&out, &e).unwrap_err();
         assert!(
             err.to_string().contains("evaluated to empty"),
             "unexpected error: {}",
@@ -515,7 +552,7 @@ mod tests {
             TemplateFragment::Interp(ek(ExprKind::Ident(vec!["workspace".into(), "host".into()]))),
             TemplateFragment::Literal("/".into()),
         ])));
-        let err = out.render_path(&event_with_workspace()).unwrap_err();
+        let err = render_path_owned(&out, &event_with_workspace()).unwrap_err();
         assert!(
             err.to_string().contains("ends with `/`"),
             "unexpected error: {}",
@@ -536,7 +573,7 @@ mod tests {
         let out = make_output(ek(ExprKind::Template(vec![TemplateFragment::Interp(ek(
             ExprKind::Ident(vec!["workspace".into(), "v".into()]),
         ))])));
-        let err = out.render_path(&e).unwrap_err();
+        let err = render_path_owned(&out, &e).unwrap_err();
         assert!(
             err.to_string().contains("traversal component"),
             "unexpected error: {}",
@@ -550,7 +587,7 @@ mod tests {
             ExprKind::Ident(vec!["source".into()]),
         ))])));
         out.funcs = None;
-        let err = out.render_path(&event_with_workspace()).unwrap_err();
+        let err = render_path_owned(&out, &event_with_workspace()).unwrap_err();
         assert!(err.to_string().contains("FunctionRegistry not attached"));
     }
 
