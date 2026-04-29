@@ -106,38 +106,81 @@ def function parse_sudo_message(msg) {
     // dispatcher because both share the trailing `; TTY=... ; PWD=...
     // ; USER=... ; COMMAND=...` shape; the failure variant is the
     // longer, more specific match and must be tried first.
+    // sudo says `1 incorrect password attempt` (singular) and `2+
+    // incorrect password attempts` (plural). The trailing `s?` keeps
+    // both variants in one pattern.
     let auth_failed = regex_parse(
         msg,
-        "^\\s*(?P<actor>\\S+) : (?P<attempts>\\d+) incorrect password attempts ; (?:TTY=(?P<tty>\\S+) ; )?PWD=(?P<pwd>\\S+) ; USER=(?P<target>\\S+) ; COMMAND=(?P<command>.*)$"
+        "^\\s*(?P<actor>\\S+) : (?P<attempts>\\d+) incorrect password attempts? ; (?:TTY=(?P<tty>\\S+) ; )?PWD=(?P<pwd>\\S+) ; USER=(?P<target>\\S+) ; (?:ENV=(?P<env>[^;]*) ; )?COMMAND=(?P<command>.*)$"
     )
     let denied_sudoers = regex_parse(
         msg,
-        "^\\s*(?P<actor>\\S+) : user NOT in sudoers ; (?:TTY=(?P<tty>\\S+) ; )?PWD=(?P<pwd>\\S+) ; USER=(?P<target>\\S+) ; COMMAND=(?P<command>.*)$"
+        "^\\s*(?P<actor>\\S+) : user NOT in sudoers ; (?:TTY=(?P<tty>\\S+) ; )?PWD=(?P<pwd>\\S+) ; USER=(?P<target>\\S+) ; (?:ENV=(?P<env>[^;]*) ; )?COMMAND=(?P<command>.*)$"
     )
     let denied_command = regex_parse(
         msg,
-        "^\\s*(?P<actor>\\S+) : command not allowed ; (?:TTY=(?P<tty>\\S+) ; )?PWD=(?P<pwd>\\S+) ; USER=(?P<target>\\S+) ; COMMAND=(?P<command>.*)$"
+        "^\\s*(?P<actor>\\S+) : command not allowed ; (?:TTY=(?P<tty>\\S+) ; )?PWD=(?P<pwd>\\S+) ; USER=(?P<target>\\S+) ; (?:ENV=(?P<env>[^;]*) ; )?COMMAND=(?P<command>.*)$"
     )
     let invocation = regex_parse(
         msg,
-        "^\\s*(?P<actor>\\S+) : (?:TTY=(?P<tty>\\S+) ; )?PWD=(?P<pwd>\\S+) ; USER=(?P<target>\\S+) ; COMMAND=(?P<command>.*)$"
+        "^\\s*(?P<actor>\\S+) : (?:TTY=(?P<tty>\\S+) ; )?PWD=(?P<pwd>\\S+) ; USER=(?P<target>\\S+) ; (?:ENV=(?P<env>[^;]*) ; )?COMMAND=(?P<command>.*)$"
     )
+    // pam:session opened comes in three flavours across distros / pam
+    // versions:
+    //   modern:  `for user X(uid=N) by Y(uid=M)`         — both uids
+    //   older:   `for user X by Y(uid=N)`                — only the
+    //                                                      trailing uid
+    //                                                      (which carries
+    //                                                      the TARGET uid,
+    //                                                      not the actor's)
+    //   no-tty:  `for user X by (uid=N)`                 — actor name
+    //                                                      omitted (sudo
+    //                                                      invoked from a
+    //                                                      non-interactive
+    //                                                      context: cron,
+    //                                                      systemd unit,
+    //                                                      user= directive)
+    // Make uid groups optional and allow the actor to be empty.
     let pam_session_open = regex_parse(
         msg,
-        "^pam_unix\\(sudo:session\\): session opened for user (?P<target>\\S+)\\(uid=(?P<target_uid>\\d+)\\) by (?P<actor>\\S+)\\(uid=(?P<actor_uid>\\d+)\\)$"
+        "^pam_unix\\(sudo:session\\): session opened for user (?P<target>\\S+)(?:\\(uid=(?P<target_uid>\\d+)\\))? by (?P<actor>\\S*)\\(uid=(?P<by_uid>\\d+)\\)$"
     )
     let pam_session_close = regex_parse(
         msg,
         "^pam_unix\\(sudo:session\\): session closed for user (?P<target>\\S+)$"
     )
+    // pam:auth carries three distinct failure shapes that older sudo +
+    // pam_unix emit, often paired (same pid, several lines for a single
+    // bad attempt). All three are auth failures from OCSF's vantage —
+    // emit a 3003 record per line and let downstream correlation join
+    // by (host, pid).
+    //   classic: `authentication failure; logname=A uid=N euid=N tty=...
+    //             ruser=R rhost= user=U`
+    //   lookup:  `auth could not identify password for [user]`
+    //   convo:   `conversation failed`
+    let pam_auth_failure_classic = regex_parse(
+        msg,
+        "^pam_unix\\(sudo:auth\\): authentication failure; logname=(?P<logname>\\S*) uid=(?P<uid>\\d+) euid=(?P<euid>\\d+) tty=(?P<tty>\\S*) ruser=(?P<ruser>\\S*) rhost=(?P<rhost>\\S*) +user=(?P<user>\\S+)$"
+    )
+    let pam_auth_lookup_failed = regex_parse(
+        msg,
+        "^pam_unix\\(sudo:auth\\): auth could not identify password for \\[(?P<user>[^\\]]+)\\]$"
+    )
+    let pam_auth_conversation_failed = regex_match(
+        msg,
+        "^pam_unix\\(sudo:auth\\): conversation failed$"
+    )
     switch true {
-        auth_failed != null       { { kind: "auth_failed",       fields: auth_failed } }
-        denied_sudoers != null    { { kind: "denied_sudoers",    fields: denied_sudoers } }
-        denied_command != null       { { kind: "denied_command",       fields: denied_command } }
-        invocation != null        { { kind: "invocation",        fields: invocation } }
-        pam_session_open != null  { { kind: "pam_session_open",  fields: pam_session_open } }
-        pam_session_close != null { { kind: "pam_session_close", fields: pam_session_close } }
-        default                   { { kind: "unknown" } }
+        auth_failed != null                  { { kind: "auth_failed",                 fields: auth_failed } }
+        denied_sudoers != null               { { kind: "denied_sudoers",              fields: denied_sudoers } }
+        denied_command != null               { { kind: "denied_command",              fields: denied_command } }
+        invocation != null                   { { kind: "invocation",                  fields: invocation } }
+        pam_session_open != null             { { kind: "pam_session_open",            fields: pam_session_open } }
+        pam_session_close != null            { { kind: "pam_session_close",           fields: pam_session_close } }
+        pam_auth_failure_classic != null     { { kind: "pam_auth_failure_classic",    fields: pam_auth_failure_classic } }
+        pam_auth_lookup_failed != null       { { kind: "pam_auth_lookup_failed",      fields: pam_auth_lookup_failed } }
+        pam_auth_conversation_failed         { { kind: "pam_auth_conversation_failed" } }
+        default                              { { kind: "unknown" } }
     }
 }
 
@@ -153,8 +196,11 @@ def process parse_sudo {
         "auth_failed"       { process parse_sudo_auth_failed }
         "denied_sudoers"    { process parse_sudo_denied_sudoers }
         "denied_command"       { process parse_sudo_denied_command }
-        "pam_session_open"  { process parse_sudo_pam_session_open }
-        "pam_session_close" { process parse_sudo_pam_session_close }
+        "pam_session_open"            { process parse_sudo_pam_session_open }
+        "pam_session_close"           { process parse_sudo_pam_session_close }
+        "pam_auth_failure_classic"    { process parse_sudo_pam_auth_failure_classic }
+        "pam_auth_lookup_failed"      { process parse_sudo_pam_auth_lookup_failed }
+        "pam_auth_conversation_failed" { process parse_sudo_pam_auth_conversation_failed }
         default             { error "parse_sudo: unrecognised body: ${workspace.syslog.msg}" }
     }
 }
@@ -262,5 +308,69 @@ def process parse_sudo_pam_session_close {
         // and let downstream correlation join close-to-open events.
         null,
         "pam:session closed"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: classic pam_unix(sudo:auth): authentication failure
+// → 3003 / Assign Privileges / Failure (Medium severity)
+//
+// Older sudo + pam_unix emit a verbose KV-style line on each failed
+// password attempt:
+//   `authentication failure; logname=A uid=N euid=N tty=T ruser=R
+//    rhost= user=U`
+// `user=` is the principal whose password was checked (= the actor),
+// not the target user — sudo's invocation line carries the target.
+// ---------------------------------------------------------------------------
+
+def process parse_sudo_pam_auth_failure_classic {
+    workspace.limpid = sudo_authorize_session_record(
+        1,    // activity_id: Assign Privileges (denied)
+        2,    // status_id:   Failure
+        3,    // severity_id: Medium
+        null, // target unknown at this PAM line; correlate by pid
+        workspace.sudo.fields.user,
+        "pam:auth authentication failure (uid=${workspace.sudo.fields.uid}, tty=${workspace.sudo.fields.tty})"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: pam_unix(sudo:auth): auth could not identify password for [user]
+// → 3003 / Assign Privileges / Failure (Medium severity)
+//
+// Emitted when the PAM module cannot match the supplied password
+// against the user's hash. Often paired with the classic
+// `authentication failure` line in the same sudo[pid] sequence.
+// ---------------------------------------------------------------------------
+
+def process parse_sudo_pam_auth_lookup_failed {
+    workspace.limpid = sudo_authorize_session_record(
+        1,    // activity_id: Assign Privileges (denied)
+        2,    // status_id:   Failure
+        3,    // severity_id: Medium
+        null,
+        workspace.sudo.fields.user,
+        "pam:auth could not identify password"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: pam_unix(sudo:auth): conversation failed
+// → 3003 / Assign Privileges / Failure (Low severity)
+//
+// PAM conversation between sudo and the user broke (Ctrl-C at the
+// password prompt, terminal closed, EOF on stdin). No actor / target
+// in the message itself; downstream correlation by (host, pid, time)
+// joins these to the surrounding pam:auth / invocation lines.
+// ---------------------------------------------------------------------------
+
+def process parse_sudo_pam_auth_conversation_failed {
+    workspace.limpid = sudo_authorize_session_record(
+        1,    // activity_id: Assign Privileges (denied)
+        2,    // status_id:   Failure
+        2,    // severity_id: Low — usually benign abort
+        null,
+        null,
+        "pam:auth conversation failed"
     )
 }
