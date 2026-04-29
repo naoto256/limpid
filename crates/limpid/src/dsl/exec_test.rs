@@ -239,6 +239,127 @@ mod tests {
     }
 
     #[test]
+    fn let_binding_object_value_supports_dot_access() {
+        // `let f = { a: 7, b: 9 }; workspace.x = f.a; workspace.y = f.b`
+        // — dot-access on a let-bound Object resolves through the
+        // local scope and walks into the Object the same way
+        // workspace.x.y would. Regression test for the gap that made
+        // `let f = regex_parse(...); f.user` fail at runtime with
+        // "unknown identifier: f.user".
+        let event = make_event();
+        let obj = e(ExprKind::HashLit(vec![
+            ("a".into(), e(ExprKind::IntLit(7))),
+            ("b".into(), e(ExprKind::IntLit(9))),
+        ]));
+        let stmts = vec![
+            ProcessStatement::LetBinding("f".into(), obj),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["x".into()]),
+                e(ExprKind::Ident(vec!["f".into(), "a".into()])),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["y".into()]),
+                e(ExprKind::Ident(vec!["f".into(), "b".into()])),
+            ),
+        ];
+        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+            ExecResult::Continue(ev) => {
+                assert_eq!(ev.workspace["x"], Value::Int(7));
+                assert_eq!(ev.workspace["y"], Value::Int(9));
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
+    }
+
+    #[test]
+    fn let_binding_object_dot_access_missing_key_yields_null() {
+        // `let f = { a: 1 }; workspace.miss = f.nonexistent` — the
+        // walker should yield Null (not error) so callers can treat
+        // missing keys with coalesce / explicit null comparisons,
+        // matching the workspace.* path-walker contract.
+        let event = make_event();
+        let obj = e(ExprKind::HashLit(vec![(
+            "a".into(),
+            e(ExprKind::IntLit(1)),
+        )]));
+        let stmts = vec![
+            ProcessStatement::LetBinding("f".into(), obj),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["miss".into()]),
+                e(ExprKind::Ident(vec!["f".into(), "nonexistent".into()])),
+            ),
+        ];
+        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+            ExecResult::Continue(ev) => {
+                assert_eq!(ev.workspace["miss"], Value::Null);
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
+    }
+
+    #[test]
+    fn let_binding_object_supports_nested_dot_path() {
+        // `let f = { a: { b: 7 } }; workspace.x = f.a.b` — multi-segment
+        // path access (>2 segments) walks into a nested Object the
+        // same way `workspace.x.y.z` does.
+        let event = make_event();
+        let inner = e(ExprKind::HashLit(vec![(
+            "b".into(),
+            e(ExprKind::IntLit(7)),
+        )]));
+        let outer = e(ExprKind::HashLit(vec![("a".into(), inner)]));
+        let stmts = vec![
+            ProcessStatement::LetBinding("f".into(), outer),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["x".into()]),
+                e(ExprKind::Ident(vec![
+                    "f".into(),
+                    "a".into(),
+                    "b".into(),
+                ])),
+            ),
+        ];
+        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+            ExecResult::Continue(ev) => {
+                assert_eq!(ev.workspace["x"], Value::Int(7));
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
+    }
+
+    #[test]
+    fn let_binding_rebound_object_replaces_prior_value() {
+        // `let f = { a: 1 }; let f = { a: 2 }; workspace.x = f.a` —
+        // shadowing / re-binding follows the same `bind` semantics
+        // for Object values as for scalars (covered by
+        // `let_shadows_prior_binding_with_same_name`); dot-access on
+        // the latest binding sees the new Object.
+        let event = make_event();
+        let obj1 = e(ExprKind::HashLit(vec![(
+            "a".into(),
+            e(ExprKind::IntLit(1)),
+        )]));
+        let obj2 = e(ExprKind::HashLit(vec![(
+            "a".into(),
+            e(ExprKind::IntLit(2)),
+        )]));
+        let stmts = vec![
+            ProcessStatement::LetBinding("f".into(), obj1),
+            ProcessStatement::LetBinding("f".into(), obj2),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["x".into()]),
+                e(ExprKind::Ident(vec!["f".into(), "a".into()])),
+            ),
+        ];
+        match exec_process_body(&stmts, event, &NoopRegistry, &make_funcs()).unwrap() {
+            ExecResult::Continue(ev) => {
+                assert_eq!(ev.workspace["x"], Value::Int(2));
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
+    }
+
+    #[test]
     fn let_shadows_prior_binding_with_same_name() {
         // `let x = 1; let x = 2; workspace.y = x` — workspace.y is 2.
         let event = make_event();
