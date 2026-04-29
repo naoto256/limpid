@@ -727,13 +727,17 @@ def process compose_ocsf_api_activity {
         activity_id:  activity,
         type_uid:     6003 * 100 + activity,
         severity_id:  workspace.limpid.severity_id,
+        status_id:    workspace.limpid.status_id,
         time:         coalesce(workspace.limpid.time, received_at),
         api:          workspace.limpid.api,
         actor:        workspace.limpid.actor,
         src_endpoint: workspace.limpid.src_endpoint,
         dst_endpoint: workspace.limpid.dst_endpoint,
+        http_request: workspace.limpid.http_request,
+        cloud:        workspace.limpid.cloud,
         resources:    workspace.limpid.resources,
         message:      workspace.limpid.message,
+        unmapped:     workspace.limpid.unmapped,
         metadata:     workspace.limpid.metadata
     }))
 }
