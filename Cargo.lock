@@ -1066,6 +1066,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "bumpalo",
  "bytes",
  "chrono",
  "clap",

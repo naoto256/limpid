@@ -34,6 +34,13 @@ md-5 = "0.10"
 digest = "0.10"
 base64 = "0.22"
 indexmap = { version = "2", features = ["serde"] }
+# Per-event bump arena for the DSL `Value` tree. Each event allocates
+# transient `Value::Object` / `Value::Array` / `Value::String` /
+# `Value::Bytes` payloads from a thread-local `Bump`; the bump is reset
+# at event end, replacing per-allocation `drop_in_place<Value>` chains
+# (~23% of allocator samples on v0.5.7 D pipeline) with a single
+# pointer reset. See `_PLAN_V060_PERF.md`.
+bumpalo = { version = "3", features = ["collections"] }
 systemd = { version = "0.10", optional = true }
 rdkafka = { version = "0.36", features = ["cmake-build"], optional = true }
 
