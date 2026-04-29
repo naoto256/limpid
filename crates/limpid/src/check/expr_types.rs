@@ -315,8 +315,16 @@ fn check_unknown_ident(
     if first == "workspace" {
         return;
     }
-    // `let` bindings.
-    if parts.len() == 1 && bindings.get_let(first).is_some() {
+    // `let` bindings. A let-bound name is recognised as the root of
+    // both a bare reference (`f`) and a dotted access path (`f.a.b`)
+    // — the runtime resolves the latter by walking the bound value
+    // (Object key lookup or Array `[i]` access). The analyzer cannot
+    // statically prove the path exists on the bound value's shape
+    // (regex_parse / parse_json results have data-driven keys), so it
+    // suppresses the warning whenever the first segment matches a
+    // let binding. Type-mismatch and dataflow checks fire elsewhere
+    // for cases the analyzer does have shape evidence for.
+    if bindings.get_let(first).is_some() {
         return;
     }
     // Unresolved — emit a warning. Tailor the message for the most
@@ -517,10 +525,15 @@ fn arity_in_range(sig: &FunctionSig, n: usize) -> bool {
     match sig.arity {
         Arity::Fixed => n == sig.args.len(),
         Arity::Optional { required } => n >= required && n <= sig.args.len(),
+        Arity::Variadic { min } => n >= min,
     }
 }
 
 fn expected_arg_type(sig: &FunctionSig, i: usize) -> &FieldType {
+    // Variadic sigs declare a single element type that applies to every
+    // arg slot; clamping `i` to the last declared slot makes Fixed /
+    // Optional (declared per slot) and Variadic (one slot, repeated)
+    // share the same accessor.
     &sig.args[i.min(sig.args.len().saturating_sub(1))]
 }
 

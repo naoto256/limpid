@@ -8,6 +8,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
+## [0.5.8] - 2026-04-29
+> `coalesce(...)` built-in for first-non-null fallback chains, plus a follow-up fix for dot-access on `let`-bound Object values
+
+### Added — `coalesce(a, b, c, ...)` built-in (variadic)
+
+A flat primitive that returns the leftmost non-null argument, or
+`null` when every argument is null. Designed to replace the verbose
+`switch true { x != null { x } default { y } }` pattern that snippet
+composers had to repeat per OCSF leaf for the "use the parsed value
+when present, fall back to an environment value otherwise" idiom:
+
+```
+// before — per leaf, 4 lines plus indentation:
+let event_time = switch true {
+    workspace.limpid.time != null { workspace.limpid.time }
+    default { received_at }
+}
+// after:
+let event_time = coalesce(workspace.limpid.time, received_at)
+```
+
+Semantics:
+
+- accepts ≥ 1 argument; the analyzer rejects zero-arg calls and the
+  runtime returns the same arity error
+- all arguments are evaluated (DSL has no short-circuit at call
+  sites); since DSL identifiers and built-ins are pure, eager
+  evaluation has no observable difference from short-circuit
+- only `null` is "passed over" — empty strings, zero, empty objects,
+  and empty arrays are real present-but-empty values and are
+  returned as-is. Callers who want "blank string is also absent"
+  express that explicitly
+
+Implementation note: this is the first variadic built-in. The
+`Arity::Variadic { min }` enum variant was reintroduced (it had been
+removed earlier as unused). Adding the variant is a non-breaking
+extension — every existing built-in continues to use `Fixed` or
+`Optional`. The analyzer's argument type-check uses the single
+declared element type for every actual argument slot.
+
+This is the fourth DSL gap surfaced and fixed mid-snippet-library
+work — alongside `error` (v0.5.5), the `source` reshape (v0.5.6),
+and `null_omit` (v0.5.7).
+
+### Fixed — `let f = <Object>; f.x.y` resolves correctly
+
+`let f = regex_parse(...); f.user` was failing at runtime with
+`unknown identifier: f.user`. The local-scope path-resolver in
+`crates/limpid/src/dsl/eval.rs` only consulted let bindings for
+single-segment idents (`parts.len() == 1`), so any multi-segment
+access whose root happened to be let-bound (`f.user`, `f.a.b`,
+`f.list[0].kind`) skipped scope lookup entirely and fell through to
+the catch-all "unknown identifier" arm. The analyzer's UnknownIdent
+warning had the same gap.
+
+The fix extends both code paths: when the first segment matches a
+let binding, the runtime walks the bound value via the same
+`resolve_workspace_path` Object/Array walker used for
+`workspace.x.y.z`, and the analyzer suppresses the warning for the
+whole path. Missing keys yield `Null` to match the workspace
+path-walker contract — callers handle absence via `coalesce` or
+explicit null comparison.
+
+```
+// before — runtime "unknown identifier: f.user":
+def process parse_xxx {
+    let f = regex_parse(workspace.body, "(?P<user>\\S+)")
+    workspace.limpid = { user: f.user }     // ← runtime error
+}
+// after — works as written:
+def process parse_xxx {
+    let f = regex_parse(workspace.body, "(?P<user>\\S+)")
+    workspace.limpid = { user: f.user }     // ✅ "alice"
+}
+```
+
+Surfaced while writing parse_asa (Cisco ASA syslog parser) — every
+per-message-ID leaf does `let f = regex_parse(workspace.asa.body,
+"...")` and reads named captures via `f.user` / `f.src_ip` / etc.
+
+Two regression tests added covering the happy path and the
+missing-key (Null) path.
+
+### Notes
+
+- No DSL syntax change. `coalesce` is a regular flat primitive call.
+  The let-bound dot-access fix is a behaviour change in path
+  resolution semantics: before, `f.x` failed; after, it walks into
+  the bound Object.
+- No breaking changes (the only behaviour shift is the previously-
+  failing case starting to work).
+
+---
+
 ## [0.5.7] - 2026-04-29
 > `null_omit` built-in to drop `null` keys from HashLit composer output
 
