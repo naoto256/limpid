@@ -14,14 +14,19 @@ pub mod span;
 pub mod value;
 pub mod value_json;
 
-pub use value::{Map, Value};
+pub use value::{Map, OwnedValue, Value};
 
-/// Construct a [`Value`] from a JSON-literal-shaped expression.
+/// Construct an [`OwnedValue`] from a JSON-literal-shaped expression.
 ///
-/// Wraps [`serde_json::json!`] and converts the result through the
-/// JSON boundary (so the marker / escape rules in [`value_json`]
-/// apply). Intended for tests and config-literal construction; runtime
-/// hot paths should build [`Value`] directly.
+/// Wraps [`serde_json::json!`] and converts the result through the JSON
+/// boundary (so the marker / escape rules in [`value_json`] apply).
+/// Intended for tests and config-literal construction; pipeline hot
+/// paths build arena-backed [`Value`] directly via the
+/// `value::ObjectBuilder` / `ArrayBuilder` helpers.
+///
+/// Returns `OwnedValue` (not `Value<'bump>`) because the macro has no
+/// arena in scope. Tests that need a borrowed view can chain
+/// `.view_in(&arena)`.
 #[macro_export]
 macro_rules! value {
     ($($t:tt)*) => {
