@@ -260,7 +260,7 @@ A few things to read:
 
 - `process A | B` chains processes left to right — the event flows through `parse_fortigate` first, then `dedup_fortigate_traffic`. Equivalent to writing them on two `process` lines; the `|` form just reads more naturally when several processes line up.
 - `workspace.limpid.src_endpoint.ip` and `workspace.limpid.dst_endpoint.ip` exist because `parse_fortigate` ran first. Pipeline order is real order — what comes earlier has populated the canonical intermediate by the time later steps run.
-- `let key = ...` is a process-local scratch variable — scalar only, scoped to this process invocation, gone when the event leaves.
+- `let key = ...` is a process-local scratch variable — scoped to this process invocation, gone when the event leaves. The binding can hold any value type (scalar, Object, or Array); for an Object, `key.x` reads through the binding the same way `workspace.x.y` does. The binding *name* itself is a single identifier (`let foo.bar = ...` is rejected — write into `workspace.*` if you need a path target).
 - `table_upsert` resets the TTL on every call, so a flow that keeps appearing keeps being suppressed; the dedup window only opens up once a flow has been quiet for five minutes (`ttl 300` on the table).
 - The table is in-memory and lost on daemon restart. That's usually fine for dedup — at worst, the first batch after restart is forwarded normally instead of being suppressed. See [table functions](./functions/expression-functions.md#table-functions) for the full surface (`table_lookup` / `table_upsert` / `table_delete`).
 - `archive` still sees every event — it sits before the dedup process, and Step 3's deep-copy guarantee keeps it that way.
