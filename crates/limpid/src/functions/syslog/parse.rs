@@ -162,19 +162,42 @@ fn parse_rfc3164<'bump>(
 
 fn parse_tag_and_msg(input: &str) -> (&str, Option<&str>, &str) {
     let input = input.trim_start();
-    if let Some(colon_pos) = input.find(": ") {
-        let tag_part = &input[..colon_pos];
-        let msg = &input[colon_pos + 2..];
-        if let Some(bracket_start) = tag_part.find('[')
-            && let Some(bracket_end) = tag_part.find(']')
-        {
-            let appname = &tag_part[..bracket_start];
-            let procid = &tag_part[bracket_start + 1..bracket_end];
-            return (appname, Some(procid), msg);
-        }
-        return (tag_part, None, msg);
+    let bytes = input.as_bytes();
+
+    // RFC 3164 §4.1.3: the TAG is a leading run of alphanumerics (max
+    // 32 chars), terminated by the first non-alphanumeric character.
+    // We additionally require the terminator to look like `: ` (or
+    // `[pid]: `, or a bare trailing `:`) — otherwise the body itself
+    // contains the colon-space token (e.g. CEF extensions like
+    // `msg=applications3: Shenzhen...`) and a permissive `find(": ")`
+    // would split the TAG mid-payload.
+    const TAG_MAX: usize = 32;
+    let mut tag_end = 0;
+    while tag_end < bytes.len() && tag_end < TAG_MAX && bytes[tag_end].is_ascii_alphanumeric() {
+        tag_end += 1;
     }
-    ("", None, input)
+    if tag_end == 0 {
+        return ("", None, input);
+    }
+    let tag = &input[..tag_end];
+    let after_tag = &input[tag_end..];
+
+    let (procid, after_pid) = if let Some(rest) = after_tag.strip_prefix('[') {
+        match rest.find(']') {
+            Some(close) => (Some(&rest[..close]), &rest[close + 1..]),
+            None => return ("", None, input),
+        }
+    } else {
+        (None, after_tag)
+    };
+
+    if let Some(msg) = after_pid.strip_prefix(": ") {
+        (tag, procid, msg)
+    } else if after_pid == ":" {
+        (tag, procid, "")
+    } else {
+        ("", None, input)
+    }
 }
 
 fn skip_structured_data(input: &str) -> &str {
@@ -236,4 +259,133 @@ fn nth_space(input: &str, n: usize) -> Option<usize> {
         }
     }
     None
+}
+||||||| f8fe424
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::Event;
+    use bytes::Bytes;
+    use std::net::SocketAddr;
+
+    fn dummy_event() -> Event {
+        Event::new(
+            Bytes::from("test"),
+            "127.0.0.1:514".parse::<SocketAddr>().unwrap(),
+        )
+    }
+
+    fn make_reg() -> FunctionRegistry {
+        let mut reg = FunctionRegistry::new();
+        register(&mut reg);
+        reg
+    }
+
+    fn call_syslog_parse(reg: &FunctionRegistry, s: &str) -> Result<Map> {
+        let e = dummy_event();
+        let v = reg.call(Some("syslog"), "parse", &[Value::String(s.into())], &e)?;
+        let Value::Object(m) = v else {
+            panic!("expected Object")
+        };
+        Ok(m)
+    }
+
+    #[test]
+    fn rfc5424_basic() {
+        let reg = make_reg();
+        let m = call_syslog_parse(
+            &reg,
+            "<134>1 2026-04-15T10:30:00Z firewall01 sshd 1234 - - Failed password",
+        )
+        .unwrap();
+        // PRI 134 = facility 16 (local0), severity 6 (info)
+        assert_eq!(m["pri"], Value::Int(134));
+        assert_eq!(m["facility"], Value::Int(16));
+        assert_eq!(m["severity"], Value::Int(6));
+        assert_eq!(m["timestamp"], Value::String("2026-04-15T10:30:00Z".into()));
+        assert_eq!(m["hostname"], Value::String("firewall01".into()));
+        assert_eq!(m["appname"], Value::String("sshd".into()));
+        assert_eq!(m["procid"], Value::String("1234".into()));
+        assert_eq!(m["msg"], Value::String("Failed password".into()));
+    }
+
+    #[test]
+    fn rfc5424_with_structured_data() {
+        let reg = make_reg();
+        let m = call_syslog_parse(
+            &reg,
+            "<134>1 2026-04-15T10:30:00Z host app 999 ID1 [meta src=\"10.0.0.1\"] Hello world",
+        )
+        .unwrap();
+        assert_eq!(m["hostname"], Value::String("host".into()));
+        assert_eq!(m["appname"], Value::String("app".into()));
+        assert_eq!(m["msgid"], Value::String("ID1".into()));
+        assert_eq!(m["msg"], Value::String("Hello world".into()));
+    }
+
+    #[test]
+    fn rfc3164_with_pid() {
+        let reg = make_reg();
+        let m = call_syslog_parse(
+            &reg,
+            "<134>Apr 15 10:30:00 myhost sshd[1234]: Failed password",
+        )
+        .unwrap();
+        assert_eq!(m["timestamp"], Value::String("Apr 15 10:30:00".into()));
+        assert_eq!(m["hostname"], Value::String("myhost".into()));
+        assert_eq!(m["appname"], Value::String("sshd".into()));
+        assert_eq!(m["procid"], Value::String("1234".into()));
+        assert_eq!(m["msg"], Value::String("Failed password".into()));
+    }
+
+    #[test]
+    fn rfc3164_without_pid() {
+        let reg = make_reg();
+        let m =
+            call_syslog_parse(&reg, "<134>Apr 15 10:30:00 myhost kernel: Out of memory").unwrap();
+        assert_eq!(m["hostname"], Value::String("myhost".into()));
+        assert_eq!(m["appname"], Value::String("kernel".into()));
+        assert_eq!(m["msg"], Value::String("Out of memory".into()));
+    }
+
+    #[test]
+    fn no_pri_errors() {
+        let reg = make_reg();
+        let e = dummy_event();
+        let err = reg
+            .call(
+                Some("syslog"),
+                "parse",
+                &[Value::String("no pri header".into())],
+                &e,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("no PRI header"));
+    }
+
+    #[test]
+    fn defaults_fill_missing_keys() {
+        let reg = make_reg();
+        let defaults = Value::Object(
+            [("appname".to_string(), Value::String("unknown".into()))]
+                .into_iter()
+                .collect(),
+        );
+        let e = dummy_event();
+        // RFC 5424 with appname `-` (NILVALUE) — missing after parse
+        let result = reg
+            .call(
+                Some("syslog"),
+                "parse",
+                &[
+                    Value::String("<134>1 2026-04-15T10:30:00Z host - - - - body".into()),
+                    defaults,
+                ],
+                &e,
+            )
+            .unwrap();
+        let Value::Object(m) = result else { panic!() };
+        assert_eq!(m["appname"], Value::String("unknown".into()));
+    }
 }
