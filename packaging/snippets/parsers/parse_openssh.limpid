@@ -224,10 +224,7 @@ def process parse_openssh_accepted {
 
 def process parse_openssh_failed {
     let invalid = workspace.ssh.fields.user_invalid
-    let user = switch true {
-        invalid != null { invalid }
-        default         { workspace.ssh.fields.user }
-    }
+    let user = coalesce(invalid, workspace.ssh.fields.user)
     let severity = switch true {
         invalid != null { 3 }   // Medium — invalid-user attempt
         default         { 2 }   // Low — failed auth on a known account
