@@ -444,6 +444,39 @@ strptime("2026-04-15 10:30:00", "%Y-%m-%d %H:%M:%S", "local")  // naive + local
 
 If the format includes an offset specifier (`%z`, `%:z`, `%#z`), the third argument is rejected as conflicting. If the format produces a naive datetime, the third argument is required — limpid never silently assumes UTC.
 
+### parse_datetime_rfc3339(text) → Timestamp
+
+Atomic RFC 3339 datetime parser. Returns a `Value::Timestamp` (UTC-normalised).
+
+```
+parse_datetime_rfc3339("2026-04-30T01:23:45Z")
+parse_datetime_rfc3339("2026-04-30T01:23:45.123456+00:00")
+parse_datetime_rfc3339("2026-04-30T01:23:45.123456789+0900")
+```
+
+RFC 3339 is the strict internet-friendly profile of ISO 8601 used by RFC 5424 syslog timestamps, OTLP, OCSF `time` fields, AWS CloudTrail `eventTime`, and most modern cloud audit logs. The format is:
+
+```
+YYYY-MM-DDTHH:MM:SS[.fractional](Z | ±HH:MM | ±HHMM)
+```
+
+All three offset forms (`Z`, `+00:00`, `+0000`) are accepted — this is what `strptime` with `%z` cannot do alone (chrono rejects the bare `Z` literal under `%z`). Sub-second precision is preserved up to nanoseconds.
+
+For the wider ISO 8601 surface (basic format `20260430T012345`, week dates, ordinal dates), no atomic parser is provided — production wire is effectively all RFC 3339.
+
+For RFC 3164 syslog timestamps (`Apr 30 01:23:45`, no year, no timezone), there is no atomic parser either; the missing year and timezone are policy decisions. Compose `strptime` + current-year fallback + future-clamp in LPL.
+
+### parse_datetime_rfc2822(text) → Timestamp
+
+Atomic RFC 2822 / RFC 5322 datetime parser (the format used by email `Date:` headers and some legacy wire formats). Returns a `Value::Timestamp`.
+
+```
+parse_datetime_rfc2822("Thu, 30 Apr 2026 01:23:45 +0000")
+parse_datetime_rfc2822("30 Apr 2026 01:23:45 -0500")
+```
+
+For modern internet datetimes (RFC 5424 syslog, OTLP, OCSF, cloud audit logs) use `parse_datetime_rfc3339` instead.
+
 ### timestamp()
 
 Returns the current wall-clock instant as a `Value::Timestamp` (UTC). Matches the type of `received_at` and the input shape `strftime` / `strptime` expect.

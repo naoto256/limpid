@@ -33,6 +33,8 @@ pub mod hostname;
 pub mod len;
 pub mod lower;
 pub mod null_omit;
+pub mod parse_datetime_rfc2822;
+pub mod parse_datetime_rfc3339;
 pub mod parse_json;
 pub mod parse_kv;
 pub mod prepend;
@@ -77,6 +79,8 @@ pub fn register(reg: &mut FunctionRegistry, table_store: TableStore) {
     null_omit::register(reg);
     strftime::register(reg);
     strptime::register(reg);
+    parse_datetime_rfc2822::register(reg);
+    parse_datetime_rfc3339::register(reg);
     parse_json::register(reg);
     parse_kv::register(reg);
     prepend::register(reg);
