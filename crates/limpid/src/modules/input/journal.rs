@@ -1,5 +1,25 @@
 //! systemd journal input: reads entries from the systemd journal.
 //!
+//! Wire format (LOTL — Living Off The Land):
+//! `ingress` is one journald entry serialised as a single-line UTF-8
+//! JSON object, equivalent to one line of `journalctl -o json`. The
+//! field set and values match journalctl byte-for-byte; key order
+//! within the JSON object is not guaranteed to match (JSON object
+//! ordering is a serialisation detail).
+//!
+//! - field names preserved as journald exposes them (`PRIORITY`,
+//!   `_PID`, `__REALTIME_TIMESTAMP`, `SYSLOG_IDENTIFIER`, `MESSAGE`, …)
+//! - field order: insertion order from libsystemd
+//! - UTF-8-clean values: JSON strings
+//! - non-UTF-8 byte values: JSON array of integers
+//!   (`[104, 101, 108, 108, 111]`) — journalctl convention
+//! - numeric-looking fields like `PRIORITY` remain JSON strings
+//!   (`"6"`); the DSL caller does the int conversion if needed
+//!
+//! Workspace stays empty — parsing is done in the process layer
+//! (typically with the `parse_journald` snippet, which delegates to
+//! `parse_json(ingress)`).
+//!
 //! Requires the `journal` feature and `libsystemd-dev` at compile time.
 //! Only available on Linux systems with systemd.
 //!
@@ -15,6 +35,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use bytes::Bytes;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use systemd::journal::{Journal, OpenOptions};
 use tracing::{error, info, warn};
 
@@ -78,8 +99,9 @@ impl Input for JournalInput {
         let poll_interval = self.poll_interval;
         let metrics = Arc::clone(&self.metrics);
 
-        // Journal API is synchronous — run in a blocking thread
-        let (entry_tx, mut entry_rx) = tokio::sync::mpsc::channel::<(String, String)>(1024);
+        // Journal API is synchronous — run in a blocking thread.
+        // Channel payload: (entry-as-JSON-bytes, cursor)
+        let (entry_tx, mut entry_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, String)>(1024);
 
         let journal_handle = tokio::task::spawn_blocking(move || {
             run_journal_reader(matches, state_file, poll_interval, entry_tx)
@@ -99,9 +121,9 @@ impl Input for JournalInput {
 
                 entry = entry_rx.recv() => {
                     match entry {
-                        Some((message, cursor)) => {
+                        Some((bytes, cursor)) => {
                             metrics.events_received.fetch_add(1, Ordering::Relaxed);
-                            let event = Event::new(Bytes::from(message), source_addr);
+                            let event = Event::new(Bytes::from(bytes), source_addr);
                             if tx.send(event).await.is_err() {
                                 break;
                             }
@@ -119,13 +141,82 @@ impl Input for JournalInput {
     }
 }
 
-/// Read a field value from the current journal entry as a String.
-fn get_field(journal: &mut Journal, field: &str) -> Option<String> {
-    journal.get_data(field).ok().and_then(|entry| {
-        entry?
-            .value()
-            .map(|v| String::from_utf8_lossy(v).into_owned())
-    })
+/// Encode one journal entry's fields into a `serde_json::Value`
+/// equivalent to `journalctl -o json` output.
+///
+/// - field name (always UTF-8 by journald spec) → JSON object key
+/// - UTF-8-clean field value → JSON string
+/// - non-UTF-8 field value → JSON array of integers (byte values)
+/// - field with no value (rare) → JSON null
+///
+/// In addition to enumerated data fields, this also surfaces
+/// journald's trusted address metadata as `__`-prefixed keys
+/// (matching the journalctl convention):
+///   - `__CURSOR`              — opaque resume token
+///   - `__REALTIME_TIMESTAMP`  — wall-clock microseconds since epoch (string)
+///   - `__MONOTONIC_TIMESTAMP` — boot-relative microseconds (string)
+///
+/// `__SEQNUM` / `__SEQNUM_ID` (newer journalctl) are not surfaced —
+/// the systemd-0.10.x crate exposes no equivalent API. Add when
+/// upstream support lands.
+///
+/// Key order is not guaranteed to match journalctl; this is a JSON
+/// object so order is a serialisation detail, not a semantic one.
+/// Field set and values must match — that's the LOTL contract.
+fn collect_entry_fields(journal: &mut Journal) -> Result<JsonMap<String, JsonValue>> {
+    let mut map = JsonMap::new();
+    journal.restart_data();
+    while let Some(field) = journal.enumerate_data()? {
+        let name = match std::str::from_utf8(field.name()) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                // Field names are UTF-8 by journald spec; if we hit a
+                // non-UTF-8 name treat it as a corrupt entry and skip
+                // the field rather than poison the JSON object.
+                warn!("journal: skipping field with non-UTF-8 name");
+                continue;
+            }
+        };
+        let value = match field.value() {
+            None => JsonValue::Null,
+            Some(bytes) => match std::str::from_utf8(bytes) {
+                Ok(s) => JsonValue::String(s.to_string()),
+                Err(_) => {
+                    // journalctl convention: non-UTF-8 values become
+                    // an array of byte integers
+                    JsonValue::Array(
+                        bytes
+                            .iter()
+                            .map(|b| JsonValue::Number((*b as u64).into()))
+                            .collect(),
+                    )
+                }
+            },
+        };
+        map.insert(name, value);
+    }
+
+    // Trusted address metadata (set by libsystemd, not the
+    // application; not visible via enumerate_data). All values are
+    // formatted as JSON strings to match journalctl's output, where
+    // numeric-looking journald fields are always strings.
+    if let Ok(cursor) = journal.cursor() {
+        map.insert("__CURSOR".to_string(), JsonValue::String(cursor));
+    }
+    if let Ok(usec) = journal.timestamp_usec() {
+        map.insert(
+            "__REALTIME_TIMESTAMP".to_string(),
+            JsonValue::String(usec.to_string()),
+        );
+    }
+    if let Ok((mono_usec, _boot_id)) = journal.monotonic_timestamp() {
+        map.insert(
+            "__MONOTONIC_TIMESTAMP".to_string(),
+            JsonValue::String(mono_usec.to_string()),
+        );
+    }
+
+    Ok(map)
 }
 
 /// Synchronous journal reader running in a blocking thread.
@@ -133,7 +224,7 @@ fn run_journal_reader(
     matches: Vec<String>,
     state_file: Option<PathBuf>,
     poll_interval: Duration,
-    tx: tokio::sync::mpsc::Sender<(String, String)>,
+    tx: tokio::sync::mpsc::Sender<(Vec<u8>, String)>,
 ) {
     let mut journal = match OpenOptions::default().open() {
         Ok(j) => j,
@@ -178,30 +269,30 @@ fn run_journal_reader(
     loop {
         match journal.next() {
             Ok(n) if n > 0 => {
-                // Build message from journal entry fields
-                let message = match get_field(&mut journal, "MESSAGE") {
-                    Some(msg) => msg,
-                    None => continue,
+                let map = match collect_entry_fields(&mut journal) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!("journal: failed to enumerate entry fields: {}", e);
+                        continue;
+                    }
+                };
+
+                // Serialise to bytes WITHOUT trailing newline. The
+                // Event boundary itself is the record separator;
+                // journalctl-o-json puts a `\n` after each line for
+                // stream framing, but `Event.ingress` already carries
+                // exactly one entry so there is nothing to separate.
+                let bytes = match serde_json::to_vec(&JsonValue::Object(map)) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!("journal: failed to serialise entry to JSON: {}", e);
+                        continue;
+                    }
                 };
 
                 let cursor = journal.cursor().unwrap_or_default();
 
-                // Build a syslog-like message: "IDENTIFIER[PID]: MESSAGE"
-                let identifier = get_field(&mut journal, "SYSLOG_IDENTIFIER")
-                    .or_else(|| get_field(&mut journal, "_COMM"))
-                    .unwrap_or_default();
-                let pid = get_field(&mut journal, "SYSLOG_PID")
-                    .or_else(|| get_field(&mut journal, "_PID"));
-
-                let formatted = if let Some(pid) = pid {
-                    format!("{}[{}]: {}", identifier, pid, message)
-                } else if !identifier.is_empty() {
-                    format!("{}: {}", identifier, message)
-                } else {
-                    message
-                };
-
-                if tx.blocking_send((formatted, cursor)).is_err() {
+                if tx.blocking_send((bytes, cursor)).is_err() {
                     break; // receiver dropped
                 }
             }
