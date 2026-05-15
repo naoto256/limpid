@@ -110,6 +110,24 @@ The judgement rule is a single question: **does the function's behavior follow a
 
 This is Principle 1 applied to naming: putting the schema in the name makes the binding explicit and greppable — *"what talks syslog?"* becomes `rg 'syslog\.'`. It also draws a clean line that matches the previous rule: schema-specific helpers go in the snippet library under the namespace they describe; schema-agnostic primitives are part of the daemon's small, stable surface.
 
+### Workspace is event-scoped, not message-passed
+
+The `|` in `process A | process B | process C` is **syntax sugar — sequential composition that flows the same Event through A → B → C**, not an object stream where one process returns a value that the next receives as an argument (as Unix pipes or PowerShell pipelines do). The mechanism for B to receive A's return value as an argument is deliberately omitted.
+
+Instead, **workspace is global across the Event's lifecycle**: each process writes to its own scratch namespace (`workspace.syslog`, `workspace.cef`, `workspace.journald`, …), and **any downstream process can read any of them at any time**. A final vocabulary parser can pick up metadata left by a transport layer three stages upstream; a composer can peek at a parser's intermediate state for debugging.
+
+**Why:** the message-passing model (downstream takes upstream's return as an argument) only sees "the stage immediately upstream", which doesn't match real wire structure — for example, openssh's vocabulary parser frequently needs to know "what transport was this vocabulary wrapped in?" to OCSF-normalise correctly (for instance, when journald carries an application log, deciding how to map journald's `__REALTIME_TIMESTAMP` vs. the app body's `event_time` into OCSF's `time` is the vocabulary parser's job). Keeping `workspace.journald.__REALTIME_TIMESTAMP` directly addressable lets the vocabulary parser apply its own precedence and override.
+
+**Consequence:** parser/composer contracts are expressed in terms of `workspace.*` field names (`@requires` / `@produces` tag conventions). The DSL does not need an object-type design for what flows through the pipe; the syntax stays minimal. Instead, each snippet's header comment carries the responsibility of declaring "I read `workspace.<here>` and write `workspace.<there>`" (see the "Writing for a snippet library" section of the [Process Design Guide](processing/design-guide.md)).
+
+#### Where this design draws the line
+
+Library snippets covers the **common upstream stacks** for their vocabulary — typically `parse_syslog | parse_<vocab>` and `parse_journald | parse_<vocab>` — and document the assumption in their header. Esoteric stacks that no library can reasonably anticipate are **the caller's responsibility**:
+
+> `openssh` over `CEF` over `syslog` over `JSON` over `OCSF` over `OTLP`
+
+If you encode something like that and need a working OCSF Authentication record at the end, you are writing the vocabulary parser yourself — pulling fields from whichever `workspace.<layer>` your pipeline populated, choosing the precedence that makes sense for your wire stack. The library does not promise to be a universal solver across arbitrary transport stacks; that path leads to N×M coalesce lists in every parser and a refactor every time a new transport ships. The boundary is documented per snippet so you know where library responsibility ends and yours begins.
+
 ---
 
 ## How these principles are used

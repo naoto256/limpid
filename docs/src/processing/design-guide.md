@@ -257,6 +257,39 @@ A composer has no branches, no conditional drops, no enrichment calls. It takes 
 
 The reason is not aesthetic: composers are the layer most likely to be mechanically generated from a schema definition file in the future (OCSF ships its spec as JSON). A composer that is field-pluck-plus-constants can be regenerated; a composer with conditional logic cannot.
 
+### Document the upstream assumption in the file header
+
+A vocabulary parser (or any snippet that consumes prior layer state in
+`workspace.*`) is implicitly bound to a specific set of upstream stacks
+— the transport layers it knows how to find its body / pid / hostname /
+timestamp from. That binding is invisible from the dispatcher body, so
+state it explicitly in a header block at the top of the file:
+
+```
+// Vendor:   OpenSSH
+// Wire:     sshd application body (Accepted publickey for ... / Failed
+//           password for ... / Disconnected from ... etc.)
+// Upstream: parse_syslog | parse_openssh
+//             body  ← workspace.syslog.msg
+//             pid   ← workspace.syslog.pid
+//           parse_journald | parse_openssh
+//             body  ← workspace.journald.MESSAGE
+//             pid   ← coalesce(workspace.journald._PID,
+//                              workspace.journald.SYSLOG_PID)
+//           (no upstream — falls back to parse_syslog inline on `ingress`)
+// Output:   workspace.limpid.* (OCSF Authentication, class_uid 3002)
+```
+
+Stacks not listed are out of scope. If your wire is `openssh` over
+`CEF` over `syslog` over `JSON` over `OCSF` over `OTLP` (or any other
+permutation a library author would not reasonably anticipate), the
+correct response is to write your own vocabulary parser that reads
+from whichever `workspace.<layer>` your particular pipeline populated.
+The library covers the common cases and documents which they are; it
+does not pretend to be a universal solver across arbitrary transport
+stacks. See [Workspace is event-scoped, not message-passed](../design-principles.md#workspace-is-event-scoped-not-message-passed)
+for the underlying design choice.
+
 ### Test with `inject` + `tap`
 
 Every snippet that ships in a library needs a fixture: a line of realistic input and the expected `egress` (or `workspace`) after the process runs. `limpidctl inject input <name>` + `limpidctl tap process <name> --json` is the testing primitive. See [Debug Tap](../operations/tap.md).
