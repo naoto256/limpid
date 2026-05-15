@@ -8,6 +8,167 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
+## [0.7.1] - 2026-05-16
+> journal input LOTL + transport-agnostic vocabulary parsers + datetime primitives
+
+The journal input is rewritten to emit `journalctl -o json`-equivalent
+JSON on `ingress`, replacing the synthesised
+`"IDENTIFIER[PID]: MESSAGE"` string and the silent loss of every
+non-MESSAGE journald field. Downstream snippets (`parse_journald`,
+`parse_openssh`, `parse_sudo`, etc.) now see PRIORITY, _PID,
+_HOSTNAME, __REALTIME_TIMESTAMP, _SYSTEMD_UNIT, _SELINUX_CONTEXT,
+and the rest by their journald-canonical names.
+
+Vocabulary parsers (`parse_openssh`, `parse_sudo`, `parse_postfix`,
+`parse_combined_log`) are decoupled from their transport. Each now
+reads from a vocabulary-named workspace namespace (`workspace.openssh.*`,
+`workspace.sudo.*`, …) that the pipeline writer populates via an
+inline bridge from whichever transport actually arrived. The
+vocabulary parser does not enumerate transports — that knowledge
+stays in the pipeline. OCSF records grow `time`, `device.hostname`,
+and `actor.process.pid` from the trusted source the transport
+provides.
+
+Plus three new datetime parsers: `parse_datetime_rfc3339` and
+`parse_datetime_rfc2822` as Rust primitives, `parse_datetime_rfc3164`
+as an LPL snippet. The split mirrors the design principle line —
+spec'd atomic parsers live in Rust; policy / heuristic / fallback
+live in LPL.
+
+### Fixed — journal input is dumb transport again (Principle 2)
+
+`crates/limpid/src/modules/input/journal.rs` previously synthesised
+`"IDENTIFIER[PID]: MESSAGE"` on `ingress` and discarded every other
+journald field. The synthesis violated Principle 2 (input is dumb
+transport, no interpretation) and forced every downstream `wrap_*`
+process to re-extract pid / identifier with regex against the
+synthesised string. PRI on the wire was lost entirely because
+facility/severity were thrown away by the input.
+
+Live off the land: `ingress` is now byte-equivalent to one line of
+`journalctl -o json`. All enumerated data fields are preserved
+under their journald-canonical names; trusted-address metadata
+(`__CURSOR` / `__REALTIME_TIMESTAMP` / `__MONOTONIC_TIMESTAMP`) is
+surfaced via the libsystemd metadata APIs. Non-UTF-8 byte values
+become JSON arrays of integers (journalctl convention).
+
+`__SEQNUM` / `__SEQNUM_ID` are not surfaced — the `systemd-0.10.x`
+crate exposes no equivalent API. Add when upstream support lands.
+
+Workspace stays empty on input. Downstream snippets
+(`parse_journald` etc.) decode the JSON in the process layer.
+
+**Breaking**: any pipeline that consumed the old synthesised string
+needs to switch to `process parse_journald` + an inline bridge.
+
+### Added — datetime parser primitives
+
+Three layered datetime parsers, picked by what the wire actually
+carries:
+
+- **`parse_datetime_rfc3339(text)`** — Rust primitive. Strict
+  internet profile of ISO 8601 used by RFC 5424 syslog, OTLP, OCSF
+  `time`, AWS CloudTrail `eventTime`, and most modern cloud audit
+  logs. Accepts `Z` / `±HH:MM` / `±HHMM` transparently — solves the
+  `strptime("...Z", "%z")` gotcha (`chrono` rejects the bare `Z`
+  literal under `%z`).
+- **`parse_datetime_rfc2822(text)`** — Rust primitive. Email `Date:`
+  headers and legacy HTTP-date-style wires.
+- **`parse_datetime_rfc3164(text)`** — LPL `def function` shipped as
+  `packaging/snippets/functions/parse_datetime_rfc3164.limpid`. RFC
+  3164 wire (`Apr 30 01:23:45`) carries neither year nor timezone;
+  the parser encodes the standard policy (current-year +
+  future-clamp + UTC assumption — what rsyslog / syslog-ng /
+  Vector / Fluent Bit all converge on) in DSL so operators on
+  non-UTC senders can fork and edit without a rebuild.
+
+### Added — transport parsers + RFC 5424 composer
+
+Three new snippets that pair with the journal LOTL fix to express
+transport stacking explicitly in pipelines:
+
+- **`parsers/parse_syslog.limpid`** — thin wrapper around the
+  `syslog.parse(ingress)` primitive that populates
+  `workspace.syslog.*`. Lets a pipeline write
+  `process parse_syslog | <bridge> | parse_<vocabulary>` rather
+  than having every vocabulary parser inline its own
+  `syslog.parse(ingress)` call.
+- **`parsers/parse_journald.limpid`** — `workspace.journald =
+  parse_json(ingress)`. Pairs with the LOTL change to expose all
+  journald fields downstream by their canonical names.
+- **`composers/compose_rfc5424.limpid`** — `workspace.journald.*` →
+  RFC 5424 syslog wire. Replaces the hand-rolled `wrap_*` patterns
+  on edge boxes that previously synthesised a frame from a
+  regex-parsed string. Preserves the originating host via
+  `coalesce(workspace.journald._HOSTNAME, hostname())` so relayed
+  events keep their source identity instead of being stamped with
+  the relay's hostname.
+
+### Changed — vocabulary parser intake schemas
+
+`parse_openssh`, `parse_sudo`, `parse_postfix`, and
+`parse_combined_log` no longer call `syslog.parse(ingress)`
+internally. Each reads from an explicit intake schema under its
+vocabulary namespace that the pipeline writer populates:
+
+| Parser | Intake schema |
+|---|---|
+| `parse_openssh`     | `workspace.openssh.{body, pid, hostname, time}` |
+| `parse_sudo`        | `workspace.sudo.{body, pid, hostname, time}` |
+| `parse_postfix`     | `workspace.postfix.{body, hostname, time}` (pid lives inside the body's postfix tag) |
+| `parse_combined_log`| `workspace.combined_log.{body, hostname}` (CLF carries its own time + IP) |
+
+The bridge from a transport into the intake is a one-process
+inline block in the pipeline; see each parser's file header for
+worked syslog / journald / tail examples.
+
+OCSF records emitted by these parsers now include `time`,
+`device.hostname`, and `actor.process.pid` (where applicable) —
+values come from the trusted source the transport provides
+(journald `_PID` and `_HOSTNAME` are kernel-verified; syslog
+procid / hostname are sender-claimed). `compose_ocsf` leaves for
+3002 / 3003 / 4002 / 4009 are extended to forward `device` and
+`actor` into the egress JSON.
+
+`filter_openssh_journal` is rewritten to read
+`workspace.journald.MESSAGE` (set by upstream `parse_journald`)
+instead of doing `syslog.parse(ingress)` against a now-JSON
+ingress.
+
+**Breaking**: existing pipelines must insert
+`process parse_syslog | { workspace.<vocab> = { … } } | parse_<vocab>`
+or the journald counterpart ahead of the vocabulary parser. The
+"just call `parse_<vendor>`" shortcut against syslog ingress no
+longer works.
+
+### Added — design rationale and snippet authoring convention
+
+- `docs/src/design-principles.md` gains a new operating rule
+  "Workspace is event-scoped, not message-passed". Records that
+  `process A | B` is sequential composition over a shared workspace,
+  not an object pipe. Cites the "openssh over CEF over syslog over
+  JSON over OCSF over OTLP" stack as an example of where the library
+  explicitly stops covering and pushes the wiring decision to the
+  pipeline writer.
+- `docs/src/processing/design-guide.md` codifies the `// Upstream:`
+  header convention. A vocabulary parser binds implicitly to a finite
+  set of upstream stacks; spelling them out in the file header is
+  the closest we get to a checkable contract without growing the
+  DSL.
+
+### Notes
+
+- DSL syntax: unchanged.
+- 393 tests pass (`cargo test --workspace`), `cargo build --release`
+  green. 9 new tests cover `parse_datetime_rfc3339` and
+  `parse_datetime_rfc2822` (Z literal, numeric offsets, sub-second
+  precision, garbage rejection).
+- Snippet library now also ships `packaging/snippets/functions/`
+  for LPL `def function` helpers (currently
+  `parse_datetime_rfc3164.limpid`).
+
+---
+
 ## [0.7.0] - 2026-04-30
 > snippet library v1 — 11 vendor parsers, OCSF 27-class composer; DSL fix for sub-process error propagation
 

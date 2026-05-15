@@ -23,10 +23,13 @@ prefix.
 
 ## What's included (v0.7.0)
 
-### Parsers (11)
+### Parsers (13)
 
 | File | Source | OCSF class(es) emitted |
 |---|---|---|
+| **Transport** | | |
+| `parsers/parse_syslog.limpid` | RFC 3164 / 5424 syslog (transport, populates `workspace.syslog.*`) | n/a (transport layer) |
+| `parsers/parse_journald.limpid` | systemd journald JSON (transport, populates `workspace.journald.*`) | n/a (transport layer) |
 | **Security devices / cloud audit** | | |
 | `parsers/parse_fortigate_cef.limpid` | FortiGate (CEF wrap) | 4001 / 2004 / 3002 / 6002 |
 | `parsers/parse_fortigate_syslog.limpid` | FortiGate (native KV syslog) | (same as CEF) |
@@ -34,8 +37,8 @@ prefix.
 | `parsers/parse_paloalto_syslog.limpid` | PAN-OS (native CSV syslog) | (same as CEF) |
 | `parsers/parse_asa.limpid` | Cisco ASA / FTD-in-ASA-mode (syslog) | 3002 / 4001 |
 | `parsers/parse_cloudtrail.limpid` | AWS CloudTrail (JSON) | 6003 API Activity |
-| **Server / host systems** | | |
-| `parsers/parse_openssh.limpid` | OpenSSH `sshd` (syslog / journald) | 3002 Authentication |
+| **Server / host vocabulary** | | |
+| `parsers/parse_openssh.limpid` | OpenSSH `sshd` body (transport-agnostic; bridge from `parse_syslog` or `parse_journald`) | 3002 Authentication |
 | `parsers/parse_sudo.limpid` | sudo (syslog / journald) | 3003 Authorize Session |
 | `parsers/parse_combined_log.limpid` | Apache / Nginx access log (combined format) | 4002 HTTP Activity |
 | `parsers/parse_postfix.limpid` | Postfix MTA (syslog) | 4009 Email Activity |
@@ -53,12 +56,15 @@ Each parser's docstring records:
   but not yet exercised against live data — verify before relying on
   them in production.
 
-### Composers (2)
+### Composers (3)
 
 - `composers/compose_ocsf.limpid` — dispatches by
   `workspace.limpid.class_uid` to per-class leaves, covering the
   OCSF 1.3.0 priority set (27 classes). Each leaf strips `null`
   keys via `null_omit` and writes OCSF JSON to `egress`.
+- `composers/compose_rfc5424.limpid` — `workspace.journald.*` →
+  RFC 5424 syslog wire. Used at edge boxes to re-frame journald
+  entries for syslog relay (e.g. edge → relay → AMA).
 - `composers/compose_replayable.limpid` — minimal `{received_at,
   source, ingress}` shape that round-trips through `inject --json`
   for parser regression / replay capture.
@@ -67,9 +73,20 @@ Each parser's docstring records:
 
 - `filters/filter_openssh_journal.limpid` — drops `pam_unix(sshd:session):
   session opened/closed` PAM noise from journald-sourced sshd
-  streams. sshd already emits its own `Accepted ...` /
-  `Disconnected ...` lines that cover the same authentication fact;
-  the PAM duplicate would double-count.
+  streams (run between `parse_journald` and `parse_openssh`). sshd
+  itself emits the authentication fact via `Accepted ...` /
+  `Disconnected ...`; the PAM duplicate would double-count.
+
+### Functions (1)
+
+- `functions/parse_datetime_rfc3164.limpid` —
+  `parse_datetime_rfc3164(text) → Timestamp`, the LPL counterpart to
+  the built-in `parse_datetime_rfc3339` primitive. Shipped as LPL
+  rather than Rust because RFC 3164 wire carries neither year nor
+  timezone, so the parser has to encode policy (current-year +
+  future-clamp + UTC assumption) that operators should be able to
+  edit. For RFC 5424 / OTLP / OCSF input use the built-in
+  `parse_datetime_rfc3339(text)` primitive directly.
 
 ## Quick start
 

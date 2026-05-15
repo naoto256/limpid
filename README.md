@@ -173,16 +173,23 @@ installation, .deb packaging, and systemd integration.
 
 Curated parser / composer / filter library, installed under
 `/usr/share/limpid/snippets/` and `include`-able by absolute path.
-Debuts in **v0.7.0**:
+Debuts in **v0.7.0**, with the transport layer split out as its own
+snippet category in **v0.7.1**:
 
-- **Parsers (11)** — security devices / cloud audit:
+- **Transport parsers (2, v0.7.1)** — `parse_syslog` (RFC 3164 /
+  5424 syslog wire) · `parse_journald` (systemd journald JSON).
+  These populate `workspace.<transport>.*` and feed any vocabulary
+  parser downstream via an inline bridge.
+- **Vendor parsers (11)** — security devices / cloud audit:
   `parse_fortigate_cef` · `parse_fortigate_syslog` ·
   `parse_paloalto_cef` · `parse_paloalto_syslog` · `parse_asa` ·
-  `parse_cloudtrail`. Server / host: `parse_openssh` · `parse_sudo` ·
-  `parse_combined_log` (Apache / Nginx) · `parse_postfix` ·
-  `parse_winevent_json`. Vendor-neutral: `parse_ocsf`.
-- **Composers (2)** — `compose_ocsf` (OCSF 1.3.0 priority set, 27
+  `parse_cloudtrail`. Server / host vocabulary: `parse_openssh` ·
+  `parse_sudo` · `parse_combined_log` (Apache / Nginx) ·
+  `parse_postfix` · `parse_winevent_json`. Vendor-neutral:
+  `parse_ocsf`.
+- **Composers (3)** — `compose_ocsf` (OCSF 1.3.0 priority set, 27
   classes, dispatched by `workspace.limpid.class_uid`) ·
+  `compose_rfc5424` (journald → RFC 5424 wire, v0.7.1) ·
   `compose_replayable` (replay-shape capture).
 - **Filters (1)** — `filter_openssh_journal` (drops PAM session
   double-count noise from journald sshd streams).
@@ -203,6 +210,7 @@ inside a `process` body:
   `regex_replace`
 - **String predicates** — `contains` · `starts_with` · `ends_with`
 - **String manipulation** — `lower` · `upper` · `strftime` · `strptime`
+- **Datetime parsers** — `parse_datetime_rfc3339` · `parse_datetime_rfc2822`
 - **Type coercion** — `to_int` · `to_json` · `to_bytes` · `to_string`
 - **Fallback / shaping** — `coalesce` · `null_omit`
 - **Collections** — `len` · `find_by` · `append` · `prepend`
