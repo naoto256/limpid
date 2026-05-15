@@ -1,0 +1,81 @@
+// Wire:     RFC 5424 syslog (https://datatracker.ietf.org/doc/html/rfc5424)
+// Upstream: parse_journald | compose_rfc5424
+//             reads workspace.journald.{PRIORITY, SYSLOG_FACILITY,
+//                   SYSLOG_IDENTIFIER, _COMM, _PID, SYSLOG_PID, MESSAGE}
+//           Other upstreams (e.g. workspace.syslog.* or workspace.cef.*)
+//           are out of scope — write your own composer if you need to
+//           re-wrap from a different intermediate.
+// Output:   egress — single-line RFC 5424 record
+//
+// Generic journald → RFC 5424 wire composer. Replaces the hand-rolled
+// `wrap_<program>` patterns that used to live per-host (one per
+// service: sshd / sudo / etc.) and that re-extracted PID and identifier
+// from a synthesised string.
+//
+// Wire shape:
+//   <PRI>1 TIMESTAMP HOSTNAME APP-NAME PROCID MSGID STRUCTURED-DATA MSG
+//
+// Field decisions:
+//   PRI             coalesce(SYSLOG_FACILITY, "1")*8 + coalesce(PRIORITY, "6")
+//                   Default 14 (user.info) when journald did not record one.
+//                   Edge does NOT preserve __REALTIME_TIMESTAMP-derived PRI;
+//                   PRIORITY+SYSLOG_FACILITY in the entry are what we use.
+//   VERSION         1 (literal)
+//   TIMESTAMP       received_at, not __REALTIME_TIMESTAMP. Edge stays
+//                   neutral — downstream relay decides whether to
+//                   substitute the original wall-clock for replay.
+//                   Format: RFC 3339 with microsecond precision, UTC.
+//   HOSTNAME        Original `_HOSTNAME` from the journald entry,
+//                   falling back to `hostname()` (this host) if the
+//                   field is absent. This preserves the originating
+//                   host across a relay hop — the relay is forwarding
+//                   someone else's record, not generating its own, so
+//                   stamping the relay's hostname here would erase
+//                   "where did the sshd event actually happen" from
+//                   the RFC 5424 frame.
+//   APP-NAME        SYSLOG_IDENTIFIER, falling back to _COMM, then "-"
+//   PROCID          _PID, falling back to SYSLOG_PID, then "-"
+//   MSGID           "-" (journald has no equivalent concept at this layer)
+//   STRUCTURED-DATA "-" (not synthesised at the edge; downstream
+//                   composers can wrap if they need SD-ELEMENT)
+//   MSG             MESSAGE (verbatim, including any embedded newlines)
+//
+// Typical pipeline (edge box forwarding journald to a syslog relay):
+//   def pipeline ssh_to_relay {
+//       input ssh_journal
+//       process parse_journald | compose_rfc5424
+//       output relay
+//   }
+
+def function rfc5424_pri {
+    let facility = to_int(coalesce(workspace.journald.SYSLOG_FACILITY, "1"))
+    let severity = to_int(coalesce(workspace.journald.PRIORITY, "6"))
+    facility * 8 + severity
+}
+
+def function rfc5424_appname {
+    coalesce(
+        workspace.journald.SYSLOG_IDENTIFIER,
+        workspace.journald._COMM,
+        "-"
+    )
+}
+
+def function rfc5424_procid {
+    coalesce(
+        workspace.journald._PID,
+        workspace.journald.SYSLOG_PID,
+        "-"
+    )
+}
+
+def process compose_rfc5424 {
+    let pri      = rfc5424_pri()
+    let ts       = strftime(received_at, "%Y-%m-%dT%H:%M:%S%.6fZ", "UTC")
+    let host     = coalesce(workspace.journald._HOSTNAME, hostname())
+    let app      = rfc5424_appname()
+    let procid   = rfc5424_procid()
+    let msg      = coalesce(workspace.journald.MESSAGE, "")
+
+    egress = "<${pri}>1 ${ts} ${host} ${app} ${procid} - - ${msg}"
+}

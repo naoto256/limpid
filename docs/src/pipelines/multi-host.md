@@ -13,7 +13,8 @@ The example is deliberately small — one service on the edges, one CEF source, 
 |               |   |               |   |                 |
 | journal input |   | journal input |   |  (CEF over      |
 |      |        |   |      |        |   |   syslog/TCP    |
-| wrap_app      |   | wrap_app      |   |   on 514)       |
+| parse +       |   | parse +       |   |   on 514)       |
+|  compose_5424 |   |  compose_5424 |   |                 |
 |      |        |   |      |        |   |                 |
 | tcp output    |   | tcp output    |   |                 |
 |  (RFC 5424)   |   |  (RFC 5424)   |   |                 |
@@ -64,23 +65,13 @@ On the edge, the job is: read journald entries from `app.service`, wrap each one
 ```limpid
 // /etc/limpid/edge.limpid
 
+include "/usr/share/limpid/snippets/parsers/parse_journald.limpid"
+include "/usr/share/limpid/snippets/composers/compose_rfc5424.limpid"
+
 def input app_journal {
     type journal
     match "_SYSTEMD_UNIT=app.service"
     state_file "/var/lib/limpid/journal/app.cursor"
-}
-
-def process wrap_app {
-    // @requires: ingress  (journald line: "app[PID]: {JSON}")
-    // @produces: egress   (RFC 5424 frame with PRI=<14>, MSG = original payload)
-    //
-    // The journal input emits lines shaped like "IDENTIFIER[PID]: MESSAGE"
-    // (see docs/src/inputs/journal.md). We wrap the whole line as the MSG
-    // of a minimal RFC 5424 frame, using facility=user/severity=info so the
-    // edge host does not take a position on routing — the relay
-    // decides the final PRI.
-
-    egress = "<14>1 ${strftime(received_at, "%Y-%m-%dT%H:%M:%S%.3fZ", "utc")} ${hostname()} app - - - ${ingress}"
 }
 
 def output to_relay {
@@ -96,16 +87,16 @@ def output to_relay {
 
 def pipeline app_to_relay {
     input app_journal
-    process wrap_app
+    process parse_journald | compose_rfc5424
     output to_relay
 }
 ```
 
 Three design points worth calling out:
 
-- **PRI is deliberately neutral (`<14>` = user.info).** The edge host does not decide where the event ends up; it only guarantees a valid frame. The relay picks the final facility. This split — "upstream produces a shape, downstream picks the routing" — is only clean because Principle 3 says the contract is just bytes.
-- **No parsing on the edge.** The edge host does not run `parse_json` against the payload. If parsing is needed, the relay does it. Anything the edge parses becomes state that dies at the hop boundary anyway, so spending cycles on it would be wasted work and Principle 2 violation surface.
-- **Disk queue on the edge.** Network to the relay can blip; we do not want `wrap_app` blocking the journal cursor. The queue lets the output layer absorb the blip without pushing backpressure into the pipeline.
+- **PRI carries through the journald entry's own labels.** `app.service`'s `PRIORITY` / `SYSLOG_FACILITY` (set by libsystemd according to how the program writes — direct `sd_journal_send`, `printf` to stderr, syslog API) survive into the RFC 5424 frame. When the entry has neither, `compose_rfc5424` defaults to `<14>` (user.info) so the frame is always valid. Either way the edge does not invent routing; the relay still picks the final facility based on its own criteria.
+- **Parsing is mechanical, not vendor-specific.** `parse_journald` is `parse_json(ingress)` plus a docstring — the edge does not extract individual fields, it just hands the structured form to the composer. If the relay needs more (e.g. `parse_openssh | compose_ocsf`), it runs there, where the cycles can be amortised across many edge hosts. The edge's per-event work stays tiny.
+- **Disk queue on the edge.** Network to the relay can blip; we do not want the composer blocking the journal cursor. The queue lets the output layer absorb the blip without pushing backpressure into the pipeline.
 
 ## Central host: relay
 
@@ -238,6 +229,6 @@ Three configuration languages, each with its own templating, conditionals, and o
 ## Related
 
 - [Design Principles](../design-principles.md) — the principles this example exercises, especially Principle 3 (hop boundaries), Principle 4 (atomic events), and Principle 5 (operational transparency).
-- [Process Design Guide](../processing/design-guide.md) — how `wrap_app`, `app_drop_debug`, and `ama_rewrite` fit the granularity and contract conventions.
+- [Process Design Guide](../processing/design-guide.md) — how `parse_journald`, `compose_rfc5424`, `app_drop_debug`, and `ama_rewrite` fit the granularity and contract conventions.
 - [Debug Tap](../operations/tap.md) — the `tap` / `inject` workflow used throughout.
 - [Pipeline Examples](./examples.md) — smaller, single-host pipeline examples.
