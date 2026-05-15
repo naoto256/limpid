@@ -1,42 +1,64 @@
-// sudo parser
+// sudo parser (vocabulary)
 //
-// Vendor:  sudo (the Sudo Project — sudo/sudoedit; not pfexec, not
-//          doas, not /bin/su; each of those would land in their own
-//          parser file).
-// Wire:    syslog-wrapped sudo messages —
-//          `<priority>timestamp host sudo[<pid>]: <body>`
-//          sudo on Linux can emit via syslog, journald, or its own
-//          log file. journald and syslog both carry the same body, so
-//          a single parser handles both — strip the wrapper with
-//          `syslog.parse(ingress)` and feed `workspace.syslog.msg`
-//          into this snippet. (For raw journald JSON-style ingress,
-//          replace `workspace.syslog.msg` below with the body source.)
-// Output:  OCSF Authorize Session (class_uid 3003) records on
-//          `workspace.limpid`.
+// Vendor:   sudo (the Sudo Project — sudo/sudoedit; not pfexec, not
+//           doas, not /bin/su; each of those would land in their own
+//           parser file).
+// Wire:     sudo application body, post-transport-unwrap — the
+//           `alice : TTY=pts/0 ; PWD=... ; USER=root ; COMMAND=...`
+//           style text without any syslog / journald wrapper.
+// Intake:   workspace.sudo.body       (required, String) — the sudo body
+//           workspace.sudo.pid        (optional, String) — process id as string
+//           workspace.sudo.hostname   (optional, String) — host where sudo ran
+//           workspace.sudo.time       (optional, Int)    — epoch nanoseconds
+// Upstream: transport-agnostic. Two typical bridges:
 //
-// Sample inputs (RFC 3164 syslog wrapper around the sudo body):
+//           - syslog transport:
+//                 process parse_syslog | {
+//                     workspace.sudo = {
+//                         body:     workspace.syslog.msg,
+//                         pid:      workspace.syslog.procid,
+//                         hostname: workspace.syslog.hostname,
+//                         time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
+//                     }
+//                 } | parse_sudo | compose_ocsf
+//
+//           - journald transport:
+//                 process parse_journald | {
+//                     workspace.sudo = {
+//                         body:     workspace.journald.MESSAGE,
+//                         pid:      coalesce(workspace.journald._PID,
+//                                            workspace.journald.SYSLOG_PID),
+//                         hostname: workspace.journald._HOSTNAME,
+//                         time:     to_int(workspace.journald.__REALTIME_TIMESTAMP) * 1000
+//                     }
+//                 } | parse_sudo | compose_ocsf
+//
+// Output:   OCSF Authorize Session (class_uid 3003) records on
+//           `workspace.limpid`.
+//
+// Sample sudo bodies (what `workspace.sudo.body` carries):
 //
 //   Successful invocation (TTY-bearing terminal):
-//   <85>Apr 27 10:00:00 host sudo[12345]:    alice : TTY=pts/0 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/apt update
+//      alice : TTY=pts/0 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/apt update
 //
 //   Successful invocation (no TTY — the journald-via-systemd path
 //   often omits TTY when the invoker has no controlling terminal):
-//   <85>Apr 27 10:00:00 host sudo[12345]:    alice : PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/ls
+//      alice : PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/ls
 //
 //   Auth failure (incorrect password):
-//   <85>Apr 27 10:00:00 host sudo[12345]:    alice : 3 incorrect password attempts ; TTY=pts/0 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/ls
+//      alice : 3 incorrect password attempts ; TTY=pts/0 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/bin/ls
 //
 //   Authorization denied (user not in sudoers):
-//   <85>Apr 27 10:00:00 host sudo[12345]:    mallory : user NOT in sudoers ; TTY=pts/0 ; PWD=/home/mallory ; USER=root ; COMMAND=/usr/bin/ls
+//      mallory : user NOT in sudoers ; TTY=pts/0 ; PWD=/home/mallory ; USER=root ; COMMAND=/usr/bin/ls
 //
 //   Authorization denied (command not in the user's allowed list):
-//   <85>Apr 27 10:00:00 host sudo[12345]:    alice : command not allowed ; TTY=pts/0 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/sbin/reboot
+//      alice : command not allowed ; TTY=pts/0 ; PWD=/home/alice ; USER=root ; COMMAND=/usr/sbin/reboot
 //
 //   PAM session opened (privilege activation marker):
-//   <85>Apr 27 10:00:00 host sudo[12345]: pam_unix(sudo:session): session opened for user root(uid=0) by alice(uid=1000)
+//   pam_unix(sudo:session): session opened for user root(uid=0) by alice(uid=1000)
 //
 //   PAM session closed (privilege deactivation marker):
-//   <85>Apr 27 10:00:00 host sudo[12345]: pam_unix(sudo:session): session closed for user root
+//   pam_unix(sudo:session): session closed for user root
 //
 // Each pattern populates `workspace.limpid` as an OCSF Authorize
 // Session (3003) record. Invocation lines map to activity_id=1
@@ -45,10 +67,6 @@
 // open/close lines map to activity_id=2 "Activate Privileges" — they
 // mark the moment the elevated session starts/ends, which OCSF
 // "Activate" is the closest fit for among the 3003 enum values.
-//
-// Direct call (skip syslog wrapper, supply raw sudo body in
-// `ingress`): replace `workspace.syslog.msg` below with the source of
-// the body in your own dispatcher.
 //
 // Upstream filtering: PAM-pam_unix events from sudo are NOT noise the
 // way `pam_unix(sshd:session): ...` lines are for OpenSSH (the OpenSSH
@@ -64,7 +82,7 @@
 // repeating the 3003 envelope per pattern.
 // ---------------------------------------------------------------------------
 
-def function sudo_authorize_session_record(activity_id, status_id, severity_id, target_user, actor_user, message) {
+def function sudo_authorize_session_record(activity_id, status_id, severity_id, target_user, actor_user, message, pid_str, host, time_ns) {
     {
         class_uid:    3003,
         category_uid: 3,
@@ -72,6 +90,7 @@ def function sudo_authorize_session_record(activity_id, status_id, severity_id, 
         type_uid:     3003 * 100 + activity_id,
         severity_id:  severity_id,
         status_id:    status_id,
+        time:         time_ns,
         // OCSF 3003 Authorize Session models the privilege grant.
         // sudo (without explicit privilege restrictions) effectively
         // grants the full target user's authority — we list "ALL" so
@@ -79,7 +98,18 @@ def function sudo_authorize_session_record(activity_id, status_id, severity_id, 
         // rather than null.
         privileges: ["ALL"],
         user: { name: target_user },
-        actor: { user: { name: actor_user } },
+        actor: {
+            user: { name: actor_user },
+            process: {
+                pid: switch true {
+                    pid_str != null { to_int(pid_str) }
+                    default         { null }
+                }
+            }
+        },
+        device: {
+            hostname: host
+        },
         message: message,
         metadata: {
             product: {
@@ -212,9 +242,14 @@ def function parse_sudo_message(msg) {
 // ---------------------------------------------------------------------------
 
 def process parse_sudo {
-    workspace.syslog = syslog.parse(ingress)
-    workspace.sudo   = parse_sudo_message(workspace.syslog.msg)
-    switch workspace.sudo.kind {
+    // @requires: workspace.sudo.body       (required, String)
+    // @requires: workspace.sudo.pid        (optional, String)
+    // @requires: workspace.sudo.hostname   (optional, String)
+    // @requires: workspace.sudo.time       (optional, Int — epoch ns)
+    // The pipeline populates these via an inline bridge from the
+    // upstream transport. See the header for canonical bridge shapes.
+    workspace.sudo_class = parse_sudo_message(workspace.sudo.body)
+    switch workspace.sudo_class.kind {
         "invocation"        { process parse_sudo_invocation }
         "auth_failed"       { process parse_sudo_auth_failed }
         "denied_sudoers"    { process parse_sudo_denied_sudoers }
@@ -232,7 +267,7 @@ def process parse_sudo {
         // separate 3003 records would create duplicate / fragmented
         // entries downstream.
         "command_continued" { drop }
-        default             { error "parse_sudo: unrecognised body: ${workspace.syslog.msg}" }
+        default             { error "parse_sudo: unrecognised body: ${workspace.sudo.body}" }
     }
 }
 
@@ -246,9 +281,12 @@ def process parse_sudo_invocation {
         1,  // activity_id: Assign Privileges
         1,  // status_id:   Success
         1,  // severity_id: Informational
-        workspace.sudo.fields.target,
-        workspace.sudo.fields.actor,
-        workspace.sudo.fields.command
+        workspace.sudo_class.fields.target,
+        workspace.sudo_class.fields.actor,
+        workspace.sudo_class.fields.command,
+        workspace.sudo.pid,
+        workspace.sudo.hostname,
+        workspace.sudo.time
     )
 }
 
@@ -263,9 +301,12 @@ def process parse_sudo_auth_failed {
         1,  // activity_id: Assign Privileges (denied)
         2,  // status_id:   Failure
         3,  // severity_id: Medium
-        workspace.sudo.fields.target,
-        workspace.sudo.fields.actor,
-        "${workspace.sudo.fields.attempts} incorrect password attempts; command was ${workspace.sudo.fields.command}"
+        workspace.sudo_class.fields.target,
+        workspace.sudo_class.fields.actor,
+        "${workspace.sudo_class.fields.attempts} incorrect password attempts; command was ${workspace.sudo_class.fields.command}",
+        workspace.sudo.pid,
+        workspace.sudo.hostname,
+        workspace.sudo.time
     )
 }
 
@@ -280,9 +321,12 @@ def process parse_sudo_denied_sudoers {
         1,  // activity_id: Assign Privileges (denied)
         2,  // status_id:   Failure
         3,  // severity_id: Medium — non-sudoer attempting privilege
-        workspace.sudo.fields.target,
-        workspace.sudo.fields.actor,
-        "user NOT in sudoers; command was ${workspace.sudo.fields.command}"
+        workspace.sudo_class.fields.target,
+        workspace.sudo_class.fields.actor,
+        "user NOT in sudoers; command was ${workspace.sudo_class.fields.command}",
+        workspace.sudo.pid,
+        workspace.sudo.hostname,
+        workspace.sudo.time
     )
 }
 
@@ -298,9 +342,12 @@ def process parse_sudo_denied_command {
         1,  // activity_id: Assign Privileges (denied)
         2,  // status_id:   Failure
         2,  // severity_id: Low
-        workspace.sudo.fields.target,
-        workspace.sudo.fields.actor,
-        "command not allowed; command was ${workspace.sudo.fields.command}"
+        workspace.sudo_class.fields.target,
+        workspace.sudo_class.fields.actor,
+        "command not allowed; command was ${workspace.sudo_class.fields.command}",
+        workspace.sudo.pid,
+        workspace.sudo.hostname,
+        workspace.sudo.time
     )
 }
 
@@ -325,9 +372,12 @@ def process parse_sudo_password_required {
         1,  // activity_id: Assign Privileges (denied)
         2,  // status_id:   Failure
         3,  // severity_id: Medium
-        workspace.sudo.fields.target,
-        workspace.sudo.fields.actor,
-        "a password is required; command was ${workspace.sudo.fields.command}"
+        workspace.sudo_class.fields.target,
+        workspace.sudo_class.fields.actor,
+        "a password is required; command was ${workspace.sudo_class.fields.command}",
+        workspace.sudo.pid,
+        workspace.sudo.hostname,
+        workspace.sudo.time
     )
 }
 
@@ -336,9 +386,12 @@ def process parse_sudo_pam_session_open {
         2,  // activity_id: Activate Privileges
         1,  // status_id:   Success
         1,  // severity_id: Informational
-        workspace.sudo.fields.target,
-        workspace.sudo.fields.actor,
-        "pam:session opened"
+        workspace.sudo_class.fields.target,
+        workspace.sudo_class.fields.actor,
+        "pam:session opened",
+        workspace.sudo.pid,
+        workspace.sudo.hostname,
+        workspace.sudo.time
     )
 }
 
@@ -355,12 +408,15 @@ def process parse_sudo_pam_session_close {
         2,  // activity_id: Activate Privileges (closing edge)
         1,  // status_id:   Success
         1,  // severity_id: Informational
-        workspace.sudo.fields.target,
+        workspace.sudo_class.fields.target,
         // pam:session close lines do NOT carry the actor — sudo
         // emits only `for user X`, no `by Y`. Use null for the actor
         // and let downstream correlation join close-to-open events.
         null,
-        "pam:session closed"
+        "pam:session closed",
+        workspace.sudo.pid,
+        workspace.sudo.hostname,
+        workspace.sudo.time
     )
 }
 
@@ -382,8 +438,11 @@ def process parse_sudo_pam_auth_failure_classic {
         2,    // status_id:   Failure
         3,    // severity_id: Medium
         null, // target unknown at this PAM line; correlate by pid
-        workspace.sudo.fields.user,
-        "pam:auth authentication failure (uid=${workspace.sudo.fields.uid}, tty=${workspace.sudo.fields.tty})"
+        workspace.sudo_class.fields.user,
+        "pam:auth authentication failure (uid=${workspace.sudo_class.fields.uid}, tty=${workspace.sudo_class.fields.tty})",
+        workspace.sudo.pid,
+        workspace.sudo.hostname,
+        workspace.sudo.time
     )
 }
 
@@ -402,8 +461,11 @@ def process parse_sudo_pam_auth_lookup_failed {
         2,    // status_id:   Failure
         3,    // severity_id: Medium
         null,
-        workspace.sudo.fields.user,
-        "pam:auth could not identify password"
+        workspace.sudo_class.fields.user,
+        "pam:auth could not identify password",
+        workspace.sudo.pid,
+        workspace.sudo.hostname,
+        workspace.sudo.time
     )
 }
 
@@ -424,6 +486,9 @@ def process parse_sudo_pam_auth_conversation_failed {
         2,    // severity_id: Low — usually benign abort
         null,
         null,
-        "pam:auth conversation failed"
+        "pam:auth conversation failed",
+        workspace.sudo.pid,
+        workspace.sudo.hostname,
+        workspace.sudo.time
     )
 }

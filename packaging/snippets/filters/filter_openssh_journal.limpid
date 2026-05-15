@@ -14,11 +14,22 @@
 // syslog feeds (where each daemon has its own syslogtag) this filter
 // is a no-op and can be omitted.
 //
-// Usage:
+// Intake:   workspace.journald.MESSAGE  (required, String) — set by
+//           `parse_journald` upstream.
+//
+// Usage (filter sits between parse_journald and the openssh bridge):
 //
 //   def pipeline ssh {
 //       input ssh_in
-//       process filter_openssh_journal | parse_openssh | compose_ocsf
+//       process parse_journald | filter_openssh_journal | {
+//           workspace.openssh = {
+//               body:     workspace.journald.MESSAGE,
+//               pid:      coalesce(workspace.journald._PID,
+//                                  workspace.journald.SYSLOG_PID),
+//               hostname: workspace.journald._HOSTNAME,
+//               time:     to_int(workspace.journald.__REALTIME_TIMESTAMP) * 1000
+//           }
+//       } | parse_openssh | compose_ocsf
 //       output sink
 //   }
 //
@@ -38,7 +49,7 @@
 // classify.
 
 def process filter_openssh_journal {
-    let body = syslog.parse(ingress).msg
+    let body = coalesce(workspace.journald.MESSAGE, "")
     if regex_match(body, "^pam_unix\\(sshd:[a-z]+\\):") {
         drop
     }

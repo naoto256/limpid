@@ -1,31 +1,71 @@
-// OpenSSH sshd parser
+// OpenSSH sshd parser (vocabulary)
 //
-// Vendor:  OpenSSH (the OpenBSD project's reference implementation of SSH —
-//          most Linux / BSD distros use this; not Tectia, not Dropbear,
-//          not Bitvise, each of which emits different message strings
-//          and would land in their own `parse_<vendor>.limpid` file).
-// Wire:    syslog-wrapped sshd messages —
-//          `<priority>timestamp host sshd[<pid>]: <body>`
-//          OpenSSH effectively has one wire format (text → syslog or
-//          journald, both with the same body); per the snippet plan
-//          rule, single-format vendors omit the format suffix.
-// Output:  OCSF Authentication (class_uid 3002) records on `workspace.limpid`
+// Vendor:   OpenSSH (the OpenBSD project's reference implementation of SSH —
+//           most Linux / BSD distros use this; not Tectia, not Dropbear,
+//           not Bitvise, each of which emits different message strings
+//           and would land in their own `parse_<vendor>.limpid` file).
+// Wire:     sshd application body, post-transport-unwrap — the
+//           `Accepted publickey for alice from 192.0.2.10 port 54321 ssh2`
+//           style text without any syslog / journald wrapper.
+// Intake:   workspace.openssh.body       (required, String) — sshd body
+//           workspace.openssh.pid        (optional, String) — process id as string
+//           workspace.openssh.hostname   (optional, String) — SSH server hostname
+//           workspace.openssh.time       (optional, Int)    — epoch nanoseconds of the event
+// Upstream: transport-agnostic. The pipeline writer is responsible for
+//           bridging the upstream transport into the intake schema above.
+//           Two typical bridges (use the trusted source where the
+//           transport provides one — e.g. journald's `_PID` and
+//           `_HOSTNAME` are kernel-verified):
 //
-// Sample inputs (RFC 3164 syslog wrapper around sshd body):
-//   <38>Apr 27 10:00:00 host sshd[12345]: Accepted publickey for alice from 192.0.2.10 port 54321 ssh2: RSA SHA256:abcd
-//   <38>Apr 27 10:00:00 host sshd[12345]: Failed password for alice from 192.0.2.10 port 54321 ssh2
-//   <38>Apr 27 10:00:00 host sshd[12345]: Failed password for invalid user mallory from 192.0.2.10 port 54321 ssh2
-//   <38>Apr 27 10:00:00 host sshd[12345]: Invalid user mallory from 192.0.2.10 port 54321
-//   <38>Apr 27 10:00:00 host sshd[12345]: Disconnected from authenticating user alice 192.0.2.10 port 54321 [preauth]
-//   <38>Apr 27 10:00:00 host sshd[12345]: Connection closed by 192.0.2.10 port 54321 [preauth]
+//           - syslog transport (RFC 3164 / 5424; auto-detected by
+//             `syslog.parse`). For RFC 5424 wire, use
+//             `parse_datetime_rfc3339` — it accepts `Z` / `±HH:MM` /
+//             `±HHMM` transparently. For RFC 3164 wire there is no
+//             clean atomic parser (year and timezone are missing from
+//             the wire); compose `strptime` + current-year fallback +
+//             future-clamp in LPL for best-effort handling.
+//
+//                 process parse_syslog | {
+//                     workspace.openssh = {
+//                         body:     workspace.syslog.msg,
+//                         pid:      workspace.syslog.procid,
+//                         hostname: workspace.syslog.hostname,
+//                         time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
+//                     }
+//                 } | parse_openssh | compose_ocsf
+//
+//           - journald transport. Prefer `_PID` over `SYSLOG_PID` (the
+//             former is kernel-verified; the latter is application-set
+//             and can be tampered with). `__REALTIME_TIMESTAMP` is in
+//             microseconds; multiply by 1000 for the OCSF nanosecond
+//             convention.
+//                 process parse_journald | {
+//                     workspace.openssh = {
+//                         body:     workspace.journald.MESSAGE,
+//                         pid:      coalesce(workspace.journald._PID,
+//                                            workspace.journald.SYSLOG_PID),
+//                         hostname: workspace.journald._HOSTNAME,
+//                         time:     to_int(workspace.journald.__REALTIME_TIMESTAMP) * 1000
+//                     }
+//                 } | parse_openssh | compose_ocsf
+//
+//           Other stacks (CEF-wrapped, file tail with raw bodies, etc.)
+//           are the caller's responsibility — write your own bridge.
+//           See [Workspace is event-scoped, not message-passed](../../../docs/src/design-principles.md)
+//           for the rationale.
+// Output:   OCSF Authentication (class_uid 3002) records on `workspace.limpid`
+//
+// Sample sshd bodies (i.e. what `workspace.openssh.body` carries):
+//   Accepted publickey for alice from 192.0.2.10 port 54321 ssh2: RSA SHA256:abcd
+//   Failed password for alice from 192.0.2.10 port 54321 ssh2
+//   Failed password for invalid user mallory from 192.0.2.10 port 54321 ssh2
+//   Invalid user mallory from 192.0.2.10 port 54321
+//   Disconnected from authenticating user alice 192.0.2.10 port 54321 [preauth]
+//   Connection closed by 192.0.2.10 port 54321 [preauth]
 //
 // Each pattern populates workspace.limpid as an OCSF Authentication
 // (3002) record. Login attempts (success / failure) → activity_id=1;
 // session teardown → activity_id=2.
-//
-// Direct call (skip syslog wrapper, supply raw sshd body in `egress` /
-// `ingress`): replace `workspace.syslog.msg` below with the source of
-// the body in your own dispatcher.
 //
 // Upstream filtering: when sshd events are sourced from systemd
 // journald (`_SYSTEMD_UNIT=ssh.service`), the stream also contains
@@ -46,13 +86,19 @@
 // activity_id, severity_id). `port_str` is the port as captured by
 // regex_parse (always a String); `to_int` is applied here so leaves
 // don't repeat the conversion.
-def function openssh_auth_record(activity_id, status_id, severity_id, user, ip, port_str) {
+//
+// `pid_str` / `host` / `time_ns` come from the upstream transport
+// (via the inline bridge — see the header). Any of them may be null
+// if the bridge left them out or the wire didn't carry them; the
+// caller (compose_<target>) is expected to strip nulls.
+def function openssh_auth_record(activity_id, status_id, severity_id, user, ip, port_str, pid_str, host, time_ns) {
     {
         class_uid:        3002,
         category_uid:     3,
         activity_id:      activity_id,
         severity_id:      severity_id,
         status_id:        status_id,
+        time:             time_ns,
         // OCSF auth_protocol_id enum has no SSH slot; 99 = Other.
         // The string form `auth_protocol` carries the human-readable
         // name so consumers don't have to reverse-map.
@@ -64,6 +110,17 @@ def function openssh_auth_record(activity_id, status_id, severity_id, user, ip, 
         src_endpoint: {
             ip:   ip,
             port: to_int(port_str)
+        },
+        device: {
+            hostname: host
+        },
+        actor: {
+            process: {
+                pid: switch true {
+                    pid_str != null { to_int(pid_str) }
+                    default         { null }
+                }
+            }
         },
         service: {
             name: "ssh"
@@ -84,8 +141,14 @@ def function openssh_auth_record(activity_id, status_id, severity_id, user, ip, 
 // ---------------------------------------------------------------------------
 
 def process parse_openssh {
-    workspace.syslog = syslog.parse(ingress)
-    workspace.ssh    = parse_openssh_message(workspace.syslog.msg)
+    // @requires: workspace.openssh.body       (required, String)
+    // @requires: workspace.openssh.pid        (optional, String)
+    // @requires: workspace.openssh.hostname   (optional, String)
+    // @requires: workspace.openssh.time       (optional, Int — epoch ns)
+    // The pipeline populates these via an inline bridge from the
+    // upstream transport (workspace.syslog.* or workspace.journald.*).
+    // See the header for canonical bridge shapes.
+    workspace.ssh = parse_openssh_message(workspace.openssh.body)
     switch workspace.ssh.kind {
         "accepted"            { process parse_openssh_accepted }
         "failed"              { process parse_openssh_failed }
@@ -107,7 +170,7 @@ def process parse_openssh {
         // failed before sshd captured peer identity), so emitting an
         // OCSF Authentication record would be uninformative. Drop.
         "kex_error" { drop }
-        default { error "parse_openssh: unsupported sshd message: ${workspace.syslog.msg}" }
+        default { error "parse_openssh: unsupported sshd message: ${workspace.openssh.body}" }
     }
 }
 
@@ -208,7 +271,10 @@ def process parse_openssh_accepted {
         1,                              // severity_id: Informational
         workspace.ssh.fields.user,
         workspace.ssh.fields.ip,
-        workspace.ssh.fields.port
+        workspace.ssh.fields.port,
+        workspace.openssh.pid,
+        workspace.openssh.hostname,
+        workspace.openssh.time
     )
 }
 
@@ -235,7 +301,10 @@ def process parse_openssh_failed {
         severity,
         user,
         workspace.ssh.fields.ip,
-        workspace.ssh.fields.port
+        workspace.ssh.fields.port,
+        workspace.openssh.pid,
+        workspace.openssh.hostname,
+        workspace.openssh.time
     )
 }
 
@@ -251,7 +320,10 @@ def process parse_openssh_invalid_user {
         3,                              // severity_id: Medium (probe)
         workspace.ssh.fields.user,
         workspace.ssh.fields.ip,
-        workspace.ssh.fields.port
+        workspace.ssh.fields.port,
+        workspace.openssh.pid,
+        workspace.openssh.hostname,
+        workspace.openssh.time
     )
 }
 
@@ -274,7 +346,10 @@ def process parse_openssh_disconnected {
         1,                              // severity_id: Informational
         workspace.ssh.fields.user,      // may be null when no user was authenticated
         workspace.ssh.fields.ip,
-        workspace.ssh.fields.port
+        workspace.ssh.fields.port,
+        workspace.openssh.pid,
+        workspace.openssh.hostname,
+        workspace.openssh.time
     )
 }
 
@@ -293,6 +368,9 @@ def process parse_openssh_no_ident {
         2,                              // severity_id: Low
         null,                           // no user
         workspace.ssh.fields.ip,
-        workspace.ssh.fields.port
+        workspace.ssh.fields.port,
+        workspace.openssh.pid,
+        workspace.openssh.hostname,
+        workspace.openssh.time
     )
 }

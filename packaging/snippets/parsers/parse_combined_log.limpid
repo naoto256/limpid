@@ -1,25 +1,50 @@
-// Apache "combined" access log parser
+// Apache "combined" access log parser (vocabulary)
 //
-// Vendor:  Apache Software Foundation (Apache HTTP Server) — Nginx
-//          adopted the same format byte-for-byte as its default
-//          `combined` log format, so this single snippet covers both.
-//          Caddy / lighttpd / OpenLiteSpeed / IIS-with-W3C-extended /
-//          HAProxy each have their own default formats and would land
-//          in their own parser files.
-// Wire:    Apache combined log format —
-//          `<remote_addr> <ident> <remote_user> [<time>] "<request>" <status> <bytes> "<referer>" "<user_agent>"`
-//          where `<ident>` and `<remote_user>` are `-` when absent
-//          and `<request>` is `<method> <uri> <protocol>`. The format
-//          is defined by the Apache `LogFormat` directive
-//          `"%h %l %u %t \"%r\" %>s %O \"%{Referer}i\" \"%{User-Agent}i\""`
-//          which is also Nginx's `log_format combined` default.
-// Output:  OCSF HTTP Activity (class_uid 4002) records on
-//          `workspace.limpid`.
+// Vendor:   Apache Software Foundation (Apache HTTP Server) — Nginx
+//           adopted the same format byte-for-byte as its default
+//           `combined` log format, so this single snippet covers both.
+//           Caddy / lighttpd / OpenLiteSpeed / IIS-with-W3C-extended /
+//           HAProxy each have their own default formats and would land
+//           in their own parser files.
+// Wire:     Apache combined log format —
+//           `<remote_addr> <ident> <remote_user> [<time>] "<request>" <status> <bytes> "<referer>" "<user_agent>"`
+//           where `<ident>` and `<remote_user>` are `-` when absent
+//           and `<request>` is `<method> <uri> <protocol>`. The format
+//           is defined by the Apache `LogFormat` directive
+//           `"%h %l %u %t \"%r\" %>s %O \"%{Referer}i\" \"%{User-Agent}i\""`
+//           which is also Nginx's `log_format combined` default.
+// Intake:   workspace.combined_log.body      (required, String) — the CLF line
+//           workspace.combined_log.hostname  (optional, String) — web server hostname
 //
-// Sample inputs (no syslog wrapper — access logs are typically read
-// directly off disk via `tail` input or shipped as plain JSONL via a
-// log forwarder; if your forwarder wraps them in syslog, strip the
-// wrapper upstream before calling this snippet):
+//           The CLF format carries its own time and client IP, so
+//           transport `time` is unused (CLF time is more authoritative
+//           for HTTP activity than the collector receive time). The
+//           transport hostname is the only field worth forwarding.
+// Upstream: transport-agnostic. Three typical bridges:
+//
+//           - file tail (most common — limpid runs on the web server):
+//                 { workspace.combined_log = { body: ingress, hostname: hostname() } } | parse_combined_log | compose_ocsf
+//
+//           - syslog transport (rsyslog forwarding access logs):
+//                 process parse_syslog | {
+//                     workspace.combined_log = {
+//                         body:     workspace.syslog.msg,
+//                         hostname: workspace.syslog.hostname
+//                     }
+//                 } | parse_combined_log | compose_ocsf
+//
+//           - journald transport (rare for access logs, but possible):
+//                 process parse_journald | {
+//                     workspace.combined_log = {
+//                         body:     workspace.journald.MESSAGE,
+//                         hostname: workspace.journald._HOSTNAME
+//                     }
+//                 } | parse_combined_log | compose_ocsf
+//
+// Output:   OCSF HTTP Activity (class_uid 4002) records on
+//           `workspace.limpid`.
+//
+// Sample inputs (`workspace.combined_log.body` carries the CLF line):
 //
 //   Successful GET (IPv4 client, real referer + UA):
 //   192.0.2.10 - - [29/Apr/2026:13:55:36 +0900] "GET /index.html HTTP/1.1" 200 2326 "https://example.com/" "Mozilla/5.0"
@@ -29,10 +54,6 @@
 //
 //   POST with body bytes counted (status_id Failure because 5xx):
 //   ::1 - - [29/Apr/2026:13:55:36 +0900] "POST /api HTTP/1.1" 502 1024 "https://app.example/" "Apache-HttpClient/4.5"
-//
-// Direct call: this snippet is single-format (combined access log),
-// single-class (4002 HTTP Activity); no dispatcher. Call as
-// `process parse_combined_log` directly.
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -89,12 +110,16 @@ def function combined_log_severity_id(code) {
 // Top-level dispatcher: regex-match the line, route to the record
 // leaf on success or to error_log on a malformed line.
 def process parse_combined_log {
+    // @requires: workspace.combined_log.body      (required, String)
+    // @requires: workspace.combined_log.hostname  (optional, String)
+    // The pipeline populates these via an inline bridge from the
+    // upstream transport. See the header for canonical bridge shapes.
     workspace.web = regex_parse(
-        ingress,
+        workspace.combined_log.body,
         "^(?P<remote_addr>\\S+) (?P<ident>\\S+) (?P<remote_user>\\S+) \\[(?P<time>[^\\]]+)\\] \"(?P<method>[A-Z]+) (?P<uri>\\S+) (?P<proto>HTTP/[0-9.]+)\" (?P<status>\\d+) (?P<bytes>\\d+) \"(?P<referer>[^\"]*)\" \"(?P<user_agent>[^\"]*)\""
     )
     switch true {
-        workspace.web == null { error "parse_combined_log: line does not match Apache combined log format: ${ingress}" }
+        workspace.web == null { error "parse_combined_log: line does not match Apache combined log format: ${workspace.combined_log.body}" }
         default               { process parse_combined_log_record }
     }
 }
@@ -128,6 +153,9 @@ def process parse_combined_log_record {
         time:         event_time,
         src_endpoint: {
             ip: workspace.web.remote_addr
+        },
+        device: {
+            hostname: workspace.combined_log.hostname
         },
         actor: {
             user: { name: user }

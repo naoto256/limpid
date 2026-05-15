@@ -1,25 +1,55 @@
-// Postfix mail server log parser
+// Postfix mail server log parser (vocabulary)
 //
-// Vendor:  The Postfix Project (Wietse Venema's MTA — covers Postfix
-//          on Linux / BSD / macOS, the dominant outbound MTA in
-//          modern unix mail stacks; not Sendmail, not Exim, not
-//          OpenSMTPD, each of which emits different line shapes and
-//          would land in their own parser file).
-// Wire:    syslog-wrapped Postfix messages —
-//          `<priority>timestamp host postfix/<program>[<pid>]: <body>`
-//          where `<program>` is the Postfix subcomponent (`smtp`,
-//          `smtpd`, `qmgr`, `cleanup`, `bounce`, `pickup`, `master`,
-//          `trivial-rewrite`, `error`, ...) and `<body>` is the
-//          program-specific message text.
-// Output:  OCSF Email Activity (class_uid 4009) records on
-//          `workspace.limpid` for the operational mail events
-//          (delivery attempts, queue events, bounces, SMTP
-//          connections). Daemon-control noise (master / pickup /
-//          trivial-rewrite startup / shutdown / warning lines) is
-//          routed to error_log via the per-program leaf's `error`
-//          arm — they are operationally meaningful but not Email
-//          Activity, and deserve a separate observability layer
-//          (6002 Application Activity if needed).
+// Vendor:   The Postfix Project (Wietse Venema's MTA — covers Postfix
+//           on Linux / BSD / macOS, the dominant outbound MTA in
+//           modern unix mail stacks; not Sendmail, not Exim, not
+//           OpenSMTPD, each of which emits different line shapes and
+//           would land in their own parser file).
+// Wire:     Postfix log body including its internal program tag —
+//           `postfix/<program>[<pid>]: <body>` where `<program>` is
+//           the Postfix subcomponent (`smtp`, `smtpd`, `qmgr`,
+//           `cleanup`, `bounce`, `pickup`, `master`,
+//           `trivial-rewrite`, `error`, ...). The transport layer
+//           (syslog / journald) is unwrapped upstream; the postfix
+//           tag and pid live INSIDE this body because Postfix is one
+//           logical service emitting under several child program
+//           names through a single syslog identifier.
+// Intake:   workspace.postfix.body      (required, String) — the postfix-tagged body
+//           workspace.postfix.hostname  (optional, String) — host where the MTA ran
+//           workspace.postfix.time      (optional, Int)    — epoch nanoseconds
+// Upstream: transport-agnostic. Two typical bridges:
+//
+//           - syslog transport (RFC 3164 / 5424; syslog.parse leaves
+//             the postfix tag inside `msg`):
+//                 process parse_syslog | {
+//                     workspace.postfix = {
+//                         body:     workspace.syslog.msg,
+//                         hostname: workspace.syslog.hostname,
+//                         time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
+//                     }
+//                 } | parse_postfix | compose_ocsf
+//
+//           - journald transport. journald separates the postfix tag
+//             from the MESSAGE, so the bridge reconstructs the
+//             `postfix/<program>[<pid>]: <body>` form the parser
+//             expects from SYSLOG_IDENTIFIER + _PID + MESSAGE:
+//                 process parse_journald | {
+//                     workspace.postfix = {
+//                         body:     "${workspace.journald.SYSLOG_IDENTIFIER}[${coalesce(workspace.journald._PID, workspace.journald.SYSLOG_PID)}]: ${workspace.journald.MESSAGE}",
+//                         hostname: workspace.journald._HOSTNAME,
+//                         time:     to_int(workspace.journald.__REALTIME_TIMESTAMP) * 1000
+//                     }
+//                 } | parse_postfix | compose_ocsf
+//
+// Output:   OCSF Email Activity (class_uid 4009) records on
+//           `workspace.limpid` for the operational mail events
+//           (delivery attempts, queue events, bounces, SMTP
+//           connections). Daemon-control noise (master / pickup /
+//           trivial-rewrite startup / shutdown / warning lines) is
+//           routed to error_log via the per-program leaf's `error`
+//           arm — they are operationally meaningful but not Email
+//           Activity, and deserve a separate observability layer
+//           (6002 Application Activity if needed).
 //
 // Sample inputs (RFC 3164 syslog wrapper around Postfix body —
 // addresses anonymised to RFC 5321 / 5737 forms):
@@ -96,13 +126,17 @@ def function postfix_severity_for_status(s) {
 // process-call error-propagation fix.
 
 def process parse_postfix {
-    workspace.syslog = syslog.parse(ingress)
+    // @requires: workspace.postfix.body      (required, String) — postfix-tagged body
+    // @requires: workspace.postfix.hostname  (optional, String)
+    // @requires: workspace.postfix.time      (optional, Int — epoch ns)
+    // The pipeline populates these via an inline bridge from the
+    // upstream transport. See the header for canonical bridge shapes.
     workspace.pf = regex_parse(
-        workspace.syslog.msg,
+        workspace.postfix.body,
         "^postfix/(?P<program>[a-z-]+)\\[(?P<pid>\\d+)\\]: (?P<body>.*)$"
     )
     switch true {
-        workspace.pf == null { error "parse_postfix: not a Postfix syslog body: ${workspace.syslog.msg}" }
+        workspace.pf == null { error "parse_postfix: not a Postfix-tagged body: ${workspace.postfix.body}" }
         default              { process parse_postfix_dispatch }
     }
 }
@@ -150,6 +184,15 @@ def process parse_postfix_smtp_record {
         type_uid:     400901,
         severity_id:  postfix_severity_for_status(workspace.pf_smtp.status),
         status_id:    postfix_status_id(workspace.pf_smtp.status),
+        time:         workspace.postfix.time,
+        device: {
+            hostname: workspace.postfix.hostname
+        },
+        actor: {
+            process: {
+                pid: to_int(workspace.pf.pid)
+            }
+        },
         email: {
             to:          [workspace.pf_smtp.to],
             message_uid: workspace.pf_smtp.queue_id
@@ -192,6 +235,15 @@ def process parse_postfix_smtpd_connect_record {
         type_uid:     400902,
         severity_id:  1,
         status_id:    1,
+        time:         workspace.postfix.time,
+        device: {
+            hostname: workspace.postfix.hostname
+        },
+        actor: {
+            process: {
+                pid: to_int(workspace.pf.pid)
+            }
+        },
         src_endpoint: {
             ip:       workspace.pf_connect.src_ip,
             hostname: workspace.pf_connect.src_host
@@ -212,6 +264,15 @@ def process parse_postfix_smtpd_reject_record {
         type_uid:     400902,
         severity_id:  3,
         status_id:    2,
+        time:         workspace.postfix.time,
+        device: {
+            hostname: workspace.postfix.hostname
+        },
+        actor: {
+            process: {
+                pid: to_int(workspace.pf.pid)
+            }
+        },
         email: {
             from: workspace.pf_reject.from,
             to:   [workspace.pf_reject.to]
@@ -252,6 +313,15 @@ def process parse_postfix_qmgr_record {
         type_uid:     400901,
         severity_id:  1,
         status_id:    1,
+        time:         workspace.postfix.time,
+        device: {
+            hostname: workspace.postfix.hostname
+        },
+        actor: {
+            process: {
+                pid: to_int(workspace.pf.pid)
+            }
+        },
         email: {
             from:        workspace.pf_qmgr.from,
             message_uid: workspace.pf_qmgr.queue_id,
@@ -289,6 +359,15 @@ def process parse_postfix_bounce_record {
         type_uid:     400901,
         severity_id:  3,
         status_id:    2,
+        time:         workspace.postfix.time,
+        device: {
+            hostname: workspace.postfix.hostname
+        },
+        actor: {
+            process: {
+                pid: to_int(workspace.pf.pid)
+            }
+        },
         email: {
             message_uid: workspace.pf_bounce.queue_id
         },
