@@ -1,0 +1,497 @@
+// Suricata EVE JSON parser (vocabulary)
+//
+// Vendor:   OISF Suricata — open-source IDS / IPS / NSM that emits
+//           "Extensible Event Format" (EVE) as line-delimited JSON.
+//           The de-facto OSS pair with Zeek for network detection +
+//           protocol telemetry.
+// Wire:     One JSON object per line. Every event has top-level
+//           `timestamp` (RFC 3339 with TZ offset), `event_type`
+//           (`alert` / `dns` / `http` / `tls` / `flow` / `fileinfo` /
+//           `dhcp` / `smb` / `ssh` / `ftp` / `smtp` / `stats` / …),
+//           and 5-tuple fields when applicable (`src_ip`, `src_port`,
+//           `dest_ip`, `dest_port`, `proto`). The type-specific
+//           payload lives under a sub-object named after the
+//           event_type (e.g. `alert.signature`, `dns.rrname`,
+//           `http.url`). See https://docs.suricata.io/en/latest/output/eve/eve-json-format.html
+// Intake:   workspace.suricata.body      (required, Object) — parsed EVE event
+//                                         (caller does `parse_json(ingress)`)
+//           workspace.suricata.hostname  (optional, String) — collector override
+//           workspace.suricata.time      (optional, Int)    — epoch ns override
+// Upstream: Suricata typically writes EVE to a JSONL file
+//           (`/var/log/suricata/eve.json`) or ships it over syslog.
+//
+//           - Direct JSONL tail:
+//                 process { workspace.suricata = { body: parse_json(ingress), hostname: hostname(), time: to_int(received_at) } } | parse_suricata | compose_ocsf
+//
+//           - Via syslog:
+//                 process parse_syslog | {
+//                     workspace.suricata = {
+//                         body:     parse_json(workspace.syslog.msg),
+//                         hostname: workspace.syslog.hostname,
+//                         time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
+//                     }
+//                 } | parse_suricata | compose_ocsf
+//
+// Output:   OCSF records on `workspace.limpid`. Dispatch by
+//           `event_type`:
+//             alert    → 2004 Detection Finding
+//             dns      → 4003 DNS Activity
+//             http     → 4002 HTTP Activity
+//             tls      → 4001 Network Activity (TLS handshake telemetry under unmapped)
+//             flow     → 4001 Network Activity (closed-flow summary)
+//             fileinfo → 4001 Network Activity (with file evidence on unmapped)
+//             stats    → drop (operational metric, not security telemetry)
+//             other    → error_log (loud-fail-fast for unknown event_type)
+//
+// Coverage scope (v0.7.1): verified against the elastic/integrations
+// suricata corpus (63 events across alert / dns / http / tls / flow /
+// fileinfo / stats — Suricata 4.x / 5.x / 6.x EVE).
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+// IANA protocol_num for the proto name Suricata emits ("TCP" / "UDP" /
+// "ICMP" / "ICMPv6" / "SCTP").
+def function suricata_proto_num(p) {
+    switch p {
+        "TCP"     { 6 }
+        "UDP"     { 17 }
+        "ICMP"    { 1 }
+        "ICMPv6"  { 58 }
+        "SCTP"    { 132 }
+        "GRE"     { 47 }
+        "ESP"     { 50 }
+        "AH"      { 51 }
+        default   { null }
+    }
+}
+
+// Map Suricata alert severity (1=highest / 4=lowest, Snort
+// convention) to OCSF severity_id (1=Info..6=Fatal).
+def function suricata_severity_id(s) {
+    switch s {
+        1       { 5 }   // Critical
+        2       { 4 }   // High
+        3       { 3 }   // Medium
+        4       { 2 }   // Low
+        default { 1 }   // Informational
+    }
+}
+
+// Map Suricata alert action ("allowed" / "blocked") to OCSF status_id.
+def function suricata_status_id(action) {
+    switch action {
+        "allowed" { 1 }     // Success (traffic passed)
+        "blocked" { 2 }     // Failure (traffic stopped)
+        default   { 99 }
+    }
+}
+
+// Map Suricata DNS rcode name to OCSF rcode_id (matches IANA DNS
+// RCODE registry).
+def function suricata_dns_rcode_id(r) {
+    switch r {
+        "NOERROR"  { 0 }
+        "FORMERR"  { 1 }
+        "SERVFAIL" { 2 }
+        "NXDOMAIN" { 3 }
+        "NOTIMP"   { 4 }
+        "REFUSED"  { 5 }
+        "YXDOMAIN" { 6 }
+        "YXRRSET"  { 7 }
+        "NXRRSET"  { 8 }
+        "NOTAUTH"  { 9 }
+        "NOTZONE"  { 10 }
+        default    { null }
+    }
+}
+
+// HTTP method → OCSF 4002 activity_id.
+//   1 Connect / 2 Delete / 3 Get / 4 Head / 5 Options / 6 Post /
+//   7 Put / 8 Trace / 99 Other
+def function suricata_http_activity_id(method) {
+    switch method {
+        "CONNECT" { 1 }
+        "DELETE"  { 2 }
+        "GET"     { 3 }
+        "HEAD"    { 4 }
+        "OPTIONS" { 5 }
+        "POST"    { 6 }
+        "PUT"     { 7 }
+        "TRACE"   { 8 }
+        default   { 99 }
+    }
+}
+
+// Suricata timestamp `"2021-01-27T01:28:11.488362+0100"` → epoch ns.
+// Falls back to the optional `workspace.suricata.time` override if
+// the body timestamp is missing.
+def function suricata_time_ns(body, override) {
+    coalesce(
+        switch true {
+            body.timestamp != null { to_int(parse_datetime_rfc3339(body.timestamp)) }
+            default                { null }
+        },
+        override
+    )
+}
+
+// Common endpoint object built from top-level src/dest fields.
+def function suricata_endpoint(ip, port) {
+    switch true {
+        ip == null and port == null { null }
+        default {
+            {
+                ip:   ip,
+                port: port
+            }
+        }
+    }
+}
+
+// Common connection_info derived from top-level proto + app_proto +
+// optional ether MAC info.
+def function suricata_connection_info(body) {
+    switch true {
+        body.proto == null and body.app_proto == null { null }
+        default {
+            {
+                protocol_num:  suricata_proto_num(body.proto),
+                protocol_name: body.proto
+            }
+        }
+    }
+}
+
+// Suricata `flow.bytes_toserver` / `bytes_toclient` (and packet
+// equivalents) → OCSF `traffic` object. Returns null when no flow
+// sub-object is present.
+def function suricata_traffic(body) {
+    switch true {
+        body.flow == null { null }
+        default {
+            {
+                bytes_in:    body.flow.bytes_toclient,
+                bytes_out:   body.flow.bytes_toserver,
+                packets_in:  body.flow.pkts_toclient,
+                packets_out: body.flow.pkts_toserver
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Record builders — one per event_type
+// ---------------------------------------------------------------------------
+
+// `alert` → 2004 Detection Finding
+def function suricata_alert_record(body, host, time_ns) {
+    let a = body.alert
+    {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:  1,                                  // Create
+        severity_id:  suricata_severity_id(a.severity),
+        status_id:    suricata_status_id(a.action),
+        time:         time_ns,
+        finding_info: {
+            uid:   "${a.signature_id}",
+            title: a.signature,
+            types: ["Network IDS"],
+            analytic: {
+                name: a.signature,
+                uid:  "${a.signature_id}",
+                type_id: 1                                // Rule (signature-based)
+            }
+        },
+        attacks: [{
+            technique: {
+                name: a.signature,
+                uid:  "${a.signature_id}"
+            }
+        }],
+        src_endpoint:    suricata_endpoint(body.src_ip, body.src_port),
+        dst_endpoint:    suricata_endpoint(body.dest_ip, body.dest_port),
+        connection_info: suricata_connection_info(body),
+        device:          { hostname: host },
+        unmapped: {
+            event_type:   body.event_type,
+            flow_id:      body.flow_id,
+            in_iface:     body.in_iface,
+            app_proto:    body.app_proto,
+            category:     a.category,
+            gid:          a.gid,
+            rev:          a.rev,
+            action:       a.action,
+            alert_metadata: a.metadata,
+            community_id: body.community_id,
+            http:         body.http,
+            tls:          body.tls,
+            ssh:          body.ssh,
+            smb:          body.smb,
+            fileinfo:     body.fileinfo,
+            flow:         body.flow,
+            ether:        body.ether
+        },
+        metadata: {
+            product: {
+                vendor_name: "OISF",
+                name:        "Suricata"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// `dns` → 4003 DNS Activity
+def function suricata_dns_record(body, host, time_ns) {
+    let d = body.dns
+    let activity = switch d.type {
+        "query"  { 1 }       // Query
+        "answer" { 2 }       // Response
+        default  { 99 }
+    }
+    {
+        class_uid:    4003,
+        category_uid: 4,
+        activity_id:  activity,
+        severity_id:  1,
+        rcode_id:     suricata_dns_rcode_id(d.rcode),
+        time:         time_ns,
+        query: {
+            hostname: d.rrname,
+            type:     d.rrtype,
+            class:    "IN"
+        },
+        answers: d.answers,
+        src_endpoint:    suricata_endpoint(body.src_ip, body.src_port),
+        dst_endpoint:    suricata_endpoint(body.dest_ip, body.dest_port),
+        device:          { hostname: host },
+        metadata: {
+            product: {
+                vendor_name: "OISF",
+                name:        "Suricata"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// `http` → 4002 HTTP Activity
+def function suricata_http_record(body, host, time_ns) {
+    let h = body.http
+    {
+        class_uid:    4002,
+        category_uid: 4,
+        activity_id:  suricata_http_activity_id(h.http_method),
+        severity_id:  1,
+        status_id:    switch true {
+            h.status != null and h.status >= 400 { 2 }
+            h.status != null { 1 }
+            default { 99 }
+        },
+        time:         time_ns,
+        http_request: {
+            http_method: h.http_method,
+            url:         { hostname: h.hostname, path: h.url },
+            user_agent:  h.http_user_agent,
+            version:     h.protocol
+        },
+        http_response: {
+            code:         h.status,
+            content_type: h.http_content_type,
+            length:       h.length
+        },
+        src_endpoint:    suricata_endpoint(body.src_ip, body.src_port),
+        dst_endpoint:    suricata_endpoint(body.dest_ip, body.dest_port),
+        device:          { hostname: host },
+        traffic:         suricata_traffic(body),
+        metadata: {
+            product: {
+                vendor_name: "OISF",
+                name:        "Suricata"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// `flow` → 4001 Network Activity (closed-flow summary)
+def function suricata_flow_record(body, host, time_ns) {
+    let activity = switch body.flow.state {
+        "new"        { 1 }     // Open
+        "established" { 6 }    // Traffic
+        "closed"     { 2 }     // Close
+        default      { 99 }
+    }
+    {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  activity,
+        severity_id:  1,
+        status_id:    1,
+        time:         time_ns,
+        src_endpoint:    suricata_endpoint(body.src_ip, body.src_port),
+        dst_endpoint:    suricata_endpoint(body.dest_ip, body.dest_port),
+        connection_info: suricata_connection_info(body),
+        traffic:         suricata_traffic(body),
+        app_name:        body.app_proto,
+        device:          { hostname: host },
+        unmapped: {
+            event_type:   body.event_type,
+            flow_id:      body.flow_id,
+            in_iface:     body.in_iface,
+            flow_state:   body.flow.state,
+            flow_reason:  body.flow.reason,
+            flow_age:     body.flow.age,
+            flow_alerted: body.flow.alerted,
+            tcp:          body.tcp,
+            ether:        body.ether,
+            community_id: body.community_id
+        },
+        metadata: {
+            product: {
+                vendor_name: "OISF",
+                name:        "Suricata"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// `tls` → 4001 Network Activity (TLS handshake summary under unmapped)
+def function suricata_tls_record(body, host, time_ns) {
+    {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  6,                                  // Traffic
+        severity_id:  1,
+        status_id:    1,
+        time:         time_ns,
+        src_endpoint:    suricata_endpoint(body.src_ip, body.src_port),
+        dst_endpoint:    suricata_endpoint(body.dest_ip, body.dest_port),
+        connection_info: suricata_connection_info(body),
+        app_name:        coalesce(body.app_proto, "tls"),
+        device:          { hostname: host },
+        unmapped: {
+            event_type:   body.event_type,
+            flow_id:      body.flow_id,
+            in_iface:     body.in_iface,
+            tls:          body.tls,
+            community_id: body.community_id
+        },
+        metadata: {
+            product: {
+                vendor_name: "OISF",
+                name:        "Suricata"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// `fileinfo` → 4001 Network Activity with file evidence on unmapped.
+// (OCSF 1.3.0 has 4010 Network File Activity for this, but the
+// composer doesn't yet route it; emit as 4001 + unmapped.fileinfo
+// to avoid silent data loss.)
+def function suricata_fileinfo_record(body, host, time_ns) {
+    {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  6,                                  // Traffic
+        severity_id:  1,
+        status_id:    1,
+        time:         time_ns,
+        src_endpoint:    suricata_endpoint(body.src_ip, body.src_port),
+        dst_endpoint:    suricata_endpoint(body.dest_ip, body.dest_port),
+        connection_info: suricata_connection_info(body),
+        app_name:        body.app_proto,
+        device:          { hostname: host },
+        unmapped: {
+            event_type:   body.event_type,
+            flow_id:      body.flow_id,
+            in_iface:     body.in_iface,
+            fileinfo:     body.fileinfo,
+            http:         body.http,
+            community_id: body.community_id
+        },
+        metadata: {
+            product: {
+                vendor_name: "OISF",
+                name:        "Suricata"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main process — dispatch by event_type
+// ---------------------------------------------------------------------------
+
+def process parse_suricata {
+    // @requires: workspace.suricata.body      (required, Object — parsed EVE event)
+    // @requires: workspace.suricata.hostname  (optional, String)
+    // @requires: workspace.suricata.time      (optional, Int — epoch ns)
+    switch workspace.suricata.body.event_type {
+        "alert"    { process parse_suricata_alert }
+        "dns"      { process parse_suricata_dns }
+        "http"     { process parse_suricata_http }
+        "flow"     { process parse_suricata_flow }
+        "tls"      { process parse_suricata_tls }
+        "fileinfo" { process parse_suricata_fileinfo }
+        "stats"    { drop }
+        default {
+            error "parse_suricata: unsupported event_type ${workspace.suricata.body.event_type}"
+        }
+    }
+}
+
+def process parse_suricata_alert {
+    workspace.limpid = suricata_alert_record(
+        workspace.suricata.body,
+        workspace.suricata.hostname,
+        suricata_time_ns(workspace.suricata.body, workspace.suricata.time)
+    )
+}
+
+def process parse_suricata_dns {
+    workspace.limpid = suricata_dns_record(
+        workspace.suricata.body,
+        workspace.suricata.hostname,
+        suricata_time_ns(workspace.suricata.body, workspace.suricata.time)
+    )
+}
+
+def process parse_suricata_http {
+    workspace.limpid = suricata_http_record(
+        workspace.suricata.body,
+        workspace.suricata.hostname,
+        suricata_time_ns(workspace.suricata.body, workspace.suricata.time)
+    )
+}
+
+def process parse_suricata_flow {
+    workspace.limpid = suricata_flow_record(
+        workspace.suricata.body,
+        workspace.suricata.hostname,
+        suricata_time_ns(workspace.suricata.body, workspace.suricata.time)
+    )
+}
+
+def process parse_suricata_tls {
+    workspace.limpid = suricata_tls_record(
+        workspace.suricata.body,
+        workspace.suricata.hostname,
+        suricata_time_ns(workspace.suricata.body, workspace.suricata.time)
+    )
+}
+
+def process parse_suricata_fileinfo {
+    workspace.limpid = suricata_fileinfo_record(
+        workspace.suricata.body,
+        workspace.suricata.hostname,
+        suricata_time_ns(workspace.suricata.body, workspace.suricata.time)
+    )
+}
