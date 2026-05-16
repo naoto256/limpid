@@ -8,9 +8,14 @@ use bytes::Bytes;
 
 use crate::dsl::arena::EventArena;
 use crate::dsl::ast::Property;
+use crate::dsl::schema::PropertySpec;
 use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
+
+/// `output stdout` has no module-specific properties; only the common
+/// `queue { ... }` sub-block applies.
+const STDOUT_OUTPUT_SCHEMA: &[PropertySpec] = &[crate::queue::QUEUE_PROPERTY_SPEC];
 
 pub struct StdoutOutput {
     metrics: Arc<OutputMetrics>,
@@ -22,6 +27,10 @@ struct StdoutPayload {
 }
 
 impl Module for StdoutOutput {
+    fn property_schema() -> Option<&'static [PropertySpec]> {
+        Some(STDOUT_OUTPUT_SCHEMA)
+    }
+
     fn from_properties(_name: &str, _properties: &[Property]) -> Result<Self> {
         Ok(Self {
             metrics: Arc::new(OutputMetrics::default()),

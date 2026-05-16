@@ -619,7 +619,7 @@ mod tests {
     fn output_referencing_unproduced_workspace_key_errors() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "${workspace.nope}" }
+def output o { type tcp address "${workspace.nope}:1" }
 def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
@@ -632,7 +632,7 @@ def pipeline p { input i; output o }
     fn syslog_parse_binds_known_workspace_keys() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "${workspace.msg}" }
+def output o { type tcp address "${workspace.msg}:1" }
 def pipeline p {
     input i
     process { syslog.parse(ingress) }
@@ -647,7 +647,7 @@ def pipeline p {
     fn parse_json_with_defaults_narrows_to_declared_keys() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "${workspace.usr}" }
+def output o { type tcp address "${workspace.usr}:1" }
 def pipeline p {
     input i
     process { parse_json(ingress, {user: "anon"}) }
@@ -664,7 +664,7 @@ def pipeline p {
     fn parse_json_without_defaults_wildcards() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "${workspace.anything}" }
+def output o { type tcp address "${workspace.anything}:1" }
 def pipeline p {
     input i
     process { parse_json(ingress) }
@@ -681,7 +681,7 @@ def pipeline p {
     fn if_without_else_does_not_propagate_branch_bindings() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "${workspace.tag}" }
+def output o { type tcp address "${workspace.tag}:1" }
 def pipeline p {
     input i
     process {
@@ -701,7 +701,7 @@ def pipeline p {
     fn if_else_with_both_branches_binding_is_guaranteed() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "${workspace.tag}" }
+def output o { type tcp address "${workspace.tag}:1" }
 def pipeline p {
     input i
     process {
@@ -724,7 +724,7 @@ def pipeline p {
     fn eq_int_workspace_vs_string_warns() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process { parse_json(ingress, {port: 0}) }
@@ -751,7 +751,7 @@ def pipeline p {
     fn eq_int_and_int_silent() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process { parse_json(ingress, {port: 0}) }
@@ -771,7 +771,7 @@ def pipeline p {
     fn arith_minus_on_string_warns() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process { parse_json(ingress, {name: "x"}) }
@@ -792,7 +792,7 @@ def pipeline p {
     fn lower_on_int_workspace_warns() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process { parse_json(ingress, {count: 0}) }
@@ -817,7 +817,7 @@ def pipeline p {
     fn object_overwritten_with_string_warns() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process {
@@ -844,7 +844,7 @@ def pipeline p {
     fn try_catch_intersects_bindings() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "${workspace.a}" }
+def output o { type tcp address "${workspace.a}:1" }
 def pipeline p {
     input i
     process {
@@ -866,7 +866,7 @@ def pipeline p {
     fn catch_body_binds_workspace_error_as_string() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process {
@@ -889,7 +889,7 @@ def pipeline p {
     fn output_unresolved_workspace_ref_carries_value_span() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "${workspace.nope}" }
+def output o { type tcp address "${workspace.nope}:1" }
 def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
@@ -900,7 +900,7 @@ def pipeline p { input i; output o }
         sm.add_anonymous(src);
         let resolved = sm.resolve(&span).expect("span should resolve");
         assert!(
-            resolved.line_text.contains("template"),
+            resolved.line_text.contains("address"),
             "span line: {}",
             resolved.line_text
         );
@@ -910,7 +910,7 @@ def pipeline p { input i; output o }
     fn unresolved_workspace_ref_suggests_near_match() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "${workspace.mssg}" }
+def output o { type tcp address "${workspace.mssg}:1" }
 def pipeline p {
     input i
     process { syslog.parse(ingress) }
@@ -928,7 +928,7 @@ def pipeline p {
     fn unresolved_workspace_ref_silent_when_nothing_close() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "${workspace.completely_unrelated_zzz}" }
+def output o { type tcp address "${workspace.completely_unrelated_zzz}:1" }
 def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
@@ -945,7 +945,7 @@ def pipeline p { input i; output o }
     fn let_binding_visible_inside_process() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process {
@@ -970,7 +970,7 @@ def pipeline p {
         // diagnostic renders with a snippet + caret.
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process { parse_json(ingress, {count: 0}) }
@@ -1009,7 +1009,7 @@ def pipeline p {
         // lives on the `if` line. Pre-11-A the warning was spanless.
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process { parse_json(ingress, {port: 0}) }
@@ -1043,7 +1043,7 @@ def pipeline p {
     fn unresolved_workspace_output_ref_tagged_unknown_ident() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "${workspace.nope}" }
+def output o { type tcp address "${workspace.nope}:1" }
 def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
@@ -1062,7 +1062,7 @@ def pipeline p { input i; output o }
         // a targeted hint at `--check` time instead.
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process { egress = strftime(timestamp, "%Y", "UTC") }
@@ -1088,7 +1088,7 @@ def pipeline p {
     fn unknown_bare_ident_suggests_near_match() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process { egress = ingres }
@@ -1112,7 +1112,7 @@ def pipeline p {
     fn unknown_function_tagged_unknown_ident() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process { workspace.x = upperr(ingress) }
@@ -1131,7 +1131,7 @@ def pipeline p {
     fn type_mismatch_tagged_type_mismatch() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process { parse_json(ingress, {count: 0}) }
@@ -1151,7 +1151,7 @@ def pipeline p {
     fn object_overwrite_tagged_dataflow() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process {
@@ -1176,7 +1176,7 @@ def pipeline p {
         // escalate the first and leave the second alone.
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process { parse_json(ingress, {count: 0}) }
@@ -1231,7 +1231,7 @@ def pipeline p {
         let src = r#"
 def input i1 { type tcp bind "0.0.0.0:514" }
 def input i2 { type udp bind "0.0.0.0:514" }
-def output o1 { type stdout template "x" }
+def output o1 { type stdout }
 def process p { workspace.a = "z" }
 def pipeline pl { input i1; output o1 }
 "#;
@@ -1256,7 +1256,7 @@ def function normalize_proto(num) {
     }
 }
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
@@ -1271,7 +1271,7 @@ def function bad(x) {
     x + len(workspace.foo)
 }
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
@@ -1294,7 +1294,7 @@ def function bad() {
     received_at
 }
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
@@ -1319,7 +1319,7 @@ def function double_then_add_one(n) {
     result
 }
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
@@ -1340,7 +1340,7 @@ def function bad(x) {
     v
 }
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
@@ -1366,7 +1366,7 @@ def function f(x) {
     v
 }
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
@@ -1386,7 +1386,7 @@ def function bad(x) {
     let v = x
 }
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
         let parsed = crate::dsl::parser::parse_config(src);
@@ -1410,7 +1410,7 @@ def function bad(x) {
     config.foo
 }
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
@@ -1432,7 +1432,7 @@ def function rec(x) {
     rec(x)
 }
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
@@ -1451,7 +1451,7 @@ def pipeline p { input i; output o }
 def function a(x) { b(x) }
 def function b(x) { a(x) }
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
@@ -1478,7 +1478,7 @@ def function bad(x) {
     some_proc(x)
 }
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
@@ -1501,7 +1501,7 @@ def pipeline p { input i; output o }
         let src = r#"
 def function takes_two(a, b) { a + b }
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process { workspace.x = takes_two(1, 2) }
@@ -1528,7 +1528,7 @@ def function normalize_proto(num) {
     switch num { 6 { "tcp" } 17 { "udp" } default { null } }
 }
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process {
@@ -1555,7 +1555,7 @@ def pipeline p {
 def function f1(x) { x }
 def function f2(x) { x + 1 }
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
         let cfg = parse_config(src).unwrap();
@@ -1578,7 +1578,7 @@ def process bad_subtype {
     error "unknown subtype: ${workspace.kind}"
 }
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process bad_subtype
@@ -1605,7 +1605,7 @@ def process bad {
     error "computed: ${lowe("x")}"
 }
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process bad
@@ -1626,7 +1626,7 @@ def pipeline p {
     fn error_keyword_at_pipeline_level_passes_check() {
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     if source.ip == "10.0.0.99" { error "rejected source" }
@@ -1650,7 +1650,7 @@ def function bad(x) {
     error "no good"
 }
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
         let parsed = crate::dsl::parser::parse_config(src);

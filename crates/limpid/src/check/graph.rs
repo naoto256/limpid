@@ -353,7 +353,7 @@ mod tests {
 
     const SINGLE: &str = r#"
 def input a { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input a
     process { workspace.x = "y" }
@@ -364,7 +364,7 @@ def pipeline p {
     const FANIN: &str = r#"
 def input a { type tcp bind "0.0.0.0:514" }
 def input b { type udp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def process parse { workspace.x = "y" }
 def pipeline p {
     input a, b
@@ -376,8 +376,8 @@ def pipeline p {
     const TWO_PIPELINES: &str = r#"
 def input a { type tcp bind "0.0.0.0:514" }
 def input b { type tcp bind "0.0.0.0:515" }
-def output o1 { type stdout template "x" }
-def output o2 { type stdout template "x" }
+def output o1 { type stdout }
+def output o2 { type stdout }
 def pipeline first { input a; output o1 }
 def pipeline second { input b; output o2 }
 "#;

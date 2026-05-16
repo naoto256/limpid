@@ -869,7 +869,7 @@ def pipeline p {
 
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def process wrap {
     egress = strftime(timestamp, "%Y", "UTC")
 }
@@ -920,7 +920,7 @@ def pipeline p {
 
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def process refuse {
     error "I refuse"
 }
@@ -966,7 +966,7 @@ def pipeline p {
 
         let src = r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     error "blocked at pipeline gate"

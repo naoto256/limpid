@@ -31,7 +31,7 @@ fn check_clean_emits_summary_and_configuration_ok() {
         &conf,
         r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p { input i; output o }
 "#,
     )
@@ -69,7 +69,7 @@ fn check_with_warning_still_exits_zero_and_mentions_warnings() {
         &conf,
         r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process { parse_json(ingress, {count: 0}) }
@@ -97,14 +97,17 @@ def pipeline p {
 
 #[test]
 fn check_with_error_emits_error_footer_and_exits_one() {
-    // Output references workspace.nope which nothing produces → error.
+    // Output references workspace.nope inside a template — should
+    // surface as a dataflow error even though `address` is a
+    // schema-known property (the workspace-reference walk runs on
+    // every value, schema-owned or not).
     let dir = TempDir::new().unwrap();
     let conf = dir.path().join("err.conf");
     fs::write(
         &conf,
         r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "${workspace.nope}" }
+def output o { type tcp address "${workspace.nope}:1" }
 def pipeline p { input i; output o }
 "#,
     )
@@ -134,7 +137,7 @@ fn check_strict_warnings_promotes_to_exit_two() {
         &conf,
         r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process { parse_json(ingress, {count: 0}) }
@@ -172,7 +175,7 @@ fn check_expands_includes_in_summary() {
     .unwrap();
     fs::write(
         inc_dir.join("outputs.limpid"),
-        r#"def output o1 { type stdout template "x" }"#,
+        r#"def output o1 { type stdout }"#,
     )
     .unwrap();
     fs::write(
@@ -222,7 +225,7 @@ fn graph_conf(dir: &TempDir) -> std::path::PathBuf {
         r#"
 def input a { type tcp bind "0.0.0.0:514" }
 def input b { type udp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def process parse { workspace.x = "y" }
 def pipeline p {
     input a, b
@@ -333,7 +336,7 @@ fn ultra_strict_promotes_unknown_function_to_error() {
         &conf,
         r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process { workspace.x = upperr(ingress) }
@@ -371,7 +374,7 @@ fn ultra_strict_leaves_type_mismatch_as_warning() {
         &conf,
         r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process { parse_json(ingress, {count: 0}) }
@@ -401,7 +404,7 @@ fn ultra_strict_plus_strict_warnings_mixed_case() {
         &conf,
         r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process { parse_json(ingress, {count: 0}) }
@@ -434,7 +437,7 @@ fn strict_warnings_without_ultra_strict_still_exits_two_on_type_warning() {
         &conf,
         r#"
 def input i { type tcp bind "0.0.0.0:514" }
-def output o { type stdout template "x" }
+def output o { type stdout }
 def pipeline p {
     input i
     process { parse_json(ingress, {count: 0}) }

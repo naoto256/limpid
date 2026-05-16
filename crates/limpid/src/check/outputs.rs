@@ -43,23 +43,23 @@ pub(super) fn analyze_output(
             }
             // If this key is declared in the Module's property schema,
             // the schema validator (see `module_props::analyze_all`)
-            // owns its value's correctness. Skip the generic
-            // expression walk so bare-ident enum values like
-            // `framing non_transparent` don't trip the unknown-
-            // identifier diagnostic.
-            if let Some(spec) = schema
-                && schema_declares_key(spec, key)
-            {
-                continue;
+            // owns the value's *shape* — bare-ident enum values like
+            // `framing non_transparent` are no longer flagged as
+            // unresolved idents. Workspace references inside template
+            // values (`address "${workspace.x}:1"`) remain a dataflow
+            // concern, so the `collect_workspace_refs` walk still runs
+            // regardless of whether the schema covers the key.
+            let schema_owned = schema.is_some_and(|s| schema_declares_key(s, key));
+            if !schema_owned {
+                expr_types::check_types(
+                    expr,
+                    pipeline_name,
+                    bindings,
+                    registry,
+                    *value_span,
+                    diagnostics,
+                );
             }
-            expr_types::check_types(
-                expr,
-                pipeline_name,
-                bindings,
-                registry,
-                *value_span,
-                diagnostics,
-            );
             collect_workspace_refs(expr, &mut |path| {
                 check_workspace_reference(
                     path,
