@@ -29,10 +29,36 @@ use crate::dsl::arena::EventArena;
 use crate::dsl::ast::{Expr, ExprKind, Property, TemplateFragment};
 use crate::dsl::eval::{eval_expr, value_to_string};
 use crate::dsl::props;
+use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::BorrowedEvent;
 use crate::functions::FunctionRegistry;
 use crate::metrics::OutputMetrics;
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
+
+const FILE_OUTPUT_SCHEMA: &[PropertySpec] = &[
+    PropertySpec {
+        name: "path",
+        required: true,
+        kind: PropertyValueKind::String,
+    },
+    // Octal mode string — `"0640"`, `"640"`. Parsed by from_properties.
+    PropertySpec {
+        name: "mode",
+        required: false,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "owner",
+        required: false,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "group",
+        required: false,
+        kind: PropertyValueKind::String,
+    },
+    crate::queue::QUEUE_PROPERTY_SPEC,
+];
 
 /// Per-event payload built by `FileOutput::render`. The expensive work
 /// (template eval against the per-event arena) lives in `render`; the
@@ -58,6 +84,10 @@ pub struct FileOutput {
 }
 
 impl Module for FileOutput {
+    fn property_schema() -> Option<&'static [PropertySpec]> {
+        Some(FILE_OUTPUT_SCHEMA)
+    }
+
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
         let path = props::get_expr(properties, "path")
             .ok_or_else(|| anyhow::anyhow!("output '{}': file requires 'path'", name))?
