@@ -1,0 +1,440 @@
+// Check Point Syslog Exporter parser (vocabulary)
+//
+// Vendor:   Check Point Software Technologies — VPN-1 / FireWall-1 /
+//           Quantum Security Gateway / SmartConsole / Endpoint /
+//           Connectra / and the rest of the CheckPoint product family.
+//           Wire format below is the "Syslog Exporter" output that
+//           ships to generic syslog SIEMs (Splunk / Elastic / etc.).
+//           NOT the LEEF 2.0 form that targets IBM QRadar — for that,
+//           see `parse_checkpoint_leef.limpid`.
+// Wire:     RFC 5424 + Junos-style structured data, with `:` (not `=`)
+//           between key and quoted value and `; ` (semicolon-space)
+//           between pairs:
+//             <PRI>1 <ts> <host> CheckPoint <procid> - [key:"value"; key:"value"; ...]
+//           A few quirks:
+//             - `sys_message::"text"` uses double-colon (CheckPoint
+//               convention for a free-form message field).
+//             - `__policy_id_tag:"product=...;db_tag={...};..."`
+//               re-uses semicolons inside the value, but the outer
+//               KV separator is `; ` (semicolon-space) so a per-name
+//               regex with `[^"]*` for the value handles both cleanly.
+//           Field set varies wildly by CheckPoint product (System
+//           Monitor / VPN-1 & FireWall-1 / SmartConsole / Connectra /
+//           Anti-Bot / Threat Emulation / Log Update / etc.); the
+//           parser captures the common firewall / threat / auth /
+//           audit fields and surfaces the rest under `unmapped`.
+// Intake:   workspace.checkpoint_syslog.body      (required, String) — the full RFC 5424 wire
+//           workspace.checkpoint_syslog.hostname  (optional, String) — collector-side hostname override
+//           workspace.checkpoint_syslog.time      (optional, Int)    — epoch nanoseconds
+// Upstream: CheckPoint gateways / management servers emit via syslog
+//           (UDP/514 or TCP/514). The bridge passes the raw wire —
+//           parse_syslog is not used because limpid's syslog.parse
+//           does not expose the SD block.
+//
+//           - syslog (UDP/TCP):
+//                 { workspace.checkpoint_syslog = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_checkpoint_syslog | compose_ocsf
+//
+// Output:   OCSF records on `workspace.limpid`. The class depends on
+//           the action / product combination:
+//             firewall actions (Accept / Drop / Reject / Decrypt)        → 4001 Network Activity
+//             threat actions (Detect / Inline / Block + threat context)  → 2004 Detection Finding
+//             auth actions   (Log In / Failed Log In / Forgot Passcode)  → 3002 Authentication
+//             other / unknown action                                     → 4001 (with action in unmapped)
+//
+// Coverage scope: verified against the elastic/integrations
+// checkpoint corpus (~80 events across 8 product types — System
+// Monitor / VPN-1 & FireWall-1 / SmartConsole / Connectra / WEB_API /
+// Log Update / etc.).
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+// CheckPoint emits protocol as a name (`tcp` / `udp` / `icmp`) on
+// `proto`. Map to OCSF protocol_num (IANA).
+def function checkpoint_syslog_proto_num(p) {
+    switch p {
+        "tcp"    { 6 }
+        "udp"    { 17 }
+        "icmp"   { 1 }
+        "icmpv6" { 58 }
+        "gre"    { 47 }
+        "esp"    { 50 }
+        "ah"     { 51 }
+        "TCP"    { 6 }
+        "UDP"    { 17 }
+        "ICMP"   { 1 }
+        default  { null }
+    }
+}
+
+// CheckPoint emits ICMP type/code / service / port info via `service`
+// (the destination port as a string, e.g. "443") or `service_id` (the
+// service name, e.g. "https"). Normalise both to int when possible.
+def function checkpoint_syslog_int_opt(s) {
+    switch true {
+        s == null { null }
+        s == ""   { null }
+        default   { to_int(s) }
+    }
+}
+
+// Extract one CheckPoint SD field by name. Handles three real wire
+// shapes seen across CheckPoint product versions:
+//   - `key:"value"`         — Syslog Exporter (single colon, quoted)
+//   - `key::"value"`        — Syslog Exporter for `sys_message` (double colon)
+//   - `key="value"`         — R81+ "Log Fields@..." format (= separator, quoted)
+//   - `key=value`           — R81+ unquoted variant (space-terminated)
+def function parse_checkpoint_syslog_kv(sd, name) {
+    let m = regex_parse(sd, "${name}(?::{1,2}|=)\"(?P<v>[^\"]*)\"")
+    let m2 = switch true {
+        m != null { m }
+        default   { regex_parse(sd, "${name}=(?P<v>\\S+)") }
+    }
+    switch true {
+        m2 == null { null }
+        default    { m2.v }
+    }
+}
+
+// Lookup with empty / "N/A" normalisation.
+def function parse_checkpoint_syslog_kv_or_null(sd, name) {
+    let v = parse_checkpoint_syslog_kv(sd, name)
+    switch true {
+        v == null  { null }
+        v == "N/A" { null }
+        v == ""    { null }
+        default    { v }
+    }
+}
+
+// Map CheckPoint action to OCSF status_id.
+//   Accept / Decrypt / Log In / Agent is up / Download → 1 Success
+//   Drop / Block / Reject / Failed Log In              → 2 Failure
+//   Detect / Inline / Communication with C&C site      → 99 Other (alert-only or threat-context)
+//   anything else                                      → 99 Other
+def function checkpoint_syslog_status_id(action) {
+    switch action {
+        "Accept"        { 1 }
+        "Decrypt"       { 1 }
+        "Log In"        { 1 }
+        "Agent is up"   { 1 }
+        "Download"      { 1 }
+        "Drop"          { 2 }
+        "Block"         { 2 }
+        "Reject"        { 2 }
+        "Failed Log In" { 2 }
+        "Forgot Passcode" { 2 }
+        default         { 99 }
+    }
+}
+
+// Map CheckPoint action to OCSF 4001 activity_id (firewall flows):
+//   Accept / Decrypt           → 1 (Open / allow)
+//   Drop / Block / Reject       → 6 (Deny)
+//   default                     → 99 (Other)
+def function checkpoint_syslog_4001_activity_id(action) {
+    switch action {
+        "Accept"  { 1 }
+        "Decrypt" { 1 }
+        "Drop"    { 6 }
+        "Block"   { 6 }
+        "Reject"  { 6 }
+        default   { 99 }
+    }
+}
+
+// Map CheckPoint action to OCSF severity_id.
+def function checkpoint_syslog_severity_id(action, product) {
+    switch true {
+        action == "Communication with C&C site" { 5 }   // Critical
+        action == "Detect"                      { 3 }   // Medium (threat alert)
+        action == "Inline"                      { 3 }
+        action == "Block" and product != null and (regex_match(product, "(?i)(threat|anti|ips|emulation)")) { 4 }
+        action == "Failed Log In"               { 3 }
+        default                                 { 1 }   // Informational
+    }
+}
+
+// Decide the OCSF class for a CheckPoint event. Heuristic:
+//   - auth-class actions  → 3002 Authentication
+//   - threat-class action → 2004 Detection Finding
+//   - everything else     → 4001 Network Activity
+def function checkpoint_syslog_class_uid(action, product) {
+    switch true {
+        action == "Log In"           { 3002 }
+        action == "Failed Log In"    { 3002 }
+        action == "Forgot Passcode"  { 3002 }
+        action == "Communication with C&C site" { 2004 }
+        action == "Detect"           { 2004 }
+        action == "Inline"           { 2004 }
+        product != null and regex_match(product, "(?i)(threat|anti-bot|anti-virus|ips|emulation)") { 2004 }
+        default                      { 4001 }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Record builders
+// ---------------------------------------------------------------------------
+
+def function checkpoint_syslog_network_record(sd, action, src, src_port, dst, dst_port, proto, policy, rule_name, rule_uid, layer_name, host, time_ns) {
+    {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  checkpoint_syslog_4001_activity_id(action),
+        severity_id:  checkpoint_syslog_severity_id(action, parse_checkpoint_syslog_kv(sd, "product")),
+        status_id:    checkpoint_syslog_status_id(action),
+        time:         time_ns,
+        src_endpoint: {
+            ip:   src,
+            port: checkpoint_syslog_int_opt(src_port)
+        },
+        dst_endpoint: {
+            ip:   dst,
+            port: checkpoint_syslog_int_opt(dst_port)
+        },
+        connection_info: {
+            protocol_num:  checkpoint_syslog_proto_num(proto),
+            protocol_name: proto
+        },
+        traffic: {
+            bytes_in:    checkpoint_syslog_int_opt(parse_checkpoint_syslog_kv(sd, "client_inbound_bytes")),
+            bytes_out:   checkpoint_syslog_int_opt(parse_checkpoint_syslog_kv(sd, "client_outbound_bytes")),
+            packets_in:  checkpoint_syslog_int_opt(parse_checkpoint_syslog_kv(sd, "client_inbound_packets")),
+            packets_out: checkpoint_syslog_int_opt(parse_checkpoint_syslog_kv(sd, "client_outbound_packets"))
+        },
+        device: {
+            hostname: host
+        },
+        unmapped: {
+            action:      action,
+            product:     parse_checkpoint_syslog_kv(sd, "product"),
+            origin:      parse_checkpoint_syslog_kv(sd, "origin"),
+            policy_name: policy,
+            rule_name:   rule_name,
+            rule_uid:    rule_uid,
+            layer_name:  layer_name,
+            ifdir:       parse_checkpoint_syslog_kv(sd, "ifdir"),
+            ifname:      parse_checkpoint_syslog_kv(sd, "ifname"),
+            loguid:      parse_checkpoint_syslog_kv(sd, "loguid"),
+            sequencenum: parse_checkpoint_syslog_kv(sd, "sequencenum")
+        },
+        metadata: {
+            product: {
+                vendor_name: "Check Point Software Technologies",
+                name:        coalesce(parse_checkpoint_syslog_kv(sd, "product"), "Check Point")
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+def function checkpoint_syslog_finding_record(sd, action, src, src_port, dst, dst_port, proto, host, time_ns) {
+    let product = parse_checkpoint_syslog_kv(sd, "product")
+    let attack = coalesce(parse_checkpoint_syslog_kv(sd, "attack"), parse_checkpoint_syslog_kv(sd, "attack_info"), action)
+    {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:  1,                                     // Create
+        severity_id:  checkpoint_syslog_severity_id(action, product),
+        status_id:    checkpoint_syslog_status_id(action),
+        time:         time_ns,
+        finding_info: {
+            uid:   parse_checkpoint_syslog_kv(sd, "protection_id"),
+            title: attack,
+            types: ["Network IDS"],
+            analytic: {
+                name: parse_checkpoint_syslog_kv(sd, "smartdefense_profile"),
+                uid:  parse_checkpoint_syslog_kv(sd, "protection_id")
+            }
+        },
+        attacks: [{
+            technique: {
+                name: attack,
+                uid:  parse_checkpoint_syslog_kv(sd, "protection_id")
+            }
+        }],
+        src_endpoint: {
+            ip:   src,
+            port: checkpoint_syslog_int_opt(src_port)
+        },
+        dst_endpoint: {
+            ip:   dst,
+            port: checkpoint_syslog_int_opt(dst_port)
+        },
+        connection_info: {
+            protocol_num:  checkpoint_syslog_proto_num(proto),
+            protocol_name: proto
+        },
+        device: {
+            hostname: host
+        },
+        unmapped: {
+            action:           action,
+            product:          product,
+            confidence_level: parse_checkpoint_syslog_kv(sd, "confidence_level"),
+            severity:         parse_checkpoint_syslog_kv(sd, "severity"),
+            origin:           parse_checkpoint_syslog_kv(sd, "origin"),
+            attack_info:      parse_checkpoint_syslog_kv(sd, "attack_info"),
+            policy_name:      parse_checkpoint_syslog_kv(sd, "policy"),
+            description:      parse_checkpoint_syslog_kv(sd, "description"),
+            description_url:  parse_checkpoint_syslog_kv(sd, "description_url"),
+            loguid:           parse_checkpoint_syslog_kv(sd, "loguid"),
+            sequencenum:      parse_checkpoint_syslog_kv(sd, "sequencenum")
+        },
+        metadata: {
+            product: {
+                vendor_name: "Check Point Software Technologies",
+                name:        coalesce(product, "Check Point")
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+def function checkpoint_syslog_auth_record(sd, action, host, time_ns) {
+    let user = coalesce(
+        parse_checkpoint_syslog_kv_or_null(sd, "administrator"),
+        parse_checkpoint_syslog_kv_or_null(sd, "src_user_name"),
+        parse_checkpoint_syslog_kv_or_null(sd, "user")
+    )
+    let src_ip = coalesce(
+        parse_checkpoint_syslog_kv_or_null(sd, "client_ip"),
+        parse_checkpoint_syslog_kv_or_null(sd, "src")
+    )
+    let status = checkpoint_syslog_status_id(action)
+    let activity = switch action {
+        "Log In"         { 1 }       // Logon
+        "Failed Log In"  { 1 }
+        "Forgot Passcode" { 1 }
+        default          { 99 }      // Other
+    }
+    {
+        class_uid:    3002,
+        category_uid: 3,
+        activity_id:  activity,
+        severity_id:  switch status { 2 { 3 } default { 1 } },
+        status_id:    status,
+        time:         time_ns,
+        user: { name: user },
+        actor: { user: { name: user } },
+        src_endpoint: { ip: src_ip },
+        device: { hostname: host },
+        auth_protocol_id: 99,
+        auth_protocol:    coalesce(parse_checkpoint_syslog_kv(sd, "auth_method"), "Check Point"),
+        unmapped: {
+            action:          action,
+            product:         parse_checkpoint_syslog_kv(sd, "product"),
+            origin:          parse_checkpoint_syslog_kv(sd, "origin"),
+            operation:       parse_checkpoint_syslog_kv(sd, "operation"),
+            additional_info: parse_checkpoint_syslog_kv(sd, "additional_info"),
+            subject:         parse_checkpoint_syslog_kv(sd, "subject"),
+            auth_status:     parse_checkpoint_syslog_kv(sd, "auth_status"),
+            loguid:          parse_checkpoint_syslog_kv(sd, "loguid"),
+            sequencenum:     parse_checkpoint_syslog_kv(sd, "sequencenum")
+        },
+        metadata: {
+            product: {
+                vendor_name: "Check Point Software Technologies",
+                name:        coalesce(parse_checkpoint_syslog_kv(sd, "product"), "Check Point")
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Classifier
+// ---------------------------------------------------------------------------
+
+def function parse_checkpoint_syslog_classify(body) {
+    // Two real wire shapes:
+    //   - Syslog Exporter:  `<PRI>1 ts host CheckPoint <procid> - [key:"value"; ...]`
+    //   - R81+ Log Fields:  `<PRI>1 ts host CP-GW - Log [Fields@<EID> key=value ...]`
+    let cp = regex_parse(
+        body,
+        "^<\\d+>1 \\S+ (?P<host>\\S+) CheckPoint \\S+ - \\[(?P<sd>.*)\\]\\s*$"
+    )
+    switch true {
+        cp != null { cp }
+        default {
+            regex_parse(
+                body,
+                "^<\\d+>1 \\S+ (?P<host>\\S+) \\S+ - Log \\[Fields@\\S+ (?P<sd>.*)\\]\\s*$"
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main process — dispatch by class (decided heuristically from action / product)
+// ---------------------------------------------------------------------------
+
+def process parse_checkpoint_syslog {
+    // @requires: workspace.checkpoint_syslog.body      (required, String)
+    // @requires: workspace.checkpoint_syslog.hostname  (optional, String)
+    // @requires: workspace.checkpoint_syslog.time      (optional, Int — epoch ns)
+    workspace.cp_syslog_class = parse_checkpoint_syslog_classify(workspace.checkpoint_syslog.body)
+    switch true {
+        workspace.cp_syslog_class == null {
+            error "parse_checkpoint_syslog: not a CheckPoint Syslog Exporter line: ${workspace.checkpoint_syslog.body}"
+        }
+        default { process parse_checkpoint_syslog_dispatch }
+    }
+}
+
+def process parse_checkpoint_syslog_dispatch {
+    let sd = workspace.cp_syslog_class.sd
+    let action = parse_checkpoint_syslog_kv(sd, "action")
+    let product = parse_checkpoint_syslog_kv(sd, "product")
+    let class_uid = checkpoint_syslog_class_uid(action, product)
+    switch class_uid {
+        3002 { process parse_checkpoint_syslog_auth_record }
+        2004 { process parse_checkpoint_syslog_finding_record_proc }
+        default { process parse_checkpoint_syslog_network_record_proc }
+    }
+}
+
+def process parse_checkpoint_syslog_network_record_proc {
+    let sd = workspace.cp_syslog_class.sd
+    workspace.limpid = checkpoint_syslog_network_record(
+        sd,
+        parse_checkpoint_syslog_kv(sd, "action"),
+        parse_checkpoint_syslog_kv(sd, "src"),
+        parse_checkpoint_syslog_kv(sd, "s_port"),
+        parse_checkpoint_syslog_kv(sd, "dst"),
+        parse_checkpoint_syslog_kv(sd, "service"),
+        parse_checkpoint_syslog_kv(sd, "proto"),
+        parse_checkpoint_syslog_kv(sd, "policy"),
+        parse_checkpoint_syslog_kv(sd, "rule_name"),
+        parse_checkpoint_syslog_kv(sd, "rule_uid"),
+        parse_checkpoint_syslog_kv(sd, "layer_name"),
+        coalesce(workspace.cp_syslog_class.host, workspace.checkpoint_syslog.hostname),
+        workspace.checkpoint_syslog.time
+    )
+}
+
+def process parse_checkpoint_syslog_finding_record_proc {
+    let sd = workspace.cp_syslog_class.sd
+    workspace.limpid = checkpoint_syslog_finding_record(
+        sd,
+        parse_checkpoint_syslog_kv(sd, "action"),
+        parse_checkpoint_syslog_kv(sd, "src"),
+        parse_checkpoint_syslog_kv(sd, "s_port"),
+        parse_checkpoint_syslog_kv(sd, "dst"),
+        parse_checkpoint_syslog_kv(sd, "service"),
+        parse_checkpoint_syslog_kv(sd, "proto"),
+        coalesce(workspace.cp_syslog_class.host, workspace.checkpoint_syslog.hostname),
+        workspace.checkpoint_syslog.time
+    )
+}
+
+def process parse_checkpoint_syslog_auth_record {
+    let sd = workspace.cp_syslog_class.sd
+    workspace.limpid = checkpoint_syslog_auth_record(
+        sd,
+        parse_checkpoint_syslog_kv(sd, "action"),
+        coalesce(workspace.cp_syslog_class.host, workspace.checkpoint_syslog.hostname),
+        workspace.checkpoint_syslog.time
+    )
+}

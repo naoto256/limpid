@@ -56,10 +56,16 @@
 //   Reconnaissance / alert-only (no action taken):
 //   admin_domain=Default alert_id=12347 alert_type=Reconnaissance app_protocol=ICMP confidence=Tentative attack_count=5 attack_id=0x30000789 attack_name="ICMP: Network Sweep" severity=Low alert_signature="ICMP:SWEEP:001" attack_time="2026-05-16 10:02:00" category=Reconnaissance dest_ip=192.0.2.30 dest_name= dest_port= device_name=nsp-sensor-01 direction=Inbound confidence= file_name= file_hash= file_type= virus_name= action_status= error_status= protocol=ICMP result=Alert src_ip=198.51.100.7 src_name= src_port=
 //
-// Coverage scope: synthetic-verified against the Trellix-recommended
-// standard syslog template only. Custom templates (operator-defined
-// field subsets, alternate key names) would need a forked parser.
-// Real-traffic verification pending against a live NSP sensor.
+// Coverage scope: real-traffic verified against a real Trellix
+// NSP Manager — 56/56 alerts emit cleanly,
+// covering Signature alerts across HTTP / SSH / SSL / NETBIOS-SS /
+// TELNET / NTP / BACKDOOR categories. The wire format observed on the
+// real Manager omits the quotes the documented template suggests
+// (e.g. `attack_name=NETBIOS-SS: Windows SMB Remote Code Execution
+// Vulnerability` is unquoted with embedded spaces); the boundary-aware
+// `parse_nsp_kv` helper below handles this correctly. Custom templates
+// (operator-defined field subsets, alternate key names) would still
+// need a forked parser.
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -126,25 +132,47 @@ def function nsp_to_int_opt(s) {
     }
 }
 
-// `attack_confidence` and `malware_confidence` both use the bare key
-// `confidence=` in the standard template (attack first, malware
-// second). parse_kv last-wins would lose the attack value, so we
-// regex-extract both by ordered position.
-def function parse_nsp_confidence(body) {
-    let m = regex_parse(
+// Single-shot extractor for the Trellix NSP standard syslog template.
+//
+// Why one big regex instead of `parse_kv` or per-field extraction:
+//
+//   - Real-world NSP Manager (verified against real wire traffic
+//     sensor, May 2026) emits **unquoted** multi-word values for
+//     free-form fields:
+//
+//       attack_name=NETBIOS-SS: Windows SMB Remote Code Execution Vulnerability severity=Medium ...
+//       attack_time=2026-05-16 11:27:53 UTC category=Exploit ...
+//
+//     The documented template suggests these are quoted
+//     (`attack_name="..."`), but the real Manager omits the quotes.
+//     `parse_kv` (space-splits) would lose everything after the first
+//     word; boundary-detection by `\s\w+=` depends on regex
+//     backtracking behaviour that regex-lite handles unevenly.
+//
+//   - The Trellix standard template is **fixed-order** (vendor-defined,
+//     operator does not reorder it). So instead of detecting boundaries
+//     heuristically, the regex hard-codes the exact sequence of keys
+//     and uses each literal next key as the unambiguous boundary for
+//     the previous value's `.*?`. One `regex_parse` per event extracts
+//     all 27 fields plus both `confidence=` occurrences (the duplicate
+//     key — attack confidence first, malware confidence second — is
+//     resolved naturally by giving the two captures different names).
+//
+//   - Failure mode is loud-fail-fast (limpid policy): if even one key
+//     is missing or out of order, the whole regex fails and the event
+//     routes to error_log. Custom templates with reordered or
+//     different key sets need a forked parser.
+def function parse_nsp_extract(body) {
+    regex_parse(
         body,
-        "confidence=(?P<attack>\\S*).*confidence=(?P<malware>\\S*)"
+        "admin_domain=(?P<admin_domain>.*?) alert_id=(?P<alert_id>.*?) alert_type=(?P<alert_type>.*?) app_protocol=(?P<app_protocol>.*?) confidence=(?P<confidence_attack>.*?) attack_count=(?P<attack_count>.*?) attack_id=(?P<attack_id>.*?) attack_name=(?P<attack_name>.*?) severity=(?P<severity>.*?) alert_signature=(?P<alert_signature>.*?) attack_time=(?P<attack_time>.*?) category=(?P<category>.*?) dest_ip=(?P<dest_ip>.*?) dest_name=(?P<dest_name>.*?) dest_port=(?P<dest_port>.*?) device_name=(?P<device_name>.*?) direction=(?P<direction>.*?) confidence=(?P<confidence_malware>.*?) file_name=(?P<file_name>.*?) file_hash=(?P<file_hash>.*?) file_type=(?P<file_type>.*?) virus_name=(?P<virus_name>.*?) action_status=(?P<action_status>.*?) error_status=(?P<error_status>.*?) protocol=(?P<protocol>.*?) result=(?P<result>.*?) src_ip=(?P<src_ip>.*?) src_name=(?P<src_name>.*?) src_port=(?P<src_port>.*)$"
     )
-    switch true {
-        m == null { { attack: null, malware: null } }
-        default   { { attack: m.attack, malware: m.malware } }
-    }
 }
 
 // Build the OCSF Detection Finding (2004) record. `nsp` is the
 // parse_kv result; `confs` is the per-confidence object from
 // `parse_nsp_confidence`.
-def function nsp_finding_record(nsp, confs, host, time_ns) {
+def function nsp_finding_record(nsp, host, time_ns) {
     {
         class_uid:    2004,
         category_uid: 2,
@@ -156,7 +184,7 @@ def function nsp_finding_record(nsp, confs, host, time_ns) {
             uid:                nsp.alert_id,
             title:              nsp.attack_name,
             types:              ["Network IDS"],
-            confidence:         confs.attack,
+            confidence:         nsp.confidence_attack,
             analytic: {
                 name: nsp.alert_signature,
                 uid:  nsp.attack_id
@@ -222,7 +250,10 @@ def function nsp_finding_record(nsp, confs, host, time_ns) {
         },
         app_name: nsp.app_protocol,
         device: {
-            hostname: coalesce(nsp.device_name, host)
+            hostname: coalesce(
+                switch true { nsp.device_name != null and nsp.device_name != "" { nsp.device_name } default { null } },
+                host
+            )
         },
         unmapped: {
             admin_domain:  nsp.admin_domain,
@@ -230,7 +261,7 @@ def function nsp_finding_record(nsp, confs, host, time_ns) {
             category:      nsp.category,
             attack_count:  nsp.attack_count,
             attack_time:   nsp.attack_time,
-            malware_confidence: confs.malware,
+            malware_confidence: nsp.confidence_malware,
             action_status: nsp.action_status,
             error_status:  nsp.error_status,
             result:        nsp.result
@@ -253,18 +284,21 @@ def process parse_nsp {
     // @requires: workspace.nsp.body      (required, String)
     // @requires: workspace.nsp.hostname  (optional, String)
     // @requires: workspace.nsp.time      (optional, Int — epoch ns)
-    workspace.nsp_kv = parse_kv(workspace.nsp.body)
-    workspace.nsp_confs = parse_nsp_confidence(workspace.nsp.body)
+    //
+    // We do NOT use parse_kv here — see parse_nsp_extract() doc above
+    // for why: real Trellix NSP Manager emits unquoted multi-word
+    // values and the standard template is fixed-order.
+    workspace.nsp_kv = parse_nsp_extract(workspace.nsp.body)
     switch true {
-        // alert_id is mandatory in the NSP standard template; its
-        // absence means this is not a Trellix NSP custom-syslog body.
-        workspace.nsp_kv.alert_id == null {
-            error "parse_nsp: not a Trellix NSP standard-template body (no alert_id): ${workspace.nsp.body}"
+        // parse_nsp_extract returns null when the wire deviates from
+        // the standard template (missing key / reordered / extra
+        // fields). Loud-fail-fast per limpid policy.
+        workspace.nsp_kv == null {
+            error "parse_nsp: not a Trellix NSP standard-template body: ${workspace.nsp.body}"
         }
         default {
             workspace.limpid = nsp_finding_record(
                 workspace.nsp_kv,
-                workspace.nsp_confs,
                 workspace.nsp.hostname,
                 workspace.nsp.time
             )

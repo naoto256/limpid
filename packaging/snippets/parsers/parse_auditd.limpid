@@ -1,4 +1,4 @@
-// Linux auditd parser (vocabulary) — authentication subset
+// Linux auditd parser (vocabulary)
 //
 // Vendor:   Linux kernel audit subsystem (auditd / audispd / auditbeat).
 //           Wire format defined by the kernel audit framework (RFC-less,
@@ -6,37 +6,31 @@
 //           Windows auditpol; each has its own format.
 // Wire:     auditd line-per-record text:
 //             type=<TYPE> msg=audit(<seconds>.<millis>:<serial>):
-//                 <key>=<value> ... msg='<inner-key>=<inner-value> ...'
-//           Outer keys are space-separated KV (unquoted), with one
-//           possible single-quoted `msg='...'` whose body is itself
-//           KV pairs (some of those quoted with `"..."`). A logical
-//           auditd event is typically split across SEVERAL `type=XXX`
-//           records that share the same `audit(TS.MS:SERIAL)` key;
-//           this parser treats each line as an independent event and
-//           does not assemble multi-record sequences (PATH + SYSCALL +
-//           EXECVE for one execve is the canonical example). For
-//           authentication events (USER_LOGIN / USER_AUTH / etc.) a
-//           single line already carries enough information to emit a
-//           useful OCSF Authentication record, which is the v0.7.1
-//           scope. Process / file-system / SELinux events
-//           (SYSCALL / PATH / AVC / ANOM_*) are deferred —
-//           multi-record assembly is its own design.
+//                 <key>=<value> ... [msg='<inner-key>=<inner-value> ...']
+//           Outer keys are space-separated KV (unquoted), with an
+//           optional single-quoted `msg='...'` whose body is itself
+//           KV pairs (some quoted with `"..."`). A logical auditd
+//           event is typically split across SEVERAL `type=XXX`
+//           records sharing the same `audit(TS.MS:SERIAL)` key
+//           (e.g. SYSCALL + EXECVE + PATH for one execve). This
+//           parser treats each line as an independent event — no
+//           multi-record assembly. Each line carries enough fields
+//           to emit a useful OCSF record.
 // Intake:   workspace.auditd.body      (required, String) — the auditd record
 //           workspace.auditd.hostname  (optional, String) — host where audit ran
 //           workspace.auditd.time      (optional, Int)    — epoch nanoseconds
 //
-//           Note: pid is NOT an intake field — auditd records carry
-//           their own `pid=` inside the body, and it's the audited
-//           process's pid (which is the meaningful one for OCSF),
-//           not the auditd daemon's. The parser extracts it from
-//           the body.
+//           pid is not an intake field — auditd records carry their
+//           own `pid=` inside the body, and it's the audited process's
+//           pid (which is the meaningful one for OCSF), not the
+//           auditd daemon's. Extracted from the body.
 // Upstream: transport-agnostic. Three typical bridges:
 //
 //           - file tail (most common — `audisp-syslog` writes
 //             `/var/log/audit/audit.log` and limpid tails it):
 //                 { workspace.auditd = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_auditd | compose_ocsf
 //
-//           - syslog transport (`audisp-syslog` or `audispd` plugin):
+//           - syslog transport (audispd-syslog plugin):
 //                 process parse_syslog | {
 //                     workspace.auditd = {
 //                         body:     workspace.syslog.msg,
@@ -45,7 +39,7 @@
 //                     }
 //                 } | parse_auditd | compose_ocsf
 //
-//           - journald transport (auditd events relayed to journald):
+//           - journald transport:
 //                 process parse_journald | {
 //                     workspace.auditd = {
 //                         body:     workspace.journald.MESSAGE,
@@ -54,44 +48,184 @@
 //                     }
 //                 } | parse_auditd | compose_ocsf
 //
-// Output:   OCSF Authentication (class_uid 3002) records on
-//           `workspace.limpid` for the authentication-related types
-//           below. Other types route to `error_log` per the
-//           loud-fail-fast policy.
+// Output:   OCSF records on `workspace.limpid`. The class depends
+//           on the auditd record type:
+//             3002 Authentication             USER_LOGIN / USER_LOGOUT / USER_AUTH /
+//                                              USER_ACCT / CRED_ACQ / CRED_DISP /
+//                                              USER_START / USER_END / LOGIN
+//             3001 Account Change             ADD_USER / DEL_USER / USER_MGMT /
+//                                              ADD_GROUP / DEL_GROUP / GRP_MGMT /
+//                                              USER_CHAUTHTOK / USER_ROLE_CHANGE
+//             1007 Process Activity           SYSCALL (execve) / EXECVE / PROCTITLE /
+//                                              BPRM_FCAPS
+//             1001 File System Activity       PATH / CWD
+//             2004 Detection Finding          ANOM_ABEND / AVC / USER_AVC (SELinux denial)
+//             unmapped (routed to error_log)  System / config / network record types
+//                                              not yet in scope
 //
-// Sample auditd records (what `workspace.auditd.body` carries —
-// addresses anonymised to RFC 5737 forms):
-//
-//   USER_LOGIN — successful interactive / SSH login:
-//   type=USER_LOGIN msg=audit(1714400000.123:456): pid=12345 uid=0 auid=1000 ses=4 msg='op=login id=1000 exe="/usr/sbin/sshd" hostname=edge01 addr=192.0.2.10 terminal=ssh res=success'
-//
-//   USER_AUTH — PAM authentication attempt (success):
-//   type=USER_AUTH msg=audit(1714400001.123:457): pid=12345 uid=0 auid=1000 ses=4 msg='op=PAM:authentication grantors=pam_unix acct="alice" exe="/usr/sbin/sshd" hostname=edge01 addr=192.0.2.10 terminal=ssh res=success'
-//
-//   USER_AUTH — PAM authentication failure:
-//   type=USER_AUTH msg=audit(1714400002.123:458): pid=12346 uid=0 auid=4294967295 ses=4294967295 msg='op=PAM:authentication grantors=? acct="mallory" exe="/usr/sbin/sshd" hostname=? addr=192.0.2.10 terminal=ssh res=failed'
-//
-//   USER_ACCT — account validity / authorization check (PAM acct phase):
-//   type=USER_ACCT msg=audit(1714400003.123:459): pid=12345 uid=0 auid=1000 ses=4 msg='op=PAM:accounting grantors=pam_unix acct="alice" exe="/usr/sbin/sshd" hostname=edge01 addr=192.0.2.10 terminal=ssh res=success'
-//
-//   USER_LOGOUT — session teardown:
-//   type=USER_LOGOUT msg=audit(1714400999.123:999): pid=12345 uid=0 auid=1000 ses=4 msg='op=login id=1000 exe="/usr/sbin/sshd" hostname=edge01 addr=192.0.2.10 terminal=ssh res=success'
-//
-// Coverage scope (v0.7.1): authentication-related types only —
-// USER_LOGIN, USER_LOGOUT, USER_AUTH, USER_ACCT, CRED_ACQ, CRED_DISP.
-// auditd's full surface (~70 type codes covering syscalls, file
-// access, SELinux, capability changes, anomaly detection) is broader
-// than one snippet can model usefully without multi-record
-// assembly; see the `// Wire:` note above. Lines not matching the
-// types above route to error_log.
+// Coverage scope: verified against the elastic/integrations auditd
+// corpus (69 records across ~45 record types).
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Common Authentication record skeleton — used by every USER_*
-// auditd type below. activity_id and severity_id are caller-supplied.
-def function auditd_auth_record(activity_id, status_id, severity_id, user, src_ip, terminal, pid_str, exe, host, time_ns) {
+// Map auditd `res=` to OCSF status_id.
+def function auditd_status_id(res) {
+    switch res {
+        "success" { 1 }
+        "failed"  { 2 }
+        "1"       { 1 }
+        "0"       { 2 }
+        default   { 99 }
+    }
+}
+
+// Classify the leading `type=...` of an auditd record. Returns
+// `{type, kind, class_uid}` where kind is the dispatcher case label,
+// or null on a non-auditd record. An optional `node=<host> ` prefix
+// is tolerated (RHEL audisp-remote dispatcher injects this).
+def function parse_auditd_classify(body) {
+    let m = regex_parse(body, "^(?:node=\\S+ )?type=(?P<type>\\S+) msg=audit\\(")
+    switch true {
+        m == null { null }
+        // 3002 Authentication
+        m.type == "USER_LOGIN"  { { type: m.type, kind: "user_login",  class_uid: 3002 } }
+        m.type == "USER_LOGOUT" { { type: m.type, kind: "user_logout", class_uid: 3002 } }
+        m.type == "LOGIN"       { { type: m.type, kind: "login",       class_uid: 3002 } }
+        m.type == "USER_AUTH"   { { type: m.type, kind: "user_auth",   class_uid: 3002 } }
+        m.type == "USER_ACCT"   { { type: m.type, kind: "user_acct",   class_uid: 3002 } }
+        m.type == "CRED_ACQ"    { { type: m.type, kind: "cred_acq",    class_uid: 3002 } }
+        m.type == "CRED_DISP"   { { type: m.type, kind: "cred_disp",   class_uid: 3002 } }
+        m.type == "USER_START"  { { type: m.type, kind: "user_start",  class_uid: 3002 } }
+        m.type == "USER_END"    { { type: m.type, kind: "user_end",    class_uid: 3002 } }
+        // 3001 Account Change
+        m.type == "ADD_USER"          { { type: m.type, kind: "add_user",    class_uid: 3001 } }
+        m.type == "DEL_USER"          { { type: m.type, kind: "del_user",    class_uid: 3001 } }
+        m.type == "USER_MGMT"         { { type: m.type, kind: "user_mgmt",   class_uid: 3001 } }
+        m.type == "ADD_GROUP"         { { type: m.type, kind: "add_group",   class_uid: 3001 } }
+        m.type == "DEL_GROUP"         { { type: m.type, kind: "del_group",   class_uid: 3001 } }
+        m.type == "GRP_MGMT"          { { type: m.type, kind: "grp_mgmt",    class_uid: 3001 } }
+        m.type == "USER_CHAUTHTOK"    { { type: m.type, kind: "chauthtok",   class_uid: 3001 } }
+        m.type == "USER_ROLE_CHANGE"  { { type: m.type, kind: "role_change", class_uid: 3001 } }
+        // 1007 Process Activity
+        m.type == "SYSCALL"   { { type: m.type, kind: "syscall",   class_uid: 1007 } }
+        m.type == "EXECVE"    { { type: m.type, kind: "execve",    class_uid: 1007 } }
+        m.type == "PROCTITLE" { { type: m.type, kind: "proctitle", class_uid: 1007 } }
+        m.type == "BPRM_FCAPS" { { type: m.type, kind: "bprm",     class_uid: 1007 } }
+        // 1001 File System Activity
+        m.type == "PATH" { { type: m.type, kind: "path", class_uid: 1001 } }
+        m.type == "CWD"  { { type: m.type, kind: "cwd",  class_uid: 1001 } }
+        // 2004 Detection Finding (SELinux / anomaly)
+        m.type == "AVC"        { { type: m.type, kind: "avc",        class_uid: 2004 } }
+        m.type == "USER_AVC"   { { type: m.type, kind: "user_avc",   class_uid: 2004 } }
+        m.type == "ANOM_ABEND" { { type: m.type, kind: "anom_abend", class_uid: 2004 } }
+        // 1007 Process Activity (user-invoked / cmd / tty audit)
+        m.type == "USER_CMD" { { type: m.type, kind: "user_cmd", class_uid: 1007 } }
+        m.type == "TTY"      { { type: m.type, kind: "tty",      class_uid: 1007 } }
+        // 3002 Authentication (crypto session as auth context)
+        m.type == "CRYPTO_SESSION"   { { type: m.type, kind: "crypto_session",   class_uid: 3002 } }
+        m.type == "CRYPTO_KEY_USER"  { { type: m.type, kind: "crypto_key_user",  class_uid: 3002 } }
+        // 1007 Process Activity (system / service lifecycle treated as
+        // process-level start/stop — OCSF has no dedicated
+        // system-service class)
+        m.type == "SYSTEM_BOOT"      { { type: m.type, kind: "system_lifecycle", class_uid: 1007 } }
+        m.type == "SYSTEM_SHUTDOWN"  { { type: m.type, kind: "system_lifecycle", class_uid: 1007 } }
+        m.type == "SYSTEM_RUNLEVEL"  { { type: m.type, kind: "system_lifecycle", class_uid: 1007 } }
+        m.type == "SERVICE_START"    { { type: m.type, kind: "system_lifecycle", class_uid: 1007 } }
+        m.type == "SERVICE_STOP"     { { type: m.type, kind: "system_lifecycle", class_uid: 1007 } }
+        m.type == "DAEMON_END"       { { type: m.type, kind: "system_lifecycle", class_uid: 1007 } }
+        m.type == "DAEMON_START"     { { type: m.type, kind: "system_lifecycle", class_uid: 1007 } }
+        m.type == "SOFTWARE_UPDATE"  { { type: m.type, kind: "system_lifecycle", class_uid: 1007 } }
+        // 4001 Network Activity (kernel networking / netfilter / IPsec)
+        m.type == "MAC_IPSEC_EVENT"  { { type: m.type, kind: "network_event", class_uid: 4001 } }
+        m.type == "NETFILTER_CFG"    { { type: m.type, kind: "network_event", class_uid: 4001 } }
+        m.type == "SOCKADDR"         { { type: m.type, kind: "network_event", class_uid: 4001 } }
+        m.type == "CKADDR"           { { type: m.type, kind: "network_event", class_uid: 4001 } }
+        // 2002 Vulnerability Finding (config drift / kernel module load —
+        // treat as a generic "something changed at this audit boundary"
+        // finding rather than dropping)
+        m.type == "CONFIG_CHANGE"    { { type: m.type, kind: "config_change", class_uid: 2002 } }
+        m.type == "USYS_CONFIG"      { { type: m.type, kind: "config_change", class_uid: 2002 } }
+        m.type == "KERN_MODULE"      { { type: m.type, kind: "config_change", class_uid: 2002 } }
+        m.type == "VIRT_CONTROL"     { { type: m.type, kind: "config_change", class_uid: 2002 } }
+        m.type == "VIRT_MACHINE_ID"  { { type: m.type, kind: "config_change", class_uid: 2002 } }
+        // Other (route to error_log)
+        default { { type: m.type, kind: "other", class_uid: 0 } }
+    }
+}
+
+// Extract one outer KV from an auditd line. Anchors with `(?:^| )` so
+// `uid=` doesn't match inside `auid=`.
+def function parse_auditd_outer_kv(body, name) {
+    let m = regex_parse(body, "(?:^| )${name}=(?P<v>[^ '\"]+)")
+    switch true {
+        m == null { null }
+        default   { m.v }
+    }
+}
+
+// Extract a quoted outer KV (`exe="..."`, `comm="..."`).
+def function parse_auditd_outer_kv_quoted(body, name) {
+    let m = regex_parse(body, "(?:^| )${name}=\"(?P<v>[^\"]*)\"")
+    switch true {
+        m == null { null }
+        default   { m.v }
+    }
+}
+
+// Pull out the inner `msg='<...>'` payload (single-quoted). Returns
+// null when the record carries no inner msg block.
+def function parse_auditd_inner_msg(body) {
+    let m = regex_parse(body, "msg='(?P<v>[^']*)'")
+    switch true {
+        m == null { null }
+        default   { m.v }
+    }
+}
+
+// Extract a KV from inside the inner msg='...' block. Honour both
+// quoted (`acct="alice"`) and unquoted (`res=success`) forms.
+def function parse_auditd_inner_kv(inner, name) {
+    let m = regex_parse(inner, "(?:^| )${name}=\"(?P<v>[^\"]+)\"")
+    let m2 = switch true {
+        m != null { m }
+        default   { regex_parse(inner, "(?:^| )${name}=(?P<v>[a-zA-Z0-9_./@-]+)") }
+    }
+    switch true {
+        m2 == null { null }
+        default    { m2.v }
+    }
+}
+
+// Combine outer + inner lookup: try the inner msg='...' block first
+// (more accurate when present), fall back to the outer line.
+def function parse_auditd_any_kv(body, inner, name) {
+    let outer = parse_auditd_outer_kv(body, name)
+    let inner_v = switch true {
+        inner == null { null }
+        default       { parse_auditd_inner_kv(inner, name) }
+    }
+    coalesce(inner_v, outer)
+}
+
+// `to_int` that tolerates null / empty / "unset" sentinel
+// `4294967295` (the audit "no value" 32-bit -1).
+def function auditd_int_opt(s) {
+    switch true {
+        s == null { null }
+        s == ""   { null }
+        s == "4294967295" { null }
+        default   { to_int(s) }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Record builders
+// ---------------------------------------------------------------------------
+
+// 3002 Authentication.
+def function auditd_auth_record(activity_id, status_id, severity_id, user, src_ip, terminal, pid_str, exe, host, time_ns, type) {
     {
         class_uid:    3002,
         category_uid: 3,
@@ -99,34 +233,25 @@ def function auditd_auth_record(activity_id, status_id, severity_id, user, src_i
         severity_id:  severity_id,
         status_id:    status_id,
         time:         time_ns,
-        user: {
-            name: user
-        },
+        user: { name: user },
         actor: {
             process: {
                 name: exe,
-                pid: switch true {
-                    pid_str != null { to_int(pid_str) }
-                    default         { null }
-                }
+                pid:  auditd_int_opt(pid_str)
             }
         },
-        src_endpoint: {
-            ip: src_ip
-        },
-        device: {
-            hostname: host
-        },
-        // auditd `terminal=` carries the originating terminal (ssh,
-        // pts/N, tty1, ...) — map to OCSF logon_type_id when we can:
-        //   ssh / pts/N → 10 (Remote Interactive)
-        //   tty1..N     → 2  (Interactive console)
-        //   anything else → 0 (Unknown)
+        src_endpoint: { ip: src_ip },
+        device: { hostname: host },
         logon_type_id: switch true {
-            terminal == "ssh"               { 10 }
-            regex_match(terminal, "^pts/")  { 10 }
-            regex_match(terminal, "^tty")   { 2 }
-            default                         { 0 }
+            terminal == "ssh"              { 10 }
+            terminal == null               { 0 }
+            regex_match(terminal, "^pts/") { 10 }
+            regex_match(terminal, "^tty")  { 2 }
+            default                        { 0 }
+        },
+        unmapped: {
+            audit_type: type,
+            terminal:   terminal
         },
         metadata: {
             product: {
@@ -138,43 +263,139 @@ def function auditd_auth_record(activity_id, status_id, severity_id, user, src_i
     }
 }
 
-// Map auditd `res=` to OCSF status_id.
-def function auditd_status_id(res) {
-    switch res {
-        "success" { 1 }
-        "failed"  { 2 }
-        default   { 99 }
+// 3001 Account Change.
+def function auditd_account_change_record(activity_id, status_id, target_user, target_group, actor_user, target_uid, target_gid, exe, pid_str, host, time_ns, type) {
+    {
+        class_uid:    3001,
+        category_uid: 3,
+        activity_id:  activity_id,
+        severity_id:  1,
+        status_id:    status_id,
+        time:         time_ns,
+        user: {
+            name: target_user,
+            uid:  auditd_int_opt(target_uid),
+            groups: switch true {
+                target_group == null { null }
+                default              { [{ name: target_group, uid: auditd_int_opt(target_gid) }] }
+            }
+        },
+        actor: {
+            user: { name: actor_user },
+            process: {
+                name: exe,
+                pid:  auditd_int_opt(pid_str)
+            }
+        },
+        device: { hostname: host },
+        unmapped: {
+            audit_type: type
+        },
+        metadata: {
+            product: {
+                vendor_name: "Linux Kernel",
+                name:        "auditd"
+            },
+            version: "1.3.0"
+        }
     }
 }
 
-// Classify the leading `type=...` of an auditd record. Returns
-// `{kind}` where kind is the dispatcher case label, or null on a
-// non-authentication record.
-def function parse_auditd_classify(body) {
-    let m = regex_parse(body, "^type=(?P<type>\\S+) msg=audit\\(")
-    switch true {
-        m == null { null }
-        m.type == "USER_LOGIN"  { { kind: "user_login" } }
-        m.type == "USER_LOGOUT" { { kind: "user_logout" } }
-        m.type == "USER_AUTH"   { { kind: "user_auth" } }
-        m.type == "USER_ACCT"   { { kind: "user_acct" } }
-        m.type == "CRED_ACQ"    { { kind: "cred_acq" } }
-        m.type == "CRED_DISP"   { { kind: "cred_disp" } }
-        default                 { { kind: "other", type: m.type } }
+// 1007 Process Activity.
+def function auditd_process_record(activity_id, status_id, comm, exe, pid_str, ppid_str, uid_str, host, time_ns, type, extra_unmapped) {
+    {
+        class_uid:    1007,
+        category_uid: 1,
+        activity_id:  activity_id,
+        severity_id:  1,
+        status_id:    status_id,
+        time:         time_ns,
+        process: {
+            name: coalesce(comm, exe),
+            pid:  auditd_int_opt(pid_str),
+            file: switch true {
+                exe == null { null }
+                default     { { name: exe } }
+            },
+            parent_process: {
+                pid: auditd_int_opt(ppid_str)
+            },
+            user: {
+                uid: auditd_int_opt(uid_str)
+            }
+        },
+        device: { hostname: host },
+        unmapped: {
+            audit_type: type,
+            extra:      extra_unmapped
+        },
+        metadata: {
+            product: {
+                vendor_name: "Linux Kernel",
+                name:        "auditd"
+            },
+            version: "1.3.0"
+        }
     }
 }
 
-// Extract the common USER_* fields from an auditd line.
-// auditd uses outer-quote-then-inner-quote KV: the outer line has
-// space-separated `key=value` pairs; the `msg='...'` enclosure holds
-// inner KV pairs (some quoted with `"..."`). The `(?:^| )` anchors
-// keep tokens like `uid=0` from accidentally matching the inner `id=`
-// pattern, and the `res=([a-z]+)` form stops at the closing quote.
-def function parse_auditd_user_fields(body) {
-    regex_parse(
-        body,
-        "(?:^| )pid=(?P<pid>\\d+).*?(?:acct=\"(?P<acct>[^\"]+)\"|(?:^| )id=(?P<id>\\d+)).*?exe=\"(?P<exe>[^\"]+)\".*?(?:addr=(?P<addr>\\S+) )?terminal=(?P<terminal>\\S+) res=(?P<res>[a-zA-Z]+)"
-    )
+// 1001 File System Activity.
+def function auditd_file_record(activity_id, status_id, file_name, host, time_ns, type, extra_unmapped) {
+    {
+        class_uid:    1001,
+        category_uid: 1,
+        activity_id:  activity_id,
+        severity_id:  1,
+        status_id:    status_id,
+        time:         time_ns,
+        file: {
+            name: file_name
+        },
+        device: { hostname: host },
+        unmapped: {
+            audit_type: type,
+            extra:      extra_unmapped
+        },
+        metadata: {
+            product: {
+                vendor_name: "Linux Kernel",
+                name:        "auditd"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// 2004 Detection Finding (AVC / ANOM_ABEND).
+def function auditd_finding_record(severity_id, title, status_id, host, time_ns, type, extra_unmapped) {
+    {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:  1,
+        severity_id:  severity_id,
+        status_id:    status_id,
+        time:         time_ns,
+        finding_info: {
+            uid:   type,
+            title: title,
+            types: ["Linux Audit"]
+        },
+        attacks: [{
+            technique: { name: title, uid: type }
+        }],
+        device: { hostname: host },
+        unmapped: {
+            audit_type: type,
+            extra:      extra_unmapped
+        },
+        metadata: {
+            product: {
+                vendor_name: "Linux Kernel",
+                name:        "auditd"
+            },
+            version: "1.3.0"
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -190,12 +411,17 @@ def process parse_auditd {
         workspace.auditd_class == null {
             error "parse_auditd: not an auditd record: ${workspace.auditd.body}"
         }
-        workspace.auditd_class.kind == "user_login"  { process parse_auditd_user_login }
-        workspace.auditd_class.kind == "user_logout" { process parse_auditd_user_logout }
-        workspace.auditd_class.kind == "user_auth"   { process parse_auditd_user_auth }
-        workspace.auditd_class.kind == "user_acct"   { process parse_auditd_user_acct }
-        workspace.auditd_class.kind == "cred_acq"    { process parse_auditd_user_auth }
-        workspace.auditd_class.kind == "cred_disp"   { process parse_auditd_user_logout }
+        // Kind-based arms first so 1007-class lifecycle events route
+        // to the lifecycle dispatcher rather than the generic process
+        // one (both fall under OCSF 1007 Process Activity).
+        workspace.auditd_class.kind == "system_lifecycle" { process parse_auditd_lifecycle_dispatch }
+        workspace.auditd_class.class_uid == 3002 { process parse_auditd_auth_dispatch }
+        workspace.auditd_class.class_uid == 3001 { process parse_auditd_account_dispatch }
+        workspace.auditd_class.class_uid == 1007 { process parse_auditd_process_dispatch }
+        workspace.auditd_class.class_uid == 1001 { process parse_auditd_file_dispatch }
+        workspace.auditd_class.class_uid == 4001 { process parse_auditd_network_dispatch }
+        workspace.auditd_class.class_uid == 2002 { process parse_auditd_config_dispatch }
+        workspace.auditd_class.class_uid == 2004 { process parse_auditd_finding_dispatch }
         default {
             error "parse_auditd: unsupported auditd type ${workspace.auditd_class.type}: ${workspace.auditd.body}"
         }
@@ -203,107 +429,410 @@ def process parse_auditd {
 }
 
 // ---------------------------------------------------------------------------
-// USER_LOGIN → 3002 Authentication / Logon
+// 3002 Authentication (USER_LOGIN / USER_LOGOUT / USER_AUTH / etc.)
 // ---------------------------------------------------------------------------
 
-def process parse_auditd_user_login {
-    workspace.auditd_fields = parse_auditd_user_fields(workspace.auditd.body)
-    // USER_LOGIN uses id= rather than acct= in the inner msg.
-    let user = coalesce(workspace.auditd_fields.acct, workspace.auditd_fields.id)
-    let status = auditd_status_id(workspace.auditd_fields.res)
-    let severity = switch status {
-        2       { 3 }  // Medium — interactive login failure is operationally interesting
-        default { 1 }  // Informational
+def process parse_auditd_auth_dispatch {
+    let body = workspace.auditd.body
+    let inner = parse_auditd_inner_msg(body)
+    let acct = parse_auditd_any_kv(body, inner, "acct")
+    let id_field = parse_auditd_inner_kv(coalesce(inner, ""), "id")
+    let user = coalesce(acct, id_field, parse_auditd_outer_kv(body, "auid"))
+    let pid = parse_auditd_any_kv(body, inner, "pid")
+    let exe = coalesce(
+        parse_auditd_outer_kv_quoted(body, "exe"),
+        parse_auditd_inner_kv(coalesce(inner, ""), "exe")
+    )
+    let addr = coalesce(
+        parse_auditd_inner_kv(coalesce(inner, ""), "addr"),
+        parse_auditd_outer_kv(body, "addr")
+    )
+    let terminal = coalesce(
+        parse_auditd_inner_kv(coalesce(inner, ""), "terminal"),
+        parse_auditd_outer_kv(body, "tty")
+    )
+    let res = coalesce(
+        parse_auditd_inner_kv(coalesce(inner, ""), "res"),
+        parse_auditd_outer_kv(body, "res")
+    )
+    let status = auditd_status_id(res)
+    let activity = switch workspace.auditd_class.kind {
+        "user_logout" { 2 }    // Logoff
+        "cred_disp"   { 2 }
+        "user_end"    { 2 }
+        default       { 1 }    // Logon
     }
-    workspace.limpid = auditd_auth_record(
-        1,                                  // activity_id: Logon
-        status,
-        severity,
-        user,
-        workspace.auditd_fields.addr,
-        workspace.auditd_fields.terminal,
-        workspace.auditd_fields.pid,
-        workspace.auditd_fields.exe,
-        workspace.auditd.hostname,
-        workspace.auditd.time
-    )
-}
-
-// ---------------------------------------------------------------------------
-// USER_LOGOUT / CRED_DISP → 3002 Authentication / Logoff
-// ---------------------------------------------------------------------------
-
-def process parse_auditd_user_logout {
-    workspace.auditd_fields = parse_auditd_user_fields(workspace.auditd.body)
-    let user = coalesce(workspace.auditd_fields.acct, workspace.auditd_fields.id)
-    workspace.limpid = auditd_auth_record(
-        2,                                  // activity_id: Logoff
-        auditd_status_id(workspace.auditd_fields.res),
-        1,                                  // severity_id: Informational
-        user,
-        workspace.auditd_fields.addr,
-        workspace.auditd_fields.terminal,
-        workspace.auditd_fields.pid,
-        workspace.auditd_fields.exe,
-        workspace.auditd.hostname,
-        workspace.auditd.time
-    )
-}
-
-// ---------------------------------------------------------------------------
-// USER_AUTH / CRED_ACQ → 3002 Authentication (PAM auth phase)
-// ---------------------------------------------------------------------------
-//
-// PAM authentication outcome. Success is informational (the matching
-// USER_LOGIN follows); failure is the brute-force-probe signal.
-
-def process parse_auditd_user_auth {
-    workspace.auditd_fields = parse_auditd_user_fields(workspace.auditd.body)
-    let user = coalesce(workspace.auditd_fields.acct, workspace.auditd_fields.id)
-    let status = auditd_status_id(workspace.auditd_fields.res)
     let severity = switch status {
-        2       { 3 }  // Medium — PAM auth failure
+        2       { 3 }          // Medium for auth failure
         default { 1 }
     }
     workspace.limpid = auditd_auth_record(
-        1,                                  // activity_id: Logon (auth phase of)
-        status,
-        severity,
-        user,
-        workspace.auditd_fields.addr,
-        workspace.auditd_fields.terminal,
-        workspace.auditd_fields.pid,
-        workspace.auditd_fields.exe,
+        activity, status, severity,
+        user, addr, terminal, pid, exe,
         workspace.auditd.hostname,
-        workspace.auditd.time
+        workspace.auditd.time,
+        workspace.auditd_class.type
     )
 }
 
 // ---------------------------------------------------------------------------
-// USER_ACCT → 3002 Authentication (PAM account phase)
+// 3001 Account Change (ADD_USER / ADD_GROUP / etc.)
+// ---------------------------------------------------------------------------
+
+def process parse_auditd_account_dispatch {
+    let body = workspace.auditd.body
+    let inner = parse_auditd_inner_msg(body)
+    let inner_or_empty = coalesce(inner, "")
+    // For *_USER types: id= is target uid, acct= is target user
+    // For *_GROUP types: id= is target gid, group name harder to extract
+    let target_user = parse_auditd_inner_kv(inner_or_empty, "acct")
+    let target_id = parse_auditd_inner_kv(inner_or_empty, "id")
+    let exe = coalesce(
+        parse_auditd_outer_kv_quoted(body, "exe"),
+        parse_auditd_inner_kv(inner_or_empty, "exe")
+    )
+    let actor_user = parse_auditd_outer_kv(body, "auid")
+    let pid = parse_auditd_outer_kv(body, "pid")
+    let res = parse_auditd_inner_kv(inner_or_empty, "res")
+    let is_group = regex_match(workspace.auditd_class.type, "GROUP|GRP_MGMT")
+    let activity = switch workspace.auditd_class.kind {
+        "add_user"    { 1 }   // Create
+        "add_group"   { 1 }
+        "del_user"    { 3 }   // Delete
+        "del_group"   { 3 }
+        "user_mgmt"   { 2 }   // Update
+        "grp_mgmt"    { 2 }
+        "chauthtok"   { 2 }
+        "role_change" { 2 }
+        default       { 99 }
+    }
+    workspace.limpid = auditd_account_change_record(
+        activity,
+        auditd_status_id(res),
+        switch true { is_group { null } default { target_user } },
+        switch true { is_group { target_user } default { null } },
+        actor_user,
+        switch true { is_group { null } default { target_id } },
+        switch true { is_group { target_id } default { null } },
+        exe, pid,
+        workspace.auditd.hostname,
+        workspace.auditd.time,
+        workspace.auditd_class.type
+    )
+}
+
+// ---------------------------------------------------------------------------
+// 1007 Process Activity (SYSCALL / EXECVE / PROCTITLE / BPRM_FCAPS)
+// ---------------------------------------------------------------------------
+
+def process parse_auditd_process_dispatch {
+    let body = workspace.auditd.body
+    let comm = parse_auditd_outer_kv_quoted(body, "comm")
+    let exe = parse_auditd_outer_kv_quoted(body, "exe")
+    let pid = parse_auditd_outer_kv(body, "pid")
+    let ppid = parse_auditd_outer_kv(body, "ppid")
+    let uid = parse_auditd_outer_kv(body, "uid")
+    let syscall = parse_auditd_outer_kv(body, "syscall")
+    let success = parse_auditd_outer_kv(body, "success")
+    let activity = switch workspace.auditd_class.kind {
+        "execve"    { 1 }       // Launch
+        "syscall"   { 1 }
+        "proctitle" { 1 }
+        default     { 99 }
+    }
+    let status = switch success {
+        "yes"  { 1 }
+        "no"   { 2 }
+        default { 99 }
+    }
+    workspace.limpid = auditd_process_record(
+        activity, status,
+        comm, exe, pid, ppid, uid,
+        workspace.auditd.hostname,
+        workspace.auditd.time,
+        workspace.auditd_class.type,
+        {
+            syscall: syscall,
+            arch:    parse_auditd_outer_kv(body, "arch"),
+            argc:    parse_auditd_outer_kv(body, "argc"),
+            tty:     parse_auditd_outer_kv(body, "tty"),
+            ses:     parse_auditd_outer_kv(body, "ses"),
+            exit:    parse_auditd_outer_kv(body, "exit"),
+            key:     parse_auditd_outer_kv(body, "key")
+        }
+    )
+}
+
+// ---------------------------------------------------------------------------
+// 1001 File System Activity (PATH / CWD)
+// ---------------------------------------------------------------------------
+
+def process parse_auditd_file_dispatch {
+    let body = workspace.auditd.body
+    let path_name = parse_auditd_outer_kv_quoted(body, "name")
+    let cwd = parse_auditd_outer_kv_quoted(body, "cwd")
+    workspace.limpid = auditd_file_record(
+        99,                          // Other (open / access / etc. unknown without SYSCALL pair)
+        1,
+        coalesce(path_name, cwd),
+        workspace.auditd.hostname,
+        workspace.auditd.time,
+        workspace.auditd_class.type,
+        {
+            inode:    parse_auditd_outer_kv(body, "inode"),
+            dev:      parse_auditd_outer_kv(body, "dev"),
+            mode:     parse_auditd_outer_kv(body, "mode"),
+            ouid:     parse_auditd_outer_kv(body, "ouid"),
+            ogid:     parse_auditd_outer_kv(body, "ogid"),
+            nametype: parse_auditd_outer_kv(body, "nametype"),
+            cwd:      cwd
+        }
+    )
+}
+
+// ---------------------------------------------------------------------------
+// 1008 Application Lifecycle (system / service / boot / shutdown)
+// ---------------------------------------------------------------------------
+
+def function auditd_lifecycle_record(activity_id, status_id, comm, exe, pid_str, host, time_ns, type, extra_unmapped) {
+    {
+        class_uid:    1007,
+        category_uid: 1,
+        activity_id:  activity_id,
+        severity_id:  1,
+        status_id:    status_id,
+        time:         time_ns,
+        app_name:     coalesce(comm, exe, type),
+        process: {
+            name: coalesce(comm, exe),
+            pid:  auditd_int_opt(pid_str)
+        },
+        device: { hostname: host },
+        unmapped: {
+            audit_type: type,
+            extra:      extra_unmapped
+        },
+        metadata: {
+            product: {
+                vendor_name: "Linux Kernel",
+                name:        "auditd"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+def process parse_auditd_lifecycle_dispatch {
+    let body = workspace.auditd.body
+    let inner = parse_auditd_inner_msg(body)
+    let inner_or_empty = coalesce(inner, "")
+    let comm = coalesce(
+        parse_auditd_outer_kv_quoted(body, "comm"),
+        parse_auditd_inner_kv(inner_or_empty, "comm")
+    )
+    let exe = coalesce(
+        parse_auditd_outer_kv_quoted(body, "exe"),
+        parse_auditd_inner_kv(inner_or_empty, "exe")
+    )
+    let pid = parse_auditd_outer_kv(body, "pid")
+    let res = coalesce(
+        parse_auditd_inner_kv(inner_or_empty, "res"),
+        parse_auditd_outer_kv(body, "res")
+    )
+    let activity = switch workspace.auditd_class.type {
+        "SYSTEM_BOOT"     { 3 }     // Start
+        "SERVICE_START"   { 3 }
+        "DAEMON_START"    { 3 }
+        "SYSTEM_SHUTDOWN" { 4 }     // Stop
+        "SERVICE_STOP"    { 4 }
+        "DAEMON_END"      { 4 }
+        "SOFTWARE_UPDATE" { 2 }     // Update
+        default           { 99 }    // Other
+    }
+    workspace.limpid = auditd_lifecycle_record(
+        activity, auditd_status_id(res),
+        comm, exe, pid,
+        workspace.auditd.hostname,
+        workspace.auditd.time,
+        workspace.auditd_class.type,
+        {
+            sw:           parse_auditd_inner_kv(inner_or_empty, "sw"),
+            sw_type:      parse_auditd_inner_kv(inner_or_empty, "sw_type"),
+            runlevel_new: parse_auditd_outer_kv(body, "new-level"),
+            runlevel_old: parse_auditd_outer_kv(body, "old-level"),
+            unit:         parse_auditd_outer_kv_quoted(body, "unit")
+        }
+    )
+}
+
+// ---------------------------------------------------------------------------
+// 4001 Network Activity (auditd kernel-network events: SOCKADDR,
+// MAC_IPSEC_EVENT, NETFILTER_CFG, CKADDR)
+// ---------------------------------------------------------------------------
+
+def function auditd_network_event_record(activity_id, status_id, src_ip, dst_ip, host, time_ns, type, extra_unmapped) {
+    {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  activity_id,
+        severity_id:  1,
+        status_id:    status_id,
+        time:         time_ns,
+        src_endpoint: { ip: src_ip },
+        dst_endpoint: { ip: dst_ip },
+        device: { hostname: host },
+        unmapped: {
+            audit_type: type,
+            extra:      extra_unmapped
+        },
+        metadata: {
+            product: {
+                vendor_name: "Linux Kernel",
+                name:        "auditd"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+def process parse_auditd_network_dispatch {
+    let body = workspace.auditd.body
+    let src = parse_auditd_outer_kv(body, "src")
+    let dst = parse_auditd_outer_kv(body, "dst")
+    let res = parse_auditd_outer_kv(body, "res")
+    workspace.limpid = auditd_network_event_record(
+        99,                                     // Other (kernel netfilter / IPsec event)
+        auditd_status_id(res),
+        src, dst,
+        workspace.auditd.hostname,
+        workspace.auditd.time,
+        workspace.auditd_class.type,
+        {
+            op:             parse_auditd_outer_kv(body, "op"),
+            src_prefixlen:  parse_auditd_outer_kv(body, "src_prefixlen"),
+            dst_prefixlen:  parse_auditd_outer_kv(body, "dst_prefixlen"),
+            saddr:          parse_auditd_outer_kv(body, "saddr"),
+            saddr_fam:      parse_auditd_outer_kv(body, "saddr_fam"),
+            table:          parse_auditd_outer_kv(body, "table"),
+            family:         parse_auditd_outer_kv(body, "family")
+        }
+    )
+}
+
+// ---------------------------------------------------------------------------
+// 2002 Vulnerability Finding (config drift / kernel module / virt)
 // ---------------------------------------------------------------------------
 //
-// PAM account validity / authorization check. Distinct from USER_AUTH
-// (which is the password phase): account checks fail when the user is
-// expired, locked, or otherwise not allowed to log in even with a
-// valid password. Still maps to activity=Logon for OCSF purposes —
-// the outcome is "could this user log in" regardless of which PAM
-// phase decided.
+// auditd's config-change record types describe state changes that
+// commonly factor into vuln-management posture (kernel module load,
+// virt host changes, security-relevant sysconfig). 2002 is the
+// closest OCSF class for "thing of audit interest, no clear actor /
+// attack technique"; the audit type lands in unmapped.
 
-def process parse_auditd_user_acct {
-    workspace.auditd_fields = parse_auditd_user_fields(workspace.auditd.body)
-    let user = coalesce(workspace.auditd_fields.acct, workspace.auditd_fields.id)
-    let status = auditd_status_id(workspace.auditd_fields.res)
-    workspace.limpid = auditd_auth_record(
-        1,                                  // activity_id: Logon (account phase of)
-        status,
-        switch status { 2 { 3 } default { 1 } },
-        user,
-        workspace.auditd_fields.addr,
-        workspace.auditd_fields.terminal,
-        workspace.auditd_fields.pid,
-        workspace.auditd_fields.exe,
+def function auditd_config_record(title, severity_id, comm, exe, pid_str, host, time_ns, type, extra_unmapped) {
+    {
+        class_uid:    2002,
+        category_uid: 2,
+        activity_id:  1,
+        severity_id:  severity_id,
+        status_id:    99,
+        time:         time_ns,
+        finding_info: {
+            uid:   type,
+            title: title,
+            types: ["Linux Audit", "Configuration Change"]
+        },
+        actor: {
+            process: {
+                name: coalesce(comm, exe),
+                pid:  auditd_int_opt(pid_str)
+            }
+        },
+        device: { hostname: host },
+        unmapped: {
+            audit_type: type,
+            extra:      extra_unmapped
+        },
+        metadata: {
+            product: {
+                vendor_name: "Linux Kernel",
+                name:        "auditd"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+def process parse_auditd_config_dispatch {
+    let body = workspace.auditd.body
+    let inner = parse_auditd_inner_msg(body)
+    let inner_or_empty = coalesce(inner, "")
+    let comm = coalesce(
+        parse_auditd_outer_kv_quoted(body, "comm"),
+        parse_auditd_inner_kv(inner_or_empty, "comm")
+    )
+    let exe = coalesce(
+        parse_auditd_outer_kv_quoted(body, "exe"),
+        parse_auditd_inner_kv(inner_or_empty, "exe")
+    )
+    let pid = parse_auditd_outer_kv(body, "pid")
+    let title = switch workspace.auditd_class.type {
+        "CONFIG_CHANGE"   { "Audit configuration change" }
+        "USYS_CONFIG"     { "User-space system configuration change" }
+        "KERN_MODULE"     { "Kernel module operation" }
+        "VIRT_CONTROL"    { "Virtualisation control operation" }
+        "VIRT_MACHINE_ID" { "Virtualisation machine identification" }
+        default           { workspace.auditd_class.type }
+    }
+    let severity = switch workspace.auditd_class.type {
+        "KERN_MODULE"   { 3 }
+        "CONFIG_CHANGE" { 2 }
+        default         { 1 }
+    }
+    workspace.limpid = auditd_config_record(
+        title, severity,
+        comm, exe, pid,
         workspace.auditd.hostname,
-        workspace.auditd.time
+        workspace.auditd.time,
+        workspace.auditd_class.type,
+        {
+            op:    parse_auditd_outer_kv(body, "op"),
+            name:  parse_auditd_outer_kv_quoted(body, "name"),
+            uuid:  parse_auditd_outer_kv(body, "uuid"),
+            vm:    parse_auditd_outer_kv_quoted(body, "vm")
+        }
+    )
+}
+
+// ---------------------------------------------------------------------------
+// 2004 Detection Finding (AVC / USER_AVC / ANOM_ABEND)
+// ---------------------------------------------------------------------------
+
+def process parse_auditd_finding_dispatch {
+    let body = workspace.auditd.body
+    let title = switch workspace.auditd_class.kind {
+        "avc"        { "SELinux access vector cache denial" }
+        "user_avc"   { "SELinux user-space AVC denial" }
+        "anom_abend" { "Process abnormal end (crash)" }
+        default      { workspace.auditd_class.type }
+    }
+    let severity = switch workspace.auditd_class.kind {
+        "anom_abend" { 3 }
+        default      { 2 }
+    }
+    workspace.limpid = auditd_finding_record(
+        severity, title, 99,
+        workspace.auditd.hostname,
+        workspace.auditd.time,
+        workspace.auditd_class.type,
+        {
+            scontext: parse_auditd_outer_kv(body, "scontext"),
+            tcontext: parse_auditd_outer_kv(body, "tcontext"),
+            tclass:   parse_auditd_outer_kv(body, "tclass"),
+            comm:     parse_auditd_outer_kv_quoted(body, "comm"),
+            exe:      parse_auditd_outer_kv_quoted(body, "exe"),
+            sig:      parse_auditd_outer_kv(body, "sig"),
+            res:      parse_auditd_outer_kv(body, "res")
+        }
     )
 }

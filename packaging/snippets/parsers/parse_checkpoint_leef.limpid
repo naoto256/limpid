@@ -14,18 +14,18 @@
 //           and a slightly different header — the parser auto-handles
 //           both by anchoring on `LEEF:` and using `\t` as the
 //           extension separator.
-// Intake:   workspace.checkpoint.body      (required, String) — full syslog wire
+// Intake:   workspace.checkpoint_leef.body      (required, String) — full syslog wire
 //                                            (parser locates and extracts the LEEF block;
 //                                            does NOT consume an upstream parse_syslog)
-//           workspace.checkpoint.hostname  (optional, String) — collector-side hostname override
-//           workspace.checkpoint.time      (optional, Int)    — epoch nanoseconds of arrival
+//           workspace.checkpoint_leef.hostname  (optional, String) — collector-side hostname override
+//           workspace.checkpoint_leef.time      (optional, Int)    — epoch nanoseconds of arrival
 // Upstream: CheckPoint log_exporter emits syslog (UDP/514 or TCP/514).
 //           The bridge passes the raw wire — limpid's syslog.parse
 //           treats the LEEF block as opaque `msg` text, so the parser
 //           splits its own header.
 //
 //           - syslog (UDP/TCP):
-//                 { workspace.checkpoint = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_checkpoint | compose_ocsf
+//                 { workspace.checkpoint_leef = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_checkpoint_leef | compose_ocsf
 //
 // Output:   OCSF Network Activity (class_uid 4001) records on
 //           `workspace.limpid` for traffic events (Accept / Drop /
@@ -51,7 +51,7 @@
 // Helpers
 // ---------------------------------------------------------------------------
 
-def function checkpoint_proto_num(p) {
+def function checkpoint_leef_proto_num(p) {
     switch p {
         "tcp"    { 6 }
         "TCP"    { 6 }
@@ -66,7 +66,7 @@ def function checkpoint_proto_num(p) {
 }
 
 // Activity / status mapping from LEEF EventID.
-def function checkpoint_activity_id(event_id) {
+def function checkpoint_leef_activity_id(event_id) {
     switch event_id {
         "Accept" { 1 }                  // Open
         "Drop"   { 6 }                  // Deny
@@ -76,14 +76,14 @@ def function checkpoint_activity_id(event_id) {
     }
 }
 
-def function checkpoint_status_id(event_id) {
+def function checkpoint_leef_status_id(event_id) {
     switch event_id {
         "Accept" { 1 }                  // Success
         default  { 2 }                  // Failure (denied / dropped / rejected)
     }
 }
 
-def function checkpoint_severity_id(event_id) {
+def function checkpoint_leef_severity_id(event_id) {
     switch event_id {
         "Accept" { 1 }                  // Informational
         "Drop"   { 2 }                  // Low (volume-dominant; not all blocks are threats)
@@ -94,7 +94,7 @@ def function checkpoint_severity_id(event_id) {
 }
 
 // Extract one LEEF 2.0 KV from the tab-delimited extension block.
-def function parse_checkpoint_kv(ext, name) {
+def function parse_checkpoint_leef_kv(ext, name) {
     let m = regex_parse(ext, "(?:^|\\t)${name}=(?P<v>[^\\t]*)")
     switch true {
         m == null { null }
@@ -106,50 +106,50 @@ def function parse_checkpoint_kv(ext, name) {
 // Main parser
 // ---------------------------------------------------------------------------
 
-def process parse_checkpoint {
-    // @requires: workspace.checkpoint.body      (required, String)
-    // @requires: workspace.checkpoint.hostname  (optional, String)
-    // @requires: workspace.checkpoint.time      (optional, Int — epoch ns)
+def process parse_checkpoint_leef {
+    // @requires: workspace.checkpoint_leef.body      (required, String)
+    // @requires: workspace.checkpoint_leef.hostname  (optional, String)
+    // @requires: workspace.checkpoint_leef.time      (optional, Int — epoch ns)
     workspace.cp_header = regex_parse(
-        workspace.checkpoint.body,
+        workspace.checkpoint_leef.body,
         "LEEF:2\\.0\\|Check Point\\|(?P<product>[^|]+)\\|(?P<version>[^|]+)\\|(?P<event_id>[^|]+)\\|(?P<ext>.*)$"
     )
     switch true {
         workspace.cp_header == null {
-            error "parse_checkpoint: not a LEEF 2.0 / Check Point record: ${workspace.checkpoint.body}"
+            error "parse_checkpoint_leef: not a LEEF 2.0 / Check Point record: ${workspace.checkpoint_leef.body}"
         }
-        default { process parse_checkpoint_record }
+        default { process parse_checkpoint_leef_record }
     }
 }
 
-def process parse_checkpoint_record {
+def process parse_checkpoint_leef_record {
     let ext = workspace.cp_header.ext
     let event_id = workspace.cp_header.event_id
-    let activity = checkpoint_activity_id(event_id)
+    let activity = checkpoint_leef_activity_id(event_id)
     switch true {
         activity == 99 {
-            error "parse_checkpoint: unsupported LEEF EventID ${event_id}: ${workspace.checkpoint.body}"
+            error "parse_checkpoint_leef: unsupported LEEF EventID ${event_id}: ${workspace.checkpoint_leef.body}"
         }
         default {
-            let proto = parse_checkpoint_kv(ext, "proto")
-            let src_port = parse_checkpoint_kv(ext, "srcPort")
-            let dst_port = parse_checkpoint_kv(ext, "dstPort")
+            let proto = parse_checkpoint_leef_kv(ext, "proto")
+            let src_port = parse_checkpoint_leef_kv(ext, "srcPort")
+            let dst_port = parse_checkpoint_leef_kv(ext, "dstPort")
             workspace.limpid = {
                 class_uid:    4001,
                 category_uid: 4,
                 activity_id:  activity,
-                severity_id:  checkpoint_severity_id(event_id),
-                status_id:    checkpoint_status_id(event_id),
-                time:         workspace.checkpoint.time,
+                severity_id:  checkpoint_leef_severity_id(event_id),
+                status_id:    checkpoint_leef_status_id(event_id),
+                time:         workspace.checkpoint_leef.time,
                 src_endpoint: {
-                    ip:   parse_checkpoint_kv(ext, "src"),
+                    ip:   parse_checkpoint_leef_kv(ext, "src"),
                     port: switch true {
                         src_port == null { null }
                         default          { to_int(src_port) }
                     }
                 },
                 dst_endpoint: {
-                    ip:   parse_checkpoint_kv(ext, "dst"),
+                    ip:   parse_checkpoint_leef_kv(ext, "dst"),
                     port: switch true {
                         dst_port == null { null }
                         default          { to_int(dst_port) }
@@ -157,20 +157,20 @@ def process parse_checkpoint_record {
                 },
                 connection_info: {
                     protocol_name: proto,
-                    protocol_num:  checkpoint_proto_num(proto)
+                    protocol_num:  checkpoint_leef_proto_num(proto)
                 },
-                app_name: parse_checkpoint_kv(ext, "service"),
+                app_name: parse_checkpoint_leef_kv(ext, "service"),
                 actor: {
                     user: {
-                        name: switch parse_checkpoint_kv(ext, "usrName") {
+                        name: switch parse_checkpoint_leef_kv(ext, "usrName") {
                             "N/A"   { null }
                             ""      { null }
-                            default { parse_checkpoint_kv(ext, "usrName") }
+                            default { parse_checkpoint_leef_kv(ext, "usrName") }
                         }
                     }
                 },
                 device: {
-                    hostname: workspace.checkpoint.hostname,
+                    hostname: workspace.checkpoint_leef.hostname,
                     vendor_name: "Check Point",
                     product: {
                         name: workspace.cp_header.product,
@@ -178,9 +178,9 @@ def process parse_checkpoint_record {
                     }
                 },
                 unmapped: {
-                    rule:      parse_checkpoint_kv(ext, "rule"),
-                    rule_name: parse_checkpoint_kv(ext, "rule_name"),
-                    action:    parse_checkpoint_kv(ext, "action")
+                    rule:      parse_checkpoint_leef_kv(ext, "rule"),
+                    rule_name: parse_checkpoint_leef_kv(ext, "rule_name"),
+                    action:    parse_checkpoint_leef_kv(ext, "action")
                 },
                 metadata: {
                     product: {
