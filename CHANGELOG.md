@@ -89,11 +89,22 @@ major SIEM sources covering additional major sources:
 
 | Parser | Source | OCSF class(es) |
 |---|---|---|
-| `parse_juniper_srx` | Juniper Junos SRX RT_FLOW SESSION_CREATE / CLOSE / DENY (RFC 5424 wire + `[junos@2636 ...]` structured data) | 4001 |
+| `parse_juniper_srx_sd_syslog` | Juniper Junos SRX RT_FLOW SESSION_CREATE / CLOSE / DENY (RFC 5424 wire + `[junos@2636 ...]` structured data — `set security log format sd-syslog` mode) | 4001 |
+| `parse_juniper_srx_syslog` | Juniper Junos SRX RT_IDP / IDP_ATTACK_LOG_EVENT (RFC 3164 unstructured syslog — `set security log format syslog` default mode) — real-traffic verified against a real SRX | 2004 |
 | `parse_checkpoint` | Check Point LEEF 2.0 traffic events (Accept / Drop / Reject / Block) inside a syslog wrapper | 4001 |
 | `parse_sysmon` | Microsoft Sysmon EventID 1 (ProcessCreate) / 3 (NetworkConnect) / 11 (FileCreate), as JSON via NXLog / Vector / Winlogbeat | 1007 / 4001 / 1001 |
 | `parse_bind` | ISC BIND 9 `querylog` text format (`category queries`) | 4003 |
 | `parse_auditd` | Linux auditd USER_LOGIN / USER_AUTH / USER_ACCT / USER_LOGOUT / CRED_ACQ / CRED_DISP (the authentication subset of auditd's ~70 type codes) | 3002 |
+
+Junos security logs ship in two distinct wire formats — the
+`sd-syslog` structured form is rare in practice (most production
+SRX deployments stay on the default `syslog` mode), so both
+formats get a dedicated parser per the library's one-file-per-
+`(vendor, format)` convention. `parse_juniper_srx_sd_syslog` is
+synthetic-verified only; `parse_juniper_srx_syslog` is verified
+against live RT_IDP traffic from a real SRX (RT_IDP /
+IDP_ATTACK_LOG_EVENT → OCSF 2004 Detection Finding with
+`finding_info` / `attacks` / `connection_info` populated).
 
 Each parser follows the v0.7.1 intake-schema convention
 (`workspace.<vocab>.{body, …}` with hostname / time from the
@@ -105,12 +116,18 @@ release (USER_LOGIN / USER_AUTH / USER_ACCT / USER_LOGOUT /
 CRED_ACQ / CRED_DISP); SYSCALL / EXECVE / PATH multi-record
 assembly is out of scope.
 
-Compose_ocsf 1001 / 1007 / 4001 / 4003 leaves gain `status_id`,
-`actor`, `device`, and `unmapped` forwarding so the new parsers'
-fields land in the egress JSON.
+Compose_ocsf leaves extended for the new parsers' fields:
+- 1001 / 1007 / 4001 / 4003 gain `status_id`, `actor`, `device`,
+  and `unmapped` forwarding
+- 2004 Detection Finding gains `status_id`, `connection_info`,
+  `device`, `actor`, `attacks`, and `unmapped` forwarding (for
+  the new Juniper SRX IDP parser)
 
-Verified against synthetic samples in each parser's header. Real
-test corpora for these vendors are pending — header docstrings
+Verified against synthetic samples in each parser's header.
+`parse_juniper_srx_syslog` additionally verified against live
+RT_IDP traffic from a real SRX. Real test corpora for the
+other vendors (CheckPoint / Sysmon / BIND / auditd /
+Juniper SRX sd-syslog mode) are pending — header docstrings
 mark them "synthetic-verified only".
 
 ### Added — transport parsers + RFC 5424 composer

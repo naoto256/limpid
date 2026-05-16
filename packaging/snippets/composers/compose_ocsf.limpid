@@ -294,22 +294,27 @@ def process compose_ocsf_compliance_finding {
 def process compose_ocsf_detection_finding {
     let activity = workspace.limpid.activity_id
     egress = to_json(null_omit({
-        class_uid:      2004,
-        category_uid:   2,
-        activity_id:    activity,
-        type_uid:       2004 * 100 + activity,
-        severity_id:    workspace.limpid.severity_id,
-        time:           coalesce(workspace.limpid.time, received_at),
-        finding_info:   workspace.limpid.finding_info,
-        disposition_id: workspace.limpid.disposition_id,
-        src_endpoint:   workspace.limpid.src_endpoint,
-        dst_endpoint:   workspace.limpid.dst_endpoint,
-        actor:          workspace.limpid.actor,
-        attack:         workspace.limpid.attack,
-        malware:        workspace.limpid.malware,
-        evidences:      workspace.limpid.evidences,
-        message:        workspace.limpid.message,
-        metadata:       workspace.limpid.metadata
+        class_uid:       2004,
+        category_uid:    2,
+        activity_id:     activity,
+        type_uid:        2004 * 100 + activity,
+        severity_id:     workspace.limpid.severity_id,
+        status_id:       workspace.limpid.status_id,
+        time:            coalesce(workspace.limpid.time, received_at),
+        finding_info:    workspace.limpid.finding_info,
+        disposition_id:  workspace.limpid.disposition_id,
+        src_endpoint:    workspace.limpid.src_endpoint,
+        dst_endpoint:    workspace.limpid.dst_endpoint,
+        connection_info: workspace.limpid.connection_info,
+        device:          workspace.limpid.device,
+        actor:           workspace.limpid.actor,
+        attacks:         workspace.limpid.attacks,
+        attack:          workspace.limpid.attack,
+        malware:         workspace.limpid.malware,
+        evidences:       workspace.limpid.evidences,
+        message:         workspace.limpid.message,
+        unmapped:        workspace.limpid.unmapped,
+        metadata:        workspace.limpid.metadata
     }))
 }
 

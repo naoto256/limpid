@@ -1,0 +1,251 @@
+// Juniper SRX unstructured syslog parser (vocabulary)
+//
+// Vendor:   Juniper Networks SRX series — `set security log format syslog`
+//           mode (vs `sd-syslog` which is handled by
+//           parse_juniper_srx_sd_syslog). This is the default in many
+//           older Junos versions and the one most production
+//           deployments still emit because migrating to sd-syslog
+//           breaks downstream parsers.
+// Wire:     RFC 3164 syslog with a Junos-specific MSGID prefix and a
+//           free-form text body:
+//             <PRI>timestamp host RT_<DAEMON>: <MSGID>: <free-form>
+//           DAEMON ∈ {FLOW, IDP, UTM, SCREEN, ...}; MSGID is the
+//           per-event marker (e.g. RT_FLOW_SESSION_CREATE,
+//           IDP_ATTACK_LOG_EVENT, ANTIVIRUS_VIRUS_DETECTED). The
+//           body shape is MSGID-specific and must be regex-extracted
+//           per pattern.
+// Intake:   workspace.juniper_srx_syslog.body      (required, String) — the syslog wire
+//           workspace.juniper_srx_syslog.hostname  (optional, String) — collector-side hostname
+//           workspace.juniper_srx_syslog.time      (optional, Int)    — epoch nanoseconds
+// Upstream: SRX appliances emit syslog (UDP/514 or TCP/514). The
+//           bridge passes the raw wire — the parser does its own
+//           leading-`<PRI>timestamp host` strip via regex because
+//           syslog.parse leaves the daemon-prefix-and-MSGID inside
+//           workspace.syslog.msg in a way that's awkward to switch
+//           on. Two typical bridges:
+//
+//           - syslog (UDP/TCP):
+//                 { workspace.juniper_srx_syslog = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_juniper_srx_syslog | compose_ocsf
+//
+//           - tail of a forwarded text file:
+//                 { workspace.juniper_srx_syslog = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_juniper_srx_syslog | compose_ocsf
+//
+// Output:   OCSF records on `workspace.limpid`, class depends on
+//           DAEMON / MSGID:
+//             RT_IDP IDP_ATTACK_LOG_EVENT       → 2004 Detection Finding
+//             (other RT_IDP / RT_UTM subtypes)  → routed to error_log per
+//                                                 loud-fail-fast policy until
+//                                                 their shapes are added
+//
+// Sample wire (anonymised to RFC 5737):
+//
+//   IDP attack alert (intrusion detected on monitored flow):
+//   <14>May 16 13:32:30 srx01 RT_IDP: IDP_ATTACK_LOG_EVENT: IDP: at 1778905950, SIG Attack log <198.51.100.10/63074->192.0.2.100/445> for TCP protocol and service SERVICE_IDP application SMB by rule Tap of rulebase IPS in policy Tap. attack: id=19519, repeat=0, action=DROP, threat-severity=HIGH, name=SMB:CVE-2017-0143-001, NAT <198.51.100.10:0->0.0.0.0:0>, time-elapsed=0, inbytes=0, outbytes=0, inpackets=0, outpackets=0, intf:trust:ge-0/0/0.0->untrust:ge-0/0/1.0, packet-log-id: 0, alert=no, username=N/A, roles=N/A, misc-message=-
+//
+// Coverage scope: this snippet handles the Junos unstructured-syslog
+// MSGIDs the library has real-traffic samples for. Other DAEMONs
+// (RT_UTM / RT_SCREEN) and subtypes (RT_FLOW_SESSION_* in
+// unstructured form, IDP_ATTACK_LOG_EVENT_LS for logical-system
+// chassis, etc.) route to error_log; add them as samples surface.
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Map Junos protocol name (TCP / UDP / ICMP) to OCSF protocol_num.
+def function juniper_srx_syslog_proto_num(name) {
+    switch name {
+        "TCP"    { 6 }
+        "UDP"    { 17 }
+        "ICMP"   { 1 }
+        "ICMPv6" { 58 }
+        default  { null }
+    }
+}
+
+// Map Junos threat-severity to OCSF severity_id.
+//   INFO     → 1 Informational
+//   LOW      → 2 Low
+//   MEDIUM   → 3 Medium
+//   HIGH     → 4 High
+//   CRITICAL → 5 Critical
+def function juniper_srx_syslog_severity_id(s) {
+    switch s {
+        "INFO"     { 1 }
+        "LOW"      { 2 }
+        "MEDIUM"   { 3 }
+        "HIGH"     { 4 }
+        "CRITICAL" { 5 }
+        default    { 1 }
+    }
+}
+
+// Map Junos action (DROP / CLOSE / RECOMMENDED / NONE / IGNORE) to
+// OCSF Detection Finding activity_id (1=Create, 2=Update, 3=Close).
+// IDP attack notifications are best modelled as new findings, so
+// we hard-code activity_id=1 (Create) below; this helper is kept
+// for status_id mapping.
+def function juniper_srx_syslog_action_status_id(action) {
+    switch action {
+        "DROP"        { 2 }  // Failure (= the offending traffic was blocked)
+        "CLOSE"       { 2 }
+        "RECOMMENDED" { 2 }
+        "NONE"        { 99 } // Other (alert-only, no action taken)
+        "IGNORE"      { 99 }
+        default       { 99 }
+    }
+}
+
+// Strip the leading `<PRI>timestamp host ` to expose the
+// `RT_<DAEMON>: <MSGID>: <body>` shape. Returns `{host, daemon, msgid, body}`
+// or null on a non-RT_ line. `host` is the syslog HOSTNAME field (the
+// SRX device's own hostname); the leaves prefer it over the
+// bridge-supplied `workspace.juniper_srx_syslog.hostname` so a
+// collector forwarding many SRXs still reports each event's true
+// origin.
+def function parse_juniper_srx_syslog_classify(text) {
+    let m = regex_parse(
+        text,
+        "^<\\d+>\\S+ \\S+ \\S+ (?P<host>\\S+) RT_(?P<daemon>[A-Z]+): (?P<msgid>[A-Z][A-Z0-9_]+): (?P<body>.*)$"
+    )
+    switch true {
+        m == null { null }
+        default {
+            {
+                host:   m.host,
+                daemon: m.daemon,
+                msgid:  m.msgid,
+                body:   m.body
+            }
+        }
+    }
+}
+
+// IDP ATTACK_LOG_EVENT body shape (positional then key=value tail):
+//   IDP: at <ts>, SIG Attack log <src/sport->dst/dport> for <proto>
+//   protocol and service <svc> application <app> by rule <rule> of
+//   rulebase <rb> in policy <policy>. attack: id=<id>, repeat=<n>,
+//   action=<act>, threat-severity=<sev>, name=<name>, NAT
+//   <natsrc:natsport->natdst:natdport>, time-elapsed=<t>, inbytes=...
+def function parse_juniper_srx_syslog_idp_attack_fields(body) {
+    regex_parse(
+        body,
+        "^IDP: at \\d+, \\S+ Attack log <(?P<src>[^/]+)/(?P<src_port>\\d+)->(?P<dst>[^/]+)/(?P<dst_port>\\d+)> for (?P<proto>\\S+) protocol .*? by rule (?P<rule>\\S+) of rulebase (?P<rulebase>\\S+) in policy (?P<policy>[^.]+)\\.\\s*attack: id=(?P<sig_id>\\d+).*?action=(?P<action>[A-Z]+).*?threat-severity=(?P<severity>[A-Z]+).*?name=(?P<sig_name>[A-Za-z0-9:_.-]+)"
+    )
+}
+
+// Build the OCSF Detection Finding (2004) record for an IDP attack.
+def function juniper_srx_syslog_idp_finding_record(src_ip, src_port_str, dst_ip, dst_port_str, proto_name, sig_id, sig_name, action, severity_str, rule, rulebase, policy, host, time_ns) {
+    {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:  1,                                     // Create (a new finding)
+        severity_id:  juniper_srx_syslog_severity_id(severity_str),
+        status_id:    juniper_srx_syslog_action_status_id(action),
+        time:         time_ns,
+        finding_info: {
+            uid:   sig_id,
+            title: sig_name,
+            types: ["Network IDS"],
+            src_url: null
+        },
+        attacks: [{
+            tactic:    null,
+            technique: { name: sig_name, uid: sig_id }
+        }],
+        src_endpoint: {
+            ip:   src_ip,
+            port: to_int(src_port_str)
+        },
+        dst_endpoint: {
+            ip:   dst_ip,
+            port: to_int(dst_port_str)
+        },
+        connection_info: {
+            protocol_num:  juniper_srx_syslog_proto_num(proto_name),
+            protocol_name: proto_name
+        },
+        device: {
+            hostname: host
+        },
+        unmapped: {
+            policy_name:   policy,
+            rule_name:     rule,
+            rulebase_name: rulebase,
+            action:        action
+        },
+        metadata: {
+            product: {
+                vendor_name: "Juniper Networks",
+                name:        "Junos OS (SRX IDP)"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main parser
+// ---------------------------------------------------------------------------
+
+def process parse_juniper_srx_syslog {
+    // @requires: workspace.juniper_srx_syslog.body      (required, String)
+    // @requires: workspace.juniper_srx_syslog.hostname  (optional, String)
+    // @requires: workspace.juniper_srx_syslog.time      (optional, Int — epoch ns)
+    workspace.srx_syslog_class = parse_juniper_srx_syslog_classify(workspace.juniper_srx_syslog.body)
+    switch true {
+        workspace.srx_syslog_class == null {
+            error "parse_juniper_srx_syslog: not a Junos RT_<daemon> line: ${workspace.juniper_srx_syslog.body}"
+        }
+        workspace.srx_syslog_class.daemon == "IDP" {
+            process parse_juniper_srx_syslog_idp_dispatch
+        }
+        default {
+            error "parse_juniper_srx_syslog: unsupported Junos daemon RT_${workspace.srx_syslog_class.daemon}: ${workspace.juniper_srx_syslog.body}"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RT_IDP dispatcher
+// ---------------------------------------------------------------------------
+
+def process parse_juniper_srx_syslog_idp_dispatch {
+    switch workspace.srx_syslog_class.msgid {
+        "IDP_ATTACK_LOG_EVENT" { process parse_juniper_srx_syslog_idp_attack_record }
+        default {
+            error "parse_juniper_srx_syslog: unsupported RT_IDP MSGID ${workspace.srx_syslog_class.msgid}: ${workspace.juniper_srx_syslog.body}"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IDP_ATTACK_LOG_EVENT → 2004 Detection Finding / Create
+// ---------------------------------------------------------------------------
+
+def process parse_juniper_srx_syslog_idp_attack_record {
+    workspace.srx_idp_fields = parse_juniper_srx_syslog_idp_attack_fields(workspace.srx_syslog_class.body)
+    switch true {
+        workspace.srx_idp_fields == null {
+            error "parse_juniper_srx_syslog_idp_attack_record: body did not match expected shape: ${workspace.juniper_srx_syslog.body}"
+        }
+        default {
+            workspace.limpid = juniper_srx_syslog_idp_finding_record(
+                workspace.srx_idp_fields.src,
+                workspace.srx_idp_fields.src_port,
+                workspace.srx_idp_fields.dst,
+                workspace.srx_idp_fields.dst_port,
+                workspace.srx_idp_fields.proto,
+                workspace.srx_idp_fields.sig_id,
+                workspace.srx_idp_fields.sig_name,
+                workspace.srx_idp_fields.action,
+                workspace.srx_idp_fields.severity,
+                workspace.srx_idp_fields.rule,
+                workspace.srx_idp_fields.rulebase,
+                workspace.srx_idp_fields.policy,
+                coalesce(workspace.srx_syslog_class.host, workspace.juniper_srx_syslog.hostname),
+                workspace.juniper_srx_syslog.time
+            )
+        }
+    }
+}

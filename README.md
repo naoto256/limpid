@@ -180,14 +180,16 @@ snippet category in **v0.7.1**:
   5424 syslog wire) · `parse_journald` (systemd journald JSON).
   These populate `workspace.<transport>.*` and feed any vocabulary
   parser downstream via an inline bridge.
-- **Vendor parsers (16)** — security devices / cloud audit:
+- **Vendor parsers (17)** — security devices / cloud audit:
   `parse_fortigate_cef` · `parse_fortigate_syslog` ·
   `parse_paloalto_cef` · `parse_paloalto_syslog` · `parse_asa` ·
-  `parse_cloudtrail` · `parse_juniper_srx` · `parse_checkpoint`
-  (LEEF 2.0). Server / host vocabulary: `parse_openssh` ·
-  `parse_sudo` · `parse_combined_log` (Apache / Nginx) ·
-  `parse_postfix` · `parse_winevent_json` · `parse_sysmon` ·
-  `parse_bind` · `parse_auditd`. Vendor-neutral: `parse_ocsf`.
+  `parse_cloudtrail` · `parse_juniper_srx_sd_syslog` (Junos
+  structured-data) · `parse_juniper_srx_syslog` (Junos
+  unstructured RT_IDP) · `parse_checkpoint` (LEEF 2.0). Server /
+  host vocabulary: `parse_openssh` · `parse_sudo` ·
+  `parse_combined_log` (Apache / Nginx) · `parse_postfix` ·
+  `parse_winevent_json` · `parse_sysmon` · `parse_bind` ·
+  `parse_auditd`. Vendor-neutral: `parse_ocsf`.
 - **Composers (3)** — `compose_ocsf` (OCSF 1.3.0 priority set, 27
   classes, dispatched by `workspace.limpid.class_uid`) ·
   `compose_rfc5424` (journald → RFC 5424 wire, v0.7.1) ·

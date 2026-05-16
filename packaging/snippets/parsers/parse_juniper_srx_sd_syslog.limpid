@@ -15,12 +15,12 @@
 //           Other RT_FLOW MSGIDs (RT_FLOW_NEXT_HOP_CHANGE, etc.) and
 //           non-flow daemons (RT_IDS, RT_UTM, RT_SCREEN) emit
 //           different SD shapes and route to error_log.
-// Intake:   workspace.juniper_srx.body      (required, String) — the full RFC 5424 wire
+// Intake:   workspace.juniper_srx_sd_syslog.body      (required, String) — the full RFC 5424 wire
 //                                            INCLUDING the leading `<PRI>1` (the parser
 //                                            extracts MSGID and SD directly via regex;
 //                                            it does NOT consume an upstream parse_syslog)
-//           workspace.juniper_srx.hostname  (optional, String) — collector-side hostname override
-//           workspace.juniper_srx.time      (optional, Int)    — epoch nanoseconds of arrival
+//           workspace.juniper_srx_sd_syslog.hostname  (optional, String) — collector-side hostname override
+//           workspace.juniper_srx_sd_syslog.time      (optional, Int)    — epoch nanoseconds of arrival
 // Upstream: SRX appliances emit syslog (UDP/514 or TCP/514 typically).
 //           The bridge passes the raw wire — parse_syslog is NOT used
 //           because limpid's syslog.parse does not expose the
@@ -28,10 +28,10 @@
 //           entirely in SD. Two typical bridges:
 //
 //           - syslog (UDP/TCP):
-//                 { workspace.juniper_srx = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_juniper_srx | compose_ocsf
+//                 { workspace.juniper_srx_sd_syslog = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_juniper_srx_sd_syslog | compose_ocsf
 //
 //           - tail of a forwarded text file:
-//                 { workspace.juniper_srx = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_juniper_srx | compose_ocsf
+//                 { workspace.juniper_srx_sd_syslog = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_juniper_srx_sd_syslog | compose_ocsf
 //
 // Output:   OCSF Network Activity (class_uid 4001) records on
 //           `workspace.limpid`. activity_id is 1 (Open) for
@@ -55,7 +55,7 @@
 
 // Map Junos protocol-id (IANA protocol number as string) to OCSF
 // connection_info.protocol_name.
-def function juniper_srx_proto_name(p) {
+def function juniper_srx_sd_syslog_proto_name(p) {
     switch p {
         "1"   { "ICMP" }
         "6"   { "TCP" }
@@ -68,7 +68,7 @@ def function juniper_srx_proto_name(p) {
     }
 }
 
-def function juniper_srx_network_record(activity_id, status_id, severity_id, src_ip, src_port_str, dst_ip, dst_port_str, proto_str, policy, src_zone, dst_zone, session_id, app, reason, msgid, host, time_ns) {
+def function juniper_srx_sd_syslog_network_record(activity_id, status_id, severity_id, src_ip, src_port_str, dst_ip, dst_port_str, proto_str, policy, src_zone, dst_zone, session_id, app, reason, msgid, host, time_ns) {
     {
         class_uid:    4001,
         category_uid: 4,
@@ -88,7 +88,7 @@ def function juniper_srx_network_record(activity_id, status_id, severity_id, src
         },
         connection_info: {
             protocol_num:  to_int(proto_str),
-            protocol_name: juniper_srx_proto_name(proto_str),
+            protocol_name: juniper_srx_sd_syslog_proto_name(proto_str),
             session: {
                 uid: session_id
             }
@@ -115,7 +115,7 @@ def function juniper_srx_network_record(activity_id, status_id, severity_id, src
 // Classify the RT_FLOW MSGID. Returns `{kind, fields}` where fields
 // is the regex_parse output of the SD KV block, or null on a
 // non-matching line.
-def function parse_juniper_srx_classify(body) {
+def function parse_juniper_srx_sd_syslog_classify(body) {
     let header = regex_parse(
         body,
         "^<\\d+>1 \\S+ (?P<host>\\S+) RT_FLOW - (?P<msgid>RT_FLOW_SESSION_\\w+) \\[junos@\\S+ (?P<sd>.*)\\]\\s*$"
@@ -133,7 +133,7 @@ def function parse_juniper_srx_classify(body) {
 // Junos versions / MSGIDs (e.g. `application=` appears before
 // `policy-name=` on SESSION_DENY but after `session-id-32=` on
 // SESSION_CREATE), so each field is captured independently.
-def function parse_juniper_srx_kv(sd, name) {
+def function parse_juniper_srx_sd_syslog_kv(sd, name) {
     let m = regex_parse(sd, "${name}=\"(?P<v>[^\"]*)\"")
     switch true {
         m == null { null }
@@ -143,19 +143,19 @@ def function parse_juniper_srx_kv(sd, name) {
 
 // Pull the canonical session fields off the SD block into one Object
 // the leaves consume.
-def function parse_juniper_srx_session_fields(sd) {
+def function parse_juniper_srx_sd_syslog_session_fields(sd) {
     {
-        src:        parse_juniper_srx_kv(sd, "source-address"),
-        src_port:   parse_juniper_srx_kv(sd, "source-port"),
-        dst:        parse_juniper_srx_kv(sd, "destination-address"),
-        dst_port:   parse_juniper_srx_kv(sd, "destination-port"),
-        proto:      parse_juniper_srx_kv(sd, "protocol-id"),
-        policy:     parse_juniper_srx_kv(sd, "policy-name"),
-        src_zone:   parse_juniper_srx_kv(sd, "source-zone-name"),
-        dst_zone:   parse_juniper_srx_kv(sd, "destination-zone-name"),
-        session_id: parse_juniper_srx_kv(sd, "session-id-32"),
-        app:        parse_juniper_srx_kv(sd, "application"),
-        reason:     parse_juniper_srx_kv(sd, "reason")
+        src:        parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
+        src_port:   parse_juniper_srx_sd_syslog_kv(sd, "source-port"),
+        dst:        parse_juniper_srx_sd_syslog_kv(sd, "destination-address"),
+        dst_port:   parse_juniper_srx_sd_syslog_kv(sd, "destination-port"),
+        proto:      parse_juniper_srx_sd_syslog_kv(sd, "protocol-id"),
+        policy:     parse_juniper_srx_sd_syslog_kv(sd, "policy-name"),
+        src_zone:   parse_juniper_srx_sd_syslog_kv(sd, "source-zone-name"),
+        dst_zone:   parse_juniper_srx_sd_syslog_kv(sd, "destination-zone-name"),
+        session_id: parse_juniper_srx_sd_syslog_kv(sd, "session-id-32"),
+        app:        parse_juniper_srx_sd_syslog_kv(sd, "application"),
+        reason:     parse_juniper_srx_sd_syslog_kv(sd, "reason")
     }
 }
 
@@ -163,20 +163,20 @@ def function parse_juniper_srx_session_fields(sd) {
 // Main parser
 // ---------------------------------------------------------------------------
 
-def process parse_juniper_srx {
-    // @requires: workspace.juniper_srx.body      (required, String)
-    // @requires: workspace.juniper_srx.hostname  (optional, String)
-    // @requires: workspace.juniper_srx.time      (optional, Int — epoch ns)
-    workspace.srx_class = parse_juniper_srx_classify(workspace.juniper_srx.body)
+def process parse_juniper_srx_sd_syslog {
+    // @requires: workspace.juniper_srx_sd_syslog.body      (required, String)
+    // @requires: workspace.juniper_srx_sd_syslog.hostname  (optional, String)
+    // @requires: workspace.juniper_srx_sd_syslog.time      (optional, Int — epoch ns)
+    workspace.srx_sd_class = parse_juniper_srx_sd_syslog_classify(workspace.juniper_srx_sd_syslog.body)
     switch true {
-        workspace.srx_class == null {
-            error "parse_juniper_srx: not a recognised RT_FLOW SD line: ${workspace.juniper_srx.body}"
+        workspace.srx_sd_class == null {
+            error "parse_juniper_srx_sd_syslog: not a recognised RT_FLOW SD line: ${workspace.juniper_srx_sd_syslog.body}"
         }
-        workspace.srx_class.kind == "create" { process parse_juniper_srx_session_create }
-        workspace.srx_class.kind == "close"  { process parse_juniper_srx_session_close }
-        workspace.srx_class.kind == "deny"   { process parse_juniper_srx_session_deny }
+        workspace.srx_sd_class.kind == "create" { process parse_juniper_srx_sd_syslog_session_create }
+        workspace.srx_sd_class.kind == "close"  { process parse_juniper_srx_sd_syslog_session_close }
+        workspace.srx_sd_class.kind == "deny"   { process parse_juniper_srx_sd_syslog_session_deny }
         default {
-            error "parse_juniper_srx: unsupported RT_FLOW MSGID ${workspace.srx_class.header.msgid}: ${workspace.juniper_srx.body}"
+            error "parse_juniper_srx_sd_syslog: unsupported RT_FLOW MSGID ${workspace.srx_sd_class.header.msgid}: ${workspace.juniper_srx_sd_syslog.body}"
         }
     }
 }
@@ -185,31 +185,31 @@ def process parse_juniper_srx {
 // RT_FLOW_SESSION_CREATE → 4001 / Open / Success
 // ---------------------------------------------------------------------------
 
-def process parse_juniper_srx_session_create {
-    workspace.srx_fields = parse_juniper_srx_session_fields(workspace.srx_class.header.sd)
+def process parse_juniper_srx_sd_syslog_session_create {
+    workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_session_fields(workspace.srx_sd_class.header.sd)
     switch true {
-        workspace.srx_fields.src == null {
-            error "parse_juniper_srx_session_create: SD did not match expected shape: ${workspace.juniper_srx.body}"
+        workspace.srx_sd_fields.src == null {
+            error "parse_juniper_srx_sd_syslog_session_create: SD did not match expected shape: ${workspace.juniper_srx_sd_syslog.body}"
         }
         default {
-            workspace.limpid = juniper_srx_network_record(
+            workspace.limpid = juniper_srx_sd_syslog_network_record(
                 1,                              // activity_id: Open
                 1,                              // status_id:   Success
                 1,                              // severity_id: Informational
-                workspace.srx_fields.src,
-                workspace.srx_fields.src_port,
-                workspace.srx_fields.dst,
-                workspace.srx_fields.dst_port,
-                workspace.srx_fields.proto,
-                workspace.srx_fields.policy,
-                workspace.srx_fields.src_zone,
-                workspace.srx_fields.dst_zone,
-                workspace.srx_fields.session_id,
-                workspace.srx_fields.app,
+                workspace.srx_sd_fields.src,
+                workspace.srx_sd_fields.src_port,
+                workspace.srx_sd_fields.dst,
+                workspace.srx_sd_fields.dst_port,
+                workspace.srx_sd_fields.proto,
+                workspace.srx_sd_fields.policy,
+                workspace.srx_sd_fields.src_zone,
+                workspace.srx_sd_fields.dst_zone,
+                workspace.srx_sd_fields.session_id,
+                workspace.srx_sd_fields.app,
                 null,                           // CREATE has no reason
-                workspace.srx_class.header.msgid,
-                coalesce(workspace.juniper_srx.hostname, workspace.srx_class.header.host),
-                workspace.juniper_srx.time
+                workspace.srx_sd_class.header.msgid,
+                coalesce(workspace.juniper_srx_sd_syslog.hostname, workspace.srx_sd_class.header.host),
+                workspace.juniper_srx_sd_syslog.time
             )
         }
     }
@@ -219,31 +219,31 @@ def process parse_juniper_srx_session_create {
 // RT_FLOW_SESSION_CLOSE → 4001 / Close / Success
 // ---------------------------------------------------------------------------
 
-def process parse_juniper_srx_session_close {
-    workspace.srx_fields = parse_juniper_srx_session_fields(workspace.srx_class.header.sd)
+def process parse_juniper_srx_sd_syslog_session_close {
+    workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_session_fields(workspace.srx_sd_class.header.sd)
     switch true {
-        workspace.srx_fields.src == null {
-            error "parse_juniper_srx_session_close: SD did not match expected shape: ${workspace.juniper_srx.body}"
+        workspace.srx_sd_fields.src == null {
+            error "parse_juniper_srx_sd_syslog_session_close: SD did not match expected shape: ${workspace.juniper_srx_sd_syslog.body}"
         }
         default {
-            workspace.limpid = juniper_srx_network_record(
+            workspace.limpid = juniper_srx_sd_syslog_network_record(
                 2,                              // activity_id: Close
                 1,                              // status_id:   Success (session terminated normally)
                 1,                              // severity_id: Informational
-                workspace.srx_fields.src,
-                workspace.srx_fields.src_port,
-                workspace.srx_fields.dst,
-                workspace.srx_fields.dst_port,
-                workspace.srx_fields.proto,
-                workspace.srx_fields.policy,
-                workspace.srx_fields.src_zone,
-                workspace.srx_fields.dst_zone,
-                workspace.srx_fields.session_id,
-                workspace.srx_fields.app,
-                workspace.srx_fields.reason,
-                workspace.srx_class.header.msgid,
-                coalesce(workspace.juniper_srx.hostname, workspace.srx_class.header.host),
-                workspace.juniper_srx.time
+                workspace.srx_sd_fields.src,
+                workspace.srx_sd_fields.src_port,
+                workspace.srx_sd_fields.dst,
+                workspace.srx_sd_fields.dst_port,
+                workspace.srx_sd_fields.proto,
+                workspace.srx_sd_fields.policy,
+                workspace.srx_sd_fields.src_zone,
+                workspace.srx_sd_fields.dst_zone,
+                workspace.srx_sd_fields.session_id,
+                workspace.srx_sd_fields.app,
+                workspace.srx_sd_fields.reason,
+                workspace.srx_sd_class.header.msgid,
+                coalesce(workspace.juniper_srx_sd_syslog.hostname, workspace.srx_sd_class.header.host),
+                workspace.juniper_srx_sd_syslog.time
             )
         }
     }
@@ -253,31 +253,31 @@ def process parse_juniper_srx_session_close {
 // RT_FLOW_SESSION_DENY → 4001 / Deny / Failure
 // ---------------------------------------------------------------------------
 
-def process parse_juniper_srx_session_deny {
-    workspace.srx_fields = parse_juniper_srx_session_fields(workspace.srx_class.header.sd)
+def process parse_juniper_srx_sd_syslog_session_deny {
+    workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_session_fields(workspace.srx_sd_class.header.sd)
     switch true {
-        workspace.srx_fields.src == null {
-            error "parse_juniper_srx_session_deny: SD did not match expected shape: ${workspace.juniper_srx.body}"
+        workspace.srx_sd_fields.src == null {
+            error "parse_juniper_srx_sd_syslog_session_deny: SD did not match expected shape: ${workspace.juniper_srx_sd_syslog.body}"
         }
         default {
-            workspace.limpid = juniper_srx_network_record(
+            workspace.limpid = juniper_srx_sd_syslog_network_record(
                 6,                              // activity_id: Deny (OCSF 4001)
                 2,                              // status_id:   Failure (the session was rejected)
                 3,                              // severity_id: Medium (policy denial worth seeing)
-                workspace.srx_fields.src,
-                workspace.srx_fields.src_port,
-                workspace.srx_fields.dst,
-                workspace.srx_fields.dst_port,
-                workspace.srx_fields.proto,
-                workspace.srx_fields.policy,
-                workspace.srx_fields.src_zone,
-                workspace.srx_fields.dst_zone,
-                workspace.srx_fields.session_id,
-                workspace.srx_fields.app,
-                workspace.srx_fields.reason,
-                workspace.srx_class.header.msgid,
-                coalesce(workspace.juniper_srx.hostname, workspace.srx_class.header.host),
-                workspace.juniper_srx.time
+                workspace.srx_sd_fields.src,
+                workspace.srx_sd_fields.src_port,
+                workspace.srx_sd_fields.dst,
+                workspace.srx_sd_fields.dst_port,
+                workspace.srx_sd_fields.proto,
+                workspace.srx_sd_fields.policy,
+                workspace.srx_sd_fields.src_zone,
+                workspace.srx_sd_fields.dst_zone,
+                workspace.srx_sd_fields.session_id,
+                workspace.srx_sd_fields.app,
+                workspace.srx_sd_fields.reason,
+                workspace.srx_sd_class.header.msgid,
+                coalesce(workspace.juniper_srx_sd_syslog.hostname, workspace.srx_sd_class.header.host),
+                workspace.juniper_srx_sd_syslog.time
             )
         }
     }
