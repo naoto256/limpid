@@ -16,11 +16,18 @@ use tracing::{error, info, warn};
 use super::validate::validate_pri;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
+use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::InputMetrics;
 use crate::modules::{HasMetrics, Input, Module};
 
 const UNIX_SOURCE: &str = "127.0.0.1:0";
+
+const UNIX_SOCKET_INPUT_SCHEMA: &[PropertySpec] = &[PropertySpec {
+    name: "path",
+    required: true,
+    kind: PropertyValueKind::String,
+}];
 
 pub struct UnixSocketInput {
     path: String,
@@ -28,6 +35,10 @@ pub struct UnixSocketInput {
 }
 
 impl Module for UnixSocketInput {
+    fn property_schema() -> Option<&'static [PropertySpec]> {
+        Some(UNIX_SOCKET_INPUT_SCHEMA)
+    }
+
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
         let path = props::get_string(properties, "path")
             .ok_or_else(|| anyhow::anyhow!("input '{}': unix_socket requires 'path'", name))?;
