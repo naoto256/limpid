@@ -79,6 +79,16 @@ the default framing. The schema layer rejects unknown enum values at
 both `--check` time and runtime startup, with a `did you mean ...?`
 hint.
 
+### Fixed — `include` matching zero files is no longer silent
+
+`include "path/that/does/not/exist.limpid"` (and any glob that
+expands to zero matches) used to pass `--check` silently and then
+surface at runtime as confusing "unknown process" errors with no
+obvious tie back to the typo'd include line. The loader now bails
+loudly with `include path '...' (resolved to '...') matched no
+files` at config-load time, before `--check` even runs the analyzer.
+Same posture as rsyslog / syslog-ng on a missing include directive.
+
 ### Notes
 
 - Configs that pass `--check` today still pass. Configs that

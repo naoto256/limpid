@@ -173,6 +173,21 @@ fn load_recursive(
             .with_context(|| format!("error reading include pattern: {}", include_pattern))?;
         paths.sort();
 
+        // A pattern that matches no files is almost always a typo: a
+        // bare path that doesn't exist, or a glob that has drifted out
+        // of sync with the snippet layout. Silently skipping it makes
+        // the daemon look fine at `--check` time and then misbehave at
+        // runtime because the `def process` the operator thought was
+        // included is missing. Treat it as a loud config error — same
+        // posture as rsyslog / syslog-ng on a missing `$IncludeConfig`.
+        if paths.is_empty() {
+            anyhow::bail!(
+                "include path '{}' (resolved to '{}') matched no files",
+                include_pattern,
+                full_pattern.display()
+            );
+        }
+
         for inc_path in paths {
             let canonical_inc = std::fs::canonicalize(&inc_path)
                 .with_context(|| format!("failed to canonicalize {}", inc_path.display()))?;
@@ -354,13 +369,37 @@ mod tests {
     }
 
     #[test]
-    fn test_no_matches_is_ok() {
+    fn test_include_matching_no_files_is_a_loud_error() {
+        // Pre-0.7.2 this silently succeeded, which let typo'd include
+        // paths slip through `--check` and surface only at runtime as
+        // confusing "unknown process" errors. Treat any zero-match
+        // include (bare path or glob) as a config error.
         let dir = TempDir::new().unwrap();
         let main_conf = dir.path().join("main.conf");
         fs::write(&main_conf, r#"include "nonexistent/*.limpid""#).unwrap();
 
-        let config = load_config(&main_conf).unwrap();
-        assert!(config.definitions.is_empty());
+        let err = load_config(&main_conf).err().expect("must fail loudly");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("matched no files"),
+            "expected loud zero-match diagnostic, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_include_bare_path_to_missing_file_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        let main_conf = dir.path().join("main.conf");
+        fs::write(&main_conf, r#"include "missing.limpid""#).unwrap();
+
+        let err = load_config(&main_conf).err().expect("must fail loudly");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("matched no files") && msg.contains("missing.limpid"),
+            "expected loud zero-match diagnostic naming the path, got: {}",
+            msg
+        );
     }
 
     #[test]

@@ -685,6 +685,34 @@ def pipeline p { input i; output o }
 }
 
 #[test]
+fn check_rejects_include_path_matching_no_files() {
+    // Pre-0.7.2 this passed --check silently; the broken include
+    // surfaced only at runtime as an "unknown process" complaint with
+    // no obvious tie back to the typo'd include line.
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("badinc.conf");
+    fs::write(
+        &conf,
+        r#"
+include "does/not/exist.limpid"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p { input i; output o }
+"#,
+    )
+    .unwrap();
+
+    let out = run_check(&conf);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(!out.status.success(), "stderr: {}", stderr);
+    assert!(
+        stderr.contains("matched no files") && stderr.contains("does/not/exist.limpid"),
+        "expected loud zero-match diagnostic with the include path\nstderr: {}",
+        stderr
+    );
+}
+
+#[test]
 fn check_self_inclusion_is_rejected() {
     let dir = TempDir::new().unwrap();
     let main = dir.path().join("main.conf");
