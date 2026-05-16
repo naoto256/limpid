@@ -393,7 +393,12 @@ fn check_value(
 /// Pick the closest candidate to `needle` from `candidates`, or `None`
 /// when nothing falls within the typo threshold `max(2, len/3)`.
 /// Tie-breaks alphabetically for deterministic output.
-fn nearest<'a, I>(needle: &str, candidates: I) -> Option<String>
+///
+/// Reused by `check::suggestions` (for unbound workspace / function
+/// idents) and by `check::module_props` (for unknown `type` ident on
+/// `def input/output`). Keeping a single implementation here means
+/// the threshold and tie-break rules can't drift across surfaces.
+pub fn nearest<'a, I>(needle: &str, candidates: I) -> Option<String>
 where
     I: IntoIterator<Item = &'a str>,
 {

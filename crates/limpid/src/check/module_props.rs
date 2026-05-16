@@ -14,7 +14,7 @@
 //! path: `property_schema() = None` defaults to "do not enforce yet").
 
 use crate::dsl::ast::{Expr, ExprKind, InputDef, OutputDef, Property};
-use crate::dsl::schema::{self as ds, levenshtein};
+use crate::dsl::schema::{self as ds, nearest};
 use crate::dsl::span::Span;
 use crate::modules::ModuleRegistry;
 use crate::pipeline::CompiledConfig;
@@ -90,29 +90,12 @@ fn unknown_module_type_diag<'a>(
     span: Option<Span>,
     candidates: impl Iterator<Item = &'a str>,
 ) -> Diagnostic {
-    let threshold = (bad_type.len() / 3).max(2);
-    let mut best: Option<(&str, usize)> = None;
-    let collected: Vec<&str> = candidates.collect();
-    for cand in &collected {
-        let d = levenshtein(bad_type, cand);
-        if d == 0 || d > threshold {
-            continue;
-        }
-        match best {
-            None => best = Some((cand, d)),
-            Some((bn, bd)) if d < bd || (d == bd && *cand < bn) => best = Some((cand, d)),
-            _ => {}
-        }
-    }
     let mut diag = Diagnostic::error_kind(
         DiagKind::PropertySchema,
-        format!(
-            "{} '{}': unknown type '{}'",
-            surface, name, bad_type
-        ),
+        format!("{} '{}': unknown type '{}'", surface, name, bad_type),
     )
     .with_span(span);
-    if let Some((near, _)) = best {
+    if let Some(near) = nearest(bad_type, candidates) {
         diag = diag.with_help(format!("did you mean `{}`?", near));
     }
     diag
