@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
-## [0.7.1] - 2026-05-16
+## [0.7.1] - 2026-05-17
 > journal input LOTL + transport-agnostic vocabulary parsers + datetime primitives + expanded SIEM + OSS NDR parsers (real-traffic verified)
 
 The journal input is rewritten to emit `journalctl -o json`-equivalent
