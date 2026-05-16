@@ -23,9 +23,47 @@ use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use crate::dsl::arena::EventArena;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
+use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
+
+const KAFKA_OUTPUT_SCHEMA: &[PropertySpec] = &[
+    PropertySpec {
+        name: "brokers",
+        required: true,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "topic",
+        required: true,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "compression",
+        required: false,
+        kind: PropertyValueKind::Enum(&["none", "gzip", "snappy", "lz4", "zstd"]),
+    },
+    PropertySpec {
+        name: "acks",
+        required: false,
+        kind: PropertyValueKind::Enum(&["0", "1", "all"]),
+    },
+    // `key` accepts the magic value `source` or any user-chosen
+    // field name (`workspace.tenant` etc.). String, not Enum, since
+    // the field-name half is open.
+    PropertySpec {
+        name: "key",
+        required: false,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "queue_timeout",
+        required: false,
+        kind: PropertyValueKind::Duration,
+    },
+    crate::queue::QUEUE_PROPERTY_SPEC,
+];
 
 struct KafkaPayload {
     egress: Bytes,
@@ -48,6 +86,10 @@ enum KeyField {
 }
 
 impl Module for KafkaOutput {
+    fn property_schema() -> Option<&'static [PropertySpec]> {
+        Some(KAFKA_OUTPUT_SCHEMA)
+    }
+
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
         let brokers = props::get_string(properties, "brokers")
             .ok_or_else(|| anyhow::anyhow!("output '{}': kafka requires 'brokers'", name))?;
