@@ -1,0 +1,277 @@
+// Microsoft Sysmon parser (vocabulary)
+//
+// Vendor:   Microsoft Sysinternals Sysmon (System Monitor) — the
+//           Windows kernel telemetry agent that produces detailed
+//           process / network / file / registry / DNS events via the
+//           `Microsoft-Windows-Sysmon/Operational` Windows Event Log
+//           channel. Distinct from the built-in Windows Security
+//           event channel (handled by `parse_winevent_json`); Sysmon
+//           is opt-in (deploy + config XML) but produces strictly
+//           richer telemetry for EDR / SIEM correlation.
+// Wire:     Sysmon events arrive as Windows Event Log records, which
+//           a forwarder (NXLog / Vector / Winlogbeat) ships as JSON.
+//           The relevant fields are:
+//             EventID        — Sysmon-specific (1=ProcessCreate,
+//                              3=NetworkConnect, 11=FileCreate, …)
+//             Channel        — "Microsoft-Windows-Sysmon/Operational"
+//             EventTime      — RFC 3339 timestamp
+//             Computer       — Windows machine name
+//             EventData      — Object with event-type-specific keys
+//                              (Image, CommandLine, ProcessId, etc.)
+// Intake:   workspace.sysmon.body      (required, Object) — parsed Sysmon
+//                                       event Object (already JSON-decoded;
+//                                       caller does `parse_json(ingress)`
+//                                       and passes the Object as `body`)
+//           workspace.sysmon.hostname  (optional, String) — collector override
+//           workspace.sysmon.time      (optional, Int)    — epoch nanos override
+// Upstream: Sysmon JSON typically arrives via:
+//
+//           - NXLog / Vector / Winlogbeat over TCP/syslog (most common):
+//                 process parse_syslog | {
+//                     workspace.sysmon = {
+//                         body:     parse_json(workspace.syslog.msg),
+//                         hostname: workspace.syslog.hostname,
+//                         time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
+//                     }
+//                 } | parse_sysmon | compose_ocsf
+//
+//           - Direct JSON-line tail (when the forwarder writes a JSONL file):
+//                 process { workspace.sysmon = { body: parse_json(ingress), hostname: hostname(), time: to_int(received_at) } } | parse_sysmon | compose_ocsf
+//
+// Output:   OCSF records on `workspace.limpid` for the Sysmon event
+//           types this parser knows. Unknown EventIDs route to
+//           error_log per the loud-fail-fast policy.
+//
+// Coverage scope (v0.7.1):
+//
+//   | EventID | Sysmon name        | OCSF class                     |
+//   |---------|--------------------|--------------------------------|
+//   | 1       | ProcessCreate      | 1007 Process Activity / Launch |
+//   | 3       | NetworkConnect     | 4001 Network Activity / Open   |
+//   | 11      | FileCreate         | 1001 File System Activity / Create |
+//
+//   Sysmon emits 25+ event types; the three above cover the bulk of
+//   what EDR / SOC use cases consume. Others (5 ProcessTerminate,
+//   7 ImageLoad, 8 CreateRemoteThread, 12-14 Registry, 22 DnsQuery,
+//   etc.) route to error_log and would each need their own leaf with
+//   their event-data shape.
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Strip a Windows path down to its basename ("C:\\Windows\\cmd.exe" → "cmd.exe").
+// Sysmon's Image / ParentImage are always full paths.
+def function sysmon_basename(path) {
+    let m = regex_parse(path, "(?P<name>[^\\\\]+)$")
+    switch true {
+        m == null { path }
+        default   { m.name }
+    }
+}
+
+def function sysmon_proto_num(p) {
+    switch p {
+        "tcp"    { 6 }
+        "TCP"    { 6 }
+        "udp"    { 17 }
+        "UDP"    { 17 }
+        default  { null }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main parser
+// ---------------------------------------------------------------------------
+
+def process parse_sysmon {
+    // @requires: workspace.sysmon.body      (required, Object — already parse_json'd)
+    // @requires: workspace.sysmon.hostname  (optional, String)
+    // @requires: workspace.sysmon.time      (optional, Int — epoch ns)
+    switch workspace.sysmon.body.EventID {
+        1  { process parse_sysmon_process_create }
+        3  { process parse_sysmon_network_connect }
+        11 { process parse_sysmon_file_create }
+        default {
+            error "parse_sysmon: unsupported Sysmon EventID ${workspace.sysmon.body.EventID}"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EventID 1: ProcessCreate → OCSF 1007 Process Activity / Launch
+// ---------------------------------------------------------------------------
+
+def process parse_sysmon_process_create {
+    let ed = workspace.sysmon.body.EventData
+    workspace.limpid = {
+        class_uid:    1007,
+        category_uid: 1,
+        activity_id:  1,                                // Launch
+        severity_id:  1,                                // Informational
+        status_id:    1,                                // Success
+        time:         workspace.sysmon.time,
+        process: {
+            name:     sysmon_basename(ed.Image),
+            pid:      to_int(ed.ProcessId),
+            cmd_line: ed.CommandLine,
+            file: {
+                path:   ed.Image,
+                hashes: ed.Hashes,
+                product: {
+                    name:    ed.Product,
+                    vendor_name: ed.Company,
+                    version: ed.FileVersion
+                }
+            },
+            integrity_id: switch ed.IntegrityLevel {
+                "System"        { 4 }
+                "High"          { 3 }
+                "Medium"        { 2 }
+                "Low"           { 1 }
+                "Untrusted"     { 0 }
+                default         { null }
+            },
+            session: {
+                uid: ed.LogonId
+            }
+        },
+        actor: {
+            user: {
+                name: ed.User
+            },
+            process: {
+                name:     sysmon_basename(ed.ParentImage),
+                pid:      to_int(ed.ParentProcessId),
+                cmd_line: ed.ParentCommandLine,
+                file: {
+                    path: ed.ParentImage
+                }
+            }
+        },
+        device: {
+            hostname: coalesce(workspace.sysmon.hostname, workspace.sysmon.body.Computer)
+        },
+        unmapped: {
+            ProcessGuid:       ed.ProcessGuid,
+            ParentProcessGuid: ed.ParentProcessGuid,
+            CurrentDirectory:  ed.CurrentDirectory,
+            RuleName:          ed.RuleName
+        },
+        metadata: {
+            product: {
+                vendor_name: "Microsoft",
+                name:        "Sysmon"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EventID 3: NetworkConnect → OCSF 4001 Network Activity / Open
+// ---------------------------------------------------------------------------
+
+def process parse_sysmon_network_connect {
+    let ed = workspace.sysmon.body.EventData
+    workspace.limpid = {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  1,                                // Open
+        severity_id:  1,                                // Informational
+        status_id:    1,
+        time:         workspace.sysmon.time,
+        src_endpoint: {
+            ip:       ed.SourceIp,
+            port:     to_int(ed.SourcePort),
+            hostname: ed.SourceHostname
+        },
+        dst_endpoint: {
+            ip:       ed.DestinationIp,
+            port:     to_int(ed.DestinationPort),
+            hostname: ed.DestinationHostname
+        },
+        connection_info: {
+            protocol_name: ed.Protocol,
+            protocol_num:  sysmon_proto_num(ed.Protocol),
+            direction_id:  switch ed.Initiated {
+                "true"  { 1 }                          // Outbound
+                "false" { 2 }                          // Inbound
+                default { 0 }
+            }
+        },
+        actor: {
+            user: {
+                name: ed.User
+            },
+            process: {
+                name:     sysmon_basename(ed.Image),
+                pid:      to_int(ed.ProcessId),
+                file: {
+                    path: ed.Image
+                }
+            }
+        },
+        device: {
+            hostname: coalesce(workspace.sysmon.hostname, workspace.sysmon.body.Computer)
+        },
+        unmapped: {
+            ProcessGuid: ed.ProcessGuid,
+            RuleName:    ed.RuleName
+        },
+        metadata: {
+            product: {
+                vendor_name: "Microsoft",
+                name:        "Sysmon"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EventID 11: FileCreate → OCSF 1001 File System Activity / Create
+// ---------------------------------------------------------------------------
+
+def process parse_sysmon_file_create {
+    let ed = workspace.sysmon.body.EventData
+    workspace.limpid = {
+        class_uid:    1001,
+        category_uid: 1,
+        activity_id:  1,                                // Create
+        severity_id:  1,
+        status_id:    1,
+        time:         workspace.sysmon.time,
+        file: {
+            name: sysmon_basename(ed.TargetFilename),
+            path: ed.TargetFilename
+        },
+        actor: {
+            user: {
+                name: ed.User
+            },
+            process: {
+                name:     sysmon_basename(ed.Image),
+                pid:      to_int(ed.ProcessId),
+                file: {
+                    path: ed.Image
+                }
+            }
+        },
+        device: {
+            hostname: coalesce(workspace.sysmon.hostname, workspace.sysmon.body.Computer)
+        },
+        unmapped: {
+            ProcessGuid:      ed.ProcessGuid,
+            CreationUtcTime:  ed.CreationUtcTime,
+            RuleName:         ed.RuleName
+        },
+        metadata: {
+            product: {
+                vendor_name: "Microsoft",
+                name:        "Sysmon"
+            },
+            version: "1.3.0"
+        }
+    }
+}

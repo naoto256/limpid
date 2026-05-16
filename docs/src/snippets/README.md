@@ -29,12 +29,17 @@ SIGHUP).
 | `parsers/parse_paloalto_syslog.limpid` | PAN-OS (native CSV syslog) | (same as CEF) |
 | `parsers/parse_asa.limpid` | Cisco ASA / FTD-in-ASA-mode (syslog) | 3002 / 4001 |
 | `parsers/parse_cloudtrail.limpid` | AWS CloudTrail (JSON) | 6003 API Activity |
+| `parsers/parse_juniper_srx.limpid` | Juniper SRX RT_FLOW (RFC 5424 + Junos SD) | 4001 Network Activity |
+| `parsers/parse_checkpoint.limpid` | Check Point LEEF 2.0 (Accept / Drop / Reject / Block) | 4001 Network Activity |
 | **Server / host vocabulary** | | |
 | `parsers/parse_openssh.limpid` | OpenSSH `sshd` body (transport-agnostic; bridge from `parse_syslog` or `parse_journald`) | 3002 Authentication |
 | `parsers/parse_sudo.limpid` | sudo (syslog / journald) | 3003 Authorize Session |
 | `parsers/parse_combined_log.limpid` | Apache / Nginx access log (combined format) | 4002 HTTP Activity |
 | `parsers/parse_postfix.limpid` | Postfix MTA (syslog) | 4009 Email Activity |
 | `parsers/parse_winevent_json.limpid` | Windows Security event log (NXLog / Vector / Winlogbeat JSON) | 3002 / 1007 / 3001 / 3006 |
+| `parsers/parse_sysmon.limpid` | Microsoft Sysmon (NXLog / Vector / Winlogbeat JSON) — EventID 1 / 3 / 11 | 1007 / 4001 / 1001 |
+| `parsers/parse_bind.limpid` | ISC BIND 9 querylog | 4003 DNS Activity |
+| `parsers/parse_auditd.limpid` | Linux auditd USER_LOGIN / USER_AUTH / USER_LOGOUT / USER_ACCT / CRED_ACQ / CRED_DISP | 3002 Authentication |
 | **Vendor-neutral** | | |
 | `parsers/parse_ocsf.limpid` | OCSF JSON inbound (any vendor's prior compose_ocsf output) | passthrough (any class) |
 

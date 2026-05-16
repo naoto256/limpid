@@ -139,12 +139,14 @@ def process compose_ocsf_file_system_activity {
         activity_id:  activity,
         type_uid:     1001 * 100 + activity,
         severity_id:  workspace.limpid.severity_id,
+        status_id:    workspace.limpid.status_id,
         time:         coalesce(workspace.limpid.time, received_at),
         file:         workspace.limpid.file,
         actor:        workspace.limpid.actor,
         device:       workspace.limpid.device,
         user:         workspace.limpid.user,
         message:      workspace.limpid.message,
+        unmapped:     workspace.limpid.unmapped,
         metadata:     workspace.limpid.metadata
     }))
 }
@@ -166,11 +168,13 @@ def process compose_ocsf_process_activity {
         activity_id:  activity,
         type_uid:     1007 * 100 + activity,
         severity_id:  workspace.limpid.severity_id,
+        status_id:    workspace.limpid.status_id,
         time:         coalesce(workspace.limpid.time, received_at),
         process:      workspace.limpid.process,
         actor:        workspace.limpid.actor,
         device:       workspace.limpid.device,
         message:      workspace.limpid.message,
+        unmapped:     workspace.limpid.unmapped,
         metadata:     workspace.limpid.metadata
     }))
 }
@@ -488,12 +492,17 @@ def process compose_ocsf_network_activity {
         activity_id:     activity,
         type_uid:        4001 * 100 + activity,
         severity_id:     workspace.limpid.severity_id,
+        status_id:       workspace.limpid.status_id,
         time:            coalesce(workspace.limpid.time, received_at),
         src_endpoint:    workspace.limpid.src_endpoint,
         dst_endpoint:    workspace.limpid.dst_endpoint,
         connection_info: workspace.limpid.connection_info,
         traffic:         workspace.limpid.traffic,
+        app_name:        workspace.limpid.app_name,
+        device:          workspace.limpid.device,
+        actor:           workspace.limpid.actor,
         message:         workspace.limpid.message,
+        unmapped:        workspace.limpid.unmapped,
         metadata:        workspace.limpid.metadata
     }))
 }
@@ -547,6 +556,8 @@ def process compose_ocsf_dns_activity {
         time:         coalesce(workspace.limpid.time, received_at),
         src_endpoint: workspace.limpid.src_endpoint,
         dst_endpoint: workspace.limpid.dst_endpoint,
+        device:       workspace.limpid.device,
+        actor:        workspace.limpid.actor,
         query:        workspace.limpid.query,
         answers:      workspace.limpid.answers,
         message:      workspace.limpid.message,

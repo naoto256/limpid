@@ -82,6 +82,37 @@ carries:
   Vector / Fluent Bit all converge on) in DSL so operators on
   non-UTC senders can fork and edit without a rebuild.
 
+### Added — Additional vendor parsers
+
+Five additional vendor / vocabulary parsers covering the remaining
+major SIEM sources covering additional major sources:
+
+| Parser | Source | OCSF class(es) |
+|---|---|---|
+| `parse_juniper_srx` | Juniper Junos SRX RT_FLOW SESSION_CREATE / CLOSE / DENY (RFC 5424 wire + `[junos@2636 ...]` structured data) | 4001 |
+| `parse_checkpoint` | Check Point LEEF 2.0 traffic events (Accept / Drop / Reject / Block) inside a syslog wrapper | 4001 |
+| `parse_sysmon` | Microsoft Sysmon EventID 1 (ProcessCreate) / 3 (NetworkConnect) / 11 (FileCreate), as JSON via NXLog / Vector / Winlogbeat | 1007 / 4001 / 1001 |
+| `parse_bind` | ISC BIND 9 `querylog` text format (`category queries`) | 4003 |
+| `parse_auditd` | Linux auditd USER_LOGIN / USER_AUTH / USER_ACCT / USER_LOGOUT / CRED_ACQ / CRED_DISP (the authentication subset of auditd's ~70 type codes) | 3002 |
+
+Each parser follows the v0.7.1 intake-schema convention
+(`workspace.<vocab>.{body, …}` with hostname / time from the
+upstream bridge) and surfaces `device.hostname` and
+`actor.process.pid` in the emitted OCSF record where the wire
+provides them. Coverage scopes are documented per file — only the
+authentication subset of auditd's type codes is in scope this
+release (USER_LOGIN / USER_AUTH / USER_ACCT / USER_LOGOUT /
+CRED_ACQ / CRED_DISP); SYSCALL / EXECVE / PATH multi-record
+assembly is out of scope.
+
+Compose_ocsf 1001 / 1007 / 4001 / 4003 leaves gain `status_id`,
+`actor`, `device`, and `unmapped` forwarding so the new parsers'
+fields land in the egress JSON.
+
+Verified against synthetic samples in each parser's header. Real
+test corpora for these vendors are pending — header docstrings
+mark them "synthetic-verified only".
+
 ### Added — transport parsers + RFC 5424 composer
 
 Three new snippets that pair with the journal LOTL fix to express

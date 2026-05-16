@@ -1,0 +1,309 @@
+// Linux auditd parser (vocabulary) — authentication subset
+//
+// Vendor:   Linux kernel audit subsystem (auditd / audispd / auditbeat).
+//           Wire format defined by the kernel audit framework (RFC-less,
+//           but stable since Linux 2.6.6+). Not Solaris BSM, not
+//           Windows auditpol; each has its own format.
+// Wire:     auditd line-per-record text:
+//             type=<TYPE> msg=audit(<seconds>.<millis>:<serial>):
+//                 <key>=<value> ... msg='<inner-key>=<inner-value> ...'
+//           Outer keys are space-separated KV (unquoted), with one
+//           possible single-quoted `msg='...'` whose body is itself
+//           KV pairs (some of those quoted with `"..."`). A logical
+//           auditd event is typically split across SEVERAL `type=XXX`
+//           records that share the same `audit(TS.MS:SERIAL)` key;
+//           this parser treats each line as an independent event and
+//           does not assemble multi-record sequences (PATH + SYSCALL +
+//           EXECVE for one execve is the canonical example). For
+//           authentication events (USER_LOGIN / USER_AUTH / etc.) a
+//           single line already carries enough information to emit a
+//           useful OCSF Authentication record, which is the v0.7.1
+//           scope. Process / file-system / SELinux events
+//           (SYSCALL / PATH / AVC / ANOM_*) are deferred —
+//           multi-record assembly is its own design.
+// Intake:   workspace.auditd.body      (required, String) — the auditd record
+//           workspace.auditd.hostname  (optional, String) — host where audit ran
+//           workspace.auditd.time      (optional, Int)    — epoch nanoseconds
+//
+//           Note: pid is NOT an intake field — auditd records carry
+//           their own `pid=` inside the body, and it's the audited
+//           process's pid (which is the meaningful one for OCSF),
+//           not the auditd daemon's. The parser extracts it from
+//           the body.
+// Upstream: transport-agnostic. Three typical bridges:
+//
+//           - file tail (most common — `audisp-syslog` writes
+//             `/var/log/audit/audit.log` and limpid tails it):
+//                 { workspace.auditd = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_auditd | compose_ocsf
+//
+//           - syslog transport (`audisp-syslog` or `audispd` plugin):
+//                 process parse_syslog | {
+//                     workspace.auditd = {
+//                         body:     workspace.syslog.msg,
+//                         hostname: workspace.syslog.hostname,
+//                         time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
+//                     }
+//                 } | parse_auditd | compose_ocsf
+//
+//           - journald transport (auditd events relayed to journald):
+//                 process parse_journald | {
+//                     workspace.auditd = {
+//                         body:     workspace.journald.MESSAGE,
+//                         hostname: workspace.journald._HOSTNAME,
+//                         time:     to_int(workspace.journald.__REALTIME_TIMESTAMP) * 1000
+//                     }
+//                 } | parse_auditd | compose_ocsf
+//
+// Output:   OCSF Authentication (class_uid 3002) records on
+//           `workspace.limpid` for the authentication-related types
+//           below. Other types route to `error_log` per the
+//           loud-fail-fast policy.
+//
+// Sample auditd records (what `workspace.auditd.body` carries —
+// addresses anonymised to RFC 5737 forms):
+//
+//   USER_LOGIN — successful interactive / SSH login:
+//   type=USER_LOGIN msg=audit(1714400000.123:456): pid=12345 uid=0 auid=1000 ses=4 msg='op=login id=1000 exe="/usr/sbin/sshd" hostname=edge01 addr=192.0.2.10 terminal=ssh res=success'
+//
+//   USER_AUTH — PAM authentication attempt (success):
+//   type=USER_AUTH msg=audit(1714400001.123:457): pid=12345 uid=0 auid=1000 ses=4 msg='op=PAM:authentication grantors=pam_unix acct="alice" exe="/usr/sbin/sshd" hostname=edge01 addr=192.0.2.10 terminal=ssh res=success'
+//
+//   USER_AUTH — PAM authentication failure:
+//   type=USER_AUTH msg=audit(1714400002.123:458): pid=12346 uid=0 auid=4294967295 ses=4294967295 msg='op=PAM:authentication grantors=? acct="mallory" exe="/usr/sbin/sshd" hostname=? addr=192.0.2.10 terminal=ssh res=failed'
+//
+//   USER_ACCT — account validity / authorization check (PAM acct phase):
+//   type=USER_ACCT msg=audit(1714400003.123:459): pid=12345 uid=0 auid=1000 ses=4 msg='op=PAM:accounting grantors=pam_unix acct="alice" exe="/usr/sbin/sshd" hostname=edge01 addr=192.0.2.10 terminal=ssh res=success'
+//
+//   USER_LOGOUT — session teardown:
+//   type=USER_LOGOUT msg=audit(1714400999.123:999): pid=12345 uid=0 auid=1000 ses=4 msg='op=login id=1000 exe="/usr/sbin/sshd" hostname=edge01 addr=192.0.2.10 terminal=ssh res=success'
+//
+// Coverage scope (v0.7.1): authentication-related types only —
+// USER_LOGIN, USER_LOGOUT, USER_AUTH, USER_ACCT, CRED_ACQ, CRED_DISP.
+// auditd's full surface (~70 type codes covering syscalls, file
+// access, SELinux, capability changes, anomaly detection) is broader
+// than one snippet can model usefully without multi-record
+// assembly; see the `// Wire:` note above. Lines not matching the
+// types above route to error_log.
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Common Authentication record skeleton — used by every USER_*
+// auditd type below. activity_id and severity_id are caller-supplied.
+def function auditd_auth_record(activity_id, status_id, severity_id, user, src_ip, terminal, pid_str, exe, host, time_ns) {
+    {
+        class_uid:    3002,
+        category_uid: 3,
+        activity_id:  activity_id,
+        severity_id:  severity_id,
+        status_id:    status_id,
+        time:         time_ns,
+        user: {
+            name: user
+        },
+        actor: {
+            process: {
+                name: exe,
+                pid: switch true {
+                    pid_str != null { to_int(pid_str) }
+                    default         { null }
+                }
+            }
+        },
+        src_endpoint: {
+            ip: src_ip
+        },
+        device: {
+            hostname: host
+        },
+        // auditd `terminal=` carries the originating terminal (ssh,
+        // pts/N, tty1, ...) — map to OCSF logon_type_id when we can:
+        //   ssh / pts/N → 10 (Remote Interactive)
+        //   tty1..N     → 2  (Interactive console)
+        //   anything else → 0 (Unknown)
+        logon_type_id: switch true {
+            terminal == "ssh"               { 10 }
+            regex_match(terminal, "^pts/")  { 10 }
+            regex_match(terminal, "^tty")   { 2 }
+            default                         { 0 }
+        },
+        metadata: {
+            product: {
+                vendor_name: "Linux Kernel",
+                name:        "auditd"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// Map auditd `res=` to OCSF status_id.
+def function auditd_status_id(res) {
+    switch res {
+        "success" { 1 }
+        "failed"  { 2 }
+        default   { 99 }
+    }
+}
+
+// Classify the leading `type=...` of an auditd record. Returns
+// `{kind}` where kind is the dispatcher case label, or null on a
+// non-authentication record.
+def function parse_auditd_classify(body) {
+    let m = regex_parse(body, "^type=(?P<type>\\S+) msg=audit\\(")
+    switch true {
+        m == null { null }
+        m.type == "USER_LOGIN"  { { kind: "user_login" } }
+        m.type == "USER_LOGOUT" { { kind: "user_logout" } }
+        m.type == "USER_AUTH"   { { kind: "user_auth" } }
+        m.type == "USER_ACCT"   { { kind: "user_acct" } }
+        m.type == "CRED_ACQ"    { { kind: "cred_acq" } }
+        m.type == "CRED_DISP"   { { kind: "cred_disp" } }
+        default                 { { kind: "other", type: m.type } }
+    }
+}
+
+// Extract the common USER_* fields from an auditd line.
+// auditd uses outer-quote-then-inner-quote KV: the outer line has
+// space-separated `key=value` pairs; the `msg='...'` enclosure holds
+// inner KV pairs (some quoted with `"..."`). The `(?:^| )` anchors
+// keep tokens like `uid=0` from accidentally matching the inner `id=`
+// pattern, and the `res=([a-z]+)` form stops at the closing quote.
+def function parse_auditd_user_fields(body) {
+    regex_parse(
+        body,
+        "(?:^| )pid=(?P<pid>\\d+).*?(?:acct=\"(?P<acct>[^\"]+)\"|(?:^| )id=(?P<id>\\d+)).*?exe=\"(?P<exe>[^\"]+)\".*?(?:addr=(?P<addr>\\S+) )?terminal=(?P<terminal>\\S+) res=(?P<res>[a-zA-Z]+)"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Main parser
+// ---------------------------------------------------------------------------
+
+def process parse_auditd {
+    // @requires: workspace.auditd.body      (required, String)
+    // @requires: workspace.auditd.hostname  (optional, String)
+    // @requires: workspace.auditd.time      (optional, Int — epoch ns)
+    workspace.auditd_class = parse_auditd_classify(workspace.auditd.body)
+    switch true {
+        workspace.auditd_class == null {
+            error "parse_auditd: not an auditd record: ${workspace.auditd.body}"
+        }
+        workspace.auditd_class.kind == "user_login"  { process parse_auditd_user_login }
+        workspace.auditd_class.kind == "user_logout" { process parse_auditd_user_logout }
+        workspace.auditd_class.kind == "user_auth"   { process parse_auditd_user_auth }
+        workspace.auditd_class.kind == "user_acct"   { process parse_auditd_user_acct }
+        workspace.auditd_class.kind == "cred_acq"    { process parse_auditd_user_auth }
+        workspace.auditd_class.kind == "cred_disp"   { process parse_auditd_user_logout }
+        default {
+            error "parse_auditd: unsupported auditd type ${workspace.auditd_class.type}: ${workspace.auditd.body}"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// USER_LOGIN → 3002 Authentication / Logon
+// ---------------------------------------------------------------------------
+
+def process parse_auditd_user_login {
+    workspace.auditd_fields = parse_auditd_user_fields(workspace.auditd.body)
+    // USER_LOGIN uses id= rather than acct= in the inner msg.
+    let user = coalesce(workspace.auditd_fields.acct, workspace.auditd_fields.id)
+    let status = auditd_status_id(workspace.auditd_fields.res)
+    let severity = switch status {
+        2       { 3 }  // Medium — interactive login failure is operationally interesting
+        default { 1 }  // Informational
+    }
+    workspace.limpid = auditd_auth_record(
+        1,                                  // activity_id: Logon
+        status,
+        severity,
+        user,
+        workspace.auditd_fields.addr,
+        workspace.auditd_fields.terminal,
+        workspace.auditd_fields.pid,
+        workspace.auditd_fields.exe,
+        workspace.auditd.hostname,
+        workspace.auditd.time
+    )
+}
+
+// ---------------------------------------------------------------------------
+// USER_LOGOUT / CRED_DISP → 3002 Authentication / Logoff
+// ---------------------------------------------------------------------------
+
+def process parse_auditd_user_logout {
+    workspace.auditd_fields = parse_auditd_user_fields(workspace.auditd.body)
+    let user = coalesce(workspace.auditd_fields.acct, workspace.auditd_fields.id)
+    workspace.limpid = auditd_auth_record(
+        2,                                  // activity_id: Logoff
+        auditd_status_id(workspace.auditd_fields.res),
+        1,                                  // severity_id: Informational
+        user,
+        workspace.auditd_fields.addr,
+        workspace.auditd_fields.terminal,
+        workspace.auditd_fields.pid,
+        workspace.auditd_fields.exe,
+        workspace.auditd.hostname,
+        workspace.auditd.time
+    )
+}
+
+// ---------------------------------------------------------------------------
+// USER_AUTH / CRED_ACQ → 3002 Authentication (PAM auth phase)
+// ---------------------------------------------------------------------------
+//
+// PAM authentication outcome. Success is informational (the matching
+// USER_LOGIN follows); failure is the brute-force-probe signal.
+
+def process parse_auditd_user_auth {
+    workspace.auditd_fields = parse_auditd_user_fields(workspace.auditd.body)
+    let user = coalesce(workspace.auditd_fields.acct, workspace.auditd_fields.id)
+    let status = auditd_status_id(workspace.auditd_fields.res)
+    let severity = switch status {
+        2       { 3 }  // Medium — PAM auth failure
+        default { 1 }
+    }
+    workspace.limpid = auditd_auth_record(
+        1,                                  // activity_id: Logon (auth phase of)
+        status,
+        severity,
+        user,
+        workspace.auditd_fields.addr,
+        workspace.auditd_fields.terminal,
+        workspace.auditd_fields.pid,
+        workspace.auditd_fields.exe,
+        workspace.auditd.hostname,
+        workspace.auditd.time
+    )
+}
+
+// ---------------------------------------------------------------------------
+// USER_ACCT → 3002 Authentication (PAM account phase)
+// ---------------------------------------------------------------------------
+//
+// PAM account validity / authorization check. Distinct from USER_AUTH
+// (which is the password phase): account checks fail when the user is
+// expired, locked, or otherwise not allowed to log in even with a
+// valid password. Still maps to activity=Logon for OCSF purposes —
+// the outcome is "could this user log in" regardless of which PAM
+// phase decided.
+
+def process parse_auditd_user_acct {
+    workspace.auditd_fields = parse_auditd_user_fields(workspace.auditd.body)
+    let user = coalesce(workspace.auditd_fields.acct, workspace.auditd_fields.id)
+    let status = auditd_status_id(workspace.auditd_fields.res)
+    workspace.limpid = auditd_auth_record(
+        1,                                  // activity_id: Logon (account phase of)
+        status,
+        switch status { 2 { 3 } default { 1 } },
+        user,
+        workspace.auditd_fields.addr,
+        workspace.auditd_fields.terminal,
+        workspace.auditd_fields.pid,
+        workspace.auditd_fields.exe,
+        workspace.auditd.hostname,
+        workspace.auditd.time
+    )
+}

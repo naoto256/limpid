@@ -1,0 +1,284 @@
+// Juniper SRX flow log parser (vocabulary)
+//
+// Vendor:   Juniper Networks SRX series (and vSRX) — Junos OS' flow
+//           security daemon emits RT_FLOW_SESSION_* RFC 5424 records
+//           with a `[junos@2636 ...]` structured-data block carrying
+//           the session metadata. Not MX/EX/QFX (which emit different
+//           shapes); not Cisco ASA, not Palo Alto — each in its own
+//           parser file.
+// Wire:     RFC 5424 syslog with a Junos structured-data block:
+//             <PRI>1 <ts> <host> RT_FLOW - <MSGID> [junos@2636.1.1.1.2.39 key="val" key="val" ...]
+//           MSGID is one of:
+//             RT_FLOW_SESSION_CREATE  — session start
+//             RT_FLOW_SESSION_CLOSE   — session end (with reason)
+//             RT_FLOW_SESSION_DENY    — session denied by policy
+//           Other RT_FLOW MSGIDs (RT_FLOW_NEXT_HOP_CHANGE, etc.) and
+//           non-flow daemons (RT_IDS, RT_UTM, RT_SCREEN) emit
+//           different SD shapes and route to error_log.
+// Intake:   workspace.juniper_srx.body      (required, String) — the full RFC 5424 wire
+//                                            INCLUDING the leading `<PRI>1` (the parser
+//                                            extracts MSGID and SD directly via regex;
+//                                            it does NOT consume an upstream parse_syslog)
+//           workspace.juniper_srx.hostname  (optional, String) — collector-side hostname override
+//           workspace.juniper_srx.time      (optional, Int)    — epoch nanoseconds of arrival
+// Upstream: SRX appliances emit syslog (UDP/514 or TCP/514 typically).
+//           The bridge passes the raw wire — parse_syslog is NOT used
+//           because limpid's syslog.parse does not expose the
+//           structured-data block, and SRX's session metadata lives
+//           entirely in SD. Two typical bridges:
+//
+//           - syslog (UDP/TCP):
+//                 { workspace.juniper_srx = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_juniper_srx | compose_ocsf
+//
+//           - tail of a forwarded text file:
+//                 { workspace.juniper_srx = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_juniper_srx | compose_ocsf
+//
+// Output:   OCSF Network Activity (class_uid 4001) records on
+//           `workspace.limpid`. activity_id is 1 (Open) for
+//           SESSION_CREATE, 2 (Close) for SESSION_CLOSE, and 6 (Deny)
+//           for SESSION_DENY.
+//
+// Sample wire (anonymised to RFC 5737):
+//
+//   SESSION_CREATE (TCP/443 allowed, default-policy):
+//   <14>1 2026-04-30T01:23:45.123Z srx01.example.com RT_FLOW - RT_FLOW_SESSION_CREATE [junos@2636.1.1.1.2.39 source-address="192.0.2.10" source-port="51234" destination-address="198.51.100.5" destination-port="443" connection-tag="0" service-name="junos-https" nat-source-address="192.0.2.10" nat-source-port="51234" nat-destination-address="198.51.100.5" nat-destination-port="443" nat-connection-tag="0" src-nat-rule-type="N/A" src-nat-rule-name="None" dst-nat-rule-type="N/A" dst-nat-rule-name="None" protocol-id="6" policy-name="default-permit" source-zone-name="trust" destination-zone-name="untrust" session-id-32="12345" username="N/A" roles="N/A" packet-incoming-interface="ge-0/0/0.0" application="UNKNOWN" nested-application="UNKNOWN" encrypted="UNKNOWN"]
+//
+//   SESSION_CLOSE (with reason + byte / packet counts):
+//   <14>1 2026-04-30T01:24:45.456Z srx01.example.com RT_FLOW - RT_FLOW_SESSION_CLOSE [junos@2636.1.1.1.2.39 reason="TCP FIN" source-address="192.0.2.10" source-port="51234" destination-address="198.51.100.5" destination-port="443" service-name="junos-https" nat-source-address="192.0.2.10" nat-source-port="51234" nat-destination-address="198.51.100.5" nat-destination-port="443" src-nat-rule-name="None" dst-nat-rule-name="None" protocol-id="6" policy-name="default-permit" source-zone-name="trust" destination-zone-name="untrust" session-id-32="12345" packets-from-client="42" bytes-from-client="3456" packets-from-server="38" bytes-from-server="89012" elapsed-time="60" application="UNKNOWN" nested-application="UNKNOWN" username="N/A" roles="N/A" packet-incoming-interface="ge-0/0/0.0" encrypted="UNKNOWN"]
+//
+//   SESSION_DENY (policy denied the session at setup):
+//   <14>1 2026-04-30T01:25:00.789Z srx01.example.com RT_FLOW - RT_FLOW_SESSION_DENY [junos@2636.1.1.1.2.39 source-address="192.0.2.10" source-port="55555" destination-address="198.51.100.99" destination-port="3389" connection-tag="0" service-name="junos-rdp" application="UNKNOWN" nested-application="UNKNOWN" nat-source-address="192.0.2.10" nat-source-port="55555" nat-destination-address="198.51.100.99" nat-destination-port="3389" protocol-id="6" icmp-type="0" policy-name="deny-rdp-outbound" source-zone-name="trust" destination-zone-name="untrust" application-category="N/A" application-sub-category="N/A" application-risk="-1" application-characteristics="N/A" encrypted="No" reason="policy deny" session-id-32="0" username="N/A" roles="N/A" packet-incoming-interface="ge-0/0/0.0"]
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Map Junos protocol-id (IANA protocol number as string) to OCSF
+// connection_info.protocol_name.
+def function juniper_srx_proto_name(p) {
+    switch p {
+        "1"   { "ICMP" }
+        "6"   { "TCP" }
+        "17"  { "UDP" }
+        "47"  { "GRE" }
+        "50"  { "ESP" }
+        "51"  { "AH" }
+        "58"  { "ICMPv6" }
+        default { p }
+    }
+}
+
+def function juniper_srx_network_record(activity_id, status_id, severity_id, src_ip, src_port_str, dst_ip, dst_port_str, proto_str, policy, src_zone, dst_zone, session_id, app, reason, msgid, host, time_ns) {
+    {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  activity_id,
+        severity_id:  severity_id,
+        status_id:    status_id,
+        time:         time_ns,
+        src_endpoint: {
+            ip:   src_ip,
+            port: to_int(src_port_str),
+            zone: src_zone
+        },
+        dst_endpoint: {
+            ip:   dst_ip,
+            port: to_int(dst_port_str),
+            zone: dst_zone
+        },
+        connection_info: {
+            protocol_num:  to_int(proto_str),
+            protocol_name: juniper_srx_proto_name(proto_str),
+            session: {
+                uid: session_id
+            }
+        },
+        app_name: app,
+        device: {
+            hostname: host
+        },
+        message: reason,
+        unmapped: {
+            policy_name: policy,
+            msgid:       msgid
+        },
+        metadata: {
+            product: {
+                vendor_name: "Juniper Networks",
+                name:        "Junos OS (SRX)"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// Classify the RT_FLOW MSGID. Returns `{kind, fields}` where fields
+// is the regex_parse output of the SD KV block, or null on a
+// non-matching line.
+def function parse_juniper_srx_classify(body) {
+    let header = regex_parse(
+        body,
+        "^<\\d+>1 \\S+ (?P<host>\\S+) RT_FLOW - (?P<msgid>RT_FLOW_SESSION_\\w+) \\[junos@\\S+ (?P<sd>.*)\\]\\s*$"
+    )
+    switch true {
+        header == null { null }
+        header.msgid == "RT_FLOW_SESSION_CREATE" { { kind: "create", header: header } }
+        header.msgid == "RT_FLOW_SESSION_CLOSE"  { { kind: "close",  header: header } }
+        header.msgid == "RT_FLOW_SESSION_DENY"   { { kind: "deny",   header: header } }
+        default                                  { { kind: "other",  header: header } }
+    }
+}
+
+// Extract one SD field by name. SD KV order is NOT stable across
+// Junos versions / MSGIDs (e.g. `application=` appears before
+// `policy-name=` on SESSION_DENY but after `session-id-32=` on
+// SESSION_CREATE), so each field is captured independently.
+def function parse_juniper_srx_kv(sd, name) {
+    let m = regex_parse(sd, "${name}=\"(?P<v>[^\"]*)\"")
+    switch true {
+        m == null { null }
+        default   { m.v }
+    }
+}
+
+// Pull the canonical session fields off the SD block into one Object
+// the leaves consume.
+def function parse_juniper_srx_session_fields(sd) {
+    {
+        src:        parse_juniper_srx_kv(sd, "source-address"),
+        src_port:   parse_juniper_srx_kv(sd, "source-port"),
+        dst:        parse_juniper_srx_kv(sd, "destination-address"),
+        dst_port:   parse_juniper_srx_kv(sd, "destination-port"),
+        proto:      parse_juniper_srx_kv(sd, "protocol-id"),
+        policy:     parse_juniper_srx_kv(sd, "policy-name"),
+        src_zone:   parse_juniper_srx_kv(sd, "source-zone-name"),
+        dst_zone:   parse_juniper_srx_kv(sd, "destination-zone-name"),
+        session_id: parse_juniper_srx_kv(sd, "session-id-32"),
+        app:        parse_juniper_srx_kv(sd, "application"),
+        reason:     parse_juniper_srx_kv(sd, "reason")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main parser
+// ---------------------------------------------------------------------------
+
+def process parse_juniper_srx {
+    // @requires: workspace.juniper_srx.body      (required, String)
+    // @requires: workspace.juniper_srx.hostname  (optional, String)
+    // @requires: workspace.juniper_srx.time      (optional, Int — epoch ns)
+    workspace.srx_class = parse_juniper_srx_classify(workspace.juniper_srx.body)
+    switch true {
+        workspace.srx_class == null {
+            error "parse_juniper_srx: not a recognised RT_FLOW SD line: ${workspace.juniper_srx.body}"
+        }
+        workspace.srx_class.kind == "create" { process parse_juniper_srx_session_create }
+        workspace.srx_class.kind == "close"  { process parse_juniper_srx_session_close }
+        workspace.srx_class.kind == "deny"   { process parse_juniper_srx_session_deny }
+        default {
+            error "parse_juniper_srx: unsupported RT_FLOW MSGID ${workspace.srx_class.header.msgid}: ${workspace.juniper_srx.body}"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RT_FLOW_SESSION_CREATE → 4001 / Open / Success
+// ---------------------------------------------------------------------------
+
+def process parse_juniper_srx_session_create {
+    workspace.srx_fields = parse_juniper_srx_session_fields(workspace.srx_class.header.sd)
+    switch true {
+        workspace.srx_fields.src == null {
+            error "parse_juniper_srx_session_create: SD did not match expected shape: ${workspace.juniper_srx.body}"
+        }
+        default {
+            workspace.limpid = juniper_srx_network_record(
+                1,                              // activity_id: Open
+                1,                              // status_id:   Success
+                1,                              // severity_id: Informational
+                workspace.srx_fields.src,
+                workspace.srx_fields.src_port,
+                workspace.srx_fields.dst,
+                workspace.srx_fields.dst_port,
+                workspace.srx_fields.proto,
+                workspace.srx_fields.policy,
+                workspace.srx_fields.src_zone,
+                workspace.srx_fields.dst_zone,
+                workspace.srx_fields.session_id,
+                workspace.srx_fields.app,
+                null,                           // CREATE has no reason
+                workspace.srx_class.header.msgid,
+                coalesce(workspace.juniper_srx.hostname, workspace.srx_class.header.host),
+                workspace.juniper_srx.time
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RT_FLOW_SESSION_CLOSE → 4001 / Close / Success
+// ---------------------------------------------------------------------------
+
+def process parse_juniper_srx_session_close {
+    workspace.srx_fields = parse_juniper_srx_session_fields(workspace.srx_class.header.sd)
+    switch true {
+        workspace.srx_fields.src == null {
+            error "parse_juniper_srx_session_close: SD did not match expected shape: ${workspace.juniper_srx.body}"
+        }
+        default {
+            workspace.limpid = juniper_srx_network_record(
+                2,                              // activity_id: Close
+                1,                              // status_id:   Success (session terminated normally)
+                1,                              // severity_id: Informational
+                workspace.srx_fields.src,
+                workspace.srx_fields.src_port,
+                workspace.srx_fields.dst,
+                workspace.srx_fields.dst_port,
+                workspace.srx_fields.proto,
+                workspace.srx_fields.policy,
+                workspace.srx_fields.src_zone,
+                workspace.srx_fields.dst_zone,
+                workspace.srx_fields.session_id,
+                workspace.srx_fields.app,
+                workspace.srx_fields.reason,
+                workspace.srx_class.header.msgid,
+                coalesce(workspace.juniper_srx.hostname, workspace.srx_class.header.host),
+                workspace.juniper_srx.time
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RT_FLOW_SESSION_DENY → 4001 / Deny / Failure
+// ---------------------------------------------------------------------------
+
+def process parse_juniper_srx_session_deny {
+    workspace.srx_fields = parse_juniper_srx_session_fields(workspace.srx_class.header.sd)
+    switch true {
+        workspace.srx_fields.src == null {
+            error "parse_juniper_srx_session_deny: SD did not match expected shape: ${workspace.juniper_srx.body}"
+        }
+        default {
+            workspace.limpid = juniper_srx_network_record(
+                6,                              // activity_id: Deny (OCSF 4001)
+                2,                              // status_id:   Failure (the session was rejected)
+                3,                              // severity_id: Medium (policy denial worth seeing)
+                workspace.srx_fields.src,
+                workspace.srx_fields.src_port,
+                workspace.srx_fields.dst,
+                workspace.srx_fields.dst_port,
+                workspace.srx_fields.proto,
+                workspace.srx_fields.policy,
+                workspace.srx_fields.src_zone,
+                workspace.srx_fields.dst_zone,
+                workspace.srx_fields.session_id,
+                workspace.srx_fields.app,
+                workspace.srx_fields.reason,
+                workspace.srx_class.header.msgid,
+                coalesce(workspace.juniper_srx.hostname, workspace.srx_class.header.host),
+                workspace.juniper_srx.time
+            )
+        }
+    }
+}
