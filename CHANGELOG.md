@@ -189,6 +189,29 @@ back into nested Objects, with loud-fail on collisions
 vendors — used by parse_zeek_*_flat variants, and equally
 applicable to any other Filebeat-flattened JSON.
 
+### Fixed — `nest_dotted_keys` enforces depth limits (stack-overflow DoS mitigation)
+
+`nest_dotted_keys` walked dotted keys and nested values recursively
+with no depth bound. An attacker-controlled JSON like
+`{"a.a.a...(100K dots)": 1}` would have recursed 100,000 deep into
+`insert_path` and overflowed the thread stack — a denial-of-service
+on any pipeline exposed to untrusted input (Zeek `_flat` operators
+ingesting Filebeat-processed logs are the natural attack surface).
+
+Two limits added:
+
+- `MAX_DOTTED_DEPTH = 32` — segment count per dotted key. Filebeat
+  / Logstash typically flatten 2-4 levels, so 32 leaves headroom
+  without enabling unbounded recursion.
+- `MAX_VALUE_DEPTH = 64` — defence-in-depth bound for `nest()`
+  walking into Object / Array values. `parse_json` already caps JSON
+  parse depth at 128 (serde_json default), but this protects calls
+  from other Value sources.
+
+Both limits raise loud parser errors (route to error_log) rather
+than panic. Three new tests cover at-the-limit, above-the-limit,
+and value-nesting cases.
+
 ### Fixed — `parse_datetime_rfc3339` accepts `±HHMM` offset (was strict colon-only)
 
 `chrono`'s `parse_from_rfc3339` is strict per RFC 3339 and

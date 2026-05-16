@@ -25,6 +25,34 @@
 // `parse_zeek_soc` if you want loud-fail-fast on unknown _paths so
 // new log types surface as config alerts; pick `parse_zeek_full` if
 // you want to capture everything Zeek emits and triage later.
+//
+// SECURITY NOTE — `unmapped.body` carries the raw body verbatim:
+//
+//   The catch-all (`parse_zeek_full_catchall`, used for any `_path`
+//   that even parse_zeek_soc rejects) and the 14 generic_4001-routed
+//   protocols (tunnel / mysql / irc / sip / dnp3 / modbus / socks /
+//   syslog-over-wire / ntp / ocsp / pe / dpd / etc.) forward the
+//   **entire input body** to `unmapped.body` in the emitted OCSF
+//   record. This is the explicit cost of zero-data-loss: an operator
+//   who loads a custom local.zeek script that happens to emit
+//   sensitive fields (auth secrets, raw credentials, tokens in
+//   debug logs) will see those fields land in the OCSF output's
+//   `unmapped.body`.
+//
+//   Mitigation, in priority order:
+//
+//   1. Pick `parse_zeek_soc` (no catch-all) if your local.zeek is
+//      audited and you want explicit failure on unknown scripts.
+//   2. If using `parse_zeek_full`, configure your downstream OCSF
+//      sink to mask `unmapped.body` for `_path` values you haven't
+//      individually reviewed.
+//   3. If you control the Zeek deployment, prefer redacting the
+//      sensitive fields in the Zeek script itself (`unset()` /
+//      `redef`) so they never reach limpid.
+//
+//   The specific zeek_default / zeek_soc record builders are
+//   field-selective and do NOT carry the raw body — they pick only
+//   the fields documented in each Zeek schema.
 
 include "parse_zeek_soc.limpid"
 

@@ -49,6 +49,20 @@ use crate::dsl::value::{ArrayBuilder, ObjectBuilder, Value};
 use crate::functions::{FunctionRegistry, FunctionSig};
 use crate::modules::schema::FieldType;
 
+/// Maximum dotted-key segment count. Filebeat / Logstash JSON output
+/// typically flattens 2-4 levels of nesting; 32 leaves plenty of
+/// headroom while preventing an attacker-supplied JSON like
+/// `{"a.a.a...(100K dots)": 1}` from blowing the stack via recursive
+/// `insert_path` calls.
+const MAX_DOTTED_DEPTH: usize = 32;
+
+/// Maximum recursion depth for `nest` walking into Object / Array
+/// values. `parse_json` (serde_json) already enforces a 128-deep
+/// limit at JSON-parse time, so this is a defence-in-depth bound for
+/// the rare case `nest_dotted_keys` is invoked on a Value built by
+/// other means (e.g. composed in-DSL).
+const MAX_VALUE_DEPTH: usize = 64;
+
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(
         "nest_dotted_keys",
@@ -65,6 +79,20 @@ enum Node<'bump> {
 }
 
 fn nest<'bump>(arena: &EventArena<'bump>, value: &Value<'bump>) -> Result<Value<'bump>> {
+    nest_inner(arena, value, 0)
+}
+
+fn nest_inner<'bump>(
+    arena: &EventArena<'bump>,
+    value: &Value<'bump>,
+    depth: usize,
+) -> Result<Value<'bump>> {
+    if depth > MAX_VALUE_DEPTH {
+        bail!(
+            "nest_dotted_keys(): value nesting exceeds depth limit ({})",
+            MAX_VALUE_DEPTH
+        );
+    }
     match value {
         Value::Object(entries) => {
             // First pass: build a key trie so sibling dotted keys with a
@@ -78,7 +106,15 @@ fn nest<'bump>(arena: &EventArena<'bump>, value: &Value<'bump>) -> Result<Value<
                         key
                     );
                 }
-                let nested_val = nest(arena, val)?;
+                if segments.len() > MAX_DOTTED_DEPTH {
+                    bail!(
+                        "nest_dotted_keys(): key '{}' has {} dotted segments, exceeds limit ({})",
+                        key,
+                        segments.len(),
+                        MAX_DOTTED_DEPTH
+                    );
+                }
+                let nested_val = nest_inner(arena, val, depth + 1)?;
                 insert_path(&mut root, &segments, nested_val, key)?;
             }
             // Second pass: walk the trie and emit a real bump-allocated Object.
@@ -87,7 +123,7 @@ fn nest<'bump>(arena: &EventArena<'bump>, value: &Value<'bump>) -> Result<Value<
         Value::Array(items) => {
             let mut builder = ArrayBuilder::with_capacity(arena, items.len());
             for item in items.iter() {
-                builder.push(nest(arena, item)?);
+                builder.push(nest_inner(arena, item, depth + 1)?);
             }
             Ok(builder.finish())
         }
@@ -264,6 +300,48 @@ mod tests {
     fn rejects_empty_segment() {
         let err = parse_and_nest(r#"{"a..b":1}"#).unwrap_err();
         assert!(err.to_string().contains("empty segment"));
+    }
+
+    #[test]
+    fn rejects_dotted_key_above_segment_depth_limit() {
+        // 100 dot-separated segments — well past MAX_DOTTED_DEPTH (32).
+        // Without the limit, this would recurse 100-deep into insert_path
+        // and ultimately enable stack-overflow DoS for attacker-controlled
+        // JSON. With the limit, we bail loud and fast.
+        let key: String = (0..100).map(|i| format!("a{i}")).collect::<Vec<_>>().join(".");
+        let json = format!(r#"{{"{}":1}}"#, key);
+        let err = parse_and_nest(&json).unwrap_err();
+        assert!(
+            err.to_string().contains("dotted segments")
+                && err.to_string().contains("limit"),
+            "expected segment-depth error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_value_above_nesting_depth_limit() {
+        // 80-deep nested Object — past MAX_VALUE_DEPTH (64). Construct
+        // directly because serde_json would itself bail at 128 deep.
+        let mut json = String::from("1");
+        for _ in 0..80 {
+            json = format!(r#"{{"a":{json}}}"#);
+        }
+        let err = parse_and_nest(&json).unwrap_err();
+        assert!(
+            err.to_string().contains("value nesting"),
+            "expected value-depth error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn accepts_depth_at_segment_limit() {
+        // Exactly 32 segments — at the limit but not over. Should succeed.
+        let key: String = (0..32).map(|i| format!("a{i}")).collect::<Vec<_>>().join(".");
+        let json = format!(r#"{{"{}":1}}"#, key);
+        let out = parse_and_nest(&json).expect("32-segment key should be accepted");
+        assert!(out.starts_with("{\"a0\":{"));
     }
 
     #[test]
