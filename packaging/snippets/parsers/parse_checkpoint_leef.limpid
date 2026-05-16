@@ -51,19 +51,7 @@
 // Helpers
 // ---------------------------------------------------------------------------
 
-def function checkpoint_leef_proto_num(p) {
-    switch p {
-        "tcp"    { 6 }
-        "TCP"    { 6 }
-        "udp"    { 17 }
-        "UDP"    { 17 }
-        "icmp"   { 1 }
-        "ICMP"   { 1 }
-        "gre"    { 47 }
-        "esp"    { 50 }
-        default  { null }
-    }
-}
+include "../functions/proto_num.limpid"
 
 // Activity / status mapping from LEEF EventID.
 def function checkpoint_leef_activity_id(event_id) {
@@ -157,7 +145,7 @@ def process parse_checkpoint_leef_record {
                 },
                 connection_info: {
                     protocol_name: proto,
-                    protocol_num:  checkpoint_leef_proto_num(proto)
+                    protocol_num:  proto_num(proto)
                 },
                 app_name: parse_checkpoint_leef_kv(ext, "service"),
                 actor: {

@@ -47,25 +47,12 @@
 // suricata corpus (63 events across alert / dns / http / tls / flow /
 // fileinfo / stats — Suricata 4.x / 5.x / 6.x EVE).
 
+include "../functions/proto_num.limpid"
+include "../functions/http_method_activity_id.limpid"
+
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
-
-// IANA protocol_num for the proto name Suricata emits ("TCP" / "UDP" /
-// "ICMP" / "ICMPv6" / "SCTP").
-def function suricata_proto_num(p) {
-    switch p {
-        "TCP"     { 6 }
-        "UDP"     { 17 }
-        "ICMP"    { 1 }
-        "ICMPv6"  { 58 }
-        "SCTP"    { 132 }
-        "GRE"     { 47 }
-        "ESP"     { 50 }
-        "AH"      { 51 }
-        default   { null }
-    }
-}
 
 // Map Suricata alert severity (1=highest / 4=lowest, Snort
 // convention) to OCSF severity_id (1=Info..6=Fatal).
@@ -107,23 +94,6 @@ def function suricata_dns_rcode_id(r) {
     }
 }
 
-// HTTP method → OCSF 4002 activity_id.
-//   1 Connect / 2 Delete / 3 Get / 4 Head / 5 Options / 6 Post /
-//   7 Put / 8 Trace / 99 Other
-def function suricata_http_activity_id(method) {
-    switch method {
-        "CONNECT" { 1 }
-        "DELETE"  { 2 }
-        "GET"     { 3 }
-        "HEAD"    { 4 }
-        "OPTIONS" { 5 }
-        "POST"    { 6 }
-        "PUT"     { 7 }
-        "TRACE"   { 8 }
-        default   { 99 }
-    }
-}
-
 // Suricata timestamp `"2021-01-27T01:28:11.488362+0100"` → epoch ns.
 // Falls back to the optional `workspace.suricata.time` override if
 // the body timestamp is missing.
@@ -157,7 +127,7 @@ def function suricata_connection_info(body) {
         body.proto == null and body.app_proto == null { null }
         default {
             {
-                protocol_num:  suricata_proto_num(body.proto),
+                protocol_num:  proto_num(body.proto),
                 protocol_name: body.proto
             }
         }
@@ -284,7 +254,7 @@ def function suricata_http_record(body, host, time_ns) {
     {
         class_uid:    4002,
         category_uid: 4,
-        activity_id:  suricata_http_activity_id(h.http_method),
+        activity_id:  http_method_activity_id(h.http_method),
         severity_id:  1,
         status_id:    switch true {
             h.status != null and h.status >= 400 { 2 }

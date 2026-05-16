@@ -70,15 +70,7 @@ def function sysmon_basename(path) {
     }
 }
 
-def function sysmon_proto_num(p) {
-    switch p {
-        "tcp"    { 6 }
-        "TCP"    { 6 }
-        "udp"    { 17 }
-        "UDP"    { 17 }
-        default  { null }
-    }
-}
+include "../functions/proto_num.limpid"
 
 // ---------------------------------------------------------------------------
 // Main parser

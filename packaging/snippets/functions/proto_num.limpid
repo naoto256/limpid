@@ -1,0 +1,49 @@
+// Function: proto_num(name) → Int | null
+//
+// IANA protocol number for a transport-layer protocol name. The
+// universal mapping used by every vendor parser that needs to fill
+// `connection_info.protocol_num` on an OCSF record.
+//
+// Accepts both lowercase and uppercase forms — Zeek emits `"tcp"`,
+// Junos / Palo Alto / Sysmon / Suricata emit `"TCP"`, Check Point
+// mixes both. `lower()` collapses the case difference before lookup
+// so callers do not need to know the upstream's convention.
+//
+// Returned value: IANA protocol number (per RFC 5237 / IANA's
+// "Assigned Internet Protocol Numbers" registry). `null` for any
+// name not in the set below — keeps the call site OCSF-safe (a
+// missing protocol_num is preferable to a wrong one).
+//
+// Coverage scope: the transport / encapsulation protocols that real
+// security telemetry sources actually emit on `proto`:
+//
+//   tcp     → 6     (RFC 9293)
+//   udp     → 17    (RFC 768)
+//   icmp    → 1     (RFC 792)
+//   icmpv6  → 58    (RFC 4443)
+//   sctp    → 132   (RFC 9260)
+//   gre     → 47    (RFC 2784)
+//   esp     → 50    (RFC 4303 — IPsec encapsulating security payload)
+//   ah      → 51    (RFC 4302 — IPsec authentication header)
+//
+// Out of scope (return null): OSPF, IGMP, IPv4/IPv6 encapsulated,
+// EtherIP, PIM, etc. Add when a vendor parser surfaces them.
+//
+// Used by: parse_zeek_*, parse_suricata, parse_checkpoint_*,
+// parse_juniper_srx_*, parse_paloalto_*, parse_sysmon (any parser
+// emitting OCSF 4001 Network Activity or a class with
+// connection_info.protocol_num).
+
+def function proto_num(name) {
+    switch lower(name) {
+        "tcp"    { 6 }
+        "udp"    { 17 }
+        "icmp"   { 1 }
+        "icmpv6" { 58 }
+        "sctp"   { 132 }
+        "gre"    { 47 }
+        "esp"    { 50 }
+        "ah"     { 51 }
+        default  { null }
+    }
+}

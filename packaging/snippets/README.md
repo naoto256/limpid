@@ -90,8 +90,17 @@ Each parser's docstring records:
   itself emits the authentication fact via `Accepted ...` /
   `Disconnected ...`; the PAM duplicate would double-count.
 
-### Functions (1)
+### Functions (3)
 
+- `functions/proto_num.limpid` — `proto_num(name) → Int | null`,
+  IANA protocol number lookup (tcp / udp / icmp / icmpv6 / sctp /
+  gre / esp / ah). Case-insensitive. Used by every parser emitting
+  `connection_info.protocol_num` on an OCSF 4001-class record.
+- `functions/http_method_activity_id.limpid` —
+  `http_method_activity_id(method) → Int`, HTTP request method →
+  OCSF 4002 activity_id (spec-standard mapping). Used by
+  parse_suricata / parse_zeek_default / parse_combined_log and any
+  future HTTP-emitting parser.
 - `functions/parse_datetime_rfc3164.limpid` —
   `parse_datetime_rfc3164(text) → Timestamp`, the LPL counterpart to
   the built-in `parse_datetime_rfc3339` primitive. Shipped as LPL

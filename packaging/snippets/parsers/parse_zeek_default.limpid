@@ -56,24 +56,13 @@
 // zeek corpus (61 events across the 8 default streams), with the
 // corpus pre-unflattened to native nested form for the verify run.
 
+include "../functions/proto_num.limpid"
+include "../functions/http_method_activity_id.limpid"
+
 // ---------------------------------------------------------------------------
 // Shared helpers (used by record builders in this file and inherited
 // by parse_zeek_soc / parse_zeek_full)
 // ---------------------------------------------------------------------------
-
-// IANA protocol_num for Zeek's lowercase proto names.
-def function zeek_proto_num(p) {
-    switch p {
-        "tcp"    { 6 }
-        "udp"    { 17 }
-        "icmp"   { 1 }
-        "icmpv6" { 58 }
-        "gre"    { 47 }
-        "esp"    { 50 }
-        "ah"     { 51 }
-        default  { null }
-    }
-}
 
 // Zeek `ts` is a float Unix epoch in seconds with microsecond
 // precision. Convert to nanoseconds (OCSF `time` convention) without
@@ -160,21 +149,6 @@ def function zeek_dns_rcode_id(r) {
     }
 }
 
-// HTTP method → OCSF 4002 activity_id.
-def function zeek_http_activity_id(method) {
-    switch method {
-        "CONNECT" { 1 }
-        "DELETE"  { 2 }
-        "GET"     { 3 }
-        "HEAD"    { 4 }
-        "OPTIONS" { 5 }
-        "POST"    { 6 }
-        "PUT"     { 7 }
-        "TRACE"   { 8 }
-        default   { 99 }
-    }
-}
-
 // HTTP status code → OCSF status_id. 2xx/3xx → Success, 4xx/5xx →
 // Failure, anything else → Other.
 def function zeek_http_status_id(code) {
@@ -234,7 +208,7 @@ def function zeek_conn_record(body, host, time_ns) {
         src_endpoint: zeek_endpoint(body.id, "src"),
         dst_endpoint: zeek_endpoint(body.id, "dst"),
         connection_info: {
-            protocol_num:  zeek_proto_num(body.proto),
+            protocol_num:  proto_num(body.proto),
             protocol_name: body.proto,
             uid:           body.uid
         },
@@ -291,7 +265,7 @@ def function zeek_http_record(body, host, time_ns) {
     {
         class_uid:    4002,
         category_uid: 4,
-        activity_id:  zeek_http_activity_id(body.method),
+        activity_id:  http_method_activity_id(body.method),
         severity_id:  1,
         status_id:    zeek_http_status_id(body.status_code),
         time:         time_ns,

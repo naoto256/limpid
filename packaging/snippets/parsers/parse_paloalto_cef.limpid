@@ -91,19 +91,8 @@ def function paloalto_cef_threat_disposition_id(act) {
     }
 }
 
-// IANA proto name (lowercase) → number. PAN-OS emits the protocol as a
-// name string ("tcp" / "udp" / "icmp") rather than a number.
-def function paloalto_cef_proto_num(name) {
-    switch lower(name) {
-        "icmp"   { 1 }
-        "tcp"    { 6 }
-        "udp"    { 17 }
-        "gre"    { 47 }
-        "esp"    { 50 }
-        "icmpv6" { 58 }
-        default  { null }
-    }
-}
+// IANA proto name → number.
+include "../functions/proto_num.limpid"
 
 // ---------------------------------------------------------------------------
 // Dispatcher: parse syslog wrapper + CEF body, dispatch by cef.name

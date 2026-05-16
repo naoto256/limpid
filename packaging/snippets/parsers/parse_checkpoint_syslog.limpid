@@ -52,21 +52,7 @@
 
 // CheckPoint emits protocol as a name (`tcp` / `udp` / `icmp`) on
 // `proto`. Map to OCSF protocol_num (IANA).
-def function checkpoint_syslog_proto_num(p) {
-    switch p {
-        "tcp"    { 6 }
-        "udp"    { 17 }
-        "icmp"   { 1 }
-        "icmpv6" { 58 }
-        "gre"    { 47 }
-        "esp"    { 50 }
-        "ah"     { 51 }
-        "TCP"    { 6 }
-        "UDP"    { 17 }
-        "ICMP"   { 1 }
-        default  { null }
-    }
-}
+include "../functions/proto_num.limpid"
 
 // CheckPoint emits ICMP type/code / service / port info via `service`
 // (the destination port as a string, e.g. "443") or `service_id` (the
@@ -194,7 +180,7 @@ def function checkpoint_syslog_network_record(sd, action, src, src_port, dst, ds
             port: checkpoint_syslog_int_opt(dst_port)
         },
         connection_info: {
-            protocol_num:  checkpoint_syslog_proto_num(proto),
+            protocol_num:  proto_num(proto),
             protocol_name: proto
         },
         traffic: {
@@ -263,7 +249,7 @@ def function checkpoint_syslog_finding_record(sd, action, src, src_port, dst, ds
             port: checkpoint_syslog_int_opt(dst_port)
         },
         connection_info: {
-            protocol_num:  checkpoint_syslog_proto_num(proto),
+            protocol_num:  proto_num(proto),
             protocol_name: proto
         },
         device: {

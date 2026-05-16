@@ -189,6 +189,40 @@ back into nested Objects, with loud-fail on collisions
 vendors — used by parse_zeek_*_flat variants, and equally
 applicable to any other Filebeat-flattened JSON.
 
+### Added — shared `proto_num` / `http_method_activity_id` LPL helpers (DRY across vendor parsers)
+
+Two cross-vendor OCSF mappings were duplicated across parsers (9 ×
+`*_proto_num` and 3 × `*_http_activity_id`), each with the same
+semantic body. Extracted to two shared LPL functions:
+
+- `packaging/snippets/functions/proto_num.limpid` — IANA protocol
+  number lookup, case-insensitive (`lower()`-folded), covering
+  tcp / udp / icmp / icmpv6 / sctp / gre / esp / ah. Replaces
+  `zeek_proto_num` / `suricata_proto_num` /
+  `checkpoint_{syslog,leef}_proto_num` /
+  `juniper_srx_{sd_syslog,syslog}_proto_num` /
+  `paloalto_{syslog,cef}_proto_num` / `sysmon_proto_num`.
+- `packaging/snippets/functions/http_method_activity_id.limpid` —
+  HTTP request method → OCSF 4002 activity_id, the spec-standard
+  mapping. Replaces `suricata_http_activity_id` /
+  `zeek_http_activity_id` / `combined_log_activity_id`.
+
+Parsers now `include "../functions/<name>.limpid"` and call the
+shared helper directly. Behaviour identical (case-insensitive
+proto_num is a superset that accepts every previous vendor-specific
+case style; HTTP method mappings were already byte-identical across
+the three sites). 12 callsites updated, ~80 lines of duplicated
+helper deleted.
+
+### Fixed — `parse_auditd` system-lifecycle section header drift
+
+The "1008 Application Lifecycle" section header in `parse_auditd.limpid`
+suggested the function emitted `class_uid: 1008`, but the code
+emits 1007 Process Activity (OCSF 1008 is actually Windows Registry
+Key Activity, not application lifecycle, which was confirmed during
+the original additional-vendor-parser work). Header rewritten with the correct class
+plus the rationale.
+
 ### Fixed — `nest_dotted_keys` enforces depth limits (stack-overflow DoS mitigation)
 
 `nest_dotted_keys` walked dotted keys and nested values recursively

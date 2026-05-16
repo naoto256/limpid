@@ -70,18 +70,7 @@ def function juniper_srx_sd_syslog_proto_name(p) {
 // Map Junos protocol-name (TCP/UDP/ICMP/...) to OCSF protocol_num
 // (IANA). Inverse of the above for daemons that emit protocol-name
 // instead of protocol-id (RT_IDP).
-def function juniper_srx_sd_syslog_proto_num(name) {
-    switch name {
-        "TCP"    { 6 }
-        "UDP"    { 17 }
-        "ICMP"   { 1 }
-        "ICMPv6" { 58 }
-        "GRE"    { 47 }
-        "ESP"    { 50 }
-        "AH"     { 51 }
-        default  { null }
-    }
-}
+include "../functions/proto_num.limpid"
 
 // Map Junos threat-severity to OCSF severity_id (1-5).
 def function juniper_srx_sd_syslog_severity_id(s) {

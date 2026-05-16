@@ -199,7 +199,7 @@ def function zeek_traceroute_record(body, host, time_ns) {
         src_endpoint: { ip: body.src },
         dst_endpoint: { ip: body.dst },
         connection_info: {
-            protocol_num:  zeek_proto_num(body.proto),
+            protocol_num:  proto_num(body.proto),
             protocol_name: body.proto
         },
         app_name: "traceroute",

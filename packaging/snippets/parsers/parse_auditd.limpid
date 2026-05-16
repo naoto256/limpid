@@ -591,7 +591,13 @@ def process parse_auditd_file_dispatch {
 }
 
 // ---------------------------------------------------------------------------
-// 1008 Application Lifecycle (system / service / boot / shutdown)
+// System lifecycle (BOOT / SHUTDOWN / SYSTEM_RUNLEVEL / SERVICE_START /
+// SERVICE_STOP / DAEMON_START / DAEMON_END) → 1007 Process Activity
+//
+// OCSF 1008 is **Registry Key Activity** (Windows), not application
+// lifecycle as the name might suggest. System / service lifecycle
+// events route to 1007 Process Activity with the auditd type code
+// carried in unmapped.type for downstream pivot.
 // ---------------------------------------------------------------------------
 
 def function auditd_lifecycle_record(activity_id, status_id, comm, exe, pid_str, host, time_ns, type, extra_unmapped) {

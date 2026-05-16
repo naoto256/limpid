@@ -52,16 +52,8 @@
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Map Junos protocol name (TCP / UDP / ICMP) to OCSF protocol_num.
-def function juniper_srx_syslog_proto_num(name) {
-    switch name {
-        "TCP"    { 6 }
-        "UDP"    { 17 }
-        "ICMP"   { 1 }
-        "ICMPv6" { 58 }
-        default  { null }
-    }
-}
+// IANA proto name → number for connection_info.protocol_num.
+include "../functions/proto_num.limpid"
 
 // Map Junos threat-severity to OCSF severity_id.
 //   INFO     → 1 Informational

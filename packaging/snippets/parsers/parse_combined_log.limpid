@@ -57,25 +57,9 @@
 
 // ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
+include "../functions/http_method_activity_id.limpid"
 
-// HTTP method → OCSF HTTP Activity activity_id (1.3.0).
-//   1 Connect / 2 Delete / 3 Get / 4 Head / 5 Options / 6 Post /
-//   7 Put / 8 Trace / 99 Other (for less-common methods like PATCH,
-//   PROPFIND, MKCOL — OCSF 1.3.0 doesn't enumerate these).
-def function combined_log_activity_id(method) {
-    switch method {
-        "CONNECT" { 1 }
-        "DELETE"  { 2 }
-        "GET"     { 3 }
-        "HEAD"    { 4 }
-        "OPTIONS" { 5 }
-        "POST"    { 6 }
-        "PUT"     { 7 }
-        "TRACE"   { 8 }
-        default   { 99 }
-    }
-}
+// ---------------------------------------------------------------------------
 
 // HTTP status code → OCSF status_id (Success / Failure / Other).
 //   1xx-3xx → Success (1)
@@ -128,7 +112,7 @@ def process parse_combined_log {
 // captures on workspace.web.
 def process parse_combined_log_record {
     let status   = to_int(workspace.web.status)
-    let activity = combined_log_activity_id(workspace.web.method)
+    let activity = http_method_activity_id(workspace.web.method)
     // Apache `%t` formats time as `[day/month/year:HH:MM:SS ±HHMM]`
     // (the `dd/Mon/yyyy:HH:MM:SS` strftime locale is `%d/%b/%Y:%H:%M:%S`).
     // The trailing `±HHMM` is a fixed offset, parsed by `%z`. strptime
