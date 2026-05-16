@@ -13,9 +13,23 @@ use super::rate_limit::RateLimiter;
 use super::validate::validate_pri;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
+use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::InputMetrics;
 use crate::modules::{HasMetrics, Input, Module};
+
+const SYSLOG_UDP_INPUT_SCHEMA: &[PropertySpec] = &[
+    PropertySpec {
+        name: "bind",
+        required: false,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "rate_limit",
+        required: false,
+        kind: PropertyValueKind::Int,
+    },
+];
 
 pub struct SyslogUdpInput {
     pub bind_addr: String,
@@ -24,6 +38,10 @@ pub struct SyslogUdpInput {
 }
 
 impl Module for SyslogUdpInput {
+    fn property_schema() -> Option<&'static [PropertySpec]> {
+        Some(SYSLOG_UDP_INPUT_SCHEMA)
+    }
+
     fn from_properties(_name: &str, properties: &[Property]) -> Result<Self> {
         let bind =
             props::get_string(properties, "bind").unwrap_or_else(|| "0.0.0.0:514".to_string());
