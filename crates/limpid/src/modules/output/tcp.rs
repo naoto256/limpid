@@ -14,10 +14,38 @@ use tokio::sync::Mutex;
 use crate::dsl::arena::EventArena;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
+use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::persistent_conn::{PersistentConn, write_with_reconnect};
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
+
+/// Declared property surface for `output tcp`. Either `address` (in
+/// `host:port` form) or `host` + optional `port` is required, but the
+/// schema layer can only enforce shape — the cross-field "one of the
+/// two paths" rule lives in `from_properties` below.
+const TCP_OUTPUT_SCHEMA: &[PropertySpec] = &[
+    PropertySpec {
+        name: "address",
+        required: false,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "host",
+        required: false,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "port",
+        required: false,
+        kind: PropertyValueKind::Int,
+    },
+    PropertySpec {
+        name: "framing",
+        required: false,
+        kind: PropertyValueKind::Enum(&["octet_counting", "non_transparent"]),
+    },
+];
 
 struct TcpPayload {
     egress: Bytes,
@@ -37,6 +65,10 @@ pub enum TcpOutputFraming {
 }
 
 impl Module for TcpOutput {
+    fn property_schema() -> Option<&'static [PropertySpec]> {
+        Some(TCP_OUTPUT_SCHEMA)
+    }
+
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
         let address = props::get_string(properties, "address")
             .or_else(|| {
@@ -47,9 +79,25 @@ impl Module for TcpOutput {
             .ok_or_else(|| {
                 anyhow::anyhow!("output '{}': tcp requires 'address' or 'host'+'port'", name)
             })?;
+        // After schema validation, `framing` is guaranteed to be one of
+        // the declared enum values (or absent). The match is exhaustive
+        // on the legal set; we still default to the documented default
+        // for the `None` case.
         let framing = match props::get_ident(properties, "framing").as_deref() {
             Some("non_transparent") => TcpOutputFraming::NonTransparent,
-            _ => TcpOutputFraming::OctetCounting,
+            Some("octet_counting") | None => TcpOutputFraming::OctetCounting,
+            Some(other) => {
+                // Unreachable when reached through the registry, which
+                // validates the schema first. Kept as a defensive
+                // fallback for direct `from_properties` callers (tests,
+                // snippet libs); upgrades the previous silent fallback
+                // to an explicit error.
+                anyhow::bail!(
+                    "output '{}': unknown framing '{}' (expected octet_counting | non_transparent)",
+                    name,
+                    other
+                );
+            }
         };
         Ok(Self {
             address,
@@ -110,5 +158,100 @@ impl PersistentConn for TcpOutput {
 
         stream.flush().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsl::ast::{Expr, ExprKind};
+
+    fn kv(key: &str, kind: ExprKind) -> Property {
+        Property::KeyValue {
+            key: key.into(),
+            key_span: None,
+            value: Expr::spanless(kind),
+            value_span: None,
+        }
+    }
+
+    #[test]
+    fn build_accepts_minimal_valid_config() {
+        let props = vec![kv("address", ExprKind::StringLit("127.0.0.1:514".into()))];
+        let tcp = TcpOutput::build("relay", &props).expect("should build");
+        assert_eq!(tcp.address, "127.0.0.1:514");
+        assert_eq!(tcp.framing, TcpOutputFraming::OctetCounting);
+    }
+
+    #[test]
+    fn build_accepts_correct_framing_enum_value() {
+        let props = vec![
+            kv("address", ExprKind::StringLit("h:1".into())),
+            kv("framing", ExprKind::Ident(vec!["non_transparent".into()])),
+        ];
+        let tcp = TcpOutput::build("relay", &props).expect("should build");
+        assert_eq!(tcp.framing, TcpOutputFraming::NonTransparent);
+    }
+
+    #[test]
+    fn build_rejects_typoed_framing_with_did_you_mean() {
+        let props = vec![
+            kv("address", ExprKind::StringLit("h:1".into())),
+            kv("framing", ExprKind::Ident(vec!["non_trasnaprent".into()])),
+        ];
+        let err = TcpOutput::build("relay", &props).err().expect("should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("framing"), "{}", msg);
+        assert!(msg.contains("non_transparent"), "did-you-mean missing: {}", msg);
+    }
+
+    #[test]
+    fn build_rejects_unknown_key_with_did_you_mean() {
+        let props = vec![
+            kv("address", ExprKind::StringLit("h:1".into())),
+            // typo of `framing` → should suggest `framing`
+            kv("framming", ExprKind::Ident(vec!["octet_counting".into()])),
+        ];
+        let err = TcpOutput::build("relay", &props).err().expect("should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown property 'framming'"), "{}", msg);
+        assert!(msg.contains("framing"), "did-you-mean missing: {}", msg);
+    }
+
+    #[test]
+    fn build_rejects_wrong_value_type() {
+        // `port` is Int — pass a string and we should get a type
+        // mismatch finding rather than a silent fallback.
+        let props = vec![
+            kv("host", ExprKind::StringLit("h".into())),
+            kv("port", ExprKind::StringLit("five-fourteen".into())),
+        ];
+        let err = TcpOutput::build("relay", &props).err().expect("should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("port"), "{}", msg);
+        assert!(msg.contains("integer"), "{}", msg);
+    }
+
+    #[test]
+    fn build_collects_multiple_errors_in_one_message() {
+        let props = vec![
+            kv("portt", ExprKind::IntLit(514)),
+            kv("framing", ExprKind::Ident(vec!["xx".into()])),
+        ];
+        let err = TcpOutput::build("relay", &props).err().expect("should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("portt"), "{}", msg);
+        assert!(msg.contains("framing"), "{}", msg);
+    }
+
+    #[test]
+    fn from_properties_directly_still_works_for_existing_call_sites() {
+        // The trait's `from_properties` is the no-validation entry the
+        // factory closure uses (validation happens at the registry
+        // boundary). Confirm legacy direct callers — e.g. modules in
+        // their own tests — still work.
+        let props = vec![kv("address", ExprKind::StringLit("h:1".into()))];
+        let tcp = TcpOutput::from_properties("relay", &props).expect("should build");
+        assert_eq!(tcp.address, "h:1");
     }
 }

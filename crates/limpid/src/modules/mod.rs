@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 
 use crate::dsl::arena::EventArena;
 use crate::dsl::ast::Property;
+use crate::dsl::schema::{self as property_schema, PropertySpec};
 use crate::event::{BorrowedEvent, Event};
 use crate::functions::FunctionRegistry;
 use crate::metrics::{InputMetrics, OutputMetrics};
@@ -85,7 +86,53 @@ impl std::fmt::Debug for RenderedPayload {
 /// etc.) and user-defined `def process { ... }` blocks. Modules are
 /// only inputs and outputs.
 pub trait Module: Sized {
+    /// Declarative schema for the module's property surface. Defaults
+    /// to `None` so every existing module continues to compile while
+    /// they are migrated one-by-one. Once a module declares
+    /// `Some(&SCHEMA)`, the registry validates every config against it
+    /// before calling `from_properties`, and the analyzer reports
+    /// typos in `--check` against the same definition.
+    fn property_schema() -> Option<&'static [PropertySpec]> {
+        None
+    }
+
+    /// Construct the module from its declared properties. Concrete
+    /// implementations may assume the schema (if any) has already
+    /// matched: enum values are valid, scalar shapes match, required
+    /// keys are present. Cross-field rules ("at least one of address
+    /// or host+port") still belong here — those are semantic, not
+    /// shape-level.
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self>;
+
+    /// Validation + construction entry. The runtime's registry path
+    /// already validates the schema before invoking the factory, so
+    /// `build` is the convenience for direct callers (tests, snippet
+    /// libraries, anyone bypassing the registry) that want the same
+    /// loud validation surface.
+    #[allow(dead_code)] // used by module unit tests; production path
+                       // validates inside `ModuleRegistry::create_*`
+    fn build(name: &str, properties: &[Property]) -> Result<Self> {
+        if let Some(spec) = Self::property_schema() {
+            let errs = property_schema::validate(properties, spec);
+            if !errs.is_empty() {
+                anyhow::bail!(format_module_schema_errors(name, &errs));
+            }
+        }
+        Self::from_properties(name, properties)
+    }
+}
+
+/// Render a list of schema findings as a single multi-line error
+/// message suitable for `anyhow::bail!`. The caller has already
+/// identified which module the errors are for; we only describe the
+/// findings themselves.
+#[allow(dead_code)] // reachable through `Module::build` (test entry)
+fn format_module_schema_errors(name: &str, errs: &[property_schema::SchemaError]) -> String {
+    let mut out = format!("module '{}' has invalid configuration:", name);
+    for e in errs {
+        out.push_str(&format!("\n  - {}", e));
+    }
+    out
 }
 
 /// All modules expose their own metrics.
@@ -193,13 +240,23 @@ type InputFactory = Box<
 type OutputFactory =
     Box<dyn Fn(&str, &[Property], Arc<FunctionRegistry>) -> Result<CreatedOutput> + Send + Sync>;
 
+struct InputEntry {
+    factory: InputFactory,
+    schema: Option<&'static [PropertySpec]>,
+}
+
+struct OutputEntry {
+    factory: OutputFactory,
+    schema: Option<&'static [PropertySpec]>,
+}
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
 pub struct ModuleRegistry {
-    inputs: HashMap<String, InputFactory>,
-    outputs: HashMap<String, OutputFactory>,
+    inputs: HashMap<String, InputEntry>,
+    outputs: HashMap<String, OutputEntry>,
 }
 
 impl ModuleRegistry {
@@ -210,8 +267,16 @@ impl ModuleRegistry {
         }
     }
 
-    pub fn register_input<F>(&mut self, type_name: &str, factory: F)
-    where
+    /// Register an input factory along with its declared property
+    /// schema. `schema = None` opts the module out of validation
+    /// (used during the gradual migration; eventually every built-in
+    /// will carry a schema).
+    pub fn register_input<F>(
+        &mut self,
+        type_name: &str,
+        schema: Option<&'static [PropertySpec]>,
+        factory: F,
+    ) where
         F: Fn(
                 &str,
                 &[Property],
@@ -222,18 +287,59 @@ impl ModuleRegistry {
             + Sync
             + 'static,
     {
-        self.inputs.insert(type_name.to_string(), Box::new(factory));
+        self.inputs.insert(
+            type_name.to_string(),
+            InputEntry {
+                factory: Box::new(factory),
+                schema,
+            },
+        );
     }
 
-    pub fn register_output<F>(&mut self, type_name: &str, factory: F)
-    where
+    pub fn register_output<F>(
+        &mut self,
+        type_name: &str,
+        schema: Option<&'static [PropertySpec]>,
+        factory: F,
+    ) where
         F: Fn(&str, &[Property], Arc<FunctionRegistry>) -> Result<CreatedOutput>
             + Send
             + Sync
             + 'static,
     {
-        self.outputs
-            .insert(type_name.to_string(), Box::new(factory));
+        self.outputs.insert(
+            type_name.to_string(),
+            OutputEntry {
+                factory: Box::new(factory),
+                schema,
+            },
+        );
+    }
+
+    /// Schema declared by an input type, if any. Used by the analyzer
+    /// to validate `def input` property surfaces during `--check`.
+
+    pub fn input_schema(&self, type_name: &str) -> Option<&'static [PropertySpec]> {
+        self.inputs.get(type_name).and_then(|e| e.schema)
+    }
+
+    /// Schema declared by an output type, if any.
+
+    pub fn output_schema(&self, type_name: &str) -> Option<&'static [PropertySpec]> {
+        self.outputs.get(type_name).and_then(|e| e.schema)
+    }
+
+    /// All registered input type names. Used by `--check` to suggest a
+    /// fix for an unknown `type` ident on a `def input`.
+
+    pub fn input_type_names(&self) -> impl Iterator<Item = &str> {
+        self.inputs.keys().map(|s| s.as_str())
+    }
+
+    /// All registered output type names.
+
+    pub fn output_type_names(&self) -> impl Iterator<Item = &str> {
+        self.outputs.keys().map(|s| s.as_str())
     }
 
     pub fn create_input(
@@ -244,11 +350,19 @@ impl ModuleRegistry {
         tx: mpsc::Sender<Event>,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<CreatedInput> {
-        let factory = self
+        let entry = self
             .inputs
             .get(type_name)
             .ok_or_else(|| anyhow::anyhow!("unknown input type: {}", type_name))?;
-        factory(name, properties, tx, shutdown)
+        if let Some(spec) = entry.schema {
+            let errs = property_schema::validate(properties, spec);
+            if !errs.is_empty() {
+                anyhow::bail!(format_factory_schema_errors(
+                    "input", type_name, name, &errs
+                ));
+            }
+        }
+        (entry.factory)(name, properties, tx, shutdown)
     }
 
     pub fn create_output(
@@ -258,12 +372,36 @@ impl ModuleRegistry {
         properties: &[Property],
         funcs: Arc<FunctionRegistry>,
     ) -> Result<CreatedOutput> {
-        let factory = self
+        let entry = self
             .outputs
             .get(type_name)
             .ok_or_else(|| anyhow::anyhow!("unknown output type: {}", type_name))?;
-        factory(name, properties, funcs)
+        if let Some(spec) = entry.schema {
+            let errs = property_schema::validate(properties, spec);
+            if !errs.is_empty() {
+                anyhow::bail!(format_factory_schema_errors(
+                    "output", type_name, name, &errs
+                ));
+            }
+        }
+        (entry.factory)(name, properties, funcs)
     }
+}
+
+fn format_factory_schema_errors(
+    surface: &str,
+    type_name: &str,
+    name: &str,
+    errs: &[property_schema::SchemaError],
+) -> String {
+    let mut out = format!(
+        "{} '{}' (type '{}') has invalid configuration:",
+        surface, name, type_name
+    );
+    for e in errs {
+        out.push_str(&format!("\n  - {}", e));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -304,34 +442,46 @@ fn register_input_type<T>(registry: &mut ModuleRegistry, type_name: &str)
 where
     T: Input + Send + 'static,
 {
-    registry.register_input(type_name, |name, properties, tx, shutdown| {
-        let input = T::from_properties(name, properties)?;
-        let metrics = HasMetrics::metrics(&input);
-        let input_name = name.to_string();
-        let handle = tokio::spawn(async move {
-            if let Err(e) = Input::run(input, tx, shutdown).await {
-                tracing::error!("input '{}' failed: {}", input_name, e);
-            }
-        });
-        Ok(CreatedInput { handle, metrics })
-    });
+    registry.register_input(
+        type_name,
+        T::property_schema(),
+        |name, properties, tx, shutdown| {
+            // The registry has already run schema validation before
+            // calling this closure (when a schema is declared); here we
+            // only build the concrete value, so `from_properties` is
+            // the right entry point.
+            let input = T::from_properties(name, properties)?;
+            let metrics = HasMetrics::metrics(&input);
+            let input_name = name.to_string();
+            let handle = tokio::spawn(async move {
+                if let Err(e) = Input::run(input, tx, shutdown).await {
+                    tracing::error!("input '{}' failed: {}", input_name, e);
+                }
+            });
+            Ok(CreatedInput { handle, metrics })
+        },
+    );
 }
 
 fn register_output_type<T>(registry: &mut ModuleRegistry, type_name: &str)
 where
     T: Module + Output + Sync + 'static,
 {
-    registry.register_output(type_name, |name, properties, funcs| {
-        let mut output = T::from_properties(name, properties)?;
-        output.attach_funcs(funcs);
-        let metrics = HasMetrics::metrics(&output);
-        let output_arc: Arc<dyn Output> = Arc::new(output);
-        Ok(CreatedOutput {
-            output: Arc::clone(&output_arc),
-            writer: Box::new(OutputWriterWrapper(output_arc)),
-            metrics,
-        })
-    });
+    registry.register_output(
+        type_name,
+        T::property_schema(),
+        |name, properties, funcs| {
+            let mut output = T::from_properties(name, properties)?;
+            output.attach_funcs(funcs);
+            let metrics = HasMetrics::metrics(&output);
+            let output_arc: Arc<dyn Output> = Arc::new(output);
+            Ok(CreatedOutput {
+                output: Arc::clone(&output_arc),
+                writer: Box::new(OutputWriterWrapper(output_arc)),
+                metrics,
+            })
+        },
+    );
 }
 
 struct OutputWriterWrapper(Arc<dyn Output>);

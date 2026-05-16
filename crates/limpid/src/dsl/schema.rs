@@ -30,6 +30,7 @@ use super::span::Span;
 /// `Block` recurses into another static slice — Rust allows this
 /// because `&'static [PropertySpec]` is a reference, not the struct
 /// itself, so there's no infinite size.
+
 #[derive(Debug, Clone, Copy)]
 pub enum PropertyValueKind {
     /// Any string-shaped scalar: `StringLit`, `Template`, or a bare
@@ -112,6 +113,7 @@ impl SchemaError {
     /// Best span for a caret — `key_span` for key-shaped problems,
     /// `value_span` for value-shaped ones, falling back to whichever
     /// is present.
+
     pub fn primary_span(&self) -> Option<Span> {
         use SchemaErrorKind::*;
         match self.kind {
