@@ -13,10 +13,20 @@ use tokio::sync::Mutex;
 use crate::dsl::arena::EventArena;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
+use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::persistent_conn::{PersistentConn, write_with_reconnect};
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
+
+const UNIX_SOCKET_OUTPUT_SCHEMA: &[PropertySpec] = &[
+    PropertySpec {
+        name: "path",
+        required: true,
+        kind: PropertyValueKind::String,
+    },
+    crate::queue::QUEUE_PROPERTY_SPEC,
+];
 
 struct UnixSocketPayload {
     egress: Bytes,
@@ -29,6 +39,10 @@ pub struct UnixSocketOutput {
 }
 
 impl Module for UnixSocketOutput {
+    fn property_schema() -> Option<&'static [PropertySpec]> {
+        Some(UNIX_SOCKET_OUTPUT_SCHEMA)
+    }
+
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
         let path = props::get_string(properties, "path")
             .ok_or_else(|| anyhow::anyhow!("output '{}': unix_socket requires 'path'", name))?;
