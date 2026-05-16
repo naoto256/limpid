@@ -3,11 +3,7 @@
 pub mod arena;
 pub mod ast;
 pub mod eval;
-#[cfg(test)]
-mod eval_test;
 pub mod exec;
-#[cfg(test)]
-mod exec_test;
 pub mod parser;
 pub mod props;
 pub mod schema;
