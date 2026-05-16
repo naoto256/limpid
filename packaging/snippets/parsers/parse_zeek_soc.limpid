@@ -536,7 +536,7 @@ def function zeek_rdp_record(body, host, time_ns) {
 def process parse_zeek_soc_native {
     workspace.zeek = {
         body:     parse_json(ingress),
-        hostname: hostname(),
+        hostname: zeek_default_hostname(source.ip, hostname()),
         time:     to_int(received_at)
     }
     process parse_zeek_soc
@@ -545,7 +545,7 @@ def process parse_zeek_soc_native {
 def process parse_zeek_soc_flat {
     workspace.zeek = {
         body:     nest_dotted_keys(parse_json(ingress)),
-        hostname: hostname(),
+        hostname: zeek_default_hostname(source.ip, hostname()),
         time:     to_int(received_at)
     }
     process parse_zeek_soc

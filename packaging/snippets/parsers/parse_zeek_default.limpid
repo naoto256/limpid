@@ -186,6 +186,27 @@ def function zeek_http_status_id(code) {
     }
 }
 
+// Best-guess sensor hostname for the convenience `_native` / `_flat`
+// entry points below. Zeek's log body never carries a sensor-side
+// hostname (every `hostname`-like field is event content — HTTP
+// `Host:` header, TLS SNI, DHCP client name, etc.), so the parser
+// has to pick something at the intake layer:
+//
+//   - If the event came from a tail input (`source.ip == "127.0.0.1"`,
+//     limpid's no-network sentinel), the limpid box is also the Zeek
+//     sensor and `hostname()` is the right answer.
+//   - If the event came from a network input (syslog over UDP/TCP,
+//     OTLP, etc.), the remote source IP is closer to "which sensor
+//     emitted this" than the limpid host's own name. Use it
+//     directly (string-shape — operators can resolve to a real
+//     hostname downstream if they want).
+def function zeek_default_hostname(src_ip, local_name) {
+    switch true {
+        src_ip == "127.0.0.1" { local_name }
+        default               { src_ip }
+    }
+}
+
 // Constant metadata block stamped on every Zeek-derived record.
 def function zeek_metadata() {
     {
@@ -500,7 +521,7 @@ def function zeek_notice_record(body, host, time_ns) {
 def process parse_zeek_default_native {
     workspace.zeek = {
         body:     parse_json(ingress),
-        hostname: hostname(),
+        hostname: zeek_default_hostname(source.ip, hostname()),
         time:     to_int(received_at)
     }
     process parse_zeek_default
@@ -509,7 +530,7 @@ def process parse_zeek_default_native {
 def process parse_zeek_default_flat {
     workspace.zeek = {
         body:     nest_dotted_keys(parse_json(ingress)),
-        hostname: hostname(),
+        hostname: zeek_default_hostname(source.ip, hostname()),
         time:     to_int(received_at)
     }
     process parse_zeek_default
