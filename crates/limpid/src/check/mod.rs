@@ -35,6 +35,7 @@ pub mod bindings;
 mod control_flow;
 pub mod expr_types;
 mod function;
+mod global_props;
 pub mod graph;
 mod module_props;
 mod outputs;
@@ -271,6 +272,7 @@ pub fn analyze(config: &CompiledConfig, _source_map: &SourceMap) -> Vec<Diagnost
     let mut diagnostics = Vec::new();
     function::check_all_functions(config, &mut diagnostics);
     module_props::analyze_all(config, &module_registry, &mut diagnostics);
+    global_props::analyze_all(config, &mut diagnostics);
     for (name, pipeline) in &config.pipelines {
         analyze_pipeline(
             name,

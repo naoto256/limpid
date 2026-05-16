@@ -453,6 +453,58 @@ def pipeline p {
 }
 
 // ---------------------------------------------------------------------------
+// Global block schema (v0.7.2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn check_flags_unknown_key_in_control_block() {
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("ctrl.conf");
+    fs::write(
+        &conf,
+        r#"
+control { sockt "/tmp/limpid.sock" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p { input i; output o }
+"#,
+    )
+    .unwrap();
+    let out = run_check(&conf);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(!out.status.success(), "stderr: {}", stderr);
+    assert!(
+        stderr.contains("control") && stderr.contains("sockt") && stderr.contains("socket"),
+        "stderr: {}",
+        stderr
+    );
+}
+
+#[test]
+fn check_flags_unknown_key_in_table_entry() {
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("tbl.conf");
+    fs::write(
+        &conf,
+        r#"
+table { tenants { mx 1000 } }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p { input i; output o }
+"#,
+    )
+    .unwrap();
+    let out = run_check(&conf);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(!out.status.success(), "stderr: {}", stderr);
+    assert!(
+        stderr.contains("table 'tenants'") && stderr.contains("mx") && stderr.contains("max"),
+        "stderr: {}",
+        stderr
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Property schema (v0.7.2)
 // ---------------------------------------------------------------------------
 //
