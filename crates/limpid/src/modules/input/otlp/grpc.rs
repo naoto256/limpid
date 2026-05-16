@@ -63,24 +63,6 @@ pub struct OtlpGrpcInput {
     metrics: Arc<InputMetrics>,
 }
 
-const OTLP_GRPC_TLS_BLOCK_PROPERTIES: &[PropertySpec] = &[
-    PropertySpec {
-        name: "cert",
-        required: true,
-        kind: PropertyValueKind::String,
-    },
-    PropertySpec {
-        name: "key",
-        required: true,
-        kind: PropertyValueKind::String,
-    },
-    PropertySpec {
-        name: "ca",
-        required: false,
-        kind: PropertyValueKind::String,
-    },
-];
-
 const OTLP_GRPC_INPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "bind",
@@ -95,7 +77,7 @@ const OTLP_GRPC_INPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "tls",
         required: false,
-        kind: PropertyValueKind::Block(OTLP_GRPC_TLS_BLOCK_PROPERTIES),
+        kind: PropertyValueKind::Block(crate::tls::TLS_SERVER_BLOCK_PROPERTIES),
     },
 ];
 

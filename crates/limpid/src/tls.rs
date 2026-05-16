@@ -9,6 +9,72 @@ use tokio_rustls::rustls::{self, ServerConfig};
 
 use crate::dsl::ast::Property;
 use crate::dsl::props;
+use crate::dsl::schema::{PropertySpec, PropertyValueKind};
+
+// ---------------------------------------------------------------------------
+// Declarative TLS sub-block schemas
+// ---------------------------------------------------------------------------
+//
+// Every Module that exposes a `tls { ... }` block shares the same
+// inner key set: `cert`, `key`, `ca`. The only thing that differs is
+// which of those are required, and that depends on the role:
+//
+//   - **Server role** (TLS-terminating listeners like `syslog_tls`,
+//     `otlp_grpc`, the future `input limpid`): the server presents a
+//     certificate, so `cert` and `key` are required. `ca` is optional
+//     and used for client-cert verification (mTLS).
+//
+//   - **Client role** (sinks like `http`, `otlp` output, the future
+//     `output limpid`): in the pre-mTLS world only `ca` is meaningful,
+//     and `cert` / `key` aren't accepted by today's HTTP / gRPC
+//     transports. The v0.8.0 `output limpid` will lift that and accept
+//     all three (mTLS client auth); the schema already allows them as
+//     optional fields, so adding mTLS to clients won't require touching
+//     the schema layer.
+//
+// Both schemas live here next to `TlsConfig::from_properties_block` so
+// the parser and the schema description can't drift. Per-Module
+// required-ness for the *outer* `tls` property (whole block required
+// vs optional) stays with each Module — that's a transport-level
+// decision, not a TLS-block-internal one.
+
+const TLS_BLOCK_CERT_KEY_CA_REQUIRED: &[PropertySpec] = &[
+    PropertySpec {
+        name: "cert",
+        required: true,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "key",
+        required: true,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "ca",
+        required: false,
+        kind: PropertyValueKind::String,
+    },
+];
+
+const TLS_BLOCK_CA_ONLY: &[PropertySpec] = &[PropertySpec {
+    name: "ca",
+    required: false,
+    kind: PropertyValueKind::String,
+}];
+
+/// Shared schema for the `tls { cert | key | ca }` block used by
+/// TLS-terminating server Modules (`syslog_tls`, `otlp_grpc`, the
+/// future `input limpid`). `cert` and `key` are mandatory; `ca`
+/// enables mTLS client-certificate verification.
+pub const TLS_SERVER_BLOCK_PROPERTIES: &[PropertySpec] = TLS_BLOCK_CERT_KEY_CA_REQUIRED;
+
+/// Shared schema for the `tls { ca }` block used by client Modules
+/// (`output http`, `output otlp`) that only need to add a custom CA
+/// to their trust store. When v0.8.0 lands `output limpid` with mTLS
+/// the schema can switch to [`TLS_SERVER_BLOCK_PROPERTIES`] (same
+/// shape, with `cert` / `key` becoming optional) without forcing a
+/// breaking config change for the simpler clients.
+pub const TLS_CLIENT_BLOCK_PROPERTIES: &[PropertySpec] = TLS_BLOCK_CA_ONLY;
 
 /// TLS settings parsed from DSL `tls { ... }` block.
 #[derive(Debug, Clone)]

@@ -187,13 +187,6 @@ pub struct OtlpOutput {
     metrics: Arc<OutputMetrics>,
 }
 
-const OTLP_TLS_BLOCK_PROPERTIES: &[crate::dsl::schema::PropertySpec] =
-    &[crate::dsl::schema::PropertySpec {
-        name: "ca",
-        required: false,
-        kind: crate::dsl::schema::PropertyValueKind::String,
-    }];
-
 const OTLP_RETRY_BLOCK_PROPERTIES: &[crate::dsl::schema::PropertySpec] = &[
     crate::dsl::schema::PropertySpec {
         name: "max_attempts",
@@ -256,7 +249,7 @@ const OTLP_OUTPUT_SCHEMA: &[crate::dsl::schema::PropertySpec] = &[
     crate::dsl::schema::PropertySpec {
         name: "tls",
         required: false,
-        kind: crate::dsl::schema::PropertyValueKind::Block(OTLP_TLS_BLOCK_PROPERTIES),
+        kind: crate::dsl::schema::PropertyValueKind::Block(crate::tls::TLS_CLIENT_BLOCK_PROPERTIES),
     },
     crate::dsl::schema::PropertySpec {
         name: "retry",

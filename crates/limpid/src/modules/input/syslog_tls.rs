@@ -19,24 +19,6 @@ use crate::tls::TlsConfig;
 use super::rate_limit::RateLimiter;
 use super::syslog_tcp::TcpFraming;
 
-const SYSLOG_TLS_TLS_BLOCK_PROPERTIES: &[PropertySpec] = &[
-    PropertySpec {
-        name: "cert",
-        required: true,
-        kind: PropertyValueKind::String,
-    },
-    PropertySpec {
-        name: "key",
-        required: true,
-        kind: PropertyValueKind::String,
-    },
-    PropertySpec {
-        name: "ca",
-        required: false,
-        kind: PropertyValueKind::String,
-    },
-];
-
 const SYSLOG_TLS_INPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "bind",
@@ -51,7 +33,7 @@ const SYSLOG_TLS_INPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "tls",
         required: true,
-        kind: PropertyValueKind::Block(SYSLOG_TLS_TLS_BLOCK_PROPERTIES),
+        kind: PropertyValueKind::Block(crate::tls::TLS_SERVER_BLOCK_PROPERTIES),
     },
     PropertySpec {
         name: "rate_limit",

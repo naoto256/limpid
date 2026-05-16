@@ -33,12 +33,6 @@ use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
 
-const HTTP_TLS_BLOCK_PROPERTIES: &[PropertySpec] = &[PropertySpec {
-    name: "ca",
-    required: false,
-    kind: PropertyValueKind::String,
-}];
-
 const HTTP_OUTPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "url",
@@ -86,7 +80,7 @@ const HTTP_OUTPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "tls",
         required: false,
-        kind: PropertyValueKind::Block(HTTP_TLS_BLOCK_PROPERTIES),
+        kind: PropertyValueKind::Block(crate::tls::TLS_CLIENT_BLOCK_PROPERTIES),
     },
     crate::queue::QUEUE_PROPERTY_SPEC,
 ];
