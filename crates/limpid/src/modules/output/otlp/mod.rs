@@ -187,7 +187,90 @@ pub struct OtlpOutput {
     metrics: Arc<OutputMetrics>,
 }
 
+const OTLP_TLS_BLOCK_PROPERTIES: &[crate::dsl::schema::PropertySpec] =
+    &[crate::dsl::schema::PropertySpec {
+        name: "ca",
+        required: false,
+        kind: crate::dsl::schema::PropertyValueKind::String,
+    }];
+
+const OTLP_RETRY_BLOCK_PROPERTIES: &[crate::dsl::schema::PropertySpec] = &[
+    crate::dsl::schema::PropertySpec {
+        name: "max_attempts",
+        required: false,
+        kind: crate::dsl::schema::PropertyValueKind::Int,
+    },
+    crate::dsl::schema::PropertySpec {
+        name: "initial_wait",
+        required: false,
+        kind: crate::dsl::schema::PropertyValueKind::Duration,
+    },
+    crate::dsl::schema::PropertySpec {
+        name: "max_wait",
+        required: false,
+        kind: crate::dsl::schema::PropertyValueKind::Duration,
+    },
+    crate::dsl::schema::PropertySpec {
+        name: "backoff",
+        required: false,
+        kind: crate::dsl::schema::PropertyValueKind::Enum(&["fixed", "exponential"]),
+    },
+];
+
+const OTLP_OUTPUT_SCHEMA: &[crate::dsl::schema::PropertySpec] = &[
+    crate::dsl::schema::PropertySpec {
+        name: "endpoint",
+        required: true,
+        kind: crate::dsl::schema::PropertyValueKind::String,
+    },
+    crate::dsl::schema::PropertySpec {
+        name: "protocol",
+        required: false,
+        kind: crate::dsl::schema::PropertyValueKind::Enum(&["http_json", "http_protobuf", "grpc"]),
+    },
+    crate::dsl::schema::PropertySpec {
+        name: "batch_size",
+        required: false,
+        kind: crate::dsl::schema::PropertyValueKind::Int,
+    },
+    crate::dsl::schema::PropertySpec {
+        name: "batch_timeout",
+        required: false,
+        kind: crate::dsl::schema::PropertyValueKind::Duration,
+    },
+    crate::dsl::schema::PropertySpec {
+        name: "batch_level",
+        required: false,
+        kind: crate::dsl::schema::PropertyValueKind::Enum(&["none", "resource", "scope"]),
+    },
+    crate::dsl::schema::PropertySpec {
+        name: "verify",
+        required: false,
+        kind: crate::dsl::schema::PropertyValueKind::Bool,
+    },
+    crate::dsl::schema::PropertySpec {
+        name: "headers",
+        required: false,
+        kind: crate::dsl::schema::PropertyValueKind::StringMap,
+    },
+    crate::dsl::schema::PropertySpec {
+        name: "tls",
+        required: false,
+        kind: crate::dsl::schema::PropertyValueKind::Block(OTLP_TLS_BLOCK_PROPERTIES),
+    },
+    crate::dsl::schema::PropertySpec {
+        name: "retry",
+        required: false,
+        kind: crate::dsl::schema::PropertyValueKind::Block(OTLP_RETRY_BLOCK_PROPERTIES),
+    },
+    crate::queue::QUEUE_PROPERTY_SPEC,
+];
+
 impl Module for OtlpOutput {
+    fn property_schema() -> Option<&'static [crate::dsl::schema::PropertySpec]> {
+        Some(OTLP_OUTPUT_SCHEMA)
+    }
+
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
         let endpoint = props::get_string(properties, "endpoint")
             .ok_or_else(|| anyhow!("output '{}': otlp requires 'endpoint'", name))?;
