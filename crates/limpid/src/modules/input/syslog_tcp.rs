@@ -15,9 +15,35 @@ use super::rate_limit::RateLimiter;
 use super::validate::validate_pri;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
+use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::InputMetrics;
 use crate::modules::{HasMetrics, Input, Module};
+
+const SYSLOG_TCP_INPUT_SCHEMA: &[PropertySpec] = &[
+    PropertySpec {
+        name: "bind",
+        required: false,
+        kind: PropertyValueKind::String,
+    },
+    // `auto` is the default — autodetect framing per connection from
+    // the first byte (digit → octet counting, `<` → non-transparent).
+    PropertySpec {
+        name: "framing",
+        required: false,
+        kind: PropertyValueKind::Enum(&["auto", "octet_counting", "non_transparent"]),
+    },
+    PropertySpec {
+        name: "rate_limit",
+        required: false,
+        kind: PropertyValueKind::Int,
+    },
+    PropertySpec {
+        name: "max_connections",
+        required: false,
+        kind: PropertyValueKind::Int,
+    },
+];
 
 /// Maximum size of a single syslog message (bytes).
 /// RFC 5424 recommends supporting at least 2048; we allow up to 1 MiB.
@@ -62,12 +88,20 @@ pub struct SyslogTcpInput {
 }
 
 impl Module for SyslogTcpInput {
+    fn property_schema() -> Option<&'static [PropertySpec]> {
+        Some(SYSLOG_TCP_INPUT_SCHEMA)
+    }
+
     fn from_properties(_name: &str, properties: &[Property]) -> anyhow::Result<Self> {
         let bind =
             props::get_string(properties, "bind").unwrap_or_else(|| "0.0.0.0:514".to_string());
         let framing = match props::get_ident(properties, "framing").as_deref() {
             Some("octet_counting") => TcpFraming::OctetCounting,
             Some("non_transparent") => TcpFraming::NonTransparent,
+            // `auto` (explicit) or absent — both fall through to the
+            // per-connection autodetect. Any other value would have
+            // been rejected by the schema validator before we reach
+            // this point.
             _ => TcpFraming::Auto,
         };
         let rate_limit = props::get_strictly_positive_int(properties, "rate_limit")?;
