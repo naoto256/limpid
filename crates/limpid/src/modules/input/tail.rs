@@ -23,9 +23,28 @@ use tracing::{debug, error, info, warn};
 
 use crate::dsl::ast::Property;
 use crate::dsl::props;
+use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::InputMetrics;
 use crate::modules::{HasMetrics, Input, Module};
+
+const TAIL_INPUT_SCHEMA: &[PropertySpec] = &[
+    PropertySpec {
+        name: "path",
+        required: true,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "state_file",
+        required: false,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "poll_interval",
+        required: false,
+        kind: PropertyValueKind::Duration,
+    },
+];
 
 /// Default poll interval.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -41,6 +60,10 @@ pub struct TailInput {
 }
 
 impl Module for TailInput {
+    fn property_schema() -> Option<&'static [PropertySpec]> {
+        Some(TAIL_INPUT_SCHEMA)
+    }
+
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
         let path = props::get_string(properties, "path")
             .ok_or_else(|| anyhow::anyhow!("input '{}': tail requires 'path'", name))?;
