@@ -60,6 +60,7 @@ use tracing::{info, warn};
 use super::split_request;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
+use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::InputMetrics;
 use crate::modules::input::rate_limit::RateLimiter;
@@ -98,7 +99,39 @@ pub struct OtlpHttpInput {
     metrics: Arc<InputMetrics>,
 }
 
+const OTLP_HTTP_INPUT_SCHEMA: &[PropertySpec] = &[
+    PropertySpec {
+        name: "bind",
+        required: false,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "body_limit",
+        required: false,
+        kind: PropertyValueKind::Size,
+    },
+    PropertySpec {
+        name: "rate_limit",
+        required: false,
+        kind: PropertyValueKind::Int,
+    },
+    PropertySpec {
+        name: "request_rate_limit",
+        required: false,
+        kind: PropertyValueKind::Int,
+    },
+    PropertySpec {
+        name: "max_concurrent_requests",
+        required: false,
+        kind: PropertyValueKind::Int,
+    },
+];
+
 impl Module for OtlpHttpInput {
+    fn property_schema() -> Option<&'static [PropertySpec]> {
+        Some(OTLP_HTTP_INPUT_SCHEMA)
+    }
+
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
         let bind =
             props::get_string(properties, "bind").unwrap_or_else(|| "0.0.0.0:4318".to_string());
