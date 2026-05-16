@@ -36,7 +36,7 @@
 //! are policy decisions. Compose `strptime` + current-year fallback
 //! + future-clamp in LPL.
 
-use anyhow::{Result, bail};
+use anyhow::bail;
 use chrono::Utc;
 
 use super::val_to_str;
@@ -79,8 +79,8 @@ pub fn register(reg: &mut FunctionRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Result;
     use crate::dsl::arena::EventArena;
-    use crate::functions::FunctionRegistry;
 
     fn parse_one(s: &str) -> Result<Value<'static>> {
         // Mirrors the primitive's fallback chain so the unit tests

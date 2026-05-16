@@ -12,7 +12,7 @@
 //! For modern internet datetimes (RFC 5424 syslog, OTLP, OCSF, cloud
 //! audit logs), use `parse_datetime_rfc3339` instead.
 
-use anyhow::{Result, bail};
+use anyhow::bail;
 use chrono::Utc;
 
 use super::val_to_str;
@@ -41,6 +41,7 @@ pub fn register(reg: &mut FunctionRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Result;
 
     fn parse_one(s: &str) -> Result<Value<'static>> {
         let dt = chrono::DateTime::parse_from_rfc2822(s)?;
