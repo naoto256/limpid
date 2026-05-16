@@ -168,6 +168,40 @@ pub fn get_block<'a>(props: &'a [Property], key: &str) -> Option<&'a Vec<Propert
     None
 }
 
+/// Extract a `StringMap`-shaped sub-block as a list of `(key, value)`
+/// pairs. The block's key set is open (HTTP header names, k8s-style
+/// labels, etc.) and every value is rendered to `String` through the
+/// same rules `get_string` uses (`StringLit` / `Template` source
+/// reconstruction / `Ident` joined by `.` / `IntLit` decimal).
+///
+/// Returns `Vec::new()` when the block is absent. The analyzer flags
+/// non-string entries via the schema (`PropertyValueKind::StringMap`),
+/// so callers here can safely drop them without re-reporting.
+pub fn get_string_map(props: &[Property], key: &str) -> Vec<(String, String)> {
+    let Some(block) = get_block(props, key) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for prop in block {
+        if let Property::KeyValue {
+            key: k,
+            value: expr,
+            ..
+        } = prop
+            && let Some(val) = match &expr.kind {
+                ExprKind::StringLit(s) => Some(s.clone()),
+                ExprKind::Template(frags) => Some(template_to_source(frags)),
+                ExprKind::Ident(parts) => Some(parts.join(".")),
+                ExprKind::IntLit(n) => Some(n.to_string()),
+                _ => None,
+            }
+        {
+            out.push((k.clone(), val));
+        }
+    }
+    out
+}
+
 /// Parse size strings like "1GB", "512MB", "1024" (bytes).
 pub fn parse_size(s: &str) -> anyhow::Result<u64> {
     let s = s.trim().to_uppercase();

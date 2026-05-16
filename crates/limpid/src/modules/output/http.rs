@@ -136,23 +136,8 @@ impl Module for HttpOutput {
             .map(|s| s == "gzip")
             .unwrap_or(false);
 
-        // Parse headers block
-        let mut headers = Vec::new();
-        if let Some(block) = props::get_block(properties, "headers") {
-            for prop in block {
-                if let Property::KeyValue {
-                    key, value: expr, ..
-                } = prop
-                    && let Some(val) = match &expr.kind {
-                        crate::dsl::ast::ExprKind::StringLit(s) => Some(s.clone()),
-                        crate::dsl::ast::ExprKind::Ident(parts) => Some(parts.join(".")),
-                        _ => None,
-                    }
-                {
-                    headers.push((key.clone(), val));
-                }
-            }
-        }
+        // Parse headers block — open key set, schema enforces string-shaped values.
+        let headers = props::get_string_map(properties, "headers");
 
         // TLS / verify configuration
         let is_https = url.starts_with("https://");
