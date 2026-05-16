@@ -868,7 +868,7 @@ def pipeline p {
         use std::net::SocketAddr;
 
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def process wrap {
     egress = strftime(timestamp, "%Y", "UTC")
@@ -919,7 +919,7 @@ def pipeline p {
         use std::net::SocketAddr;
 
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def process refuse {
     error "I refuse"
@@ -965,7 +965,7 @@ def pipeline p {
         use std::net::SocketAddr;
 
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i

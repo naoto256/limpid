@@ -620,7 +620,7 @@ mod tests {
     #[test]
     fn output_referencing_unproduced_workspace_key_errors() {
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type tcp address "${workspace.nope}:1" }
 def pipeline p { input i; output o }
 "#;
@@ -633,7 +633,7 @@ def pipeline p { input i; output o }
     #[test]
     fn syslog_parse_binds_known_workspace_keys() {
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type tcp address "${workspace.msg}:1" }
 def pipeline p {
     input i
@@ -648,7 +648,7 @@ def pipeline p {
     #[test]
     fn parse_json_with_defaults_narrows_to_declared_keys() {
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type tcp address "${workspace.usr}:1" }
 def pipeline p {
     input i
@@ -665,7 +665,7 @@ def pipeline p {
     #[test]
     fn parse_json_without_defaults_wildcards() {
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type tcp address "${workspace.anything}:1" }
 def pipeline p {
     input i
@@ -682,7 +682,7 @@ def pipeline p {
     #[test]
     fn if_without_else_does_not_propagate_branch_bindings() {
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type tcp address "${workspace.tag}:1" }
 def pipeline p {
     input i
@@ -702,7 +702,7 @@ def pipeline p {
     #[test]
     fn if_else_with_both_branches_binding_is_guaranteed() {
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type tcp address "${workspace.tag}:1" }
 def pipeline p {
     input i
@@ -725,7 +725,7 @@ def pipeline p {
     #[test]
     fn eq_int_workspace_vs_string_warns() {
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -752,7 +752,7 @@ def pipeline p {
     #[test]
     fn eq_int_and_int_silent() {
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -772,7 +772,7 @@ def pipeline p {
     #[test]
     fn arith_minus_on_string_warns() {
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -793,7 +793,7 @@ def pipeline p {
     #[test]
     fn lower_on_int_workspace_warns() {
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -818,7 +818,7 @@ def pipeline p {
     #[test]
     fn object_overwritten_with_string_warns() {
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -845,7 +845,7 @@ def pipeline p {
     #[test]
     fn try_catch_intersects_bindings() {
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type tcp address "${workspace.a}:1" }
 def pipeline p {
     input i
@@ -867,7 +867,7 @@ def pipeline p {
     #[test]
     fn catch_body_binds_workspace_error_as_string() {
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -890,7 +890,7 @@ def pipeline p {
     #[test]
     fn output_unresolved_workspace_ref_carries_value_span() {
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type tcp address "${workspace.nope}:1" }
 def pipeline p { input i; output o }
 "#;
@@ -911,7 +911,7 @@ def pipeline p { input i; output o }
     #[test]
     fn unresolved_workspace_ref_suggests_near_match() {
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type tcp address "${workspace.mssg}:1" }
 def pipeline p {
     input i
@@ -929,7 +929,7 @@ def pipeline p {
     #[test]
     fn unresolved_workspace_ref_silent_when_nothing_close() {
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type tcp address "${workspace.completely_unrelated_zzz}:1" }
 def pipeline p { input i; output o }
 "#;
@@ -946,7 +946,7 @@ def pipeline p { input i; output o }
     #[test]
     fn let_binding_visible_inside_process() {
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -971,7 +971,7 @@ def pipeline p {
         // span resolves to the `workspace.count` substring, so the
         // diagnostic renders with a snippet + caret.
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -1010,7 +1010,7 @@ def pipeline p {
         // BinOp span should cover the comparison expression, which
         // lives on the `if` line. Pre-11-A the warning was spanless.
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -1044,7 +1044,7 @@ def pipeline p {
     #[test]
     fn unresolved_workspace_output_ref_tagged_unknown_ident() {
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type tcp address "${workspace.nope}:1" }
 def pipeline p { input i; output o }
 "#;
@@ -1063,7 +1063,7 @@ def pipeline p { input i; output o }
         // forwarded events with the original ingress unchanged. Surface
         // a targeted hint at `--check` time instead.
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -1089,7 +1089,7 @@ def pipeline p {
     #[test]
     fn unknown_bare_ident_suggests_near_match() {
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -1113,7 +1113,7 @@ def pipeline p {
     #[test]
     fn unknown_function_tagged_unknown_ident() {
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -1132,7 +1132,7 @@ def pipeline p {
     #[test]
     fn type_mismatch_tagged_type_mismatch() {
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -1152,7 +1152,7 @@ def pipeline p {
     #[test]
     fn object_overwrite_tagged_dataflow() {
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -1177,7 +1177,7 @@ def pipeline p {
         // type mismatch (TypeMismatch). `promote_unknown_idents` should
         // escalate the first and leave the second alone.
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -1231,7 +1231,7 @@ def pipeline p {
     #[test]
     fn def_counts_aggregate_each_kind() {
         let src = r#"
-def input i1 { type tcp bind "0.0.0.0:514" }
+def input i1 { type syslog_tcp bind "0.0.0.0:514" }
 def input i2 { type udp bind "0.0.0.0:514" }
 def output o1 { type stdout }
 def process p { workspace.a = "z" }
@@ -1257,7 +1257,7 @@ def function normalize_proto(num) {
         default { null }
     }
 }
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
@@ -1272,7 +1272,7 @@ def pipeline p { input i; output o }
 def function bad(x) {
     x + len(workspace.foo)
 }
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
@@ -1295,7 +1295,7 @@ def pipeline p { input i; output o }
 def function bad() {
     received_at
 }
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
@@ -1320,7 +1320,7 @@ def function double_then_add_one(n) {
     let result = doubled + 1
     result
 }
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
@@ -1341,7 +1341,7 @@ def function bad(x) {
     let v = x + len(workspace.foo)
     v
 }
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
@@ -1367,7 +1367,7 @@ def function f(x) {
     let v = v * 3
     v
 }
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
@@ -1387,7 +1387,7 @@ def pipeline p { input i; output o }
 def function bad(x) {
     let v = x
 }
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
@@ -1411,7 +1411,7 @@ def pipeline p { input i; output o }
 def function bad(x) {
     config.foo
 }
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
@@ -1433,7 +1433,7 @@ def pipeline p { input i; output o }
 def function rec(x) {
     rec(x)
 }
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
@@ -1452,7 +1452,7 @@ def pipeline p { input i; output o }
         let src = r#"
 def function a(x) { b(x) }
 def function b(x) { a(x) }
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
@@ -1479,7 +1479,7 @@ def process some_proc { workspace.x = 1 }
 def function bad(x) {
     some_proc(x)
 }
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
@@ -1502,7 +1502,7 @@ def pipeline p { input i; output o }
         // to avoid double-flagging.)
         let src = r#"
 def function takes_two(a, b) { a + b }
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -1529,7 +1529,7 @@ def pipeline p {
 def function normalize_proto(num) {
     switch num { 6 { "tcp" } 17 { "udp" } default { null } }
 }
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -1556,7 +1556,7 @@ def pipeline p {
         let src = r#"
 def function f1(x) { x }
 def function f2(x) { x + 1 }
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p { input i; output o }
 "#;
@@ -1579,7 +1579,7 @@ def process bad_subtype {
     workspace.kind = "foo"
     error "unknown subtype: ${workspace.kind}"
 }
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -1606,7 +1606,7 @@ def pipeline p {
 def process bad {
     error "computed: ${lowe("x")}"
 }
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -1627,7 +1627,7 @@ def pipeline p {
     #[test]
     fn error_keyword_at_pipeline_level_passes_check() {
         let src = r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -1651,7 +1651,7 @@ def pipeline p {
 def function bad(x) {
     error "no good"
 }
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p { input i; output o }
 "#;

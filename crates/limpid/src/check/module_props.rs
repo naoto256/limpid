@@ -14,7 +14,8 @@
 //! path: `property_schema() = None` defaults to "do not enforce yet").
 
 use crate::dsl::ast::{Expr, ExprKind, InputDef, OutputDef, Property};
-use crate::dsl::schema as ds;
+use crate::dsl::schema::{self as ds, levenshtein};
+use crate::dsl::span::Span;
 use crate::modules::ModuleRegistry;
 use crate::pipeline::CompiledConfig;
 
@@ -39,10 +40,17 @@ pub(super) fn analyze_all(
 }
 
 fn analyze_input_def(def: &InputDef, registry: &ModuleRegistry, diags: &mut Vec<Diagnostic>) {
-    let Some(type_name) = read_type_ident(&def.properties) else {
+    let Some((type_name, type_span)) = read_type_ident(&def.properties) else {
         return;
     };
     let Some(spec) = registry.input_schema(type_name) else {
+        diags.push(unknown_module_type_diag(
+            "input",
+            &def.name,
+            type_name,
+            type_span,
+            registry.input_type_names(),
+        ));
         return;
     };
     let stripped = strip_type_property(&def.properties);
@@ -54,10 +62,17 @@ fn analyze_input_def(def: &InputDef, registry: &ModuleRegistry, diags: &mut Vec<
 }
 
 fn analyze_output_def(def: &OutputDef, registry: &ModuleRegistry, diags: &mut Vec<Diagnostic>) {
-    let Some(type_name) = read_type_ident(&def.properties) else {
+    let Some((type_name, type_span)) = read_type_ident(&def.properties) else {
         return;
     };
     let Some(spec) = registry.output_schema(type_name) else {
+        diags.push(unknown_module_type_diag(
+            "output",
+            &def.name,
+            type_name,
+            type_span,
+            registry.output_type_names(),
+        ));
         return;
     };
     let stripped = strip_type_property(&def.properties);
@@ -68,10 +83,46 @@ fn analyze_output_def(def: &OutputDef, registry: &ModuleRegistry, diags: &mut Ve
     }
 }
 
-/// Names a Module's `type tcp` style identifier. Bare ident only —
-/// `type "tcp"` (string literal) is not idiomatic and is ignored here;
-/// the runtime would already reject it.
-fn read_type_ident(properties: &[Property]) -> Option<&str> {
+fn unknown_module_type_diag<'a>(
+    surface: &str,
+    name: &str,
+    bad_type: &str,
+    span: Option<Span>,
+    candidates: impl Iterator<Item = &'a str>,
+) -> Diagnostic {
+    let threshold = (bad_type.len() / 3).max(2);
+    let mut best: Option<(&str, usize)> = None;
+    let collected: Vec<&str> = candidates.collect();
+    for cand in &collected {
+        let d = levenshtein(bad_type, cand);
+        if d == 0 || d > threshold {
+            continue;
+        }
+        match best {
+            None => best = Some((cand, d)),
+            Some((bn, bd)) if d < bd || (d == bd && *cand < bn) => best = Some((cand, d)),
+            _ => {}
+        }
+    }
+    let mut diag = Diagnostic::error_kind(
+        DiagKind::PropertySchema,
+        format!(
+            "{} '{}': unknown type '{}'",
+            surface, name, bad_type
+        ),
+    )
+    .with_span(span);
+    if let Some((near, _)) = best {
+        diag = diag.with_help(format!("did you mean `{}`?", near));
+    }
+    diag
+}
+
+/// Names a Module's `type tcp` style identifier and the value span
+/// for the diagnostic caret. Bare ident only — `type "tcp"` (string
+/// literal) is not idiomatic and is ignored here; the runtime would
+/// already reject it.
+fn read_type_ident(properties: &[Property]) -> Option<(&str, Option<Span>)> {
     for prop in properties {
         if let Property::KeyValue {
             key,
@@ -79,11 +130,12 @@ fn read_type_ident(properties: &[Property]) -> Option<&str> {
                 kind: ExprKind::Ident(parts),
                 ..
             },
+            value_span,
             ..
         } = prop
             && key == "type"
         {
-            return parts.first().map(String::as_str);
+            return parts.first().map(|s| (s.as_str(), *value_span));
         }
     }
     None

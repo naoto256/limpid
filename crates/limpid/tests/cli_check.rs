@@ -30,7 +30,7 @@ fn check_clean_emits_summary_and_configuration_ok() {
     fs::write(
         &conf,
         r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p { input i; output o }
 "#,
@@ -68,7 +68,7 @@ fn check_with_warning_still_exits_zero_and_mentions_warnings() {
     fs::write(
         &conf,
         r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -106,7 +106,7 @@ fn check_with_error_emits_error_footer_and_exits_one() {
     fs::write(
         &conf,
         r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type tcp address "${workspace.nope}:1" }
 def pipeline p { input i; output o }
 "#,
@@ -136,7 +136,7 @@ fn check_strict_warnings_promotes_to_exit_two() {
     fs::write(
         &conf,
         r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -170,7 +170,7 @@ fn check_expands_includes_in_summary() {
     fs::create_dir(&inc_dir).unwrap();
     fs::write(
         inc_dir.join("inputs.limpid"),
-        r#"def input i1 { type tcp bind "0.0.0.0:514" }"#,
+        r#"def input i1 { type syslog_tcp bind "0.0.0.0:514" }"#,
     )
     .unwrap();
     fs::write(
@@ -223,8 +223,8 @@ fn graph_conf(dir: &TempDir) -> std::path::PathBuf {
     fs::write(
         &conf,
         r#"
-def input a { type tcp bind "0.0.0.0:514" }
-def input b { type udp bind "0.0.0.0:514" }
+def input a { type syslog_tcp bind "0.0.0.0:514" }
+def input b { type syslog_udp bind "0.0.0.0:514" }
 def output o { type stdout }
 def process parse { workspace.x = "y" }
 def pipeline p {
@@ -335,7 +335,7 @@ fn ultra_strict_promotes_unknown_function_to_error() {
     fs::write(
         &conf,
         r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -373,7 +373,7 @@ fn ultra_strict_leaves_type_mismatch_as_warning() {
     fs::write(
         &conf,
         r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -403,7 +403,7 @@ fn ultra_strict_plus_strict_warnings_mixed_case() {
     fs::write(
         &conf,
         r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -436,7 +436,7 @@ fn strict_warnings_without_ultra_strict_still_exits_two_on_type_warning() {
     fs::write(
         &conf,
         r#"
-def input i { type tcp bind "0.0.0.0:514" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
@@ -655,6 +655,33 @@ def pipeline p { input i; output o }
     assert!(!out.status.success(), "stderr: {}", stderr);
     assert!(stderr.contains("addres"), "stderr missing addres: {}", stderr);
     assert!(stderr.contains("framing"), "stderr missing framing: {}", stderr);
+}
+
+#[test]
+fn check_loudly_rejects_unknown_module_type() {
+    // The runtime would bail at `create_input` with "unknown input
+    // type"; surfacing the same diagnostic at --check time means CI
+    // catches the typo before the daemon ever starts.
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("badtype.conf");
+    fs::write(
+        &conf,
+        r#"
+def input i { type syslog_tcl bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p { input i; output o }
+"#,
+    )
+    .unwrap();
+
+    let out = run_check(&conf);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(!out.status.success(), "stderr: {}", stderr);
+    assert!(
+        stderr.contains("unknown type 'syslog_tcl'") && stderr.contains("syslog_tcp"),
+        "expected unknown-type error with did-you-mean\nstderr: {}",
+        stderr
+    );
 }
 
 #[test]
