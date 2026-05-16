@@ -147,7 +147,7 @@ def process parse_paloalto_cef_traffic {
             port: to_int(workspace.cef.dpt)
         },
         connection_info: {
-            protocol_num:  paloalto_cef_proto_num(workspace.cef.proto),
+            protocol_num:  proto_num(workspace.cef.proto),
             protocol_name: lower(workspace.cef.proto)
         },
         traffic: {

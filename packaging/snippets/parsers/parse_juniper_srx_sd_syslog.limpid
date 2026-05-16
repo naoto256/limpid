@@ -230,7 +230,7 @@ def function juniper_srx_sd_syslog_finding_record(severity_id, status_id, src_ip
         },
         connection_info: {
             protocol_name: proto_name,
-            protocol_num:  juniper_srx_sd_syslog_proto_num(proto_name)
+            protocol_num:  proto_num(proto_name)
         },
         device: {
             hostname: host

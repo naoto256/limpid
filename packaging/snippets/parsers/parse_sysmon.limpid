@@ -185,7 +185,7 @@ def process parse_sysmon_network_connect {
         },
         connection_info: {
             protocol_name: ed.Protocol,
-            protocol_num:  sysmon_proto_num(ed.Protocol),
+            protocol_num:  proto_num(ed.Protocol),
             direction_id:  switch ed.Initiated {
                 "true"  { 1 }                          // Outbound
                 "false" { 2 }                          // Inbound

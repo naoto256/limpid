@@ -154,7 +154,7 @@ def function juniper_srx_syslog_idp_finding_record(src_ip, src_port_str, dst_ip,
             port: to_int(dst_port_str)
         },
         connection_info: {
-            protocol_num:  juniper_srx_syslog_proto_num(proto_name),
+            protocol_num:  proto_num(proto_name),
             protocol_name: proto_name
         },
         device: {

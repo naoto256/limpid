@@ -189,7 +189,7 @@ def process parse_paloalto_syslog_traffic {
             location: { country: workspace.pan.DestinationLocation }
         },
         connection_info: {
-            protocol_num:  paloalto_syslog_proto_num(workspace.pan.IPProtocol),
+            protocol_num:  proto_num(workspace.pan.IPProtocol),
             protocol_name: lower(workspace.pan.IPProtocol)
         },
         traffic: {
