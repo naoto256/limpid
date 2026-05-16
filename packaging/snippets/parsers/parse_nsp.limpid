@@ -1,0 +1,273 @@
+// Trellix / McAfee Network Security Platform (NSP) parser (vocabulary)
+//
+// Vendor:   Trellix (formerly McAfee) Network Security Platform — the
+//           inline IPS appliance product. Wire format below is the
+//           **vendor-recommended standard template** for the syslog
+//           forwarder ("Custom Syslog" notification with the standard
+//           field list). Operators with custom templates would need to
+//           fork this parser; the canonical template covers the
+//           ~95% case.
+// Wire:     Space-separated `key=value` pairs (quoted-string values
+//           when the value contains spaces). The full standard
+//           template field set:
+//             admin_domain alert_id alert_type app_protocol
+//             confidence attack_count attack_id attack_name severity
+//             alert_signature attack_time category dest_ip dest_name
+//             dest_port device_name direction confidence file_name
+//             file_hash file_type virus_name action_status
+//             error_status protocol result src_ip src_name src_port
+//
+//           Note the **duplicate `confidence=` key**: NSP's standard
+//           template emits attack-confidence first and
+//           malware-confidence second under the same key name. The
+//           parser regex-extracts each by position so neither is lost
+//           to last-wins KV parsing.
+// Intake:   workspace.nsp.body      (required, String) — the KV body
+//           workspace.nsp.hostname  (optional, String) — collector-side hostname
+//           workspace.nsp.time      (optional, Int)    — epoch nanoseconds
+// Upstream: NSP sensors forward via syslog (typically UDP/514). The
+//           bridge passes the raw KV body (post-syslog-strip if the
+//           sensor wraps in syslog framing, or `ingress` directly
+//           if not). Two typical bridges:
+//
+//           - syslog transport (sensor emits with syslog wrapper):
+//                 process parse_syslog | {
+//                     workspace.nsp = {
+//                         body:     workspace.syslog.msg,
+//                         hostname: workspace.syslog.hostname,
+//                         time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
+//                     }
+//                 } | parse_nsp | compose_ocsf
+//
+//           - raw forwarder (sensor → text-only forwarder → limpid tail):
+//                 { workspace.nsp = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_nsp | compose_ocsf
+//
+// Output:   OCSF Detection Finding (class_uid 2004) records on
+//           `workspace.limpid`.
+//
+// Sample bodies (synthetic, anonymised to RFC 5737):
+//
+//   Attack alert (no malware fields populated):
+//   admin_domain=Default alert_id=12345 alert_type=Signature app_protocol=HTTP confidence=Tentative attack_count=1 attack_id=0x40000123 attack_name="HTTP: SQL Injection Attempt" severity=High alert_signature="HTTP:SQL-INJ:001" attack_time="2026-05-16 10:00:00" category="Application Layer" dest_ip=192.0.2.10 dest_name=webserver01 dest_port=80 device_name=nsp-sensor-01 direction=Inbound confidence= file_name= file_hash= file_type= virus_name= action_status= error_status= protocol=TCP result=Blocked src_ip=198.51.100.5 src_name= src_port=54321
+//
+//   Malware detection (file + virus fields populated):
+//   admin_domain=Default alert_id=12346 alert_type=Malware app_protocol=SMB confidence=High attack_count=1 attack_id=0x50000456 attack_name="Malware: Win32.Generic Backdoor" severity=Critical alert_signature="MALWARE:WIN32:GEN" attack_time="2026-05-16 10:01:00" category=Malware dest_ip=192.0.2.20 dest_name=fileserver02 dest_port=445 device_name=nsp-sensor-01 direction=Inbound confidence=Definitive file_name="payload.exe" file_hash=d41d8cd98f00b204e9800998ecf8427e file_type=PE32 virus_name=Win32/Generic.Backdoor action_status=blocked error_status= protocol=TCP result=Quarantined src_ip=198.51.100.6 src_name= src_port=54322
+//
+//   Reconnaissance / alert-only (no action taken):
+//   admin_domain=Default alert_id=12347 alert_type=Reconnaissance app_protocol=ICMP confidence=Tentative attack_count=5 attack_id=0x30000789 attack_name="ICMP: Network Sweep" severity=Low alert_signature="ICMP:SWEEP:001" attack_time="2026-05-16 10:02:00" category=Reconnaissance dest_ip=192.0.2.30 dest_name= dest_port= device_name=nsp-sensor-01 direction=Inbound confidence= file_name= file_hash= file_type= virus_name= action_status= error_status= protocol=ICMP result=Alert src_ip=198.51.100.7 src_name= src_port=
+//
+// Coverage scope: synthetic-verified against the Trellix-recommended
+// standard syslog template only. Custom templates (operator-defined
+// field subsets, alternate key names) would need a forked parser.
+// Real-traffic verification pending against a live NSP sensor.
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Map NSP severity ("Informational" / "Low" / "Medium" / "High" /
+// "Critical") to OCSF severity_id.
+def function nsp_severity_id(s) {
+    switch s {
+        "Informational" { 1 }
+        "Low"           { 2 }
+        "Medium"        { 3 }
+        "High"          { 4 }
+        "Critical"      { 5 }
+        default         { 1 }
+    }
+}
+
+// Map NSP protocol name to OCSF protocol_num (IANA).
+def function nsp_protocol_num(p) {
+    switch p {
+        "TCP"    { 6 }
+        "UDP"    { 17 }
+        "ICMP"   { 1 }
+        "ICMPv6" { 58 }
+        "GRE"    { 47 }
+        "ESP"    { 50 }
+        default  { null }
+    }
+}
+
+// Map NSP `result=` to OCSF status_id.
+//   Blocked / Quarantined / Dropped → 2 (Failure — offending traffic stopped)
+//   Alert (alert-only, no action)    → 99 (Other)
+//   Allowed                          → 1 (Success — passed through)
+def function nsp_status_id(r) {
+    switch r {
+        "Blocked"     { 2 }
+        "Quarantined" { 2 }
+        "Dropped"     { 2 }
+        "Allowed"     { 1 }
+        "Alert"       { 99 }
+        default       { 99 }
+    }
+}
+
+// NSP-style direction → OCSF direction_id (1=Inbound, 2=Outbound, 3=Lateral).
+def function nsp_direction_id(d) {
+    switch d {
+        "Inbound"  { 1 }
+        "Outbound" { 2 }
+        "Lateral"  { 3 }
+        default    { 0 }
+    }
+}
+
+// `to_int` that tolerates the empty-string sentinel NSP uses for "no
+// value" (`dest_port=`). Returns null instead of erroring.
+def function nsp_to_int_opt(s) {
+    switch true {
+        s == null { null }
+        s == ""   { null }
+        default   { to_int(s) }
+    }
+}
+
+// `attack_confidence` and `malware_confidence` both use the bare key
+// `confidence=` in the standard template (attack first, malware
+// second). parse_kv last-wins would lose the attack value, so we
+// regex-extract both by ordered position.
+def function parse_nsp_confidence(body) {
+    let m = regex_parse(
+        body,
+        "confidence=(?P<attack>\\S*).*confidence=(?P<malware>\\S*)"
+    )
+    switch true {
+        m == null { { attack: null, malware: null } }
+        default   { { attack: m.attack, malware: m.malware } }
+    }
+}
+
+// Build the OCSF Detection Finding (2004) record. `nsp` is the
+// parse_kv result; `confs` is the per-confidence object from
+// `parse_nsp_confidence`.
+def function nsp_finding_record(nsp, confs, host, time_ns) {
+    {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:  1,                                // Create (new finding)
+        severity_id:  nsp_severity_id(nsp.severity),
+        status_id:    nsp_status_id(nsp.result),
+        time:         time_ns,
+        finding_info: {
+            uid:                nsp.alert_id,
+            title:              nsp.attack_name,
+            types:              ["Network IDS"],
+            confidence:         confs.attack,
+            analytic: {
+                name: nsp.alert_signature,
+                uid:  nsp.attack_id
+            }
+        },
+        attacks: [{
+            technique: {
+                name: nsp.attack_name,
+                uid:  nsp.attack_id
+            }
+        }],
+        malware: switch true {
+            nsp.virus_name != null and nsp.virus_name != "" {
+                [{
+                    name:        nsp.virus_name,
+                    classification_ids: [99],
+                    provider:    "Trellix NSP"
+                }]
+            }
+            default { null }
+        },
+        evidences: switch true {
+            nsp.file_hash != null and nsp.file_hash != "" {
+                [{
+                    file: {
+                        name: switch true {
+                            nsp.file_name != "" { nsp.file_name }
+                            default             { null }
+                        },
+                        type: switch true {
+                            nsp.file_type != "" { nsp.file_type }
+                            default             { null }
+                        },
+                        hashes: [{
+                            algorithm_id: 1,                  // 1=MD5 (NSP standard hash)
+                            value:        nsp.file_hash
+                        }]
+                    }
+                }]
+            }
+            default { null }
+        },
+        src_endpoint: {
+            ip:        nsp.src_ip,
+            port:      nsp_to_int_opt(nsp.src_port),
+            hostname:  switch true {
+                nsp.src_name != "" { nsp.src_name }
+                default            { null }
+            }
+        },
+        dst_endpoint: {
+            ip:        nsp.dest_ip,
+            port:      nsp_to_int_opt(nsp.dest_port),
+            hostname:  switch true {
+                nsp.dest_name != "" { nsp.dest_name }
+                default             { null }
+            }
+        },
+        connection_info: {
+            protocol_num:  nsp_protocol_num(nsp.protocol),
+            protocol_name: nsp.protocol,
+            direction_id:  nsp_direction_id(nsp.direction)
+        },
+        app_name: nsp.app_protocol,
+        device: {
+            hostname: coalesce(nsp.device_name, host)
+        },
+        unmapped: {
+            admin_domain:  nsp.admin_domain,
+            alert_type:    nsp.alert_type,
+            category:      nsp.category,
+            attack_count:  nsp.attack_count,
+            attack_time:   nsp.attack_time,
+            malware_confidence: confs.malware,
+            action_status: nsp.action_status,
+            error_status:  nsp.error_status,
+            result:        nsp.result
+        },
+        metadata: {
+            product: {
+                vendor_name: "Trellix",
+                name:        "Network Security Platform"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main parser
+// ---------------------------------------------------------------------------
+
+def process parse_nsp {
+    // @requires: workspace.nsp.body      (required, String)
+    // @requires: workspace.nsp.hostname  (optional, String)
+    // @requires: workspace.nsp.time      (optional, Int — epoch ns)
+    workspace.nsp_kv = parse_kv(workspace.nsp.body)
+    workspace.nsp_confs = parse_nsp_confidence(workspace.nsp.body)
+    switch true {
+        // alert_id is mandatory in the NSP standard template; its
+        // absence means this is not a Trellix NSP custom-syslog body.
+        workspace.nsp_kv.alert_id == null {
+            error "parse_nsp: not a Trellix NSP standard-template body (no alert_id): ${workspace.nsp.body}"
+        }
+        default {
+            workspace.limpid = nsp_finding_record(
+                workspace.nsp_kv,
+                workspace.nsp_confs,
+                workspace.nsp.hostname,
+                workspace.nsp.time
+            )
+        }
+    }
+}

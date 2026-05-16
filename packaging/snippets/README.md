@@ -39,6 +39,7 @@ prefix.
 | `parsers/parse_cloudtrail.limpid` | AWS CloudTrail (JSON) | 6003 API Activity |
 | `parsers/parse_juniper_srx_sd_syslog.limpid` | Juniper SRX RT_FLOW (RFC 5424 + Junos SD, `set security log format sd-syslog` mode) | 4001 Network Activity |
 | `parsers/parse_juniper_srx_syslog.limpid` | Juniper SRX RT_IDP / IDP_ATTACK_LOG_EVENT (RFC 3164 unstructured, default `syslog` mode) | 2004 Detection Finding |
+| `parsers/parse_nsp.limpid` | Trellix / McAfee Network Security Platform IPS alerts (standard syslog KV template) | 2004 Detection Finding |
 | `parsers/parse_checkpoint.limpid` | Check Point LEEF 2.0 (Accept / Drop / Reject / Block) | 4001 Network Activity |
 | **Server / host vocabulary** | | |
 | `parsers/parse_openssh.limpid` | OpenSSH `sshd` body (transport-agnostic; bridge from `parse_syslog` or `parse_journald`) | 3002 Authentication |

@@ -91,6 +91,7 @@ major SIEM sources covering additional major sources:
 |---|---|---|
 | `parse_juniper_srx_sd_syslog` | Juniper Junos SRX RT_FLOW SESSION_CREATE / CLOSE / DENY (RFC 5424 wire + `[junos@2636 ...]` structured data — `set security log format sd-syslog` mode) | 4001 |
 | `parse_juniper_srx_syslog` | Juniper Junos SRX RT_IDP / IDP_ATTACK_LOG_EVENT (RFC 3164 unstructured syslog — `set security log format syslog` default mode) — real-traffic verified against a real SRX | 2004 |
+| `parse_nsp` | Trellix / McAfee Network Security Platform (NSP) IPS alerts in the vendor-recommended standard syslog KV template (handles the duplicate `confidence=` key for attack vs. malware confidence by ordered regex extraction) | 2004 |
 | `parse_checkpoint` | Check Point LEEF 2.0 traffic events (Accept / Drop / Reject / Block) inside a syslog wrapper | 4001 |
 | `parse_sysmon` | Microsoft Sysmon EventID 1 (ProcessCreate) / 3 (NetworkConnect) / 11 (FileCreate), as JSON via NXLog / Vector / Winlogbeat | 1007 / 4001 / 1001 |
 | `parse_bind` | ISC BIND 9 `querylog` text format (`category queries`) | 4003 |
