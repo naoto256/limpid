@@ -19,11 +19,14 @@ use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
 
-const UDP_OUTPUT_SCHEMA: &[PropertySpec] = &[PropertySpec {
-    name: "address",
-    required: true,
-    kind: PropertyValueKind::String,
-}];
+const UDP_OUTPUT_SCHEMA: &[PropertySpec] = &[
+    PropertySpec {
+        name: "address",
+        required: true,
+        kind: PropertyValueKind::String,
+    },
+    crate::queue::QUEUE_PROPERTY_SPEC,
+];
 
 struct UdpPayload {
     egress: Bytes,

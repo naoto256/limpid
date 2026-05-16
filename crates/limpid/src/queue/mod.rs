@@ -12,8 +12,60 @@ use tracing::{error, info, warn};
 
 use crate::dsl::ast::Property;
 use crate::dsl::props;
+use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::modules::RenderedPayload;
+
+// ---------------------------------------------------------------------------
+// Declarative schema for the per-output `queue { ... }` sub-block
+// ---------------------------------------------------------------------------
+//
+// Every output supports the same `queue { type / path / max_size /
+// capacity }` block, parsed by `QueueConfig::from_output_properties`
+// below. We declare its shape once so every Module's
+// `property_schema()` can splice in `QUEUE_PROPERTY_SPEC` instead of
+// repeating the same four entries. Keeping the schema co-located with
+// the parsing code is intentional — if a queue option is renamed
+// here, both surfaces update in the same edit.
+
+const QUEUE_BLOCK_PROPERTIES: &[PropertySpec] = &[
+    PropertySpec {
+        name: "type",
+        required: false,
+        kind: PropertyValueKind::Enum(&["memory", "disk"]),
+    },
+    PropertySpec {
+        name: "path",
+        required: false,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "max_size",
+        required: false,
+        kind: PropertyValueKind::Size,
+    },
+    PropertySpec {
+        name: "capacity",
+        required: false,
+        kind: PropertyValueKind::Int,
+    },
+];
+
+/// `queue { ... }` sub-block specification shared by every output
+/// Module's property schema. Spread into a Module schema as a single
+/// `PropertySpec` value:
+///
+/// ```ignore
+/// const TCP_OUTPUT_SCHEMA: &[PropertySpec] = &[
+///     PropertySpec { name: "address", ... },
+///     crate::queue::QUEUE_PROPERTY_SPEC,
+/// ];
+/// ```
+pub const QUEUE_PROPERTY_SPEC: PropertySpec = PropertySpec {
+    name: "queue",
+    required: false,
+    kind: PropertyValueKind::Block(QUEUE_BLOCK_PROPERTIES),
+};
 
 // ---------------------------------------------------------------------------
 // SinkInput — what flows over the per-output queue

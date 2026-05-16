@@ -45,6 +45,7 @@ const TCP_OUTPUT_SCHEMA: &[PropertySpec] = &[
         required: false,
         kind: PropertyValueKind::Enum(&["octet_counting", "non_transparent"]),
     },
+    crate::queue::QUEUE_PROPERTY_SPEC,
 ];
 
 struct TcpPayload {
