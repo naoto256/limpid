@@ -11,12 +11,59 @@ use tracing::{debug, error, info, warn};
 
 use crate::dsl::ast::Property;
 use crate::dsl::props;
+use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::modules::{HasMetrics, Input, Module};
 use crate::tls::TlsConfig;
 
 use super::rate_limit::RateLimiter;
 use super::syslog_tcp::TcpFraming;
+
+const SYSLOG_TLS_TLS_BLOCK_PROPERTIES: &[PropertySpec] = &[
+    PropertySpec {
+        name: "cert",
+        required: true,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "key",
+        required: true,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "ca",
+        required: false,
+        kind: PropertyValueKind::String,
+    },
+];
+
+const SYSLOG_TLS_INPUT_SCHEMA: &[PropertySpec] = &[
+    PropertySpec {
+        name: "bind",
+        required: false,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "framing",
+        required: false,
+        kind: PropertyValueKind::Enum(&["auto", "octet_counting", "non_transparent"]),
+    },
+    PropertySpec {
+        name: "tls",
+        required: true,
+        kind: PropertyValueKind::Block(SYSLOG_TLS_TLS_BLOCK_PROPERTIES),
+    },
+    PropertySpec {
+        name: "rate_limit",
+        required: false,
+        kind: PropertyValueKind::Int,
+    },
+    PropertySpec {
+        name: "max_connections",
+        required: false,
+        kind: PropertyValueKind::Int,
+    },
+];
 
 /// Syslog TCP+TLS input: listens on a TCP socket with TLS encryption.
 ///
@@ -32,6 +79,10 @@ pub struct SyslogTlsInput {
 }
 
 impl Module for SyslogTlsInput {
+    fn property_schema() -> Option<&'static [PropertySpec]> {
+        Some(SYSLOG_TLS_INPUT_SCHEMA)
+    }
+
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
         let bind =
             props::get_string(properties, "bind").unwrap_or_else(|| "0.0.0.0:6514".to_string());
