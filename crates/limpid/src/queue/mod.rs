@@ -380,14 +380,23 @@ pub enum BackoffStrategy {
     Fixed,
 }
 
-/// Trait for output writers usable in queue consumers.
+/// Narrow `dyn`-safe adapter the queue consumer holds onto an output
+/// through. Lives separately from [`Output`] (in `modules::mod`) on
+/// purpose: `Output` carries `render`, which takes a `BorrowedEvent`
+/// tied to the per-event arena — that lifetime makes the trait object
+/// non-object-safe for the queue's `Box<dyn _>` storage, and the
+/// hot-path `render` isn't called from the queue side anyway.
 ///
-/// The queue carries `SinkInput`, which is either a `Rendered` payload
-/// (built by the pipeline via `Output::render`) or an `Owned` event
-/// (disk-queue replay, control-socket inject — paths that bypass
-/// pipeline rendering). Implementors dispatch on the variant.
+/// Currently the only implementer is `modules::OutputWriterWrapper`,
+/// which forwards `consume` to the underlying `Arc<dyn Output>`. The
+/// trait is intentionally 1-impl: it exists as a **dyn-safety
+/// boundary**, not as an extension point, and stays that shape until
+/// a second writer kind appears (e.g. a side-channel sink that
+/// consumes `SinkInput` without going through a full `Output`).
 ///
-/// Uses `async_trait` for dyn compatibility (required by plugin registry).
+/// `SinkInput` discriminates between a pipeline-rendered payload
+/// (memory-queue hot path) and an `OwnedEvent` (disk-queue replay,
+/// control-socket inject). Implementors dispatch on the variant.
 #[async_trait::async_trait]
 pub trait OutputWriter: Send + Sync + 'static {
     async fn consume(&self, input: SinkInput) -> anyhow::Result<()>;
