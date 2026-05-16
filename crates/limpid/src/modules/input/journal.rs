@@ -41,12 +41,31 @@ use tracing::{error, info, warn};
 
 use crate::dsl::ast::Property;
 use crate::dsl::props;
+use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::InputMetrics;
 use crate::modules::{HasMetrics, Input, Module};
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const JOURNAL_SOURCE: &str = "127.0.0.1:0";
+
+const JOURNAL_INPUT_SCHEMA: &[PropertySpec] = &[
+    PropertySpec {
+        name: "match",
+        required: false,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "state_file",
+        required: false,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "poll_interval",
+        required: false,
+        kind: PropertyValueKind::Duration,
+    },
+];
 
 pub struct JournalInput {
     matches: Vec<String>,
@@ -56,6 +75,10 @@ pub struct JournalInput {
 }
 
 impl Module for JournalInput {
+    fn property_schema() -> Option<&'static [PropertySpec]> {
+        Some(JOURNAL_INPUT_SCHEMA)
+    }
+
     fn from_properties(_name: &str, properties: &[Property]) -> Result<Self> {
         let mut matches = Vec::new();
         if let Some(m) = props::get_string(properties, "match") {
