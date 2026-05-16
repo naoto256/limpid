@@ -6,6 +6,7 @@
 //! at most two typos, longer ones get more latitude. We never suggest
 //! when nothing's close — silence beats a wrong guess.
 
+use crate::dsl::schema::levenshtein;
 use crate::functions::FunctionRegistry;
 
 use super::bindings::Bindings;
@@ -71,51 +72,15 @@ fn pick_best(needle: &str, candidates: &[String]) -> Option<String> {
     best.map(|(n, _)| n)
 }
 
-/// Standard Levenshtein edit distance. O(|a|*|b|) time, O(min(|a|,|b|))
-/// memory. Case-sensitive on purpose — DSL identifiers are
-/// case-sensitive and `User` vs `user` is meaningful.
-pub fn levenshtein(a: &str, b: &str) -> usize {
-    if a == b {
-        return 0;
-    }
-    let a_chars: Vec<char> = a.chars().collect();
-    let b_chars: Vec<char> = b.chars().collect();
-    if a_chars.is_empty() {
-        return b_chars.len();
-    }
-    if b_chars.is_empty() {
-        return a_chars.len();
-    }
-    let (short, long) = if a_chars.len() <= b_chars.len() {
-        (&a_chars, &b_chars)
-    } else {
-        (&b_chars, &a_chars)
-    };
-    let mut prev: Vec<usize> = (0..=short.len()).collect();
-    let mut curr = vec![0usize; short.len() + 1];
-    for (i, lc) in long.iter().enumerate() {
-        curr[0] = i + 1;
-        for (j, sc) in short.iter().enumerate() {
-            let cost = if lc == sc { 0 } else { 1 };
-            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-    prev[short.len()]
-}
+// Levenshtein lives in `dsl::schema` so the schema validator (which
+// cannot depend upward on `check`) can use the same routine. We import
+// it above; the analyzer uses `pick_best` below to apply the
+// threshold + tie-break rules that surrounding analyzer diagnostics
+// share.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn levenshtein_basic() {
-        assert_eq!(levenshtein("kitten", "sitting"), 3);
-        assert_eq!(levenshtein("foo", "foo"), 0);
-        assert_eq!(levenshtein("", "abc"), 3);
-        assert_eq!(levenshtein("abc", ""), 3);
-        assert_eq!(levenshtein("hostname", "hostnmae"), 2);
-    }
 
     #[test]
     fn pick_best_prefers_closer_then_alpha() {

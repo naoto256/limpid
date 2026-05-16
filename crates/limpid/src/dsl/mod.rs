@@ -10,6 +10,7 @@ pub mod exec;
 mod exec_test;
 pub mod parser;
 pub mod props;
+pub mod schema;
 pub mod span;
 pub mod value;
 pub mod value_json;
