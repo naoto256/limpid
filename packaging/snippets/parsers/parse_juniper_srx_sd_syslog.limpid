@@ -1,31 +1,25 @@
-// Juniper SRX flow log parser (vocabulary)
+// Juniper SRX structured-data syslog parser (vocabulary)
 //
-// Vendor:   Juniper Networks SRX series (and vSRX) — Junos OS' flow
-//           security daemon emits RT_FLOW_SESSION_* RFC 5424 records
-//           with a `[junos@2636 ...]` structured-data block carrying
-//           the session metadata. Not MX/EX/QFX (which emit different
-//           shapes); not Cisco ASA, not Palo Alto — each in its own
-//           parser file.
-// Wire:     RFC 5424 syslog with a Junos structured-data block:
-//             <PRI>1 <ts> <host> RT_FLOW - <MSGID> [junos@2636.1.1.1.2.39 key="val" key="val" ...]
-//           MSGID is one of:
-//             RT_FLOW_SESSION_CREATE  — session start
-//             RT_FLOW_SESSION_CLOSE   — session end (with reason)
-//             RT_FLOW_SESSION_DENY    — session denied by policy
-//           Other RT_FLOW MSGIDs (RT_FLOW_NEXT_HOP_CHANGE, etc.) and
-//           non-flow daemons (RT_IDS, RT_UTM, RT_SCREEN) emit
-//           different SD shapes and route to error_log.
-// Intake:   workspace.juniper_srx_sd_syslog.body      (required, String) — the full RFC 5424 wire
-//                                            INCLUDING the leading `<PRI>1` (the parser
-//                                            extracts MSGID and SD directly via regex;
-//                                            it does NOT consume an upstream parse_syslog)
-//           workspace.juniper_srx_sd_syslog.hostname  (optional, String) — collector-side hostname override
+// Vendor:   Juniper Networks SRX series (and vSRX) — Junos OS'
+//           security log subsystem in `set security log format
+//           sd-syslog` mode. Covers the daemons that emit a
+//           `[junos@<EID> ...]` structured-data block: RT_FLOW,
+//           RT_IDP, RT_IDS (Screen), RT_UTM, RT_AAMW (Sky ATP /
+//           Advanced Anti-Malware), RT_SECINTEL.
+// Wire:     RFC 5424 + Junos structured-data block:
+//             <PRI>1 <ts> <host> RT_<DAEMON> - <MSGID> [junos@<EID> key="val" ...]
+//           Every daemon shares this outer shape; the SD KV
+//           contents differ per MSGID. Field order inside SD is
+//           NOT stable across Junos versions, so this parser
+//           extracts every field by name independently.
+// Intake:   workspace.juniper_srx_sd_syslog.body      (required, String) — the full RFC 5424 wire INCLUDING the leading `<PRI>1`
+//           workspace.juniper_srx_sd_syslog.hostname  (optional, String) — collector-side override (parser prefers the wire's HOSTNAME field via classify)
 //           workspace.juniper_srx_sd_syslog.time      (optional, Int)    — epoch nanoseconds of arrival
-// Upstream: SRX appliances emit syslog (UDP/514 or TCP/514 typically).
-//           The bridge passes the raw wire — parse_syslog is NOT used
+// Upstream: SRX appliances emit syslog (UDP/514 or TCP/514). The
+//           bridge passes the raw wire — parse_syslog is not used
 //           because limpid's syslog.parse does not expose the
-//           structured-data block, and SRX's session metadata lives
-//           entirely in SD. Two typical bridges:
+//           structured-data block, and the SRX session metadata
+//           lives entirely in SD. Two typical bridges:
 //
 //           - syslog (UDP/TCP):
 //                 { workspace.juniper_srx_sd_syslog = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_juniper_srx_sd_syslog | compose_ocsf
@@ -33,28 +27,33 @@
 //           - tail of a forwarded text file:
 //                 { workspace.juniper_srx_sd_syslog = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_juniper_srx_sd_syslog | compose_ocsf
 //
-// Output:   OCSF Network Activity (class_uid 4001) records on
-//           `workspace.limpid`. activity_id is 1 (Open) for
-//           SESSION_CREATE, 2 (Close) for SESSION_CLOSE, and 6 (Deny)
-//           for SESSION_DENY.
+// Output:   OCSF records on `workspace.limpid`. The class depends
+//           on the daemon / MSGID:
+//             RT_FLOW (incl. APPTRACK_*)                                            → 4001 Network Activity
+//             RT_IDP (IDP_ATTACK_LOG_EVENT, IDP_APPDDOS_*)                          → 2004 Detection Finding
+//             RT_IDS (RT_SCREEN_*)                                                  → 2004 Detection Finding
+//             RT_UTM AV_*, ANTISPAM_*, CONTENT_FILTERING_*                          → 2004 Detection Finding
+//             RT_UTM WEBFILTER_URL_BLOCKED / _PERMITTED                             → 4002 HTTP Activity
+//             RT_AAMW (AAMW_*_LOG, SRX_AAMW_ACTION_LOG)                             → 2004 Detection Finding
+//             RT_SECINTEL (SECINTEL_ACTION_LOG)                                     → 2004 Detection Finding
 //
-// Sample wire (anonymised to RFC 5737):
+//           `_LS` (Logical Systems) variants of any MSGID share
+//           the SD shape with their non-`_LS` counterpart and
+//           route through the same leaf.
 //
-//   SESSION_CREATE (TCP/443 allowed, default-policy):
-//   <14>1 2026-04-30T01:23:45.123Z srx01.example.com RT_FLOW - RT_FLOW_SESSION_CREATE [junos@2636.1.1.1.2.39 source-address="192.0.2.10" source-port="51234" destination-address="198.51.100.5" destination-port="443" connection-tag="0" service-name="junos-https" nat-source-address="192.0.2.10" nat-source-port="51234" nat-destination-address="198.51.100.5" nat-destination-port="443" nat-connection-tag="0" src-nat-rule-type="N/A" src-nat-rule-name="None" dst-nat-rule-type="N/A" dst-nat-rule-name="None" protocol-id="6" policy-name="default-permit" source-zone-name="trust" destination-zone-name="untrust" session-id-32="12345" username="N/A" roles="N/A" packet-incoming-interface="ge-0/0/0.0" application="UNKNOWN" nested-application="UNKNOWN" encrypted="UNKNOWN"]
-//
-//   SESSION_CLOSE (with reason + byte / packet counts):
-//   <14>1 2026-04-30T01:24:45.456Z srx01.example.com RT_FLOW - RT_FLOW_SESSION_CLOSE [junos@2636.1.1.1.2.39 reason="TCP FIN" source-address="192.0.2.10" source-port="51234" destination-address="198.51.100.5" destination-port="443" service-name="junos-https" nat-source-address="192.0.2.10" nat-source-port="51234" nat-destination-address="198.51.100.5" nat-destination-port="443" src-nat-rule-name="None" dst-nat-rule-name="None" protocol-id="6" policy-name="default-permit" source-zone-name="trust" destination-zone-name="untrust" session-id-32="12345" packets-from-client="42" bytes-from-client="3456" packets-from-server="38" bytes-from-server="89012" elapsed-time="60" application="UNKNOWN" nested-application="UNKNOWN" username="N/A" roles="N/A" packet-incoming-interface="ge-0/0/0.0" encrypted="UNKNOWN"]
-//
-//   SESSION_DENY (policy denied the session at setup):
-//   <14>1 2026-04-30T01:25:00.789Z srx01.example.com RT_FLOW - RT_FLOW_SESSION_DENY [junos@2636.1.1.1.2.39 source-address="192.0.2.10" source-port="55555" destination-address="198.51.100.99" destination-port="3389" connection-tag="0" service-name="junos-rdp" application="UNKNOWN" nested-application="UNKNOWN" nat-source-address="192.0.2.10" nat-source-port="55555" nat-destination-address="198.51.100.99" nat-destination-port="3389" protocol-id="6" icmp-type="0" policy-name="deny-rdp-outbound" source-zone-name="trust" destination-zone-name="untrust" application-category="N/A" application-sub-category="N/A" application-risk="-1" application-characteristics="N/A" encrypted="No" reason="policy deny" session-id-32="0" username="N/A" roles="N/A" packet-incoming-interface="ge-0/0/0.0"]
+// Coverage scope: sd-syslog mode only. For unstructured `syslog`
+// mode (default Junos format with no SD block, e.g. RT_IDP /
+// IDP_ATTACK_LOG_EVENT in plain text) see
+// `parse_juniper_srx_syslog.limpid`. Verified against the
+// elastic/integrations juniper_srx test fixtures (88 events
+// covering RT_FLOW / APPTRACK / RT_IDP / RT_IDS / RT_UTM /
+// RT_AAMW / RT_SECINTEL).
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Shared helpers
 // ---------------------------------------------------------------------------
 
-// Map Junos protocol-id (IANA protocol number as string) to OCSF
-// connection_info.protocol_name.
+// Map Junos protocol-id (IANA number as string) to OCSF protocol_name.
 def function juniper_srx_sd_syslog_proto_name(p) {
     switch p {
         "1"   { "ICMP" }
@@ -68,7 +67,94 @@ def function juniper_srx_sd_syslog_proto_name(p) {
     }
 }
 
-def function juniper_srx_sd_syslog_network_record(activity_id, status_id, severity_id, src_ip, src_port_str, dst_ip, dst_port_str, proto_str, policy, src_zone, dst_zone, session_id, app, reason, msgid, host, time_ns) {
+// Map Junos protocol-name (TCP/UDP/ICMP/...) to OCSF protocol_num
+// (IANA). Inverse of the above for daemons that emit protocol-name
+// instead of protocol-id (RT_IDP).
+def function juniper_srx_sd_syslog_proto_num(name) {
+    switch name {
+        "TCP"    { 6 }
+        "UDP"    { 17 }
+        "ICMP"   { 1 }
+        "ICMPv6" { 58 }
+        "GRE"    { 47 }
+        "ESP"    { 50 }
+        "AH"     { 51 }
+        default  { null }
+    }
+}
+
+// Map Junos threat-severity to OCSF severity_id (1-5).
+def function juniper_srx_sd_syslog_severity_id(s) {
+    switch s {
+        "INFO"     { 1 }
+        "LOW"      { 2 }
+        "MEDIUM"   { 3 }
+        "HIGH"     { 4 }
+        "CRITICAL" { 5 }
+        default    { 1 }
+    }
+}
+
+// Map Junos action to OCSF status_id.
+//   DROP / BLOCK / DENY / REJECT / drop / CLOSE → 2 Failure (blocked)
+//   PERMIT / ALLOW / permit / accept              → 1 Success (passed)
+//   anything else (NONE / IGNORE / log-only)      → 99 Other
+def function juniper_srx_sd_syslog_status_id(action) {
+    switch action {
+        "DROP"   { 2 }
+        "BLOCK"  { 2 }
+        "DENY"   { 2 }
+        "REJECT" { 2 }
+        "drop"   { 2 }
+        "block"  { 2 }
+        "deny"   { 2 }
+        "CLOSE"  { 2 }
+        "PERMIT" { 1 }
+        "ALLOW"  { 1 }
+        "permit" { 1 }
+        "accept" { 1 }
+        default  { 99 }
+    }
+}
+
+// Extract one SD field by name. SD KV order is NOT stable across
+// Junos versions / MSGIDs, so each field is captured independently.
+def function parse_juniper_srx_sd_syslog_kv(sd, name) {
+    let m = regex_parse(sd, "${name}=\"(?P<v>[^\"]*)\"")
+    switch true {
+        m == null { null }
+        default   { m.v }
+    }
+}
+
+// Convenience: lookup with empty-string / "N/A" normalisation
+// (Junos commonly emits `key="N/A"` for "no value").
+def function parse_juniper_srx_sd_syslog_kv_or_null(sd, name) {
+    let v = parse_juniper_srx_sd_syslog_kv(sd, name)
+    switch true {
+        v == null  { null }
+        v == "N/A" { null }
+        v == ""    { null }
+        default    { v }
+    }
+}
+
+// `to_int` that tolerates null / empty (returns null instead of erroring).
+def function juniper_srx_sd_syslog_int_opt(s) {
+    switch true {
+        s == null  { null }
+        s == ""    { null }
+        s == "N/A" { null }
+        default    { to_int(s) }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Record builders (per OCSF class)
+// ---------------------------------------------------------------------------
+
+// 4001 Network Activity (RT_FLOW / APPTRACK).
+def function juniper_srx_sd_syslog_network_record(activity_id, status_id, severity_id, src_ip, src_port_str, dst_ip, dst_port_str, proto_str, policy, src_zone, dst_zone, session_id, app, bytes_in_str, bytes_out_str, packets_in_str, packets_out_str, reason, msgid, host, time_ns) {
     {
         class_uid:    4001,
         category_uid: 4,
@@ -78,20 +164,26 @@ def function juniper_srx_sd_syslog_network_record(activity_id, status_id, severi
         time:         time_ns,
         src_endpoint: {
             ip:   src_ip,
-            port: to_int(src_port_str),
+            port: juniper_srx_sd_syslog_int_opt(src_port_str),
             zone: src_zone
         },
         dst_endpoint: {
             ip:   dst_ip,
-            port: to_int(dst_port_str),
+            port: juniper_srx_sd_syslog_int_opt(dst_port_str),
             zone: dst_zone
         },
         connection_info: {
-            protocol_num:  to_int(proto_str),
+            protocol_num:  juniper_srx_sd_syslog_int_opt(proto_str),
             protocol_name: juniper_srx_sd_syslog_proto_name(proto_str),
             session: {
                 uid: session_id
             }
+        },
+        traffic: {
+            bytes_in:    juniper_srx_sd_syslog_int_opt(bytes_in_str),
+            bytes_out:   juniper_srx_sd_syslog_int_opt(bytes_out_str),
+            packets_in:  juniper_srx_sd_syslog_int_opt(packets_in_str),
+            packets_out: juniper_srx_sd_syslog_int_opt(packets_out_str)
         },
         app_name: app,
         device: {
@@ -112,38 +204,178 @@ def function juniper_srx_sd_syslog_network_record(activity_id, status_id, severi
     }
 }
 
-// Classify the RT_FLOW MSGID. Returns `{kind, fields}` where fields
-// is the regex_parse output of the SD KV block, or null on a
-// non-matching line.
+// 2004 Detection Finding (RT_IDP / RT_IDS / RT_UTM AV/Spam/Content /
+// RT_AAMW / RT_SECINTEL). Common skeleton.
+def function juniper_srx_sd_syslog_finding_record(severity_id, status_id, src_ip, src_port_str, dst_ip, dst_port_str, proto_name, sig_id, sig_name, technique_name, finding_types, action, policy, rule, rulebase, src_zone, dst_zone, msgid, host, time_ns, extra_unmapped) {
+    {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:  1,
+        severity_id:  severity_id,
+        status_id:    status_id,
+        time:         time_ns,
+        finding_info: {
+            uid:   sig_id,
+            title: sig_name,
+            types: finding_types,
+            analytic: {
+                name: rule,
+                uid:  sig_id
+            }
+        },
+        attacks: [{
+            technique: {
+                name: technique_name,
+                uid:  sig_id
+            }
+        }],
+        src_endpoint: {
+            ip:   src_ip,
+            port: juniper_srx_sd_syslog_int_opt(src_port_str),
+            zone: src_zone
+        },
+        dst_endpoint: {
+            ip:   dst_ip,
+            port: juniper_srx_sd_syslog_int_opt(dst_port_str),
+            zone: dst_zone
+        },
+        connection_info: {
+            protocol_name: proto_name,
+            protocol_num:  juniper_srx_sd_syslog_proto_num(proto_name)
+        },
+        device: {
+            hostname: host
+        },
+        unmapped: {
+            msgid:         msgid,
+            action:        action,
+            policy_name:   policy,
+            rule_name:     rule,
+            rulebase_name: rulebase,
+            extra:         extra_unmapped
+        },
+        metadata: {
+            product: {
+                vendor_name: "Juniper Networks",
+                name:        "Junos OS (SRX)"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// 4002 HTTP Activity (RT_UTM WEBFILTER_URL_BLOCKED / _PERMITTED).
+def function juniper_srx_sd_syslog_http_record(status_id, severity_id, src_ip, src_port_str, dst_ip, dst_port_str, url, category, reason, profile, username, msgid, host, time_ns) {
+    {
+        class_uid:    4002,
+        category_uid: 4,
+        activity_id:  3,
+        severity_id:  severity_id,
+        status_id:    status_id,
+        time:         time_ns,
+        src_endpoint: {
+            ip:   src_ip,
+            port: juniper_srx_sd_syslog_int_opt(src_port_str)
+        },
+        dst_endpoint: {
+            ip:   dst_ip,
+            port: juniper_srx_sd_syslog_int_opt(dst_port_str)
+        },
+        actor: {
+            user: { name: username }
+        },
+        http_request: {
+            url: { url_string: url }
+        },
+        device: {
+            hostname: host
+        },
+        unmapped: {
+            msgid:    msgid,
+            category: category,
+            reason:   reason,
+            profile:  profile
+        },
+        metadata: {
+            product: {
+                vendor_name: "Juniper Networks",
+                name:        "Junos OS (SRX UTM)"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Classifier
+// ---------------------------------------------------------------------------
+
 def function parse_juniper_srx_sd_syslog_classify(body) {
+    // Two SD bracket forms seen across Junos versions / vSRX builds:
+    //   - `[junos@<EID> <KV>]`  — traditional, with the IANA-style
+    //                              enterprise-id prefix (Junos < ~2023)
+    //   - `[<KV>]`              — newer vSRX (~2023+) omits the
+    //                              `junos@<EID>` prefix and emits the
+    //                              KV directly inside the brackets
+    // The `(?:junos@\S+ )?` group makes the prefix optional.
     let header = regex_parse(
         body,
-        "^<\\d+>1 \\S+ (?P<host>\\S+) RT_FLOW - (?P<msgid>RT_FLOW_SESSION_\\w+) \\[junos@\\S+ (?P<sd>.*)\\]\\s*$"
+        "^<\\d+>1 \\S+ (?P<host>\\S+) RT_(?P<daemon>[A-Z]+) - (?P<msgid>[A-Z][A-Z0-9_]+) \\[(?:junos@\\S+ )?(?P<sd>.*)\\]\\s*$"
     )
     switch true {
         header == null { null }
-        header.msgid == "RT_FLOW_SESSION_CREATE" { { kind: "create", header: header } }
-        header.msgid == "RT_FLOW_SESSION_CLOSE"  { { kind: "close",  header: header } }
-        header.msgid == "RT_FLOW_SESSION_DENY"   { { kind: "deny",   header: header } }
-        default                                  { { kind: "other",  header: header } }
+        default        { header }
     }
 }
 
-// Extract one SD field by name. SD KV order is NOT stable across
-// Junos versions / MSGIDs (e.g. `application=` appears before
-// `policy-name=` on SESSION_DENY but after `session-id-32=` on
-// SESSION_CREATE), so each field is captured independently.
-def function parse_juniper_srx_sd_syslog_kv(sd, name) {
-    let m = regex_parse(sd, "${name}=\"(?P<v>[^\"]*)\"")
+// ---------------------------------------------------------------------------
+// Main process — dispatch by daemon
+// ---------------------------------------------------------------------------
+
+def process parse_juniper_srx_sd_syslog {
+    // @requires: workspace.juniper_srx_sd_syslog.body      (required, String)
+    // @requires: workspace.juniper_srx_sd_syslog.hostname  (optional, String)
+    // @requires: workspace.juniper_srx_sd_syslog.time      (optional, Int — epoch ns)
+    workspace.srx_sd_class = parse_juniper_srx_sd_syslog_classify(workspace.juniper_srx_sd_syslog.body)
     switch true {
-        m == null { null }
-        default   { m.v }
+        workspace.srx_sd_class == null {
+            error "parse_juniper_srx_sd_syslog: not a recognised RT_<daemon> sd-syslog line: ${workspace.juniper_srx_sd_syslog.body}"
+        }
+        workspace.srx_sd_class.daemon == "FLOW"     { process parse_juniper_srx_sd_syslog_flow_dispatch }
+        workspace.srx_sd_class.daemon == "IDP"      { process parse_juniper_srx_sd_syslog_idp_dispatch }
+        workspace.srx_sd_class.daemon == "IDS"      { process parse_juniper_srx_sd_syslog_screen_record }
+        workspace.srx_sd_class.daemon == "UTM"      { process parse_juniper_srx_sd_syslog_utm_dispatch }
+        workspace.srx_sd_class.daemon == "AAMW"     { process parse_juniper_srx_sd_syslog_aamw_dispatch }
+        workspace.srx_sd_class.daemon == "SECINTEL" { process parse_juniper_srx_sd_syslog_secintel_record }
+        default {
+            error "parse_juniper_srx_sd_syslog: unsupported Junos daemon RT_${workspace.srx_sd_class.daemon}: ${workspace.juniper_srx_sd_syslog.body}"
+        }
     }
 }
 
-// Pull the canonical session fields off the SD block into one Object
-// the leaves consume.
-def function parse_juniper_srx_sd_syslog_session_fields(sd) {
+// ---------------------------------------------------------------------------
+// RT_FLOW dispatch (session + apptrack)
+// ---------------------------------------------------------------------------
+
+def process parse_juniper_srx_sd_syslog_flow_dispatch {
+    switch workspace.srx_sd_class.msgid {
+        "RT_FLOW_SESSION_CREATE"        { process parse_juniper_srx_sd_syslog_flow_create }
+        "RT_FLOW_SESSION_CREATE_LS"     { process parse_juniper_srx_sd_syslog_flow_create }
+        "RT_FLOW_SESSION_CLOSE"         { process parse_juniper_srx_sd_syslog_flow_close }
+        "RT_FLOW_SESSION_DENY"          { process parse_juniper_srx_sd_syslog_flow_deny }
+        "RT_FLOW_SESSION_DENY_LS"       { process parse_juniper_srx_sd_syslog_flow_deny }
+        "APPTRACK_SESSION_CREATE"       { process parse_juniper_srx_sd_syslog_apptrack_create }
+        "APPTRACK_SESSION_CLOSE"        { process parse_juniper_srx_sd_syslog_apptrack_close }
+        "APPTRACK_SESSION_CLOSE_LS"     { process parse_juniper_srx_sd_syslog_apptrack_close }
+        "APPTRACK_SESSION_VOL_UPDATE"   { process parse_juniper_srx_sd_syslog_apptrack_volume }
+        "APPTRACK_SESSION_ROUTE_UPDATE" { process parse_juniper_srx_sd_syslog_apptrack_volume }
+        default {
+            error "parse_juniper_srx_sd_syslog: unsupported RT_FLOW MSGID ${workspace.srx_sd_class.msgid}: ${workspace.juniper_srx_sd_syslog.body}"
+        }
+    }
+}
+
+def function parse_juniper_srx_sd_syslog_flow_fields(sd) {
     {
         src:        parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
         src_port:   parse_juniper_srx_sd_syslog_kv(sd, "source-port"),
@@ -154,131 +386,505 @@ def function parse_juniper_srx_sd_syslog_session_fields(sd) {
         src_zone:   parse_juniper_srx_sd_syslog_kv(sd, "source-zone-name"),
         dst_zone:   parse_juniper_srx_sd_syslog_kv(sd, "destination-zone-name"),
         session_id: parse_juniper_srx_sd_syslog_kv(sd, "session-id-32"),
-        app:        parse_juniper_srx_sd_syslog_kv(sd, "application"),
-        reason:     parse_juniper_srx_sd_syslog_kv(sd, "reason")
+        app:        parse_juniper_srx_sd_syslog_kv_or_null(sd, "application"),
+        reason:     parse_juniper_srx_sd_syslog_kv(sd, "reason"),
+        bytes_in:   parse_juniper_srx_sd_syslog_kv(sd, "bytes-from-client"),
+        bytes_out:  parse_juniper_srx_sd_syslog_kv(sd, "bytes-from-server"),
+        pkts_in:    parse_juniper_srx_sd_syslog_kv(sd, "packets-from-client"),
+        pkts_out:   parse_juniper_srx_sd_syslog_kv(sd, "packets-from-server")
     }
 }
 
+def process parse_juniper_srx_sd_syslog_flow_create {
+    workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
+    workspace.limpid = juniper_srx_sd_syslog_network_record(
+        1, 1, 1,
+        workspace.srx_sd_fields.src, workspace.srx_sd_fields.src_port,
+        workspace.srx_sd_fields.dst, workspace.srx_sd_fields.dst_port,
+        workspace.srx_sd_fields.proto,
+        workspace.srx_sd_fields.policy,
+        workspace.srx_sd_fields.src_zone, workspace.srx_sd_fields.dst_zone,
+        workspace.srx_sd_fields.session_id, workspace.srx_sd_fields.app,
+        null, null, null, null,
+        null,
+        workspace.srx_sd_class.msgid,
+        coalesce(workspace.srx_sd_class.host, workspace.juniper_srx_sd_syslog.hostname),
+        workspace.juniper_srx_sd_syslog.time
+    )
+}
+
+def process parse_juniper_srx_sd_syslog_flow_close {
+    workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
+    workspace.limpid = juniper_srx_sd_syslog_network_record(
+        2, 1, 1,
+        workspace.srx_sd_fields.src, workspace.srx_sd_fields.src_port,
+        workspace.srx_sd_fields.dst, workspace.srx_sd_fields.dst_port,
+        workspace.srx_sd_fields.proto,
+        workspace.srx_sd_fields.policy,
+        workspace.srx_sd_fields.src_zone, workspace.srx_sd_fields.dst_zone,
+        workspace.srx_sd_fields.session_id, workspace.srx_sd_fields.app,
+        workspace.srx_sd_fields.bytes_in, workspace.srx_sd_fields.bytes_out,
+        workspace.srx_sd_fields.pkts_in, workspace.srx_sd_fields.pkts_out,
+        workspace.srx_sd_fields.reason,
+        workspace.srx_sd_class.msgid,
+        coalesce(workspace.srx_sd_class.host, workspace.juniper_srx_sd_syslog.hostname),
+        workspace.juniper_srx_sd_syslog.time
+    )
+}
+
+def process parse_juniper_srx_sd_syslog_flow_deny {
+    workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
+    workspace.limpid = juniper_srx_sd_syslog_network_record(
+        6, 2, 3,
+        workspace.srx_sd_fields.src, workspace.srx_sd_fields.src_port,
+        workspace.srx_sd_fields.dst, workspace.srx_sd_fields.dst_port,
+        workspace.srx_sd_fields.proto,
+        workspace.srx_sd_fields.policy,
+        workspace.srx_sd_fields.src_zone, workspace.srx_sd_fields.dst_zone,
+        workspace.srx_sd_fields.session_id, workspace.srx_sd_fields.app,
+        null, null, null, null,
+        workspace.srx_sd_fields.reason,
+        workspace.srx_sd_class.msgid,
+        coalesce(workspace.srx_sd_class.host, workspace.juniper_srx_sd_syslog.hostname),
+        workspace.juniper_srx_sd_syslog.time
+    )
+}
+
+def process parse_juniper_srx_sd_syslog_apptrack_create {
+    workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
+    workspace.limpid = juniper_srx_sd_syslog_network_record(
+        1, 1, 1,
+        workspace.srx_sd_fields.src, workspace.srx_sd_fields.src_port,
+        workspace.srx_sd_fields.dst, workspace.srx_sd_fields.dst_port,
+        workspace.srx_sd_fields.proto,
+        workspace.srx_sd_fields.policy,
+        workspace.srx_sd_fields.src_zone, workspace.srx_sd_fields.dst_zone,
+        workspace.srx_sd_fields.session_id, workspace.srx_sd_fields.app,
+        null, null, null, null,
+        null,
+        workspace.srx_sd_class.msgid,
+        coalesce(workspace.srx_sd_class.host, workspace.juniper_srx_sd_syslog.hostname),
+        workspace.juniper_srx_sd_syslog.time
+    )
+}
+
+def process parse_juniper_srx_sd_syslog_apptrack_close {
+    workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
+    workspace.limpid = juniper_srx_sd_syslog_network_record(
+        2, 1, 1,
+        workspace.srx_sd_fields.src, workspace.srx_sd_fields.src_port,
+        workspace.srx_sd_fields.dst, workspace.srx_sd_fields.dst_port,
+        workspace.srx_sd_fields.proto,
+        workspace.srx_sd_fields.policy,
+        workspace.srx_sd_fields.src_zone, workspace.srx_sd_fields.dst_zone,
+        workspace.srx_sd_fields.session_id, workspace.srx_sd_fields.app,
+        workspace.srx_sd_fields.bytes_in, workspace.srx_sd_fields.bytes_out,
+        workspace.srx_sd_fields.pkts_in, workspace.srx_sd_fields.pkts_out,
+        workspace.srx_sd_fields.reason,
+        workspace.srx_sd_class.msgid,
+        coalesce(workspace.srx_sd_class.host, workspace.juniper_srx_sd_syslog.hostname),
+        workspace.juniper_srx_sd_syslog.time
+    )
+}
+
+def process parse_juniper_srx_sd_syslog_apptrack_volume {
+    workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
+    workspace.limpid = juniper_srx_sd_syslog_network_record(
+        99, 1, 1,
+        workspace.srx_sd_fields.src, workspace.srx_sd_fields.src_port,
+        workspace.srx_sd_fields.dst, workspace.srx_sd_fields.dst_port,
+        workspace.srx_sd_fields.proto,
+        workspace.srx_sd_fields.policy,
+        workspace.srx_sd_fields.src_zone, workspace.srx_sd_fields.dst_zone,
+        workspace.srx_sd_fields.session_id, workspace.srx_sd_fields.app,
+        workspace.srx_sd_fields.bytes_in, workspace.srx_sd_fields.bytes_out,
+        workspace.srx_sd_fields.pkts_in, workspace.srx_sd_fields.pkts_out,
+        null,
+        workspace.srx_sd_class.msgid,
+        coalesce(workspace.srx_sd_class.host, workspace.juniper_srx_sd_syslog.hostname),
+        workspace.juniper_srx_sd_syslog.time
+    )
+}
+
 // ---------------------------------------------------------------------------
-// Main parser
+// RT_IDP dispatch
 // ---------------------------------------------------------------------------
 
-def process parse_juniper_srx_sd_syslog {
-    // @requires: workspace.juniper_srx_sd_syslog.body      (required, String)
-    // @requires: workspace.juniper_srx_sd_syslog.hostname  (optional, String)
-    // @requires: workspace.juniper_srx_sd_syslog.time      (optional, Int — epoch ns)
-    workspace.srx_sd_class = parse_juniper_srx_sd_syslog_classify(workspace.juniper_srx_sd_syslog.body)
-    switch true {
-        workspace.srx_sd_class == null {
-            error "parse_juniper_srx_sd_syslog: not a recognised RT_FLOW SD line: ${workspace.juniper_srx_sd_syslog.body}"
-        }
-        workspace.srx_sd_class.kind == "create" { process parse_juniper_srx_sd_syslog_session_create }
-        workspace.srx_sd_class.kind == "close"  { process parse_juniper_srx_sd_syslog_session_close }
-        workspace.srx_sd_class.kind == "deny"   { process parse_juniper_srx_sd_syslog_session_deny }
+def process parse_juniper_srx_sd_syslog_idp_dispatch {
+    switch workspace.srx_sd_class.msgid {
+        "IDP_ATTACK_LOG_EVENT"            { process parse_juniper_srx_sd_syslog_idp_attack }
+        "IDP_APPDDOS_APP_ATTACK_EVENT"    { process parse_juniper_srx_sd_syslog_idp_appddos }
+        "IDP_APPDDOS_APP_ATTACK_EVENT_LS" { process parse_juniper_srx_sd_syslog_idp_appddos }
+        "IDP_APPDDOS_APP_STATE_EVENT"     { process parse_juniper_srx_sd_syslog_idp_appddos }
         default {
-            error "parse_juniper_srx_sd_syslog: unsupported RT_FLOW MSGID ${workspace.srx_sd_class.header.msgid}: ${workspace.juniper_srx_sd_syslog.body}"
+            error "parse_juniper_srx_sd_syslog: unsupported RT_IDP MSGID ${workspace.srx_sd_class.msgid}: ${workspace.juniper_srx_sd_syslog.body}"
         }
     }
 }
 
+def process parse_juniper_srx_sd_syslog_idp_attack {
+    let sd = workspace.srx_sd_class.sd
+    let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
+    workspace.limpid = juniper_srx_sd_syslog_finding_record(
+        juniper_srx_sd_syslog_severity_id(parse_juniper_srx_sd_syslog_kv(sd, "threat-severity")),
+        juniper_srx_sd_syslog_status_id(action),
+        parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
+        parse_juniper_srx_sd_syslog_kv(sd, "source-port"),
+        parse_juniper_srx_sd_syslog_kv(sd, "destination-address"),
+        parse_juniper_srx_sd_syslog_kv(sd, "destination-port"),
+        parse_juniper_srx_sd_syslog_kv(sd, "protocol-name"),
+        parse_juniper_srx_sd_syslog_kv(sd, "attack-name"),
+        parse_juniper_srx_sd_syslog_kv(sd, "attack-name"),
+        parse_juniper_srx_sd_syslog_kv(sd, "attack-name"),
+        ["Network IDS"],
+        action,
+        parse_juniper_srx_sd_syslog_kv(sd, "policy-name"),
+        parse_juniper_srx_sd_syslog_kv(sd, "rule-name"),
+        parse_juniper_srx_sd_syslog_kv(sd, "rulebase-name"),
+        parse_juniper_srx_sd_syslog_kv(sd, "source-zone-name"),
+        parse_juniper_srx_sd_syslog_kv(sd, "destination-zone-name"),
+        workspace.srx_sd_class.msgid,
+        coalesce(workspace.srx_sd_class.host, workspace.juniper_srx_sd_syslog.hostname),
+        workspace.juniper_srx_sd_syslog.time,
+        {
+            application_name: parse_juniper_srx_sd_syslog_kv(sd, "application-name"),
+            service_name:     parse_juniper_srx_sd_syslog_kv(sd, "service-name")
+        }
+    )
+}
+
+def process parse_juniper_srx_sd_syslog_idp_appddos {
+    let sd = workspace.srx_sd_class.sd
+    let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
+    let title = coalesce(parse_juniper_srx_sd_syslog_kv(sd, "application-name"), "IDP AppDDoS")
+    workspace.limpid = juniper_srx_sd_syslog_finding_record(
+        4,
+        juniper_srx_sd_syslog_status_id(action),
+        parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
+        parse_juniper_srx_sd_syslog_kv(sd, "source-port"),
+        parse_juniper_srx_sd_syslog_kv(sd, "destination-address"),
+        parse_juniper_srx_sd_syslog_kv(sd, "destination-port"),
+        parse_juniper_srx_sd_syslog_kv(sd, "protocol-name"),
+        title, title, title,
+        ["Application DDoS"],
+        action,
+        parse_juniper_srx_sd_syslog_kv(sd, "policy-name"),
+        parse_juniper_srx_sd_syslog_kv(sd, "rule-name"),
+        parse_juniper_srx_sd_syslog_kv(sd, "rulebase-name"),
+        parse_juniper_srx_sd_syslog_kv(sd, "source-zone-name"),
+        parse_juniper_srx_sd_syslog_kv(sd, "destination-zone-name"),
+        workspace.srx_sd_class.msgid,
+        coalesce(workspace.srx_sd_class.host, workspace.juniper_srx_sd_syslog.hostname),
+        workspace.juniper_srx_sd_syslog.time,
+        null
+    )
+}
+
 // ---------------------------------------------------------------------------
-// RT_FLOW_SESSION_CREATE → 4001 / Open / Success
+// RT_IDS (Screen / DDoS detection)
 // ---------------------------------------------------------------------------
 
-def process parse_juniper_srx_sd_syslog_session_create {
-    workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_session_fields(workspace.srx_sd_class.header.sd)
-    switch true {
-        workspace.srx_sd_fields.src == null {
-            error "parse_juniper_srx_sd_syslog_session_create: SD did not match expected shape: ${workspace.juniper_srx_sd_syslog.body}"
+def process parse_juniper_srx_sd_syslog_screen_record {
+    let sd = workspace.srx_sd_class.sd
+    let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
+    let attack = parse_juniper_srx_sd_syslog_kv(sd, "attack-name")
+    workspace.limpid = juniper_srx_sd_syslog_finding_record(
+        3,
+        juniper_srx_sd_syslog_status_id(action),
+        parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
+        parse_juniper_srx_sd_syslog_kv(sd, "source-port"),
+        parse_juniper_srx_sd_syslog_kv(sd, "destination-address"),
+        parse_juniper_srx_sd_syslog_kv(sd, "destination-port"),
+        null,
+        attack, attack, attack,
+        ["Screen / DDoS"],
+        action,
+        null, null, null,
+        parse_juniper_srx_sd_syslog_kv(sd, "source-zone-name"),
+        null,
+        workspace.srx_sd_class.msgid,
+        coalesce(workspace.srx_sd_class.host, workspace.juniper_srx_sd_syslog.hostname),
+        workspace.juniper_srx_sd_syslog.time,
+        {
+            interface_name: parse_juniper_srx_sd_syslog_kv(sd, "interface-name")
         }
+    )
+}
+
+// ---------------------------------------------------------------------------
+// RT_UTM dispatch
+// ---------------------------------------------------------------------------
+
+def process parse_juniper_srx_sd_syslog_utm_dispatch {
+    switch workspace.srx_sd_class.msgid {
+        "WEBFILTER_URL_BLOCKED"          { process parse_juniper_srx_sd_syslog_utm_webfilter }
+        "WEBFILTER_URL_BLOCKED_LS"       { process parse_juniper_srx_sd_syslog_utm_webfilter }
+        "WEBFILTER_URL_PERMITTED"        { process parse_juniper_srx_sd_syslog_utm_webfilter }
+        "AV_VIRUS_DETECTED_MT"           { process parse_juniper_srx_sd_syslog_utm_antivirus }
+        "AV_VIRUS_DETECTED_MT_LS"        { process parse_juniper_srx_sd_syslog_utm_antivirus }
+        "AV_FILE_NOT_SCANNED_DROPPED_MT" { process parse_juniper_srx_sd_syslog_utm_antivirus }
+        "AV_HUGE_FILE_DROPPED_MT"        { process parse_juniper_srx_sd_syslog_utm_antivirus }
+        "AV_SCANNER_DROP_FILE_MT"        { process parse_juniper_srx_sd_syslog_utm_antivirus }
+        "ANTISPAM_SPAM_DETECTED_MT"      { process parse_juniper_srx_sd_syslog_utm_antispam }
+        "CONTENT_FILTERING_BLOCKED_MT"   { process parse_juniper_srx_sd_syslog_utm_content }
         default {
-            workspace.limpid = juniper_srx_sd_syslog_network_record(
-                1,                              // activity_id: Open
-                1,                              // status_id:   Success
-                1,                              // severity_id: Informational
-                workspace.srx_sd_fields.src,
-                workspace.srx_sd_fields.src_port,
-                workspace.srx_sd_fields.dst,
-                workspace.srx_sd_fields.dst_port,
-                workspace.srx_sd_fields.proto,
-                workspace.srx_sd_fields.policy,
-                workspace.srx_sd_fields.src_zone,
-                workspace.srx_sd_fields.dst_zone,
-                workspace.srx_sd_fields.session_id,
-                workspace.srx_sd_fields.app,
-                null,                           // CREATE has no reason
-                workspace.srx_sd_class.header.msgid,
-                coalesce(workspace.juniper_srx_sd_syslog.hostname, workspace.srx_sd_class.header.host),
-                workspace.juniper_srx_sd_syslog.time
-            )
+            error "parse_juniper_srx_sd_syslog: unsupported RT_UTM MSGID ${workspace.srx_sd_class.msgid}: ${workspace.juniper_srx_sd_syslog.body}"
         }
     }
 }
 
+def process parse_juniper_srx_sd_syslog_utm_webfilter {
+    let sd = workspace.srx_sd_class.sd
+    let permitted = workspace.srx_sd_class.msgid == "WEBFILTER_URL_PERMITTED"
+    workspace.limpid = juniper_srx_sd_syslog_http_record(
+        switch true { permitted { 1 } default { 2 } },
+        switch true { permitted { 1 } default { 3 } },
+        parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
+        parse_juniper_srx_sd_syslog_kv(sd, "source-port"),
+        parse_juniper_srx_sd_syslog_kv(sd, "destination-address"),
+        parse_juniper_srx_sd_syslog_kv(sd, "destination-port"),
+        parse_juniper_srx_sd_syslog_kv(sd, "url"),
+        parse_juniper_srx_sd_syslog_kv(sd, "category"),
+        parse_juniper_srx_sd_syslog_kv(sd, "reason"),
+        parse_juniper_srx_sd_syslog_kv(sd, "profile"),
+        parse_juniper_srx_sd_syslog_kv_or_null(sd, "username"),
+        workspace.srx_sd_class.msgid,
+        coalesce(workspace.srx_sd_class.host, workspace.juniper_srx_sd_syslog.hostname),
+        workspace.juniper_srx_sd_syslog.time
+    )
+}
+
+def process parse_juniper_srx_sd_syslog_utm_antivirus {
+    let sd = workspace.srx_sd_class.sd
+    let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
+    let virus = coalesce(parse_juniper_srx_sd_syslog_kv(sd, "virus-name"), workspace.srx_sd_class.msgid)
+    workspace.limpid = juniper_srx_sd_syslog_finding_record(
+        4,
+        juniper_srx_sd_syslog_status_id(action),
+        parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
+        parse_juniper_srx_sd_syslog_kv(sd, "source-port"),
+        parse_juniper_srx_sd_syslog_kv(sd, "destination-address"),
+        parse_juniper_srx_sd_syslog_kv(sd, "destination-port"),
+        null,
+        virus, virus, virus,
+        ["Malware"],
+        action,
+        null, null, null,
+        parse_juniper_srx_sd_syslog_kv(sd, "source-zone-name"),
+        parse_juniper_srx_sd_syslog_kv(sd, "destination-zone-name"),
+        workspace.srx_sd_class.msgid,
+        coalesce(workspace.srx_sd_class.host, workspace.juniper_srx_sd_syslog.hostname),
+        workspace.juniper_srx_sd_syslog.time,
+        {
+            filename:           parse_juniper_srx_sd_syslog_kv(sd, "filename"),
+            temporary_filename: parse_juniper_srx_sd_syslog_kv(sd, "temporary-filename"),
+            url:                parse_juniper_srx_sd_syslog_kv(sd, "url")
+        }
+    )
+}
+
+def process parse_juniper_srx_sd_syslog_utm_antispam {
+    let sd = workspace.srx_sd_class.sd
+    let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
+    workspace.limpid = juniper_srx_sd_syslog_finding_record(
+        3,
+        juniper_srx_sd_syslog_status_id(action),
+        parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
+        null, null, null,
+        null,
+        workspace.srx_sd_class.msgid,
+        "Antispam: spam detected",
+        "Antispam",
+        ["Spam"],
+        action,
+        parse_juniper_srx_sd_syslog_kv(sd, "profile-name"),
+        null, null,
+        parse_juniper_srx_sd_syslog_kv(sd, "source-zone"),
+        parse_juniper_srx_sd_syslog_kv(sd, "destination-zone"),
+        workspace.srx_sd_class.msgid,
+        coalesce(workspace.srx_sd_class.host, workspace.juniper_srx_sd_syslog.hostname),
+        workspace.juniper_srx_sd_syslog.time,
+        {
+            reason:   parse_juniper_srx_sd_syslog_kv(sd, "reason"),
+            username: parse_juniper_srx_sd_syslog_kv_or_null(sd, "username")
+        }
+    )
+}
+
+def process parse_juniper_srx_sd_syslog_utm_content {
+    let sd = workspace.srx_sd_class.sd
+    let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
+    workspace.limpid = juniper_srx_sd_syslog_finding_record(
+        3,
+        juniper_srx_sd_syslog_status_id(action),
+        parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
+        parse_juniper_srx_sd_syslog_kv(sd, "source-port"),
+        parse_juniper_srx_sd_syslog_kv(sd, "destination-address"),
+        parse_juniper_srx_sd_syslog_kv(sd, "destination-port"),
+        parse_juniper_srx_sd_syslog_kv(sd, "protocol"),
+        workspace.srx_sd_class.msgid,
+        "Content filter: blocked",
+        "Content Filter",
+        ["Content Filter"],
+        action,
+        parse_juniper_srx_sd_syslog_kv(sd, "profile-name"),
+        null, null,
+        parse_juniper_srx_sd_syslog_kv(sd, "source-zone"),
+        parse_juniper_srx_sd_syslog_kv(sd, "destination-zone"),
+        workspace.srx_sd_class.msgid,
+        coalesce(workspace.srx_sd_class.host, workspace.juniper_srx_sd_syslog.hostname),
+        workspace.juniper_srx_sd_syslog.time,
+        {
+            reason: parse_juniper_srx_sd_syslog_kv(sd, "reason")
+        }
+    )
+}
+
 // ---------------------------------------------------------------------------
-// RT_FLOW_SESSION_CLOSE → 4001 / Close / Success
+// RT_AAMW dispatch (Sky ATP / Advanced Anti-Malware)
 // ---------------------------------------------------------------------------
 
-def process parse_juniper_srx_sd_syslog_session_close {
-    workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_session_fields(workspace.srx_sd_class.header.sd)
-    switch true {
-        workspace.srx_sd_fields.src == null {
-            error "parse_juniper_srx_sd_syslog_session_close: SD did not match expected shape: ${workspace.juniper_srx_sd_syslog.body}"
-        }
+def process parse_juniper_srx_sd_syslog_aamw_dispatch {
+    switch workspace.srx_sd_class.msgid {
+        "AAMW_ACTION_LOG"              { process parse_juniper_srx_sd_syslog_aamw_action }
+        "SRX_AAMW_ACTION_LOG"          { process parse_juniper_srx_sd_syslog_aamw_action }
+        "AAMW_MALWARE_EVENT_LOG"       { process parse_juniper_srx_sd_syslog_aamw_malware }
+        "AAMW_HOST_INFECTED_EVENT_LOG" { process parse_juniper_srx_sd_syslog_aamw_host }
         default {
-            workspace.limpid = juniper_srx_sd_syslog_network_record(
-                2,                              // activity_id: Close
-                1,                              // status_id:   Success (session terminated normally)
-                1,                              // severity_id: Informational
-                workspace.srx_sd_fields.src,
-                workspace.srx_sd_fields.src_port,
-                workspace.srx_sd_fields.dst,
-                workspace.srx_sd_fields.dst_port,
-                workspace.srx_sd_fields.proto,
-                workspace.srx_sd_fields.policy,
-                workspace.srx_sd_fields.src_zone,
-                workspace.srx_sd_fields.dst_zone,
-                workspace.srx_sd_fields.session_id,
-                workspace.srx_sd_fields.app,
-                workspace.srx_sd_fields.reason,
-                workspace.srx_sd_class.header.msgid,
-                coalesce(workspace.juniper_srx_sd_syslog.hostname, workspace.srx_sd_class.header.host),
-                workspace.juniper_srx_sd_syslog.time
-            )
+            error "parse_juniper_srx_sd_syslog: unsupported RT_AAMW MSGID ${workspace.srx_sd_class.msgid}: ${workspace.juniper_srx_sd_syslog.body}"
         }
     }
 }
 
+def process parse_juniper_srx_sd_syslog_aamw_action {
+    let sd = workspace.srx_sd_class.sd
+    let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
+    let mal = coalesce(parse_juniper_srx_sd_syslog_kv_or_null(sd, "malware-info"), "AAMW action")
+    workspace.limpid = juniper_srx_sd_syslog_finding_record(
+        4,
+        juniper_srx_sd_syslog_status_id(action),
+        parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
+        parse_juniper_srx_sd_syslog_kv(sd, "source-port"),
+        parse_juniper_srx_sd_syslog_kv(sd, "destination-address"),
+        parse_juniper_srx_sd_syslog_kv(sd, "destination-port"),
+        juniper_srx_sd_syslog_proto_name(parse_juniper_srx_sd_syslog_kv(sd, "protocol-id")),
+        mal, mal, mal,
+        ["Sky ATP", "Malware"],
+        action,
+        parse_juniper_srx_sd_syslog_kv(sd, "policy-name"),
+        null, null,
+        parse_juniper_srx_sd_syslog_kv(sd, "source-zone-name"),
+        parse_juniper_srx_sd_syslog_kv(sd, "destination-zone-name"),
+        workspace.srx_sd_class.msgid,
+        coalesce(workspace.srx_sd_class.host, workspace.juniper_srx_sd_syslog.hostname),
+        workspace.juniper_srx_sd_syslog.time,
+        {
+            file_category:  parse_juniper_srx_sd_syslog_kv(sd, "file-category"),
+            verdict_number: parse_juniper_srx_sd_syslog_kv(sd, "verdict-number"),
+            http_host:      parse_juniper_srx_sd_syslog_kv(sd, "http-host"),
+            hostname_field: parse_juniper_srx_sd_syslog_kv(sd, "hostname"),
+            application:    parse_juniper_srx_sd_syslog_kv(sd, "application"),
+            session_id:     parse_juniper_srx_sd_syslog_kv(sd, "session-id-32"),
+            username:       parse_juniper_srx_sd_syslog_kv_or_null(sd, "username")
+        }
+    )
+}
+
+def process parse_juniper_srx_sd_syslog_aamw_malware {
+    let sd = workspace.srx_sd_class.sd
+    let mal = coalesce(parse_juniper_srx_sd_syslog_kv_or_null(sd, "malware-info"), "AAMW malware")
+    workspace.limpid = juniper_srx_sd_syslog_finding_record(
+        4,
+        2,
+        parse_juniper_srx_sd_syslog_kv(sd, "client-ip"),
+        null, null, null,
+        null,
+        mal, mal, mal,
+        ["Sky ATP", "Malware"],
+        null,
+        null, null, null, null, null,
+        workspace.srx_sd_class.msgid,
+        coalesce(workspace.srx_sd_class.host, workspace.juniper_srx_sd_syslog.hostname),
+        workspace.juniper_srx_sd_syslog.time,
+        {
+            tenant_id:      parse_juniper_srx_sd_syslog_kv(sd, "tenant-id"),
+            sample_sha256:  parse_juniper_srx_sd_syslog_kv(sd, "sample-sha256"),
+            verdict_number: parse_juniper_srx_sd_syslog_kv(sd, "verdict-number"),
+            hostname_field: parse_juniper_srx_sd_syslog_kv(sd, "hostname"),
+            username:       parse_juniper_srx_sd_syslog_kv_or_null(sd, "username")
+        }
+    )
+}
+
+def process parse_juniper_srx_sd_syslog_aamw_host {
+    let sd = workspace.srx_sd_class.sd
+    workspace.limpid = juniper_srx_sd_syslog_finding_record(
+        5,
+        2,
+        parse_juniper_srx_sd_syslog_kv(sd, "client-ip"),
+        null, null, null,
+        null,
+        "AAMW host infected",
+        "Sky ATP host-infected event",
+        "Host Infected",
+        ["Sky ATP", "Host Infected"],
+        null,
+        parse_juniper_srx_sd_syslog_kv(sd, "policy-name"),
+        null, null, null, null,
+        workspace.srx_sd_class.msgid,
+        coalesce(workspace.srx_sd_class.host, workspace.juniper_srx_sd_syslog.hostname),
+        workspace.juniper_srx_sd_syslog.time,
+        {
+            tenant_id:      parse_juniper_srx_sd_syslog_kv(sd, "tenant-id"),
+            hostname_field: parse_juniper_srx_sd_syslog_kv(sd, "hostname"),
+            status:         parse_juniper_srx_sd_syslog_kv(sd, "status"),
+            th:             parse_juniper_srx_sd_syslog_kv(sd, "th"),
+            state:          parse_juniper_srx_sd_syslog_kv(sd, "state"),
+            reason:         parse_juniper_srx_sd_syslog_kv(sd, "reason"),
+            message:        parse_juniper_srx_sd_syslog_kv(sd, "message")
+        }
+    )
+}
+
 // ---------------------------------------------------------------------------
-// RT_FLOW_SESSION_DENY → 4001 / Deny / Failure
+// RT_SECINTEL (threat-feed action)
 // ---------------------------------------------------------------------------
 
-def process parse_juniper_srx_sd_syslog_session_deny {
-    workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_session_fields(workspace.srx_sd_class.header.sd)
-    switch true {
-        workspace.srx_sd_fields.src == null {
-            error "parse_juniper_srx_sd_syslog_session_deny: SD did not match expected shape: ${workspace.juniper_srx_sd_syslog.body}"
+def process parse_juniper_srx_sd_syslog_secintel_record {
+    let sd = workspace.srx_sd_class.sd
+    let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
+    let sev_str = parse_juniper_srx_sd_syslog_kv(sd, "threat-severity")
+    let title = coalesce(parse_juniper_srx_sd_syslog_kv_or_null(sd, "feed-name"), "SecIntel")
+    workspace.limpid = juniper_srx_sd_syslog_finding_record(
+        switch true {
+            sev_str == "0"  { 1 }
+            sev_str == null { 1 }
+            default         { juniper_srx_sd_syslog_int_opt(sev_str) }
+        },
+        juniper_srx_sd_syslog_status_id(action),
+        parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
+        parse_juniper_srx_sd_syslog_kv(sd, "source-port"),
+        parse_juniper_srx_sd_syslog_kv(sd, "destination-address"),
+        parse_juniper_srx_sd_syslog_kv(sd, "destination-port"),
+        juniper_srx_sd_syslog_proto_name(parse_juniper_srx_sd_syslog_kv(sd, "protocol-id")),
+        title, title, title,
+        ["Threat Intelligence"],
+        action,
+        parse_juniper_srx_sd_syslog_kv(sd, "policy-name"),
+        parse_juniper_srx_sd_syslog_kv(sd, "profile-name"),
+        null,
+        parse_juniper_srx_sd_syslog_kv(sd, "source-zone-name"),
+        parse_juniper_srx_sd_syslog_kv(sd, "destination-zone-name"),
+        workspace.srx_sd_class.msgid,
+        coalesce(workspace.srx_sd_class.host, workspace.juniper_srx_sd_syslog.hostname),
+        workspace.juniper_srx_sd_syslog.time,
+        {
+            category:      parse_juniper_srx_sd_syslog_kv(sd, "category"),
+            sub_category:  parse_juniper_srx_sd_syslog_kv(sd, "sub-category"),
+            action_detail: parse_juniper_srx_sd_syslog_kv(sd, "action-detail"),
+            http_host:     parse_juniper_srx_sd_syslog_kv(sd, "http-host"),
+            session_id:    parse_juniper_srx_sd_syslog_kv(sd, "session-id-32"),
+            username:      parse_juniper_srx_sd_syslog_kv_or_null(sd, "username")
         }
-        default {
-            workspace.limpid = juniper_srx_sd_syslog_network_record(
-                6,                              // activity_id: Deny (OCSF 4001)
-                2,                              // status_id:   Failure (the session was rejected)
-                3,                              // severity_id: Medium (policy denial worth seeing)
-                workspace.srx_sd_fields.src,
-                workspace.srx_sd_fields.src_port,
-                workspace.srx_sd_fields.dst,
-                workspace.srx_sd_fields.dst_port,
-                workspace.srx_sd_fields.proto,
-                workspace.srx_sd_fields.policy,
-                workspace.srx_sd_fields.src_zone,
-                workspace.srx_sd_fields.dst_zone,
-                workspace.srx_sd_fields.session_id,
-                workspace.srx_sd_fields.app,
-                workspace.srx_sd_fields.reason,
-                workspace.srx_sd_class.header.msgid,
-                coalesce(workspace.juniper_srx_sd_syslog.hostname, workspace.srx_sd_class.header.host),
-                workspace.juniper_srx_sd_syslog.time
-            )
-        }
-    }
+    )
 }

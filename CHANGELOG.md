@@ -89,7 +89,7 @@ major SIEM sources covering additional major sources:
 
 | Parser | Source | OCSF class(es) |
 |---|---|---|
-| `parse_juniper_srx_sd_syslog` | Juniper Junos SRX RT_FLOW SESSION_CREATE / CLOSE / DENY (RFC 5424 wire + `[junos@2636 ...]` structured data — `set security log format sd-syslog` mode) | 4001 |
+| `parse_juniper_srx_sd_syslog` | Juniper Junos SRX in `set security log format sd-syslog` mode — covers all daemons that emit a `[junos@<EID> ...]` SD block: **RT_FLOW** (SESSION_CREATE/CLOSE/DENY + APPTRACK_SESSION_*), **RT_IDP** (IDP_ATTACK_LOG_EVENT + IDP_APPDDOS_*), **RT_IDS** (RT_SCREEN_*), **RT_UTM** (AV / Antispam / Content / Webfilter), **RT_AAMW** (Sky ATP), **RT_SECINTEL** (threat-feed). Verified against the elastic/integrations juniper_srx corpus (66/66 emit, 0 error) | 4001 / 2004 / 4002 |
 | `parse_juniper_srx_syslog` | Juniper Junos SRX RT_IDP / IDP_ATTACK_LOG_EVENT (RFC 3164 unstructured syslog — `set security log format syslog` default mode) — real-traffic verified against a real SRX | 2004 |
 | `parse_nsp` | Trellix / McAfee Network Security Platform (NSP) IPS alerts in the vendor-recommended standard syslog KV template (handles the duplicate `confidence=` key for attack vs. malware confidence by ordered regex extraction) | 2004 |
 | `parse_checkpoint` | Check Point LEEF 2.0 traffic events (Accept / Drop / Reject / Block) inside a syslog wrapper | 4001 |
