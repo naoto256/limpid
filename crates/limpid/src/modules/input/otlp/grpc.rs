@@ -49,6 +49,7 @@ use tracing::{info, warn};
 use super::split_request;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
+use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::InputMetrics;
 use crate::modules::input::rate_limit::RateLimiter;
@@ -62,7 +63,47 @@ pub struct OtlpGrpcInput {
     metrics: Arc<InputMetrics>,
 }
 
+const OTLP_GRPC_TLS_BLOCK_PROPERTIES: &[PropertySpec] = &[
+    PropertySpec {
+        name: "cert",
+        required: true,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "key",
+        required: true,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "ca",
+        required: false,
+        kind: PropertyValueKind::String,
+    },
+];
+
+const OTLP_GRPC_INPUT_SCHEMA: &[PropertySpec] = &[
+    PropertySpec {
+        name: "bind",
+        required: false,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "rate_limit",
+        required: false,
+        kind: PropertyValueKind::Int,
+    },
+    PropertySpec {
+        name: "tls",
+        required: false,
+        kind: PropertyValueKind::Block(OTLP_GRPC_TLS_BLOCK_PROPERTIES),
+    },
+];
+
 impl Module for OtlpGrpcInput {
+    fn property_schema() -> Option<&'static [PropertySpec]> {
+        Some(OTLP_GRPC_INPUT_SCHEMA)
+    }
+
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
         let bind =
             props::get_string(properties, "bind").unwrap_or_else(|| "0.0.0.0:4317".to_string());
