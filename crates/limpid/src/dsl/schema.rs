@@ -57,6 +57,13 @@ pub enum PropertyValueKind {
     /// Nested block. The slice describes the inner schema; the
     /// validator recurses.
     Block(&'static [PropertySpec]),
+    /// Open block whose keys are user-defined identifiers (HTTP
+    /// header names, k8s-style labels, etc.) and whose values must
+    /// each be string-shaped. The schema validator never flags an
+    /// "unknown key" inside this block — it only checks that every
+    /// entry is a key-value (not a nested sub-block) with a
+    /// string-shaped value.
+    StringMap,
 }
 
 /// One declared key in a property surface.
@@ -203,7 +210,11 @@ pub fn validate(props: &[Property], spec: &[PropertySpec]) -> Vec<SchemaError> {
             (PropertyValueKind::Block(inner_spec), Property::Block { properties, .. }) => {
                 errs.extend(validate(properties, inner_spec));
             }
-            (PropertyValueKind::Block(_), Property::KeyValue { value_span, .. }) => {
+            (PropertyValueKind::StringMap, Property::Block { properties, .. }) => {
+                errs.extend(validate_string_map(properties));
+            }
+            (PropertyValueKind::Block(_) | PropertyValueKind::StringMap,
+                Property::KeyValue { value_span, .. }) => {
                 errs.push(SchemaError {
                     kind: SchemaErrorKind::ExpectedBlock,
                     key: name.to_string(),
@@ -243,6 +254,47 @@ pub fn validate(props: &[Property], spec: &[PropertySpec]) -> Vec<SchemaError> {
         }
     }
 
+    errs
+}
+
+/// Validate a `StringMap`-kind block: every entry must be a key-value
+/// with a string-shaped value. The key set is open, so there is no
+/// unknown-key check.
+fn validate_string_map(properties: &[Property]) -> Vec<SchemaError> {
+    let mut errs = Vec::new();
+    for prop in properties {
+        match prop {
+            Property::KeyValue {
+                key,
+                key_span,
+                value,
+                value_span,
+            } => {
+                match &value.kind {
+                    ExprKind::StringLit(_)
+                    | ExprKind::Template(_)
+                    | ExprKind::Ident(_)
+                    | ExprKind::IntLit(_) => {}
+                    _ => errs.push(SchemaError {
+                        kind: SchemaErrorKind::TypeMismatch { expected: "a string" },
+                        key: key.clone(),
+                        key_span: *key_span,
+                        value_span: *value_span,
+                        did_you_mean: None,
+                    }),
+                }
+            }
+            Property::Block { key, key_span, .. } => {
+                errs.push(SchemaError {
+                    kind: SchemaErrorKind::ExpectedValue,
+                    key: key.clone(),
+                    key_span: *key_span,
+                    value_span: None,
+                    did_you_mean: None,
+                });
+            }
+        }
+    }
     errs
 }
 
@@ -327,7 +379,7 @@ fn check_value(
             }
             _ => mismatch("an identifier"),
         },
-        PropertyValueKind::Block(_) => {
+        PropertyValueKind::Block(_) | PropertyValueKind::StringMap => {
             // unreachable: handled at the caller's match arm before we get here.
             None
         }
@@ -628,6 +680,39 @@ mod tests {
         ];
         let errs = validate(&props, SIMPLE);
         assert_eq!(errs.len(), 4);
+    }
+
+    #[test]
+    fn string_map_accepts_any_key_with_string_value() {
+        const S: &[PropertySpec] = &[PropertySpec {
+            name: "headers",
+            required: false,
+            kind: PropertyValueKind::StringMap,
+        }];
+        let props = vec![block(
+            "headers",
+            vec![
+                kv("Authorization", ExprKind::StringLit("Bearer xxx".into())),
+                kv("X-Tenant", ExprKind::Ident(vec!["acme".into()])),
+            ],
+        )];
+        assert!(validate(&props, S).is_empty());
+    }
+
+    #[test]
+    fn string_map_rejects_non_string_value() {
+        const S: &[PropertySpec] = &[PropertySpec {
+            name: "headers",
+            required: false,
+            kind: PropertyValueKind::StringMap,
+        }];
+        let props = vec![block(
+            "headers",
+            vec![kv("Retry-After", ExprKind::BoolLit(true))],
+        )];
+        let errs = validate(&props, S);
+        assert_eq!(errs.len(), 1);
+        assert!(matches!(errs[0].kind, SchemaErrorKind::TypeMismatch { .. }));
     }
 
     #[test]

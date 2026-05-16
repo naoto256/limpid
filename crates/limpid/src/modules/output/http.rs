@@ -28,9 +28,68 @@ use tokio::sync::Mutex;
 use crate::dsl::arena::EventArena;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
+use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
+
+const HTTP_TLS_BLOCK_PROPERTIES: &[PropertySpec] = &[PropertySpec {
+    name: "ca",
+    required: false,
+    kind: PropertyValueKind::String,
+}];
+
+const HTTP_OUTPUT_SCHEMA: &[PropertySpec] = &[
+    PropertySpec {
+        name: "url",
+        required: true,
+        kind: PropertyValueKind::String,
+    },
+    // Verbs accepted by reqwest — kept as plain String rather than an
+    // Enum so users can pass uncommon ones (PROPFIND, MKCOL, etc.)
+    // without bumping the schema.
+    PropertySpec {
+        name: "method",
+        required: false,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "content_type",
+        required: false,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "batch_size",
+        required: false,
+        kind: PropertyValueKind::Int,
+    },
+    PropertySpec {
+        name: "batch_timeout",
+        required: false,
+        kind: PropertyValueKind::Duration,
+    },
+    PropertySpec {
+        name: "verify",
+        required: false,
+        kind: PropertyValueKind::Bool,
+    },
+    PropertySpec {
+        name: "compress",
+        required: false,
+        kind: PropertyValueKind::Enum(&["gzip"]),
+    },
+    PropertySpec {
+        name: "headers",
+        required: false,
+        kind: PropertyValueKind::StringMap,
+    },
+    PropertySpec {
+        name: "tls",
+        required: false,
+        kind: PropertyValueKind::Block(HTTP_TLS_BLOCK_PROPERTIES),
+    },
+    crate::queue::QUEUE_PROPERTY_SPEC,
+];
 
 struct HttpPayload {
     msg: String,
@@ -56,6 +115,10 @@ pub struct HttpOutput {
 }
 
 impl Module for HttpOutput {
+    fn property_schema() -> Option<&'static [PropertySpec]> {
+        Some(HTTP_OUTPUT_SCHEMA)
+    }
+
     fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
         let url = props::get_string(properties, "url")
             .ok_or_else(|| anyhow::anyhow!("output '{}': http requires 'url'", name))?;
