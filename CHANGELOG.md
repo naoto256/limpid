@@ -8,8 +8,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
+<<<<<<< HEAD
 ## [0.7.1] - 2026-05-17
 > journal input LOTL + transport-agnostic vocabulary parsers + datetime primitives + expanded SIEM + OSS NDR parsers (real-traffic verified)
+||||||| parent of 12045f6 (release: 0.7.2 — declarative property schema, loud --check coverage)
+## [0.7.1] - 2026-05-16
+> journal input LOTL + transport-agnostic vocabulary parsers + datetime primitives
+=======
+## [0.7.2] - 2026-05-16
+> declarative property schema — `--check` now loudly rejects every config typo
+
+`--check`'s coverage extended from pipeline / process DSL to every
+property surface in the configuration: Module properties on `def
+input` / `def output`, their nested sub-blocks (`queue`, `tls`,
+`retry`, `headers`), and the top-level `control` / `geoip` / `table`
+blocks. Each Module advertises its accepted shape as a
+`&'static [PropertySpec]`; the analyzer and the runtime read the same
+declaration, so unknown keys, type-mismatched values, out-of-set enum
+values, and missing required fields surface as rustc-style errors
+with `did you mean ...?` suggestions instead of being silently
+defaulted away.
+
+### Added — `dsl::schema` + per-Module `property_schema()`
+
+- New `dsl::schema` module declares `PropertyValueKind`
+  (`String | Int | Bool | Duration | Size | Enum | Block | StringMap`)
+  and `PropertySpec`. Modules splice these into a single static
+  schema; `dsl::schema::validate` walks any property surface against
+  it and collects every finding in one pass.
+- `Module::property_schema()` trait method (default `None` for a
+  gradual migration; every built-in carries a schema after this
+  release). `Module::build()` is the convenience entry that runs
+  validation before construction for direct callers (tests, snippet
+  libraries) — the `ModuleRegistry` does the equivalent step at
+  `create_input` / `create_output` time.
+- Shared `queue::QUEUE_PROPERTY_SPEC` declared once next to the
+  queue parser and spliced into every output schema, so the
+  `queue { type | path | max_size | capacity }` block is checked
+  uniformly across all sinks.
+
+### Added — analyzer wiring
+
+- New `check::module_props` pass validates every `def input` / `def
+  output` against the Module's schema, including a Levenshtein-based
+  did-you-mean hint drawn from the registered type names when
+  `type tcsp` or similar misses every known module.
+- New `check::global_props` pass applies the same treatment to the
+  top-level `control { socket | error_log }`, `geoip { database }`,
+  and `table { <name> { load | max | ttl } }` blocks.
+- New `DiagKind::PropertySchema` keeps these findings filterable
+  separately from existing `UnknownIdent` / `TypeMismatch` /
+  `Dataflow` categories.
+
+### Fixed — `framing non_transparent` false-positive
+
+The expression-level "unknown identifier" walk on output properties
+used to flag legitimate bare-ident enum values (`framing
+non_transparent`, `queue { type disk }`) as unbound — it had no idea
+the bare ident was an enum member. The walk now consults the
+Module's schema and skips its own shape check for keys the schema
+already owns. Workspace references inside template values
+(`address "${workspace.x}:1"`) are *not* skipped — the dataflow
+reference check still applies on every property regardless of
+schema coverage.
+
+### Fixed — silent fallback on unknown enum values
+
+Previously `framing non_trasnaprent` (a typo) silently fell back to
+the default framing. The schema layer rejects unknown enum values at
+both `--check` time and runtime startup, with a `did you mean ...?`
+hint.
+
+### Notes
+
+- Configs that pass `--check` today still pass. Configs that
+  previously slipped through with silent fallbacks (typo'd keys,
+  unknown enum values, mis-typed `type` ident) now fail loudly. This
+  is a bug fix, not a breaking change in the semver sense — the
+  previous behaviour silently corrupted the operator's intent.
+- `dsl::schema::levenshtein` consolidates the two
+  Levenshtein implementations the codebase used to carry; the
+  analyzer's `suggestions` module now re-exports the same routine
+  the schema validator uses.
+
+## [0.7.1] - 2026-05-16
+> journal input LOTL + transport-agnostic vocabulary parsers + datetime primitives
+>>>>>>> 12045f6 (release: 0.7.2 — declarative property schema, loud --check coverage)
 
 The journal input is rewritten to emit `journalctl -o json`-equivalent
 JSON on `ingress`, replacing the synthesised
