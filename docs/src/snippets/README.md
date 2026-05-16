@@ -31,8 +31,14 @@ SIGHUP).
 | `parsers/parse_cloudtrail.limpid` | AWS CloudTrail (JSON) | 6003 API Activity |
 | `parsers/parse_juniper_srx_sd_syslog.limpid` | Juniper SRX RT_FLOW (RFC 5424 + Junos SD, `set security log format sd-syslog` mode) | 4001 Network Activity |
 | `parsers/parse_juniper_srx_syslog.limpid` | Juniper SRX RT_IDP / IDP_ATTACK_LOG_EVENT (RFC 3164 unstructured, default `syslog` mode) | 2004 Detection Finding |
-| `parsers/parse_nsp.limpid` | Trellix / McAfee Network Security Platform IPS alerts (standard syslog KV template) | 2004 Detection Finding |
-| `parsers/parse_checkpoint.limpid` | Check Point LEEF 2.0 (Accept / Drop / Reject / Block) | 4001 Network Activity |
+| `parsers/parse_nsp.limpid` | Trellix / McAfee Network Security Platform IPS alerts (standard syslog KV template, real-traffic verified) | 2004 Detection Finding |
+| `parsers/parse_checkpoint_leef.limpid` | Check Point LEEF 2.0 (Accept / Drop / Reject / Block) — for QRadar bridges | 4001 Network Activity |
+| `parsers/parse_checkpoint_syslog.limpid` | Check Point Syslog Exporter (Junos-style SD with `:` separator; handles R81+ `Log [Fields@<EID> ...]` `=` variant) | 4001 / 2004 / 3002 |
+| **OSS NDR** | | |
+| `parsers/parse_suricata.limpid` | OISF Suricata EVE JSON (event_type dispatch: alert / dns / http / flow / tls / fileinfo; stats dropped) | 2004 / 4001 / 4002 / 4003 |
+| `parsers/parse_zeek_default.limpid` | Zeek default-enabled scripts (conn / dns / http / ssl / files / x509 / weird / notice) + `_native` / `_flat` convenience entry points | 2004 / 4001 / 4002 / 4003 |
+| `parsers/parse_zeek_soc.limpid` | Transitively includes default + adds auth / SMB / DCE-RPC / SNMP / RDP / DHCP (ssh / smtp / ftp / kerberos / ntlm / radius / smb_* / dce_rpc / snmp / rdp) | + 3002 / 4004 / 4005 / 4006 / 4007 / 4008 / 4009 |
+| `parsers/parse_zeek_full.limpid` | Transitively includes soc + adds remaining specialised scripts (signature / intel / traceroute / tunnel / mysql / irc / sip / dnp3 / modbus / socks / syslog / ntp / ocsp / pe / rfb / dpd) + drops low-value operational streams + catch-all for unknown `_path` (zero data loss) | + catch-all |
 | **Server / host vocabulary** | | |
 | `parsers/parse_openssh.limpid` | OpenSSH `sshd` body (transport-agnostic; bridge from `parse_syslog` or `parse_journald`) | 3002 Authentication |
 | `parsers/parse_sudo.limpid` | sudo (syslog / journald) | 3003 Authorize Session |
@@ -41,7 +47,7 @@ SIGHUP).
 | `parsers/parse_winevent_json.limpid` | Windows Security event log (NXLog / Vector / Winlogbeat JSON) | 3002 / 1007 / 3001 / 3006 |
 | `parsers/parse_sysmon.limpid` | Microsoft Sysmon (NXLog / Vector / Winlogbeat JSON) — EventID 1 / 3 / 11 | 1007 / 4001 / 1001 |
 | `parsers/parse_bind.limpid` | ISC BIND 9 querylog | 4003 DNS Activity |
-| `parsers/parse_auditd.limpid` | Linux auditd USER_LOGIN / USER_AUTH / USER_LOGOUT / USER_ACCT / CRED_ACQ / CRED_DISP | 3002 Authentication |
+| `parsers/parse_auditd.limpid` | Linux auditd, ~45 type codes across 7 OCSF classes (auth / account change / process / file / network / vulnerability / detection), real-corpus verified | 3002 / 3001 / 1007 / 1001 / 4001 / 2002 / 2004 |
 | **Vendor-neutral** | | |
 | `parsers/parse_ocsf.limpid` | OCSF JSON inbound (any vendor's prior compose_ocsf output) | passthrough (any class) |
 

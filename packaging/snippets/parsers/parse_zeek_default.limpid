@@ -1,0 +1,603 @@
+// Zeek (formerly Bro) JSON parser — default-enabled scripts (vocabulary)
+//
+// Vendor:   Zeek Project — open-source network monitoring framework
+//           that passively observes traffic and emits per-protocol
+//           structured logs. The de-facto OSS NDR pair with Suricata:
+//           Suricata raises alerts via signatures, Zeek records
+//           protocol telemetry exhaustively.
+//
+//           This file covers the **default-enabled** Zeek scripts
+//           (what a stock `local.zeek` produces): conn / dns / http /
+//           ssl / files / x509 / weird / notice. For broader coverage
+//           (auth protocols, SMB, RDP, etc.) include
+//           `parse_zeek_soc.limpid`; for full coverage with a
+//           zero-data-loss catch-all, include `parse_zeek_full.limpid`.
+//
+// Wire:     **Native Zeek JSON output** (`redef LogAscii::use_json = T`).
+//           Each line is one JSON object with `_path` set to the log
+//           name (`conn`, `dns`, …) and the 5-tuple nested under `id`:
+//
+//             {"ts": 1547188415.857, "uid": "CAcJw...",
+//              "id": {"orig_h":"...", "orig_p":80, "resp_h":"...", "resp_p":443},
+//              "proto":"tcp", "service":"http", ...}
+//
+//           NOT supported: the dotted-flat form (`"id.orig_h": "..."`)
+//           that Filebeat / Logstash zeek modules emit for ES indexing.
+//           That shape exists only because of downstream pipeline
+//           conventions; operators shipping Zeek directly to limpid
+//           should leave the native nested form alone.
+//
+// Intake:   workspace.zeek.body      (required, Object) — parsed Zeek event
+//                                     (caller does `parse_json(ingress)`)
+//           workspace.zeek.hostname  (optional, String) — collector override
+//           workspace.zeek.time      (optional, Int)    — epoch ns override
+//
+// Upstream: Zeek typically writes JSONL to per-protocol files (e.g.
+//           `/usr/local/zeek/logs/current/conn.log`). Operators tail
+//           those individually, or use a unified shipper that merges
+//           all log streams to a single endpoint.
+//
+//           - Per-log JSONL tail:
+//                 process { workspace.zeek = { body: parse_json(ingress), hostname: hostname(), time: to_int(received_at) } } | parse_zeek_default | compose_ocsf
+//
+// Output:   OCSF records on `workspace.limpid`. Dispatch by `_path`:
+//             conn   → 4001 Network Activity (conn_state → activity_id)
+//             dns    → 4003 DNS Activity
+//             http   → 4002 HTTP Activity (method → activity_id)
+//             ssl    → 4001 Network Activity (TLS handshake under unmapped)
+//             files  → 4001 Network Activity (file evidence under unmapped)
+//             x509   → 4001 Network Activity (cert under unmapped)
+//             weird  → 2004 Detection Finding (protocol anomaly)
+//             notice → 2004 Detection Finding (Zeek-script finding)
+//             other  → error_log (loud-fail-fast; use parse_zeek_full
+//                      for a catch-all that absorbs unknown _paths)
+//
+// Coverage scope (v0.7.1): verified against the elastic/integrations
+// zeek corpus (61 events across the 8 default streams), with the
+// corpus pre-unflattened to native nested form for the verify run.
+
+// ---------------------------------------------------------------------------
+// Shared helpers (used by record builders in this file and inherited
+// by parse_zeek_soc / parse_zeek_full)
+// ---------------------------------------------------------------------------
+
+// IANA protocol_num for Zeek's lowercase proto names.
+def function zeek_proto_num(p) {
+    switch p {
+        "tcp"    { 6 }
+        "udp"    { 17 }
+        "icmp"   { 1 }
+        "icmpv6" { 58 }
+        "gre"    { 47 }
+        "esp"    { 50 }
+        "ah"     { 51 }
+        default  { null }
+    }
+}
+
+// Zeek `ts` is a float Unix epoch in seconds with microsecond
+// precision. Convert to nanoseconds (OCSF `time` convention) without
+// losing sub-second resolution.
+def function zeek_time_ns(body, override) {
+    coalesce(
+        switch true {
+            body.ts != null { to_int(body.ts * 1000000000) }
+            default         { null }
+        },
+        override
+    )
+}
+
+// Build the canonical OCSF endpoint from Zeek's nested `id` object.
+def function zeek_endpoint(id_obj, side) {
+    switch true {
+        id_obj == null { null }
+        side == "src" {
+            { ip: id_obj.orig_h, port: id_obj.orig_p }
+        }
+        side == "dst" {
+            { ip: id_obj.resp_h, port: id_obj.resp_p }
+        }
+        default { null }
+    }
+}
+
+// Map Zeek `conn_state` (https://docs.zeek.io/en/master/logs/conn.html)
+// to OCSF 4001 activity_id:
+//   1 Open / 2 Close / 3 Reset / 4 Fail / 5 Refuse / 6 Traffic / 99 Other
+def function zeek_conn_state_activity_id(s) {
+    switch s {
+        "S0"     { 4 }        // SYN, no reply  → Fail
+        "S1"     { 1 }        // established    → Open
+        "SF"     { 2 }        // normal close   → Close
+        "REJ"    { 5 }        // rejected       → Refuse
+        "S2"     { 1 }
+        "S3"     { 1 }
+        "RSTO"   { 3 }        // originator reset
+        "RSTR"   { 3 }        // responder reset
+        "RSTOS0" { 3 }
+        "RSTRH"  { 3 }
+        "SH"     { 2 }        // half-closed
+        "SHR"    { 2 }
+        "OTH"    { 99 }
+        default  { 99 }
+    }
+}
+
+// Map Zeek `conn_state` to OCSF status_id (1 Success / 2 Failure /
+// 99 Other). Reset / rejected / no-reply → Failure.
+def function zeek_conn_status_id(s) {
+    switch s {
+        "SF"     { 1 }
+        "S1"     { 1 }
+        "S2"     { 1 }
+        "S3"     { 1 }
+        "S0"     { 2 }
+        "REJ"    { 2 }
+        "RSTO"   { 2 }
+        "RSTR"   { 2 }
+        "RSTOS0" { 2 }
+        "RSTRH"  { 2 }
+        default  { 99 }
+    }
+}
+
+// DNS rcode name → OCSF rcode_id (IANA DNS RCODE registry).
+def function zeek_dns_rcode_id(r) {
+    switch r {
+        "NOERROR"  { 0 }
+        "FORMERR"  { 1 }
+        "SERVFAIL" { 2 }
+        "NXDOMAIN" { 3 }
+        "NOTIMP"   { 4 }
+        "REFUSED"  { 5 }
+        "YXDOMAIN" { 6 }
+        "YXRRSET"  { 7 }
+        "NXRRSET"  { 8 }
+        "NOTAUTH"  { 9 }
+        "NOTZONE"  { 10 }
+        default    { null }
+    }
+}
+
+// HTTP method → OCSF 4002 activity_id.
+def function zeek_http_activity_id(method) {
+    switch method {
+        "CONNECT" { 1 }
+        "DELETE"  { 2 }
+        "GET"     { 3 }
+        "HEAD"    { 4 }
+        "OPTIONS" { 5 }
+        "POST"    { 6 }
+        "PUT"     { 7 }
+        "TRACE"   { 8 }
+        default   { 99 }
+    }
+}
+
+// HTTP status code → OCSF status_id. 2xx/3xx → Success, 4xx/5xx →
+// Failure, anything else → Other.
+def function zeek_http_status_id(code) {
+    switch true {
+        code == null            { 99 }
+        code >= 200 and code < 400 { 1 }
+        code >= 400             { 2 }
+        default                 { 99 }
+    }
+}
+
+// Constant metadata block stamped on every Zeek-derived record.
+def function zeek_metadata() {
+    {
+        product: {
+            vendor_name: "Zeek Project",
+            name:        "Zeek"
+        },
+        version: "1.3.0"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Record builders — one per _path in the default-enabled set
+// ---------------------------------------------------------------------------
+
+// `conn` → 4001 Network Activity
+def function zeek_conn_record(body, host, time_ns) {
+    {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  zeek_conn_state_activity_id(body.conn_state),
+        severity_id:  1,
+        status_id:    zeek_conn_status_id(body.conn_state),
+        time:         time_ns,
+        src_endpoint: zeek_endpoint(body.id, "src"),
+        dst_endpoint: zeek_endpoint(body.id, "dst"),
+        connection_info: {
+            protocol_num:  zeek_proto_num(body.proto),
+            protocol_name: body.proto,
+            uid:           body.uid
+        },
+        traffic: {
+            bytes_in:    body.resp_bytes,
+            bytes_out:   body.orig_bytes,
+            packets_in:  body.resp_pkts,
+            packets_out: body.orig_pkts
+        },
+        app_name: body.service,
+        device:   { hostname: host },
+        unmapped: {
+            zeek_path:      body._path,
+            conn_state:     body.conn_state,
+            duration:       body.duration,
+            history:        body.history,
+            local_orig:     body.local_orig,
+            local_resp:     body.local_resp,
+            missed_bytes:   body.missed_bytes,
+            orig_ip_bytes:  body.orig_ip_bytes,
+            resp_ip_bytes:  body.resp_ip_bytes,
+            tunnel_parents: body.tunnel_parents
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// `dns` → 4003 DNS Activity. Zeek emits one event per
+// request/response pair, so we always tag it as a Query (activity_id
+// 1) with response data carried alongside.
+def function zeek_dns_record(body, host, time_ns) {
+    {
+        class_uid:    4003,
+        category_uid: 4,
+        activity_id:  1,                                  // Query
+        severity_id:  1,
+        rcode_id:     zeek_dns_rcode_id(body.rcode_name),
+        time:         time_ns,
+        query: {
+            hostname: body.query,
+            type:     body.qtype_name,
+            class:    body.qclass_name
+        },
+        answers:      body.answers,
+        src_endpoint: zeek_endpoint(body.id, "src"),
+        dst_endpoint: zeek_endpoint(body.id, "dst"),
+        device:       { hostname: host },
+        metadata:     zeek_metadata()
+    }
+}
+
+// `http` → 4002 HTTP Activity
+def function zeek_http_record(body, host, time_ns) {
+    {
+        class_uid:    4002,
+        category_uid: 4,
+        activity_id:  zeek_http_activity_id(body.method),
+        severity_id:  1,
+        status_id:    zeek_http_status_id(body.status_code),
+        time:         time_ns,
+        http_request: {
+            http_method: body.method,
+            url:         { hostname: body.host, path: body.uri },
+            user_agent:  body.user_agent,
+            version:     body.version,
+            length:      body.request_body_len
+        },
+        http_response: {
+            code:    body.status_code,
+            message: body.status_msg,
+            length:  body.response_body_len
+        },
+        src_endpoint: zeek_endpoint(body.id, "src"),
+        dst_endpoint: zeek_endpoint(body.id, "dst"),
+        device:       { hostname: host },
+        actor:        switch true {
+            body.username != null { { user: { name: body.username } } }
+            default               { null }
+        },
+        metadata:     zeek_metadata()
+    }
+}
+
+// `ssl` → 4001 Network Activity (TLS handshake summary)
+def function zeek_ssl_record(body, host, time_ns) {
+    {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  6,                                  // Traffic
+        severity_id:  1,
+        status_id:    switch true {
+            body.established == true     { 1 }
+            body.established == false    { 2 }
+            default                      { 99 }
+        },
+        time:         time_ns,
+        src_endpoint: zeek_endpoint(body.id, "src"),
+        dst_endpoint: zeek_endpoint(body.id, "dst"),
+        connection_info: {
+            uid:           body.uid,
+            protocol_name: "tls"
+        },
+        app_name:     "tls",
+        device:       { hostname: host },
+        unmapped: {
+            zeek_path:               body._path,
+            tls_version:             body.version,
+            tls_cipher:              body.cipher,
+            tls_curve:               body.curve,
+            tls_server_name:         body.server_name,
+            tls_resumed:             body.resumed,
+            tls_established:         body.established,
+            tls_subject:             body.subject,
+            tls_issuer:              body.issuer,
+            tls_validation_status:   body.validation_status,
+            cert_chain_fuids:        body.cert_chain_fuids,
+            client_cert_chain_fuids: body.client_cert_chain_fuids,
+            ja3:                     body.ja3,
+            ja3s:                    body.ja3s
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// `files` → 4001 Network Activity (file evidence on unmapped).
+// OCSF 1.3.0 has 4010 Network File Activity for this, but the
+// composer doesn't yet route it; carry the file detail under
+// unmapped to avoid silent data loss.
+def function zeek_files_record(body, host, time_ns) {
+    {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  6,                                  // Traffic
+        severity_id:  1,
+        status_id:    switch true {
+            body.timedout == true { 2 }
+            default               { 1 }
+        },
+        time:         time_ns,
+        src_endpoint: switch true {
+            body.tx_hosts != null { { ip: body.tx_hosts } }
+            default               { null }
+        },
+        dst_endpoint: switch true {
+            body.rx_hosts != null { { ip: body.rx_hosts } }
+            default               { null }
+        },
+        device:       { hostname: host },
+        unmapped: {
+            zeek_path:     body._path,
+            fuid:          body.fuid,
+            conn_uids:     body.conn_uids,
+            source:        body.source,
+            depth:         body.depth,
+            analyzers:     body.analyzers,
+            mime_type:     body.mime_type,
+            duration:      body.duration,
+            local_orig:    body.local_orig,
+            is_orig:       body.is_orig,
+            seen_bytes:    body.seen_bytes,
+            missing_bytes: body.missing_bytes,
+            overflow_bytes: body.overflow_bytes,
+            timedout:      body.timedout,
+            md5:           body.md5,
+            sha1:          body.sha1,
+            sha256:        body.sha256,
+            filename:      body.filename
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// `x509` → 4001 Network Activity (certificate detail on unmapped).
+// x509 events lack a 5-tuple in Zeek's schema (they're keyed on the
+// cert fuid, joinable back to ssl/files via fuid), so endpoint
+// objects are null.
+def function zeek_x509_record(body, host, time_ns) {
+    {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  6,                                  // Traffic
+        severity_id:  1,
+        status_id:    1,
+        time:         time_ns,
+        device:       { hostname: host },
+        unmapped: {
+            zeek_path:    body._path,
+            fuid:         body.id,                        // x509 reuses `id` as the file uid
+            certificate:  body.certificate,
+            san:          body.san,
+            basic_constraints: body.basic_constraints
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// `weird` → 2004 Detection Finding (protocol-level anomaly)
+def function zeek_weird_record(body, host, time_ns) {
+    {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:  1,                                  // Create
+        severity_id:  2,                                  // Low (most weirds are noise)
+        status_id:    99,
+        time:         time_ns,
+        finding_info: {
+            title: body.name,
+            types: ["Protocol Anomaly"],
+            analytic: {
+                name: body.name
+            }
+        },
+        src_endpoint: zeek_endpoint(body.id, "src"),
+        dst_endpoint: zeek_endpoint(body.id, "dst"),
+        connection_info: {
+            uid: body.uid
+        },
+        device:   { hostname: host },
+        unmapped: {
+            zeek_path: body._path,
+            weird:     body.notice,
+            peer:      body.peer,
+            addl:      body.addl
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// `notice` → 2004 Detection Finding (Zeek-script policy finding)
+def function zeek_notice_record(body, host, time_ns) {
+    {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:  1,                                  // Create
+        severity_id:  3,                                  // Medium (operator opt-in)
+        status_id:    99,
+        time:         time_ns,
+        finding_info: {
+            title: body.note,
+            desc:  body.msg,
+            types: ["Network Notice"],
+            analytic: {
+                name: body.note
+            }
+        },
+        src_endpoint: switch true {
+            body.src != null { { ip: body.src } }
+            default          { zeek_endpoint(body.id, "src") }
+        },
+        dst_endpoint: switch true {
+            body.dst != null { { ip: body.dst } }
+            default          { zeek_endpoint(body.id, "dst") }
+        },
+        device:   { hostname: host },
+        message:  body.msg,
+        unmapped: {
+            zeek_path:     body._path,
+            sub:           body.sub,
+            peer_descr:    body.peer_descr,
+            actions:       body.actions,
+            suppress_for:  body.suppress_for,
+            dropped:       body.dropped
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Convenience entry points — include intake + dispatch in one process.
+// ---------------------------------------------------------------------------
+//
+// The base `parse_zeek_default` (below) assumes the operator has
+// already populated `workspace.zeek = { body: <Object>, ... }`.
+// These convenience variants fold the intake step in so the pipeline
+// can pipe the raw input directly:
+//
+//   - `_native` — Zeek's own JSON output (`redef LogAscii::use_json = T`),
+//                 5-tuple nested under `id`. The expected production form.
+//   - `_flat`   — Filebeat / Logstash-flattened form (`"id.orig_h"` etc.),
+//                 the dotted-keys shape downstream ES pipelines emit.
+//                 Runs `nest_dotted_keys` first to recover the native
+//                 nested shape before dispatch.
+
+def process parse_zeek_default_native {
+    workspace.zeek = {
+        body:     parse_json(ingress),
+        hostname: hostname(),
+        time:     to_int(received_at)
+    }
+    process parse_zeek_default
+}
+
+def process parse_zeek_default_flat {
+    workspace.zeek = {
+        body:     nest_dotted_keys(parse_json(ingress)),
+        hostname: hostname(),
+        time:     to_int(received_at)
+    }
+    process parse_zeek_default
+}
+
+// ---------------------------------------------------------------------------
+// Main process — dispatch by `_path`
+// ---------------------------------------------------------------------------
+
+def process parse_zeek_default {
+    // @requires: workspace.zeek.body      (required, Object — parsed Zeek event)
+    // @requires: workspace.zeek.hostname  (optional, String)
+    // @requires: workspace.zeek.time      (optional, Int — epoch ns)
+    switch workspace.zeek.body._path {
+        "conn"   { process parse_zeek_default_conn }
+        "dns"    { process parse_zeek_default_dns }
+        "http"   { process parse_zeek_default_http }
+        "ssl"    { process parse_zeek_default_ssl }
+        "files"  { process parse_zeek_default_files }
+        "x509"   { process parse_zeek_default_x509 }
+        "weird"  { process parse_zeek_default_weird }
+        "notice" { process parse_zeek_default_notice }
+        default {
+            error "parse_zeek_default: unsupported _path '${workspace.zeek.body._path}' (use parse_zeek_soc or parse_zeek_full for broader coverage)"
+        }
+    }
+}
+
+def process parse_zeek_default_conn {
+    workspace.limpid = zeek_conn_record(
+        workspace.zeek.body,
+        workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time)
+    )
+}
+
+def process parse_zeek_default_dns {
+    workspace.limpid = zeek_dns_record(
+        workspace.zeek.body,
+        workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time)
+    )
+}
+
+def process parse_zeek_default_http {
+    workspace.limpid = zeek_http_record(
+        workspace.zeek.body,
+        workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time)
+    )
+}
+
+def process parse_zeek_default_ssl {
+    workspace.limpid = zeek_ssl_record(
+        workspace.zeek.body,
+        workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time)
+    )
+}
+
+def process parse_zeek_default_files {
+    workspace.limpid = zeek_files_record(
+        workspace.zeek.body,
+        workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time)
+    )
+}
+
+def process parse_zeek_default_x509 {
+    workspace.limpid = zeek_x509_record(
+        workspace.zeek.body,
+        workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time)
+    )
+}
+
+def process parse_zeek_default_weird {
+    workspace.limpid = zeek_weird_record(
+        workspace.zeek.body,
+        workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time)
+    )
+}
+
+def process parse_zeek_default_notice {
+    workspace.limpid = zeek_notice_record(
+        workspace.zeek.body,
+        workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time)
+    )
+}

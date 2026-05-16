@@ -32,6 +32,7 @@ pub mod hashes;
 pub mod hostname;
 pub mod len;
 pub mod lower;
+pub mod nest_dotted_keys;
 pub mod null_omit;
 pub mod parse_datetime_rfc2822;
 pub mod parse_datetime_rfc3339;
@@ -76,6 +77,7 @@ pub fn register(reg: &mut FunctionRegistry, table_store: TableStore) {
     hashes::register(reg);
     hostname::register(reg);
     len::register(reg);
+    nest_dotted_keys::register(reg);
     null_omit::register(reg);
     strftime::register(reg);
     strptime::register(reg);

@@ -9,7 +9,7 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [0.7.1] - 2026-05-16
-> journal input LOTL + transport-agnostic vocabulary parsers + datetime primitives
+> journal input LOTL + transport-agnostic vocabulary parsers + datetime primitives + expanded SIEM + OSS NDR parsers (real-traffic verified)
 
 The journal input is rewritten to emit `journalctl -o json`-equivalent
 JSON on `ingress`, replacing the synthesised
@@ -91,11 +91,12 @@ major SIEM sources covering additional major sources:
 |---|---|---|
 | `parse_juniper_srx_sd_syslog` | Juniper Junos SRX in `set security log format sd-syslog` mode — covers all daemons that emit a `[junos@<EID> ...]` SD block: **RT_FLOW** (SESSION_CREATE/CLOSE/DENY + APPTRACK_SESSION_*), **RT_IDP** (IDP_ATTACK_LOG_EVENT + IDP_APPDDOS_*), **RT_IDS** (RT_SCREEN_*), **RT_UTM** (AV / Antispam / Content / Webfilter), **RT_AAMW** (Sky ATP), **RT_SECINTEL** (threat-feed). Verified against the elastic/integrations juniper_srx corpus (66/66 emit, 0 error) | 4001 / 2004 / 4002 |
 | `parse_juniper_srx_syslog` | Juniper Junos SRX RT_IDP / IDP_ATTACK_LOG_EVENT (RFC 3164 unstructured syslog — `set security log format syslog` default mode) — real-traffic verified against a real SRX | 2004 |
-| `parse_nsp` | Trellix / McAfee Network Security Platform (NSP) IPS alerts in the vendor-recommended standard syslog KV template (handles the duplicate `confidence=` key for attack vs. malware confidence by ordered regex extraction) | 2004 |
-| `parse_checkpoint` | Check Point LEEF 2.0 traffic events (Accept / Drop / Reject / Block) inside a syslog wrapper | 4001 |
-| `parse_sysmon` | Microsoft Sysmon EventID 1 (ProcessCreate) / 3 (NetworkConnect) / 11 (FileCreate), as JSON via NXLog / Vector / Winlogbeat | 1007 / 4001 / 1001 |
-| `parse_bind` | ISC BIND 9 `querylog` text format (`category queries`) | 4003 |
-| `parse_auditd` | Linux auditd USER_LOGIN / USER_AUTH / USER_ACCT / USER_LOGOUT / CRED_ACQ / CRED_DISP (the authentication subset of auditd's ~70 type codes) | 3002 |
+| `parse_nsp` | Trellix / McAfee Network Security Platform (NSP) IPS alerts. **Real-traffic verified** against real NSP traffic — 72/72 alerts emit cleanly across HTTP / SSH / SSL / NETBIOS-SS / TELNET / NTP / BACKDOOR categories. Real wire turned out to emit unquoted multi-word values (`attack_name=NETBIOS-SS: Windows SMB Remote Code Execution Vulnerability` without the documented quotes); the parser now uses a single fixed-order regex over the full Trellix standard template, which is the only robust extraction strategy for unquoted KV with embedded spaces | 2004 |
+| `parse_checkpoint_leef` | Check Point LEEF 2.0 traffic events (Accept / Drop / Reject / Block) inside a syslog wrapper. Renamed from `parse_checkpoint`; targets the LEEF wire format used by QRadar bridges. Synthetic-verified only | 4001 |
+| `parse_checkpoint_syslog` | Check Point Syslog Exporter wire format (`[key:"value"; ...]` SD with `sys_message::"..."` double-colon convention; also handles R81+ `Log [Fields@<EID> ...]` `=` variant). **Real-corpus verified** against elastic/integrations checkpoint (91/91 events emit across firewall / threat / auth / audit dispositions) | 4001 / 2004 / 3002 |
+| `parse_sysmon` | Microsoft Sysmon EventID 1 (ProcessCreate) / 3 (NetworkConnect) / 11 (FileCreate), as JSON via NXLog / Vector / Winlogbeat. Synthetic-verified only — the elastic sysmon_linux corpus uses a different field-path convention (`winlog.event_id` / `winlog.event_data`) so it cannot exercise this parser as-is | 1007 / 4001 / 1001 |
+| `parse_bind` | ISC BIND 9 `querylog` text format (`category queries`). Synthetic-verified only — no public corpus discovered for the format | 4003 |
+| `parse_auditd` | Linux auditd, covers ~45 type codes across 7 OCSF classes (3002 Authentication / 3001 Account Change / 1007 Process Activity / 1001 File System / 4001 Network / 2002 Vulnerability Finding / 2004 Detection Finding). Handles `node=<host>` prefix injected by RHEL `audisp-remote` dispatcher. **Real-corpus verified** against elastic/integrations auditd (68/69 emit, 1 corrupt record errors loudly) | 3002 / 3001 / 1007 / 1001 / 4001 / 2002 / 2004 |
 
 Junos security logs ship in two distinct wire formats — the
 `sd-syslog` structured form is rare in practice (most production
@@ -124,12 +125,87 @@ Compose_ocsf leaves extended for the new parsers' fields:
   `device`, `actor`, `attacks`, and `unmapped` forwarding (for
   the new Juniper SRX IDP parser)
 
-Verified against synthetic samples in each parser's header.
-`parse_juniper_srx_syslog` additionally verified against live
-RT_IDP traffic from a real SRX. Real test corpora for the
-other vendors (CheckPoint / Sysmon / BIND / auditd /
-Juniper SRX sd-syslog mode) are pending — header docstrings
-mark them "synthetic-verified only".
+Real-corpus verification pass on elastic/integrations and (for
+NSP) production traffic completes the trustworthiness story for
+most newly-added vendor parsers — every parser's header `Coverage scope`
+section now lists the exact corpus / dataset / device it was
+exercised against, and what residual gaps remain (Sysmon and
+BIND have no usable public corpus; CheckPoint LEEF has no
+public corpus distinct from the Syslog Exporter form).
+
+### Added — OSS NDR parsers (Suricata + Zeek)
+
+The de-facto open-source NDR pair. Suricata raises alerts via
+signatures; Zeek records per-protocol telemetry exhaustively.
+Operators deploying either ship event volumes that dwarf any
+single vendor source, so both get first-class snippet coverage.
+
+| Parser | Source | OCSF class(es) |
+|---|---|---|
+| `parse_suricata` | OISF Suricata Extensible Event Format (EVE) JSON, dispatched by `event_type`: alert → 2004, dns → 4003, http → 4002, flow / tls / fileinfo → 4001, stats → drop. **Real-corpus verified** against elastic/integrations suricata (61/63 emit + 1 stats drop + 1 corrupt JSON in corpus) | 2004 / 4001 / 4002 / 4003 |
+| `parse_zeek_default` | Zeek default-enabled scripts: conn / dns / http / ssl / files / x509 / weird / notice. **Real-corpus verified** against elastic/integrations zeek (61/61 emit, all 8 streams) | 2004 / 4001 / 4002 / 4003 |
+| `parse_zeek_soc` | Adds auth / protocol scripts most SOC deployments enable: ssh / smtp / ftp / dhcp / kerberos / ntlm / radius / smb_{mapping,cmd,files} / dce_rpc / snmp / rdp. Transitively includes `parse_zeek_default`. **Real-corpus verified** (85/85 emit, 20 distinct streams) | + 3002 / 4004 / 4005 / 4006 / 4007 / 4008 / 4009 |
+| `parse_zeek_full` | Adds the rest (signature / intel / traceroute / tunnel / pe / mysql / irc / sip / dnp3 / modbus / socks / syslog / ntp / ocsp / rfb / dpd) + drops low-value operational streams (stats / capture_loss / known_hosts / known_services / known_certs / software) + a **catch-all** that wraps any remaining unknown `_path` into a 4001 record's `unmapped` (zero data loss guarantee). Transitively includes `parse_zeek_soc`. **Real-corpus verified** against the full 43-stream elastic/integrations zeek corpus (120/135 emit + 15 expected drops) | + catch-all |
+
+Zeek's scope layering is **nested**: an operator picking
+`parse_zeek_soc` automatically gets default coverage (the SOC
+file includes default); picking `parse_zeek_full` gets soc +
+default + everything else. One include line, one process name
+in the pipeline.
+
+Each Zeek scope file also ships **convenience entry points** with
+`_native` / `_flat` suffixes that fold the intake step into the
+parser itself:
+
+- `_native` — Zeek's own JSON output (5-tuple nested under `id`),
+  the expected production shape.
+- `_flat` — Filebeat / Logstash-flattened form
+  (`"id.orig_h"` etc.), the dotted-keys shape downstream ES
+  pipelines emit. Runs `nest_dotted_keys` first to recover the
+  native nested shape before dispatch.
+
+Pipeline becomes a single stage: `process parse_zeek_soc_native
+| compose_ocsf` (no separate `process { workspace.zeek = ... }`
+intake block needed).
+
+Suricata's EVE format does not vary by downstream shipper, so it
+ships only one entry point following the existing
+intake-separate convention.
+
+### Added — `nest_dotted_keys` primitive
+
+Some upstreams (Filebeat / Logstash JSON emitters used by zeek
+and suricata modules, certain Splunk HEC sources, OpenSearch
+ingest pipelines) flatten nested JSON for Elasticsearch indexing
+conventions: `{"id": {"orig_h": "1.1.1.1"}}` becomes
+`{"id.orig_h": "1.1.1.1"}`. The limpid DSL deliberately does
+not expose bracket-subscript access (`body["id.orig_h"]`), so
+dotted keys are unreachable from a parser without normalising
+first.
+
+`nest_dotted_keys(obj)` recursively un-flattens dotted keys
+back into nested Objects, with loud-fail on collisions
+(`{"a": 1, "a.b": 2}` errors out clearly). Generic across
+vendors — used by parse_zeek_*_flat variants, and equally
+applicable to any other Filebeat-flattened JSON.
+
+### Fixed — `parse_datetime_rfc3339` accepts `±HHMM` offset (was strict colon-only)
+
+`chrono`'s `parse_from_rfc3339` is strict per RFC 3339 and
+requires the offset as `±HH:MM` (colon form) or `Z`. Many real
+emitters (Suricata EVE, journald JSON export, `jq -r` default,
+some CloudTrail regions) omit the colon and emit `±HHMM`. The
+primitive's doc claimed both forms were accepted, but the
+existing implementation only called the strict parser, so
+`±HHMM` bodies routed silently to error_log.
+
+The primitive now composes a small fallback chain:
+`parse_from_rfc3339` → on failure → `parse_from_str` with `%z`
+(which accepts both shapes). Documented surface is therefore
+exactly `Z` / `±HH:MM` / `±HHMM`; deviations (space separator
+instead of `T`, ISO 8601 basic form without dashes, abbreviated
+offset `+09`, named zones) remain rejected and must be
+normalised upstream.
 
 ### Added — transport parsers + RFC 5424 composer
 
@@ -208,13 +284,23 @@ longer works.
 ### Notes
 
 - DSL syntax: unchanged.
-- 393 tests pass (`cargo test --workspace`), `cargo build --release`
-  green. 9 new tests cover `parse_datetime_rfc3339` and
-  `parse_datetime_rfc2822` (Z literal, numeric offsets, sub-second
-  precision, garbage rejection).
+- `cargo build --release` green; `cargo test --workspace` green.
+  Datetime primitives gained an extra `accepts_microsecond_fractional_no_colon`
+  test for the Suricata-shape `±HHMM`+microsecond case. `nest_dotted_keys`
+  ships with 9 unit tests covering simple nesting, sibling merging,
+  three-level nesting, recursion into nested objects / arrays,
+  leaf/branch collision rejection, empty-segment rejection, and
+  pass-through of non-Object inputs.
 - Snippet library now also ships `packaging/snippets/functions/`
   for LPL `def function` helpers (currently
   `parse_datetime_rfc3164.limpid`).
+- Snippet file count this release: 4 Zeek scope files
+  (`parse_zeek_default` / `parse_zeek_soc` / `parse_zeek_full` +
+  the `_native` / `_flat` convenience variants live inside each)
+  + 1 Suricata + 1 CheckPoint Syslog Exporter + 2 Juniper SRX
+  format variants + 1 Trellix NSP + expanded `parse_auditd` /
+  `parse_openssh` = 9 new parser files on top of the v0.7.0
+  baseline.
 
 ---
 

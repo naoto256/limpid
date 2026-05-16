@@ -1,0 +1,373 @@
+// Zeek full-scope parser (vocabulary)
+//
+// Extends `parse_zeek_soc.limpid` with:
+//   - Specialised handlers for the rest of the Zeek default protocol
+//     scripts (signature / intel / traceroute / tunnel / mysql /
+//     irc / sip / dnp3 / modbus / socks / syslog / ntp / ocsp / pe /
+//     rfb / dpd).
+//   - **Drop arms** for low-signal operational streams (stats /
+//     capture_loss / known_hosts / known_services / known_certs /
+//     software) — operator visibility into Zeek's own runtime and
+//     asset inventory, almost never security-relevant in raw form.
+//   - **Catch-all** for any remaining unknown `_path`: wraps the
+//     entire raw body into a 4001 Network Activity record's
+//     `unmapped` so absolutely nothing is silently dropped. Operator
+//     can post-process by inspecting `unmapped.zeek_path` to recover
+//     the original log type.
+//
+// Composition: transitively includes parse_zeek_soc → parse_zeek_default.
+// Operators picking the full scope only write one include + reference
+// `parse_zeek_full` in the pipeline.
+//
+// Trade-off vs parse_zeek_soc: full guarantees zero data loss at the
+// cost of emitting "weak" 4001 records for everything below
+// security-relevance (ICS / DB / protocol-specific telemetry). Pick
+// `parse_zeek_soc` if you want loud-fail-fast on unknown _paths so
+// new log types surface as config alerts; pick `parse_zeek_full` if
+// you want to capture everything Zeek emits and triage later.
+
+include "parse_zeek_soc.limpid"
+
+// ---------------------------------------------------------------------------
+// Convenience entry points — see parse_zeek_default.limpid for rationale.
+// ---------------------------------------------------------------------------
+
+def process parse_zeek_full_native {
+    workspace.zeek = {
+        body:     parse_json(ingress),
+        hostname: hostname(),
+        time:     to_int(received_at)
+    }
+    process parse_zeek_full
+}
+
+def process parse_zeek_full_flat {
+    workspace.zeek = {
+        body:     nest_dotted_keys(parse_json(ingress)),
+        hostname: hostname(),
+        time:     to_int(received_at)
+    }
+    process parse_zeek_full
+}
+
+// ---------------------------------------------------------------------------
+// Generic record builder — used for full-extra _paths that have no
+// rich OCSF class beyond 4001 Network Activity. The whole body
+// (minus the 5-tuple we lift to endpoints) is carried under unmapped.
+// ---------------------------------------------------------------------------
+
+def function zeek_generic_4001_record(body, host, time_ns, app_proto) {
+    {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  6,                                  // Traffic
+        severity_id:  1,
+        status_id:    1,
+        time:         time_ns,
+        src_endpoint: zeek_endpoint(body.id, "src"),
+        dst_endpoint: zeek_endpoint(body.id, "dst"),
+        connection_info: {
+            uid:           body.uid,
+            protocol_name: app_proto
+        },
+        app_name:     app_proto,
+        device:       { hostname: host },
+        unmapped: {
+            zeek_path: body._path,
+            body:      body
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Specialised builders — for paths where a richer OCSF mapping is
+// either available or worth the small amount of structure.
+// ---------------------------------------------------------------------------
+
+// `signature` → 2004 Detection Finding (Zeek signature framework match)
+def function zeek_signature_record(body, host, time_ns) {
+    {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:  1,                                  // Create
+        severity_id:  3,
+        status_id:    99,
+        time:         time_ns,
+        finding_info: {
+            uid:   body.sig_id,
+            title: body.note,
+            desc:  body.event_msg,
+            types: ["Signature Match"],
+            analytic: {
+                name: body.sig_id
+            }
+        },
+        src_endpoint: {
+            ip:   body.src_addr,
+            port: body.src_port
+        },
+        dst_endpoint: {
+            ip:   body.dst_addr,
+            port: body.dst_port
+        },
+        device:   { hostname: host },
+        message:  body.event_msg,
+        unmapped: {
+            zeek_path: body._path,
+            uid:       body.uid,
+            sub_msg:   body.sub_msg,
+            host_count: body.host_count,
+            engine:    body.engine
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// `intel` → 2004 Detection Finding (threat-intel framework match)
+def function zeek_intel_record(body, host, time_ns) {
+    {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:  1,                                  // Create
+        severity_id:  3,
+        status_id:    99,
+        time:         time_ns,
+        finding_info: {
+            title: body.seen.indicator,
+            types: ["Threat Intel Match"],
+            analytic: {
+                name: body.seen.where
+            }
+        },
+        src_endpoint: zeek_endpoint(body.id, "src"),
+        dst_endpoint: zeek_endpoint(body.id, "dst"),
+        device:   { hostname: host },
+        unmapped: {
+            zeek_path:      body._path,
+            uid:            body.uid,
+            indicator:      body.seen.indicator,
+            indicator_type: body.seen.indicator_type,
+            seen_where:     body.seen.where,
+            seen_node:      body.seen.node,
+            matched:        body.matched,
+            sources:        body.sources,
+            file_mime_type: body.file_mime_type,
+            file_desc:      body.file_desc
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// `traceroute` → 4001 (network discovery; no 5-tuple, just src/dst pair)
+def function zeek_traceroute_record(body, host, time_ns) {
+    {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  6,
+        severity_id:  1,
+        status_id:    1,
+        time:         time_ns,
+        src_endpoint: { ip: body.src },
+        dst_endpoint: { ip: body.dst },
+        connection_info: {
+            protocol_num:  zeek_proto_num(body.proto),
+            protocol_name: body.proto
+        },
+        app_name: "traceroute",
+        device:   { hostname: host },
+        unmapped: {
+            zeek_path: body._path
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// `rfb` → 4005 RDP Activity (RFB / VNC is a remote-desktop protocol)
+def function zeek_rfb_record(body, host, time_ns) {
+    {
+        class_uid:    4005,
+        category_uid: 4,
+        activity_id:  1,
+        severity_id:  1,
+        status_id:    switch true {
+            body.auth == true  { 1 }
+            body.auth == false { 2 }
+            default            { 99 }
+        },
+        time:         time_ns,
+        src_endpoint: zeek_endpoint(body.id, "src"),
+        dst_endpoint: zeek_endpoint(body.id, "dst"),
+        connection_info: {
+            uid:           body.uid,
+            protocol_name: "rfb"
+        },
+        device:   { hostname: host },
+        unmapped: {
+            zeek_path:             body._path,
+            client_major_version:  body.client_major_version,
+            client_minor_version:  body.client_minor_version,
+            server_major_version:  body.server_major_version,
+            server_minor_version:  body.server_minor_version,
+            authentication_method: body.authentication_method,
+            auth:                  body.auth,
+            share_flag:            body.share_flag,
+            desktop_name:          body.desktop_name,
+            width:                 body.width,
+            height:                body.height
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main process — dispatch full-extra _paths, drop low-value streams,
+// fall through to soc for known protocols, wrap unknowns into 4001
+// catch-all.
+// ---------------------------------------------------------------------------
+
+def process parse_zeek_full {
+    switch workspace.zeek.body._path {
+        // High-signal full-extra
+        "signature"  { process parse_zeek_full_signature }
+        "intel"      { process parse_zeek_full_intel }
+        "traceroute" { process parse_zeek_full_traceroute }
+        "rfb"        { process parse_zeek_full_rfb }
+
+        // Generic protocol telemetry — wrap into 4001 with body in unmapped
+        "tunnel"     { process parse_zeek_full_tunnel }
+        "mysql"      { process parse_zeek_full_mysql }
+        "irc"        { process parse_zeek_full_irc }
+        "sip"        { process parse_zeek_full_sip }
+        "dnp3"       { process parse_zeek_full_dnp3 }
+        "modbus"     { process parse_zeek_full_modbus }
+        "socks"      { process parse_zeek_full_socks }
+        "syslog"     { process parse_zeek_full_syslog_over_wire }
+        "ntp"        { process parse_zeek_full_ntp }
+        "ocsp"       { process parse_zeek_full_ocsp }
+        "pe"         { process parse_zeek_full_pe }
+        "dpd"        { process parse_zeek_full_dpd }
+
+        // Low-value operational / asset-inventory streams — drop
+        "stats"           { drop }
+        "capture_loss"    { drop }
+        "known_hosts"     { drop }
+        "known_services"  { drop }
+        "known_certs"     { drop }
+        "software"        { drop }
+
+        // Everything else: try soc (which itself falls through to default).
+        // If soc also doesn't know the _path, soc's default arm raises
+        // an error — but we catch that here and route through the
+        // catch-all generic 4001 so nothing is silently lost.
+        default {
+            try { process parse_zeek_soc }
+            catch { process parse_zeek_full_catchall }
+        }
+    }
+}
+
+def process parse_zeek_full_signature {
+    workspace.limpid = zeek_signature_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
+}
+
+def process parse_zeek_full_intel {
+    workspace.limpid = zeek_intel_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
+}
+
+def process parse_zeek_full_traceroute {
+    workspace.limpid = zeek_traceroute_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
+}
+
+def process parse_zeek_full_rfb {
+    workspace.limpid = zeek_rfb_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
+}
+
+def process parse_zeek_full_tunnel {
+    workspace.limpid = zeek_generic_4001_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "tunnel")
+}
+
+def process parse_zeek_full_mysql {
+    workspace.limpid = zeek_generic_4001_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "mysql")
+}
+
+def process parse_zeek_full_irc {
+    workspace.limpid = zeek_generic_4001_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "irc")
+}
+
+def process parse_zeek_full_sip {
+    workspace.limpid = zeek_generic_4001_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "sip")
+}
+
+def process parse_zeek_full_dnp3 {
+    workspace.limpid = zeek_generic_4001_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "dnp3")
+}
+
+def process parse_zeek_full_modbus {
+    workspace.limpid = zeek_generic_4001_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "modbus")
+}
+
+def process parse_zeek_full_socks {
+    workspace.limpid = zeek_generic_4001_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "socks")
+}
+
+def process parse_zeek_full_syslog_over_wire {
+    workspace.limpid = zeek_generic_4001_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "syslog")
+}
+
+def process parse_zeek_full_ntp {
+    workspace.limpid = zeek_generic_4001_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "ntp")
+}
+
+def process parse_zeek_full_ocsp {
+    workspace.limpid = zeek_generic_4001_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "ocsp")
+}
+
+def process parse_zeek_full_pe {
+    workspace.limpid = zeek_generic_4001_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "pe")
+}
+
+def process parse_zeek_full_dpd {
+    workspace.limpid = zeek_generic_4001_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "dpd")
+}
+
+// Catch-all: any _path that even parse_zeek_soc rejects. Wraps the
+// entire body into a 4001 Network Activity record's `unmapped`.
+def process parse_zeek_full_catchall {
+    workspace.limpid = zeek_generic_4001_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time),
+        coalesce(workspace.zeek.body._path, "unknown"))
+}

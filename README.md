@@ -180,17 +180,24 @@ snippet category in **v0.7.1**:
   5424 syslog wire) · `parse_journald` (systemd journald JSON).
   These populate `workspace.<transport>.*` and feed any vocabulary
   parser downstream via an inline bridge.
-- **Vendor parsers (18)** — security devices / cloud audit:
+- **Vendor parsers (22)** — security devices / cloud audit:
   `parse_fortigate_cef` · `parse_fortigate_syslog` ·
   `parse_paloalto_cef` · `parse_paloalto_syslog` · `parse_asa` ·
   `parse_cloudtrail` · `parse_juniper_srx_sd_syslog` (Junos
   structured-data) · `parse_juniper_srx_syslog` (Junos
-  unstructured RT_IDP) · `parse_checkpoint` (LEEF 2.0) ·
-  `parse_nsp` (Trellix Network Security Platform). Server /
-  host vocabulary: `parse_openssh` · `parse_sudo` ·
-  `parse_combined_log` (Apache / Nginx) · `parse_postfix` ·
-  `parse_winevent_json` · `parse_sysmon` · `parse_bind` ·
-  `parse_auditd`. Vendor-neutral: `parse_ocsf`.
+  unstructured RT_IDP) · `parse_checkpoint_leef` (LEEF 2.0 /
+  QRadar) · `parse_checkpoint_syslog` (Check Point Syslog
+  Exporter, real-corpus verified) · `parse_nsp` (Trellix
+  Network Security Platform, real-traffic verified). OSS NDR:
+  `parse_suricata` (EVE JSON) · `parse_zeek_default` /
+  `parse_zeek_soc` / `parse_zeek_full` (Zeek 8 / 20 / 43
+  protocol scripts, nested-superset scopes, with `_native` /
+  `_flat` convenience variants for raw Zeek vs Filebeat-flat
+  upstream). Server / host vocabulary: `parse_openssh` ·
+  `parse_sudo` · `parse_combined_log` (Apache / Nginx) ·
+  `parse_postfix` · `parse_winevent_json` · `parse_sysmon` ·
+  `parse_bind` · `parse_auditd` (7 OCSF classes, real-corpus
+  verified). Vendor-neutral: `parse_ocsf`.
 - **Composers (3)** — `compose_ocsf` (OCSF 1.3.0 priority set, 27
   classes, dispatched by `workspace.limpid.class_uid`) ·
   `compose_rfc5424` (journald → RFC 5424 wire, v0.7.1) ·

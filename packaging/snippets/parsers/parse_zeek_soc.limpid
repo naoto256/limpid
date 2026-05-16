@@ -1,0 +1,656 @@
+// Zeek SOC-scope parser (vocabulary)
+//
+// Extends `parse_zeek_default.limpid` with the auth / protocol logs
+// most actively-monitored SOC deployments enable on top of the
+// stock Zeek scripts:
+//   ssh / smtp / ftp / dhcp / kerberos / ntlm / radius /
+//   smb_mapping / smb_cmd / smb_files / dce_rpc / snmp / rdp
+//
+// Composition: this file transitively includes parse_zeek_default,
+// so operators picking the SOC scope only write a single include line
+// and reference `parse_zeek_soc` in the pipeline. The dispatcher
+// here handles SOC-extra _paths and falls through to
+// `parse_zeek_default` for the stock-Zeek set.
+//
+// For broader coverage (catch-all that absorbs unknown _paths and
+// keeps low-value operational streams as drops), include
+// `parse_zeek_full.limpid` instead.
+//
+// Output: OCSF records on `workspace.limpid`. Dispatch by `_path`:
+//   ssh         → 4007 SSH Activity
+//   smtp        → 4009 Email Activity
+//   ftp         → 4008 FTP Activity
+//   dhcp        → 4004 DHCP Activity
+//   kerberos    → 3002 Authentication
+//   ntlm        → 3002 Authentication
+//   radius      → 3002 Authentication
+//   smb_mapping → 4006 SMB Activity (tree mount)
+//   smb_cmd     → 4006 SMB Activity (per-command)
+//   smb_files   → 4006 SMB Activity (file op over SMB)
+//   dce_rpc     → 4001 Network Activity (RPC method under unmapped)
+//   snmp        → 4001 Network Activity (SNMP detail under unmapped)
+//   rdp         → 4005 RDP Activity
+//   other       → process parse_zeek_default (which handles
+//                 default-set _paths and errors on the rest)
+
+include "parse_zeek_default.limpid"
+
+// ---------------------------------------------------------------------------
+// Record builders — SOC-extra _paths
+// ---------------------------------------------------------------------------
+
+// `ssh` → 4007 SSH Activity. activity_id 1=Open (handshake), 2=Close.
+// Zeek does not separate session open / close for ssh.log; we tag as
+// Open and surface auth result via status_id.
+def function zeek_ssh_record(body, host, time_ns) {
+    {
+        class_uid:    4007,
+        category_uid: 4,
+        activity_id:  1,                                  // Open
+        severity_id:  1,
+        status_id:    switch true {
+            body.auth_success == true  { 1 }
+            body.auth_success == false { 2 }
+            default                    { 99 }
+        },
+        time:         time_ns,
+        src_endpoint: zeek_endpoint(body.id, "src"),
+        dst_endpoint: zeek_endpoint(body.id, "dst"),
+        connection_info: {
+            uid:           body.uid,
+            protocol_name: "ssh"
+        },
+        client: {
+            version: body.client
+        },
+        server: {
+            version: body.server
+        },
+        device:   { hostname: host },
+        unmapped: {
+            zeek_path:       body._path,
+            ssh_version:     body.version,
+            auth_attempts:   body.auth_attempts,
+            cipher_alg:      body.cipher_alg,
+            mac_alg:         body.mac_alg,
+            compression_alg: body.compression_alg,
+            kex_alg:         body.kex_alg,
+            host_key_alg:    body.host_key_alg,
+            host_key:        body.host_key
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// `smtp` → 4009 Email Activity. activity_id 1=Send (Zeek smtp.log
+// always represents a send transaction from the client's view).
+def function zeek_smtp_record(body, host, time_ns) {
+    {
+        class_uid:    4009,
+        category_uid: 4,
+        activity_id:  1,                                  // Send
+        severity_id:  1,
+        status_id:    1,
+        time:         time_ns,
+        src_endpoint: zeek_endpoint(body.id, "src"),
+        dst_endpoint: zeek_endpoint(body.id, "dst"),
+        connection_info: {
+            uid:           body.uid,
+            protocol_name: "smtp"
+        },
+        email: {
+            from:        body.mailfrom,
+            to:          body.rcptto,
+            subject:     body.subject,
+            message_uid: body.msg_id,
+            x_originating_ip: body.x_originating_ip
+        },
+        device:   { hostname: host },
+        unmapped: {
+            zeek_path:    body._path,
+            trans_depth:  body.trans_depth,
+            helo:         body.helo,
+            date:         body.date,
+            user_agent:   body.user_agent,
+            tls:          body.tls,
+            is_webmail:   body.is_webmail,
+            last_reply:   body.last_reply,
+            path:         body.path,
+            fuids:        body.fuids
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// `ftp` → 4008 FTP Activity. activity_id from FTP command verb.
+def function zeek_ftp_activity_id(cmd) {
+    switch cmd {
+        "RETR" { 4 }       // Get
+        "STOR" { 6 }       // Put
+        "STOU" { 6 }
+        "APPE" { 6 }
+        "DELE" { 2 }       // Delete
+        "LIST" { 5 }       // List
+        "NLST" { 5 }
+        "MKD"  { 6 }
+        "RMD"  { 2 }
+        "RNFR" { 7 }       // Rename (Move)
+        "RNTO" { 7 }
+        default { 99 }
+    }
+}
+def function zeek_ftp_record(body, host, time_ns) {
+    {
+        class_uid:    4008,
+        category_uid: 4,
+        activity_id:  zeek_ftp_activity_id(body.command),
+        severity_id:  1,
+        status_id:    switch true {
+            body.reply_code != null and body.reply_code >= 200 and body.reply_code < 400 { 1 }
+            body.reply_code != null and body.reply_code >= 400 { 2 }
+            default { 99 }
+        },
+        time:         time_ns,
+        src_endpoint: zeek_endpoint(body.id, "src"),
+        dst_endpoint: zeek_endpoint(body.id, "dst"),
+        connection_info: {
+            uid:           body.uid,
+            protocol_name: "ftp"
+        },
+        actor: switch true {
+            body.user != null { { user: { name: body.user } } }
+            default           { null }
+        },
+        device:   { hostname: host },
+        unmapped: {
+            zeek_path:    body._path,
+            command:      body.command,
+            arg:          body.arg,
+            mime_type:    body.mime_type,
+            file_size:    body.file_size,
+            reply_code:   body.reply_code,
+            reply_msg:    body.reply_msg,
+            data_channel: body.data_channel,
+            fuid:         body.fuid,
+            password:     body.password
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// `dhcp` → 4004 DHCP Activity. activity_id from msg_types (Zeek
+// emits the array of all message types seen in the session, e.g.
+// ["DISCOVER","OFFER","REQUEST","ACK"]).
+def function zeek_dhcp_record(body, host, time_ns) {
+    {
+        class_uid:    4004,
+        category_uid: 4,
+        activity_id:  6,                                  // Traffic (multi-msg session)
+        severity_id:  1,
+        time:         time_ns,
+        src_endpoint: switch true {
+            body.client_addr != null { { ip: body.client_addr, mac: body.mac, hostname: body.host_name } }
+            default                  { null }
+        },
+        dst_endpoint: switch true {
+            body.server_addr != null { { ip: body.server_addr } }
+            default                  { null }
+        },
+        device:   { hostname: host },
+        unmapped: {
+            zeek_path:      body._path,
+            uids:           body.uids,
+            client_fqdn:    body.client_fqdn,
+            domain:         body.domain,
+            requested_addr: body.requested_addr,
+            assigned_addr:  body.assigned_addr,
+            lease_time:     body.lease_time,
+            msg_types:      body.msg_types,
+            duration:       body.duration,
+            trans_id:       body.trans_id
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// `kerberos` → 3002 Authentication. status_id from success, activity
+// from request_type (AS = initial Logon, TGS = service ticket = 99 Other).
+def function zeek_kerberos_record(body, host, time_ns) {
+    {
+        class_uid:    3002,
+        category_uid: 3,
+        activity_id:  switch body.request_type {
+            "AS"  { 1 }            // Logon
+            "TGS" { 99 }
+            default { 99 }
+        },
+        severity_id:  1,
+        status_id:    switch true {
+            body.success == true  { 1 }
+            body.success == false { 2 }
+            default               { 99 }
+        },
+        time:         time_ns,
+        user:  { name: body.client },
+        actor: { user: { name: body.client } },
+        src_endpoint: zeek_endpoint(body.id, "src"),
+        dst_endpoint: zeek_endpoint(body.id, "dst"),
+        auth_protocol_id: 1,                              // Kerberos
+        auth_protocol:    "Kerberos",
+        device:   { hostname: host },
+        unmapped: {
+            zeek_path:    body._path,
+            request_type: body.request_type,
+            service:      body.service,
+            till:         body.till,
+            cipher:       body.cipher,
+            forwardable:  body.forwardable,
+            renewable:    body.renewable,
+            error_msg:    body.error_msg,
+            cert:         body.cert
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// `ntlm` → 3002 Authentication
+def function zeek_ntlm_record(body, host, time_ns) {
+    {
+        class_uid:    3002,
+        category_uid: 3,
+        activity_id:  1,                                  // Logon
+        severity_id:  1,
+        status_id:    switch true {
+            body.success == true  { 1 }
+            body.success == false { 2 }
+            default               { 99 }
+        },
+        time:         time_ns,
+        user:  { name: body.username },
+        actor: { user: { name: body.username, domain: body.domainname } },
+        src_endpoint: zeek_endpoint(body.id, "src"),
+        dst_endpoint: zeek_endpoint(body.id, "dst"),
+        auth_protocol_id: 4,                              // NTLM
+        auth_protocol:    "NTLM",
+        device:   { hostname: host },
+        unmapped: {
+            zeek_path:                body._path,
+            hostname:                 body.hostname,
+            server_nb_computer_name:  body.server_nb_computer_name,
+            server_dns_computer_name: body.server_dns_computer_name,
+            server_tree_name:         body.server_tree_name,
+            status:                   body.status
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// `radius` → 3002 Authentication
+def function zeek_radius_record(body, host, time_ns) {
+    {
+        class_uid:    3002,
+        category_uid: 3,
+        activity_id:  1,                                  // Logon
+        severity_id:  1,
+        status_id:    switch body.result {
+            "success" { 1 }
+            "failed"  { 2 }
+            default   { 99 }
+        },
+        time:         time_ns,
+        user:  { name: body.username },
+        actor: { user: { name: body.username } },
+        src_endpoint: zeek_endpoint(body.id, "src"),
+        dst_endpoint: zeek_endpoint(body.id, "dst"),
+        auth_protocol_id: 7,                              // RADIUS
+        auth_protocol:    "RADIUS",
+        device:   { hostname: host },
+        unmapped: {
+            zeek_path:        body._path,
+            mac:              body.mac,
+            framed_addr:      body.framed_addr,
+            tunnel_client:    body.tunnel_client,
+            connect_info:     body.connect_info,
+            reply_msg:        body.reply_msg,
+            result:           body.result,
+            logged:           body.logged
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// `smb_mapping` → 4006 SMB Activity (tree connect / share mount)
+def function zeek_smb_mapping_record(body, host, time_ns) {
+    {
+        class_uid:    4006,
+        category_uid: 4,
+        activity_id:  6,                                  // Traffic (tree connect)
+        severity_id:  1,
+        status_id:    1,
+        time:         time_ns,
+        src_endpoint: zeek_endpoint(body.id, "src"),
+        dst_endpoint: zeek_endpoint(body.id, "dst"),
+        connection_info: {
+            uid:           body.uid,
+            protocol_name: "smb"
+        },
+        device:   { hostname: host },
+        unmapped: {
+            zeek_path:    body._path,
+            smb_path:     body.path,
+            share_type:   body.share_type,
+            service:      body.service,
+            native_file_system: body.native_file_system
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// `smb_cmd` → 4006 SMB Activity (per-command)
+def function zeek_smb_cmd_record(body, host, time_ns) {
+    {
+        class_uid:    4006,
+        category_uid: 4,
+        activity_id:  6,                                  // Traffic
+        severity_id:  1,
+        status_id:    switch body.status {
+            "SUCCESS" { 1 }
+            default   { 99 }
+        },
+        time:         time_ns,
+        src_endpoint: zeek_endpoint(body.id, "src"),
+        dst_endpoint: zeek_endpoint(body.id, "dst"),
+        connection_info: {
+            uid:           body.uid,
+            protocol_name: "smb"
+        },
+        device:   { hostname: host },
+        unmapped: {
+            zeek_path:       body._path,
+            smb_command:     body.command,
+            sub_command:     body.sub_command,
+            argument:        body.argument,
+            status:          body.status,
+            rtt:             body.rtt,
+            version:         body.version,
+            username:        body.username,
+            tree:            body.tree,
+            tree_service:    body.tree_service,
+            referenced_file: body.referenced_file
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// `smb_files` → 4006 SMB Activity (file-level operation on SMB)
+def function zeek_smb_files_activity_id(action) {
+    switch action {
+        "SMB::FILE_OPEN"   { 1 }   // Open  (mapped to 1 = Open)
+        "SMB::FILE_READ"   { 1 }
+        "SMB::FILE_WRITE"  { 1 }
+        "SMB::FILE_CLOSE"  { 2 }   // Close
+        "SMB::FILE_DELETE" { 1 }
+        "SMB::FILE_RENAME" { 1 }
+        default            { 6 }   // Traffic / catch-all
+    }
+}
+def function zeek_smb_files_record(body, host, time_ns) {
+    {
+        class_uid:    4006,
+        category_uid: 4,
+        activity_id:  zeek_smb_files_activity_id(body.action),
+        severity_id:  1,
+        status_id:    1,
+        time:         time_ns,
+        src_endpoint: zeek_endpoint(body.id, "src"),
+        dst_endpoint: zeek_endpoint(body.id, "dst"),
+        connection_info: {
+            uid:           body.uid,
+            protocol_name: "smb"
+        },
+        device:   { hostname: host },
+        unmapped: {
+            zeek_path:    body._path,
+            smb_action:   body.action,
+            smb_path:     body.path,
+            file_name:    body.name,
+            file_size:    body.size,
+            prev_name:    body.prev_name,
+            data_offset_req: body.data_offset_req,
+            data_len_req: body.data_len_req,
+            data_len_rsp: body.data_len_rsp,
+            times:        body.times
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// `dce_rpc` → 4001 Network Activity (RPC method under unmapped)
+def function zeek_dce_rpc_record(body, host, time_ns) {
+    {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  6,                                  // Traffic
+        severity_id:  1,
+        status_id:    1,
+        time:         time_ns,
+        src_endpoint: zeek_endpoint(body.id, "src"),
+        dst_endpoint: zeek_endpoint(body.id, "dst"),
+        connection_info: {
+            uid:           body.uid,
+            protocol_name: "dcerpc"
+        },
+        app_name: "dcerpc",
+        device:   { hostname: host },
+        unmapped: {
+            zeek_path:  body._path,
+            rtt:        body.rtt,
+            named_pipe: body.named_pipe,
+            endpoint:   body.endpoint,
+            operation:  body.operation
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// `snmp` → 4001 Network Activity (SNMP detail under unmapped)
+def function zeek_snmp_record(body, host, time_ns) {
+    {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  6,                                  // Traffic
+        severity_id:  1,
+        status_id:    1,
+        time:         time_ns,
+        src_endpoint: zeek_endpoint(body.id, "src"),
+        dst_endpoint: zeek_endpoint(body.id, "dst"),
+        connection_info: {
+            uid:           body.uid,
+            protocol_name: "snmp"
+        },
+        app_name: "snmp",
+        device:   { hostname: host },
+        unmapped: {
+            zeek_path:         body._path,
+            duration:          body.duration,
+            snmp_version:      body.version,
+            snmp_community:    body.community,
+            get_requests:      body.get_requests,
+            get_bulk_requests: body.get_bulk_requests,
+            get_responses:     body.get_responses,
+            set_requests:      body.set_requests,
+            up_since:          body.up_since,
+            display_string:    body.display_string
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// `rdp` → 4005 RDP Activity
+def function zeek_rdp_record(body, host, time_ns) {
+    {
+        class_uid:    4005,
+        category_uid: 4,
+        activity_id:  1,                                  // Open (initial handshake)
+        severity_id:  1,
+        status_id:    switch body.result {
+            "encrypted" { 1 }
+            "success"   { 1 }
+            default     { 99 }
+        },
+        time:         time_ns,
+        src_endpoint: zeek_endpoint(body.id, "src"),
+        dst_endpoint: zeek_endpoint(body.id, "dst"),
+        connection_info: {
+            uid:           body.uid,
+            protocol_name: "rdp"
+        },
+        device:   { hostname: host },
+        unmapped: {
+            zeek_path:         body._path,
+            cookie:            body.cookie,
+            result:            body.result,
+            security_protocol: body.security_protocol,
+            cert_count:        body.cert_count,
+            cert_permanent:    body.cert_permanent,
+            encryption_level:  body.encryption_level,
+            encryption_method: body.encryption_method,
+            ssl:               body.ssl,
+            keyboard_layout:   body.keyboard_layout,
+            client_build:      body.client_build,
+            client_name:       body.client_name,
+            client_dig_product_id: body.client_dig_product_id,
+            desktop_width:     body.desktop_width,
+            desktop_height:    body.desktop_height,
+            requested_color_depth: body.requested_color_depth
+        },
+        metadata: zeek_metadata()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Convenience entry points — see parse_zeek_default.limpid for the
+// rationale. Mirror naming: `_native` / `_flat`.
+// ---------------------------------------------------------------------------
+
+def process parse_zeek_soc_native {
+    workspace.zeek = {
+        body:     parse_json(ingress),
+        hostname: hostname(),
+        time:     to_int(received_at)
+    }
+    process parse_zeek_soc
+}
+
+def process parse_zeek_soc_flat {
+    workspace.zeek = {
+        body:     nest_dotted_keys(parse_json(ingress)),
+        hostname: hostname(),
+        time:     to_int(received_at)
+    }
+    process parse_zeek_soc
+}
+
+// ---------------------------------------------------------------------------
+// Main process — dispatch SOC-extra _paths, fall through to default
+// ---------------------------------------------------------------------------
+
+def process parse_zeek_soc {
+    // @requires: workspace.zeek.body      (required, Object)
+    // @requires: workspace.zeek.hostname  (optional, String)
+    // @requires: workspace.zeek.time      (optional, Int — epoch ns)
+    switch workspace.zeek.body._path {
+        "ssh"         { process parse_zeek_soc_ssh }
+        "smtp"        { process parse_zeek_soc_smtp }
+        "ftp"         { process parse_zeek_soc_ftp }
+        "dhcp"        { process parse_zeek_soc_dhcp }
+        "kerberos"    { process parse_zeek_soc_kerberos }
+        "ntlm"        { process parse_zeek_soc_ntlm }
+        "radius"      { process parse_zeek_soc_radius }
+        "smb_mapping" { process parse_zeek_soc_smb_mapping }
+        "smb_cmd"     { process parse_zeek_soc_smb_cmd }
+        "smb_files"   { process parse_zeek_soc_smb_files }
+        "dce_rpc"     { process parse_zeek_soc_dce_rpc }
+        "snmp"        { process parse_zeek_soc_snmp }
+        "rdp"         { process parse_zeek_soc_rdp }
+        default       { process parse_zeek_default }
+    }
+}
+
+def process parse_zeek_soc_ssh {
+    workspace.limpid = zeek_ssh_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
+}
+
+def process parse_zeek_soc_smtp {
+    workspace.limpid = zeek_smtp_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
+}
+
+def process parse_zeek_soc_ftp {
+    workspace.limpid = zeek_ftp_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
+}
+
+def process parse_zeek_soc_dhcp {
+    workspace.limpid = zeek_dhcp_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
+}
+
+def process parse_zeek_soc_kerberos {
+    workspace.limpid = zeek_kerberos_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
+}
+
+def process parse_zeek_soc_ntlm {
+    workspace.limpid = zeek_ntlm_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
+}
+
+def process parse_zeek_soc_radius {
+    workspace.limpid = zeek_radius_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
+}
+
+def process parse_zeek_soc_smb_mapping {
+    workspace.limpid = zeek_smb_mapping_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
+}
+
+def process parse_zeek_soc_smb_cmd {
+    workspace.limpid = zeek_smb_cmd_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
+}
+
+def process parse_zeek_soc_smb_files {
+    workspace.limpid = zeek_smb_files_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
+}
+
+def process parse_zeek_soc_dce_rpc {
+    workspace.limpid = zeek_dce_rpc_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
+}
+
+def process parse_zeek_soc_snmp {
+    workspace.limpid = zeek_snmp_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
+}
+
+def process parse_zeek_soc_rdp {
+    workspace.limpid = zeek_rdp_record(
+        workspace.zeek.body, workspace.zeek.hostname,
+        zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
+}
