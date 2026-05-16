@@ -110,8 +110,7 @@ def function fortigate_syslog_proto_name(num) {
 // the leading `<PRI>` and feed the rest straight into `parse_kv`. The body
 // itself carries `date` and `time` as KV fields, plus `devname` for host.
 //
-// Verified against real FortiGate v7.x captures (see
-// <offline operator-side corpus snapshot>).
+// Verified against real FortiGate v7.x captures.
 //
 // Dispatch is flat on `type:subtype` (synthesized) so there's only one
 // switch site per format — mirrors the CEF parser shape (which dispatches

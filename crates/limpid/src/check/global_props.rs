@@ -104,14 +104,6 @@ fn analyze_table(props: &[Property], diags: &mut Vec<Diagnostic>) {
 
 fn emit_findings(surface: &str, errs: &[ds::SchemaError], diags: &mut Vec<Diagnostic>) {
     for err in errs {
-        let mut d = Diagnostic::error_kind(
-            DiagKind::PropertySchema,
-            format!("{}: {}", surface, err),
-        )
-        .with_span(err.primary_span());
-        if let Some(s) = &err.did_you_mean {
-            d = d.with_help(format!("did you mean `{}`?", s));
-        }
-        diags.push(d);
+        diags.push(Diagnostic::from_schema_error(err, surface));
     }
 }

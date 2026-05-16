@@ -8,14 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
-<<<<<<< HEAD
-## [0.7.1] - 2026-05-17
-> journal input LOTL + transport-agnostic vocabulary parsers + datetime primitives + expanded SIEM + OSS NDR parsers (real-traffic verified)
-||||||| parent of 12045f6 (release: 0.7.2 — declarative property schema, loud --check coverage)
-## [0.7.1] - 2026-05-16
-> journal input LOTL + transport-agnostic vocabulary parsers + datetime primitives
-=======
-## [0.7.2] - 2026-05-16
+## [0.7.2] - 2026-05-17
 > declarative property schema — `--check` now loudly rejects every config typo
 
 `--check`'s coverage extended from pipeline / process DSL to every
@@ -101,9 +94,8 @@ Same posture as rsyslog / syslog-ng on a missing include directive.
   analyzer's `suggestions` module now re-exports the same routine
   the schema validator uses.
 
-## [0.7.1] - 2026-05-16
-> journal input LOTL + transport-agnostic vocabulary parsers + datetime primitives
->>>>>>> 12045f6 (release: 0.7.2 — declarative property schema, loud --check coverage)
+## [0.7.1] - 2026-05-17
+> journal input LOTL + transport-agnostic vocabulary parsers + datetime primitives + additional SIEM and OSS NDR parsers (real-traffic verified)
 
 The journal input is rewritten to emit `journalctl -o json`-equivalent
 JSON on `ingress`, replacing the synthesised
@@ -176,10 +168,10 @@ carries:
   Vector / Fluent Bit all converge on) in DSL so operators on
   non-UTC senders can fork and edit without a rebuild.
 
-### Added — Additional vendor parsers
+### Added — additional vendor parsers
 
 Five additional vendor / vocabulary parsers covering the remaining
-major SIEM sources covering additional major sources:
+major SIEM sources covering Juniper SRX, Check Point, Trellix NSP, Sysmon, BIND, and auditd:
 
 | Parser | Source | OCSF class(es) |
 |---|---|---|
@@ -221,7 +213,7 @@ Compose_ocsf leaves extended for the new parsers' fields:
 
 Real-corpus verification pass on elastic/integrations and (for
 NSP) production traffic completes the trustworthiness story for
-most newly-added vendor parsers — every parser's header `Coverage scope`
+most of these vendor parsers — every parser's header `Coverage scope`
 section now lists the exact corpus / dataset / device it was
 exercised against, and what residual gaps remain (Sysmon and
 BIND have no usable public corpus; CheckPoint LEEF has no
@@ -314,7 +306,7 @@ The "1008 Application Lifecycle" section header in `parse_auditd.limpid`
 suggested the function emitted `class_uid: 1008`, but the code
 emits 1007 Process Activity (OCSF 1008 is actually Windows Registry
 Key Activity, not application lifecycle, which was confirmed during
-the original additional-vendor-parser work). Header rewritten with the correct class
+the auditd parser was first written). Header rewritten with the correct class
 plus the rationale.
 
 ### Fixed — `nest_dotted_keys` enforces depth limits (stack-overflow DoS mitigation)

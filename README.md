@@ -40,7 +40,7 @@ output is achieved by freely combining `process`es.
 A reusable chunk of pipeline logic — small, named, drop-in. You write
 them yourself, or you include them from the snippet library (a curated
 collection that debuts in **v0.7.0** and expands substantially in
-**v0.7.1**: 22 vendor parsers (SIEM and OSS NDR), 2
+**v0.7.1**: 22 vendor parsers (SIEM + OSS NDR), 2
 transport parsers, the OCSF 1.3.0 27-class composer, and shared
 helper functions; full list in
 [Snippet Library](docs/src/snippets/README.md)). Here is what an OCSF

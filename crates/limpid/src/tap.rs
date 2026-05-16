@@ -2,7 +2,7 @@
 //! flowing through inputs, processes, and outputs.
 //!
 //! Tap points are registered at startup with keys like:
-//!   `input splunk_udp`, `process strip_pri`, `output juniper_srx`
+//!   `input splunk_udp`, `process strip_pri`, `output juniper01`
 //!
 //! Performance: `emit()` checks an atomic subscriber count before
 //! acquiring any lock. When no subscribers are connected, the only

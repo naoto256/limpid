@@ -57,7 +57,7 @@ fn analyze_input_def(def: &InputDef, registry: &ModuleRegistry, diags: &mut Vec<
     let errs = ds::validate(&stripped, spec);
     let surface = format!("input '{}'", def.name);
     for err in errs {
-        diags.push(diagnostic_from(&err, &surface));
+        diags.push(Diagnostic::from_schema_error(&err, &surface));
     }
 }
 
@@ -79,7 +79,7 @@ fn analyze_output_def(def: &OutputDef, registry: &ModuleRegistry, diags: &mut Ve
     let errs = ds::validate(&stripped, spec);
     let surface = format!("output '{}'", def.name);
     for err in errs {
-        diags.push(diagnostic_from(&err, &surface));
+        diags.push(Diagnostic::from_schema_error(&err, &surface));
     }
 }
 
@@ -139,17 +139,6 @@ fn strip_type_property(properties: &[Property]) -> Vec<Property> {
         .collect()
 }
 
-fn diagnostic_from(err: &ds::SchemaError, surface: &str) -> Diagnostic {
-    let mut d = Diagnostic::error_kind(
-        DiagKind::PropertySchema,
-        format!("{}: {}", surface, err),
-    )
-    .with_span(err.primary_span());
-    if let Some(s) = &err.did_you_mean {
-        d = d.with_help(format!("did you mean `{}`?", s));
-    }
-    d
-}
 
 /// Returns true if `key` is declared in `spec`. Lets the existing
 /// `outputs::analyze_output` walk skip its generic

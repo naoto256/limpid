@@ -177,6 +177,29 @@ impl Diagnostic {
         self.help = Some(help.into());
         self
     }
+
+    /// Convert a [`SchemaError`] from the schema validator into a
+    /// tagged `PropertySchema` diagnostic. `surface` names the human-
+    /// readable origin (`"output 'o'"`, `"control"`, `"table
+    /// 'tenants'"`, …) and is prepended to the validator's own
+    /// message; the value-or-key span and did-you-mean suggestion
+    /// thread through unchanged. Centralising the wording here means
+    /// `module_props` and `global_props` (and any future schema
+    /// surface) cannot drift in how they format the same error.
+    pub(super) fn from_schema_error(
+        err: &crate::dsl::schema::SchemaError,
+        surface: &str,
+    ) -> Self {
+        let mut d = Self::error_kind(
+            DiagKind::PropertySchema,
+            format!("{}: {}", surface, err),
+        )
+        .with_span(err.primary_span());
+        if let Some(s) = &err.did_you_mean {
+            d = d.with_help(format!("did you mean `{}`?", s));
+        }
+        d
+    }
 }
 
 /// Post-process diagnostics for `--ultra-strict`: promote every
