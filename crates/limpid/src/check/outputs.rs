@@ -10,17 +10,22 @@
 use crate::dsl::ast::{Expr, ExprKind, OutputDef, Property, walk_children};
 use crate::dsl::span::Span;
 use crate::functions::FunctionRegistry;
+use crate::modules::ModuleRegistry;
 
 use super::bindings::Bindings;
+use super::module_props::schema_declares_key;
 use super::{DiagKind, Diagnostic, expr_types, suggestions};
 
 pub(super) fn analyze_output(
     output: &OutputDef,
     pipeline_name: &str,
     registry: &FunctionRegistry,
+    module_registry: &ModuleRegistry,
     bindings: &Bindings,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    let schema = output_schema_for(output, module_registry);
+
     for prop in &output.properties {
         if let Property::KeyValue {
             key,
@@ -34,6 +39,17 @@ pub(super) fn analyze_output(
             // (`stdout`, `tcp`, …) would otherwise trip the
             // unknown-identifier diagnostic in `check_types`.
             if key == "type" {
+                continue;
+            }
+            // If this key is declared in the Module's property schema,
+            // the schema validator (see `module_props::analyze_all`)
+            // owns its value's correctness. Skip the generic
+            // expression walk so bare-ident enum values like
+            // `framing non_transparent` don't trip the unknown-
+            // identifier diagnostic.
+            if let Some(spec) = schema
+                && schema_declares_key(spec, key)
+            {
                 continue;
             }
             expr_types::check_types(
@@ -56,6 +72,28 @@ pub(super) fn analyze_output(
             });
         }
     }
+}
+
+fn output_schema_for<'a>(
+    output: &OutputDef,
+    registry: &'a ModuleRegistry,
+) -> Option<&'a [crate::dsl::schema::PropertySpec]> {
+    for prop in &output.properties {
+        if let Property::KeyValue {
+            key,
+            value: Expr {
+                kind: ExprKind::Ident(parts),
+                ..
+            },
+            ..
+        } = prop
+            && key == "type"
+            && let Some(t) = parts.first()
+        {
+            return registry.output_schema(t);
+        }
+    }
+    None
 }
 
 fn check_workspace_reference(

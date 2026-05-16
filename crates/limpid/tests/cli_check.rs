@@ -449,6 +449,159 @@ def pipeline p {
     assert_eq!(out.status.code(), Some(2));
 }
 
+// ---------------------------------------------------------------------------
+// Property schema (v0.7.2)
+// ---------------------------------------------------------------------------
+//
+// `output tcp` is the schema-driven pilot. These tests exercise the
+// analyzer's wiring of `dsl::schema::validate` against the Module's
+// declared `property_schema()`.
+
+#[test]
+fn check_accepts_correct_framing_enum_value_without_false_warning() {
+    // Pre-schema, `framing non_transparent` (a perfectly valid enum
+    // value) tripped `expr_types::check_unknown_ident` because the
+    // bare ident is unbound in expression context. With the schema
+    // owning that key, the expression walk is skipped — no warning.
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("ok.conf");
+    fs::write(
+        &conf,
+        r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o {
+    type tcp
+    address "127.0.0.1:514"
+    framing non_transparent
+}
+def pipeline p { input i; output o }
+"#,
+    )
+    .unwrap();
+
+    let out = run_check(&conf);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {}", stderr);
+    assert!(
+        !stderr.contains("non_transparent") && !stdout.contains("non_transparent"),
+        "schema-owned enum value should not be flagged as unknown ident\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+}
+
+#[test]
+fn check_loudly_rejects_typoed_framing_with_did_you_mean() {
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("typo.conf");
+    fs::write(
+        &conf,
+        r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o {
+    type tcp
+    address "127.0.0.1:514"
+    framing non_trasnaprent
+}
+def pipeline p { input i; output o }
+"#,
+    )
+    .unwrap();
+
+    let out = run_check(&conf);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(!out.status.success(), "stderr: {}", stderr);
+    assert!(
+        stderr.contains("framing") && stderr.contains("non_transparent"),
+        "expected did-you-mean for framing typo\nstderr: {}",
+        stderr
+    );
+}
+
+#[test]
+fn check_rejects_unknown_property_key_with_did_you_mean() {
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("bad-key.conf");
+    fs::write(
+        &conf,
+        r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o {
+    type tcp
+    addres "127.0.0.1:514"
+}
+def pipeline p { input i; output o }
+"#,
+    )
+    .unwrap();
+
+    let out = run_check(&conf);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(!out.status.success(), "stderr: {}", stderr);
+    assert!(
+        stderr.contains("unknown property 'addres'") && stderr.contains("address"),
+        "expected unknown-key error with suggestion\nstderr: {}",
+        stderr
+    );
+}
+
+#[test]
+fn check_rejects_wrong_value_type_on_typed_property() {
+    // `port` declared as Int — passing a string is a TypeMismatch.
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("bad-type.conf");
+    fs::write(
+        &conf,
+        r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o {
+    type tcp
+    host "127.0.0.1"
+    port "five-fourteen"
+}
+def pipeline p { input i; output o }
+"#,
+    )
+    .unwrap();
+
+    let out = run_check(&conf);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(!out.status.success(), "stderr: {}", stderr);
+    assert!(
+        stderr.contains("port") && stderr.contains("integer"),
+        "expected port type-mismatch\nstderr: {}",
+        stderr
+    );
+}
+
+#[test]
+fn check_reports_every_property_finding_in_one_run() {
+    // Multiple schema findings on the same output should all surface
+    // in a single --check invocation, not just the first one.
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("many.conf");
+    fs::write(
+        &conf,
+        r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o {
+    type tcp
+    addres "h:1"
+    framing non_trasnaprent
+}
+def pipeline p { input i; output o }
+"#,
+    )
+    .unwrap();
+
+    let out = run_check(&conf);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(!out.status.success(), "stderr: {}", stderr);
+    assert!(stderr.contains("addres"), "stderr missing addres: {}", stderr);
+    assert!(stderr.contains("framing"), "stderr missing framing: {}", stderr);
+}
+
 #[test]
 fn check_self_inclusion_is_rejected() {
     let dir = TempDir::new().unwrap();

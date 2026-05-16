@@ -27,6 +27,7 @@ pub(super) fn analyze_if_chain(
     pipeline_name: &str,
     config: &CompiledConfig,
     registry: &FunctionRegistry,
+    module_registry: &crate::modules::ModuleRegistry,
     bindings: &mut Bindings,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -38,7 +39,15 @@ pub(super) fn analyze_if_chain(
         for item in body {
             match item {
                 BranchBody::Pipeline(p) => {
-                    analyze_pipeline_stmt(p, pipeline_name, config, registry, &mut b, diagnostics);
+                    analyze_pipeline_stmt(
+                        p,
+                        pipeline_name,
+                        config,
+                        registry,
+                        module_registry,
+                        &mut b,
+                        diagnostics,
+                    );
                 }
                 BranchBody::Process(s) => {
                     analyze_process_stmt(s, pipeline_name, registry, &mut b, diagnostics);
@@ -52,7 +61,15 @@ pub(super) fn analyze_if_chain(
         for item in else_body {
             match item {
                 BranchBody::Pipeline(p) => {
-                    analyze_pipeline_stmt(p, pipeline_name, config, registry, &mut b, diagnostics);
+                    analyze_pipeline_stmt(
+                        p,
+                        pipeline_name,
+                        config,
+                        registry,
+                        module_registry,
+                        &mut b,
+                        diagnostics,
+                    );
                 }
                 BranchBody::Process(s) => {
                     analyze_process_stmt(s, pipeline_name, registry, &mut b, diagnostics);
@@ -76,6 +93,7 @@ pub(super) fn analyze_switch(
     pipeline_name: &str,
     config: &CompiledConfig,
     registry: &FunctionRegistry,
+    module_registry: &crate::modules::ModuleRegistry,
     bindings: &mut Bindings,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -92,7 +110,15 @@ pub(super) fn analyze_switch(
         for item in &arm.body {
             match item {
                 BranchBody::Pipeline(p) => {
-                    analyze_pipeline_stmt(p, pipeline_name, config, registry, &mut b, diagnostics);
+                    analyze_pipeline_stmt(
+                        p,
+                        pipeline_name,
+                        config,
+                        registry,
+                        module_registry,
+                        &mut b,
+                        diagnostics,
+                    );
                 }
                 BranchBody::Process(s) => {
                     analyze_process_stmt(s, pipeline_name, registry, &mut b, diagnostics);

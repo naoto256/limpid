@@ -26,6 +26,7 @@ fn category_of(d: &Diagnostic) -> &'static str {
     match d.kind {
         DiagKind::UnknownIdent | DiagKind::Dataflow => "dataflow",
         DiagKind::TypeMismatch => "type",
+        DiagKind::PropertySchema => "config",
         DiagKind::Other => "check",
     }
 }

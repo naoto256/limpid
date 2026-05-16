@@ -36,6 +36,7 @@ mod control_flow;
 pub mod expr_types;
 mod function;
 pub mod graph;
+mod module_props;
 mod outputs;
 mod parser_effects;
 pub mod render;
@@ -80,6 +81,14 @@ pub enum DiagKind {
     /// Dataflow shape problem (e.g. assignment that overwrites an
     /// Object with a scalar and invalidates nested reads).
     Dataflow,
+    /// A property on a `def input` / `def output` (or, in the future,
+    /// on `control` / `table` / sub-block) does not match the
+    /// Module's declared property schema — typo'd key, wrong value
+    /// type, unknown enum value, missing required, duplicate. Distinct
+    /// from `UnknownIdent` (which is for unresolved workspace / function
+    /// refs in *expression* position) so consumers can filter / promote
+    /// them separately.
+    PropertySchema,
     /// Catch-all for diagnostics that don't fit the above buckets.
     #[allow(dead_code)]
     Other,
@@ -252,10 +261,25 @@ pub fn analyze(config: &CompiledConfig, _source_map: &SourceMap) -> Vec<Diagnost
     // in pipelines see the right arity / signature.
     crate::functions::register_user_functions(&mut registry, config);
 
+    // Build the same Module registry the runtime uses, so the
+    // analyzer reads the same `property_schema()` the daemon would
+    // enforce on startup. Schemas only — the closures inside the
+    // registry are never invoked at analysis time.
+    let mut module_registry = crate::modules::ModuleRegistry::new();
+    crate::modules::register_builtins(&mut module_registry);
+
     let mut diagnostics = Vec::new();
     function::check_all_functions(config, &mut diagnostics);
+    module_props::analyze_all(config, &module_registry, &mut diagnostics);
     for (name, pipeline) in &config.pipelines {
-        analyze_pipeline(name, pipeline, config, &registry, &mut diagnostics);
+        analyze_pipeline(
+            name,
+            pipeline,
+            config,
+            &registry,
+            &module_registry,
+            &mut diagnostics,
+        );
     }
     diagnostics
 }
@@ -269,6 +293,7 @@ fn analyze_pipeline(
     pipeline: &PipelineDef,
     config: &CompiledConfig,
     registry: &FunctionRegistry,
+    module_registry: &crate::modules::ModuleRegistry,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let mut bindings = Bindings::new();
@@ -280,6 +305,7 @@ fn analyze_pipeline(
             pipeline_name,
             config,
             registry,
+            module_registry,
             &mut bindings,
             diagnostics,
         );
@@ -293,6 +319,7 @@ pub(super) fn analyze_pipeline_stmt(
     pipeline_name: &str,
     config: &CompiledConfig,
     registry: &FunctionRegistry,
+    module_registry: &crate::modules::ModuleRegistry,
     bindings: &mut Bindings,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -316,7 +343,14 @@ pub(super) fn analyze_pipeline_stmt(
         }
         PipelineStatement::Output(name) => {
             if let Some(out) = config.outputs.get(name) {
-                outputs::analyze_output(out, pipeline_name, registry, bindings, diagnostics);
+                outputs::analyze_output(
+                    out,
+                    pipeline_name,
+                    registry,
+                    module_registry,
+                    bindings,
+                    diagnostics,
+                );
             }
         }
         PipelineStatement::Drop | PipelineStatement::Finish => {}
@@ -334,6 +368,7 @@ pub(super) fn analyze_pipeline_stmt(
                 pipeline_name,
                 config,
                 registry,
+                module_registry,
                 bindings,
                 diagnostics,
             );
@@ -352,6 +387,7 @@ pub(super) fn analyze_pipeline_stmt(
                 pipeline_name,
                 config,
                 registry,
+                module_registry,
                 bindings,
                 diagnostics,
             );
