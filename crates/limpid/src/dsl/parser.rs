@@ -129,6 +129,7 @@ fn parse_output_def(pair: Pair<Rule>, file_id: u32) -> Result<OutputDef> {
 fn parse_property(pair: Pair<Rule>, file_id: u32) -> Result<Property> {
     let mut inner = pair.into_inner();
     let key_pair = inner.next().unwrap();
+    let key_span = Some(span_of(&key_pair, file_id));
     let key = key_pair.as_str().to_string();
 
     let second = inner.next().unwrap();
@@ -142,6 +143,7 @@ fn parse_property(pair: Pair<Rule>, file_id: u32) -> Result<Property> {
             }
             Ok(Property::Block {
                 key,
+                key_span,
                 properties: props,
             })
         }
@@ -151,6 +153,7 @@ fn parse_property(pair: Pair<Rule>, file_id: u32) -> Result<Property> {
             let value = parse_expr_from_pair(second, file_id)?;
             Ok(Property::KeyValue {
                 key,
+                key_span,
                 value,
                 value_span,
             })

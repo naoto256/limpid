@@ -323,6 +323,7 @@ mod tests {
     fn prop_str(key: &str, val: &str) -> Property {
         Property::KeyValue {
             key: key.to_string(),
+            key_span: None,
             value: Expr::spanless(ExprKind::StringLit(val.to_string())),
             value_span: None,
         }
@@ -331,6 +332,7 @@ mod tests {
     fn prop_int(key: &str, val: i64) -> Property {
         Property::KeyValue {
             key: key.to_string(),
+            key_span: None,
             value: Expr::spanless(ExprKind::IntLit(val)),
             value_span: None,
         }

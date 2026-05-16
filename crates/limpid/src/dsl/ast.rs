@@ -59,21 +59,25 @@ pub struct OutputDef {
 
 /// A key-value property or nested block inside input/output definitions.
 ///
-/// `value_span` covers the whole value expression — the analyzer uses
-/// it to position a caret when a reference inside that value is
-/// unresolved. `Option<Span>` so test code that hand-constructs AST
-/// nodes need not invent spans.
+/// `key_span` covers just the key identifier — used by the property
+/// schema validator to point at the offending key when it is unknown
+/// or mistyped. `value_span` covers the whole value expression — the
+/// analyzer uses it to position a caret when a reference inside that
+/// value is unresolved or its type is wrong. Both are `Option<Span>`
+/// so test code that hand-constructs AST nodes need not invent spans.
 #[derive(Debug, Clone)]
 pub enum Property {
     /// `key value`  e.g. `type syslog_udp`, `bind "0.0.0.0:514"`
     KeyValue {
         key: String,
+        key_span: Option<Span>,
         value: Expr,
         value_span: Option<Span>,
     },
     /// `key { ... }` e.g. `tls { cert "..." }`, `queue { type disk }`
     Block {
         key: String,
+        key_span: Option<Span>,
         properties: Vec<Property>,
     },
 }

@@ -706,6 +706,7 @@ mod tests {
     fn prop_str(key: &str, val: &str) -> Property {
         Property::KeyValue {
             key: key.to_string(),
+            key_span: None,
             value: Expr::spanless(ExprKind::StringLit(val.to_string())),
             value_span: None,
         }
@@ -714,6 +715,7 @@ mod tests {
     fn prop_int(key: &str, val: i64) -> Property {
         Property::KeyValue {
             key: key.to_string(),
+            key_span: None,
             value: Expr::spanless(ExprKind::IntLit(val)),
             value_span: None,
         }
@@ -759,6 +761,7 @@ mod tests {
             prop_str("protocol", "grpc"),
             Property::KeyValue {
                 key: "verify".into(),
+                key_span: None,
                 value: Expr::spanless(ExprKind::Ident(vec!["false".into()])),
                 value_span: None,
             },
@@ -1011,6 +1014,7 @@ mod tests {
             prop_str("endpoint", "http://x"),
             Property::Block {
                 key: "retry".into(),
+                key_span: None,
                 properties: vec![
                     prop_int("max_attempts", 2),
                     prop_str("initial_wait", "100ms"),
@@ -1345,6 +1349,7 @@ mod tests {
                 prop_int("batch_size", 1),
                 Property::Block {
                     key: "retry".into(),
+                    key_span: None,
                     properties: vec![
                         prop_int("max_attempts", 5),
                         prop_str("initial_wait", "10ms"),
@@ -1393,6 +1398,7 @@ mod tests {
                 prop_int("batch_size", 1),
                 Property::Block {
                     key: "retry".into(),
+                    key_span: None,
                     properties: vec![
                         prop_int("max_attempts", 3),
                         prop_str("initial_wait", "10ms"),
