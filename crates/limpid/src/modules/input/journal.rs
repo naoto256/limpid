@@ -39,7 +39,6 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use systemd::journal::{Journal, OpenOptions};
 use tracing::{error, info, warn};
 
-use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;

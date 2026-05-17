@@ -87,12 +87,12 @@ impl std::fmt::Debug for RenderedPayload {
 // the registry's indirection and is not part of any module's declared schema.
 //
 // 0.7.2 carried this invariant only by convention. Each call site was expected
-// to strip `type` before validating against the schema (see
-// `check::module_props::strip_type_property`). The runtime side
-// (`create_input` / `create_output`) skipped the strip, and the resulting
-// asymmetry slipped past CI: `--check` reported "OK", `cargo run` rejected
-// the same config with "unknown property 'type'". Diagnosed and root-caused
-// in v0.7.3.
+// to strip `type` before validating against the schema (the analyzer carried a
+// private `strip_type_property` helper in `check::module_props` for that
+// purpose; both since removed in 0.7.3). The runtime side (`create_input` /
+// `create_output`) skipped the strip, and the resulting asymmetry slipped
+// past CI: `--check` reported "OK", `cargo run` rejected the same config with
+// "unknown property 'type'". Diagnosed and root-caused in v0.7.3.
 //
 // `ModuleProperties` makes that asymmetry structurally impossible. The parser
 // constructs one of these for every `def input` / `def output`; `type` is
