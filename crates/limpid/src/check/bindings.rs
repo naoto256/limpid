@@ -21,8 +21,9 @@
 //!   merged via [`FieldType::union`].
 //!
 //! The analyzer never rejects unknown `workspace.*` reads outright (the
-//! runtime returns `Null`), but the dataflow pass emits a warning when an output
-//! template references a workspace key that no upstream module produces.
+//! runtime returns `Null`), but the dataflow pass emits a warning when
+//! an output template references a workspace key that no upstream
+//! module produces.
 
 use std::collections::HashMap;
 

@@ -223,12 +223,12 @@ pub fn json_to_value_in<'bump>(
 //
 // `to_json(value)` is the primary hot-path consumer of JSON encoding —
 // the OCSF compose pipeline calls it once per event. Going through an
-// intermediate `serde_json::Value` (the prior `value_view_to_json` helper)
-// double-walked the tree (Value -> JsonValue -> bytes) and re-allocated
-// every leaf string. The direct `Serialize` impl below streams into the
-// caller's `Serializer` (typically `serde_json::ser::Serializer`)
-// without the intermediate, dropping the `JsonValue` allocation column
-// from the v0.6.0 D-pipeline flamegraph.
+// intermediate `serde_json::Value` (the prior `value_view_to_json`
+// helper) double-walked the tree (Value -> JsonValue -> bytes) and
+// re-allocated every leaf string. The direct `Serialize` impl below
+// streams into the caller's `Serializer` (typically
+// `serde_json::ser::Serializer`) without the intermediate, dropping
+// the `JsonValue` allocation column from the v0.6.0 flamegraph.
 //
 // Wire form is identical to the boundary `value_to_json` /
 // `json_to_value` pair: bytes go through the `$bytes_b64` marker,

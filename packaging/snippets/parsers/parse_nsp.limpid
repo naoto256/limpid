@@ -56,11 +56,11 @@
 //   Reconnaissance / alert-only (no action taken):
 //   admin_domain=Default alert_id=12347 alert_type=Reconnaissance app_protocol=ICMP confidence=Tentative attack_count=5 attack_id=0x30000789 attack_name="ICMP: Network Sweep" severity=Low alert_signature="ICMP:SWEEP:001" attack_time="2026-05-16 10:02:00" category=Reconnaissance dest_ip=192.0.2.30 dest_name= dest_port= device_name=nsp-sensor-01 direction=Inbound confidence= file_name= file_hash= file_type= virus_name= action_status= error_status= protocol=ICMP result=Alert src_ip=198.51.100.7 src_name= src_port=
 //
-// Coverage scope: real-traffic verified against a real Trellix
-// NSP Manager (ips01) on 2026-05-16 — 56/56 alerts emit cleanly,
-// covering Signature alerts across HTTP / SSH / SSL / NETBIOS-SS /
-// TELNET / NTP / BACKDOOR categories. The wire format observed on the
-// real Manager omits the quotes the documented template suggests
+// Coverage scope: real-traffic verified against a Trellix NSP
+// Manager — 56/56 alerts emit cleanly, covering Signature alerts
+// across HTTP / SSH / SSL / NETBIOS-SS / TELNET / NTP / BACKDOOR
+// categories. The wire format observed on the real Manager omits
+// the quotes the documented template suggests
 // (e.g. `attack_name=NETBIOS-SS: Windows SMB Remote Code Execution
 // Vulnerability` is unquoted with embedded spaces); the boundary-aware
 // `parse_nsp_kv` helper below handles this correctly. Custom templates
@@ -136,9 +136,8 @@ def function nsp_to_int_opt(s) {
 //
 // Why one big regex instead of `parse_kv` or per-field extraction:
 //
-//   - Real-world NSP Manager (verified against ips01
-//     sensor, May 2026) emits **unquoted** multi-word values for
-//     free-form fields:
+//   - The real NSP Manager wire format emits **unquoted**
+//     multi-word values for free-form fields:
 //
 //       attack_name=NETBIOS-SS: Windows SMB Remote Code Execution Vulnerability severity=Medium ...
 //       attack_time=2026-05-16 11:27:53 UTC category=Exploit ...

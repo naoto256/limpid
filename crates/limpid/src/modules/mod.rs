@@ -318,26 +318,22 @@ impl ModuleRegistry {
 
     /// Schema declared by an input type, if any. Used by the analyzer
     /// to validate `def input` property surfaces during `--check`.
-
     pub fn input_schema(&self, type_name: &str) -> Option<&'static [PropertySpec]> {
         self.inputs.get(type_name).and_then(|e| e.schema)
     }
 
     /// Schema declared by an output type, if any.
-
     pub fn output_schema(&self, type_name: &str) -> Option<&'static [PropertySpec]> {
         self.outputs.get(type_name).and_then(|e| e.schema)
     }
 
     /// All registered input type names. Used by `--check` to suggest a
     /// fix for an unknown `type` ident on a `def input`.
-
     pub fn input_type_names(&self) -> impl Iterator<Item = &str> {
         self.inputs.keys().map(|s| s.as_str())
     }
 
     /// All registered output type names.
-
     pub fn output_type_names(&self) -> impl Iterator<Item = &str> {
         self.outputs.keys().map(|s| s.as_str())
     }

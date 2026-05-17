@@ -439,7 +439,8 @@ mod tests {
 
     /// Test helper: resolve a path against an OwnedEvent without
     /// duplicating arena boilerplate at every call site. Mirrors what
-    /// the previous `render_path(&Event)` signature (before the v0.6.0 Output trait refactor) did.
+    /// the previous `render_path(&Event)` signature (before the v0.6.0
+    /// Output trait refactor) did.
     fn render_path_owned(out: &FileOutput, event: &Event) -> Result<(String, bool)> {
         let bump = bumpalo::Bump::new();
         let arena = EventArena::new(&bump);

@@ -10,9 +10,9 @@
 //!
 //! Streams `Value<'bump>` directly into `serde_json::ser::Serializer`
 //! via the [`Serialize`] impl in [`crate::dsl::value_json`] — no
-//! intermediate `serde_json::Value` allocation. This is the v0.6.0
-//! Replaces the prior `value_view_to_json` double walk that was
-//! the largest hot-path allocation in v0.6.0.
+//! intermediate `serde_json::Value` allocation. Replaces the prior
+//! `value_view_to_json` double walk that was the largest hot-path
+//! allocation in v0.6.0.
 
 use anyhow::{Result, bail};
 

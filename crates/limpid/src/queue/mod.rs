@@ -71,11 +71,11 @@ pub const QUEUE_PROPERTY_SPEC: PropertySpec = PropertySpec {
 // SinkInput — what flows over the per-output queue
 // ---------------------------------------------------------------------------
 //
-// The pipeline → output sink transport carries either a
-// pre-rendered, sink-specific payload (memory-queue hot path) or an
-// `OwnedEvent` (disk-queue persist, control-socket inject — cold paths
-// where the event must be serializable). The pipeline picks at the
-// output statement based on each output's queue type.
+// The pipeline → output sink transport carries either a pre-rendered,
+// sink-specific payload (memory-queue hot path) or an `OwnedEvent`
+// (disk-queue persist, control-socket inject — cold paths where the
+// event must be serializable). The pipeline picks at the output
+// statement based on each output's queue type.
 
 /// Item carried by an output queue.
 pub enum SinkInput {

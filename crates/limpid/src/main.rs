@@ -142,10 +142,13 @@ fn run_daemon(config_path: &str) -> Result<()> {
                 signal::SignalAction::Reload => {
                     let file = runtime.config_file().to_path_buf();
 
-                    // Snapshot the running config (in-memory, not from disk) so we can fall back to it if the new config fails to start.
+                    // Snapshot the running config (in-memory, not from disk)
+                    // so we can fall back to it if the new config fails to
+                    // start.
                     let old_config = runtime.compiled_config();
 
-                    // Load and validate the new config from disk. Errors here are recoverable: keep the running config and log.
+                    // Load and validate the new config from disk. Errors
+                    // here are recoverable: keep the running config and log.
                     let new_compiled =
                         match config::load_config(&file).and_then(CompiledConfig::from_config) {
                             Ok(c) => c,

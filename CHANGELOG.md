@@ -170,14 +170,14 @@ carries:
 
 ### Added — additional vendor parsers
 
-Five additional vendor / vocabulary parsers covering the remaining
-major SIEM sources covering Juniper SRX, Check Point, Trellix NSP, Sysmon, BIND, and auditd:
+Five additional vendor / vocabulary parsers covering Juniper SRX,
+Check Point, Trellix NSP, Sysmon, BIND, and auditd:
 
 | Parser | Source | OCSF class(es) |
 |---|---|---|
 | `parse_juniper_srx_sd_syslog` | Juniper Junos SRX in `set security log format sd-syslog` mode — covers all daemons that emit a `[junos@<EID> ...]` SD block: **RT_FLOW** (SESSION_CREATE/CLOSE/DENY + APPTRACK_SESSION_*), **RT_IDP** (IDP_ATTACK_LOG_EVENT + IDP_APPDDOS_*), **RT_IDS** (RT_SCREEN_*), **RT_UTM** (AV / Antispam / Content / Webfilter), **RT_AAMW** (Sky ATP), **RT_SECINTEL** (threat-feed). Verified against the elastic/integrations juniper_srx corpus (66/66 emit, 0 error) | 4001 / 2004 / 4002 |
-| `parse_juniper_srx_syslog` | Juniper Junos SRX RT_IDP / IDP_ATTACK_LOG_EVENT (RFC 3164 unstructured syslog — `set security log format syslog` default mode) — real-traffic verified against a real SRX | 2004 |
-| `parse_nsp` | Trellix / McAfee Network Security Platform (NSP) IPS alerts. **Real-traffic verified** against real NSP traffic — 72/72 alerts emit cleanly across HTTP / SSH / SSL / NETBIOS-SS / TELNET / NTP / BACKDOOR categories. Real wire turned out to emit unquoted multi-word values (`attack_name=NETBIOS-SS: Windows SMB Remote Code Execution Vulnerability` without the documented quotes); the parser now uses a single fixed-order regex over the full Trellix standard template, which is the only robust extraction strategy for unquoted KV with embedded spaces | 2004 |
+| `parse_juniper_srx_syslog` | Juniper Junos SRX RT_IDP / IDP_ATTACK_LOG_EVENT (RFC 3164 unstructured syslog — `set security log format syslog` default mode) — real-traffic verified | 2004 |
+| `parse_nsp` | Trellix / McAfee Network Security Platform (NSP) IPS alerts. **Real-traffic verified**: 72/72 alerts emit cleanly across HTTP / SSH / SSL / NETBIOS-SS / TELNET / NTP / BACKDOOR categories. Real wire turned out to emit unquoted multi-word values (`attack_name=NETBIOS-SS: Windows SMB Remote Code Execution Vulnerability` without the documented quotes); the parser now uses a single fixed-order regex over the full Trellix standard template, which is the only robust extraction strategy for unquoted KV with embedded spaces | 2004 |
 | `parse_checkpoint_leef` | Check Point LEEF 2.0 traffic events (Accept / Drop / Reject / Block) inside a syslog wrapper. Renamed from `parse_checkpoint`; targets the LEEF wire format used by QRadar bridges. Synthetic-verified only | 4001 |
 | `parse_checkpoint_syslog` | Check Point Syslog Exporter wire format (`[key:"value"; ...]` SD with `sys_message::"..."` double-colon convention; also handles R81+ `Log [Fields@<EID> ...]` `=` variant). **Real-corpus verified** against elastic/integrations checkpoint (91/91 events emit across firewall / threat / auth / audit dispositions) | 4001 / 2004 / 3002 |
 | `parse_sysmon` | Microsoft Sysmon EventID 1 (ProcessCreate) / 3 (NetworkConnect) / 11 (FileCreate), as JSON via NXLog / Vector / Winlogbeat. Synthetic-verified only — the elastic sysmon_linux corpus uses a different field-path convention (`winlog.event_id` / `winlog.event_data`) so it cannot exercise this parser as-is | 1007 / 4001 / 1001 |
@@ -185,14 +185,14 @@ major SIEM sources covering Juniper SRX, Check Point, Trellix NSP, Sysmon, BIND,
 | `parse_auditd` | Linux auditd, covers ~45 type codes across 7 OCSF classes (3002 Authentication / 3001 Account Change / 1007 Process Activity / 1001 File System / 4001 Network / 2002 Vulnerability Finding / 2004 Detection Finding). Handles `node=<host>` prefix injected by RHEL `audisp-remote` dispatcher. **Real-corpus verified** against elastic/integrations auditd (68/69 emit, 1 corrupt record errors loudly) | 3002 / 3001 / 1007 / 1001 / 4001 / 2002 / 2004 |
 
 Junos security logs ship in two distinct wire formats — the
-`sd-syslog` structured form is rare in practice (most production
-SRX deployments stay on the default `syslog` mode), so both
-formats get a dedicated parser per the library's one-file-per-
+`sd-syslog` structured form is rare in practice (most SRX
+deployments stay on the default `syslog` mode), so both formats
+get a dedicated parser per the library's one-file-per-
 `(vendor, format)` convention. `parse_juniper_srx_sd_syslog` is
 synthetic-verified only; `parse_juniper_srx_syslog` is verified
-against live RT_IDP traffic from a real SRX (RT_IDP /
-IDP_ATTACK_LOG_EVENT → OCSF 2004 Detection Finding with
-`finding_info` / `attacks` / `connection_info` populated).
+against live RT_IDP traffic (RT_IDP / IDP_ATTACK_LOG_EVENT → OCSF
+2004 Detection Finding with `finding_info` / `attacks` /
+`connection_info` populated).
 
 Each parser follows the v0.7.1 intake-schema convention
 (`workspace.<vocab>.{body, …}` with hostname / time from the
@@ -212,10 +212,10 @@ Compose_ocsf leaves extended for the new parsers' fields:
   the new Juniper SRX IDP parser)
 
 Real-corpus verification pass on elastic/integrations and (for
-NSP) production traffic completes the trustworthiness story for
-most of these vendor parsers — every parser's header `Coverage scope`
-section now lists the exact corpus / dataset / device it was
-exercised against, and what residual gaps remain (Sysmon and
+NSP) real wire traffic completes the trustworthiness story for
+most of these vendor parsers — every parser's header
+`Coverage scope` section now lists the exact corpus / dataset it
+was exercised against, and what residual gaps remain (Sysmon and
 BIND have no usable public corpus; CheckPoint LEEF has no
 public corpus distinct from the Syslog Exporter form).
 
@@ -306,8 +306,8 @@ The "1008 Application Lifecycle" section header in `parse_auditd.limpid`
 suggested the function emitted `class_uid: 1008`, but the code
 emits 1007 Process Activity (OCSF 1008 is actually Windows Registry
 Key Activity, not application lifecycle, which was confirmed during
-the auditd parser was first written). Header rewritten with the correct class
-plus the rationale.
+the auditd parser was first written). Header rewritten with the
+correct class plus the rationale.
 
 ### Fixed — `nest_dotted_keys` enforces depth limits (stack-overflow DoS mitigation)
 
@@ -721,8 +721,8 @@ unchanged.
 `to_json(workspace.x)` and other JSON-emit paths previously routed
 through an intermediate `serde_json::Value` tree. Implementing
 `Serialize` directly on the arena-backed `Value` skips that copy,
-collapsing `value_view_to_json` (1.11% of profile on the prior revision) to zero on the
-profile.
+collapsing `value_view_to_json` (1.11% of profile on the prior
+revision) to zero.
 
 ### Added — static-literal key interning in DSL hashes
 
@@ -1870,9 +1870,9 @@ tooling on top of the DSL finalised in v0.3.0. No DSL breaking changes
 - Parser functions (`parse_json`, `parse_kv`, `syslog.parse`,
   `cef.parse`, `regex_parse`) declare the workspace keys they produce
   via `ParserInfo`; downstream references to those keys are verified.
-- Diagnostic rendering: rustc-style source snippet
-  + caret, "did you mean" Levenshtein suggestions for unknown
-  identifiers / functions, and clear summary + footer lines.
+- Diagnostic rendering: rustc-style source snippet + caret,
+  "did you mean" Levenshtein suggestions for unknown identifiers /
+  functions, and clear summary + footer lines.
 - Expr-level span: diagnostics carry precise source spans from
   expression nodes (not just statements), so the caret points at the
   offending sub-expression (`lower(workspace.count)` → carets the arg).
