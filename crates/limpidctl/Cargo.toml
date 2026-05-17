@@ -3,6 +3,7 @@ name = "limpidctl"
 version = "0.7.3"
 edition = "2024"
 description = "Control and debug CLI for limpid"
+license.workspace = true
 
 [[bin]]
 name = "limpidctl"

@@ -3,6 +3,7 @@ name = "limpid-prometheus"
 version = "0.7.3"
 edition = "2024"
 description = "Prometheus exporter for limpid — converts control socket JSON to Prometheus text format"
+license.workspace = true
 
 [[bin]]
 name = "limpid-prometheus"

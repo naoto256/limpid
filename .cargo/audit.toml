@@ -1,0 +1,21 @@
+# cargo-audit configuration.
+#
+# Mirrors `deny.toml`'s [advisories.ignore] entries so the two tools
+# stay in sync. The uchgs pre-push gate verifies both
+# `push cargo-deny` and `push cargo-audit` push-receipts; their
+# acceptance criteria must match or one will silently drift past the
+# other.
+#
+# Every ignore MUST carry a rationale comment pointing at the underlying
+# issue and the conditions under which the entry can be removed.
+
+[advisories]
+ignore = [
+    # rustls-pemfile is unmaintained as of 2025-08. Pulled in only
+    # transitively by tonic 0.12 (OTLP gRPC); the advisory itself
+    # states "No safe upgrade is available!" because the upstream
+    # migration path (rustls-pki-types' PemObject) requires tonic to
+    # update first. Re-evaluate when tonic ships a version that drops
+    # rustls-pemfile.
+    "RUSTSEC-2025-0134",
+]

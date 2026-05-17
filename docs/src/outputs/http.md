@@ -123,7 +123,7 @@ def output loki {
 ```
 def output internal {
     type http
-    url "https://es.internal:9200/_bulk"
+    url "https://es.example.com:9200/_bulk"
     verify false
 }
 ```

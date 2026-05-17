@@ -3,7 +3,7 @@ name = "limpid"
 version = "0.7.3"
 edition = "2024"
 description = "Log pipelines, limpid as intent."
-license = "MIT OR Apache-2.0"
+license.workspace = true
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

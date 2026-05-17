@@ -1,0 +1,114 @@
+# cargo-deny configuration.
+#
+# Gate `cargo deny check` for limpid's supply chain. Run as part of the
+# uchgs pre-push security audit (see ~/.config/git/uchgs/README.md);
+# `code-rust-audit` skill reads this config and issues the
+# `push cargo-deny` receipt.
+#
+# Posture: limpid itself is dual-licensed `MIT OR Apache-2.0` (permissive,
+# no source-disclosure obligation). The allow list below admits only
+# licenses whose obligations the maintainer is willing to carry into
+# limpid's redistribution surface. Strong copyleft (GPL / AGPL / SSPL)
+# and commercial-restricted (BUSL, CC-BY-NC) are deliberately omitted —
+# pulling in such a dep would force limpid as a whole to inherit those
+# terms, breaking the dual-license promise.
+#
+# Adding a new dep that triggers `licenses FAILED` is the correct moment
+# to decide: pick a permissive alternative, or extend this list with a
+# rationale comment.
+
+[graph]
+# Audit only the build targets we actually ship binaries for.
+# Wasm / weird embedded targets pull in license-exotic deps that don't
+# matter for limpid's actual deliverables.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "aarch64-apple-darwin" },
+]
+# Include every workspace member's full dep closure (default, made explicit).
+all-features = false
+
+[licenses]
+# Confidence floor for SPDX expression matching. cargo-deny's default is
+# 0.8 (= 80% sure of the license identification). Raise to 0.93 so an
+# ambiguous LICENSE file in a transitive dep surfaces as a finding
+# instead of getting silently auto-classified.
+confidence-threshold = 0.93
+
+# Crates carrying any license in this list are accepted into the build.
+# Rationale per family:
+# - MIT / Apache-2.0 / BSD-{2,3}-Clause / ISC / 0BSD / Zlib: permissive,
+#   attribution-only or weaker. Compatible with limpid's MIT OR Apache-2.0
+#   distribution.
+# - Unicode-3.0 / Unicode-DFS-2016: governs the Unicode tables in icu_*,
+#   unicode-ident, unicode-* crates. Permissive with attribution.
+# - CC0-1.0: public-domain dedication; treated as permissive.
+#
+# Deliberately NOT listed (would need explicit re-evaluation if a dep
+# transitions into them):
+# - MPL-2.0: file-level weak copyleft. Rust static-link semantics are
+#   undecided in case law. If a dep starts using MPL-2.0, decide
+#   between vendoring with source disclosure, swapping the dep, or
+#   adding MPL-2.0 here with a documented rationale.
+# - LGPL-*: dynamic-link safe-harbour is irrelevant for Rust static
+#   linking; treat as copyleft and avoid.
+# - GPL-* / AGPL-* / SSPL / BUSL / CC-BY-NC: incompatible with
+#   permissive redistribution. Reject.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "0BSD",
+    "Unicode-3.0",
+    "Zlib",
+    # CDLA-Permissive-2.0: Community Data License Agreement (permissive
+    # variant, no share-alike). Used by webpki-roots to license the
+    # Mozilla CA bundle it ships as data. Functionally a permissive
+    # attribution license for datasets — compatible with limpid's
+    # redistribution posture.
+    "CDLA-Permissive-2.0",
+]
+
+# Per-crate exceptions go here as needed (e.g. a single utility crate
+# with an SPDX expression cargo-deny can't fully parse). Empty for now —
+# add with rationale if a finding requires it.
+exceptions = []
+
+[advisories]
+# RustSec database — checked at every audit. `version = 2` is the
+# current schema (cargo-deny 0.16+); pinning silences a noisy
+# deprecation warning on the older v1 default.
+version = 2
+
+# Known-acceptable advisories. Each entry MUST carry a rationale comment
+# pointing at the underlying issue and the conditions under which the
+# entry can be removed.
+ignore = [
+    # rustls-pemfile is unmaintained as of 2025-08. It's pulled in only
+    # transitively by tonic 0.12 (which we use for OTLP gRPC), and the
+    # advisory itself states "No safe upgrade is available!" — the
+    # upstream migration path (use rustls-pki-types' PemObject) requires
+    # tonic to update first. Re-evaluate when tonic releases a version
+    # that drops rustls-pemfile.
+    "RUSTSEC-2025-0134",
+]
+
+[bans]
+# Default policy: warn on multiple major versions of the same crate,
+# error on explicitly banned ones. Currently no bans needed; the major-
+# version-skew warning is informational and lets us notice supply-chain
+# drift without blocking.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Only crates.io is accepted as a registry. git deps and unknown
+# registries are rejected — we want every dep to be reproducible via
+# Cargo.lock against a public registry.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

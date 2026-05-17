@@ -1,3 +1,11 @@
 [workspace]
 members = ["crates/limpid", "crates/limpidctl", "crates/limpid-prometheus"]
 resolver = "3"
+
+# Shared package metadata. Each member crate inherits via
+# `<field>.workspace = true` in its own `[package]` section. Keeping
+# `license` here means a new sub-crate cannot ship without inheriting
+# the same license posture — and `cargo deb` / `cargo deny licenses` /
+# `crates.io` all stop warning about missing field.
+[workspace.package]
+license = "MIT OR Apache-2.0"
