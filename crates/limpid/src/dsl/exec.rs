@@ -454,7 +454,7 @@ mod tests {
     use bytes::Bytes;
     use std::net::SocketAddr;
 
-    use crate::dsl::ast::*;
+    
     use crate::dsl::exec::*;
     use crate::event::{BorrowedEvent, Event};
     use crate::functions::FunctionRegistry;

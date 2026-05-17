@@ -30,7 +30,7 @@ pub fn parse_config(input: &str) -> Result<Config> {
 pub fn parse_config_with_file_id(input: &str, file_id: u32) -> Result<Config> {
     let mut pairs = LimpidParser::parse(Rule::config, input).context("failed to parse DSL")?;
 
-    let config_pair = pairs.next().unwrap();
+    let config_pair = pairs.next().expect("pest grammar invariant");
     let mut definitions = Vec::new();
     let mut global_blocks = Vec::new();
     let mut includes = Vec::new();
@@ -94,7 +94,7 @@ fn span_of(pair: &Pair<Rule>, file_id: u32) -> Span {
 
 fn parse_global_block(pair: Pair<Rule>, file_id: u32) -> Result<GlobalBlock> {
     let mut inner = pair.into_inner();
-    let name_pair = inner.next().unwrap();
+    let name_pair = inner.next().expect("pest grammar invariant");
     let name = name_pair.as_str().to_string();
     let properties = inner
         .map(|p| parse_property(p, file_id))
@@ -108,7 +108,7 @@ fn parse_global_block(pair: Pair<Rule>, file_id: u32) -> Result<GlobalBlock> {
 
 fn parse_input_def(pair: Pair<Rule>, file_id: u32) -> Result<InputDef> {
     let mut inner = pair.into_inner();
-    let name_pair = inner.next().unwrap();
+    let name_pair = inner.next().expect("pest grammar invariant");
     let name = name_pair.as_str().to_string();
     let properties = inner
         .map(|p| parse_property(p, file_id))
@@ -118,7 +118,7 @@ fn parse_input_def(pair: Pair<Rule>, file_id: u32) -> Result<InputDef> {
 
 fn parse_output_def(pair: Pair<Rule>, file_id: u32) -> Result<OutputDef> {
     let mut inner = pair.into_inner();
-    let name_pair = inner.next().unwrap();
+    let name_pair = inner.next().expect("pest grammar invariant");
     let name = name_pair.as_str().to_string();
     let properties = inner
         .map(|p| parse_property(p, file_id))
@@ -128,11 +128,11 @@ fn parse_output_def(pair: Pair<Rule>, file_id: u32) -> Result<OutputDef> {
 
 fn parse_property(pair: Pair<Rule>, file_id: u32) -> Result<Property> {
     let mut inner = pair.into_inner();
-    let key_pair = inner.next().unwrap();
+    let key_pair = inner.next().expect("pest grammar invariant");
     let key_span = Some(span_of(&key_pair, file_id));
     let key = key_pair.as_str().to_string();
 
-    let second = inner.next().unwrap();
+    let second = inner.next().expect("pest grammar invariant");
     match second.as_rule() {
         Rule::property => {
             // nested block: key { property* }
@@ -167,7 +167,7 @@ fn parse_property(pair: Pair<Rule>, file_id: u32) -> Result<Property> {
 
 fn parse_process_def(pair: Pair<Rule>, file_id: u32) -> Result<ProcessDef> {
     let mut inner = pair.into_inner();
-    let name_pair = inner.next().unwrap();
+    let name_pair = inner.next().expect("pest grammar invariant");
     let name = name_pair.as_str().to_string();
     let body = inner
         .map(|p| parse_process_stmt(p, file_id))
@@ -203,7 +203,7 @@ fn parse_process_error(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatemen
 
 fn parse_process_call(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
     let mut inner = pair.into_inner();
-    let name = inner.next().unwrap().as_str().to_string();
+    let name = inner.next().expect("pest grammar invariant").as_str().to_string();
     let args = if let Some(args_pair) = inner.next() {
         parse_func_args(args_pair, file_id)?
     } else {
@@ -214,8 +214,8 @@ fn parse_process_call(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement
 
 fn parse_process_let(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
     let mut inner = pair.into_inner();
-    let name = inner.next().unwrap().as_str().to_string();
-    let expr = parse_expr_from_pair(inner.next().unwrap(), file_id)?;
+    let name = inner.next().expect("pest grammar invariant").as_str().to_string();
+    let expr = parse_expr_from_pair(inner.next().expect("pest grammar invariant"), file_id)?;
     Ok(ProcessStatement::LetBinding(name, expr))
 }
 
@@ -227,9 +227,9 @@ fn parse_process_expr_stmt(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStat
 
 fn parse_process_assign(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
     let mut inner = pair.into_inner();
-    let target_pair = inner.next().unwrap();
+    let target_pair = inner.next().expect("pest grammar invariant");
     let target = parse_assign_target(target_pair)?;
-    let expr = parse_expr_from_pair(inner.next().unwrap(), file_id)?;
+    let expr = parse_expr_from_pair(inner.next().expect("pest grammar invariant"), file_id)?;
     Ok(ProcessStatement::Assign(target, expr))
 }
 
@@ -259,7 +259,7 @@ fn parse_process_if(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> 
 
 fn parse_process_switch(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
     let mut inner = pair.into_inner();
-    let discriminant = parse_expr_from_pair(inner.next().unwrap(), file_id)?;
+    let discriminant = parse_expr_from_pair(inner.next().expect("pest grammar invariant"), file_id)?;
     let arms = inner
         .map(|arm| {
             parse_switch_arm_generic(arm, file_id, |p, fid| {
@@ -272,8 +272,8 @@ fn parse_process_switch(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStateme
 
 fn parse_process_try_catch(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
     let mut inner = pair.into_inner();
-    let try_pair = inner.next().unwrap();
-    let catch_pair = inner.next().unwrap();
+    let try_pair = inner.next().expect("pest grammar invariant");
+    let catch_pair = inner.next().expect("pest grammar invariant");
     let try_body = try_pair
         .into_inner()
         .map(|p| parse_process_stmt(p, file_id))
@@ -287,7 +287,7 @@ fn parse_process_try_catch(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStat
 
 fn parse_process_foreach(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
     let mut inner = pair.into_inner();
-    let iterable = parse_expr_from_pair(inner.next().unwrap(), file_id)?;
+    let iterable = parse_expr_from_pair(inner.next().expect("pest grammar invariant"), file_id)?;
     let body = inner
         .map(|p| parse_process_stmt(p, file_id))
         .collect::<Result<Vec<_>>>()?;
@@ -300,7 +300,7 @@ fn parse_process_foreach(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatem
 
 fn parse_pipeline_def(pair: Pair<Rule>, file_id: u32) -> Result<PipelineDef> {
     let mut inner = pair.into_inner();
-    let name_pair = inner.next().unwrap();
+    let name_pair = inner.next().expect("pest grammar invariant");
     let name = name_pair.as_str().to_string();
     let body = inner
         .map(|p| parse_pipeline_stmt(p, file_id))
@@ -317,7 +317,7 @@ fn parse_pipeline_def(pair: Pair<Rule>, file_id: u32) -> Result<PipelineDef> {
 /// [`parse_switch_expr`]).
 fn parse_function_def(pair: Pair<Rule>, file_id: u32) -> Result<FunctionDef> {
     let mut inner = pair.into_inner();
-    let name_pair = inner.next().unwrap();
+    let name_pair = inner.next().expect("pest grammar invariant");
     let name = name_pair.as_str().to_string();
     let mut params = Vec::new();
     let mut body: Option<FuncBody> = None;
@@ -346,8 +346,8 @@ fn parse_func_body(pair: Pair<Rule>, file_id: u32) -> Result<FuncBody> {
         match p.as_rule() {
             Rule::process_let => {
                 let mut li = p.into_inner();
-                let name = li.next().unwrap().as_str().to_string();
-                let value = parse_expr_from_pair(li.next().unwrap(), file_id)?;
+                let name = li.next().expect("pest grammar invariant").as_str().to_string();
+                let value = parse_expr_from_pair(li.next().expect("pest grammar invariant"), file_id)?;
                 lets.push(FuncLet { name, value });
             }
             Rule::expr => {
@@ -407,7 +407,7 @@ fn parse_chain_element(pair: Pair<Rule>, file_id: u32) -> Result<ProcessChainEle
     match inner.as_rule() {
         Rule::process_ref => {
             let mut parts = inner.into_inner();
-            let name = parts.next().unwrap().as_str().to_string();
+            let name = parts.next().expect("pest grammar invariant").as_str().to_string();
             let args = if let Some(args_pair) = parts.next() {
                 parse_func_args(args_pair, file_id)?
             } else {
@@ -436,7 +436,7 @@ fn parse_pipeline_if(pair: Pair<Rule>, file_id: u32) -> Result<PipelineStatement
 
 fn parse_pipeline_switch(pair: Pair<Rule>, file_id: u32) -> Result<PipelineStatement> {
     let mut inner = pair.into_inner();
-    let discriminant = parse_expr_from_pair(inner.next().unwrap(), file_id)?;
+    let discriminant = parse_expr_from_pair(inner.next().expect("pest grammar invariant"), file_id)?;
     let arms = inner
         .map(|arm| {
             parse_switch_arm_generic(arm, file_id, |p, fid| {
@@ -504,7 +504,7 @@ where
 
     // Check if first child is an expr (non-default arm) or a body stmt (default arm)
     let pattern = if inner.peek().map(|p| p.as_rule()) == Some(Rule::expr) {
-        Some(parse_expr_from_pair(inner.next().unwrap(), file_id)?)
+        Some(parse_expr_from_pair(inner.next().expect("pest grammar invariant"), file_id)?)
     } else {
         None
     };
@@ -578,12 +578,16 @@ fn fold_by_precedence(operands: &mut Vec<Expr>, operators: &mut Vec<BinOp>) -> R
     }
 
     // Find lowest precedence operator (rightmost for left-associativity)
-    let min_prec = operators.iter().map(precedence).min().unwrap();
+    let min_prec = operators
+        .iter()
+        .map(precedence)
+        .min()
+        .expect("operators non-empty: caller only enters this branch with >= 1 operator");
     // Find the *last* operator with that precedence (left-associative: fold left, so find first)
     let idx = operators
         .iter()
         .position(|op| precedence(op) == min_prec)
-        .unwrap();
+        .expect("min_prec was just computed from operators, so at least one matches");
 
     let op = operators.remove(idx);
     let mut right_operands = operands.split_off(idx + 1);
@@ -609,14 +613,14 @@ fn parse_atom_or_unary(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
     match pair.as_rule() {
         Rule::unary_expr => {
             let mut inner = pair.into_inner();
-            let first = inner.next().unwrap();
+            let first = inner.next().expect("pest grammar invariant");
             if first.as_rule() == Rule::unary_op {
                 let op = match first.as_str().trim() {
                     "not" => UnaryOp::Not,
                     "-" => UnaryOp::Neg,
                     other => bail!("unknown unary operator: {}", other),
                 };
-                let operand = parse_atom_or_unary(inner.next().unwrap(), file_id)?;
+                let operand = parse_atom_or_unary(inner.next().expect("pest grammar invariant"), file_id)?;
                 Ok(Expr::new(ExprKind::UnaryOp(op, Box::new(operand)), span))
             } else {
                 // It's a postfix_expr (atom with optional .field access)
@@ -649,7 +653,7 @@ fn parse_atom_or_unary(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
 fn parse_postfix_expr(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
     let span = span_of(&pair, file_id);
     let mut inner = pair.into_inner();
-    let atom_pair = inner.next().unwrap();
+    let atom_pair = inner.next().expect("pest grammar invariant");
     let base = parse_atom(atom_pair, file_id)?;
 
     // Collect ".field" suffixes
@@ -694,7 +698,7 @@ fn parse_atom(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
 fn parse_switch_expr(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
     let span = span_of(&pair, file_id);
     let mut inner = pair.into_inner();
-    let scrutinee_pair = inner.next().unwrap();
+    let scrutinee_pair = inner.next().expect("pest grammar invariant");
     let scrutinee = parse_expr(scrutinee_pair, file_id)?;
     let mut arms = Vec::new();
     for arm_pair in inner {
@@ -704,14 +708,14 @@ fn parse_switch_expr(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
             1 => {
                 arms.push(SwitchExprArm {
                     pattern: None,
-                    body: parse_expr(arm_inner.into_iter().next().unwrap(), file_id)?,
+                    body: parse_expr(arm_inner.into_iter().next().expect("pest grammar invariant"), file_id)?,
                 });
             }
             // `pattern { expr }` — two expression children: pattern, body
             2 => {
                 let mut iter = arm_inner.into_iter();
-                let pat = parse_expr(iter.next().unwrap(), file_id)?;
-                let body = parse_expr(iter.next().unwrap(), file_id)?;
+                let pat = parse_expr(iter.next().expect("pest grammar invariant"), file_id)?;
+                let body = parse_expr(iter.next().expect("pest grammar invariant"), file_id)?;
                 arms.push(SwitchExprArm {
                     pattern: Some(pat),
                     body,
@@ -748,7 +752,7 @@ fn parse_func_call_expr(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
         .map(|p| p.as_rule() == Rule::func_args)
         .unwrap_or(false)
     {
-        Some(inner.pop().unwrap())
+        Some(inner.pop().expect("just checked .last() is Some via the surrounding `if`"))
     } else {
         None
     };
@@ -793,8 +797,8 @@ fn parse_hash_lit(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
         .into_inner()
         .map(|entry| {
             let mut inner = entry.into_inner();
-            let key = inner.next().unwrap().as_str().to_string();
-            let value = parse_expr_from_pair(inner.next().unwrap(), file_id)?;
+            let key = inner.next().expect("pest grammar invariant").as_str().to_string();
+            let value = parse_expr_from_pair(inner.next().expect("pest grammar invariant"), file_id)?;
             Ok((key, value))
         })
         .collect::<Result<Vec<_>>>()?;

@@ -80,7 +80,7 @@ pub fn register(reg: &mut FunctionRegistry) {
 mod tests {
     use super::*;
     use anyhow::Result;
-    use crate::dsl::arena::EventArena;
+    
 
     fn parse_one(s: &str) -> Result<Value<'static>> {
         // Mirrors the primitive's fallback chain so the unit tests

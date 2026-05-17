@@ -378,7 +378,7 @@ mod tests {
         let main_conf = dir.path().join("main.conf");
         fs::write(&main_conf, r#"include "nonexistent/*.limpid""#).unwrap();
 
-        let err = load_config(&main_conf).err().expect("must fail loudly");
+        let err = load_config(&main_conf).expect_err("must fail loudly");
         let msg = format!("{:#}", err);
         assert!(
             msg.contains("matched no files"),
@@ -393,7 +393,7 @@ mod tests {
         let main_conf = dir.path().join("main.conf");
         fs::write(&main_conf, r#"include "missing.limpid""#).unwrap();
 
-        let err = load_config(&main_conf).err().expect("must fail loudly");
+        let err = load_config(&main_conf).expect_err("must fail loudly");
         let msg = format!("{:#}", err);
         assert!(
             msg.contains("matched no files") && msg.contains("missing.limpid"),
@@ -531,13 +531,12 @@ mod tests {
             // Don't clobber a real install.
             return None;
         }
-        if let Some(parent) = sys.parent() {
-            if !parent.exists() {
+        if let Some(parent) = sys.parent()
+            && !parent.exists() {
                 // /usr/share/limpid may not exist in CI; try to create
                 // the whole chain. Fall through on EACCES.
                 let _ = std::fs::create_dir_all(parent);
             }
-        }
         std::os::unix::fs::symlink(target, sys).ok()
     }
 

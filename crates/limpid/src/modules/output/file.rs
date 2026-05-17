@@ -409,24 +409,75 @@ impl FileOutput {
     }
 }
 
+// Buffer size for the reentrant getpwnam_r / getgrnam_r calls below.
+// POSIX recommends consulting `sysconf(_SC_GETPW_R_SIZE_MAX)` (typically
+// 1024 on Linux, 4096 on macOS), but for user-name lookups during
+// daemon startup a fixed 4 KiB buffer is comfortably larger than any
+// realistic passwd/group record. Stack-allocated so there's no heap
+// concern.
+const NSS_RECORD_BUF: usize = 4096;
+
+/// Resolve a username to its uid via `getpwnam_r`. The reentrant
+/// variant is used in place of `getpwnam` so the call is safe to make
+/// concurrently with other `getpw*` users in the process (the legacy
+/// `getpwnam` returns a pointer into a static buffer shared across
+/// threads). Called only at module construction time today, but the
+/// hard guarantee removes a hazard for any future caller that wires
+/// this onto a hot path.
 fn resolve_uid(name: &str) -> Result<u32> {
     use std::ffi::CString;
+    use std::mem::MaybeUninit;
     let c_name = CString::new(name)?;
-    let pw = unsafe { libc::getpwnam(c_name.as_ptr()) };
-    if pw.is_null() {
+    let mut buf = [0u8; NSS_RECORD_BUF];
+    let mut pwd: MaybeUninit<libc::passwd> = MaybeUninit::uninit();
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getpwnam_r(
+            c_name.as_ptr(),
+            pwd.as_mut_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 {
+        anyhow::bail!("getpwnam_r failed for '{}': errno {}", name, rc);
+    }
+    if result.is_null() {
         anyhow::bail!("user '{}' not found", name);
     }
-    Ok(unsafe { (*pw).pw_uid })
+    // SAFETY: `result` is non-null and points into the `pwd` storage we
+    // just initialised via `getpwnam_r`; the pw_uid field is a plain
+    // numeric copy and outlives the borrow on `pwd`/`buf`.
+    Ok(unsafe { (*result).pw_uid })
 }
 
+/// Resolve a group name to its gid via `getgrnam_r`. Same thread-
+/// safety rationale as [`resolve_uid`].
 fn resolve_gid(name: &str) -> Result<u32> {
     use std::ffi::CString;
+    use std::mem::MaybeUninit;
     let c_name = CString::new(name)?;
-    let gr = unsafe { libc::getgrnam(c_name.as_ptr()) };
-    if gr.is_null() {
+    let mut buf = [0u8; NSS_RECORD_BUF];
+    let mut grp: MaybeUninit<libc::group> = MaybeUninit::uninit();
+    let mut result: *mut libc::group = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getgrnam_r(
+            c_name.as_ptr(),
+            grp.as_mut_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 {
+        anyhow::bail!("getgrnam_r failed for '{}': errno {}", name, rc);
+    }
+    if result.is_null() {
         anyhow::bail!("group '{}' not found", name);
     }
-    Ok(unsafe { (*gr).gr_gid })
+    // SAFETY: same as in `resolve_uid`.
+    Ok(unsafe { (*result).gr_gid })
 }
 
 #[cfg(test)]
