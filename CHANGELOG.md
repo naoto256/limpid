@@ -82,6 +82,20 @@ loudly with `include path '...' (resolved to '...') matched no
 files` at config-load time, before `--check` even runs the analyzer.
 Same posture as rsyslog / syslog-ng on a missing include directive.
 
+### Security / hardening
+
+- **Daemon mode now refuses to start as root (euid 0).** limpid is a
+  network-listening daemon and an event-processing engine; both
+  surfaces have meaningful blast radius if compromised, so the
+  principle is "drop privileges before reading any event". The
+  canonical operational shape is systemd `User=limpid` plus
+  `AmbientCapabilities=CAP_NET_BIND_SERVICE` for listeners on
+  privileged ports (< 1024). The check applies only to daemon mode;
+  `--check` / `--test-pipeline` / `--graph` are read-only and run
+  fine as root. Operators who genuinely need to run the daemon as
+  root (containerised init, debugging) can set
+  `LIMPID_ALLOW_ROOT=1` to override.
+
 ### Notes
 
 - Configs that pass `--check` today still pass. Configs that

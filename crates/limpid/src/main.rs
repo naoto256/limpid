@@ -122,8 +122,39 @@ fn main() -> Result<()> {
     run_daemon(&cli.config)
 }
 
+/// Refuse to start the daemon when invoked with euid 0 (root). limpid
+/// is a network-listening daemon and an event-processing engine; both
+/// surfaces have meaningful blast radius if compromised, so the
+/// principle is "drop privileges before reading any event". The
+/// canonical operational shape is systemd `User=limpid` plus
+/// `AmbientCapabilities=CAP_NET_BIND_SERVICE` for listeners on
+/// privileged ports (< 1024). Operators who genuinely need to run as
+/// root (containerised init that hasn't dropped UID yet, debugging on
+/// a workstation, …) can set `LIMPID_ALLOW_ROOT=1` to override.
+///
+/// The check applies only to daemon mode. `--check` / `--test-pipeline`
+/// / `--graph` are read-only analyses with no network or file-system
+/// side effects beyond reading the config, so running them as root is
+/// fine.
+fn refuse_root_unless_overridden() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let euid = unsafe { libc::geteuid() };
+        if euid == 0 && std::env::var_os("LIMPID_ALLOW_ROOT").is_none() {
+            anyhow::bail!(
+                "limpid refuses to start as root (euid 0). Run as an \
+                 unprivileged user; bind privileged ports via systemd \
+                 `AmbientCapabilities=CAP_NET_BIND_SERVICE`. To override \
+                 (not recommended), set LIMPID_ALLOW_ROOT=1."
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Daemon mode: start the tokio runtime and run the log pipeline.
 fn run_daemon(config_path: &str) -> Result<()> {
+    refuse_root_unless_overridden()?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let config_file = Path::new(config_path).to_path_buf();
