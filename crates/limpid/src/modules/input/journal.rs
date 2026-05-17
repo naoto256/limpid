@@ -79,7 +79,8 @@ impl Module for JournalInput {
         Some(JOURNAL_INPUT_SCHEMA)
     }
 
-    fn from_properties(_name: &str, properties: &[Property]) -> Result<Self> {
+    fn from_properties(_name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
+        let properties = properties.user_properties();
         let mut matches = Vec::new();
         if let Some(m) = props::get_string(properties, "match") {
             matches.push(m);

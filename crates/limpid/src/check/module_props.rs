@@ -8,12 +8,16 @@
 //! [`DiagKind::PropertySchema`] with the offending key/value span
 //! attached.
 //!
-//! The `type` property is stripped before validation — it isn't part
-//! of the Module's own surface (it selects *which* module). Modules
-//! without a registered schema are skipped (the gradual migration
-//! path: `property_schema() = None` defaults to "do not enforce yet").
+//! The `type` indirection is consumed by the parser when it constructs
+//! the [`crate::modules::ModuleProperties`] wrapper for the def block;
+//! the analyzer reads `def.properties.type_name()` and validates only
+//! `def.properties.user_properties()`. The previous "strip `type` from
+//! a raw `Vec<Property>` before validating" pattern was the source of
+//! the v0.7.2 asymmetry bug where the runtime forgot the strip — see
+//! the [`crate::modules::ModuleProperties`] type docs for the
+//! structural fix that landed in 0.7.3.
 
-use crate::dsl::ast::{Expr, ExprKind, InputDef, OutputDef, Property};
+use crate::dsl::ast::{InputDef, OutputDef};
 use crate::dsl::schema::{self as ds, nearest};
 use crate::dsl::span::Span;
 use crate::modules::ModuleRegistry;
@@ -40,21 +44,18 @@ pub(super) fn analyze_all(
 }
 
 fn analyze_input_def(def: &InputDef, registry: &ModuleRegistry, diags: &mut Vec<Diagnostic>) {
-    let Some((type_name, type_span)) = read_type_ident(&def.properties) else {
-        return;
-    };
+    let type_name = def.properties.type_name();
     let Some(spec) = registry.input_schema(type_name) else {
         diags.push(unknown_module_type_diag(
             "input",
             &def.name,
             type_name,
-            type_span,
+            def.properties.type_span(),
             registry.input_type_names(),
         ));
         return;
     };
-    let stripped = strip_type_property(&def.properties);
-    let errs = ds::validate(&stripped, spec);
+    let errs = ds::validate(def.properties.user_properties(), spec);
     let surface = format!("input '{}'", def.name);
     for err in errs {
         diags.push(Diagnostic::from_schema_error(&err, &surface));
@@ -62,21 +63,18 @@ fn analyze_input_def(def: &InputDef, registry: &ModuleRegistry, diags: &mut Vec<
 }
 
 fn analyze_output_def(def: &OutputDef, registry: &ModuleRegistry, diags: &mut Vec<Diagnostic>) {
-    let Some((type_name, type_span)) = read_type_ident(&def.properties) else {
-        return;
-    };
+    let type_name = def.properties.type_name();
     let Some(spec) = registry.output_schema(type_name) else {
         diags.push(unknown_module_type_diag(
             "output",
             &def.name,
             type_name,
-            type_span,
+            def.properties.type_span(),
             registry.output_type_names(),
         ));
         return;
     };
-    let stripped = strip_type_property(&def.properties);
-    let errs = ds::validate(&stripped, spec);
+    let errs = ds::validate(def.properties.user_properties(), spec);
     let surface = format!("output '{}'", def.name);
     for err in errs {
         diags.push(Diagnostic::from_schema_error(&err, &surface));
@@ -100,45 +98,6 @@ fn unknown_module_type_diag<'a>(
     }
     diag
 }
-
-/// Names a Module's `type tcp` style identifier and the value span
-/// for the diagnostic caret. Bare ident only — `type "tcp"` (string
-/// literal) is not idiomatic and is ignored here; the runtime would
-/// already reject it.
-fn read_type_ident(properties: &[Property]) -> Option<(&str, Option<Span>)> {
-    for prop in properties {
-        if let Property::KeyValue {
-            key,
-            value: Expr {
-                kind: ExprKind::Ident(parts),
-                ..
-            },
-            value_span,
-            ..
-        } = prop
-            && key == "type"
-        {
-            return parts.first().map(|s| (s.as_str(), *value_span));
-        }
-    }
-    None
-}
-
-/// Module schemas describe only the Module's own properties — `type`
-/// is the indirection that picks the Module. Strip it before
-/// validation so the schema doesn't have to (every Module would
-/// otherwise duplicate the same `type: String` entry).
-fn strip_type_property(properties: &[Property]) -> Vec<Property> {
-    properties
-        .iter()
-        .filter(|p| match p {
-            Property::KeyValue { key, .. } => key != "type",
-            Property::Block { key, .. } => key != "type",
-        })
-        .cloned()
-        .collect()
-}
-
 
 /// Returns true if `key` is declared in `spec`. Lets the existing
 /// `outputs::analyze_output` walk skip its generic

@@ -48,13 +48,18 @@ pub enum Definition {
 #[derive(Debug, Clone)]
 pub struct InputDef {
     pub name: String,
-    pub properties: Vec<Property>,
+    /// Type-enforced property surface. `type` lives in
+    /// `properties.type_name()`; the Module impl sees only
+    /// `properties.user_properties()`. See [`crate::modules::ModuleProperties`]
+    /// for the structural invariant that motivates the wrapper.
+    pub properties: crate::modules::ModuleProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct OutputDef {
     pub name: String,
-    pub properties: Vec<Property>,
+    /// Same invariant as [`InputDef::properties`].
+    pub properties: crate::modules::ModuleProperties,
 }
 
 /// A key-value property or nested block inside input/output definitions.

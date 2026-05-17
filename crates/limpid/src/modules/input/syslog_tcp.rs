@@ -13,7 +13,6 @@ use tracing::{debug, error, info, warn};
 
 use super::rate_limit::RateLimiter;
 use super::validate::validate_pri;
-use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
@@ -92,7 +91,8 @@ impl Module for SyslogTcpInput {
         Some(SYSLOG_TCP_INPUT_SCHEMA)
     }
 
-    fn from_properties(_name: &str, properties: &[Property]) -> anyhow::Result<Self> {
+    fn from_properties(_name: &str, properties: &crate::modules::ModuleProperties) -> anyhow::Result<Self> {
+        let properties = properties.user_properties();
         let bind =
             props::get_string(properties, "bind").unwrap_or_else(|| "0.0.0.0:514".to_string());
         let framing = match props::get_ident(properties, "framing").as_deref() {

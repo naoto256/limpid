@@ -24,9 +24,12 @@ pub(super) fn analyze_output(
     bindings: &Bindings,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let schema = output_schema_for(output, module_registry);
+    let schema = module_registry.output_schema(output.properties.type_name());
 
-    for prop in &output.properties {
+    // `type` no longer appears in `user_properties()` — it lives in a typed
+    // slot on `ModuleProperties` — so the explicit `if key == "type" { continue; }`
+    // guard that earlier versions carried is gone by construction.
+    for prop in output.properties.user_properties() {
         if let Property::KeyValue {
             key,
             value: expr,
@@ -34,13 +37,6 @@ pub(super) fn analyze_output(
             ..
         } = prop
         {
-            // `type` is a module-name reference resolved at config-load
-            // time, not a runtime expression — its bare-ident value
-            // (`stdout`, `tcp`, …) would otherwise trip the
-            // unknown-identifier diagnostic in `check_types`.
-            if key == "type" {
-                continue;
-            }
             // If this key is declared in the Module's property schema,
             // the schema validator (see `module_props::analyze_all`)
             // owns the value's *shape* — bare-ident enum values like
@@ -72,28 +68,6 @@ pub(super) fn analyze_output(
             });
         }
     }
-}
-
-fn output_schema_for<'a>(
-    output: &OutputDef,
-    registry: &'a ModuleRegistry,
-) -> Option<&'a [crate::dsl::schema::PropertySpec]> {
-    for prop in &output.properties {
-        if let Property::KeyValue {
-            key,
-            value: Expr {
-                kind: ExprKind::Ident(parts),
-                ..
-            },
-            ..
-        } = prop
-            && key == "type"
-            && let Some(t) = parts.first()
-        {
-            return registry.output_schema(t);
-        }
-    }
-    None
 }
 
 fn check_workspace_reference(

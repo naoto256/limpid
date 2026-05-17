@@ -11,7 +11,6 @@ use tracing::{error, info, warn};
 
 use super::rate_limit::RateLimiter;
 use super::validate::validate_pri;
-use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
@@ -42,7 +41,8 @@ impl Module for SyslogUdpInput {
         Some(SYSLOG_UDP_INPUT_SCHEMA)
     }
 
-    fn from_properties(_name: &str, properties: &[Property]) -> Result<Self> {
+    fn from_properties(_name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
+        let properties = properties.user_properties();
         let bind =
             props::get_string(properties, "bind").unwrap_or_else(|| "0.0.0.0:514".to_string());
         let rate_limit = props::get_strictly_positive_int(properties, "rate_limit")?;

@@ -8,6 +8,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
+## [0.7.3] - 2026-05-17
+> property-schema parity — `--check` and runtime now read the same surface
+
+### Fixed — `--check` OK / runtime fail asymmetry on every `def input` / `def output`
+
+0.7.2's declarative property schema was applied at two points: the analyzer
+(`--check`) and the runtime (`ModuleRegistry::create_input` / `create_output`).
+The analyzer stripped the structural `type` key before validating against the
+Module's schema; the runtime did not. The result was that every config with a
+`type tcp` (or any other type) line passed `--check` cleanly but was rejected
+by the daemon at startup with:
+
+    output 'forwarder' (type 'tcp') has invalid configuration:
+      - unknown property 'type' — aborting startup
+
+The fix is structural. A new `ModuleProperties` type extracts `type` into a
+typed slot at parse time, and the Module trait's `from_properties` /
+`ModuleRegistry::create_*` factory closures both consume only
+`properties.user_properties()` — there is no `Vec<Property>` view that still
+contains `type` for anyone to forget to strip. The bug class is impossible to
+re-introduce without changing the type signatures.
+
+`property_schema()`'s contract is unchanged; every Module schema continues to
+describe its own user properties only. Configs that pass `--check` on 0.7.2
+now also start the daemon on 0.7.3 — no operator action required beyond
+upgrading the binary.
+
+### Fixed — missing `type` is now a parse-time error
+
+Previously `def input foo { ... }` without a `type` key was silently skipped
+by `module_props.rs` and surfaced as a confusing "input '...' has no type"
+error only at daemon start. The parser now constructs `ModuleProperties` for
+every def block; a missing, duplicated, or non-ident `type` becomes a
+parse-time error with the def name in the message:
+
+    input 'foo': missing required property 'type'
+
+Same loudness as a syntax error, same location attribution.
+
 ## [0.7.2] - 2026-05-17
 > declarative property schema — `--check` now loudly rejects every config typo
 

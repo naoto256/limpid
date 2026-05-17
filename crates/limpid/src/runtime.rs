@@ -59,14 +59,17 @@ impl Runtime {
         let mut output_receivers = Vec::new();
 
         for (name, output_def) in &config.outputs {
-            let queue_config = QueueConfig::from_output_properties(name, &output_def.properties)?;
-            let retry_config = RetryConfig::from_output_properties(&output_def.properties)?;
+            let queue_config =
+                QueueConfig::from_output_properties(name, output_def.properties.user_properties())?;
+            let retry_config =
+                RetryConfig::from_output_properties(output_def.properties.user_properties())?;
             let (mut sender, receiver) = queue::create_queue(name.clone(), queue_config)?;
 
-            let output_type = props::get_ident(&output_def.properties, "type")
-                .ok_or_else(|| anyhow::anyhow!("output '{}' has no type", name))?;
+            // `output_def.properties` is a `ModuleProperties`: it carries the
+            // resolved `type` already, so `create_output` doesn't take a
+            // separate type_name argument (and can't be passed one — the
+            // strip is the whole point).
             let created = match registry.create_output(
-                &output_type,
                 name,
                 &output_def.properties,
                 Arc::clone(&func_registry),
@@ -187,11 +190,9 @@ impl Runtime {
                 .get(&input_name)
                 .ok_or_else(|| anyhow::anyhow!("input '{}' not found", input_name))?;
 
-            let input_type = props::get_ident(&input_def.properties, "type")
-                .ok_or_else(|| anyhow::anyhow!("input '{}' has no type", input_name))?;
-
-            let queue_size = props::get_positive_int(&input_def.properties, "queue_size")?
-                .unwrap_or(4096) as usize;
+            let queue_size =
+                props::get_positive_int(input_def.properties.user_properties(), "queue_size")?
+                    .unwrap_or(4096) as usize;
             let (event_tx, event_rx) = mpsc::channel::<Event>(queue_size);
 
             // Pipeline workers subscribed to this input. A pipeline with fan-in
@@ -215,9 +216,10 @@ impl Runtime {
                 run_pipeline_workers(event_rx, &workers, &ctx, &iname, shutdown_for_worker).await;
             }));
 
-            // Input — registry builds, spawns, and returns metrics handle
+            // Input — registry builds, spawns, and returns metrics handle.
+            // `input_def.properties` carries the resolved `type`; no separate
+            // type_name argument needed (see ModuleProperties rationale).
             let created = match registry.create_input(
-                &input_type,
                 &input_name,
                 &input_def.properties,
                 event_tx,

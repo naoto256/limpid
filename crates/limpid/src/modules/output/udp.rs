@@ -12,7 +12,6 @@ use tokio::net::UdpSocket;
 use tokio::sync::OnceCell;
 
 use crate::dsl::arena::EventArena;
-use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::BorrowedEvent;
@@ -44,7 +43,8 @@ impl Module for UdpOutput {
         Some(UDP_OUTPUT_SCHEMA)
     }
 
-    fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
+    fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
+        let properties = properties.user_properties();
         // Schema marks `address` required; this `ok_or_else` is the
         // defensive path for direct `from_properties` callers that
         // skip the registry / `build` validation step.
@@ -105,6 +105,16 @@ impl Output for UdpOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dsl::ast::Property;
+
+    /// Wrap a property list in a `ModuleProperties` shaped for this test module.
+    /// Mirrors what the parser produces for `def input/output ... { type udp; ... }`
+    /// without going through pest, so tests can drive `Module::{build,from_properties}`
+    /// directly.
+    fn mp(props: &[Property]) -> crate::modules::ModuleProperties {
+        crate::modules::ModuleProperties::from_parts("udp", props.to_vec())
+    }
+
     use crate::dsl::ast::{Expr, ExprKind};
 
     fn kv(key: &str, kind: ExprKind) -> Property {
@@ -119,20 +129,20 @@ mod tests {
     #[test]
     fn build_accepts_address() {
         let props = vec![kv("address", ExprKind::StringLit("h:1".into()))];
-        let u = UdpOutput::build("u", &props).expect("ok");
+        let u = UdpOutput::build("u", &mp(&props)).expect("ok");
         assert_eq!(u.address, "h:1");
     }
 
     #[test]
     fn build_rejects_missing_address() {
-        let err = UdpOutput::build("u", &[]).err().expect("missing address");
+        let err = UdpOutput::build("u", &mp(&[])).err().expect("missing address");
         assert!(err.to_string().contains("address"));
     }
 
     #[test]
     fn build_rejects_unknown_key_with_did_you_mean() {
         let props = vec![kv("adress", ExprKind::StringLit("h:1".into()))];
-        let err = UdpOutput::build("u", &props).err().expect("typo");
+        let err = UdpOutput::build("u", &mp(&props)).err().expect("typo");
         let msg = err.to_string();
         assert!(msg.contains("adress") && msg.contains("address"), "{}", msg);
     }

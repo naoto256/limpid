@@ -110,9 +110,11 @@ fn parse_input_def(pair: Pair<Rule>, file_id: u32) -> Result<InputDef> {
     let mut inner = pair.into_inner();
     let name_pair = inner.next().expect("pest grammar invariant");
     let name = name_pair.as_str().to_string();
-    let properties = inner
+    let raw_properties = inner
         .map(|p| parse_property(p, file_id))
         .collect::<Result<Vec<_>>>()?;
+    let properties = crate::modules::ModuleProperties::parse(raw_properties)
+        .map_err(|e| anyhow::anyhow!("input '{}': {}", name, e))?;
     Ok(InputDef { name, properties })
 }
 
@@ -120,9 +122,11 @@ fn parse_output_def(pair: Pair<Rule>, file_id: u32) -> Result<OutputDef> {
     let mut inner = pair.into_inner();
     let name_pair = inner.next().expect("pest grammar invariant");
     let name = name_pair.as_str().to_string();
-    let properties = inner
+    let raw_properties = inner
         .map(|p| parse_property(p, file_id))
         .collect::<Result<Vec<_>>>()?;
+    let properties = crate::modules::ModuleProperties::parse(raw_properties)
+        .map_err(|e| anyhow::anyhow!("output '{}': {}", name, e))?;
     Ok(OutputDef { name, properties })
 }
 
@@ -965,7 +969,10 @@ def input fw_syslog {
         match &config.definitions[0] {
             Definition::Input(def) => {
                 assert_eq!(def.name, "fw_syslog");
-                assert_eq!(def.properties.len(), 4);
+                // `type` lives in its own typed slot now; only the three
+                // user properties remain on the property surface.
+                assert_eq!(def.properties.type_name(), "syslog_udp");
+                assert_eq!(def.properties.user_properties().len(), 3);
             }
             _ => panic!("expected Input definition"),
         }
@@ -989,8 +996,9 @@ def output ama {
         match &config.definitions[0] {
             Definition::Output(def) => {
                 assert_eq!(def.name, "ama");
-                // type, path, queue block
-                assert_eq!(def.properties.len(), 3);
+                assert_eq!(def.properties.type_name(), "unix_socket");
+                // type now lives in its own slot; user properties: path + queue
+                assert_eq!(def.properties.user_properties().len(), 2);
             }
             _ => panic!("expected Output definition"),
         }
@@ -1480,7 +1488,7 @@ def output sink {
 "#;
         let config = parse_config(input).unwrap();
         match &config.definitions[0] {
-            Definition::Output(def) => match &property_value(&def.properties, "path").kind {
+            Definition::Output(def) => match &property_value(def.properties.user_properties(), "path").kind {
                 ExprKind::StringLit(s) => assert_eq!(s, "/var/log/app.log"),
                 other => panic!("expected StringLit, got {:?}", other),
             },
@@ -1498,7 +1506,7 @@ def output sink {
 "#;
         let config = parse_config(input).unwrap();
         match &config.definitions[0] {
-            Definition::Output(def) => match &property_value(&def.properties, "path").kind {
+            Definition::Output(def) => match &property_value(def.properties.user_properties(), "path").kind {
                 ExprKind::Template(frags) => {
                     assert_eq!(frags.len(), 5);
                     // /var/log/
@@ -1536,7 +1544,7 @@ def output sink {
 "#;
         let config = parse_config(input).unwrap();
         match &config.definitions[0] {
-            Definition::Output(def) => match &property_value(&def.properties, "path").kind {
+            Definition::Output(def) => match &property_value(def.properties.user_properties(), "path").kind {
                 ExprKind::StringLit(s) => assert_eq!(s, "literal-${x}-here"),
                 other => panic!("expected StringLit, got {:?}", other),
             },

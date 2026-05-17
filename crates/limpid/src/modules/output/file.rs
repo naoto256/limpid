@@ -26,7 +26,7 @@ use tokio::sync::Mutex;
 use bytes::Bytes;
 
 use crate::dsl::arena::EventArena;
-use crate::dsl::ast::{Expr, ExprKind, Property, TemplateFragment};
+use crate::dsl::ast::{Expr, ExprKind, TemplateFragment};
 use crate::dsl::eval::{eval_expr, value_to_string};
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
@@ -88,7 +88,8 @@ impl Module for FileOutput {
         Some(FILE_OUTPUT_SCHEMA)
     }
 
-    fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
+    fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
+        let properties = properties.user_properties();
         let path = props::get_expr(properties, "path")
             .ok_or_else(|| anyhow::anyhow!("output '{}': file requires 'path'", name))?
             .clone();

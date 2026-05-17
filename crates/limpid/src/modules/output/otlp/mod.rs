@@ -74,7 +74,6 @@ use tokio::sync::Mutex;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 use crate::dsl::arena::EventArena;
-use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
@@ -264,7 +263,8 @@ impl Module for OtlpOutput {
         Some(OTLP_OUTPUT_SCHEMA)
     }
 
-    fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
+    fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
+        let properties = properties.user_properties();
         let endpoint = props::get_string(properties, "endpoint")
             .ok_or_else(|| anyhow!("output '{}': otlp requires 'endpoint'", name))?;
         let protocol_str = props::get_string(properties, "protocol")
@@ -762,6 +762,16 @@ async fn send_grpc(inner: &Inner, channel: &Channel, req: &ExportLogsServiceRequ
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dsl::ast::Property;
+
+    /// Wrap a property list in a `ModuleProperties` shaped for this test module.
+    /// Mirrors what the parser produces for `def input/output ... { type otlp; ... }`
+    /// without going through pest, so tests can drive `Module::{build,from_properties}`
+    /// directly.
+    fn mp(props: &[Property]) -> crate::modules::ModuleProperties {
+        crate::modules::ModuleProperties::from_parts("otlp", props.to_vec())
+    }
+
     use crate::dsl::ast::{Expr, ExprKind};
     use crate::event::Event;
 
@@ -785,7 +795,7 @@ mod tests {
 
     #[test]
     fn requires_endpoint() {
-        let err = OtlpOutput::from_properties("o", &[]).err().unwrap();
+        let err = OtlpOutput::from_properties("o", &mp(&[])).err().unwrap();
         assert!(err.to_string().contains("endpoint"));
     }
 
@@ -795,7 +805,7 @@ mod tests {
             prop_str("endpoint", "http://localhost:4317"),
             prop_str("protocol", "grpc"),
         ];
-        let output = OtlpOutput::from_properties("o", &props).unwrap();
+        let output = OtlpOutput::from_properties("o", &mp(&props)).unwrap();
         assert!(matches!(output.inner.protocol, Protocol::Grpc));
         assert!(matches!(output.inner.transport, Transport::Grpc(_)));
     }
@@ -810,7 +820,7 @@ mod tests {
             prop_str("endpoint", "https://collector.example.com:4317"),
             prop_str("protocol", "grpc"),
         ];
-        let output = OtlpOutput::from_properties("o", &props).unwrap();
+        let output = OtlpOutput::from_properties("o", &mp(&props)).unwrap();
         assert!(matches!(output.inner.transport, Transport::Grpc(_)));
     }
 
@@ -828,7 +838,7 @@ mod tests {
                 value_span: None,
             },
         ];
-        let err = OtlpOutput::from_properties("o", &props).err().unwrap();
+        let err = OtlpOutput::from_properties("o", &mp(&props)).err().unwrap();
         assert!(
             err.to_string().contains("verify false"),
             "unexpected error: {err}"
@@ -841,13 +851,13 @@ mod tests {
             prop_str("endpoint", "http://x"),
             prop_str("protocol", "carrier_pigeon"),
         ];
-        let err = OtlpOutput::from_properties("o", &props).err().unwrap();
+        let err = OtlpOutput::from_properties("o", &mp(&props)).err().unwrap();
         assert!(err.to_string().contains("unknown"));
     }
 
     #[test]
     fn batch_level_default_is_none() {
-        let output = OtlpOutput::from_properties("o", &[prop_str("endpoint", "http://x")]).unwrap();
+        let output = OtlpOutput::from_properties("o", &mp(&[prop_str("endpoint", "http://x")])).unwrap();
         assert!(matches!(output.inner.batch_level, BatchLevel::None));
     }
 
@@ -855,20 +865,20 @@ mod tests {
     fn batch_level_accepts_resource_and_scope() {
         let r = OtlpOutput::from_properties(
             "o",
-            &[
+            &mp(&[
                 prop_str("endpoint", "http://x"),
                 prop_str("batch_level", "resource"),
             ],
-        )
+        ))
         .unwrap();
         assert!(matches!(r.inner.batch_level, BatchLevel::Resource));
         let s = OtlpOutput::from_properties(
             "o",
-            &[
+            &mp(&[
                 prop_str("endpoint", "http://x"),
                 prop_str("batch_level", "scope"),
             ],
-        )
+        ))
         .unwrap();
         assert!(matches!(s.inner.batch_level, BatchLevel::Scope));
     }
@@ -877,11 +887,11 @@ mod tests {
     fn rejects_unknown_batch_level() {
         let err = OtlpOutput::from_properties(
             "o",
-            &[
+            &mp(&[
                 prop_str("endpoint", "http://x"),
                 prop_str("batch_level", "logrecord"),
             ],
-        )
+        ))
         .err()
         .unwrap();
         assert!(
@@ -1044,27 +1054,27 @@ mod tests {
     #[test]
     fn defaults_protocol_to_http_protobuf() {
         let props = vec![prop_str("endpoint", "http://x")];
-        let output = OtlpOutput::from_properties("o", &props).unwrap();
+        let output = OtlpOutput::from_properties("o", &mp(&props)).unwrap();
         assert!(matches!(output.inner.protocol, Protocol::HttpProtobuf));
     }
 
     #[test]
     fn batch_size_defaults_to_one() {
         let props = vec![prop_str("endpoint", "http://x")];
-        let output = OtlpOutput::from_properties("o", &props).unwrap();
+        let output = OtlpOutput::from_properties("o", &mp(&props)).unwrap();
         assert_eq!(output.batch_size, 1);
     }
 
     #[test]
     fn batch_size_explicit() {
         let props = vec![prop_str("endpoint", "http://x"), prop_int("batch_size", 64)];
-        let output = OtlpOutput::from_properties("o", &props).unwrap();
+        let output = OtlpOutput::from_properties("o", &mp(&props)).unwrap();
         assert_eq!(output.batch_size, 64);
     }
 
     #[test]
     fn retry_config_defaults_match_shared_default() {
-        let output = OtlpOutput::from_properties("o", &[prop_str("endpoint", "http://x")]).unwrap();
+        let output = OtlpOutput::from_properties("o", &mp(&[prop_str("endpoint", "http://x")])).unwrap();
         let default = RetryConfig::default();
         assert_eq!(output.inner.retry_config.max_attempts, default.max_attempts);
         assert_eq!(output.inner.retry_config.initial_wait, default.initial_wait);
@@ -1084,7 +1094,7 @@ mod tests {
                 ],
             },
         ];
-        let output = OtlpOutput::from_properties("o", &props).unwrap();
+        let output = OtlpOutput::from_properties("o", &mp(&props)).unwrap();
         assert_eq!(output.inner.retry_config.max_attempts, 2);
         assert_eq!(
             output.inner.retry_config.initial_wait,
@@ -1106,12 +1116,12 @@ mod tests {
     async fn drop_aborts_pending_flush_timer() {
         let output = OtlpOutput::from_properties(
             "test",
-            &[
+            &mp(&[
                 prop_str("endpoint", "http://127.0.0.1:1"),
                 prop_int("batch_size", 1024), // big enough that write does not flush
                 prop_str("batch_timeout", "30s"),
             ],
-        )
+        ))
         .unwrap();
         // Push one event so ensure_flush_timer schedules a task.
         output
@@ -1235,12 +1245,12 @@ mod tests {
         let endpoint = format!("http://{}", addr);
         let output = OtlpOutput::from_properties(
             "test",
-            &[
+            &mp(&[
                 prop_str("endpoint", &endpoint),
                 prop_str("protocol", "grpc"),
                 prop_int("batch_size", 1),
             ],
-        )
+        ))
         .unwrap();
         output
             .write_owned(&event_with_egress(singleton_bytes(
@@ -1405,7 +1415,7 @@ mod tests {
         let endpoint = format!("http://{}/v1/logs", addr);
         let output = OtlpOutput::from_properties(
             "test",
-            &[
+            &mp(&[
                 prop_str("endpoint", &endpoint),
                 prop_str("protocol", "http_protobuf"),
                 prop_int("batch_size", 1),
@@ -1419,7 +1429,7 @@ mod tests {
                     ],
                 },
             ],
-        )
+        ))
         .unwrap();
 
         // The first ship 503s twice then succeeds; the call should
@@ -1454,7 +1464,7 @@ mod tests {
         let endpoint = format!("http://{}/v1/logs", addr);
         let output = OtlpOutput::from_properties(
             "test",
-            &[
+            &mp(&[
                 prop_str("endpoint", &endpoint),
                 prop_str("protocol", "http_protobuf"),
                 prop_int("batch_size", 1),
@@ -1468,7 +1478,7 @@ mod tests {
                     ],
                 },
             ],
-        )
+        ))
         .unwrap();
         let err = output
             .write_owned(&event_with_egress(singleton_bytes(456)))
@@ -1487,12 +1497,12 @@ mod tests {
         let endpoint = format!("http://{}/v1/logs", addr);
         let output = OtlpOutput::from_properties(
             "test",
-            &[
+            &mp(&[
                 prop_str("endpoint", &endpoint),
                 prop_str("protocol", "http_protobuf"),
                 prop_int("batch_size", 1),
             ],
-        )
+        ))
         .unwrap();
         output
             .write_owned(&event_with_egress(singleton_bytes(123)))
@@ -1517,12 +1527,12 @@ mod tests {
         let endpoint = format!("http://{}/v1/logs", addr);
         let output = OtlpOutput::from_properties(
             "test",
-            &[
+            &mp(&[
                 prop_str("endpoint", &endpoint),
                 prop_str("protocol", "http_json"),
                 prop_int("batch_size", 1),
             ],
-        )
+        ))
         .unwrap();
         output
             .write_owned(&event_with_egress(singleton_bytes(456)))

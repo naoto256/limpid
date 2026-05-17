@@ -26,7 +26,6 @@ use anyhow::{Context, Result};
 use tokio::sync::Mutex;
 
 use crate::dsl::arena::EventArena;
-use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::BorrowedEvent;
@@ -113,7 +112,8 @@ impl Module for HttpOutput {
         Some(HTTP_OUTPUT_SCHEMA)
     }
 
-    fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
+    fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
+        let properties = properties.user_properties();
         let url = props::get_string(properties, "url")
             .ok_or_else(|| anyhow::anyhow!("output '{}': http requires 'url'", name))?;
         let method = props::get_ident(properties, "method")

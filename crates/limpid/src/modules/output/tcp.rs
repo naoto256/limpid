@@ -12,7 +12,6 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use crate::dsl::arena::EventArena;
-use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::BorrowedEvent;
@@ -70,7 +69,8 @@ impl Module for TcpOutput {
         Some(TCP_OUTPUT_SCHEMA)
     }
 
-    fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
+    fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
+        let properties = properties.user_properties();
         let address = props::get_string(properties, "address")
             .or_else(|| {
                 let host = props::get_string(properties, "host")?;
@@ -165,6 +165,16 @@ impl PersistentConn for TcpOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dsl::ast::Property;
+
+    /// Wrap a property list in a `ModuleProperties` shaped for this test module.
+    /// Mirrors what the parser produces for `def input/output ... { type tcp; ... }`
+    /// without going through pest, so tests can drive `Module::{build,from_properties}`
+    /// directly.
+    fn mp(props: &[Property]) -> crate::modules::ModuleProperties {
+        crate::modules::ModuleProperties::from_parts("tcp", props.to_vec())
+    }
+
     use crate::dsl::ast::{Expr, ExprKind};
 
     fn kv(key: &str, kind: ExprKind) -> Property {
@@ -179,7 +189,7 @@ mod tests {
     #[test]
     fn build_accepts_minimal_valid_config() {
         let props = vec![kv("address", ExprKind::StringLit("127.0.0.1:514".into()))];
-        let tcp = TcpOutput::build("relay", &props).expect("should build");
+        let tcp = TcpOutput::build("relay", &mp(&props)).expect("should build");
         assert_eq!(tcp.address, "127.0.0.1:514");
         assert_eq!(tcp.framing, TcpOutputFraming::OctetCounting);
     }
@@ -190,7 +200,7 @@ mod tests {
             kv("address", ExprKind::StringLit("h:1".into())),
             kv("framing", ExprKind::Ident(vec!["non_transparent".into()])),
         ];
-        let tcp = TcpOutput::build("relay", &props).expect("should build");
+        let tcp = TcpOutput::build("relay", &mp(&props)).expect("should build");
         assert_eq!(tcp.framing, TcpOutputFraming::NonTransparent);
     }
 
@@ -200,7 +210,7 @@ mod tests {
             kv("address", ExprKind::StringLit("h:1".into())),
             kv("framing", ExprKind::Ident(vec!["non_trasnaprent".into()])),
         ];
-        let err = TcpOutput::build("relay", &props).err().expect("should fail");
+        let err = TcpOutput::build("relay", &mp(&props)).err().expect("should fail");
         let msg = err.to_string();
         assert!(msg.contains("framing"), "{}", msg);
         assert!(msg.contains("non_transparent"), "did-you-mean missing: {}", msg);
@@ -213,7 +223,7 @@ mod tests {
             // typo of `framing` → should suggest `framing`
             kv("framming", ExprKind::Ident(vec!["octet_counting".into()])),
         ];
-        let err = TcpOutput::build("relay", &props).err().expect("should fail");
+        let err = TcpOutput::build("relay", &mp(&props)).err().expect("should fail");
         let msg = err.to_string();
         assert!(msg.contains("unknown property 'framming'"), "{}", msg);
         assert!(msg.contains("framing"), "did-you-mean missing: {}", msg);
@@ -227,7 +237,7 @@ mod tests {
             kv("host", ExprKind::StringLit("h".into())),
             kv("port", ExprKind::StringLit("five-fourteen".into())),
         ];
-        let err = TcpOutput::build("relay", &props).err().expect("should fail");
+        let err = TcpOutput::build("relay", &mp(&props)).err().expect("should fail");
         let msg = err.to_string();
         assert!(msg.contains("port"), "{}", msg);
         assert!(msg.contains("integer"), "{}", msg);
@@ -239,7 +249,7 @@ mod tests {
             kv("portt", ExprKind::IntLit(514)),
             kv("framing", ExprKind::Ident(vec!["xx".into()])),
         ];
-        let err = TcpOutput::build("relay", &props).err().expect("should fail");
+        let err = TcpOutput::build("relay", &mp(&props)).err().expect("should fail");
         let msg = err.to_string();
         assert!(msg.contains("portt"), "{}", msg);
         assert!(msg.contains("framing"), "{}", msg);
@@ -252,7 +262,7 @@ mod tests {
         // boundary). Confirm legacy direct callers — e.g. modules in
         // their own tests — still work.
         let props = vec![kv("address", ExprKind::StringLit("h:1".into()))];
-        let tcp = TcpOutput::from_properties("relay", &props).expect("should build");
+        let tcp = TcpOutput::from_properties("relay", &mp(&props)).expect("should build");
         assert_eq!(tcp.address, "h:1");
     }
 }

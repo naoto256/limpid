@@ -104,8 +104,9 @@ impl CompiledConfig {
 
         let mut outputs_queue_kind: HashMap<String, QueueKind> = HashMap::new();
         for (name, output_def) in &outputs {
-            let kind =
-                crate::queue::QueueConfig::kind_from_output_properties(&output_def.properties);
+            let kind = crate::queue::QueueConfig::kind_from_output_properties(
+                output_def.properties.user_properties(),
+            );
             outputs_queue_kind.insert(name.clone(), kind);
         }
 

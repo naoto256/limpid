@@ -21,7 +21,6 @@ use bytes::Bytes;
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
 use tracing::{debug, error, info, warn};
 
-use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
@@ -64,7 +63,8 @@ impl Module for TailInput {
         Some(TAIL_INPUT_SCHEMA)
     }
 
-    fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
+    fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
+        let properties = properties.user_properties();
         let path = props::get_string(properties, "path")
             .ok_or_else(|| anyhow::anyhow!("input '{}': tail requires 'path'", name))?;
         let state_file = props::get_string(properties, "state_file").map(PathBuf::from);

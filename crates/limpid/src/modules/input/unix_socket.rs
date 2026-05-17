@@ -14,7 +14,6 @@ use tokio::net::UnixDatagram;
 use tracing::{error, info, warn};
 
 use super::validate::validate_pri;
-use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
@@ -39,7 +38,8 @@ impl Module for UnixSocketInput {
         Some(UNIX_SOCKET_INPUT_SCHEMA)
     }
 
-    fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
+    fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
+        let properties = properties.user_properties();
         let path = props::get_string(properties, "path")
             .ok_or_else(|| anyhow::anyhow!("input '{}': unix_socket requires 'path'", name))?;
         Ok(Self {

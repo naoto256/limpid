@@ -47,7 +47,6 @@ use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
 use super::split_request;
-use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
@@ -86,7 +85,8 @@ impl Module for OtlpGrpcInput {
         Some(OTLP_GRPC_INPUT_SCHEMA)
     }
 
-    fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
+    fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
+        let properties = properties.user_properties();
         let bind =
             props::get_string(properties, "bind").unwrap_or_else(|| "0.0.0.0:4317".to_string());
         let rate_limit = props::get_strictly_positive_int(properties, "rate_limit")?;
@@ -253,6 +253,16 @@ fn empty_response() -> ExportLogsServiceResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dsl::ast::Property;
+
+    /// Wrap a property list in a `ModuleProperties` shaped for this test module.
+    /// Mirrors what the parser produces for `def input/output ... { type otlp_grpc; ... }`
+    /// without going through pest, so tests can drive `Module::{build,from_properties}`
+    /// directly.
+    fn mp(props: &[Property]) -> crate::modules::ModuleProperties {
+        crate::modules::ModuleProperties::from_parts("otlp_grpc", props.to_vec())
+    }
+
     use opentelemetry_proto::tonic::{
         common::v1::InstrumentationScope,
         logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
@@ -262,7 +272,7 @@ mod tests {
 
     #[test]
     fn defaults_bind_address_no_rate_limit_no_tls() {
-        let i = OtlpGrpcInput::from_properties("o", &[]).unwrap();
+        let i = OtlpGrpcInput::from_properties("o", &mp(&[])).unwrap();
         assert_eq!(i.bind_addr, "0.0.0.0:4317");
         assert_eq!(i.rate_limit, None);
         assert!(i.tls.is_none());
@@ -276,7 +286,7 @@ mod tests {
             value: crate::dsl::ast::Expr::spanless(crate::dsl::ast::ExprKind::IntLit(2500)),
             value_span: None,
         };
-        let i = OtlpGrpcInput::from_properties("o", &[prop]).unwrap();
+        let i = OtlpGrpcInput::from_properties("o", &mp(&[prop])).unwrap();
         assert_eq!(i.rate_limit, Some(2500));
     }
 
@@ -319,7 +329,7 @@ mod tests {
     #[test]
     fn tls_block_records_cert_key() {
         let props = vec![tls_block("/c.pem", "/k.pem", None)];
-        let i = OtlpGrpcInput::from_properties("o", &props).unwrap();
+        let i = OtlpGrpcInput::from_properties("o", &mp(&props)).unwrap();
         let tls = i.tls.expect("tls present");
         assert_eq!(tls.cert_path, "/c.pem");
         assert_eq!(tls.key_path, "/k.pem");
@@ -329,7 +339,7 @@ mod tests {
     #[test]
     fn tls_block_records_ca_for_mtls() {
         let props = vec![tls_block("/c.pem", "/k.pem", Some("/ca.pem"))];
-        let i = OtlpGrpcInput::from_properties("o", &props).unwrap();
+        let i = OtlpGrpcInput::from_properties("o", &mp(&props)).unwrap();
         let tls = i.tls.expect("tls present");
         assert_eq!(tls.ca_path.as_deref(), Some("/ca.pem"));
     }
@@ -348,7 +358,7 @@ mod tests {
                 value_span: None,
             }],
         }];
-        let err = OtlpGrpcInput::from_properties("o", &props).err().unwrap();
+        let err = OtlpGrpcInput::from_properties("o", &mp(&props)).err().unwrap();
         assert!(
             err.to_string().contains("tls block requires 'cert'"),
             "unexpected: {err}"

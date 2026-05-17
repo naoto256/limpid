@@ -9,7 +9,6 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
-use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
@@ -65,7 +64,8 @@ impl Module for SyslogTlsInput {
         Some(SYSLOG_TLS_INPUT_SCHEMA)
     }
 
-    fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
+    fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
+        let properties = properties.user_properties();
         let bind =
             props::get_string(properties, "bind").unwrap_or_else(|| "0.0.0.0:6514".to_string());
         let framing = match props::get_ident(properties, "framing").as_deref() {

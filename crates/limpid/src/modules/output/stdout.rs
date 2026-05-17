@@ -7,7 +7,6 @@ use anyhow::Result;
 use bytes::Bytes;
 
 use crate::dsl::arena::EventArena;
-use crate::dsl::ast::Property;
 use crate::dsl::schema::PropertySpec;
 use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
@@ -31,7 +30,7 @@ impl Module for StdoutOutput {
         Some(STDOUT_OUTPUT_SCHEMA)
     }
 
-    fn from_properties(_name: &str, _properties: &[Property]) -> Result<Self> {
+    fn from_properties(_name: &str, _properties: &crate::modules::ModuleProperties) -> Result<Self> {
         Ok(Self {
             metrics: Arc::new(OutputMetrics::default()),
         })

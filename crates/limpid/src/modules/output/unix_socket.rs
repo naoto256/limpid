@@ -11,7 +11,6 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 use crate::dsl::arena::EventArena;
-use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::BorrowedEvent;
@@ -43,7 +42,8 @@ impl Module for UnixSocketOutput {
         Some(UNIX_SOCKET_OUTPUT_SCHEMA)
     }
 
-    fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
+    fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
+        let properties = properties.user_properties();
         let path = props::get_string(properties, "path")
             .ok_or_else(|| anyhow::anyhow!("output '{}': unix_socket requires 'path'", name))?;
         Ok(Self {

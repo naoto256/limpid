@@ -90,7 +90,8 @@ impl Module for KafkaOutput {
         Some(KAFKA_OUTPUT_SCHEMA)
     }
 
-    fn from_properties(name: &str, properties: &[Property]) -> Result<Self> {
+    fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
+        let properties = properties.user_properties();
         let brokers = props::get_string(properties, "brokers")
             .ok_or_else(|| anyhow::anyhow!("output '{}': kafka requires 'brokers'", name))?;
         let topic = props::get_string(properties, "topic")
