@@ -1666,12 +1666,12 @@ def process p {
         }
     }
 
-    // ---- dot namespace syntax (Block 3) --------------------------------
+    // ---- dot namespace syntax (v0.3.0) ---------------------------------
 
     #[test]
     fn test_parse_namespaced_func_call() {
         // Grammar should accept `<ns>.<fn>(args)` and build a FuncCall
-        // with `namespace = Some("syslog")`. Block 3 only adds the
+        // with `namespace = Some("syslog")`. The v0.3.0 work only adds the
         // syntax + registry — no syslog.* function is registered yet,
         // which is fine because parsing is structural.
         let input = r#"

@@ -278,8 +278,8 @@ pub enum AssignTarget {
 
 /// An expression node — kind plus the source span it covers.
 ///
-/// Block 11 commit 11-A introduced the wrapper form (`{ kind, span }`)
-/// so the analyzer can emit precise `snippet + caret` diagnostics for
+/// The wrapper form (`{ kind, span }`) was introduced when expr-level
+/// spans landed, so the analyzer can emit precise `snippet + caret` diagnostics for
 /// type / operator / function-arg warnings that previously fell back to
 /// the statement-level span (or spanless output). The parser fills
 /// `span` from `pest`; code that hand-constructs AST nodes (tests, a
@@ -427,7 +427,7 @@ pub enum ExprKind {
     /// `namespace = None` is the flat primitive form (`parse_json(x)`,
     /// `lower(workspace.name)`). `namespace = Some("syslog")` is the
     /// dot-namespaced form (`syslog.parse(ingress)`) introduced in
-    /// v0.3.0 Block 3; the registry dispatches on `(namespace, name)`.
+    /// v0.3.0; the registry dispatches on `(namespace, name)`.
     FuncCall {
         namespace: Option<String>,
         name: String,

@@ -127,7 +127,7 @@ impl CompiledConfig {
     /// `_builtins` is kept in the signature for callers that want to
     /// validate against registered inputs/outputs in the future; process
     /// names are now resolved exclusively against user-defined DSL
-    /// processes (v0.3.0 Block 4 removed the native process layer).
+    /// processes (v0.3.0 removed the native process layer).
     pub fn validate(&self, _builtins: &ModuleRegistry) -> Result<()> {
         for (name, pipeline) in &self.pipelines {
             for stmt in &pipeline.body {
@@ -328,7 +328,7 @@ pub struct PipelineRunResult {
 /// A process registry backed by compiled DSL process definitions.
 ///
 /// Only user-defined `def process { ... }` blocks resolve here.
-/// Built-in processes were removed in v0.3.0 Block 4 — former native
+/// Built-in processes were removed in v0.3.0 — former native
 /// transforms are now DSL functions (`syslog.parse`, `parse_json`,
 /// `regex_replace`, …) invoked via expression statements.
 struct DslProcessRegistry<'a> {

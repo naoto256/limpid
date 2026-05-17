@@ -984,13 +984,13 @@ def pipeline p {
         assert!(warnings(&diags).is_empty(), "got: {:?}", diags);
     }
 
-    // ----- expr-level spans (Block 11-A) ---------------------------------
+    // ----- expr-level spans ----------------------------------------------
 
     #[test]
     fn lower_on_int_workspace_carries_arg_span() {
-        // Regression: before 11-A, type warnings inside process bodies
-        // were spanless and fell back to the one-line
-        // `warning: ...` format. After 11-A the arg's `ExprKind::Ident`
+        // Regression: before expr-level spans landed, type warnings inside
+        // process bodies were spanless and fell back to the one-line
+        // `warning: ...` format. With expr-level spans the arg's `ExprKind::Ident`
         // span resolves to the `workspace.count` substring, so the
         // diagnostic renders with a snippet + caret.
         let src = r#"
@@ -1031,7 +1031,7 @@ def pipeline p {
     fn operator_type_mismatch_carries_binop_span() {
         // `workspace.port == "80"` where workspace.port is Int: the
         // BinOp span should cover the comparison expression, which
-        // lives on the `if` line. Pre-11-A the warning was spanless.
+        // lives on the `if` line. Before expr-level spans landed the warning was spanless.
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
@@ -1062,7 +1062,7 @@ def pipeline p {
         );
     }
 
-    // ----- DiagKind tagging / promotion (Block 11-C) --------------------
+    // ----- DiagKind tagging / promotion -----------------------------------
 
     #[test]
     fn unresolved_workspace_output_ref_tagged_unknown_ident() {

@@ -9,7 +9,7 @@
 //! Schema-specific functions (`syslog.*`, `cef.*`, …) live in sibling
 //! modules next to this one. See `design-principles.md` Principle 5.
 //!
-//! The split into one-file-per-function was introduced in v0.3.0 Block 4
+//! The split into one-file-per-function was introduced in v0.3.0
 //! to stop `functions/mod.rs` from becoming a megafile once the set of
 //! primitives grew past a dozen entries.
 

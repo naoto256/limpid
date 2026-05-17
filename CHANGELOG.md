@@ -1995,8 +1995,8 @@ tooling on top of the DSL finalised in v0.3.0. No DSL breaking changes
 
 - `limpidctl check` references in operations / pipelines / processing
   docs corrected to `limpid --check` (check lives in the daemon binary,
-  not the CLI tool — this was the Block 1 decision during v0.3.0
-  restructure, but the docs had drifted).
+  not the CLI tool — this was decided during the v0.3.0 restructure,
+  but the docs had drifted).
 
 ## [0.3.0] - 2026-04-24
 

@@ -179,7 +179,7 @@ fn ident_type(parts: &[String], bindings: &Bindings) -> FieldType {
 /// anchor the whole tree to a coarser location (e.g. the `value_span`
 /// of an output property). Individual warnings still prefer the tight
 /// sub-expression span from the AST — carried on each [`Expr`] since
-/// Block 11 — and only fall back to this coarser span when the parser
+/// the expr-level span work landed — and only fall back to this coarser span when the parser
 /// couldn't attribute a precise source range (e.g. synthesized AST
 /// rebuilds in the analyzer that use [`Expr::spanless`]).
 pub fn check_types(

@@ -204,7 +204,7 @@ fn check_expands_includes_in_summary() {
 }
 
 // ---------------------------------------------------------------------------
-// --graph flag (Block 11-B)
+// --graph flag
 // ---------------------------------------------------------------------------
 
 fn run_check_with_graph(config: &std::path::Path, graph_arg: &str) -> std::process::Output {
@@ -314,7 +314,7 @@ fn graph_unknown_format_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// --ultra-strict flag (Block 11-C)
+// --ultra-strict flag
 // ---------------------------------------------------------------------------
 
 fn run_with_flags(config: &std::path::Path, flags: &[&str]) -> std::process::Output {

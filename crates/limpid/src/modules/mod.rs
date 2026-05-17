@@ -250,7 +250,7 @@ impl ModuleProperties {
 /// I/O-pure (ingress bytes in, egress bytes out) and have no data
 /// contract to advertise.
 ///
-/// Processes are not modules: v0.3.0 Block 4 removed the native
+/// Processes are not modules: v0.3.0 removed the native
 /// process layer entirely in favour of DSL functions (`syslog.parse`
 /// etc.) and user-defined `def process { ... }` blocks. Modules are
 /// only inputs and outputs.
@@ -598,7 +598,7 @@ pub fn register_builtins(registry: &mut ModuleRegistry) {
     #[cfg(feature = "kafka")]
     register_output_type::<output::kafka::KafkaOutput>(registry, "kafka");
 
-    // No built-in processes — v0.3.0 Block 4 removed the native process
+    // No built-in processes — v0.3.0 removed the native process
     // layer. Schema-specific parsers are DSL functions (`syslog.parse`,
     // `cef.parse`), format primitives are flat functions (`parse_json`,
     // `parse_kv`, `regex_replace`, …), and custom transforms are

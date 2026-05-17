@@ -8,8 +8,8 @@
 //! and is attached to parsers / function signatures rather than to
 //! modules: inputs and outputs are I/O-pure (ingress bytes in, egress
 //! bytes out) and have no schema to advertise. The old `ModuleSchema`
-//! struct and `Module::schema()` were removed in v0.4.0 Block 9
-//! (analyzer rebase).
+//! struct and `Module::schema()` were removed in v0.4.0 during the
+//! analyzer rebase.
 //!
 //! The `FieldType` vocabulary lives here so it can be used from both
 //! `modules::*` and `check::*` without a cyclic include.

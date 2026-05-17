@@ -179,7 +179,7 @@ pub type ExprFn = Box<
 /// Registry key: `(namespace, name)`. `namespace = None` is the flat
 /// primitive namespace (`parse_json`, `regex_*`, `strftime`, ...).
 /// `namespace = Some("syslog")` and friends are the dot-namespaced
-/// form introduced in v0.3.0 Block 3.
+/// form introduced in v0.3.0.
 type FnKey = (Option<String>, String);
 
 pub struct FunctionRegistry {
@@ -254,8 +254,8 @@ impl FunctionRegistry {
     }
 
     /// Register a namespaced function, callable as `<namespace>.<name>(...)`
-    /// in the DSL. Block 3 introduced the dispatch path; Block 4
-    /// populated the first real namespaces (`syslog`, `cef`). Future
+    /// in the DSL. v0.3.0 introduced the dispatch path and populated the
+    /// first real namespaces (`syslog`, `cef`); future
     /// work will add `ocsf.*` composers.
     pub fn register_in<F>(&mut self, namespace: &str, name: &str, f: F)
     where
