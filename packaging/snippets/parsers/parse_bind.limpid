@@ -1,56 +1,64 @@
 // BIND DNS query log parser (vocabulary)
 //
-// Vendor:   ISC BIND 9 (Internet Systems Consortium) — the dominant
-//           authoritative + recursive DNS server on Linux / BSD. Not
-//           Unbound, not Knot, not PowerDNS, not djbdns; each of those
-//           has its own query log format and would land in its own
-//           parser file.
-// Wire:     BIND `querylog` text format. With `querylog yes;` set in
-//           `named.conf` (and a matching `category queries` channel
-//           that writes the log somewhere), each query produces one
-//           line shaped like:
-//             <timestamp> client @<addr> <ip>#<port> [(<view>):]
-//             (<qname>): query: <qname> <class> <type> <flags>[ (<server-ip>)]
-//           The `@<addr>` is BIND's internal client-id pointer; ignored
-//           by this parser. The optional `(<view>)` marker appears when
-//           the server has multiple `view` clauses configured.
-// Intake:   workspace.bind.body       (required, String) — the query log line
-//           workspace.bind.pid        (optional, String) — named pid
-//           workspace.bind.hostname   (optional, String) — DNS server hostname
-//           workspace.bind.time       (optional, Int)    — epoch nanoseconds of arrival
-// Upstream: transport-agnostic. The BIND timestamp inside the body
-//           carries millisecond precision in a BIND-specific format
-//           (`30-Apr-2026 01:23:45.123`); the OCSF `time` field is
-//           populated from the upstream transport time when available
-//           (more accurate for SIEM correlation than the BIND
-//           timestamp, which is local-TZ-by-default). Two typical
-//           bridges:
+// Vendor:      ISC BIND 9 (Internet Systems Consortium) — the dominant
+//              authoritative + recursive DNS server on Linux / BSD. Not
+//              Unbound, not Knot, not PowerDNS, not djbdns; each of those
+//              has its own query log format and would land in its own
+//              parser file.
+// Wire:        BIND `querylog` text format. With `querylog yes;` set in
+//              `named.conf` (and a matching `category queries` channel
+//              that writes the log somewhere), each query produces one
+//              line shaped like:
+//                <timestamp> client @<addr> <ip>#<port> [(<view>):]
+//                (<qname>): query: <qname> <class> <type> <flags>[ (<server-ip>)]
+//              The `@<addr>` is BIND's internal client-id pointer; ignored
+//              by this parser. The optional `(<view>)` marker appears when
+//              the server has multiple `view` clauses configured.
+// Upstream:    transport-agnostic body parser. The BIND timestamp inside
+//              the body carries millisecond precision in a BIND-specific
+//              format (`30-Apr-2026 01:23:45.123`); the OCSF `time` field
+//              is populated from the upstream transport time when
+//              available (more accurate for SIEM correlation than the
+//              BIND timestamp, which is local-TZ-by-default). Two typical
+//              bridges:
 //
-//           - file tail (most common — limpid runs on the DNS server):
-//                 { workspace.bind = { body: ingress, pid: null, hostname: hostname(), time: to_int(received_at) } } | parse_bind | compose_ocsf
+//              - file tail (most common — limpid runs on the DNS server):
+//                    { workspace.bind = { body: ingress, pid: null, hostname: hostname(), time: to_int(received_at) } } | parse_bind | compose_ocsf
 //
-//           - syslog transport (named logs via syslog instead of file):
-//                 process parse_syslog | {
-//                     workspace.bind = {
-//                         body:     workspace.syslog.msg,
-//                         pid:      workspace.syslog.procid,
-//                         hostname: workspace.syslog.hostname,
-//                         time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
-//                     }
-//                 } | parse_bind | compose_ocsf
+//              - syslog transport (named logs via syslog instead of file):
+//                    process parse_syslog | {
+//                        workspace.bind = {
+//                            body:     workspace.syslog.msg,
+//                            pid:      workspace.syslog.procid,
+//                            hostname: workspace.syslog.hostname,
+//                            time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
+//                        }
+//                    } | parse_bind | compose_ocsf
 //
-//           - journald transport (named running under systemd):
-//                 process parse_journald | {
-//                     workspace.bind = {
-//                         body:     workspace.journald.MESSAGE,
-//                         pid:      coalesce(workspace.journald._PID, workspace.journald.SYSLOG_PID),
-//                         hostname: workspace.journald._HOSTNAME,
-//                         time:     to_int(workspace.journald.__REALTIME_TIMESTAMP) * 1000
-//                     }
-//                 } | parse_bind | compose_ocsf
+//              - journald transport (named running under systemd):
+//                    process parse_journald | {
+//                        workspace.bind = {
+//                            body:     workspace.journald.MESSAGE,
+//                            pid:      coalesce(workspace.journald._PID, workspace.journald.SYSLOG_PID),
+//                            hostname: workspace.journald._HOSTNAME,
+//                            time:     to_int(workspace.journald.__REALTIME_TIMESTAMP) * 1000
+//                        }
+//                    } | parse_bind | compose_ocsf
 //
-// Output:   OCSF DNS Activity (class_uid 4003) records on
-//           `workspace.limpid`.
+// Intake:      workspace.bind.body       (required, String) — the query log line
+//              workspace.bind.pid        (optional, String) — named pid
+//              workspace.bind.hostname   (optional, String) — DNS server hostname
+//              workspace.bind.time       (optional, Int)    — epoch nanoseconds of arrival
+// Output:      OCSF DNS Activity (class_uid 4003) records on
+//              `workspace.limpid`. Handles BIND's `category queries`
+//              channel — the per-query line emitted by `querylog yes;`.
+//              Other BIND log categories (`network`, `security`,
+//              `update`, `notify`, …) emit different shapes and would
+//              need their own parsers. Lines that do not match the query
+//              shape (e.g. `lame-servers`, `network unreachable`) route
+//              to `error_log` per the loud-fail-fast policy.
+// Test corpus: spec-only (BIND 9 ARM querylog format and synthesised sample
+//              lines below; no live capture — verify before production use).
 //
 // Sample BIND querylog lines (what `workspace.bind.body` carries):
 //
@@ -63,13 +71,6 @@
 //
 //   Reverse lookup (PTR):
 //   30-Apr-2026 01:23:45.126 client @0x7fef10003330 192.0.2.10#54322 (10.2.0.192.in-addr.arpa): query: 10.2.0.192.in-addr.arpa IN PTR + (1.2.3.4)
-//
-// Coverage scope: this snippet handles BIND's `category queries`
-// channel — the per-query line emitted by `querylog yes;`. Other BIND
-// log categories (`network`, `security`, `update`, `notify`, …) emit
-// different shapes; each would need its own parser. Lines that do not
-// match the query shape (e.g. `lame-servers`, `network unreachable`)
-// route to `error_log` per the loud-fail-fast policy.
 
 // ---------------------------------------------------------------------------
 // Helpers

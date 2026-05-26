@@ -1,53 +1,51 @@
 // Juniper SRX structured-data syslog parser (vocabulary)
 //
-// Vendor:   Juniper Networks SRX series (and vSRX) — Junos OS'
-//           security log subsystem in `set security log format
-//           sd-syslog` mode. Covers the daemons that emit a
-//           `[junos@<EID> ...]` structured-data block: RT_FLOW,
-//           RT_IDP, RT_IDS (Screen), RT_UTM, RT_AAMW (Sky ATP /
-//           Advanced Anti-Malware), RT_SECINTEL.
-// Wire:     RFC 5424 + Junos structured-data block:
-//             <PRI>1 <ts> <host> RT_<DAEMON> - <MSGID> [junos@<EID> key="val" ...]
-//           Every daemon shares this outer shape; the SD KV
-//           contents differ per MSGID. Field order inside SD is
-//           NOT stable across Junos versions, so this parser
-//           extracts every field by name independently.
-// Intake:   workspace.juniper_srx_sd_syslog.body      (required, String) — the full RFC 5424 wire INCLUDING the leading `<PRI>1`
-//           workspace.juniper_srx_sd_syslog.hostname  (optional, String) — collector-side override (parser prefers the wire's HOSTNAME field via classify)
-//           workspace.juniper_srx_sd_syslog.time      (optional, Int)    — epoch nanoseconds of arrival
-// Upstream: SRX appliances emit syslog (UDP/514 or TCP/514). The
-//           bridge passes the raw wire — parse_syslog is not used
-//           because limpid's syslog.parse does not expose the
-//           structured-data block, and the SRX session metadata
-//           lives entirely in SD. Two typical bridges:
+// Vendor:      Juniper Networks SRX series (and vSRX) — Junos OS'
+//              security log subsystem in `set security log format
+//              sd-syslog` mode. Covers the daemons that emit a
+//              `[junos@<EID> ...]` structured-data block: RT_FLOW,
+//              RT_IDP, RT_IDS (Screen), RT_UTM, RT_AAMW (Sky ATP /
+//              Advanced Anti-Malware), RT_SECINTEL.
+// Wire:        RFC 5424 + Junos structured-data block:
+//                <PRI>1 <ts> <host> RT_<DAEMON> - <MSGID> [junos@<EID> key="val" ...]
+//              Every daemon shares this outer shape; the SD KV
+//              contents differ per MSGID. Field order inside SD is
+//              NOT stable across Junos versions, so this parser
+//              extracts every field by name independently.
+// Upstream:    raw-wire bridge (SRX appliances emit syslog UDP/514 or
+//              TCP/514). The bridge passes the raw wire — parse_syslog
+//              is not used because limpid's syslog.parse does not
+//              expose the structured-data block, and the SRX session
+//              metadata lives entirely in SD. Two typical bridges
+//              (syslog vs file tail):
 //
-//           - syslog (UDP/TCP):
-//                 { workspace.juniper_srx_sd_syslog = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_juniper_srx_sd_syslog | compose_ocsf
+//              - syslog (UDP/TCP):
+//                    { workspace.juniper_srx_sd_syslog = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_juniper_srx_sd_syslog | compose_ocsf
 //
-//           - tail of a forwarded text file:
-//                 { workspace.juniper_srx_sd_syslog = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_juniper_srx_sd_syslog | compose_ocsf
+//              - tail of a forwarded text file:
+//                    { workspace.juniper_srx_sd_syslog = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_juniper_srx_sd_syslog | compose_ocsf
 //
-// Output:   OCSF records on `workspace.limpid`. The class depends
-//           on the daemon / MSGID:
-//             RT_FLOW (incl. APPTRACK_*)                                            → 4001 Network Activity
-//             RT_IDP (IDP_ATTACK_LOG_EVENT, IDP_APPDDOS_*)                          → 2004 Detection Finding
-//             RT_IDS (RT_SCREEN_*)                                                  → 2004 Detection Finding
-//             RT_UTM AV_*, ANTISPAM_*, CONTENT_FILTERING_*                          → 2004 Detection Finding
-//             RT_UTM WEBFILTER_URL_BLOCKED / _PERMITTED                             → 4002 HTTP Activity
-//             RT_AAMW (AAMW_*_LOG, SRX_AAMW_ACTION_LOG)                             → 2004 Detection Finding
-//             RT_SECINTEL (SECINTEL_ACTION_LOG)                                     → 2004 Detection Finding
-//
-//           `_LS` (Logical Systems) variants of any MSGID share
-//           the SD shape with their non-`_LS` counterpart and
-//           route through the same leaf.
-//
-// Coverage scope: sd-syslog mode only. For unstructured `syslog`
-// mode (default Junos format with no SD block, e.g. RT_IDP /
-// IDP_ATTACK_LOG_EVENT in plain text) see
-// `parse_juniper_srx_syslog.limpid`. Verified against the
-// elastic/integrations juniper_srx test fixtures (88 events
-// covering RT_FLOW / APPTRACK / RT_IDP / RT_IDS / RT_UTM /
-// RT_AAMW / RT_SECINTEL).
+// Intake:      workspace.juniper_srx_sd_syslog.body      (required, String) — the full RFC 5424 wire INCLUDING the leading `<PRI>1`
+//              workspace.juniper_srx_sd_syslog.hostname  (optional, String) — collector-side override (parser prefers the wire's HOSTNAME field via classify)
+//              workspace.juniper_srx_sd_syslog.time      (optional, Int)    — epoch nanoseconds of arrival
+// Output:      OCSF records on `workspace.limpid`. The class depends
+//              on the daemon / MSGID:
+//                RT_FLOW (incl. APPTRACK_*)                                            → 4001 Network Activity
+//                RT_IDP (IDP_ATTACK_LOG_EVENT, IDP_APPDDOS_*)                          → 2004 Detection Finding
+//                RT_IDS (RT_SCREEN_*)                                                  → 2004 Detection Finding
+//                RT_UTM AV_*, ANTISPAM_*, CONTENT_FILTERING_*                          → 2004 Detection Finding
+//                RT_UTM WEBFILTER_URL_BLOCKED / _PERMITTED                             → 4002 HTTP Activity
+//                RT_AAMW (AAMW_*_LOG, SRX_AAMW_ACTION_LOG)                             → 2004 Detection Finding
+//                RT_SECINTEL (SECINTEL_ACTION_LOG)                                     → 2004 Detection Finding
+//              `_LS` (Logical Systems) variants of any MSGID share the
+//              SD shape with their non-`_LS` counterpart and route
+//              through the same leaf. Sd-syslog mode only — for
+//              unstructured `syslog` mode (default Junos format with
+//              no SD block, e.g. RT_IDP / IDP_ATTACK_LOG_EVENT in plain
+//              text) see `parse_juniper_srx_syslog.limpid`.
+// Test corpus: public (elastic/integrations juniper_srx test fixtures,
+//              88 events covering RT_FLOW / APPTRACK / RT_IDP / RT_IDS /
+//              RT_UTM / RT_AAMW / RT_SECINTEL).
 
 // ---------------------------------------------------------------------------
 // Shared helpers

@@ -1,44 +1,50 @@
 // Cisco ASA syslog parser
 //
-// Vendor:  Cisco Systems
-// Product: Adaptive Security Appliance (ASA) — also covers Cisco
-//          Firepower Threat Defense (FTD) running in ASA-syslog-
-//          compatibility mode. Pure FTD eStreamer / Snort-3 / FMC
-//          syslog has its own format and would land in a separate
-//          parser file (`parse_firepower_*.limpid`).
-// Wire:    syslog-wrapped ASA messages —
-//          `<priority>timestamp host : %ASA-<level>-<msg_id>: <body>`
-//          The colon between host and `%ASA-...` is part of ASA's
-//          syslog server output; the same body text is emitted whether
-//          ASA is using `logging host`, `logging buffered`, or
-//          `logging trap`. Logging level prefix `%ASA-<n>-` is the
-//          numeric severity (0 emergency .. 7 debug); the message ID
-//          is a 6-digit Cisco-assigned identifier whose meaning is
-//          fixed across ASA / FTD versions.
-// Output:  OCSF records on `workspace.limpid`. The class depends on
-//          the message ID:
-//            - 605004 / 605005 (admin login fail / permit)
-//              → 3002 Authentication
-//            - 611101 / 611102 (VPN user auth succeeded / failed)
-//              → 3002 Authentication
-//            - 611103 (VPN user logout)
-//              → 3002 Authentication (Logoff)
-//            - 109001 / 109005 / 109017 (AAA auth start / success /
-//              insufficient-resources)
-//              → 3002 Authentication
-//            - 113012 (AAA user accept)
-//              → 3002 Authentication
-//            - 302013 / 302014 (TCP connection built / teardown)
-//              → 4001 Network Activity (Open / Close)
-//            - 302015 / 302016 (UDP connection built / teardown)
-//              → 4001 Network Activity (Open / Close)
-//            - 106023 (Deny by ACL)
-//              → 4001 Network Activity (Refuse)
-//            - everything else → error_log via the default arm. The
-//              ASA Syslog Messages Guide documents thousands of IDs;
-//              this snippet covers the operationally meaningful subset
-//              and routes the long tail to the dispatcher's `error`
-//              arm, which is the right loud-fail-fast behaviour.
+// Vendor:      Adaptive Security Appliance (ASA) (from Cisco Systems) — also
+//              covers Cisco Firepower Threat Defense (FTD) running in ASA-
+//              syslog-compatibility mode. Pure FTD eStreamer / Snort-3 / FMC
+//              syslog has its own format and would land in a separate parser
+//              file (`parse_firepower_*.limpid`).
+// Wire:        syslog-wrapped ASA messages —
+//              `<priority>timestamp host : %ASA-<level>-<msg_id>: <body>`
+//              The colon between host and `%ASA-...` is part of ASA's
+//              syslog server output; the same body text is emitted whether
+//              ASA is using `logging host`, `logging buffered`, or
+//              `logging trap`. Logging level prefix `%ASA-<n>-` is the
+//              numeric severity (0 emergency .. 7 debug); the message ID
+//              is a 6-digit Cisco-assigned identifier whose meaning is
+//              fixed across ASA / FTD versions.
+// Upstream:    ingress (raw wire)
+// Output:      OCSF records on `workspace.limpid`. The class depends on
+//              the message ID:
+//                - 605004 / 605005 (admin login fail / permit)
+//                  → 3002 Authentication
+//                - 611101 / 611102 (VPN user auth succeeded / failed)
+//                  → 3002 Authentication
+//                - 611103 (VPN user logout)
+//                  → 3002 Authentication (Logoff)
+//                - 109001 / 109005 / 109017 (AAA auth start / success /
+//                  insufficient-resources)
+//                  → 3002 Authentication
+//                - 113012 (AAA user accept)
+//                  → 3002 Authentication
+//                - 302013 / 302014 (TCP connection built / teardown)
+//                  → 4001 Network Activity (Open / Close)
+//                - 302015 / 302016 (UDP connection built / teardown)
+//                  → 4001 Network Activity (Open / Close)
+//                - 106023 (Deny by ACL)
+//                  → 4001 Network Activity (Refuse)
+//                - everything else → error_log via the default arm. The
+//                  ASA Syslog Messages Guide documents thousands of IDs;
+//                  this snippet covers the operationally meaningful subset
+//                  and routes the long tail to the dispatcher's `error`
+//                  arm, which is the right loud-fail-fast behaviour.
+// Test corpus: synthetic (miroslav-siklosi/Syslog-Generator covering
+//              605004 / 605005 / 611101 / 611103 / 109001 / 109005 /
+//              109017 shapes; 302013 / 302014 / 302015 / 302016 / 106023 /
+//              611102 / 113012 are NOTE-flagged in the leaf bodies as
+//              spec-derived from the Cisco ASA Syslog Messages Guide and
+//              not exercised against live data — verify before production).
 //
 // Sample inputs (RFC 3164 syslog wrapper around ASA body — note the
 // `: ` between host and `%ASA-...` which is part of ASA's syslog

@@ -1,37 +1,44 @@
 // CheckPoint LEEF parser (vocabulary)
 //
-// Vendor:   Check Point Software Technologies — VPN-1 / FireWall-1 /
-//           Quantum Security Gateway, the dominant enterprise CheckPoint
-//           firewall family. Emits LEEF 2.0 records via the
-//           `log_exporter` mechanism (or older OPSEC LEA). Not Cisco
-//           ASA, not Juniper SRX, not PAN-OS — each in its own parser
-//           file.
-// Wire:     IBM LEEF 2.0 format inside a syslog wrapper:
-//             LEEF:2.0|Check Point|<Product>|<Version>|<EventID>|<TAB-separated KV>
-//           Standard delimiter is a literal `\t` byte (0x09) between
-//           extension key=value pairs. Some CheckPoint setups emit
-//           LEEF 1.0 which is identical except for the version digit
-//           and a slightly different header — the parser auto-handles
-//           both by anchoring on `LEEF:` and using `\t` as the
-//           extension separator.
-// Intake:   workspace.checkpoint_leef.body      (required, String) — full syslog wire
-//                                            (parser locates and extracts the LEEF block;
-//                                            does NOT consume an upstream parse_syslog)
-//           workspace.checkpoint_leef.hostname  (optional, String) — collector-side hostname override
-//           workspace.checkpoint_leef.time      (optional, Int)    — epoch nanoseconds of arrival
-// Upstream: CheckPoint log_exporter emits syslog (UDP/514 or TCP/514).
-//           The bridge passes the raw wire — limpid's syslog.parse
-//           treats the LEEF block as opaque `msg` text, so the parser
-//           splits its own header.
+// Vendor:      Check Point Software Technologies — VPN-1 / FireWall-1 /
+//              Quantum Security Gateway, the dominant enterprise CheckPoint
+//              firewall family. Emits LEEF 2.0 records via the
+//              `log_exporter` mechanism (or older OPSEC LEA). Not Cisco
+//              ASA, not Juniper SRX, not PAN-OS — each in its own parser
+//              file.
+// Wire:        IBM LEEF 2.0 format inside a syslog wrapper:
+//                LEEF:2.0|Check Point|<Product>|<Version>|<EventID>|<TAB-separated KV>
+//              Standard delimiter is a literal `\t` byte (0x09) between
+//              extension key=value pairs. Some CheckPoint setups emit
+//              LEEF 1.0 which is identical except for the version digit
+//              and a slightly different header — the parser auto-handles
+//              both by anchoring on `LEEF:` and using `\t` as the
+//              extension separator.
+// Upstream:    raw-wire bridge (CheckPoint log_exporter emits syslog
+//              UDP/514 or TCP/514). The bridge passes the raw wire —
+//              limpid's syslog.parse treats the LEEF block as opaque
+//              `msg` text, so the parser splits its own header.
 //
-//           - syslog (UDP/TCP):
-//                 { workspace.checkpoint_leef = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_checkpoint_leef | compose_ocsf
+//              - syslog (UDP/TCP):
+//                    { workspace.checkpoint_leef = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_checkpoint_leef | compose_ocsf
 //
-// Output:   OCSF Network Activity (class_uid 4001) records on
-//           `workspace.limpid` for traffic events (Accept / Drop /
-//           Reject / Block). Non-traffic LEEF events (Authentication,
-//           VPN tunnel state, etc.) route to error_log per the
-//           loud-fail-fast policy and would need their own subtypes.
+// Intake:      workspace.checkpoint_leef.body      (required, String) — full syslog wire
+//                                                  (parser locates and extracts the LEEF
+//                                                  block; does NOT consume an upstream
+//                                                  parse_syslog)
+//              workspace.checkpoint_leef.hostname  (optional, String) — collector-side
+//                                                  hostname override
+//              workspace.checkpoint_leef.time      (optional, Int)    — epoch nanoseconds
+//                                                  of arrival
+// Output:      OCSF Network Activity (class_uid 4001) records on
+//              `workspace.limpid` for LEEF 2.0 traffic events
+//              (EventID ∈ {Accept, Drop, Reject, Block}). Non-traffic
+//              LEEF events (Authentication, VPN tunnel state, etc.)
+//              route to error_log per the loud-fail-fast policy and
+//              would need their own subtypes.
+// Test corpus: spec-only (IBM LEEF 2.0 spec + Check Point log_exporter
+//              schema; synthesised sample lines below — verify before
+//              production use).
 //
 // Sample wire (anonymised to RFC 5737):
 //
@@ -43,9 +50,6 @@
 //
 //   Reject (rejected with TCP RST / ICMP unreachable):
 //   <14>1 2026-04-30T01:24:30Z cpgw01 CheckPoint - - LEEF:2.0|Check Point|VPN-1 & FireWall-1|R81|Reject|cat=Firewall\tsrc=192.0.2.50\tdst=198.51.100.5\tsrcPort=33333\tdstPort=3389\tproto=tcp\trule=42\trule_name=Block-RDP\taction=Reject\tservice=rdp
-//
-// Coverage scope: LEEF 2.0 traffic events (EventID ∈ {Accept, Drop,
-// Reject, Block}). Other LEEF EventIDs route to error_log.
 
 // ---------------------------------------------------------------------------
 // Helpers

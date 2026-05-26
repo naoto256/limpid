@@ -1,52 +1,54 @@
 // Juniper SRX unstructured syslog parser (vocabulary)
 //
-// Vendor:   Juniper Networks SRX series — `set security log format syslog`
-//           mode (vs `sd-syslog` which is handled by
-//           parse_juniper_srx_sd_syslog). This is the default in many
-//           older Junos versions and the one most production
-//           deployments still emit because migrating to sd-syslog
-//           breaks downstream parsers.
-// Wire:     RFC 3164 syslog with a Junos-specific MSGID prefix and a
-//           free-form text body:
-//             <PRI>timestamp host RT_<DAEMON>: <MSGID>: <free-form>
-//           DAEMON ∈ {FLOW, IDP, UTM, SCREEN, ...}; MSGID is the
-//           per-event marker (e.g. RT_FLOW_SESSION_CREATE,
-//           IDP_ATTACK_LOG_EVENT, ANTIVIRUS_VIRUS_DETECTED). The
-//           body shape is MSGID-specific and must be regex-extracted
-//           per pattern.
-// Intake:   workspace.juniper_srx_syslog.body      (required, String) — the syslog wire
-//           workspace.juniper_srx_syslog.hostname  (optional, String) — collector-side hostname
-//           workspace.juniper_srx_syslog.time      (optional, Int)    — epoch nanoseconds
-// Upstream: SRX appliances emit syslog (UDP/514 or TCP/514). The
-//           bridge passes the raw wire — the parser does its own
-//           leading-`<PRI>timestamp host` strip via regex because
-//           syslog.parse leaves the daemon-prefix-and-MSGID inside
-//           workspace.syslog.msg in a way that's awkward to switch
-//           on. Two typical bridges:
+// Vendor:      Juniper Networks SRX series — `set security log format
+//              syslog` mode (vs `sd-syslog` which is handled by
+//              parse_juniper_srx_sd_syslog). This is the default in many
+//              older Junos versions and the one most production
+//              deployments still emit because migrating to sd-syslog
+//              breaks downstream parsers.
+// Wire:        RFC 3164 syslog with a Junos-specific MSGID prefix and a
+//              free-form text body:
+//                <PRI>timestamp host RT_<DAEMON>: <MSGID>: <free-form>
+//              DAEMON ∈ {FLOW, IDP, UTM, SCREEN, ...}; MSGID is the
+//              per-event marker (e.g. RT_FLOW_SESSION_CREATE,
+//              IDP_ATTACK_LOG_EVENT, ANTIVIRUS_VIRUS_DETECTED). The
+//              body shape is MSGID-specific and must be regex-extracted
+//              per pattern.
+// Upstream:    raw-wire bridge (SRX appliances emit syslog UDP/514 or
+//              TCP/514). The bridge passes the raw wire — the parser
+//              does its own leading-`<PRI>timestamp host` strip via
+//              regex because syslog.parse leaves the daemon-prefix-and-
+//              MSGID inside workspace.syslog.msg in a way that's awkward
+//              to switch on. Two typical bridges (syslog vs file tail):
 //
-//           - syslog (UDP/TCP):
-//                 { workspace.juniper_srx_syslog = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_juniper_srx_syslog | compose_ocsf
+//              - syslog (UDP/TCP):
+//                    { workspace.juniper_srx_syslog = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_juniper_srx_syslog | compose_ocsf
 //
-//           - tail of a forwarded text file:
-//                 { workspace.juniper_srx_syslog = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_juniper_srx_syslog | compose_ocsf
+//              - tail of a forwarded text file:
+//                    { workspace.juniper_srx_syslog = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_juniper_srx_syslog | compose_ocsf
 //
-// Output:   OCSF records on `workspace.limpid`, class depends on
-//           DAEMON / MSGID:
-//             RT_IDP IDP_ATTACK_LOG_EVENT       → 2004 Detection Finding
-//             (other RT_IDP / RT_UTM subtypes)  → routed to error_log per
-//                                                 loud-fail-fast policy until
-//                                                 their shapes are added
+// Intake:      workspace.juniper_srx_syslog.body      (required, String) — the syslog wire
+//              workspace.juniper_srx_syslog.hostname  (optional, String) — collector-side hostname
+//              workspace.juniper_srx_syslog.time      (optional, Int)    — epoch nanoseconds
+// Output:      OCSF records on `workspace.limpid`, class depends on
+//              DAEMON / MSGID:
+//                RT_IDP IDP_ATTACK_LOG_EVENT       → 2004 Detection Finding
+//                (other RT_IDP / RT_UTM subtypes)  → routed to error_log per
+//                                                    loud-fail-fast policy until
+//                                                    their shapes are added
+//              Handles the Junos unstructured-syslog MSGIDs the library
+//              has real-traffic samples for. Other DAEMONs (RT_UTM /
+//              RT_SCREEN) and subtypes (RT_FLOW_SESSION_* in unstructured
+//              form, IDP_ATTACK_LOG_EVENT_LS for logical-system chassis,
+//              etc.) route to error_log; add them as samples surface.
+// Test corpus: real (SRX IDP_ATTACK_LOG_EVENT samples — only the MSGIDs
+//              with real-traffic samples are wired up; all other DAEMON
+//              / MSGID combinations route to error_log).
 //
 // Sample wire (anonymised to RFC 5737):
 //
 //   IDP attack alert (intrusion detected on monitored flow):
 //   <14>May 16 13:32:30 srx01 RT_IDP: IDP_ATTACK_LOG_EVENT: IDP: at 1778905950, SIG Attack log <198.51.100.10/63074->192.0.2.100/445> for TCP protocol and service SERVICE_IDP application SMB by rule Tap of rulebase IPS in policy Tap. attack: id=19519, repeat=0, action=DROP, threat-severity=HIGH, name=SMB:CVE-2017-0143-001, NAT <198.51.100.10:0->0.0.0.0:0>, time-elapsed=0, inbytes=0, outbytes=0, inpackets=0, outpackets=0, intf:trust:ge-0/0/0.0->untrust:ge-0/0/1.0, packet-log-id: 0, alert=no, username=N/A, roles=N/A, misc-message=-
-//
-// Coverage scope: this snippet handles the Junos unstructured-syslog
-// MSGIDs the library has real-traffic samples for. Other DAEMONs
-// (RT_UTM / RT_SCREEN) and subtypes (RT_FLOW_SESSION_* in
-// unstructured form, IDP_ATTACK_LOG_EVENT_LS for logical-system
-// chassis, etc.) route to error_log; add them as samples surface.
 
 // ---------------------------------------------------------------------------
 // Helpers

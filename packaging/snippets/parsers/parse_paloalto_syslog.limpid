@@ -1,29 +1,31 @@
 // Palo Alto Networks PAN-OS syslog (CSV) parser
 //
-// Vendor:  Palo Alto Networks
-// Product: PAN-OS (Next-Generation Firewalls — PA-series, VM-series)
-// Wire:    syslog-wrapped CSV — `<priority>timestamp host FUTURE_USE,RecvTime,Serial,Type,Subtype,...`
-// Schema:  PAN-OS native CSV log format (positional, ~60-117 fields per Type)
-//
-// PAN-OS encodes the log Type at position 4 in the CSV row:
-//   "TRAFFIC"        — connection start/end (OCSF Network Activity 4001)
-//   "THREAT"         — IPS / vulnerability / spyware / virus
-//                      (OCSF Detection Finding 2004; also URL via
-//                       Subtype="url" → OCSF Web Resource Access 6004,
-//                       and WILDFIRE via Subtype="wildfire" → 2004)
-//   "GLOBALPROTECT"  — VPN session events (OCSF Authentication 3002)
-//   "AUTHENTICATION" — admin / user authentication (OCSF Authentication 3002)
-//   "SYSTEM"         — device events
-//   "CONFIG"         — configuration changes
-//   "USERID"         — user-ID mapping
-//   "HIPMATCH"       — Host Information Profile match
-//
-// Two-pass parse:
-//   1. Lightweight csv_parse with a header-only schema to extract
-//      `Type` (and `Subtype` for THREAT routing) — keeps the dispatcher
-//      cheap, single-row parse skips most of the field array.
-//   2. The matched leaf re-runs csv_parse with the type-specific full
-//      schema and maps to canonical workspace.limpid.
+// Vendor:      PAN-OS (Next-Generation Firewalls — PA-series, VM-series;
+//              from Palo Alto Networks)
+// Wire:        syslog-wrapped CSV — `<priority>timestamp host FUTURE_USE,RecvTime,Serial,Type,Subtype,...`
+//              PAN-OS native CSV log format (positional, ~60-117 fields
+//              per Type). PAN-OS encodes the log Type at position 4 in
+//              the CSV row.
+// Upstream:    ingress (raw wire)
+// Output:      OCSF records on `workspace.limpid`. Dispatch by Type:
+//                "TRAFFIC"        — connection start/end (OCSF Network Activity 4001)
+//                "THREAT"         — IPS / vulnerability / spyware / virus
+//                                   (OCSF Detection Finding 2004; also URL via
+//                                    Subtype="url" → OCSF Web Resource Access 6004,
+//                                    and WILDFIRE via Subtype="wildfire" → 2004)
+//                "GLOBALPROTECT"  — VPN session events (OCSF Authentication 3002)
+//                "AUTHENTICATION" — admin / user authentication (OCSF Authentication 3002)
+//                "SYSTEM" / "CONFIG" / "USERID" / "HIPMATCH" follow when
+//                concrete mappings stabilise.
+//              Two-pass parse: (1) lightweight csv_parse with a header-
+//              only schema to extract `Type` (and `Subtype` for THREAT
+//              routing) keeps the dispatcher cheap; (2) the matched leaf
+//              re-runs csv_parse with the type-specific full schema and
+//              maps to canonical workspace.limpid.
+// Test corpus: real (live PA-460 in tap mode covering TRAFFIC / THREAT /
+//              URL / GLOBALPROTECT / AUTHENTICATION shapes; per-Type CSV
+//              schemas tracked against PAN-OS 10.x / 11.x field-ordering
+//              reference).
 //
 // Sample input (RFC 3164 syslog wrapper around CSV, TRAFFIC):
 //   <134>Apr 27 10:00:00 fw-pan01 1,2026-04-27 10:00:00,012345678,TRAFFIC,end,2049,2026-04-27 10:00:00,192.0.2.10,198.51.100.5,...

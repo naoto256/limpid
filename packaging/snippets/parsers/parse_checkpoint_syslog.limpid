@@ -1,50 +1,50 @@
 // Check Point Syslog Exporter parser (vocabulary)
 //
-// Vendor:   Check Point Software Technologies — VPN-1 / FireWall-1 /
-//           Quantum Security Gateway / SmartConsole / Endpoint /
-//           Connectra / and the rest of the CheckPoint product family.
-//           Wire format below is the "Syslog Exporter" output that
-//           ships to generic syslog SIEMs (Splunk / Elastic / etc.).
-//           NOT the LEEF 2.0 form that targets IBM QRadar — for that,
-//           see `parse_checkpoint_leef.limpid`.
-// Wire:     RFC 5424 + Junos-style structured data, with `:` (not `=`)
-//           between key and quoted value and `; ` (semicolon-space)
-//           between pairs:
-//             <PRI>1 <ts> <host> CheckPoint <procid> - [key:"value"; key:"value"; ...]
-//           A few quirks:
-//             - `sys_message::"text"` uses double-colon (CheckPoint
-//               convention for a free-form message field).
-//             - `__policy_id_tag:"product=...;db_tag={...};..."`
-//               re-uses semicolons inside the value, but the outer
-//               KV separator is `; ` (semicolon-space) so a per-name
-//               regex with `[^"]*` for the value handles both cleanly.
-//           Field set varies wildly by CheckPoint product (System
-//           Monitor / VPN-1 & FireWall-1 / SmartConsole / Connectra /
-//           Anti-Bot / Threat Emulation / Log Update / etc.); the
-//           parser captures the common firewall / threat / auth /
-//           audit fields and surfaces the rest under `unmapped`.
-// Intake:   workspace.checkpoint_syslog.body      (required, String) — the full RFC 5424 wire
-//           workspace.checkpoint_syslog.hostname  (optional, String) — collector-side hostname override
-//           workspace.checkpoint_syslog.time      (optional, Int)    — epoch nanoseconds
-// Upstream: CheckPoint gateways / management servers emit via syslog
-//           (UDP/514 or TCP/514). The bridge passes the raw wire —
-//           parse_syslog is not used because limpid's syslog.parse
-//           does not expose the SD block.
+// Vendor:      Check Point Software Technologies — VPN-1 / FireWall-1 /
+//              Quantum Security Gateway / SmartConsole / Endpoint /
+//              Connectra / and the rest of the CheckPoint product family.
+//              Wire format below is the "Syslog Exporter" output that
+//              ships to generic syslog SIEMs (Splunk / Elastic / etc.).
+//              NOT the LEEF 2.0 form that targets IBM QRadar — for that,
+//              see `parse_checkpoint_leef.limpid`.
+// Wire:        RFC 5424 + Junos-style structured data, with `:` (not `=`)
+//              between key and quoted value and `; ` (semicolon-space)
+//              between pairs:
+//                <PRI>1 <ts> <host> CheckPoint <procid> - [key:"value"; key:"value"; ...]
+//              Field set varies wildly by CheckPoint product (System
+//              Monitor / VPN-1 & FireWall-1 / SmartConsole / Connectra /
+//              Anti-Bot / Threat Emulation / Log Update / etc.); the
+//              parser captures the common firewall / threat / auth /
+//              audit fields and surfaces the rest under `unmapped`.
+// Upstream:    raw-wire bridge (CheckPoint gateways / management servers
+//              emit via syslog UDP/514 or TCP/514). The bridge passes
+//              the raw wire — parse_syslog is not used because limpid's
+//              syslog.parse does not expose the SD block.
 //
-//           - syslog (UDP/TCP):
-//                 { workspace.checkpoint_syslog = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_checkpoint_syslog | compose_ocsf
+//              - syslog (UDP/TCP):
+//                    { workspace.checkpoint_syslog = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_checkpoint_syslog | compose_ocsf
 //
-// Output:   OCSF records on `workspace.limpid`. The class depends on
-//           the action / product combination:
-//             firewall actions (Accept / Drop / Reject / Decrypt)        → 4001 Network Activity
-//             threat actions (Detect / Inline / Block + threat context)  → 2004 Detection Finding
-//             auth actions   (Log In / Failed Log In / Forgot Passcode)  → 3002 Authentication
-//             other / unknown action                                     → 4001 (with action in unmapped)
+// Intake:      workspace.checkpoint_syslog.body      (required, String) — the full RFC 5424 wire
+//              workspace.checkpoint_syslog.hostname  (optional, String) — collector-side hostname override
+//              workspace.checkpoint_syslog.time      (optional, Int)    — epoch nanoseconds
+// Output:      OCSF records on `workspace.limpid`. The class depends on
+//              the action / product combination:
+//                firewall actions (Accept / Drop / Reject / Decrypt)        → 4001 Network Activity
+//                threat actions (Detect / Inline / Block + threat context)  → 2004 Detection Finding
+//                auth actions   (Log In / Failed Log In / Forgot Passcode)  → 3002 Authentication
+//                other / unknown action                                     → 4001 (with action in unmapped)
+// Test corpus: public (elastic/integrations checkpoint corpus, ~80 events
+//              across 8 product types — System Monitor / VPN-1 &
+//              FireWall-1 / SmartConsole / Connectra / WEB_API / Log
+//              Update / etc.).
 //
-// Coverage scope: verified against the elastic/integrations
-// checkpoint corpus (~80 events across 8 product types — System
-// Monitor / VPN-1 & FireWall-1 / SmartConsole / Connectra / WEB_API /
-// Log Update / etc.).
+// A few quirks:
+//   - `sys_message::"text"` uses double-colon (CheckPoint convention
+//     for a free-form message field).
+//   - `__policy_id_tag:"product=...;db_tag={...};..."` re-uses
+//     semicolons inside the value, but the outer KV separator is
+//     `; ` (semicolon-space) so a per-name regex with `[^"]*` for the
+//     value handles both cleanly.
 
 // ---------------------------------------------------------------------------
 // Shared helpers

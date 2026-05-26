@@ -1,35 +1,36 @@
-// Vendor:   systemd journald (Linux)
-// Wire:     one line of `journalctl -o json` (UTF-8 JSON object)
-// Upstream: none — `parse_journald` is a transport-layer parser, run
-//           directly off `ingress` (typically the first process in a
-//           pipeline whose `input` is `type journal`)
-// Output:   workspace.journald.* — all fields as journald exposes them
-//
-// `parse_journald` is a thin LOTL wrapper: limpid's `input journal`
-// emits ingress as `journalctl -o json`-byte-identical JSON, and this
-// snippet just hands it to `parse_json`. No vendor-specific decoding
-// happens here — field names stay journald-canonical so downstream
-// composers (e.g. `compose_rfc5424`) can read them by their original
-// name.
-//
-// Field naming notes:
-//   PRIORITY               — syslog severity (0-7), JSON string ("6")
-//   SYSLOG_FACILITY        — syslog facility (0-23), JSON string ("4")
-//   SYSLOG_IDENTIFIER      — program name (e.g. "sshd")
-//   _COMM                  — actual binary name (fallback for IDENTIFIER)
-//   _PID / SYSLOG_PID      — process id, JSON string
-//   _HOSTNAME              — host where the entry was recorded
-//   _SYSTEMD_UNIT          — owning systemd unit (e.g. "ssh.service")
-//   __REALTIME_TIMESTAMP   — wall-clock microseconds since epoch, string
-//   __MONOTONIC_TIMESTAMP  — boot-relative microseconds, string
-//   MESSAGE                — log line text
-//
-// Numeric-looking fields stay JSON strings (journalctl convention);
-// convert with `to_int(...)` if you need arithmetic (e.g. PRI).
-//
-// Binary-valued fields (rare; e.g. COREDUMP) surface as arrays of
-// integers, not strings. Treat with care if your downstream is
-// text-only.
+// Vendor:      systemd journald (Linux)
+// Wire:        one line of `journalctl -o json` (UTF-8 JSON object)
+// Upstream:    ingress (raw wire)
+//              Transport-layer parser, run directly off `ingress`
+//              (typically the first process in a pipeline whose `input`
+//              is `type journal`).
+// Output:      workspace.journald.* — all fields as journald exposes them.
+//              This is a thin LOTL wrapper: limpid's `input journal`
+//              emits ingress as `journalctl -o json`-byte-identical JSON,
+//              and this snippet just hands it to `parse_json`. No
+//              vendor-specific decoding happens here — field names stay
+//              journald-canonical so downstream composers (e.g.
+//              `compose_rfc5424`) can read them by their original name.
+//              Field naming:
+//                PRIORITY               — syslog severity (0-7), JSON string ("6")
+//                SYSLOG_FACILITY        — syslog facility (0-23), JSON string ("4")
+//                SYSLOG_IDENTIFIER      — program name (e.g. "sshd")
+//                _COMM                  — actual binary name (fallback for IDENTIFIER)
+//                _PID / SYSLOG_PID      — process id, JSON string
+//                _HOSTNAME              — host where the entry was recorded
+//                _SYSTEMD_UNIT          — owning systemd unit (e.g. "ssh.service")
+//                __REALTIME_TIMESTAMP   — wall-clock microseconds since epoch, string
+//                __MONOTONIC_TIMESTAMP  — boot-relative microseconds, string
+//                MESSAGE                — log line text
+//              Numeric-looking fields stay JSON strings (journalctl
+//              convention); convert with `to_int(...)` if you need
+//              arithmetic (e.g. PRI). Binary-valued fields (rare; e.g.
+//              COREDUMP) surface as arrays of integers, not strings —
+//              treat with care if your downstream is text-only.
+// Test corpus: spec-only (journalctl JSON export format; the parser is
+//              a passthrough `parse_json` wrapper so no per-shape
+//              verification applies — downstream parsers like
+//              parse_openssh carry their own corpus).
 //
 // Sample wire:
 //   {"__CURSOR":"s=...","__REALTIME_TIMESTAMP":"1714400000000000",
@@ -37,7 +38,7 @@
 //    "_PID":"12345","_HOSTNAME":"edge01","_SYSTEMD_UNIT":"ssh.service",
 //    "MESSAGE":"Accepted publickey for alice from 192.0.2.10 port 51234 ssh2"}
 //
-// Typical pipeline:
+// Typical pipeline (illustrative):
 //   process parse_journald | compose_rfc5424
 //   process parse_journald | parse_openssh | compose_ocsf
 

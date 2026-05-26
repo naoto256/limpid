@@ -1,37 +1,55 @@
 // Zeek SOC-scope parser (vocabulary)
 //
-// Extends `parse_zeek_default.limpid` with the auth / protocol logs
-// most actively-monitored SOC deployments enable on top of the
-// stock Zeek scripts:
-//   ssh / smtp / ftp / dhcp / kerberos / ntlm / radius /
-//   smb_mapping / smb_cmd / smb_files / dce_rpc / snmp / rdp
+// Vendor:      Zeek (formerly Bro) — see `parse_zeek_default.limpid`
+//              for the framework overview. This file extends the
+//              default-scope parser with the auth / protocol logs most
+//              actively-monitored SOC deployments enable on top of the
+//              stock Zeek scripts: ssh / smtp / ftp / dhcp / kerberos /
+//              ntlm / radius / smb_mapping / smb_cmd / smb_files /
+//              dce_rpc / snmp / rdp.
+// Wire:        **Native Zeek JSON output** (`redef LogAscii::use_json = T`)
+//              — same wire as parse_zeek_default; this file adds
+//              handlers for additional `_path` values.
+// Upstream:    raw JSONL tail bridge (inherits parse_zeek_default's
+//              ingestion contract):
 //
-// Composition: this file transitively includes parse_zeek_default,
-// so operators picking the SOC scope only write a single include line
-// and reference `parse_zeek_soc` in the pipeline. The dispatcher
-// here handles SOC-extra _paths and falls through to
-// `parse_zeek_default` for the stock-Zeek set.
+//              - Per-log JSONL tail:
+//                    process { workspace.zeek = { body: parse_json(ingress), hostname: hostname(), time: to_int(received_at) } } | parse_zeek_soc | compose_ocsf
 //
-// For broader coverage (catch-all that absorbs unknown _paths and
-// keeps low-value operational streams as drops), include
-// `parse_zeek_full.limpid` instead.
+// Intake:      workspace.zeek.body      (required, Object) — parsed Zeek event
+//                                       (caller does `parse_json(ingress)`)
+//              workspace.zeek.hostname  (optional, String) — collector override
+//              workspace.zeek.time      (optional, Int)    — epoch ns override
+// Output:      OCSF records on `workspace.limpid`. Dispatch by `_path`:
+//                ssh         → 4007 SSH Activity
+//                smtp        → 4009 Email Activity
+//                ftp         → 4008 FTP Activity
+//                dhcp        → 4004 DHCP Activity
+//                kerberos    → 3002 Authentication
+//                ntlm        → 3002 Authentication
+//                radius      → 3002 Authentication
+//                smb_mapping → 4006 SMB Activity (tree mount)
+//                smb_cmd     → 4006 SMB Activity (per-command)
+//                smb_files   → 4006 SMB Activity (file op over SMB)
+//                dce_rpc     → 4001 Network Activity (RPC method under unmapped)
+//                snmp        → 4001 Network Activity (SNMP detail under unmapped)
+//                rdp         → 4005 RDP Activity
+//                other       → process parse_zeek_default (which handles
+//                              default-set _paths and errors on the rest)
+//              For broader coverage (catch-all that absorbs unknown
+//              _paths and keeps low-value operational streams as drops),
+//              include `parse_zeek_full.limpid` instead.
+// Test corpus: spec-only (record builders for the SOC-extra _paths are
+//              spec-derived from the Zeek default-script schemas.
+//              Inherits the parse_zeek_default elastic/integrations
+//              corpus coverage for the stock _paths; the SOC-extra
+//              _paths are not individually verified against a corpus).
 //
-// Output: OCSF records on `workspace.limpid`. Dispatch by `_path`:
-//   ssh         → 4007 SSH Activity
-//   smtp        → 4009 Email Activity
-//   ftp         → 4008 FTP Activity
-//   dhcp        → 4004 DHCP Activity
-//   kerberos    → 3002 Authentication
-//   ntlm        → 3002 Authentication
-//   radius      → 3002 Authentication
-//   smb_mapping → 4006 SMB Activity (tree mount)
-//   smb_cmd     → 4006 SMB Activity (per-command)
-//   smb_files   → 4006 SMB Activity (file op over SMB)
-//   dce_rpc     → 4001 Network Activity (RPC method under unmapped)
-//   snmp        → 4001 Network Activity (SNMP detail under unmapped)
-//   rdp         → 4005 RDP Activity
-//   other       → process parse_zeek_default (which handles
-//                 default-set _paths and errors on the rest)
+// Composition: transitively includes parse_zeek_default, so operators
+// picking the SOC scope only write a single include line and reference
+// `parse_zeek_soc` in the pipeline. The dispatcher here handles
+// SOC-extra _paths and falls through to `parse_zeek_default` for the
+// stock-Zeek set.
 
 include "parse_zeek_default.limpid"
 

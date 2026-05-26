@@ -1,9 +1,17 @@
 // FortiGate CEF parser
 //
-// Vendor:  Fortinet
-// Product: FortiGate (FortiOS 6.x / 7.x with `set format cef`)
-// Wire:    syslog-wrapped CEF — `<PRI>Mmm DD HH:MM:SS host CEF:0|Fortinet|Fortigate|...`
-// Schema:  ArcSight CEF (header) + FortiGate-specific extension keys
+// Vendor:      FortiGate (FortiOS 6.x / 7.x with `set format cef`; from Fortinet)
+// Wire:        syslog-wrapped CEF — `<PRI>Mmm DD HH:MM:SS host CEF:0|Fortinet|Fortigate|...`.
+//              ArcSight CEF header + FortiGate-specific extension keys.
+// Upstream:    ingress (raw wire)
+// Output:      OCSF Network Activity (4001), Detection Finding (2004),
+//              Authentication (3002), Application Activity (6002) on
+//              workspace.limpid. Dispatches on the `cat=<category>:<subtype>`
+//              extension; non-OCSF FortiGate fields are left on
+//              workspace.cef and not propagated.
+// Test corpus: real (live FortiGate captures across utm:ips / utm:av /
+//              utm:ssl / event:system / traffic:forward subtypes; some
+//              subtypes are NOTE-flagged pending more diverse captures).
 //
 // FortiGate CEF dialect quirks (verified against real captures):
 //
@@ -22,9 +30,6 @@
 //
 // Sample input (anonymised IPS detection):
 //   <129>Apr 27 10:00:00 fw01 CEF:0|Fortinet|Fortigate|v7.4.11|16384|utm:ips signature|7|deviceExternalId=FG-EXAMPLE cat=utm:ips FTNTFGTsubtype=ips FTNTFGTseverity=high src=192.0.2.10 spt=36208 dst=198.51.100.5 dpt=9100 proto=6 act=detected FTNTFGTattack=<sig> FTNTFGTattackid=<id> msg=<text>
-//
-// Output: workspace.limpid populated to OCSF-shape; compose_ocsf takes
-// it from there.
 
 // ---------------------------------------------------------------------------
 // Vendor-specific mapping helpers (FortiGate CEF dialect)

@@ -1,23 +1,25 @@
-// Vendor:   RFC 3164 / RFC 5424 syslog (transport)
-// Wire:     `<PRI>...` syslog header + message body, single line per
-//           record (auto-detects RFC 3164 BSD vs RFC 5424 versioned)
-// Upstream: none — `parse_syslog` is a transport-layer parser, run
-//           directly off `ingress` (typically the first process in a
-//           pipeline whose `input` is `syslog_tcp` / `syslog_udp` /
-//           `syslog_tls`)
-// Output:   workspace.syslog.{pri, facility, severity, timestamp,
-//           hostname, appname, procid, msgid, msg}
-//
-// Thin wrapper around the `syslog.parse()` primitive. Exists so a
-// pipeline can express transport stacking explicitly:
-//
-//   process parse_syslog | <bridge> | parse_<vocabulary> | compose_<target>
-//
-// rather than having every vocabulary parser inline `syslog.parse(ingress)`
-// against an assumed syslog wire. Bridging the syslog body into a
-// vocabulary-specific intake (`workspace.<vocab>.body` etc.) is the
-// caller's responsibility — see e.g. parse_openssh's header for
-// example bridges.
+// Vendor:      RFC 3164 / RFC 5424 syslog (transport)
+// Wire:        `<PRI>...` syslog header + message body, single line per
+//              record (auto-detects RFC 3164 BSD vs RFC 5424 versioned)
+// Upstream:    ingress (raw wire)
+//              Transport-layer parser, run directly off `ingress`
+//              (typically the first process in a pipeline whose `input`
+//              is `syslog_tcp` / `syslog_udp` / `syslog_tls`).
+// Output:      workspace.syslog.{pri, facility, severity, timestamp,
+//              hostname, appname, procid, msgid, msg}. Thin wrapper
+//              around the `syslog.parse()` primitive. Exists so a
+//              pipeline can express transport stacking explicitly
+//              (`process parse_syslog | <bridge> | parse_<vocabulary> |
+//              compose_<target>`) rather than having every vocabulary
+//              parser inline `syslog.parse(ingress)` against an assumed
+//              syslog wire. Bridging the syslog body into a
+//              vocabulary-specific intake (`workspace.<vocab>.body` etc.)
+//              is the caller's responsibility — see e.g. parse_openssh's
+//              header for example bridges.
+// Test corpus: spec-only (RFC 3164 + RFC 5424; the parser is a wrapper
+//              around the `syslog.parse()` primitive so per-shape
+//              verification belongs to the primitive's unit tests —
+//              downstream vocabulary parsers carry their own corpora).
 //
 // Sample input (RFC 5424):
 //   <38>1 2026-04-30T01:23:45.123456Z host01 sshd 12345 - - Accepted publickey for alice from 192.0.2.10 port 51234 ssh2

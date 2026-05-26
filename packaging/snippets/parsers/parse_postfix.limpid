@@ -1,55 +1,64 @@
 // Postfix mail server log parser (vocabulary)
 //
-// Vendor:   The Postfix Project (Wietse Venema's MTA — covers Postfix
-//           on Linux / BSD / macOS, the dominant outbound MTA in
-//           modern unix mail stacks; not Sendmail, not Exim, not
-//           OpenSMTPD, each of which emits different line shapes and
-//           would land in their own parser file).
-// Wire:     Postfix log body including its internal program tag —
-//           `postfix/<program>[<pid>]: <body>` where `<program>` is
-//           the Postfix subcomponent (`smtp`, `smtpd`, `qmgr`,
-//           `cleanup`, `bounce`, `pickup`, `master`,
-//           `trivial-rewrite`, `error`, ...). The transport layer
-//           (syslog / journald) is unwrapped upstream; the postfix
-//           tag and pid live INSIDE this body because Postfix is one
-//           logical service emitting under several child program
-//           names through a single syslog identifier.
-// Intake:   workspace.postfix.body      (required, String) — the postfix-tagged body
-//           workspace.postfix.hostname  (optional, String) — host where the MTA ran
-//           workspace.postfix.time      (optional, Int)    — epoch nanoseconds
-// Upstream: transport-agnostic. Two typical bridges:
+// Vendor:      Postfix (Wietse Venema's MTA — covers Postfix on Linux /
+//              BSD / macOS, the dominant outbound MTA in modern unix
+//              mail stacks; not Sendmail, not Exim, not OpenSMTPD, each
+//              of which emits different line shapes and would land in
+//              their own parser file).
+// Wire:        Postfix log body including its internal program tag —
+//              `postfix/<program>[<pid>]: <body>` where `<program>` is
+//              the Postfix subcomponent (`smtp`, `smtpd`, `qmgr`,
+//              `cleanup`, `bounce`, `pickup`, `master`,
+//              `trivial-rewrite`, `error`, ...). The transport layer
+//              (syslog / journald) is unwrapped upstream; the postfix
+//              tag and pid live INSIDE this body because Postfix is one
+//              logical service emitting under several child program
+//              names through a single syslog identifier.
+// Upstream:    parse_syslog | parse_journald (transport-agnostic body
+//              parser). Two typical bridges:
 //
-//           - syslog transport (RFC 3164 / 5424; syslog.parse leaves
-//             the postfix tag inside `msg`):
-//                 process parse_syslog | {
-//                     workspace.postfix = {
-//                         body:     workspace.syslog.msg,
-//                         hostname: workspace.syslog.hostname,
-//                         time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
-//                     }
-//                 } | parse_postfix | compose_ocsf
+//              - syslog transport (RFC 3164 / 5424; syslog.parse leaves
+//                the postfix tag inside `msg`):
+//                    process parse_syslog | {
+//                        workspace.postfix = {
+//                            body:     workspace.syslog.msg,
+//                            hostname: workspace.syslog.hostname,
+//                            time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
+//                        }
+//                    } | parse_postfix | compose_ocsf
 //
-//           - journald transport. journald separates the postfix tag
-//             from the MESSAGE, so the bridge reconstructs the
-//             `postfix/<program>[<pid>]: <body>` form the parser
-//             expects from SYSLOG_IDENTIFIER + _PID + MESSAGE:
-//                 process parse_journald | {
-//                     workspace.postfix = {
-//                         body:     "${workspace.journald.SYSLOG_IDENTIFIER}[${coalesce(workspace.journald._PID, workspace.journald.SYSLOG_PID)}]: ${workspace.journald.MESSAGE}",
-//                         hostname: workspace.journald._HOSTNAME,
-//                         time:     to_int(workspace.journald.__REALTIME_TIMESTAMP) * 1000
-//                     }
-//                 } | parse_postfix | compose_ocsf
+//              - journald transport. journald separates the postfix tag
+//                from the MESSAGE, so the bridge reconstructs the
+//                `postfix/<program>[<pid>]: <body>` form the parser
+//                expects from SYSLOG_IDENTIFIER + _PID + MESSAGE:
+//                    process parse_journald | {
+//                        workspace.postfix = {
+//                            body:     "${workspace.journald.SYSLOG_IDENTIFIER}[${coalesce(workspace.journald._PID, workspace.journald.SYSLOG_PID)}]: ${workspace.journald.MESSAGE}",
+//                            hostname: workspace.journald._HOSTNAME,
+//                            time:     to_int(workspace.journald.__REALTIME_TIMESTAMP) * 1000
+//                        }
+//                    } | parse_postfix | compose_ocsf
 //
-// Output:   OCSF Email Activity (class_uid 4009) records on
-//           `workspace.limpid` for the operational mail events
-//           (delivery attempts, queue events, bounces, SMTP
-//           connections). Daemon-control noise (master / pickup /
-//           trivial-rewrite startup / shutdown / warning lines) is
-//           routed to error_log via the per-program leaf's `error`
-//           arm — they are operationally meaningful but not Email
-//           Activity, and deserve a separate observability layer
-//           (6002 Application Activity if needed).
+// Intake:      workspace.postfix.body      (required, String) — the postfix-tagged body
+//              workspace.postfix.hostname  (optional, String) — host where the MTA ran
+//              workspace.postfix.time      (optional, Int)    — epoch nanoseconds
+// Output:      OCSF Email Activity (class_uid 4009) records on
+//              `workspace.limpid` for the operational mail events
+//              (delivery attempts, queue events, bounces, SMTP
+//              connections). Targets Postfix's mail-flow vocabulary
+//              (smtp / smtpd / qmgr / bounce). Daemon-control noise
+//              (master / pickup / trivial-rewrite startup / shutdown /
+//              warning lines) and `warning:` / `fatal:` bodies inside
+//              the operational programs route to error_log via the
+//              per-program leaf's `error` arm — operationally
+//              meaningful but not Email Activity, and would deserve a
+//              separate observability layer (6002 Application Activity
+//              if needed). Dispatch is internal; call as
+//              `process parse_postfix`.
+// Test corpus: spec-only (Postfix documentation and synthesised sample
+//              lines below covering smtp success / deferred / bounced,
+//              smtpd connect / reject, qmgr expired, bounce NDR;
+//              verify before production use).
 //
 // Sample inputs (RFC 3164 syslog wrapper around Postfix body —
 // addresses anonymised to RFC 5321 / 5737 forms):
@@ -75,15 +84,6 @@
 //   bounce (NDR generated):
 //   <22>Apr 27 10:00:00 mail01 postfix/bounce[2222]: ABCDEF1234: sender non-delivery notification: FFFFFF5678
 //
-// Direct call: dispatch is internal; call as `process parse_postfix`.
-//
-// Coverage scope: this snippet targets Postfix's mail-flow vocabulary
-// (smtp / smtpd / qmgr / bounce). Programs that exist for daemon
-// control (master / pickup / trivial-rewrite / error) emit
-// administrative warnings rather than email events, and `warning:` /
-// `fatal:` bodies inside the operational programs are likewise
-// daemon-control noise — both fall through to the dispatcher's /
-// per-program leaf's `error` arm.
 
 // ---------------------------------------------------------------------------
 // Helpers

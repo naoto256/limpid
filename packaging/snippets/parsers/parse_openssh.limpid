@@ -1,21 +1,17 @@
 // OpenSSH sshd parser (vocabulary)
 //
-// Vendor:   OpenSSH (the OpenBSD project's reference implementation of SSH —
-//           most Linux / BSD distros use this; not Tectia, not Dropbear,
-//           not Bitvise, each of which emits different message strings
-//           and would land in their own `parse_<vendor>.limpid` file).
-// Wire:     sshd application body, post-transport-unwrap — the
-//           `Accepted publickey for alice from 192.0.2.10 port 54321 ssh2`
-//           style text without any syslog / journald wrapper.
-// Intake:   workspace.openssh.body       (required, String) — sshd body
-//           workspace.openssh.pid        (optional, String) — process id as string
-//           workspace.openssh.hostname   (optional, String) — SSH server hostname
-//           workspace.openssh.time       (optional, Int)    — epoch nanoseconds of the event
-// Upstream: transport-agnostic. The pipeline writer is responsible for
-//           bridging the upstream transport into the intake schema above.
-//           Two typical bridges (use the trusted source where the
-//           transport provides one — e.g. journald's `_PID` and
-//           `_HOSTNAME` are kernel-verified):
+// Vendor:      OpenSSH (the OpenBSD project's reference implementation of SSH —
+//              most Linux / BSD distros use this; not Tectia, not Dropbear,
+//              not Bitvise, each of which emits different message strings
+//              and would land in their own `parse_<vendor>.limpid` file).
+// Wire:        sshd application body, post-transport-unwrap — the
+//              `Accepted publickey for alice from 192.0.2.10 port 54321 ssh2`
+//              style text without any syslog / journald wrapper.
+// Upstream:    parse_syslog | parse_journald (transport-agnostic body parser).
+//              The pipeline writer is responsible for bridging the upstream
+//              transport into the intake schema below. Two typical bridges
+//              (use the trusted source where the transport provides one —
+//              e.g. journald's `_PID` and `_HOSTNAME` are kernel-verified):
 //
 //           - syslog transport (RFC 3164 / 5424; auto-detected by
 //             `syslog.parse`). For RFC 5424 wire, use
@@ -49,11 +45,25 @@
 //                     }
 //                 } | parse_openssh | compose_ocsf
 //
-//           Other stacks (CEF-wrapped, file tail with raw bodies, etc.)
-//           are the caller's responsibility — write your own bridge.
-//           See [Workspace is event-scoped, not message-passed](../../../docs/src/design-principles.md)
-//           for the rationale.
-// Output:   OCSF Authentication (class_uid 3002) records on `workspace.limpid`
+//              Other stacks (CEF-wrapped, file tail with raw bodies, etc.)
+//              are the caller's responsibility — write your own bridge.
+//              See [Workspace is event-scoped, not message-passed](../../../docs/src/design-principles.md)
+//              for the rationale.
+// Intake:      workspace.openssh.body       (required, String) — sshd body
+//              workspace.openssh.pid        (optional, String) — process id as string
+//              workspace.openssh.hostname   (optional, String) — SSH server hostname
+//              workspace.openssh.time       (optional, Int)    — epoch nanoseconds of the event
+// Output:      OCSF 3002 (Authentication) on workspace.limpid: activity_id
+//              (1=login attempt / 2=session teardown / 99=other for
+//              preauth / kex / banner / Invalid user shapes that don't
+//              fit logon / logoff), actor.user.name, src_endpoint.ip /
+//              port, auth_protocol="SSH", status_id, status_detail. No
+//              non-OCSF extension fields.
+// Test corpus: real (playground sshd capture + journald feed of internet-facing
+//              sshd; additionally cross-checked against logpai/loghub
+//              OpenSSH_2k.log; covers Accepted / Failed / Invalid user /
+//              Disconnected / Connection closed / banner exchange / Did not
+//              receive identification shapes).
 //
 // Sample sshd bodies (i.e. what `workspace.openssh.body` carries):
 //   Accepted publickey for alice from 192.0.2.10 port 54321 ssh2: RSA SHA256:abcd

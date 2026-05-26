@@ -1,19 +1,45 @@
 // Zeek full-scope parser (vocabulary)
 //
-// Extends `parse_zeek_soc.limpid` with:
-//   - Specialised handlers for the rest of the Zeek default protocol
-//     scripts (signature / intel / traceroute / tunnel / mysql /
-//     irc / sip / dnp3 / modbus / socks / syslog / ntp / ocsp / pe /
-//     rfb / dpd).
-//   - **Drop arms** for low-signal operational streams (stats /
-//     capture_loss / known_hosts / known_services / known_certs /
-//     software) — operator visibility into Zeek's own runtime and
-//     asset inventory, almost never security-relevant in raw form.
-//   - **Catch-all** for any remaining unknown `_path`: wraps the
-//     entire raw body into a 4001 Network Activity record's
-//     `unmapped` so absolutely nothing is silently dropped. Operator
-//     can post-process by inspecting `unmapped.zeek_path` to recover
-//     the original log type.
+// Vendor:      Zeek (formerly Bro) — see `parse_zeek_default.limpid`
+//              for the framework overview. This file is the
+//              full-scope extension layered atop parse_zeek_soc.
+// Wire:        **Native Zeek JSON output** (`redef LogAscii::use_json = T`)
+//              — same wire as parse_zeek_default; this file adds
+//              handlers for additional `_path` values.
+// Upstream:    raw JSONL tail bridge (inherits parse_zeek_default's
+//              ingestion contract — operators tail per-protocol JSONL
+//              files or use a unified shipper):
+//
+//              - Per-log JSONL tail:
+//                    process { workspace.zeek = { body: parse_json(ingress), hostname: hostname(), time: to_int(received_at) } } | parse_zeek_full | compose_ocsf
+//
+// Intake:      workspace.zeek.body      (required, Object) — parsed Zeek event
+//                                       (caller does `parse_json(ingress)`)
+//              workspace.zeek.hostname  (optional, String) — collector override
+//              workspace.zeek.time      (optional, Int)    — epoch ns override
+// Output:      OCSF records on `workspace.limpid`. Extends parse_zeek_soc
+//              (and transitively parse_zeek_default) with:
+//                - Specialised handlers for the rest of the Zeek default
+//                  protocol scripts (signature / intel / traceroute /
+//                  tunnel / mysql / irc / sip / dnp3 / modbus / socks /
+//                  syslog / ntp / ocsp / pe / rfb / dpd).
+//                - **Drop arms** for low-signal operational streams
+//                  (stats / capture_loss / known_hosts / known_services /
+//                  known_certs / software) — operator visibility into
+//                  Zeek's own runtime and asset inventory, almost never
+//                  security-relevant in raw form.
+//                - **Catch-all** for any remaining unknown `_path`:
+//                  wraps the entire raw body into a 4001 Network
+//                  Activity record's `unmapped` so absolutely nothing
+//                  is silently dropped. Operator can post-process by
+//                  inspecting `unmapped.zeek_path` to recover the
+//                  original log type.
+// Test corpus: spec-only (extension layer; the catch-all and
+//              generic_4001-routed protocols are spec-derived from the
+//              Zeek default-script schemas. Inherits the parse_zeek_soc
+//              / parse_zeek_default elastic/integrations corpus coverage
+//              for the shared protocols; the additional protocols this
+//              layer adds are not individually verified).
 //
 // Composition: transitively includes parse_zeek_soc → parse_zeek_default.
 // Operators picking the full scope only write one include + reference

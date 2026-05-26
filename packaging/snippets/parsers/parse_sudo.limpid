@@ -1,40 +1,52 @@
 // sudo parser (vocabulary)
 //
-// Vendor:   sudo (the Sudo Project — sudo/sudoedit; not pfexec, not
-//           doas, not /bin/su; each of those would land in their own
-//           parser file).
-// Wire:     sudo application body, post-transport-unwrap — the
-//           `alice : TTY=pts/0 ; PWD=... ; USER=root ; COMMAND=...`
-//           style text without any syslog / journald wrapper.
-// Intake:   workspace.sudo.body       (required, String) — the sudo body
-//           workspace.sudo.pid        (optional, String) — process id as string
-//           workspace.sudo.hostname   (optional, String) — host where sudo ran
-//           workspace.sudo.time       (optional, Int)    — epoch nanoseconds
-// Upstream: transport-agnostic. Two typical bridges:
+// Vendor:      sudo (the Sudo Project — sudo/sudoedit; not pfexec, not
+//              doas, not /bin/su; each of those would land in their own
+//              parser file).
+// Wire:        sudo application body, post-transport-unwrap — the
+//              `alice : TTY=pts/0 ; PWD=... ; USER=root ; COMMAND=...`
+//              style text without any syslog / journald wrapper.
+// Upstream:    parse_syslog | parse_journald (transport-agnostic body
+//              parser). Two typical bridges:
 //
-//           - syslog transport:
-//                 process parse_syslog | {
-//                     workspace.sudo = {
-//                         body:     workspace.syslog.msg,
-//                         pid:      workspace.syslog.procid,
-//                         hostname: workspace.syslog.hostname,
-//                         time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
-//                     }
-//                 } | parse_sudo | compose_ocsf
+//              - syslog transport:
+//                    process parse_syslog | {
+//                        workspace.sudo = {
+//                            body:     workspace.syslog.msg,
+//                            pid:      workspace.syslog.procid,
+//                            hostname: workspace.syslog.hostname,
+//                            time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
+//                        }
+//                    } | parse_sudo | compose_ocsf
 //
-//           - journald transport:
-//                 process parse_journald | {
-//                     workspace.sudo = {
-//                         body:     workspace.journald.MESSAGE,
-//                         pid:      coalesce(workspace.journald._PID,
-//                                            workspace.journald.SYSLOG_PID),
-//                         hostname: workspace.journald._HOSTNAME,
-//                         time:     to_int(workspace.journald.__REALTIME_TIMESTAMP) * 1000
-//                     }
-//                 } | parse_sudo | compose_ocsf
+//              - journald transport:
+//                    process parse_journald | {
+//                        workspace.sudo = {
+//                            body:     workspace.journald.MESSAGE,
+//                            pid:      coalesce(workspace.journald._PID,
+//                                               workspace.journald.SYSLOG_PID),
+//                            hostname: workspace.journald._HOSTNAME,
+//                            time:     to_int(workspace.journald.__REALTIME_TIMESTAMP) * 1000
+//                        }
+//                    } | parse_sudo | compose_ocsf
 //
-// Output:   OCSF Authorize Session (class_uid 3003) records on
-//           `workspace.limpid`.
+// Intake:      workspace.sudo.body       (required, String) — the sudo body
+//              workspace.sudo.pid        (optional, String) — process id as string
+//              workspace.sudo.hostname   (optional, String) — host where sudo ran
+//              workspace.sudo.time       (optional, Int)    — epoch nanoseconds
+// Output:      OCSF Authorize Session (class_uid 3003) records on
+//              `workspace.limpid`. Invocation lines map to
+//              activity_id=1 "Assign Privileges" (status=Success on a
+//              clean invocation, status=Failure on auth or authorization
+//              denial). PAM session open/close lines map to
+//              activity_id=2 "Activate Privileges" — they mark the
+//              moment the elevated session starts/ends, which OCSF
+//              "Activate" is the closest fit for among the 3003 enum
+//              values.
+// Test corpus: spec-only (sudo documentation + synthesised sample bodies
+//              below covering successful TTY / no-TTY invocations, auth
+//              failure, NOT in sudoers, command not allowed, PAM session
+//              open/close; verify before production use).
 //
 // Sample sudo bodies (what `workspace.sudo.body` carries):
 //

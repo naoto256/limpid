@@ -1,60 +1,65 @@
 // Microsoft Sysmon parser (vocabulary)
 //
-// Vendor:   Microsoft Sysinternals Sysmon (System Monitor) — the
-//           Windows kernel telemetry agent that produces detailed
-//           process / network / file / registry / DNS events via the
-//           `Microsoft-Windows-Sysmon/Operational` Windows Event Log
-//           channel. Distinct from the built-in Windows Security
-//           event channel (handled by `parse_winevent_json`); Sysmon
-//           is opt-in (deploy + config XML) but produces strictly
-//           richer telemetry for EDR / SIEM correlation.
-// Wire:     Sysmon events arrive as Windows Event Log records, which
-//           a forwarder (NXLog / Vector / Winlogbeat) ships as JSON.
-//           The relevant fields are:
-//             EventID        — Sysmon-specific (1=ProcessCreate,
-//                              3=NetworkConnect, 11=FileCreate, …)
-//             Channel        — "Microsoft-Windows-Sysmon/Operational"
-//             EventTime      — RFC 3339 timestamp
-//             Computer       — Windows machine name
-//             EventData      — Object with event-type-specific keys
-//                              (Image, CommandLine, ProcessId, etc.)
-// Intake:   workspace.sysmon.body      (required, Object) — parsed Sysmon
-//                                       event Object (already JSON-decoded;
-//                                       caller does `parse_json(ingress)`
-//                                       and passes the Object as `body`)
-//           workspace.sysmon.hostname  (optional, String) — collector override
-//           workspace.sysmon.time      (optional, Int)    — epoch nanos override
-// Upstream: Sysmon JSON typically arrives via:
+// Vendor:      Sysmon / System Monitor (from Microsoft Sysinternals) —
+//              the Windows kernel telemetry agent that produces detailed
+//              process / network / file / registry / DNS events via the
+//              `Microsoft-Windows-Sysmon/Operational` Windows Event Log
+//              channel. Distinct from the built-in Windows Security
+//              event channel (handled by `parse_winevent_json`); Sysmon
+//              is opt-in (deploy + config XML) but produces strictly
+//              richer telemetry for EDR / SIEM correlation.
+// Wire:        Sysmon events arrive as Windows Event Log records, which
+//              a forwarder (NXLog / Vector / Winlogbeat) ships as JSON.
+//              Relevant fields:
+//                EventID        — Sysmon-specific (1=ProcessCreate,
+//                                 3=NetworkConnect, 11=FileCreate, …)
+//                Channel        — "Microsoft-Windows-Sysmon/Operational"
+//                EventTime      — RFC 3339 timestamp
+//                Computer       — Windows machine name
+//                EventData      — Object with event-type-specific keys
+//                                 (Image, CommandLine, ProcessId, etc.)
+// Upstream:    parse_syslog | raw JSONL tail bridge (Sysmon JSON
+//              typically arrives via NXLog / Vector / Winlogbeat over
+//              TCP/syslog, or as a JSONL file the forwarder writes):
 //
-//           - NXLog / Vector / Winlogbeat over TCP/syslog (most common):
-//                 process parse_syslog | {
-//                     workspace.sysmon = {
-//                         body:     parse_json(workspace.syslog.msg),
-//                         hostname: workspace.syslog.hostname,
-//                         time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
-//                     }
-//                 } | parse_sysmon | compose_ocsf
+//              - NXLog / Vector / Winlogbeat over TCP/syslog (most common):
+//                    process parse_syslog | {
+//                        workspace.sysmon = {
+//                            body:     parse_json(workspace.syslog.msg),
+//                            hostname: workspace.syslog.hostname,
+//                            time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
+//                        }
+//                    } | parse_sysmon | compose_ocsf
 //
-//           - Direct JSON-line tail (when the forwarder writes a JSONL file):
-//                 process { workspace.sysmon = { body: parse_json(ingress), hostname: hostname(), time: to_int(received_at) } } | parse_sysmon | compose_ocsf
+//              - Direct JSON-line tail (forwarder writes a JSONL file):
+//                    process { workspace.sysmon = { body: parse_json(ingress), hostname: hostname(), time: to_int(received_at) } } | parse_sysmon | compose_ocsf
 //
-// Output:   OCSF records on `workspace.limpid` for the Sysmon event
-//           types this parser knows. Unknown EventIDs route to
-//           error_log per the loud-fail-fast policy.
+// Intake:      workspace.sysmon.body      (required, Object) — parsed Sysmon
+//                                         event Object (already JSON-decoded;
+//                                         caller does `parse_json(ingress)`
+//                                         and passes the Object as `body`)
+//              workspace.sysmon.hostname  (optional, String) — collector override
+//              workspace.sysmon.time      (optional, Int)    — epoch nanos override
+// Output:      OCSF records on `workspace.limpid` for the Sysmon event
+//              types this parser knows. Unknown EventIDs route to
+//              error_log per the loud-fail-fast policy. Covered EventIDs:
 //
-// Coverage scope (v0.7.1):
+//                | EventID | Sysmon name        | OCSF class                         |
+//                |---------|--------------------|------------------------------------|
+//                | 1       | ProcessCreate      | 1007 Process Activity / Launch     |
+//                | 3       | NetworkConnect     | 4001 Network Activity / Open       |
+//                | 11      | FileCreate         | 1001 File System Activity / Create |
 //
-//   | EventID | Sysmon name        | OCSF class                     |
-//   |---------|--------------------|--------------------------------|
-//   | 1       | ProcessCreate      | 1007 Process Activity / Launch |
-//   | 3       | NetworkConnect     | 4001 Network Activity / Open   |
-//   | 11      | FileCreate         | 1001 File System Activity / Create |
-//
-//   Sysmon emits 25+ event types; the three above cover the bulk of
-//   what EDR / SOC use cases consume. Others (5 ProcessTerminate,
-//   7 ImageLoad, 8 CreateRemoteThread, 12-14 Registry, 22 DnsQuery,
-//   etc.) route to error_log and would each need their own leaf with
-//   their event-data shape.
+//              Sysmon emits 25+ event types; the three above cover the
+//              bulk of what EDR / SOC use cases consume. Others (5
+//              ProcessTerminate, 7 ImageLoad, 8 CreateRemoteThread,
+//              12-14 Registry, 22 DnsQuery, etc.) route to error_log
+//              and would each need their own leaf with their event-data
+//              shape.
+// Test corpus: spec-only (Sysmon EventData schema per Sysinternals
+//              documentation; the three covered EventIDs are wired up
+//              to Sysmon's documented field layouts — verify against
+//              your forwarder's exact JSON before production use).
 
 // ---------------------------------------------------------------------------
 // Helpers

@@ -1,70 +1,69 @@
 // Linux auditd parser (vocabulary)
 //
-// Vendor:   Linux kernel audit subsystem (auditd / audispd / auditbeat).
-//           Wire format defined by the kernel audit framework (RFC-less,
-//           but stable since Linux 2.6.6+). Not Solaris BSM, not
-//           Windows auditpol; each has its own format.
-// Wire:     auditd line-per-record text:
-//             type=<TYPE> msg=audit(<seconds>.<millis>:<serial>):
-//                 <key>=<value> ... [msg='<inner-key>=<inner-value> ...']
-//           Outer keys are space-separated KV (unquoted), with an
-//           optional single-quoted `msg='...'` whose body is itself
-//           KV pairs (some quoted with `"..."`). A logical auditd
-//           event is typically split across SEVERAL `type=XXX`
-//           records sharing the same `audit(TS.MS:SERIAL)` key
-//           (e.g. SYSCALL + EXECVE + PATH for one execve). This
-//           parser treats each line as an independent event — no
-//           multi-record assembly. Each line carries enough fields
-//           to emit a useful OCSF record.
-// Intake:   workspace.auditd.body      (required, String) — the auditd record
-//           workspace.auditd.hostname  (optional, String) — host where audit ran
-//           workspace.auditd.time      (optional, Int)    — epoch nanoseconds
+// Vendor:      Linux kernel audit subsystem (auditd / audispd / auditbeat).
+//              Wire format defined by the kernel audit framework (RFC-less,
+//              but stable since Linux 2.6.6+). Not Solaris BSM, not
+//              Windows auditpol; each has its own format.
+// Wire:        auditd line-per-record text:
+//                type=<TYPE> msg=audit(<seconds>.<millis>:<serial>):
+//                    <key>=<value> ... [msg='<inner-key>=<inner-value> ...']
+//              Outer keys are space-separated KV (unquoted), with an
+//              optional single-quoted `msg='...'` whose body is itself
+//              KV pairs (some quoted with `"..."`). A logical auditd
+//              event is typically split across SEVERAL `type=XXX`
+//              records sharing the same `audit(TS.MS:SERIAL)` key
+//              (e.g. SYSCALL + EXECVE + PATH for one execve). This
+//              parser treats each line as an independent event — no
+//              multi-record assembly. Each line carries enough fields
+//              to emit a useful OCSF record.
+// Upstream:    transport-agnostic body parser. Three typical bridges:
 //
-//           pid is not an intake field — auditd records carry their
-//           own `pid=` inside the body, and it's the audited process's
-//           pid (which is the meaningful one for OCSF), not the
-//           auditd daemon's. Extracted from the body.
-// Upstream: transport-agnostic. Three typical bridges:
+//              - file tail (most common — `audisp-syslog` writes
+//                `/var/log/audit/audit.log` and limpid tails it):
+//                    { workspace.auditd = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_auditd | compose_ocsf
 //
-//           - file tail (most common — `audisp-syslog` writes
-//             `/var/log/audit/audit.log` and limpid tails it):
-//                 { workspace.auditd = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_auditd | compose_ocsf
+//              - syslog transport (audispd-syslog plugin):
+//                    process parse_syslog | {
+//                        workspace.auditd = {
+//                            body:     workspace.syslog.msg,
+//                            hostname: workspace.syslog.hostname,
+//                            time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
+//                        }
+//                    } | parse_auditd | compose_ocsf
 //
-//           - syslog transport (audispd-syslog plugin):
-//                 process parse_syslog | {
-//                     workspace.auditd = {
-//                         body:     workspace.syslog.msg,
-//                         hostname: workspace.syslog.hostname,
-//                         time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
-//                     }
-//                 } | parse_auditd | compose_ocsf
+//              - journald transport:
+//                    process parse_journald | {
+//                        workspace.auditd = {
+//                            body:     workspace.journald.MESSAGE,
+//                            hostname: workspace.journald._HOSTNAME,
+//                            time:     to_int(workspace.journald.__REALTIME_TIMESTAMP) * 1000
+//                        }
+//                    } | parse_auditd | compose_ocsf
 //
-//           - journald transport:
-//                 process parse_journald | {
-//                     workspace.auditd = {
-//                         body:     workspace.journald.MESSAGE,
-//                         hostname: workspace.journald._HOSTNAME,
-//                         time:     to_int(workspace.journald.__REALTIME_TIMESTAMP) * 1000
-//                     }
-//                 } | parse_auditd | compose_ocsf
+// Intake:      workspace.auditd.body      (required, String) — the auditd record
+//              workspace.auditd.hostname  (optional, String) — host where audit ran
+//              workspace.auditd.time      (optional, Int)    — epoch nanoseconds
 //
-// Output:   OCSF records on `workspace.limpid`. The class depends
-//           on the auditd record type:
-//             3002 Authentication             USER_LOGIN / USER_LOGOUT / USER_AUTH /
-//                                              USER_ACCT / CRED_ACQ / CRED_DISP /
-//                                              USER_START / USER_END / LOGIN
-//             3001 Account Change             ADD_USER / DEL_USER / USER_MGMT /
-//                                              ADD_GROUP / DEL_GROUP / GRP_MGMT /
-//                                              USER_CHAUTHTOK / USER_ROLE_CHANGE
-//             1007 Process Activity           SYSCALL (execve) / EXECVE / PROCTITLE /
-//                                              BPRM_FCAPS
-//             1001 File System Activity       PATH / CWD
-//             2004 Detection Finding          ANOM_ABEND / AVC / USER_AVC (SELinux denial)
-//             unmapped (routed to error_log)  System / config / network record types
-//                                              not yet in scope
-//
-// Coverage scope: verified against the elastic/integrations auditd
-// corpus (69 records across ~45 record types).
+//              pid is not an intake field — auditd records carry their
+//              own `pid=` inside the body, and it's the audited process's
+//              pid (which is the meaningful one for OCSF), not the
+//              auditd daemon's. Extracted from the body.
+// Output:      OCSF records on `workspace.limpid`. The class depends
+//              on the auditd record type:
+//                3002 Authentication             USER_LOGIN / USER_LOGOUT / USER_AUTH /
+//                                                 USER_ACCT / CRED_ACQ / CRED_DISP /
+//                                                 USER_START / USER_END / LOGIN
+//                3001 Account Change             ADD_USER / DEL_USER / USER_MGMT /
+//                                                 ADD_GROUP / DEL_GROUP / GRP_MGMT /
+//                                                 USER_CHAUTHTOK / USER_ROLE_CHANGE
+//                1007 Process Activity           SYSCALL (execve) / EXECVE / PROCTITLE /
+//                                                 BPRM_FCAPS
+//                1001 File System Activity       PATH / CWD
+//                2004 Detection Finding          ANOM_ABEND / AVC / USER_AVC (SELinux denial)
+//                unmapped (routed to error_log)  System / config / network record types
+//                                                 not yet in scope
+// Test corpus: public (elastic/integrations auditd corpus, 69 records across
+//              ~45 record types).
 
 // ---------------------------------------------------------------------------
 // Helpers

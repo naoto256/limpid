@@ -1,21 +1,25 @@
 // Palo Alto Networks PAN-OS CEF parser
 //
-// Vendor:  Palo Alto Networks
-// Product: PAN-OS (Next-Generation Firewalls — PA-series, VM-series)
-// Wire:    syslog-wrapped CEF — `<priority>timestamp host CEF:0|Palo Alto Networks|PAN-OS|...`
-// Schema:  ArcSight CEF (header) + PAN-OS-specific extension keys
-//
-// PAN-OS encodes the log type in the CEF `name` field:
-//   "TRAFFIC"        — connection start/end (OCSF Network Activity 4001)
-//   "THREAT"         — IPS / vulnerability / spyware (OCSF Detection Finding 2004)
-//   "URL"            — URL filtering (OCSF Web Resource Access 6004)
-//   "WILDFIRE"       — malware sandbox verdict (OCSF Detection Finding 2004)
-//   "GLOBALPROTECT"  — VPN session events (OCSF Authentication 3002)
-//   "AUTHENTICATION" — admin / user authentication (OCSF Authentication 3002)
-//   "SYSTEM"         — device events (OCSF Application Activity)
-//   "CONFIG"         — configuration changes
-//   "USERID"         — user-ID mapping events
-//   "HIPMATCH"       — Host Information Profile match
+// Vendor:      PAN-OS (Next-Generation Firewalls — PA-series, VM-series;
+//              from Palo Alto Networks)
+// Wire:        syslog-wrapped CEF — `<priority>timestamp host CEF:0|Palo Alto Networks|PAN-OS|...`
+//              ArcSight CEF header + PAN-OS-specific extension keys.
+// Upstream:    ingress (raw wire)
+// Output:      OCSF records on `workspace.limpid`. PAN-OS encodes the log
+//              type in the CEF `name` field; dispatch:
+//                "TRAFFIC"        — connection start/end (OCSF Network Activity 4001)
+//                "THREAT"         — IPS / vulnerability / spyware (OCSF Detection Finding 2004)
+//                "URL"            — URL filtering (OCSF Web Resource Access 6004)
+//                "WILDFIRE"       — malware sandbox verdict (OCSF Detection Finding 2004)
+//                "GLOBALPROTECT"  — VPN session events (OCSF Authentication 3002)
+//                "AUTHENTICATION" — admin / user authentication (OCSF Authentication 3002)
+//                "SYSTEM" / "CONFIG" / "USERID" / "HIPMATCH" follow when
+//                concrete mappings stabilise (unsupported → error route).
+// Test corpus: real (live PA-460 in tap mode covering TRAFFIC / THREAT /
+//              URL / GLOBALPROTECT / AUTHENTICATION shapes; WILDFIRE
+//              cs1/cs2 mapping is NOTE-flagged in the leaf body as
+//              spec-derived from legacy PAN-OS CEF docs and not verified
+//              against live WildFire events — verify before trusting).
 //
 // Sample input (RFC 3164 syslog wrapper around CEF, TRAFFIC subtype):
 //   <134>Apr 27 10:00:00 fw-pan01 CEF:0|Palo Alto Networks|PAN-OS|10.2.0|end|TRAFFIC|3|src=192.0.2.10 spt=54321 dst=198.51.100.5 dpt=443 proto=tcp act=allow in=2048 out=1024 app=ssl suser=alice

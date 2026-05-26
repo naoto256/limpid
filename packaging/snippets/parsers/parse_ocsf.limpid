@@ -1,14 +1,24 @@
 // OCSF inbound parser
 //
-// Vendor:  vendor-neutral (input is already in OCSF JSON form, e.g. an
-//          upstream pipeline's compose_ocsf output, a Security Lake
-//          parquet-converted-back-to-JSON stream, an OCSF-aware SIEM
-//          export, or test fixture).
-// Wire:    OCSF JSON — one object per event, top-level is an OCSF
-//          class instance (`class_uid` at the root).
-// Output:  populates `workspace.limpid` with the same OCSF object,
-//          ready for `compose_ocsf` (or any downstream OCSF-aware
-//          process) to dispatch by `class_uid`.
+// Vendor:      vendor-neutral (input is already in OCSF JSON form, e.g.
+//              an upstream pipeline's compose_ocsf output, a Security
+//              Lake parquet-converted-back-to-JSON stream, an OCSF-aware
+//              SIEM export, or test fixture).
+// Wire:        OCSF JSON — one object per event, top-level is an OCSF
+//              class instance (`class_uid` at the root).
+// Upstream:    ingress (raw wire)
+// Output:      populates `workspace.limpid` with the same OCSF object,
+//              ready for `compose_ocsf` (or any downstream OCSF-aware
+//              process) to dispatch by `class_uid`. Contract: top-level
+//              JSON object becomes `workspace.limpid` directly; unknown
+//              / missing `class_uid` is left to downstream (compose_ocsf
+//              already routes unknown class_uid to error_log); non-object
+//              JSON or malformed JSON fails inside parse_json (process
+//              error → DLQ per pipeline error policy).
+// Test corpus: spec-only (any vendor's prior compose_ocsf output round-
+//              trips through this passthrough; symmetric correctness
+//              tests in this repo feed compose_ocsf → parse_ocsf →
+//              compose_ocsf and diff across all 27 priority classes).
 //
 // Sample input (OCSF Network Activity 4001, abbreviated):
 //   {"class_uid":4001,"category_uid":4,"activity_id":6,"type_uid":400106,
@@ -27,13 +37,6 @@
 //   * Multi-stage pipelines: an upstream limpid emits OCSF, this stage
 //     re-parses it for further processing (enrichment, filtering,
 //     class-specific routing) without re-implementing 27 class shapes.
-//
-// Contract (per the workspace.limpid canonical intermediate):
-//   * top-level JSON object becomes `workspace.limpid` directly
-//   * unknown / missing `class_uid` is left to downstream
-//     (compose_ocsf already routes unknown class_uid to error_log)
-//   * non-object JSON or malformed JSON fails inside parse_json
-//     (process error → DLQ per pipeline error policy)
 
 def process parse_ocsf {
     workspace.limpid = parse_json(ingress)
