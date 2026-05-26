@@ -1,0 +1,14 @@
+# Cargo workspace config.
+#
+# The `xtask` alias is the standard cargo-xtask pattern: it makes
+# `cargo xtask <subcommand>` map to `cargo run --package xtask --`,
+# so developers and CI invoke dev workflows the same way without
+# remembering the explicit `--package xtask --` indirection.
+#
+# We intentionally do NOT pass `--quiet`: if the xtask binary fails
+# to compile (e.g. after a dep bump), cargo's normal output reveals
+# the compilation diagnostics. The minor noise of "Compiling …"
+# lines on a clean build is acceptable in exchange.
+
+[alias]
+xtask = "run --package xtask --"

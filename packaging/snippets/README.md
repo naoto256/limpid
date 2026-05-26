@@ -400,9 +400,15 @@ across syslog and journald.
 ### Header schema
 
 Every parser file opens with a comment header that follows a fixed
-schema. The xtask inventory generator (planned for the 0.7.4 line)
-will parse these headers to produce the `What's included` tables
-in this README and to lint for missing or malformed keys.
+schema. Two `xtask` subcommands operate on these headers:
+
+- `cargo xtask lint-snippet-headers` validates each header against
+  the schema below. Run it locally before committing.
+- `cargo xtask gen-snippet-inventory` regenerates the
+  `What's included` table in this README between the
+  `<!-- BEGIN: inventory:parsers -->` / `<!-- END: -->` markers
+  from the per-file headers. Run it whenever a header changes;
+  CI's `--check` mode fails the build on drift.
 
 | Key | Required | Value format |
 |---|---|---|
@@ -416,8 +422,7 @@ in this README and to lint for missing or malformed keys.
 Conventions:
 
 - **Order**: keys appear in the order listed above. The generator
-  will emit diagnostics on order violations (once the xtask
-  lands) to keep diffs stable.
+  emits diagnostics on order violations to keep diffs stable.
 - **Continuation**: a value may span multiple lines; continuation
   lines start with `//` followed by ≥2 spaces of indentation.
 - **Unknown keys**: tolerated with a generator warning. Use them
@@ -477,6 +482,29 @@ units.
   (principle 5). Moving a helper from inline to shared is a
   refactor that lands in its own commit, after the third caller
   arrives.
+
+### Adding a new parser — checklist
+
+Concrete steps for contributing a parser to this pack:
+
+1. Create `packaging/snippets/parsers/parse_<vendor>.limpid` with
+   the canonical header (Vendor / Wire / Upstream /
+   Intake[conditional] / Output / Test corpus) followed by the
+   parser body.
+2. Run `cargo xtask lint-snippet-headers` and fix any errors. The
+   lint catches missing keys, order violations, and Intake /
+   Upstream consistency.
+3. Decide which category the new parser belongs to and add an
+   entry to `crates/xtask/src/inventory.rs::CATEGORIES`. Without
+   this step the parser appears under "Uncategorised" in the
+   inventory (and the generator emits a warning naming it).
+4. Run `cargo xtask gen-snippet-inventory` to refresh the
+   inventory table in this README. Commit both the parser file
+   and the regenerated README in the same change.
+5. CI runs both subcommands (`--check` for the generator) after
+   the existing build / test / clippy steps; the build fails on
+   header lint errors or inventory drift, so the local checks in
+   steps 2 and 4 are the cheap way to catch issues before push.
 
 ### See also
 
