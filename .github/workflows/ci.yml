@@ -40,3 +40,9 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
+
+      - name: Snippet header lint
+        run: cargo xtask lint-snippet-headers
+
+      - name: Snippet inventory in sync
+        run: cargo xtask gen-snippet-inventory --check
