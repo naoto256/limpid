@@ -210,8 +210,10 @@ snippet category in **v0.7.1**:
 Each parser writes to the canonical `workspace.limpid.*`
 intermediate; `compose_ocsf` reads from it and emits OCSF JSON to
 `egress`. Two `include` lines + a two-stage pipeline gets vendor
-logs into a SIEM / data lake in OCSF form. Full reference:
-[Snippet Library](docs/src/snippets/README.md).
+logs into a SIEM / data lake in OCSF form. Concept-level overview:
+[Snippet Library](docs/src/snippets/README.md). Full reference
+(design contracts, per-parser inventory, authoring conventions):
+[packaging/snippets/README.md](packaging/snippets/README.md).
 
 ### Functions
 
