@@ -31,16 +31,22 @@ const TAIL_INPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "path",
         required: true,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
     PropertySpec {
         name: "state_file",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
     PropertySpec {
         name: "poll_interval",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Duration,
     },
 ];

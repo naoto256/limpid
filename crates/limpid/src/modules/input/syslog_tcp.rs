@@ -23,6 +23,8 @@ const SYSLOG_TCP_INPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "bind",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
     // `auto` is the default — autodetect framing per connection from
@@ -30,16 +32,22 @@ const SYSLOG_TCP_INPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "framing",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Enum(&["auto", "octet_counting", "non_transparent"]),
     },
     PropertySpec {
         name: "rate_limit",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Int,
     },
     PropertySpec {
         name: "max_connections",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Int,
     },
 ];
@@ -91,7 +99,10 @@ impl Module for SyslogTcpInput {
         Some(SYSLOG_TCP_INPUT_SCHEMA)
     }
 
-    fn from_properties(_name: &str, properties: &crate::modules::ModuleProperties) -> anyhow::Result<Self> {
+    fn from_properties(
+        _name: &str,
+        properties: &crate::modules::ModuleProperties,
+    ) -> anyhow::Result<Self> {
         let properties = properties.user_properties();
         let bind =
             props::get_string(properties, "bind").unwrap_or_else(|| "0.0.0.0:514".to_string());

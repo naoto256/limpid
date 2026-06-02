@@ -190,21 +190,29 @@ const OTLP_RETRY_BLOCK_PROPERTIES: &[crate::dsl::schema::PropertySpec] = &[
     crate::dsl::schema::PropertySpec {
         name: "max_attempts",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: crate::dsl::schema::PropertyValueKind::Int,
     },
     crate::dsl::schema::PropertySpec {
         name: "initial_wait",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: crate::dsl::schema::PropertyValueKind::Duration,
     },
     crate::dsl::schema::PropertySpec {
         name: "max_wait",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: crate::dsl::schema::PropertyValueKind::Duration,
     },
     crate::dsl::schema::PropertySpec {
         name: "backoff",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: crate::dsl::schema::PropertyValueKind::Enum(&["fixed", "exponential"]),
     },
 ];
@@ -213,46 +221,64 @@ const OTLP_OUTPUT_SCHEMA: &[crate::dsl::schema::PropertySpec] = &[
     crate::dsl::schema::PropertySpec {
         name: "endpoint",
         required: true,
+        repeatable: false,
+        exclusive_group: None,
         kind: crate::dsl::schema::PropertyValueKind::String,
     },
     crate::dsl::schema::PropertySpec {
         name: "protocol",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: crate::dsl::schema::PropertyValueKind::Enum(&["http_json", "http_protobuf", "grpc"]),
     },
     crate::dsl::schema::PropertySpec {
         name: "batch_size",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: crate::dsl::schema::PropertyValueKind::Int,
     },
     crate::dsl::schema::PropertySpec {
         name: "batch_timeout",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: crate::dsl::schema::PropertyValueKind::Duration,
     },
     crate::dsl::schema::PropertySpec {
         name: "batch_level",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: crate::dsl::schema::PropertyValueKind::Enum(&["none", "resource", "scope"]),
     },
     crate::dsl::schema::PropertySpec {
         name: "verify",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: crate::dsl::schema::PropertyValueKind::Bool,
     },
     crate::dsl::schema::PropertySpec {
         name: "headers",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: crate::dsl::schema::PropertyValueKind::StringMap,
     },
     crate::dsl::schema::PropertySpec {
         name: "tls",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: crate::dsl::schema::PropertyValueKind::Block(crate::tls::TLS_CLIENT_BLOCK_PROPERTIES),
     },
     crate::dsl::schema::PropertySpec {
         name: "retry",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: crate::dsl::schema::PropertyValueKind::Block(OTLP_RETRY_BLOCK_PROPERTIES),
     },
     crate::queue::QUEUE_PROPERTY_SPEC,
@@ -857,7 +883,8 @@ mod tests {
 
     #[test]
     fn batch_level_default_is_none() {
-        let output = OtlpOutput::from_properties("o", &mp(&[prop_str("endpoint", "http://x")])).unwrap();
+        let output =
+            OtlpOutput::from_properties("o", &mp(&[prop_str("endpoint", "http://x")])).unwrap();
         assert!(matches!(output.inner.batch_level, BatchLevel::None));
     }
 
@@ -868,8 +895,8 @@ mod tests {
             &mp(&[
                 prop_str("endpoint", "http://x"),
                 prop_str("batch_level", "resource"),
-            ],
-        ))
+            ]),
+        )
         .unwrap();
         assert!(matches!(r.inner.batch_level, BatchLevel::Resource));
         let s = OtlpOutput::from_properties(
@@ -877,8 +904,8 @@ mod tests {
             &mp(&[
                 prop_str("endpoint", "http://x"),
                 prop_str("batch_level", "scope"),
-            ],
-        ))
+            ]),
+        )
         .unwrap();
         assert!(matches!(s.inner.batch_level, BatchLevel::Scope));
     }
@@ -890,8 +917,8 @@ mod tests {
             &mp(&[
                 prop_str("endpoint", "http://x"),
                 prop_str("batch_level", "logrecord"),
-            ],
-        ))
+            ]),
+        )
         .err()
         .unwrap();
         assert!(
@@ -1074,7 +1101,8 @@ mod tests {
 
     #[test]
     fn retry_config_defaults_match_shared_default() {
-        let output = OtlpOutput::from_properties("o", &mp(&[prop_str("endpoint", "http://x")])).unwrap();
+        let output =
+            OtlpOutput::from_properties("o", &mp(&[prop_str("endpoint", "http://x")])).unwrap();
         let default = RetryConfig::default();
         assert_eq!(output.inner.retry_config.max_attempts, default.max_attempts);
         assert_eq!(output.inner.retry_config.initial_wait, default.initial_wait);
@@ -1120,8 +1148,8 @@ mod tests {
                 prop_str("endpoint", "http://127.0.0.1:1"),
                 prop_int("batch_size", 1024), // big enough that write does not flush
                 prop_str("batch_timeout", "30s"),
-            ],
-        ))
+            ]),
+        )
         .unwrap();
         // Push one event so ensure_flush_timer schedules a task.
         output
@@ -1249,8 +1277,8 @@ mod tests {
                 prop_str("endpoint", &endpoint),
                 prop_str("protocol", "grpc"),
                 prop_int("batch_size", 1),
-            ],
-        ))
+            ]),
+        )
         .unwrap();
         output
             .write_owned(&event_with_egress(singleton_bytes(
@@ -1428,8 +1456,8 @@ mod tests {
                         prop_str("max_wait", "50ms"),
                     ],
                 },
-            ],
-        ))
+            ]),
+        )
         .unwrap();
 
         // The first ship 503s twice then succeeds; the call should
@@ -1477,8 +1505,8 @@ mod tests {
                         prop_str("max_wait", "20ms"),
                     ],
                 },
-            ],
-        ))
+            ]),
+        )
         .unwrap();
         let err = output
             .write_owned(&event_with_egress(singleton_bytes(456)))
@@ -1501,8 +1529,8 @@ mod tests {
                 prop_str("endpoint", &endpoint),
                 prop_str("protocol", "http_protobuf"),
                 prop_int("batch_size", 1),
-            ],
-        ))
+            ]),
+        )
         .unwrap();
         output
             .write_owned(&event_with_egress(singleton_bytes(123)))
@@ -1531,8 +1559,8 @@ mod tests {
                 prop_str("endpoint", &endpoint),
                 prop_str("protocol", "http_json"),
                 prop_int("batch_size", 1),
-            ],
-        ))
+            ]),
+        )
         .unwrap();
         output
             .write_owned(&event_with_egress(singleton_bytes(456)))

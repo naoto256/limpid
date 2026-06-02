@@ -27,21 +27,29 @@ const TCP_OUTPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "address",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
     PropertySpec {
         name: "host",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
     PropertySpec {
         name: "port",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Int,
     },
     PropertySpec {
         name: "framing",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Enum(&["octet_counting", "non_transparent"]),
     },
     crate::queue::QUEUE_PROPERTY_SPEC,
@@ -210,10 +218,16 @@ mod tests {
             kv("address", ExprKind::StringLit("h:1".into())),
             kv("framing", ExprKind::Ident(vec!["non_trasnaprent".into()])),
         ];
-        let err = TcpOutput::build("relay", &mp(&props)).err().expect("should fail");
+        let err = TcpOutput::build("relay", &mp(&props))
+            .err()
+            .expect("should fail");
         let msg = err.to_string();
         assert!(msg.contains("framing"), "{}", msg);
-        assert!(msg.contains("non_transparent"), "did-you-mean missing: {}", msg);
+        assert!(
+            msg.contains("non_transparent"),
+            "did-you-mean missing: {}",
+            msg
+        );
     }
 
     #[test]
@@ -223,7 +237,9 @@ mod tests {
             // typo of `framing` → should suggest `framing`
             kv("framming", ExprKind::Ident(vec!["octet_counting".into()])),
         ];
-        let err = TcpOutput::build("relay", &mp(&props)).err().expect("should fail");
+        let err = TcpOutput::build("relay", &mp(&props))
+            .err()
+            .expect("should fail");
         let msg = err.to_string();
         assert!(msg.contains("unknown property 'framming'"), "{}", msg);
         assert!(msg.contains("framing"), "did-you-mean missing: {}", msg);
@@ -237,7 +253,9 @@ mod tests {
             kv("host", ExprKind::StringLit("h".into())),
             kv("port", ExprKind::StringLit("five-fourteen".into())),
         ];
-        let err = TcpOutput::build("relay", &mp(&props)).err().expect("should fail");
+        let err = TcpOutput::build("relay", &mp(&props))
+            .err()
+            .expect("should fail");
         let msg = err.to_string();
         assert!(msg.contains("port"), "{}", msg);
         assert!(msg.contains("integer"), "{}", msg);
@@ -249,7 +267,9 @@ mod tests {
             kv("portt", ExprKind::IntLit(514)),
             kv("framing", ExprKind::Ident(vec!["xx".into()])),
         ];
-        let err = TcpOutput::build("relay", &mp(&props)).err().expect("should fail");
+        let err = TcpOutput::build("relay", &mp(&props))
+            .err()
+            .expect("should fail");
         let msg = err.to_string();
         assert!(msg.contains("portt"), "{}", msg);
         assert!(msg.contains("framing"), "{}", msg);

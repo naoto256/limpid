@@ -32,21 +32,29 @@ const KAFKA_OUTPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "brokers",
         required: true,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
     PropertySpec {
         name: "topic",
         required: true,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
     PropertySpec {
         name: "compression",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Enum(&["none", "gzip", "snappy", "lz4", "zstd"]),
     },
     PropertySpec {
         name: "acks",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Enum(&["0", "1", "all"]),
     },
     // `key` accepts the magic value `source` or any user-chosen
@@ -55,11 +63,15 @@ const KAFKA_OUTPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "key",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
     PropertySpec {
         name: "queue_timeout",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Duration,
     },
     crate::queue::QUEUE_PROPERTY_SPEC,

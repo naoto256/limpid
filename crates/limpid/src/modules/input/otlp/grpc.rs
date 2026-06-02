@@ -66,16 +66,22 @@ const OTLP_GRPC_INPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "bind",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
     PropertySpec {
         name: "rate_limit",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Int,
     },
     PropertySpec {
         name: "tls",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Block(crate::tls::TLS_SERVER_BLOCK_PROPERTIES),
     },
 ];
@@ -358,7 +364,9 @@ mod tests {
                 value_span: None,
             }],
         }];
-        let err = OtlpGrpcInput::from_properties("o", &mp(&props)).err().unwrap();
+        let err = OtlpGrpcInput::from_properties("o", &mp(&props))
+            .err()
+            .unwrap();
         assert!(
             err.to_string().contains("tls block requires 'cert'"),
             "unexpected: {err}"

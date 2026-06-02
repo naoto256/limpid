@@ -102,26 +102,36 @@ const OTLP_HTTP_INPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "bind",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
     PropertySpec {
         name: "body_limit",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Size,
     },
     PropertySpec {
         name: "rate_limit",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Int,
     },
     PropertySpec {
         name: "request_rate_limit",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Int,
     },
     PropertySpec {
         name: "max_concurrent_requests",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Int,
     },
 ];
@@ -398,8 +408,8 @@ mod tests {
             &mp(&[
                 prop_int("request_rate_limit", 100),
                 prop_int("max_concurrent_requests", 32),
-            ],
-        ))
+            ]),
+        )
         .unwrap();
         assert_eq!(i.request_rate_limit, Some(100));
         assert_eq!(i.max_concurrent_requests, Some(32));
@@ -409,9 +419,10 @@ mod tests {
     fn zero_concurrency_is_rejected() {
         // get_strictly_positive_int forbids 0; the property is
         // documented as "off when absent", so 0 is meaningless.
-        let err = OtlpHttpInput::from_properties("o", &mp(&[prop_int("max_concurrent_requests", 0)]))
-            .err()
-            .unwrap();
+        let err =
+            OtlpHttpInput::from_properties("o", &mp(&[prop_int("max_concurrent_requests", 0)]))
+                .err()
+                .unwrap();
         assert!(
             err.to_string().contains("max_concurrent_requests"),
             "unexpected: {err}"
@@ -422,7 +433,8 @@ mod tests {
     fn body_limit_accepts_size_suffix() {
         let i = OtlpHttpInput::from_properties("o", &mp(&[prop_str("body_limit", "1MB")])).unwrap();
         assert_eq!(i.body_limit, 1024 * 1024);
-        let i = OtlpHttpInput::from_properties("o", &mp(&[prop_str("body_limit", "64MB")])).unwrap();
+        let i =
+            OtlpHttpInput::from_properties("o", &mp(&[prop_str("body_limit", "64MB")])).unwrap();
         assert_eq!(i.body_limit, 64 * 1024 * 1024);
     }
 
@@ -478,8 +490,8 @@ mod tests {
             &mp(&[
                 prop_str("bind", &addr.to_string()),
                 prop_str("body_limit", "256"),
-            ],
-        ))
+            ]),
+        )
         .unwrap();
         let (tx, _rx) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -569,8 +581,8 @@ mod tests {
             &mp(&[
                 prop_str("bind", &addr.to_string()),
                 prop_str("body_limit", "1KB"),
-            ],
-        ))
+            ]),
+        )
         .unwrap();
         let (tx, mut rx) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -644,8 +656,8 @@ mod tests {
             &mp(&[
                 prop_str("bind", &addr.to_string()),
                 prop_int("rate_limit", 5),
-            ],
-        ))
+            ]),
+        )
         .unwrap();
         let (tx, mut rx) = mpsc::channel(64);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -749,8 +761,8 @@ mod tests {
                 // `request_limiter.acquire().await` after it has
                 // taken the semaphore permit.
                 prop_int("request_rate_limit", 1),
-            ],
-        ))
+            ]),
+        )
         .unwrap();
         let (tx, mut rx) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
