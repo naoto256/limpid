@@ -547,6 +547,29 @@ def pipeline p { input i; output o }
 }
 
 #[test]
+fn check_accepts_syslog_tls_output_with_named_profile() {
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("tls-output.conf");
+    fs::write(
+        &conf,
+        r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o {
+    type syslog_tls
+    tls { my { ca "/etc/limpid/ca.pem" } }
+    peer { host "h"; port 6514; tls my }
+}
+def pipeline p { input i; output o }
+"#,
+    )
+    .unwrap();
+
+    let out = run_check(&conf);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {}", stderr);
+}
+
+#[test]
 fn check_loudly_rejects_typoed_framing_with_did_you_mean() {
     let dir = TempDir::new().unwrap();
     let conf = dir.path().join("typo.conf");
