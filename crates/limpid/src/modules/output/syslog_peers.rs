@@ -14,13 +14,13 @@ pub const PEER_COOLDOWN: Duration = Duration::from_secs(5);
 
 type PeerAttemptFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
 
-/// A configured destination. `tls` is `Some(...)` only for the future
-/// syslog_tls output; syslog_tcp / syslog_udp leave it `None`.
+/// A configured destination. `tls` is `Some(...)` only for outputs
+/// that negotiate client-side TLS; plaintext outputs leave it `None`.
 #[derive(Debug, Clone)]
 pub struct Peer {
     pub host: String,
     pub port: u16,
-    pub tls: Option<crate::tls::TlsConfig>,
+    pub tls: Option<crate::tls::ClientTlsConfig>,
 }
 
 impl Peer {

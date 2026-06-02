@@ -31,6 +31,7 @@ gethostname = "0.5"
 async-trait = "0.1"
 maxminddb = "0.27"
 tokio-rustls = "0.26"
+webpki-roots = "0.26"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 flate2 = "1"
 sha2 = "0.10"
