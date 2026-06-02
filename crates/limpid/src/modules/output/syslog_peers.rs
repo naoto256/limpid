@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 /// may later be exposed as a DSL property.
 pub const PEER_COOLDOWN: Duration = Duration::from_secs(5);
 
-type PeerAttemptFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>;
+type PeerAttemptFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
 
 /// A configured destination. `tls` is `Some(...)` only for the future
 /// syslog_tls output; syslog_tcp / syslog_udp leave it `None`.

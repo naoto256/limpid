@@ -98,16 +98,16 @@ def pipeline p {
 #[test]
 fn check_with_error_emits_error_footer_and_exits_one() {
     // Output references workspace.nope inside a template — should
-    // surface as a dataflow error even though `address` is a
-    // schema-known property (the workspace-reference walk runs on
-    // every value, schema-owned or not).
+    // surface as a dataflow error even though nested `host` is
+    // schema-known (the workspace-reference walk runs on every value,
+    // schema-owned or not).
     let dir = TempDir::new().unwrap();
     let conf = dir.path().join("err.conf");
     fs::write(
         &conf,
         r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type syslog_tcp address "${workspace.nope}:1" }
+def output o { type syslog_tcp peer { host "${workspace.nope}" port 1 } }
 def pipeline p { input i; output o }
 "#,
     )
@@ -526,7 +526,7 @@ fn check_accepts_correct_framing_enum_value_without_false_warning() {
 def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o {
     type syslog_tcp
-    address "127.0.0.1:514"
+    peer { host "127.0.0.1" port 514 }
     framing non_transparent
 }
 def pipeline p { input i; output o }
@@ -556,7 +556,7 @@ fn check_loudly_rejects_typoed_framing_with_did_you_mean() {
 def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o {
     type syslog_tcp
-    address "127.0.0.1:514"
+    peer { host "127.0.0.1" port 514 }
     framing non_trasnaprent
 }
 def pipeline p { input i; output o }
@@ -584,7 +584,7 @@ fn check_rejects_unknown_property_key_with_did_you_mean() {
 def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o {
     type syslog_tcp
-    addres "127.0.0.1:514"
+    per { host "127.0.0.1" port 514 }
 }
 def pipeline p { input i; output o }
 "#,
@@ -595,7 +595,7 @@ def pipeline p { input i; output o }
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(!out.status.success(), "stderr: {}", stderr);
     assert!(
-        stderr.contains("unknown property 'addres'") && stderr.contains("address"),
+        stderr.contains("unknown property 'per'") && stderr.contains("peer"),
         "expected unknown-key error with suggestion\nstderr: {}",
         stderr
     );
@@ -612,8 +612,7 @@ fn check_rejects_wrong_value_type_on_typed_property() {
 def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o {
     type syslog_tcp
-    host "127.0.0.1"
-    port "five-fourteen"
+    peer { host "127.0.0.1" port "five-fourteen" }
 }
 def pipeline p { input i; output o }
 "#,
@@ -642,7 +641,7 @@ fn check_reports_every_property_finding_in_one_run() {
 def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o {
     type syslog_tcp
-    addres "h:1"
+    per { host "h" port 1 }
     framing non_trasnaprent
 }
 def pipeline p { input i; output o }
@@ -653,8 +652,12 @@ def pipeline p { input i; output o }
     let out = run_check(&conf);
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(!out.status.success(), "stderr: {}", stderr);
-    assert!(stderr.contains("addres"), "stderr missing addres: {}", stderr);
-    assert!(stderr.contains("framing"), "stderr missing framing: {}", stderr);
+    assert!(stderr.contains("per"), "stderr missing per: {}", stderr);
+    assert!(
+        stderr.contains("framing"),
+        "stderr missing framing: {}",
+        stderr
+    );
 }
 
 #[test]
