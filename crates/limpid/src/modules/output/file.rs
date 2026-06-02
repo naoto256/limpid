@@ -39,22 +39,30 @@ const FILE_OUTPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "path",
         required: true,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
     // Octal mode string — `"0640"`, `"640"`. Parsed by from_properties.
     PropertySpec {
         name: "mode",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
     PropertySpec {
         name: "owner",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
     PropertySpec {
         name: "group",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
     crate::queue::QUEUE_PROPERTY_SPEC,
@@ -146,11 +154,7 @@ impl Output for FileOutput {
         self.funcs = Some(funcs);
     }
 
-    fn render(
-        &self,
-        event: &BorrowedEvent<'_>,
-        arena: &EventArena<'_>,
-    ) -> Result<RenderedPayload> {
+    fn render(&self, event: &BorrowedEvent<'_>, arena: &EventArena<'_>) -> Result<RenderedPayload> {
         let (resolved, is_dynamic) = self.render_path_in(event, arena)?;
         Ok(RenderedPayload::new(FilePayload {
             egress: event.egress.clone(),
@@ -267,8 +271,7 @@ impl FileOutput {
                     match frag {
                         TemplateFragment::Literal(s) => out.push_str(s),
                         TemplateFragment::Interp(expr) => {
-                            let rendered =
-                                value_to_string(&eval_expr(expr, bevent, funcs, arena)?);
+                            let rendered = value_to_string(&eval_expr(expr, bevent, funcs, arena)?);
                             // Pass 1: per-interp `/` `\` → `_` and reject empty.
                             // An empty interp would silently produce paths like
                             // `/foo//bar` or `/foo/.log` that almost never reflect
@@ -605,7 +608,8 @@ mod tests {
             Bytes::from("hello"),
             "192.168.1.10:514".parse::<SocketAddr>().unwrap(),
         );
-        e.workspace.insert("empty".into(), OwnedValue::String("".into()));
+        e.workspace
+            .insert("empty".into(), OwnedValue::String("".into()));
         let out = make_output(ek(ExprKind::Template(vec![
             TemplateFragment::Literal("/var/log/".into()),
             TemplateFragment::Interp(ek(ExprKind::Ident(vec![
@@ -652,7 +656,8 @@ mod tests {
             Bytes::from("hello"),
             "192.168.1.10:514".parse::<SocketAddr>().unwrap(),
         );
-        e.workspace.insert("v".into(), OwnedValue::String("..".into()));
+        e.workspace
+            .insert("v".into(), OwnedValue::String("..".into()));
         let out = make_output(ek(ExprKind::Template(vec![TemplateFragment::Interp(ek(
             ExprKind::Ident(vec!["workspace".into(), "v".into()]),
         ))])));

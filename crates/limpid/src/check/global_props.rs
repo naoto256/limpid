@@ -18,11 +18,15 @@ const CONTROL_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "socket",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
     PropertySpec {
         name: "error_log",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
 ];
@@ -30,6 +34,8 @@ const CONTROL_SCHEMA: &[PropertySpec] = &[
 const GEOIP_SCHEMA: &[PropertySpec] = &[PropertySpec {
     name: "database",
     required: false,
+    repeatable: false,
+    exclusive_group: None,
     kind: PropertyValueKind::String,
 }];
 
@@ -40,16 +46,22 @@ const TABLE_ENTRY_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "load",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
     PropertySpec {
         name: "max",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Int,
     },
     PropertySpec {
         name: "ttl",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Int,
     },
 ];

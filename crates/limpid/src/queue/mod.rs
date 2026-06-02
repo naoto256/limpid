@@ -32,21 +32,29 @@ const QUEUE_BLOCK_PROPERTIES: &[PropertySpec] = &[
     PropertySpec {
         name: "type",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Enum(&["memory", "disk"]),
     },
     PropertySpec {
         name: "path",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
     PropertySpec {
         name: "max_size",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Size,
     },
     PropertySpec {
         name: "capacity",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Int,
     },
 ];
@@ -64,6 +72,8 @@ const QUEUE_BLOCK_PROPERTIES: &[PropertySpec] = &[
 pub const QUEUE_PROPERTY_SPEC: PropertySpec = PropertySpec {
     name: "queue",
     required: false,
+    repeatable: false,
+    exclusive_group: None,
     kind: PropertyValueKind::Block(QUEUE_BLOCK_PROPERTIES),
 };
 
@@ -86,7 +96,6 @@ pub enum SinkInput {
     /// `Output::render`; the matching `Output::write` downcasts it.
     Rendered(RenderedPayload),
 }
-
 
 /// Memory-vs-disk queue discriminator surfaced on `CompiledConfig` so
 /// the pipeline can pick `SinkInput::Owned` (disk persist) vs

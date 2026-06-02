@@ -22,26 +22,36 @@ const SYSLOG_TLS_INPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "bind",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
     PropertySpec {
         name: "framing",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Enum(&["auto", "octet_counting", "non_transparent"]),
     },
     PropertySpec {
         name: "tls",
         required: true,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Block(crate::tls::TLS_SERVER_BLOCK_PROPERTIES),
     },
     PropertySpec {
         name: "rate_limit",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Int,
     },
     PropertySpec {
         name: "max_connections",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Int,
     },
 ];

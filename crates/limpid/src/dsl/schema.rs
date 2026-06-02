@@ -56,6 +56,11 @@ pub enum PropertyValueKind {
     /// Nested block. The slice describes the inner schema; the
     /// validator recurses.
     Block(&'static [PropertySpec]),
+    /// Open block whose keys are user-defined identifiers and whose
+    /// values must each be a nested block conforming to the given schema.
+    /// `tls { profile_a { ca "..." } profile_b { ca "..." cert "..." key "..." } }`
+    #[allow(dead_code)]
+    BlockMap(&'static [PropertySpec]),
     /// Open block whose keys are user-defined identifiers (HTTP
     /// header names, k8s-style labels, etc.) and whose values must
     /// each be string-shaped. The schema validator never flags an
@@ -63,6 +68,57 @@ pub enum PropertyValueKind {
     /// entry is a key-value (not a nested sub-block) with a
     /// string-shaped value.
     StringMap,
+    /// Value can be one of multiple shapes. Used for keys that accept
+    /// either an inline block or a reference identifier.
+    #[allow(dead_code)]
+    OneOf(&'static [PropertyValueKind]),
+}
+
+impl PropertyValueKind {
+    fn label(self) -> &'static str {
+        match self {
+            PropertyValueKind::String => "String",
+            PropertyValueKind::Int => "Int",
+            PropertyValueKind::Bool => "Bool",
+            PropertyValueKind::Duration => "Duration",
+            PropertyValueKind::Size => "Size",
+            PropertyValueKind::Enum(_) => "Ident",
+            PropertyValueKind::Block(_) => "Block",
+            PropertyValueKind::BlockMap(_) => "BlockMap",
+            PropertyValueKind::StringMap => "StringMap",
+            PropertyValueKind::OneOf(_) => "OneOf",
+        }
+    }
+}
+
+impl Property {
+    fn label(&self) -> &'static str {
+        match self {
+            Property::KeyValue { value, .. } => value.label(),
+            Property::Block { .. } => "Block",
+        }
+    }
+}
+
+impl Expr {
+    fn label(&self) -> &'static str {
+        match self.kind {
+            ExprKind::StringLit(_) => "String",
+            ExprKind::Template(_) => "Template",
+            ExprKind::IntLit(_) => "Int",
+            ExprKind::FloatLit(_) => "Float",
+            ExprKind::BoolLit(_) => "Bool",
+            ExprKind::Null => "Null",
+            ExprKind::Ident(_) => "Ident",
+            ExprKind::FuncCall { .. } => "FuncCall",
+            ExprKind::BinOp(_, _, _) => "BinOp",
+            ExprKind::UnaryOp(_, _) => "UnaryOp",
+            ExprKind::HashLit(_) => "Hash",
+            ExprKind::ArrayLit(_) => "Array",
+            ExprKind::PropertyAccess(_, _) => "PropertyAccess",
+            ExprKind::SwitchExpr { .. } => "Switch",
+        }
+    }
 }
 
 /// One declared key in a property surface.
@@ -70,6 +126,8 @@ pub enum PropertyValueKind {
 pub struct PropertySpec {
     pub name: &'static str,
     pub required: bool,
+    pub repeatable: bool,
+    pub exclusive_group: Option<&'static str>,
     pub kind: PropertyValueKind,
 }
 
@@ -88,6 +146,12 @@ pub enum SchemaErrorKind {
     /// Same key appears twice in the same surface. Later occurrence
     /// silently won in legacy code — surface it explicitly.
     DuplicateKey,
+    /// Multiple mutually exclusive properties from the same group
+    /// appeared in the same surface.
+    ExclusiveGroupViolation {
+        group: &'static str,
+        conflicting: Vec<String>,
+    },
     /// Schema declares this key as a `Block(_)` but the config wrote a
     /// scalar (`tls "..."`).
     ExpectedBlock,
@@ -97,10 +161,13 @@ pub enum SchemaErrorKind {
     /// Scalar value doesn't match the declared kind (e.g. an `Int`
     /// expected but a string given; a `Duration` that failed to parse).
     TypeMismatch { expected: &'static str },
-    /// Bare ident value doesn't match any of the allowed enum variants.
-    UnknownEnumValue {
-        allowed: &'static [&'static str],
+    /// Value did not match any variant declared by `OneOf`.
+    OneOfMismatch {
+        expected: Vec<&'static str>,
+        actual: &'static str,
     },
+    /// Bare ident value doesn't match any of the allowed enum variants.
+    UnknownEnumValue { allowed: &'static [&'static str] },
 }
 
 /// One validation finding. Carries enough span context for either the
@@ -122,10 +189,15 @@ impl SchemaError {
     pub fn primary_span(&self) -> Option<Span> {
         use SchemaErrorKind::*;
         match self.kind {
-            UnknownKey | MissingRequired | DuplicateKey | ExpectedBlock | ExpectedValue => {
-                self.key_span.or(self.value_span)
+            UnknownKey
+            | MissingRequired
+            | DuplicateKey
+            | ExclusiveGroupViolation { .. }
+            | ExpectedBlock
+            | ExpectedValue => self.key_span.or(self.value_span),
+            TypeMismatch { .. } | OneOfMismatch { .. } | UnknownEnumValue { .. } => {
+                self.value_span.or(self.key_span)
             }
-            TypeMismatch { .. } | UnknownEnumValue { .. } => self.value_span.or(self.key_span),
         }
     }
 }
@@ -143,11 +215,24 @@ impl std::fmt::Display for SchemaError {
             }
             MissingRequired => write!(f, "missing required property '{}'", self.key),
             DuplicateKey => write!(f, "duplicate property '{}'", self.key),
+            ExclusiveGroupViolation { group, conflicting } => write!(
+                f,
+                "properties in exclusive group '{}' conflict: {}",
+                group,
+                conflicting.join(", ")
+            ),
             ExpectedBlock => write!(f, "'{}' expects a block ({{ ... }})", self.key),
             ExpectedValue => write!(f, "'{}' expects a value, not a block", self.key),
             TypeMismatch { expected } => {
                 write!(f, "'{}' expects {}", self.key, expected)
             }
+            OneOfMismatch { expected, actual } => write!(
+                f,
+                "'{}' expects one of: {}, got {}",
+                self.key,
+                expected.join(" | "),
+                actual
+            ),
             UnknownEnumValue { allowed } => {
                 write!(f, "'{}' has unknown value", self.key)?;
                 if let Some(s) = &self.did_you_mean {
@@ -173,24 +258,14 @@ impl std::fmt::Display for SchemaError {
 pub fn validate(props: &[Property], spec: &[PropertySpec]) -> Vec<SchemaError> {
     let mut errs = Vec::new();
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut exclusive_groups: std::collections::HashMap<&'static str, Vec<String>> =
+        std::collections::HashMap::new();
 
     for prop in props {
         let (name, key_span) = match prop {
             Property::KeyValue { key, key_span, .. } => (key.as_str(), *key_span),
             Property::Block { key, key_span, .. } => (key.as_str(), *key_span),
         };
-
-        if !seen.insert(name) {
-            errs.push(SchemaError {
-                kind: SchemaErrorKind::DuplicateKey,
-                key: name.to_string(),
-                key_span,
-                value_span: None,
-                did_you_mean: None,
-            });
-            // Still fall through and validate the value — typo and
-            // type-mismatch findings on the duplicate are still useful.
-        }
 
         let Some(s) = spec.iter().find(|s| s.name == name) else {
             let dym = nearest(name, spec.iter().map(|s| s.name));
@@ -204,40 +279,26 @@ pub fn validate(props: &[Property], spec: &[PropertySpec]) -> Vec<SchemaError> {
             continue;
         };
 
-        match (&s.kind, prop) {
-            (PropertyValueKind::Block(inner_spec), Property::Block { properties, .. }) => {
-                errs.extend(validate(properties, inner_spec));
-            }
-            (PropertyValueKind::StringMap, Property::Block { properties, .. }) => {
-                errs.extend(validate_string_map(properties));
-            }
-            (PropertyValueKind::Block(_) | PropertyValueKind::StringMap,
-                Property::KeyValue { value_span, .. }) => {
-                errs.push(SchemaError {
-                    kind: SchemaErrorKind::ExpectedBlock,
-                    key: name.to_string(),
-                    key_span,
-                    value_span: *value_span,
-                    did_you_mean: None,
-                });
-            }
-            (_, Property::Block { .. }) => {
-                errs.push(SchemaError {
-                    kind: SchemaErrorKind::ExpectedValue,
-                    key: name.to_string(),
-                    key_span,
-                    value_span: None,
-                    did_you_mean: None,
-                });
-            }
-            (kind, Property::KeyValue {
-                value, value_span, ..
-            }) => {
-                if let Some(err) = check_value(name, *kind, value, *value_span, key_span) {
-                    errs.push(err);
-                }
-            }
+        if !seen.insert(name) && !s.repeatable {
+            errs.push(SchemaError {
+                kind: SchemaErrorKind::DuplicateKey,
+                key: name.to_string(),
+                key_span,
+                value_span: None,
+                did_you_mean: None,
+            });
+            // Still fall through and validate the value — typo and
+            // type-mismatch findings on the duplicate are still useful.
         }
+
+        if let Some(group) = s.exclusive_group {
+            exclusive_groups
+                .entry(group)
+                .or_default()
+                .push(name.to_string());
+        }
+
+        errs.extend(check_property(name, s.kind, prop, key_span));
     }
 
     for s in spec {
@@ -252,6 +313,135 @@ pub fn validate(props: &[Property], spec: &[PropertySpec]) -> Vec<SchemaError> {
         }
     }
 
+    for (group, mut conflicting) in exclusive_groups {
+        conflicting.sort();
+        conflicting.dedup();
+        if conflicting.len() > 1 {
+            errs.push(SchemaError {
+                kind: SchemaErrorKind::ExclusiveGroupViolation { group, conflicting },
+                key: group.to_string(),
+                key_span: None,
+                value_span: None,
+                did_you_mean: None,
+            });
+        }
+    }
+
+    errs
+}
+
+fn check_property(
+    key: &str,
+    kind: PropertyValueKind,
+    prop: &Property,
+    key_span: Option<Span>,
+) -> Vec<SchemaError> {
+    match kind {
+        PropertyValueKind::Block(inner_spec) => match prop {
+            Property::Block { properties, .. } => validate(properties, inner_spec),
+            Property::KeyValue { value_span, .. } => vec![SchemaError {
+                kind: SchemaErrorKind::ExpectedBlock,
+                key: key.to_string(),
+                key_span,
+                value_span: *value_span,
+                did_you_mean: None,
+            }],
+        },
+        PropertyValueKind::BlockMap(inner_spec) => match prop {
+            Property::Block { properties, .. } => validate_block_map(properties, inner_spec),
+            Property::KeyValue { value_span, .. } => vec![SchemaError {
+                kind: SchemaErrorKind::ExpectedBlock,
+                key: key.to_string(),
+                key_span,
+                value_span: *value_span,
+                did_you_mean: None,
+            }],
+        },
+        PropertyValueKind::StringMap => match prop {
+            Property::Block { properties, .. } => validate_string_map(properties),
+            Property::KeyValue { value_span, .. } => vec![SchemaError {
+                kind: SchemaErrorKind::ExpectedBlock,
+                key: key.to_string(),
+                key_span,
+                value_span: *value_span,
+                did_you_mean: None,
+            }],
+        },
+        PropertyValueKind::OneOf(variants) => check_one_of(key, variants, prop, key_span),
+        scalar_kind => match prop {
+            Property::Block { .. } => vec![SchemaError {
+                kind: SchemaErrorKind::ExpectedValue,
+                key: key.to_string(),
+                key_span,
+                value_span: None,
+                did_you_mean: None,
+            }],
+            Property::KeyValue {
+                value, value_span, ..
+            } => check_value(key, scalar_kind, value, *value_span, key_span)
+                .into_iter()
+                .collect(),
+        },
+    }
+}
+
+fn check_one_of(
+    key: &str,
+    variants: &'static [PropertyValueKind],
+    prop: &Property,
+    key_span: Option<Span>,
+) -> Vec<SchemaError> {
+    debug_assert!(
+        variants
+            .iter()
+            .all(|kind| !matches!(kind, PropertyValueKind::OneOf(_))),
+        "nested PropertyValueKind::OneOf is not supported"
+    );
+
+    if variants
+        .iter()
+        .any(|kind| check_property(key, *kind, prop, key_span).is_empty())
+    {
+        return Vec::new();
+    }
+
+    vec![SchemaError {
+        kind: SchemaErrorKind::OneOfMismatch {
+            expected: variants.iter().map(|kind| kind.label()).collect(),
+            actual: prop.label(),
+        },
+        key: key.to_string(),
+        key_span,
+        value_span: prop_value_span(prop),
+        did_you_mean: None,
+    }]
+}
+
+/// Validate a `BlockMap`-kind block: every entry must be a nested block
+/// whose contents satisfy the declared inner schema. The entry names are
+/// user-defined, so there is no unknown-key check at this level.
+fn validate_block_map(properties: &[Property], inner_spec: &[PropertySpec]) -> Vec<SchemaError> {
+    let mut errs = Vec::new();
+    for prop in properties {
+        match prop {
+            Property::Block {
+                properties: inner_properties,
+                ..
+            } => errs.extend(validate(inner_properties, inner_spec)),
+            Property::KeyValue {
+                key,
+                key_span,
+                value_span,
+                ..
+            } => errs.push(SchemaError {
+                kind: SchemaErrorKind::ExpectedBlock,
+                key: key.clone(),
+                key_span: *key_span,
+                value_span: *value_span,
+                did_you_mean: None,
+            }),
+        }
+    }
     errs
 }
 
@@ -267,21 +457,21 @@ fn validate_string_map(properties: &[Property]) -> Vec<SchemaError> {
                 key_span,
                 value,
                 value_span,
-            } => {
-                match &value.kind {
-                    ExprKind::StringLit(_)
-                    | ExprKind::Template(_)
-                    | ExprKind::Ident(_)
-                    | ExprKind::IntLit(_) => {}
-                    _ => errs.push(SchemaError {
-                        kind: SchemaErrorKind::TypeMismatch { expected: "a string" },
-                        key: key.clone(),
-                        key_span: *key_span,
-                        value_span: *value_span,
-                        did_you_mean: None,
-                    }),
-                }
-            }
+            } => match &value.kind {
+                ExprKind::StringLit(_)
+                | ExprKind::Template(_)
+                | ExprKind::Ident(_)
+                | ExprKind::IntLit(_) => {}
+                _ => errs.push(SchemaError {
+                    kind: SchemaErrorKind::TypeMismatch {
+                        expected: "a string",
+                    },
+                    key: key.clone(),
+                    key_span: *key_span,
+                    value_span: *value_span,
+                    did_you_mean: None,
+                }),
+            },
             Property::Block { key, key_span, .. } => {
                 errs.push(SchemaError {
                     kind: SchemaErrorKind::ExpectedValue,
@@ -377,7 +567,10 @@ fn check_value(
             }
             _ => mismatch("an identifier"),
         },
-        PropertyValueKind::Block(_) | PropertyValueKind::StringMap => {
+        PropertyValueKind::Block(_)
+        | PropertyValueKind::BlockMap(_)
+        | PropertyValueKind::StringMap
+        | PropertyValueKind::OneOf(_) => {
             // unreachable: handled at the caller's match arm before we get here.
             None
         }
@@ -484,16 +677,22 @@ mod tests {
         PropertySpec {
             name: "address",
             required: true,
+            repeatable: false,
+            exclusive_group: None,
             kind: PropertyValueKind::String,
         },
         PropertySpec {
             name: "port",
             required: false,
+            repeatable: false,
+            exclusive_group: None,
             kind: PropertyValueKind::Int,
         },
         PropertySpec {
             name: "framing",
             required: false,
+            repeatable: false,
+            exclusive_group: None,
             kind: PropertyValueKind::Enum(&["octet_counting", "non_transparent"]),
         },
     ];
@@ -535,7 +734,9 @@ mod tests {
         assert_eq!(errs.len(), 1);
         assert!(matches!(
             errs[0].kind,
-            SchemaErrorKind::TypeMismatch { expected: "an integer" }
+            SchemaErrorKind::TypeMismatch {
+                expected: "an integer"
+            }
         ));
     }
 
@@ -573,7 +774,59 @@ mod tests {
             kv("address", ExprKind::StringLit("b".into())),
         ];
         let errs = validate(&props, SIMPLE);
-        assert!(errs.iter().any(|e| matches!(e.kind, SchemaErrorKind::DuplicateKey)));
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e.kind, SchemaErrorKind::DuplicateKey))
+        );
+    }
+
+    #[test]
+    fn repeatable_block_accepts_duplicate_keys() {
+        const S: &[PropertySpec] = &[PropertySpec {
+            name: "peer",
+            required: false,
+            repeatable: true,
+            exclusive_group: None,
+            kind: PropertyValueKind::Block(&[PropertySpec {
+                name: "host",
+                required: true,
+                repeatable: false,
+                exclusive_group: None,
+                kind: PropertyValueKind::String,
+            }]),
+        }];
+        let props = vec![
+            block("peer", vec![kv("host", ExprKind::StringLit("a".into()))]),
+            block("peer", vec![kv("host", ExprKind::StringLit("b".into()))]),
+        ];
+        let errs = validate(&props, S);
+        assert!(errs.is_empty(), "unexpected errors: {:?}", errs);
+    }
+
+    #[test]
+    fn non_repeatable_block_rejects_duplicate_keys() {
+        const S: &[PropertySpec] = &[PropertySpec {
+            name: "peer",
+            required: false,
+            repeatable: false,
+            exclusive_group: None,
+            kind: PropertyValueKind::Block(&[PropertySpec {
+                name: "host",
+                required: true,
+                repeatable: false,
+                exclusive_group: None,
+                kind: PropertyValueKind::String,
+            }]),
+        }];
+        let props = vec![
+            block("peer", vec![kv("host", ExprKind::StringLit("a".into()))]),
+            block("peer", vec![kv("host", ExprKind::StringLit("b".into()))]),
+        ];
+        let errs = validate(&props, S);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e.kind, SchemaErrorKind::DuplicateKey))
+        );
     }
 
     #[test]
@@ -581,9 +834,13 @@ mod tests {
         const NESTED: &[PropertySpec] = &[PropertySpec {
             name: "tls",
             required: false,
+            repeatable: false,
+            exclusive_group: None,
             kind: PropertyValueKind::Block(&[PropertySpec {
                 name: "cert",
                 required: true,
+                repeatable: false,
+                exclusive_group: None,
                 kind: PropertyValueKind::String,
             }]),
         }];
@@ -598,15 +855,21 @@ mod tests {
         const NESTED: &[PropertySpec] = &[PropertySpec {
             name: "tls",
             required: false,
+            repeatable: false,
+            exclusive_group: None,
             kind: PropertyValueKind::Block(&[
                 PropertySpec {
                     name: "cert",
                     required: true,
+                    repeatable: false,
+                    exclusive_group: None,
                     kind: PropertyValueKind::String,
                 },
                 PropertySpec {
                     name: "key",
                     required: false,
+                    repeatable: false,
+                    exclusive_group: None,
                     kind: PropertyValueKind::String,
                 },
             ]),
@@ -623,16 +886,208 @@ mod tests {
     }
 
     #[test]
+    fn block_map_accepts_arbitrary_keys_and_validates_inner_schema() {
+        const TLS_PROFILE: &[PropertySpec] = &[
+            PropertySpec {
+                name: "ca",
+                required: true,
+                repeatable: false,
+                exclusive_group: None,
+                kind: PropertyValueKind::String,
+            },
+            PropertySpec {
+                name: "cert",
+                required: false,
+                repeatable: false,
+                exclusive_group: None,
+                kind: PropertyValueKind::String,
+            },
+        ];
+        const S: &[PropertySpec] = &[PropertySpec {
+            name: "tls",
+            required: false,
+            repeatable: false,
+            exclusive_group: None,
+            kind: PropertyValueKind::BlockMap(TLS_PROFILE),
+        }];
+
+        let valid = vec![block(
+            "tls",
+            vec![block(
+                "profile_a",
+                vec![kv("ca", ExprKind::StringLit("ca.pem".into()))],
+            )],
+        )];
+        assert!(validate(&valid, S).is_empty());
+
+        let invalid = vec![block(
+            "tls",
+            vec![
+                block(
+                    "missing_ca",
+                    vec![kv("cert", ExprKind::StringLit("c.pem".into()))],
+                ),
+                block(
+                    "unknown_key",
+                    vec![
+                        kv("ca", ExprKind::StringLit("ca.pem".into())),
+                        kv("bogus", ExprKind::StringLit("x".into())),
+                    ],
+                ),
+            ],
+        )];
+        let errs = validate(&invalid, S);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e.kind, SchemaErrorKind::MissingRequired))
+        );
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e.kind, SchemaErrorKind::UnknownKey))
+        );
+    }
+
+    #[test]
+    fn block_map_rejects_scalar_entries() {
+        const S: &[PropertySpec] = &[PropertySpec {
+            name: "tls",
+            required: false,
+            repeatable: false,
+            exclusive_group: None,
+            kind: PropertyValueKind::BlockMap(&[PropertySpec {
+                name: "ca",
+                required: true,
+                repeatable: false,
+                exclusive_group: None,
+                kind: PropertyValueKind::String,
+            }]),
+        }];
+        let props = vec![block(
+            "tls",
+            vec![kv("profile_a", ExprKind::StringLit("ca.pem".into()))],
+        )];
+        let errs = validate(&props, S);
+        assert_eq!(errs.len(), 1);
+        assert!(matches!(errs[0].kind, SchemaErrorKind::ExpectedBlock));
+    }
+
+    #[test]
+    fn one_of_accepts_either_variant() {
+        const TLS_INLINE: &[PropertySpec] = &[PropertySpec {
+            name: "ca",
+            required: true,
+            repeatable: false,
+            exclusive_group: None,
+            kind: PropertyValueKind::String,
+        }];
+        const S: &[PropertySpec] = &[PropertySpec {
+            name: "tls",
+            required: false,
+            repeatable: false,
+            exclusive_group: None,
+            kind: PropertyValueKind::OneOf(&[
+                PropertyValueKind::Block(TLS_INLINE),
+                PropertyValueKind::Enum(&["profile_a"]),
+            ]),
+        }];
+
+        assert!(
+            validate(
+                &[block(
+                    "tls",
+                    vec![kv("ca", ExprKind::StringLit("ca.pem".into()))]
+                )],
+                S
+            )
+            .is_empty()
+        );
+        assert!(validate(&[kv("tls", ExprKind::Ident(vec!["profile_a".into()]))], S).is_empty());
+    }
+
+    #[test]
+    fn one_of_rejects_neither_variant() {
+        const S: &[PropertySpec] = &[PropertySpec {
+            name: "tls",
+            required: false,
+            repeatable: false,
+            exclusive_group: None,
+            kind: PropertyValueKind::OneOf(&[
+                PropertyValueKind::Block(&[]),
+                PropertyValueKind::Enum(&["profile_a"]),
+            ]),
+        }];
+        let errs = validate(&[kv("tls", ExprKind::StringLit("profile_a".into()))], S);
+        assert_eq!(errs.len(), 1);
+        let rendered = errs[0].to_string();
+        assert!(rendered.contains("Block"), "{rendered}");
+        assert!(rendered.contains("Ident"), "{rendered}");
+        assert!(rendered.contains("String"), "{rendered}");
+    }
+
+    #[test]
+    fn exclusive_group_allows_one() {
+        const S: &[PropertySpec] = &[
+            PropertySpec {
+                name: "peer",
+                required: false,
+                repeatable: false,
+                exclusive_group: Some("destinations"),
+                kind: PropertyValueKind::Block(&[]),
+            },
+            PropertySpec {
+                name: "peers",
+                required: false,
+                repeatable: false,
+                exclusive_group: Some("destinations"),
+                kind: PropertyValueKind::Block(&[]),
+            },
+        ];
+        assert!(validate(&[block("peer", vec![])], S).is_empty());
+    }
+
+    #[test]
+    fn exclusive_group_rejects_multiple() {
+        const S: &[PropertySpec] = &[
+            PropertySpec {
+                name: "peer",
+                required: false,
+                repeatable: false,
+                exclusive_group: Some("destinations"),
+                kind: PropertyValueKind::Block(&[]),
+            },
+            PropertySpec {
+                name: "peers",
+                required: false,
+                repeatable: false,
+                exclusive_group: Some("destinations"),
+                kind: PropertyValueKind::Block(&[]),
+            },
+        ];
+        let errs = validate(&[block("peer", vec![]), block("peers", vec![])], S);
+        let err = errs
+            .iter()
+            .find(|e| matches!(e.kind, SchemaErrorKind::ExclusiveGroupViolation { .. }))
+            .expect("expected exclusive group violation");
+        let rendered = err.to_string();
+        assert!(rendered.contains("peer"), "{rendered}");
+        assert!(rendered.contains("peers"), "{rendered}");
+    }
+
+    #[test]
     fn duration_and_size_kinds_accept_valid_strings() {
         const S: &[PropertySpec] = &[
             PropertySpec {
                 name: "interval",
                 required: false,
+                repeatable: false,
+                exclusive_group: None,
                 kind: PropertyValueKind::Duration,
             },
             PropertySpec {
                 name: "max_size",
                 required: false,
+                repeatable: false,
+                exclusive_group: None,
                 kind: PropertyValueKind::Size,
             },
         ];
@@ -648,6 +1103,8 @@ mod tests {
         const S: &[PropertySpec] = &[PropertySpec {
             name: "interval",
             required: false,
+            repeatable: false,
+            exclusive_group: None,
             kind: PropertyValueKind::Duration,
         }];
         let props = vec![kv("interval", ExprKind::StringLit("yesterday".into()))];
@@ -661,6 +1118,8 @@ mod tests {
         const S: &[PropertySpec] = &[PropertySpec {
             name: "verify",
             required: false,
+            repeatable: false,
+            exclusive_group: None,
             kind: PropertyValueKind::Bool,
         }];
         assert!(validate(&[kv("verify", ExprKind::BoolLit(false))], S).is_empty());
@@ -690,6 +1149,8 @@ mod tests {
         const S: &[PropertySpec] = &[PropertySpec {
             name: "headers",
             required: false,
+            repeatable: false,
+            exclusive_group: None,
             kind: PropertyValueKind::StringMap,
         }];
         let props = vec![block(
@@ -707,6 +1168,8 @@ mod tests {
         const S: &[PropertySpec] = &[PropertySpec {
             name: "headers",
             required: false,
+            repeatable: false,
+            exclusive_group: None,
             kind: PropertyValueKind::StringMap,
         }];
         let props = vec![block(

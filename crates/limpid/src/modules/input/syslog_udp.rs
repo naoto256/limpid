@@ -21,11 +21,15 @@ const SYSLOG_UDP_INPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "bind",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
     PropertySpec {
         name: "rate_limit",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::Int,
     },
 ];

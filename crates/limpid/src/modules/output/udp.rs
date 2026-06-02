@@ -22,6 +22,8 @@ const UDP_OUTPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "address",
         required: true,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
     crate::queue::QUEUE_PROPERTY_SPEC,
@@ -135,7 +137,9 @@ mod tests {
 
     #[test]
     fn build_rejects_missing_address() {
-        let err = UdpOutput::build("u", &mp(&[])).err().expect("missing address");
+        let err = UdpOutput::build("u", &mp(&[]))
+            .err()
+            .expect("missing address");
         assert!(err.to_string().contains("address"));
     }
 
