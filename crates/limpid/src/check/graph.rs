@@ -363,7 +363,7 @@ def pipeline p {
 
     const FANIN: &str = r#"
 def input a { type syslog_tcp bind "0.0.0.0:514" }
-def input b { type udp bind "0.0.0.0:514" }
+def input b { type syslog_udp bind "0.0.0.0:514" }
 def output o { type stdout }
 def process parse { workspace.x = "y" }
 def pipeline p {

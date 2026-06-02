@@ -162,7 +162,7 @@ struct Inner {
     batch_timeout: Duration,
     transport: Transport,
     /// Per-batch retry policy. The shared `RetryConfig` parser used by
-    /// the file/tcp/http outputs reads `retry { max_attempts initial_wait
+    /// the file/syslog_tcp/http outputs reads `retry { max_attempts initial_wait
     /// max_wait backoff }` from the output's properties; we re-use it
     /// so every limpid output speaks the same retry vocabulary.
     ///

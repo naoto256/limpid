@@ -79,7 +79,7 @@ impl std::fmt::Debug for RenderedPayload {
 //
 // Why a dedicated type instead of `&[Property]`:
 //
-// The DSL `def input foo { type tcp; address "..."; ... }` block produces a
+// The DSL `def input foo { type syslog_tcp; address "..."; ... }` block produces a
 // property list that mixes one structural key (`type`, the module selector)
 // with the Module's own user properties (`address`, `bind`, `queue { ... }`).
 // Every consumer downstream — analyzer schema check, runtime schema check,
@@ -125,7 +125,7 @@ pub enum ModulePropertyError {
     /// No `type` key was present in the property list.
     Missing,
     /// The `type` key exists but its value is not a bare identifier (e.g.
-    /// `type "tcp"` as a string literal, or `type { ... }` as a block).
+    /// `type "syslog_tcp"` as a string literal, or `type { ... }` as a block).
     /// The grammar in principle should reject this earlier, but the
     /// property parser is permissive about value shapes, so we re-check.
     /// `span` is the value (or block-key) span; currently unused by `Display`,
@@ -149,7 +149,7 @@ impl std::fmt::Display for ModulePropertyError {
         match self {
             Self::Missing => write!(f, "missing required property 'type'"),
             Self::NonIdent { .. } => {
-                write!(f, "'type' must be a bare identifier (e.g. `type tcp`)")
+                write!(f, "'type' must be a bare identifier (e.g. `type syslog_tcp`)")
             }
             Self::Duplicate { .. } => write!(f, "'type' specified more than once"),
         }
@@ -207,7 +207,7 @@ impl ModuleProperties {
         })
     }
 
-    /// The resolved module type identifier (e.g. `"tcp"`, `"syslog_udp"`).
+    /// The resolved module type identifier (e.g. `"syslog_tcp"`, `"syslog_udp"`).
     /// Always populated by construction.
     pub fn type_name(&self) -> &str {
         &self.type_name
@@ -590,10 +590,10 @@ pub fn register_builtins(registry: &mut ModuleRegistry) {
     // Outputs
     register_output_type::<output::file::FileOutput>(registry, "file");
     register_output_type::<output::unix_socket::UnixSocketOutput>(registry, "unix_socket");
-    register_output_type::<output::tcp::TcpOutput>(registry, "tcp");
+    register_output_type::<output::syslog_tcp::SyslogTcpOutput>(registry, "syslog_tcp");
     register_output_type::<output::http::HttpOutput>(registry, "http");
     register_output_type::<output::otlp::OtlpOutput>(registry, "otlp");
-    register_output_type::<output::udp::UdpOutput>(registry, "udp");
+    register_output_type::<output::syslog_udp::SyslogUdpOutput>(registry, "syslog_udp");
     register_output_type::<output::stdout::StdoutOutput>(registry, "stdout");
     #[cfg(feature = "kafka")]
     register_output_type::<output::kafka::KafkaOutput>(registry, "kafka");
@@ -692,12 +692,12 @@ mod module_properties_tests {
     #[test]
     fn parse_extracts_type_and_strips_it_from_user_properties() {
         let raw = vec![
-            kv("type", ExprKind::Ident(vec!["tcp".into()])),
+            kv("type", ExprKind::Ident(vec!["syslog_tcp".into()])),
             kv("address", ExprKind::StringLit("127.0.0.1:514".into())),
             block("queue"),
         ];
         let mp = ModuleProperties::parse(raw).expect("should parse");
-        assert_eq!(mp.type_name(), "tcp");
+        assert_eq!(mp.type_name(), "syslog_tcp");
         // type is gone from the user view; only address + queue remain
         assert_eq!(mp.user_properties().len(), 2);
         let keys: Vec<&str> = mp
@@ -720,8 +720,8 @@ mod module_properties_tests {
 
     #[test]
     fn parse_rejects_non_ident_type_string_literal() {
-        // `type "tcp"` — string instead of bare ident
-        let raw = vec![kv("type", ExprKind::StringLit("tcp".into()))];
+        // `type "syslog_tcp"` — string instead of bare ident
+        let raw = vec![kv("type", ExprKind::StringLit("syslog_tcp".into()))];
         let err = ModuleProperties::parse(raw).expect_err("should fail");
         assert!(matches!(err, ModulePropertyError::NonIdent { .. }));
     }
@@ -737,8 +737,8 @@ mod module_properties_tests {
     #[test]
     fn parse_rejects_duplicate_type() {
         let raw = vec![
-            kv("type", ExprKind::Ident(vec!["tcp".into()])),
-            kv("type", ExprKind::Ident(vec!["udp".into()])),
+            kv("type", ExprKind::Ident(vec!["syslog_tcp".into()])),
+            kv("type", ExprKind::Ident(vec!["syslog_udp".into()])),
         ];
         let err = ModuleProperties::parse(raw).expect_err("should fail");
         assert!(matches!(err, ModulePropertyError::Duplicate { .. }));
@@ -749,8 +749,8 @@ mod module_properties_tests {
         // Test-only helper short-circuits the parse step; verify the round-trip
         // shape matches what a parser-produced ModuleProperties would expose.
         let props = vec![kv("address", ExprKind::StringLit("h:1".into()))];
-        let mp = ModuleProperties::from_parts("tcp", props.clone());
-        assert_eq!(mp.type_name(), "tcp");
+        let mp = ModuleProperties::from_parts("syslog_tcp", props.clone());
+        assert_eq!(mp.type_name(), "syslog_tcp");
         assert_eq!(mp.user_properties().len(), 1);
     }
 }
