@@ -186,15 +186,9 @@ impl Diagnostic {
     /// thread through unchanged. Centralising the wording here means
     /// `module_props` and `global_props` (and any future schema
     /// surface) cannot drift in how they format the same error.
-    pub(super) fn from_schema_error(
-        err: &crate::dsl::schema::SchemaError,
-        surface: &str,
-    ) -> Self {
-        let mut d = Self::error_kind(
-            DiagKind::PropertySchema,
-            format!("{}: {}", surface, err),
-        )
-        .with_span(err.primary_span());
+    pub(super) fn from_schema_error(err: &crate::dsl::schema::SchemaError, surface: &str) -> Self {
+        let mut d = Self::error_kind(DiagKind::PropertySchema, format!("{}: {}", surface, err))
+            .with_span(err.primary_span());
         if let Some(s) = &err.did_you_mean {
             d = d.with_help(format!("did you mean `{}`?", s));
         }
@@ -644,7 +638,7 @@ mod tests {
     fn output_referencing_unproduced_workspace_key_errors() {
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type syslog_tcp address "${workspace.nope}:1" }
+def output o { type syslog_tcp peer { host "${workspace.nope}" port 1 } }
 def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
@@ -657,7 +651,7 @@ def pipeline p { input i; output o }
     fn syslog_parse_binds_known_workspace_keys() {
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type syslog_tcp address "${workspace.msg}:1" }
+def output o { type syslog_tcp peer { host "${workspace.msg}" port 1 } }
 def pipeline p {
     input i
     process { syslog.parse(ingress) }
@@ -672,7 +666,7 @@ def pipeline p {
     fn parse_json_with_defaults_narrows_to_declared_keys() {
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type syslog_tcp address "${workspace.usr}:1" }
+def output o { type syslog_tcp peer { host "${workspace.usr}" port 1 } }
 def pipeline p {
     input i
     process { parse_json(ingress, {user: "anon"}) }
@@ -689,7 +683,7 @@ def pipeline p {
     fn parse_json_without_defaults_wildcards() {
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type syslog_tcp address "${workspace.anything}:1" }
+def output o { type syslog_tcp peer { host "${workspace.anything}" port 1 } }
 def pipeline p {
     input i
     process { parse_json(ingress) }
@@ -706,7 +700,7 @@ def pipeline p {
     fn if_without_else_does_not_propagate_branch_bindings() {
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type syslog_tcp address "${workspace.tag}:1" }
+def output o { type syslog_tcp peer { host "${workspace.tag}" port 1 } }
 def pipeline p {
     input i
     process {
@@ -726,7 +720,7 @@ def pipeline p {
     fn if_else_with_both_branches_binding_is_guaranteed() {
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type syslog_tcp address "${workspace.tag}:1" }
+def output o { type syslog_tcp peer { host "${workspace.tag}" port 1 } }
 def pipeline p {
     input i
     process {
@@ -869,7 +863,7 @@ def pipeline p {
     fn try_catch_intersects_bindings() {
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type syslog_tcp address "${workspace.a}:1" }
+def output o { type syslog_tcp peer { host "${workspace.a}" port 1 } }
 def pipeline p {
     input i
     process {
@@ -914,7 +908,7 @@ def pipeline p {
     fn output_unresolved_workspace_ref_carries_value_span() {
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type syslog_tcp address "${workspace.nope}:1" }
+def output o { type syslog_tcp peer { host "${workspace.nope}" port 1 } }
 def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
@@ -925,7 +919,7 @@ def pipeline p { input i; output o }
         sm.add_anonymous(src);
         let resolved = sm.resolve(&span).expect("span should resolve");
         assert!(
-            resolved.line_text.contains("address"),
+            resolved.line_text.contains("host"),
             "span line: {}",
             resolved.line_text
         );
@@ -935,7 +929,7 @@ def pipeline p { input i; output o }
     fn unresolved_workspace_ref_suggests_near_match() {
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type syslog_tcp address "${workspace.mssg}:1" }
+def output o { type syslog_tcp peer { host "${workspace.mssg}" port 1 } }
 def pipeline p {
     input i
     process { syslog.parse(ingress) }
@@ -953,7 +947,7 @@ def pipeline p {
     fn unresolved_workspace_ref_silent_when_nothing_close() {
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type syslog_tcp address "${workspace.completely_unrelated_zzz}:1" }
+def output o { type syslog_tcp peer { host "${workspace.completely_unrelated_zzz}" port 1 } }
 def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
@@ -1068,7 +1062,7 @@ def pipeline p {
     fn unresolved_workspace_output_ref_tagged_unknown_ident() {
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type syslog_tcp address "${workspace.nope}:1" }
+def output o { type syslog_tcp peer { host "${workspace.nope}" port 1 } }
 def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);

@@ -79,7 +79,7 @@ impl std::fmt::Debug for RenderedPayload {
 //
 // Why a dedicated type instead of `&[Property]`:
 //
-// The DSL `def input foo { type syslog_tcp; address "..."; ... }` block produces a
+// The DSL `def output foo { type syslog_tcp; peer { host "..."; ... } }` block produces a
 // property list that mixes one structural key (`type`, the module selector)
 // with the Module's own user properties (`address`, `bind`, `queue { ... }`).
 // Every consumer downstream — analyzer schema check, runtime schema check,

@@ -30,22 +30,47 @@ pub(super) fn analyze_output(
     // slot on `ModuleProperties` — so the explicit `if key == "type" { continue; }`
     // guard that earlier versions carried is gone by construction.
     for prop in output.properties.user_properties() {
-        if let Property::KeyValue {
-            key,
+        analyze_property(
+            prop,
+            schema.is_some_and(|s| schema_declares_key(s, property_key(prop))),
+            &output.name,
+            pipeline_name,
+            registry,
+            bindings,
+            diagnostics,
+        );
+    }
+}
+
+fn property_key(prop: &Property) -> &str {
+    match prop {
+        Property::KeyValue { key, .. } | Property::Block { key, .. } => key,
+    }
+}
+
+fn analyze_property(
+    prop: &Property,
+    schema_owned: bool,
+    output_name: &str,
+    pipeline_name: &str,
+    registry: &FunctionRegistry,
+    bindings: &Bindings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    match prop {
+        Property::KeyValue {
             value: expr,
             value_span,
             ..
-        } = prop
-        {
+        } => {
             // If this key is declared in the Module's property schema,
             // the schema validator (see `module_props::analyze_all`)
             // owns the value's *shape* — bare-ident enum values like
             // `framing non_transparent` are no longer flagged as
             // unresolved idents. Workspace references inside template
-            // values (`address "${workspace.x}:1"`) remain a dataflow
-            // concern, so the `collect_workspace_refs` walk still runs
-            // regardless of whether the schema covers the key.
-            let schema_owned = schema.is_some_and(|s| schema_declares_key(s, key));
+            // values remain a dataflow concern, so the
+            // `collect_workspace_refs` walk still runs regardless of
+            // whether the schema covers the key.
             if !schema_owned {
                 expr_types::check_types(
                     expr,
@@ -59,13 +84,26 @@ pub(super) fn analyze_output(
             collect_workspace_refs(expr, &mut |path| {
                 check_workspace_reference(
                     path,
-                    &output.name,
+                    output_name,
                     pipeline_name,
                     bindings,
                     *value_span,
                     diagnostics,
                 );
             });
+        }
+        Property::Block { properties, .. } => {
+            for inner in properties {
+                analyze_property(
+                    inner,
+                    schema_owned,
+                    output_name,
+                    pipeline_name,
+                    registry,
+                    bindings,
+                    diagnostics,
+                );
+            }
         }
     }
 }
