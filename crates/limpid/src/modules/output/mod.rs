@@ -7,6 +7,6 @@ pub mod kafka;
 pub mod otlp;
 pub(crate) mod persistent_conn;
 pub mod stdout;
-pub mod tcp;
-pub mod udp;
+pub mod syslog_tcp;
+pub mod syslog_udp;
 pub mod unix_socket;

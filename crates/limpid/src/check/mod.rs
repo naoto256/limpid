@@ -644,7 +644,7 @@ mod tests {
     fn output_referencing_unproduced_workspace_key_errors() {
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type tcp address "${workspace.nope}:1" }
+def output o { type syslog_tcp address "${workspace.nope}:1" }
 def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
@@ -657,7 +657,7 @@ def pipeline p { input i; output o }
     fn syslog_parse_binds_known_workspace_keys() {
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type tcp address "${workspace.msg}:1" }
+def output o { type syslog_tcp address "${workspace.msg}:1" }
 def pipeline p {
     input i
     process { syslog.parse(ingress) }
@@ -672,7 +672,7 @@ def pipeline p {
     fn parse_json_with_defaults_narrows_to_declared_keys() {
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type tcp address "${workspace.usr}:1" }
+def output o { type syslog_tcp address "${workspace.usr}:1" }
 def pipeline p {
     input i
     process { parse_json(ingress, {user: "anon"}) }
@@ -689,7 +689,7 @@ def pipeline p {
     fn parse_json_without_defaults_wildcards() {
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type tcp address "${workspace.anything}:1" }
+def output o { type syslog_tcp address "${workspace.anything}:1" }
 def pipeline p {
     input i
     process { parse_json(ingress) }
@@ -706,7 +706,7 @@ def pipeline p {
     fn if_without_else_does_not_propagate_branch_bindings() {
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type tcp address "${workspace.tag}:1" }
+def output o { type syslog_tcp address "${workspace.tag}:1" }
 def pipeline p {
     input i
     process {
@@ -726,7 +726,7 @@ def pipeline p {
     fn if_else_with_both_branches_binding_is_guaranteed() {
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type tcp address "${workspace.tag}:1" }
+def output o { type syslog_tcp address "${workspace.tag}:1" }
 def pipeline p {
     input i
     process {
@@ -869,7 +869,7 @@ def pipeline p {
     fn try_catch_intersects_bindings() {
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type tcp address "${workspace.a}:1" }
+def output o { type syslog_tcp address "${workspace.a}:1" }
 def pipeline p {
     input i
     process {
@@ -914,7 +914,7 @@ def pipeline p {
     fn output_unresolved_workspace_ref_carries_value_span() {
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type tcp address "${workspace.nope}:1" }
+def output o { type syslog_tcp address "${workspace.nope}:1" }
 def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
@@ -935,7 +935,7 @@ def pipeline p { input i; output o }
     fn unresolved_workspace_ref_suggests_near_match() {
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type tcp address "${workspace.mssg}:1" }
+def output o { type syslog_tcp address "${workspace.mssg}:1" }
 def pipeline p {
     input i
     process { syslog.parse(ingress) }
@@ -953,7 +953,7 @@ def pipeline p {
     fn unresolved_workspace_ref_silent_when_nothing_close() {
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type tcp address "${workspace.completely_unrelated_zzz}:1" }
+def output o { type syslog_tcp address "${workspace.completely_unrelated_zzz}:1" }
 def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
@@ -1068,7 +1068,7 @@ def pipeline p {
     fn unresolved_workspace_output_ref_tagged_unknown_ident() {
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type tcp address "${workspace.nope}:1" }
+def output o { type syslog_tcp address "${workspace.nope}:1" }
 def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
@@ -1255,7 +1255,7 @@ def pipeline p {
     fn def_counts_aggregate_each_kind() {
         let src = r#"
 def input i1 { type syslog_tcp bind "0.0.0.0:514" }
-def input i2 { type udp bind "0.0.0.0:514" }
+def input i2 { type syslog_udp bind "0.0.0.0:514" }
 def output o1 { type stdout }
 def process p { workspace.a = "z" }
 def pipeline pl { input i1; output o1 }
@@ -1275,8 +1275,8 @@ def pipeline pl { input i1; output o1 }
         let src = r#"
 def function normalize_proto(num) {
     switch num {
-        6  { "tcp" }
-        17 { "udp" }
+        6  { "syslog_tcp" }
+        17 { "syslog_udp" }
         default { null }
     }
 }
@@ -1550,7 +1550,7 @@ def pipeline p {
         // identifier or function.
         let src = r#"
 def function normalize_proto(num) {
-    switch num { 6 { "tcp" } 17 { "udp" } default { null } }
+    switch num { 6 { "syslog_tcp" } 17 { "syslog_udp" } default { null } }
 }
 def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }

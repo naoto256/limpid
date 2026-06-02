@@ -64,7 +64,7 @@ const QUEUE_BLOCK_PROPERTIES: &[PropertySpec] = &[
 /// `PropertySpec` value:
 ///
 /// ```ignore
-/// const TCP_OUTPUT_SCHEMA: &[PropertySpec] = &[
+/// const SYSLOG_TCP_OUTPUT_SCHEMA: &[PropertySpec] = &[
 ///     PropertySpec { name: "address", ... },
 ///     crate::queue::QUEUE_PROPERTY_SPEC,
 /// ];

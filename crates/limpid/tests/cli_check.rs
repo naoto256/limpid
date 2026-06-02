@@ -107,7 +107,7 @@ fn check_with_error_emits_error_footer_and_exits_one() {
         &conf,
         r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type tcp address "${workspace.nope}:1" }
+def output o { type syslog_tcp address "${workspace.nope}:1" }
 def pipeline p { input i; output o }
 "#,
     )
@@ -525,7 +525,7 @@ fn check_accepts_correct_framing_enum_value_without_false_warning() {
         r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o {
-    type tcp
+    type syslog_tcp
     address "127.0.0.1:514"
     framing non_transparent
 }
@@ -555,7 +555,7 @@ fn check_loudly_rejects_typoed_framing_with_did_you_mean() {
         r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o {
-    type tcp
+    type syslog_tcp
     address "127.0.0.1:514"
     framing non_trasnaprent
 }
@@ -583,7 +583,7 @@ fn check_rejects_unknown_property_key_with_did_you_mean() {
         r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o {
-    type tcp
+    type syslog_tcp
     addres "127.0.0.1:514"
 }
 def pipeline p { input i; output o }
@@ -611,7 +611,7 @@ fn check_rejects_wrong_value_type_on_typed_property() {
         r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o {
-    type tcp
+    type syslog_tcp
     host "127.0.0.1"
     port "five-fourteen"
 }
@@ -641,7 +641,7 @@ fn check_reports_every_property_finding_in_one_run() {
         r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o {
-    type tcp
+    type syslog_tcp
     addres "h:1"
     framing non_trasnaprent
 }
