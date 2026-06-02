@@ -25,6 +25,8 @@ const UNIX_SOURCE: &str = "127.0.0.1:0";
 const UNIX_SOCKET_INPUT_SCHEMA: &[PropertySpec] = &[PropertySpec {
     name: "path",
     required: true,
+    repeatable: false,
+    exclusive_group: None,
     kind: PropertyValueKind::String,
 }];
 

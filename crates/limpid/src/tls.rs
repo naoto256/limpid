@@ -42,16 +42,22 @@ const TLS_BLOCK_CERT_KEY_CA_REQUIRED: &[PropertySpec] = &[
     PropertySpec {
         name: "cert",
         required: true,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
     PropertySpec {
         name: "key",
         required: true,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
     PropertySpec {
         name: "ca",
         required: false,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
 ];
@@ -59,6 +65,8 @@ const TLS_BLOCK_CERT_KEY_CA_REQUIRED: &[PropertySpec] = &[
 const TLS_BLOCK_CA_ONLY: &[PropertySpec] = &[PropertySpec {
     name: "ca",
     required: false,
+    repeatable: false,
+    exclusive_group: None,
     kind: PropertyValueKind::String,
 }];
 

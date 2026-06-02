@@ -22,6 +22,8 @@ const UNIX_SOCKET_OUTPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "path",
         required: true,
+        repeatable: false,
+        exclusive_group: None,
         kind: PropertyValueKind::String,
     },
     crate::queue::QUEUE_PROPERTY_SPEC,
