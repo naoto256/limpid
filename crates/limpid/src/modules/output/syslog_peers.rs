@@ -12,6 +12,16 @@ use tokio::sync::Mutex;
 /// may later be exposed as a DSL property.
 pub const PEER_COOLDOWN: Duration = Duration::from_secs(5);
 
+/// Maximum time to wait for a TCP / UDP connect (per peer).
+pub const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum time to wait for a TLS handshake to complete (per peer).
+pub const PEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum time to wait for a single write/flush on an established
+/// connection (per peer).
+pub const PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 type PeerAttemptFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
 
 /// A configured destination. `tls` is `Some(...)` only for outputs
@@ -184,6 +194,13 @@ mod tests {
         (0..n)
             .map(|idx| peer(&format!("peer-{idx}"), 514 + idx as u16))
             .collect()
+    }
+
+    #[test]
+    fn peer_timeouts_are_documented_defaults() {
+        assert_eq!(PEER_CONNECT_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(PEER_HANDSHAKE_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(PEER_WRITE_TIMEOUT, Duration::from_secs(10));
     }
 
     #[tokio::test]

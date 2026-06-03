@@ -19,7 +19,9 @@ use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
-use crate::modules::output::syslog_peers::{Peer, PeerList};
+use crate::modules::output::syslog_peers::{
+    PEER_CONNECT_TIMEOUT, PEER_HANDSHAKE_TIMEOUT, PEER_WRITE_TIMEOUT, Peer, PeerList,
+};
 use crate::modules::output::syslog_tcp::SyslogTcpFraming;
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
 use crate::tls::{ClientTlsConfig, build_client_config_sync};
@@ -330,23 +332,40 @@ impl Output for SyslogTlsOutput {
                 let connector = connectors[idx].clone();
                 Box::pin(async move {
                     if state.conn.is_none() {
-                        let tcp = TcpStream::connect(&address)
-                            .await
-                            .with_context(|| format!("syslog_tls TCP connect to {}", address))?;
+                        let tcp = tokio::time::timeout(
+                            PEER_CONNECT_TIMEOUT,
+                            TcpStream::connect(&address),
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("syslog_tls TCP connect to {} timed out", address)
+                        })?
+                        .with_context(|| format!("syslog_tls TCP connect to {}", address))?;
                         let server_name = ServerName::try_from(server_name.as_str())
                             .with_context(|| {
                                 format!("syslog_tls invalid server name: {}", server_name)
                             })?
                             .to_owned();
-                        let stream = connector
-                            .connect(server_name, tcp)
-                            .await
-                            .with_context(|| format!("syslog_tls TLS handshake to {}", address))?;
+                        let stream = tokio::time::timeout(
+                            PEER_HANDSHAKE_TIMEOUT,
+                            connector.connect(server_name, tcp),
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("syslog_tls TLS handshake to {} timed out", address)
+                        })?
+                        .with_context(|| format!("syslog_tls TLS handshake to {}", address))?;
                         state.conn = Some(stream);
                     }
 
                     let stream = state.conn.as_mut().expect("connection should be present");
-                    let write_result = write_syslog_tls_framed(stream, framing, &egress).await;
+                    let write_result = tokio::time::timeout(
+                        PEER_WRITE_TIMEOUT,
+                        write_syslog_tls_framed(stream, framing, &egress),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("syslog_tls write to {} timed out", address))
+                    .and_then(|res| res);
                     if write_result.is_err() {
                         state.conn = None;
                     }
@@ -392,55 +411,6 @@ mod tests {
     use crate::dsl::ast::{ExprKind, Property};
     use tempfile::TempDir;
 
-    const TEST_CERT: &str = r#"-----BEGIN CERTIFICATE-----
-MIIDCTCCAfGgAwIBAgIUeiseSch7hojGeuX6gs0LwjyixX8wDQYJKoZIhvcNAQEL
-BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDYwMjE4MjY0NVoXDTI3MDYw
-MjE4MjY0NVowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
-AAOCAQ8AMIIBCgKCAQEAqMTTsn6R5WVv0Qh4ziG6welH8UjPZIvd4i9jVb8NjWUc
-GUIj0c5hE7zBkPODZy/RkuhmckwBNjfss4X/0SGiu0pm0gC329mUGarzwzhq0Bhx
-ptzz9iZTwIsG+laiZKP0UomcnIdN3LzGGpVtCq0kGm+WKSNBt3ZdCAmtKBnHCoBf
-U0nCRP190RRZ8Wc4BP5W0wzWCARW/n7aWBzBy74bGzMTK2IOInBrjFU5bpqxnlQG
-DaEsE2ZAhm160+uZ2u+CrdE3B8NVUZtwtHCcJEVjsTL1lBCYz5BRVKFUDnuxa6k9
-cbv6PCU0w6keQxBdoMiGViEXUHi1BVvMZb/4XQmSuwIDAQABo1MwUTAdBgNVHQ4E
-FgQUkycrzmK/DLLQFs5x7HDR7G5b1TIwHwYDVR0jBBgwFoAUkycrzmK/DLLQFs5x
-7HDR7G5b1TIwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAWDCA
-sWGvKg95A/Ik7iq2G/GTPXLJKiPKAzixyhEDlTvdncqRkzWvCLOLstjEbZAGbleu
-YXzMC6mAxP78oyrmoVXzIwxj1bmKKY79sIDzzKHdt+2YoAw43iL7GCWfMU34ROtT
-SZ6uWvP7VZoXssTT/iFD6PVlYCVvBwUiJLLd+lyDri7zmffIh6ub57v3izDobELB
-DdPzc5y9NewXn/VzdrHVuMJVJjT9VZfiOilWx0FKiMoA7CB2K1B4+hkQeJ6+n1YG
-qsZwfG1opN7aX/THarrRztVPkYJCps1wtIgvZ8NifdddzcfJIVSK0DzWuhbxxUAo
-3MXDKXLcK9LIrI7fGA==
------END CERTIFICATE-----"#;
-
-    const TEST_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
-MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCoxNOyfpHlZW/R
-CHjOIbrB6UfxSM9ki93iL2NVvw2NZRwZQiPRzmETvMGQ84NnL9GS6GZyTAE2N+yz
-hf/RIaK7SmbSALfb2ZQZqvPDOGrQGHGm3PP2JlPAiwb6VqJko/RSiZych03cvMYa
-lW0KrSQab5YpI0G3dl0ICa0oGccKgF9TScJE/X3RFFnxZzgE/lbTDNYIBFb+ftpY
-HMHLvhsbMxMrYg4icGuMVTlumrGeVAYNoSwTZkCGbXrT65na74Kt0TcHw1VRm3C0
-cJwkRWOxMvWUEJjPkFFUoVQOe7FrqT1xu/o8JTTDqR5DEF2gyIZWIRdQeLUFW8xl
-v/hdCZK7AgMBAAECggEACdPkYVQzhMCNFrFqmij7/3IT3r4XAvY4xoTB68ADYa94
-nRPtPWN04w8D1UAI79z9/uhfnC+cMR8Sk+WtXu1EKlSL0Ot6dBKjKCzR+Gqe9bKR
-Xl58KmJS+uGzAf2Xg/V0MyDmU3XMQpq6N9lpucxupMdzXr6PLh12D2jDgj6gs5YW
-ewyQbYFTrTTbBdtPT2DZPBeArPD6Sr7MTUrMYnnAEyHdW2hgDBDvX05WkjlEtj4d
-CvsfF9YxqEKKsZIc2NS7wxY+QLKVIMAhoi1nGjCQbXGp1/jfNkMUjXsRK5XFmt06
-gZMZGZAoNrAjDKVdSwgeWXo1BX/nMo+v44xmfJJNsQKBgQDkkG7sUmcjZCjqqT4+
-8eAw1BAkvqV9sENZAOEVDh+4uiq/16zAS3WN5NBR9nLX6jk0eQ7or2ERPDT1ugY0
-jUJsE/cJjrWQ2mOv6QRgf7UkNc8AFaxhCSBU5zqhq7vPCaB8xJFXU8/E2ttQ2g8Q
-fycAPUF98iP8qh354nUqphbP4wKBgQC9BvAoVvSiHuRl9GZAJ+EtHEvc1iZw8pKY
-Kg8iBeZNTSiUn1NQctpY6LfTgkXt0M3s/MfJxv0ljiMf3qetJmU0qjgtxHw3IMGq
-l78O4g22o1d8MVArwkJFr5cKTm2b5/tg/RucIgFg3xk30FNMs8sQx2DlY9Bvp7h1
-kZsHbYJ5SQKBgQDM0wo0SVwYASgRsn0Pl14bI88bvqU7T3vrBLiwT6nptxucM8Ch
-yn2cHNL6wGoGR+XfuiS8LH5GHbgwBPaOnZBKnlGhhPv8xVjUSXMcrxU7T+Ui5ElH
-5A/PRi/qtaVmUfA6H0VIBtmIRcCIYgFh/TCMLFjGbvoE8MZQKrpo79I9lQKBgB3r
-LDXmVYAXjaUJgumipkRilytUBe+YpVVKSuzirCoODV9AvIoeM6sg4n+qvfC/POjG
-tcSdJ1I7ZhnUPwvr6NbmHlA4KkT7fUvICuiLJQqEXgN9NqhGbgDjou9xrG2h0Srv
-xN/4jelMRoyL/7NDPd/g/tgv7TzO+iY5rqUFU0JpAoGBALgOK1TbP3O2rl3QKGnY
-7ceGyXwMsC8V+C6u1ENi8hy93EchZ3NPlcJVrE8WxPhGGOL1JO521mMIp3eFaFMz
-LbZfXHaYPQEXj8brAG66AIunswQwVqU0K8MttE6ZLK40S7MhAT5UYTg2LkpG/2hy
-tyzDZ7oUSeRL/qF8WieLOrVQ
------END PRIVATE KEY-----"#;
-
     struct PemFiles {
         _dir: TempDir,
         cert: String,
@@ -449,14 +419,18 @@ tyzDZ7oUSeRL/qF8WieLOrVQ
 
     fn pem_files() -> PemFiles {
         let dir = TempDir::new().unwrap();
-        let cert = dir.path().join("cert.pem");
-        let key = dir.path().join("key.pem");
-        std::fs::write(&cert, TEST_CERT).unwrap();
-        std::fs::write(&key, TEST_KEY).unwrap();
+        let cert_params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("valid CN");
+        let key_pair = rcgen::KeyPair::generate().expect("key gen");
+        let cert = cert_params.self_signed(&key_pair).expect("self-sign");
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
         PemFiles {
             _dir: dir,
-            cert: cert.display().to_string(),
-            key: key.display().to_string(),
+            cert: cert_path.display().to_string(),
+            key: key_path.display().to_string(),
         }
     }
 
