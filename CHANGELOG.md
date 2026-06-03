@@ -8,6 +8,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
+## [Unreleased]
+> multi-destination syslog outputs + TLS
+
+### Added — `syslog_tls` output
+
+A new output module sends syslog over TLS-encrypted TCP. Default port
+is 6514 (RFC 5425). Supports server verification against a custom CA
+or the Mozilla root store, and optional mutual TLS via a client
+certificate. Named TLS profiles can be defined at the output level and
+referenced from individual peers; per-peer inline TLS blocks are also
+supported.
+
+### Added — multi-destination peer lists with round-robin failover
+
+The `syslog_tcp`, `syslog_udp`, and new `syslog_tls` outputs now accept
+a `peers { peer { ... } ... }` block in addition to the single `peer
+{ ... }` form. Events are distributed across peers in round-robin
+order. A peer that returns a send, connect, or (for TLS) handshake
+error is taken out of rotation for a 5-second cooldown; the existing
+queue layer handles retry when every peer is unavailable.
+
+### Changed (BREAKING) — output module rename: tcp/udp → syslog_tcp/syslog_udp
+
+The `output` modules previously named `tcp` and `udp` are renamed to
+`syslog_tcp` and `syslog_udp`, matching the input-side naming. Both
+modules have always implemented RFC 6587 syslog framing, so the new
+names are honest about their scope. No alias is retained.
+
+Configs that used `type tcp` or `type udp` in `def output { ... }`
+must be updated:
+
+    -    type tcp
+    +    type syslog_tcp
+
+    -    type udp
+    +    type syslog_udp
+
+### Changed (BREAKING) — DSL: `address` / `host`+`port` replaced by `peer { ... }`
+
+The top-level `address "host:port"` (and `host` + `port`) properties
+on `syslog_tcp` and `syslog_udp` are removed. Configs must use the
+new `peer { host port }` form (single destination) or
+`peers { peer { ... } ... }` (multiple). Mixed-form configs are
+rejected by the schema validator.
+
+    -    type syslog_tcp
+    -    address "10.0.0.1:514"
+    +    type syslog_tcp
+    +    peer { host "10.0.0.1" port 514 }
+
 ## [0.7.3] - 2026-05-17
 > property-schema parity — `--check` and runtime now read the same surface
 

@@ -62,8 +62,8 @@ def input ama_tcp {
 }
 
 def output ama {
-    type tcp
-    address "127.0.0.1:28330"
+    type syslog_tcp
+    peer { host "127.0.0.1" port 28330 }
     framing non_transparent
     queue {
         type disk
@@ -137,4 +137,3 @@ def pipeline siem {
     output elasticsearch
 }
 ```
-
