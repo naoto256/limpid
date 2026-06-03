@@ -1,7 +1,7 @@
 //! Shared persistent-connection orchestration for stream-oriented outputs.
 //!
-//! TCP and Unix-socket outputs both hold a `Mutex<Option<Stream>>` and
-//! follow the same dance on every `write()`:
+//! Outputs with a single persistent stream can hold a
+//! `Mutex<Option<Stream>>` and follow the same dance on every `write()`:
 //!
 //! 1. Lock the slot.
 //! 2. If a stream is cached, try the framed write. On success bump the
@@ -10,14 +10,9 @@
 //! 4. If the slot is empty (initial call, or just-dropped broken conn),
 //!    dial a fresh connection, cache it, and write once more.
 //!
-//! The framing (octet counting vs. newline-terminated, etc.) and the
-//! concrete stream type live in the caller — this helper only owns the
-//! reconnect + metric-increment loop so that a third persistent-conn
-//! output (e.g. TLS) can plug in without reimplementing the dance.
-//!
-//! Dispatch stays hardcoded per-output (TCP, Unix socket) because
-//! there are currently only two implementations; if a third
-//! persistent-conn sink lands (e.g. TLS), promote to a registry.
+//! The framing and the concrete stream type live in the caller — this
+//! helper only owns the reconnect + metric-increment loop for outputs
+//! that use one cached connection rather than a peer list.
 //!
 //! Kept `pub(crate)` — internal implementation detail of the output
 //! layer, not part of the module contract.
