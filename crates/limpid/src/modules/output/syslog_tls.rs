@@ -6,8 +6,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
@@ -21,8 +19,8 @@ use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::syslog_peers::{
     PEER_CONNECT_TIMEOUT, PEER_HANDSHAKE_TIMEOUT, PEER_WRITE_TIMEOUT, Peer, PeerList,
+    SyslogFraming, SyslogPayload, iter_peers_block, parse_host_port, write_framed,
 };
-use crate::modules::output::syslog_tcp::SyslogTcpFraming;
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
 use crate::tls::{ClientTlsConfig, build_client_config_sync};
 
@@ -119,12 +117,8 @@ const SYSLOG_TLS_OUTPUT_SCHEMA: &[PropertySpec] = &[
     crate::queue::QUEUE_PROPERTY_SPEC,
 ];
 
-struct SyslogTlsPayload {
-    egress: Bytes,
-}
-
 pub struct SyslogTlsOutput {
-    pub framing: SyslogTcpFraming,
+    pub framing: SyslogFraming,
     peers: PeerList<TlsStream<TcpStream>>,
     connectors: Vec<TlsConnector>,
     metrics: Arc<OutputMetrics>,
@@ -162,10 +156,10 @@ impl Module for SyslogTlsOutput {
     }
 }
 
-fn parse_framing(name: &str, properties: &[Property]) -> Result<SyslogTcpFraming> {
+fn parse_framing(name: &str, properties: &[Property]) -> Result<SyslogFraming> {
     match props::get_ident(properties, "framing").as_deref() {
-        Some("non_transparent") => Ok(SyslogTcpFraming::NonTransparent),
-        Some("octet_counting") | None => Ok(SyslogTcpFraming::OctetCounting),
+        Some("non_transparent") => Ok(SyslogFraming::NonTransparent),
+        Some("octet_counting") | None => Ok(SyslogFraming::OctetCounting),
         Some(other) => anyhow::bail!(
             "output '{}': unknown framing '{}' (expected octet_counting | non_transparent)",
             name,
@@ -209,25 +203,10 @@ fn parse_peers(
     }
 
     if let Some(peers_block) = props::get_block(properties, "peers") {
-        let mut out = Vec::new();
-        for prop in peers_block {
-            if let Property::Block {
-                key,
-                properties: inner,
-                ..
-            } = prop
-                && key == "peer"
-            {
-                out.push(parse_peer(name, "peers.peer", inner, profiles)?);
-            }
-        }
-        if out.is_empty() {
-            anyhow::bail!(
-                "output '{}': peers block must contain at least one peer",
-                name
-            );
-        }
-        return Ok(out);
+        let label = format!("output '{}': peers", name);
+        return iter_peers_block(peers_block, &label, |inner| {
+            parse_peer(name, "peers.peer", inner, profiles)
+        });
     }
 
     anyhow::bail!("output '{}': either 'peer' or 'peers' is required", name)
@@ -239,13 +218,8 @@ fn parse_peer(
     properties: &[Property],
     profiles: &HashMap<String, ClientTlsConfig>,
 ) -> Result<Peer> {
-    let host = props::get_string(properties, "host")
-        .ok_or_else(|| anyhow::anyhow!("output '{}': {} requires 'host'", name, label))?;
-    let port = match props::get_int(properties, "port") {
-        Some(port) => u16::try_from(port)
-            .with_context(|| format!("output '{}': {} port must be 0..=65535", name, label))?,
-        None => 6514,
-    };
+    let host_port_label = format!("output '{}': {}", name, label);
+    let (host, port) = parse_host_port(properties, 6514, &host_port_label)?;
     let tls = parse_peer_tls(name, label, properties, profiles)?;
     Ok(Peer { host, port, tls })
 }
@@ -313,13 +287,13 @@ impl Output for SyslogTlsOutput {
         event: &BorrowedEvent<'_>,
         _arena: &EventArena<'_>,
     ) -> Result<RenderedPayload> {
-        Ok(RenderedPayload::new(SyslogTlsPayload {
+        Ok(RenderedPayload::new(SyslogPayload {
             egress: event.egress.clone(),
         }))
     }
 
     async fn write(&self, payload: RenderedPayload) -> Result<()> {
-        let payload: SyslogTlsPayload = payload.downcast()?;
+        let payload: SyslogPayload = payload.downcast()?;
         let framing = self.framing;
         let metrics = Arc::clone(&self.metrics);
         let connectors = self.connectors.clone();
@@ -361,7 +335,7 @@ impl Output for SyslogTlsOutput {
                     let stream = state.conn.as_mut().expect("connection should be present");
                     let write_result = tokio::time::timeout(
                         PEER_WRITE_TIMEOUT,
-                        write_syslog_tls_framed(stream, framing, &egress),
+                        write_framed(stream, framing, &egress),
                     )
                     .await
                     .map_err(|_| anyhow::anyhow!("syslog_tls write to {} timed out", address))
@@ -382,27 +356,6 @@ impl Output for SyslogTlsOutput {
             Err(err) => Err(anyhow::anyhow!("{}", err)),
         }
     }
-}
-
-async fn write_syslog_tls_framed(
-    stream: &mut TlsStream<TcpStream>,
-    framing: SyslogTcpFraming,
-    payload: &Bytes,
-) -> Result<()> {
-    match framing {
-        SyslogTcpFraming::OctetCounting => {
-            let header = format!("{} ", payload.len());
-            stream.write_all(header.as_bytes()).await?;
-            stream.write_all(payload).await?;
-        }
-        SyslogTcpFraming::NonTransparent => {
-            stream.write_all(payload).await?;
-            stream.write_all(b"\n").await?;
-        }
-    }
-
-    stream.flush().await?;
-    Ok(())
 }
 
 #[cfg(test)]

@@ -6,7 +6,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
+use bytes::Bytes;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
+
+use crate::dsl::ast::Property;
+use crate::dsl::props;
 
 /// Per-peer cooldown after a send/connect failure. Hardcoded for now;
 /// may later be exposed as a DSL property.
@@ -24,6 +30,22 @@ pub const PEER_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 type PeerAttemptFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
 
+/// Payload carried from `render` to `write` for every syslog output.
+/// All sinks ship one frame's bytes; nothing else is needed.
+pub struct SyslogPayload {
+    pub egress: Bytes,
+}
+
+/// Syslog over TCP framing per RFC 6587. Shared between syslog_tcp
+/// and syslog_tls outputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyslogFraming {
+    /// RFC 6587 §3.4.1: `MSG-LEN SP SYSLOG-MSG`.
+    OctetCounting,
+    /// RFC 6587 §3.4.2: messages terminated by LF.
+    NonTransparent,
+}
+
 /// A configured destination. `tls` is `Some(...)` only for outputs
 /// that negotiate client-side TLS; plaintext outputs leave it `None`.
 #[derive(Debug, Clone)]
@@ -37,6 +59,77 @@ impl Peer {
     pub fn address(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
+}
+
+/// Parse `host` and `port` properties from a peer block. The caller
+/// supplies the default port and the label used in error messages.
+pub fn parse_host_port(
+    properties: &[Property],
+    default_port: u16,
+    label: &str,
+) -> anyhow::Result<(String, u16)> {
+    let host = props::get_string(properties, "host")
+        .ok_or_else(|| anyhow::anyhow!("{} requires 'host'", label))?;
+    let port = match props::get_int(properties, "port") {
+        Some(port) => {
+            u16::try_from(port).with_context(|| format!("{} port must be 0..=65535", label))?
+        }
+        None => default_port,
+    };
+    Ok((host, port))
+}
+
+/// Iterate `peer` blocks inside a `peers` block, invoking the provided
+/// per-peer parser for each one.
+pub fn iter_peers_block<T, F>(
+    peers_block: &[Property],
+    label: &str,
+    mut parse_one: F,
+) -> anyhow::Result<Vec<T>>
+where
+    F: FnMut(&[Property]) -> anyhow::Result<T>,
+{
+    let mut out = Vec::new();
+    for prop in peers_block {
+        if let Property::Block {
+            key,
+            properties: inner,
+            ..
+        } = prop
+            && key == "peer"
+        {
+            out.push(parse_one(inner)?);
+        }
+    }
+    if out.is_empty() {
+        anyhow::bail!("{} block must contain at least one peer", label);
+    }
+    Ok(out)
+}
+
+/// Write one syslog message with RFC 6587 framing.
+pub async fn write_framed<S>(
+    stream: &mut S,
+    framing: SyslogFraming,
+    payload: &Bytes,
+) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    match framing {
+        SyslogFraming::OctetCounting => {
+            let header = format!("{} ", payload.len());
+            stream.write_all(header.as_bytes()).await?;
+            stream.write_all(payload).await?;
+        }
+        SyslogFraming::NonTransparent => {
+            stream.write_all(payload).await?;
+            stream.write_all(b"\n").await?;
+        }
+    }
+
+    stream.flush().await?;
+    Ok(())
 }
 
 /// Per-peer mutable state. C is the connection type (TcpStream,

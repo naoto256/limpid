@@ -5,8 +5,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use crate::dsl::arena::EventArena;
@@ -16,7 +14,8 @@ use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::syslog_peers::{
-    PEER_CONNECT_TIMEOUT, PEER_WRITE_TIMEOUT, Peer, PeerList,
+    PEER_CONNECT_TIMEOUT, PEER_WRITE_TIMEOUT, Peer, PeerList, SyslogFraming, SyslogPayload,
+    iter_peers_block, parse_host_port, write_framed,
 };
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
 
@@ -70,20 +69,10 @@ const SYSLOG_TCP_OUTPUT_SCHEMA: &[PropertySpec] = &[
     crate::queue::QUEUE_PROPERTY_SPEC,
 ];
 
-struct SyslogTcpPayload {
-    egress: Bytes,
-}
-
 pub struct SyslogTcpOutput {
-    pub framing: SyslogTcpFraming,
+    pub framing: SyslogFraming,
     peers: PeerList<TcpStream>,
     metrics: Arc<OutputMetrics>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SyslogTcpFraming {
-    OctetCounting,
-    NonTransparent,
 }
 
 impl Module for SyslogTcpOutput {
@@ -103,10 +92,10 @@ impl Module for SyslogTcpOutput {
     }
 }
 
-fn parse_framing(name: &str, properties: &[Property]) -> Result<SyslogTcpFraming> {
+fn parse_framing(name: &str, properties: &[Property]) -> Result<SyslogFraming> {
     match props::get_ident(properties, "framing").as_deref() {
-        Some("non_transparent") => Ok(SyslogTcpFraming::NonTransparent),
-        Some("octet_counting") | None => Ok(SyslogTcpFraming::OctetCounting),
+        Some("non_transparent") => Ok(SyslogFraming::NonTransparent),
+        Some("octet_counting") | None => Ok(SyslogFraming::OctetCounting),
         Some(other) => anyhow::bail!(
             "output '{}': unknown framing '{}' (expected octet_counting | non_transparent)",
             name,
@@ -121,38 +110,18 @@ fn parse_peers(name: &str, properties: &[Property]) -> Result<Vec<Peer>> {
     }
 
     if let Some(peers_block) = props::get_block(properties, "peers") {
-        let mut out = Vec::new();
-        for prop in peers_block {
-            if let Property::Block {
-                key,
-                properties: inner,
-                ..
-            } = prop
-                && key == "peer"
-            {
-                out.push(parse_peer(name, "peers.peer", inner)?);
-            }
-        }
-        if out.is_empty() {
-            anyhow::bail!(
-                "output '{}': peers block must contain at least one peer",
-                name
-            );
-        }
-        return Ok(out);
+        let label = format!("output '{}': peers", name);
+        return iter_peers_block(peers_block, &label, |inner| {
+            parse_peer(name, "peers.peer", inner)
+        });
     }
 
     anyhow::bail!("output '{}': either 'peer' or 'peers' is required", name)
 }
 
 fn parse_peer(name: &str, label: &str, properties: &[Property]) -> Result<Peer> {
-    let host = props::get_string(properties, "host")
-        .ok_or_else(|| anyhow::anyhow!("output '{}': {} requires 'host'", name, label))?;
-    let port = match props::get_int(properties, "port") {
-        Some(port) => u16::try_from(port)
-            .with_context(|| format!("output '{}': {} port must be 0..=65535", name, label))?,
-        None => 514,
-    };
+    let label = format!("output '{}': {}", name, label);
+    let (host, port) = parse_host_port(properties, 514, &label)?;
     Ok(Peer {
         host,
         port,
@@ -174,13 +143,13 @@ impl Output for SyslogTcpOutput {
         event: &BorrowedEvent<'_>,
         _arena: &EventArena<'_>,
     ) -> Result<RenderedPayload> {
-        Ok(RenderedPayload::new(SyslogTcpPayload {
+        Ok(RenderedPayload::new(SyslogPayload {
             egress: event.egress.clone(),
         }))
     }
 
     async fn write(&self, payload: RenderedPayload) -> Result<()> {
-        let payload: SyslogTcpPayload = payload.downcast()?;
+        let payload: SyslogPayload = payload.downcast()?;
         let framing = self.framing;
         let metrics = Arc::clone(&self.metrics);
         let result = self
@@ -203,7 +172,7 @@ impl Output for SyslogTcpOutput {
                     let stream = state.conn.as_mut().expect("connection should be present");
                     let write_result = tokio::time::timeout(
                         PEER_WRITE_TIMEOUT,
-                        write_syslog_tcp_framed(stream, framing, &egress),
+                        write_framed(stream, framing, &egress),
                     )
                     .await
                     .map_err(|_| anyhow::anyhow!("syslog_tcp write to {} timed out", address))
@@ -224,27 +193,6 @@ impl Output for SyslogTcpOutput {
             Err(err) => Err(anyhow::anyhow!("{}", err)),
         }
     }
-}
-
-async fn write_syslog_tcp_framed(
-    stream: &mut TcpStream,
-    framing: SyslogTcpFraming,
-    payload: &Bytes,
-) -> Result<()> {
-    match framing {
-        SyslogTcpFraming::OctetCounting => {
-            let header = format!("{} ", payload.len());
-            stream.write_all(header.as_bytes()).await?;
-            stream.write_all(payload).await?;
-        }
-        SyslogTcpFraming::NonTransparent => {
-            stream.write_all(payload).await?;
-            stream.write_all(b"\n").await?;
-        }
-    }
-
-    stream.flush().await?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -294,7 +242,7 @@ mod tests {
         let tcp = SyslogTcpOutput::build("relay", &mp(&props)).expect("should build");
         assert_eq!(tcp.peers.len(), 1);
         assert_eq!(tcp.peers.peers()[0].address(), "127.0.0.1:514");
-        assert_eq!(tcp.framing, SyslogTcpFraming::OctetCounting);
+        assert_eq!(tcp.framing, SyslogFraming::OctetCounting);
     }
 
     #[test]
@@ -323,7 +271,7 @@ mod tests {
             kv("framing", ExprKind::Ident(vec!["non_transparent".into()])),
         ];
         let tcp = SyslogTcpOutput::build("relay", &mp(&props)).expect("should build");
-        assert_eq!(tcp.framing, SyslogTcpFraming::NonTransparent);
+        assert_eq!(tcp.framing, SyslogFraming::NonTransparent);
     }
 
     #[test]
