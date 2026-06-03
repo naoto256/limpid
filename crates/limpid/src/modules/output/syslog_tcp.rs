@@ -15,7 +15,9 @@ use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
-use crate::modules::output::syslog_peers::{Peer, PeerList};
+use crate::modules::output::syslog_peers::{
+    PEER_CONNECT_TIMEOUT, PEER_WRITE_TIMEOUT, Peer, PeerList,
+};
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
 
 const SYSLOG_TCP_PEER_SCHEMA: &[PropertySpec] = &[
@@ -188,14 +190,24 @@ impl Output for SyslogTcpOutput {
                 let address = peer.address();
                 Box::pin(async move {
                     if state.conn.is_none() {
-                        let stream = TcpStream::connect(&address)
-                            .await
-                            .with_context(|| format!("syslog_tcp connect to {}", address))?;
+                        let stream = tokio::time::timeout(
+                            PEER_CONNECT_TIMEOUT,
+                            TcpStream::connect(&address),
+                        )
+                        .await
+                        .with_context(|| format!("syslog_tcp connect to {} timed out", address))?
+                        .with_context(|| format!("syslog_tcp connect to {}", address))?;
                         state.conn = Some(stream);
                     }
 
                     let stream = state.conn.as_mut().expect("connection should be present");
-                    let write_result = write_syslog_tcp_framed(stream, framing, &egress).await;
+                    let write_result = tokio::time::timeout(
+                        PEER_WRITE_TIMEOUT,
+                        write_syslog_tcp_framed(stream, framing, &egress),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("syslog_tcp write to {} timed out", address))
+                    .and_then(|res| res);
                     if write_result.is_err() {
                         state.conn = None;
                     }

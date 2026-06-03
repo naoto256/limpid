@@ -13,7 +13,9 @@ use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
-use crate::modules::output::syslog_peers::{Peer, PeerList};
+use crate::modules::output::syslog_peers::{
+    PEER_CONNECT_TIMEOUT, PEER_WRITE_TIMEOUT, Peer, PeerList,
+};
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
 
 const SYSLOG_UDP_PEER_SCHEMA: &[PropertySpec] = &[
@@ -160,17 +162,25 @@ impl Output for SyslogUdpOutput {
                         let socket = UdpSocket::bind("0.0.0.0:0")
                             .await
                             .context("syslog_udp output: failed to bind ephemeral socket")?;
-                        socket.connect(&address).await.with_context(|| {
-                            format!("syslog_udp output: failed to connect to {}", address)
-                        })?;
+                        tokio::time::timeout(PEER_CONNECT_TIMEOUT, socket.connect(&address))
+                            .await
+                            .with_context(|| {
+                                format!("syslog_udp connect to {} timed out", address)
+                            })?
+                            .with_context(|| format!("syslog_udp connect to {}", address))?;
                         state.conn = Some(socket);
                     }
 
                     let socket = state.conn.as_mut().expect("connection should be present");
-                    let send_result = socket
-                        .send(&egress)
-                        .await
-                        .with_context(|| format!("syslog_udp output: send to {}", address));
+                    let send_result =
+                        tokio::time::timeout(PEER_WRITE_TIMEOUT, socket.send(&egress))
+                            .await
+                            .map_err(|_| {
+                                anyhow::anyhow!("syslog_udp send to {} timed out", address)
+                            })
+                            .and_then(|res| {
+                                res.with_context(|| format!("syslog_udp send to {}", address))
+                            });
                     if send_result.is_err() {
                         state.conn = None;
                     }

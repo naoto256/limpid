@@ -168,8 +168,27 @@ installation, .deb packaging, and systemd integration.
 `unix_socket` · `otlp_http` · `otlp_grpc`
 
 ### Outputs
-`file` · `http` · `kafka` · `tcp` · `udp` · `unix_socket` · `stdout` ·
-`otlp`
+`syslog_udp` · `syslog_tcp` · `syslog_tls` · `file` · `http` · `kafka` ·
+`unix_socket` · `stdout` · `otlp`
+
+### Upgrading from earlier versions
+
+The `output tcp` and `output udp` modules have been renamed to
+`output syslog_tcp` and `output syslog_udp` to match the input-side
+naming. Configs using the old type names are rejected at startup; no
+alias is retained.
+
+The DSL surface for these outputs also changed: the top-level
+`address` property carrying a `host:port` string (and `host` + `port`)
+is removed in favour of `peer { host port }` (single destination) or
+`peers { peer { ... } ... }` (round-robin across multiple
+destinations). See `CHANGELOG.md` for the full diff and
+`docs/src/outputs/syslog-tcp.md` (and `-tls.md` / `-udp.md`) for the
+new shape.
+
+A new `output syslog_tls` module covers TLS-encrypted syslog with
+optional client mTLS; named profiles are defined at the output level
+and referenced per peer. Default port is 6514 (RFC 5425).
 
 ### Snippets
 
