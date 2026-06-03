@@ -2,9 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'release/*']
   pull_request:
-    branches: [main]
+    branches: [main, 'release/*']
+  workflow_dispatch:
 
 # Minimum required for `actions/checkout` (read the repo). Cache via
 # `Swatinem/rust-cache` works in read-only fallback without an explicit
