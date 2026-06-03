@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
 use tokio::net::UdpSocket;
 
 use crate::dsl::arena::EventArena;
@@ -14,7 +13,8 @@ use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::syslog_peers::{
-    PEER_CONNECT_TIMEOUT, PEER_WRITE_TIMEOUT, Peer, PeerList,
+    PEER_CONNECT_TIMEOUT, PEER_WRITE_TIMEOUT, Peer, PeerList, SyslogPayload, iter_peers_block,
+    parse_host_port,
 };
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
 
@@ -61,10 +61,6 @@ const SYSLOG_UDP_OUTPUT_SCHEMA: &[PropertySpec] = &[
     crate::queue::QUEUE_PROPERTY_SPEC,
 ];
 
-struct SyslogUdpPayload {
-    egress: Bytes,
-}
-
 pub struct SyslogUdpOutput {
     peers: PeerList<UdpSocket>,
     metrics: Arc<OutputMetrics>,
@@ -91,38 +87,18 @@ fn parse_peers(name: &str, properties: &[Property]) -> Result<Vec<Peer>> {
     }
 
     if let Some(peers_block) = props::get_block(properties, "peers") {
-        let mut out = Vec::new();
-        for prop in peers_block {
-            if let Property::Block {
-                key,
-                properties: inner,
-                ..
-            } = prop
-                && key == "peer"
-            {
-                out.push(parse_peer(name, "peers.peer", inner)?);
-            }
-        }
-        if out.is_empty() {
-            anyhow::bail!(
-                "output '{}': peers block must contain at least one peer",
-                name
-            );
-        }
-        return Ok(out);
+        let label = format!("output '{}': peers", name);
+        return iter_peers_block(peers_block, &label, |inner| {
+            parse_peer(name, "peers.peer", inner)
+        });
     }
 
     anyhow::bail!("output '{}': either 'peer' or 'peers' is required", name)
 }
 
 fn parse_peer(name: &str, label: &str, properties: &[Property]) -> Result<Peer> {
-    let host = props::get_string(properties, "host")
-        .ok_or_else(|| anyhow::anyhow!("output '{}': {} requires 'host'", name, label))?;
-    let port = match props::get_int(properties, "port") {
-        Some(port) => u16::try_from(port)
-            .with_context(|| format!("output '{}': {} port must be 0..=65535", name, label))?,
-        None => 514,
-    };
+    let label = format!("output '{}': {}", name, label);
+    let (host, port) = parse_host_port(properties, 514, &label)?;
     Ok(Peer {
         host,
         port,
@@ -144,13 +120,13 @@ impl Output for SyslogUdpOutput {
         event: &BorrowedEvent<'_>,
         _arena: &EventArena<'_>,
     ) -> Result<RenderedPayload> {
-        Ok(RenderedPayload::new(SyslogUdpPayload {
+        Ok(RenderedPayload::new(SyslogPayload {
             egress: event.egress.clone(),
         }))
     }
 
     async fn write(&self, payload: RenderedPayload) -> Result<()> {
-        let payload: SyslogUdpPayload = payload.downcast()?;
+        let payload: SyslogPayload = payload.downcast()?;
         let metrics = Arc::clone(&self.metrics);
         let result = self
             .peers
