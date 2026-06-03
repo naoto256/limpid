@@ -17,5 +17,5 @@ None.
 ## Notes
 
 - Each event is written as one line (`egress` bytes + newline).
-- Not recommended for production use — use [file](./file.md) or [tcp](./tcp.md) instead.
+- Not recommended for production use — use [file](./file.md) or [syslog_tcp](./syslog-tcp.md) instead.
 - Useful with `--test-pipeline` for seeing processed output.

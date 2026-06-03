@@ -71,8 +71,8 @@ def input ssh_journal {
 }
 
 def output relay {
-    type tcp
-    address "relay.example:514"
+    type syslog_tcp
+    peer { host "relay.example" port 514 }
 }
 
 def pipeline ssh_to_relay {
