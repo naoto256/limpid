@@ -75,6 +75,7 @@ journal = ["dep:systemd"]
 kafka = ["dep:rdkafka"]
 
 [dev-dependencies]
+rcgen = "0.13"
 tempfile = "3"
 tokio-stream = { version = "0.1", features = ["net"] }
 
