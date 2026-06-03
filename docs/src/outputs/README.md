@@ -9,8 +9,9 @@ Output modules write processed events to external destinations.
 | [`file`](./file.md) | Local file with dynamic path templates |
 | [`http`](./http.md) | HTTP/HTTPS endpoint (Elasticsearch, Splunk HEC, etc.) |
 | [`kafka`](./kafka.md) | Apache Kafka topic (requires `--features kafka`) |
-| [`tcp`](./tcp.md) | TCP with persistent connection |
-| [`udp`](./udp.md) | UDP datagram |
+| [`syslog_tcp`](./syslog-tcp.md) | Syslog TCP with persistent per-peer connections |
+| [`syslog_udp`](./syslog-udp.md) | Syslog UDP datagrams |
+| [`syslog_tls`](./syslog-tls.md) | Syslog TCP over TLS with optional client certificate |
 | [`unix_socket`](./unix-socket.md) | Unix stream socket |
 | [`stdout`](./stdout.md) | Standard output (debugging) |
 | [`otlp`](./otlp.md) | OTLP logs sender (HTTP/JSON, HTTP/protobuf, gRPC) |
@@ -21,8 +22,8 @@ Every output has an async queue that decouples pipeline processing from I/O. You
 
 ```
 def output reliable {
-    type tcp
-    address "10.0.0.1:514"
+    type syslog_tcp
+    peer { host "10.0.0.1" port 514 }
 
     queue {
         type disk                          // memory (default) | disk

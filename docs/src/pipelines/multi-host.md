@@ -75,8 +75,8 @@ def input app_journal {
 }
 
 def output to_relay {
-    type tcp
-    address "10.0.0.10:514"
+    type syslog_tcp
+    peer { host "10.0.0.10" port 514 }
     framing non_transparent
     queue {
         type disk
@@ -111,8 +111,8 @@ def input tcp514 {
 }
 
 def output ama {
-    type tcp
-    address "127.0.0.1:28330"
+    type syslog_tcp
+    peer { host "127.0.0.1" port 28330 }
     framing non_transparent
     queue {
         type disk
