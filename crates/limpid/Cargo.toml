@@ -1,6 +1,6 @@
 [package]
 name = "limpid"
-version = "0.7.5"
+version = "0.7.4"
 edition = "2024"
 description = "Log pipelines, limpid as intent."
 license.workspace = true

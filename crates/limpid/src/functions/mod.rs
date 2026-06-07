@@ -24,10 +24,8 @@
 //!   (`hostname`, `version`), enrichment (`geoip`, `table_*`), hashing
 //!   (`md5` / `sha1` / `sha256`), serialisation (`to_json`, `to_bytes`,
 //!   `to_string`, `to_int`), parsers (`parse_json`, `parse_kv`,
-//!   `csv_parse`, `regex_parse`), arrays (`map`, `filter`, `find`,
-//!   `reduce`, `first`, `last`, `concat`, `entitle`, `path`, `sum`,
-//!   `max`, `min`, `distinct`, `len`, `append`, `prepend`). One file
-//!   per function (or per tightly-related group
+//!   `csv_parse`, `regex_parse`), arrays (`find_by`, `len`, `append`,
+//!   `prepend`). One file per function (or per tightly-related group
 //!   such as `hashes.rs` / `string_predicates.rs`) so `mod.rs` does
 //!   not become a megafile.
 //! - [`syslog`] / [`cef`] — schema-specific namespaces (`syslog.*`,
@@ -823,14 +821,8 @@ mod tests {
         let tsv = ts_value("2026-04-19T10:30:45+00:00");
         let fmt = Value::String(arena.alloc_str("%H:%M"));
         let tz = Value::String(arena.alloc_str("UTC"));
-        assert!(
-            reg.call(None, "strftime", &[tsv, fmt], &bevent, &arena)
-                .is_ok()
-        );
-        assert!(
-            reg.call(None, "strftime", &[tsv, fmt, tz], &bevent, &arena)
-                .is_ok()
-        );
+        assert!(reg.call(None, "strftime", &[tsv, fmt], &bevent, &arena).is_ok());
+        assert!(reg.call(None, "strftime", &[tsv, fmt, tz], &bevent, &arena).is_ok());
     }
 
     #[test]
@@ -990,4 +982,5 @@ mod tests {
             Value::String("namespaced")
         );
     }
+
 }
