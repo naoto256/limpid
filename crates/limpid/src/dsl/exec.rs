@@ -5,13 +5,13 @@
 //! never enters this module. Boundary conversions happen at the
 //! pipeline level (`pipeline::run_pipeline` entry/exit).
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use bytes::Bytes;
 use thiserror::Error;
 
 use super::arena::EventArena;
 use super::ast::*;
-use super::eval::{eval_expr_with_scope, value_to_string, values_match, LocalScope};
+use super::eval::{LocalScope, eval_expr_with_scope, value_to_string, values_match};
 use super::value::Value;
 use crate::event::BorrowedEvent;
 use crate::functions::FunctionRegistry;
@@ -1296,6 +1296,14 @@ mod tests {
                 call_fn("last", vec![xs()]),
             ),
             ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["first_null".into()]),
+                call_fn("first", vec![e(ExprKind::Null)]),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["last_null".into()]),
+                call_fn("last", vec![e(ExprKind::Null)]),
+            ),
+            ProcessStatement::Assign(
                 AssignTarget::Workspace(vec!["distinct".into()]),
                 call_fn("distinct", vec![xs()]),
             ),
@@ -1359,6 +1367,8 @@ mod tests {
             ExecResult::Continue(ev) => {
                 assert_eq!(ev.workspace_get("first"), Some(Value::Int(1)));
                 assert_eq!(ev.workspace_get("last"), Some(Value::Int(3)));
+                assert_eq!(ev.workspace_get("first_null"), Some(Value::Null));
+                assert_eq!(ev.workspace_get("last_null"), Some(Value::Null));
                 assert_eq!(
                     ev.workspace_get("distinct").unwrap().to_owned_value(),
                     OwnedValue::Array(vec![
@@ -1383,6 +1393,30 @@ mod tests {
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
+    }
+
+    #[test]
+    fn test_exec_sum_rejects_null_input() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
+        let event = make_event();
+        let bevent = event.view_in(&arena);
+        let stmts = vec![ProcessStatement::Assign(
+            AssignTarget::Workspace(vec!["sum".into()]),
+            call_fn("sum", vec![e(ExprKind::Null)]),
+        )];
+        let err = expect_exec_err(exec_process_body(
+            &stmts,
+            bevent,
+            &NoopRegistry,
+            &make_funcs(),
+            &arena,
+        ));
+        assert!(
+            err.to_string().contains("sum() expects an Array, got null"),
+            "expected sum(null) to fail loudly, got: {}",
+            err
+        );
     }
 
     #[test]
