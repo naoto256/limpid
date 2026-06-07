@@ -53,9 +53,10 @@ pub enum FieldType {
     Null,
     /// Nested object (has children).
     Object,
-    /// Positionless collection. No element-type refinement in v0.5.0 —
-    /// every read that flows out of an array (via `foreach`, `find_by`,
-    /// element access) lands in `Any`. A typed `Array(Box<FieldType>)`
+    /// Ordered, index-hidden collection. No element-type refinement
+    /// in v0.5.0 — every read that flows out of an array (via `map`,
+    /// `filter`, `find`, `first`, `last`, etc.) lands in `Any`. A typed
+    /// `Array(Box<FieldType>)`
     /// can be introduced later without breaking the external shape
     /// because union / type_compatible already treat unknown variants
     /// conservatively.

@@ -573,9 +573,10 @@ Why arrays are not compacted: the function name advertises "omit
 null *keys*", not "compact arrays". A `null` slot in an array is
 often a parser's intentional placeholder, and dropping it would
 change the array length silently — which can carry meaning even
-though limpid arrays are [positionless](../processing/user-defined.md#arrays).
-When array compaction is what you want, use a dedicated array
-primitive instead.
+though limpid arrays are [index-hidden](../processing/user-defined.md#arrays).
+When array compaction is what you want, use
+`filter(arr) { |x| x != null }` — the block-arg `filter` covers
+this without a dedicated `compact` primitive.
 
 ## Hash functions
 
@@ -659,20 +660,113 @@ Motivation: CEF extension values and CSV column values arrive as strings even wh
 
 ## Array helpers
 
-Arrays in limpid are **positionless collections** — you construct them with `[a, b, c]` literals, but the DSL deliberately omits positional access (`arr[n]`) and positional writes (`arr[n] = v`). Element identity, not position, is the addressing model; see [User-defined Processes → Arrays](../processing/user-defined.md#arrays) for the rationale and `find_by` / `foreach` / `append` / `prepend` / `len` below.
+Arrays in limpid are **ordered but index-hidden** — you construct them with `[a, b, c]` literals, but the DSL deliberately omits positional access (`arr[n]`) and positional writes (`arr[n] = v`). Element identity (or whole-array transforms) is the addressing model; see [User-defined Processes → Arrays](../processing/user-defined.md#arrays) for the rationale and the per-primitive references below.
 
-### find_by(array, key, value)
+Four primitives — `map`, `filter`, `find`, `reduce` — take a **block argument** (`{ |x| ... }`) per element. Block syntax and the universal pipe operator `|>` are documented in [DSL Syntax Basics → Block argument](../dsl-syntax.md#block-argument).
 
-Returns the first element of `array` that is an object whose `key` field equals `value`. Returns `null` when nothing matches, the input is not an array, or the key is not a string.
+### map(array) { |x| body }
+
+Per-element transform; returns a new array of the same length, with each element replaced by the block's return value. Construction order is preserved. `Null` input → empty array.
 
 ```
-workspace.process = find_by(workspace.evidence, "entityType", "Process")
-workspace.user    = find_by(workspace.evidence, "entityType", "User")
+workspace.upper_users = map(workspace.events) { |e| upper(e.user) }
 ```
 
-Equality is value-level with no coercion: `find_by(arr, "n", "2")` does not match `{"n": 2}`. Callers who need coercion should cast the value first (`to_int`, string interpolation, etc.). Non-object elements inside the array are skipped silently, so mixed arrays do not cause errors.
+### filter(array) { |x| predicate }
 
-Designed for event schemas that carry arrays-of-objects (MDE evidence, OCSF observables, CEF ext lists) where the caller wants "pick the first item matching this type" as a scalar result rather than iterating with `foreach`.
+Keep elements where the block returns a truthy value. Order-preserving; non-truthy elements (`false`, `null`, `0`, `""`, empty containers) are dropped.
+
+```
+workspace.alerts = filter(workspace.events) { |e| e.severity >= 7 }
+```
+
+Equivalent to `compact` for null removal: `filter(arr) { |x| x != null }` drops `null` entries (no separate `compact` primitive ships — `null_omit` operates on objects, not arrays).
+
+### find(array) { |x| predicate }
+
+First element where the block returns truthy, or `null` if no match. Replaces the v0.7.3 `find_by(arr, key, value)` — the new form composes for arbitrary predicates:
+
+```
+workspace.process = find(workspace.evidence) { |e| e.entityType == "Process" }
+workspace.user    = find(workspace.evidence) { |e| e.entityType == "User" }
+workspace.recent  = find(workspace.events)   { |e| e.received_at > workspace.cutoff }
+```
+
+Non-object elements no longer have to be skipped silently — predicate logic decides what counts as a match.
+
+### reduce(array, init) { |acc, x| step }
+
+Left fold. The block takes two parameters: the running accumulator (`init` on the first iteration) and the current element. The block's return value becomes the new accumulator. Empty array → `init` unchanged.
+
+```
+let total = reduce(workspace.amounts, 0) { |acc, x| acc + x }
+let joined = reduce(workspace.tags, "") { |acc, t| acc + "," + t }
+```
+
+### first(array) / last(array)
+
+Head / tail element, or `null` if the array is empty. Non-array input (including `null`) also returns `null` so call sites can chain through optional fields without an existence guard.
+
+```
+let latest = last(workspace.login_events)   // chronologically last
+let primary = first(workspace.addresses)    // construction-order head
+```
+
+Use these only when the order is itself the contract (chronology, "most recent", "the only one"). For "the element matching this property" use `find` instead — see the rationale on the [Arrays](../processing/user-defined.md#arrays) page.
+
+### concat(a, b, ...)
+
+Variadic array concatenation; every argument must be an `Array`. Mixed input bails (no scalar auto-wrap — wrap explicitly if you want a single element: `concat(arr, [x])`).
+
+```
+workspace.all_tags = concat(workspace.host_tags, workspace.role_tags, ["pii"])
+```
+
+### distinct(array)
+
+Equality-based dedupe; preserves the first occurrence of each value. Equality follows `==` rules (Int / Float cross-compare; Bytes never equals String).
+
+```
+workspace.distinct_users = distinct(map(workspace.events) { |e| e.user })
+```
+
+### sum(array) / max(array) / min(array)
+
+Reduce a numeric array to a scalar.
+
+- `sum` — all-Int stays Int; any Float participant promotes the result to Float. Empty array → `Int(0)`.
+- `max` / `min` — compare through `f64`; empty array → `null`.
+
+Non-numeric elements bail rather than silently coerce. Mixed numeric / null arrays also bail, because "skip the nulls" is a per-pipeline policy decision; use `filter(arr) { |x| x != null } |> sum` to opt in.
+
+```
+let total_bytes = sum(map(workspace.flows) { |f| f.bytes })
+let highest_severity = max(map(workspace.alerts) { |a| a.severity })
+```
+
+### entitle(values, keys)
+
+Name positional captures: take an `Array` of values and an `Array` of string keys (same length), produce an `Object` keyed by name. Length mismatch is a **loud failure** — the typical use is naming parser captures, where a drift is almost always a parser-shape bug the operator wants to hear about.
+
+```
+let cap = regex_parse_groups(ingress, "(\\S+) (\\S+) (\\S+)")
+workspace.fields = entitle(cap, ["user", "host", "action"])
+```
+
+### path(obj, key1, key2, ...)
+
+Dynamic dotted-path access. Equivalent to `obj.key1.key2.…` but with the keys computed at run time. Missing keys yield `null` (matches the `workspace.x.y` path-walker semantics). The first argument may be Object, Array, or Null:
+
+- Object → looked up by name.
+- Null → propagates as null (no error).
+- Anything else → null.
+
+**Integer keys are rejected** — positional access on arrays is intentionally absent from the DSL; `path(arr, 0)` would re-introduce it through the back door. Use `find(arr) { |x| ... }` to pick an element by identity.
+
+```
+// Same as workspace.geo.country.name, but the key list is dynamic:
+let leaf = path(workspace.geo, dynamic_key, "name")
+```
 
 ### append(array, value) / prepend(array, value)
 
@@ -691,7 +785,7 @@ workspace.high_prio_tags = prepend(workspace.high_prio_tags, "urgent")
 
 `value` may be any type, including `null` — if the caller wants to record "a slot with no value", that's a legitimate element.
 
-These are the only mutation paths for arrays because they identify "where" by insertion-order semantics rather than a numeric index. Middle insertion / removal is out of scope for v0.5.0; use identity-based primitives (future `insert_after_by`, `remove_by`) when that need surfaces.
+These are the back / front growth primitives; whole-array transforms use `map` / `filter` / `concat`. Middle insertion / removal stays out of scope.
 
 ### len(value)
 
@@ -711,6 +805,35 @@ workspace.msg_len = len(workspace.syslog.msg)
 ```
 
 Returning `null` on scalars (rather than `0` or an error) keeps the "not applicable" signal distinguishable from a legitimately empty collection.
+
+### is_array(value)
+
+Type predicate. Returns `true` when `value` is an Array, `false` for any other type (including `Null`, `String`, `Object`, `Int`, `Float`, `Bool`, `Bytes`, `Timestamp`).
+
+```
+let xs = [1, 2, 3]
+is_array(xs)            // true
+is_array([])            // true (empty array is still an array)
+is_array("[1,2,3]")     // false (a String that looks like an array is not an array)
+is_array(null)          // false
+is_array({a: 1})        // false (Object, not Array)
+```
+
+Designed for snippet parsers that consume vendor JSON whose nominally-array fields may arrive as scalars when upstream is malformed. The pattern is **pre-validate intake shape, emit a parser-authored error on mismatch** — rather than fall through to `find()` / `map()` / `filter()` and surface a generic `<primitive>() expects an array` runtime error:
+
+```
+def process parse_okta_system {
+    workspace.okta = parse_json(ingress)
+    switch true {
+        workspace.okta.target != null and not is_array(workspace.okta.target) {
+            error "parse_okta_system: target field is not an array (got ${workspace.okta.target}): ${ingress}"
+        }
+        // ... normal dispatch ...
+    }
+}
+```
+
+Sibling predicates (`is_object`, `is_string`, …) are deferred until repeated need surfaces — `is_array` alone covers the array-input pre-check pattern that every block-arg primitive shares.
 
 ## Serialization
 

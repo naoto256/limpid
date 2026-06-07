@@ -245,7 +245,9 @@ inside a `process` body:
 - **Datetime parsers** — `parse_datetime_rfc3339` · `parse_datetime_rfc2822`
 - **Type coercion** — `to_int` · `to_json` · `to_bytes` · `to_string`
 - **Fallback / shaping** — `coalesce` · `null_omit`
-- **Collections** — `len` · `find_by` · `append` · `prepend`
+- **Collections** — `map` · `filter` · `find` · `reduce` · `first` ·
+  `last` · `concat` · `distinct` · `sum` · `max` · `min` ·
+  `entitle` · `path` · `append` · `prepend` · `len` · `is_array`
 - **Hashing** — `md5` · `sha1` · `sha256`
 - **Tables / enrichment** — `table_lookup` · `table_upsert` ·
   `table_delete` · `geoip`

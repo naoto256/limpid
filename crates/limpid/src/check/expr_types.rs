@@ -57,6 +57,7 @@ pub fn infer(expr: &Expr, bindings: &Bindings, registry: &FunctionRegistry) -> F
             namespace,
             name,
             args: _,
+            block_arg: _,
         } => registry
             .signature(namespace.as_deref(), name)
             .map(|s| s.ret.clone())
@@ -223,6 +224,7 @@ pub fn check_types(
             namespace,
             name,
             args,
+            block_arg: _,
         } => {
             walk_children(expr, |child| {
                 check_types(
@@ -537,7 +539,7 @@ fn expected_arg_type(sig: &FunctionSig, i: usize) -> &FieldType {
     &sig.args[i.min(sig.args.len().saturating_sub(1))]
 }
 
-fn qualified_name(namespace: Option<&str>, name: &str) -> String {
+pub(super) fn qualified_name(namespace: Option<&str>, name: &str) -> String {
     match namespace {
         Some(ns) => format!("{}.{}", ns, name),
         None => name.to_string(),
