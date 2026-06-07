@@ -91,11 +91,12 @@ def process tag {
 binding can hold any value type (scalar, Object, or Array): if the
 expression returns an Object, dot-access reads through the binding
 the same way `workspace.x.y` does — for example
-`let f = regex_parse(...)` followed by `f.user`. The binding name
-itself, however, is not a path target on the left of `=`: writes go
-to `egress` or `workspace.*` (`let f.x = ...` is rejected). See
-[User-defined Processes](./processing/user-defined.md) for the full
-statement set.
+`let f = regex_parse(...)` followed by `f.user`, or
+`let alert = workspace._item` followed by `alert.evidence[0].file`.
+The binding name itself, however, is not a path target on the left
+of `=`: writes go to `egress` or `workspace.*` (`let f.x = ...` is
+rejected). See [User-defined Processes](./processing/user-defined.md)
+for the full statement set.
 
 ## String interpolation
 
@@ -149,6 +150,7 @@ The DSL has six control-flow constructs. The summary table maps each one to wher
 |-----------|------|--------------|---------------|
 | **if / else** | `if expr { ... } else if expr { ... } else { ... }` | yes | yes |
 | **switch** | `switch expr { value1 { ... } value2 { ... } default { ... } }` | yes | yes |
+| **foreach** | `foreach <array-path> { ... }` (current element exposed as `workspace._item`) | yes | — |
 | **try / catch** | `try { ... } catch { ... }` (error message exposed as `error`) | yes | — |
 | **drop** | `drop` | yes (concession — see note) | yes (terminates routing for this event) |
 | **finish** | `finish` | — | yes (completes pipeline early without dropping) |
@@ -249,49 +251,8 @@ The expression form has no side effects (no `workspace.x = …`, no `process foo
 
 The constructs not detailed above live on the page they semantically belong to:
 
-- **`try-catch`** — process-body only. See [User-defined Processes → Control flow](./processing/user-defined.md#control-flow) for the syntax and the `error` name binding inside `catch`. Iteration over arrays is *not* a control-flow construct in limpid: use the block-arg primitives (`map`, `filter`, `find`, `reduce`) instead — see [Arrays](./processing/user-defined.md#arrays).
+- **`foreach` / `try-catch`** — process-body only, transformations over per-event data. See [User-defined Processes → Control flow](./processing/user-defined.md#control-flow) for the syntax and the per-context details (`workspace._item` binding, the `error` name inside `catch`).
 - **`drop` / `finish` / `error`** — pipeline routing. `drop` terminates the event silently (intended discard, counted as `events_dropped`); `finish` ends the pipeline early without dropping (counted as `events_finished`); `error <expr?>` routes the event to the [error log](./operations/error-log.md) with an operator-readable reason (counted as `events_errored`, same as a runtime process failure). `drop` and `error` are also allowed inside a process body; `finish` is pipeline-only. See [Pipelines → drop, finish, and error](./pipelines/drop-finish-error.md) for when to choose which.
-
-## Pipe operator
-
-The pipe operator chains expression-shaped transforms: `lhs |> f(...)` is parse-time sugar for `f(lhs, ...)` — the left-hand value is inserted as the first positional argument of the function call on the right. The transformation is purely syntactic; the AST contains only ordinary `FuncCall` nodes.
-
-```
-// Without pipe:
-workspace.users = distinct(map(filter(workspace.events) { |e| e.type == "auth" }) { |e| e.user })
-
-// With pipe — read top-to-bottom:
-workspace.users =
-    workspace.events
-    |> filter { |e| e.type == "auth" }
-    |> map { |e| e.user }
-    |> distinct
-```
-
-Pipe is universal — it works with any function (`foo |> to_int`, `evidence |> first |> path("file", "hash")`). Precedence is the lowest of any operator, so `a + 1 |> f(2)` parses as `f(a + 1, 2)`.
-
-The right-hand side can be:
-
-- A function call with explicit parens: `arr |> map(arr_extra) { |x| ... }`, `text |> regex_extract(pat)`.
-- A bare identifier (zero-arg form): `arr |> first` ≡ `arr |> first()`.
-- A bare identifier with a trailing block argument: `arr |> map { |x| x.id }` ≡ `arr |> map() { |x| x.id }`.
-
-All three forms produce identical FuncCall AST after the parser splices the LHS as the first argument. The bare form is purely ergonomic — useful when the pipe is the only argument source and the function has no other positional inputs (`first` / `last` / `distinct` / `sum`) or only takes a block (`map` / `filter` / `find` over the pipe-fed array).
-
-## Block argument
-
-The block-arg primitives — `map`, `filter`, `find`, `reduce` — accept a trailing block argument that binds one (or, for `reduce`, two) identifier per element and runs the body against it:
-
-```
-let evens = filter(workspace.nums) { |n| n % 2 == 0 }
-let doubled = map(workspace.nums) { |n| n * 2 }
-let user_alert = find(workspace.alerts) { |a| a.user == "alice" }
-let total = reduce(workspace.amounts, 0) { |acc, x| acc + x }
-```
-
-The body has the same shape as a `def function` body: zero or more `let` bindings followed by a required trailing return expression. Locals introduced inside the body do not leak back to the caller — each iteration starts with a fresh child of the caller's scope.
-
-Only `map` / `filter` / `find` / `reduce` accept block-args today; attaching one to any other function is a clear error. See [Built-in Functions → Array operations](./functions/expression-functions.md) for the per-primitive details and edge cases.
 
 ## Reserved identifiers
 

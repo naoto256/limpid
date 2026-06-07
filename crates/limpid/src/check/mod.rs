@@ -287,7 +287,7 @@ pub fn analyze(config: &CompiledConfig, _source_map: &SourceMap) -> Vec<Diagnost
     crate::modules::register_builtins(&mut module_registry);
 
     let mut diagnostics = Vec::new();
-    function::check_all_functions(config, &registry, &mut diagnostics);
+    function::check_all_functions(config, &mut diagnostics);
     module_props::analyze_all(config, &module_registry, &mut diagnostics);
     global_props::analyze_all(config, &mut diagnostics);
     for (name, pipeline) in &config.pipelines {
@@ -527,7 +527,6 @@ pub(super) fn analyze_process_stmt(
                         namespace,
                         name,
                         args,
-                        block_arg: _,
                     },
                 ..
             },
@@ -592,6 +591,17 @@ pub(super) fn analyze_process_stmt(
                 bindings,
                 diagnostics,
             );
+        }
+        ProcessStatement::ForEach(iterable, body) => {
+            expr_types::check_types(
+                iterable,
+                pipeline_name,
+                bindings,
+                registry,
+                None,
+                diagnostics,
+            );
+            control_flow::analyze_for_each(body, pipeline_name, registry, bindings, diagnostics);
         }
     }
 }

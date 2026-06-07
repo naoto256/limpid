@@ -2,7 +2,7 @@
 
 limpid is preparing a [Snippet Library](../snippets/README.md) of pre-built processes for common parsing / mapping work (landing in v0.6.0). Even once it ships, sooner or later you'll hit a situation the library doesn't cover — a vendor format we haven't shipped, a one-off enrichment, a dedup or rate-limit shape that's specific to your environment — and want to write your own. This page covers how.
 
-You define a process with `def process <name> { ... }`. Inside the body you call functions, assign to event slots and workspace, branch with `if` / `switch` / `try`, transform arrays with the block-arg primitives (`map`, `filter`, `find`, `reduce`), and call other processes by name.
+You define a process with `def process <name> { ... }`. Inside the body you call functions, assign to event slots and workspace, branch with `if` / `switch` / `try`, iterate with `foreach`, and call other processes by name.
 
 ## Defining a process
 
@@ -39,10 +39,12 @@ def process parse_xxx {
         user: f.user,                    // read from the let-bound Object
         host: f.host
     }
+    let alert = workspace._item
+    workspace.first_evidence = alert.evidence[0].file_hash
 }
 ```
 
-Read-side dot-access on a `let` binding is the same path-walk used for `workspace.*`: missing keys yield `null` (so `coalesce(f.maybe_missing, fallback)` works). The restriction is only on the write side: `let f = obj` followed by `let f.x = 1` is not legal — write into `workspace.*` if you need to mutate a structure.
+Read-side dot-access on a `let` binding is the same path-walk used for `workspace.*`: missing keys yield `null` (so `coalesce(f.maybe_missing, fallback)` works), and Array index access (`f.list[0]`) is supported. The restriction is only on the write side: `let f = obj` followed by `let f.x = 1` is not legal — write into `workspace.*` if you need to mutate a structure.
 
 ### Important: what is and isn't reflected in output
 
@@ -81,6 +83,39 @@ def process ama_rewrite {
 ## Control flow
 
 `if` / `else` / `switch` are documented in full at [DSL Syntax Basics → Control flow](../dsl-syntax.md#control-flow); they work the same inside a process body, with the arms being process statements (function calls, assignments, nested control flow). The notes below cover what's *unique* to process-body control flow.
+
+### foreach
+
+```
+foreach <array-path> {
+    // body — runs once per element
+}
+```
+
+Iterates over an array, binding the current element to `workspace._item` for the duration of the body. `<array-path>` is any expression that evaluates to an array — typically a workspace key set by an upstream parser, sometimes an inline array literal.
+
+```
+def process count_evidence {
+    workspace.evidence_count = 0
+    foreach workspace.alert.evidence {
+        workspace.evidence_count = workspace.evidence_count + 1
+    }
+}
+```
+
+`workspace._item` is a real workspace key — visible to other primitives, accessible by dotted path (`workspace._item.entityType`), and survives until the next iteration overwrites it (or the loop ends and it is removed). Nested `foreach` re-binds `_item` to the inner element; if you need the outer one inside a nested loop, save it first:
+
+```
+foreach workspace.alerts {
+    let alert = workspace._item
+    foreach alert.evidence {
+        // workspace._item is now the inner evidence; `alert` still
+        // holds the outer alert.
+    }
+}
+```
+
+`foreach` is the read primitive for arrays; together with `find_by` (identity-keyed lookup) it covers the cases where positional indexing would otherwise be reached for. Arrays in limpid are positionless on purpose — see [Arrays](#arrays) for the rationale.
 
 ### try / catch
 
@@ -128,49 +163,39 @@ Rule of thumb: if the catch block has nothing useful to do besides stamp `worksp
 
 ## Arrays
 
-limpid arrays are **ordered but index-hidden**. You construct them with `[a, b, c]` literals; reads order-preservingly through `map` / `filter` / `concat` / `first` / `last` / `distinct`; identity-based picks through `find`; whole-array reductions through `reduce` / `sum` / `max` / `min` / `len`; growth through `append` / `prepend`. What you cannot do is name an element by numeric index — `arr[0]`, `arr[-1]`, `arr[0] = v` are intentionally absent from the grammar, and `path(arr, 0)` is rejected too.
+limpid treats arrays as **positionless collections**. You construct them with `[a, b, c]` literals, and you can iterate with `foreach`, pick by identity with `find_by`, count with `len`, and add with `append` / `prepend`. What you can **not** do is refer to a numeric index — `arr[0]`, `arr[-1]`, and `arr[0] = v` are intentionally absent from the grammar.
 
 ### Why no positional access
 
-A numeric index is a human convenience that drifts the moment anything else mutates the collection. If "evidence of type Process" happened to land at `arr[0]` in one event and `arr[1]` in the next because an extra entity was prepended upstream, positional code silently reads the wrong thing. Use `find` to address by intrinsic identity, or `first` / `last` when "the only one" or "the most recent" is what you actually mean:
+A numeric index is a human convenience that drifts the moment anything else mutates the collection. If "evidence of type Process" happened to land at `arr[0]` in one event and `arr[1]` in the next because an extra entity was prepended upstream, positional code silently reads the wrong thing. Addressing by intrinsic identity is the fix:
 
 ```
 // WRONG (position is an accident of construction order)
 workspace.process = workspace.evidence[0]
 
 // RIGHT (identity survives insertion / deletion)
-workspace.process = find(workspace.evidence) { |e| e.entityType == "Process" }
+workspace.process = find_by(workspace.evidence, "entityType", "Process")
 ```
 
-The library steers toward identity-based access so snippets stay correct under upstream evolution of vendor schemas. `first` / `last` are reserved for cases where the chronological / construction order is itself the contract (e.g. "the last login event in this session").
+The library steers toward identity-based access so snippets stay correct under upstream evolution of vendor schemas.
 
 ### What arrays can do
 
 | Operation | Form |
 |-----------|------|
 | Construction | `[a, b, c]`, `[]`, mixed types and nesting OK |
-| Per-element transform | `map(arr) { \|x\| <expr> }` — order-preserving |
-| Predicate filter | `filter(arr) { \|x\| <bool> }` — order-preserving |
-| Identity-keyed pick | `find(arr) { \|x\| <bool> }` — first match or `null` |
-| Head / tail | `first(arr)`, `last(arr)` — element or `null` |
-| Fold | `reduce(arr, init) { \|acc, x\| <step> }` |
-| Numeric reductions | `sum(arr)`, `max(arr)`, `min(arr)` |
+| Iteration | `foreach workspace.items { ... }` — `workspace._item` is the current element |
+| Identity-keyed lookup | `find_by(arr, "key", "value")` — returns the element or `null` |
 | Cardinality | `len(arr)` |
-| Concatenate | `concat(a, b, ...)` |
-| Dedupe | `distinct(arr)` (preserves first occurrence) |
-| Name positional captures | `entitle(values, keys)` — `[v1, v2]` × `["a", "b"]` → `{a: v1, b: v2}` |
-| Dynamic key access | `path(obj, "k1", "k2", ...)` (object only; integer keys rejected) |
-| Add to back / front | `append(arr, v)`, `prepend(arr, v)` |
-| Serialise to JSON | `to_json(arr)` |
-
-Block-arg primitives (`map`, `filter`, `find`, `reduce`) and the pipe operator (`|>`) are documented in [DSL Syntax Basics → Block argument](../dsl-syntax.md#block-argument) and [Pipe operator](../dsl-syntax.md#pipe-operator).
+| Add to back / front | `workspace.x = append(workspace.x, v)`, `workspace.x = prepend(workspace.x, v)` |
+| Serialize to JSON | `to_json(workspace.arr)` — arrays pass through as JSON arrays |
 
 ### Example: building an OCSF multi-value field
 
 ```
 def process compose_types {
-    // Start with a fresh collection. Arrays preserve construction order
-    // but consumers should not rely on the index of any one element.
+    // Start with a fresh collection. Arrays are positionless — the order
+    // below is construction convenience, not an index consumers can rely on.
     workspace.types = []
 
     if workspace.cef.name != null {
@@ -187,26 +212,12 @@ def process compose_types {
 ```
 def process parse_mde_alert {
     parse_json(ingress)
-    workspace.process_ev = find(workspace.evidence) { |e| e.entityType == "Process" }
-    workspace.user_ev    = find(workspace.evidence) { |e| e.entityType == "User" }
+    workspace.process_ev = find_by(workspace.evidence, "entityType", "Process")
+    workspace.user_ev    = find_by(workspace.evidence, "entityType", "User")
 }
 ```
 
-Neither lookup cares whether "the Process entity" appears first, last, or third in the evidence list. That independence is the point.
-
-### Example: chained transforms with pipe
-
-```
-def process top_user_logins {
-    // The pipe operator inserts the LHS as the first arg of the call on
-    // the right; `a |> f(b)` ≡ `f(a, b)`. Reads top-to-bottom.
-    workspace.distinct_users =
-        workspace.events
-        |> filter { |e| e.kind == "login" }
-        |> map { |e| e.user }
-        |> distinct
-}
-```
+Neither parser cares whether "the Process entity" appears first, last, or third in the evidence list. That independence is the point.
 
 ## process call
 
@@ -221,3 +232,4 @@ def process enrich_and_tag {
 ```
 
 Each call runs the named process's body against the same event in sequence. Only the named single-call form works here — the `|`-chain shape (`process strip_headers | enrich`) and inline anonymous processes (`process { ... }`) are pipeline-side composition primitives, not process-body statements. See [Pipelines → Routing](../pipelines/routing.md) for those.
+

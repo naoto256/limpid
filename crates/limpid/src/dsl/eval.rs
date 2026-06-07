@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use anyhow::{Result, bail};
 
 use super::arena::EventArena;
-use super::ast::{BinOp, BlockArg, Expr, ExprKind, TemplateFragment, UnaryOp};
+use super::ast::{BinOp, Expr, ExprKind, TemplateFragment, UnaryOp};
 use super::value::{ArrayBuilder, ObjectBuilder, Value};
 use crate::event::BorrowedEvent;
 use crate::functions::FunctionRegistry;
@@ -136,25 +136,7 @@ pub fn eval_expr_with_scope<'bump>(
             namespace,
             name,
             args,
-            block_arg,
         } => {
-            // Block-arg primitives (`map` / `filter` / `find` / `reduce`)
-            // need access to the unevaluated body so it can be re-evaluated
-            // per element with a fresh local binding. These dispatch
-            // before ordinary primitive evaluation so the arg-evaluation
-            // loop below never runs for them.
-            if let Some(block) = block_arg {
-                return eval_block_primitive(
-                    namespace.as_deref(),
-                    name,
-                    args,
-                    block,
-                    event,
-                    funcs,
-                    scope,
-                    arena,
-                );
-            }
             let mut evaluated_args =
                 bumpalo::collections::Vec::with_capacity_in(args.len(), arena.bump());
             for a in args {
@@ -235,210 +217,6 @@ pub fn eval_expr_with_scope<'bump>(
     }
 }
 
-/// Evaluate a primitive call that carries a trailing `{ |id| body }`
-/// block argument.
-///
-/// Only `map` / `filter` / `find` / `reduce` accept block-args (other
-/// names bail with a clear error). For each, the array argument is
-/// evaluated up-front (so type errors surface deterministically), then
-/// the block body is re-evaluated per element with the bound identifier
-/// pushed onto a child copy of the caller's [`LocalScope`]. Locals
-/// introduced inside the block body do not leak back to the caller —
-/// each iteration runs against a fresh clone.
-#[allow(clippy::too_many_arguments)]
-fn eval_block_primitive<'bump>(
-    namespace: Option<&str>,
-    name: &str,
-    args: &[Expr],
-    block: &BlockArg,
-    event: &BorrowedEvent<'bump>,
-    funcs: &FunctionRegistry,
-    scope: &LocalScope<'bump>,
-    arena: &'bump EventArena<'bump>,
-) -> Result<Value<'bump>> {
-    if let Some(ns) = namespace {
-        bail!(
-            "block-arg primitives are flat-namespaced; {}.{} does not accept a `{{ |x| ... }}` block",
-            ns,
-            name
-        );
-    }
-    match name {
-        "map" => eval_map(args, block, event, funcs, scope, arena),
-        "filter" => eval_filter(args, block, event, funcs, scope, arena),
-        "find" => eval_find(args, block, event, funcs, scope, arena),
-        "reduce" => eval_reduce(args, block, event, funcs, scope, arena),
-        other => bail!(
-            "function `{}` does not accept a block argument (only map / filter / find / reduce do)",
-            other
-        ),
-    }
-}
-
-/// Evaluate a block body with a child scope where `params` are bound to
-/// `values`. Used per-iteration by map/filter/find/reduce. Returns the
-/// value of the trailing return expression.
-fn eval_block_body<'bump>(
-    block: &BlockArg,
-    values: &[Value<'bump>],
-    event: &BorrowedEvent<'bump>,
-    funcs: &FunctionRegistry,
-    parent_scope: &LocalScope<'bump>,
-    arena: &'bump EventArena<'bump>,
-) -> Result<Value<'bump>> {
-    if values.len() != block.params.len() {
-        bail!(
-            "block arity mismatch: declared {} parameter(s) but caller bound {}",
-            block.params.len(),
-            values.len()
-        );
-    }
-    let mut scope = parent_scope.clone();
-    for (param, val) in block.params.iter().zip(values.iter()) {
-        scope.bind(param, *val);
-    }
-    for fl in &block.body.lets {
-        let v = eval_expr_with_scope(&fl.value, event, funcs, &scope, arena)?;
-        scope.bind(&fl.name, v);
-    }
-    eval_expr_with_scope(&block.body.ret, event, funcs, &scope, arena)
-}
-
-fn expect_one_arg_array<'bump>(
-    name: &str,
-    args: &[Expr],
-    event: &BorrowedEvent<'bump>,
-    funcs: &FunctionRegistry,
-    scope: &LocalScope<'bump>,
-    arena: &'bump EventArena<'bump>,
-) -> Result<&'bump [Value<'bump>]> {
-    if args.len() != 1 {
-        bail!(
-            "{}() with a block expects 1 array argument, got {}",
-            name,
-            args.len()
-        );
-    }
-    let v = eval_expr_with_scope(&args[0], event, funcs, scope, arena)?;
-    match v {
-        Value::Array(items) => Ok(items),
-        Value::Null => Ok(&[]),
-        other => bail!(
-            "{}() expects an array as its first argument, got {}",
-            name,
-            other.type_name()
-        ),
-    }
-}
-
-fn eval_map<'bump>(
-    args: &[Expr],
-    block: &BlockArg,
-    event: &BorrowedEvent<'bump>,
-    funcs: &FunctionRegistry,
-    scope: &LocalScope<'bump>,
-    arena: &'bump EventArena<'bump>,
-) -> Result<Value<'bump>> {
-    if block.params.len() != 1 {
-        bail!(
-            "map block takes exactly 1 parameter (`{{ |x| ... }}`); got {}",
-            block.params.len()
-        );
-    }
-    let items = expect_one_arg_array("map", args, event, funcs, scope, arena)?;
-    let mut out = ArrayBuilder::with_capacity(arena, items.len());
-    for item in items {
-        let v = eval_block_body(block, &[*item], event, funcs, scope, arena)?;
-        out.push(v);
-    }
-    Ok(out.finish())
-}
-
-fn eval_filter<'bump>(
-    args: &[Expr],
-    block: &BlockArg,
-    event: &BorrowedEvent<'bump>,
-    funcs: &FunctionRegistry,
-    scope: &LocalScope<'bump>,
-    arena: &'bump EventArena<'bump>,
-) -> Result<Value<'bump>> {
-    if block.params.len() != 1 {
-        bail!(
-            "filter block takes exactly 1 parameter (`{{ |x| ... }}`); got {}",
-            block.params.len()
-        );
-    }
-    let items = expect_one_arg_array("filter", args, event, funcs, scope, arena)?;
-    let mut out = ArrayBuilder::new(arena);
-    for item in items {
-        let v = eval_block_body(block, &[*item], event, funcs, scope, arena)?;
-        if v.is_truthy() {
-            out.push(*item);
-        }
-    }
-    Ok(out.finish())
-}
-
-fn eval_find<'bump>(
-    args: &[Expr],
-    block: &BlockArg,
-    event: &BorrowedEvent<'bump>,
-    funcs: &FunctionRegistry,
-    scope: &LocalScope<'bump>,
-    arena: &'bump EventArena<'bump>,
-) -> Result<Value<'bump>> {
-    if block.params.len() != 1 {
-        bail!(
-            "find block takes exactly 1 parameter (`{{ |x| ... }}`); got {}",
-            block.params.len()
-        );
-    }
-    let items = expect_one_arg_array("find", args, event, funcs, scope, arena)?;
-    for item in items {
-        let v = eval_block_body(block, &[*item], event, funcs, scope, arena)?;
-        if v.is_truthy() {
-            return Ok(*item);
-        }
-    }
-    Ok(Value::Null)
-}
-
-fn eval_reduce<'bump>(
-    args: &[Expr],
-    block: &BlockArg,
-    event: &BorrowedEvent<'bump>,
-    funcs: &FunctionRegistry,
-    scope: &LocalScope<'bump>,
-    arena: &'bump EventArena<'bump>,
-) -> Result<Value<'bump>> {
-    if block.params.len() != 2 {
-        bail!(
-            "reduce block takes exactly 2 parameters (`{{ |acc, x| ... }}`); got {}",
-            block.params.len()
-        );
-    }
-    if args.len() != 2 {
-        bail!(
-            "reduce() with a block expects 2 arguments (array, init), got {}",
-            args.len()
-        );
-    }
-    let arr_val = eval_expr_with_scope(&args[0], event, funcs, scope, arena)?;
-    let items: &[Value<'bump>] = match arr_val {
-        Value::Array(items) => items,
-        Value::Null => &[],
-        other => bail!(
-            "reduce() expects an array as its first argument, got {}",
-            other.type_name()
-        ),
-    };
-    let mut acc = eval_expr_with_scope(&args[1], event, funcs, scope, arena)?;
-    for item in items {
-        acc = eval_block_body(block, &[acc, *item], event, funcs, scope, arena)?;
-    }
-    Ok(acc)
-}
-
 /// Equality check used by [`ExprKind::SwitchExpr`] arm matching. Mirrors
 /// the statement-form switch's match semantics: integer / float
 /// comparison normalised through `f64`, strings byte-equal, bools
@@ -510,9 +288,9 @@ fn resolve_ident<'bump>(
             builder.push("port", Value::Int(event.source.port() as i64));
             Ok(builder.finish())
         }
-        Some("source") if parts.len() == 2 && parts[1] == "ip" => Ok(Value::String(
-            arena.alloc_str(&event.source.ip().to_string()),
-        )),
+        Some("source") if parts.len() == 2 && parts[1] == "ip" => {
+            Ok(Value::String(arena.alloc_str(&event.source.ip().to_string())))
+        }
         Some("source") if parts.len() == 2 && parts[1] == "port" => {
             Ok(Value::Int(event.source.port() as i64))
         }
@@ -747,8 +525,10 @@ fn add_values<'bump>(
     if matches!(left, Value::Bytes(_)) || matches!(right, Value::Bytes(_)) {
         return match (left, right) {
             (Value::Bytes(a), Value::Bytes(b)) => {
-                let mut buf =
-                    bumpalo::collections::Vec::with_capacity_in(a.len() + b.len(), arena.bump());
+                let mut buf = bumpalo::collections::Vec::with_capacity_in(
+                    a.len() + b.len(),
+                    arena.bump(),
+                );
                 buf.extend_from_slice(a);
                 buf.extend_from_slice(b);
                 Ok(Value::Bytes(buf.into_bump_slice()))
@@ -1067,7 +847,6 @@ mod tests {
                 e(ExprKind::Ident(vec!["ingress".into()])),
                 e(ExprKind::StringLit("test".into())),
             ],
-            block_arg: None,
         });
         assert_eq!(
             eval_expr(&expr, &bev, &f, &arena).unwrap(),
@@ -1127,7 +906,6 @@ mod tests {
             namespace: None,
             name: "lower".into(),
             args: vec![e(ExprKind::StringLit("HELLO".into()))],
-            block_arg: None,
         });
         assert_eq!(
             eval_expr(&lower, &bev, &f, &arena).unwrap(),
@@ -1138,7 +916,6 @@ mod tests {
             namespace: None,
             name: "upper".into(),
             args: vec![e(ExprKind::StringLit("hello".into()))],
-            block_arg: None,
         });
         assert_eq!(
             eval_expr(&upper, &bev, &f, &arena).unwrap(),
@@ -1159,7 +936,6 @@ mod tests {
             namespace: None,
             name: "to_json".into(),
             args: vec![e(ExprKind::Ident(vec!["workspace".into()]))],
-            block_arg: None,
         });
         let result = eval_expr(&expr, &bev, &f, &arena).unwrap();
         let s = result.as_str().unwrap();
@@ -1636,9 +1412,7 @@ mod tests {
                         namespace: None,
                         name: "double".into(),
                         args: vec![e(ExprKind::Ident(vec!["x".into()]))],
-                        block_arg: None,
                     })],
-                    block_arg: None,
                 }),
             },
         });
@@ -1788,7 +1562,8 @@ mod tests {
         .unwrap();
         match v {
             Value::Object(map) => {
-                let lookup = |k: &str| map.iter().find(|(kk, _)| *kk == k).map(|(_, vv)| *vv);
+                let lookup =
+                    |k: &str| map.iter().find(|(kk, _)| *kk == k).map(|(_, vv)| *vv);
                 assert_eq!(lookup("ip"), Some(Value::String("10.0.0.1")));
                 assert_eq!(lookup("port"), Some(Value::Int(514)));
             }

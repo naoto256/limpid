@@ -127,6 +127,8 @@ pub enum ProcessStatement {
     Switch(Expr, Vec<SwitchArm>),
     /// `try { ... } catch { ... }`
     TryCatch(Vec<ProcessStatement>, Vec<ProcessStatement>),
+    /// `foreach field_expr { ... }`
+    ForEach(Expr, Vec<ProcessStatement>),
     /// Expression statement: `table_upsert(...)`, `table_delete(...)`, etc.
     /// Evaluates the expression and discards the result.
     ExprStmt(Expr),
@@ -162,7 +164,7 @@ pub struct FunctionDef {
 /// The trailing expression is required — a function must yield a value.
 /// `let` is the only statement form allowed; assignments, routing
 /// (`drop`, `finish`, `process foo`), and statement-form control flow
-/// (`if`, `switch`, `try-catch`) are all parser-rejected by
+/// (`if`, `switch`, `foreach`, `try-catch`) are all parser-rejected by
 /// the slim function-body grammar. Use the expression-form `switch` for
 /// branching.
 ///
@@ -182,20 +184,6 @@ pub struct FuncBody {
 pub struct FuncLet {
     pub name: String,
     pub value: Expr,
-}
-
-/// Trailing block argument attached to a [`ExprKind::FuncCall`].
-///
-/// Built by the parser from `{ |id1[, id2, ...]| <func_body> }` and
-/// consumed by `eval::eval_block_primitive`. `params` is the bound
-/// identifier list (1 for map/filter/find, 2 for reduce — `|acc, x|`).
-/// `body` reuses [`FuncBody`] so block bodies have the exact same shape
-/// as `def function` bodies: zero or more `let` bindings followed by a
-/// required trailing return expression.
-#[derive(Debug, Clone)]
-pub struct BlockArg {
-    pub params: Vec<String>,
-    pub body: FuncBody,
 }
 
 // ---------------------------------------------------------------------------
@@ -357,17 +345,9 @@ impl Expr {
 /// closure that re-enters the walker).
 pub fn walk_children<'a, F: FnMut(&'a Expr)>(expr: &'a Expr, mut f: F) {
     match &expr.kind {
-        ExprKind::FuncCall {
-            args, block_arg, ..
-        } => {
+        ExprKind::FuncCall { args, .. } => {
             for a in args {
                 f(a);
-            }
-            if let Some(b) = block_arg {
-                for fl in &b.body.lets {
-                    f(&fl.value);
-                }
-                f(&b.body.ret);
             }
         }
         ExprKind::BinOp(l, _, r) => {
@@ -448,16 +428,10 @@ pub enum ExprKind {
     /// `lower(workspace.name)`). `namespace = Some("syslog")` is the
     /// dot-namespaced form (`syslog.parse(ingress)`) introduced in
     /// v0.3.0; the registry dispatches on `(namespace, name)`.
-    ///
-    /// `block_arg` is the optional trailing `{ |x| body }` lambda used
-    /// by block-arg primitives (`map`, `filter`, `find`, `reduce`).
-    /// `None` for ordinary calls; `Some(_)` triggers the in-evaluator
-    /// block dispatch path — see `eval::eval_block_primitive`.
     FuncCall {
         namespace: Option<String>,
         name: String,
         args: Vec<Expr>,
-        block_arg: Option<Box<BlockArg>>,
     },
     /// Binary operation: `a == b`, `a and b`, `a + b`, etc.
     BinOp(Box<Expr>, BinOp, Box<Expr>),

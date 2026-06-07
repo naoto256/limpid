@@ -98,7 +98,7 @@ This is Principle 1 (zero hidden behavior) applied to the vendor axis: a format 
 
 ### Schema-specific functions live under a schema namespace
 
-Functions that depend on a specific schema specification (syslog, CEF, OTLP, …) live under a dot namespace that names the schema: `syslog.*`, `cef.*`, `otlp.*`. Schema-agnostic primitives — the ones that don't know or care what format the input is — stay flat: `parse_json`, `regex_extract`, `strftime`, `table_lookup`, `csv_parse`, `to_int`, `to_bytes`, `find`, …
+Functions that depend on a specific schema specification (syslog, CEF, OTLP, …) live under a dot namespace that names the schema: `syslog.*`, `cef.*`, `otlp.*`. Schema-agnostic primitives — the ones that don't know or care what format the input is — stay flat: `parse_json`, `regex_extract`, `strftime`, `table_lookup`, `csv_parse`, `to_int`, `to_bytes`, `find_by`, …
 
 The judgement rule is a single question: **does the function's behavior follow a specific schema specification?** If yes, the schema's name is part of the function's name. If no, it's a flat primitive.
 

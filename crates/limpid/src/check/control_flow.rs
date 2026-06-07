@@ -235,3 +235,22 @@ pub(super) fn analyze_try_catch(
 
     *bindings = intersect_branches(&[try_b, catch_b]);
 }
+
+/// `for_each` body — may not run at all, so any new bindings must
+/// intersect with "skipped" (the starting bindings).
+pub(super) fn analyze_for_each(
+    body: &[ProcessStatement],
+    pipeline_name: &str,
+    registry: &FunctionRegistry,
+    bindings: &mut Bindings,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let starting = bindings.clone();
+    let mut iter_b = starting.clone();
+    iter_b.push_let_scope();
+    for s in body {
+        analyze_process_stmt(s, pipeline_name, registry, &mut iter_b, diagnostics);
+    }
+    iter_b.pop_let_scope();
+    *bindings = intersect_branches(&[iter_b, starting]);
+}

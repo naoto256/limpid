@@ -8,40 +8,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
-## [0.7.5] - 2026-06-07
-> array primitives and expression chaining
-
-### Added — block-argument array primitives
-
-Arrays can now be transformed with expression-level block arguments:
-`map(array) { |x| ... }`, `filter(array) { |x| ... }`,
-`find(array) { |x| ... }`, and `reduce(array, init) { |acc, x| ... }`.
-The block body follows the same expression-function shape as
-`def function`: optional `let` bindings followed by a required return
-expression. Block locals are scoped to the block evaluation and do not
-leak into event workspace.
-
-### Added — expression pipe operator
-
-The `|>` operator chains expression-shaped transforms by inserting the
-left-hand value as the first argument to the function on the right.
-For example, `events |> filter { |e| e.kind == "auth" } |> map { |e| e.user }`
-is parse-time sugar for nested ordinary function calls; no runtime pipe
-object is introduced.
-
-### Added — array helper primitives
-
-New collection helpers cover common whole-array operations:
-`first`, `last`, `concat`, `distinct`, `sum`, `max`, `min`, `entitle`,
-`path`, and `is_array`. Existing `append`, `prepend`, and `len` remain.
-
-### Changed (BREAKING) — remove `find_by` and statement-form `foreach`
-
-`find_by(array, key, value)` is removed in favour of
-`find(array) { |x| x.key == value }`, which supports arbitrary
-predicates. Statement-form `foreach` and the magic `workspace._item`
-binding are removed; use `map`, `filter`, `find`, or `reduce` instead.
-
 ## [0.7.4] - 2026-06-03
 > multi-destination syslog outputs + TLS
 

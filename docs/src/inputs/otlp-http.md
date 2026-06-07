@@ -65,7 +65,7 @@ See [`otlp.decode_resourcelog_protobuf`](../functions/expression-functions.md#ot
 
 A request may carry many ResourceLogs / ScopeLogs / LogRecords. The input splits along the LogRecord axis: one LogRecord per Event. Resource and Scope metadata are preserved on each split — the per-Event ResourceLogs is a singleton (one Resource + one Scope) so all the originating context travels with the LogRecord.
 
-This matches Principle 4 (atomic events through the pipeline): the input is the only layer with the right to split, and it splits to the smallest meaningful unit.
+This matches Principle 6 (pipelines do not change Event granularity): the input is the only layer with the right to split, and it splits to the smallest meaningful unit.
 
 ## Content-type detection
 
