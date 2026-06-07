@@ -24,8 +24,10 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::dsl::ast::{Expr, ExprKind, FunctionDef, walk_children};
+use crate::functions::FunctionRegistry;
 use crate::pipeline::CompiledConfig;
 
+use super::suggestions;
 use super::{DiagKind, Diagnostic, Level};
 
 /// Reserved Event-bound identifier names. A function body that reads
@@ -46,10 +48,15 @@ const EVENT_IDENTS: &[&str] = &[
 /// violations and call-graph cycles. Caller (top-level `analyze`) is
 /// responsible for splicing the resulting diagnostics into the
 /// existing pipeline-level diagnostic stream.
-pub(super) fn check_all_functions(config: &CompiledConfig, diagnostics: &mut Vec<Diagnostic>) {
-    // First pass: per-function purity (Event refs + process calls).
+pub(super) fn check_all_functions(
+    config: &CompiledConfig,
+    registry: &FunctionRegistry,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    // First pass: per-function purity (Event refs + process calls) +
+    // unknown-function detection.
     for fn_def in config.functions.values() {
-        check_function_body(fn_def, config, diagnostics);
+        check_function_body(fn_def, config, registry, diagnostics);
     }
 
     // Second pass: call-graph cycle detection across all user
@@ -62,6 +69,7 @@ pub(super) fn check_all_functions(config: &CompiledConfig, diagnostics: &mut Vec
 fn check_function_body(
     fn_def: &FunctionDef,
     config: &CompiledConfig,
+    registry: &FunctionRegistry,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     // `known` accumulates names that are valid single-segment
@@ -70,10 +78,24 @@ fn check_function_body(
     // it, so we extend after walking the RHS).
     let mut known: HashSet<String> = fn_def.params.iter().cloned().collect();
     for fl in &fn_def.body.lets {
-        walk_for_purity(&fl.value, &fn_def.name, &known, config, diagnostics);
+        walk_for_purity(
+            &fl.value,
+            &fn_def.name,
+            &known,
+            config,
+            registry,
+            diagnostics,
+        );
         known.insert(fl.name.clone());
     }
-    walk_for_purity(&fn_def.body.ret, &fn_def.name, &known, config, diagnostics);
+    walk_for_purity(
+        &fn_def.body.ret,
+        &fn_def.name,
+        &known,
+        config,
+        registry,
+        diagnostics,
+    );
 }
 
 fn walk_for_purity(
@@ -81,6 +103,7 @@ fn walk_for_purity(
     fn_name: &str,
     params: &HashSet<String>,
     config: &CompiledConfig,
+    registry: &FunctionRegistry,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     match &expr.kind {
@@ -159,6 +182,7 @@ fn walk_for_purity(
             namespace,
             name,
             args,
+            block_arg,
         } => {
             // Disallow calls to user-defined `def process` declarations
             // — process bodies have side effects that pure functions
@@ -175,15 +199,70 @@ fn walk_for_purity(
                     )
                     .with_span(Some(expr.span)),
                 );
+            } else if registry.signature(namespace.as_deref(), name).is_none()
+                && !(namespace.is_none() && config.functions.contains_key(name))
+            {
+                // Unknown function call: not a registered built-in
+                // primitive, not a user-defined `def function`, and not
+                // a user-defined process (handled above). The previous
+                // analyzer (pipeline-level expr_types) only emitted
+                // this diagnostic when a near-match name existed in the
+                // registry; that gap let typos like `to_lower` / removed
+                // primitives like `find_by` slip through to runtime.
+                // Here we always emit, with the near-match as a help
+                // hint when available.
+                let mut diag = Diagnostic::error_kind(
+                    DiagKind::UnknownIdent,
+                    format!(
+                        "[function {}] call to unknown function `{}`",
+                        fn_name,
+                        super::expr_types::qualified_name(namespace.as_deref(), name),
+                    ),
+                )
+                .with_span(Some(expr.span));
+                if namespace.is_none()
+                    && let Some(near) = suggestions::near_function_name(name, registry)
+                {
+                    diag = diag.with_help(format!("did you mean `{}`?", near));
+                }
+                diagnostics.push(diag);
             }
             for a in args {
-                walk_for_purity(a, fn_name, params, config, diagnostics);
+                walk_for_purity(a, fn_name, params, config, registry, diagnostics);
+            }
+            // Walk into the block-arg body too — its expression(s) may
+            // contain further unknown-function calls or Event references.
+            // Block-arg parameters extend the known set for the duration
+            // of the body walk (so `map(arr) { |x| f(x) }` doesn't flag
+            // `x` as unknown).
+            if let Some(ba) = block_arg {
+                let mut block_known: HashSet<String> = params.iter().cloned().collect();
+                block_known.extend(ba.params.iter().cloned());
+                for fl in &ba.body.lets {
+                    walk_for_purity(
+                        &fl.value,
+                        fn_name,
+                        &block_known,
+                        config,
+                        registry,
+                        diagnostics,
+                    );
+                    block_known.insert(fl.name.clone());
+                }
+                walk_for_purity(
+                    &ba.body.ret,
+                    fn_name,
+                    &block_known,
+                    config,
+                    registry,
+                    diagnostics,
+                );
             }
         }
         // All other variants delegate recursion to `walk_children`;
         // their own structure carries no purity-relevant signal.
         _ => walk_children(expr, |child| {
-            walk_for_purity(child, fn_name, params, config, diagnostics)
+            walk_for_purity(child, fn_name, params, config, registry, diagnostics)
         }),
     }
 }
@@ -229,6 +308,7 @@ fn collect_user_callees<'a>(expr: &'a Expr, config: &'a CompiledConfig, out: &mu
         namespace,
         name,
         args,
+        block_arg: _,
     } = &expr.kind
     {
         if namespace.is_none()
