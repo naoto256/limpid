@@ -189,7 +189,6 @@ fn parse_process_stmt(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement
         Rule::process_if => parse_process_if(inner, file_id),
         Rule::process_switch => parse_process_switch(inner, file_id),
         Rule::process_try_catch => parse_process_try_catch(inner, file_id),
-        Rule::process_foreach => parse_process_foreach(inner, file_id),
         Rule::process_let => parse_process_let(inner, file_id),
         Rule::process_expr_stmt => parse_process_expr_stmt(inner, file_id),
         _ => bail!("unexpected process statement: {:?}", inner.as_rule()),
@@ -207,7 +206,11 @@ fn parse_process_error(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatemen
 
 fn parse_process_call(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
     let mut inner = pair.into_inner();
-    let name = inner.next().expect("pest grammar invariant").as_str().to_string();
+    let name = inner
+        .next()
+        .expect("pest grammar invariant")
+        .as_str()
+        .to_string();
     let args = if let Some(args_pair) = inner.next() {
         parse_func_args(args_pair, file_id)?
     } else {
@@ -218,7 +221,11 @@ fn parse_process_call(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement
 
 fn parse_process_let(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
     let mut inner = pair.into_inner();
-    let name = inner.next().expect("pest grammar invariant").as_str().to_string();
+    let name = inner
+        .next()
+        .expect("pest grammar invariant")
+        .as_str()
+        .to_string();
     let expr = parse_expr_from_pair(inner.next().expect("pest grammar invariant"), file_id)?;
     Ok(ProcessStatement::LetBinding(name, expr))
 }
@@ -263,7 +270,8 @@ fn parse_process_if(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> 
 
 fn parse_process_switch(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
     let mut inner = pair.into_inner();
-    let discriminant = parse_expr_from_pair(inner.next().expect("pest grammar invariant"), file_id)?;
+    let discriminant =
+        parse_expr_from_pair(inner.next().expect("pest grammar invariant"), file_id)?;
     let arms = inner
         .map(|arm| {
             parse_switch_arm_generic(arm, file_id, |p, fid| {
@@ -287,15 +295,6 @@ fn parse_process_try_catch(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStat
         .map(|p| parse_process_stmt(p, file_id))
         .collect::<Result<Vec<_>>>()?;
     Ok(ProcessStatement::TryCatch(try_body, catch_body))
-}
-
-fn parse_process_foreach(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
-    let mut inner = pair.into_inner();
-    let iterable = parse_expr_from_pair(inner.next().expect("pest grammar invariant"), file_id)?;
-    let body = inner
-        .map(|p| parse_process_stmt(p, file_id))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(ProcessStatement::ForEach(iterable, body))
 }
 
 // ---------------------------------------------------------------------------
@@ -350,8 +349,13 @@ fn parse_func_body(pair: Pair<Rule>, file_id: u32) -> Result<FuncBody> {
         match p.as_rule() {
             Rule::process_let => {
                 let mut li = p.into_inner();
-                let name = li.next().expect("pest grammar invariant").as_str().to_string();
-                let value = parse_expr_from_pair(li.next().expect("pest grammar invariant"), file_id)?;
+                let name = li
+                    .next()
+                    .expect("pest grammar invariant")
+                    .as_str()
+                    .to_string();
+                let value =
+                    parse_expr_from_pair(li.next().expect("pest grammar invariant"), file_id)?;
                 lets.push(FuncLet { name, value });
             }
             Rule::expr => {
@@ -411,7 +415,11 @@ fn parse_chain_element(pair: Pair<Rule>, file_id: u32) -> Result<ProcessChainEle
     match inner.as_rule() {
         Rule::process_ref => {
             let mut parts = inner.into_inner();
-            let name = parts.next().expect("pest grammar invariant").as_str().to_string();
+            let name = parts
+                .next()
+                .expect("pest grammar invariant")
+                .as_str()
+                .to_string();
             let args = if let Some(args_pair) = parts.next() {
                 parse_func_args(args_pair, file_id)?
             } else {
@@ -440,7 +448,8 @@ fn parse_pipeline_if(pair: Pair<Rule>, file_id: u32) -> Result<PipelineStatement
 
 fn parse_pipeline_switch(pair: Pair<Rule>, file_id: u32) -> Result<PipelineStatement> {
     let mut inner = pair.into_inner();
-    let discriminant = parse_expr_from_pair(inner.next().expect("pest grammar invariant"), file_id)?;
+    let discriminant =
+        parse_expr_from_pair(inner.next().expect("pest grammar invariant"), file_id)?;
     let arms = inner
         .map(|arm| {
             parse_switch_arm_generic(arm, file_id, |p, fid| {
@@ -508,7 +517,10 @@ where
 
     // Check if first child is an expr (non-default arm) or a body stmt (default arm)
     let pattern = if inner.peek().map(|p| p.as_rule()) == Some(Rule::expr) {
-        Some(parse_expr_from_pair(inner.next().expect("pest grammar invariant"), file_id)?)
+        Some(parse_expr_from_pair(
+            inner.next().expect("pest grammar invariant"),
+            file_id,
+        )?)
     } else {
         None
     };
@@ -527,13 +539,97 @@ where
 fn parse_expr_from_pair(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
     match pair.as_rule() {
         Rule::expr => parse_expr(pair, file_id),
+        Rule::bin_expr => parse_bin_expr(pair, file_id),
         _ => parse_atom_or_unary(pair, file_id),
     }
 }
 
-/// Parse an `expr` rule: `unary_expr (bin_op unary_expr)*`
-/// Uses a simple precedence climbing approach.
+/// Parse an `expr` rule: `bin_expr ("|>" pipe_target)*`.
+///
+/// Pipe operator `|>` is implemented as **parse-time sugar**: each
+/// `a |> f(b, c)` is rewritten into `f(a, b, c)` (left-associative,
+/// inserting the LHS as the first positional argument). No AST node
+/// exists for pipe — by the time the analyzer / evaluator see the tree,
+/// every `|>` has already become a nested `ExprKind::FuncCall`.
 fn parse_expr(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
+    let span = span_of(&pair, file_id);
+    let mut inner = pair.into_inner();
+    let bin_pair = inner
+        .next()
+        .expect("expr always has at least a bin_expr child");
+    let mut current = parse_bin_expr(bin_pair, file_id)?;
+
+    // Each remaining child is a `pipe_target` (either `func_call` or
+    // `pipe_bare_target` = `ident ~ block_arg?`). Fold left-associatively,
+    // splicing `current` in as the new first arg.
+    for pt in inner {
+        let target_inner = first_inner(pt)?; // pipe_target wraps one alternative
+        let call_expr = match target_inner.as_rule() {
+            Rule::func_call => parse_func_call_expr(target_inner, file_id)?,
+            Rule::pipe_bare_target => parse_pipe_bare_target(target_inner, file_id)?,
+            other => bail!("unexpected pipe target rule: {:?}", other),
+        };
+        current = pipe_into(current, call_expr, span)?;
+    }
+    Ok(current)
+}
+
+/// Parse a `pipe_bare_target` (= `ident ~ block_arg?`) into a 0-arg
+/// `FuncCall` expression. The caller (`pipe_into`) then splices the
+/// LHS as the first argument, producing the same AST shape as a
+/// fully-parenthesized `func_call` would.
+fn parse_pipe_bare_target(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
+    let span = span_of(&pair, file_id);
+    let mut inner = pair.into_inner();
+    let ident_pair = inner
+        .next()
+        .expect("pipe_bare_target always has an ident child");
+    let name = ident_pair.as_str().to_string();
+    let block_arg = match inner.next() {
+        Some(p) if p.as_rule() == Rule::block_arg => Some(Box::new(parse_block_arg(p, file_id)?)),
+        Some(_) | None => None,
+    };
+    Ok(Expr::new(
+        ExprKind::FuncCall {
+            namespace: None,
+            name,
+            args: Vec::new(),
+            block_arg,
+        },
+        span,
+    ))
+}
+
+/// Rewrite `lhs |> call_expr` into a `FuncCall` with `lhs` spliced as
+/// the first positional argument. Errors if `call_expr` is somehow not
+/// a `FuncCall` — the grammar guarantees it.
+fn pipe_into(lhs: Expr, call_expr: Expr, span: Span) -> Result<Expr> {
+    let Expr { kind, .. } = call_expr;
+    match kind {
+        ExprKind::FuncCall {
+            namespace,
+            name,
+            mut args,
+            block_arg,
+        } => {
+            args.insert(0, lhs);
+            Ok(Expr::new(
+                ExprKind::FuncCall {
+                    namespace,
+                    name,
+                    args,
+                    block_arg,
+                },
+                span,
+            ))
+        }
+        other => bail!("pipe target must be a function call, got {:?}", other),
+    }
+}
+
+/// Parse a `bin_expr`: `unary_expr (bin_op unary_expr)*`.
+/// Uses a simple precedence climbing approach.
+fn parse_bin_expr(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
     let mut inner: Vec<Pair<Rule>> = pair.into_inner().collect();
 
     if inner.len() == 1 {
@@ -624,7 +720,8 @@ fn parse_atom_or_unary(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
                     "-" => UnaryOp::Neg,
                     other => bail!("unknown unary operator: {}", other),
                 };
-                let operand = parse_atom_or_unary(inner.next().expect("pest grammar invariant"), file_id)?;
+                let operand =
+                    parse_atom_or_unary(inner.next().expect("pest grammar invariant"), file_id)?;
                 Ok(Expr::new(ExprKind::UnaryOp(op, Box::new(operand)), span))
             } else {
                 // It's a postfix_expr (atom with optional .field access)
@@ -712,7 +809,13 @@ fn parse_switch_expr(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
             1 => {
                 arms.push(SwitchExprArm {
                     pattern: None,
-                    body: parse_expr(arm_inner.into_iter().next().expect("pest grammar invariant"), file_id)?,
+                    body: parse_expr(
+                        arm_inner
+                            .into_iter()
+                            .next()
+                            .expect("pest grammar invariant"),
+                        file_id,
+                    )?,
                 });
             }
             // `pattern { expr }` — two expression children: pattern, body
@@ -741,22 +844,38 @@ fn parse_switch_expr(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
 }
 
 fn parse_func_call_expr(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
-    // Grammar has two alternatives:
-    //   ident "." ident "(" args ")"   — namespaced:  inner = [ns, name, args?]
-    //   ident "(" args ")"             — flat:        inner = [name, args?]
-    // We peek at how many leading `ident` pairs there are before the
-    // `func_args` child. This is simpler than threading a silent tag
-    // through the grammar.
+    // Grammar shape:
+    //   ident "." ident "(" args ")" block_arg?   — namespaced
+    //   ident         "(" args ")" block_arg?     — flat
+    // After collecting into a Vec, the tail is `func_args` (always
+    // present, may be empty) optionally followed by `block_arg`. Leading
+    // children are the 1 or 2 `ident` pairs.
     let span = span_of(&pair, file_id);
     let mut inner: Vec<Pair<Rule>> = pair.into_inner().collect();
 
-    // Last child (if present) is `func_args`. Strip it off first.
+    // Optional trailing block_arg — strip first so the args-stripping
+    // logic below stays a single-position pop.
+    let block_arg_pair = if inner
+        .last()
+        .map(|p| p.as_rule() == Rule::block_arg)
+        .unwrap_or(false)
+    {
+        Some(inner.pop().expect("just checked .last() is Some"))
+    } else {
+        None
+    };
+
+    // Last remaining child (if a func_args) is the call arguments.
     let args_pair = if inner
         .last()
         .map(|p| p.as_rule() == Rule::func_args)
         .unwrap_or(false)
     {
-        Some(inner.pop().expect("just checked .last() is Some via the surrounding `if`"))
+        Some(
+            inner
+                .pop()
+                .expect("just checked .last() is Some via the surrounding `if`"),
+        )
     } else {
         None
     };
@@ -779,14 +898,39 @@ fn parse_func_call_expr(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
         vec![]
     };
 
+    let block_arg = block_arg_pair
+        .map(|p| parse_block_arg(p, file_id).map(Box::new))
+        .transpose()?;
+
     Ok(Expr::new(
         ExprKind::FuncCall {
             namespace,
             name,
             args,
+            block_arg,
         },
         span,
     ))
+}
+
+/// Parse a `block_arg` rule: `{ |id, ...| <func_body> }`. Inner pairs
+/// are a run of `ident` (the bound parameter names, at least one) followed
+/// by a single `func_body`.
+fn parse_block_arg(pair: Pair<Rule>, file_id: u32) -> Result<BlockArg> {
+    let mut params: Vec<String> = Vec::new();
+    let mut body: Option<FuncBody> = None;
+    for p in pair.into_inner() {
+        match p.as_rule() {
+            Rule::ident => params.push(p.as_str().to_string()),
+            Rule::func_body => body = Some(parse_func_body(p, file_id)?),
+            other => bail!("unexpected rule in block_arg: {:?}", other),
+        }
+    }
+    if params.is_empty() {
+        bail!("block argument requires at least one bound identifier (e.g. `{{ |x| ... }}`)");
+    }
+    let body = body.ok_or_else(|| anyhow::anyhow!("block argument missing body"))?;
+    Ok(BlockArg { params, body })
 }
 
 fn parse_func_args(pair: Pair<Rule>, file_id: u32) -> Result<Vec<Expr>> {
@@ -801,8 +945,13 @@ fn parse_hash_lit(pair: Pair<Rule>, file_id: u32) -> Result<Expr> {
         .into_inner()
         .map(|entry| {
             let mut inner = entry.into_inner();
-            let key = inner.next().expect("pest grammar invariant").as_str().to_string();
-            let value = parse_expr_from_pair(inner.next().expect("pest grammar invariant"), file_id)?;
+            let key = inner
+                .next()
+                .expect("pest grammar invariant")
+                .as_str()
+                .to_string();
+            let value =
+                parse_expr_from_pair(inner.next().expect("pest grammar invariant"), file_id)?;
             Ok((key, value))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1433,6 +1582,7 @@ def process test {
                                     namespace,
                                     name,
                                     args,
+                                    ..
                                 },
                             ..
                         },
@@ -1488,10 +1638,12 @@ def output sink {
 "#;
         let config = parse_config(input).unwrap();
         match &config.definitions[0] {
-            Definition::Output(def) => match &property_value(def.properties.user_properties(), "path").kind {
-                ExprKind::StringLit(s) => assert_eq!(s, "/var/log/app.log"),
-                other => panic!("expected StringLit, got {:?}", other),
-            },
+            Definition::Output(def) => {
+                match &property_value(def.properties.user_properties(), "path").kind {
+                    ExprKind::StringLit(s) => assert_eq!(s, "/var/log/app.log"),
+                    other => panic!("expected StringLit, got {:?}", other),
+                }
+            }
             _ => panic!("expected Output definition"),
         }
     }
@@ -1506,29 +1658,33 @@ def output sink {
 "#;
         let config = parse_config(input).unwrap();
         match &config.definitions[0] {
-            Definition::Output(def) => match &property_value(def.properties.user_properties(), "path").kind {
-                ExprKind::Template(frags) => {
-                    assert_eq!(frags.len(), 5);
-                    // /var/log/
-                    assert!(matches!(&frags[0], TemplateFragment::Literal(s) if s == "/var/log/"));
-                    // ${source}
-                    assert!(matches!(
-                        &frags[1],
-                        TemplateFragment::Interp(Expr { kind: ExprKind::Ident(parts), .. }) if parts == &vec!["source".to_string()]
-                    ));
-                    // /
-                    assert!(matches!(&frags[2], TemplateFragment::Literal(s) if s == "/"));
-                    // ${workspace.date}
-                    assert!(matches!(
-                        &frags[3],
-                        TemplateFragment::Interp(Expr { kind: ExprKind::Ident(parts), .. })
-                            if parts == &vec!["workspace".to_string(), "date".to_string()]
-                    ));
-                    // .log
-                    assert!(matches!(&frags[4], TemplateFragment::Literal(s) if s == ".log"));
+            Definition::Output(def) => {
+                match &property_value(def.properties.user_properties(), "path").kind {
+                    ExprKind::Template(frags) => {
+                        assert_eq!(frags.len(), 5);
+                        // /var/log/
+                        assert!(
+                            matches!(&frags[0], TemplateFragment::Literal(s) if s == "/var/log/")
+                        );
+                        // ${source}
+                        assert!(matches!(
+                            &frags[1],
+                            TemplateFragment::Interp(Expr { kind: ExprKind::Ident(parts), .. }) if parts == &vec!["source".to_string()]
+                        ));
+                        // /
+                        assert!(matches!(&frags[2], TemplateFragment::Literal(s) if s == "/"));
+                        // ${workspace.date}
+                        assert!(matches!(
+                            &frags[3],
+                            TemplateFragment::Interp(Expr { kind: ExprKind::Ident(parts), .. })
+                                if parts == &vec!["workspace".to_string(), "date".to_string()]
+                        ));
+                        // .log
+                        assert!(matches!(&frags[4], TemplateFragment::Literal(s) if s == ".log"));
+                    }
+                    other => panic!("expected Template, got {:?}", other),
                 }
-                other => panic!("expected Template, got {:?}", other),
-            },
+            }
             _ => panic!("expected Output definition"),
         }
     }
@@ -1544,10 +1700,12 @@ def output sink {
 "#;
         let config = parse_config(input).unwrap();
         match &config.definitions[0] {
-            Definition::Output(def) => match &property_value(def.properties.user_properties(), "path").kind {
-                ExprKind::StringLit(s) => assert_eq!(s, "literal-${x}-here"),
-                other => panic!("expected StringLit, got {:?}", other),
-            },
+            Definition::Output(def) => {
+                match &property_value(def.properties.user_properties(), "path").kind {
+                    ExprKind::StringLit(s) => assert_eq!(s, "literal-${x}-here"),
+                    other => panic!("expected StringLit, got {:?}", other),
+                }
+            }
             _ => panic!("expected Output definition"),
         }
     }
@@ -1651,6 +1809,7 @@ def process p {
                                 namespace,
                                 name: fname,
                                 args,
+                                ..
                             },
                         ..
                     },
@@ -1691,6 +1850,7 @@ def process p {
                                 namespace,
                                 name: fname,
                                 args,
+                                ..
                             },
                         ..
                     },
@@ -1725,6 +1885,7 @@ def process p {
                                 namespace,
                                 name,
                                 args,
+                                ..
                             },
                         ..
                     },

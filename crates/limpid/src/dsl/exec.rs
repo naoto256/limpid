@@ -5,13 +5,13 @@
 //! never enters this module. Boundary conversions happen at the
 //! pipeline level (`pipeline::run_pipeline` entry/exit).
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use bytes::Bytes;
 use thiserror::Error;
 
 use super::arena::EventArena;
 use super::ast::*;
-use super::eval::{LocalScope, eval_expr_with_scope, value_to_string, values_match};
+use super::eval::{eval_expr_with_scope, value_to_string, values_match, LocalScope};
 use super::value::Value;
 use crate::event::BorrowedEvent;
 use crate::functions::FunctionRegistry;
@@ -107,9 +107,7 @@ fn exec_process_stmt<'bump>(
             // `workspace._error` (same exposure as any runtime error);
             // otherwise the message lands in the DLQ entry's `reason`.
             let msg = match msg_expr {
-                Some(e) => value_to_string(&eval_expr_with_scope(
-                    e, &event, funcs, scope, arena,
-                )?),
+                Some(e) => value_to_string(&eval_expr_with_scope(e, &event, funcs, scope, arena)?),
                 None => "explicit error routing".to_string(),
             };
             anyhow::bail!("{}", msg);
@@ -215,36 +213,14 @@ fn exec_process_stmt<'bump>(
                     let mut recovered = event_backup;
                     let msg = arena.alloc_str(&e.to_string());
                     recovered.workspace_set_str(arena, "_error", Value::String(msg));
-                    let mut result = exec_stmts_with_scope(
-                        catch_body, recovered, registry, funcs, scope, arena,
-                    );
+                    let mut result =
+                        exec_stmts_with_scope(catch_body, recovered, registry, funcs, scope, arena);
                     // Clean up _error after catch body
                     if let Ok(ExecResult::Continue(ref mut evt)) = result {
                         evt.workspace_remove("_error");
                     }
                     result
                 }
-            }
-        }
-
-        ProcessStatement::ForEach(iterable_expr, body) => {
-            let iterable = eval_expr_with_scope(iterable_expr, &event, funcs, scope, arena)?;
-            if let Value::Array(items) = iterable {
-                for item in items.iter() {
-                    // Bind current item to `workspace._item` for access
-                    // in body. The key is a static string literal so
-                    // it can ride straight into the arena slot list.
-                    event.workspace_set_str(arena, "_item", *item);
-                    match exec_stmts_with_scope(body, event, registry, funcs, scope, arena)? {
-                        ExecResult::Continue(e) => event = e,
-                        ExecResult::Dropped => return Ok(ExecResult::Dropped),
-                    }
-                }
-                event.workspace_remove("_item");
-                Ok(ExecResult::Continue(event))
-            } else {
-                // Not an array, skip
-                Ok(ExecResult::Continue(event))
             }
         }
 
@@ -402,8 +378,7 @@ fn set_object_path<'bump>(
     };
 
     // Capacity = existing + 1 (room for a new key at the leaf level).
-    let mut builder =
-        super::value::ObjectBuilder::with_capacity(arena, existing_entries.len() + 1);
+    let mut builder = super::value::ObjectBuilder::with_capacity(arena, existing_entries.len() + 1);
     let mut placed = false;
     for (k, v) in existing_entries.iter() {
         if *k == head {
@@ -454,7 +429,6 @@ mod tests {
     use bytes::Bytes;
     use std::net::SocketAddr;
 
-    
     use crate::dsl::exec::*;
     use crate::event::{BorrowedEvent, Event};
     use crate::functions::FunctionRegistry;
@@ -847,11 +821,7 @@ mod tests {
             ProcessStatement::LetBinding("f".into(), outer),
             ProcessStatement::Assign(
                 AssignTarget::Workspace(vec!["x".into()]),
-                e(ExprKind::Ident(vec![
-                    "f".into(),
-                    "a".into(),
-                    "b".into(),
-                ])),
+                e(ExprKind::Ident(vec!["f".into(), "a".into(), "b".into()])),
             ),
         ];
         match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
@@ -960,9 +930,8 @@ mod tests {
             "x".into(),
             e(ExprKind::IntLit(1)),
         )];
-        let _ =
-            exec_process_body(&first, event.view_in(&arena), &NoopRegistry, &funcs, &arena)
-                .unwrap();
+        let _ = exec_process_body(&first, event.view_in(&arena), &NoopRegistry, &funcs, &arena)
+            .unwrap();
 
         let second = vec![ProcessStatement::Assign(
             AssignTarget::Workspace(vec!["y".into()]),
@@ -1048,7 +1017,7 @@ mod tests {
     // ------------------------------------------------------------------------
     // Array literal + primitives E2E — these exercise the full evaluator
     // path (ExprKind::ArrayLit through exec_process_body's Assign arm,
-    // function registry dispatch for len / append / prepend / find_by).
+    // function registry dispatch for len / append / prepend / find).
     // ------------------------------------------------------------------------
 
     fn call_fn(name: &str, args: Vec<Expr>) -> Expr {
@@ -1056,6 +1025,19 @@ mod tests {
             namespace: None,
             name: name.into(),
             args,
+            block_arg: None,
+        })
+    }
+
+    fn block_call(name: &str, args: Vec<Expr>, params: Vec<&str>, ret: Expr) -> Expr {
+        e(ExprKind::FuncCall {
+            namespace: None,
+            name: name.into(),
+            args,
+            block_arg: Some(Box::new(BlockArg {
+                params: params.into_iter().map(str::to_string).collect(),
+                body: FuncBody { lets: vec![], ret },
+            })),
         })
     }
 
@@ -1194,37 +1176,243 @@ mod tests {
     }
 
     #[test]
-    fn test_exec_find_by_over_literal_array_of_objects() {
+    fn test_exec_block_array_primitives_transform_filter_find_reduce() {
         let _bump = ::bumpalo::Bump::new();
         let arena = crate::dsl::arena::EventArena::new(&_bump);
-        // workspace.found = find_by([{t:"a", n:1}, {t:"b", n:2}], "t", "b")
         let event = make_event();
         let bevent = event.view_in(&arena);
-        let obj = |t: &str, n: i64| {
-            e(ExprKind::HashLit(vec![
-                ("t".into(), e(ExprKind::StringLit(t.into()))),
-                ("n".into(), e(ExprKind::IntLit(n))),
-            ]))
-        };
-        let stmts = vec![ProcessStatement::Assign(
-            AssignTarget::Workspace(vec!["found".into()]),
-            call_fn(
-                "find_by",
-                vec![
-                    e(ExprKind::ArrayLit(vec![obj("a", 1), obj("b", 2)])),
-                    e(ExprKind::StringLit("t".into())),
-                    e(ExprKind::StringLit("b".into())),
-                ],
+        let nums = e(ExprKind::ArrayLit(vec![
+            e(ExprKind::IntLit(1)),
+            e(ExprKind::IntLit(2)),
+            e(ExprKind::IntLit(3)),
+            e(ExprKind::IntLit(4)),
+        ]));
+        let n = || e(ExprKind::Ident(vec!["n".into()]));
+        let stmts = vec![
+            ProcessStatement::Assign(AssignTarget::Workspace(vec!["nums".into()]), nums),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["doubled".into()]),
+                block_call(
+                    "map",
+                    vec![e(ExprKind::Ident(vec!["workspace".into(), "nums".into()]))],
+                    vec!["n"],
+                    e(ExprKind::BinOp(
+                        Box::new(n()),
+                        BinOp::Mul,
+                        Box::new(e(ExprKind::IntLit(2))),
+                    )),
+                ),
             ),
-        )];
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["evens".into()]),
+                block_call(
+                    "filter",
+                    vec![e(ExprKind::Ident(vec!["workspace".into(), "nums".into()]))],
+                    vec!["n"],
+                    e(ExprKind::BinOp(
+                        Box::new(e(ExprKind::BinOp(
+                            Box::new(n()),
+                            BinOp::Mod,
+                            Box::new(e(ExprKind::IntLit(2))),
+                        ))),
+                        BinOp::Eq,
+                        Box::new(e(ExprKind::IntLit(0))),
+                    )),
+                ),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["found".into()]),
+                block_call(
+                    "find",
+                    vec![e(ExprKind::Ident(vec!["workspace".into(), "nums".into()]))],
+                    vec!["n"],
+                    e(ExprKind::BinOp(
+                        Box::new(n()),
+                        BinOp::Gt,
+                        Box::new(e(ExprKind::IntLit(2))),
+                    )),
+                ),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["total".into()]),
+                block_call(
+                    "reduce",
+                    vec![
+                        e(ExprKind::Ident(vec!["workspace".into(), "nums".into()])),
+                        e(ExprKind::IntLit(0)),
+                    ],
+                    vec!["acc", "n"],
+                    e(ExprKind::BinOp(
+                        Box::new(e(ExprKind::Ident(vec!["acc".into()]))),
+                        BinOp::Add,
+                        Box::new(n()),
+                    )),
+                ),
+            ),
+        ];
         match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
-                let found = ev.workspace_get("found").unwrap();
-                assert_eq!(found.get("t"), Some(Value::String("b")));
-                assert_eq!(found.get("n"), Some(Value::Int(2)));
+                assert_eq!(
+                    ev.workspace_get("doubled").unwrap().to_owned_value(),
+                    OwnedValue::Array(vec![
+                        OwnedValue::Int(2),
+                        OwnedValue::Int(4),
+                        OwnedValue::Int(6),
+                        OwnedValue::Int(8),
+                    ])
+                );
+                assert_eq!(
+                    ev.workspace_get("evens").unwrap().to_owned_value(),
+                    OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(4)])
+                );
+                assert_eq!(ev.workspace_get("found"), Some(Value::Int(3)));
+                assert_eq!(ev.workspace_get("total"), Some(Value::Int(10)));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
+    }
+
+    #[test]
+    fn test_exec_array_helper_primitives_cover_shape_and_reductions() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
+        let event = make_event();
+        let bevent = event.view_in(&arena);
+        let xs = || {
+            e(ExprKind::ArrayLit(vec![
+                e(ExprKind::IntLit(1)),
+                e(ExprKind::IntLit(2)),
+                e(ExprKind::IntLit(2)),
+                e(ExprKind::IntLit(3)),
+            ]))
+        };
+        let stmts = vec![
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["first".into()]),
+                call_fn("first", vec![xs()]),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["last".into()]),
+                call_fn("last", vec![xs()]),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["distinct".into()]),
+                call_fn("distinct", vec![xs()]),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["concat".into()]),
+                call_fn(
+                    "concat",
+                    vec![
+                        e(ExprKind::ArrayLit(vec![e(ExprKind::IntLit(1))])),
+                        e(ExprKind::ArrayLit(vec![
+                            e(ExprKind::IntLit(2)),
+                            e(ExprKind::IntLit(3)),
+                        ])),
+                    ],
+                ),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["sum".into()]),
+                call_fn("sum", vec![xs()]),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["max".into()]),
+                call_fn("max", vec![xs()]),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["min".into()]),
+                call_fn("min", vec![xs()]),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["named".into()]),
+                call_fn(
+                    "entitle",
+                    vec![
+                        e(ExprKind::ArrayLit(vec![
+                            e(ExprKind::StringLit("alice".into())),
+                            e(ExprKind::IntLit(7)),
+                        ])),
+                        e(ExprKind::ArrayLit(vec![
+                            e(ExprKind::StringLit("user".into())),
+                            e(ExprKind::StringLit("score".into())),
+                        ])),
+                    ],
+                ),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["score".into()]),
+                call_fn(
+                    "path",
+                    vec![
+                        e(ExprKind::Ident(vec!["workspace".into(), "named".into()])),
+                        e(ExprKind::StringLit("score".into())),
+                    ],
+                ),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["is_array".into()]),
+                call_fn("is_array", vec![xs()]),
+            ),
+        ];
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
+            ExecResult::Continue(ev) => {
+                assert_eq!(ev.workspace_get("first"), Some(Value::Int(1)));
+                assert_eq!(ev.workspace_get("last"), Some(Value::Int(3)));
+                assert_eq!(
+                    ev.workspace_get("distinct").unwrap().to_owned_value(),
+                    OwnedValue::Array(vec![
+                        OwnedValue::Int(1),
+                        OwnedValue::Int(2),
+                        OwnedValue::Int(3),
+                    ])
+                );
+                assert_eq!(
+                    ev.workspace_get("concat").unwrap().to_owned_value(),
+                    OwnedValue::Array(vec![
+                        OwnedValue::Int(1),
+                        OwnedValue::Int(2),
+                        OwnedValue::Int(3),
+                    ])
+                );
+                assert_eq!(ev.workspace_get("sum"), Some(Value::Int(8)));
+                assert_eq!(ev.workspace_get("max"), Some(Value::Int(3)));
+                assert_eq!(ev.workspace_get("min"), Some(Value::Int(1)));
+                assert_eq!(ev.workspace_get("score"), Some(Value::Int(7)));
+                assert_eq!(ev.workspace_get("is_array"), Some(Value::Bool(true)));
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
+    }
+
+    #[test]
+    fn test_exec_path_rejects_integer_array_index_escape_hatch() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
+        let event = make_event();
+        let bevent = event.view_in(&arena);
+        let stmts = vec![ProcessStatement::Assign(
+            AssignTarget::Workspace(vec!["bad".into()]),
+            call_fn(
+                "path",
+                vec![
+                    e(ExprKind::ArrayLit(vec![e(ExprKind::StringLit("x".into()))])),
+                    e(ExprKind::IntLit(0)),
+                ],
+            ),
+        )];
+        let err = expect_exec_err(exec_process_body(
+            &stmts,
+            bevent,
+            &NoopRegistry,
+            &make_funcs(),
+            &arena,
+        ));
+        assert!(
+            err.to_string().contains("rejects integer keys"),
+            "expected path integer-key rejection, got: {}",
+            err
+        );
     }
 
     // ------------------------------------------------------------------------
@@ -1340,6 +1528,7 @@ mod tests {
                     namespace: None,
                     name: "to_bytes".into(),
                     args: vec![e(ExprKind::StringLit("hi".into()))],
+                    block_arg: None,
                 }),
             ),
             ("label".into(), e(ExprKind::StringLit("ok".into()))),
@@ -1387,118 +1576,6 @@ mod tests {
         match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
             ExecResult::Continue(ev) => {
                 assert_eq!(ev.workspace_get("y"), Some(Value::Int(7)));
-            }
-            ExecResult::Dropped => panic!("unexpected drop"),
-        }
-    }
-
-    /// Concern 5 (normal exit): on natural ForEach termination the
-    /// loop variable `workspace._item` is removed before the event
-    /// continues. A downstream process must not be able to observe the
-    /// last iteration's item via that magic key.
-    #[test]
-    fn foreach_clears_item_after_normal_exit() {
-        let _bump = ::bumpalo::Bump::new();
-        let arena = crate::dsl::arena::EventArena::new(&_bump);
-        let event = make_event();
-        let bevent = event.view_in(&arena);
-        let stmts = vec![ProcessStatement::ForEach(
-            e(ExprKind::ArrayLit(vec![
-                e(ExprKind::IntLit(1)),
-                e(ExprKind::IntLit(2)),
-            ])),
-            // Body: copy the current item into workspace.last so we
-            // know the loop ran. The cleanup assertion below targets
-            // _item, which is the implementation-defined loop key.
-            vec![ProcessStatement::Assign(
-                AssignTarget::Workspace(vec!["last".into()]),
-                e(ExprKind::Ident(vec!["workspace".into(), "_item".into()])),
-            )],
-        )];
-        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
-            ExecResult::Continue(ev) => {
-                assert_eq!(ev.workspace_get("last"), Some(Value::Int(2)));
-                assert!(
-                    ev.workspace_get("_item").is_none(),
-                    "_item must be cleared after the loop body completes"
-                );
-            }
-            ExecResult::Dropped => panic!("unexpected drop"),
-        }
-    }
-
-    /// Concern 5 (drop path): when the ForEach body drops mid-iteration
-    /// the loop variable cleanup is not run, but the entire event is
-    /// discarded by the caller, so no observable leak escapes the
-    /// pipeline. This test pins that drop wins over cleanup; if the
-    /// implementation were ever changed to keep iterating after a drop
-    /// the test would break.
-    #[test]
-    fn foreach_drop_short_circuits_iteration() {
-        let _bump = ::bumpalo::Bump::new();
-        let arena = crate::dsl::arena::EventArena::new(&_bump);
-        let event = make_event();
-        let bevent = event.view_in(&arena);
-        let stmts = vec![ProcessStatement::ForEach(
-            e(ExprKind::ArrayLit(vec![
-                e(ExprKind::IntLit(1)),
-                e(ExprKind::IntLit(2)),
-                e(ExprKind::IntLit(3)),
-            ])),
-            // First iteration drops; later iterations must not run.
-            vec![ProcessStatement::Drop],
-        )];
-        let result =
-            exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap();
-        assert!(matches!(result, ExecResult::Dropped));
-    }
-
-    /// Concern 5 (let persistence): a `let` declared inside the
-    /// ForEach body persists across iterations because `exec.rs` runs
-    /// each iteration with the same outer scope (no inner scope per
-    /// iteration). The body sees the previous iteration's binding;
-    /// rebinding via `let x = ...` shadows. This is consistent with
-    /// the no-inner-scopes rule for `if` (concern 4) and is the
-    /// intended behaviour, but worth pinning so a future refactor
-    /// does not silently change it.
-    #[test]
-    fn let_inside_foreach_body_persists_across_iterations() {
-        let _bump = ::bumpalo::Bump::new();
-        let arena = crate::dsl::arena::EventArena::new(&_bump);
-        let event = make_event();
-        let bevent = event.view_in(&arena);
-        let stmts = vec![
-            // Initial sentinel — `acc` exists in scope before the loop.
-            ProcessStatement::LetBinding("acc".into(), e(ExprKind::IntLit(0))),
-            ProcessStatement::ForEach(
-                e(ExprKind::ArrayLit(vec![
-                    e(ExprKind::IntLit(1)),
-                    e(ExprKind::IntLit(2)),
-                    e(ExprKind::IntLit(3)),
-                ])),
-                vec![
-                    // acc = acc + workspace._item — exercises both
-                    // cross-iteration persistence and the bare-ident
-                    // resolution into the let scope.
-                    ProcessStatement::LetBinding(
-                        "acc".into(),
-                        e(ExprKind::BinOp(
-                            Box::new(e(ExprKind::Ident(vec!["acc".into()]))),
-                            BinOp::Add,
-                            Box::new(e(ExprKind::Ident(vec!["workspace".into(), "_item".into()]))),
-                        )),
-                    ),
-                ],
-            ),
-            // After the loop, `acc` should be 0 + 1 + 2 + 3 = 6.
-            ProcessStatement::Assign(
-                AssignTarget::Workspace(vec!["sum".into()]),
-                e(ExprKind::Ident(vec!["acc".into()])),
-            ),
-        ];
-        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
-            ExecResult::Continue(ev) => {
-                assert_eq!(ev.workspace_get("sum"), Some(Value::Int(6)));
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
