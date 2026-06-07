@@ -21,7 +21,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # pin-audit:2026-06-03 de0fac2 | v6.0.2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # pin-audit:2026-05-21 34e1148 | v4.3.1
         with:
           persist-credentials: false
 
