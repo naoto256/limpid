@@ -10,7 +10,7 @@ use crate::modules::schema::FieldType;
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(
         "first",
-        FunctionSig::fixed(&[FieldType::Array], FieldType::Any),
+        FunctionSig::fixed(&[FieldType::Any], FieldType::Any),
         |_arena, args, _event| Ok(head(&args[0])),
     );
 }

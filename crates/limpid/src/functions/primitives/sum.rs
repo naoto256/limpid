@@ -23,7 +23,6 @@ pub fn register(reg: &mut FunctionRegistry) {
 fn add<'bump>(v: &Value<'bump>) -> anyhow::Result<Value<'bump>> {
     let items = match v {
         Value::Array(items) => *items,
-        Value::Null => return Ok(Value::Int(0)),
         other => bail!("sum() expects an Array, got {}", other.type_name()),
     };
     let mut int_acc: i64 = 0;
