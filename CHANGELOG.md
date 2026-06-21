@@ -10,7 +10,34 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [0.7.6] - 2026-06-21
 > syslog TLS folded into `syslog_tcp` on both sides (output: per-peer,
-> input: optional block)
+> input: optional block); `otlp_http` gains TLS / mTLS
+
+### Added — `input otlp_http` optional `tls { ... }` block (HTTPS + mTLS)
+
+`input otlp_http` now accepts the same `tls { cert key ca }` block that
+`input syslog_tcp` and `input otlp_grpc` already use. With the block
+present, the listener accepts HTTPS only (no HTTP fallback on the same
+port). `ca` enables mTLS — clients without a valid certificate signed
+by the configured CA are rejected at handshake.
+
+The OTLP/HTTP default port (4318) is unchanged regardless of the block;
+there is no separate "secure" port in the OTLP spec.
+
+```
+def input otlp_in {
+    type otlp_http
+    tls {
+        cert "/etc/limpid/cert.pem"
+        key  "/etc/limpid/key.pem"
+        ca   "/etc/limpid/client-ca.pem"   # optional; enables mTLS
+    }
+}
+```
+
+Internals: `otlp_http` now drives the axum `Router` through the
+`axum-server` crate (the bundled `axum::serve` is hardcoded to
+plaintext `TcpListener` in 0.7), giving the same HTTP/1+2 + graceful
+shutdown shape on both transports.
 
 ### Changed (BREAKING) — `output syslog_tls` removed, TLS is now per-peer on `syslog_tcp`
 
