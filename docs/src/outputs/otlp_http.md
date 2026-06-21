@@ -34,22 +34,25 @@ def output otlp_out {
 }
 ```
 
-A single-peer setup is also valid:
+A single-peer setup can use the `peer { ... }` shorthand (same shape `output syslog_tcp` accepts):
 
 ```
 def output otlp_out {
     type otlp_http
-    peers {
-        peer { endpoint "https://collector.example.com:4318/v1/logs" }
+    peer {
+        endpoint "https://collector.example.com:4318/v1/logs"
+        tls { ca "/etc/limpid/ca.crt" }
     }
 }
 ```
+
+`peer { ... }` and `peers { peer { ... } ... }` are mutually exclusive — exactly one of the two must be present.
 
 ## Properties
 
 | Property | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `peers { peer { endpoint tls{...} } ... }` | yes | — | One or more peer blocks. See [§ peers](#peers) below. |
+| `peer { endpoint tls{...} }` or `peers { peer { ... } ... }` | yes (one of) | — | One or more peer blocks. See [§ peers](#peers) below. |
 | `protocol` | no | `http_protobuf` | `http_protobuf` (canonical OTLP wire form) or `http_json` (OTLP/JSON canonical mapping). |
 | `batch_size` | no | `1` | Flush after this many Events. `1` ships every Event immediately. |
 | `batch_timeout` | no | `5s` | Flush deferred Events after this duration. |
