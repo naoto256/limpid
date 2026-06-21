@@ -1,44 +1,115 @@
-//! HTTP output: sends events to an HTTP/HTTPS endpoint.
+//! HTTP output: sends events to one or more HTTP/HTTPS endpoints.
 //!
-//! Supports Elasticsearch Bulk API, Splunk HEC, Datadog, Loki,
-//! and any generic HTTP endpoint.
+//! Supports Elasticsearch Bulk API, Splunk HEC, Datadog, Loki, and any
+//! generic HTTP endpoint. Multiple peers are tried in round-robin
+//! order with per-peer cooldown on failure.
 //!
-//! Properties:
-//!   url          "https://es:9200/_bulk"        — required
-//!   method       POST                            — optional (default: POST)
-//!   content_type "application/json"              — optional (default: application/json)
-//!   batch_size   100                             — optional (default: 1, no batching)
-//!   batch_timeout "5s"                           — optional (flush interval, default: 5s)
-//!   verify       false                           — optional (default: true, verify TLS certs)
-//!   compress     gzip                            — optional (gzip compress request body)
-//!   headers {                                    — optional extra headers
-//!       Authorization "Bearer xxx"
-//!   }
-//!   tls {                                        — optional custom CA
-//!       ca "/path/to/ca.crt"
-//!   }
+//! ```text
+//! def output es_cluster {
+//!     type http
+//!     peers {
+//!         peer {
+//!             url "https://es01.example.com:9200/_bulk"
+//!             tls { ca "/etc/limpid/ca.crt" }
+//!         }
+//!         peer {
+//!             url "https://es02.example.com:9200/_bulk"
+//!             tls {
+//!                 ca   "/etc/limpid/ca.crt"
+//!                 cert "/etc/limpid/client.crt"   # mTLS
+//!                 key  "/etc/limpid/client.key"
+//!             }
+//!         }
+//!     }
+//!     method POST
+//!     content_type "application/json"
+//!     headers { Authorization "Bearer xxx" }
+//! }
+//! ```
+//!
+//! Single-peer setups use the `peer { ... }` shorthand (same shape
+//! `output syslog_tcp` and `output otlp_http` accept):
+//!
+//! ```text
+//! def output one {
+//!     type http
+//!     peer {
+//!         url "https://es.example.com:9200/_bulk"
+//!         tls { ca "/etc/limpid/ca.crt" }
+//!     }
+//! }
+//! ```
+//!
+//! ### Round-robin + cooldown
+//!
+//! On each send the rotation picks the next available peer (cooldown
+//! expired) and tries it. On failure that peer is marked cooled-down
+//! for `PEER_COOLDOWN` (5 s, shared with the syslog / otlp outputs)
+//! and subsequent sends rotate past it until the cooldown expires.
+//! Within a single send the rotation falls back to the cursor start
+//! when every peer is cooled (single-peer retry path) — the queue
+//! layer's per-event retry then handles re-delivery on persistent
+//! failure.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::sync::Mutex;
 
 use crate::dsl::arena::EventArena;
+use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
+use crate::modules::output::syslog_peers::{PEER_COOLDOWN, iter_peers_block};
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
+use crate::tls::ClientTlsConfig;
 
-const HTTP_OUTPUT_SCHEMA: &[PropertySpec] = &[
+const HTTP_PEER_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "url",
         required: true,
         repeatable: false,
         exclusive_group: None,
         kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "tls",
+        required: false,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::Block(crate::tls::TLS_CLIENT_BLOCK_PROPERTIES),
+    },
+];
+
+const HTTP_PEERS_SCHEMA: &[PropertySpec] = &[PropertySpec {
+    name: "peer",
+    required: true,
+    repeatable: true,
+    exclusive_group: None,
+    kind: PropertyValueKind::Block(HTTP_PEER_SCHEMA),
+}];
+
+const HTTP_OUTPUT_SCHEMA: &[PropertySpec] = &[
+    // Single-peer shorthand or multi-peer block. Exactly one of the
+    // two must be present; both at once is rejected by the schema
+    // layer.
+    PropertySpec {
+        name: "peer",
+        required: false,
+        repeatable: false,
+        exclusive_group: Some("destination"),
+        kind: PropertyValueKind::Block(HTTP_PEER_SCHEMA),
+    },
+    PropertySpec {
+        name: "peers",
+        required: false,
+        repeatable: false,
+        exclusive_group: Some("destination"),
+        kind: PropertyValueKind::Block(HTTP_PEERS_SCHEMA),
     },
     // Verbs accepted by reqwest — kept as plain String rather than an
     // Enum so users can pass uncommon ones (PROPFIND, MKCOL, etc.)
@@ -92,13 +163,6 @@ const HTTP_OUTPUT_SCHEMA: &[PropertySpec] = &[
         exclusive_group: None,
         kind: PropertyValueKind::StringMap,
     },
-    PropertySpec {
-        name: "tls",
-        required: false,
-        repeatable: false,
-        exclusive_group: None,
-        kind: PropertyValueKind::Block(crate::tls::TLS_CLIENT_BLOCK_PROPERTIES),
-    },
     crate::queue::QUEUE_PROPERTY_SPEC,
 ];
 
@@ -106,15 +170,33 @@ struct HttpPayload {
     msg: String,
 }
 
+struct HttpPeer {
+    url: String,
+    client: reqwest::Client,
+}
+
+struct PeerState {
+    cooldown_until: Mutex<Option<Instant>>,
+}
+
+impl Default for PeerState {
+    fn default() -> Self {
+        Self {
+            cooldown_until: Mutex::new(None),
+        }
+    }
+}
+
 /// Shared state between write() and the flush timer task.
 struct Inner {
-    url: String,
+    peers: Vec<HttpPeer>,
+    peer_state: Vec<PeerState>,
+    cursor: AtomicUsize,
     method: String,
     content_type: String,
     headers: Vec<(String, String)>,
     batch_timeout: Duration,
     compress: bool,
-    client: reqwest::Client,
     batch: Mutex<Vec<String>>,
 }
 
@@ -125,6 +207,112 @@ pub struct HttpOutput {
     metrics: Arc<OutputMetrics>,
 }
 
+/// Parse one `peer { url tls{...} }` block and build the per-peer
+/// `reqwest::Client` with the appropriate root CA / mTLS identity.
+/// `verify` is top-level (applies to every peer) — it disables
+/// certificate verification globally when set to `false`; the per-peer
+/// `tls` block is then ignored. The `name` and `output_label` strings
+/// only affect error context wording.
+fn parse_peer(name: &str, peer_props: &[Property], verify: bool) -> Result<HttpPeer> {
+    let url = props::get_string(peer_props, "url")
+        .ok_or_else(|| anyhow::anyhow!("output '{}': http peer requires 'url'", name))?;
+
+    let is_https = url.starts_with("https://");
+    let tls_block = props::get_block(peer_props, "tls");
+    let has_tls_block = tls_block.is_some();
+
+    if !is_https && has_tls_block {
+        tracing::warn!(
+            "output '{}': 'tls' block on peer '{}' has no effect on non-HTTPS URL",
+            name,
+            url
+        );
+    }
+    if is_https && !verify {
+        // Loud, unconditional warning when TLS verification is
+        // disabled on HTTPS. `verify false` is a config-level
+        // footgun — one line opens MITM. Emit the warning once at
+        // startup so ops can grep for it, regardless of whether a
+        // `tls { ca ... }` block is also present.
+        tracing::warn!(
+            "output '{}': TLS certificate verification is DISABLED (verify false) — \
+             connections to {} are vulnerable to MITM. Debugging only; never use in production.",
+            name,
+            url
+        );
+    }
+
+    let tls_config = if verify {
+        tls_block
+            .map(|block| {
+                let cfg = ClientTlsConfig {
+                    ca_path: props::get_string(block, "ca"),
+                    cert_path: props::get_string(block, "cert"),
+                    key_path: props::get_string(block, "key"),
+                };
+                cfg.validate(&format!("output '{}'", name))?;
+                Ok::<_, anyhow::Error>(cfg)
+            })
+            .transpose()?
+    } else {
+        if has_tls_block {
+            tracing::warn!(
+                "output '{}': 'tls' block on peer '{}' is ignored because 'verify false' disables certificate validation",
+                name,
+                url
+            );
+        }
+        None
+    };
+
+    let mut client_builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
+
+    if !verify {
+        client_builder = client_builder.danger_accept_invalid_certs(true);
+    }
+
+    if let Some(tls) = &tls_config {
+        if let Some(ca_path) = &tls.ca_path {
+            let pem = std::fs::read(ca_path).with_context(|| {
+                format!("output '{}': failed to read CA cert: {}", name, ca_path)
+            })?;
+            let cert = reqwest::Certificate::from_pem(&pem)
+                .with_context(|| format!("output '{}': invalid CA cert: {}", name, ca_path))?;
+            client_builder = client_builder.add_root_certificate(cert);
+        }
+        if let (Some(cert_path), Some(key_path)) = (&tls.cert_path, &tls.key_path) {
+            let cert_pem = std::fs::read(cert_path).with_context(|| {
+                format!("output '{}': cannot read client cert {}", name, cert_path)
+            })?;
+            let key_pem = std::fs::read(key_path).with_context(|| {
+                format!("output '{}': cannot read client key {}", name, key_path)
+            })?;
+            // reqwest expects the identity as a concatenated PEM blob
+            // (cert chain followed by the private key); we hand-build
+            // it here so users can keep cert and key in separate files
+            // (matches the syslog_tcp / kafka / otlp mTLS disposition).
+            let mut combined = cert_pem.clone();
+            if !combined.ends_with(b"\n") {
+                combined.push(b'\n');
+            }
+            combined.extend_from_slice(&key_pem);
+            let identity = reqwest::Identity::from_pem(&combined).with_context(|| {
+                format!(
+                    "output '{}': invalid client cert/key PEM ({}, {})",
+                    name, cert_path, key_path
+                )
+            })?;
+            client_builder = client_builder.identity(identity);
+        }
+    }
+
+    let client = client_builder
+        .build()
+        .with_context(|| format!("output '{}': failed to build HTTP client", name))?;
+
+    Ok(HttpPeer { url, client })
+}
+
 impl Module for HttpOutput {
     fn property_schema() -> Option<&'static [PropertySpec]> {
         Some(HTTP_OUTPUT_SCHEMA)
@@ -132,8 +320,7 @@ impl Module for HttpOutput {
 
     fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
         let properties = properties.user_properties();
-        let url = props::get_string(properties, "url")
-            .ok_or_else(|| anyhow::anyhow!("output '{}': http requires 'url'", name))?;
+
         let method = props::get_ident(properties, "method")
             .unwrap_or_else(|| "POST".to_string())
             .to_uppercase();
@@ -147,84 +334,43 @@ impl Module for HttpOutput {
         let compress = props::get_ident(properties, "compress")
             .map(|s| s == "gzip")
             .unwrap_or(false);
-
-        // Parse headers block — open key set, schema enforces string-shaped values.
         let headers = props::get_string_map(properties, "headers");
 
-        // TLS / verify configuration
-        let is_https = url.starts_with("https://");
         let verify = props::get_ident(properties, "verify")
             .map(|s| s != "false")
             .unwrap_or(true);
-        let has_tls_block = props::get_block(properties, "tls").is_some();
 
-        if !is_https {
-            if !verify {
-                tracing::warn!(
-                    "output '{}': 'verify false' has no effect on non-HTTPS URL",
-                    name
-                );
-            }
-            if has_tls_block {
-                tracing::warn!(
-                    "output '{}': 'tls' block has no effect on non-HTTPS URL",
-                    name
-                );
-            }
-        }
-
-        if !verify && has_tls_block {
-            tracing::warn!(
-                "output '{}': 'tls' block is ignored because 'verify false' disables certificate validation",
+        // Single-peer shorthand (`peer { url ... }`) or multi-peer
+        // (`peers { peer { ... } ... }`). The schema's exclusive_group
+        // already forbids both at once, so we just probe in priority
+        // order.
+        let peers = if let Some(peer_block) = props::get_block(properties, "peer") {
+            vec![parse_peer(name, peer_block, verify)?]
+        } else if let Some(peers_block) = props::get_block(properties, "peers") {
+            iter_peers_block(
+                peers_block,
+                &format!("output '{}': peers", name),
+                |peer_props| parse_peer(name, peer_props, verify),
+            )?
+        } else {
+            anyhow::bail!(
+                "output '{}': http requires a 'peer {{ ... }}' or 'peers {{ peer {{ ... }} ... }}' block",
                 name
             );
-        }
+        };
 
-        // Loud, unconditional warning when TLS verification is disabled on HTTPS.
-        // `verify false` is a config-level footgun — one line opens MITM. Emit
-        // the warning once at startup so ops can grep for it, regardless of
-        // whether a `tls { ca ... }` block is also present.
-        if is_https && !verify {
-            tracing::warn!(
-                "output '{}': TLS certificate verification is DISABLED (verify false) — \
-                 connections to {} are vulnerable to MITM. This is for debugging only; \
-                 never use in production.",
-                name,
-                url
-            );
-        }
-
-        let mut client_builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
-
-        if !verify {
-            client_builder = client_builder.danger_accept_invalid_certs(true);
-        }
-
-        if verify
-            && let Some(tls_block) = props::get_block(properties, "tls")
-            && let Some(ca_path) = props::get_string(tls_block, "ca")
-        {
-            let ca_pem = std::fs::read(&ca_path).with_context(|| {
-                format!("output '{}': failed to read CA cert: {}", name, ca_path)
-            })?;
-            let ca_cert = reqwest::Certificate::from_pem(&ca_pem)
-                .with_context(|| format!("output '{}': invalid CA cert: {}", name, ca_path))?;
-            client_builder = client_builder.add_root_certificate(ca_cert);
-        }
-
-        let client = client_builder
-            .build()
-            .context("failed to build HTTP client")?;
+        let peer_state = peers.iter().map(|_| PeerState::default()).collect();
 
         Ok(Self {
             inner: Arc::new(Inner {
-                url,
+                peers,
+                peer_state,
+                cursor: AtomicUsize::new(0),
                 method,
                 content_type,
                 headers,
                 batch_timeout,
                 compress,
-                client,
                 batch: Mutex::new(Vec::with_capacity(batch_size.max(1))),
             }),
             batch_size,
@@ -360,6 +506,12 @@ impl HttpOutput {
 }
 
 impl Inner {
+    /// Ship `messages` to one of the configured peers, rotating to the
+    /// next peer in round-robin order. A peer that fails the request
+    /// is cooled down for `PEER_COOLDOWN` and skipped on subsequent
+    /// flushes. When every peer is currently cooled the rotation falls
+    /// back to the cursor start — the queue layer's per-event retry
+    /// then handles longer-term re-delivery.
     async fn send_batch(&self, messages: &[String]) -> Result<()> {
         let body_str = messages.join("\n");
 
@@ -378,40 +530,71 @@ impl Inner {
             body_str.into_bytes()
         };
 
-        let mut request = match self.method.as_str() {
-            "PUT" => self.client.put(&self.url),
-            _ => self.client.post(&self.url),
-        };
+        let n = self.peers.len();
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
+        let now = Instant::now();
 
-        request = request.header("Content-Type", &self.content_type);
-
-        if self.compress {
-            request = request.header("Content-Encoding", "gzip");
+        // Pick the next non-cooled peer in rotation; if every peer is
+        // cooled, fall back to the rotation start (the queue layer's
+        // retry then handles the persistent-failure case).
+        let mut idx = start;
+        for offset in 0..n {
+            let candidate = (start + offset) % n;
+            let guard = self.peer_state[candidate].cooldown_until.lock().await;
+            if guard.is_none_or(|until| until <= now) {
+                idx = candidate;
+                break;
+            }
         }
 
-        for (key, value) in &self.headers {
-            request = request.header(key.as_str(), value.as_str());
+        let peer = &self.peers[idx];
+        match send_once(peer, self, &body).await {
+            Ok(()) => {
+                *self.peer_state[idx].cooldown_until.lock().await = None;
+                Ok(())
+            }
+            Err(e) => {
+                *self.peer_state[idx].cooldown_until.lock().await = Some(now + PEER_COOLDOWN);
+                Err(e)
+            }
         }
-
-        let response = request
-            .body(body)
-            .send()
-            .await
-            .with_context(|| format!("http output: request to {} failed", self.url))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let resp_body = response.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "http output: {} returned {} — {}",
-                self.url,
-                status,
-                resp_body.chars().take(200).collect::<String>()
-            );
-        }
-
-        Ok(())
     }
+}
+
+async fn send_once(peer: &HttpPeer, inner: &Inner, body: &[u8]) -> Result<()> {
+    let mut request = match inner.method.as_str() {
+        "PUT" => peer.client.put(&peer.url),
+        _ => peer.client.post(&peer.url),
+    };
+
+    request = request.header("Content-Type", &inner.content_type);
+
+    if inner.compress {
+        request = request.header("Content-Encoding", "gzip");
+    }
+
+    for (key, value) in &inner.headers {
+        request = request.header(key.as_str(), value.as_str());
+    }
+
+    let response = request
+        .body(body.to_vec())
+        .send()
+        .await
+        .with_context(|| format!("http output: request to {} failed", peer.url))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let resp_body = response.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "http output: {} returned {} — {}",
+            peer.url,
+            status,
+            resp_body.chars().take(200).collect::<String>()
+        );
+    }
+
+    Ok(())
 }
 
 impl Drop for HttpOutput {
@@ -419,7 +602,6 @@ impl Drop for HttpOutput {
         if let Some(h) = self.flush_handle.get_mut().take() {
             h.abort();
         }
-        // Check buffer via try_lock (best-effort in Drop)
         if let Ok(buf) = self.inner.batch.try_lock()
             && !buf.is_empty()
         {
@@ -428,5 +610,255 @@ impl Drop for HttpOutput {
                 buf.len()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsl::ast::{Expr, ExprKind, Property};
+    use crate::event::Event;
+    use std::net::SocketAddr;
+
+    fn mp(props: &[Property]) -> crate::modules::ModuleProperties {
+        crate::modules::ModuleProperties::from_parts("http", props.to_vec())
+    }
+
+    fn prop_str(key: &str, val: &str) -> Property {
+        Property::KeyValue {
+            key: key.to_string(),
+            key_span: None,
+            value: Expr::spanless(ExprKind::StringLit(val.to_string())),
+            value_span: None,
+        }
+    }
+
+    fn prop_int(key: &str, val: i64) -> Property {
+        Property::KeyValue {
+            key: key.to_string(),
+            key_span: None,
+            value: Expr::spanless(ExprKind::IntLit(val)),
+            value_span: None,
+        }
+    }
+
+    fn peer_block(url: &str) -> Property {
+        Property::Block {
+            key: "peer".into(),
+            key_span: None,
+            properties: vec![prop_str("url", url)],
+        }
+    }
+
+    fn peers_block_with(peers: Vec<Property>) -> Property {
+        Property::Block {
+            key: "peers".into(),
+            key_span: None,
+            properties: peers,
+        }
+    }
+
+    #[test]
+    fn requires_peer_or_peers_block() {
+        let err = HttpOutput::from_properties("o", &mp(&[])).err().unwrap();
+        assert!(
+            err.to_string().contains("'peer {") && err.to_string().contains("'peers {"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn peer_requires_url() {
+        let props = vec![Property::Block {
+            key: "peer".into(),
+            key_span: None,
+            properties: vec![],
+        }];
+        let err = HttpOutput::from_properties("o", &mp(&props)).err().unwrap();
+        assert!(err.to_string().contains("url"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn accepts_single_peer_shorthand() {
+        let props = vec![peer_block("http://x:8080/")];
+        let output = HttpOutput::from_properties("o", &mp(&props)).unwrap();
+        assert_eq!(output.inner.peers.len(), 1);
+        assert_eq!(output.inner.peers[0].url, "http://x:8080/");
+    }
+
+    #[test]
+    fn parses_multi_peer_block() {
+        let props = vec![peers_block_with(vec![
+            peer_block("http://a:8080/"),
+            peer_block("http://b:8080/"),
+            peer_block("http://c:8080/"),
+        ])];
+        let output = HttpOutput::from_properties("o", &mp(&props)).unwrap();
+        assert_eq!(output.inner.peers.len(), 3);
+        assert_eq!(output.inner.peers[2].url, "http://c:8080/");
+    }
+
+    #[test]
+    fn rejects_tls_with_cert_but_no_key() {
+        let props = vec![Property::Block {
+            key: "peer".into(),
+            key_span: None,
+            properties: vec![
+                prop_str("url", "https://x:8443/"),
+                Property::Block {
+                    key: "tls".into(),
+                    key_span: None,
+                    properties: vec![prop_str("cert", "/c.pem")],
+                },
+            ],
+        }];
+        let err = HttpOutput::from_properties("o", &mp(&props)).err().unwrap();
+        assert!(
+            err.to_string().contains("cert and key"),
+            "unexpected: {err}"
+        );
+    }
+
+    fn event_with(msg: &str) -> Event {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let bytes = bytes::Bytes::from(msg.to_string());
+        let mut e = Event::new(bytes.clone(), addr);
+        e.egress = bytes;
+        e
+    }
+
+    async fn run_echo_collector() -> (
+        SocketAddr,
+        Arc<Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{
+            Router, extract::State, http::StatusCode, response::IntoResponse, routing::post,
+        };
+        #[derive(Clone)]
+        struct AppState {
+            received: Arc<Mutex<Vec<String>>>,
+        }
+        async fn handle(
+            State(state): State<AppState>,
+            body: axum::body::Bytes,
+        ) -> impl IntoResponse {
+            state
+                .received
+                .lock()
+                .await
+                .push(String::from_utf8_lossy(&body).into_owned());
+            (StatusCode::OK, "")
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new().route("/", post(handle)).with_state(AppState {
+            received: Arc::clone(&received),
+        });
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, received, handle)
+    }
+
+    #[tokio::test]
+    async fn round_trip_single_peer() {
+        let (addr, received, server) = run_echo_collector().await;
+        let url = format!("http://{}/", addr);
+        let output = HttpOutput::from_properties(
+            "test",
+            &mp(&[peer_block(&url), prop_int("batch_size", 1)]),
+        )
+        .unwrap();
+        output
+            .write_owned(&event_with("hello-single"))
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            if !received.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        server.abort();
+        let got = received.lock().await.clone();
+        assert_eq!(got, vec!["hello-single".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn round_robin_distributes_across_peers() {
+        // Three echo collectors; send 9 events; expect 3 per peer.
+        let (a, r_a, s_a) = run_echo_collector().await;
+        let (b, r_b, s_b) = run_echo_collector().await;
+        let (c, r_c, s_c) = run_echo_collector().await;
+        let props = vec![
+            peers_block_with(vec![
+                peer_block(&format!("http://{}/", a)),
+                peer_block(&format!("http://{}/", b)),
+                peer_block(&format!("http://{}/", c)),
+            ]),
+            prop_int("batch_size", 1),
+        ];
+        let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
+        for i in 0..9 {
+            output
+                .write_owned(&event_with(&format!("rr-{}", i)))
+                .await
+                .unwrap();
+        }
+        for _ in 0..50 {
+            let na = r_a.lock().await.len();
+            let nb = r_b.lock().await.len();
+            let nc = r_c.lock().await.len();
+            if na + nb + nc == 9 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        s_a.abort();
+        s_b.abort();
+        s_c.abort();
+        assert_eq!(r_a.lock().await.len(), 3);
+        assert_eq!(r_b.lock().await.len(), 3);
+        assert_eq!(r_c.lock().await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn rotates_to_healthy_peer_when_first_fails() {
+        use axum::{Router, http::StatusCode, response::IntoResponse, routing::post};
+        async fn fail(_: axum::body::Bytes) -> impl IntoResponse {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        async fn ok(_: axum::body::Bytes) -> impl IntoResponse {
+            StatusCode::OK
+        }
+        let l_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l_a.local_addr().unwrap();
+        let l_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b = l_b.local_addr().unwrap();
+        let s_a = tokio::spawn(async move {
+            let _ = axum::serve(l_a, Router::new().route("/", post(fail))).await;
+        });
+        let s_b = tokio::spawn(async move {
+            let _ = axum::serve(l_b, Router::new().route("/", post(ok))).await;
+        });
+        let props = vec![
+            peers_block_with(vec![
+                peer_block(&format!("http://{}/", a)),
+                peer_block(&format!("http://{}/", b)),
+            ]),
+            prop_int("batch_size", 1),
+        ];
+        let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
+        // First send goes to A (cursor 0), fails, A cools down.
+        // The queue layer would normally re-send; here we just send
+        // again and expect B to take it (cursor advances to 1).
+        let first = output.write_owned(&event_with("rr-fail")).await;
+        assert!(first.is_err(), "first attempt should fail (peer A is 500)");
+        // Second event goes to peer B (next in rotation, A cooled).
+        output.write_owned(&event_with("rr-ok")).await.unwrap();
+        s_a.abort();
+        s_b.abort();
     }
 }

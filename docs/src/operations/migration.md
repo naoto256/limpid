@@ -33,7 +33,7 @@ sudo dpkg -i limpid_*.deb
 | `action(type="omfile" file="/var/log/msg.log")` | `def output msg { type file path "/var/log/msg.log" }` |
 | `action(type="omfwd" target="10.0.0.1" port="514" protocol="tcp")` | `def output remote { type syslog_tcp peer { host "10.0.0.1" port 514 } }` |
 | `action(type="omfwd" target="10.0.0.1" port="514" protocol="udp")` | `def output remote { type syslog_udp peer { host "10.0.0.1" port 514 } }` |
-| `action(type="omelasticsearch" server="es:9200")` | `def output es { type http url "https://es:9200/_bulk" }` |
+| `action(type="omelasticsearch" server="es:9200")` | `def output es { type http peer { url "https://es:9200/_bulk" } }` |
 
 ### Filters
 
