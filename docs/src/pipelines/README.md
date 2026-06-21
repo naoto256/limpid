@@ -62,7 +62,7 @@ Symmetric to fan-out: a single pipeline can subscribe to multiple inputs. List t
 
 ```
 def pipeline syslog_ingest {
-    input syslog_udp, syslog_tcp, syslog_tls    // three transports, one pipeline
+    input syslog_udp, syslog_tcp, syslog_tcp_tls    // three transports, one pipeline
     process normalize
     output siem
 }

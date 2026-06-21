@@ -1,14 +1,24 @@
-//! Syslog TCP input with RFC 6587 framing (octet counting + non-transparent).
-//! Includes PRI validation (RFC 5424), idle timeout, and rate limiting.
+//! Syslog TCP input with RFC 6587 framing (octet counting + non-transparent),
+//! with optional TLS termination (mTLS supported via `tls { ca cert key }`).
+//!
+//! When the `tls { ... }` block is present, the listener terminates TLS
+//! before applying the same framing logic; without it, the listener
+//! reads plaintext directly. Default port flips per configuration:
+//! 6514 (RFC 5425) when TLS is enabled, 514 (RFC 6587) otherwise.
 
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::Result;
 use bytes::Bytes;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::server::TlsStream;
 use tracing::{debug, error, info, warn};
 
 use super::rate_limit::RateLimiter;
@@ -18,6 +28,7 @@ use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::InputMetrics;
 use crate::modules::{HasMetrics, Input, Module};
+use crate::tls::TlsConfig;
 
 const SYSLOG_TCP_INPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
@@ -37,6 +48,13 @@ const SYSLOG_TCP_INPUT_SCHEMA: &[PropertySpec] = &[
         kind: PropertyValueKind::Enum(&["auto", "octet_counting", "non_transparent"]),
     },
     PropertySpec {
+        name: "tls",
+        required: false,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::Block(crate::tls::TLS_SERVER_BLOCK_PROPERTIES),
+    },
+    PropertySpec {
         name: "rate_limit",
         required: false,
         repeatable: false,
@@ -51,6 +69,37 @@ const SYSLOG_TCP_INPUT_SCHEMA: &[PropertySpec] = &[
         kind: PropertyValueKind::Int,
     },
 ];
+
+// ---------------------------------------------------------------------------
+// AcceptedStream — plaintext TCP or TLS, behind one AsyncRead façade
+// ---------------------------------------------------------------------------
+
+/// Per-connection stream, polymorphic over plaintext / TLS. Both
+/// variants implement [`AsyncRead`] so framing helpers
+/// (`detect_framing`, `read_octet_counting`, `read_non_transparent`)
+/// don't branch on the transport.
+///
+/// The TLS variant is boxed because `TlsStream` carries rustls
+/// connection state much larger than a bare `TcpStream`; leaving it
+/// inline would inflate every `BufReader` allocation including
+/// plaintext connections.
+pub(crate) enum AcceptedStream {
+    Plain(TcpStream),
+    Tls(Box<TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for AcceptedStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            AcceptedStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            AcceptedStream::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
 
 /// Maximum size of a single syslog message (bytes).
 /// RFC 5424 recommends supporting at least 2048; we allow up to 1 MiB.
@@ -89,6 +138,10 @@ pub const DEFAULT_MAX_CONNECTIONS: u64 = 1024;
 pub struct SyslogTcpInput {
     pub bind_addr: String,
     pub framing: TcpFraming,
+    /// `Some` enables TLS termination on this listener (mTLS when
+    /// `ca_path` is set). `None` keeps the listener in plaintext
+    /// mode.
+    pub tls_config: Option<TlsConfig>,
     pub rate_limit: Option<u64>,
     pub max_connections: usize,
     metrics: Arc<InputMetrics>,
@@ -100,12 +153,23 @@ impl Module for SyslogTcpInput {
     }
 
     fn from_properties(
-        _name: &str,
+        name: &str,
         properties: &crate::modules::ModuleProperties,
     ) -> anyhow::Result<Self> {
         let properties = properties.user_properties();
-        let bind =
-            props::get_string(properties, "bind").unwrap_or_else(|| "0.0.0.0:514".to_string());
+        let tls_config = TlsConfig::from_properties_block(&format!("input '{}'", name), properties)?;
+        // The crypto provider must be installed before rustls server
+        // config assembly. Only pay the cost when TLS is actually
+        // configured for this input.
+        if tls_config.is_some() {
+            crate::tls::install_default_crypto_provider();
+        }
+        // RFC 5425 (TLS) → 6514, RFC 6587 (TCP plain) → 514. The
+        // default flips with the `tls` block presence so configs
+        // typically don't need an explicit `port`.
+        let default_port = if tls_config.is_some() { 6514 } else { 514 };
+        let bind = props::get_string(properties, "bind")
+            .unwrap_or_else(|| format!("0.0.0.0:{}", default_port));
         let framing = match props::get_ident(properties, "framing").as_deref() {
             Some("octet_counting") => TcpFraming::OctetCounting,
             Some("non_transparent") => TcpFraming::NonTransparent,
@@ -121,6 +185,7 @@ impl Module for SyslogTcpInput {
         Ok(Self {
             bind_addr: bind,
             framing,
+            tls_config,
             max_connections,
             rate_limit,
             metrics: Arc::new(InputMetrics::default()),
@@ -142,8 +207,22 @@ impl Input for SyslogTcpInput {
         tx: tokio::sync::mpsc::Sender<Event>,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
+        // Build the TLS acceptor up-front (rather than per-connection)
+        // so cert / key parse errors fail-fast at daemon start.
+        let acceptor = match self.tls_config {
+            Some(ref tls) => {
+                let server_config = crate::tls::build_server_config(tls).await?;
+                Some(TlsAcceptor::from(server_config))
+            }
+            None => None,
+        };
+
         let listener = TcpListener::bind(&self.bind_addr).await?;
-        info!("syslog_tcp listening on {}", self.bind_addr);
+        info!(
+            "syslog_tcp listening on {} ({})",
+            self.bind_addr,
+            if acceptor.is_some() { "TLS" } else { "plaintext" }
+        );
 
         let limiter: Option<Arc<RateLimiter>> = self.rate_limit.map(|r| {
             info!("syslog_tcp rate_limit: {} events/sec", r);
@@ -181,9 +260,28 @@ impl Input for SyslogTcpInput {
                             let framing = self.framing;
                             let limiter = limiter.clone();
                             let metrics = Arc::clone(&self.metrics);
+                            let acceptor = acceptor.clone();
                             debug!("syslog_tcp: new connection from {}", addr);
                             conn_handles.push(tokio::spawn(async move {
-                                let mut reader = BufReader::new(stream);
+                                let accepted = match acceptor {
+                                    Some(acceptor) => {
+                                        match acceptor.accept(stream).await {
+                                            Ok(s) => {
+                                                debug!("syslog_tcp [{}]: TLS handshake complete", addr);
+                                                AcceptedStream::Tls(Box::new(s))
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    "syslog_tcp [{}]: TLS handshake failed: {}",
+                                                    addr, e
+                                                );
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    None => AcceptedStream::Plain(stream),
+                                };
+                                let mut reader = BufReader::new(accepted);
 
                                 // Detect framing if Auto
                                 let effective_framing = if framing == TcpFraming::Auto {
@@ -802,5 +900,127 @@ mod tests {
         let mut reader = BufReader::new(&data[..]);
         let framing = detect_framing(&mut reader, addr()).await;
         assert_eq!(framing, None);
+    }
+
+    // -------------------------------------------------------------------
+    // from_properties — TLS block + per-config default port
+    // -------------------------------------------------------------------
+
+    use crate::dsl::ast::{Expr, ExprKind, Property};
+    use tempfile::TempDir;
+
+    struct PemFiles {
+        _dir: TempDir,
+        cert: String,
+        key: String,
+    }
+
+    fn pem_files() -> PemFiles {
+        let dir = TempDir::new().unwrap();
+        let cert_params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("valid CN");
+        let key_pair = rcgen::KeyPair::generate().expect("key gen");
+        let cert = cert_params.self_signed(&key_pair).expect("self-sign");
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
+        PemFiles {
+            _dir: dir,
+            cert: cert_path.display().to_string(),
+            key: key_path.display().to_string(),
+        }
+    }
+
+    fn mp(props: &[Property]) -> crate::modules::ModuleProperties {
+        crate::modules::ModuleProperties::from_parts("syslog_tcp", props.to_vec())
+    }
+
+    fn kv(key: &str, kind: ExprKind) -> Property {
+        Property::KeyValue {
+            key: key.into(),
+            key_span: None,
+            value: Expr::spanless(kind),
+            value_span: None,
+        }
+    }
+
+    fn block(key: &str, properties: Vec<Property>) -> Property {
+        Property::Block {
+            key: key.into(),
+            key_span: None,
+            properties,
+        }
+    }
+
+    #[test]
+    fn build_plaintext_defaults_to_port_514() {
+        let i = SyslogTcpInput::build("relay", &mp(&[])).expect("should build");
+        assert_eq!(i.bind_addr, "0.0.0.0:514");
+        assert!(i.tls_config.is_none());
+    }
+
+    #[test]
+    fn build_with_tls_defaults_to_port_6514() {
+        let files = pem_files();
+        let props = vec![block(
+            "tls",
+            vec![
+                kv("cert", ExprKind::StringLit(files.cert.clone())),
+                kv("key", ExprKind::StringLit(files.key.clone())),
+            ],
+        )];
+        let i = SyslogTcpInput::build("relay", &mp(&props)).expect("should build");
+        assert_eq!(i.bind_addr, "0.0.0.0:6514");
+        let tls = i.tls_config.as_ref().expect("tls present");
+        assert_eq!(tls.cert_path, files.cert);
+        assert_eq!(tls.key_path, files.key);
+        assert!(tls.ca_path.is_none());
+    }
+
+    #[test]
+    fn build_with_mtls_records_ca_path() {
+        let files = pem_files();
+        let props = vec![block(
+            "tls",
+            vec![
+                kv("cert", ExprKind::StringLit(files.cert.clone())),
+                kv("key", ExprKind::StringLit(files.key.clone())),
+                kv("ca", ExprKind::StringLit(files.cert.clone())),
+            ],
+        )];
+        let i = SyslogTcpInput::build("relay", &mp(&props)).expect("should build");
+        let tls = i.tls_config.as_ref().expect("tls present");
+        assert_eq!(tls.ca_path.as_deref(), Some(files.cert.as_str()));
+    }
+
+    #[test]
+    fn build_with_tls_rejects_missing_cert() {
+        let files = pem_files();
+        let props = vec![block(
+            "tls",
+            vec![kv("key", ExprKind::StringLit(files.key))],
+        )];
+        let err = SyslogTcpInput::build("relay", &mp(&props))
+            .err()
+            .expect("should fail");
+        assert!(err.to_string().to_lowercase().contains("cert"), "{}", err);
+    }
+
+    #[test]
+    fn build_explicit_bind_overrides_default_port() {
+        let files = pem_files();
+        let props = vec![
+            kv("bind", ExprKind::StringLit("127.0.0.1:9999".into())),
+            block(
+                "tls",
+                vec![
+                    kv("cert", ExprKind::StringLit(files.cert)),
+                    kv("key", ExprKind::StringLit(files.key)),
+                ],
+            ),
+        ];
+        let i = SyslogTcpInput::build("relay", &mp(&props)).expect("should build");
+        assert_eq!(i.bind_addr, "127.0.0.1:9999");
     }
 }

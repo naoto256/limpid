@@ -713,7 +713,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // TLS-on-syslog_tcp behavior (carried over from syslog_tls tests)
+    // TLS-on-syslog_tcp behavior (carried over from the legacy syslog_tls output)
     // -------------------------------------------------------------------
 
     #[test]

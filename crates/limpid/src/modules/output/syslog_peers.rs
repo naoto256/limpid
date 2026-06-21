@@ -36,8 +36,9 @@ pub struct SyslogPayload {
     pub egress: Bytes,
 }
 
-/// Syslog over TCP framing per RFC 6587. Shared between syslog_tcp
-/// and syslog_tls outputs.
+/// Syslog over TCP framing per RFC 6587. Used by the `syslog_tcp`
+/// output (which handles both plaintext and per-peer TLS through
+/// its `Conn` enum).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyslogFraming {
     /// RFC 6587 §3.4.1: `MSG-LEN SP SYSLOG-MSG`.
@@ -159,8 +160,8 @@ pub struct PeerMetrics {
 
 /// N-peer rotational sink with passive health check (cooldown on
 /// failure). Generic over the per-peer connection type C so syslog_tcp
-/// (TcpStream), syslog_tls (TlsStream<TcpStream>), and syslog_udp
-/// (UdpSocket) all share this layer.
+/// (its own `Conn` enum wrapping plaintext or TLS streams) and
+/// syslog_udp (`UdpSocket`) share this layer.
 pub struct PeerList<C> {
     peers: Vec<Peer>,
     cursor: AtomicUsize,

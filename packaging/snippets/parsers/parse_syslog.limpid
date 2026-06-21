@@ -3,8 +3,8 @@
 //           record (auto-detects RFC 3164 BSD vs RFC 5424 versioned)
 // Upstream: none — `parse_syslog` is a transport-layer parser, run
 //           directly off `ingress` (typically the first process in a
-//           pipeline whose `input` is `syslog_tcp` / `syslog_udp` /
-//           `syslog_tls`)
+//           pipeline whose `input` is `syslog_tcp` (optionally TLS-
+//           terminated) or `syslog_udp`)
 // Output:   workspace.syslog.{pri, facility, severity, timestamp,
 //           hostname, appname, procid, msgid, msg}
 //
