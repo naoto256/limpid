@@ -10,7 +10,52 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [0.7.6] - 2026-06-21
 > syslog TLS folded into `syslog_tcp` on both sides (output: per-peer,
-> input: optional block); `otlp_http` gains TLS / mTLS
+> input: optional block); `otlp_http` gains TLS / mTLS; `output kafka`
+> gains TLS / mTLS / SASL
+
+### Added — `output kafka` `tls { ... }` and `sasl { ... }` blocks
+
+`output kafka` now accepts optional `tls { ca cert key }` and
+`sasl { mechanism username password_file }` blocks. The
+`security.protocol` is derived from which blocks are present
+(`plaintext` / `ssl` / `sasl_plaintext` / `sasl_ssl`), so the most
+common production setup (SASL/SCRAM over TLS) is a single config
+change away.
+
+`cert + key` in the `tls` block are both-or-neither: present them
+together for mTLS, omit both for one-way TLS. `ca` alone is fine for
+private-CA broker certs.
+
+Supported SASL mechanisms: `plain`, `scram_sha_256`, `scram_sha_512`.
+The DSL ident grammar forbids `-`, so the SCRAM mechanisms are spelled
+with underscores in the config and mapped to librdkafka's hyphen
+spelling (`SCRAM-SHA-256` / `SCRAM-SHA-512`) at parse time.
+
+SASL credentials are split intentionally: `username` is inline (not
+secret), `password_file` points to a separate file (chmod 600) — the
+same disposition limpid uses for TLS private keys. Inline `password`
+is **not** supported, so credentials never end up in config diffs,
+backups, or pretty-printed log output. Empty `password_file` is
+rejected as a misconfiguration.
+
+`brokers` is still a single comma-separated bootstrap list — librdkafka
+handles broker discovery / partition routing / leader failover
+internally, so unlike the syslog / http / otlp outputs there is no
+per-peer rotation layer to add here.
+
+```
+def output secure {
+    type kafka
+    brokers "kafka1.example.com:9094"
+    topic "syslog-events"
+    tls { ca "/etc/limpid/kafka-ca.pem" }
+    sasl {
+        mechanism scram-sha-512
+        username "limpid-producer"
+        password_file "/etc/limpid/kafka.pw"
+    }
+}
+```
 
 ### Added — `input otlp_http` optional `tls { ... }` block (HTTPS + mTLS)
 

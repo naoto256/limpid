@@ -22,16 +22,90 @@ def output events {
 }
 ```
 
+TLS to the brokers (with optional client cert for mTLS):
+
+```
+def output secure {
+    type kafka
+    brokers "kafka1.example.com:9093,kafka2.example.com:9093"
+    topic "syslog-events"
+    tls {
+        ca   "/etc/limpid/kafka-ca.pem"
+        cert "/etc/limpid/kafka-client.crt"   // optional; required only for mTLS
+        key  "/etc/limpid/kafka-client.key"   // optional; pairs with cert
+    }
+}
+```
+
+SASL/SCRAM (over TLS — the typical production combo):
+
+```
+def output authenticated {
+    type kafka
+    brokers "kafka1.example.com:9094"
+    topic "syslog-events"
+    tls { ca "/etc/limpid/kafka-ca.pem" }
+    sasl {
+        mechanism scram_sha_512
+        username "limpid-producer"
+        password_file "/etc/limpid/kafka.pw"   // chmod 600
+    }
+}
+```
+
 ## Properties
 
 | Property | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `brokers` | yes | — | Comma-separated list of Kafka brokers |
+| `brokers` | yes | — | Comma-separated list of Kafka brokers (bootstrap list) |
 | `topic` | yes | — | Target topic name |
 | `compression` | no | `none` | `none`, `gzip`, `snappy`, `lz4`, `zstd` |
 | `acks` | no | `all` | `0` (fire-and-forget), `1` (leader only), `all` (all replicas) |
 | `key` | no | none | Event value to use as partition key |
 | `queue_timeout` | no | `5s` | Max wait when rdkafka's internal queue is full |
+| `tls` | no | — | TLS block (see [tls block](#tls-block)). Omit for plaintext. |
+| `sasl` | no | — | SASL block (see [sasl block](#sasl-block)). Omit for no auth. |
+
+`security.protocol` is derived from which blocks are present:
+
+| `tls` | `sasl` | result |
+|---|---|---|
+| absent | absent | `plaintext` (librdkafka default) |
+| present | absent | `ssl` |
+| absent | present | `sasl_plaintext` |
+| present | present | `sasl_ssl` (the recommended production combo) |
+
+### tls block
+
+| Property | Required | Description |
+|----------|----------|-------------|
+| `ca` | no | Path to PEM-encoded CA cert for broker verification. Omit to use the system root store. |
+| `cert` | no | Path to PEM-encoded client certificate (for mTLS). Pairs with `key`. |
+| `key` | no | Path to PEM-encoded client private key. Pairs with `cert`. |
+
+`cert` and `key` are both-or-neither: specify them together for mTLS, or
+omit both for one-way TLS.
+
+### sasl block
+
+| Property | Required | Description |
+|----------|----------|-------------|
+| `mechanism` | yes | One of `plain`, `scram_sha_256`, `scram_sha_512`. The DSL ident grammar forbids `-`, so the mechanism is spelled with underscores; limpid maps it to the librdkafka canonical spelling (`SCRAM-SHA-256` / `SCRAM-SHA-512`) internally. |
+| `username` | yes | SASL username (not a secret; goes in the config) |
+| `password_file` | yes | Path to a file containing the SASL password (the **only** way to set the password — inline `password` is intentionally not supported) |
+
+The `password_file` is read once at daemon start; rotate it and restart
+the daemon to refresh credentials. `chmod 600` it and ensure the file
+is owned by the limpid user. A trailing newline is stripped, so
+`echo "secret" > /etc/limpid/kafka.pw` works as expected. An empty file
+is rejected — that's almost always a misconfigured secret, not a
+deliberate empty password.
+
+Why no inline `password`: inline credentials end up in version-control
+diffs, backups, and log output of any tool that pretty-prints the config.
+Treating SASL passwords with the same disposition as TLS private keys
+(file on disk, restrictive perms) keeps both secrets on the same operational
+footing.
 
 ## Partition key
 

@@ -169,7 +169,8 @@ installation, .deb packaging, and systemd integration.
 
 ### Outputs
 `syslog_udp` · `syslog_tcp` (with optional per-peer TLS) · `file` ·
-`http` · `kafka` · `unix_socket` · `stdout` · `otlp`
+`http` · `kafka` (with optional TLS / mTLS / SASL) · `unix_socket` ·
+`stdout` · `otlp`
 
 ### Upgrading from earlier versions
 
@@ -200,6 +201,18 @@ when TLS is configured, 514 otherwise. The standalone
 `input syslog_tls` module is removed in 0.7.6 — see `CHANGELOG.md`
 for migration. (`input otlp_http` gains the same `tls { ... }` block
 in the same release; `input otlp_grpc` already had it.)
+
+`output kafka` gains optional `tls { ca cert key }` and
+`sasl { mechanism username password_file }` blocks. With both
+configured the producer talks SASL/SCRAM (or PLAIN) over TLS — the
+standard production combination. `cert + key` in `tls` enables mTLS;
+`password_file` (not inline `password`) is the only supported way to
+pass SASL credentials, matching the on-disk-with-chmod-600 pattern
+already used for TLS private keys. No per-peer rotation: librdkafka's
+`brokers` bootstrap list already handles broker discovery and leader
+failover internally. Building with `--features kafka` now requires
+`libssl-dev` and `libsasl2-dev` on Debian/Ubuntu (the cmake-built
+librdkafka links against them at compile time).
 
 ### Snippets
 

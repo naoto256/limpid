@@ -57,7 +57,7 @@ bumpalo = { version = "3", features = ["collections"] }
 # strings, …) sit comfortably under the inline budget.
 compact_str = { version = "0.9", features = ["serde"] }
 systemd = { version = "0.10", optional = true }
-rdkafka = { version = "0.36", features = ["cmake-build"], optional = true }
+rdkafka = { version = "0.36", features = ["cmake-build", "ssl", "sasl"], optional = true }
 
 # OTLP (OpenTelemetry Protocol). Pre-generated message types from the
 # official OpenTelemetry-rust ecosystem. `gen-tonic` pulls in tonic +
