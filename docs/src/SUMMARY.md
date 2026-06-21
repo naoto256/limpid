@@ -15,7 +15,6 @@
 - [Inputs](./inputs/README.md)
   - [syslog_udp](./inputs/syslog-udp.md)
   - [syslog_tcp](./inputs/syslog-tcp.md)
-  - [syslog_tls](./inputs/syslog-tls.md)
   - [tail](./inputs/tail.md)
   - [journal](./inputs/journal.md)
   - [unix_socket](./inputs/unix-socket.md)
