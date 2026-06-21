@@ -214,6 +214,17 @@ failover internally. Building with `--features kafka` now requires
 `libssl-dev` and `libsasl2-dev` on Debian/Ubuntu (the cmake-built
 librdkafka links against them at compile time).
 
+The single `output otlp { protocol grpc | http_* }` module is split
+in 0.7.6 into two transport-specific modules: `output otlp_http`
+(keeps the `protocol http_protobuf|http_json` selector) and
+`output otlp_grpc` (no `protocol`, gRPC is one wire format). The
+single top-level `endpoint` property is replaced by a
+`peers { peer { endpoint tls{...} } ... }` block on both modules —
+flushes round-robin through the peers with per-peer cooldown on
+failure, the standard production shape. Per-peer `tls { ca cert key }`
+enables mTLS for either transport. See `CHANGELOG.md` for the
+migration table.
+
 ### Snippets
 
 Curated parser / composer / filter library, installed under
