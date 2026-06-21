@@ -591,7 +591,6 @@ pub fn register_builtins(registry: &mut ModuleRegistry) {
     register_output_type::<output::file::FileOutput>(registry, "file");
     register_output_type::<output::unix_socket::UnixSocketOutput>(registry, "unix_socket");
     register_output_type::<output::syslog_tcp::SyslogTcpOutput>(registry, "syslog_tcp");
-    register_output_type::<output::syslog_tls::SyslogTlsOutput>(registry, "syslog_tls");
     register_output_type::<output::http::HttpOutput>(registry, "http");
     register_output_type::<output::otlp::OtlpOutput>(registry, "otlp");
     register_output_type::<output::syslog_udp::SyslogUdpOutput>(registry, "syslog_udp");
