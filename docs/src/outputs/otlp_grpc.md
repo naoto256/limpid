@@ -33,22 +33,25 @@ def output otlp_out {
 }
 ```
 
-A single-peer setup is also valid:
+A single-peer setup can use the `peer { ... }` shorthand (same shape `output syslog_tcp` accepts):
 
 ```
 def output otlp_out {
     type otlp_grpc
-    peers {
-        peer { endpoint "https://collector.example.com:4317" }
+    peer {
+        endpoint "https://collector.example.com:4317"
+        tls { ca "/etc/limpid/ca.crt" }
     }
 }
 ```
+
+`peer { ... }` and `peers { peer { ... } ... }` are mutually exclusive — exactly one of the two must be present.
 
 ## Properties
 
 | Property | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `peers { peer { endpoint tls{...} } ... }` | yes | — | One or more peer blocks. See [§ peers](#peers) below. |
+| `peer { endpoint tls{...} }` or `peers { peer { ... } ... }` | yes (one of) | — | One or more peer blocks. See [§ peers](#peers) below. |
 | `batch_size` | no | `1` | Flush after this many Events. `1` ships every Event immediately. |
 | `batch_timeout` | no | `5s` | Flush deferred Events after this duration. |
 | `batch_level` | no | `none` | One of `none` / `resource` / `scope`. See [§ batch_level](#batch_level). |

@@ -133,11 +133,21 @@ const GRPC_PEERS_SCHEMA: &[PropertySpec] = &[PropertySpec {
 }];
 
 const OTLP_GRPC_OUTPUT_SCHEMA: &[PropertySpec] = &[
+    // Shorthand for the common single-collector case; mirrors the
+    // syslog_tcp ergonomics. One of `peer` (single) or `peers` (multi)
+    // is required; both at once is rejected by the schema layer.
+    PropertySpec {
+        name: "peer",
+        required: false,
+        repeatable: false,
+        exclusive_group: Some("destination"),
+        kind: PropertyValueKind::Block(GRPC_PEER_SCHEMA),
+    },
     PropertySpec {
         name: "peers",
-        required: true,
+        required: false,
         repeatable: false,
-        exclusive_group: None,
+        exclusive_group: Some("destination"),
         kind: PropertyValueKind::Block(GRPC_PEERS_SCHEMA),
     },
     PropertySpec {
@@ -235,13 +245,6 @@ impl Module for OtlpGrpcOutput {
     fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
         let properties = properties.user_properties();
 
-        let peers_block = props::get_block(properties, "peers").ok_or_else(|| {
-            anyhow!(
-                "output '{}': otlp_grpc requires a 'peers' block with at least one peer",
-                name
-            )
-        })?;
-
         let batch_size = props::get_positive_int(properties, "batch_size")?.unwrap_or(1) as usize;
         let batch_timeout = match props::get_string(properties, "batch_timeout") {
             Some(s) => props::parse_duration(&s)?,
@@ -254,11 +257,24 @@ impl Module for OtlpGrpcOutput {
 
         let headers = props::get_string_map(properties, "headers");
 
-        let peers = iter_peers_block(
-            peers_block,
-            &format!("output '{}': peers", name),
-            |peer_props| parse_peer(name, peer_props),
-        )?;
+        // Single-peer shorthand (`peer { endpoint ... }`) or multi-peer
+        // (`peers { peer { ... } ... }`). The schema's exclusive_group
+        // already forbids both at once, so we just probe in priority
+        // order.
+        let peers = if let Some(peer_block) = props::get_block(properties, "peer") {
+            vec![parse_peer(name, peer_block)?]
+        } else if let Some(peers_block) = props::get_block(properties, "peers") {
+            iter_peers_block(
+                peers_block,
+                &format!("output '{}': peers", name),
+                |peer_props| parse_peer(name, peer_props),
+            )?
+        } else {
+            anyhow::bail!(
+                "output '{}': otlp_grpc requires a 'peer {{ ... }}' or 'peers {{ peer {{ ... }} ... }}' block",
+                name
+            );
+        };
 
         let peer_state = peers.iter().map(|_| PeerState::default()).collect();
 
@@ -569,11 +585,26 @@ mod tests {
     }
 
     #[test]
-    fn requires_peers_block() {
+    fn requires_peer_or_peers_block() {
         let err = OtlpGrpcOutput::from_properties("o", &mp(&[]))
             .err()
             .unwrap();
-        assert!(err.to_string().contains("peers"));
+        assert!(
+            err.to_string().contains("'peer {") && err.to_string().contains("'peers {"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_single_peer_shorthand() {
+        let props = vec![Property::Block {
+            key: "peer".into(),
+            key_span: None,
+            properties: vec![prop_str("endpoint", "http://x:4317")],
+        }];
+        let output = OtlpGrpcOutput::from_properties("o", &mp(&props)).unwrap();
+        assert_eq!(output.inner.peers.len(), 1);
+        assert_eq!(output.inner.peers[0].endpoint, "http://x:4317");
     }
 
     #[test]
