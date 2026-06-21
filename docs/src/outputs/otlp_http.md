@@ -1,6 +1,6 @@
-# otlp
+# otlp_http
 
-Forwards events to an OpenTelemetry collector or OTLP-compatible SaaS backend over any of the three OTLP transports: `http_json`, `http_protobuf`, `grpc`.
+Forwards events to an OpenTelemetry collector or OTLP-compatible SaaS backend over OTLP/HTTP, in either `http_protobuf` (default) or `http_json` wire format.
 
 Each Event's `egress` is expected to be the singleton ResourceLogs protobuf bytes produced by [`otlp.encode_resourcelog_protobuf`](../functions/expression-functions.md#otlp). The output buffers these per-Event ResourceLogs, flushes on `batch_size` or `batch_timeout`, wraps the batch in an `ExportLogsServiceRequest`, and ships it.
 
@@ -10,9 +10,9 @@ Each Event's `egress` is expected to be the singleton ResourceLogs protobuf byte
 
 ```
 def output otlp_out {
-    type otlp
+    type otlp_http
     endpoint "https://collector.example.com:4318/v1/logs"
-    protocol "http_protobuf"   // http_json | http_protobuf | grpc
+    protocol "http_protobuf"   // http_protobuf | http_json
     batch_size 512
     batch_timeout "5s"
     headers {
@@ -28,22 +28,15 @@ def output otlp_out {
 
 | Property | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `endpoint` | yes | — | OTLP endpoint URL. Full path including `/v1/logs` for HTTP transports. |
-| `protocol` | no | `http_protobuf` | One of `http_json`, `http_protobuf`, `grpc`. |
+| `endpoint` | yes | — | Full OTLP/HTTP URL including `/v1/logs` (limpid does not append it). |
+| `protocol` | no | `http_protobuf` | `http_protobuf` (canonical OTLP wire form) or `http_json` (OTLP/JSON canonical mapping). |
 | `batch_size` | no | `1` | Flush after this many Events. `1` ships every Event immediately. |
 | `batch_timeout` | no | `5s` | Flush deferred Events after this duration. |
 | `batch_level` | no | `none` | One of `none` / `resource` / `scope`. See [§ batch_level](#batch_level). |
-| `headers` | no | — | HTTP headers (HTTP transports) / gRPC metadata (gRPC). Map keys are lower-cased for gRPC per HTTP/2 convention. |
+| `headers` | no | — | HTTP request headers added to every batch. |
 | `tls.ca` | no | system roots | Custom CA certificate file (PEM). |
-| `verify` | no | `true` | TLS verify (HTTP only — gRPC does not support `verify false`; use `http://` for plaintext). |
-| `retry { max_attempts initial_wait max_wait backoff }` | no | shared default (5 attempts, 1s → 60s exponential) | Per-batch retry policy. The OTLP output retries the **whole** ExportLogsServiceRequest internally so a transient failure does not lose buffered Events. Same `retry { … }` shape every other output uses. |
-
-## Endpoint conventions
-
-| Transport | Endpoint shape |
-|-----------|---------------|
-| `http_json` / `http_protobuf` | full URL including `/v1/logs` (limpid does not append it). |
-| `grpc` | gRPC server URL — the `LogsService.Export` path is implicit. `https://` triggers TLS, `http://` is plaintext. |
+| `verify` | no | `true` | Verify the server's TLS certificate. `false` skips verification (development only). |
+| `retry { max_attempts initial_wait max_wait backoff }` | no | shared default (5 attempts, 1s → 60s exponential) | Per-batch retry policy. Retries the **whole** ExportLogsServiceRequest internally so a transient failure does not lose buffered Events. Same `retry { … }` shape every other output uses. |
 
 ## Pipeline contract
 
@@ -104,14 +97,8 @@ Resource / Scope equality is order-insensitive on attributes — proto3 does not
 
 The merging modes are wire-efficiency optimisations; if your batch sizes are modest (hundreds of Events), `none` is fine. For collector → SaaS hops where every byte counts, `scope` is usually the right choice.
 
-## gRPC notes
+## Notes
 
-- `partial_success` on the response (rejected log records) is logged as a warning. The internal `retry { … }` block does not branch on `partial_success` — it retries the whole batch on transport failures only. A finer "retry just the rejects" policy is queued for v0.5.x.
-- Headers map to gRPC metadata. Tonic enforces lower-case keys; limpid lower-cases on the way through.
-- Server TLS uses rustls (aws-lc-rs provider). System root certificates are loaded via `tonic`'s `tls-roots`; supply `tls { ca }` to add a custom CA.
-
-## HTTP notes
-
-- HTTP/JSON serializes per the OTLP/JSON canonical mapping (camelCase, u64-as-string, bytes-as-hex).
-- HTTP/protobuf is the canonical OTLP wire form.
-- The same `tls { ca }` block applies; `verify false` skips certificate verification (development only).
+- `http_protobuf` is the canonical OTLP wire form; `http_json` serializes per the OTLP/JSON canonical mapping (camelCase, u64-as-string, bytes-as-hex).
+- `verify false` skips certificate verification — development only.
+- For gRPC transport see [otlp_grpc](./otlp_grpc.md).

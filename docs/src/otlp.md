@@ -12,7 +12,7 @@ The reference docs for *how to use* OTLP in limpid are elsewhere:
 
 - [`otlp_http`](./inputs/otlp-http.md) and
   [`otlp_grpc`](./inputs/otlp-grpc.md) — input transports
-- [`otlp` output](./outputs/otlp.md) — three-protocol sender
+- [`otlp_http` output](./outputs/otlp_http.md) / [`otlp_grpc` output](./outputs/otlp_grpc.md) — HTTP and gRPC senders
 - [`otlp.*` functions](./functions/expression-functions.md#otlp---opentelemetry-protocol-logs-signal) —
   encode / decode primitives
 
@@ -251,7 +251,7 @@ The OTel Collector's exporter merges aggressively (smallest wire form).
 Some bespoke senders do pure concat (smallest CPU). limpid offers
 all three as `batch_level = none | resource | scope` and documents
 that they are semantically identical at the wire. See [§ batch_level
-on the output reference page](./outputs/otlp.md#batch_level) for the
+on the output reference page](./outputs/otlp_http.md#batch_level) for the
 operational tradeoff and §5.1 above for the underlying wire ↔ CPU
 trade that motivates the choice.
 
@@ -553,7 +553,7 @@ section reference and the wire trace.
 
 | Question | Source |
 |---|---|
-| How do I configure the input / output? | [otlp_http](./inputs/otlp-http.md), [otlp_grpc](./inputs/otlp-grpc.md), [otlp output](./outputs/otlp.md) |
+| How do I configure the input / output? | [otlp_http](./inputs/otlp-http.md), [otlp_grpc](./inputs/otlp-grpc.md), [otlp_http output](./outputs/otlp_http.md), [otlp_grpc output](./outputs/otlp_grpc.md) |
 | What primitives are in the `otlp.*` namespace? | [Built-in Functions](./functions/expression-functions.md#otlp---opentelemetry-protocol-logs-signal) |
 | What are the design principles this builds on? | [Design Principles](./design-principles.md) |
 | What changed in v0.5.0 specifically? | [CHANGELOG](../../CHANGELOG.md) (covers the `Event.timestamp` → `Event.received_at` migration) |

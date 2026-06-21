@@ -170,7 +170,7 @@ installation, .deb packaging, and systemd integration.
 ### Outputs
 `syslog_udp` · `syslog_tcp` (with optional per-peer TLS) · `file` ·
 `http` · `kafka` (with optional TLS / mTLS / SASL) · `unix_socket` ·
-`stdout` · `otlp`
+`stdout` · `otlp_http` · `otlp_grpc`
 
 ### Upgrading from earlier versions
 

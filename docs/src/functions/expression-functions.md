@@ -210,7 +210,7 @@ the same `AnyValue` are an error.
 ### otlp.encode_resourcelog_protobuf(hashlit) → Bytes
 
 Encode the HashLit as a `ResourceLogs` proto3 message and return
-the raw wire bytes. Pair with the [`otlp` output](../outputs/otlp.md)'s
+the raw wire bytes. Pair with the [`otlp_http` output](../outputs/otlp_http.md) / [`otlp_grpc` output](../outputs/otlp_grpc.md)'s
 `http_protobuf` or `grpc` protocol.
 
 ### otlp.decode_resourcelog_protobuf(bytes) → Object
@@ -229,7 +229,7 @@ def process redact_pii {
 ### otlp.encode_resourcelog_json(hashlit) → String
 
 Encode as canonical OTLP/JSON (camelCase, u64-as-string, bytes-as-hex).
-For the [`otlp` output](../outputs/otlp.md) `http_json` protocol.
+For the [`otlp_http` output](../outputs/otlp_http.md) / [`otlp_grpc` output](../outputs/otlp_grpc.md) `http_json` protocol.
 
 ### otlp.decode_resourcelog_json(s) → Object
 
