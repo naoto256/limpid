@@ -7,8 +7,7 @@ Input modules receive log messages from external sources and feed them into pipe
 | Type | Description |
 |------|-------------|
 | [`syslog_udp`](./syslog-udp.md) | UDP syslog receiver |
-| [`syslog_tcp`](./syslog-tcp.md) | TCP syslog receiver (RFC 6587) |
-| [`syslog_tls`](./syslog-tls.md) | TCP+TLS syslog receiver |
+| [`syslog_tcp`](./syslog-tcp.md) | TCP syslog receiver (RFC 6587); optional TLS termination + mTLS |
 | [`tail`](./tail.md) | File tailing with rotation detection |
 | [`journal`](./journal.md) | systemd journal reader (requires `--features journal`) |
 | [`unix_socket`](./unix-socket.md) | Unix datagram socket (`/dev/log`) |

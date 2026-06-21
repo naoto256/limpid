@@ -19,8 +19,9 @@ use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 // inner key set: `cert`, `key`, `ca`. The only thing that differs is
 // which of those are required, and that depends on the role:
 //
-//   - **Server role** (TLS-terminating listeners like `syslog_tls`,
-//     `otlp_grpc`, the future `input limpid`): the server presents a
+//   - **Server role** (TLS-terminating listeners like `syslog_tcp`
+//     (with optional `tls` block), `otlp_grpc`, `otlp_http`,
+//     the future `input limpid`): the server presents a
 //     certificate, so `cert` and `key` are required. `ca` is optional
 //     and used for client-cert verification (mTLS).
 //
@@ -71,9 +72,9 @@ const TLS_BLOCK_CA_ONLY: &[PropertySpec] = &[PropertySpec {
 }];
 
 /// Shared schema for the `tls { cert | key | ca }` block used by
-/// TLS-terminating server Modules (`syslog_tls`, `otlp_grpc`, the
-/// future `input limpid`). `cert` and `key` are mandatory; `ca`
-/// enables mTLS client-certificate verification.
+/// TLS-terminating server Modules (`syslog_tcp`, `otlp_grpc`,
+/// `otlp_http`, the future `input limpid`). `cert` and `key` are
+/// mandatory; `ca` enables mTLS client-certificate verification.
 pub const TLS_SERVER_BLOCK_PROPERTIES: &[PropertySpec] = TLS_BLOCK_CERT_KEY_CA_REQUIRED;
 
 /// Shared schema for the `tls { ca }` block used by client Modules
@@ -99,7 +100,7 @@ impl TlsConfig {
     /// callers can branch on plaintext vs TLS, and a clear error when
     /// the block exists but is missing required fields. The single
     /// implementation keeps error wording consistent across every
-    /// module that accepts the same block (syslog_tls, otlp_grpc, …).
+    /// module that accepts the same block (syslog_tcp, otlp_grpc, …).
     pub fn from_properties_block(
         module_name: &str,
         properties: &[Property],

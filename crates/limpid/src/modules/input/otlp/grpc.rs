@@ -171,7 +171,7 @@ impl Input for OtlpGrpcInput {
 
 /// Read cert / key / CA PEM files and assemble tonic's
 /// `ServerTlsConfig`. Parallels `crate::tls::build_server_config`
-/// (rustls-native loader used by `syslog_tls`) — both follow the same
+/// (rustls-native loader used by `syslog_tcp` TLS) — both follow the same
 /// "spawn_blocking off the reactor" pattern, but the output types
 /// differ (tonic's wrapper vs raw `Arc<rustls::ServerConfig>`), so
 /// they cannot share the loader function. Code reuse stops at

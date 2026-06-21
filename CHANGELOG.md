@@ -9,7 +9,8 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [0.7.6] - 2026-06-21
-> syslog TLS output folded into `syslog_tcp` as per-peer TLS
+> syslog TLS folded into `syslog_tcp` on both sides (output: per-peer,
+> input: optional block)
 
 ### Changed (BREAKING) — `output syslog_tls` removed, TLS is now per-peer on `syslog_tcp`
 
@@ -41,9 +42,35 @@ def output secure {
 }
 ```
 
-The `input syslog_tls` listener is unchanged — it remains a separate
-module because the server-role TLS termination has no "per-peer"
-analogue.
+### Changed (BREAKING) — `input syslog_tls` removed, TLS is now an optional block on `input syslog_tcp`
+
+The standalone `input syslog_tls` module is removed; `input syslog_tcp`
+now accepts an optional `tls { cert key ca }` block. mTLS (client cert
+verification) is enabled by setting `ca` in the block — exactly the
+same shape as `input otlp_grpc`, which has worked this way since 0.7.0.
+
+Default bind port flips with the block: **6514** (RFC 5425) when
+`tls` is configured, **514** (RFC 6587) otherwise.
+
+Migration — rename `type syslog_tls` to `type syslog_tcp`. The existing
+`tls { ... }` block works as-is:
+
+```diff
+def input secure {
+-    type syslog_tls
++    type syslog_tcp
+    tls {
+        cert "/etc/limpid/certs/server.crt"
+        key  "/etc/limpid/certs/server.key"
+        ca   "/etc/limpid/certs/client-ca.crt"   # mTLS
+    }
+}
+```
+
+A latent rustls panic (`CryptoProvider not installed`) that triggered
+when running `input syslog_tls` alone is fixed as a side effect — the
+new `syslog_tcp` code calls `install_default_crypto_provider()` before
+the rustls server config is built.
 
 ## [0.7.5] - 2026-06-07
 > array primitives and expression chaining

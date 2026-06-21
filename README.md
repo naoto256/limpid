@@ -164,8 +164,8 @@ installation, .deb packaging, and systemd integration.
 ## What's in the box
 
 ### Inputs
-`syslog_udp` · `syslog_tcp` · `syslog_tls` · `tail` · `journal` ·
-`unix_socket` · `otlp_http` · `otlp_grpc`
+`syslog_udp` · `syslog_tcp` (with optional TLS / mTLS) · `tail` ·
+`journal` · `unix_socket` · `otlp_http` · `otlp_grpc`
 
 ### Outputs
 `syslog_udp` · `syslog_tcp` (with optional per-peer TLS) · `file` ·
@@ -192,6 +192,14 @@ is set on that peer, 514 (RFC 6587) otherwise. Optional client mTLS
 via the same block (`cert` / `key` / `ca`). The standalone
 `output syslog_tls` module that shipped briefly in 0.7.4 is removed in
 0.7.6 — see `CHANGELOG.md` for migration.
+
+`input syslog_tcp` accepts the same optional `tls { cert key ca }`
+block for TLS termination on the listener side (`ca` enables mTLS
+client-cert verification). Default port flips with the block: 6514
+when TLS is configured, 514 otherwise. The standalone
+`input syslog_tls` module is removed in 0.7.6 — see `CHANGELOG.md`
+for migration. (`input otlp_http` gains the same `tls { ... }` block
+in the same release; `input otlp_grpc` already had it.)
 
 ### Snippets
 
