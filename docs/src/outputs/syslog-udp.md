@@ -55,6 +55,6 @@ detected and does not enter cooldown.
 ## Notes
 
 - UDP provides no delivery guarantee. For reliable delivery use
-  [syslog_tcp](./syslog-tcp.md), [syslog_tls](./syslog-tls.md), or
+  [syslog_tcp](./syslog-tcp.md) (with optional per-peer TLS) or
   [http](./http.md) with a disk queue.
 - Each peer's socket is bound to an ephemeral local port on first use.

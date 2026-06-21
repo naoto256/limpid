@@ -547,7 +547,9 @@ def pipeline p { input i; output o }
 }
 
 #[test]
-fn check_accepts_syslog_tls_output_with_named_profile() {
+fn check_accepts_syslog_tcp_output_with_per_peer_named_profile() {
+    // Per-peer TLS on syslog_tcp (the post-0.7.6 shape, replacing the
+    // standalone `output syslog_tls` module).
     let dir = TempDir::new().unwrap();
     let conf = dir.path().join("tls-output.conf");
     fs::write(
@@ -555,7 +557,7 @@ fn check_accepts_syslog_tls_output_with_named_profile() {
         r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o {
-    type syslog_tls
+    type syslog_tcp
     tls { my { ca "/etc/limpid/ca.pem" } }
     peer { host "h"; port 6514; tls my }
 }

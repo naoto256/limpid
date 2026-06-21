@@ -8,6 +8,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
+## [0.7.6] - 2026-06-21
+> syslog TLS output folded into `syslog_tcp` as per-peer TLS
+
+### Changed (BREAKING) — `output syslog_tls` removed, TLS is now per-peer on `syslog_tcp`
+
+The standalone `output syslog_tls` module that shipped in 0.7.4 is
+removed. The `output syslog_tcp` module now accepts a per-peer `tls`
+block (inline or named-profile reference); peers without `tls` use
+plaintext on the same output. A single relay can therefore fan out to
+a mix of TLS-encrypted and plain destinations.
+
+Default port is per-peer: 6514 (RFC 5425) when `tls` is set on that
+peer, 514 (RFC 6587) otherwise.
+
+Migration — rename `type syslog_tls` to `type syslog_tcp`. The existing
+top-level `tls { profile { ca cert key } }` map and the per-peer
+`tls { ... }` / `tls <profile_name>` forms work as-is:
+
+```diff
+def output secure {
+-    type syslog_tls
++    type syslog_tcp
+    framing octet_counting
+    tls {
+        corporate_ca { ca "/etc/limpid/corp-ca.pem" }
+    }
+    peers {
+        peer { host "a.example.com" tls corporate_ca }
+        peer { host "b.example.com" tls corporate_ca }
+    }
+}
+```
+
+The `input syslog_tls` listener is unchanged — it remains a separate
+module because the server-role TLS termination has no "per-peer"
+analogue.
+
 ## [0.7.5] - 2026-06-07
 > array primitives and expression chaining
 

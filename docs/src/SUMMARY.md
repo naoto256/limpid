@@ -27,7 +27,6 @@
   - [kafka](./outputs/kafka.md)
   - [syslog_tcp](./outputs/syslog-tcp.md)
   - [syslog_udp](./outputs/syslog-udp.md)
-  - [syslog_tls](./outputs/syslog-tls.md)
   - [unix_socket](./outputs/unix-socket.md)
   - [stdout](./outputs/stdout.md)
   - [otlp](./outputs/otlp.md)
