@@ -7,13 +7,14 @@ Output modules write processed events to external destinations.
 | Type | Description |
 |------|-------------|
 | [`file`](./file.md) | Local file with dynamic path templates |
-| [`http`](./http.md) | HTTP/HTTPS endpoint (Elasticsearch, Splunk HEC, etc.) |
-| [`kafka`](./kafka.md) | Apache Kafka topic (requires `--features kafka`) |
-| [`syslog_tcp`](./syslog-tcp.md) | Syslog TCP with persistent per-peer connections; per-peer TLS optional |
+| [`http`](./http.md) | HTTP/HTTPS endpoint (Elasticsearch, Splunk HEC, etc.); per-peer TLS / mTLS, round-robin across peers |
+| [`kafka`](./kafka.md) | Apache Kafka topic with optional TLS / mTLS / SASL (requires `--features kafka`) |
+| [`syslog_tcp`](./syslog-tcp.md) | Syslog TCP with persistent per-peer connections; per-peer TLS / mTLS optional |
 | [`syslog_udp`](./syslog-udp.md) | Syslog UDP datagrams |
 | [`unix_socket`](./unix-socket.md) | Unix stream socket |
 | [`stdout`](./stdout.md) | Standard output (debugging) |
-| [`otlp`](./otlp.md) | OTLP logs sender (HTTP/JSON, HTTP/protobuf, gRPC) |
+| [`otlp_http`](./otlp_http.md) | OTLP/HTTP logs sender (`http_protobuf` / `http_json`), per-peer TLS / mTLS |
+| [`otlp_grpc`](./otlp_grpc.md) | OTLP/gRPC logs sender, per-peer TLS / mTLS |
 
 ## Queue and retry
 

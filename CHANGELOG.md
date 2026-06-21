@@ -193,7 +193,7 @@ def output secure {
     topic "syslog-events"
     tls { ca "/etc/limpid/kafka-ca.pem" }
     sasl {
-        mechanism scram-sha-512
+        mechanism scram_sha_512
         username "limpid-producer"
         password_file "/etc/limpid/kafka.pw"
     }

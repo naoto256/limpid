@@ -168,10 +168,11 @@ installation, .deb packaging, and systemd integration.
 `journal` · `unix_socket` · `otlp_http` · `otlp_grpc`
 
 ### Outputs
-`syslog_udp` · `syslog_tcp` (with optional per-peer TLS) · `file` ·
-`http` (with per-peer TLS / mTLS, round-robin across peers) ·
+`syslog_udp` · `syslog_tcp` (with optional per-peer TLS / mTLS) ·
+`file` · `http` (with per-peer TLS / mTLS, round-robin across peers) ·
 `kafka` (with optional TLS / mTLS / SASL) · `unix_socket` ·
-`stdout` · `otlp_http` · `otlp_grpc`
+`stdout` · `otlp_http` / `otlp_grpc` (with per-peer TLS / mTLS,
+round-robin across peers)
 
 ### Upgrading from earlier versions
 

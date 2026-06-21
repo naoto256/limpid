@@ -99,7 +99,7 @@ A decode failure returns HTTP 400 and increments `events_invalid`. Successful bu
 
 ## Pure pass-through
 
-If the pipeline has no process layer, an OTLP/HTTP → `otlp` output topology relays without re-encoding — `egress` is already valid singleton ResourceLogs proto bytes:
+If the pipeline has no process layer, an OTLP/HTTP → `otlp_http` (or `otlp_grpc`) output topology relays without re-encoding — `egress` is already valid singleton ResourceLogs proto bytes:
 
 ```
 def pipeline otlp_relay {
@@ -110,4 +110,9 @@ def pipeline otlp_relay {
 
 ## TLS
 
-Server-side TLS is **not** implemented for `otlp_http` as of v0.5.0. Front the input with a reverse proxy (envoy, nginx, traefik) for TLS termination, or use [`otlp_grpc`](./otlp-grpc.md) — its `tls { cert key ca }` block does ship in v0.5.0 and supports both plain TLS and mutual TLS. Native HTTPS support for `otlp_http` is queued for v0.5.x.
+Native HTTPS lands in v0.7.6 via the [`tls` block](#tls-block) at the
+top of this page — `tls { cert key }` for plain server TLS, plus
+optional `ca` for mTLS (client-cert verification at handshake). The
+same shape is shared with [`input syslog_tcp`](./syslog-tcp.md) and
+[`input otlp_grpc`](./otlp-grpc.md). Without the block, the listener
+serves plaintext HTTP on the configured port.
