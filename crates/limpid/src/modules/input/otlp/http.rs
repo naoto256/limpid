@@ -17,8 +17,20 @@
 //!     rate_limit 10000             // optional, events/sec budget
 //!     request_rate_limit 100       // optional, req/sec budget
 //!     max_concurrent_requests 32   // optional, in-flight req cap
+//!     tls {                        // optional; omit for plaintext
+//!         cert "/etc/limpid/cert.pem"
+//!         key  "/etc/limpid/key.pem"
+//!         ca   "/etc/limpid/client-ca.pem"   // optional; enables mTLS
+//!     }
 //! }
 //! ```
+//!
+//! With no `tls` block the input listens plaintext (HTTP/1.1 over
+//! TCP), suitable for loopback or behind a TLS-terminating proxy.
+//! The `tls` block uses the shared server-side schema
+//! ([`crate::tls::TLS_SERVER_BLOCK_PROPERTIES`]); `cert` and `key`
+//! are required, `ca` enables client-certificate verification
+//! (mTLS). Same shape as `input otlp_grpc` and `input syslog_tcp`.
 //!
 //! The four budgets stack as orthogonal defense layers:
 //! - `body_limit` caps **bytes per single request** (axum body limit)
@@ -43,8 +55,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     Router,
     extract::{ConnectInfo, DefaultBodyLimit, State},
@@ -52,6 +65,8 @@ use axum::{
     response::IntoResponse,
     routing::post,
 };
+use axum_server::Handle;
+use axum_server::tls_rustls::RustlsConfig;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use prost::Message;
 use tokio::sync::{Semaphore, mpsc};
@@ -64,6 +79,7 @@ use crate::event::Event;
 use crate::metrics::InputMetrics;
 use crate::modules::input::rate_limit::RateLimiter;
 use crate::modules::{HasMetrics, Input, Module};
+use crate::tls::TlsConfig;
 
 /// Default body cap for OTLP/HTTP requests. axum 0.7 itself defaults
 /// to 2 MiB, which is too small for typical collector → collector
@@ -95,6 +111,9 @@ pub struct OtlpHttpInput {
     rate_limit: Option<u64>,
     request_rate_limit: Option<u64>,
     max_concurrent_requests: Option<usize>,
+    /// `Some` enables HTTPS on the listener (mTLS when `ca_path` is
+    /// set). `None` keeps the listener plaintext HTTP.
+    tls_config: Option<TlsConfig>,
     metrics: Arc<InputMetrics>,
 }
 
@@ -134,6 +153,13 @@ const OTLP_HTTP_INPUT_SCHEMA: &[PropertySpec] = &[
         exclusive_group: None,
         kind: PropertyValueKind::Int,
     },
+    PropertySpec {
+        name: "tls",
+        required: false,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::Block(crate::tls::TLS_SERVER_BLOCK_PROPERTIES),
+    },
 ];
 
 impl Module for OtlpHttpInput {
@@ -143,6 +169,12 @@ impl Module for OtlpHttpInput {
 
     fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
         let properties = properties.user_properties();
+        let tls_config = TlsConfig::from_properties_block(&format!("input '{}'", name), properties)?;
+        // Install the rustls crypto provider before we ever assemble a
+        // ServerConfig. Only paid when TLS is actually configured.
+        if tls_config.is_some() {
+            crate::tls::install_default_crypto_provider();
+        }
         let bind =
             props::get_string(properties, "bind").unwrap_or_else(|| "0.0.0.0:4318".to_string());
         let body_limit = match props::get_string(properties, "body_limit") {
@@ -178,6 +210,7 @@ impl Module for OtlpHttpInput {
             rate_limit,
             request_rate_limit,
             max_concurrent_requests,
+            tls_config,
             metrics: Arc::new(InputMetrics::default()),
         })
     }
@@ -239,21 +272,58 @@ impl Input for OtlpHttpInput {
             .layer(DefaultBodyLimit::max(self.body_limit))
             .with_state(state);
 
-        let listener = tokio::net::TcpListener::bind(&self.bind_addr).await?;
+        // Build the TLS server config up-front so cert / key parse
+        // errors fail-fast before the listener binds. `RustlsConfig`
+        // is `axum-server`'s wrapper around `Arc<rustls::ServerConfig>`.
+        let rustls = match self.tls_config {
+            Some(ref tls) => {
+                let server_config = crate::tls::build_server_config(tls).await?;
+                Some(RustlsConfig::from_config(server_config))
+            }
+            None => None,
+        };
+
+        let addr: SocketAddr = self.bind_addr.parse().with_context(|| {
+            format!(
+                "otlp_http: invalid bind address '{}': expected host:port",
+                self.bind_addr
+            )
+        })?;
         info!(
-            "otlp_http listening on {} (body_limit={} bytes)",
-            self.bind_addr, self.body_limit
+            "otlp_http listening on {} ({}, body_limit={} bytes)",
+            self.bind_addr,
+            if rustls.is_some() { "HTTPS" } else { "HTTP" },
+            self.body_limit
         );
 
-        let server = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move {
+        // axum-server uses a dedicated `Handle` for shutdown; bridge
+        // tokio::watch (our cross-input shutdown signal) into the
+        // handle via a tiny task.
+        let handle = Handle::new();
+        let shutdown_handle = handle.clone();
+        let shutdown_task = tokio::spawn(async move {
             let _ = shutdown.changed().await;
+            shutdown_handle.graceful_shutdown(Some(Duration::from_secs(10)));
         });
 
-        if let Err(e) = server.await {
+        let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
+        let result = match rustls {
+            Some(config) => {
+                axum_server::bind_rustls(addr, config)
+                    .handle(handle)
+                    .serve(make_service)
+                    .await
+            }
+            None => {
+                axum_server::bind(addr)
+                    .handle(handle)
+                    .serve(make_service)
+                    .await
+            }
+        };
+        shutdown_task.abort();
+
+        if let Err(e) = result {
             warn!("otlp_http server error: {}", e);
         }
         info!("otlp_http: shutting down");
@@ -458,6 +528,101 @@ mod tests {
             .unwrap();
         assert!(
             err.to_string().contains("invalid size"),
+            "unexpected: {err}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // from_properties — TLS block (HTTPS + optional mTLS)
+    // -------------------------------------------------------------------
+
+    fn prop_block(key: &str, properties: Vec<Property>) -> Property {
+        Property::Block {
+            key: key.to_string(),
+            key_span: None,
+            properties,
+        }
+    }
+
+    struct PemFiles {
+        _dir: tempfile::TempDir,
+        cert: String,
+        key: String,
+    }
+
+    fn pem_files() -> PemFiles {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cert_params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("valid CN");
+        let key_pair = rcgen::KeyPair::generate().expect("key gen");
+        let cert = cert_params.self_signed(&key_pair).expect("self-sign");
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
+        PemFiles {
+            _dir: dir,
+            cert: cert_path.display().to_string(),
+            key: key_path.display().to_string(),
+        }
+    }
+
+    #[test]
+    fn defaults_have_no_tls() {
+        let i = OtlpHttpInput::from_properties("o", &mp(&[])).unwrap();
+        assert!(i.tls_config.is_none());
+    }
+
+    #[test]
+    fn tls_block_records_paths() {
+        let files = pem_files();
+        let i = OtlpHttpInput::from_properties(
+            "o",
+            &mp(&[prop_block(
+                "tls",
+                vec![
+                    prop_str("cert", &files.cert),
+                    prop_str("key", &files.key),
+                ],
+            )]),
+        )
+        .unwrap();
+        let tls = i.tls_config.as_ref().expect("tls present");
+        assert_eq!(tls.cert_path, files.cert);
+        assert_eq!(tls.key_path, files.key);
+        assert!(tls.ca_path.is_none(), "no mTLS without ca");
+    }
+
+    #[test]
+    fn tls_block_records_mtls_ca() {
+        let files = pem_files();
+        let i = OtlpHttpInput::from_properties(
+            "o",
+            &mp(&[prop_block(
+                "tls",
+                vec![
+                    prop_str("cert", &files.cert),
+                    prop_str("key", &files.key),
+                    prop_str("ca", &files.cert),
+                ],
+            )]),
+        )
+        .unwrap();
+        let tls = i.tls_config.as_ref().expect("tls present");
+        assert_eq!(tls.ca_path.as_deref(), Some(files.cert.as_str()));
+    }
+
+    #[test]
+    fn tls_block_requires_cert() {
+        let files = pem_files();
+        let err = OtlpHttpInput::from_properties(
+            "o",
+            &mp(&[prop_block("tls", vec![prop_str("key", &files.key)])]),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            err.to_string().to_lowercase().contains("cert"),
             "unexpected: {err}"
         );
     }

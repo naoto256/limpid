@@ -68,6 +68,11 @@ opentelemetry-proto = { version = "0.27", features = ["logs", "gen-tonic", "with
 tonic = { version = "0.12", features = ["tls", "tls-roots"] }
 prost = "0.13"
 axum = "0.7"
+# axum-server with rustls support for the otlp_http TLS / mTLS path.
+# axum 0.7's bundled `axum::serve` is hardcoded to `TcpListener`; switching
+# to axum_server::bind / bind_rustls lets the same Router run on either
+# transport without rolling a manual hyper accept loop.
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 
 [features]

@@ -14,6 +14,13 @@ def input otlp_in {
     rate_limit 10000               // optional events/sec budget
     request_rate_limit 1000        // optional req/sec budget
     max_concurrent_requests 64     // optional in-flight req cap
+
+    // Optional TLS (HTTPS). Omit the block for plaintext HTTP.
+    tls {
+        cert "/etc/limpid/cert.pem"
+        key  "/etc/limpid/key.pem"
+        ca   "/etc/limpid/client-ca.pem"   // optional; enables mTLS
+    }
 }
 ```
 
@@ -26,6 +33,19 @@ def input otlp_in {
 | `rate_limit` | no | unlimited | Sustained **events**-per-second cap (positive integer). Each emitted Event consumes 1 token; over-budget records `acquire().await` until the token bucket refills. Applied *after* request decode and split. Same implementation as the `syslog_*` inputs. |
 | `request_rate_limit` | no | unlimited | Sustained **requests**-per-second cap (positive integer). One token per RPC, applied *before* decode. Smooths sustained QPS without bounding peak concurrency — pair with `max_concurrent_requests` for memory protection. |
 | `max_concurrent_requests` | no | unlimited | In-flight request cap (positive integer). Worst-case decode memory becomes `max_concurrent_requests × body_limit`, turning the open-ended decode-amplification path into a known quantity. Excess requests are rejected with HTTP 503 *Service Unavailable* (fail-fast — OTLP senders typically retry, so backpressuring the socket would amplify overload). |
+| `tls` | no | - | Optional TLS block (see [tls block](#tls-block)). When present the listener accepts HTTPS only — there is no HTTP fallback on the same port. |
+
+### tls block
+
+| Property | Required | Description |
+|----------|----------|-------------|
+| `cert` | yes | Path to PEM-encoded server certificate |
+| `key` | yes | Path to PEM-encoded server private key |
+| `ca` | no | Path to CA cert for **client** verification (mTLS). With `ca`, clients without a valid cert signed by it are rejected at handshake. |
+
+Cert / key / CA files are loaded and parsed at daemon start; bad files
+fail-fast before the listener binds. Same shape as `input syslog_tcp`
+and `input otlp_grpc`.
 
 The four budgets stack as orthogonal defense layers. A typical exposed-ingress preset:
 
