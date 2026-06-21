@@ -63,13 +63,29 @@ const TLS_BLOCK_CERT_KEY_CA_REQUIRED: &[PropertySpec] = &[
     },
 ];
 
-const TLS_BLOCK_CA_ONLY: &[PropertySpec] = &[PropertySpec {
-    name: "ca",
-    required: false,
-    repeatable: false,
-    exclusive_group: None,
-    kind: PropertyValueKind::String,
-}];
+const TLS_BLOCK_CERT_KEY_CA_OPTIONAL: &[PropertySpec] = &[
+    PropertySpec {
+        name: "ca",
+        required: false,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "cert",
+        required: false,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "key",
+        required: false,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::String,
+    },
+];
 
 /// Shared schema for the `tls { cert | key | ca }` block used by
 /// TLS-terminating server Modules (`syslog_tcp`, `otlp_grpc`,
@@ -77,13 +93,14 @@ const TLS_BLOCK_CA_ONLY: &[PropertySpec] = &[PropertySpec {
 /// mandatory; `ca` enables mTLS client-certificate verification.
 pub const TLS_SERVER_BLOCK_PROPERTIES: &[PropertySpec] = TLS_BLOCK_CERT_KEY_CA_REQUIRED;
 
-/// Shared schema for the `tls { ca }` block used by client Modules
-/// (`output http`, `output otlp`) that only need to add a custom CA
-/// to their trust store. When v0.8.0 lands `output limpid` with mTLS
-/// the schema can switch to [`TLS_SERVER_BLOCK_PROPERTIES`] (same
-/// shape, with `cert` / `key` becoming optional) without forcing a
-/// breaking config change for the simpler clients.
-pub const TLS_CLIENT_BLOCK_PROPERTIES: &[PropertySpec] = TLS_BLOCK_CA_ONLY;
+/// Shared schema for the `tls { ca | cert | key }` block used by
+/// client Modules (`output syslog_tcp` per-peer, `output kafka`,
+/// `output http`, `output otlp_http`, `output otlp_grpc`). All three
+/// keys are optional at the schema layer; the cert↔key paired
+/// invariant is enforced at parse time by
+/// [`ClientTlsConfig::validate`]. `ca` alone is a custom CA, `ca` +
+/// `cert` + `key` is mTLS, and an empty block is rejected by callers.
+pub const TLS_CLIENT_BLOCK_PROPERTIES: &[PropertySpec] = TLS_BLOCK_CERT_KEY_CA_OPTIONAL;
 
 /// TLS settings parsed from DSL `tls { ... }` block.
 #[derive(Debug, Clone)]
