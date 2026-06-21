@@ -149,7 +149,10 @@ impl std::fmt::Display for ModulePropertyError {
         match self {
             Self::Missing => write!(f, "missing required property 'type'"),
             Self::NonIdent { .. } => {
-                write!(f, "'type' must be a bare identifier (e.g. `type syslog_tcp`)")
+                write!(
+                    f,
+                    "'type' must be a bare identifier (e.g. `type syslog_tcp`)"
+                )
             }
             Self::Duplicate { .. } => write!(f, "'type' specified more than once"),
         }
@@ -176,10 +179,11 @@ impl ModuleProperties {
             }
             match &prop {
                 Property::KeyValue {
-                    value: Expr {
-                        kind: ExprKind::Ident(parts),
-                        ..
-                    },
+                    value:
+                        Expr {
+                            kind: ExprKind::Ident(parts),
+                            ..
+                        },
                     value_span,
                     ..
                 } => {
@@ -280,7 +284,7 @@ pub trait Module: Sized {
     /// libraries, anyone bypassing the registry) that want the same
     /// loud validation surface.
     #[allow(dead_code)] // used by module unit tests; production path
-                       // validates inside `ModuleRegistry::create_*`
+    // validates inside `ModuleRegistry::create_*`
     fn build(name: &str, properties: &ModuleProperties) -> Result<Self> {
         if let Some(spec) = Self::property_schema() {
             let errs = property_schema::validate(properties.user_properties(), spec);
@@ -334,11 +338,7 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     /// happens against the pipeline's per-event arena, so the payload
     /// can capture `String` / `Bytes` results without paying for a
     /// `to_owned` round-trip on the event's `workspace`.
-    fn render(
-        &self,
-        event: &BorrowedEvent<'_>,
-        arena: &EventArena<'_>,
-    ) -> Result<RenderedPayload>;
+    fn render(&self, event: &BorrowedEvent<'_>, arena: &EventArena<'_>) -> Result<RenderedPayload>;
 
     /// Hot path: consume a `RenderedPayload` produced by `render` and
     /// perform the actual I/O. Each sink downcasts the payload to its
@@ -591,7 +591,8 @@ pub fn register_builtins(registry: &mut ModuleRegistry) {
     register_output_type::<output::unix_socket::UnixSocketOutput>(registry, "unix_socket");
     register_output_type::<output::syslog_tcp::SyslogTcpOutput>(registry, "syslog_tcp");
     register_output_type::<output::http::HttpOutput>(registry, "http");
-    register_output_type::<output::otlp::OtlpOutput>(registry, "otlp");
+    register_output_type::<output::otlp::http::OtlpHttpOutput>(registry, "otlp_http");
+    register_output_type::<output::otlp::grpc::OtlpGrpcOutput>(registry, "otlp_grpc");
     register_output_type::<output::syslog_udp::SyslogUdpOutput>(registry, "syslog_udp");
     register_output_type::<output::stdout::StdoutOutput>(registry, "stdout");
     #[cfg(feature = "kafka")]

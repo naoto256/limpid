@@ -1,0 +1,921 @@
+//! OTLP/HTTP output: forwards Events to an OpenTelemetry collector /
+//! SaaS backend via OTLP over HTTP, in either `http_protobuf` (default)
+//! or `http_json` wire format.
+//!
+//! ```text
+//! def output otlp_out {
+//!     type otlp_http
+//!     endpoint "https://collector.example.com:4318/v1/logs"
+//!     protocol "http_protobuf"   // http_protobuf | http_json
+//!     batch_size 512
+//!     batch_timeout "5s"
+//!     headers {
+//!         Authorization "Bearer ${env.OTLP_TOKEN}"
+//!     }
+//!     tls {
+//!         ca "/etc/limpid/ca.crt"
+//!     }
+//! }
+//! ```
+//!
+//! ### Endpoint conventions
+//!
+//! Point at the full OTLP/HTTP path (typically `:4318/v1/logs`).
+//! limpid does not append `/v1/logs` automatically; collectors that
+//! mount the receiver elsewhere (e.g. behind a path prefix) just work.
+
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow, bail};
+use bytes::Bytes;
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use prost::Message;
+use tokio::sync::Mutex;
+
+use crate::dsl::arena::EventArena;
+use crate::dsl::props;
+use crate::dsl::schema::{PropertySpec, PropertyValueKind};
+use crate::event::BorrowedEvent;
+use crate::metrics::OutputMetrics;
+use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
+use crate::queue::{BackoffStrategy, RetryConfig};
+
+use super::{BatchLevel, OTLP_RETRY_BLOCK_PROPERTIES, OtlpPayload, decode_drained_to_request};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpProtocol {
+    Json,
+    Protobuf,
+}
+
+impl HttpProtocol {
+    fn parse(s: &str, output_name: &str) -> Result<Self> {
+        match s {
+            "http_json" => Ok(HttpProtocol::Json),
+            "http_protobuf" => Ok(HttpProtocol::Protobuf),
+            other => bail!(
+                "output '{}': unknown protocol '{}' (expected http_protobuf or http_json)",
+                output_name,
+                other
+            ),
+        }
+    }
+
+    fn content_type(self) -> &'static str {
+        match self {
+            HttpProtocol::Json => "application/json",
+            HttpProtocol::Protobuf => "application/x-protobuf",
+        }
+    }
+}
+
+struct Inner {
+    endpoint: String,
+    protocol: HttpProtocol,
+    batch_level: BatchLevel,
+    headers: Vec<(String, String)>,
+    batch_timeout: Duration,
+    client: reqwest::Client,
+    /// Per-batch retry policy. The shared `RetryConfig` parser used by
+    /// the file / syslog_tcp / http outputs reads `retry { max_attempts
+    /// initial_wait max_wait backoff }` from the output's properties;
+    /// we re-use it so every limpid output speaks the same retry
+    /// vocabulary.
+    ///
+    /// Internal retry matters for OTLP specifically because it batches
+    /// Events from multiple `write()` calls — without an internal
+    /// retry, a single transient ship failure would lose the whole
+    /// drained batch (the queue layer's per-event retry only re-pushes
+    /// the most recent Event).
+    retry_config: RetryConfig,
+    /// Buffered per-Event singleton ResourceLogs proto bytes. Each
+    /// entry is exactly what `otlp.encode_resourcelog_protobuf`
+    /// produced; flush wraps them per `batch_level` into one
+    /// ExportLogsServiceRequest.
+    batch: Mutex<Vec<Bytes>>,
+}
+
+pub struct OtlpHttpOutput {
+    inner: Arc<Inner>,
+    batch_size: usize,
+    flush_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    metrics: Arc<OutputMetrics>,
+}
+
+const OTLP_HTTP_OUTPUT_SCHEMA: &[PropertySpec] = &[
+    PropertySpec {
+        name: "endpoint",
+        required: true,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "protocol",
+        required: false,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::Enum(&["http_json", "http_protobuf"]),
+    },
+    PropertySpec {
+        name: "batch_size",
+        required: false,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::Int,
+    },
+    PropertySpec {
+        name: "batch_timeout",
+        required: false,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::Duration,
+    },
+    PropertySpec {
+        name: "batch_level",
+        required: false,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::Enum(&["none", "resource", "scope"]),
+    },
+    PropertySpec {
+        name: "verify",
+        required: false,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::Bool,
+    },
+    PropertySpec {
+        name: "headers",
+        required: false,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::StringMap,
+    },
+    PropertySpec {
+        name: "tls",
+        required: false,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::Block(crate::tls::TLS_CLIENT_BLOCK_PROPERTIES),
+    },
+    PropertySpec {
+        name: "retry",
+        required: false,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::Block(OTLP_RETRY_BLOCK_PROPERTIES),
+    },
+    crate::queue::QUEUE_PROPERTY_SPEC,
+];
+
+impl Module for OtlpHttpOutput {
+    fn property_schema() -> Option<&'static [PropertySpec]> {
+        Some(OTLP_HTTP_OUTPUT_SCHEMA)
+    }
+
+    fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
+        let properties = properties.user_properties();
+        let endpoint = props::get_string(properties, "endpoint")
+            .ok_or_else(|| anyhow!("output '{}': otlp_http requires 'endpoint'", name))?;
+        let protocol_str = props::get_string(properties, "protocol")
+            .or_else(|| props::get_ident(properties, "protocol"))
+            .unwrap_or_else(|| "http_protobuf".to_string());
+        let protocol = HttpProtocol::parse(&protocol_str, name)?;
+        let batch_size = props::get_positive_int(properties, "batch_size")?.unwrap_or(1) as usize;
+        let batch_timeout = match props::get_string(properties, "batch_timeout") {
+            Some(s) => props::parse_duration(&s)?,
+            None => Duration::from_secs(5),
+        };
+        let batch_level_str = props::get_string(properties, "batch_level")
+            .or_else(|| props::get_ident(properties, "batch_level"))
+            .unwrap_or_else(|| "none".to_string());
+        let batch_level = BatchLevel::parse(&batch_level_str, name)?;
+
+        // Headers block — open key set, schema enforces string-shaped values.
+        let headers = props::get_string_map(properties, "headers");
+
+        let verify = props::get_ident(properties, "verify")
+            .map(|s| s != "false")
+            .unwrap_or(true);
+        let ca_path =
+            props::get_block(properties, "tls").and_then(|block| props::get_string(block, "ca"));
+        let ca_pem = ca_path
+            .as_ref()
+            .map(|p| {
+                std::fs::read(p)
+                    .with_context(|| format!("output '{}': cannot read CA cert {}", name, p))
+            })
+            .transpose()?;
+
+        let mut builder = reqwest::Client::builder();
+        if !verify {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        if let Some(pem) = &ca_pem {
+            let cert = reqwest::Certificate::from_pem(pem).with_context(|| {
+                format!(
+                    "output '{}': invalid CA cert PEM at {}",
+                    name,
+                    ca_path.as_deref().unwrap_or("<inline>")
+                )
+            })?;
+            builder = builder.add_root_certificate(cert);
+        }
+        let client = builder
+            .build()
+            .with_context(|| format!("output '{}': failed to build HTTP client", name))?;
+
+        let retry_config = RetryConfig::from_output_properties(properties)?;
+
+        Ok(Self {
+            inner: Arc::new(Inner {
+                endpoint,
+                protocol,
+                batch_level,
+                headers,
+                batch_timeout,
+                client,
+                retry_config,
+                batch: Mutex::new(Vec::new()),
+            }),
+            batch_size,
+            flush_handle: Mutex::new(None),
+            metrics: Arc::new(OutputMetrics::default()),
+        })
+    }
+}
+
+impl HasMetrics for OtlpHttpOutput {
+    type Stats = OutputMetrics;
+    fn metrics(&self) -> Arc<OutputMetrics> {
+        Arc::clone(&self.metrics)
+    }
+}
+
+#[async_trait::async_trait]
+impl Output for OtlpHttpOutput {
+    fn render(
+        &self,
+        event: &BorrowedEvent<'_>,
+        _arena: &EventArena<'_>,
+    ) -> Result<RenderedPayload> {
+        Ok(RenderedPayload::new(OtlpPayload {
+            egress: event.egress.clone(),
+        }))
+    }
+
+    async fn write(&self, payload: RenderedPayload) -> Result<()> {
+        let payload: OtlpPayload = payload.downcast()?;
+        let proto = payload.egress;
+        let mut batch = self.inner.batch.lock().await;
+        batch.push(proto);
+        let should_flush = batch.len() >= self.batch_size;
+        drop(batch);
+
+        if should_flush {
+            self.flush().await?;
+        } else {
+            self.ensure_flush_timer().await;
+        }
+        Ok(())
+    }
+}
+
+impl OtlpHttpOutput {
+    /// Drain the current batch, build an ExportLogsServiceRequest, and
+    /// ship it. No-op if the buffer is empty.
+    async fn flush(&self) -> Result<()> {
+        let drained: Vec<Bytes> = {
+            let mut batch = self.inner.batch.lock().await;
+            std::mem::take(&mut *batch)
+        };
+        if drained.is_empty() {
+            return Ok(());
+        }
+        let count = drained.len();
+        let result = send_batch(&self.inner, drained).await;
+        match result {
+            Ok(()) => {
+                self.metrics
+                    .events_written
+                    .fetch_add(count as u64, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) => {
+                self.metrics
+                    .events_failed
+                    .fetch_add(count as u64, Ordering::Relaxed);
+                Err(e)
+            }
+        }
+    }
+
+    /// Schedule (or refresh) a deferred flush so events do not sit in
+    /// the buffer indefinitely when traffic is below `batch_size`.
+    async fn ensure_flush_timer(&self) {
+        let mut handle = self.flush_handle.lock().await;
+        if let Some(h) = handle.as_ref()
+            && !h.is_finished()
+        {
+            return;
+        }
+
+        let inner = Arc::clone(&self.inner);
+        let metrics = Arc::clone(&self.metrics);
+        let new_handle = tokio::spawn(async move {
+            tokio::time::sleep(inner.batch_timeout).await;
+            let drained: Vec<Bytes> = {
+                let mut batch = inner.batch.lock().await;
+                std::mem::take(&mut *batch)
+            };
+            if drained.is_empty() {
+                return;
+            }
+            let count = drained.len();
+            match send_batch(&inner, drained).await {
+                Ok(()) => {
+                    metrics
+                        .events_written
+                        .fetch_add(count as u64, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::warn!("otlp_http flush timer: send failed ({})", e);
+                    metrics
+                        .events_failed
+                        .fetch_add(count as u64, Ordering::Relaxed);
+                }
+            }
+        });
+        *handle = Some(new_handle);
+    }
+}
+
+impl Drop for OtlpHttpOutput {
+    fn drop(&mut self) {
+        if let Some(h) = self.flush_handle.get_mut().take() {
+            h.abort();
+        }
+        if let Ok(buf) = self.inner.batch.try_lock()
+            && !buf.is_empty()
+        {
+            tracing::warn!(
+                "otlp_http output: {} events in buffer at shutdown (will be re-delivered from queue)",
+                buf.len()
+            );
+        }
+    }
+}
+
+async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<()> {
+    let req = decode_drained_to_request(drained, inner.batch_level)?;
+
+    let cfg = &inner.retry_config;
+    let max_attempts = cfg.max_attempts.max(1);
+    let mut attempt = 0u32;
+    let mut wait = cfg.initial_wait;
+    loop {
+        let result = send_once(inner, &req).await;
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt + 1 >= max_attempts => return Err(e),
+            Err(e) => {
+                attempt += 1;
+                tracing::warn!(
+                    "otlp_http output: ship attempt {}/{} failed: {} — retrying in {:?}",
+                    attempt,
+                    max_attempts,
+                    e,
+                    wait,
+                );
+                tokio::time::sleep(wait).await;
+                if matches!(cfg.backoff, BackoffStrategy::Exponential) {
+                    // saturating_mul is the safe doubling: `Duration *
+                    // 2` panics on overflow (~584 years), and while the
+                    // practical reach of that limit is "never", making
+                    // the bound explicit is the defensive choice —
+                    // `.min(max_wait)` then clamps back to the
+                    // configured ceiling.
+                    wait = wait.saturating_mul(2).min(cfg.max_wait);
+                }
+            }
+        }
+    }
+}
+
+async fn send_once(inner: &Inner, req: &ExportLogsServiceRequest) -> Result<()> {
+    let body = match inner.protocol {
+        HttpProtocol::Protobuf => {
+            let mut buf = Vec::with_capacity(req.encoded_len());
+            req.encode(&mut buf)
+                .map_err(|e| anyhow!("output otlp_http: protobuf encode failed: {e}"))?;
+            buf
+        }
+        HttpProtocol::Json => serde_json::to_vec(req)
+            .map_err(|e| anyhow!("output otlp_http: JSON encode failed: {e}"))?,
+    };
+    let mut http_req = inner
+        .client
+        .post(&inner.endpoint)
+        .header("Content-Type", inner.protocol.content_type())
+        .body(body);
+    for (k, v) in &inner.headers {
+        http_req = http_req.header(k, v);
+    }
+    let resp = http_req
+        .send()
+        .await
+        .with_context(|| format!("output otlp_http: POST {} failed", inner.endpoint))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        bail!(
+            "output otlp_http: {} returned HTTP {} — {}",
+            inner.endpoint,
+            status.as_u16(),
+            text.chars().take(500).collect::<String>()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsl::ast::{Expr, ExprKind, Property};
+    use crate::event::Event;
+    use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+    use std::net::SocketAddr;
+
+    fn mp(props: &[Property]) -> crate::modules::ModuleProperties {
+        crate::modules::ModuleProperties::from_parts("otlp_http", props.to_vec())
+    }
+
+    fn prop_str(key: &str, val: &str) -> Property {
+        Property::KeyValue {
+            key: key.to_string(),
+            key_span: None,
+            value: Expr::spanless(ExprKind::StringLit(val.to_string())),
+            value_span: None,
+        }
+    }
+
+    fn prop_int(key: &str, val: i64) -> Property {
+        Property::KeyValue {
+            key: key.to_string(),
+            key_span: None,
+            value: Expr::spanless(ExprKind::IntLit(val)),
+            value_span: None,
+        }
+    }
+
+    #[test]
+    fn requires_endpoint() {
+        let err = OtlpHttpOutput::from_properties("o", &mp(&[]))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("endpoint"));
+    }
+
+    #[test]
+    fn defaults_protocol_to_http_protobuf() {
+        let props = vec![prop_str("endpoint", "http://x")];
+        let output = OtlpHttpOutput::from_properties("o", &mp(&props)).unwrap();
+        assert!(matches!(output.inner.protocol, HttpProtocol::Protobuf));
+    }
+
+    #[test]
+    fn rejects_grpc_protocol_value() {
+        // gRPC has its own module (`otlp_grpc`); the http schema only
+        // accepts the two http wire formats. The Enum schema rejects
+        // before from_properties parses.
+        let props = vec![
+            prop_str("endpoint", "http://x"),
+            prop_str("protocol", "carrier_pigeon"),
+        ];
+        let err = OtlpHttpOutput::from_properties("o", &mp(&props))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("unknown"));
+    }
+
+    #[test]
+    fn batch_level_default_is_none() {
+        let output =
+            OtlpHttpOutput::from_properties("o", &mp(&[prop_str("endpoint", "http://x")])).unwrap();
+        assert!(matches!(output.inner.batch_level, BatchLevel::None));
+    }
+
+    #[test]
+    fn batch_level_accepts_resource_and_scope() {
+        let r = OtlpHttpOutput::from_properties(
+            "o",
+            &mp(&[
+                prop_str("endpoint", "http://x"),
+                prop_str("batch_level", "resource"),
+            ]),
+        )
+        .unwrap();
+        assert!(matches!(r.inner.batch_level, BatchLevel::Resource));
+        let s = OtlpHttpOutput::from_properties(
+            "o",
+            &mp(&[
+                prop_str("endpoint", "http://x"),
+                prop_str("batch_level", "scope"),
+            ]),
+        )
+        .unwrap();
+        assert!(matches!(s.inner.batch_level, BatchLevel::Scope));
+    }
+
+    #[test]
+    fn rejects_unknown_batch_level() {
+        let err = OtlpHttpOutput::from_properties(
+            "o",
+            &mp(&[
+                prop_str("endpoint", "http://x"),
+                prop_str("batch_level", "logrecord"),
+            ]),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            err.to_string().contains("unknown batch_level"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn batch_size_defaults_to_one() {
+        let output =
+            OtlpHttpOutput::from_properties("o", &mp(&[prop_str("endpoint", "http://x")])).unwrap();
+        assert_eq!(output.batch_size, 1);
+    }
+
+    #[test]
+    fn batch_size_explicit() {
+        let props = vec![prop_str("endpoint", "http://x"), prop_int("batch_size", 64)];
+        let output = OtlpHttpOutput::from_properties("o", &mp(&props)).unwrap();
+        assert_eq!(output.batch_size, 64);
+    }
+
+    #[test]
+    fn retry_config_defaults_match_shared_default() {
+        let output =
+            OtlpHttpOutput::from_properties("o", &mp(&[prop_str("endpoint", "http://x")])).unwrap();
+        let default = RetryConfig::default();
+        assert_eq!(output.inner.retry_config.max_attempts, default.max_attempts);
+        assert_eq!(output.inner.retry_config.initial_wait, default.initial_wait);
+    }
+
+    #[test]
+    fn retry_block_overrides_defaults() {
+        let props = vec![
+            prop_str("endpoint", "http://x"),
+            Property::Block {
+                key: "retry".into(),
+                key_span: None,
+                properties: vec![
+                    prop_int("max_attempts", 2),
+                    prop_str("initial_wait", "100ms"),
+                    prop_str("max_wait", "500ms"),
+                ],
+            },
+        ];
+        let output = OtlpHttpOutput::from_properties("o", &mp(&props)).unwrap();
+        assert_eq!(output.inner.retry_config.max_attempts, 2);
+        assert_eq!(
+            output.inner.retry_config.initial_wait,
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            output.inner.retry_config.max_wait,
+            Duration::from_millis(500)
+        );
+    }
+
+    // ---- wire-level round-trips ----
+
+    fn singleton_bytes(time_unix_nano: u64) -> Bytes {
+        let rl = ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![],
+                dropped_attributes_count: 0,
+            }),
+            scope_logs: vec![ScopeLogs {
+                scope: Some(InstrumentationScope {
+                    name: "limpid-test".into(),
+                    version: "0.5.0".into(),
+                    attributes: vec![],
+                    dropped_attributes_count: 0,
+                }),
+                log_records: vec![LogRecord {
+                    time_unix_nano,
+                    severity_number: 9,
+                    severity_text: "INFO".into(),
+                    ..Default::default()
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        };
+        let mut buf = Vec::with_capacity(rl.encoded_len());
+        rl.encode(&mut buf).unwrap();
+        Bytes::from(buf)
+    }
+
+    fn event_with_egress(egress: Bytes) -> Event {
+        let mut e = Event::new(egress.clone(), "127.0.0.1:0".parse::<SocketAddr>().unwrap());
+        e.egress = egress;
+        e
+    }
+
+    async fn wait_for<T>(mut probe: impl FnMut() -> Option<T>) -> T {
+        for _ in 0..50 {
+            if let Some(v) = probe() {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("timeout waiting for receiver to record the request");
+    }
+
+    async fn run_http_collector(
+        protocol: &'static str,
+    ) -> (
+        SocketAddr,
+        Arc<Mutex<Vec<ExportLogsServiceRequest>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{
+            Router,
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::post,
+        };
+
+        #[derive(Clone)]
+        struct AppState {
+            received: Arc<Mutex<Vec<ExportLogsServiceRequest>>>,
+            protocol: &'static str,
+        }
+
+        async fn handle(
+            State(state): State<AppState>,
+            headers: HeaderMap,
+            body: axum::body::Bytes,
+        ) -> impl IntoResponse {
+            let ct = headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let req: ExportLogsServiceRequest = match state.protocol {
+                "http_protobuf" => {
+                    if !ct.starts_with("application/x-protobuf") {
+                        return (
+                            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                            format!("expected protobuf, got {ct:?}"),
+                        )
+                            .into_response();
+                    }
+                    match ExportLogsServiceRequest::decode(&*body) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return (StatusCode::BAD_REQUEST, format!("decode: {e}"))
+                                .into_response();
+                        }
+                    }
+                }
+                "http_json" => {
+                    if !ct.starts_with("application/json") {
+                        return (
+                            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                            format!("expected json, got {ct:?}"),
+                        )
+                            .into_response();
+                    }
+                    match serde_json::from_slice(&body) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return (StatusCode::BAD_REQUEST, format!("json: {e}")).into_response();
+                        }
+                    }
+                }
+                _ => unreachable!("test-only enumeration"),
+            };
+            state.received.lock().await.push(req);
+            (StatusCode::OK, "").into_response()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/logs", post(handle))
+            .with_state(AppState {
+                received: Arc::clone(&received),
+                protocol,
+            });
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, received, handle)
+    }
+
+    #[tokio::test]
+    async fn retries_until_success() {
+        use axum::{
+            Router, extract::State, http::StatusCode, response::IntoResponse, routing::post,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        #[derive(Clone)]
+        struct AppState {
+            attempts: Arc<AtomicUsize>,
+            fail_until: usize,
+        }
+
+        async fn handle(
+            State(state): State<AppState>,
+            _body: axum::body::Bytes,
+        ) -> impl IntoResponse {
+            let n = state.attempts.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            if n <= state.fail_until {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::OK
+            }
+        }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/logs", post(handle))
+            .with_state(AppState {
+                attempts: Arc::clone(&attempts),
+                fail_until: 2,
+            });
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let endpoint = format!("http://{}/v1/logs", addr);
+        let output = OtlpHttpOutput::from_properties(
+            "test",
+            &mp(&[
+                prop_str("endpoint", &endpoint),
+                prop_str("protocol", "http_protobuf"),
+                prop_int("batch_size", 1),
+                Property::Block {
+                    key: "retry".into(),
+                    key_span: None,
+                    properties: vec![
+                        prop_int("max_attempts", 5),
+                        prop_str("initial_wait", "10ms"),
+                        prop_str("max_wait", "50ms"),
+                    ],
+                },
+            ]),
+        )
+        .unwrap();
+
+        output
+            .write_owned(&event_with_egress(singleton_bytes(123)))
+            .await
+            .unwrap();
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 3);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_max_attempts() {
+        use axum::{Router, http::StatusCode, response::IntoResponse, routing::post};
+
+        async fn always_fail(_body: axum::body::Bytes) -> impl IntoResponse {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/v1/logs", post(always_fail));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let endpoint = format!("http://{}/v1/logs", addr);
+        let output = OtlpHttpOutput::from_properties(
+            "test",
+            &mp(&[
+                prop_str("endpoint", &endpoint),
+                prop_str("protocol", "http_protobuf"),
+                prop_int("batch_size", 1),
+                Property::Block {
+                    key: "retry".into(),
+                    key_span: None,
+                    properties: vec![
+                        prop_int("max_attempts", 3),
+                        prop_str("initial_wait", "10ms"),
+                        prop_str("max_wait", "20ms"),
+                    ],
+                },
+            ]),
+        )
+        .unwrap();
+        let err = output
+            .write_owned(&event_with_egress(singleton_bytes(456)))
+            .await
+            .expect_err("send must fail after retries exhausted");
+        assert!(
+            err.to_string().contains("503") || err.to_string().contains("HTTP"),
+            "unexpected error after retry exhaustion: {err}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn round_trip_protobuf() {
+        let (addr, received, server) = run_http_collector("http_protobuf").await;
+        let endpoint = format!("http://{}/v1/logs", addr);
+        let output = OtlpHttpOutput::from_properties(
+            "test",
+            &mp(&[
+                prop_str("endpoint", &endpoint),
+                prop_str("protocol", "http_protobuf"),
+                prop_int("batch_size", 1),
+            ]),
+        )
+        .unwrap();
+        output
+            .write_owned(&event_with_egress(singleton_bytes(123)))
+            .await
+            .unwrap();
+        let probe = || {
+            let g = received.try_lock().ok()?;
+            if g.is_empty() { None } else { Some(g.clone()) }
+        };
+        let got = wait_for(probe).await;
+        server.abort();
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].resource_logs[0].scope_logs[0].log_records[0].time_unix_nano,
+            123
+        );
+    }
+
+    #[tokio::test]
+    async fn round_trip_json() {
+        let (addr, received, server) = run_http_collector("http_json").await;
+        let endpoint = format!("http://{}/v1/logs", addr);
+        let output = OtlpHttpOutput::from_properties(
+            "test",
+            &mp(&[
+                prop_str("endpoint", &endpoint),
+                prop_str("protocol", "http_json"),
+                prop_int("batch_size", 1),
+            ]),
+        )
+        .unwrap();
+        output
+            .write_owned(&event_with_egress(singleton_bytes(456)))
+            .await
+            .unwrap();
+        let probe = || {
+            let g = received.try_lock().ok()?;
+            if g.is_empty() { None } else { Some(g.clone()) }
+        };
+        let got = wait_for(probe).await;
+        server.abort();
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].resource_logs[0].scope_logs[0].log_records[0].time_unix_nano,
+            456
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_aborts_pending_flush_timer() {
+        let output = OtlpHttpOutput::from_properties(
+            "test",
+            &mp(&[
+                prop_str("endpoint", "http://127.0.0.1:1"),
+                prop_int("batch_size", 1024),
+                prop_str("batch_timeout", "30s"),
+            ]),
+        )
+        .unwrap();
+        output
+            .write_owned(&event_with_egress(singleton_bytes(1)))
+            .await
+            .unwrap();
+        let handle_before = output.flush_handle.lock().await.is_some();
+        assert!(handle_before, "write must arm the flush timer");
+        drop(output);
+    }
+}

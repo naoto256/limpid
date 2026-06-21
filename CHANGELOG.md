@@ -11,7 +11,46 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 ## [0.7.6] - 2026-06-21
 > syslog TLS folded into `syslog_tcp` on both sides (output: per-peer,
 > input: optional block); `otlp_http` gains TLS / mTLS; `output kafka`
-> gains TLS / mTLS / SASL
+> gains TLS / mTLS / SASL; `output otlp` split into `otlp_http` /
+> `otlp_grpc`
+
+### Changed — `output otlp` split into `output otlp_http` and `output otlp_grpc` (breaking)
+
+The single `output otlp { protocol grpc | http_* }` module is replaced
+by two independent modules — one per transport. The DSL no longer has a
+`protocol` switch that flips request-shape, header semantics, and
+endpoint conventions inside the same module.
+
+Migration:
+
+```text
+# before (0.7.5)                 # after (0.7.6+)
+def output o {                   def output o {
+    type otlp                        type otlp_http        # or otlp_grpc
+    protocol "http_protobuf"         protocol "http_protobuf"   # otlp_http only;
+    endpoint "..."                   endpoint "..."             # otlp_grpc has no `protocol`
+    ...                              ...
+}                                }
+```
+
+Old configs (`type otlp` + `protocol grpc | http_*`) are rejected at
+startup. Wire-level behaviour is unchanged — the existing
+`ExportLogsServiceRequest` encoding, retry semantics, `batch_level`
+merging, headers / metadata handling, and TLS surface all carry over
+byte-for-byte. Only the DSL surface and module registration changed:
+the shared bits live under `crates/limpid/src/modules/output/otlp/`
+(internal helpers), and the public modules are
+`output/otlp/http.rs` (`OtlpHttpOutput`, `type otlp_http`) and
+`output/otlp/grpc.rs` (`OtlpGrpcOutput`, `type otlp_grpc`), mirroring
+the input side which has shipped split modules since 0.7.0.
+
+Why split rather than keep one knob: every `protocol`-conditional
+property — `headers` (HTTP) vs gRPC metadata, `verify false` (HTTP
+only — tonic refuses), endpoint path conventions, compression sets,
+peer round-robin semantics (the future addition) — turned into a
+`protocol`-dependent check at parse time and a footnote in docs.
+Splitting collapses each module's surface to what its transport
+actually supports.
 
 ### Added — `output kafka` `tls { ... }` and `sasl { ... }` blocks
 
