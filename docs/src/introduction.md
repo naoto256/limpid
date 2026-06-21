@@ -48,7 +48,7 @@ def output archive {
 
 def output siem {
     type http
-    url "https://es:9200/_bulk"
+    peer { url "https://es:9200/_bulk" }
     batch_size 100
 }
 

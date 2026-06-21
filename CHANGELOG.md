@@ -12,7 +12,63 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 > syslog TLS folded into `syslog_tcp` on both sides (output: per-peer,
 > input: optional block); `otlp_http` gains TLS / mTLS; `output kafka`
 > gains TLS / mTLS / SASL; `output otlp` split into `otlp_http` /
-> `otlp_grpc` and both gain per-peer rotation + mTLS
+> `otlp_grpc` and both gain per-peer rotation + mTLS; `output http`
+> gains per-peer rotation + mTLS
+
+### Added — `output http` per-peer rotation + mTLS
+
+`output http` now accepts a `peer { url tls{...} }` (single destination
+shorthand) or `peers { peer { url tls{...} } ... }` (multi-destination)
+block in place of the previous top-level `url`. On each send the
+rotation picks the next available peer (cooldown expired) and tries
+it; a peer that fails the request is marked cooled-down for the
+shared 5-second window and skipped on subsequent sends until the
+cooldown expires. When every peer is currently cooled the rotation
+falls back to the cursor start — the queue layer's per-event retry
+then handles longer-term re-delivery (consistent with the existing
+`output http` retry semantics, which never had an internal retry
+loop).
+
+Per-peer `tls { ca cert key }` enables mTLS. `cert` and `key` are
+paired (both-or-neither, enforced at parse time by
+`ClientTlsConfig::validate`). PEM files for the cert and key are
+loaded once at startup; chmod 600 the key, the daemon already refuses
+to run as root.
+
+This is a **breaking change** for any existing `output http` config
+that used a single top-level `url`:
+
+```text
+# before
+def output es {
+    type http
+    url "https://es:9200/_bulk"
+    tls { ca "/etc/limpid/ca.crt" }
+}
+
+# after (single peer — shorthand mirrors output syslog_tcp / otlp_http)
+def output es {
+    type http
+    peer {
+        url "https://es:9200/_bulk"
+        tls { ca "/etc/limpid/ca.crt" }
+    }
+}
+
+# after (round-robin across multiple endpoints)
+def output es {
+    type http
+    peers {
+        peer { url "https://es01.example.com:9200/_bulk"; tls { ca "/etc/limpid/ca.crt" } }
+        peer { url "https://es02.example.com:9200/_bulk"; tls { ca "/etc/limpid/ca.crt" } }
+    }
+}
+```
+
+`verify` stays top-level — disabling certificate validation is an
+output-wide debug switch, not a per-peer one. `method`,
+`content_type`, `compress`, `headers`, `batch_size`, `batch_timeout`
+also remain top-level (they apply across all peers).
 
 ### Added — `output otlp_http` / `output otlp_grpc` per-peer rotation + mTLS
 

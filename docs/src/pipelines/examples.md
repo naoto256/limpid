@@ -110,7 +110,7 @@ def output archive {
 
 def output elasticsearch {
     type http
-    url "https://es:9200/firewall-logs/_bulk"
+    peer { url "https://es:9200/firewall-logs/_bulk" }
     content_type "application/x-ndjson"
     batch_size 100
     batch_timeout "5s"

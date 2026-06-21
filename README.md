@@ -169,7 +169,8 @@ installation, .deb packaging, and systemd integration.
 
 ### Outputs
 `syslog_udp` · `syslog_tcp` (with optional per-peer TLS) · `file` ·
-`http` · `kafka` (with optional TLS / mTLS / SASL) · `unix_socket` ·
+`http` (with per-peer TLS / mTLS, round-robin across peers) ·
+`kafka` (with optional TLS / mTLS / SASL) · `unix_socket` ·
 `stdout` · `otlp_http` · `otlp_grpc`
 
 ### Upgrading from earlier versions
@@ -223,6 +224,15 @@ single top-level `endpoint` property is replaced by a
 flushes round-robin through the peers with per-peer cooldown on
 failure, the standard production shape. Per-peer `tls { ca cert key }`
 enables mTLS for either transport. See `CHANGELOG.md` for the
+migration table.
+
+`output http` gets the same treatment in 0.7.6 — the top-level `url`
+property is replaced by `peer { url tls{...} }` (single destination
+shorthand) or `peers { peer { url tls{...} } ... }` (round-robin
+across multiple endpoints). Per-peer `tls { ca cert key }` enables
+mTLS to the target. The `verify`, `method`, `content_type`,
+`compress`, `headers`, `batch_size`, `batch_timeout` properties stay
+top-level — they apply across all peers. See `CHANGELOG.md` for the
 migration table.
 
 ### Snippets
