@@ -15,7 +15,7 @@ jobs:
   build-deb:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # pin-audit:2026-05-21 34e1148 | v4.3.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # pin-audit:2026-06-03 de0fac2 | v6.0.2
         with:
           persist-credentials: false
 
@@ -67,8 +67,19 @@ jobs:
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # pin-audit:2026-05-21 3bb1273 | v2.6.2
-        with:
-          name: ${{ steps.notes.outputs.name }}
-          files: target/debian/*.deb
-          body_path: RELEASE_NOTES.md
+        env:
+          # Pre-installed gh CLI on the runner authenticates with the
+          # job's GITHUB_TOKEN; no third-party action in the trust path.
+          GH_TOKEN: ${{ github.token }}
+          # Pass the release title through an env var rather than
+          # interpolating `${{ ... }}` into `run:` — the value comes
+          # from CHANGELOG via awk, so it is repo-controlled rather
+          # than attacker-controlled, but expression substitution into
+          # a shell command would still be the wrong defense-in-depth
+          # shape if a future change ever lets non-repo data flow into
+          # `steps.notes.outputs.name`.
+          RELEASE_TITLE: ${{ steps.notes.outputs.name }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" target/debian/*.deb \
+            --title "$RELEASE_TITLE" \
+            --notes-file RELEASE_NOTES.md
