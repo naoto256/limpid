@@ -70,7 +70,7 @@ The gRPC input pairs naturally with the gRPC output for collector-to-collector r
 ```
 def pipeline otlp_relay {
     input otlp_grpc_in
-    output otlp_grpc_out  // type otlp, protocol "grpc"
+    output otlp_grpc_out  // type otlp_grpc
 }
 ```
 
