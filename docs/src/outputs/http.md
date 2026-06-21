@@ -1,15 +1,28 @@
 # http
 
-Sends events to an HTTP/HTTPS endpoint. Supports batching, gzip compression, custom headers, and TLS certificate configuration.
+Sends events to one or more HTTP/HTTPS endpoints. Supports batching, gzip compression, custom headers, per-peer TLS / mTLS, and round-robin across multiple peers with per-peer cooldown on failure.
 
 Works with Elasticsearch Bulk API, Splunk HEC, Datadog, Grafana Loki, and any generic HTTP endpoint.
 
 ## Configuration
 
 ```
-def output elasticsearch {
+def output es_cluster {
     type http
-    url "https://es:9200/_bulk"
+    peers {
+        peer {
+            url "https://es01.example.com:9200/_bulk"
+            tls { ca "/etc/limpid/ca.crt" }
+        }
+        peer {
+            url "https://es02.example.com:9200/_bulk"
+            tls {
+                ca   "/etc/limpid/ca.crt"
+                cert "/etc/limpid/client.crt"   # mTLS
+                key  "/etc/limpid/client.key"
+            }
+        }
+    }
     content_type "application/x-ndjson"
     batch_size 100
     batch_timeout "5s"
@@ -20,17 +33,44 @@ def output elasticsearch {
 }
 ```
 
+Single-peer setups use the `peer { ... }` shorthand (same shape `output syslog_tcp` / `output otlp_http` accept):
+
+```
+def output es {
+    type http
+    peer {
+        url "https://es:9200/_bulk"
+        tls { ca "/etc/limpid/ca.crt" }
+    }
+}
+```
+
+`peer { ... }` and `peers { peer { ... } ... }` are mutually exclusive — exactly one of the two must be present.
+
 ## Properties
 
 | Property | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `url` | yes | — | Target URL (http:// or https://) |
+| `peer { url tls{...} }` or `peers { peer { ... } ... }` | yes (one of) | — | See [§ peers](#peers) below. |
 | `method` | no | `POST` | HTTP method (`POST` or `PUT`) |
 | `content_type` | no | `application/json` | Content-Type header |
 | `batch_size` | no | `1` | Events per HTTP request (1 = no batching) |
 | `batch_timeout` | no | `5s` | Max time before flushing a partial batch |
 | `compress` | no | none | `gzip` to compress request body |
-| `verify` | no | `true` | `false` to skip TLS certificate validation |
+| `verify` | no | `true` | `false` to skip TLS certificate validation (applies to every peer) |
+| `headers` | no | — | Extra HTTP request headers (see below) |
+
+### peers
+
+Each `peer` block configures one target endpoint:
+
+| Per-peer property | Required | Description |
+|-------------------|----------|-------------|
+| `url` | yes | Target URL (`http://` or `https://`) |
+| `tls.ca` | no | Custom CA certificate file (PEM) for this peer. Falls back to the system root store if omitted. |
+| `tls.cert`, `tls.key` | no (paired) | Client certificate and private key for mTLS, as separate PEM files (chmod 600 the key). Both must be present together. |
+
+On each send the rotation picks the next available peer (cooldown expired) and tries it. On failure that peer is marked cooled-down for ~5 s and subsequent sends rotate past it until the cooldown expires. When every peer is currently cooled the rotation falls back to the cursor start — the queue layer's per-event retry then handles re-delivery.
 
 ### headers block
 
@@ -40,18 +80,6 @@ headers {
     X-Custom-Header "value"
 }
 ```
-
-### tls block
-
-```
-tls {
-    ca "/etc/limpid/certs/corp-ca.crt"
-}
-```
-
-| Property | Description |
-|----------|-------------|
-| `ca` | Path to PEM-encoded CA certificate for private PKI |
 
 ## Status
 
@@ -68,17 +96,21 @@ On flush failure, events are returned to the buffer for retry by the queue.
 
 ## TLS behavior
 
+Per peer:
+
 | Setting | Effect |
 |---------|--------|
-| Default | Validate server cert against system CA store |
-| `tls { ca "..." }` | Add custom CA for private PKI |
-| `verify false` | Skip all certificate validation |
+| `https://` URL, no `tls` block | Validate server cert against system CA store |
+| `https://` URL, `tls { ca "..." }` | Add custom CA for private PKI |
+| `https://` URL, `tls { ca cert key }` | mTLS — present `cert`/`key` as client identity |
+| `verify false` (top-level) | Skip all certificate validation for every peer |
 
 > **Warning**: `verify false` disables TLS certificate validation entirely — the
 > connection is vulnerable to MITM. limpid emits a loud `WARN` log at startup
 > when this is set. This setting is for debugging against self-signed test
 > endpoints only; **never use it in production**. For private PKI, use
-> `tls { ca "..." }` to trust an internal CA instead.
+> per-peer `tls { ca "..." }` to trust an internal CA instead. For mTLS, set
+> `cert` + `key` together.
 
 ## Examples
 
@@ -87,7 +119,7 @@ On flush failure, events are returned to the buffer for retry by the queue.
 ```
 def output splunk {
     type http
-    url "https://splunk:8088/services/collector/event"
+    peer { url "https://splunk:8088/services/collector/event" }
     headers {
         Authorization "Splunk your-hec-token"
     }
@@ -99,7 +131,7 @@ def output splunk {
 ```
 def output datadog {
     type http
-    url "https://http-intake.logs.datadoghq.com/api/v2/logs"
+    peer { url "https://http-intake.logs.datadoghq.com/api/v2/logs" }
     batch_size 50
     compress gzip
     headers {
@@ -113,8 +145,37 @@ def output datadog {
 ```
 def output loki {
     type http
-    url "http://loki:3100/loki/api/v1/push"
+    peer { url "http://loki:3100/loki/api/v1/push" }
     content_type "application/json"
+}
+```
+
+### Elasticsearch cluster with mTLS (round-robin)
+
+```
+def output es {
+    type http
+    peers {
+        peer {
+            url "https://es01.example.com:9200/_bulk"
+            tls {
+                ca   "/etc/limpid/ca.crt"
+                cert "/etc/limpid/client.crt"
+                key  "/etc/limpid/client.key"
+            }
+        }
+        peer {
+            url "https://es02.example.com:9200/_bulk"
+            tls {
+                ca   "/etc/limpid/ca.crt"
+                cert "/etc/limpid/client.crt"
+                key  "/etc/limpid/client.key"
+            }
+        }
+    }
+    content_type "application/x-ndjson"
+    batch_size 200
+    compress gzip
 }
 ```
 
@@ -123,11 +184,11 @@ def output loki {
 ```
 def output internal {
     type http
-    url "https://es.example.com:9200/_bulk"
+    peer { url "https://es.example.com:9200/_bulk" }
     verify false
 }
 ```
 
 `verify false` disables certificate validation entirely. Prefer pointing to an
-internal CA via `tls { ca "..." }` for private PKI — that keeps the connection
-authenticated.
+internal CA via per-peer `tls { ca "..." }` for private PKI — that keeps the
+connection authenticated.
