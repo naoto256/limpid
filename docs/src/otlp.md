@@ -22,14 +22,14 @@ read that and explains the OTLP-specific reading on top.
 
 ---
 
-## 1. Scope of v0.5.0
+## 1. Scope
 
-| Aspect | v0.5.0 |
+| Aspect | Current (0.7.6) |
 |---|---|
 | Signal | **logs** only — no traces, no metrics, no profiles |
-| Transports | HTTP/JSON, HTTP/protobuf, gRPC (all three) |
+| Transports | HTTP/JSON, HTTP/protobuf, gRPC (all three; output side split into `output otlp_http` / `output otlp_grpc` as of 0.7.6) |
 | Direction | input *and* output (so collector-to-collector relay works) |
-| TLS | server-side TLS / mTLS on `otlp_grpc`; HTTP server TLS queued for v0.5.x |
+| TLS | server-side TLS / mTLS on every input (`otlp_http`, `otlp_grpc`); client-side TLS / mTLS on every output (per-peer `tls { ca cert key }` on both `output otlp_http` and `output otlp_grpc` as of 0.7.6) |
 | Versioning | OTLP 1.4 wire (the proto3 schema as of opentelemetry-proto 0.27) |
 
 Traces and metrics share the same wire envelope shape but use different
@@ -405,9 +405,10 @@ producer's "High" means OTLP 13 (WARN) for some vendors and OTLP 17
 (ERROR) for others. limpid does not bake any mapping into Rust;
 snippets carry the table.
 
-The reference snippet library (queued for v0.6.0) will ship
-opinionated mappings for common vendors. Until then, snippet authors
-write the table inline.
+The reference snippet library that landed in v0.7.0 (and expanded in
+v0.7.1) ships opinionated mappings for common vendors — see
+[Snippet Library](./snippets/README.md). Authors of new snippets
+follow the table conventions documented there.
 
 ### 5.6 Retry: transport-level only
 

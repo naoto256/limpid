@@ -175,7 +175,7 @@ The question "function or process?" has a clean answer:
 | Recursive | A `def process` (`def function` rejects recursion at `--check` time) |
 | Operator-specific policy (facility rewrite, vendor filter, site-specific routing) | Always a `def process`, defined close to the pipeline that uses it |
 
-A snippet library (for example, the v0.6.0 `_common/*.limpid` + `parsers/*.limpid` + `composers/*.limpid` collection) mixes the three: `def function` for vendor-agnostic mappings (severity, proto, action), `def process` for the parser / composer bodies that consume Event state and write to `workspace.limpid`, and built-in primitives (`syslog.parse`, `cef.parse`, `to_json`, `regex_*`) as the building blocks underneath.
+A snippet library (for example, the v0.7.0 `_common/*.limpid` + `parsers/*.limpid` + `composers/*.limpid` collection that ships under `/usr/share/limpid/snippets/`) mixes the three: `def function` for vendor-agnostic mappings (severity, proto, action), `def process` for the parser / composer bodies that consume Event state and write to `workspace.limpid`, and built-in primitives (`syslog.parse`, `cef.parse`, `to_json`, `regex_*`) as the building blocks underneath.
 
 ## Writing for a snippet library
 

@@ -1,6 +1,6 @@
 # User-defined Processes
 
-limpid is preparing a [Snippet Library](../snippets/README.md) of pre-built processes for common parsing / mapping work (landing in v0.6.0). Even once it ships, sooner or later you'll hit a situation the library doesn't cover — a vendor format we haven't shipped, a one-off enrichment, a dedup or rate-limit shape that's specific to your environment — and want to write your own. This page covers how.
+limpid ships a [Snippet Library](../snippets/README.md) of pre-built processes for common parsing / mapping work (debuts in v0.7.0, expanded in v0.7.1). Sooner or later you'll hit a situation the library doesn't cover — a vendor format we haven't shipped, a one-off enrichment, a dedup or rate-limit shape that's specific to your environment — and want to write your own. This page covers how.
 
 You define a process with `def process <name> { ... }`. Inside the body you call functions, assign to event slots and workspace, branch with `if` / `switch` / `try`, transform arrays with the block-arg primitives (`map`, `filter`, `find`, `reduce`), and call other processes by name.
 
