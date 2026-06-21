@@ -168,8 +168,8 @@ installation, .deb packaging, and systemd integration.
 `unix_socket` · `otlp_http` · `otlp_grpc`
 
 ### Outputs
-`syslog_udp` · `syslog_tcp` · `syslog_tls` · `file` · `http` · `kafka` ·
-`unix_socket` · `stdout` · `otlp`
+`syslog_udp` · `syslog_tcp` (with optional per-peer TLS) · `file` ·
+`http` · `kafka` · `unix_socket` · `stdout` · `otlp`
 
 ### Upgrading from earlier versions
 
@@ -183,12 +183,15 @@ The DSL surface for these outputs also changed: the top-level
 is removed in favour of `peer { host port }` (single destination) or
 `peers { peer { ... } ... }` (round-robin across multiple
 destinations). See `CHANGELOG.md` for the full diff and
-`docs/src/outputs/syslog-tcp.md` (and `-tls.md` / `-udp.md`) for the
-new shape.
+`docs/src/outputs/syslog-tcp.md` (and `-udp.md`) for the new shape.
 
-A new `output syslog_tls` module covers TLS-encrypted syslog with
-optional client mTLS; named profiles are defined at the output level
-and referenced per peer. Default port is 6514 (RFC 5425).
+`output syslog_tcp` accepts a per-peer `tls` block (inline or
+named-profile reference) so plaintext and TLS destinations can share
+one peer list. Default port flips per peer: 6514 (RFC 5425) when `tls`
+is set on that peer, 514 (RFC 6587) otherwise. Optional client mTLS
+via the same block (`cert` / `key` / `ca`). The standalone
+`output syslog_tls` module that shipped briefly in 0.7.4 is removed in
+0.7.6 — see `CHANGELOG.md` for migration.
 
 ### Snippets
 
