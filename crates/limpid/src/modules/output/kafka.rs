@@ -47,33 +47,6 @@ use crate::metrics::OutputMetrics;
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
 use crate::tls::ClientTlsConfig;
 
-/// All three fields are optional at the schema layer; the invariant
-/// (cert ↔ key paired) is enforced at parse time via
-/// [`ClientTlsConfig::validate`].
-const KAFKA_TLS_BLOCK_PROPERTIES: &[PropertySpec] = &[
-    PropertySpec {
-        name: "ca",
-        required: false,
-        repeatable: false,
-        exclusive_group: None,
-        kind: PropertyValueKind::String,
-    },
-    PropertySpec {
-        name: "cert",
-        required: false,
-        repeatable: false,
-        exclusive_group: None,
-        kind: PropertyValueKind::String,
-    },
-    PropertySpec {
-        name: "key",
-        required: false,
-        repeatable: false,
-        exclusive_group: None,
-        kind: PropertyValueKind::String,
-    },
-];
-
 /// Supported SASL mechanisms. The DSL spelling is underscore-separated
 /// (`scram_sha_256`) to fit the DSL's ident grammar — `-` would
 /// tokenise as subtraction. They're mapped to librdkafka's canonical
@@ -163,7 +136,7 @@ const KAFKA_OUTPUT_SCHEMA: &[PropertySpec] = &[
         required: false,
         repeatable: false,
         exclusive_group: None,
-        kind: PropertyValueKind::Block(KAFKA_TLS_BLOCK_PROPERTIES),
+        kind: PropertyValueKind::Block(crate::tls::TLS_CLIENT_BLOCK_PROPERTIES),
     },
     PropertySpec {
         name: "sasl",
@@ -199,15 +172,12 @@ fn parse_sasl_block(name: &str, properties: &[Property]) -> Result<Option<SaslCo
     let Some(block) = props::get_block(properties, "sasl") else {
         return Ok(None);
     };
-    let mechanism = props::get_ident(block, "mechanism").ok_or_else(|| {
-        anyhow::anyhow!("output '{}': sasl block requires 'mechanism'", name)
-    })?;
-    let username = props::get_string(block, "username").ok_or_else(|| {
-        anyhow::anyhow!("output '{}': sasl block requires 'username'", name)
-    })?;
-    let password_file = props::get_string(block, "password_file").ok_or_else(|| {
-        anyhow::anyhow!("output '{}': sasl block requires 'password_file'", name)
-    })?;
+    let mechanism = props::get_ident(block, "mechanism")
+        .ok_or_else(|| anyhow::anyhow!("output '{}': sasl block requires 'mechanism'", name))?;
+    let username = props::get_string(block, "username")
+        .ok_or_else(|| anyhow::anyhow!("output '{}': sasl block requires 'username'", name))?;
+    let password_file = props::get_string(block, "password_file")
+        .ok_or_else(|| anyhow::anyhow!("output '{}': sasl block requires 'password_file'", name))?;
 
     let raw = std::fs::read_to_string(&password_file).with_context(|| {
         format!(

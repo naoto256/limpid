@@ -12,7 +12,55 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 > syslog TLS folded into `syslog_tcp` on both sides (output: per-peer,
 > input: optional block); `otlp_http` gains TLS / mTLS; `output kafka`
 > gains TLS / mTLS / SASL; `output otlp` split into `otlp_http` /
-> `otlp_grpc`
+> `otlp_grpc` and both gain per-peer rotation + mTLS
+
+### Added — `output otlp_http` / `output otlp_grpc` per-peer rotation + mTLS
+
+Both OTLP output transports now accept a `peers { peer { endpoint
+tls{...} } ... }` block in place of the previous top-level `endpoint`.
+On each flush the rotation tries peers in round-robin order; a peer
+that fails the request is cooled-down for the standard 5-second
+window (shared with the syslog outputs) and skipped on subsequent
+flushes until the cooldown expires. Inside one flush the `retry
+{ … }` budget still governs total attempts, but the rotation
+transparently picks the next available peer for each retry.
+
+Per-peer `tls { ca cert key }` enables mTLS. `cert` and `key` are
+paired (both-or-neither, enforced at parse time); `ca` alone adds a
+custom CA on top of the system root store. PEM files for the cert and
+key are loaded once at startup; chmod 600 the key, the daemon already
+refuses to run as root.
+
+This is a **breaking change** for any existing `output otlp_http` or
+`output otlp_grpc` config that used a single top-level `endpoint`:
+
+```text
+# before
+def output o {
+    type otlp_http
+    endpoint "https://collector.example.com:4318/v1/logs"
+    tls { ca "/etc/limpid/ca.crt" }
+}
+
+# after
+def output o {
+    type otlp_http
+    peers {
+        peer {
+            endpoint "https://collector.example.com:4318/v1/logs"
+            tls { ca "/etc/limpid/ca.crt" }
+        }
+    }
+}
+```
+
+The shared `crate::tls::TLS_CLIENT_BLOCK_PROPERTIES` schema was
+extended from `ca`-only to `ca` / `cert` / `key` (all optional, with
+the paired invariant enforced by `ClientTlsConfig::validate`).
+`output syslog_tcp` (per-peer) and `output kafka` were both already
+carrying their own ca/cert/key block constants and have been migrated
+to the shared schema — no user-visible config change for those two,
+but the duplicated `PropertySpec` definitions are gone.
 
 ### Changed — `output otlp` split into `output otlp_http` and `output otlp_grpc` (breaking)
 

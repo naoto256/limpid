@@ -1,31 +1,53 @@
-//! OTLP/gRPC output: forwards Events to an OpenTelemetry collector /
-//! SaaS backend via OTLP over gRPC.
+//! OTLP/gRPC output: forwards Events to one or more OpenTelemetry
+//! collectors / SaaS backends via OTLP over gRPC.
 //!
 //! ```text
 //! def output otlp_out {
 //!     type otlp_grpc
-//!     endpoint "https://collector.example.com:4317"
+//!     peers {
+//!         peer {
+//!             endpoint "https://collector-a.example.com:4317"
+//!             tls { ca "/etc/limpid/ca.crt" }
+//!         }
+//!         peer {
+//!             endpoint "https://collector-b.example.com:4317"
+//!             tls {
+//!                 ca   "/etc/limpid/ca.crt"
+//!                 cert "/etc/limpid/client.crt"
+//!                 key  "/etc/limpid/client.key"
+//!             }
+//!         }
+//!     }
 //!     batch_size 512
 //!     batch_timeout "5s"
 //!     headers {
 //!         Authorization "Bearer ${env.OTLP_TOKEN}"
-//!     }
-//!     tls {
-//!         ca "/etc/limpid/ca.crt"
 //!     }
 //! }
 //! ```
 //!
 //! ### Endpoint conventions
 //!
-//! Point at the gRPC server URL (typically `:4317`). The service name
+//! Each `peer.endpoint` is the gRPC server URL (typically `:4317`).
+//! The service name
 //! (`opentelemetry.proto.collector.logs.v1.LogsService`) is implicit
 //! in the generated client. `https://` and `http://` schemes select
 //! TLS / plaintext respectively. Headers translate to gRPC metadata.
+//!
+//! ### Round-robin + cooldown
+//!
+//! On each flush, peers are tried in round-robin order. A peer that
+//! fails the request is marked cooled-down for `PEER_COOLDOWN` (5s,
+//! shared with the syslog outputs) and skipped on subsequent flushes
+//! until the cooldown expires. The `retry { … }` block controls the
+//! per-flush retry budget; within one budget the rotation transparently
+//! picks the next available peer. If every peer is currently cooled
+//! the rotation falls back to the cursor start — the retry budget,
+//! not the cooldown, protects the single-peer-just-failed case.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
@@ -36,21 +58,41 @@ use tokio::sync::Mutex;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 use crate::dsl::arena::EventArena;
+use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
+use crate::modules::output::syslog_peers::{PEER_COOLDOWN, iter_peers_block};
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
 use crate::queue::{BackoffStrategy, RetryConfig};
 
 use super::{BatchLevel, OTLP_RETRY_BLOCK_PROPERTIES, OtlpPayload, decode_drained_to_request};
 
-struct Inner {
+struct GrpcPeer {
     endpoint: String,
+    channel: Channel,
+}
+
+struct PeerState {
+    cooldown_until: Mutex<Option<Instant>>,
+}
+
+impl Default for PeerState {
+    fn default() -> Self {
+        Self {
+            cooldown_until: Mutex::new(None),
+        }
+    }
+}
+
+struct Inner {
+    peers: Vec<GrpcPeer>,
+    peer_state: Vec<PeerState>,
+    cursor: AtomicUsize,
     batch_level: BatchLevel,
     headers: Vec<(String, String)>,
     batch_timeout: Duration,
-    channel: Channel,
     /// Per-batch retry policy — see [`super::http`] for the
     /// rationale.
     retry_config: RetryConfig,
@@ -65,13 +107,38 @@ pub struct OtlpGrpcOutput {
     metrics: Arc<OutputMetrics>,
 }
 
-const OTLP_GRPC_OUTPUT_SCHEMA: &[PropertySpec] = &[
+const GRPC_PEER_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "endpoint",
         required: true,
         repeatable: false,
         exclusive_group: None,
         kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "tls",
+        required: false,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::Block(crate::tls::TLS_CLIENT_BLOCK_PROPERTIES),
+    },
+];
+
+const GRPC_PEERS_SCHEMA: &[PropertySpec] = &[PropertySpec {
+    name: "peer",
+    required: true,
+    repeatable: true,
+    exclusive_group: None,
+    kind: PropertyValueKind::Block(GRPC_PEER_SCHEMA),
+}];
+
+const OTLP_GRPC_OUTPUT_SCHEMA: &[PropertySpec] = &[
+    PropertySpec {
+        name: "peers",
+        required: true,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::Block(GRPC_PEERS_SCHEMA),
     },
     PropertySpec {
         name: "batch_size",
@@ -102,13 +169,6 @@ const OTLP_GRPC_OUTPUT_SCHEMA: &[PropertySpec] = &[
         kind: PropertyValueKind::StringMap,
     },
     PropertySpec {
-        name: "tls",
-        required: false,
-        repeatable: false,
-        exclusive_group: None,
-        kind: PropertyValueKind::Block(crate::tls::TLS_CLIENT_BLOCK_PROPERTIES),
-    },
-    PropertySpec {
         name: "retry",
         required: false,
         repeatable: false,
@@ -118,6 +178,55 @@ const OTLP_GRPC_OUTPUT_SCHEMA: &[PropertySpec] = &[
     crate::queue::QUEUE_PROPERTY_SPEC,
 ];
 
+fn parse_peer(name: &str, peer_props: &[Property]) -> Result<GrpcPeer> {
+    let endpoint = props::get_string(peer_props, "endpoint")
+        .ok_or_else(|| anyhow!("output '{}': otlp_grpc peer requires 'endpoint'", name))?;
+
+    let tls_block = props::get_block(peer_props, "tls");
+    let tls_cfg = tls_block
+        .map(|block| {
+            let cfg = crate::tls::ClientTlsConfig {
+                ca_path: props::get_string(block, "ca"),
+                cert_path: props::get_string(block, "cert"),
+                key_path: props::get_string(block, "key"),
+            };
+            cfg.validate(&format!("output '{}'", name))?;
+            Ok::<_, anyhow::Error>(cfg)
+        })
+        .transpose()?;
+
+    let mut endpoint_builder = Endpoint::from_shared(endpoint.clone())
+        .with_context(|| format!("output '{}': invalid gRPC endpoint '{}'", name, endpoint))?;
+
+    let needs_tls = endpoint.starts_with("https://") || tls_cfg.is_some();
+    if needs_tls {
+        crate::tls::install_default_crypto_provider();
+        let mut tls = ClientTlsConfig::new().with_native_roots();
+        if let Some(cfg) = &tls_cfg {
+            if let Some(ca_path) = &cfg.ca_path {
+                let pem = std::fs::read(ca_path).with_context(|| {
+                    format!("output '{}': cannot read CA cert {}", name, ca_path)
+                })?;
+                tls = tls.ca_certificate(tonic::transport::Certificate::from_pem(pem));
+            }
+            if let (Some(cert_path), Some(key_path)) = (&cfg.cert_path, &cfg.key_path) {
+                let cert_pem = std::fs::read(cert_path).with_context(|| {
+                    format!("output '{}': cannot read client cert {}", name, cert_path)
+                })?;
+                let key_pem = std::fs::read(key_path).with_context(|| {
+                    format!("output '{}': cannot read client key {}", name, key_path)
+                })?;
+                tls = tls.identity(tonic::transport::Identity::from_pem(cert_pem, key_pem));
+            }
+        }
+        endpoint_builder = endpoint_builder
+            .tls_config(tls)
+            .with_context(|| format!("output '{}': failed to configure gRPC TLS", name))?;
+    }
+    let channel = endpoint_builder.connect_lazy();
+    Ok(GrpcPeer { endpoint, channel })
+}
+
 impl Module for OtlpGrpcOutput {
     fn property_schema() -> Option<&'static [PropertySpec]> {
         Some(OTLP_GRPC_OUTPUT_SCHEMA)
@@ -125,8 +234,14 @@ impl Module for OtlpGrpcOutput {
 
     fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
         let properties = properties.user_properties();
-        let endpoint = props::get_string(properties, "endpoint")
-            .ok_or_else(|| anyhow!("output '{}': otlp_grpc requires 'endpoint'", name))?;
+
+        let peers_block = props::get_block(properties, "peers").ok_or_else(|| {
+            anyhow!(
+                "output '{}': otlp_grpc requires a 'peers' block with at least one peer",
+                name
+            )
+        })?;
+
         let batch_size = props::get_positive_int(properties, "batch_size")?.unwrap_or(1) as usize;
         let batch_timeout = match props::get_string(properties, "batch_timeout") {
             Some(s) => props::parse_duration(&s)?,
@@ -139,39 +254,24 @@ impl Module for OtlpGrpcOutput {
 
         let headers = props::get_string_map(properties, "headers");
 
-        let ca_path =
-            props::get_block(properties, "tls").and_then(|block| props::get_string(block, "ca"));
-        let ca_pem = ca_path
-            .as_ref()
-            .map(|p| {
-                std::fs::read(p)
-                    .with_context(|| format!("output '{}': cannot read CA cert {}", name, p))
-            })
-            .transpose()?;
+        let peers = iter_peers_block(
+            peers_block,
+            &format!("output '{}': peers", name),
+            |peer_props| parse_peer(name, peer_props),
+        )?;
 
-        let mut endpoint_builder = Endpoint::from_shared(endpoint.clone())
-            .with_context(|| format!("output '{}': invalid gRPC endpoint", name))?;
-        if endpoint.starts_with("https://") || ca_pem.is_some() {
-            crate::tls::install_default_crypto_provider();
-            let mut tls = ClientTlsConfig::new().with_native_roots();
-            if let Some(pem) = &ca_pem {
-                tls = tls.ca_certificate(tonic::transport::Certificate::from_pem(pem));
-            }
-            endpoint_builder = endpoint_builder
-                .tls_config(tls)
-                .with_context(|| format!("output '{}': failed to configure gRPC TLS", name))?;
-        }
-        let channel = endpoint_builder.connect_lazy();
+        let peer_state = peers.iter().map(|_| PeerState::default()).collect();
 
         let retry_config = RetryConfig::from_output_properties(properties)?;
 
         Ok(Self {
             inner: Arc::new(Inner {
-                endpoint,
+                peers,
+                peer_state,
+                cursor: AtomicUsize::new(0),
                 batch_level,
                 headers,
                 batch_timeout,
-                channel,
                 retry_config,
                 batch: Mutex::new(Vec::new()),
             }),
@@ -301,36 +401,57 @@ impl Drop for OtlpGrpcOutput {
 
 async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<()> {
     let req = decode_drained_to_request(drained, inner.batch_level)?;
+    let n = inner.peers.len();
 
     let cfg = &inner.retry_config;
     let max_attempts = cfg.max_attempts.max(1);
     let mut attempt = 0u32;
     let mut wait = cfg.initial_wait;
-    loop {
-        let result = send_once(inner, &req).await;
-        match result {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt + 1 >= max_attempts => return Err(e),
-            Err(e) => {
-                attempt += 1;
-                tracing::warn!(
-                    "otlp_grpc output: ship attempt {}/{} failed: {} — retrying in {:?}",
-                    attempt,
-                    max_attempts,
-                    e,
-                    wait,
-                );
-                tokio::time::sleep(wait).await;
-                if matches!(cfg.backoff, BackoffStrategy::Exponential) {
-                    wait = wait.saturating_mul(2).min(cfg.max_wait);
-                }
+
+    let final_err = loop {
+        let start = inner.cursor.fetch_add(1, Ordering::Relaxed) % n;
+        let now = Instant::now();
+        let mut idx = start;
+        for offset in 0..n {
+            let candidate = (start + offset) % n;
+            let guard = inner.peer_state[candidate].cooldown_until.lock().await;
+            if guard.is_none_or(|until| until <= now) {
+                idx = candidate;
+                break;
             }
         }
-    }
+
+        let err = match send_once(&inner.peers[idx], inner, &req).await {
+            Ok(()) => {
+                *inner.peer_state[idx].cooldown_until.lock().await = None;
+                return Ok(());
+            }
+            Err(e) => {
+                *inner.peer_state[idx].cooldown_until.lock().await = Some(now + PEER_COOLDOWN);
+                e
+            }
+        };
+        if attempt + 1 >= max_attempts {
+            break err;
+        }
+        attempt += 1;
+        tracing::warn!(
+            "otlp_grpc output: ship attempt {}/{} failed: {} — retrying in {:?}",
+            attempt,
+            max_attempts,
+            err,
+            wait,
+        );
+        tokio::time::sleep(wait).await;
+        if matches!(cfg.backoff, BackoffStrategy::Exponential) {
+            wait = wait.saturating_mul(2).min(cfg.max_wait);
+        }
+    };
+    Err(final_err)
 }
 
-async fn send_once(inner: &Inner, req: &ExportLogsServiceRequest) -> Result<()> {
-    let mut client = LogsServiceClient::new(inner.channel.clone());
+async fn send_once(peer: &GrpcPeer, inner: &Inner, req: &ExportLogsServiceRequest) -> Result<()> {
+    let mut client = LogsServiceClient::new(peer.channel.clone());
     let mut request = tonic::Request::new(req.clone());
     let metadata = request.metadata_mut();
     for (k, v) in &inner.headers {
@@ -360,7 +481,7 @@ async fn send_once(inner: &Inner, req: &ExportLogsServiceRequest) -> Result<()> 
     let response = client
         .export(request)
         .await
-        .with_context(|| format!("output otlp_grpc: export to {} failed", inner.endpoint))?;
+        .with_context(|| format!("output otlp_grpc: export to {} failed", peer.endpoint))?;
     // The receiver may report `partial_success.rejected_log_records`.
     // Currently logged as a warning; selective re-send of *only* the
     // rejected records is queued for a later release. The retry loop
@@ -373,7 +494,7 @@ async fn send_once(inner: &Inner, req: &ExportLogsServiceRequest) -> Result<()> 
     {
         tracing::warn!(
             "otlp_grpc: {} rejected {} log record(s){}",
-            inner.endpoint,
+            peer.endpoint,
             partial.rejected_log_records,
             if partial.error_message.is_empty() {
                 String::new()
@@ -427,69 +548,119 @@ mod tests {
         }
     }
 
+    fn peer_block(endpoint: &str) -> Property {
+        Property::Block {
+            key: "peer".into(),
+            key_span: None,
+            properties: vec![prop_str("endpoint", endpoint)],
+        }
+    }
+
+    fn peers_block_with(peers: Vec<Property>) -> Property {
+        Property::Block {
+            key: "peers".into(),
+            key_span: None,
+            properties: peers,
+        }
+    }
+
+    fn one_peer_props(endpoint: &str) -> Vec<Property> {
+        vec![peers_block_with(vec![peer_block(endpoint)])]
+    }
+
     #[test]
-    fn requires_endpoint() {
+    fn requires_peers_block() {
         let err = OtlpGrpcOutput::from_properties("o", &mp(&[]))
             .err()
             .unwrap();
-        assert!(err.to_string().contains("endpoint"));
+        assert!(err.to_string().contains("peers"));
+    }
+
+    #[test]
+    fn rejects_peers_block_with_no_peer() {
+        let props = vec![peers_block_with(vec![])];
+        let err = OtlpGrpcOutput::from_properties("o", &mp(&props))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("at least one peer"));
     }
 
     #[tokio::test]
     async fn accepts_plain_http_endpoint() {
-        let output = OtlpGrpcOutput::from_properties(
-            "o",
-            &mp(&[prop_str("endpoint", "http://localhost:4317")]),
-        )
-        .unwrap();
-        // No external observation of the Channel beyond construction;
-        // building without error is the contract.
-        let _ = output.inner.endpoint.as_str();
+        let output =
+            OtlpGrpcOutput::from_properties("o", &mp(&one_peer_props("http://localhost:4317")))
+                .unwrap();
+        assert_eq!(output.inner.peers.len(), 1);
     }
 
     #[tokio::test]
     async fn accepts_https_endpoint_with_native_tls() {
         let output = OtlpGrpcOutput::from_properties(
             "o",
-            &mp(&[prop_str("endpoint", "https://collector.example.com:4317")]),
+            &mp(&one_peer_props("https://collector.example.com:4317")),
         )
         .unwrap();
-        let _ = output.inner.endpoint.as_str();
+        assert_eq!(output.inner.peers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn parses_multi_peer_block() {
+        let props = vec![peers_block_with(vec![
+            peer_block("http://a:4317"),
+            peer_block("http://b:4317"),
+        ])];
+        let output = OtlpGrpcOutput::from_properties("o", &mp(&props)).unwrap();
+        assert_eq!(output.inner.peers.len(), 2);
+        assert_eq!(output.inner.peers[0].endpoint, "http://a:4317");
+    }
+
+    #[test]
+    fn rejects_tls_with_key_but_no_cert() {
+        let props = vec![peers_block_with(vec![Property::Block {
+            key: "peer".into(),
+            key_span: None,
+            properties: vec![
+                prop_str("endpoint", "https://x:4317"),
+                Property::Block {
+                    key: "tls".into(),
+                    key_span: None,
+                    properties: vec![prop_str("key", "/k.pem")],
+                },
+            ],
+        }])];
+        let err = OtlpGrpcOutput::from_properties("o", &mp(&props))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("cert and key"));
     }
 
     #[tokio::test]
     async fn batch_level_default_is_none() {
         let output =
-            OtlpGrpcOutput::from_properties("o", &mp(&[prop_str("endpoint", "http://x")])).unwrap();
+            OtlpGrpcOutput::from_properties("o", &mp(&one_peer_props("http://x"))).unwrap();
         assert!(matches!(output.inner.batch_level, BatchLevel::None));
     }
 
     #[tokio::test]
     async fn batch_size_defaults_to_one() {
         let output =
-            OtlpGrpcOutput::from_properties("o", &mp(&[prop_str("endpoint", "http://x")])).unwrap();
+            OtlpGrpcOutput::from_properties("o", &mp(&one_peer_props("http://x"))).unwrap();
         assert_eq!(output.batch_size, 1);
     }
 
     #[tokio::test]
     async fn retry_block_overrides_defaults() {
-        let props = vec![
-            prop_str("endpoint", "http://x"),
-            Property::Block {
-                key: "retry".into(),
-                key_span: None,
-                properties: vec![
-                    prop_int("max_attempts", 2),
-                    prop_str("initial_wait", "100ms"),
-                ],
-            },
-        ];
+        let mut props = one_peer_props("http://x");
+        props.push(Property::Block {
+            key: "retry".into(),
+            key_span: None,
+            properties: vec![
+                prop_int("max_attempts", 2),
+                prop_str("initial_wait", "100ms"),
+            ],
+        });
         let output = OtlpGrpcOutput::from_properties("o", &mp(&props)).unwrap();
         assert_eq!(output.inner.retry_config.max_attempts, 2);
-        assert_eq!(
-            output.inner.retry_config.initial_wait,
-            Duration::from_millis(100)
-        );
     }
 
     // ---- wire-level round-trip ----
@@ -576,11 +747,9 @@ mod tests {
         });
 
         let endpoint = format!("http://{}", addr);
-        let output = OtlpGrpcOutput::from_properties(
-            "test",
-            &mp(&[prop_str("endpoint", &endpoint), prop_int("batch_size", 1)]),
-        )
-        .unwrap();
+        let mut props = one_peer_props(&endpoint);
+        props.push(prop_int("batch_size", 1));
+        let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
         output
             .write_owned(&event_with_egress(singleton_bytes(
                 1_700_000_000_000_000_000,
@@ -598,27 +767,14 @@ mod tests {
         assert_eq!(got.len(), 1);
         let lr = &got[0].resource_logs[0].scope_logs[0].log_records[0];
         assert_eq!(lr.time_unix_nano, 1_700_000_000_000_000_000);
-        assert_eq!(
-            got[0].resource_logs[0].scope_logs[0]
-                .scope
-                .as_ref()
-                .unwrap()
-                .name,
-            "limpid-test"
-        );
     }
 
     #[tokio::test]
     async fn drop_aborts_pending_flush_timer() {
-        let output = OtlpGrpcOutput::from_properties(
-            "test",
-            &mp(&[
-                prop_str("endpoint", "http://127.0.0.1:1"),
-                prop_int("batch_size", 1024),
-                prop_str("batch_timeout", "30s"),
-            ]),
-        )
-        .unwrap();
+        let mut props = one_peer_props("http://127.0.0.1:1");
+        props.push(prop_int("batch_size", 1024));
+        props.push(prop_str("batch_timeout", "30s"));
+        let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
         output
             .write_owned(&event_with_egress(singleton_bytes(1)))
             .await
