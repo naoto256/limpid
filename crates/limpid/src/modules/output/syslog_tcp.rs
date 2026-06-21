@@ -43,35 +43,11 @@ use crate::tls::{ClientTlsConfig, build_client_config_sync};
 // Schema
 // ---------------------------------------------------------------------------
 
-const TLS_BLOCK_PROPERTIES: &[PropertySpec] = &[
-    PropertySpec {
-        name: "ca",
-        required: false,
-        repeatable: false,
-        exclusive_group: None,
-        kind: PropertyValueKind::String,
-    },
-    PropertySpec {
-        name: "cert",
-        required: false,
-        repeatable: false,
-        exclusive_group: None,
-        kind: PropertyValueKind::String,
-    },
-    PropertySpec {
-        name: "key",
-        required: false,
-        repeatable: false,
-        exclusive_group: None,
-        kind: PropertyValueKind::String,
-    },
-];
-
 /// `peer.tls` may be either an inline block or a profile name (ident
 /// or string). `OneOf` lets the schema validator accept either shape
 /// without flagging the other as a type error.
 const PEER_TLS_KINDS: &[PropertyValueKind] = &[
-    PropertyValueKind::Block(TLS_BLOCK_PROPERTIES),
+    PropertyValueKind::Block(crate::tls::TLS_CLIENT_BLOCK_PROPERTIES),
     PropertyValueKind::String,
 ];
 
@@ -120,7 +96,7 @@ const SYSLOG_TCP_OUTPUT_SCHEMA: &[PropertySpec] = &[
         required: false,
         repeatable: false,
         exclusive_group: None,
-        kind: PropertyValueKind::BlockMap(TLS_BLOCK_PROPERTIES),
+        kind: PropertyValueKind::BlockMap(crate::tls::TLS_CLIENT_BLOCK_PROPERTIES),
     },
     PropertySpec {
         name: "peer",
@@ -217,7 +193,9 @@ impl Module for SyslogTcpOutput {
         let connectors = peers
             .iter()
             .map(|peer| match &peer.tls {
-                Some(tls) => build_client_config_sync(tls).map(TlsConnector::from).map(Some),
+                Some(tls) => build_client_config_sync(tls)
+                    .map(TlsConnector::from)
+                    .map(Some),
                 None => Ok(None),
             })
             .collect::<Result<Vec<_>>>()?;
@@ -571,7 +549,10 @@ mod tests {
 
     #[test]
     fn build_accepts_multiple_peers() {
-        let props = vec![block("peers", vec![peer_plain("a", 514), peer_plain("b", 1514)])];
+        let props = vec![block(
+            "peers",
+            vec![peer_plain("a", 514), peer_plain("b", 1514)],
+        )];
         let tcp = SyslogTcpOutput::build("relay", &mp(&props)).expect("should build");
         assert_eq!(tcp.peers.len(), 2);
         assert_eq!(tcp.peers.peers()[0].address(), "a:514");
@@ -653,7 +634,10 @@ mod tests {
 
     #[test]
     fn build_rejects_peer_and_peers_together() {
-        let props = vec![peer_plain("a", 514), block("peers", vec![peer_plain("b", 514)])];
+        let props = vec![
+            peer_plain("a", 514),
+            block("peers", vec![peer_plain("b", 514)]),
+        ];
         let err = SyslogTcpOutput::build("relay", &mp(&props))
             .err()
             .expect("should fail");

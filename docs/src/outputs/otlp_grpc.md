@@ -1,6 +1,6 @@
 # otlp_grpc
 
-Forwards events to an OpenTelemetry collector or OTLP-compatible SaaS backend over OTLP/gRPC.
+Forwards events to one or more OpenTelemetry collectors / OTLP-compatible SaaS backends over OTLP/gRPC. Multiple peers are tried in round-robin order with per-peer cooldown on failure.
 
 Each Event's `egress` is expected to be the singleton ResourceLogs protobuf bytes produced by [`otlp.encode_resourcelog_protobuf`](../functions/expression-functions.md#otlp). The output buffers these per-Event ResourceLogs, flushes on `batch_size` or `batch_timeout`, wraps the batch in an `ExportLogsServiceRequest`, and ships it.
 
@@ -11,14 +11,35 @@ Each Event's `egress` is expected to be the singleton ResourceLogs protobuf byte
 ```
 def output otlp_out {
     type otlp_grpc
-    endpoint "https://collector.example.com:4317"
+    peers {
+        peer {
+            endpoint "https://collector-a.example.com:4317"
+            tls { ca "/etc/limpid/ca.crt" }
+        }
+        peer {
+            endpoint "https://collector-b.example.com:4317"
+            tls {
+                ca   "/etc/limpid/ca.crt"
+                cert "/etc/limpid/client.crt"   # mTLS
+                key  "/etc/limpid/client.key"
+            }
+        }
+    }
     batch_size 512
     batch_timeout "5s"
     headers {
         Authorization "Bearer ${env.OTLP_TOKEN}"
     }
-    tls {
-        ca "/etc/limpid/ca.crt"
+}
+```
+
+A single-peer setup is also valid:
+
+```
+def output otlp_out {
+    type otlp_grpc
+    peers {
+        peer { endpoint "https://collector.example.com:4317" }
     }
 }
 ```
@@ -27,13 +48,24 @@ def output otlp_out {
 
 | Property | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `endpoint` | yes | — | gRPC server URL. `https://` selects TLS, `http://` selects plaintext. The `LogsService.Export` path is implicit. |
+| `peers { peer { endpoint tls{...} } ... }` | yes | — | One or more peer blocks. See [§ peers](#peers) below. |
 | `batch_size` | no | `1` | Flush after this many Events. `1` ships every Event immediately. |
 | `batch_timeout` | no | `5s` | Flush deferred Events after this duration. |
 | `batch_level` | no | `none` | One of `none` / `resource` / `scope`. See [§ batch_level](#batch_level). |
 | `headers` | no | — | gRPC metadata added to every batch. Keys are lower-cased per HTTP/2 / gRPC convention; tonic rejects mixed-case (e.g. `Authorization`). |
-| `tls.ca` | no | system roots | Custom CA certificate file (PEM). |
-| `retry { max_attempts initial_wait max_wait backoff }` | no | shared default (5 attempts, 1s → 60s exponential) | Per-batch retry policy. Retries the **whole** ExportLogsServiceRequest internally so a transient failure does not lose buffered Events. Same `retry { … }` shape every other output uses. |
+| `retry { max_attempts initial_wait max_wait backoff }` | no | shared default (5 attempts, 1s → 60s exponential) | Per-flush retry budget. Inside one budget the rotation transparently picks the next available peer; the budget caps total attempts across all peers for a single batch. |
+
+### peers
+
+Each `peer` block configures one collector endpoint:
+
+| Per-peer property | Required | Description |
+|-------------------|----------|-------------|
+| `endpoint` | yes | gRPC server URL. `https://` selects TLS, `http://` selects plaintext. The `LogsService.Export` path is implicit. |
+| `tls.ca` | no | Custom CA certificate file (PEM) for this peer. Falls back to the system root store if omitted. |
+| `tls.cert`, `tls.key` | no (paired) | Client certificate and private key for mTLS, as separate PEM files (chmod 600 the key). Both must be present together. |
+
+On each flush, peers are tried in round-robin order. A peer that fails the request is marked cooled-down for ~5s and skipped on subsequent flushes until the cooldown expires. The cursor advances per flush so successive flushes start at successive peers; within one flush the `retry` budget protects against transient failures by rotating to the next available peer.
 
 > `verify false` is intentionally not exposed. tonic does not support insecure-skip-verify the way reqwest does; use an `http://` endpoint for plaintext development setups or terminate TLS at a sidecar.
 

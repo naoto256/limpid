@@ -1,32 +1,52 @@
-//! OTLP/HTTP output: forwards Events to an OpenTelemetry collector /
-//! SaaS backend via OTLP over HTTP, in either `http_protobuf` (default)
-//! or `http_json` wire format.
+//! OTLP/HTTP output: forwards Events to one or more OpenTelemetry
+//! collectors / SaaS backends via OTLP over HTTP, in either
+//! `http_protobuf` (default) or `http_json` wire format.
 //!
 //! ```text
 //! def output otlp_out {
 //!     type otlp_http
-//!     endpoint "https://collector.example.com:4318/v1/logs"
+//!     peers {
+//!         peer {
+//!             endpoint "https://collector-a.example.com:4318/v1/logs"
+//!             tls { ca "/etc/limpid/ca.crt" }
+//!         }
+//!         peer {
+//!             endpoint "https://collector-b.example.com:4318/v1/logs"
+//!             tls {
+//!                 ca   "/etc/limpid/ca.crt"
+//!                 cert "/etc/limpid/client.crt"
+//!                 key  "/etc/limpid/client.key"
+//!             }
+//!         }
+//!     }
 //!     protocol "http_protobuf"   // http_protobuf | http_json
 //!     batch_size 512
 //!     batch_timeout "5s"
 //!     headers {
 //!         Authorization "Bearer ${env.OTLP_TOKEN}"
 //!     }
-//!     tls {
-//!         ca "/etc/limpid/ca.crt"
-//!     }
 //! }
 //! ```
 //!
 //! ### Endpoint conventions
 //!
-//! Point at the full OTLP/HTTP path (typically `:4318/v1/logs`).
-//! limpid does not append `/v1/logs` automatically; collectors that
-//! mount the receiver elsewhere (e.g. behind a path prefix) just work.
+//! Each `peer.endpoint` is the full OTLP/HTTP path (typically
+//! `:4318/v1/logs`). limpid does not append `/v1/logs` automatically;
+//! collectors that mount the receiver elsewhere (e.g. behind a path
+//! prefix) just work.
+//!
+//! ### Round-robin + cooldown
+//!
+//! On each flush, peers are tried in round-robin order. A peer that
+//! fails the request is marked cooled-down for `PEER_COOLDOWN` (5s,
+//! shared with the syslog outputs) and skipped on subsequent flushes
+//! until the cooldown expires. The `retry { … }` block controls the
+//! per-flush retry budget; within one budget the rotation transparently
+//! picks the next available peer.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
@@ -35,12 +55,15 @@ use prost::Message;
 use tokio::sync::Mutex;
 
 use crate::dsl::arena::EventArena;
+use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
+use crate::modules::output::syslog_peers::{PEER_COOLDOWN, iter_peers_block};
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
 use crate::queue::{BackoffStrategy, RetryConfig};
+use crate::tls::ClientTlsConfig;
 
 use super::{BatchLevel, OTLP_RETRY_BLOCK_PROPERTIES, OtlpPayload, decode_drained_to_request};
 
@@ -71,13 +94,38 @@ impl HttpProtocol {
     }
 }
 
-struct Inner {
+struct HttpPeer {
     endpoint: String,
+    client: reqwest::Client,
+}
+
+struct PeerState {
+    cooldown_until: Mutex<Option<Instant>>,
+}
+
+impl Default for PeerState {
+    fn default() -> Self {
+        Self {
+            cooldown_until: Mutex::new(None),
+        }
+    }
+}
+
+struct Inner {
+    peers: Vec<HttpPeer>,
+    /// Per-peer cooldown state. Same length as `peers`. Wrapped in
+    /// `Mutex` because `Instant` is not `Copy`-loadable from an atomic
+    /// — but contention is low (one short critical section per flush
+    /// per peer).
+    peer_state: Vec<PeerState>,
+    /// Round-robin cursor. Incremented per flush so successive flushes
+    /// start at successive peers; the rotation inside one flush handles
+    /// retries.
+    cursor: AtomicUsize,
     protocol: HttpProtocol,
     batch_level: BatchLevel,
     headers: Vec<(String, String)>,
     batch_timeout: Duration,
-    client: reqwest::Client,
     /// Per-batch retry policy. The shared `RetryConfig` parser used by
     /// the file / syslog_tcp / http outputs reads `retry { max_attempts
     /// initial_wait max_wait backoff }` from the output's properties;
@@ -90,10 +138,7 @@ struct Inner {
     /// drained batch (the queue layer's per-event retry only re-pushes
     /// the most recent Event).
     retry_config: RetryConfig,
-    /// Buffered per-Event singleton ResourceLogs proto bytes. Each
-    /// entry is exactly what `otlp.encode_resourcelog_protobuf`
-    /// produced; flush wraps them per `batch_level` into one
-    /// ExportLogsServiceRequest.
+    /// Buffered per-Event singleton ResourceLogs proto bytes.
     batch: Mutex<Vec<Bytes>>,
 }
 
@@ -104,13 +149,38 @@ pub struct OtlpHttpOutput {
     metrics: Arc<OutputMetrics>,
 }
 
-const OTLP_HTTP_OUTPUT_SCHEMA: &[PropertySpec] = &[
+const HTTP_PEER_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "endpoint",
         required: true,
         repeatable: false,
         exclusive_group: None,
         kind: PropertyValueKind::String,
+    },
+    PropertySpec {
+        name: "tls",
+        required: false,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::Block(crate::tls::TLS_CLIENT_BLOCK_PROPERTIES),
+    },
+];
+
+const HTTP_PEERS_SCHEMA: &[PropertySpec] = &[PropertySpec {
+    name: "peer",
+    required: true,
+    repeatable: true,
+    exclusive_group: None,
+    kind: PropertyValueKind::Block(HTTP_PEER_SCHEMA),
+}];
+
+const OTLP_HTTP_OUTPUT_SCHEMA: &[PropertySpec] = &[
+    PropertySpec {
+        name: "peers",
+        required: true,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::Block(HTTP_PEERS_SCHEMA),
     },
     PropertySpec {
         name: "protocol",
@@ -155,13 +225,6 @@ const OTLP_HTTP_OUTPUT_SCHEMA: &[PropertySpec] = &[
         kind: PropertyValueKind::StringMap,
     },
     PropertySpec {
-        name: "tls",
-        required: false,
-        repeatable: false,
-        exclusive_group: None,
-        kind: PropertyValueKind::Block(crate::tls::TLS_CLIENT_BLOCK_PROPERTIES),
-    },
-    PropertySpec {
         name: "retry",
         required: false,
         repeatable: false,
@@ -171,6 +234,72 @@ const OTLP_HTTP_OUTPUT_SCHEMA: &[PropertySpec] = &[
     crate::queue::QUEUE_PROPERTY_SPEC,
 ];
 
+/// Parse one `peer { endpoint tls{...} }` block. `verify` is a
+/// top-level toggle (applies to every peer); it is threaded in here so
+/// the reqwest builder gets the right `danger_accept_invalid_certs`
+/// flag at construction time.
+fn parse_peer(name: &str, peer_props: &[Property], verify: bool) -> Result<HttpPeer> {
+    let endpoint = props::get_string(peer_props, "endpoint")
+        .ok_or_else(|| anyhow!("output '{}': otlp_http peer requires 'endpoint'", name))?;
+    let tls_block = props::get_block(peer_props, "tls");
+    let tls_config = tls_block
+        .map(|block| {
+            let cfg = ClientTlsConfig {
+                ca_path: props::get_string(block, "ca"),
+                cert_path: props::get_string(block, "cert"),
+                key_path: props::get_string(block, "key"),
+            };
+            cfg.validate(&format!("output '{}'", name))?;
+            Ok::<_, anyhow::Error>(cfg)
+        })
+        .transpose()?;
+
+    let mut builder = reqwest::Client::builder();
+    if !verify {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    if let Some(tls) = &tls_config {
+        if let Some(ca_path) = &tls.ca_path {
+            let pem = std::fs::read(ca_path)
+                .with_context(|| format!("output '{}': cannot read CA cert {}", name, ca_path))?;
+            let cert = reqwest::Certificate::from_pem(&pem).with_context(|| {
+                format!("output '{}': invalid CA cert PEM at {}", name, ca_path)
+            })?;
+            builder = builder.add_root_certificate(cert);
+        }
+        if let (Some(cert_path), Some(key_path)) = (&tls.cert_path, &tls.key_path) {
+            let cert_pem = std::fs::read(cert_path).with_context(|| {
+                format!("output '{}': cannot read client cert {}", name, cert_path)
+            })?;
+            let key_pem = std::fs::read(key_path).with_context(|| {
+                format!("output '{}': cannot read client key {}", name, key_path)
+            })?;
+            // reqwest expects the identity as a concatenated PEM blob
+            // (cert chain followed by the private key); we hand-build it
+            // here so users can keep cert and key in separate files
+            // (matches the syslog_tcp / kafka mTLS disposition).
+            let mut combined = cert_pem.clone();
+            if !combined.ends_with(b"\n") {
+                combined.push(b'\n');
+            }
+            combined.extend_from_slice(&key_pem);
+            let identity = reqwest::Identity::from_pem(&combined).with_context(|| {
+                format!(
+                    "output '{}': invalid client cert/key PEM ({}, {})",
+                    name, cert_path, key_path
+                )
+            })?;
+            builder = builder.identity(identity);
+        }
+    }
+
+    let client = builder
+        .build()
+        .with_context(|| format!("output '{}': failed to build HTTP client", name))?;
+
+    Ok(HttpPeer { endpoint, client })
+}
+
 impl Module for OtlpHttpOutput {
     fn property_schema() -> Option<&'static [PropertySpec]> {
         Some(OTLP_HTTP_OUTPUT_SCHEMA)
@@ -178,8 +307,14 @@ impl Module for OtlpHttpOutput {
 
     fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
         let properties = properties.user_properties();
-        let endpoint = props::get_string(properties, "endpoint")
-            .ok_or_else(|| anyhow!("output '{}': otlp_http requires 'endpoint'", name))?;
+
+        let peers_block = props::get_block(properties, "peers").ok_or_else(|| {
+            anyhow!(
+                "output '{}': otlp_http requires a 'peers' block with at least one peer",
+                name
+            )
+        })?;
+
         let protocol_str = props::get_string(properties, "protocol")
             .or_else(|| props::get_ident(properties, "protocol"))
             .unwrap_or_else(|| "http_protobuf".to_string());
@@ -194,50 +329,31 @@ impl Module for OtlpHttpOutput {
             .unwrap_or_else(|| "none".to_string());
         let batch_level = BatchLevel::parse(&batch_level_str, name)?;
 
-        // Headers block — open key set, schema enforces string-shaped values.
         let headers = props::get_string_map(properties, "headers");
 
         let verify = props::get_ident(properties, "verify")
             .map(|s| s != "false")
             .unwrap_or(true);
-        let ca_path =
-            props::get_block(properties, "tls").and_then(|block| props::get_string(block, "ca"));
-        let ca_pem = ca_path
-            .as_ref()
-            .map(|p| {
-                std::fs::read(p)
-                    .with_context(|| format!("output '{}': cannot read CA cert {}", name, p))
-            })
-            .transpose()?;
 
-        let mut builder = reqwest::Client::builder();
-        if !verify {
-            builder = builder.danger_accept_invalid_certs(true);
-        }
-        if let Some(pem) = &ca_pem {
-            let cert = reqwest::Certificate::from_pem(pem).with_context(|| {
-                format!(
-                    "output '{}': invalid CA cert PEM at {}",
-                    name,
-                    ca_path.as_deref().unwrap_or("<inline>")
-                )
-            })?;
-            builder = builder.add_root_certificate(cert);
-        }
-        let client = builder
-            .build()
-            .with_context(|| format!("output '{}': failed to build HTTP client", name))?;
+        let peers = iter_peers_block(
+            peers_block,
+            &format!("output '{}': peers", name),
+            |peer_props| parse_peer(name, peer_props, verify),
+        )?;
+
+        let peer_state = peers.iter().map(|_| PeerState::default()).collect();
 
         let retry_config = RetryConfig::from_output_properties(properties)?;
 
         Ok(Self {
             inner: Arc::new(Inner {
-                endpoint,
+                peers,
+                peer_state,
+                cursor: AtomicUsize::new(0),
                 protocol,
                 batch_level,
                 headers,
                 batch_timeout,
-                client,
                 retry_config,
                 batch: Mutex::new(Vec::new()),
             }),
@@ -371,41 +487,71 @@ impl Drop for OtlpHttpOutput {
 
 async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<()> {
     let req = decode_drained_to_request(drained, inner.batch_level)?;
+    let n = inner.peers.len();
 
     let cfg = &inner.retry_config;
     let max_attempts = cfg.max_attempts.max(1);
     let mut attempt = 0u32;
     let mut wait = cfg.initial_wait;
-    loop {
-        let result = send_once(inner, &req).await;
-        match result {
-            Ok(()) => return Ok(()),
-            Err(e) if attempt + 1 >= max_attempts => return Err(e),
-            Err(e) => {
-                attempt += 1;
-                tracing::warn!(
-                    "otlp_http output: ship attempt {}/{} failed: {} — retrying in {:?}",
-                    attempt,
-                    max_attempts,
-                    e,
-                    wait,
-                );
-                tokio::time::sleep(wait).await;
-                if matches!(cfg.backoff, BackoffStrategy::Exponential) {
-                    // saturating_mul is the safe doubling: `Duration *
-                    // 2` panics on overflow (~584 years), and while the
-                    // practical reach of that limit is "never", making
-                    // the bound explicit is the defensive choice —
-                    // `.min(max_wait)` then clamps back to the
-                    // configured ceiling.
-                    wait = wait.saturating_mul(2).min(cfg.max_wait);
-                }
+
+    let final_err = loop {
+        // Pick the next peer to try. Rotation starts at `cursor` and
+        // walks forward looking for one whose cooldown has expired. If
+        // every peer is currently cooled (typical single-peer retry
+        // path: the peer just failed on the previous attempt) fall
+        // back to the rotation start — the retry budget is what
+        // protects us, not the cooldown. The cooldown's actual job is
+        // to bias *future flushes* away from a known-bad peer when an
+        // alternative exists.
+        let start = inner.cursor.fetch_add(1, Ordering::Relaxed) % n;
+        let now = Instant::now();
+        let mut idx = start;
+        for offset in 0..n {
+            let candidate = (start + offset) % n;
+            let guard = inner.peer_state[candidate].cooldown_until.lock().await;
+            if guard.is_none_or(|until| until <= now) {
+                idx = candidate;
+                break;
             }
         }
-    }
+
+        let err = match send_once(&inner.peers[idx], inner, &req).await {
+            Ok(()) => {
+                // Reset cooldown on success so future flushes pick
+                // this peer freely.
+                *inner.peer_state[idx].cooldown_until.lock().await = None;
+                return Ok(());
+            }
+            Err(e) => {
+                *inner.peer_state[idx].cooldown_until.lock().await = Some(now + PEER_COOLDOWN);
+                e
+            }
+        };
+        if attempt + 1 >= max_attempts {
+            break err;
+        }
+        attempt += 1;
+        tracing::warn!(
+            "otlp_http output: ship attempt {}/{} failed: {} — retrying in {:?}",
+            attempt,
+            max_attempts,
+            err,
+            wait,
+        );
+        tokio::time::sleep(wait).await;
+        if matches!(cfg.backoff, BackoffStrategy::Exponential) {
+            // saturating_mul is the safe doubling: `Duration * 2`
+            // panics on overflow (~584 years), and while the practical
+            // reach of that limit is "never", making the bound
+            // explicit is the defensive choice — `.min(max_wait)` then
+            // clamps back to the configured ceiling.
+            wait = wait.saturating_mul(2).min(cfg.max_wait);
+        }
+    };
+    Err(final_err)
 }
 
-async fn send_once(inner: &Inner, req: &ExportLogsServiceRequest) -> Result<()> {
+async fn send_once(peer: &HttpPeer, inner: &Inner, req: &ExportLogsServiceRequest) -> Result<()> {
     let body = match inner.protocol {
         HttpProtocol::Protobuf => {
             let mut buf = Vec::with_capacity(req.encoded_len());
@@ -416,9 +562,9 @@ async fn send_once(inner: &Inner, req: &ExportLogsServiceRequest) -> Result<()> 
         HttpProtocol::Json => serde_json::to_vec(req)
             .map_err(|e| anyhow!("output otlp_http: JSON encode failed: {e}"))?,
     };
-    let mut http_req = inner
+    let mut http_req = peer
         .client
-        .post(&inner.endpoint)
+        .post(&peer.endpoint)
         .header("Content-Type", inner.protocol.content_type())
         .body(body);
     for (k, v) in &inner.headers {
@@ -427,13 +573,13 @@ async fn send_once(inner: &Inner, req: &ExportLogsServiceRequest) -> Result<()> 
     let resp = http_req
         .send()
         .await
-        .with_context(|| format!("output otlp_http: POST {} failed", inner.endpoint))?;
+        .with_context(|| format!("output otlp_http: POST {} failed", peer.endpoint))?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
         bail!(
             "output otlp_http: {} returned HTTP {} — {}",
-            inner.endpoint,
+            peer.endpoint,
             status.as_u16(),
             text.chars().take(500).collect::<String>()
         );
@@ -473,9 +619,51 @@ mod tests {
         }
     }
 
+    fn peer_block(endpoint: &str) -> Property {
+        Property::Block {
+            key: "peer".into(),
+            key_span: None,
+            properties: vec![prop_str("endpoint", endpoint)],
+        }
+    }
+
+    fn peers_block_with(peers: Vec<Property>) -> Property {
+        Property::Block {
+            key: "peers".into(),
+            key_span: None,
+            properties: peers,
+        }
+    }
+
+    fn one_peer_props(endpoint: &str) -> Vec<Property> {
+        vec![peers_block_with(vec![peer_block(endpoint)])]
+    }
+
     #[test]
-    fn requires_endpoint() {
+    fn requires_peers_block() {
         let err = OtlpHttpOutput::from_properties("o", &mp(&[]))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("peers"));
+    }
+
+    #[test]
+    fn rejects_peers_block_with_no_peer() {
+        let props = vec![peers_block_with(vec![])];
+        let err = OtlpHttpOutput::from_properties("o", &mp(&props))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("at least one peer"));
+    }
+
+    #[test]
+    fn peer_requires_endpoint() {
+        let props = vec![peers_block_with(vec![Property::Block {
+            key: "peer".into(),
+            key_span: None,
+            properties: vec![],
+        }])];
+        let err = OtlpHttpOutput::from_properties("o", &mp(&props))
             .err()
             .unwrap();
         assert!(err.to_string().contains("endpoint"));
@@ -483,20 +671,15 @@ mod tests {
 
     #[test]
     fn defaults_protocol_to_http_protobuf() {
-        let props = vec![prop_str("endpoint", "http://x")];
-        let output = OtlpHttpOutput::from_properties("o", &mp(&props)).unwrap();
+        let output =
+            OtlpHttpOutput::from_properties("o", &mp(&one_peer_props("http://x"))).unwrap();
         assert!(matches!(output.inner.protocol, HttpProtocol::Protobuf));
     }
 
     #[test]
-    fn rejects_grpc_protocol_value() {
-        // gRPC has its own module (`otlp_grpc`); the http schema only
-        // accepts the two http wire formats. The Enum schema rejects
-        // before from_properties parses.
-        let props = vec![
-            prop_str("endpoint", "http://x"),
-            prop_str("protocol", "carrier_pigeon"),
-        ];
+    fn rejects_unknown_protocol_value() {
+        let mut props = one_peer_props("http://x");
+        props.push(prop_str("protocol", "carrier_pigeon"));
         let err = OtlpHttpOutput::from_properties("o", &mp(&props))
             .err()
             .unwrap();
@@ -506,95 +689,67 @@ mod tests {
     #[test]
     fn batch_level_default_is_none() {
         let output =
-            OtlpHttpOutput::from_properties("o", &mp(&[prop_str("endpoint", "http://x")])).unwrap();
+            OtlpHttpOutput::from_properties("o", &mp(&one_peer_props("http://x"))).unwrap();
         assert!(matches!(output.inner.batch_level, BatchLevel::None));
-    }
-
-    #[test]
-    fn batch_level_accepts_resource_and_scope() {
-        let r = OtlpHttpOutput::from_properties(
-            "o",
-            &mp(&[
-                prop_str("endpoint", "http://x"),
-                prop_str("batch_level", "resource"),
-            ]),
-        )
-        .unwrap();
-        assert!(matches!(r.inner.batch_level, BatchLevel::Resource));
-        let s = OtlpHttpOutput::from_properties(
-            "o",
-            &mp(&[
-                prop_str("endpoint", "http://x"),
-                prop_str("batch_level", "scope"),
-            ]),
-        )
-        .unwrap();
-        assert!(matches!(s.inner.batch_level, BatchLevel::Scope));
-    }
-
-    #[test]
-    fn rejects_unknown_batch_level() {
-        let err = OtlpHttpOutput::from_properties(
-            "o",
-            &mp(&[
-                prop_str("endpoint", "http://x"),
-                prop_str("batch_level", "logrecord"),
-            ]),
-        )
-        .err()
-        .unwrap();
-        assert!(
-            err.to_string().contains("unknown batch_level"),
-            "unexpected: {err}"
-        );
     }
 
     #[test]
     fn batch_size_defaults_to_one() {
         let output =
-            OtlpHttpOutput::from_properties("o", &mp(&[prop_str("endpoint", "http://x")])).unwrap();
+            OtlpHttpOutput::from_properties("o", &mp(&one_peer_props("http://x"))).unwrap();
         assert_eq!(output.batch_size, 1);
     }
 
     #[test]
-    fn batch_size_explicit() {
-        let props = vec![prop_str("endpoint", "http://x"), prop_int("batch_size", 64)];
+    fn parses_multi_peer_block() {
+        let props = vec![peers_block_with(vec![
+            peer_block("http://a"),
+            peer_block("http://b"),
+            peer_block("http://c"),
+        ])];
         let output = OtlpHttpOutput::from_properties("o", &mp(&props)).unwrap();
-        assert_eq!(output.batch_size, 64);
+        assert_eq!(output.inner.peers.len(), 3);
+        assert_eq!(output.inner.peers[0].endpoint, "http://a");
+        assert_eq!(output.inner.peers[2].endpoint, "http://c");
     }
 
     #[test]
-    fn retry_config_defaults_match_shared_default() {
-        let output =
-            OtlpHttpOutput::from_properties("o", &mp(&[prop_str("endpoint", "http://x")])).unwrap();
-        let default = RetryConfig::default();
-        assert_eq!(output.inner.retry_config.max_attempts, default.max_attempts);
-        assert_eq!(output.inner.retry_config.initial_wait, default.initial_wait);
+    fn rejects_tls_with_cert_but_no_key() {
+        let props = vec![peers_block_with(vec![Property::Block {
+            key: "peer".into(),
+            key_span: None,
+            properties: vec![
+                prop_str("endpoint", "https://x"),
+                Property::Block {
+                    key: "tls".into(),
+                    key_span: None,
+                    properties: vec![prop_str("cert", "/c.pem")],
+                },
+            ],
+        }])];
+        let err = OtlpHttpOutput::from_properties("o", &mp(&props))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("cert and key"));
     }
 
     #[test]
     fn retry_block_overrides_defaults() {
-        let props = vec![
-            prop_str("endpoint", "http://x"),
-            Property::Block {
-                key: "retry".into(),
-                key_span: None,
-                properties: vec![
-                    prop_int("max_attempts", 2),
-                    prop_str("initial_wait", "100ms"),
-                    prop_str("max_wait", "500ms"),
-                ],
-            },
-        ];
+        let mut props = one_peer_props("http://x");
+        props.push(Property::Block {
+            key: "retry".into(),
+            key_span: None,
+            properties: vec![
+                prop_int("max_attempts", 2),
+                prop_str("initial_wait", "100ms"),
+                prop_str("max_wait", "500ms"),
+            ],
+        });
         let output = OtlpHttpOutput::from_properties("o", &mp(&props)).unwrap();
         assert_eq!(output.inner.retry_config.max_attempts, 2);
         assert_eq!(
             output.inner.retry_config.initial_wait,
             Duration::from_millis(100)
-        );
-        assert_eq!(
-            output.inner.retry_config.max_wait,
-            Duration::from_millis(500)
         );
     }
 
@@ -729,11 +884,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retries_until_success() {
+    async fn retries_until_success_single_peer() {
         use axum::{
             Router, extract::State, http::StatusCode, response::IntoResponse, routing::post,
         };
-        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::atomic::Ordering as AtomicOrdering;
 
         #[derive(Clone)]
         struct AppState {
@@ -767,38 +922,86 @@ mod tests {
         });
 
         let endpoint = format!("http://{}/v1/logs", addr);
-        let output = OtlpHttpOutput::from_properties(
-            "test",
-            &mp(&[
-                prop_str("endpoint", &endpoint),
-                prop_str("protocol", "http_protobuf"),
-                prop_int("batch_size", 1),
-                Property::Block {
-                    key: "retry".into(),
-                    key_span: None,
-                    properties: vec![
-                        prop_int("max_attempts", 5),
-                        prop_str("initial_wait", "10ms"),
-                        prop_str("max_wait", "50ms"),
-                    ],
-                },
-            ]),
-        )
-        .unwrap();
+        let mut props = one_peer_props(&endpoint);
+        props.push(prop_str("protocol", "http_protobuf"));
+        props.push(prop_int("batch_size", 1));
+        props.push(Property::Block {
+            key: "retry".into(),
+            key_span: None,
+            properties: vec![
+                prop_int("max_attempts", 5),
+                prop_str("initial_wait", "10ms"),
+                prop_str("max_wait", "50ms"),
+            ],
+        });
+        let output = OtlpHttpOutput::from_properties("test", &mp(&props)).unwrap();
 
         output
             .write_owned(&event_with_egress(singleton_bytes(123)))
             .await
             .unwrap();
-        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
         server.abort();
     }
 
     #[tokio::test]
-    async fn gives_up_after_max_attempts() {
+    async fn rotates_to_healthy_peer_when_first_fails() {
+        // Two peers: A always 500, B always 200. Round-robin starts at
+        // A, fails, cools it down, retries onto B which succeeds.
         use axum::{Router, http::StatusCode, response::IntoResponse, routing::post};
 
-        async fn always_fail(_body: axum::body::Bytes) -> impl IntoResponse {
+        async fn fail(_: axum::body::Bytes) -> impl IntoResponse {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        async fn ok(_: axum::body::Bytes) -> impl IntoResponse {
+            StatusCode::OK
+        }
+
+        let l_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l_a.local_addr().unwrap();
+        let l_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b = l_b.local_addr().unwrap();
+        let app_a = Router::new().route("/v1/logs", post(fail));
+        let app_b = Router::new().route("/v1/logs", post(ok));
+        let s_a = tokio::spawn(async move {
+            let _ = axum::serve(l_a, app_a).await;
+        });
+        let s_b = tokio::spawn(async move {
+            let _ = axum::serve(l_b, app_b).await;
+        });
+
+        let props = vec![
+            peers_block_with(vec![
+                peer_block(&format!("http://{}/v1/logs", a)),
+                peer_block(&format!("http://{}/v1/logs", b)),
+            ]),
+            prop_str("protocol", "http_protobuf"),
+            prop_int("batch_size", 1),
+            Property::Block {
+                key: "retry".into(),
+                key_span: None,
+                properties: vec![
+                    prop_int("max_attempts", 3),
+                    prop_str("initial_wait", "10ms"),
+                    prop_str("max_wait", "20ms"),
+                ],
+            },
+        ];
+        let output = OtlpHttpOutput::from_properties("test", &mp(&props)).unwrap();
+        output
+            .write_owned(&event_with_egress(singleton_bytes(42)))
+            .await
+            .unwrap();
+
+        s_a.abort();
+        s_b.abort();
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_max_attempts_all_peers_fail() {
+        use axum::{Router, http::StatusCode, response::IntoResponse, routing::post};
+
+        async fn always_fail(_: axum::body::Bytes) -> impl IntoResponse {
             StatusCode::SERVICE_UNAVAILABLE
         }
 
@@ -810,24 +1013,19 @@ mod tests {
         });
 
         let endpoint = format!("http://{}/v1/logs", addr);
-        let output = OtlpHttpOutput::from_properties(
-            "test",
-            &mp(&[
-                prop_str("endpoint", &endpoint),
-                prop_str("protocol", "http_protobuf"),
-                prop_int("batch_size", 1),
-                Property::Block {
-                    key: "retry".into(),
-                    key_span: None,
-                    properties: vec![
-                        prop_int("max_attempts", 3),
-                        prop_str("initial_wait", "10ms"),
-                        prop_str("max_wait", "20ms"),
-                    ],
-                },
-            ]),
-        )
-        .unwrap();
+        let mut props = one_peer_props(&endpoint);
+        props.push(prop_str("protocol", "http_protobuf"));
+        props.push(prop_int("batch_size", 1));
+        props.push(Property::Block {
+            key: "retry".into(),
+            key_span: None,
+            properties: vec![
+                prop_int("max_attempts", 3),
+                prop_str("initial_wait", "10ms"),
+                prop_str("max_wait", "20ms"),
+            ],
+        });
+        let output = OtlpHttpOutput::from_properties("test", &mp(&props)).unwrap();
         let err = output
             .write_owned(&event_with_egress(singleton_bytes(456)))
             .await
@@ -843,15 +1041,10 @@ mod tests {
     async fn round_trip_protobuf() {
         let (addr, received, server) = run_http_collector("http_protobuf").await;
         let endpoint = format!("http://{}/v1/logs", addr);
-        let output = OtlpHttpOutput::from_properties(
-            "test",
-            &mp(&[
-                prop_str("endpoint", &endpoint),
-                prop_str("protocol", "http_protobuf"),
-                prop_int("batch_size", 1),
-            ]),
-        )
-        .unwrap();
+        let mut props = one_peer_props(&endpoint);
+        props.push(prop_str("protocol", "http_protobuf"));
+        props.push(prop_int("batch_size", 1));
+        let output = OtlpHttpOutput::from_properties("test", &mp(&props)).unwrap();
         output
             .write_owned(&event_with_egress(singleton_bytes(123)))
             .await
@@ -873,15 +1066,10 @@ mod tests {
     async fn round_trip_json() {
         let (addr, received, server) = run_http_collector("http_json").await;
         let endpoint = format!("http://{}/v1/logs", addr);
-        let output = OtlpHttpOutput::from_properties(
-            "test",
-            &mp(&[
-                prop_str("endpoint", &endpoint),
-                prop_str("protocol", "http_json"),
-                prop_int("batch_size", 1),
-            ]),
-        )
-        .unwrap();
+        let mut props = one_peer_props(&endpoint);
+        props.push(prop_str("protocol", "http_json"));
+        props.push(prop_int("batch_size", 1));
+        let output = OtlpHttpOutput::from_properties("test", &mp(&props)).unwrap();
         output
             .write_owned(&event_with_egress(singleton_bytes(456)))
             .await
@@ -901,15 +1089,10 @@ mod tests {
 
     #[tokio::test]
     async fn drop_aborts_pending_flush_timer() {
-        let output = OtlpHttpOutput::from_properties(
-            "test",
-            &mp(&[
-                prop_str("endpoint", "http://127.0.0.1:1"),
-                prop_int("batch_size", 1024),
-                prop_str("batch_timeout", "30s"),
-            ]),
-        )
-        .unwrap();
+        let mut props = one_peer_props("http://127.0.0.1:1");
+        props.push(prop_int("batch_size", 1024));
+        props.push(prop_str("batch_timeout", "30s"));
+        let output = OtlpHttpOutput::from_properties("test", &mp(&props)).unwrap();
         output
             .write_owned(&event_with_egress(singleton_bytes(1)))
             .await
