@@ -36,6 +36,16 @@ pub fn register(reg: &mut FunctionRegistry) {
                 &["workspace", "severity"],
                 FieldType::Union(vec![FieldType::Int, FieldType::String]),
             ),
+            // Raw extension blob, as it appeared on the wire (before
+            // the `key=value` split that flattens individual fields
+            // into siblings of the header keys). Present only when the
+            // Extension section was non-empty; omitted otherwise to
+            // mirror `syslog.parse`'s treatment of `msg`. Useful for
+            // passthrough / re-emission, debugging the splitter, or
+            // surfacing dialect-specific extension content that the
+            // splitter doesn't decode (escape sequences, custom
+            // separators).
+            FieldSpec::new(&["workspace", "ext"], FieldType::String),
         ],
         wildcards: true,
     });
@@ -74,6 +84,15 @@ fn parse_impl<'bump>(
         .map(Value::Int)
         .unwrap_or_else(|_| Value::String(arena.alloc_str(parts[6])));
     builder.push("severity", severity_value);
+
+    // Emit the raw extension blob (omitted when empty, to mirror
+    // `syslog.parse`'s treatment of `msg`). This must come BEFORE the
+    // split so the raw form is captured before the splitter consumes
+    // its input; the split itself does not mutate `remaining`, but
+    // keeping the ordering explicit avoids future regressions.
+    if !remaining.is_empty() {
+        builder.push("ext", Value::String(arena.alloc_str(remaining)));
+    }
 
     parse_cef_extensions(arena, remaining, &mut builder);
 
@@ -145,5 +164,252 @@ fn parse_cef_extensions<'bump>(
         };
         let value = extensions[val_start..val_end].trim();
         builder.push_str(key, Value::String(arena.alloc_str(value)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsl::arena::EventArena;
+    use crate::event::OwnedEvent;
+    use crate::functions::FunctionRegistry;
+    use crate::functions::table::TableStore;
+    use bytes::Bytes;
+    use std::net::SocketAddr;
+
+    fn dummy_event() -> OwnedEvent {
+        OwnedEvent::new(
+            Bytes::from_static(b""),
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        )
+    }
+
+    fn make_registry() -> FunctionRegistry {
+        let mut reg = FunctionRegistry::new();
+        let table_store = TableStore::from_configs(vec![]).unwrap();
+        crate::functions::register_builtins(&mut reg, table_store);
+        reg
+    }
+
+    fn lookup<'bump>(
+        entries: &'bump [(&'bump str, Value<'bump>)],
+        key: &str,
+    ) -> Option<Value<'bump>> {
+        entries.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+    }
+
+    fn parse_into<'bump>(
+        reg: &FunctionRegistry,
+        bevent: &crate::event::BorrowedEvent<'bump>,
+        arena: &'bump EventArena<'bump>,
+        line: &'bump str,
+    ) -> Value<'bump> {
+        reg.call(
+            Some("cef"),
+            "parse",
+            &[Value::String(line)],
+            bevent,
+            arena,
+        )
+        .expect("parse should succeed")
+    }
+
+    #[test]
+    fn header_fields_extracted() {
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = dummy_event();
+        let bevent = owned.view_in(&arena);
+        let reg = make_registry();
+        let line = arena.alloc_str("CEF:0|ArcSight|Console|6.9|13|alert raised|3|src=10.0.0.1");
+        let v = parse_into(&reg, &bevent, &arena, line);
+        let Value::Object(entries) = v else {
+            panic!("expected Object");
+        };
+        assert_eq!(lookup(entries, "version"), Some(Value::String("0")));
+        assert_eq!(lookup(entries, "device_vendor"), Some(Value::String("ArcSight")));
+        assert_eq!(lookup(entries, "device_product"), Some(Value::String("Console")));
+        assert_eq!(lookup(entries, "device_version"), Some(Value::String("6.9")));
+        assert_eq!(lookup(entries, "signature_id"), Some(Value::String("13")));
+        assert_eq!(lookup(entries, "name"), Some(Value::String("alert raised")));
+        assert_eq!(lookup(entries, "severity"), Some(Value::Int(3)));
+    }
+
+    #[test]
+    fn extension_split_into_flat_keys_and_raw_ext() {
+        // Both forms must be present: the flat per-key form
+        // (`workspace.cef.src` etc., the documented authoring
+        // surface) AND the raw `ext` blob (the spec-bug fix —
+        // previously the raw form was lost).
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = dummy_event();
+        let bevent = owned.view_in(&arena);
+        let reg = make_registry();
+        let line = arena.alloc_str(
+            "CEF:0|Fortinet|FortiGate|7.0|13|forward|3|src=10.0.0.1 dst=10.0.0.2 act=accept",
+        );
+        let v = parse_into(&reg, &bevent, &arena, line);
+        let Value::Object(entries) = v else {
+            panic!("expected Object");
+        };
+        // Flat per-key form
+        assert_eq!(lookup(entries, "src"), Some(Value::String("10.0.0.1")));
+        assert_eq!(lookup(entries, "dst"), Some(Value::String("10.0.0.2")));
+        assert_eq!(lookup(entries, "act"), Some(Value::String("accept")));
+        // Raw ext blob
+        assert_eq!(
+            lookup(entries, "ext"),
+            Some(Value::String("src=10.0.0.1 dst=10.0.0.2 act=accept"))
+        );
+    }
+
+    #[test]
+    fn empty_extensions_omits_ext_field() {
+        // CEF allows an empty Extension section. When empty, `ext`
+        // must be omitted entirely (mirrors syslog.parse's treatment
+        // of empty `msg`), so callers can write `if workspace.cef.ext
+        // { ... }` against a presence test rather than against an
+        // empty-string test.
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = dummy_event();
+        let bevent = owned.view_in(&arena);
+        let reg = make_registry();
+        let line = arena.alloc_str("CEF:0|Vendor|Product|1.0|sig|name|5|");
+        let v = parse_into(&reg, &bevent, &arena, line);
+        let Value::Object(entries) = v else {
+            panic!("expected Object");
+        };
+        // Header still emitted.
+        assert_eq!(lookup(entries, "version"), Some(Value::String("0")));
+        assert_eq!(lookup(entries, "severity"), Some(Value::Int(5)));
+        // ext must be absent (not "" or null).
+        assert!(
+            lookup(entries, "ext").is_none(),
+            "ext key must be omitted when Extensions are empty"
+        );
+    }
+
+    #[test]
+    fn severity_falls_back_to_string_when_nonnumeric() {
+        // CEF spec says severity is numeric 0–10, but real producers
+        // send strings like "High". Keep the raw value rather than
+        // bailing — the analyzer's Union(Int|String) signature
+        // covers both shapes.
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = dummy_event();
+        let bevent = owned.view_in(&arena);
+        let reg = make_registry();
+        let line = arena.alloc_str("CEF:0|V|P|1.0|sig|name|High|src=1.1.1.1");
+        let v = parse_into(&reg, &bevent, &arena, line);
+        let Value::Object(entries) = v else {
+            panic!("expected Object");
+        };
+        assert_eq!(lookup(entries, "severity"), Some(Value::String("High")));
+    }
+
+    #[test]
+    fn extension_value_with_spaces_consumes_to_next_key() {
+        // CEF values can contain spaces; the splitter must keep
+        // walking until it sees the next ` key=` pattern. Regression
+        // anchor for the "msg=Failed login attempt user=alice" case
+        // where a naive `split(' ')` would corrupt both values.
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = dummy_event();
+        let bevent = owned.view_in(&arena);
+        let reg = make_registry();
+        let line = arena.alloc_str(
+            "CEF:0|V|P|1.0|sig|name|3|msg=Failed login attempt user=alice src=10.0.0.1",
+        );
+        let v = parse_into(&reg, &bevent, &arena, line);
+        let Value::Object(entries) = v else {
+            panic!("expected Object");
+        };
+        assert_eq!(lookup(entries, "msg"), Some(Value::String("Failed login attempt")));
+        assert_eq!(lookup(entries, "user"), Some(Value::String("alice")));
+        assert_eq!(lookup(entries, "src"), Some(Value::String("10.0.0.1")));
+    }
+
+    #[test]
+    fn missing_prefix_errors() {
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = dummy_event();
+        let bevent = owned.view_in(&arena);
+        let reg = make_registry();
+        let line = arena.alloc_str("not a CEF message");
+        let err = reg
+            .call(
+                Some("cef"),
+                "parse",
+                &[Value::String(line)],
+                &bevent,
+                &arena,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("CEF:"),
+            "expected error mentioning the CEF: prefix, got: {err}"
+        );
+    }
+
+    #[test]
+    fn incomplete_header_errors() {
+        // Fewer than 7 pipes — the body has no Severity / Extension
+        // marker. Bail rather than silently emit a half-populated
+        // header.
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = dummy_event();
+        let bevent = owned.view_in(&arena);
+        let reg = make_registry();
+        let line = arena.alloc_str("CEF:0|V|P|1.0|sig|name");
+        let err = reg
+            .call(
+                Some("cef"),
+                "parse",
+                &[Value::String(line)],
+                &bevent,
+                &arena,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("incomplete CEF header"),
+            "expected 'incomplete CEF header' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn defaults_applied_for_missing_keys() {
+        // Second arg `defaults` fills any key the parse didn't emit.
+        // Existing keys win over defaults; missing keys take the
+        // default. Mirrors `syslog.parse`'s second-arg contract.
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = dummy_event();
+        let bevent = owned.view_in(&arena);
+        let reg = make_registry();
+        let line = arena.alloc_str("CEF:0|V|P|1.0|sig|name|3|");
+        let mut defaults_builder = ObjectBuilder::new(&arena);
+        defaults_builder.push("act", Value::String("unknown"));
+        let defaults = defaults_builder.finish();
+        let v = reg
+            .call(
+                Some("cef"),
+                "parse",
+                &[Value::String(line), defaults],
+                &bevent,
+                &arena,
+            )
+            .expect("parse should succeed");
+        let Value::Object(entries) = v else {
+            panic!("expected Object");
+        };
+        // `act` was not in the (empty) extension blob, so the default
+        // wins.
+        assert_eq!(lookup(entries, "act"), Some(Value::String("unknown")));
     }
 }

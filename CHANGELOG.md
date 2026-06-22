@@ -8,7 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
-## [0.7.6] - 2026-06-21
+## [Unreleased] - 0.7.7
+
+### Fixed — `cef.parse` now emits the raw extension blob as `ext`
+
+`cef.parse` previously split the CEF Extension section into individual
+`key=value` siblings of the header keys (`src` / `dst` / `act` / …) and
+discarded the raw blob. There was no way to recover the original
+extension string — needed for passthrough / re-emission, debugging the
+splitter, and dialect-specific extension content the splitter doesn't
+decode (escape sequences, custom separators).
+
+The function now emits **both** forms: the split per-key form (the
+documented authoring surface, unchanged) **and** the raw blob as
+`workspace.cef.ext` (the new field). The raw form is omitted when the
+Extension section is empty, mirroring `syslog.parse`'s treatment of
+empty `msg`. `cef.parse` also gained the unit-test coverage that was
+missing before — eight tests pin the header parse, extension split,
+raw-`ext` emission, empty-extension omission, non-numeric severity
+fallback, value-with-spaces splitter behaviour, and the two error
+paths.
+
+
 > syslog TLS folded into `syslog_tcp` on both sides (output: per-peer,
 > input: optional block); `otlp_http` gains TLS / mTLS; `output kafka`
 > gains TLS / mTLS / SASL; `output otlp` split into `otlp_http` /
