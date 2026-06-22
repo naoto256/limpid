@@ -58,7 +58,7 @@ use crate::dsl::arena::EventArena;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
-use crate::event::BorrowedEvent;
+use crate::event::{BorrowedEvent, Event};
 use crate::metrics::OutputMetrics;
 use crate::modules::output::syslog_peers::{PEER_COOLDOWN, iter_peers_block};
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
@@ -66,6 +66,13 @@ use crate::queue::{BackoffStrategy, RetryConfig};
 use crate::tls::ClientTlsConfig;
 
 use super::{BatchLevel, OTLP_RETRY_BLOCK_PROPERTIES, OtlpPayload, decode_drained_to_request};
+
+/// Upper bound on a single HTTP export — connect, TLS handshake,
+/// request body send, response headers, response body. A peer that
+/// accepts the connection but never replies would otherwise hold the
+/// flush future open indefinitely and starve the rotation/retry path.
+/// Matches the gRPC side.
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HttpProtocol {
@@ -252,6 +259,19 @@ fn parse_peer(name: &str, peer_props: &[Property], verify: bool) -> Result<HttpP
     let endpoint = props::get_string(peer_props, "endpoint")
         .ok_or_else(|| anyhow!("output '{}': otlp_http peer requires 'endpoint'", name))?;
     let tls_block = props::get_block(peer_props, "tls");
+    if tls_block.is_some() && !endpoint.to_ascii_lowercase().starts_with("https://") {
+        // A `tls { ... }` block on a plaintext `http://` endpoint is
+        // almost always an operator error: reqwest would silently
+        // ignore the CA / client-cert settings (TLS only kicks in on
+        // an https scheme) and the daemon would happily ship in clear
+        // text. Refuse at parse time so the misconfiguration is
+        // visible.
+        bail!(
+            "output '{}': otlp_http peer endpoint '{}' uses a plaintext scheme but a tls {{ ... }} block was supplied — switch the endpoint to https:// or drop the tls block",
+            name,
+            endpoint
+        );
+    }
     let tls_config = tls_block
         .map(|block| {
             let cfg = ClientTlsConfig {
@@ -264,7 +284,7 @@ fn parse_peer(name: &str, peer_props: &[Property], verify: bool) -> Result<HttpP
         })
         .transpose()?;
 
-    let mut builder = reqwest::Client::builder();
+    let mut builder = reqwest::Client::builder().timeout(HTTP_REQUEST_TIMEOUT);
     if !verify {
         builder = builder.danger_accept_invalid_certs(true);
     }
@@ -413,6 +433,30 @@ impl Output for OtlpHttpOutput {
             self.ensure_flush_timer().await;
         }
         Ok(())
+    }
+
+    /// Owned-event path (disk-queue replay, control-socket inject). See
+    /// the rationale on `OtlpGrpcOutput::write_owned`: the queue
+    /// consumer needs a per-event ship verdict, and the batched buffer
+    /// would lose it. Ship inline here, bypassing the batch.
+    async fn write_owned(&self, event: &Event) -> Result<()> {
+        let payload = {
+            let bump = bumpalo::Bump::new();
+            let arena = EventArena::new(&bump);
+            let bevent = event.view_in(&arena);
+            self.render(&bevent, &arena)?
+        };
+        let payload: OtlpPayload = payload.downcast()?;
+        match send_batch(&self.inner, vec![payload.egress]).await {
+            Ok(()) => {
+                self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) => {
+                self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -1120,16 +1164,105 @@ mod tests {
 
     #[tokio::test]
     async fn drop_aborts_pending_flush_timer() {
+        // The flush timer is only armed by the Rendered (memory hot
+        // path) buffer write — Owned events bypass the batch entirely
+        // (see `write_owned`) so they never arm the timer. Drive the
+        // timer via the Rendered path here.
         let mut props = one_peer_props("http://127.0.0.1:1");
         props.push(prop_int("batch_size", 1024));
         props.push(prop_str("batch_timeout", "30s"));
         let output = OtlpHttpOutput::from_properties("test", &mp(&props)).unwrap();
-        output
+        let ev = event_with_egress(singleton_bytes(1));
+        let payload = {
+            let bump = bumpalo::Bump::new();
+            let arena = EventArena::new(&bump);
+            let bev = ev.view_in(&arena);
+            output.render(&bev, &arena).unwrap()
+        };
+        output.write(payload).await.unwrap();
+        let handle_before = output.flush_handle.lock().await.is_some();
+        assert!(handle_before, "Rendered write must arm the flush timer");
+        drop(output);
+    }
+
+    #[tokio::test]
+    async fn write_owned_bypasses_batch_buffer() {
+        let mut props = one_peer_props("http://127.0.0.1:1");
+        props.push(prop_int("batch_size", 1024));
+        props.push(prop_str("batch_timeout", "30s"));
+        props.push(Property::Block {
+            key: "retry".into(),
+            key_span: None,
+            properties: vec![
+                prop_int("max_attempts", 1),
+                prop_str("initial_wait", "1ms"),
+                prop_str("max_wait", "1ms"),
+            ],
+        });
+        let output = OtlpHttpOutput::from_properties("test", &mp(&props)).unwrap();
+        let err = output
             .write_owned(&event_with_egress(singleton_bytes(1)))
             .await
+            .expect_err("send must fail against unreachable peer");
+        assert!(
+            err.to_string().contains("otlp_http"),
+            "expected ship error, got: {err}"
+        );
+        let batch_len = output.inner.batch.lock().await.len();
+        assert_eq!(batch_len, 0, "Owned event must not land in the batch");
+        let timer_armed = output.flush_handle.lock().await.is_some();
+        assert!(!timer_armed, "Owned event must not arm the flush timer");
+    }
+
+    #[test]
+    fn rejects_tls_block_on_plaintext_endpoint() {
+        // `tls { ... }` on an `http://` endpoint is almost always an
+        // operator error — reqwest silently ignores the CA / client
+        // cert when the URL is plaintext, so the daemon would ship in
+        // clear text without any indication that the tls block did
+        // nothing. Fail fast at parse time.
+        let props = vec![peers_block_with(vec![Property::Block {
+            key: "peer".into(),
+            key_span: None,
+            properties: vec![
+                prop_str("endpoint", "http://collector.example.com:4318/v1/logs"),
+                Property::Block {
+                    key: "tls".into(),
+                    key_span: None,
+                    properties: vec![prop_str("ca", "/etc/ca.pem")],
+                },
+            ],
+        }])];
+        let err = OtlpHttpOutput::from_properties("o", &mp(&props))
+            .err()
             .unwrap();
-        let handle_before = output.flush_handle.lock().await.is_some();
-        assert!(handle_before, "write must arm the flush timer");
-        drop(output);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("plaintext") && msg.contains("https://"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn accepts_empty_tls_block_on_https_endpoint() {
+        // Regression guard for the plaintext-rejection check: https://
+        // endpoints must still accept a (here empty) tls block. We use
+        // an empty block so the test doesn't try to read a CA pem off
+        // disk; the validation we care about (scheme check) runs
+        // before the file read.
+        let props = vec![peers_block_with(vec![Property::Block {
+            key: "peer".into(),
+            key_span: None,
+            properties: vec![
+                prop_str("endpoint", "https://collector.example.com:4318/v1/logs"),
+                Property::Block {
+                    key: "tls".into(),
+                    key_span: None,
+                    properties: vec![],
+                },
+            ],
+        }])];
+        let output = OtlpHttpOutput::from_properties("o", &mp(&props)).unwrap();
+        assert_eq!(output.inner.peers.len(), 1);
     }
 }

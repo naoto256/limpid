@@ -61,13 +61,21 @@ use crate::dsl::arena::EventArena;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
-use crate::event::BorrowedEvent;
+use crate::event::{BorrowedEvent, Event};
 use crate::metrics::OutputMetrics;
 use crate::modules::output::syslog_peers::{PEER_COOLDOWN, iter_peers_block};
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
 use crate::queue::{BackoffStrategy, RetryConfig};
 
 use super::{BatchLevel, OTLP_RETRY_BLOCK_PROPERTIES, OtlpPayload, decode_drained_to_request};
+
+/// Upper bound on a single gRPC export. A stalled collector (TCP
+/// connection accepted but no HEADERS frame returned) would otherwise
+/// hold the flush future open indefinitely and starve the
+/// rotation/retry path. 30s is loose enough for normal collector
+/// latency including TLS handshake; flushes that take longer are
+/// almost certainly hung.
+const GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct GrpcPeer {
     endpoint: String,
@@ -332,6 +340,32 @@ impl Output for OtlpGrpcOutput {
         }
         Ok(())
     }
+
+    /// Owned-event path (disk-queue replay, control-socket inject). The
+    /// queue consumer needs a per-event ship verdict — Ok ⇒ drop from
+    /// the queue, Err ⇒ retry / disk-replay / secondary — so routing
+    /// Owned events through the batched buffer would silently merge them
+    /// into a later flush and the caller would lose the verdict. Ship
+    /// inline here, bypassing the batch.
+    async fn write_owned(&self, event: &Event) -> Result<()> {
+        let payload = {
+            let bump = bumpalo::Bump::new();
+            let arena = EventArena::new(&bump);
+            let bevent = event.view_in(&arena);
+            self.render(&bevent, &arena)?
+        };
+        let payload: OtlpPayload = payload.downcast()?;
+        match send_batch(&self.inner, vec![payload.egress]).await {
+            Ok(()) => {
+                self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) => {
+                self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                Err(e)
+            }
+        }
+    }
 }
 
 impl OtlpGrpcOutput {
@@ -494,9 +528,15 @@ async fn send_once(peer: &GrpcPeer, inner: &Inner, req: &ExportLogsServiceReques
             }
         }
     }
-    let response = client
-        .export(request)
+    let response = tokio::time::timeout(GRPC_REQUEST_TIMEOUT, client.export(request))
         .await
+        .map_err(|_| {
+            anyhow!(
+                "output otlp_grpc: export to {} timed out after {:?}",
+                peer.endpoint,
+                GRPC_REQUEST_TIMEOUT
+            )
+        })?
         .with_context(|| format!("output otlp_grpc: export to {} failed", peer.endpoint))?;
     // The receiver may report `partial_success.rejected_log_records`.
     // Currently logged as a warning; selective re-send of *only* the
@@ -802,16 +842,60 @@ mod tests {
 
     #[tokio::test]
     async fn drop_aborts_pending_flush_timer() {
+        // The flush timer is only armed by the Rendered (memory hot
+        // path) buffer write — Owned events bypass the batch entirely
+        // (see `write_owned`) so they never arm the timer. Drive the
+        // timer via the Rendered path here.
         let mut props = one_peer_props("http://127.0.0.1:1");
         props.push(prop_int("batch_size", 1024));
         props.push(prop_str("batch_timeout", "30s"));
         let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
-        output
+        let ev = event_with_egress(singleton_bytes(1));
+        let payload = {
+            let bump = bumpalo::Bump::new();
+            let arena = EventArena::new(&bump);
+            let bev = ev.view_in(&arena);
+            output.render(&bev, &arena).unwrap()
+        };
+        output.write(payload).await.unwrap();
+        let handle_before = output.flush_handle.lock().await.is_some();
+        assert!(handle_before, "Rendered write must arm the flush timer");
+        drop(output);
+    }
+
+    #[tokio::test]
+    async fn write_owned_bypasses_batch_buffer() {
+        // Owned events ship inline rather than landing in the batch
+        // buffer, so the queue consumer's per-event Ok/Err contract is
+        // honored (Err → disk-replay / retry / secondary). Use an
+        // unreachable endpoint and large batch_size so the only way
+        // the assertion can fail is if write_owned routed through the
+        // batch instead of bypassing it.
+        let mut props = one_peer_props("http://127.0.0.1:1");
+        props.push(prop_int("batch_size", 1024));
+        props.push(prop_str("batch_timeout", "30s"));
+        // Single attempt with no backoff so the test finishes fast.
+        props.push(Property::Block {
+            key: "retry".into(),
+            key_span: None,
+            properties: vec![
+                prop_int("max_attempts", 1),
+                prop_str("initial_wait", "1ms"),
+                prop_str("max_wait", "1ms"),
+            ],
+        });
+        let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
+        let err = output
             .write_owned(&event_with_egress(singleton_bytes(1)))
             .await
-            .unwrap();
-        let handle_before = output.flush_handle.lock().await.is_some();
-        assert!(handle_before, "write must arm the flush timer");
-        drop(output);
+            .expect_err("send must fail against unreachable peer");
+        assert!(
+            err.to_string().contains("otlp_grpc"),
+            "expected ship error, got: {err}"
+        );
+        let batch_len = output.inner.batch.lock().await.len();
+        assert_eq!(batch_len, 0, "Owned event must not land in the batch");
+        let timer_armed = output.flush_handle.lock().await.is_some();
+        assert!(!timer_armed, "Owned event must not arm the flush timer");
     }
 }

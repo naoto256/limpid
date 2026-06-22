@@ -67,11 +67,13 @@ Each `peer` block configures one collector endpoint:
 
 | Per-peer property | Required | Description |
 |-------------------|----------|-------------|
-| `endpoint` | yes | Full OTLP/HTTP URL including `/v1/logs` (limpid does not append it). |
+| `endpoint` | yes | Full OTLP/HTTP URL including `/v1/logs` (limpid does not append it). A `tls { ... }` block is rejected at config-load time if this is not an `https://` URL — reqwest only negotiates TLS on https URLs, so a tls block on a plaintext endpoint would silently ship in clear text. |
 | `tls.ca` | no | Custom CA certificate file (PEM) for this peer. Falls back to the system root store if omitted. |
 | `tls.cert`, `tls.key` | no (paired) | Client certificate and private key for mTLS, as separate PEM files (chmod 600 the key). Both must be present together. |
 
 On each flush, peers are tried in round-robin order. A peer that fails the request is marked cooled-down for ~5s and skipped on subsequent flushes until the cooldown expires. The cursor advances per flush so successive flushes start at successive peers; within one flush the `retry` budget protects against transient failures by rotating to the next available peer.
+
+Every HTTP export is bounded by a 30s timeout (connect, TLS handshake, request send, response body). A peer that accepts the connection but never replies counts as a failure and yields to the next peer in the rotation.
 
 ## Pipeline contract
 
