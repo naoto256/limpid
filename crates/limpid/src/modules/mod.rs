@@ -370,6 +370,50 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     fn attach_funcs(&mut self, _funcs: Arc<FunctionRegistry>) {}
 }
 
+/// Helper for `Output::write_owned` overrides that ship a single Owned
+/// event inline, bypassing any internal buffer. Renders the event in a
+/// transient arena (same scope discipline as the default impl), awaits
+/// the caller-supplied `ship` closure, then updates the
+/// `events_written` / `events_failed` counters on the metrics handle.
+///
+/// The batched outputs (`otlp_grpc`, `otlp_http`, `output http`)
+/// each need to override `write_owned` so the queue consumer's
+/// per-event `Ok`/`Err` contract is honored (disk-replay events
+/// would otherwise be merged into a batched flush and the verdict
+/// would be lost). They differ only in the `ship` body — payload
+/// downcast and the per-module `send_batch` shape — so the
+/// scaffolding lives here once.
+pub async fn ship_owned_inline<O, F, Fut>(
+    output: &O,
+    event: &Event,
+    metrics: &OutputMetrics,
+    ship: F,
+) -> Result<()>
+where
+    O: Output + ?Sized,
+    F: FnOnce(RenderedPayload) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    use std::sync::atomic::Ordering;
+
+    let payload = {
+        let bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let bevent = event.view_in(&arena);
+        output.render(&bevent, &arena)?
+    };
+    match ship(payload).await {
+        Ok(()) => {
+            metrics.events_written.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(e) => {
+            metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+            Err(e)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Factory return types
 // ---------------------------------------------------------------------------
