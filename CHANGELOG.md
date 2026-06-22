@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
+## [Unreleased] - 0.7.8
+
+### Fixed — `output kafka`: reject `mechanism plain` without a `tls { ... }` block
+
+SASL/PLAIN puts the username and password in clear text on the wire —
+the only safe transport for that mechanism is TLS. Previously
+`mechanism plain` paired with an absent `tls` block selected
+librdkafka's `sasl_plaintext`, sending credentials to the broker in
+clear text. limpid now refuses this combination at config-load time
+and the daemon will not start until either a `tls { ... }` block is
+added or the mechanism is switched to `scram_sha_256` / `scram_sha_512`
+(SCRAM uses challenge-response and never puts the password on the
+wire).
+
+### Fixed — `output kafka`: SASL `password_file` handles CRLF / bare CR
+
+Trailing-newline stripping now matches `\r\n` and bare `\r` in addition
+to bare `\n`, so password files written on Windows hosts (or with an
+editor that defaults to CRLF) authenticate correctly. Previously a
+CRLF-terminated file left a `\r` on the password and produced a
+`bad credentials`–shaped failure that looked like an operator typo.
+
 ## [0.7.7] - 2026-06-22
 
 ### Fixed — `cef.parse` now emits the raw extension blob as `ext`

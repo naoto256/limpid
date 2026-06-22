@@ -186,10 +186,16 @@ fn parse_sasl_block(name: &str, properties: &[Property]) -> Result<Option<SaslCo
         )
     })?;
     // Strip a single trailing newline (the common case for
-    // `echo "secret" > pw`). Empty file or whitespace-only file is
-    // probably a misconfigured secret, not a deliberate empty
-    // password, so reject it.
-    let password = raw.strip_suffix('\n').unwrap_or(&raw).to_string();
+    // `echo "secret" > pw`), handling CRLF as well as bare LF so
+    // password files written on Windows hosts authenticate correctly.
+    // Empty file or whitespace-only file is probably a misconfigured
+    // secret, not a deliberate empty password, so reject it.
+    let password = raw
+        .strip_suffix("\r\n")
+        .or_else(|| raw.strip_suffix('\n'))
+        .or_else(|| raw.strip_suffix('\r'))
+        .unwrap_or(&raw)
+        .to_string();
     if password.trim().is_empty() {
         anyhow::bail!(
             "output '{}': sasl password_file '{}' is empty",
@@ -218,6 +224,30 @@ fn parse_sasl_block(name: &str, properties: &[Property]) -> Result<Option<SaslCo
         username,
         password,
     }))
+}
+
+/// Reject `mechanism plain` without a `tls { ... }` block — SASL/PLAIN
+/// transmits the username and password in clear text on the wire, so
+/// the only safe transport is TLS (Kafka and Confluent both document
+/// this requirement: "TLS/SSL encryption should always be used if SASL
+/// mechanism is PLAIN"). If the operator wants plain-text Kafka, the
+/// supported path is `scram_sha_256` / `scram_sha_512`, which use a
+/// challenge-response and never put the password on the wire.
+fn require_tls_for_plain(
+    name: &str,
+    sasl: Option<&SaslConfig>,
+    tls: Option<&ClientTlsConfig>,
+) -> Result<()> {
+    if let Some(s) = sasl
+        && s.mechanism == "PLAIN"
+        && tls.is_none()
+    {
+        anyhow::bail!(
+            "output '{}': sasl mechanism 'plain' requires a tls {{ ... }} block — PLAIN puts credentials in clear text on the wire and must run over TLS. Use scram_sha_256 or scram_sha_512 if TLS is not available.",
+            name
+        );
+    }
+    Ok(())
 }
 
 /// Pick librdkafka's `security.protocol` from which of (tls, sasl)
@@ -299,6 +329,7 @@ impl Module for KafkaOutput {
 
         let tls = parse_tls_block(name, properties)?;
         let sasl = parse_sasl_block(name, properties)?;
+        require_tls_for_plain(name, sasl.as_ref(), tls.as_ref())?;
 
         // message.timeout.ms: rdkafka's internal delivery timeout (includes retries to broker).
         // Separate from queue_timeout which is the wait time when the internal queue is full.
@@ -571,5 +602,87 @@ mod tests {
         )];
         let err = parse_sasl_block("k", &props).err().unwrap();
         assert!(err.to_string().contains("empty"), "{}", err);
+    }
+
+    #[test]
+    fn parse_sasl_plain_strips_crlf_password_file() {
+        // Windows hosts (or any editor that uses CRLF) write the
+        // trailing newline as `\r\n`; stripping only `\n` leaves a
+        // bare `\r` on the password and Kafka authentication fails
+        // with a "bad credentials" error that looks like a wrong
+        // password.
+        let pw = make_password_file(b"hunter2\r\n");
+        let props = vec![block(
+            "sasl",
+            vec![
+                ident_prop("mechanism", "plain"),
+                str_prop("username", "limpid"),
+                str_prop("password_file", &pw.path),
+            ],
+        )];
+        let sasl = parse_sasl_block("k", &props).unwrap().unwrap();
+        assert_eq!(sasl.password, "hunter2");
+    }
+
+    #[test]
+    fn parse_sasl_plain_strips_bare_cr_password_file() {
+        let pw = make_password_file(b"hunter2\r");
+        let props = vec![block(
+            "sasl",
+            vec![
+                ident_prop("mechanism", "plain"),
+                str_prop("username", "u"),
+                str_prop("password_file", &pw.path),
+            ],
+        )];
+        let sasl = parse_sasl_block("k", &props).unwrap().unwrap();
+        assert_eq!(sasl.password, "hunter2");
+    }
+
+    // ---- require_tls_for_plain ----
+
+    fn sasl(mechanism: &str) -> SaslConfig {
+        SaslConfig {
+            mechanism: mechanism.to_string(),
+            username: "u".into(),
+            password: "p".into(),
+        }
+    }
+
+    fn empty_tls() -> ClientTlsConfig {
+        ClientTlsConfig {
+            ca_path: None,
+            cert_path: None,
+            key_path: None,
+        }
+    }
+
+    #[test]
+    fn require_tls_for_plain_rejects_plain_without_tls() {
+        let s = sasl("PLAIN");
+        let err = require_tls_for_plain("k", Some(&s), None).err().unwrap();
+        assert!(err.to_string().contains("tls"), "{}", err);
+        assert!(err.to_string().contains("plain"), "{}", err);
+    }
+
+    #[test]
+    fn require_tls_for_plain_accepts_plain_with_tls() {
+        let s = sasl("PLAIN");
+        let t = empty_tls();
+        require_tls_for_plain("k", Some(&s), Some(&t)).unwrap();
+    }
+
+    #[test]
+    fn require_tls_for_plain_accepts_scram_without_tls() {
+        // SCRAM uses challenge-response; the password never goes on
+        // the wire, so plaintext transport is acceptable (though
+        // typically still paired with TLS in production).
+        let s = sasl("SCRAM-SHA-512");
+        require_tls_for_plain("k", Some(&s), None).unwrap();
+    }
+
+    #[test]
+    fn require_tls_for_plain_accepts_no_sasl() {
+        require_tls_for_plain("k", None, None).unwrap();
     }
 }
