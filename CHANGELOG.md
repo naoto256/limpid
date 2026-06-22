@@ -2608,7 +2608,7 @@ hot reload via `SIGHUP` with automatic rollback; per-output disk-backed
 queues.
 
 [0.7.7]: https://github.com/naoto256/limpid/compare/v0.7.6...v0.7.7
-[Unreleased]: https://github.com/naoto256/limpid/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/naoto256/limpid/compare/v0.7.7...HEAD
 [0.4.0]: https://github.com/naoto256/limpid/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/naoto256/limpid/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/naoto256/limpid/compare/v0.2.1...v0.2.2
