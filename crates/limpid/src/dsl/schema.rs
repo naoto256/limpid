@@ -398,11 +398,46 @@ fn check_one_of(
         "nested PropertyValueKind::OneOf is not supported"
     );
 
-    if variants
+    // Try every variant; cache the per-variant error set so we can
+    // make a smarter pick than "first error wins".
+    let per_variant: Vec<Vec<SchemaError>> = variants
         .iter()
-        .any(|kind| check_property(key, *kind, prop, key_span).is_empty())
-    {
+        .map(|kind| check_property(key, *kind, prop, key_span))
+        .collect();
+
+    // Happy path — at least one variant accepted the property.
+    if per_variant.iter().any(Vec::is_empty) {
         return Vec::new();
+    }
+
+    // None accepted, but a variant may have *structurally* matched
+    // (the property's outer shape — Block vs. KeyValue — fit) and only
+    // failed on inner content (e.g. an inline `tls { ... }` block
+    // missing a required key inside). When exactly one variant matches
+    // structurally, surface its inner errors instead of collapsing to
+    // a generic `OneOfMismatch` — the latter says "expected Block |
+    // Ident, got Block" which is actively misleading when the user
+    // wrote a Block and the real problem is one missing inner key.
+    //
+    // A structural failure shows up as `ExpectedBlock` (variant wanted
+    // a block, got a scalar) or `ExpectedValue` (variant wanted a
+    // scalar, got a block). Any other error kind means the variant
+    // recognised the outer shape and is reporting a content-level
+    // problem.
+    let structural_matches: Vec<&Vec<SchemaError>> = per_variant
+        .iter()
+        .filter(|errs| {
+            !errs.iter().any(|e| {
+                matches!(
+                    e.kind,
+                    SchemaErrorKind::ExpectedBlock | SchemaErrorKind::ExpectedValue
+                )
+            })
+        })
+        .collect();
+
+    if let [only] = structural_matches.as_slice() {
+        return (*only).clone();
     }
 
     vec![SchemaError {
@@ -1006,6 +1041,11 @@ mod tests {
 
     #[test]
     fn one_of_rejects_neither_variant() {
+        // OneOf[Block, Ident] with a string value: the user's input
+        // didn't match either outer shape (Block needs `{ ... }`,
+        // Ident needs a bare word). Both branches failed *structurally*,
+        // so the error collapses to `OneOfMismatch` which lists every
+        // variant so the operator can pick a direction.
         const S: &[PropertySpec] = &[PropertySpec {
             name: "tls",
             required: false,
@@ -1016,12 +1056,89 @@ mod tests {
                 PropertyValueKind::Enum(&["profile_a"]),
             ]),
         }];
+        // Wait — the Ident branch *can* take a KeyValue (just with the
+        // wrong value kind), so it actually matches structurally and
+        // emits TypeMismatch. The collapse to OneOfMismatch only
+        // happens when **multiple or zero** variants structurally
+        // match. Here exactly one (Enum) does, so we surface its
+        // specific error: "expects an identifier".
         let errs = validate(&[kv("tls", ExprKind::StringLit("profile_a".into()))], S);
-        assert_eq!(errs.len(), 1);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(matches!(
+            errs[0].kind,
+            SchemaErrorKind::TypeMismatch { .. }
+        ));
         let rendered = errs[0].to_string();
-        assert!(rendered.contains("Block"), "{rendered}");
-        assert!(rendered.contains("Ident"), "{rendered}");
-        assert!(rendered.contains("String"), "{rendered}");
+        assert!(
+            rendered.contains("identifier"),
+            "expected the Enum branch's specific error, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn one_of_falls_back_to_mismatch_when_zero_variants_structurally_match() {
+        // OneOf[Block, Block-with-other-shape] — two block variants,
+        // user wrote a KeyValue. Both fail with ExpectedBlock; neither
+        // structurally matches; the error collapses to OneOfMismatch.
+        const S: &[PropertySpec] = &[PropertySpec {
+            name: "x",
+            required: false,
+            repeatable: false,
+            exclusive_group: None,
+            kind: PropertyValueKind::OneOf(&[
+                PropertyValueKind::Block(&[]),
+                PropertyValueKind::BlockMap(&[]),
+            ]),
+        }];
+        let errs = validate(&[kv("x", ExprKind::IntLit(5))], S);
+        assert_eq!(errs.len(), 1);
+        assert!(matches!(
+            errs[0].kind,
+            SchemaErrorKind::OneOfMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn one_of_surfaces_inner_block_error_when_block_variant_matches() {
+        // The motivating CodeRabbit case: OneOf[Block(inner_schema),
+        // Ident]. The user wrote a Block but forgot a required inner
+        // key. The Block variant matches structurally and reports
+        // MissingRequired; the Ident variant fails with ExpectedValue
+        // (structural). Exactly one structural match → return the
+        // Block variant's inner error rather than a vague
+        // "expected Block | Ident, got Block".
+        const INNER: &[PropertySpec] = &[PropertySpec {
+            name: "cert",
+            required: true,
+            repeatable: false,
+            exclusive_group: None,
+            kind: PropertyValueKind::String,
+        }];
+        const S: &[PropertySpec] = &[PropertySpec {
+            name: "tls",
+            required: false,
+            repeatable: false,
+            exclusive_group: None,
+            kind: PropertyValueKind::OneOf(&[
+                PropertyValueKind::Block(INNER),
+                PropertyValueKind::Enum(&["profile_a"]),
+            ]),
+        }];
+        // Inline block with `cert` missing.
+        let errs = validate(
+            &[Property::Block {
+                key: "tls".into(),
+                key_span: None,
+                properties: vec![],
+            }],
+            S,
+        );
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(matches!(
+            errs[0].kind,
+            SchemaErrorKind::MissingRequired
+        ));
+        assert_eq!(errs[0].key, "cert");
     }
 
     #[test]
