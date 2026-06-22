@@ -348,23 +348,11 @@ impl Output for OtlpGrpcOutput {
     /// into a later flush and the caller would lose the verdict. Ship
     /// inline here, bypassing the batch.
     async fn write_owned(&self, event: &Event) -> Result<()> {
-        let payload = {
-            let bump = bumpalo::Bump::new();
-            let arena = EventArena::new(&bump);
-            let bevent = event.view_in(&arena);
-            self.render(&bevent, &arena)?
-        };
-        let payload: OtlpPayload = payload.downcast()?;
-        match send_batch(&self.inner, vec![payload.egress]).await {
-            Ok(()) => {
-                self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
-            Err(e) => {
-                self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-                Err(e)
-            }
-        }
+        crate::modules::ship_owned_inline(self, event, &self.metrics, |payload| async move {
+            let payload: OtlpPayload = payload.downcast()?;
+            send_batch(&self.inner, vec![payload.egress]).await
+        })
+        .await
     }
 }
 
