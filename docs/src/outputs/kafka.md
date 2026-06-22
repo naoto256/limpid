@@ -72,7 +72,7 @@ def output authenticated {
 |---|---|---|
 | absent | absent | `plaintext` (librdkafka default) |
 | present | absent | `ssl` |
-| absent | present | `sasl_plaintext` |
+| absent | present | `sasl_plaintext` (rejected when `mechanism` is `plain` — see [SASL/PLAIN requires TLS](#saslplain-requires-tls)) |
 | present | present | `sasl_ssl` (the recommended production combo) |
 
 ### tls block
@@ -96,10 +96,39 @@ omit both for one-way TLS.
 
 The `password_file` is read once at daemon start; rotate it and restart
 the daemon to refresh credentials. `chmod 600` it and ensure the file
-is owned by the limpid user. A trailing newline is stripped, so
-`echo "secret" > /etc/limpid/kafka.pw` works as expected. An empty file
-is rejected — that's almost always a misconfigured secret, not a
-deliberate empty password.
+is owned by the limpid user. A trailing newline is stripped (`\r\n`,
+bare `\n`, and bare `\r` are all handled), so `echo "secret" >
+/etc/limpid/kafka.pw` works as expected and a CRLF-terminated file from
+a Windows host authenticates correctly. An empty file is rejected —
+that's almost always a misconfigured secret, not a deliberate empty
+password.
+
+### SASL/PLAIN requires TLS
+
+`mechanism plain` transmits the username and password in clear text on
+the wire — the only safe transport is TLS. limpid rejects this
+combination at config-load time:
+
+```
+output kafka {
+    name "lake"
+    brokers "..."
+    topic "events"
+    sasl {
+        mechanism plain        # ← plain on its own is rejected
+        username "limpid"
+        password_file "/etc/limpid/kafka.pw"
+    }
+    # NO tls block → daemon refuses to start
+}
+```
+
+Add a `tls { ... }` block (server CA, optionally `cert` / `key` for
+mTLS) to permit `plain`, or switch the mechanism to `scram_sha_256` /
+`scram_sha_512` — SCRAM uses a challenge-response so the password is
+never sent on the wire and runs safely without TLS. The Kafka project
+and Confluent both require TLS for `PLAIN`; limpid enforces this at
+config-load rather than letting the daemon start and leak credentials.
 
 Why no inline `password`: inline credentials end up in version-control
 diffs, backups, and log output of any tool that pretty-prints the config.
