@@ -2607,8 +2607,26 @@ with TTL, GeoIP; control socket (`limpidctl tap`, `stats`, `health`);
 hot reload via `SIGHUP` with automatic rollback; per-output disk-backed
 queues.
 
-[0.7.7]: https://github.com/naoto256/limpid/compare/v0.7.6...v0.7.7
 [Unreleased]: https://github.com/naoto256/limpid/compare/v0.7.7...HEAD
+[0.7.7]: https://github.com/naoto256/limpid/compare/v0.7.6...v0.7.7
+[0.7.6]: https://github.com/naoto256/limpid/compare/v0.7.5...v0.7.6
+[0.7.5]: https://github.com/naoto256/limpid/compare/v0.7.4...v0.7.5
+[0.7.4]: https://github.com/naoto256/limpid/compare/v0.7.3...v0.7.4
+[0.7.3]: https://github.com/naoto256/limpid/compare/v0.7.2...v0.7.3
+[0.7.2]: https://github.com/naoto256/limpid/compare/v0.7.1...v0.7.2
+[0.7.1]: https://github.com/naoto256/limpid/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/naoto256/limpid/compare/v0.6.1...v0.7.0
+[0.6.1]: https://github.com/naoto256/limpid/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/naoto256/limpid/compare/v0.5.8...v0.6.0
+[0.5.8]: https://github.com/naoto256/limpid/compare/v0.5.7...v0.5.8
+[0.5.7]: https://github.com/naoto256/limpid/compare/v0.5.6...v0.5.7
+[0.5.6]: https://github.com/naoto256/limpid/compare/v0.5.5...v0.5.6
+[0.5.5]: https://github.com/naoto256/limpid/compare/v0.5.4...v0.5.5
+[0.5.4]: https://github.com/naoto256/limpid/compare/v0.5.3...v0.5.4
+[0.5.3]: https://github.com/naoto256/limpid/compare/v0.5.2...v0.5.3
+[0.5.2]: https://github.com/naoto256/limpid/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/naoto256/limpid/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/naoto256/limpid/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/naoto256/limpid/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/naoto256/limpid/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/naoto256/limpid/compare/v0.2.1...v0.2.2
