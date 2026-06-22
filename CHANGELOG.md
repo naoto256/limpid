@@ -10,6 +10,32 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased] - 0.7.8
 
+### Fixed — `output http`: four correctness fixes from the 0.7.6 review
+
+- **`verify false` no longer drops the client identity.** A `tls { cert
+  key }` block on a peer used to be discarded entirely when `verify
+  false` was set on the output, so mTLS silently broke whenever the
+  operator disabled server-cert validation. The client identity is now
+  preserved regardless of `verify`; only the `tls.ca` portion is
+  ignored (with a warning) under `verify false`.
+- **Peer cooldown now measured from the failure time.** With the new
+  30 s per-request timeout and the 5 s peer-cooldown window, capturing
+  `now` *before* the request meant a timed-out failure could record an
+  already-expired cooldown and immediately reselect the bad peer.
+  `Instant::now()` is now read after the call returns.
+- **Method honored end-to-end.** Methods other than `POST` and `PUT`
+  used to silently degrade to `POST`. The configured method is now
+  parsed into `reqwest::Method` at config-load time (invalid verbs
+  fail fast with a clear error) and sent verbatim via
+  `client.request(method, url)` — `PATCH`, `DELETE`, `MKCOL`,
+  RFC-compliant extension tokens all reach the peer as intended.
+- **Error response body capped at 4 KiB.** A malicious or
+  misconfigured peer used to be able to return an unbounded error
+  body, which `response.text().await` would buffer in full before the
+  caller trimmed it. The new `read_body_capped` helper stops reading
+  at 4 KiB via `Response::chunk()` so the failure diagnostic stays
+  bounded regardless of peer behaviour.
+
 ### Fixed — `output otlp_grpc` / `output otlp_http` / `output http`: Owned events no longer get silently merged into a batch
 
 Disk-queue replay and control-socket inject events (`SinkInput::Owned`)

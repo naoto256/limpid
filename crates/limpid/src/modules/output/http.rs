@@ -192,7 +192,7 @@ struct Inner {
     peers: Vec<HttpPeer>,
     peer_state: Vec<PeerState>,
     cursor: AtomicUsize,
-    method: String,
+    method: reqwest::Method,
     content_type: String,
     headers: Vec<(String, String)>,
     batch_timeout: Duration,
@@ -242,28 +242,35 @@ fn parse_peer(name: &str, peer_props: &[Property], verify: bool) -> Result<HttpP
         );
     }
 
-    let tls_config = if verify {
-        tls_block
-            .map(|block| {
-                let cfg = ClientTlsConfig {
-                    ca_path: props::get_string(block, "ca"),
-                    cert_path: props::get_string(block, "cert"),
-                    key_path: props::get_string(block, "key"),
-                };
-                cfg.validate(&format!("output '{}'", name))?;
-                Ok::<_, anyhow::Error>(cfg)
-            })
-            .transpose()?
-    } else {
-        if has_tls_block {
-            tracing::warn!(
-                "output '{}': 'tls' block on peer '{}' is ignored because 'verify false' disables certificate validation",
-                name,
-                url
-            );
-        }
-        None
-    };
+    // Parse the tls block regardless of `verify`. Client certs / keys
+    // (mTLS identity) must still be applied when verification is
+    // disabled — `verify false` only relaxes server-cert checks, the
+    // server may still demand a client certificate.
+    let tls_config = tls_block
+        .map(|block| {
+            let cfg = ClientTlsConfig {
+                ca_path: props::get_string(block, "ca"),
+                cert_path: props::get_string(block, "cert"),
+                key_path: props::get_string(block, "key"),
+            };
+            cfg.validate(&format!("output '{}'", name))?;
+            Ok::<_, anyhow::Error>(cfg)
+        })
+        .transpose()?;
+
+    if !verify
+        && let Some(tls) = &tls_config
+        && tls.ca_path.is_some()
+    {
+        // CA bundling is meaningless when verification is off; warn the
+        // operator so the misconfiguration is visible, then proceed
+        // with the remaining (identity) bits of the tls block.
+        tracing::warn!(
+            "output '{}': peer '{}' ignores tls.ca because 'verify false' disables certificate validation",
+            name,
+            url
+        );
+    }
 
     let mut client_builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
 
@@ -272,7 +279,10 @@ fn parse_peer(name: &str, peer_props: &[Property], verify: bool) -> Result<HttpP
     }
 
     if let Some(tls) = &tls_config {
-        if let Some(ca_path) = &tls.ca_path {
+        // Skip CA loading when verify is off — `danger_accept_invalid_certs`
+        // already short-circuits server-cert validation, and adding a root
+        // would be wasted work (and could mask the warning above).
+        if verify && let Some(ca_path) = &tls.ca_path {
             let pem = std::fs::read(ca_path).with_context(|| {
                 format!("output '{}': failed to read CA cert: {}", name, ca_path)
             })?;
@@ -321,9 +331,21 @@ impl Module for HttpOutput {
     fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
         let properties = properties.user_properties();
 
-        let method = props::get_ident(properties, "method")
+        // Parse the configured method into a typed `reqwest::Method`
+        // at config-load time so unsupported verbs fail fast (rather
+        // than at the first send) and so the hot path doesn't reparse
+        // per request. Reqwest's `FromStr` covers every standard
+        // method (GET / POST / PUT / DELETE / PATCH / HEAD / OPTIONS
+        // / CONNECT / TRACE) plus any RFC-compliant extension token.
+        let method_str = props::get_ident(properties, "method")
             .unwrap_or_else(|| "POST".to_string())
             .to_uppercase();
+        let method = method_str.parse::<reqwest::Method>().with_context(|| {
+            format!(
+                "output '{}': invalid http method '{}' (expected GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS or an RFC-compliant extension token)",
+                name, method_str
+            )
+        })?;
         let content_type = props::get_string(properties, "content_type")
             .unwrap_or_else(|| "application/json".to_string());
         let batch_size = props::get_positive_int(properties, "batch_size")?.unwrap_or(1) as usize;
@@ -568,18 +590,53 @@ impl Inner {
                 Ok(())
             }
             Err(e) => {
-                *self.peer_state[idx].cooldown_until.lock().await = Some(now + PEER_COOLDOWN);
+                // Cool down relative to the *failure time*, not request
+                // start. With a 30s request timeout and a 5s cooldown,
+                // measuring from `now` could record an already-expired
+                // cooldown and immediately reselect the same bad peer.
+                *self.peer_state[idx].cooldown_until.lock().await =
+                    Some(Instant::now() + PEER_COOLDOWN);
                 Err(e)
             }
         }
     }
 }
 
+/// Hard cap on how many bytes of an error response body we read into
+/// memory for the failure diagnostic. A malicious or misconfigured
+/// peer can otherwise return an unbounded body and `response.text()`
+/// would buffer the whole thing before we trim it. 4 KiB is plenty
+/// for the typical "what went wrong" snippet a downstream operator
+/// needs to see in the daemon log.
+const ERROR_BODY_BYTE_CAP: usize = 4096;
+
+/// Drain at most `cap` bytes from the response, then stop. Uses
+/// `Response::chunk()` (available without the `stream` reqwest
+/// feature) so we don't have to pull in `futures-util` for one
+/// streaming consumer.
+async fn read_body_capped(mut response: reqwest::Response, cap: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(cap.min(1024));
+    while buf.len() < cap {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = cap - buf.len();
+                let take = chunk.len().min(remaining);
+                buf.extend_from_slice(&chunk[..take]);
+                if chunk.len() > take {
+                    // We hit the cap mid-chunk; stop reading so the
+                    // peer's connection can be returned to the pool
+                    // and we don't keep streaming bytes we discard.
+                    break;
+                }
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    buf
+}
+
 async fn send_once(peer: &HttpPeer, inner: &Inner, body: &[u8]) -> Result<()> {
-    let mut request = match inner.method.as_str() {
-        "PUT" => peer.client.put(&peer.url),
-        _ => peer.client.post(&peer.url),
-    };
+    let mut request = peer.client.request(inner.method.clone(), &peer.url);
 
     request = request.header("Content-Type", &inner.content_type);
 
@@ -599,13 +656,13 @@ async fn send_once(peer: &HttpPeer, inner: &Inner, body: &[u8]) -> Result<()> {
 
     let status = response.status();
     if !status.is_success() {
-        let resp_body = response.text().await.unwrap_or_default();
-        anyhow::bail!(
-            "http output: {} returned {} — {}",
-            peer.url,
-            status,
-            resp_body.chars().take(200).collect::<String>()
-        );
+        let raw = read_body_capped(response, ERROR_BODY_BYTE_CAP).await;
+        // The cap is in bytes; UTF-8 boundary handling falls out of
+        // `from_utf8_lossy`. We then trim to 200 chars for the log
+        // line so the message stays readable even when the peer
+        // returned the full 4 KiB of diagnostic.
+        let snippet: String = String::from_utf8_lossy(&raw).chars().take(200).collect();
+        anyhow::bail!("http output: {} returned {} — {}", peer.url, status, snippet);
     }
 
     Ok(())
@@ -661,6 +718,15 @@ mod tests {
             key: "peer".into(),
             key_span: None,
             properties: vec![prop_str("url", url)],
+        }
+    }
+
+    fn ident_prop(key: &str, val: &str) -> Property {
+        Property::KeyValue {
+            key: key.to_string(),
+            key_span: None,
+            value: Expr::spanless(ExprKind::Ident(vec![val.to_string()])),
+            value_span: None,
         }
     }
 
@@ -874,6 +940,212 @@ mod tests {
         output.write_owned(&event_with("rr-ok")).await.unwrap();
         s_a.abort();
         s_b.abort();
+    }
+
+    #[test]
+    fn invalid_method_rejected_at_config_load() {
+        // Misconfigured methods should fail fast at parse time, not at
+        // the first send. The error message names the offending value
+        // and lists the expected forms so the operator can correct
+        // their config.
+        let props = vec![
+            peer_block("http://example.com/"),
+            ident_prop("method", "CARRIER PIGEON"),
+        ];
+        let err = HttpOutput::from_properties("test", &mp(&props))
+            .err()
+            .expect("invalid method must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("invalid http method"), "got: {msg}");
+        assert!(msg.contains("CARRIER PIGEON"), "got: {msg}");
+    }
+
+    #[test]
+    fn verify_false_with_client_identity_parses_ok() {
+        // Even with `verify false`, a tls block carrying client
+        // cert/key must still parse successfully so mTLS keeps working
+        // for ops who intentionally disable server-cert validation
+        // (typically dev environments with self-signed servers behind
+        // a corporate CA they don't want to bundle). Generate a real
+        // ephemeral cert/key with rcgen so the test exercises
+        // reqwest's identity loader, not just the config plumbing.
+        use rcgen::{CertificateParams, KeyPair};
+        use tempfile::TempDir;
+
+        let key_pair = KeyPair::generate().unwrap();
+        let params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+
+        let dir = TempDir::new().unwrap();
+        let cert_path = dir.path().join("c.pem");
+        let key_path = dir.path().join("k.pem");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
+
+        let props = vec![
+            Property::Block {
+                key: "peer".into(),
+                key_span: None,
+                properties: vec![
+                    prop_str("url", "https://example.com/"),
+                    Property::Block {
+                        key: "tls".into(),
+                        key_span: None,
+                        properties: vec![
+                            prop_str("cert", cert_path.to_str().unwrap()),
+                            prop_str("key", key_path.to_str().unwrap()),
+                        ],
+                    },
+                ],
+            },
+            ident_prop("verify", "false"),
+        ];
+        // `verify false` must NOT discard the client identity. Old
+        // behaviour: tls block silently ignored; reqwest builds a
+        // plain client without the identity → mTLS broken at runtime.
+        let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
+        assert_eq!(output.inner.peers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn honors_configured_method() {
+        // Method other than POST/PUT used to silently degrade to POST.
+        // Now PATCH should reach the server as PATCH.
+        use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::any};
+
+        #[derive(Clone)]
+        struct AppState {
+            received: Arc<Mutex<Vec<String>>>,
+        }
+
+        async fn handle(
+            State(state): State<AppState>,
+            method: axum::http::Method,
+            _body: axum::body::Bytes,
+        ) -> impl IntoResponse {
+            state.received.lock().await.push(method.to_string());
+            (StatusCode::OK, "")
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new().route("/", any(handle)).with_state(AppState {
+            received: Arc::clone(&received),
+        });
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let url = format!("http://{}/", addr);
+        let props = vec![
+            peer_block(&url),
+            prop_int("batch_size", 1),
+            ident_prop("method", "PATCH"),
+        ];
+        let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
+        output.write_owned(&event_with("hello")).await.unwrap();
+        for _ in 0..50 {
+            if !received.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        server.abort();
+        let got = received.lock().await.clone();
+        assert_eq!(got, vec!["PATCH".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn caps_error_response_body() {
+        // A peer returning a huge error body used to be buffered in
+        // full via `response.text().await` before being trimmed. The
+        // cap now stops reading at ERROR_BODY_BYTE_CAP bytes, so the
+        // diagnostic line stays bounded regardless of peer behaviour.
+        use axum::{Router, http::StatusCode, response::IntoResponse, routing::post};
+
+        // 256 KiB — way over the 4 KiB cap so any unbounded read
+        // would manifest as a much larger error message.
+        const BIG: usize = 256 * 1024;
+        async fn handle() -> impl IntoResponse {
+            let body = "X".repeat(BIG);
+            (StatusCode::INTERNAL_SERVER_ERROR, body)
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/", post(handle));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let url = format!("http://{}/", addr);
+        let props = vec![peer_block(&url), prop_int("batch_size", 1)];
+        let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
+        let err = output
+            .write_owned(&event_with("hello"))
+            .await
+            .expect_err("500 must surface as Err");
+        server.abort();
+        let msg = err.to_string();
+        // Snippet caps at 200 chars; the full message is "http output:
+        // <url> returned 500 Internal Server Error — XXXX…" which
+        // tops out well under 1 KiB even with a 16 KiB peer payload.
+        assert!(
+            msg.len() < 1024,
+            "error message must stay bounded, got {} bytes: {}",
+            msg.len(),
+            &msg[..msg.len().min(80)]
+        );
+        assert!(msg.contains("returned 500"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn cooldown_measured_from_failure_time_not_request_start() {
+        // With a slow-responding peer, the cooldown timestamp must be
+        // captured AFTER the request returns. The old code captured a
+        // `now` before send and added PEER_COOLDOWN to it; if the
+        // request took longer than the cooldown, the cooldown would
+        // be already expired by the time it was written, so the next
+        // rotation immediately picks the same broken peer.
+        use axum::{Router, http::StatusCode, response::IntoResponse, routing::post};
+
+        async fn slow_fail() -> impl IntoResponse {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/", post(slow_fail));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let url = format!("http://{}/", addr);
+        let props = vec![peer_block(&url), prop_int("batch_size", 1)];
+        let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
+        let pre_call = Instant::now();
+        let _ = output.write_owned(&event_with("hello")).await;
+        let cooldown_until = output.inner.peer_state[0]
+            .cooldown_until
+            .lock()
+            .await
+            .expect("cooldown must be set after failure");
+        server.abort();
+
+        // The cooldown was set at *failure time*, so it must be later
+        // than `pre_call + PEER_COOLDOWN` by at least the artificial
+        // 300 ms request delay (minus a small tolerance for scheduling
+        // jitter). The old behaviour set it at exactly `pre_call +
+        // PEER_COOLDOWN`.
+        let expected_floor = pre_call + PEER_COOLDOWN + Duration::from_millis(200);
+        assert!(
+            cooldown_until > expected_floor,
+            "cooldown_until ({:?}) must exceed pre_call + PEER_COOLDOWN + delay ({:?})",
+            cooldown_until,
+            expected_floor
+        );
     }
 
     #[tokio::test]

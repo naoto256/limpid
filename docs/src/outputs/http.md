@@ -52,7 +52,7 @@ def output es {
 | Property | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `peer { url tls{...} }` or `peers { peer { ... } ... }` | yes (one of) | — | See [§ peers](#peers) below. |
-| `method` | no | `POST` | HTTP method (`POST` or `PUT`) |
+| `method` | no | `POST` | HTTP method — any RFC-compliant verb (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`, …). Invalid methods fail at config-load time. |
 | `content_type` | no | `application/json` | Content-Type header |
 | `batch_size` | no | `1` | Events per HTTP request (1 = no batching) |
 | `batch_timeout` | no | `5s` | Max time before flushing a partial batch |
@@ -111,6 +111,12 @@ Per peer:
 > endpoints only; **never use it in production**. For private PKI, use
 > per-peer `tls { ca "..." }` to trust an internal CA instead. For mTLS, set
 > `cert` + `key` together.
+
+`verify false` only relaxes **server-cert validation**. A `tls { cert key }`
+pair on the same peer continues to be applied as the client identity — mTLS
+remains intact even with `verify false`. `tls { ca "..." }` is ignored when
+`verify false` is set (and a warning surfaces) because trusting a custom CA
+is moot when no chain is checked at all.
 
 ## Examples
 
