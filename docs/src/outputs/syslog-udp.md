@@ -41,7 +41,7 @@ Exactly one of `peer` or `peers` must be specified.
 
 | Property | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `host` | yes | - | Hostname or IP of the syslog receiver |
+| `host` | yes | - | Hostname or IP of the syslog receiver. IPv4 literals (`10.0.0.1`), IPv6 literals (`::1`, `2001:db8::1` — bare or bracketed), and hostnames are all accepted. Hostnames that resolve only to AAAA work as well; limpid binds the ephemeral local socket in the matching address family. |
 | `port` | no | `514` | UDP port |
 
 ## Multi-destination semantics

@@ -87,7 +87,7 @@ Exactly one of `peer` or `peers` must be specified.
 
 | Property | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `host` | yes | - | Hostname or IP of the syslog receiver. Also used as the TLS SNI / certificate verification name when `tls` is set. |
+| `host` | yes | - | Hostname or IP of the syslog receiver. IPv4 literals, IPv6 literals (`::1` / `2001:db8::1`, bare or bracketed), and hostnames are all accepted. Also used as the TLS SNI / certificate verification name when `tls` is set. |
 | `port` | no | per-peer | TCP port. Defaults to `6514` when this peer has a `tls` block (RFC 5425) and `514` otherwise (RFC 6587). |
 | `tls` | no | - | Either an inline [tls block](#tls-block) or a bare identifier referencing a profile defined in the outer `tls { ... }` map. Omit to use plaintext TCP. |
 
