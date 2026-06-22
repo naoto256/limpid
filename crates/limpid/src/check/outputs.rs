@@ -8,6 +8,7 @@
 //! mean" hints are attached when a near match exists.
 
 use crate::dsl::ast::{Expr, ExprKind, OutputDef, Property, walk_children};
+use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::dsl::span::Span;
 use crate::functions::FunctionRegistry;
 use crate::modules::ModuleRegistry;
@@ -15,6 +16,33 @@ use crate::modules::ModuleRegistry;
 use super::bindings::Bindings;
 use super::module_props::schema_declares_key;
 use super::{DiagKind, Diagnostic, expr_types, suggestions};
+
+/// When descending into a `Property::Block`, look up the inner schema
+/// for that block's key in the parent schema (if any). Returns the
+/// inner spec so the recursion can re-evaluate `schema_owned` for each
+/// nested key on its own merits rather than inheriting the parent's
+/// flag. Supports `Block`, `BlockMap`, and `OneOf` (the last by
+/// preferring the first block-shaped variant).
+fn inner_block_schema(
+    parent: &'static [PropertySpec],
+    key: &str,
+) -> Option<&'static [PropertySpec]> {
+    let spec = parent.iter().find(|p| p.name == key)?;
+    inner_block_schema_of(&spec.kind)
+}
+
+fn inner_block_schema_of(
+    kind: &PropertyValueKind,
+) -> Option<&'static [PropertySpec]> {
+    match kind {
+        PropertyValueKind::Block(s) => Some(s),
+        PropertyValueKind::BlockMap(s) => Some(s),
+        PropertyValueKind::OneOf(variants) => {
+            variants.iter().find_map(inner_block_schema_of)
+        }
+        _ => None,
+    }
+}
 
 pub(super) fn analyze_output(
     output: &OutputDef,
@@ -32,7 +60,7 @@ pub(super) fn analyze_output(
     for prop in output.properties.user_properties() {
         analyze_property(
             prop,
-            schema.is_some_and(|s| schema_declares_key(s, property_key(prop))),
+            schema,
             &output.name,
             pipeline_name,
             registry,
@@ -50,28 +78,51 @@ fn property_key(prop: &Property) -> &str {
 
 fn analyze_property(
     prop: &Property,
-    schema_owned: bool,
+    parent_schema: Option<&'static [PropertySpec]>,
     output_name: &str,
     pipeline_name: &str,
     registry: &FunctionRegistry,
     bindings: &Bindings,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    // Whether *this* key is declared in the *parent* schema. The
+    // previous shape carried a single `schema_owned` flag down through
+    // every recursion level, which silently silenced expression-level
+    // diagnostics inside any nested block whose outer key was
+    // schema-declared (e.g. `peer { host "${upperr(...)}" }` skipped
+    // `expr_types::check_types` on `host` because the parent `peer`
+    // block was schema-declared). Recomputing per-key against the
+    // current schema level — and descending into the inner spec when
+    // we enter a block — fixes that.
+    let schema_owned =
+        parent_schema.is_some_and(|s| schema_declares_key(s, property_key(prop)));
+
     match prop {
         Property::KeyValue {
             value: expr,
             value_span,
             ..
         } => {
-            // If this key is declared in the Module's property schema,
-            // the schema validator (see `module_props::analyze_all`)
-            // owns the value's *shape* — bare-ident enum values like
-            // `framing non_transparent` are no longer flagged as
-            // unresolved idents. Workspace references inside template
-            // values remain a dataflow concern, so the
-            // `collect_workspace_refs` walk still runs regardless of
-            // whether the schema covers the key.
-            if !schema_owned {
+            // The schema validator (see `module_props::analyze_all`)
+            // owns the *shape* of schema-declared values — that's why
+            // `framing non_transparent` (a bare-ident enum value)
+            // doesn't surface as "unresolved ident". The previous
+            // implementation skipped `expr_types::check_types` for
+            // every schema-declared key, which over-applied the
+            // silencing: an unknown function inside a template
+            // interpolation like `host "${upperr(...)}"` was silenced
+            // too because `host` is schema-declared (as `String`).
+            //
+            // Restrict the skip to the only case it actually targets:
+            // a bare top-level `ExprKind::Ident` value, i.e. the form
+            // `framing non_transparent`. Every other value shape
+            // (StringLit with interpolations, IntLit, BoolLit,
+            // FuncCall, etc.) still gets walked by `check_types` so
+            // unknown-function / type-mismatch diagnostics inside
+            // template bodies continue to surface.
+            let skip_expr_types =
+                schema_owned && matches!(expr.kind, ExprKind::Ident(_));
+            if !skip_expr_types {
                 expr_types::check_types(
                     expr,
                     pipeline_name,
@@ -93,10 +144,17 @@ fn analyze_property(
             });
         }
         Property::Block { properties, .. } => {
+            // Descend into the inner schema for this block's key if
+            // the parent declares one. If the key isn't schema-owned
+            // at this level, we pass `None` so inner keys evaluate
+            // against no schema (and therefore aren't "owned") —
+            // expression-level diagnostics will run on them.
+            let inner_schema = parent_schema
+                .and_then(|s| inner_block_schema(s, property_key(prop)));
             for inner in properties {
                 analyze_property(
                     inner,
-                    schema_owned,
+                    inner_schema,
                     output_name,
                     pipeline_name,
                     registry,

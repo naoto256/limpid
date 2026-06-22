@@ -1651,6 +1651,38 @@ def pipeline p {
     }
 
     #[test]
+    fn unknown_function_inside_nested_output_block_is_flagged() {
+        // Regression guard: `peer { host "${upperr(...)}" }` —
+        // `upperr` is a typo for `upper`. The unknown-function
+        // diagnostic must surface even though `host` lives inside a
+        // schema-owned `peer` block. The previous implementation
+        // forwarded the parent's `schema_owned=true` flag down through
+        // every nested property and silently skipped `expr_types::
+        // check_types` for the inner key. Now `schema_owned` is
+        // recomputed against the nested inner schema at each level —
+        // `host` is declared as `String`, not `Block`, so it's a
+        // value-shaped key whose expression body must still be type-
+        // checked.
+        let src = r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type syslog_tcp peer { host "${upperr(workspace.msg)}" port 1 } }
+def pipeline p {
+    input i
+    process { syslog.parse(ingress) }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("upperr") && d.message.contains("unknown function")),
+            "expected unknown-function diagnostic for `upperr` inside nested block, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
     fn error_keyword_in_function_body_fails_to_parse() {
         // Function body grammar is `process_let* ~ expr` — `error` is a
         // statement, not an expression, so it can't appear there.
