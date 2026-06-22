@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-1.0 releases may introduce breaking changes freely as the DSL and
 runtime shape converge. After 1.0, changes will follow semver strictly.
 
-## [Unreleased] - 0.7.7
+## [0.7.7] - 2026-06-22
 
 ### Fixed — `cef.parse` now emits the raw extension blob as `ext`
 
@@ -2607,6 +2607,7 @@ with TTL, GeoIP; control socket (`limpidctl tap`, `stats`, `health`);
 hot reload via `SIGHUP` with automatic rollback; per-output disk-backed
 queues.
 
+[0.7.7]: https://github.com/naoto256/limpid/compare/v0.7.6...v0.7.7
 [Unreleased]: https://github.com/naoto256/limpid/compare/v0.4.0...HEAD
 [0.4.0]: https://github.com/naoto256/limpid/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/naoto256/limpid/compare/v0.2.2...v0.3.0
