@@ -143,7 +143,7 @@ When CEF arrives on transports without a syslog wrapper (HTTP body, file, …), 
 workspace.cef = cef.parse(ingress)
 ```
 
-Returns a `Value::Object` with these header keys:
+Returns a `Value::Object`:
 
 | key              | type           | meaning                  |
 |------------------|----------------|--------------------------|
@@ -154,8 +154,9 @@ Returns a `Value::Object` with these header keys:
 | `signature_id`   | String         | vendor-specific event id |
 | `name`           | String         | human-readable event name |
 | `severity`       | Int \| String  | vendor severity (0–10), or the raw string when the producer sent garbage |
+| `ext`            | String         | raw extension blob from the wire — present only when the Extension section was non-empty (mirrors `syslog.parse`'s treatment of `msg`) |
 
-Extension `key=value` pairs from the CEF tail (e.g. `src=10.0.0.1 dst=192.168.1.1 act=block`) are emitted alongside the header keys, under the names defined by the CEF spec (`src`, `dst`, `act`, …) — those names are part of CEF, not a limpid convention.
+Extension `key=value` pairs from the CEF tail (e.g. `src=10.0.0.1 dst=192.168.1.1 act=block`) are emitted **both** as the raw blob in `ext` **and** split into siblings of the header keys (`src`, `dst`, `act`, … — those names are part of CEF, not a limpid convention). The split form is what authors typically read from downstream; the raw `ext` is for passthrough / re-emission, debugging the splitter, or surfacing dialect-specific extension content the splitter doesn't decode (escape sequences, custom separators).
 
 The optional `defaults` argument behaves the same as in `syslog.parse`.
 
