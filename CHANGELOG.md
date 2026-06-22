@@ -10,6 +10,34 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased] - 0.7.8
 
+### Fixed — `limpidctl check`: nested-block expression diagnostics + OneOf branch-specific errors
+
+Two diagnostic-quality fixes from the PR #9 (release 0.7.4) review:
+
+- **Expression-level diagnostics inside nested output blocks no longer
+  silenced.** A typo like `peer { host "${upperr(workspace.msg)}" }`
+  used to skip `expr_types::check_types` for `host` — the analyzer
+  inherited the parent block's `schema_owned=true` flag through every
+  recursion level and silenced every inner key, masking unknown
+  functions, type mismatches, and similar expression errors inside
+  any schema-declared nested block. The skip is now narrowed to the
+  only case it actually targets — a bare top-level `ExprKind::Ident`
+  value like `framing non_transparent` (= an enum-shaped value the
+  schema validator owns) — so template interpolations inside nested
+  output properties get checked again.
+- **`OneOf` schema mismatches now surface the specific inner error
+  when exactly one variant matched structurally.** Previously, when
+  no variant matched cleanly, every failure collapsed to
+  `OneOfMismatch` ("expected Block | Ident, got Block") — actively
+  misleading when the user wrote the right outer shape and the real
+  problem was one missing inner key. If exactly one variant matches
+  the outer shape (no `ExpectedBlock` / `ExpectedValue` failure),
+  the analyzer now surfaces that variant's specific inner error
+  (e.g. `MissingRequired` for the missing `cert`). When zero or
+  multiple variants structurally match, the generic `OneOfMismatch`
+  still fires so the operator sees the full variant list.
+
+
 ### Fixed — `output syslog_tcp` / `output syslog_udp`: IPv6 + parse-path correctness
 
 Three fixes from the PR #9 (release 0.7.4) review that surfaced once
