@@ -34,7 +34,7 @@ use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::syslog_peers::{
     PEER_CONNECT_TIMEOUT, PEER_HANDSHAKE_TIMEOUT, PEER_WRITE_TIMEOUT, Peer, PeerList,
-    SyslogFraming, SyslogPayload, iter_peers_block, parse_host_port, write_framed,
+    SyslogFraming, SyslogPayload, parse_host_port, write_framed,
 };
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
 use crate::tls::{ClientTlsConfig, build_client_config_sync};
@@ -251,28 +251,11 @@ fn parse_peers(
     properties: &[Property],
     profiles: &HashMap<String, ClientTlsConfig>,
 ) -> Result<Vec<Peer>> {
-    // The schema marks `peer` and `peers` as mutually exclusive via
-    // its `exclusive_group`, but `from_properties()` can also be
-    // called directly (e.g. from snippet expansion / inline test
-    // fixtures) before schema validation runs. Re-enforce the
-    // exclusivity here so the contract holds on every entry point.
-    match (
-        props::get_block(properties, "peer"),
-        props::get_block(properties, "peers"),
-    ) {
-        (Some(_), Some(_)) => anyhow::bail!(
-            "output '{}': 'peer' and 'peers' are mutually exclusive",
-            name
-        ),
-        (Some(peer_block), None) => Ok(vec![parse_peer(name, "peer", peer_block, profiles)?]),
-        (None, Some(peers_block)) => {
-            let label = format!("output '{}': peers", name);
-            iter_peers_block(peers_block, &label, |inner| {
-                parse_peer(name, "peers.peer", inner, profiles)
-            })
-        }
-        (None, None) => anyhow::bail!("output '{}': either 'peer' or 'peers' is required", name),
-    }
+    crate::modules::output::syslog_peers::parse_peer_or_peers(
+        name,
+        properties,
+        |label, peer_props| parse_peer(name, label, peer_props, profiles),
+    )
 }
 
 fn parse_peer(

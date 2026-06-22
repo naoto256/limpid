@@ -8,12 +8,11 @@ use tokio::net::UdpSocket;
 
 use crate::dsl::arena::EventArena;
 use crate::dsl::ast::Property;
-use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::syslog_peers::{
-    PEER_CONNECT_TIMEOUT, PEER_WRITE_TIMEOUT, Peer, PeerList, SyslogPayload, iter_peers_block,
+    PEER_CONNECT_TIMEOUT, PEER_WRITE_TIMEOUT, Peer, PeerList, SyslogPayload,
     parse_host_port,
 };
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
@@ -82,28 +81,11 @@ impl Module for SyslogUdpOutput {
 }
 
 fn parse_peers(name: &str, properties: &[Property]) -> Result<Vec<Peer>> {
-    // The schema marks `peer` and `peers` as mutually exclusive via
-    // its `exclusive_group`, but `from_properties()` can also be
-    // called directly (e.g. from snippet expansion / inline test
-    // fixtures) before schema validation runs. Re-enforce the
-    // exclusivity here so the contract holds on every entry point.
-    match (
-        props::get_block(properties, "peer"),
-        props::get_block(properties, "peers"),
-    ) {
-        (Some(_), Some(_)) => anyhow::bail!(
-            "output '{}': 'peer' and 'peers' are mutually exclusive",
-            name
-        ),
-        (Some(peer_block), None) => Ok(vec![parse_peer(name, "peer", peer_block)?]),
-        (None, Some(peers_block)) => {
-            let label = format!("output '{}': peers", name);
-            iter_peers_block(peers_block, &label, |inner| {
-                parse_peer(name, "peers.peer", inner)
-            })
-        }
-        (None, None) => anyhow::bail!("output '{}': either 'peer' or 'peers' is required", name),
-    }
+    crate::modules::output::syslog_peers::parse_peer_or_peers(
+        name,
+        properties,
+        |label, peer_props| parse_peer(name, label, peer_props),
+    )
 }
 
 fn parse_peer(name: &str, label: &str, properties: &[Property]) -> Result<Peer> {
