@@ -82,18 +82,28 @@ impl Module for SyslogUdpOutput {
 }
 
 fn parse_peers(name: &str, properties: &[Property]) -> Result<Vec<Peer>> {
-    if let Some(peer_block) = props::get_block(properties, "peer") {
-        return Ok(vec![parse_peer(name, "peer", peer_block)?]);
+    // The schema marks `peer` and `peers` as mutually exclusive via
+    // its `exclusive_group`, but `from_properties()` can also be
+    // called directly (e.g. from snippet expansion / inline test
+    // fixtures) before schema validation runs. Re-enforce the
+    // exclusivity here so the contract holds on every entry point.
+    match (
+        props::get_block(properties, "peer"),
+        props::get_block(properties, "peers"),
+    ) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "output '{}': 'peer' and 'peers' are mutually exclusive",
+            name
+        ),
+        (Some(peer_block), None) => Ok(vec![parse_peer(name, "peer", peer_block)?]),
+        (None, Some(peers_block)) => {
+            let label = format!("output '{}': peers", name);
+            iter_peers_block(peers_block, &label, |inner| {
+                parse_peer(name, "peers.peer", inner)
+            })
+        }
+        (None, None) => anyhow::bail!("output '{}': either 'peer' or 'peers' is required", name),
     }
-
-    if let Some(peers_block) = props::get_block(properties, "peers") {
-        let label = format!("output '{}': peers", name);
-        return iter_peers_block(peers_block, &label, |inner| {
-            parse_peer(name, "peers.peer", inner)
-        });
-    }
-
-    anyhow::bail!("output '{}': either 'peer' or 'peers' is required", name)
 }
 
 fn parse_peer(name: &str, label: &str, properties: &[Property]) -> Result<Peer> {
@@ -135,10 +145,43 @@ impl Output for SyslogUdpOutput {
                 let address = peer.address();
                 Box::pin(async move {
                     if state.conn.is_none() {
-                        let socket = UdpSocket::bind("0.0.0.0:0")
+                        // Resolve the peer address first and pick the
+                        // bind family from the resolved SocketAddr —
+                        // hard-binding to `0.0.0.0:0` would refuse to
+                        // connect any peer that resolves only to AAAA,
+                        // and `host` accepts hostnames that may do
+                        // exactly that. Hostnames are still typically
+                        // dual-stack, so this preserves the common
+                        // case while admitting v6-only destinations.
+                        let resolved = tokio::time::timeout(
+                            PEER_CONNECT_TIMEOUT,
+                            tokio::net::lookup_host(address.as_str()),
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("syslog_udp lookup {} timed out", address)
+                        })?
+                        .with_context(|| format!("syslog_udp lookup {}", address))?
+                        .next()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "syslog_udp: name resolution for {} returned no addresses",
+                                address
+                            )
+                        })?;
+                        let bind_addr = match resolved {
+                            std::net::SocketAddr::V4(_) => "0.0.0.0:0",
+                            std::net::SocketAddr::V6(_) => "[::]:0",
+                        };
+                        let socket = UdpSocket::bind(bind_addr)
                             .await
-                            .context("syslog_udp output: failed to bind ephemeral socket")?;
-                        tokio::time::timeout(PEER_CONNECT_TIMEOUT, socket.connect(&address))
+                            .with_context(|| {
+                                format!(
+                                    "syslog_udp output: failed to bind ephemeral socket ({})",
+                                    bind_addr
+                                )
+                            })?;
+                        tokio::time::timeout(PEER_CONNECT_TIMEOUT, socket.connect(resolved))
                             .await
                             .with_context(|| {
                                 format!("syslog_udp connect to {} timed out", address)
@@ -180,6 +223,7 @@ mod tests {
     use super::*;
     use crate::dsl::ast::{Expr, ExprKind, Property};
     use crate::dsl::schema::SchemaErrorKind;
+    use std::time::Duration;
 
     /// Wrap a property list in a `ModuleProperties` shaped for this test module.
     /// Mirrors what the parser produces for `def input/output ... { type syslog_udp; ... }`
@@ -286,6 +330,23 @@ mod tests {
     }
 
     #[test]
+    fn from_properties_rejects_peer_and_peers_together() {
+        // `Module::build` validates the schema first and so always
+        // catches the exclusive_group violation before reaching
+        // `from_properties`. But callers that bypass schema validation
+        // (snippet expansion, inline test fixtures) hit
+        // `from_properties` directly — without this check it would
+        // silently take the first `peer` block and discard the
+        // `peers` block. Belt-and-braces.
+        let props = vec![peer("a", 1), block("peers", vec![peer("b", 2)])];
+        let err = SyslogUdpOutput::from_properties("u", &mp(&props))
+            .err()
+            .expect("from_properties should reject both blocks");
+        let msg = err.to_string();
+        assert!(msg.contains("mutually exclusive"), "{}", msg);
+    }
+
+    #[test]
     fn build_rejects_empty_peers_block() {
         let err = SyslogUdpOutput::from_properties("u", &mp(&[block("peers", vec![])]))
             .err()
@@ -313,5 +374,53 @@ mod tests {
             .err()
             .expect("should fail");
         assert!(err.to_string().contains("host"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn send_to_ipv6_loopback_peer() {
+        // Regression guard for the IPv4-forced bind. Listen on the
+        // IPv6 loopback, configure the output to send there, and
+        // verify the bytes arrive. Pre-fix, the output would bind a
+        // v4 socket and `connect()` to a v6 destination, which fails
+        // before the first datagram leaves.
+        use bytes::Bytes;
+        use std::net::SocketAddr;
+
+        let listener = UdpSocket::bind("[::1]:0")
+            .await
+            .expect("ipv6 loopback unavailable on this host");
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port() as i64;
+
+        let output = SyslogUdpOutput::build(
+            "u6",
+            &mp(&[block(
+                "peer",
+                vec![
+                    kv("host", ExprKind::StringLit("::1".into())),
+                    kv("port", ExprKind::IntLit(port)),
+                ],
+            )]),
+        )
+        .expect("build");
+
+        // Hand-craft a RenderedPayload the way the runtime does.
+        let payload = RenderedPayload::new(SyslogPayload {
+            egress: Bytes::from_static(b"<134>hello-v6"),
+        });
+        output.write(payload).await.expect("write should succeed");
+
+        // Read one datagram off the listener.
+        let mut buf = [0u8; 64];
+        let (n, src) = tokio::time::timeout(Duration::from_secs(1), listener.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for datagram")
+            .expect("recv_from");
+        assert_eq!(&buf[..n], b"<134>hello-v6");
+        assert!(
+            matches!(src, SocketAddr::V6(_)),
+            "peer source must be v6, got {:?}",
+            src
+        );
     }
 }
