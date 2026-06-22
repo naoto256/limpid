@@ -10,6 +10,16 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased] - 0.7.8
 
+### Fixed — `input syslog_tcp`: TLS handshakes are now bounded at 10 s
+
+A client that opened TCP but never completed the TLS handshake would
+otherwise pin a task on `acceptor.accept().await` forever and consume
+one of the `max_connections` slots. With enough stalled handshakes an
+attacker (or a misbehaving client) could exhaust the slot pool and
+deny service to legitimate peers. Handshakes now have a hard 10 s
+ceiling; on timeout the connection is dropped with a `WARN` log
+naming the peer address and the timeout duration.
+
 ### Fixed — `output http`: four correctness fixes from the 0.7.6 review
 
 - **`verify false` no longer drops the client identity.** A `tls { cert

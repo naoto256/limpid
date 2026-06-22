@@ -87,3 +87,6 @@ Framing detection runs after the TLS handshake when `tls` is configured.
 - Connections exceeding `max_connections` are rejected immediately.
 - TLS server config (cert / key / CA loading + parsing) happens at
   daemon start — invalid files fail-fast before the listener binds.
+- TLS handshakes are bounded at 10 s. A client that opens TCP but
+  never completes the handshake is dropped after the timeout so it
+  cannot pin a connection slot indefinitely.
