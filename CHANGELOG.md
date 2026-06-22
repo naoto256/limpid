@@ -10,6 +10,31 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased] - 0.7.8
 
+### Fixed — `output syslog_tcp` / `output syslog_udp`: IPv6 + parse-path correctness
+
+Three fixes from the PR #9 (release 0.7.4) review that surfaced once
+this PR audit ran end-to-end on the current codebase:
+
+- **`Peer::address` now brackets IPv6 literals.** A peer configured
+  with `host "::1"` previously produced the address string `::1:514`,
+  which Rust's `SocketAddr` parser rejects (it reads the trailing
+  `:514` as part of the address). Both TCP `TcpStream::connect` and
+  UDP `UdpSocket::connect` hit this. The formatted address now reads
+  `[::1]:514`; IPv4 and hostnames are left unbracketed; an already-
+  bracketed literal is preserved.
+- **`output syslog_tcp` / `output syslog_udp` reject `peer` + `peers`
+  in `from_properties` too.** The schema-validating `Module::build`
+  path already caught this, but `from_properties` (called directly
+  from snippet expansion and inline test fixtures) silently took the
+  first `peer` block and discarded the `peers` block. The exclusivity
+  contract is now enforced on every entry point.
+- **`output syslog_udp` no longer forces an IPv4 ephemeral socket.**
+  The previous hard `UdpSocket::bind("0.0.0.0:0")` meant any peer
+  that resolved only to AAAA failed before the first datagram left.
+  The output now resolves the peer first, picks `0.0.0.0:0` or
+  `[::]:0` to match the resolved address family, then connects.
+
+
 ### Fixed — `input syslog_tcp`: TLS handshakes are now bounded at 10 s
 
 A client that opened TCP but never completed the TLS handshake would

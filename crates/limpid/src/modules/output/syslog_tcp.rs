@@ -251,18 +251,28 @@ fn parse_peers(
     properties: &[Property],
     profiles: &HashMap<String, ClientTlsConfig>,
 ) -> Result<Vec<Peer>> {
-    if let Some(peer_block) = props::get_block(properties, "peer") {
-        return Ok(vec![parse_peer(name, "peer", peer_block, profiles)?]);
+    // The schema marks `peer` and `peers` as mutually exclusive via
+    // its `exclusive_group`, but `from_properties()` can also be
+    // called directly (e.g. from snippet expansion / inline test
+    // fixtures) before schema validation runs. Re-enforce the
+    // exclusivity here so the contract holds on every entry point.
+    match (
+        props::get_block(properties, "peer"),
+        props::get_block(properties, "peers"),
+    ) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "output '{}': 'peer' and 'peers' are mutually exclusive",
+            name
+        ),
+        (Some(peer_block), None) => Ok(vec![parse_peer(name, "peer", peer_block, profiles)?]),
+        (None, Some(peers_block)) => {
+            let label = format!("output '{}': peers", name);
+            iter_peers_block(peers_block, &label, |inner| {
+                parse_peer(name, "peers.peer", inner, profiles)
+            })
+        }
+        (None, None) => anyhow::bail!("output '{}': either 'peer' or 'peers' is required", name),
     }
-
-    if let Some(peers_block) = props::get_block(properties, "peers") {
-        let label = format!("output '{}': peers", name);
-        return iter_peers_block(peers_block, &label, |inner| {
-            parse_peer(name, "peers.peer", inner, profiles)
-        });
-    }
-
-    anyhow::bail!("output '{}': either 'peer' or 'peers' is required", name)
 }
 
 fn parse_peer(
@@ -644,6 +654,24 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("exclusive group"), "{}", msg);
         assert!(msg.contains("peer") && msg.contains("peers"), "{}", msg);
+    }
+
+    #[test]
+    fn from_properties_rejects_peer_and_peers_together() {
+        // `Module::build` validates the schema and catches this case,
+        // but callers that bypass schema validation (snippet
+        // expansion, inline test fixtures) reach `from_properties`
+        // directly. Without this check, `parse_peers` would silently
+        // take the first `peer` block and discard the `peers` block.
+        let props = vec![
+            peer_plain("a", 514),
+            block("peers", vec![peer_plain("b", 514)]),
+        ];
+        let err = SyslogTcpOutput::from_properties("relay", &mp(&props))
+            .err()
+            .expect("from_properties should reject both blocks");
+        let msg = err.to_string();
+        assert!(msg.contains("mutually exclusive"), "{}", msg);
     }
 
     #[test]

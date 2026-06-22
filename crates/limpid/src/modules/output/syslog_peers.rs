@@ -57,8 +57,22 @@ pub struct Peer {
 }
 
 impl Peer {
+    /// Formatted `host:port` suitable for `TcpStream::connect` /
+    /// `UdpSocket::connect`. Bare IPv6 literals (e.g. `::1`) must be
+    /// bracketed so the port parses correctly — `format!("{}:{}", "::1", 514)`
+    /// yields `::1:514` which Rust's `SocketAddr` parser rejects (it
+    /// reads the trailing `:514` as part of the address). Hostnames
+    /// and IPv4 literals don't need brackets; an already-bracketed
+    /// literal (`[::1]`) is left untouched.
     pub fn address(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        if self.host.contains(':')
+            && !self.host.starts_with('[')
+            && !self.host.ends_with(']')
+        {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
     }
 }
 
@@ -288,6 +302,43 @@ mod tests {
         (0..n)
             .map(|idx| peer(&format!("peer-{idx}"), 514 + idx as u16))
             .collect()
+    }
+
+    #[test]
+    fn address_brackets_ipv6_literal() {
+        // `format!("{}:{}", "::1", 514)` yields `::1:514` which Rust's
+        // `SocketAddr::parse` rejects (it reads the trailing `:514` as
+        // part of the address itself). `Peer::address` is fed directly
+        // into `TcpStream::connect` / `UdpSocket::connect`, so the v6
+        // path must come out as `[::1]:514`.
+        let p = peer("::1", 514);
+        assert_eq!(p.address(), "[::1]:514");
+
+        // Full-form IPv6 literal.
+        let p = peer("2001:db8::1", 6514);
+        assert_eq!(p.address(), "[2001:db8::1]:6514");
+    }
+
+    #[test]
+    fn address_leaves_ipv4_unbracketed() {
+        let p = peer("127.0.0.1", 514);
+        assert_eq!(p.address(), "127.0.0.1:514");
+    }
+
+    #[test]
+    fn address_leaves_hostname_unbracketed() {
+        // Hostnames don't contain `:` so the no-bracket path applies.
+        let p = peer("relay.example.com", 514);
+        assert_eq!(p.address(), "relay.example.com:514");
+    }
+
+    #[test]
+    fn address_does_not_double_bracket_ipv6() {
+        // If the operator already wrote the literal with brackets in
+        // the config (some tools do), preserve that — adding another
+        // pair would produce `[[::1]]:514` which doesn't parse.
+        let p = peer("[::1]", 514);
+        assert_eq!(p.address(), "[::1]:514");
     }
 
     #[test]
