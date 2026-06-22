@@ -10,6 +10,43 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased] - 0.7.8
 
+### Fixed — `output otlp_grpc` / `output otlp_http` / `output http`: Owned events no longer get silently merged into a batch
+
+Disk-queue replay and control-socket inject events (`SinkInput::Owned`)
+need a per-event ship verdict from the output module — `Ok` ⇒ drop from
+the queue, `Err` ⇒ retry / disk-replay / secondary. The batched outputs
+previously routed Owned events through the same buffer as the memory
+hot path and returned `Ok` after only enqueueing the event, so the
+caller never saw a per-event verdict. If the eventual flush failed the
+buffered events were silently lost (the queue had already dropped
+them).
+
+The three batched outputs now override `write_owned` to ship a single
+event inline, bypassing the batch, so the caller's queue retry / disk
+replay semantics work as designed. The memory hot path (Rendered)
+continues to batch as before.
+
+### Fixed — `output otlp_grpc`: per-export 30s timeout
+
+`client.export(request)` is now wrapped in `tokio::time::timeout(30s)`.
+A collector that accepted the connection but never returned a HEADERS
+frame would previously hold the flush future open indefinitely, blocking
+rotation and starving retry. Matches the existing per-call timeouts
+used elsewhere (syslog input, etc.).
+
+### Fixed — `output otlp_http`: per-export 30s timeout + reject `tls { ... }` on plaintext endpoints
+
+Two related corrections:
+
+- The reqwest client now carries a 30s `timeout(...)` so a peer that
+  accepts the connection but never replies counts as a failure and
+  yields to the next peer in the rotation. Without this, a stalled
+  collector blocked flush indefinitely.
+- A `tls { ... }` block paired with an `http://` endpoint is rejected
+  at config-load time. reqwest only negotiates TLS on `https://` URLs,
+  so the previous behaviour silently shipped in clear text while
+  pretending the tls block was active.
+
 ### Fixed — `output kafka`: reject `mechanism plain` without a `tls { ... }` block
 
 SASL/PLAIN puts the username and password in clear text on the wire —
