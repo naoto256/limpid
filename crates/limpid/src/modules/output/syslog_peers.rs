@@ -94,6 +94,48 @@ pub fn parse_host_port(
     Ok((host, port))
 }
 
+/// Single entry point that turns a syslog-style output's top-level
+/// `peer { ... }` / `peers { peer { ... } ... }` schema into a `Vec<Peer>`.
+///
+/// Enforces the contract every syslog output shares:
+/// - `peer` and `peers` are mutually exclusive — supplying both is an
+///   error (the schema marks them as an `exclusive_group`, but this
+///   function is also called from `from_properties` which bypasses
+///   schema validation, so we re-enforce here).
+/// - At least one must be present.
+/// - Both forms ultimately delegate to a caller-supplied `parse_peer`
+///   closure for the per-`peer { ... }` parsing — that part is per-
+///   output (TCP needs `profiles`, UDP doesn't), so it stays a
+///   closure rather than being baked into this helper.
+///
+/// The `label` passed to `parse_peer` distinguishes the two call
+/// shapes for error messages: `"peer"` for the single-shorthand,
+/// `"peers.peer"` for each inner `peer` of a `peers` block.
+pub fn parse_peer_or_peers<F>(
+    name: &str,
+    properties: &[Property],
+    mut parse_peer: F,
+) -> anyhow::Result<Vec<Peer>>
+where
+    F: FnMut(&str, &[Property]) -> anyhow::Result<Peer>,
+{
+    match (
+        props::get_block(properties, "peer"),
+        props::get_block(properties, "peers"),
+    ) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "output '{}': 'peer' and 'peers' are mutually exclusive",
+            name
+        ),
+        (Some(peer_block), None) => Ok(vec![parse_peer("peer", peer_block)?]),
+        (None, Some(peers_block)) => {
+            let label = format!("output '{}': peers", name);
+            iter_peers_block(peers_block, &label, |inner| parse_peer("peers.peer", inner))
+        }
+        (None, None) => anyhow::bail!("output '{}': either 'peer' or 'peers' is required", name),
+    }
+}
+
 /// Iterate `peer` blocks inside a `peers` block, invoking the provided
 /// per-peer parser for each one.
 pub fn iter_peers_block<T, F>(
