@@ -735,7 +735,7 @@ workspace.distinct_users = distinct(map(workspace.events) { |e| e.user })
 
 Reduce a numeric array to a scalar.
 
-- `sum` — all-Int stays Int; any Float participant promotes the result to Float. Empty array → `Int(0)`.
+- `sum` — all-Int stays Int; any Float participant promotes the result to Float. Empty array → `Int(0)`. Integer-only sums that exceed the `i64` range surface a typed error (`sum() overflowed i64 …`) rather than silently wrapping in release builds — wrap the input in `map(...) { |x| x as f64 }` if you genuinely need to sum past `i64::MAX`.
 - `max` / `min` — compare through `f64`; empty array → `null`.
 
 Non-numeric elements bail rather than silently coerce. Mixed numeric / null arrays also bail, because "skip the nulls" is a per-pipeline policy decision; use `filter(arr) { |x| x != null } |> sum` to opt in.
