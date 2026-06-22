@@ -62,7 +62,7 @@ use crate::dsl::arena::EventArena;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
-use crate::event::BorrowedEvent;
+use crate::event::{BorrowedEvent, Event};
 use crate::metrics::OutputMetrics;
 use crate::modules::output::syslog_peers::{PEER_COOLDOWN, iter_peers_block};
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
@@ -427,6 +427,32 @@ impl Output for HttpOutput {
         }
 
         Ok(())
+    }
+
+    /// Owned-event path (disk-queue replay, control-socket inject). The
+    /// queue consumer needs a per-event ship verdict; routing Owned
+    /// events through the batched buffer would silently merge them into
+    /// a later flush and the caller would lose the verdict. Ship inline
+    /// here, bypassing the batch (same disposition as the
+    /// `batch_size <= 1` short-circuit in `write`).
+    async fn write_owned(&self, event: &Event) -> Result<()> {
+        let payload = {
+            let bump = bumpalo::Bump::new();
+            let arena = EventArena::new(&bump);
+            let bevent = event.view_in(&arena);
+            self.render(&bevent, &arena)?
+        };
+        let payload: HttpPayload = payload.downcast()?;
+        match self.inner.send_batch(&[payload.msg]).await {
+            Ok(()) => {
+                self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) => {
+                self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -860,5 +886,26 @@ mod tests {
         output.write_owned(&event_with("rr-ok")).await.unwrap();
         s_a.abort();
         s_b.abort();
+    }
+
+    #[tokio::test]
+    async fn write_owned_bypasses_batch_buffer() {
+        // Owned events ship inline rather than landing in the batch
+        // buffer, so the queue consumer's per-event Ok/Err contract is
+        // honored. Verify the buffer stays empty and no flush timer is
+        // armed even with batch_size > 1.
+        let mut props = vec![peer_block("http://127.0.0.1:1/")];
+        props.push(prop_int("batch_size", 1024));
+        props.push(prop_str("batch_timeout", "30s"));
+        let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
+        let err = output
+            .write_owned(&event_with("bypass"))
+            .await
+            .expect_err("send must fail against unreachable peer");
+        assert!(err.to_string().contains("http"), "got: {err}");
+        let batch_len = output.inner.batch.lock().await.len();
+        assert_eq!(batch_len, 0, "Owned event must not land in the batch");
+        let timer_armed = output.flush_handle.lock().await.is_some();
+        assert!(!timer_armed, "Owned event must not arm the flush timer");
     }
 }

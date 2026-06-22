@@ -70,6 +70,8 @@ Each `peer` block configures one collector endpoint:
 
 On each flush, peers are tried in round-robin order. A peer that fails the request is marked cooled-down for ~5s and skipped on subsequent flushes until the cooldown expires. The cursor advances per flush so successive flushes start at successive peers; within one flush the `retry` budget protects against transient failures by rotating to the next available peer.
 
+Every gRPC `Export` call is bounded by a 30s timeout. A peer that accepts the connection but never returns a HEADERS frame counts as a failure and yields to the next peer in the rotation.
+
 > `verify false` is intentionally not exposed. tonic does not support insecure-skip-verify the way reqwest does; use an `http://` endpoint for plaintext development setups or terminate TLS at a sidecar.
 
 ## Pipeline contract
