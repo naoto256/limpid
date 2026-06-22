@@ -30,6 +30,8 @@ fallback, value-with-spaces splitter behaviour, and the two error
 paths.
 
 
+## [0.7.6] - 2026-06-21
+
 > syslog TLS folded into `syslog_tcp` on both sides (output: per-peer,
 > input: optional block); `otlp_http` gains TLS / mTLS; `output kafka`
 > gains TLS / mTLS / SASL; `output otlp` split into `otlp_http` /
