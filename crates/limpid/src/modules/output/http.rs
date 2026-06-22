@@ -436,23 +436,11 @@ impl Output for HttpOutput {
     /// here, bypassing the batch (same disposition as the
     /// `batch_size <= 1` short-circuit in `write`).
     async fn write_owned(&self, event: &Event) -> Result<()> {
-        let payload = {
-            let bump = bumpalo::Bump::new();
-            let arena = EventArena::new(&bump);
-            let bevent = event.view_in(&arena);
-            self.render(&bevent, &arena)?
-        };
-        let payload: HttpPayload = payload.downcast()?;
-        match self.inner.send_batch(&[payload.msg]).await {
-            Ok(()) => {
-                self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
-            Err(e) => {
-                self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-                Err(e)
-            }
-        }
+        crate::modules::ship_owned_inline(self, event, &self.metrics, |payload| async move {
+            let payload: HttpPayload = payload.downcast()?;
+            self.inner.send_batch(&[payload.msg]).await
+        })
+        .await
     }
 }
 
