@@ -10,6 +10,22 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased] - 0.7.8
 
+### Fixed — `sum()` now reports i64 overflow as a typed error
+
+The integer accumulator used unchecked `+=` and depended on the
+build profile for overflow behaviour: debug builds panicked,
+release builds wrapped silently and produced bogus (often
+negative) totals for large arrays. The accumulator now uses
+`checked_add` and surfaces a typed error
+`sum() overflowed i64 (accumulator …, element …)` regardless of
+build mode, catching the bug in tests / `--check` instead of
+production. Nine new unit tests cover the function (no inline
+tests existed before): integer / mixed-numeric / empty-array
+happy paths, type-error rejections (non-array input, null
+input, non-numeric element), and the overflow boundaries at
+`i64::MAX` + 1 and `i64::MIN` − 1.
+
+
 ### Fixed — `limpidctl check`: nested-block expression diagnostics + OneOf branch-specific errors
 
 Two diagnostic-quality fixes from the PR #9 (release 0.7.4) review:
