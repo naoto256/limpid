@@ -113,6 +113,15 @@ const MAX_MSG_LEN_DIGITS: usize = 7;
 /// the connection is dropped. Prevents resource leaks from dead peers.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Upper bound on the TLS handshake. A client that opens TCP but never
+/// finishes the handshake (slow handshakes happen on real networks;
+/// hung-mid-handshake attempts happen on hostile ones) would otherwise
+/// pin a task on `acceptor.accept().await` forever and consume one of
+/// the `max_connections` slots. 10 s is loose enough for high-latency
+/// links + a slow CPU on the client and tight enough that a handful of
+/// stalled handshakes can't exhaust the slot pool.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Syslog TCP framing method per RFC 6587.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpFraming {
@@ -265,15 +274,37 @@ impl Input for SyslogTcpInput {
                             conn_handles.push(tokio::spawn(async move {
                                 let accepted = match acceptor {
                                     Some(acceptor) => {
-                                        match acceptor.accept(stream).await {
-                                            Ok(s) => {
+                                        // Bound the TLS handshake: a client that
+                                        // opens TCP but never finishes the
+                                        // handshake (slow / malicious) would
+                                        // otherwise pin a task on this stalled
+                                        // future and burn one of the
+                                        // `max_connections` slots until something
+                                        // unrelated kills it. 10 s is loose
+                                        // enough for normal TLS over high-latency
+                                        // links and short enough that an attacker
+                                        // can't trivially exhaust the slot pool.
+                                        match tokio::time::timeout(
+                                            TLS_HANDSHAKE_TIMEOUT,
+                                            acceptor.accept(stream),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(s)) => {
                                                 debug!("syslog_tcp [{}]: TLS handshake complete", addr);
                                                 AcceptedStream::Tls(Box::new(s))
                                             }
-                                            Err(e) => {
+                                            Ok(Err(e)) => {
                                                 warn!(
                                                     "syslog_tcp [{}]: TLS handshake failed: {}",
                                                     addr, e
+                                                );
+                                                return;
+                                            }
+                                            Err(_) => {
+                                                warn!(
+                                                    "syslog_tcp [{}]: TLS handshake timed out after {:?}",
+                                                    addr, TLS_HANDSHAKE_TIMEOUT
                                                 );
                                                 return;
                                             }
@@ -951,6 +982,23 @@ mod tests {
             key_span: None,
             properties,
         }
+    }
+
+    #[test]
+    fn tls_handshake_timeout_is_sensible() {
+        // Regression guard: the constant exists, is non-zero, and sits
+        // in a band that doesn't trivially exhaust the connection pool
+        // (≤ 30 s) while still tolerating real-world high-latency
+        // links + slow client CPUs (≥ 1 s). A full timing test would
+        // require either a 10 s real-wait or a paused-time harness
+        // tangled around the runtime's task spawning; neither pays
+        // for itself given the change is a mechanical tokio::time::
+        // timeout wrap. Code review + this bound check catch the
+        // regression modes that matter (const removed, set to 0,
+        // set to a multi-minute value that lets attackers fill the
+        // slot pool with stalled handshakes).
+        assert!(TLS_HANDSHAKE_TIMEOUT >= Duration::from_secs(1));
+        assert!(TLS_HANDSHAKE_TIMEOUT <= Duration::from_secs(30));
     }
 
     #[test]
