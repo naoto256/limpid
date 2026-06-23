@@ -300,7 +300,18 @@ impl<C> PeerList<C> {
                     return Ok(());
                 }
                 Err(_) => {
-                    state.cooldown_until = Some(now + PEER_COOLDOWN);
+                    // Capture the timestamp AFTER the attempt failed,
+                    // not the `now` we were called with — that was
+                    // snapshot at the START of the rotation pass.
+                    // `attempt` may take up to PEER_WRITE_TIMEOUT
+                    // (10s, see § const above), which is longer than
+                    // PEER_COOLDOWN (5s); using `now + PEER_COOLDOWN`
+                    // would set a cooldown that has already expired
+                    // and immediately re-select the bad peer on the
+                    // next write. HTTP/OTLP fixed the same shape
+                    // earlier (`output http` PR limpid#33); align
+                    // the shared helper.
+                    state.cooldown_until = Some(Instant::now() + PEER_COOLDOWN);
                     self.metrics[idx]
                         .connect_failures
                         .fetch_add(1, Ordering::Relaxed);
@@ -579,6 +590,53 @@ mod tests {
                 .events_written
                 .load(Ordering::Relaxed),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn cooldown_measured_from_failure_time_not_attempt_start() {
+        // Regression: cooldown_until used to be set to
+        // `now + PEER_COOLDOWN` where `now` was the snapshot taken
+        // at the START of the rotation pass. If `attempt` actually
+        // took longer than PEER_COOLDOWN (which is realistic:
+        // PEER_WRITE_TIMEOUT is 10 s, PEER_COOLDOWN is 5 s), the
+        // cooldown's expiry would already be in the past by the
+        // time it was written, so the very next write would
+        // immediately re-select the same broken peer. HTTP/OTLP
+        // sinks were fixed earlier; this pins the syslog-shared
+        // helper to the same contract: cooldown is anchored on
+        // failure-completion time.
+        let list = PeerList::<()>::new(peers(1));
+        let pre_call = Instant::now();
+        let delay = Duration::from_millis(300);
+
+        let _ = list
+            .write_with_rotation_now(move |_, _, _| {
+                Box::pin(async move {
+                    tokio::time::sleep(delay).await;
+                    Err(anyhow!("slow failure"))
+                })
+            })
+            .await
+            .expect_err("attempt errors → peer cools down");
+
+        let cooldown_until = list.state[0]
+            .lock()
+            .await
+            .cooldown_until
+            .expect("failure must set cooldown_until");
+
+        // Anchored on failure-completion: cooldown_until > pre_call
+        // + PEER_COOLDOWN + most of the delay. Allow generous slack
+        // for scheduling jitter. With the old code,
+        // cooldown_until == pre_call + PEER_COOLDOWN (no delay
+        // contribution).
+        let expected_floor = pre_call + PEER_COOLDOWN + Duration::from_millis(200);
+        assert!(
+            cooldown_until > expected_floor,
+            "cooldown_until ({:?}) must exceed pre_call + PEER_COOLDOWN + delay ({:?})",
+            cooldown_until,
+            expected_floor
         );
     }
 }
