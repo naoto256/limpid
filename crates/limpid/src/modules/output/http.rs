@@ -64,6 +64,7 @@ use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::{BorrowedEvent, Event};
 use crate::metrics::OutputMetrics;
+use crate::modules::output::http_util::{ERROR_BODY_BYTE_CAP, read_body_capped};
 use crate::modules::output::syslog_peers::{PEER_COOLDOWN, iter_peers_block};
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
 use crate::tls::ClientTlsConfig;
@@ -600,39 +601,6 @@ impl Inner {
             }
         }
     }
-}
-
-/// Hard cap on how many bytes of an error response body we read into
-/// memory for the failure diagnostic. A malicious or misconfigured
-/// peer can otherwise return an unbounded body and `response.text()`
-/// would buffer the whole thing before we trim it. 4 KiB is plenty
-/// for the typical "what went wrong" snippet a downstream operator
-/// needs to see in the daemon log.
-const ERROR_BODY_BYTE_CAP: usize = 4096;
-
-/// Drain at most `cap` bytes from the response, then stop. Uses
-/// `Response::chunk()` (available without the `stream` reqwest
-/// feature) so we don't have to pull in `futures-util` for one
-/// streaming consumer.
-async fn read_body_capped(mut response: reqwest::Response, cap: usize) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(cap.min(1024));
-    while buf.len() < cap {
-        match response.chunk().await {
-            Ok(Some(chunk)) => {
-                let remaining = cap - buf.len();
-                let take = chunk.len().min(remaining);
-                buf.extend_from_slice(&chunk[..take]);
-                if chunk.len() > take {
-                    // We hit the cap mid-chunk; stop reading so the
-                    // peer's connection can be returned to the pool
-                    // and we don't keep streaming bytes we discard.
-                    break;
-                }
-            }
-            Ok(None) | Err(_) => break,
-        }
-    }
-    buf
 }
 
 async fn send_once(peer: &HttpPeer, inner: &Inner, body: &[u8]) -> Result<()> {
