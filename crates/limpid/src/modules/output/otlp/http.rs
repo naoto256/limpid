@@ -572,7 +572,13 @@ async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<()> {
                 return Ok(());
             }
             Err(e) => {
-                *inner.peer_state[idx].cooldown_until.lock().await = Some(now + PEER_COOLDOWN);
+                // Measure cooldown from failure time, not request start:
+                // `now` was captured before `send_once`, so for any non-
+                // trivial request latency (and especially after a 30s
+                // HTTP_REQUEST_TIMEOUT firing) `now + PEER_COOLDOWN`
+                // can already be in the past, defeating the rotation.
+                *inner.peer_state[idx].cooldown_until.lock().await =
+                    Some(Instant::now() + PEER_COOLDOWN);
                 e
             }
         };
