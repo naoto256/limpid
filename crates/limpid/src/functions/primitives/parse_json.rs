@@ -100,3 +100,103 @@ pub(crate) fn apply_defaults<'bump>(
 pub(crate) fn type_name(v: &Value<'_>) -> &'static str {
     v.type_name()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsl::arena::EventArena;
+
+    fn call(input: &str, defaults: Option<Value<'_>>) -> Result<String> {
+        // Run the parser with a one-shot arena and convert the result
+        // back to JSON for easy assertion. This lets us assert on the
+        // wrapping contract without threading lifetimes through the
+        // test API.
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let text_val = Value::String(arena.alloc_str(input));
+        let args: Vec<Value<'_>> = match defaults {
+            Some(d) => vec![text_val, d],
+            None => vec![text_val],
+        };
+        let result = parse_json_impl(&arena, &args)?;
+        Ok(crate::dsl::value_json::value_to_json(&result.to_owned_value())?.to_string())
+    }
+
+    #[test]
+    fn object_root_returns_object_as_is() {
+        let s = call(r#"{"a":1,"b":2}"#, None).unwrap();
+        // Field order preserved; no _json wrap.
+        assert_eq!(s, r#"{"a":1,"b":2}"#);
+    }
+
+    #[test]
+    fn array_root_wraps_under_underscore_json() {
+        // Documented contract: non-object roots wrap under `_json`
+        // so the bare-statement workspace-merge rule doesn't silently
+        // drop the value. A regression that returned the raw array
+        // would break every downstream process pipeline that bare-
+        // calls `parse_json(ingress)`.
+        let s = call(r#"[1,2,3]"#, None).unwrap();
+        assert_eq!(s, r#"{"_json":[1,2,3]}"#);
+    }
+
+    #[test]
+    fn scalar_string_root_wraps_under_underscore_json() {
+        let s = call(r#""hello""#, None).unwrap();
+        assert_eq!(s, r#"{"_json":"hello"}"#);
+    }
+
+    #[test]
+    fn scalar_number_root_wraps_under_underscore_json() {
+        let s = call("42", None).unwrap();
+        assert_eq!(s, r#"{"_json":42}"#);
+    }
+
+    #[test]
+    fn scalar_bool_root_wraps_under_underscore_json() {
+        let s = call("true", None).unwrap();
+        assert_eq!(s, r#"{"_json":true}"#);
+    }
+
+    #[test]
+    fn scalar_null_root_wraps_under_underscore_json() {
+        let s = call("null", None).unwrap();
+        assert_eq!(s, r#"{"_json":null}"#);
+    }
+
+    #[test]
+    fn defaults_fill_only_missing_keys() {
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        // Build defaults = {a: "default_a", c: "default_c"}.
+        let mut db = ObjectBuilder::with_capacity(&arena, 2);
+        db.push("a", Value::String(arena.alloc_str("default_a")));
+        db.push("c", Value::String(arena.alloc_str("default_c")));
+        let defaults = db.finish();
+
+        let text_val = Value::String(arena.alloc_str(r#"{"a":"input_a","b":"input_b"}"#));
+        let result = parse_json_impl(&arena, &[text_val, defaults]).unwrap();
+        let json = crate::dsl::value_json::value_to_json(&result.to_owned_value()).unwrap();
+        // Input wins for `a` and `b`; default fills `c`.
+        assert_eq!(json["a"], "input_a");
+        assert_eq!(json["b"], "input_b");
+        assert_eq!(json["c"], "default_c");
+    }
+
+    #[test]
+    fn defaults_null_arg_is_noop() {
+        // Documented behaviour: passing Null for defaults is the
+        // same as omitting them; must not error.
+        let s = call(r#"{"a":1}"#, Some(Value::Null)).unwrap();
+        assert_eq!(s, r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn malformed_json_errors_with_parse_json_prefix() {
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let text_val = Value::String(arena.alloc_str("{not valid json"));
+        let err = parse_json_impl(&arena, &[text_val]).unwrap_err();
+        assert!(err.to_string().contains("parse_json"), "got: {err}");
+    }
+}
