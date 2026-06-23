@@ -259,6 +259,18 @@ fn walk_for_purity(
                 );
             }
         }
+        ExprKind::SwitchExpr { arms, .. } => {
+            // Walk children first so any unknown idents / cross-scope
+            // refs inside arm patterns / bodies still surface. Then
+            // run the default-position check at this node — function
+            // bodies frequently *are* a switch expression so a
+            // misplaced `default` here would otherwise sail through
+            // `--check`.
+            walk_children(expr, |child| {
+                walk_for_purity(child, fn_name, params, config, registry, diagnostics)
+            });
+            super::control_flow::validate_switch_default_position(arms, fn_name, diagnostics);
+        }
         // All other variants delegate recursion to `walk_children`;
         // their own structure carries no purity-relevant signal.
         _ => walk_children(expr, |child| {

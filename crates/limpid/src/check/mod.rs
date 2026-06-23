@@ -1700,4 +1700,101 @@ def pipeline p { input i; output o }
             "expected parse failure for `error` inside function body"
         );
     }
+
+    // ----- switch default position validation --------------------------
+
+    #[test]
+    fn switch_default_not_last_in_function_body_errors() {
+        // Regression: the runtime walks switch arms in source order and
+        // dispatches at the first match. `default` matches every value,
+        // so anything after it is unreachable. Pre-fix `--check` was
+        // silent on this shape; configs that meant "case 6 → tcp,
+        // otherwise null" but accidentally put default first sent every
+        // event to the default branch with no diagnostic.
+        let src = r#"
+def function bad(num) {
+    switch num {
+        default { null }
+        6 { "syslog_tcp" }
+    }
+}
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        let errs = errors(&diags);
+        assert!(
+            errs.iter()
+                .any(|d| d.message.contains("`default`") && d.message.contains("unreachable")),
+            "expected default-not-last error, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn switch_multiple_defaults_in_function_body_errors() {
+        // Two `default` arms — ambiguous, only the first runs. Almost
+        // certainly an operator typo (probably one was meant to be a
+        // pattern arm).
+        let src = r#"
+def function bad(num) {
+    switch num {
+        6 { "syslog_tcp" }
+        default { "a" }
+        default { "b" }
+    }
+}
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        let errs = errors(&diags);
+        assert!(
+            errs.iter()
+                .any(|d| d.message.contains("multiple `default`")),
+            "expected multiple-default error, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn switch_default_last_is_accepted() {
+        // Baseline: the common idiomatic shape (pattern arms first,
+        // `default` last) passes cleanly.
+        let src = r#"
+def function ok(num) {
+    switch num {
+        6 { "syslog_tcp" }
+        17 { "syslog_udp" }
+        default { null }
+    }
+}
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        assert!(errors(&diags).is_empty(), "got errors: {:?}", diags);
+    }
+
+    #[test]
+    fn switch_without_default_is_accepted() {
+        // Baseline: omitting `default` is legal (events that match no
+        // arm fall through unchanged). No diagnostic should fire.
+        let src = r#"
+def function partial(num) {
+    switch num {
+        6 { "syslog_tcp" }
+        17 { "syslog_udp" }
+    }
+}
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        assert!(errors(&diags).is_empty(), "got errors: {:?}", diags);
+    }
 }
