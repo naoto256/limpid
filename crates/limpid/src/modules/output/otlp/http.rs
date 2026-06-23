@@ -1255,6 +1255,82 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn export_timeout_fires_against_stalled_peer() {
+        // A peer that accepts the TCP connection but never sends a
+        // response must surface as a timeout failure within
+        // HTTP_REQUEST_TIMEOUT (30 s). Without `reqwest::Client::
+        // builder().timeout(HTTP_REQUEST_TIMEOUT)` a single stalled
+        // collector would block the rotation forever. Constant-value
+        // checks (or a non-existent constant rename) wouldn't catch a
+        // regression that removed the builder call or pointed it at
+        // a much larger duration — this test exercises the firing
+        // path end-to-end.
+        use std::sync::Arc;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        // Stalled "server": accept the TCP connection and hold the
+        // socket open without ever writing a response line, so reqwest
+        // hangs waiting for HTTP status bytes.
+        let stall = tokio::spawn(async move {
+            let held = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            loop {
+                if let Ok((sock, _)) = listener.accept().await {
+                    held.lock().await.push(sock);
+                }
+            }
+        });
+
+        let endpoint = format!("http://{}/v1/logs", addr);
+        let mut props = one_peer_props(&endpoint);
+        props.push(prop_int("batch_size", 1));
+        props.push(Property::Block {
+            key: "retry".into(),
+            key_span: None,
+            properties: vec![
+                prop_int("max_attempts", 1),
+                prop_str("initial_wait", "1ms"),
+                prop_str("max_wait", "1ms"),
+            ],
+        });
+        let output = OtlpHttpOutput::from_properties("test", &mp(&props)).unwrap();
+        let send = tokio::spawn(async move {
+            output
+                .write_owned(&event_with_egress(singleton_bytes(1)))
+                .await
+        });
+
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(HTTP_REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+
+        let result = send.await.unwrap();
+        stall.abort();
+
+        let err = result.expect_err("stalled peer must surface as Err");
+        // Walk the anyhow chain; reqwest's timeout shows up as
+        // `error sending request for url (...): operation timed out`
+        // in the underlying reqwest::Error, while the top-level
+        // anyhow context says "POST ... failed".
+        let mut chain_text = String::new();
+        let mut current: &dyn std::error::Error = err.as_ref();
+        chain_text.push_str(&current.to_string());
+        while let Some(src) = current.source() {
+            chain_text.push_str(" -> ");
+            chain_text.push_str(&src.to_string());
+            current = src;
+        }
+        let chain_lower = chain_text.to_ascii_lowercase();
+        assert!(
+            chain_lower.contains("timed out") || chain_lower.contains("timeout"),
+            "expected timeout-flavoured error somewhere in the chain, got: {chain_text}"
+        );
+    }
+
     #[test]
     fn accepts_empty_tls_block_on_https_endpoint() {
         // Regression guard for the plaintext-rejection check: https://

@@ -922,6 +922,75 @@ mod tests {
         drop(output);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn export_timeout_fires_against_stalled_peer() {
+        // A peer that accepts the TCP connection but never returns a
+        // gRPC HEADERS frame must surface as a timeout failure within
+        // GRPC_REQUEST_TIMEOUT (30 s). Without the
+        // `tokio::time::timeout(GRPC_REQUEST_TIMEOUT, …)` wrapper a
+        // single stalled collector would block the rotation forever.
+        // The constant-value assertion in another test catches the
+        // case where the constant gets renamed, but it would not catch
+        // a regression where the wrapper itself was removed or
+        // pointed at a different (e.g. much larger) duration. This
+        // test exercises the firing path end-to-end.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        // Stalled "server": accept the TCP connection and hold the
+        // socket open without ever sending HTTP/2 SETTINGS or a gRPC
+        // response. tonic's client preface goes out, then it waits
+        // forever for the server preface — exactly the case the
+        // GRPC_REQUEST_TIMEOUT exists to bound.
+        let stall = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                if let Ok((sock, _)) = listener.accept().await {
+                    held.push(sock);
+                }
+            }
+        });
+
+        let endpoint = format!("http://{}", addr);
+        let mut props = one_peer_props(&endpoint);
+        props.push(prop_int("batch_size", 1));
+        props.push(Property::Block {
+            key: "retry".into(),
+            key_span: None,
+            properties: vec![
+                prop_int("max_attempts", 1),
+                prop_str("initial_wait", "1ms"),
+                prop_str("max_wait", "1ms"),
+            ],
+        });
+        let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
+        let send = tokio::spawn(async move {
+            output
+                .write_owned(&event_with_egress(singleton_bytes(1)))
+                .await
+        });
+
+        // Let the spawned future reach the timeout-wrapped await,
+        // then advance virtual time past GRPC_REQUEST_TIMEOUT so the
+        // timeout fires. The TCP connect happens on real I/O; a short
+        // wall-clock yield keeps the test from racing the connect.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(GRPC_REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+
+        let result = send.await.unwrap();
+        stall.abort();
+
+        let err = result.expect_err("stalled peer must surface as Err");
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("timed out") || msg.contains("timeout"),
+            "expected timeout-flavoured error, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn write_owned_bypasses_batch_buffer() {
         // Owned events ship inline rather than landing in the batch
