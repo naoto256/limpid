@@ -105,16 +105,8 @@ impl Input for TailInput {
 
         let source_addr = TAIL_SOURCE.parse().unwrap();
 
-        // Load saved position or start from end of file
-        let mut offset = self.load_position().unwrap_or(0);
+        let mut offset = self.initial_offset().await;
         let mut last_inode = get_inode(&self.path);
-
-        // If no state file or first run, start from end of file
-        if (self.state_file.is_none() || offset == 0)
-            && let Ok(meta) = tokio::fs::metadata(&self.path).await
-        {
-            offset = meta.len();
-        }
 
         loop {
             // Check for shutdown
@@ -218,11 +210,36 @@ impl TailInput {
 
             let event = Event::new(Bytes::copy_from_slice(trimmed.as_bytes()), source_addr);
             if tx.send(event).await.is_err() {
+                // Downstream closed. Rewind so this line is re-read
+                // on the next poll instead of being saved as already
+                // consumed; otherwise `run()` persists the advanced
+                // offset and the unsent line gets silently dropped.
+                current_offset -= bytes_read as u64;
                 break;
             }
         }
 
         Ok(current_offset)
+    }
+
+    /// Where to start the very first read for this `run()`.
+    ///
+    /// - `Some(n)` from the state file → resume from `n`, including
+    ///   the legitimate `Some(0)` case (e.g. we shut down right after
+    ///   a rotate/truncate). Treating `Some(0)` as "no state" used
+    ///   to send the cursor to EOF and silently skip every line
+    ///   appended between save and restart.
+    /// - `None` (no state file configured, missing, or unparseable)
+    ///   → start at EOF so a fresh daemon doesn't replay the entire
+    ///   historical log.
+    async fn initial_offset(&self) -> u64 {
+        match self.load_position() {
+            Some(n) => n,
+            None => tokio::fs::metadata(&self.path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0),
+        }
     }
 
     fn load_position(&self) -> Option<u64> {
@@ -385,6 +402,77 @@ mod tests {
         std::fs::write(&log, b"").unwrap();
         let input = make_input(&log, Some(&state));
         assert_eq!(input.load_position(), None);
+    }
+
+    #[tokio::test]
+    async fn initial_offset_resumes_from_saved_zero_not_eof() {
+        // Regression: `save_position(0)` used to be indistinguishable
+        // from "no state file" because `load_position().unwrap_or(0)`
+        // collapsed both into the same `0`, and the follow-up `if
+        // offset == 0` then bumped the cursor to EOF. That silently
+        // dropped any data appended between a rotation-time save (=
+        // offset 0) and the next start — the typical recovery shape
+        // for `tail`.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let state = dir.path().join("state");
+        std::fs::write(&log, b"appended-since-shutdown\n").unwrap();
+        let input = make_input(&log, Some(&state));
+        input.save_position(0);
+
+        assert_eq!(
+            input.initial_offset().await,
+            0,
+            "Some(0) from the state file must resume at 0, not EOF",
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_offset_starts_at_eof_without_state_file() {
+        // First-run / no-state-file behaviour is preserved: don't
+        // replay the entire historical log, start at EOF.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        std::fs::write(&log, b"existing-content\n").unwrap();
+        let input = make_input(&log, None);
+
+        assert_eq!(input.initial_offset().await, 17);
+    }
+
+    #[tokio::test]
+    async fn initial_offset_starts_at_eof_when_state_file_missing() {
+        // State file configured but absent (= first start) — same
+        // contract as "no state file at all": start at EOF.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let state = dir.path().join("does-not-exist");
+        std::fs::write(&log, b"existing\n").unwrap();
+        let input = make_input(&log, Some(&state));
+
+        assert_eq!(input.initial_offset().await, 9);
+    }
+
+    #[tokio::test]
+    async fn read_new_lines_rewinds_on_downstream_send_failure() {
+        // Regression: when the consumer is gone and `tx.send().await`
+        // fails, `read_new_lines` used to break out with
+        // `current_offset` already advanced past the un-sent line.
+        // `run()` then saved that offset and the next poll skipped
+        // the line entirely — silent data loss. The fix rewinds by
+        // `bytes_read` so the line is retried.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        std::fs::write(&path, b"line1\nline2\n").unwrap();
+        let input = make_input(&path, None);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
+        // Close the receiver so the first send fails.
+        drop(rx);
+
+        let next_off = input.read_new_lines(0, &tx, dummy_addr()).await.unwrap();
+        assert_eq!(
+            next_off, 0,
+            "send failure must rewind so the un-sent line is retried",
+        );
     }
 
     #[test]
