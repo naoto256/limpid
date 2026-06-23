@@ -288,6 +288,19 @@ fn parse_peer(name: &str, peer_props: &[Property], verify: bool) -> Result<HttpP
     let mut builder = reqwest::Client::builder().timeout(HTTP_REQUEST_TIMEOUT);
     if !verify {
         builder = builder.danger_accept_invalid_certs(true);
+        if endpoint.to_ascii_lowercase().starts_with("https://") {
+            // Loud, unconditional warning when TLS verification is
+            // disabled on an https endpoint. `verify false` is a
+            // config-level footgun — one line opens MITM. Emit the
+            // warning once per peer at startup so ops can grep for
+            // it. Mirrors the matching warn in `output http`.
+            tracing::warn!(
+                "output '{}': TLS certificate verification is DISABLED (verify false) — \
+                 connections to {} are vulnerable to MITM. Debugging only; never use in production.",
+                name,
+                endpoint
+            );
+        }
     }
     if let Some(tls) = &tls_config {
         if let Some(ca_path) = &tls.ca_path {
