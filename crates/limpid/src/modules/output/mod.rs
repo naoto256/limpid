@@ -2,6 +2,7 @@
 
 pub mod file;
 pub mod http;
+pub(crate) mod http_util;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 pub mod otlp;
