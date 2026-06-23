@@ -382,7 +382,10 @@ impl OtlpGrpcOutput {
             return Ok(());
         }
         let count = drained.len() as u64;
-        let result = send_batch(&self.inner, drained).await;
+        // Clone for the send so the original survives for retry
+        // restoration on transport error. `Bytes::clone` is a
+        // refcount bump, no payload copy.
+        let result = send_batch(&self.inner, drained.clone()).await;
         match result {
             Ok(outcome) => {
                 let rejected = outcome.rejected.min(count);
@@ -400,9 +403,16 @@ impl OtlpGrpcOutput {
                 Ok(())
             }
             Err(e) => {
-                self.metrics
-                    .events_failed
-                    .fetch_add(count, Ordering::Relaxed);
+                // Transport error: put the drained batch back into
+                // the buffer for retry instead of dropping it.
+                // Mirrors `output http` (PR limpid#33) and the
+                // sibling `otlp_http` write-flush path. Do NOT bump
+                // events_failed — the events are retained, not
+                // permanently rejected.
+                let mut batch = self.inner.batch.lock().await;
+                let new_events = std::mem::take(&mut *batch);
+                *batch = drained;
+                batch.extend(new_events);
                 Err(e)
             }
         }
@@ -428,7 +438,7 @@ impl OtlpGrpcOutput {
                 return;
             }
             let count = drained.len() as u64;
-            match send_batch(&inner, drained).await {
+            match send_batch(&inner, drained.clone()).await {
                 Ok(outcome) => {
                     let rejected = outcome.rejected.min(count);
                     let written = count - rejected;
@@ -440,8 +450,18 @@ impl OtlpGrpcOutput {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("otlp_grpc flush timer: send failed ({})", e);
-                    metrics.events_failed.fetch_add(count, Ordering::Relaxed);
+                    // Same retention contract as the write-triggered
+                    // flush: return the drained batch to the buffer
+                    // for the next write or timer firing to retry.
+                    tracing::warn!(
+                        "otlp_grpc flush timer: send failed ({}) — {} events returned to buffer",
+                        e,
+                        count
+                    );
+                    let mut buf = inner.batch.lock().await;
+                    let new_events = std::mem::take(&mut *buf);
+                    *buf = drained;
+                    buf.extend(new_events);
                 }
             }
         });
@@ -1147,5 +1167,58 @@ mod tests {
         assert_eq!(batch_len, 0, "Owned event must not land in the batch");
         let timer_armed = output.flush_handle.lock().await.is_some();
         assert!(!timer_armed, "Owned event must not arm the flush timer");
+    }
+
+    #[tokio::test]
+    async fn flush_failure_restores_batch_to_buffer() {
+        // Regression mirror of `otlp_http`'s same-named test: the
+        // batched flush path used to drain the batch and, on
+        // transport failure, bump events_failed and drop the events.
+        // `output http` retained them for retry; OTLP was the odd
+        // one out. The fix restores the drained batch so the next
+        // write or timer firing can re-attempt.
+        let mut props = one_peer_props("http://127.0.0.1:1");
+        props.push(prop_int("batch_size", 2));
+        props.push(prop_str("batch_timeout", "30s"));
+        // Single attempt, no backoff — keeps the test fast.
+        props.push(Property::Block {
+            key: "retry".into(),
+            key_span: None,
+            properties: vec![
+                prop_int("max_attempts", 1),
+                prop_str("initial_wait", "1ms"),
+                prop_str("max_wait", "1ms"),
+            ],
+        });
+        let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
+
+        let arena_bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&arena_bump);
+        let e1 = event_with_egress(singleton_bytes(1));
+        let p1 = output.render(&e1.view_in(&arena), &arena).unwrap();
+        output.write(p1).await.unwrap();
+        assert_eq!(output.inner.batch.lock().await.len(), 1);
+
+        let e2 = event_with_egress(singleton_bytes(2));
+        let p2 = output.render(&e2.view_in(&arena), &arena).unwrap();
+        let err = output
+            .write(p2)
+            .await
+            .expect_err("flush against unreachable peer must fail");
+        assert!(
+            err.to_string().contains("otlp_grpc"),
+            "expected ship error, got: {err}"
+        );
+
+        let batch_len = output.inner.batch.lock().await.len();
+        assert_eq!(
+            batch_len, 2,
+            "flush failure must put the drained batch back into the buffer",
+        );
+        let failed = output.metrics.events_failed.load(Ordering::Relaxed);
+        assert_eq!(
+            failed, 0,
+            "events retained for retry must NOT be counted as failed yet (got {failed})",
+        );
     }
 }
