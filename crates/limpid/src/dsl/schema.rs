@@ -424,6 +424,20 @@ fn check_one_of(
     // scalar, got a block). Any other error kind means the variant
     // recognised the outer shape and is reporting a content-level
     // problem.
+    //
+    // When 0 or 2+ variants structurally match we deliberately
+    // collapse to `OneOfMismatch`:
+    //   - 0: every variant rejected the outer shape, so listing all
+    //     allowed shapes ("expected Block | Ident, got KeyValue") is
+    //     more useful than picking one arbitrary structural-rejection
+    //     error.
+    //   - 2+: the outer shape fit multiple variants but each disagrees
+    //     on the inner type. Picking one would hide the others (e.g.
+    //     for `OneOf[String, Int]` given a Bool, surfacing only
+    //     "expected String, got Bool" hides that Int was also OK).
+    //     `OneOfMismatch { expected: ["String", "Int"], actual:
+    //     "Bool" }` reads as "expected String | Int, got Bool" which
+    //     names all valid forms in one line.
     let structural_matches: Vec<&Vec<SchemaError>> = per_variant
         .iter()
         .filter(|errs| {
@@ -1073,6 +1087,37 @@ mod tests {
             rendered.contains("identifier"),
             "expected the Enum branch's specific error, got: {rendered}"
         );
+    }
+
+    #[test]
+    fn one_of_falls_back_to_mismatch_when_multiple_scalar_variants_structurally_match() {
+        // OneOf[String, Int] given a Bool literal: both variants accept
+        // the KeyValue outer shape and emit TypeMismatch on the inner
+        // type. With 2 structural matches the fallback is intentional —
+        // OneOfMismatch reads as "expected String | Int, got Bool"
+        // which is more useful than surfacing only one variant's
+        // TypeMismatch and hiding that the other was also allowed.
+        // This guards the doc-comment claim in `check_one_of`.
+        const S: &[PropertySpec] = &[PropertySpec {
+            name: "x",
+            required: false,
+            repeatable: false,
+            exclusive_group: None,
+            kind: PropertyValueKind::OneOf(&[
+                PropertyValueKind::String,
+                PropertyValueKind::Int,
+            ]),
+        }];
+        let errs = validate(&[kv("x", ExprKind::BoolLit(true))], S);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        match &errs[0].kind {
+            SchemaErrorKind::OneOfMismatch { expected, actual } => {
+                assert!(expected.iter().any(|e| *e == "String"), "{expected:?}");
+                assert!(expected.iter().any(|e| *e == "Int"), "{expected:?}");
+                assert!(actual.contains("Bool"), "{actual}");
+            }
+            other => panic!("expected OneOfMismatch, got {other:?}"),
+        }
     }
 
     #[test]
