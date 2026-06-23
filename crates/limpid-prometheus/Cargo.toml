@@ -17,6 +17,10 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 serde_json = "1"
 
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util", "macros", "rt", "net", "io-util", "time"] }
+tempfile = "3"
+
 [package.metadata.deb]
 maintainer = "Naoto Morishima"
 copyright = "2026, Naoto Morishima"

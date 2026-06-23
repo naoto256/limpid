@@ -10,10 +10,9 @@
 
 use std::convert::Infallible;
 use std::fmt::Write as _;
-use std::io::{BufRead, Write};
 use std::net::SocketAddr;
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use clap::Parser;
 use http_body_util::Full;
@@ -22,7 +21,17 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, UnixStream};
+
+/// Hard upper bound on a single control-socket round trip. limpid's
+/// control socket is local IPC and a `stats` reply is typically a few
+/// kilobytes returned in well under a millisecond, so anything past
+/// this window means the daemon is wedged or shutting down. Capping
+/// the call keeps Prometheus scrapes from piling up on a stuck peer:
+/// a scrape that hits the timeout returns an error body, and the next
+/// scrape gets a fresh attempt instead of waiting behind the old one.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Parser)]
 #[command(name = "limpid-prometheus", about = "Prometheus exporter for limpid")]
@@ -66,7 +75,7 @@ async fn main() {
         tokio::spawn(async move {
             let svc = service_fn(move |req| {
                 let socket = socket.clone();
-                async move { handle_request(req, &socket) }
+                async move { handle_request(req, &socket).await }
             });
             if let Err(e) = http1::Builder::new().serve_connection(io, svc).await
                 && !e.is_incomplete_message()
@@ -77,13 +86,13 @@ async fn main() {
     }
 }
 
-fn handle_request(
+async fn handle_request(
     req: Request<hyper::body::Incoming>,
-    socket_path: &PathBuf,
+    socket_path: &Path,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     match req.uri().path() {
         "/health" => {
-            let body = match query_control(socket_path, "health") {
+            let body = match query_control(socket_path, "health").await {
                 Ok(s) => s,
                 Err(e) => e,
             };
@@ -94,7 +103,7 @@ fn handle_request(
                 .unwrap())
         }
         "/metrics" => {
-            let body = match query_control(socket_path, "stats") {
+            let body = match query_control(socket_path, "stats").await {
                 Ok(json) => match json_to_prometheus(&json) {
                     Ok(text) => text,
                     Err(e) => format!("# error: {}\n", e),
@@ -287,24 +296,94 @@ fn escape_label_value(s: &str) -> String {
     out
 }
 
-fn query_control(socket_path: &PathBuf, command: &str) -> Result<String, String> {
-    let mut stream =
-        UnixStream::connect(socket_path).map_err(|e| format!("cannot connect to limpid: {}", e))?;
+async fn query_control(socket_path: &Path, command: &str) -> Result<String, String> {
+    // Wrap the whole connect+write+read sequence in a single deadline.
+    // Old code used the synchronous `std::os::unix::net::UnixStream` +
+    // blocking `BufRead::lines()` from inside an async hyper handler,
+    // which parked a tokio worker thread until the daemon answered (or
+    // forever, with no timeout) — slow / stuck scrapes silently
+    // starved the runtime. Switching to `tokio::net::UnixStream` +
+    // `AsyncBufReadExt` keeps the I/O cooperative; `tokio::time::timeout`
+    // gives it a documented upper bound (see QUERY_TIMEOUT).
+    let cmd = command.to_string();
+    let path = socket_path.to_path_buf();
+    tokio::time::timeout(QUERY_TIMEOUT, async move {
+        let mut stream = UnixStream::connect(&path)
+            .await
+            .map_err(|e| format!("cannot connect to limpid: {}", e))?;
 
-    writeln!(stream, "{}", command).map_err(|e| format!("cannot send command: {}", e))?;
+        stream
+            .write_all(format!("{}\n", cmd).as_bytes())
+            .await
+            .map_err(|e| format!("cannot send command: {}", e))?;
+        // Half-close the write side so the daemon sees EOF and starts
+        // responding (mirrors the sync path's `shutdown(Write)`).
+        let _ = stream.shutdown().await;
 
-    let _ = stream.shutdown(std::net::Shutdown::Write);
-
-    let reader = std::io::BufReader::new(stream);
-    let mut result = String::new();
-    for line in reader.lines() {
-        match line {
-            Ok(text) => {
-                result.push_str(&text);
-                result.push('\n');
+        let mut reader = BufReader::new(stream);
+        let mut result = String::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => result.push_str(&line),
+                Err(_) => break,
             }
-            Err(_) => break,
         }
+        Ok::<_, String>(result)
+    })
+    .await
+    .map_err(|_| {
+        format!(
+            "control socket timed out after {}s",
+            QUERY_TIMEOUT.as_secs()
+        )
+    })?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::UnixListener;
+
+    #[tokio::test(start_paused = true)]
+    async fn query_control_times_out_when_peer_stalls() {
+        // Regression: with the previous synchronous code path, a
+        // wedged limpid daemon (= accepted the connection but never
+        // wrote a reply) parked a tokio worker thread forever. The
+        // async path wraps the round trip in `tokio::time::timeout`,
+        // so a stalled peer surfaces a bounded error instead.
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+
+        // Stalled server: accept the connection, then sit on it
+        // without ever writing. Without QUERY_TIMEOUT, the read
+        // loop would suspend indefinitely.
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // Hold the stream open. With paused time + no I/O ever
+            // happening on this side, the future just yields.
+            let _hold = stream;
+            std::future::pending::<()>().await;
+        });
+
+        // Drive the timeout deterministically with virtual time.
+        let call = query_control(&sock, "stats");
+        tokio::pin!(call);
+
+        // Confirm the call is not ready before the timeout window
+        // has elapsed. One advance just past QUERY_TIMEOUT must
+        // wake the timeout future and surface the error.
+        tokio::time::advance(QUERY_TIMEOUT + Duration::from_secs(1)).await;
+        let result = call.await;
+        server.abort();
+
+        let err = result.expect_err("stalled peer must surface as timeout Err");
+        assert!(
+            err.contains("timed out"),
+            "expected timeout-flavoured error, got: {err}"
+        );
     }
-    Ok(result)
 }
