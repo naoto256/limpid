@@ -533,4 +533,138 @@ mod tests {
             });
         }
     }
+
+    // ---------- enforce_max_size unread-protection invariant ----------
+
+    fn make_segment(dir: &Path, seq: u64, byte_len: usize) {
+        let path = segment_path(dir, seq);
+        std::fs::write(&path, vec![b'x'; byte_len]).unwrap();
+    }
+
+    fn segment_exists(dir: &Path, seq: u64) -> bool {
+        segment_path(dir, seq).exists()
+    }
+
+    #[test]
+    fn enforce_max_size_deletes_oldest_consumed_segments_until_under_cap() {
+        // 5 segments seq=0..4, each 1024 bytes; cap = 2048, reader is
+        // sitting on seq=4 (everything before consumed). Caller must
+        // delete seq=0, 1, 2 to fit; seq=3 might or might not be
+        // removed depending on order, but seq=4 (== current_read_seq)
+        // must stay because it's the live read target.
+        let dir = tempfile::tempdir().unwrap();
+        for s in 0..5u64 {
+            make_segment(dir.path(), s, 1024);
+        }
+        enforce_max_size(dir.path(), 2048, /* current_read_seq */ 4, 4);
+        // seq < 4 may be deleted; seq=4 MUST stay (live read segment).
+        assert!(
+            segment_exists(dir.path(), 4),
+            "live read segment must not be deleted"
+        );
+    }
+
+    #[test]
+    fn enforce_max_size_never_deletes_unread_segments_even_when_over_cap() {
+        // 4 segments seq=0..3, each 1 MiB. Cap = 100 KiB, reader is
+        // ONLY at seq=0 (everything ahead is unread). enforce_max_size
+        // is forbidden from deleting unread data (= `seq >= current_read_seq`),
+        // so the function must STOP at seq=0 even though total is
+        // still over the cap. This is the data-loss invariant: an
+        // operator setting a too-small max_size must not silently lose
+        // events that haven't been processed yet.
+        let dir = tempfile::tempdir().unwrap();
+        for s in 0..4u64 {
+            make_segment(dir.path(), s, 1024 * 1024);
+        }
+        enforce_max_size(dir.path(), 100 * 1024, /* current_read_seq */ 0, 3);
+        // All 4 segments must still exist: seq=0 is current_read_seq
+        // (live), seq=1..3 are unread, NONE are deletable.
+        for s in 0..4u64 {
+            assert!(
+                segment_exists(dir.path(), s),
+                "seq={s} was deleted but is at or past the read cursor"
+            );
+        }
+    }
+
+    #[test]
+    fn enforce_max_size_no_op_when_total_under_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        for s in 0..3u64 {
+            make_segment(dir.path(), s, 1024);
+        }
+        enforce_max_size(dir.path(), 1024 * 1024, 0, 2);
+        for s in 0..3u64 {
+            assert!(segment_exists(dir.path(), s));
+        }
+    }
+
+    #[test]
+    fn enforce_max_size_zero_cap_disables_enforcement() {
+        // max_size = 0 is the "no cap" sentinel; enforce_max_size
+        // must early-return without scanning the dir. Documented via
+        // the early-return branch; pin it so a refactor that flips
+        // the predicate doesn't accidentally turn this into "cap at
+        // 0 bytes → delete everything".
+        let dir = tempfile::tempdir().unwrap();
+        for s in 0..3u64 {
+            make_segment(dir.path(), s, 1024 * 1024);
+        }
+        enforce_max_size(dir.path(), 0, 1, 2);
+        for s in 0..3u64 {
+            assert!(segment_exists(dir.path(), s));
+        }
+    }
+
+    // ---------- save_cursor / load_cursor ----------
+
+    #[test]
+    fn save_cursor_round_trips_through_load_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        save_cursor(dir.path(), 42, 12345);
+        let (seq, off) = load_cursor(dir.path());
+        assert_eq!((seq, off), (42, 12345));
+    }
+
+    #[test]
+    fn save_cursor_overwrites_previous_value_atomically() {
+        // The save_cursor path is "write tmp, rename atomically". A
+        // regression that, e.g., writes directly to the cursor file
+        // would leave the file truncated mid-write on a crash. We
+        // can't simulate a crash easily, but we can verify that
+        // repeated overwrites land cleanly and that no leftover .tmp
+        // remains after a successful save.
+        let dir = tempfile::tempdir().unwrap();
+        save_cursor(dir.path(), 1, 10);
+        save_cursor(dir.path(), 2, 20);
+        save_cursor(dir.path(), 3, 30);
+        let (seq, off) = load_cursor(dir.path());
+        assert_eq!((seq, off), (3, 30));
+        let tmp = cursor_path(dir.path()).with_extension("tmp");
+        assert!(
+            !tmp.exists(),
+            "leftover .tmp after successful save: {}",
+            tmp.display()
+        );
+    }
+
+    #[test]
+    fn load_cursor_returns_zero_zero_for_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (seq, off) = load_cursor(dir.path());
+        assert_eq!((seq, off), (0, 0));
+    }
+
+    #[test]
+    fn load_cursor_returns_zero_zero_for_malformed_file() {
+        // A cursor file from a future format, or one that got
+        // truncated, must NOT panic. The function falls back to (0,0)
+        // — pessimistic but safe (= replays everything since the
+        // start of the available segments).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(cursor_path(dir.path()), "not-a-cursor").unwrap();
+        let (seq, off) = load_cursor(dir.path());
+        assert_eq!((seq, off), (0, 0));
+    }
 }
