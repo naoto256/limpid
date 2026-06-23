@@ -36,7 +36,7 @@ The split between `received` and `injected` keeps "real" traffic distinguishable
 | `received` | Total events that entered this output's queue (from pipelines + injects) |
 | `injected` | Events pushed into this output's queue via `limpidctl inject` |
 | `written` | Events successfully written to the destination |
-| `failed` | Events that failed after all retry attempts |
+| `failed` | Events that failed after all retry attempts. For the OTLP outputs (`otlp_grpc` / `otlp_http`), the receiver's `partial_success.rejected_log_records` is also routed here — those are events the server *accepted at the transport layer* but refused at the validation layer, dropped per the [`partial_success` policy](../otlp.md#56-retry-transport-level-only), and surfaced via this counter so dashboards see the loss. |
 | `retries` | Total retry attempts across all events |
 
 `received - injected` = events delivered via pipelines. `received - written - failed` ≈ events pending in the queue (useful for disk queues).
