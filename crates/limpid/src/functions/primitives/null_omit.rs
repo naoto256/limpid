@@ -33,10 +33,7 @@ pub fn register(reg: &mut FunctionRegistry) {
 /// Walk `value` and produce its null-stripped form. Returns `None` when
 /// the *whole* value is `Null` (the caller — an Object — drops the key).
 /// Otherwise returns `Some(stripped)`. Arrays preserve `Null` elements.
-fn strip<'bump>(
-    arena: &EventArena<'bump>,
-    value: &Value<'bump>,
-) -> Option<Value<'bump>> {
+fn strip<'bump>(arena: &EventArena<'bump>, value: &Value<'bump>) -> Option<Value<'bump>> {
     match value {
         Value::Null => None,
         Value::Object(entries) => {

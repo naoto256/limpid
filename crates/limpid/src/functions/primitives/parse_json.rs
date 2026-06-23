@@ -32,8 +32,8 @@ fn parse_json_impl<'bump>(
     let text = val_to_str(&args[0])?;
     let json: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| anyhow::anyhow!("parse_json(): JSON parse error: {}", e))?;
-    let parsed = json_to_value_in(&json, arena)
-        .map_err(|e| anyhow::anyhow!("parse_json(): {}", e))?;
+    let parsed =
+        json_to_value_in(&json, arena).map_err(|e| anyhow::anyhow!("parse_json(): {}", e))?;
 
     let result = match parsed {
         Value::Object(_) => parsed,

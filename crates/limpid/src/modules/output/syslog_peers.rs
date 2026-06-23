@@ -65,10 +65,7 @@ impl Peer {
     /// and IPv4 literals don't need brackets; an already-bracketed
     /// literal (`[::1]`) is left untouched.
     pub fn address(&self) -> String {
-        if self.host.contains(':')
-            && !self.host.starts_with('[')
-            && !self.host.ends_with(']')
-        {
+        if self.host.contains(':') && !self.host.starts_with('[') && !self.host.ends_with(']') {
             format!("[{}]:{}", self.host, self.port)
         } else {
             format!("{}:{}", self.host, self.port)

@@ -89,11 +89,8 @@ fn insert_path(node: &mut Tree, path: &str, value: &str) {
                 if !current.order.iter().any(|s| s == part) {
                     current.order.push(part.to_string());
                 }
-                current
-                    .children
-                    .entry(part.to_string())
-                    .or_default()
-                    .leaf = Some(value.to_string());
+                current.children.entry(part.to_string()).or_default().leaf =
+                    Some(value.to_string());
             }
             return;
         }

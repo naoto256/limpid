@@ -531,21 +531,15 @@ impl OtlpHttpOutput {
                     let rejected = outcome.rejected.min(count);
                     let written = count - rejected;
                     if written > 0 {
-                        metrics
-                            .events_written
-                            .fetch_add(written, Ordering::Relaxed);
+                        metrics.events_written.fetch_add(written, Ordering::Relaxed);
                     }
                     if rejected > 0 {
-                        metrics
-                            .events_failed
-                            .fetch_add(rejected, Ordering::Relaxed);
+                        metrics.events_failed.fetch_add(rejected, Ordering::Relaxed);
                     }
                 }
                 Err(e) => {
                     tracing::warn!("otlp_http flush timer: send failed ({})", e);
-                    metrics
-                        .events_failed
-                        .fetch_add(count, Ordering::Relaxed);
+                    metrics.events_failed.fetch_add(count, Ordering::Relaxed);
                 }
             }
         });
@@ -1262,10 +1256,7 @@ mod tests {
             received_count: Arc<AtomicUsize>,
         }
 
-        async fn handle(
-            State(state): State<AppState>,
-            body: AxumBytes,
-        ) -> impl IntoResponse {
+        async fn handle(State(state): State<AppState>, body: AxumBytes) -> impl IntoResponse {
             // Decode the request only to confirm it parsed; the test
             // exercise is the response body, not the request.
             let _ = ExportLogsServiceRequest::decode(&body[..]);
@@ -1332,8 +1323,14 @@ mod tests {
 
         let written = output.metrics.events_written.load(Ordering::Relaxed);
         let failed = output.metrics.events_failed.load(Ordering::Relaxed);
-        assert_eq!(written, 1, "expected 1 written, got {written} (failed={failed})");
-        assert_eq!(failed, 2, "expected 2 failed, got {failed} (written={written})");
+        assert_eq!(
+            written, 1,
+            "expected 1 written, got {written} (failed={failed})"
+        );
+        assert_eq!(
+            failed, 2,
+            "expected 2 failed, got {failed} (written={written})"
+        );
     }
 
     #[tokio::test]

@@ -28,10 +28,7 @@ pub fn register(reg: &mut FunctionRegistry) {
     );
 }
 
-fn set_pri_impl<'bump>(
-    arena: &EventArena<'bump>,
-    args: &[Value<'bump>],
-) -> Result<Value<'bump>> {
+fn set_pri_impl<'bump>(arena: &EventArena<'bump>, args: &[Value<'bump>]) -> Result<Value<'bump>> {
     let text = val_to_str(&args[0])?;
     let facility = arg_as_u8(&args[1], "facility", 23)?;
     let severity = arg_as_u8(&args[2], "severity", 7)?;

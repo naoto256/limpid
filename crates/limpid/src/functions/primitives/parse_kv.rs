@@ -231,7 +231,13 @@ mod tests {
         // boundary. Pin that the parse succeeds AND the value is
         // recoverable as the original string.
         let p = pairs("name=日本語 next=v", b' ');
-        assert_eq!(p, vec![("name".into(), "日本語".into()), ("next".into(), "v".into())]);
+        assert_eq!(
+            p,
+            vec![
+                ("name".into(), "日本語".into()),
+                ("next".into(), "v".into())
+            ]
+        );
     }
 
     #[test]

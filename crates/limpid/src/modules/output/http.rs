@@ -634,7 +634,12 @@ async fn send_once(peer: &HttpPeer, inner: &Inner, body: &[u8]) -> Result<()> {
         // bytes>` placeholder so the daemon log doesn't fill with
         // replacement-char soup.
         let snippet = error_snippet(response, ERROR_BODY_BYTE_CAP, 200).await;
-        anyhow::bail!("http output: {} returned {} — {}", peer.url, status, snippet);
+        anyhow::bail!(
+            "http output: {} returned {} — {}",
+            peer.url,
+            status,
+            snippet
+        );
     }
 
     Ok(())
@@ -983,7 +988,9 @@ mod tests {
     async fn honors_configured_method() {
         // Method other than POST/PUT used to silently degrade to POST.
         // Now PATCH should reach the server as PATCH.
-        use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::any};
+        use axum::{
+            Router, extract::State, http::StatusCode, response::IntoResponse, routing::any,
+        };
 
         #[derive(Clone)]
         struct AppState {

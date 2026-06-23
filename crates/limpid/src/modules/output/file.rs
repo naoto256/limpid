@@ -659,9 +659,10 @@ mod tests {
             Bytes::from("x"),
             "192.168.1.10:514".parse::<SocketAddr>().unwrap(),
         );
-        event
-            .workspace
-            .insert("winpath".into(), OwnedValue::String("C:\\Users\\bob".into()));
+        event.workspace.insert(
+            "winpath".into(),
+            OwnedValue::String("C:\\Users\\bob".into()),
+        );
         let (rendered, _) = render_path_owned(&out, &event).unwrap();
         assert_eq!(rendered, "/var/log/C:_Users_bob.log");
     }

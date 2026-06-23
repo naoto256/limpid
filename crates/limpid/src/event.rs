@@ -261,11 +261,7 @@ impl<'bump> BorrowedEvent<'bump> {
     /// `String` should `arena.alloc_str(...)` first; for ergonomics
     /// see [`Self::workspace_set_str`].
     pub fn workspace_set(&mut self, key: &'bump str, value: Value<'bump>) {
-        if let Some(slot) = self
-            .workspace
-            .iter_mut()
-            .find(|(k, _)| *k == key)
-        {
+        if let Some(slot) = self.workspace.iter_mut().find(|(k, _)| *k == key) {
             slot.1 = value;
         } else {
             self.workspace.push((key, value));
@@ -274,12 +270,7 @@ impl<'bump> BorrowedEvent<'bump> {
 
     /// Insert or replace the workspace entry for `key`, copying the
     /// key into the arena first.
-    pub fn workspace_set_str(
-        &mut self,
-        arena: &EventArena<'bump>,
-        key: &str,
-        value: Value<'bump>,
-    ) {
+    pub fn workspace_set_str(&mut self, arena: &EventArena<'bump>, key: &str, value: Value<'bump>) {
         if let Some(slot) = self.workspace.iter_mut().find(|(k, _)| *k == key) {
             slot.1 = value;
         } else {
@@ -335,10 +326,13 @@ mod boundary_tests {
             "192.0.2.10:5140".parse::<SocketAddr>().unwrap(),
         );
         ev.egress = Bytes::from_static(b"rendered");
-        ev.workspace.insert("k_str".into(), OwnedValue::String("v".into()));
-        ev.workspace.insert("k_int".into(), OwnedValue::Int(42));
         ev.workspace
-            .insert("k_bytes".into(), OwnedValue::Bytes(Bytes::from_static(&[0xff, 0x00, 0xab])));
+            .insert("k_str".into(), OwnedValue::String("v".into()));
+        ev.workspace.insert("k_int".into(), OwnedValue::Int(42));
+        ev.workspace.insert(
+            "k_bytes".into(),
+            OwnedValue::Bytes(Bytes::from_static(&[0xff, 0x00, 0xab])),
+        );
         ev
     }
 

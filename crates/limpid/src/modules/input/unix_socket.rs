@@ -214,7 +214,11 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         // Path should now be a socket, not a regular file.
         let meta = std::fs::symlink_metadata(&socket_path).unwrap();
-        assert!(meta.file_type().is_socket(), "expected socket, got {:?}", meta.file_type());
+        assert!(
+            meta.file_type().is_socket(),
+            "expected socket, got {:?}",
+            meta.file_type()
+        );
         let _ = sd_tx.send(true);
         let _ = handle.await;
     }
@@ -232,7 +236,10 @@ mod tests {
 
         let (handle, sd_tx, _rx) = spawn_with_path(&socket_path);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let mode = std::fs::metadata(&socket_path).unwrap().permissions().mode();
+        let mode = std::fs::metadata(&socket_path)
+            .unwrap()
+            .permissions()
+            .mode();
         // mode() returns the full st_mode including file-type bits;
         // mask to the permission portion (0o7777).
         assert_eq!(
