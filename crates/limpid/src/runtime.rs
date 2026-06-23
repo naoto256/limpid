@@ -372,8 +372,7 @@ fn validate_secondary_refs<'a>(
 ) -> Result<()> {
     // First pass: per-edge checks (typo + direct self-reference).
     // Collect the edge map at the same time for the cycle pass below.
-    let mut edges: std::collections::HashMap<&str, &str> =
-        std::collections::HashMap::new();
+    let mut edges: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for (name, secondary) in refs {
         let Some(target) = secondary else { continue };
         if target == name {
@@ -901,10 +900,7 @@ mod tests {
         let err = validate_secondary_refs(refs.iter().copied(), &known)
             .expect_err("two-node secondary cycle must fail validation");
         let msg = err.to_string();
-        assert!(
-            msg.contains("cycle"),
-            "expected cycle error, got: {msg}"
-        );
+        assert!(msg.contains("cycle"), "expected cycle error, got: {msg}");
         // Operator-friendly: the cycle path must be shown so the
         // operator can see which secondary edge to remove.
         assert!(
@@ -917,11 +913,7 @@ mod tests {
     fn validate_secondary_refs_rejects_indirect_cycle_three_node() {
         // A→B→C→A — same shape with one more hop. Pin that the
         // cycle detector follows the chain beyond two nodes.
-        let refs = [
-            ("a", Some("b")),
-            ("b", Some("c")),
-            ("c", Some("a")),
-        ];
+        let refs = [("a", Some("b")), ("b", Some("c")), ("c", Some("a"))];
         let known = known(&["a", "b", "c"]);
         let err = validate_secondary_refs(refs.iter().copied(), &known)
             .expect_err("three-node secondary cycle must fail validation");
@@ -937,11 +929,7 @@ mod tests {
         // exhausted on A spills to B, anything exhausted on B
         // spills to C, and C has no secondary so events that
         // exhaust on C are dropped). No cycle, must pass.
-        let refs = [
-            ("a", Some("b")),
-            ("b", Some("c")),
-            ("c", None),
-        ];
+        let refs = [("a", Some("b")), ("b", Some("c")), ("c", None)];
         let known = known(&["a", "b", "c"]);
         validate_secondary_refs(refs.iter().copied(), &known).unwrap();
     }
