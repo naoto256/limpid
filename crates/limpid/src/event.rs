@@ -324,3 +324,92 @@ fn json_to_bytes(v: &JsonValue) -> Option<Bytes> {
     }
     None
 }
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    fn sample_event() -> OwnedEvent {
+        let mut ev = OwnedEvent::new(
+            Bytes::from_static(b"<13>hello world"),
+            "192.0.2.10:5140".parse::<SocketAddr>().unwrap(),
+        );
+        ev.egress = Bytes::from_static(b"rendered");
+        ev.workspace.insert("k_str".into(), OwnedValue::String("v".into()));
+        ev.workspace.insert("k_int".into(), OwnedValue::Int(42));
+        ev.workspace
+            .insert("k_bytes".into(), OwnedValue::Bytes(Bytes::from_static(&[0xff, 0x00, 0xab])));
+        ev
+    }
+
+    #[test]
+    fn view_in_then_to_owned_round_trips_event() {
+        // The pipeline runs against `BorrowedEvent<'bump>`; failure
+        // paths (errored / disk-queue / dlq / inject) need to recover
+        // the equivalent `OwnedEvent`. The round-trip through
+        // `view_in(arena) → to_owned()` must preserve every field
+        // including workspace order-insensitive equality of keys.
+        let original = sample_event();
+        let bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let borrowed = original.view_in(&arena);
+        let recovered: OwnedEvent = borrowed.to_owned();
+        assert_eq!(recovered.received_at, original.received_at);
+        assert_eq!(recovered.source, original.source);
+        assert_eq!(recovered.ingress, original.ingress);
+        assert_eq!(recovered.egress, original.egress);
+        assert_eq!(recovered.workspace.len(), original.workspace.len());
+        for (k, v) in &original.workspace {
+            assert_eq!(recovered.workspace.get(k), Some(v), "key {k} lost");
+        }
+    }
+
+    #[test]
+    fn to_json_value_then_from_json_round_trips_event() {
+        // This boundary is exercised every time a disk-queue replay /
+        // tap snapshot / error-log entry / inject command needs to
+        // serialise and re-hydrate an event. A regression in either
+        // direction would silently drop fields. We hit each
+        // representative value variant: String, Int, Bytes (which
+        // routes through the `$bytes_b64` escape pathway).
+        let original = sample_event();
+        let json = original.to_json_value();
+        let serialized = serde_json::to_string(&json).unwrap();
+        let recovered =
+            OwnedEvent::from_json(&serialized).expect("from_json must accept its own to_json");
+        assert_eq!(recovered.received_at, original.received_at);
+        assert_eq!(recovered.source, original.source);
+        assert_eq!(recovered.ingress, original.ingress);
+        assert_eq!(recovered.egress, original.egress);
+        assert_eq!(recovered.workspace.len(), original.workspace.len());
+        // Bytes round-trip: the value must come back as Bytes (not as
+        // a base64 String), otherwise downstream consumers that
+        // pattern-match on OwnedValue::Bytes would silently see
+        // String instead.
+        match recovered.workspace.get("k_bytes") {
+            Some(OwnedValue::Bytes(b)) => assert_eq!(&b[..], &[0xff, 0x00, 0xab]),
+            other => panic!("k_bytes round-tripped as wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_json_preserves_received_at_to_seconds_precision() {
+        // received_at is serialised as an i64 Unix-seconds in the v0.5.6+
+        // wire form. Recovery must reproduce the original timestamp to
+        // at least seconds precision (sub-second is intentionally
+        // dropped; pin it so a future "promote to ms" change is an
+        // explicit decision rather than a silent regression).
+        let mut original = OwnedEvent::new(
+            Bytes::from_static(b"x"),
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        );
+        original.received_at =
+            chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let json = serde_json::to_string(&original.to_json_value()).unwrap();
+        let recovered = OwnedEvent::from_json(&json).unwrap();
+        assert_eq!(
+            recovered.received_at.timestamp(),
+            original.received_at.timestamp()
+        );
+    }
+}
