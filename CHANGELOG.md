@@ -10,6 +10,11 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased] - 0.7.8
 
+### Fixed — `output otlp_http` now warns loudly when `verify false` is paired with an https endpoint
+
+`output http` already emits a one-line, greppable `tracing::warn!` when `verify false` is paired with an https URL, so operators can audit the daemon log for MITM-vulnerable peers. `output otlp_http` exposes the identical `verify` knob but had no such warning — `verify false` toggled `danger_accept_invalid_certs(true)` silently, so the same security-relevant misconfiguration was visible in one output and invisible in the other. The warn now fires once per https peer at startup with the same wording as the `output http` message.
+
+
 ### Fixed — `output otlp_grpc` rejects `tls { ... }` on plaintext `http://` endpoints
 
 Same trap `output otlp_http` already closes for itself in 0.7.8: tonic only engages the TLS layer when the URI scheme is `https`, so a `peer { endpoint "http://otel:4317"; tls { ca ...; cert ...; key ... } }` configuration silently dropped the entire TLS block and shipped gRPC in clear text — exactly the misconfiguration an operator who took the trouble to write a `tls` block was trying to avoid. The mismatch is now rejected at parse time with the same error wording as the `otlp_http` guard: switch the endpoint to `https://` or drop the `tls` block.
