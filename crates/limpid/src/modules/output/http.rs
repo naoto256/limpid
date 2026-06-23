@@ -444,7 +444,22 @@ impl Output for HttpOutput {
 
         if should_flush {
             self.cancel_timer().await;
-            self.flush().await?;
+            let res = self.flush().await;
+            if res.is_err() {
+                // flush() put the batch back into the buffer on
+                // failure. Without re-arming the timer the batch
+                // would sit there until the next write() arrives —
+                // which may never come, since the queue layer
+                // counted this event as failed (Rendered payloads
+                // don't retry; see queue/mod.rs). The operator then
+                // sees events_failed += 1 but the batch is still
+                // pending in our buffer with no timer to drain it.
+                // Re-arm so the stuck batch retries after
+                // batch_timeout, restoring "no event silently lost
+                // in the HTTP buffer".
+                self.reset_timer().await;
+            }
+            res?;
         } else {
             self.reset_timer().await;
         }
@@ -1188,5 +1203,107 @@ mod tests {
         assert_eq!(batch_len, 0, "Owned event must not land in the batch");
         let timer_armed = output.flush_handle.lock().await.is_some();
         assert!(!timer_armed, "Owned event must not arm the flush timer");
+    }
+
+    #[tokio::test]
+    async fn flush_failure_rearms_timer_so_batch_retries() {
+        // Regression: when an HTTP batch flush fails, flush() puts
+        // the batch back into the buffer but the caller used to
+        // skip re-arming the flush timer. The stuck batch then sat
+        // in the buffer until the next write() arrived — which may
+        // never happen, since the queue layer counts the event as
+        // failed (Rendered payloads don't retry; see queue/mod.rs).
+        // events_failed went up, yet the data still lived in our
+        // buffer with no schedule to drain it. The fix re-arms the
+        // timer on flush() Err, so batch_timeout drives a retry.
+        use axum::{
+            Router, extract::State, http::StatusCode, response::IntoResponse, routing::post,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        #[derive(Clone)]
+        struct S {
+            calls: Arc<AtomicUsize>,
+            body: Arc<Mutex<Vec<String>>>,
+        }
+        async fn handle(
+            State(s): State<S>,
+            body: axum::body::Bytes,
+        ) -> axum::response::Response {
+            let n = s.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if n == 0 {
+                (StatusCode::INTERNAL_SERVER_ERROR, "fail").into_response()
+            } else {
+                s.body
+                    .lock()
+                    .await
+                    .push(String::from_utf8_lossy(&body).into_owned());
+                (StatusCode::OK, "").into_response()
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = Arc::new(Mutex::new(Vec::new()));
+        let state = S {
+            calls: Arc::new(AtomicUsize::new(0)),
+            body: Arc::clone(&body),
+        };
+        let app = Router::new().route("/", post(handle)).with_state(state);
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let url = format!("http://{}/", addr);
+        let props = vec![
+            peer_block(&url),
+            prop_int("batch_size", 2),
+            prop_str("batch_timeout", "200ms"),
+        ];
+        let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
+
+        // Two writes → triggers should_flush → first POST is the
+        // failing one → Err propagates and the batch is restored.
+        let p1 = RenderedPayload::new(HttpPayload { msg: "e1".into() });
+        output.write(p1).await.unwrap();
+        let p2 = RenderedPayload::new(HttpPayload { msg: "e2".into() });
+        let err = output.write(p2).await.expect_err("first flush must fail");
+        assert!(
+            err.to_string().contains("http") || err.to_string().contains("500"),
+            "got: {err}"
+        );
+
+        // The batch is sitting in the buffer, restored by flush()'s
+        // Err arm.
+        assert_eq!(
+            output.inner.batch.lock().await.len(),
+            2,
+            "batch must be put back into the buffer on flush failure"
+        );
+        // Regression assertion: the timer must be armed so the
+        // batch will be retried after batch_timeout. Before the
+        // fix, flush_handle was None here.
+        assert!(
+            output.flush_handle.lock().await.is_some(),
+            "flush failure must re-arm the timer (regression)"
+        );
+
+        // Wait for the timer to fire and retry against the
+        // now-healthy peer. batch_timeout is 200ms.
+        for _ in 0..100 {
+            if !body.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        server.abort();
+
+        let got = body.lock().await.clone();
+        assert_eq!(got.len(), 1, "retry must POST the batched body once");
+        let posted = &got[0];
+        assert!(
+            posted.contains("e1") && posted.contains("e2"),
+            "retry must carry the same two events; got: {posted}"
+        );
     }
 }
