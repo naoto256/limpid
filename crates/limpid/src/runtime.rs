@@ -370,6 +370,10 @@ fn validate_secondary_refs<'a>(
     refs: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
     known_outputs: &std::collections::HashSet<&str>,
 ) -> Result<()> {
+    // First pass: per-edge checks (typo + direct self-reference).
+    // Collect the edge map at the same time for the cycle pass below.
+    let mut edges: std::collections::HashMap<&str, &str> =
+        std::collections::HashMap::new();
     for (name, secondary) in refs {
         let Some(target) = secondary else { continue };
         if target == name {
@@ -387,7 +391,38 @@ fn validate_secondary_refs<'a>(
                  configured outputs: {listed:?}"
             ));
         }
+        edges.insert(name, target);
     }
+
+    // Second pass: indirect cycle detection (A→B→A, A→B→C→A, …).
+    // Same poison-event ping-pong as the direct self-reference case;
+    // on disk-backed queues each loop iteration also re-persists the
+    // event, so the cycle grows the queue files unboundedly. With at
+    // most one outgoing edge per node (each output has a single
+    // `secondary`), the chain from any node is deterministic and
+    // either terminates at a node without a secondary or revisits a
+    // node — visit each starting node in turn and break on the first
+    // repeat.
+    for &start in edges.keys() {
+        let mut visited: Vec<&str> = vec![start];
+        let mut cursor = start;
+        while let Some(&next) = edges.get(cursor) {
+            if let Some(repeat_idx) = visited.iter().position(|n| *n == next) {
+                // Build the cycle path for an operator-friendly error.
+                let mut cycle: Vec<&str> = visited[repeat_idx..].to_vec();
+                cycle.push(next);
+                return Err(anyhow::anyhow!(
+                    "secondary cycle detected ({path}); a cycle would form an \
+                     infinite retry loop on a poison event, and on disk-backed \
+                     queues each iteration re-persists the event",
+                    path = cycle.join(" -> "),
+                ));
+            }
+            visited.push(next);
+            cursor = next;
+        }
+    }
+
     Ok(())
 }
 
@@ -852,6 +887,63 @@ mod tests {
             msg.contains("primary") && msg.contains("itself"),
             "expected self-reference message, got: {msg}"
         );
+    }
+
+    #[test]
+    fn validate_secondary_refs_rejects_indirect_cycle_two_node() {
+        // Horizontal expansion of the self-reference finding: A→B→A
+        // is the same poison-event ping-pong as A→A, just with one
+        // hop in between. Per-edge check passes (each target is
+        // valid + not self), but the cycle still grows disk-backed
+        // queues unboundedly under repeated retry exhaustion.
+        let refs = [("primary", Some("backup")), ("backup", Some("primary"))];
+        let known = known(&["primary", "backup"]);
+        let err = validate_secondary_refs(refs.iter().copied(), &known)
+            .expect_err("two-node secondary cycle must fail validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cycle"),
+            "expected cycle error, got: {msg}"
+        );
+        // Operator-friendly: the cycle path must be shown so the
+        // operator can see which secondary edge to remove.
+        assert!(
+            msg.contains("primary") && msg.contains("backup"),
+            "cycle error must name involved outputs; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_secondary_refs_rejects_indirect_cycle_three_node() {
+        // A→B→C→A — same shape with one more hop. Pin that the
+        // cycle detector follows the chain beyond two nodes.
+        let refs = [
+            ("a", Some("b")),
+            ("b", Some("c")),
+            ("c", Some("a")),
+        ];
+        let known = known(&["a", "b", "c"]);
+        let err = validate_secondary_refs(refs.iter().copied(), &known)
+            .expect_err("three-node secondary cycle must fail validation");
+        assert!(
+            err.to_string().contains("cycle"),
+            "expected cycle error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_secondary_refs_accepts_acyclic_chain() {
+        // Baseline: A→B→C is a valid dead-letter chain (anything
+        // exhausted on A spills to B, anything exhausted on B
+        // spills to C, and C has no secondary so events that
+        // exhaust on C are dropped). No cycle, must pass.
+        let refs = [
+            ("a", Some("b")),
+            ("b", Some("c")),
+            ("c", None),
+        ];
+        let known = known(&["a", "b", "c"]);
+        validate_secondary_refs(refs.iter().copied(), &known).unwrap();
     }
 
     #[test]
