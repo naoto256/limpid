@@ -459,6 +459,7 @@ pub trait OutputWriter: Send + Sync + 'static {
 }
 
 /// Run a queue consumer that drains events and writes them to an output.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_queue_consumer(
     mut receiver: QueueReceiver,
     writer: Box<dyn OutputWriter>,
@@ -466,6 +467,7 @@ pub async fn run_queue_consumer(
     secondary_sender: Option<QueueSender>,
     tap: Option<crate::tap::TapRegistry>,
     metrics: Arc<crate::metrics::OutputMetrics>,
+    error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let name = Arc::clone(&receiver.name);
@@ -478,7 +480,7 @@ pub async fn run_queue_consumer(
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     info!("output '{}': shutting down, draining queue", name);
-                    drain_remaining(&mut receiver, writer.as_ref(), &retry_config, &secondary_sender, &name, &metrics, tap.as_ref()).await;
+                    drain_remaining(&mut receiver, writer.as_ref(), &retry_config, &secondary_sender, &name, &metrics, tap.as_ref(), error_log.as_ref()).await;
                     break;
                 }
             }
@@ -490,7 +492,7 @@ pub async fn run_queue_consumer(
                         // delivered / routed-to-secondary / dropped
                         // all ack-and-continue from this consumer's
                         // POV. PR-O / PR-P will fan out on it.
-                        let _ = write_with_retry(writer.as_ref(), input, &retry_config, &secondary_sender, &name, &metrics, tap.as_ref()).await;
+                        let _ = write_with_retry(writer.as_ref(), input, &retry_config, &secondary_sender, &name, &metrics, tap.as_ref(), error_log.as_ref()).await;
                         // Acknowledge the event regardless of
                         // disposition (delivered, routed to
                         // secondary, or retries exhausted): from
@@ -524,6 +526,7 @@ pub async fn run_queue_consumer(
     info!("output '{}': queue consumer stopped", name);
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drain_remaining(
     receiver: &mut QueueReceiver,
     writer: &dyn OutputWriter,
@@ -532,6 +535,7 @@ async fn drain_remaining(
     name: &str,
     metrics: &crate::metrics::OutputMetrics,
     tap: Option<&crate::tap::TapRegistry>,
+    error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
 ) {
     let mut count = 0u64;
     while let Some(input) = receiver.try_recv() {
@@ -545,6 +549,7 @@ async fn drain_remaining(
             name,
             metrics,
             tap,
+            error_log,
         )
         .await;
         // Mirror the steady-state ack contract: each event's
@@ -573,6 +578,7 @@ async fn drain_remaining(
 ///   to the secondary path immediately. Operators who need full retry
 ///   semantics on a sink should configure a disk queue (which always
 ///   carries `SinkInput::Owned`).
+#[allow(clippy::too_many_arguments)]
 async fn write_with_retry(
     writer: &dyn OutputWriter,
     input: SinkInput,
@@ -581,6 +587,7 @@ async fn write_with_retry(
     name: &str,
     metrics: &crate::metrics::OutputMetrics,
     tap: Option<&crate::tap::TapRegistry>,
+    error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
 ) -> WriteDisposition {
     use std::sync::atomic::Ordering;
 
@@ -626,9 +633,24 @@ async fn write_with_retry(
                         );
                     }
                     metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                    // Recovery routing order (BC-3 / PR-O):
+                    //   1. secondary configured + Owned available → try
+                    //      to enqueue. Success returns
+                    //      `RoutedToSecondary`; failure falls through
+                    //      to the error_log step so the payload still
+                    //      lands on disk.
+                    //   2. error_log configured → write a JSONL record
+                    //      mirroring the pipeline DLQ format. Success
+                    //      returns `DroppedToRecovery`; failure warns
+                    //      and falls through to `Dropped`.
+                    //   3. neither path captured the payload → preserve
+                    //      the existing 0.7.7 `Dropped` behaviour
+                    //      (warn + give up). The original `Rendered`
+                    //      case (no owned payload to capture) also
+                    //      collapses here.
                     if let Some(secondary) = secondary_sender {
-                        if let Some(ev) = owned_for_retry.take() {
-                            match secondary.send(SinkInput::Owned(ev)).await {
+                        if let Some(ev) = owned_for_retry.as_ref() {
+                            match secondary.send(SinkInput::Owned(ev.clone())).await {
                                 Ok(()) => return WriteDisposition::RoutedToSecondary,
                                 Err(err) => {
                                     error!(
@@ -643,8 +665,30 @@ async fn write_with_retry(
                                 name
                             );
                         }
-                    } else {
-                        error!("output '{}': dropping event (no secondary)", name);
+                    }
+                    if let (Some(writer), Some(ev)) = (error_log, owned_for_retry.take()) {
+                        let ctx = crate::pipeline::ErroredEventContext {
+                            timestamp: chrono::Utc::now(),
+                            pipeline: String::new(),
+                            process: format!("(output {})", name),
+                            reason: format!("output write failed after {} attempts: {}", attempt, e),
+                            event: ev,
+                        };
+                        match writer.write(&ctx).await {
+                            Ok(()) => return WriteDisposition::DroppedToRecovery,
+                            Err(write_err) => {
+                                warn!(
+                                    "output '{}': error_log write failed: {} — dropping event",
+                                    name, write_err
+                                );
+                            }
+                        }
+                    } else if secondary_sender.is_none() {
+                        // No recovery path of any kind configured.
+                        error!(
+                            "output '{}': dropping event (no secondary, no error_log)",
+                            name
+                        );
                     }
                     return WriteDisposition::Dropped;
                 }
@@ -746,6 +790,7 @@ mod write_with_retry_tests {
             "test",
             &m,
             None,
+            None,
         )
         .await;
         assert_eq!(disposition, WriteDisposition::Delivered);
@@ -770,6 +815,7 @@ mod write_with_retry_tests {
             "test",
             &m,
             None,
+            None,
         )
         .await;
         assert_eq!(disposition, WriteDisposition::Delivered);
@@ -793,6 +839,7 @@ mod write_with_retry_tests {
             &None,
             "test",
             &m,
+            None,
             None,
         )
         .await;
@@ -821,6 +868,7 @@ mod write_with_retry_tests {
             &None,
             "test",
             &m,
+            None,
             None,
         )
         .await;
@@ -859,6 +907,7 @@ mod write_with_retry_tests {
             &secondary,
             "primary",
             &m,
+            None,
             None,
         )
         .await;
@@ -899,6 +948,7 @@ mod write_with_retry_tests {
             "primary",
             &m,
             None,
+            None,
         )
         .await;
         assert!(sec_rx.try_recv().is_none(), "Rendered must NOT route");
@@ -930,6 +980,7 @@ mod write_with_retry_tests {
             &Some(sec_tx),
             "primary",
             &m,
+            None,
             None,
         )
         .await;
@@ -963,6 +1014,7 @@ mod write_with_retry_tests {
             &Some(sec_tx),
             "primary",
             &m,
+            None,
             None,
         )
         .await;
@@ -1022,5 +1074,185 @@ mod write_with_retry_tests {
             "expected RenderedOnDisk, got {:?}",
             err
         );
+    }
+
+    // ---- BC-3 secondary-recovery routing (PR-O) ----
+
+    /// Stub writer that *always* refuses the write — every test below
+    /// drives the retry-exhaustion path, so the underlying writer just
+    /// has to fail predictably without any per-test scripting.
+    struct AlwaysFailWriter;
+
+    #[async_trait::async_trait]
+    impl OutputWriter for AlwaysFailWriter {
+        async fn consume(&self, _input: SinkInput) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("permanent failure"))
+        }
+    }
+
+    fn error_log_in(dir: &tempfile::TempDir) -> (Arc<crate::error_log::ErrorLogWriter>, PathBuf) {
+        let path = dir.path().join("errored.jsonl");
+        (
+            Arc::new(crate::error_log::ErrorLogWriter::new(path.clone())),
+            path,
+        )
+    }
+
+    use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn no_secondary_with_error_log_persists_and_returns_dropped_to_recovery() {
+        // BC-3 happy path: retries exhaust, no secondary configured,
+        // but `error_log` captures the payload. Must report
+        // `DroppedToRecovery` and the JSONL file must contain one
+        // record carrying the original ingress.
+        let dir = tempfile::tempdir().unwrap();
+        let (el, path) = error_log_in(&dir);
+        let m = fresh_metrics();
+        let disposition = write_with_retry(
+            &AlwaysFailWriter,
+            SinkInput::Owned(owned_event()),
+            &fast_cfg(2),
+            &None,
+            "primary",
+            &m,
+            None,
+            Some(&el),
+        )
+        .await;
+        assert_eq!(disposition, WriteDisposition::DroppedToRecovery);
+        let body = tokio::fs::read_to_string(&path).await.unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 1, "expected exactly one JSONL record");
+        let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v["process"], "(output primary)");
+        assert!(v["reason"].as_str().unwrap().contains("permanent failure"));
+        assert!(v["event"].get("ingress").is_some());
+        assert_eq!(m.events_failed.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn secondary_send_failure_with_error_log_falls_through_to_recovery() {
+        // BC-3 fallback chain: secondary is configured but its receiver
+        // is gone, so the secondary enqueue itself fails. The error_log
+        // must catch the payload and the disposition must collapse to
+        // `DroppedToRecovery` (not `Dropped`).
+        let dir = tempfile::tempdir().unwrap();
+        let (el, path) = error_log_in(&dir);
+        let m = fresh_metrics();
+        let (sec_tx, sec_rx) = create_queue(
+            "secondary".into(),
+            QueueConfig {
+                queue_type: QueueType::Memory,
+                capacity: 8,
+                overflow: OverflowStrategy::Block,
+            },
+        )
+        .unwrap();
+        drop(sec_rx);
+        let disposition = write_with_retry(
+            &AlwaysFailWriter,
+            SinkInput::Owned(owned_event()),
+            &fast_cfg(2),
+            &Some(sec_tx),
+            "primary",
+            &m,
+            None,
+            Some(&el),
+        )
+        .await;
+        assert_eq!(disposition, WriteDisposition::DroppedToRecovery);
+        let body = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(body.lines().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn no_secondary_no_error_log_preserves_existing_dropped_behavior() {
+        // BC-3 regression anchor for the 0.7.7 baseline: with neither
+        // a secondary nor an error_log configured, retry-exhaustion
+        // must still surface `Dropped`. The warn line is observable in
+        // logs but not asserted here.
+        let m = fresh_metrics();
+        let disposition = write_with_retry(
+            &AlwaysFailWriter,
+            SinkInput::Owned(owned_event()),
+            &fast_cfg(2),
+            &None,
+            "primary",
+            &m,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(disposition, WriteDisposition::Dropped);
+        assert_eq!(m.events_failed.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn secondary_success_unchanged_when_error_log_present() {
+        // Regression anchor: the recovery routing must not steal the
+        // happy `RoutedToSecondary` path. When the secondary enqueue
+        // succeeds, error_log must NOT receive a duplicate record even
+        // if it is configured.
+        let dir = tempfile::tempdir().unwrap();
+        let (el, path) = error_log_in(&dir);
+        let m = fresh_metrics();
+        let (sec_tx, mut sec_rx) = create_queue(
+            "secondary".into(),
+            QueueConfig {
+                queue_type: QueueType::Memory,
+                capacity: 8,
+                overflow: OverflowStrategy::Block,
+            },
+        )
+        .unwrap();
+        let disposition = write_with_retry(
+            &AlwaysFailWriter,
+            SinkInput::Owned(owned_event()),
+            &fast_cfg(2),
+            &Some(sec_tx),
+            "primary",
+            &m,
+            None,
+            Some(&el),
+        )
+        .await;
+        assert_eq!(disposition, WriteDisposition::RoutedToSecondary);
+        assert!(
+            matches!(sec_rx.try_recv(), Some(SinkInput::Owned(_))),
+            "secondary did not receive the routed event"
+        );
+        // error_log file must not exist (or be empty) — the secondary
+        // captured the payload, recovery routing was a no-op.
+        let exists = tokio::fs::try_exists(&path).await.unwrap_or(false);
+        assert!(!exists, "error_log was written even though secondary succeeded");
+    }
+
+    #[tokio::test]
+    async fn error_log_write_failure_falls_back_to_dropped_without_recursion() {
+        // BC-3 last-resort path: error_log is configured but its
+        // parent dir does not exist, so `write()` returns Err. The
+        // function must warn and return `Dropped` (NOT
+        // `DroppedToRecovery`), and must not retry the error_log write
+        // or panic.
+        let dir = tempfile::tempdir().unwrap();
+        // Point at a path whose parent is missing — write() will fail
+        // at open time. ErrorLogWriter::new doesn't validate eagerly.
+        let bad_path = dir.path().join("missing-subdir/errored.jsonl");
+        let el = Arc::new(crate::error_log::ErrorLogWriter::new(bad_path));
+        let m = fresh_metrics();
+        let disposition = write_with_retry(
+            &AlwaysFailWriter,
+            SinkInput::Owned(owned_event()),
+            &fast_cfg(2),
+            &None,
+            "primary",
+            &m,
+            None,
+            Some(&el),
+        )
+        .await;
+        assert_eq!(disposition, WriteDisposition::Dropped);
+        assert_eq!(m.events_failed.load(Ordering::Relaxed), 1);
     }
 }

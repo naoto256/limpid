@@ -124,6 +124,32 @@ impl Runtime {
             )?;
         }
 
+        // Optional dead-letter queue for events that fail in `process`
+        // or that an output drops after exhausting retries (BC-3
+        // recovery, PR-O). `control { error_log "..." }` opts in to
+        // file-based recovery; when unset, the runtime falls back to a
+        // structured tracing line for the pipeline path and a plain
+        // `Dropped` disposition for the output path. The path is
+        // validated at startup (parent dir reachable) so operator typos
+        // surface before the first failure event.
+        //
+        // Built *before* output consumers spawn so each consumer can
+        // hold an `Arc` reference for retry-exhausted recovery; the
+        // same handle is later passed into the pipeline context for
+        // process-error DLQ writes.
+        let error_log_path = config
+            .global_blocks
+            .get("control")
+            .and_then(|p| props::get_string(p, "error_log"));
+        let error_log = match error_log_path {
+            Some(p) => {
+                let writer = crate::error_log::ErrorLogWriter::new(PathBuf::from(p));
+                writer.validate_at_startup().await?;
+                Some(Arc::new(writer))
+            }
+            None => None,
+        };
+
         // Start queue consumers (no metrics counting here — output does it)
         for (_name, receiver, writer, retry_config, output_metrics) in output_receivers {
             let secondary_sender = retry_config
@@ -132,6 +158,7 @@ impl Runtime {
                 .and_then(|s| output_senders.get(s).cloned());
             let shutdown = shutdown_rx.clone();
             let tap_clone = tap.clone();
+            let error_log_for_consumer = error_log.as_ref().map(Arc::clone);
             handles.push(tokio::spawn(async move {
                 queue::run_queue_consumer(
                     receiver,
@@ -140,6 +167,7 @@ impl Runtime {
                     secondary_sender,
                     Some(tap_clone),
                     output_metrics,
+                    error_log_for_consumer,
                     shutdown,
                 )
                 .await;
@@ -181,24 +209,6 @@ impl Runtime {
         // --- 3. Start inputs (each input owns its own InputMetrics) ---
         let compiled_config = config.clone();
         let config = Arc::new(config);
-
-        // Optional dead-letter queue for events that fail in `process`.
-        // `control { error_log "..." }` opts in to file-based DLQ; when
-        // unset, the runtime falls back to a structured tracing line.
-        // The path is validated at startup (parent dir reachable) so
-        // operator typos surface before the first failure event.
-        let error_log_path = config
-            .global_blocks
-            .get("control")
-            .and_then(|p| props::get_string(p, "error_log"));
-        let error_log = match error_log_path {
-            Some(p) => {
-                let writer = crate::error_log::ErrorLogWriter::new(PathBuf::from(p));
-                writer.validate_at_startup().await?;
-                Some(Arc::new(writer))
-            }
-            None => None,
-        };
 
         let mut input_senders: HashMap<
             String,

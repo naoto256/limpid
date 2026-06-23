@@ -93,4 +93,15 @@ pub enum WriteDisposition {
     /// re-routable). The consumer treats all three as "done from the
     /// queue's POV" and acks anyway.
     Dropped,
+
+    /// `consume` ultimately failed, the event could not be routed to a
+    /// secondary queue (none configured, or the secondary enqueue
+    /// itself failed), and the payload was persisted to the configured
+    /// `error_log` JSONL file for manual recovery. Distinguishes the
+    /// "payload survives on disk" outcome from the unrecoverable
+    /// [`Dropped`] case so PR-Q metrics can count recoverable losses
+    /// separately.
+    ///
+    /// [`Dropped`]: WriteDisposition::Dropped
+    DroppedToRecovery,
 }
