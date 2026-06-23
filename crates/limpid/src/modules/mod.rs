@@ -368,6 +368,26 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     /// expressions at write time (e.g. `${...}` templates in a path)
     /// override this to stash the registry. Default: no-op.
     fn attach_funcs(&mut self, _funcs: Arc<FunctionRegistry>) {}
+
+    /// Drain any internal buffer before the queue consumer stops.
+    ///
+    /// `Drop` cannot do this because it is synchronous and the
+    /// sink-side I/O is async. Batched outputs (`http`, `otlp_http`,
+    /// `otlp_grpc`) collect events in an in-memory buffer between
+    /// flushes, and on a clean shutdown those events would otherwise
+    /// be dropped: the memory queue already counted them as
+    /// delivered when the per-event `write()` returned `Ok`, the
+    /// flush timer is aborted by `Drop`, and the daemon exits with
+    /// the buffer contents still resident in memory. Override to
+    /// flush before returning. Default impl is a no-op for unbatched
+    /// sinks.
+    ///
+    /// Errors are surfaced for logging but the consumer continues
+    /// the shutdown sequence regardless — there is no further retry
+    /// path available at this point.
+    async fn shutdown(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Helper for `Output::write_owned` overrides that ship a single Owned
@@ -721,6 +741,10 @@ impl OutputWriter for OutputWriterWrapper {
             SinkInput::Rendered(payload) => self.0.write(payload).await,
             SinkInput::Owned(event) => self.0.write_owned(&event).await,
         }
+    }
+
+    async fn shutdown(&self) -> anyhow::Result<()> {
+        self.0.shutdown().await
     }
 }
 

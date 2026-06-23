@@ -482,6 +482,14 @@ impl Output for HttpOutput {
         })
         .await
     }
+
+    async fn shutdown(&self) -> Result<()> {
+        // Cancel any pending timer first so it doesn't race with us
+        // for the buffer lock and end up double-flushing an
+        // already-empty buffer.
+        self.cancel_timer().await;
+        self.flush().await
+    }
 }
 
 impl HttpOutput {
@@ -1308,6 +1316,68 @@ mod tests {
         assert!(
             posted.contains("e1") && posted.contains("e2"),
             "retry must carry the same two events; got: {posted}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_flushes_pending_batch_buffer() {
+        // Regression: under batch_size > 1 the queue-side `write()`
+        // returns Ok once the event is in the buffer, so the memory
+        // queue considers it delivered. If the daemon shuts down
+        // before the batch fills or the timer fires, Drop alone
+        // aborts the timer and leaks the buffered events. The fix
+        // gives Output a `shutdown()` method that the queue consumer
+        // calls once the consume loop exits, and HttpOutput
+        // overrides it to cancel the timer and run one final flush.
+        let (addr, received, server) = run_echo_collector().await;
+        let url = format!("http://{}/", addr);
+        let output = HttpOutput::from_properties(
+            "test",
+            &mp(&[
+                peer_block(&url),
+                // Large batch + long timer so the only thing that
+                // can drain this buffer is the explicit shutdown.
+                prop_int("batch_size", 100),
+                prop_str("batch_timeout", "30s"),
+            ]),
+        )
+        .unwrap();
+
+        let p1 = RenderedPayload::new(HttpPayload { msg: "ev1".into() });
+        output.write(p1).await.unwrap();
+        let p2 = RenderedPayload::new(HttpPayload { msg: "ev2".into() });
+        output.write(p2).await.unwrap();
+        assert_eq!(
+            output.inner.batch.lock().await.len(),
+            2,
+            "events must sit in the buffer (batch_size and timer both far away)"
+        );
+        // Server has nothing yet — neither write triggered a flush.
+        assert!(received.lock().await.is_empty());
+
+        output.shutdown().await.unwrap();
+
+        // Buffer drained.
+        assert_eq!(
+            output.inner.batch.lock().await.len(),
+            0,
+            "shutdown() must drain the buffer"
+        );
+
+        // And the request actually went out.
+        for _ in 0..50 {
+            if !received.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        server.abort();
+        let got = received.lock().await.clone();
+        assert_eq!(got.len(), 1, "shutdown flush must POST exactly once");
+        let body = &got[0];
+        assert!(
+            body.contains("ev1") && body.contains("ev2"),
+            "shutdown POST must carry the buffered events; got: {body}"
         );
     }
 }

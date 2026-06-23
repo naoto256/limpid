@@ -409,6 +409,14 @@ pub enum BackoffStrategy {
 #[async_trait::async_trait]
 pub trait OutputWriter: Send + Sync + 'static {
     async fn consume(&self, input: SinkInput) -> anyhow::Result<()>;
+
+    /// Drain any buffered events before the consumer stops. Forwarded
+    /// to the underlying `Output::shutdown` for `OutputWriterWrapper`;
+    /// default no-op for any future writer kind that holds no
+    /// internal buffer.
+    async fn shutdown(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Run a queue consumer that drains events and writes them to an output.
@@ -448,6 +456,15 @@ pub async fn run_queue_consumer(
                 }
             }
         }
+    }
+
+    // Batched sinks hold an in-memory buffer that queue-side `write()`
+    // has already counted as delivered. Drop alone would abort the
+    // flush timer and leak those events; tell the output to drain
+    // itself before we exit. Both break paths above (shutdown signal
+    // and queue-closed) come through here so the contract is uniform.
+    if let Err(e) = writer.shutdown().await {
+        warn!("output '{}': shutdown flush failed: {}", name, e);
     }
 
     info!("output '{}': queue consumer stopped", name);

@@ -370,6 +370,18 @@ impl Output for OtlpGrpcOutput {
         })
         .await
     }
+
+    async fn shutdown(&self) -> Result<()> {
+        // Same contract as `otlp_http::shutdown`: abort the timer to
+        // avoid a race for the buffer lock, then drain in one final
+        // send. Without this the queue consumer's shutdown call
+        // races the timer task, and either Drop's abort or the
+        // process exit can leave the in-flight buffer behind.
+        if let Some(h) = self.flush_handle.lock().await.take() {
+            h.abort();
+        }
+        self.flush().await
+    }
 }
 
 impl OtlpGrpcOutput {
@@ -1167,6 +1179,79 @@ mod tests {
         assert_eq!(batch_len, 0, "Owned event must not land in the batch");
         let timer_armed = output.flush_handle.lock().await.is_some();
         assert!(!timer_armed, "Owned event must not arm the flush timer");
+    }
+
+    #[tokio::test]
+    async fn shutdown_flushes_pending_batch_buffer() {
+        // Regression mirror of `output http` / `otlp_http`: when
+        // batch_size > 1 the queue-side `write()` returns Ok once
+        // the event is in the buffer, so the memory queue considers
+        // it delivered. If the daemon shuts down before the batch
+        // fills, Drop alone aborts the timer and leaks the buffer.
+        // `shutdown()` aborts the timer and runs one final flush.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let svc = RecordingLogs {
+            received: Arc::clone(&received),
+        };
+        let server = tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(LogsServiceServer::new(svc))
+                .serve_with_incoming(incoming)
+                .await;
+        });
+
+        let endpoint = format!("http://{}", addr);
+        let mut props = one_peer_props(&endpoint);
+        // Large batch + long timer: only shutdown drains the buffer.
+        props.push(prop_int("batch_size", 100));
+        props.push(prop_str("batch_timeout", "30s"));
+        let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
+
+        let arena_bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&arena_bump);
+        for ts in [1u64, 2u64] {
+            let ev = event_with_egress(singleton_bytes(ts));
+            let payload = output.render(&ev.view_in(&arena), &arena).unwrap();
+            output.write(payload).await.unwrap();
+        }
+        assert_eq!(
+            output.inner.batch.lock().await.len(),
+            2,
+            "writes must land in the buffer"
+        );
+
+        output.shutdown().await.unwrap();
+
+        assert_eq!(
+            output.inner.batch.lock().await.len(),
+            0,
+            "shutdown() must drain the buffer"
+        );
+
+        let probe = || {
+            let g = received.try_lock().ok()?;
+            if g.is_empty() { None } else { Some(g.clone()) }
+        };
+        let got = wait_for(probe).await;
+        server.abort();
+
+        assert_eq!(got.len(), 1, "shutdown flush must send exactly once");
+        let record_count: usize = got[0]
+            .resource_logs
+            .iter()
+            .flat_map(|rl| rl.scope_logs.iter())
+            .map(|sl| sl.log_records.len())
+            .sum();
+        assert_eq!(
+            record_count, 2,
+            "shutdown send must carry both buffered records"
+        );
     }
 
     #[tokio::test]
