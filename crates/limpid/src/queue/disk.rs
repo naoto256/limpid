@@ -138,18 +138,18 @@ pub fn create_disk_queue(
 }
 
 impl DiskQueueSender {
-    pub async fn send(&self, event: Event) -> bool {
+    pub async fn send(&self, event: Event) -> Result<(), super::QueueSendError> {
         let serialized = match serde_json::to_string(&event.to_json_value()) {
             Ok(s) => s,
             Err(e) => {
                 error!("disk queue: failed to serialize event: {}", e);
-                return false;
+                return Err(super::QueueSendError::Serialize(e));
             }
         };
 
         // Use spawn_blocking to avoid blocking the tokio worker thread
         let state = Arc::clone(&self.state);
-        let result = match tokio::task::spawn_blocking(move || {
+        let wrote = match tokio::task::spawn_blocking(move || {
             let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
             write_to_segment(&mut state, serialized.as_bytes())
         })
@@ -158,14 +158,19 @@ impl DiskQueueSender {
             Ok(ok) => ok,
             Err(e) => {
                 error!("disk queue: write task failed: {}", e);
-                false
+                return Err(super::QueueSendError::JoinError(e));
             }
         };
 
-        if result {
+        if wrote {
             self.notify.notify_one();
+            Ok(())
+        } else {
+            // `write_to_segment` already logged the specific I/O
+            // error (open/append/flush). Surface a single
+            // `DiskWrite` outcome to the caller.
+            Err(super::QueueSendError::DiskWrite)
         }
-        result
     }
 }
 
@@ -567,8 +572,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (tx, mut rx) = create_disk_queue(dir.path().to_str().unwrap(), 0).unwrap();
 
-        tx.send(make_event("<134>msg1")).await;
-        tx.send(make_event("<134>msg2")).await;
+        tx.send(make_event("<134>msg1")).await.unwrap();
+        tx.send(make_event("<134>msg2")).await.unwrap();
 
         let e1 = rx.recv().await.unwrap();
         assert_eq!(String::from_utf8_lossy(&e1.ingress), "<134>msg1");
@@ -588,8 +593,8 @@ mod tests {
             // Use blocking send via try approach
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                tx.send(make_event("<134>persist1")).await;
-                tx.send(make_event("<134>persist2")).await;
+                tx.send(make_event("<134>persist1")).await.unwrap();
+                tx.send(make_event("<134>persist2")).await.unwrap();
             });
         }
 
@@ -756,8 +761,8 @@ mod tests {
 
         {
             let (tx, mut rx) = create_disk_queue(path, 0).unwrap();
-            tx.send(make_event("<134>e1")).await;
-            tx.send(make_event("<134>e2")).await;
+            tx.send(make_event("<134>e1")).await.unwrap();
+            tx.send(make_event("<134>e2")).await.unwrap();
             // Receive e1 but don't ack — simulates a process that
             // started shipping it and crashed before completing.
             let e1 = rx.recv().await.unwrap();
@@ -789,8 +794,8 @@ mod tests {
 
         {
             let (tx, mut rx) = create_disk_queue(path, 0).unwrap();
-            tx.send(make_event("<134>e1")).await;
-            tx.send(make_event("<134>e2")).await;
+            tx.send(make_event("<134>e1")).await.unwrap();
+            tx.send(make_event("<134>e2")).await.unwrap();
             let e1 = rx.recv().await.unwrap();
             assert_eq!(String::from_utf8_lossy(&e1.ingress), "<134>e1");
             rx.ack();
@@ -817,7 +822,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
         let (tx, mut rx) = create_disk_queue(path, 0).unwrap();
-        tx.send(make_event("<134>only")).await;
+        tx.send(make_event("<134>only")).await.unwrap();
         let _ = rx.recv().await.unwrap();
         rx.ack();
         // Second ack with nothing new to commit must be a clean

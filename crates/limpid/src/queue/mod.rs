@@ -5,10 +5,13 @@
 //! - **Disk queue**: WAL-based, survives restarts, configurable max size
 
 pub mod disk;
+pub mod outcome;
 
 use std::sync::Arc;
 
 use tracing::{error, info, warn};
+
+pub use outcome::{QueueSendError, WriteDisposition};
 
 use crate::dsl::ast::Property;
 use crate::dsl::props;
@@ -225,9 +228,11 @@ impl QueueSender {
     /// statement; the `Rendered`-on-Disk arm here is a defence-in-depth
     /// log+drop so a programmer mistake elsewhere doesn't silently
     /// corrupt the persist path.
-    pub async fn send(&self, input: SinkInput) -> bool {
-        let ok = match (&self.inner, input) {
-            (SenderInner::Memory(tx), input) => tx.send(input).await.is_ok(),
+    pub async fn send(&self, input: SinkInput) -> Result<(), QueueSendError> {
+        let result: Result<(), QueueSendError> = match (&self.inner, input) {
+            (SenderInner::Memory(tx), input) => {
+                tx.send(input).await.map_err(|_| QueueSendError::ChannelClosed)
+            }
             (SenderInner::Disk(tx), SinkInput::Owned(ev)) => tx.send(ev).await,
             (SenderInner::Disk(_), SinkInput::Rendered(_)) => {
                 error!(
@@ -235,11 +240,11 @@ impl QueueSender {
                      — this is a programmer bug; dropping event",
                     self.name
                 );
-                false
+                Err(QueueSendError::RenderedOnDisk)
             }
         };
         if let Some(m) = &self.metrics {
-            if ok {
+            if result.is_ok() {
                 m.events_received
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             } else {
@@ -258,14 +263,14 @@ impl QueueSender {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
-        ok
+        result
     }
 
     /// Convenience: send an `OwnedEvent` regardless of queue kind.
     /// Used by the cold paths (control-socket inject, retry secondary)
     /// that already hold an owned event and don't go through the
     /// render path.
-    pub async fn send_owned(&self, event: Event) -> bool {
+    pub async fn send_owned(&self, event: Event) -> Result<(), QueueSendError> {
         self.send(SinkInput::Owned(event)).await
     }
 
@@ -481,7 +486,11 @@ pub async fn run_queue_consumer(
             input = receiver.recv() => {
                 match input {
                     Some(input) => {
-                        write_with_retry(writer.as_ref(), input, &retry_config, &secondary_sender, &name, &metrics, tap.as_ref()).await;
+                        // Disposition is intentionally ignored here:
+                        // delivered / routed-to-secondary / dropped
+                        // all ack-and-continue from this consumer's
+                        // POV. PR-O / PR-P will fan out on it.
+                        let _ = write_with_retry(writer.as_ref(), input, &retry_config, &secondary_sender, &name, &metrics, tap.as_ref()).await;
                         // Acknowledge the event regardless of
                         // disposition (delivered, routed to
                         // secondary, or retries exhausted): from
@@ -526,7 +535,9 @@ async fn drain_remaining(
 ) {
     let mut count = 0u64;
     while let Some(input) = receiver.try_recv() {
-        write_with_retry(
+        // Disposition ignored: same rationale as the steady-state
+        // loop — drain just needs to ack each event.
+        let _ = write_with_retry(
             writer,
             input,
             retry_config,
@@ -550,7 +561,8 @@ async fn drain_remaining(
     }
 }
 
-/// Returns true on success, false if event was dropped/sent to secondary.
+/// Returns a [`WriteDisposition`] indicating whether the event was
+/// delivered, routed to the secondary queue, or dropped.
 ///
 /// Retry semantics:
 /// - `SinkInput::Owned(event)` is cloneable, so each attempt re-runs the
@@ -569,7 +581,7 @@ async fn write_with_retry(
     name: &str,
     metrics: &crate::metrics::OutputMetrics,
     tap: Option<&crate::tap::TapRegistry>,
-) -> bool {
+) -> WriteDisposition {
     use std::sync::atomic::Ordering;
 
     // Fast-split: extract the optional Owned event (used for tap emit
@@ -597,7 +609,7 @@ async fn write_with_retry(
         };
         let is_owned = matches!(this, SinkInput::Owned(_));
         match writer.consume(this).await {
-            Ok(()) => return true,
+            Ok(()) => return WriteDisposition::Delivered,
             Err(e) => {
                 attempt += 1;
                 metrics.retries.fetch_add(1, Ordering::Relaxed);
@@ -616,8 +628,14 @@ async fn write_with_retry(
                     metrics.events_failed.fetch_add(1, Ordering::Relaxed);
                     if let Some(secondary) = secondary_sender {
                         if let Some(ev) = owned_for_retry.take() {
-                            if !secondary.send(SinkInput::Owned(ev)).await {
-                                error!("output '{}': secondary output also failed", name);
+                            match secondary.send(SinkInput::Owned(ev)).await {
+                                Ok(()) => return WriteDisposition::RoutedToSecondary,
+                                Err(err) => {
+                                    error!(
+                                        "output '{}': secondary output also failed: {}",
+                                        name, err
+                                    );
+                                }
                             }
                         } else {
                             error!(
@@ -628,7 +646,7 @@ async fn write_with_retry(
                     } else {
                         error!("output '{}': dropping event (no secondary)", name);
                     }
-                    return false;
+                    return WriteDisposition::Dropped;
                 }
                 warn!(
                     "output '{}': write failed (attempt {}/{}): {} — retrying in {:?}",
@@ -649,7 +667,9 @@ async fn write_with_retry(
             }
         }
     }
-    false
+    // Loop ran out of next-attempt inputs without a return — treated
+    // as dropped, matching the previous `false` fall-through.
+    WriteDisposition::Dropped
 }
 
 #[cfg(test)]
@@ -718,7 +738,7 @@ mod write_with_retry_tests {
     async fn owned_succeeds_on_first_attempt_counts_no_retries() {
         let w = ScriptedWriter::new(vec![Ok(())]);
         let m = fresh_metrics();
-        let ok = write_with_retry(
+        let disposition = write_with_retry(
             &w,
             SinkInput::Owned(owned_event()),
             &fast_cfg(3),
@@ -728,7 +748,7 @@ mod write_with_retry_tests {
             None,
         )
         .await;
-        assert!(ok);
+        assert_eq!(disposition, WriteDisposition::Delivered);
         assert_eq!(w.calls(), 1);
         assert_eq!(m.retries.load(Ordering::Relaxed), 0);
         assert_eq!(m.events_failed.load(Ordering::Relaxed), 0);
@@ -742,7 +762,7 @@ mod write_with_retry_tests {
             Ok(()),
         ]);
         let m = fresh_metrics();
-        let ok = write_with_retry(
+        let disposition = write_with_retry(
             &w,
             SinkInput::Owned(owned_event()),
             &fast_cfg(5),
@@ -752,7 +772,7 @@ mod write_with_retry_tests {
             None,
         )
         .await;
-        assert!(ok);
+        assert_eq!(disposition, WriteDisposition::Delivered);
         assert_eq!(w.calls(), 3, "expected 1 + 2 retries");
         assert_eq!(m.retries.load(Ordering::Relaxed), 2);
         assert_eq!(m.events_failed.load(Ordering::Relaxed), 0);
@@ -766,7 +786,7 @@ mod write_with_retry_tests {
             Err(anyhow::anyhow!("permanent")),
         ]);
         let m = fresh_metrics();
-        let ok = write_with_retry(
+        let disposition = write_with_retry(
             &w,
             SinkInput::Owned(owned_event()),
             &fast_cfg(3),
@@ -776,7 +796,8 @@ mod write_with_retry_tests {
             None,
         )
         .await;
-        assert!(!ok);
+        // No secondary configured -> Dropped.
+        assert_eq!(disposition, WriteDisposition::Dropped);
         assert_eq!(w.calls(), 3);
         assert_eq!(m.events_failed.load(Ordering::Relaxed), 1);
         assert_eq!(m.retries.load(Ordering::Relaxed), 3);
@@ -793,7 +814,7 @@ mod write_with_retry_tests {
         // has nothing left to consume.
         let w = ScriptedWriter::new(vec![Err(anyhow::anyhow!("nope"))]);
         let m = fresh_metrics();
-        let ok = write_with_retry(
+        let disposition = write_with_retry(
             &w,
             rendered_event(),
             &fast_cfg(5), // 5 allowed but only 1 attempt should happen
@@ -803,7 +824,7 @@ mod write_with_retry_tests {
             None,
         )
         .await;
-        assert!(!ok);
+        assert_eq!(disposition, WriteDisposition::Dropped);
         assert_eq!(
             w.calls(),
             1,
@@ -831,7 +852,7 @@ mod write_with_retry_tests {
         )
         .unwrap();
         let secondary = Some(sec_tx);
-        let ok = write_with_retry(
+        let disposition = write_with_retry(
             &w,
             SinkInput::Owned(owned_event()),
             &fast_cfg(2),
@@ -841,7 +862,7 @@ mod write_with_retry_tests {
             None,
         )
         .await;
-        assert!(!ok);
+        assert_eq!(disposition, WriteDisposition::RoutedToSecondary);
         let routed = sec_rx.try_recv();
         assert!(
             matches!(routed, Some(SinkInput::Owned(_))),
@@ -882,5 +903,124 @@ mod write_with_retry_tests {
         .await;
         assert!(sec_rx.try_recv().is_none(), "Rendered must NOT route");
         assert_eq!(m.events_failed.load(Ordering::Relaxed), 1);
+    }
+
+    // ---- type-encoded outcome contract (PR-L) ----
+
+    #[tokio::test]
+    async fn rendered_exhausted_with_secondary_yields_dropped() {
+        // Rendered cannot be routed even when a secondary is
+        // configured — the original payload was consumed. The
+        // disposition must be `Dropped`, NOT `RoutedToSecondary`.
+        let w = ScriptedWriter::new(vec![Err(anyhow::anyhow!("rendered fail"))]);
+        let m = fresh_metrics();
+        let (sec_tx, _sec_rx) = create_queue(
+            "secondary".into(),
+            QueueConfig {
+                queue_type: QueueType::Memory,
+                capacity: 8,
+                overflow: OverflowStrategy::Block,
+            },
+        )
+        .unwrap();
+        let disposition = write_with_retry(
+            &w,
+            rendered_event(),
+            &fast_cfg(5),
+            &Some(sec_tx),
+            "primary",
+            &m,
+            None,
+        )
+        .await;
+        assert_eq!(disposition, WriteDisposition::Dropped);
+    }
+
+    #[tokio::test]
+    async fn secondary_send_failure_yields_dropped() {
+        // Owned event exhausts retries with a secondary configured —
+        // but the secondary's receiver is dropped first, so the
+        // secondary send itself fails. Disposition must collapse to
+        // `Dropped` (not `RoutedToSecondary`), preserving the
+        // historical bool=false behaviour while distinguishing it
+        // from the happy fallback path.
+        let w = ScriptedWriter::new(vec![Err(anyhow::anyhow!("e1")), Err(anyhow::anyhow!("e2"))]);
+        let m = fresh_metrics();
+        let (sec_tx, sec_rx) = create_queue(
+            "secondary".into(),
+            QueueConfig {
+                queue_type: QueueType::Memory,
+                capacity: 8,
+                overflow: OverflowStrategy::Block,
+            },
+        )
+        .unwrap();
+        drop(sec_rx); // close the secondary channel
+        let disposition = write_with_retry(
+            &w,
+            SinkInput::Owned(owned_event()),
+            &fast_cfg(2),
+            &Some(sec_tx),
+            "primary",
+            &m,
+            None,
+        )
+        .await;
+        assert_eq!(disposition, WriteDisposition::Dropped);
+    }
+
+    #[tokio::test]
+    async fn queue_sender_send_returns_channel_closed_when_receiver_dropped() {
+        // Memory queue with a dropped receiver — send must surface
+        // QueueSendError::ChannelClosed, not silently succeed.
+        let (tx, rx) = create_queue(
+            "mem".into(),
+            QueueConfig {
+                queue_type: QueueType::Memory,
+                capacity: 4,
+                overflow: OverflowStrategy::Block,
+            },
+        )
+        .unwrap();
+        drop(rx);
+        let err = tx
+            .send(SinkInput::Owned(owned_event()))
+            .await
+            .expect_err("send to closed memory channel must fail");
+        assert!(
+            matches!(err, QueueSendError::ChannelClosed),
+            "expected ChannelClosed, got {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_sender_send_returns_rendered_on_disk_when_misrouted() {
+        // Routing a Rendered payload to a disk queue is a programmer
+        // bug — the disk sink only accepts serialisable Owned events.
+        // The send must return QueueSendError::RenderedOnDisk so the
+        // pipeline-level DLQ path is taken.
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = create_queue(
+            "disk".into(),
+            QueueConfig {
+                queue_type: QueueType::Disk {
+                    path: dir.path().to_string_lossy().into_owned(),
+                    max_size: 0,
+                },
+                capacity: 4,
+                overflow: OverflowStrategy::Block,
+            },
+        )
+        .unwrap();
+        let err = tx
+            .send(rendered_event())
+            .await
+            .expect_err("Rendered-on-Disk must fail");
+        assert!(
+            matches!(err, QueueSendError::RenderedOnDisk),
+            "expected RenderedOnDisk, got {:?}",
+            err
+        );
     }
 }
