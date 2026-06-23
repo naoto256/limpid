@@ -261,6 +261,27 @@ pub fn check_types(
                 diagnostics,
             );
         }
+        ExprKind::SwitchExpr { arms, .. } => {
+            // Recurse into the scrutinee and each arm's pattern/body
+            // via the generic walker, then run the default-position
+            // check at this node. Sibling pipeline/process `switch`
+            // statements get the same check in
+            // `check::control_flow::analyze_switch` /
+            // `analyze_inline_switch`, and function bodies route
+            // through `check::function::walk_for_purity` which calls
+            // the same helper.
+            walk_children(expr, |child| {
+                check_types(
+                    child,
+                    pipeline_name,
+                    bindings,
+                    registry,
+                    fallback_span,
+                    diagnostics,
+                )
+            });
+            super::control_flow::validate_switch_default_position(arms, pipeline_name, diagnostics);
+        }
         // Everything else is plain recursion — no node-local check
         // beyond visiting children.
         _ => walk_children(expr, |child| {
@@ -577,3 +598,4 @@ fn warning(pipeline: &str, message: String, span: Option<Span>) -> Diagnostic {
         help: None,
     }
 }
+
