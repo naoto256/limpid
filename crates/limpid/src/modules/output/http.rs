@@ -64,7 +64,7 @@ use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::{BorrowedEvent, Event};
 use crate::metrics::OutputMetrics;
-use crate::modules::output::http_util::{ERROR_BODY_BYTE_CAP, read_body_capped};
+use crate::modules::output::http_util::{ERROR_BODY_BYTE_CAP, error_snippet};
 use crate::modules::output::syslog_peers::{PEER_COOLDOWN, iter_peers_block};
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
 use crate::tls::ClientTlsConfig;
@@ -624,12 +624,14 @@ async fn send_once(peer: &HttpPeer, inner: &Inner, body: &[u8]) -> Result<()> {
 
     let status = response.status();
     if !status.is_success() {
-        let raw = read_body_capped(response, ERROR_BODY_BYTE_CAP).await;
-        // The cap is in bytes; UTF-8 boundary handling falls out of
-        // `from_utf8_lossy`. We then trim to 200 chars for the log
-        // line so the message stays readable even when the peer
-        // returned the full 4 KiB of diagnostic.
-        let snippet: String = String::from_utf8_lossy(&raw).chars().take(200).collect();
+        // `error_snippet` byte-caps the body via `read_body_capped`,
+        // then trims to 200 chars on the lossy decode for a readable
+        // log line; if the peer advertises a Content-Encoding limpid
+        // doesn't decode (gzip / brotli / deflate are all off in our
+        // reqwest build), it substitutes a `<gzip-encoded body, N
+        // bytes>` placeholder so the daemon log doesn't fill with
+        // replacement-char soup.
+        let snippet = error_snippet(response, ERROR_BODY_BYTE_CAP, 200).await;
         anyhow::bail!("http output: {} returned {} — {}", peer.url, status, snippet);
     }
 
@@ -1066,6 +1068,55 @@ mod tests {
             &msg[..msg.len().min(80)]
         );
         assert!(msg.contains("returned 500"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn error_body_with_unsupported_content_encoding_renders_placeholder() {
+        // limpid's reqwest is built without gzip/brotli/deflate
+        // decompression, so a peer that advertises Content-Encoding:
+        // gzip on its error body returns still-compressed bytes from
+        // `Response::chunk()`. Running `from_utf8_lossy` over that
+        // produces a daemon log line full of � replacement chars.
+        // `error_snippet` substitutes a placeholder noting the
+        // encoding + byte count so the log stays readable.
+        use axum::{
+            Router,
+            http::{HeaderValue, StatusCode, header::CONTENT_ENCODING},
+            response::IntoResponse,
+            routing::post,
+        };
+
+        async fn handle() -> impl IntoResponse {
+            // Bytes that look superficially binary; the exact contents
+            // don't matter, we're asserting on the rendering path.
+            let body: Vec<u8> = (0u8..=200).collect();
+            let mut resp = (StatusCode::BAD_GATEWAY, body).into_response();
+            resp.headers_mut()
+                .insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+            resp
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/", post(handle));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let url = format!("http://{}/", addr);
+        let props = vec![peer_block(&url), prop_int("batch_size", 1)];
+        let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
+        let err = output
+            .write_owned(&event_with("hello"))
+            .await
+            .expect_err("502 must surface as Err");
+        server.abort();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gzip-encoded body"),
+            "must show placeholder, got: {msg}"
+        );
+        assert!(msg.contains("returned 502"), "got: {msg}");
     }
 
     #[tokio::test]

@@ -60,7 +60,7 @@ use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::{BorrowedEvent, Event};
 use crate::metrics::OutputMetrics;
-use crate::modules::output::http_util::{ERROR_BODY_BYTE_CAP, read_body_capped};
+use crate::modules::output::http_util::{ERROR_BODY_BYTE_CAP, error_snippet};
 use crate::modules::output::syslog_peers::{PEER_COOLDOWN, iter_peers_block};
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
 use crate::queue::{BackoffStrategy, RetryConfig};
@@ -644,12 +644,11 @@ async fn send_once(peer: &HttpPeer, inner: &Inner, req: &ExportLogsServiceReques
         .with_context(|| format!("output otlp_http: POST {} failed", peer.endpoint))?;
     let status = resp.status();
     if !status.is_success() {
-        let raw = read_body_capped(resp, ERROR_BODY_BYTE_CAP).await;
-        // The cap is in bytes; UTF-8 boundary handling falls out of
-        // `from_utf8_lossy`. We then trim to 500 chars for the log
-        // line so the message stays readable even when the peer
-        // returned the full 4 KiB of diagnostic.
-        let snippet: String = String::from_utf8_lossy(&raw).chars().take(500).collect();
+        // 4 KiB byte cap, 500 chars on the lossy decode for the log
+        // line; gzip / brotli / deflate get a placeholder so the
+        // daemon log doesn't fill with replacement-char soup (limpid's
+        // reqwest is built without those decompression features).
+        let snippet = error_snippet(resp, ERROR_BODY_BYTE_CAP, 500).await;
         bail!(
             "output otlp_http: {} returned HTTP {} — {}",
             peer.endpoint,
