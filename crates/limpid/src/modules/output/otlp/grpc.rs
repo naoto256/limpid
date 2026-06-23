@@ -49,7 +49,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, logs_service_client::LogsServiceClient,
@@ -201,6 +201,20 @@ fn parse_peer(name: &str, peer_props: &[Property]) -> Result<GrpcPeer> {
         .ok_or_else(|| anyhow!("output '{}': otlp_grpc peer requires 'endpoint'", name))?;
 
     let tls_block = props::get_block(peer_props, "tls");
+    if tls_block.is_some() && !endpoint.to_ascii_lowercase().starts_with("https://") {
+        // A `tls { ... }` block on a plaintext (http:// or
+        // scheme-less) endpoint is almost always an operator
+        // error: tonic only engages the TLS layer when the URI
+        // scheme is https, so the configured CA / client identity
+        // is silently dropped and the daemon ships gRPC in clear
+        // text. Refuse at parse time so the misconfiguration is
+        // visible. Mirrors the matching guard in `output otlp_http`.
+        bail!(
+            "output '{}': otlp_grpc peer endpoint '{}' uses a plaintext scheme but a tls {{ ... }} block was supplied — switch the endpoint to https:// or drop the tls block",
+            name,
+            endpoint
+        );
+    }
     let tls_cfg = tls_block
         .map(|block| {
             let cfg = crate::tls::ClientTlsConfig {
@@ -655,6 +669,57 @@ mod tests {
         let output =
             OtlpGrpcOutput::from_properties("o", &mp(&one_peer_props("http://localhost:4317")))
                 .unwrap();
+        assert_eq!(output.inner.peers.len(), 1);
+    }
+
+    #[test]
+    fn rejects_tls_block_on_plaintext_endpoint() {
+        // `tls { ... }` on an `http://` endpoint is almost always an
+        // operator error — tonic only engages TLS when the URI scheme
+        // is https, so the configured CA / client identity would be
+        // silently dropped and the daemon would ship gRPC in clear
+        // text. Fail fast at parse time. Mirrors the matching guard
+        // in `output otlp_http`.
+        let props = vec![peers_block_with(vec![Property::Block {
+            key: "peer".into(),
+            key_span: None,
+            properties: vec![
+                prop_str("endpoint", "http://collector.example.com:4317"),
+                Property::Block {
+                    key: "tls".into(),
+                    key_span: None,
+                    properties: vec![prop_str("ca", "/etc/ca.pem")],
+                },
+            ],
+        }])];
+        let err = OtlpGrpcOutput::from_properties("o", &mp(&props))
+            .err()
+            .unwrap();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("plaintext") && msg.contains("https://"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_empty_tls_block_on_https_endpoint() {
+        // Regression guard for the plaintext-rejection check: https://
+        // endpoints must still accept a (here empty) tls block. Empty
+        // block keeps the test off-disk; the scheme check runs first.
+        let props = vec![peers_block_with(vec![Property::Block {
+            key: "peer".into(),
+            key_span: None,
+            properties: vec![
+                prop_str("endpoint", "https://collector.example.com:4317"),
+                Property::Block {
+                    key: "tls".into(),
+                    key_span: None,
+                    properties: vec![],
+                },
+            ],
+        }])];
+        let output = OtlpGrpcOutput::from_properties("o", &mp(&props)).unwrap();
         assert_eq!(output.inner.peers.len(), 1);
     }
 
