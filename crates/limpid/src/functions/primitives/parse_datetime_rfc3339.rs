@@ -59,10 +59,7 @@ pub fn register(reg: &mut FunctionRegistry) {
             match chrono::DateTime::parse_from_rfc3339(&text) {
                 Ok(dt) => Ok(Value::Timestamp(dt.with_timezone(&Utc))),
                 Err(rfc_err) => {
-                    match chrono::DateTime::parse_from_str(
-                        &text,
-                        "%Y-%m-%dT%H:%M:%S%.f%z",
-                    ) {
+                    match chrono::DateTime::parse_from_str(&text, "%Y-%m-%dT%H:%M:%S%.f%z") {
                         Ok(dt) => Ok(Value::Timestamp(dt.with_timezone(&Utc))),
                         Err(_) => bail!(
                             "parse_datetime_rfc3339(): could not parse '{}': {}",
@@ -80,19 +77,16 @@ pub fn register(reg: &mut FunctionRegistry) {
 mod tests {
     use super::*;
     use anyhow::Result;
-    
 
     fn parse_one(s: &str) -> Result<Value<'static>> {
         // Mirrors the primitive's fallback chain so the unit tests
         // exercise the same surface operators rely on at runtime.
         match chrono::DateTime::parse_from_rfc3339(s) {
             Ok(dt) => Ok(Value::Timestamp(dt.with_timezone(&Utc))),
-            Err(rfc_err) => {
-                match chrono::DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%z") {
-                    Ok(dt) => Ok(Value::Timestamp(dt.with_timezone(&Utc))),
-                    Err(_) => Err(rfc_err.into()),
-                }
-            }
+            Err(rfc_err) => match chrono::DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%z") {
+                Ok(dt) => Ok(Value::Timestamp(dt.with_timezone(&Utc))),
+                Err(_) => Err(rfc_err.into()),
+            },
         }
     }
 
@@ -150,7 +144,10 @@ mod tests {
         let v = parse_one("2026-04-30T01:23:45.123456789Z").unwrap();
         match v {
             Value::Timestamp(dt) => {
-                assert_eq!(dt.timestamp_nanos_opt().unwrap() % 1_000_000_000, 123_456_789);
+                assert_eq!(
+                    dt.timestamp_nanos_opt().unwrap() % 1_000_000_000,
+                    123_456_789
+                );
             }
             _ => panic!("expected Timestamp"),
         }

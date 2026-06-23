@@ -619,11 +619,7 @@ mod write_with_retry_tests {
         async fn consume(&self, _input: SinkInput) -> anyhow::Result<()> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             let mut s = self.script.lock().unwrap();
-            if s.is_empty() {
-                Ok(())
-            } else {
-                s.remove(0)
-            }
+            if s.is_empty() { Ok(()) } else { s.remove(0) }
         }
     }
 
@@ -742,7 +738,12 @@ mod write_with_retry_tests {
         )
         .await;
         assert!(!ok);
-        assert_eq!(w.calls(), 1, "Rendered must NOT retry, got {} calls", w.calls());
+        assert_eq!(
+            w.calls(),
+            1,
+            "Rendered must NOT retry, got {} calls",
+            w.calls()
+        );
         assert_eq!(m.events_failed.load(Ordering::Relaxed), 1);
     }
 
@@ -752,10 +753,7 @@ mod write_with_retry_tests {
         // secondary queue. A regression that dropped the secondary
         // routing or swapped the secondary->primary direction would
         // make the secondary silently dead.
-        let w = ScriptedWriter::new(vec![
-            Err(anyhow::anyhow!("e1")),
-            Err(anyhow::anyhow!("e2")),
-        ]);
+        let w = ScriptedWriter::new(vec![Err(anyhow::anyhow!("e1")), Err(anyhow::anyhow!("e2"))]);
         let m = fresh_metrics();
         let (sec_tx, mut sec_rx) = create_queue(
             "secondary".into(),

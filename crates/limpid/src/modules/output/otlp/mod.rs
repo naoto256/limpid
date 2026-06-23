@@ -336,7 +336,12 @@ mod tests {
 
     /// Helper: same-resource singleton with an explicit Resource-level
     /// schema_url so the schema-url merge rule can be exercised.
-    fn singleton_with_schema(svc: &str, scope: &str, t: u64, resource_schema: &str) -> ResourceLogs {
+    fn singleton_with_schema(
+        svc: &str,
+        scope: &str,
+        t: u64,
+        resource_schema: &str,
+    ) -> ResourceLogs {
         let mut rl = singleton(svc, scope, t);
         rl.schema_url = resource_schema.to_string();
         rl
@@ -353,7 +358,11 @@ mod tests {
             singleton_with_schema("svc-a", "scope-1", 2, "https://schemas.example.com/v2"),
         ];
         let req = merge_by_resource(input);
-        assert_eq!(req.resource_logs.len(), 2, "different schema_urls must stay distinct");
+        assert_eq!(
+            req.resource_logs.len(),
+            2,
+            "different schema_urls must stay distinct"
+        );
         let urls: Vec<&str> = req
             .resource_logs
             .iter()
@@ -375,7 +384,10 @@ mod tests {
         ];
         let req = merge_by_resource(input);
         assert_eq!(req.resource_logs.len(), 1);
-        assert_eq!(req.resource_logs[0].schema_url, "https://schemas.example.com/v1");
+        assert_eq!(
+            req.resource_logs[0].schema_url,
+            "https://schemas.example.com/v1"
+        );
         assert_eq!(req.resource_logs[0].scope_logs.len(), 2);
     }
 
@@ -388,7 +400,10 @@ mod tests {
         ];
         let req = merge_by_resource(input);
         assert_eq!(req.resource_logs.len(), 1);
-        assert_eq!(req.resource_logs[0].schema_url, "https://schemas.example.com/v1");
+        assert_eq!(
+            req.resource_logs[0].schema_url,
+            "https://schemas.example.com/v1"
+        );
     }
 
     #[test]

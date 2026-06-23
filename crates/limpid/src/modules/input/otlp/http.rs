@@ -169,7 +169,8 @@ impl Module for OtlpHttpInput {
 
     fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
         let properties = properties.user_properties();
-        let tls_config = TlsConfig::from_properties_block(&format!("input '{}'", name), properties)?;
+        let tls_config =
+            TlsConfig::from_properties_block(&format!("input '{}'", name), properties)?;
         // Install the rustls crypto provider before we ever assemble a
         // ServerConfig. Only paid when TLS is actually configured.
         if tls_config.is_some() {
@@ -580,10 +581,7 @@ mod tests {
             "o",
             &mp(&[prop_block(
                 "tls",
-                vec![
-                    prop_str("cert", &files.cert),
-                    prop_str("key", &files.key),
-                ],
+                vec![prop_str("cert", &files.cert), prop_str("key", &files.key)],
             )]),
         )
         .unwrap();

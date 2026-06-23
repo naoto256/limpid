@@ -204,14 +204,8 @@ mod tests {
         arena: &'bump EventArena<'bump>,
         line: &'bump str,
     ) -> Value<'bump> {
-        reg.call(
-            Some("cef"),
-            "parse",
-            &[Value::String(line)],
-            bevent,
-            arena,
-        )
-        .expect("parse should succeed")
+        reg.call(Some("cef"), "parse", &[Value::String(line)], bevent, arena)
+            .expect("parse should succeed")
     }
 
     #[test]
@@ -227,9 +221,18 @@ mod tests {
             panic!("expected Object");
         };
         assert_eq!(lookup(entries, "version"), Some(Value::String("0")));
-        assert_eq!(lookup(entries, "device_vendor"), Some(Value::String("ArcSight")));
-        assert_eq!(lookup(entries, "device_product"), Some(Value::String("Console")));
-        assert_eq!(lookup(entries, "device_version"), Some(Value::String("6.9")));
+        assert_eq!(
+            lookup(entries, "device_vendor"),
+            Some(Value::String("ArcSight"))
+        );
+        assert_eq!(
+            lookup(entries, "device_product"),
+            Some(Value::String("Console"))
+        );
+        assert_eq!(
+            lookup(entries, "device_version"),
+            Some(Value::String("6.9"))
+        );
         assert_eq!(lookup(entries, "signature_id"), Some(Value::String("13")));
         assert_eq!(lookup(entries, "name"), Some(Value::String("alert raised")));
         assert_eq!(lookup(entries, "severity"), Some(Value::Int(3)));
@@ -321,14 +324,16 @@ mod tests {
         let owned = dummy_event();
         let bevent = owned.view_in(&arena);
         let reg = make_registry();
-        let line = arena.alloc_str(
-            "CEF:0|V|P|1.0|sig|name|3|msg=Failed login attempt user=alice src=10.0.0.1",
-        );
+        let line = arena
+            .alloc_str("CEF:0|V|P|1.0|sig|name|3|msg=Failed login attempt user=alice src=10.0.0.1");
         let v = parse_into(&reg, &bevent, &arena, line);
         let Value::Object(entries) = v else {
             panic!("expected Object");
         };
-        assert_eq!(lookup(entries, "msg"), Some(Value::String("Failed login attempt")));
+        assert_eq!(
+            lookup(entries, "msg"),
+            Some(Value::String("Failed login attempt"))
+        );
         assert_eq!(lookup(entries, "user"), Some(Value::String("alice")));
         assert_eq!(lookup(entries, "src"), Some(Value::String("10.0.0.1")));
     }
@@ -451,15 +456,17 @@ mod tests {
         let owned = dummy_event();
         let bevent = owned.view_in(&arena);
         let reg = make_registry();
-        let line = arena.alloc_str(
-            "CEF:0|V|P|1.0|sig|name|3|vendor_field=v1 cs1Label=Source IP cs1=10.0.0.1",
-        );
+        let line = arena
+            .alloc_str("CEF:0|V|P|1.0|sig|name|3|vendor_field=v1 cs1Label=Source IP cs1=10.0.0.1");
         let v = parse_into(&reg, &bevent, &arena, line);
         let Value::Object(entries) = v else {
             panic!("expected Object");
         };
         assert_eq!(lookup(entries, "vendor_field"), Some(Value::String("v1")));
-        assert_eq!(lookup(entries, "cs1Label"), Some(Value::String("Source IP")));
+        assert_eq!(
+            lookup(entries, "cs1Label"),
+            Some(Value::String("Source IP"))
+        );
         assert_eq!(lookup(entries, "cs1"), Some(Value::String("10.0.0.1")));
     }
 
@@ -482,9 +489,7 @@ mod tests {
         let bevent = owned.view_in(&arena);
         let reg = make_registry();
         // 7 fields; the `name` field contains an escaped pipe.
-        let line = arena.alloc_str(
-            "CEF:0|V|P|1.0|sig|deny\\|drop|3|act=block",
-        );
+        let line = arena.alloc_str("CEF:0|V|P|1.0|sig|deny\\|drop|3|act=block");
         let v = parse_into(&reg, &bevent, &arena, line);
         // Just verify parse succeeded and produced an Object — the
         // exact name value depends on whether the parser unescapes.
@@ -512,9 +517,8 @@ mod tests {
         let owned = dummy_event();
         let bevent = owned.view_in(&arena);
         let reg = make_registry();
-        let line = arena.alloc_str(
-            "CEF:0|V|P|1.0|sig|name|3|src=10.0.0.1 src=10.0.0.2 dst=8.8.8.8",
-        );
+        let line =
+            arena.alloc_str("CEF:0|V|P|1.0|sig|name|3|src=10.0.0.1 src=10.0.0.2 dst=8.8.8.8");
         let v = parse_into(&reg, &bevent, &arena, line);
         let Value::Object(entries) = v else {
             panic!("expected Object");

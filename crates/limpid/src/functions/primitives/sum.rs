@@ -89,7 +89,11 @@ mod tests {
     #[test]
     fn sums_integers() {
         let bump = Bump::new();
-        let v = run(&bump, arr(&bump, &[Value::Int(1), Value::Int(2), Value::Int(3)])).unwrap();
+        let v = run(
+            &bump,
+            arr(&bump, &[Value::Int(1), Value::Int(2), Value::Int(3)]),
+        )
+        .unwrap();
         assert_eq!(v, Value::Int(6));
     }
 
@@ -129,7 +133,10 @@ mod tests {
         let bump = Bump::new();
         let v = arr(&bump, &[Value::Int(1), Value::String("nope")]);
         let err = run(&bump, v).err().unwrap();
-        assert!(err.to_string().contains("expects numeric elements"), "{err}");
+        assert!(
+            err.to_string().contains("expects numeric elements"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -168,7 +175,10 @@ mod tests {
         let bump = Bump::new();
         let v = run(
             &bump,
-            arr(&bump, &[Value::Float(1.5), Value::Float(2.25), Value::Float(0.25)]),
+            arr(
+                &bump,
+                &[Value::Float(1.5), Value::Float(2.25), Value::Float(0.25)],
+            ),
         )
         .unwrap();
         assert_eq!(v, Value::Float(4.0));
@@ -221,7 +231,10 @@ mod tests {
         // the input means the operator wants to know the input was
         // dirty, not that it should be silently dropped.
         let bump = Bump::new();
-        let v = arr(&bump, &[Value::Float(1.0), Value::Float(f64::NAN), Value::Float(2.0)]);
+        let v = arr(
+            &bump,
+            &[Value::Float(1.0), Value::Float(f64::NAN), Value::Float(2.0)],
+        );
         let result = run(&bump, v).unwrap();
         match result {
             Value::Float(f) => assert!(f.is_nan(), "got {f}"),
@@ -235,6 +248,9 @@ mod tests {
         let v = arr(&bump, &[Value::Int(i64::MAX), Value::Int(1)]);
         let err = run(&bump, v).err().unwrap();
         let msg = err.to_string();
-        assert!(msg.contains("multiply by 1.0"), "remediation hint missing: {msg}");
+        assert!(
+            msg.contains("multiply by 1.0"),
+            "remediation hint missing: {msg}"
+        );
     }
 }

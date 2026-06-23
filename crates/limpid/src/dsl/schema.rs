@@ -1078,10 +1078,7 @@ mod tests {
         // specific error: "expects an identifier".
         let errs = validate(&[kv("tls", ExprKind::StringLit("profile_a".into()))], S);
         assert_eq!(errs.len(), 1, "{errs:?}");
-        assert!(matches!(
-            errs[0].kind,
-            SchemaErrorKind::TypeMismatch { .. }
-        ));
+        assert!(matches!(errs[0].kind, SchemaErrorKind::TypeMismatch { .. }));
         let rendered = errs[0].to_string();
         assert!(
             rendered.contains("identifier"),
@@ -1103,10 +1100,7 @@ mod tests {
             required: false,
             repeatable: false,
             exclusive_group: None,
-            kind: PropertyValueKind::OneOf(&[
-                PropertyValueKind::String,
-                PropertyValueKind::Int,
-            ]),
+            kind: PropertyValueKind::OneOf(&[PropertyValueKind::String, PropertyValueKind::Int]),
         }];
         let errs = validate(&[kv("x", ExprKind::BoolLit(true))], S);
         assert_eq!(errs.len(), 1, "{errs:?}");
@@ -1179,10 +1173,7 @@ mod tests {
             S,
         );
         assert_eq!(errs.len(), 1, "{errs:?}");
-        assert!(matches!(
-            errs[0].kind,
-            SchemaErrorKind::MissingRequired
-        ));
+        assert!(matches!(errs[0].kind, SchemaErrorKind::MissingRequired));
         assert_eq!(errs[0].key, "cert");
     }
 

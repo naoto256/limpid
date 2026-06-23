@@ -380,7 +380,9 @@ mod tests {
         };
         let err = build_server_config(&cfg).await.expect_err("must fail");
         assert!(
-            err.to_string().to_ascii_lowercase().contains("server config")
+            err.to_string()
+                .to_ascii_lowercase()
+                .contains("server config")
                 || err.to_string().to_ascii_lowercase().contains("key"),
             "expected pairing-rejection error, got: {err}"
         );
@@ -429,10 +431,7 @@ mod tests {
             key_path: None,
         };
         let err = build_client_config_sync(&cfg).expect_err("must fail");
-        assert!(
-            err.to_string().contains("cert and key"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("cert and key"), "got: {err}");
     }
 
     #[test]

@@ -83,7 +83,9 @@ fn parse_impl<'bump>(
 
     if let Some(v) = args.get(1) {
         match v {
-            Value::Object(_) | Value::Null => apply_defaults(arena, "syslog.parse", Some(v), parsed),
+            Value::Object(_) | Value::Null => {
+                apply_defaults(arena, "syslog.parse", Some(v), parsed)
+            }
             other => bail!(
                 "syslog.parse(): second argument must be a hash literal, got {}",
                 type_name(other)
@@ -261,7 +263,6 @@ fn nth_space(input: &str, n: usize) -> Option<usize> {
     None
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,9 +317,8 @@ mod tests {
         let owned = dummy_event();
         let bevent = owned.view_in(&arena);
         let reg = make_registry();
-        let line = arena.alloc_str(
-            "<134>1 2026-04-15T10:30:00Z firewall01 sshd 1234 - - Failed password",
-        );
+        let line =
+            arena.alloc_str("<134>1 2026-04-15T10:30:00Z firewall01 sshd 1234 - - Failed password");
         let v = parse_into(&reg, &bevent, &arena, line);
         let Value::Object(entries) = v else {
             panic!("expected Object");
@@ -331,10 +331,16 @@ mod tests {
             lookup(entries, "timestamp"),
             Some(Value::String("2026-04-15T10:30:00Z"))
         );
-        assert_eq!(lookup(entries, "hostname"), Some(Value::String("firewall01")));
+        assert_eq!(
+            lookup(entries, "hostname"),
+            Some(Value::String("firewall01"))
+        );
         assert_eq!(lookup(entries, "appname"), Some(Value::String("sshd")));
         assert_eq!(lookup(entries, "procid"), Some(Value::String("1234")));
-        assert_eq!(lookup(entries, "msg"), Some(Value::String("Failed password")));
+        assert_eq!(
+            lookup(entries, "msg"),
+            Some(Value::String("Failed password"))
+        );
     }
 
     #[test]
@@ -344,9 +350,7 @@ mod tests {
         let owned = dummy_event();
         let bevent = owned.view_in(&arena);
         let reg = make_registry();
-        let line = arena.alloc_str(
-            "<134>Apr 15 10:30:00 myhost sshd[1234]: Failed password",
-        );
+        let line = arena.alloc_str("<134>Apr 15 10:30:00 myhost sshd[1234]: Failed password");
         let v = parse_into(&reg, &bevent, &arena, line);
         let Value::Object(entries) = v else {
             panic!("expected Object");
@@ -371,19 +375,14 @@ mod tests {
         let owned = dummy_event();
         let bevent = owned.view_in(&arena);
         let reg = make_registry();
-        let line = arena.alloc_str(
-            "<134>Apr 15 10:30:00 myhost kernel: Out of memory",
-        );
+        let line = arena.alloc_str("<134>Apr 15 10:30:00 myhost kernel: Out of memory");
         let v = parse_into(&reg, &bevent, &arena, line);
         let Value::Object(entries) = v else {
             panic!("expected Object");
         };
         assert_eq!(lookup(entries, "hostname"), Some(Value::String("myhost")));
         assert_eq!(lookup(entries, "appname"), Some(Value::String("kernel")));
-        assert_eq!(
-            lookup(entries, "msg"),
-            Some(Value::String("Out of memory"))
-        );
+        assert_eq!(lookup(entries, "msg"), Some(Value::String("Out of memory")));
     }
 
     #[test]

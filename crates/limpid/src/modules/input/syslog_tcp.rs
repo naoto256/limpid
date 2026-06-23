@@ -166,7 +166,8 @@ impl Module for SyslogTcpInput {
         properties: &crate::modules::ModuleProperties,
     ) -> anyhow::Result<Self> {
         let properties = properties.user_properties();
-        let tls_config = TlsConfig::from_properties_block(&format!("input '{}'", name), properties)?;
+        let tls_config =
+            TlsConfig::from_properties_block(&format!("input '{}'", name), properties)?;
         // The crypto provider must be installed before rustls server
         // config assembly. Only pay the cost when TLS is actually
         // configured for this input.
@@ -230,7 +231,11 @@ impl Input for SyslogTcpInput {
         info!(
             "syslog_tcp listening on {} ({})",
             self.bind_addr,
-            if acceptor.is_some() { "TLS" } else { "plaintext" }
+            if acceptor.is_some() {
+                "TLS"
+            } else {
+                "plaintext"
+            }
         );
 
         let limiter: Option<Arc<RateLimiter>> = self.rate_limit.map(|r| {

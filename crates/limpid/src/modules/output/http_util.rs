@@ -68,6 +68,9 @@ pub(crate) async fn error_snippet(
         Some(enc) if !enc.is_empty() && enc != "identity" => {
             format!("<{}-encoded body, {} bytes>", enc, raw.len())
         }
-        _ => String::from_utf8_lossy(&raw).chars().take(max_chars).collect(),
+        _ => String::from_utf8_lossy(&raw)
+            .chars()
+            .take(max_chars)
+            .collect(),
     }
 }
