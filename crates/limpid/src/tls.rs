@@ -99,7 +99,11 @@ pub const TLS_SERVER_BLOCK_PROPERTIES: &[PropertySpec] = TLS_BLOCK_CERT_KEY_CA_R
 /// keys are optional at the schema layer; the cert↔key paired
 /// invariant is enforced at parse time by
 /// [`ClientTlsConfig::validate`]. `ca` alone is a custom CA, `ca` +
-/// `cert` + `key` is mTLS, and an empty block is rejected by callers.
+/// `cert` + `key` is mTLS; empty-block handling is module-specific
+/// (most callers accept it as "use system CA roots, no client identity",
+/// but a module is free to layer additional rejection rules on top —
+/// e.g. `output otlp_http` rejects any `tls` block on a plaintext
+/// endpoint, regardless of contents).
 pub const TLS_CLIENT_BLOCK_PROPERTIES: &[PropertySpec] = TLS_BLOCK_CERT_KEY_CA_OPTIONAL;
 
 /// TLS settings parsed from DSL `tls { ... }` block.

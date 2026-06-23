@@ -6,7 +6,7 @@ Surface-level rules of the limpid DSL — keywords, literal forms, block structu
 
 The `def` keyword introduces a top-level definition. The five kinds are:
 
-```
+```limpid
 def input <name> { ... }              // see Inputs
 def output <name> { ... }             // see Outputs
 def process <name> { ... }            // see Processing → User-defined Processes
@@ -18,7 +18,7 @@ A name is an identifier (`[A-Za-z_][A-Za-z0-9_]*`). Definitions can appear in an
 
 ## Comments
 
-```
+```limpid
 // Line comment to end of line.
 ```
 
@@ -28,7 +28,7 @@ Block comments are not supported.
 
 Newlines separate statements. Semicolons are **optional** and only useful when you want multiple statements on one line:
 
-```
+```limpid
 def output fw01 {
     type file
     path "/var/log/fw/fw01.log"
@@ -67,7 +67,7 @@ Strings are double-quoted only — no single-quote form. Strings support `${expr
 
 Dotted identifiers reach into nested objects:
 
-```
+```limpid
 workspace.host                  // workspace -> "host" key
 workspace.geo.country           // nested
 workspace.cef.src_endpoint.ip   // arbitrarily deep
@@ -79,7 +79,7 @@ The leading segment is one of the event-level names (`ingress`, `egress`, `recei
 
 Inside a `def process { ... }` body, the `=` operator assigns to an identifier path. The left side must be a path under `egress`, `workspace`, or `let`:
 
-```
+```limpid
 def process tag {
     workspace.host_safe = lower(workspace.syslog.hostname)
     egress = "${workspace.host_safe}: ${workspace.syslog.msg}"
@@ -101,7 +101,7 @@ statement set.
 
 Any string literal can contain `${...}` interpolations. Each `${expr}` is an ordinary DSL expression: parsed when the config loads, evaluated per event when the string is used.
 
-```
+```limpid
 def output archive {
     type file
     path "/var/log/limpid/${source.ip}/${strftime(received_at, "%Y-%m-%d", "local")}.log"
@@ -160,7 +160,7 @@ The DSL has six control-flow constructs. The summary table maps each one to wher
 
 ### if / else if / else
 
-```
+```limpid
 if expr { ... }
 if expr { ... } else { ... }
 if expr { ... } else if expr { ... } else { ... }
@@ -180,7 +180,7 @@ if expr { ... } else if expr { ... } else { ... }
 
 Arms are statements valid in the surrounding body — pipeline statements at pipeline level (`output`, `process`, nested `if` / `switch`, `drop`, `finish`, `error`), process statements inside a `process` body (function calls, assignments, nested control flow, `drop`, `error`). An empty arm (`if cond { }`) is allowed but rare.
 
-```
+```limpid
 // pipeline body
 if workspace.cef.severity >= 8 {
     output alert
@@ -202,7 +202,7 @@ if workspace.kv.action == "deny" {
 
 ### switch
 
-```
+```limpid
 switch expr {
     value1 { ... }
     value2 { ... }
@@ -212,7 +212,7 @@ switch expr {
 
 The discriminator after `switch` is any DSL expression, evaluated once. Each arm's literal is matched against it with `==` semantics — types must agree (`switch workspace.severity { 5 { ... } }` matches `Int(5)` but not `String("5")`). The first matching arm runs. If none match, `default` runs; if `default` is absent, the `switch` is a no-op.
 
-```
+```limpid
 // pipeline body — route by source IP
 switch source.ip {
     "192.0.2.1" { output fw01 }
@@ -232,7 +232,7 @@ Arm bodies are statements valid in the surrounding body, same rule as `if`. Ther
 
 There is also an **expression form** of `switch` — each arm body is one expression rather than a statement list, and the matching arm's value is the value of the whole `switch`. Used inside `def function` bodies and anywhere a value is expected:
 
-```
+```limpid
 def function normalize_proto(num) {
     switch num {
         6  { "tcp" }
@@ -256,7 +256,7 @@ The constructs not detailed above live on the page they semantically belong to:
 
 The pipe operator chains expression-shaped transforms: `lhs |> f(...)` is parse-time sugar for `f(lhs, ...)` — the left-hand value is inserted as the first positional argument of the function call on the right. The transformation is purely syntactic; the AST contains only ordinary `FuncCall` nodes.
 
-```
+```limpid
 // Without pipe:
 workspace.users = distinct(map(filter(workspace.events) { |e| e.type == "auth" }) { |e| e.user })
 
@@ -282,7 +282,7 @@ All three forms produce identical FuncCall AST after the parser splices the LHS 
 
 The block-arg primitives — `map`, `filter`, `find`, `reduce` — accept a trailing block argument that binds one (or, for `reduce`, two) identifier per element and runs the body against it:
 
-```
+```limpid
 let evens = filter(workspace.nums) { |n| n % 2 == 0 }
 let doubled = map(workspace.nums) { |n| n * 2 }
 let user_alert = find(workspace.alerts) { |a| a.user == "alice" }
