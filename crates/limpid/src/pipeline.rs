@@ -998,6 +998,102 @@ def pipeline p {
     }
 
     #[test]
+    fn render_failure_falls_back_to_owned_sink_input() {
+        // The memory-queue render path catches a sink's `render` Err
+        // and falls back to `SinkInput::Owned(event.to_owned())` so
+        // the pipeline never drops an event because of a renderer
+        // bug. Mock an Output whose render() always errors, dispatch
+        // through run_pipeline, and assert the output_sinks list
+        // contains an Owned variant — not Rendered, not empty.
+        use crate::event::{BorrowedEvent, Event, OwnedEvent};
+        use crate::functions::{FunctionRegistry, register_builtins, table::TableStore};
+        use crate::metrics::OutputMetrics;
+        use crate::modules::{HasMetrics, Output, RenderedPayload};
+        use bytes::Bytes;
+        use std::net::SocketAddr;
+
+        struct AlwaysFailRender {
+            metrics: Arc<OutputMetrics>,
+        }
+        impl HasMetrics for AlwaysFailRender {
+            type Stats = OutputMetrics;
+            fn metrics(&self) -> Arc<OutputMetrics> {
+                Arc::clone(&self.metrics)
+            }
+        }
+        #[async_trait::async_trait]
+        impl Output for AlwaysFailRender {
+            fn render(
+                &self,
+                _event: &BorrowedEvent<'_>,
+                _arena: &crate::dsl::arena::EventArena<'_>,
+            ) -> anyhow::Result<RenderedPayload> {
+                anyhow::bail!("intentional render failure")
+            }
+            async fn write(&self, _payload: RenderedPayload) -> anyhow::Result<()> {
+                unreachable!("write must not be called when render errored")
+            }
+        }
+
+        let src = r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p {
+    input i
+    output o
+}
+"#;
+        let cfg = compile(src).unwrap();
+        let pipeline = cfg.pipelines.get("p").unwrap();
+        let mut funcs = FunctionRegistry::new();
+        let store = TableStore::from_configs(vec![]).unwrap();
+        register_builtins(&mut funcs, store);
+
+        // Replace `o`'s sink with the mock so render() errors.
+        let mut sinks: HashMap<String, Arc<dyn Output>> = HashMap::new();
+        sinks.insert(
+            "o".into(),
+            Arc::new(AlwaysFailRender {
+                metrics: Arc::new(OutputMetrics::default()),
+            }) as Arc<dyn Output>,
+        );
+
+        let event = OwnedEvent::new(
+            Bytes::from_static(b"payload"),
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        );
+        let result = run_pipeline(
+            pipeline,
+            &event,
+            &cfg,
+            &funcs,
+            None,
+            &sinks,
+            &mut bumpalo::Bump::new(),
+        )
+        .unwrap();
+        assert_eq!(result.termination, PipelineTermination::Finished);
+        assert_eq!(result.outputs.len(), 1, "expected 1 output, got {}", result.outputs.len());
+        let (name, sink_input) = &result.outputs[0];
+        assert_eq!(name, "o");
+        assert!(
+            matches!(sink_input, SinkInput::Owned(_)),
+            "render failure must fall back to Owned, got Rendered"
+        );
+        // Round-trip: the Owned event's ingress must equal what we fed.
+        if let SinkInput::Owned(ev) = sink_input {
+            assert_eq!(&ev.ingress[..], b"payload");
+        }
+        // Drop unused name to keep clippy happy in case the assert
+        // above doesn't reference it.
+        let _ = name;
+        let _: &Event = match sink_input {
+            SinkInput::Owned(e) => e,
+            SinkInput::Rendered(_) => unreachable!(),
+        };
+    }
+
+    #[test]
     fn validate_accepts_fan_in_when_all_inputs_exist() {
         let src = r#"
 def input a { type syslog_udp bind "0.0.0.0:5140" }
