@@ -1233,10 +1233,7 @@ mod tests {
             calls: Arc<AtomicUsize>,
             body: Arc<Mutex<Vec<String>>>,
         }
-        async fn handle(
-            State(s): State<S>,
-            body: axum::body::Bytes,
-        ) -> axum::response::Response {
+        async fn handle(State(s): State<S>, body: axum::body::Bytes) -> axum::response::Response {
             let n = s.calls.fetch_add(1, AtomicOrdering::SeqCst);
             if n == 0 {
                 (StatusCode::INTERNAL_SERVER_ERROR, "fail").into_response()
