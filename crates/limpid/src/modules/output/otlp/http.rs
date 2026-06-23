@@ -50,7 +50,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use opentelemetry_proto::tonic::collector::logs::v1::{
+    ExportLogsServiceRequest, ExportLogsServiceResponse,
+};
 use prost::Message;
 use tokio::sync::Mutex;
 
@@ -456,7 +458,9 @@ impl Output for OtlpHttpOutput {
     async fn write_owned(&self, event: &Event) -> Result<()> {
         crate::modules::ship_owned_inline(self, event, &self.metrics, |payload| async move {
             let payload: OtlpPayload = payload.downcast()?;
-            send_batch(&self.inner, vec![payload.egress]).await
+            send_batch(&self.inner, vec![payload.egress])
+                .await
+                .map(|o| o.rejected)
         })
         .await
     }
@@ -473,19 +477,28 @@ impl OtlpHttpOutput {
         if drained.is_empty() {
             return Ok(());
         }
-        let count = drained.len();
+        let count = drained.len() as u64;
         let result = send_batch(&self.inner, drained).await;
         match result {
-            Ok(()) => {
-                self.metrics
-                    .events_written
-                    .fetch_add(count as u64, Ordering::Relaxed);
+            Ok(outcome) => {
+                let rejected = outcome.rejected.min(count);
+                let written = count - rejected;
+                if written > 0 {
+                    self.metrics
+                        .events_written
+                        .fetch_add(written, Ordering::Relaxed);
+                }
+                if rejected > 0 {
+                    self.metrics
+                        .events_failed
+                        .fetch_add(rejected, Ordering::Relaxed);
+                }
                 Ok(())
             }
             Err(e) => {
                 self.metrics
                     .events_failed
-                    .fetch_add(count as u64, Ordering::Relaxed);
+                    .fetch_add(count, Ordering::Relaxed);
                 Err(e)
             }
         }
@@ -512,18 +525,27 @@ impl OtlpHttpOutput {
             if drained.is_empty() {
                 return;
             }
-            let count = drained.len();
+            let count = drained.len() as u64;
             match send_batch(&inner, drained).await {
-                Ok(()) => {
-                    metrics
-                        .events_written
-                        .fetch_add(count as u64, Ordering::Relaxed);
+                Ok(outcome) => {
+                    let rejected = outcome.rejected.min(count);
+                    let written = count - rejected;
+                    if written > 0 {
+                        metrics
+                            .events_written
+                            .fetch_add(written, Ordering::Relaxed);
+                    }
+                    if rejected > 0 {
+                        metrics
+                            .events_failed
+                            .fetch_add(rejected, Ordering::Relaxed);
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("otlp_http flush timer: send failed ({})", e);
                     metrics
                         .events_failed
-                        .fetch_add(count as u64, Ordering::Relaxed);
+                        .fetch_add(count, Ordering::Relaxed);
                 }
             }
         });
@@ -547,7 +569,7 @@ impl Drop for OtlpHttpOutput {
     }
 }
 
-async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<()> {
+async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<super::SendOutcome> {
     let req = decode_drained_to_request(drained, inner.batch_level)?;
     let n = inner.peers.len();
 
@@ -578,11 +600,11 @@ async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<()> {
         }
 
         let err = match send_once(&inner.peers[idx], inner, &req).await {
-            Ok(()) => {
+            Ok(outcome) => {
                 // Reset cooldown on success so future flushes pick
                 // this peer freely.
                 *inner.peer_state[idx].cooldown_until.lock().await = None;
-                return Ok(());
+                return Ok(outcome);
             }
             Err(e) => {
                 // Measure cooldown from failure time, not request start:
@@ -619,7 +641,11 @@ async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<()> {
     Err(final_err)
 }
 
-async fn send_once(peer: &HttpPeer, inner: &Inner, req: &ExportLogsServiceRequest) -> Result<()> {
+async fn send_once(
+    peer: &HttpPeer,
+    inner: &Inner,
+    req: &ExportLogsServiceRequest,
+) -> Result<super::SendOutcome> {
     let body = match inner.protocol {
         HttpProtocol::Protobuf => {
             let mut buf = Vec::with_capacity(req.encoded_len());
@@ -656,7 +682,47 @@ async fn send_once(peer: &HttpPeer, inner: &Inner, req: &ExportLogsServiceReques
             snippet
         );
     }
-    Ok(())
+    // Parse the response body for `partial_success.rejected_log_records`.
+    // The OTLP/HTTP spec guarantees the body is an
+    // `ExportLogsServiceResponse` in the same wire form (protobuf or
+    // JSON) as the request. A peer that returns 2xx with an empty body,
+    // or with a body we can't decode, is treated as fully accepted —
+    // the alternative (failing the call) would convert lenient
+    // collectors into ship errors. Same semantics as
+    // `otlp_grpc::send_once` so the two transports report identical
+    // metrics for identical receiver behaviour.
+    let body_bytes = resp.bytes().await.unwrap_or_default();
+    let rejected = if body_bytes.is_empty() {
+        0
+    } else {
+        let parsed = match inner.protocol {
+            HttpProtocol::Protobuf => ExportLogsServiceResponse::decode(&*body_bytes).ok(),
+            HttpProtocol::Json => {
+                serde_json::from_slice::<ExportLogsServiceResponse>(&body_bytes).ok()
+            }
+        };
+        let r = parsed
+            .as_ref()
+            .and_then(|r| r.partial_success.as_ref())
+            .map(|p| p.rejected_log_records.max(0) as u64)
+            .unwrap_or(0);
+        if r > 0
+            && let Some(partial) = parsed.as_ref().and_then(|r| r.partial_success.as_ref())
+        {
+            tracing::warn!(
+                "otlp_http: {} rejected {} log record(s){}",
+                peer.endpoint,
+                partial.rejected_log_records,
+                if partial.error_message.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", partial.error_message)
+                }
+            );
+        }
+        r
+    };
+    Ok(super::SendOutcome { rejected })
 }
 
 #[cfg(test)]
@@ -1172,6 +1238,102 @@ mod tests {
             got[0].resource_logs[0].scope_logs[0].log_records[0].time_unix_nano,
             456
         );
+    }
+
+    #[tokio::test]
+    async fn partial_success_rejected_log_records_routes_to_events_failed() {
+        // Regression guard: when the receiver returns 2xx with a body
+        // containing `partial_success.rejected_log_records = N`,
+        // events_written must NOT cover the N rejected records. The
+        // pre-fix code did not parse the response body at all, so
+        // operators saw zero events_failed for server-side rejections.
+        // Mirror of the equivalent test in otlp_grpc — both transports
+        // must report identical metrics for identical receiver
+        // behaviour.
+        use axum::{
+            Router, body::Bytes as AxumBytes, extract::State, http::StatusCode,
+            response::IntoResponse, routing::post,
+        };
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsPartialSuccess;
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        #[derive(Clone)]
+        struct AppState {
+            received_count: Arc<AtomicUsize>,
+        }
+
+        async fn handle(
+            State(state): State<AppState>,
+            body: AxumBytes,
+        ) -> impl IntoResponse {
+            // Decode the request only to confirm it parsed; the test
+            // exercise is the response body, not the request.
+            let _ = ExportLogsServiceRequest::decode(&body[..]);
+            state.received_count.fetch_add(1, AtomicOrdering::SeqCst);
+            // Always claim 2 records were rejected.
+            let resp = ExportLogsServiceResponse {
+                partial_success: Some(ExportLogsPartialSuccess {
+                    rejected_log_records: 2,
+                    error_message: "test partial-success".into(),
+                }),
+            };
+            let mut buf = Vec::with_capacity(resp.encoded_len());
+            resp.encode(&mut buf).unwrap();
+            (
+                StatusCode::OK,
+                [("content-type", "application/x-protobuf")],
+                buf,
+            )
+                .into_response()
+        }
+
+        let received_count = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/logs", post(handle))
+            .with_state(AppState {
+                received_count: Arc::clone(&received_count),
+            });
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let endpoint = format!("http://{}/v1/logs", addr);
+        let mut props = one_peer_props(&endpoint);
+        props.push(prop_str("protocol", "http_protobuf"));
+        props.push(prop_int("batch_size", 3));
+        let output = OtlpHttpOutput::from_properties("test", &mp(&props)).unwrap();
+
+        let mut payloads: Vec<RenderedPayload> = Vec::new();
+        for i in 0..3 {
+            let ev = event_with_egress(singleton_bytes(900_000_000 + i));
+            let payload = {
+                let bump = bumpalo::Bump::new();
+                let arena = EventArena::new(&bump);
+                let bev = ev.view_in(&arena);
+                output.render(&bev, &arena).unwrap()
+            };
+            payloads.push(payload);
+        }
+        for p in payloads {
+            output.write(p).await.unwrap();
+        }
+        for _ in 0..50 {
+            if output.metrics.events_written.load(Ordering::Relaxed)
+                + output.metrics.events_failed.load(Ordering::Relaxed)
+                >= 3
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        server.abort();
+
+        let written = output.metrics.events_written.load(Ordering::Relaxed);
+        let failed = output.metrics.events_failed.load(Ordering::Relaxed);
+        assert_eq!(written, 1, "expected 1 written, got {written} (failed={failed})");
+        assert_eq!(failed, 2, "expected 2 failed, got {failed} (written={written})");
     }
 
     #[tokio::test]

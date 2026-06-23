@@ -364,7 +364,9 @@ impl Output for OtlpGrpcOutput {
     async fn write_owned(&self, event: &Event) -> Result<()> {
         crate::modules::ship_owned_inline(self, event, &self.metrics, |payload| async move {
             let payload: OtlpPayload = payload.downcast()?;
-            send_batch(&self.inner, vec![payload.egress]).await
+            send_batch(&self.inner, vec![payload.egress])
+                .await
+                .map(|o| o.rejected)
         })
         .await
     }
@@ -379,19 +381,28 @@ impl OtlpGrpcOutput {
         if drained.is_empty() {
             return Ok(());
         }
-        let count = drained.len();
+        let count = drained.len() as u64;
         let result = send_batch(&self.inner, drained).await;
         match result {
-            Ok(()) => {
-                self.metrics
-                    .events_written
-                    .fetch_add(count as u64, Ordering::Relaxed);
+            Ok(outcome) => {
+                let rejected = outcome.rejected.min(count);
+                let written = count - rejected;
+                if written > 0 {
+                    self.metrics
+                        .events_written
+                        .fetch_add(written, Ordering::Relaxed);
+                }
+                if rejected > 0 {
+                    self.metrics
+                        .events_failed
+                        .fetch_add(rejected, Ordering::Relaxed);
+                }
                 Ok(())
             }
             Err(e) => {
                 self.metrics
                     .events_failed
-                    .fetch_add(count as u64, Ordering::Relaxed);
+                    .fetch_add(count, Ordering::Relaxed);
                 Err(e)
             }
         }
@@ -416,18 +427,27 @@ impl OtlpGrpcOutput {
             if drained.is_empty() {
                 return;
             }
-            let count = drained.len();
+            let count = drained.len() as u64;
             match send_batch(&inner, drained).await {
-                Ok(()) => {
-                    metrics
-                        .events_written
-                        .fetch_add(count as u64, Ordering::Relaxed);
+                Ok(outcome) => {
+                    let rejected = outcome.rejected.min(count);
+                    let written = count - rejected;
+                    if written > 0 {
+                        metrics
+                            .events_written
+                            .fetch_add(written, Ordering::Relaxed);
+                    }
+                    if rejected > 0 {
+                        metrics
+                            .events_failed
+                            .fetch_add(rejected, Ordering::Relaxed);
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("otlp_grpc flush timer: send failed ({})", e);
                     metrics
                         .events_failed
-                        .fetch_add(count as u64, Ordering::Relaxed);
+                        .fetch_add(count, Ordering::Relaxed);
                 }
             }
         });
@@ -451,7 +471,7 @@ impl Drop for OtlpGrpcOutput {
     }
 }
 
-async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<()> {
+async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<super::SendOutcome> {
     let req = decode_drained_to_request(drained, inner.batch_level)?;
     let n = inner.peers.len();
 
@@ -474,9 +494,9 @@ async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<()> {
         }
 
         let err = match send_once(&inner.peers[idx], inner, &req).await {
-            Ok(()) => {
+            Ok(outcome) => {
                 *inner.peer_state[idx].cooldown_until.lock().await = None;
-                return Ok(());
+                return Ok(outcome);
             }
             Err(e) => {
                 // Measure cooldown from failure time, not request start:
@@ -508,7 +528,11 @@ async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<()> {
     Err(final_err)
 }
 
-async fn send_once(peer: &GrpcPeer, inner: &Inner, req: &ExportLogsServiceRequest) -> Result<()> {
+async fn send_once(
+    peer: &GrpcPeer,
+    inner: &Inner,
+    req: &ExportLogsServiceRequest,
+) -> Result<super::SendOutcome> {
     let mut client = LogsServiceClient::new(peer.channel.clone());
     let mut request = tonic::Request::new(req.clone());
     let metadata = request.metadata_mut();
@@ -547,13 +571,21 @@ async fn send_once(peer: &GrpcPeer, inner: &Inner, req: &ExportLogsServiceReques
         })?
         .with_context(|| format!("output otlp_grpc: export to {} failed", peer.endpoint))?;
     // The receiver may report `partial_success.rejected_log_records`.
-    // Currently logged as a warning; selective re-send of *only* the
-    // rejected records is queued for a later release. The retry loop
+    // Logged here as a warning AND propagated to the caller via
+    // `SendOutcome.rejected` so the flush path can split the batch's
+    // events between `events_written` (accepted) and `events_failed`
+    // (rejected by the server). Selective re-send of *only* the
+    // rejected records is queued for a later release; the retry loop
     // in `send_batch` handles hard failures (connection refused, 5xx,
     // …) but not partial-success deltas, since the rejected set is a
     // strict subset of what already shipped.
     let inner_resp = response.into_inner();
-    if let Some(partial) = inner_resp.partial_success
+    let rejected = inner_resp
+        .partial_success
+        .as_ref()
+        .map(|p| p.rejected_log_records.max(0) as u64)
+        .unwrap_or(0);
+    if let Some(partial) = inner_resp.partial_success.as_ref()
         && partial.rejected_log_records > 0
     {
         tracing::warn!(
@@ -567,7 +599,7 @@ async fn send_once(peer: &GrpcPeer, inner: &Inner, req: &ExportLogsServiceReques
             }
         );
     }
-    Ok(())
+    Ok(super::SendOutcome { rejected })
 }
 
 // Note: `verify false` is intentionally not a property on `otlp_grpc`.
@@ -897,6 +929,94 @@ mod tests {
         assert_eq!(got.len(), 1);
         let lr = &got[0].resource_logs[0].scope_logs[0].log_records[0];
         assert_eq!(lr.time_unix_nano, 1_700_000_000_000_000_000);
+    }
+
+    /// Test-only LogsService that ALWAYS reports `partial_success.
+    /// rejected_log_records = rejected_count`. Used to pin the
+    /// behaviour of `events_written` / `events_failed` when the
+    /// receiver advertises a partial-success rejection.
+    struct PartialSuccessLogs {
+        rejected_per_call: i64,
+    }
+
+    #[tonic::async_trait]
+    impl LogsService for PartialSuccessLogs {
+        async fn export(
+            &self,
+            _request: tonic::Request<ExportLogsServiceRequest>,
+        ) -> std::result::Result<tonic::Response<ExportLogsServiceResponse>, tonic::Status>
+        {
+            Ok(tonic::Response::new(ExportLogsServiceResponse {
+                partial_success: Some(
+                    opentelemetry_proto::tonic::collector::logs::v1::ExportLogsPartialSuccess {
+                        rejected_log_records: self.rejected_per_call,
+                        error_message: "test rejection".into(),
+                    },
+                ),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_success_rejected_log_records_routes_to_events_failed() {
+        // Regression guard: when the receiver returns 2xx-equivalent
+        // (gRPC OK) with `partial_success.rejected_log_records = N`,
+        // events_written must NOT cover the N rejected records.
+        // Previously the entire batch was counted as written and
+        // operators saw zero events_failed for server-side rejections,
+        // making partial-success outages invisible on dashboards.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+        let svc = PartialSuccessLogs { rejected_per_call: 2 };
+        let server = tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(LogsServiceServer::new(svc))
+                .serve_with_incoming(incoming)
+                .await;
+        });
+
+        let endpoint = format!("http://{}", addr);
+        // batch_size=3 so the single Rendered write triggers flush at
+        // exactly 3 events; receiver rejects 2 of them.
+        let mut props = one_peer_props(&endpoint);
+        props.push(prop_int("batch_size", 3));
+        let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
+
+        let mut payloads: Vec<RenderedPayload> = Vec::new();
+        for i in 0..3 {
+            let ev = event_with_egress(singleton_bytes(1_000_000_000 + i));
+            let payload = {
+                let bump = bumpalo::Bump::new();
+                let arena = EventArena::new(&bump);
+                let bev = ev.view_in(&arena);
+                output.render(&bev, &arena).unwrap()
+            };
+            payloads.push(payload);
+        }
+        for p in payloads {
+            output.write(p).await.unwrap();
+        }
+        // Give the inline flush a moment.
+        for _ in 0..50 {
+            if output.metrics.events_written.load(Ordering::Relaxed)
+                + output.metrics.events_failed.load(Ordering::Relaxed)
+                >= 3
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        server.abort();
+
+        // 3 events total: 2 rejected → events_failed, 1 accepted → events_written.
+        let written = output.metrics.events_written.load(Ordering::Relaxed);
+        let failed = output.metrics.events_failed.load(Ordering::Relaxed);
+        assert_eq!(written, 1, "expected 1 written, got {written} (failed={failed})");
+        assert_eq!(failed, 2, "expected 2 failed, got {failed} (written={written})");
     }
 
     #[tokio::test]

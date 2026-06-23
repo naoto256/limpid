@@ -47,6 +47,21 @@ use prost::Message;
 
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 
+/// Transport-success outcome from a single OTLP export call.
+///
+/// `rejected` is the number of LogRecords the receiver acknowledged
+/// as not-stored via OTLP's `partial_success.rejected_log_records`.
+/// The HTTP 2xx / gRPC OK is still a transport success — the receiver
+/// processed the request, it just refused some records (typically
+/// quota / schema / size violations). limpid does not retry rejected
+/// records (selective re-send is queued for a later release); the
+/// counter split lets `events_failed` reflect the data loss so
+/// operator dashboards stay accurate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SendOutcome {
+    pub rejected: u64,
+}
+
 pub(crate) struct OtlpPayload {
     pub(crate) egress: Bytes,
 }
@@ -142,10 +157,17 @@ pub(crate) fn decode_drained_to_request(
 pub(crate) fn merge_by_resource(decoded: Vec<ResourceLogs>) -> ExportLogsServiceRequest {
     let mut out: Vec<ResourceLogs> = Vec::new();
     for rl in decoded {
-        if let Some(idx) = out
-            .iter()
-            .position(|existing| resources_eq(&existing.resource, &rl.resource))
-        {
+        // Match only on (Resource, schema_url-compat). Two ResourceLogs
+        // entries with identical Resource but *different non-empty*
+        // schema_urls describe the same resource under different
+        // schemas, and OTLP semantics say these are distinct — merging
+        // them would silently drop one schema_url and conflate two
+        // semantically different declarations into one bucket. Keep
+        // them separate.
+        if let Some(idx) = out.iter().position(|existing| {
+            resources_eq(&existing.resource, &rl.resource)
+                && schema_urls_compatible(&existing.schema_url, &rl.schema_url)
+        }) {
             // Promote schema_url if the accumulator was empty and the
             // incoming entry has one (rare but spec-allowed).
             if out[idx].schema_url.is_empty() && !rl.schema_url.is_empty() {
@@ -159,6 +181,14 @@ pub(crate) fn merge_by_resource(decoded: Vec<ResourceLogs>) -> ExportLogsService
     ExportLogsServiceRequest { resource_logs: out }
 }
 
+/// Two schema_urls are merge-compatible when they're equal OR at least
+/// one side is empty (= unspecified, can take the other's). Different
+/// non-empty schema_urls are NOT compatible — keeping them in separate
+/// buckets prevents the silent drop of one of the two declarations.
+fn schema_urls_compatible(a: &str, b: &str) -> bool {
+    a.is_empty() || b.is_empty() || a == b
+}
+
 /// `merge_by_resource` plus an inner pass: within each Resource bucket,
 /// ScopeLogs sharing an InstrumentationScope (name + version +
 /// attributes + dropped_attributes_count) collapse into a single
@@ -169,10 +199,15 @@ pub(crate) fn merge_by_scope(decoded: Vec<ResourceLogs>) -> ExportLogsServiceReq
         let scope_logs = std::mem::take(&mut rl.scope_logs);
         let mut grouped: Vec<ScopeLogs> = Vec::new();
         for sl in scope_logs {
-            if let Some(idx) = grouped
-                .iter()
-                .position(|existing| scopes_eq(&existing.scope, &sl.scope))
-            {
+            // Same logic as the Resource-level merge above: only merge
+            // ScopeLogs that share an InstrumentationScope AND have
+            // compatible schema_urls. Different non-empty schema_urls
+            // describe the same scope under different schemas and must
+            // stay separate to avoid silently dropping one.
+            if let Some(idx) = grouped.iter().position(|existing| {
+                scopes_eq(&existing.scope, &sl.scope)
+                    && schema_urls_compatible(&existing.schema_url, &sl.schema_url)
+            }) {
                 if grouped[idx].schema_url.is_empty() && !sl.schema_url.is_empty() {
                     grouped[idx].schema_url = sl.schema_url;
                 }
@@ -297,6 +332,88 @@ mod tests {
         ];
         let req = merge_by_resource(input);
         assert_eq!(req.resource_logs.len(), 2);
+    }
+
+    /// Helper: same-resource singleton with an explicit Resource-level
+    /// schema_url so the schema-url merge rule can be exercised.
+    fn singleton_with_schema(svc: &str, scope: &str, t: u64, resource_schema: &str) -> ResourceLogs {
+        let mut rl = singleton(svc, scope, t);
+        rl.schema_url = resource_schema.to_string();
+        rl
+    }
+
+    #[test]
+    fn merge_by_resource_does_not_drop_distinct_schema_urls() {
+        // Same Resource, two different non-empty schema_urls. The
+        // pre-fix code silently dropped one schema_url and conflated
+        // the two declarations into a single bucket. They MUST stay
+        // in separate buckets so neither schema_url is lost.
+        let input = vec![
+            singleton_with_schema("svc-a", "scope-1", 1, "https://schemas.example.com/v1"),
+            singleton_with_schema("svc-a", "scope-1", 2, "https://schemas.example.com/v2"),
+        ];
+        let req = merge_by_resource(input);
+        assert_eq!(req.resource_logs.len(), 2, "different schema_urls must stay distinct");
+        let urls: Vec<&str> = req
+            .resource_logs
+            .iter()
+            .map(|rl| rl.schema_url.as_str())
+            .collect();
+        assert!(urls.contains(&"https://schemas.example.com/v1"));
+        assert!(urls.contains(&"https://schemas.example.com/v2"));
+    }
+
+    #[test]
+    fn merge_by_resource_merges_empty_into_existing_schema_url() {
+        // Same Resource, one with schema_url, one without. The empty
+        // side is unspecified — taking the populated side's schema_url
+        // is the existing 'rare but spec-allowed' promotion behaviour
+        // and must not regress.
+        let input = vec![
+            singleton_with_schema("svc-a", "scope-1", 1, "https://schemas.example.com/v1"),
+            singleton_with_schema("svc-a", "scope-2", 2, ""),
+        ];
+        let req = merge_by_resource(input);
+        assert_eq!(req.resource_logs.len(), 1);
+        assert_eq!(req.resource_logs[0].schema_url, "https://schemas.example.com/v1");
+        assert_eq!(req.resource_logs[0].scope_logs.len(), 2);
+    }
+
+    #[test]
+    fn merge_by_resource_promotes_empty_acc_with_incoming_schema_url() {
+        // Reverse order: empty schema_url first, then populated.
+        let input = vec![
+            singleton_with_schema("svc-a", "scope-1", 1, ""),
+            singleton_with_schema("svc-a", "scope-2", 2, "https://schemas.example.com/v1"),
+        ];
+        let req = merge_by_resource(input);
+        assert_eq!(req.resource_logs.len(), 1);
+        assert_eq!(req.resource_logs[0].schema_url, "https://schemas.example.com/v1");
+    }
+
+    #[test]
+    fn merge_by_scope_does_not_drop_distinct_scope_schema_urls() {
+        // Same Resource, same Scope, two different non-empty Scope-
+        // level schema_urls. Like the Resource-level test, the
+        // pre-fix code silently dropped one of the two.
+        let mut a = singleton("svc-a", "scope-1", 1);
+        a.scope_logs[0].schema_url = "https://schemas.example.com/scope/v1".into();
+        let mut b = singleton("svc-a", "scope-1", 2);
+        b.scope_logs[0].schema_url = "https://schemas.example.com/scope/v2".into();
+        let req = merge_by_scope(vec![a, b]);
+        // Same Resource bucket (only the resource matches; schema_urls
+        // at the Resource level are empty so they're compatible) ...
+        assert_eq!(req.resource_logs.len(), 1);
+        // ... but two distinct ScopeLogs entries inside, one per
+        // schema_url, with their log_records intact.
+        assert_eq!(req.resource_logs[0].scope_logs.len(), 2);
+        let scope_urls: Vec<&str> = req.resource_logs[0]
+            .scope_logs
+            .iter()
+            .map(|sl| sl.schema_url.as_str())
+            .collect();
+        assert!(scope_urls.contains(&"https://schemas.example.com/scope/v1"));
+        assert!(scope_urls.contains(&"https://schemas.example.com/scope/v2"));
     }
 
     #[test]
