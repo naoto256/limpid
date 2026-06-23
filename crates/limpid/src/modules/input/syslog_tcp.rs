@@ -1001,6 +1001,63 @@ mod tests {
         assert!(TLS_HANDSHAKE_TIMEOUT <= Duration::from_secs(30));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn tls_handshake_timeout_fires_against_stalled_client() {
+        // The motivating slot-exhaustion vector for this timeout is
+        // a TCP-only client that connects (consuming a slot) but
+        // never sends the TLS ClientHello. Without the
+        // `tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, …)` wrap, the
+        // accept future stays pending forever and the slot is held
+        // until something unrelated kills the task. The existing
+        // bound-check test guards against the constant being removed
+        // or set to a nonsensical value; this test exercises the
+        // firing path directly, using the same `TlsAcceptor` +
+        // `tokio::time::timeout` pair the production accept loop
+        // calls.
+        crate::tls::install_default_crypto_provider();
+        let files = pem_files();
+        let tls_cfg = crate::tls::TlsConfig {
+            cert_path: files.cert.clone(),
+            key_path: files.key.clone(),
+            ca_path: None,
+        };
+        let server_config = crate::tls::build_server_config(&tls_cfg)
+            .await
+            .expect("build server config");
+        let acceptor = TlsAcceptor::from(server_config);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let accept_task = tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.expect("accept");
+            // Same wrap as the production accept loop in `run`:
+            // bound the handshake at TLS_HANDSHAKE_TIMEOUT so a
+            // stalled client cannot pin the slot indefinitely.
+            tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await
+        });
+
+        // Bare TCP connect — never speaks TLS. The acceptor sits
+        // waiting for the ClientHello forever; the timeout wrap is
+        // the only thing that releases the slot.
+        let _stalled_client = TcpStream::connect(addr).await.expect("tcp connect");
+
+        // Let the spawned accept task make progress (real-time
+        // TCP connect already returned), then jump virtual time
+        // past the handshake timeout so the wrap fires.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(TLS_HANDSHAKE_TIMEOUT + Duration::from_secs(1)).await;
+
+        let result = accept_task.await.expect("task join");
+        assert!(
+            result.is_err(),
+            "expected timeout Err, got Ok({:?})",
+            result.is_ok()
+        );
+    }
+
     #[test]
     fn build_plaintext_defaults_to_port_514() {
         let i = SyslogTcpInput::build("relay", &mp(&[])).expect("should build");
