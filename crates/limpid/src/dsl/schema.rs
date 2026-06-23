@@ -1112,8 +1112,8 @@ mod tests {
         assert_eq!(errs.len(), 1, "{errs:?}");
         match &errs[0].kind {
             SchemaErrorKind::OneOfMismatch { expected, actual } => {
-                assert!(expected.iter().any(|e| *e == "String"), "{expected:?}");
-                assert!(expected.iter().any(|e| *e == "Int"), "{expected:?}");
+                assert!(expected.contains(&"String"), "{expected:?}");
+                assert!(expected.contains(&"Int"), "{expected:?}");
                 assert!(actual.contains("Bool"), "{actual}");
             }
             other => panic!("expected OneOfMismatch, got {other:?}"),
