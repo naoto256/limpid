@@ -38,7 +38,28 @@ fn inner_block_schema_of(
         PropertyValueKind::Block(s) => Some(s),
         PropertyValueKind::BlockMap(s) => Some(s),
         PropertyValueKind::OneOf(variants) => {
-            variants.iter().find_map(inner_block_schema_of)
+            // Return a schema only when *exactly one* block-shaped
+            // variant exists. The production schema where this is
+            // exercised today is `OneOf[Block(TLS_CLIENT_BLOCK_PROPERTIES),
+            // String]` (where String is the inline-CA-pem-path
+            // shorthand), so "the one block variant" is unambiguous.
+            // The day a `OneOf[Block(A), Block(B)]` lands — e.g.
+            // inline-TLS vs inline-mTLS configs — arbitrarily picking
+            // the first would silently validate against the wrong
+            // schema with no signal to the operator. Returning None
+            // in that case falls back to expression-level checks,
+            // which is the conservative choice until a per-OneOf
+            // resolution rule is encoded explicitly.
+            let mut found: Option<&'static [PropertySpec]> = None;
+            for v in variants.iter() {
+                if let Some(s) = inner_block_schema_of(v) {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(s);
+                }
+            }
+            found
         }
         _ => None,
     }
