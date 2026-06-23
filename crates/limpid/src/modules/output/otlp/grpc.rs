@@ -109,6 +109,9 @@ struct Inner {
 }
 
 pub struct OtlpGrpcOutput {
+    /// Operator-facing instance name; surfaced on PR-P shutdown-recovery
+    /// records as `(output <name> shutdown)`.
+    name: String,
     inner: Arc<Inner>,
     batch_size: usize,
     flush_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -303,6 +306,7 @@ impl Module for OtlpGrpcOutput {
         let retry_config = RetryConfig::from_output_properties(properties)?;
 
         Ok(Self {
+            name: name.to_string(),
             inner: Arc::new(Inner {
                 peers,
                 peer_state,
@@ -371,7 +375,10 @@ impl Output for OtlpGrpcOutput {
         .await
     }
 
-    async fn shutdown(&self) -> Result<()> {
+    async fn shutdown(
+        &self,
+        error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+    ) -> Result<()> {
         // Same contract as `otlp_http::shutdown`: abort the timer to
         // avoid a race for the buffer lock, then drain in one final
         // send. Without this the queue consumer's shutdown call
@@ -380,7 +387,28 @@ impl Output for OtlpGrpcOutput {
         if let Some(h) = self.flush_handle.lock().await.take() {
             h.abort();
         }
-        self.flush().await
+        match self.flush().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // BC-4 / PR-P: `flush()` restored the drained batch
+                // into `self.inner.batch` on transport error. Drain
+                // it into `error_log` when the operator opted in;
+                // otherwise return Err and preserve 0.7.7 behaviour
+                // (queue consumer logs a warn and the buffer is
+                // lost).
+                if let Some(writer) = error_log {
+                    let payloads: Vec<bytes::Bytes> =
+                        std::mem::take(&mut *self.inner.batch.lock().await);
+                    crate::modules::write_shutdown_buffer_to_error_log(
+                        writer, &self.name, payloads, &e,
+                    )
+                    .await;
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 }
 
@@ -1226,7 +1254,7 @@ mod tests {
             "writes must land in the buffer"
         );
 
-        output.shutdown().await.unwrap();
+        output.shutdown(None).await.unwrap();
 
         assert_eq!(
             output.inner.batch.lock().await.len(),
@@ -1305,5 +1333,131 @@ mod tests {
             failed, 0,
             "events retained for retry must NOT be counted as failed yet (got {failed})",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // BC-4 / PR-P: shutdown-time buffer-loss recovery via `error_log`.
+    // -----------------------------------------------------------------------
+
+    fn shutdown_recovery_props(endpoint: &str) -> Vec<Property> {
+        let mut props = one_peer_props(endpoint);
+        props.push(prop_int("batch_size", 100));
+        props.push(prop_str("batch_timeout", "30s"));
+        // Single attempt + minimal wait so the shutdown flush against
+        // an unreachable peer completes quickly.
+        props.push(Property::Block {
+            key: "retry".into(),
+            key_span: None,
+            properties: vec![
+                prop_int("max_attempts", 1),
+                prop_str("initial_wait", "1ms"),
+                prop_str("max_wait", "1ms"),
+            ],
+        });
+        props
+    }
+
+    async fn buffer_two(output: &OtlpGrpcOutput) {
+        let arena_bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&arena_bump);
+        for ts in [1u64, 2u64] {
+            let ev = event_with_egress(singleton_bytes(ts));
+            let p = output.render(&ev.view_in(&arena), &arena).unwrap();
+            output.write(p).await.unwrap();
+        }
+        assert_eq!(output.inner.batch.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_failure_with_error_log_persists_buffer() {
+        // Unreachable peer → flush() fails inside shutdown and PR-F
+        // restores the batch into the buffer. The new recovery path
+        // drains it into the operator-configured `error_log` and the
+        // override returns Ok so the consumer treats the daemon as
+        // cleanly stopped.
+        let props = shutdown_recovery_props("http://127.0.0.1:1");
+        let output = OtlpGrpcOutput::from_properties("myout", &mp(&props)).unwrap();
+        buffer_two(&output).await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("errored.jsonl");
+        let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
+
+        output.shutdown(Some(&writer)).await.unwrap();
+        assert_eq!(output.inner.batch.lock().await.len(), 0);
+
+        let body = tokio::fs::read_to_string(&path).await.unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["process"], "(output myout shutdown)");
+            assert!(v["reason"].as_str().unwrap().contains("shutdown flush"));
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_failure_without_error_log_matches_077() {
+        // 0.7.7 parity: no DLQ configured → surface the flush error to
+        // the queue consumer (which warns and exits). Buffer remains
+        // for inspection on the way out.
+        let props = shutdown_recovery_props("http://127.0.0.1:1");
+        let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
+        buffer_two(&output).await;
+
+        let err = output.shutdown(None).await.expect_err("flush must Err");
+        assert!(err.to_string().contains("otlp_grpc"), "got: {err}");
+        assert_eq!(output.inner.batch.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_success_does_not_touch_error_log() {
+        // Healthy server: shutdown flush succeeds, the operator's
+        // audit trail must stay empty even with `error_log` set.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let svc = RecordingLogs {
+            received: Arc::clone(&received),
+        };
+        let server = tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(LogsServiceServer::new(svc))
+                .serve_with_incoming(incoming)
+                .await;
+        });
+
+        let endpoint = format!("http://{}", addr);
+        let mut props = one_peer_props(&endpoint);
+        props.push(prop_int("batch_size", 100));
+        props.push(prop_str("batch_timeout", "30s"));
+        let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
+        buffer_two(&output).await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("errored.jsonl");
+        let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
+
+        output.shutdown(Some(&writer)).await.unwrap();
+        server.abort();
+        assert!(!path.exists(), "DLQ must stay untouched on clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn shutdown_recovery_writer_failure_does_not_recurse() {
+        // error_log writer itself fails on every record (parent dir
+        // missing). Helper must warn + continue, never loop or panic.
+        let props = shutdown_recovery_props("http://127.0.0.1:1");
+        let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
+        buffer_two(&output).await;
+
+        let writer = Arc::new(crate::error_log::ErrorLogWriter::new(
+            std::path::PathBuf::from("/nonexistent/limpid-grpc-test/errored.jsonl"),
+        ));
+        output.shutdown(Some(&writer)).await.unwrap();
+        assert_eq!(output.inner.batch.lock().await.len(), 0);
     }
 }
