@@ -127,15 +127,22 @@ impl Output for SyslogUdpOutput {
                 let address = peer.address();
                 Box::pin(async move {
                     if state.conn.is_none() {
-                        // Resolve the peer address first and pick the
-                        // bind family from the resolved SocketAddr —
-                        // hard-binding to `0.0.0.0:0` would refuse to
-                        // connect any peer that resolves only to AAAA,
-                        // and `host` accepts hostnames that may do
-                        // exactly that. Hostnames are still typically
-                        // dual-stack, so this preserves the common
-                        // case while admitting v6-only destinations.
-                        let resolved = tokio::time::timeout(
+                        // Resolve the peer address and walk every
+                        // result, picking the bind family per address
+                        // — hostnames are typically dual-stack and a
+                        // partial v6 outage (or a misconfigured AAAA)
+                        // would otherwise leave us stuck on the first
+                        // record. Pre-0.7.8 `socket.connect(host:port)`
+                        // walked the resolution list internally; the
+                        // 0.7.8 family-aware rewrite kept the v6-only
+                        // destination working but regressed the
+                        // failover by committing to `lookup_host().next()`.
+                        // Now we explicitly retry each resolved
+                        // SocketAddr (binding a fresh ephemeral socket
+                        // of the matching family) and break on first
+                        // success, mirroring the standard library's
+                        // `TcpStream::connect` walking semantics.
+                        let resolved: Vec<std::net::SocketAddr> = tokio::time::timeout(
                             PEER_CONNECT_TIMEOUT,
                             tokio::net::lookup_host(address.as_str()),
                         )
@@ -144,31 +151,63 @@ impl Output for SyslogUdpOutput {
                             format!("syslog_udp lookup {} timed out", address)
                         })?
                         .with_context(|| format!("syslog_udp lookup {}", address))?
-                        .next()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
+                        .collect();
+                        if resolved.is_empty() {
+                            anyhow::bail!(
                                 "syslog_udp: name resolution for {} returned no addresses",
                                 address
+                            );
+                        }
+                        let mut socket: Option<UdpSocket> = None;
+                        let mut last_err: Option<anyhow::Error> = None;
+                        for addr in &resolved {
+                            let bind_addr = match addr {
+                                std::net::SocketAddr::V4(_) => "0.0.0.0:0",
+                                std::net::SocketAddr::V6(_) => "[::]:0",
+                            };
+                            let candidate = match UdpSocket::bind(bind_addr).await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    last_err = Some(anyhow::Error::from(e).context(format!(
+                                        "syslog_udp output: failed to bind ephemeral socket ({})",
+                                        bind_addr
+                                    )));
+                                    continue;
+                                }
+                            };
+                            let connect_res = tokio::time::timeout(
+                                PEER_CONNECT_TIMEOUT,
+                                candidate.connect(*addr),
                             )
-                        })?;
-                        let bind_addr = match resolved {
-                            std::net::SocketAddr::V4(_) => "0.0.0.0:0",
-                            std::net::SocketAddr::V6(_) => "[::]:0",
-                        };
-                        let socket = UdpSocket::bind(bind_addr)
                             .await
-                            .with_context(|| {
-                                format!(
-                                    "syslog_udp output: failed to bind ephemeral socket ({})",
-                                    bind_addr
+                            .map_err(|_| {
+                                anyhow::anyhow!(
+                                    "syslog_udp connect to {} ({}) timed out",
+                                    address,
+                                    addr
                                 )
-                            })?;
-                        tokio::time::timeout(PEER_CONNECT_TIMEOUT, socket.connect(resolved))
-                            .await
-                            .with_context(|| {
-                                format!("syslog_udp connect to {} timed out", address)
-                            })?
-                            .with_context(|| format!("syslog_udp connect to {}", address))?;
+                            })
+                            .and_then(|res| {
+                                res.with_context(|| {
+                                    format!("syslog_udp connect to {} ({})", address, addr)
+                                })
+                            });
+                            match connect_res {
+                                Ok(()) => {
+                                    socket = Some(candidate);
+                                    break;
+                                }
+                                Err(e) => last_err = Some(e),
+                            }
+                        }
+                        let socket = socket.ok_or_else(|| {
+                            last_err.unwrap_or_else(|| {
+                                anyhow::anyhow!(
+                                    "syslog_udp: no resolved address for {} could be connected",
+                                    address
+                                )
+                            })
+                        })?;
                         state.conn = Some(socket);
                     }
 
