@@ -10,6 +10,11 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased] - 0.7.8
 
+### Fixed — Docs: fenced code blocks now tagged for markdownlint MD040 compliance
+
+`docs/src/{dsl-syntax,functions/expression-functions,processing/user-defined,inputs/syslog-tcp,outputs/syslog-udp}.md` had unannotated fenced code blocks. mdbook-style consumers tolerate this, but markdownlint MD040 flags them and standard syntax-highlighting falls back to "no language". All 93 bare fences across these 5 files are now tagged `limpid` (the contents are uniformly limpid DSL — `def input/output/process { … }`, `workspace.x = …`, expression-function call sites). The accompanying `tls.rs` doc comment on `TLS_CLIENT_BLOCK_PROPERTIES` is also corrected: it claimed "empty `tls {}` block is rejected by callers", but the actual contract is module-specific (`output otlp_http` rejects on plaintext endpoints; other callers accept empty blocks as "use system CA roots"). Doc-only — no code path touched.
+
+
 ### Fixed — `sum()` now reports i64 overflow as a typed error
 
 The integer accumulator used unchecked `+=` and depended on the

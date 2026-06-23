@@ -2,7 +2,7 @@
 
 Built-in functions are primitives implemented in Rust and shipped with the daemon. They cover the parts that have to live close to the runtime — parsers, encoders, regex, hashing, GeoIP, table operations, OS helpers — and adding a new one means a Rust commit and a daemon rebuild.
 
-```
+```limpid
 def process parse_cef_line {
     workspace.syslog = syslog.parse(ingress)
     workspace.cef    = cef.parse(workspace.syslog.msg)
@@ -27,7 +27,7 @@ A parser function returns a `Value::Object` whose keys are taken from the parse 
 
 **Bare statement** — the returned object's top-level keys are merged directly into `workspace`:
 
-```
+```limpid
 def process parse_fw_flat {
     syslog.parse(ingress)        // workspace.hostname, workspace.msg, ...
 }
@@ -35,7 +35,7 @@ def process parse_fw_flat {
 
 **Capture into a path** — the object lands as a single value at the assigned path:
 
-```
+```limpid
 def process parse_fw_namespaced {
     workspace.syslog = syslog.parse(ingress)   // workspace.syslog.hostname, workspace.syslog.msg, ...
     workspace.cef    = cef.parse(ingress)      // workspace.cef.version, workspace.cef.src, ...
@@ -48,7 +48,7 @@ When a function returns `null` (e.g. `table_upsert(...)`), the bare statement is
 
 Other assignment targets:
 
-```
+```limpid
 let pri = syslog.extract_pri(egress)    // process-local scratch
 egress  = syslog.strip_pri(egress)      // overwrite egress
 egress  = syslog.set_pri(egress, 16, 6) // rewrite the PRI byte
@@ -64,7 +64,7 @@ The remaining sections describe each function — its signature, what it returns
 
 Parses an RFC 3164 (BSD) or RFC 5424 (versioned) syslog header. Auto-detects the version by looking for a single digit followed by a space after `<PRI>`. Errors when no valid `<PRI>` header is present (1–3 ASCII digits, value 0–191, framed by `<` and `>` at the start of the input).
 
-```
+```limpid
 workspace.syslog = syslog.parse(ingress)   // recommended: capture under a namespace
 syslog.parse(ingress)                       // bare merge into workspace top-level (collision-prone)
 ```
@@ -95,7 +95,7 @@ If you only need the PRI value (e.g. to route on severity without tokenising the
 
 Removes a leading `<PRI>` header. Returns the input unchanged if there is no syntactically valid `<N>` header (1-3 digits, value 0-191).
 
-```
+```limpid
 egress = syslog.strip_pri(egress)
 ```
 
@@ -103,7 +103,7 @@ egress = syslog.strip_pri(egress)
 
 Writes or rewrites the leading `<PRI>` header. `facility` must be 0-23, `severity` 0-7. If the input already has a valid `<PRI>`, it is replaced; otherwise the new header is prepended.
 
-```
+```limpid
 egress = syslog.set_pri(egress, 16, 6)   // local0.info
 ```
 
@@ -111,7 +111,7 @@ egress = syslog.set_pri(egress, 16, 6)   // local0.info
 
 Returns the leading `<PRI>` value as a number (0-191), or `null` when no valid PRI is present.
 
-```
+```limpid
 let pri = syslog.extract_pri(ingress)
 if pri != null and pri < 8 {
     output alert        // emergencies and alerts
@@ -120,7 +120,7 @@ if pri != null and pri < 8 {
 
 To recover the constituent facility / severity:
 
-```
+```limpid
 let pri      = syslog.extract_pri(ingress)
 let facility = pri / 8
 let severity = pri % 8
@@ -132,14 +132,14 @@ let severity = pri % 8
 
 Parses CEF. The input must start with `CEF:` — syslog wrapper handling is the caller's responsibility, not the CEF parser's. The canonical pattern for CEF over syslog:
 
-```
+```limpid
 workspace.syslog = syslog.parse(ingress)
 workspace.cef    = cef.parse(workspace.syslog.msg)
 ```
 
 When CEF arrives on transports without a syslog wrapper (HTTP body, file, …), call directly:
 
-```
+```limpid
 workspace.cef = cef.parse(ingress)
 ```
 
@@ -179,7 +179,7 @@ so authors write directly against the OTLP spec. The JSON form
 applies the canonical OTLP/JSON conventions (camelCase, u64-as-string,
 bytes-as-hex) at the wire boundary.
 
-```
+```limpid
 workspace.otlp = {
     resource: {
         attributes: [
@@ -219,7 +219,7 @@ the raw wire bytes. Pair with the [`otlp_http` output](../outputs/otlp_http.md) 
 Inverse of `encode_resourcelog_protobuf`. Used by snippets that
 need to inspect / transform an inbound OTLP record:
 
-```
+```limpid
 def process redact_pii {
     workspace.otlp = otlp.decode_resourcelog_protobuf(ingress)
     // ... edit workspace.otlp ...
@@ -261,7 +261,7 @@ typically only emit the canonical level value.
 
 Returns `true` if `haystack` contains `needle` anywhere.
 
-```
+```limpid
 if contains(workspace.syslog.msg, "Failed password") {
     output alerts
 }
@@ -271,7 +271,7 @@ if contains(workspace.syslog.msg, "Failed password") {
 
 Returns `true` if `haystack` starts (resp. ends) with `needle`. Use these when the position matters — for example, dispatching to the right parser based on the leading bytes:
 
-```
+```limpid
 workspace.syslog = syslog.parse(ingress)
 if starts_with(workspace.syslog.msg, "CEF:") {
     workspace.cef = cef.parse(workspace.syslog.msg)
@@ -282,7 +282,7 @@ if starts_with(workspace.syslog.msg, "CEF:") {
 
 Returns the string in lowercase or uppercase.
 
-```
+```limpid
 workspace.syslog.hostname = lower(workspace.syslog.hostname)
 ```
 
@@ -290,7 +290,7 @@ workspace.syslog.hostname = lower(workspace.syslog.hostname)
 
 Returns `true` if `str` matches the regex pattern.
 
-```
+```limpid
 if regex_match(egress, "^\\d{4}-\\d{2}-\\d{2}") {
     workspace.has_date = true
 }
@@ -300,7 +300,7 @@ if regex_match(egress, "^\\d{4}-\\d{2}-\\d{2}") {
 
 Returns the first capture group (or full match if no groups). Returns `null` if no match.
 
-```
+```limpid
 workspace.ip = regex_extract(egress, "(\\d+\\.\\d+\\.\\d+\\.\\d+)")
 ```
 
@@ -310,7 +310,7 @@ Runs `pattern` against `str` and returns a `Value::Object` with one key per **na
 
 Capture names containing `.` build a nested object, so `(?P<date.month>...)` populates `{ date: { month: "..." } }` and sibling dotted names merge under the same parent. Used as a bare statement, the returned object merges into `workspace` exactly like `parse_json` / `parse_kv` / `syslog.parse`.
 
-```
+```limpid
 // Bare-statement merge: parse a FortiGate-style header into workspace.
 regex_parse(ingress, "^(?P<date>\\S+) (?P<time>\\S+) (?P<host>\\S+) (?P<prog>\\w+):")
 
@@ -338,7 +338,7 @@ Returns:
 
 Returns the string with all matches replaced. Supports capture group references (`$1`, `$2`).
 
-```
+```limpid
 egress = regex_replace(egress, "\\d{16}", "REDACTED")
 ```
 
@@ -352,7 +352,7 @@ JSON and KV are *formats*, not schemas — they describe how bytes are arranged,
 
 Parses `text` as JSON and returns the top-level object. Non-object JSON (arrays, scalars) is wrapped under the `_json` key so the return is always an object.
 
-```
+```limpid
 workspace.body = parse_json(egress)      // recommended: capture under a namespace
 parse_json(egress)                       // bare merge top-level keys into workspace (collision-prone)
 ```
@@ -363,7 +363,7 @@ The returned object's keys are whatever the source JSON contains at the top leve
 
 Parses `key=value` pairs (handling quoted values). Tokens without `=` are skipped.
 
-```
+```limpid
 workspace.kv = parse_kv(egress)          // recommended: capture under a namespace
 parse_kv(egress)                          // bare merge into workspace
 // egress = `date=2026-04-15 srcip=10.0.0.1 action=deny msg="login failed"`
@@ -372,7 +372,7 @@ parse_kv(egress)                          // bare merge into workspace
 
 `separator` is a single ASCII byte (default `' '`). Comma-separated payloads (Cisco ASA, Microsoft Defender, OEM telemetry) pass an explicit separator:
 
-```
+```limpid
 workspace.kv = parse_kv(workspace.syslog.msg, ",")
 // "a=1,b=2,c=\"three,four\"" → {a: "1", b: "2", c: "three,four"}
 ```
@@ -385,7 +385,7 @@ The returned object's keys come from the parsed input as-is. Useful for FortiGat
 
 Parses a single CSV row into an object keyed by the supplied field names. `field_names` is a JSON array of strings; positional columns that line up with empty names (`""`) are skipped. Useful for vendor exports that ship long flat rows with no header, most notably Palo Alto Networks syslog logs (100+ positional fields per THREAT / TRAFFIC record).
 
-```
+```limpid
 csv_parse(egress, ["future1", "receive_time", "serial", "log_type",
                    "threat_type", "", "generated_time", "src_ip", "dst_ip", ...])
 // → workspace.future1 = "1", workspace.receive_time = "2026/04/25 10:00:00", ...
@@ -411,7 +411,7 @@ Timestamps and strings are distinct types. `contains(received_at, "2026")` is a 
 
 Formats a `Value::Timestamp` (such as `received_at`) according to a [`chrono` strftime](https://docs.rs/chrono/latest/chrono/format/strftime/) format string.
 
-```
+```limpid
 strftime(received_at, "%Y-%m-%d")          // 2026-04-19
 strftime(received_at, "%b %e %H:%M:%S")    // Apr 19 10:30:45
 strftime(received_at, "%Y-%m-%d", "local") // convert to local time first
@@ -431,7 +431,7 @@ An invalid timezone specifier is a loud error — `strftime` never silently retu
 
 Inverse of `strftime`. Parses an arbitrary timestamp string with a `strftime`-style format and returns a `Value::Timestamp`.
 
-```
+```limpid
 workspace.event_time = strptime(workspace.kv.date, "%Y-%m-%d %H:%M:%S", "UTC")
 strptime("2026-04-15T10:30:00+09:00", "%Y-%m-%dT%H:%M:%S%:z")  // tz in format → no third arg
 strptime("2026-04-15 10:30:00", "%Y-%m-%d %H:%M:%S", "local")  // naive + local
@@ -449,7 +449,7 @@ If the format includes an offset specifier (`%z`, `%:z`, `%#z`), the third argum
 
 Atomic RFC 3339 datetime parser. Returns a `Value::Timestamp` (UTC-normalised).
 
-```
+```limpid
 parse_datetime_rfc3339("2026-04-30T01:23:45Z")
 parse_datetime_rfc3339("2026-04-30T01:23:45.123456+00:00")
 parse_datetime_rfc3339("2026-04-30T01:23:45.123456789+0900")
@@ -457,7 +457,7 @@ parse_datetime_rfc3339("2026-04-30T01:23:45.123456789+0900")
 
 RFC 3339 is the strict internet-friendly profile of ISO 8601 used by RFC 5424 syslog timestamps, OTLP, OCSF `time` fields, AWS CloudTrail `eventTime`, and most modern cloud audit logs. The format is:
 
-```
+```limpid
 YYYY-MM-DDTHH:MM:SS[.fractional](Z | ±HH:MM | ±HHMM)
 ```
 
@@ -471,7 +471,7 @@ For RFC 3164 syslog timestamps (`Apr 30 01:23:45`, no year, no timezone), there 
 
 Atomic RFC 2822 / RFC 5322 datetime parser (the format used by email `Date:` headers and some legacy wire formats). Returns a `Value::Timestamp`.
 
-```
+```limpid
 parse_datetime_rfc2822("Thu, 30 Apr 2026 01:23:45 +0000")
 parse_datetime_rfc2822("30 Apr 2026 01:23:45 -0500")
 ```
@@ -482,7 +482,7 @@ For modern internet datetimes (RFC 5424 syslog, OTLP, OCSF, cloud audit logs) us
 
 Returns the current wall-clock instant as a `Value::Timestamp` (UTC). Matches the type of `received_at` and the input shape `strftime` / `strptime` expect.
 
-```
+```limpid
 workspace.processed_at = timestamp()
 egress = "${strftime(timestamp(), \"%Y-%m-%dT%H:%M:%S%:z\", \"local\")} ${egress}"
 ```
@@ -498,7 +498,7 @@ Return the leftmost argument that is not `null`; if every argument is
 "prefer parsed value, fall back to environment" pattern that recurs
 throughout composers and parsers.
 
-```
+```limpid
 // Composer: prefer parsed event time, fall back to received_at
 let event_time = coalesce(workspace.limpid.time, received_at)
 
@@ -536,7 +536,7 @@ compacted — a `null` element survives, because that's often the
 parser's placeholder ("this slot was unknown") and silently dropping
 it would hide the signal.
 
-```
+```limpid
 workspace.payload = {
     src: workspace.cef.src,
     dst: workspace.cef.dst,
@@ -585,7 +585,7 @@ this without a dedicated `compact` primitive.
 
 Return the hex digest.
 
-```
+```limpid
 workspace.fingerprint = md5(egress)
 workspace.hash = sha256(egress)
 
@@ -609,7 +609,7 @@ primitive is the explicit text → binary boundary.
 | `"hex"` | Parse as hex (lowercase or upper, even length). `"deadBEEF"` → 4 bytes. |
 | `"base64"` | Decode standard RFC 4648 base64 with padding. |
 
-```
+```limpid
 workspace.signature = to_bytes(workspace.sig_hex, "hex")
 egress = to_bytes(workspace.payload_b64, "base64")
 ```
@@ -629,7 +629,7 @@ Convert raw bytes to a string. Counterpart of `to_bytes`.
 | `"hex"` | (ignored) | Lowercase hex pair per byte. |
 | `"base64"` | (ignored) | Standard RFC 4648 with padding. |
 
-```
+```limpid
 workspace.message = to_string(ingress)                       // strict UTF-8 — error on binary
 workspace.message = to_string(ingress, "utf8", false)        // lossy fallback
 workspace.signature_b64 = to_string(workspace.sig, "base64") // bytes → printable
@@ -643,7 +643,7 @@ Text-only primitives (`upper`, `regex_*`, `format`, `to_int`,
 
 Coerces a value to a 64-bit signed integer. Returns `null` on unparseable input, matching the partial-data policy of `regex_extract` and `table_lookup`.
 
-```
+```limpid
 workspace.limpid.src_endpoint.port = to_int(workspace.cef.spt)  // CEF ext: "54321" → 54321
 ```
 
@@ -669,7 +669,7 @@ Four primitives — `map`, `filter`, `find`, `reduce` — take a **block argumen
 
 Per-element transform; returns a new array of the same length, with each element replaced by the block's return value. Construction order is preserved. `Null` input → empty array.
 
-```
+```limpid
 workspace.upper_users = map(workspace.events) { |e| upper(e.user) }
 ```
 
@@ -677,7 +677,7 @@ workspace.upper_users = map(workspace.events) { |e| upper(e.user) }
 
 Keep elements where the block returns a truthy value. Order-preserving; non-truthy elements (`false`, `null`, `0`, `""`, empty containers) are dropped.
 
-```
+```limpid
 workspace.alerts = filter(workspace.events) { |e| e.severity >= 7 }
 ```
 
@@ -687,7 +687,7 @@ Equivalent to `compact` for null removal: `filter(arr) { |x| x != null }` drops 
 
 First element where the block returns truthy, or `null` if no match. Replaces the v0.7.3 `find_by(arr, key, value)` — the new form composes for arbitrary predicates:
 
-```
+```limpid
 workspace.process = find(workspace.evidence) { |e| e.entityType == "Process" }
 workspace.user    = find(workspace.evidence) { |e| e.entityType == "User" }
 workspace.recent  = find(workspace.events)   { |e| e.received_at > workspace.cutoff }
@@ -699,7 +699,7 @@ Non-object elements no longer have to be skipped silently — predicate logic de
 
 Left fold. The block takes two parameters: the running accumulator (`init` on the first iteration) and the current element. The block's return value becomes the new accumulator. Empty array → `init` unchanged.
 
-```
+```limpid
 let total = reduce(workspace.amounts, 0) { |acc, x| acc + x }
 let joined = reduce(workspace.tags, "") { |acc, t| acc + "," + t }
 ```
@@ -708,7 +708,7 @@ let joined = reduce(workspace.tags, "") { |acc, t| acc + "," + t }
 
 Head / tail element, or `null` if the array is empty. Non-array input (including `null`) also returns `null` so call sites can chain through optional fields without an existence guard.
 
-```
+```limpid
 let latest = last(workspace.login_events)   // chronologically last
 let primary = first(workspace.addresses)    // construction-order head
 ```
@@ -719,7 +719,7 @@ Use these only when the order is itself the contract (chronology, "most recent",
 
 Variadic array concatenation; every argument must be an `Array`. Mixed input bails (no scalar auto-wrap — wrap explicitly if you want a single element: `concat(arr, [x])`).
 
-```
+```limpid
 workspace.all_tags = concat(workspace.host_tags, workspace.role_tags, ["pii"])
 ```
 
@@ -727,7 +727,7 @@ workspace.all_tags = concat(workspace.host_tags, workspace.role_tags, ["pii"])
 
 Equality-based dedupe; preserves the first occurrence of each value. Equality follows `==` rules (Int / Float cross-compare; Bytes never equals String).
 
-```
+```limpid
 workspace.distinct_users = distinct(map(workspace.events) { |e| e.user })
 ```
 
@@ -740,7 +740,7 @@ Reduce a numeric array to a scalar.
 
 Non-numeric elements bail rather than silently coerce. Mixed numeric / null arrays also bail, because "skip the nulls" is a per-pipeline policy decision; use `filter(arr) { |x| x != null } |> sum` to opt in.
 
-```
+```limpid
 let total_bytes = sum(map(workspace.flows) { |f| f.bytes })
 let highest_severity = max(map(workspace.alerts) { |a| a.severity })
 ```
@@ -749,7 +749,7 @@ let highest_severity = max(map(workspace.alerts) { |a| a.severity })
 
 Name positional captures: take an `Array` of values and an `Array` of string keys (same length), produce an `Object` keyed by name. Length mismatch is a **loud failure** — the typical use is naming parser captures, where a drift is almost always a parser-shape bug the operator wants to hear about.
 
-```
+```limpid
 let cap = regex_parse_groups(ingress, "(\\S+) (\\S+) (\\S+)")
 workspace.fields = entitle(cap, ["user", "host", "action"])
 ```
@@ -764,7 +764,7 @@ Dynamic dotted-path access. Equivalent to `obj.key1.key2.…` but with the keys 
 
 **Integer keys are rejected** — positional access on arrays is intentionally absent from the DSL; `path(arr, 0)` would re-introduce it through the back door. Use `find(arr) { |x| ... }` to pick an element by identity.
 
-```
+```limpid
 // Same as workspace.geo.country.name, but the key list is dynamic:
 let leaf = path(workspace.geo, dynamic_key, "name")
 ```
@@ -773,7 +773,7 @@ let leaf = path(workspace.geo, dynamic_key, "name")
 
 Return a new array with `value` added at the back (`append`) or the front (`prepend`). The input array is not mutated — callers re-bind:
 
-```
+```limpid
 workspace.limpid.observables = append(workspace.limpid.observables, new_obs)
 workspace.high_prio_tags = prepend(workspace.high_prio_tags, "urgent")
 ```
@@ -800,7 +800,7 @@ Cardinality primitive — works for every container-like type:
 | `Null` | `Null` |
 | Scalars (`Int` / `Float` / `Bool`) | `Null` |
 
-```
+```limpid
 workspace.n_observables = len(workspace.limpid.observables)
 workspace.msg_len = len(workspace.syslog.msg)
 ```
@@ -811,7 +811,7 @@ Returning `null` on scalars (rather than `0` or an error) keeps the "not applica
 
 Type predicate. Returns `true` when `value` is an Array, `false` for any other type (including `Null`, `String`, `Object`, `Int`, `Float`, `Bool`, `Bytes`, `Timestamp`).
 
-```
+```limpid
 let xs = [1, 2, 3]
 is_array(xs)            // true
 is_array([])            // true (empty array is still an array)
@@ -822,7 +822,7 @@ is_array({a: 1})        // false (Object, not Array)
 
 Designed for snippet parsers that consume vendor JSON whose nominally-array fields may arrive as scalars when upstream is malformed. The pattern is **pre-validate intake shape, emit a parser-authored error on mismatch** — rather than fall through to `find()` / `map()` / `filter()` and surface a generic `<primitive>() expects an array` runtime error:
 
-```
+```limpid
 def process parse_okta_system {
     workspace.okta = parse_json(ingress)
     switch true {
@@ -842,7 +842,7 @@ Sibling predicates (`is_object`, `is_string`, …) are deferred until repeated n
 
 Serializes a value to a JSON string. Errors if the value (or any nested value) contains `Value::Bytes` — convert explicitly via `to_string(b)` if you mean to embed bytes as text.
 
-```
+```limpid
 egress = to_json(workspace)               // common: ship workspace as JSON downstream
 workspace.geo_json = to_json(geoip(workspace.src))
 egress = to_json({                         // build any shape inline
@@ -860,7 +860,7 @@ In-memory key-value tables with optional TTL and max entry limits. Tables are de
 
 Returns the value for a key, or `null` if not found or expired.
 
-```
+```limpid
 workspace.asset_name = table_lookup("asset", workspace.src)
 ```
 
@@ -870,7 +870,7 @@ Inserts or updates a key. `expire` is TTL in seconds (0 = no expiry, omitted = t
 
 Can be used as an expression statement (no assignment needed):
 
-```
+```limpid
 table_upsert("seen", workspace._hash, "1", 300)
 ```
 
@@ -878,7 +878,7 @@ table_upsert("seen", workspace._hash, "1", 300)
 
 Removes a key from the table.
 
-```
+```limpid
 table_delete("sessions", workspace.session_id)
 ```
 
@@ -886,7 +886,7 @@ table_delete("sessions", workspace.session_id)
 
 **Asset enrichment** — look up metadata from a static table loaded at startup:
 
-```
+```limpid
 def process enrich {
     workspace.asset = table_lookup("assets", source)
     workspace.owner = table_lookup("owners", source)
@@ -895,7 +895,7 @@ def process enrich {
 
 **Event deduplication** — suppress repeated events from the same source within a time window:
 
-```
+```limpid
 def process dedup {
     workspace._key = sha256(regex_extract(ingress, "msg=(.+)"))
     if table_lookup("seen", workspace._key) != null {
@@ -907,7 +907,7 @@ def process dedup {
 
 **Rate limiting by source** — allow one event per source IP per interval, drop the rest:
 
-```
+```limpid
 def process rate_limit_alerts {
     if table_lookup("alert_rate", source) != null {
         drop
@@ -918,7 +918,7 @@ def process rate_limit_alerts {
 
 **Session tracking** — track active sessions and clean up on disconnect:
 
-```
+```limpid
 def process track_session {
     if contains(ingress, "session opened") {
         workspace._sid = regex_extract(ingress, "session=(\\S+)")
@@ -939,7 +939,7 @@ See [Configuration](../configuration.md#table) for table definition options.
 
 Returns a GeoIP lookup result as an object with `country`, `city`, `latitude`, and `longitude` fields.
 
-```
+```limpid
 workspace.geo = geoip(workspace.src)
 // workspace.geo.country = "JP"
 // workspace.geo.city = "Tokyo"
@@ -949,7 +949,7 @@ Requires the `geoip` global block. See [Configuration](../configuration.md#geoip
 
 Access nested properties with postfix property access:
 
-```
+```limpid
 workspace.country = geoip(workspace.src).country
 ```
 
@@ -957,7 +957,7 @@ workspace.country = geoip(workspace.src).country
 
 Returns the hostname of the machine running the limpid daemon. Resolved at every call via `gethostname(2)`.
 
-```
+```limpid
 workspace.forwarded_by = hostname()
 ```
 
@@ -967,7 +967,7 @@ Useful for tagging events with the forwarder's identity (e.g. when several limpi
 
 Returns the limpid daemon's version string, baked in at compile time (e.g. `"0.5.0"`).
 
-```
+```limpid
 workspace.processed_by_version = version()
 ```
 
@@ -990,7 +990,7 @@ Expressions support the following operators:
 
 If either operand is a string, `+` concatenates after stringifying the other side:
 
-```
+```limpid
 egress = "[" + workspace.syslog.hostname + "] " + egress
 egress = source.ip + " " + egress
 ```

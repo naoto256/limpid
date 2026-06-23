@@ -6,7 +6,7 @@ You define a process with `def process <name> { ... }`. Inside the body you call
 
 ## Defining a process
 
-```
+```limpid
 def process enrich_fortigate {
     workspace.cef = cef.parse(workspace.syslog.msg)   // capture parser output
 
@@ -32,7 +32,7 @@ Anything else on the left of `=` is rejected as an unknown assignment target.
 
 A `let` binding can hold any value type — scalar, Object, or Array. When the bound value is an Object, dot-access reads through the binding the same way `workspace.x.y` does:
 
-```
+```limpid
 def process parse_xxx {
     let f = regex_parse(workspace.body, "(?P<user>\\S+) (?P<host>\\S+)")
     workspace.limpid = {
@@ -48,7 +48,7 @@ Read-side dot-access on a `let` binding is the same path-walk used for `workspac
 
 **`egress`** is the byte buffer that output modules write to the wire. If you want to change what gets sent, you must change `egress`:
 
-```
+```limpid
 // This changes the output:
 egress = "${workspace.syslog.hostname}: ${workspace.syslog.msg}"
 
@@ -59,7 +59,7 @@ workspace.syslog.hostname = "new-host"
 
 `workspace` is a pipeline-local scratch area for intermediate values — parsed data, enrichment results, routing decisions. Workspace values are **not** automatically serialised into `egress`. To include them in the output, explicitly rebuild `egress`:
 
-```
+```limpid
 workspace.kv = parse_kv(egress)               // capture into namespace
 egress = to_json(workspace)                   // serialise workspace as JSON
 // or
@@ -68,7 +68,7 @@ egress = "${workspace.kv.srcip} -> ${workspace.kv.dstip}"
 
 ### Rewriting the syslog PRI
 
-```
+```limpid
 def process ama_rewrite {
     if contains(ingress, "CEF:") {
         egress = syslog.set_pri(egress, 16, 6)   // local0.info for CEF
@@ -84,7 +84,7 @@ def process ama_rewrite {
 
 ### try / catch
 
-```
+```limpid
 try {
     // body — may raise an error
 } catch {
@@ -94,7 +94,7 @@ try {
 
 Catches errors raised inside the `try` body — an unparseable `parse_json` input, a `to_int` overflow, a regex compile failure, or any other primitive that bails. The error message is bound to the reserved name `error` inside the `catch` block.
 
-```
+```limpid
 def process safe_parse_json {
     try {
         workspace.body = parse_json(egress)
@@ -134,7 +134,7 @@ limpid arrays are **ordered but index-hidden**. You construct them with `[a, b, 
 
 A numeric index is a human convenience that drifts the moment anything else mutates the collection. If "evidence of type Process" happened to land at `arr[0]` in one event and `arr[1]` in the next because an extra entity was prepended upstream, positional code silently reads the wrong thing. Use `find` to address by intrinsic identity, or `first` / `last` when "the only one" or "the most recent" is what you actually mean:
 
-```
+```limpid
 // WRONG (position is an accident of construction order)
 workspace.process = workspace.evidence[0]
 
@@ -167,7 +167,7 @@ Block-arg primitives (`map`, `filter`, `find`, `reduce`) and the pipe operator (
 
 ### Example: building an OCSF multi-value field
 
-```
+```limpid
 def process compose_types {
     // Start with a fresh collection. Arrays preserve construction order
     // but consumers should not rely on the index of any one element.
@@ -184,7 +184,7 @@ def process compose_types {
 
 ### Example: picking specific evidence from an MDE alert
 
-```
+```limpid
 def process parse_mde_alert {
     parse_json(ingress)
     workspace.process_ev = find(workspace.evidence) { |e| e.entityType == "Process" }
@@ -196,7 +196,7 @@ Neither lookup cares whether "the Process entity" appears first, last, or third 
 
 ### Example: chained transforms with pipe
 
-```
+```limpid
 def process top_user_logins {
     // The pipe operator inserts the LHS as the first arg of the call on
     // the right; `a |> f(b)` ≡ `f(a, b)`. Reads top-to-bottom.
@@ -212,7 +212,7 @@ def process top_user_logins {
 
 Inside a process body you can call another named process by name:
 
-```
+```limpid
 def process enrich_and_tag {
     process enrich_fortigate
     process my_custom_enrichment

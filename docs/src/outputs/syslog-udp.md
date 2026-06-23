@@ -9,7 +9,7 @@ with UDP best-effort caveats.
 
 Single destination:
 
-```
+```limpid
 def output relay {
     type syslog_udp
     peer { host "10.0.0.1" port 514 }
@@ -18,7 +18,7 @@ def output relay {
 
 Multiple destinations:
 
-```
+```limpid
 def output relay {
     type syslog_udp
     peers {
