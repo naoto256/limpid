@@ -25,13 +25,16 @@
 //! `tokio::sync::Mutex` before opening the file. The serialisation
 //! is inside the `error_log` boundary, not at the kernel layer.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
+use crate::event::Event;
 use crate::pipeline::ErroredEventContext;
 
 /// Writer for the configured `error_log` JSONL file.
@@ -97,6 +100,44 @@ impl ErrorLogWriter {
     /// Append one JSONL record for `ctx`. Errors here are surfaced to
     /// the caller (runtime layer) which counts them in
     /// `events_errored_unwritable` and falls back to tracing.
+    /// Persist a rendered buffer entry that survived an
+    /// [`Output::shutdown`] flush failure (BC-4 / PR-P).
+    ///
+    /// The batched outputs (`http`, `otlp_http`, `otlp_grpc`) carry
+    /// rendered bytes in their in-memory buffer; by the time the
+    /// shutdown flush fails, the originating `OwnedEvent` is long gone
+    /// (the memory queue already counted the per-event `write()` as
+    /// delivered). We synthesise a minimal `OwnedEvent` carrying the
+    /// rendered payload as `ingress` so the existing
+    /// [`ErroredEventContext`] schema and `error_log` JSONL format are
+    /// reused verbatim. The `process` field is set to
+    /// `"(output <name> shutdown)"` so operators can distinguish
+    /// shutdown-recovery records from PR-O's retry-exhausted records
+    /// (which use `"(output <name>)"`).
+    ///
+    /// `source` is set to `127.0.0.1:0` — a marker that matches the
+    /// daemon's other synthetic events (control-socket inject,
+    /// `--test-pipeline`). `received_at` defaults to "now"; the
+    /// `timestamp` field on the outer context already records the
+    /// shutdown wall-clock.
+    pub async fn write_shutdown_payload(
+        &self,
+        output_name: &str,
+        payload: Bytes,
+        reason: &str,
+    ) -> Result<()> {
+        let source: SocketAddr = "127.0.0.1:0".parse().expect("static addr parses");
+        let event = Event::new(payload, source);
+        let ctx = ErroredEventContext {
+            timestamp: chrono::Utc::now(),
+            pipeline: String::new(),
+            process: format!("(output {} shutdown)", output_name),
+            reason: reason.to_string(),
+            event,
+        };
+        self.write(&ctx).await
+    }
+
     pub async fn write(&self, ctx: &ErroredEventContext) -> Result<()> {
         let mut line = ctx.to_jsonl();
         line.push('\n');
