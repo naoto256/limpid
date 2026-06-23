@@ -376,6 +376,15 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
 /// the caller-supplied `ship` closure, then updates the
 /// `events_written` / `events_failed` counters on the metrics handle.
 ///
+/// The closure returns `Result<u64>` where the `u64` is the number of
+/// records the server acknowledged as rejected (OTLP's
+/// `partial_success.rejected_log_records`; always 0 for outputs that
+/// have no equivalent concept, like `output http`). For a single Owned
+/// event a non-zero rejection means the server processed the request
+/// but refused our one record — transport-success, data-loss — so
+/// we count it as `events_failed` even though the call returns Ok
+/// (the queue layer must not retry; the server already said no).
+///
 /// The batched outputs (`otlp_grpc`, `otlp_http`, `output http`)
 /// each need to override `write_owned` so the queue consumer's
 /// per-event `Ok`/`Err` contract is honored (disk-replay events
@@ -392,7 +401,7 @@ pub async fn ship_owned_inline<O, F, Fut>(
 where
     O: Output + ?Sized,
     F: FnOnce(RenderedPayload) -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
+    Fut: std::future::Future<Output = Result<u64>>,
 {
     use std::sync::atomic::Ordering;
 
@@ -403,8 +412,16 @@ where
         output.render(&bevent, &arena)?
     };
     match ship(payload).await {
-        Ok(()) => {
+        Ok(0) => {
             metrics.events_written.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        Ok(_rejected) => {
+            // Transport said OK, server rejected the single record we
+            // sent. Count as failed so dashboards reflect the data
+            // loss; return Ok so the queue does not retry — the
+            // server already refused this exact bytes.
+            metrics.events_failed.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
         Err(e) => {

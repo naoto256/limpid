@@ -461,7 +461,9 @@ impl Output for HttpOutput {
     async fn write_owned(&self, event: &Event) -> Result<()> {
         crate::modules::ship_owned_inline(self, event, &self.metrics, |payload| async move {
             let payload: HttpPayload = payload.downcast()?;
-            self.inner.send_batch(&[payload.msg]).await
+            // Plain HTTP has no partial-success concept; either the
+            // POST succeeds end-to-end or it errors. Always Ok(0).
+            self.inner.send_batch(&[payload.msg]).await.map(|()| 0)
         })
         .await
     }

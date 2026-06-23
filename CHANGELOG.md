@@ -10,6 +10,16 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased] - 0.7.8
 
+### Fixed — `output otlp_grpc` / `output otlp_http`: route `partial_success.rejected_log_records` to `events_failed`
+
+When the OTLP receiver returned 2xx-equivalent with `partial_success.rejected_log_records > 0`, both transports counted the entire batch as `events_written`, hiding server-side data loss from operator dashboards. `otlp_grpc` parsed the response and logged a warning but did not split the metric; `otlp_http` did not parse the response body at all. The OTLP transport-success path now splits the batch's events between `events_written` (accepted) and `events_failed` (rejected) using the receiver's `partial_success.rejected_log_records`. `otlp_http` learned to decode the response body in both protobuf and JSON forms — peers returning empty bodies or undecodable bodies are still treated as fully accepted (the lenient default). Selective re-send of *only* the rejected records remains queued for a later release, as documented in the existing `send_once` doc comments; this change is purely metrics accuracy.
+
+
+### Fixed — `output otlp_grpc` / `output otlp_http`: stop silently dropping distinct `schema_url`s when merging by Resource / Scope
+
+`merge_by_resource` (and the inner Scope-level pass in `merge_by_scope`) keyed merges only on Resource (or Resource + InstrumentationScope) equality. Two entries sharing a Resource but declaring *different non-empty* `schema_url`s — semantically: "the same resource described under two different schemas" — collapsed into a single bucket and the second `schema_url` was dropped on the floor. Per OTLP semantics they should remain distinct. The merge key now also requires `schema_url` compatibility (equal, or at least one side empty), so different non-empty `schema_url`s keep their own bucket. The existing "promote empty acc → take incoming schema_url" behaviour is preserved (and now regression-guarded).
+
+
 ### Upgrading — configs that now fail-fast (action required if matched)
 
 0.7.8 turns three previously-tolerated misconfigurations into hard parse-time errors. If a 0.7.7 config matches any of the patterns below, the daemon will refuse to start on 0.7.8 and limpidctl check will reject it:
