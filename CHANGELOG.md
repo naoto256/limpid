@@ -10,6 +10,11 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased] - 0.7.8
 
+### Fixed — `output otlp_grpc` rejects `tls { ... }` on plaintext `http://` endpoints
+
+Same trap `output otlp_http` already closes for itself in 0.7.8: tonic only engages the TLS layer when the URI scheme is `https`, so a `peer { endpoint "http://otel:4317"; tls { ca ...; cert ...; key ... } }` configuration silently dropped the entire TLS block and shipped gRPC in clear text — exactly the misconfiguration an operator who took the trouble to write a `tls` block was trying to avoid. The mismatch is now rejected at parse time with the same error wording as the `otlp_http` guard: switch the endpoint to `https://` or drop the `tls` block.
+
+
 ### Fixed — `output otlp_grpc` and `output otlp_http` now bound peer cooldown from failure time, not request start
 
 The peer-rotation cooldown timer was being measured from a pre-request `Instant::now()`, the same bug `output http` already fixed in 0.7.8 (commit `e0484e9`) and which was not propagated to the OTLP sinks. With the newly-introduced 30 s export timeout and a 5 s `PEER_COOLDOWN`, a peer that timed out wrote a cooldown that was already 25 s in the past, so the immediately-following batch reselected the same bad peer instead of rotating away. The cooldown timestamp now derives from a fresh `Instant::now()` captured on the failure branch in both `otlp/grpc.rs` and `otlp/http.rs`, matching the `output http` fix and giving the rotation budget the wall-clock distance it needs to actually shift load to a healthy peer.
