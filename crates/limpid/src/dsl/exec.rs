@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use super::arena::EventArena;
 use super::ast::*;
-use super::eval::{LocalScope, eval_expr_with_scope, value_to_string, values_match};
+use super::eval::{LocalScope, eval_expr_with_scope, select_if_branch, select_switch_arm, value_to_string};
 use super::value::Value;
 use crate::event::BorrowedEvent;
 use crate::functions::FunctionRegistry;
@@ -166,33 +166,22 @@ fn exec_process_stmt<'bump>(
         }
 
         ProcessStatement::If(if_chain) => {
-            exec_if_chain_process(if_chain, event, registry, funcs, scope, arena)
+            match select_if_branch(if_chain, |c| {
+                eval_expr_with_scope(c, &event, funcs, scope, arena)
+            })? {
+                Some(body) => exec_branch_body_process(body, event, registry, funcs, scope, arena),
+                None => Ok(ExecResult::Continue(event)),
+            }
         }
 
         ProcessStatement::Switch(discriminant, arms) => {
             let disc_val = eval_expr_with_scope(discriminant, &event, funcs, scope, arena)?;
-            for arm in arms {
-                if arm.pattern.is_none() {
-                    // default arm
-                    return exec_branch_body_process(
-                        &arm.body, event, registry, funcs, scope, arena,
-                    );
-                }
-                let pattern_val = eval_expr_with_scope(
-                    arm.pattern.as_ref().unwrap(),
-                    &event,
-                    funcs,
-                    scope,
-                    arena,
-                )?;
-                if values_match(&disc_val, &pattern_val) {
-                    return exec_branch_body_process(
-                        &arm.body, event, registry, funcs, scope, arena,
-                    );
-                }
+            match select_switch_arm(&disc_val, arms, |e| {
+                eval_expr_with_scope(e, &event, funcs, scope, arena)
+            })? {
+                Some(body) => exec_branch_body_process(body, event, registry, funcs, scope, arena),
+                None => Ok(ExecResult::Continue(event)),
             }
-            // No arm matched, pass through
-            Ok(ExecResult::Continue(event))
         }
 
         ProcessStatement::TryCatch(try_body, catch_body) => {
@@ -257,26 +246,6 @@ fn exec_process_stmt<'bump>(
             Ok(ExecResult::Continue(event))
         }
     }
-}
-
-fn exec_if_chain_process<'bump>(
-    if_chain: &IfChain,
-    event: BorrowedEvent<'bump>,
-    registry: &dyn ProcessRegistry,
-    funcs: &FunctionRegistry,
-    scope: &mut LocalScope<'bump>,
-    arena: &'bump EventArena<'bump>,
-) -> Result<ExecResult<'bump>> {
-    for (condition, body) in &if_chain.branches {
-        let cond_val = eval_expr_with_scope(condition, &event, funcs, scope, arena)?;
-        if cond_val.is_truthy() {
-            return exec_branch_body_process(body, event, registry, funcs, scope, arena);
-        }
-    }
-    if let Some(else_body) = &if_chain.else_body {
-        return exec_branch_body_process(else_body, event, registry, funcs, scope, arena);
-    }
-    Ok(ExecResult::Continue(event))
 }
 
 fn exec_branch_body_process<'bump>(
