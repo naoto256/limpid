@@ -10,6 +10,11 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased] - 0.7.8
 
+### Fixed — `output otlp_http` no longer buffers unbounded error bodies into memory
+
+The peer-failure diagnostic path used `resp.text().await` and then trimmed the resulting `String` to 500 chars. Because `text()` buffers the entire response body before returning, a peer (or upstream proxy) emitting a multi-MB error body forced the daemon to allocate / decode the full payload on every failure — an availability footgun the matching fix in `output http` already closed. `output otlp_http` now reads via the shared `read_body_capped` helper with the same 4 KiB cap, so the cost of a failing peer is bounded regardless of how chatty its error responses are.
+
+
 ### Internal — `read_body_capped` extracted to a shared helper
 
 `output http` and the soon-to-be-aligned `output otlp_http` both need to bound how many bytes of an error response body they read into memory, so the helper moved from `modules/output/http.rs` to a new `modules/output/http_util.rs` module. No behaviour change for `output http`. The lingering misleading comment that claimed the connection "returns to the pool" after a mid-chunk break is also corrected: reqwest/hyper closes the underlying TCP connection when the `Response` is dropped without reaching EOF, and that's an accepted trade-off (bounded memory matters more on a failing peer than reusing its connection).
