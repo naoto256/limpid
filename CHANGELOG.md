@@ -10,6 +10,17 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased] - 0.7.8
 
+### Upgrading — configs that now fail-fast (action required if matched)
+
+0.7.8 turns three previously-tolerated misconfigurations into hard parse-time errors. If a 0.7.7 config matches any of the patterns below, the daemon will refuse to start on 0.7.8 and limpidctl check will reject it:
+
+- **`output kafka` with `mechanism plain` and no `tls { ... }` block.** SASL/PLAIN sends credentials in clear text, so 0.7.8 requires a TLS transport. Remediation: add a `tls { ... }` block (CA only is fine for a server-cert-validated peer) or switch to `mechanism scram_sha_256` / `scram_sha_512`, which use challenge-response and never put the password on the wire.
+- **`output otlp_http` with a `tls { ... }` block on an `http://` endpoint** (and now `output otlp_grpc` too, added in the 0.7.8 sibling-regression follow-up). reqwest and tonic only engage TLS when the URI scheme is `https`, so the previous behaviour silently dropped the TLS block and shipped in clear text. Remediation: change the endpoint to `https://...`, or drop the `tls { ... }` block if plaintext is intended.
+- **`output http` with a `method` other than POST / PUT / an extension token reqwest accepts.** 0.7.7 silently downgraded unknown methods to POST; 0.7.8 fails fast at parse time. Remediation: spell the method correctly. The set of accepted methods matches reqwest's `Method::from_bytes` — uppercase, ASCII.
+
+No CHANGELOG entry intentionally hides any of these; they are individually called out in the `Fixed —` entries below. This summary just gives operators upgrading from 0.7.7 a single place to scan before the upgrade.
+
+
 ### Internal — End-to-end timeout-firing tests for the 0.7.8 export and TLS-handshake timeouts
 
 The three timeout constants introduced in 0.7.8 — `GRPC_REQUEST_TIMEOUT` / `HTTP_REQUEST_TIMEOUT` (30 s, on the OTLP sinks) and `TLS_HANDSHAKE_TIMEOUT` (10 s, on `input syslog_tcp`) — previously had bound-check assertions only. A regression that removed the `tokio::time::timeout(…)` wrap, or pointed it at a much larger duration, would not have been caught by a constant-value check. Three new paused-time tests (`export_timeout_fires_against_stalled_peer` in each of `output/otlp/grpc.rs` and `output/otlp/http.rs`, plus `tls_handshake_timeout_fires_against_stalled_client` in `input/syslog_tcp.rs`) exercise the actual firing path against a stalled TCP peer / client. Each uses `tokio::time::advance` past the documented timeout and asserts the call surfaces a timeout-flavoured error rather than hanging. `tokio`'s `test-util` feature is added to `[dev-dependencies]` to enable virtual time control. No production code change.
