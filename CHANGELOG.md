@@ -10,6 +10,11 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased] - 0.7.8
 
+### Internal — `read_body_capped` extracted to a shared helper
+
+`output http` and the soon-to-be-aligned `output otlp_http` both need to bound how many bytes of an error response body they read into memory, so the helper moved from `modules/output/http.rs` to a new `modules/output/http_util.rs` module. No behaviour change for `output http`. The lingering misleading comment that claimed the connection "returns to the pool" after a mid-chunk break is also corrected: reqwest/hyper closes the underlying TCP connection when the `Response` is dropped without reaching EOF, and that's an accepted trade-off (bounded memory matters more on a failing peer than reusing its connection).
+
+
 ### Fixed — Docs: fenced code blocks now tagged for markdownlint MD040 compliance
 
 `docs/src/{dsl-syntax,functions/expression-functions,processing/user-defined,inputs/syslog-tcp,outputs/syslog-udp}.md` had unannotated fenced code blocks. mdbook-style consumers tolerate this, but markdownlint MD040 flags them and standard syntax-highlighting falls back to "no language". All 93 bare fences across these 5 files are now tagged `limpid` (the contents are uniformly limpid DSL — `def input/output/process { … }`, `workspace.x = …`, expression-function call sites). The accompanying `tls.rs` doc comment on `TLS_CLIENT_BLOCK_PROPERTIES` is also corrected: it claimed "empty `tls {}` block is rejected by callers", but the actual contract is module-specific (`output otlp_http` rejects on plaintext endpoints; other callers accept empty blocks as "use system CA roots"). Doc-only — no code path touched.
