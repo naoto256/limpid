@@ -1128,4 +1128,116 @@ mod tests {
         let i = SyslogTcpInput::build("relay", &mp(&props)).expect("should build");
         assert_eq!(i.bind_addr, "127.0.0.1:9999");
     }
+
+    // ---------------------------------------------------------------------
+    // Accept-loop end-to-end tests: max_connections wire enforcement +
+    // valid-event delivery. Coverage-gap audit Agent A flagged these
+    // paths as High risk: the framing helpers are well-tested but the
+    // listener that wraps them is not.
+    // ---------------------------------------------------------------------
+
+    fn pick_port() -> u16 {
+        let s = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        s.local_addr().unwrap().port()
+    }
+
+    fn spawn_plain_input(
+        bind_addr: String,
+        max_connections: usize,
+    ) -> (
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+        tokio::sync::watch::Sender<bool>,
+        tokio::sync::mpsc::Receiver<Event>,
+        Arc<InputMetrics>,
+    ) {
+        let metrics = Arc::new(InputMetrics::default());
+        let input = SyslogTcpInput {
+            bind_addr,
+            framing: TcpFraming::OctetCounting,
+            tls_config: None,
+            rate_limit: None,
+            max_connections,
+            metrics: Arc::clone(&metrics),
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(async move { input.run(tx, sd_rx).await });
+        (handle, sd_tx, rx, metrics)
+    }
+
+    #[tokio::test]
+    async fn accepts_valid_octet_count_message_end_to_end() {
+        // Sanity baseline for the accept-loop: bind, connect, send an
+        // octet-counted frame `<len> <PRI>body`, observe the Event on
+        // the mpsc. Framing helpers are tested above; this exercises
+        // the listener that glues them together.
+        use tokio::io::AsyncWriteExt;
+        let port = pick_port();
+        let bind = format!("127.0.0.1:{port}");
+        let (handle, sd_tx, mut rx, _metrics) = spawn_plain_input(bind.clone(), 8);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut client = tokio::net::TcpStream::connect(&bind).await.unwrap();
+        // Frame: "9 <13>hello" — 9-byte body, then payload.
+        client.write_all(b"9 <13>hello").await.unwrap();
+        client.flush().await.unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("recv timed out")
+            .expect("channel closed");
+        assert_eq!(&event.ingress[..], b"<13>hello");
+
+        let _ = sd_tx.send(true);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn max_connections_cap_rejects_additional_clients() {
+        // The accept loop refuses the (max_connections + 1)th
+        // connection by dropping the stream immediately. A regression
+        // that off-by-oned the `>= self.max_connections` check or
+        // forgot to retain `conn_handles` would silently let the cap
+        // drift. Open `cap` long-lived TCP connections that never
+        // send data (so their per-conn tasks stay alive), then open
+        // one more and assert it gets closed promptly.
+        let port = pick_port();
+        let bind = format!("127.0.0.1:{port}");
+        let cap = 2usize;
+        let (handle, sd_tx, _rx, _metrics) = spawn_plain_input(bind.clone(), cap);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Hold `cap` connections open (no data sent → per-conn task
+        // sits in fill_buf / read_exact, holding the slot).
+        let mut held: Vec<tokio::net::TcpStream> = Vec::new();
+        for _ in 0..cap {
+            held.push(tokio::net::TcpStream::connect(&bind).await.unwrap());
+        }
+        // Brief yield so accept_loop registers each one in conn_handles.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // (cap + 1)th client connects but should be dropped by the
+        // accept loop. The client sees a TCP close — its read returns
+        // EOF (0 bytes) quickly.
+        let mut extra = tokio::net::TcpStream::connect(&bind).await.unwrap();
+        let mut buf = [0u8; 1];
+        let read_res = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tokio::io::AsyncReadExt::read(&mut extra, &mut buf),
+        )
+        .await;
+        match read_res {
+            Ok(Ok(0)) => {} // EOF, expected — server closed
+            Ok(Ok(n)) => panic!("rejected client read {n} bytes; expected EOF"),
+            Ok(Err(e)) => panic!("rejected client read errored: {e}"),
+            Err(_) => panic!(
+                "rejected client read timed out — server kept connection alive past max_connections"
+            ),
+        }
+
+        // The original `cap` connections remain open.
+        let _ = held;
+        let _ = sd_tx.send(true);
+        let _ = handle.await;
+    }
 }
