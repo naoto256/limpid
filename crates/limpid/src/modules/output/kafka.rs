@@ -267,6 +267,19 @@ fn pre_check_plain_requires_tls(
 /// which use a challenge-response and never put the password on the
 /// wire. Kept as a belt-and-braces check after `pre_check_plain_requires_tls`
 /// in case future refactors reorder or skip the pre-check.
+///
+/// Note on semantics: this checks `tls.is_none()` — i.e. *presence*
+/// of any `tls { ... }` block — not its validity. A tls block whose
+/// `ca` / `cert` / `key` paths point at non-existent files satisfies
+/// the guard at config-load time and is only rejected later when
+/// rdkafka tries to load the PEM bytes. Today that's fine because
+/// the kafka schema doesn't expose a `verify` toggle, so the only
+/// way to "have a tls block but no real TLS" is via a path typo,
+/// and the operator sees the file error a moment later. If a future
+/// `verify false` knob lands here (matching `output http` /
+/// `output otlp_http`), this guard would need to additionally
+/// reject `mechanism plain` + `verify false` since that combination
+/// would also put PLAIN credentials on a non-verified wire.
 fn require_tls_for_plain(
     name: &str,
     sasl: Option<&SaslConfig>,
