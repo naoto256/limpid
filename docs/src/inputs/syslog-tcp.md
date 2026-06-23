@@ -7,7 +7,7 @@ optional TLS termination (mTLS via client certificate verification).
 
 Plaintext:
 
-```
+```limpid
 def input fw_tcp {
     type syslog_tcp
     bind "0.0.0.0:514"
@@ -19,7 +19,7 @@ def input fw_tcp {
 
 TLS-terminated (default port 6514):
 
-```
+```limpid
 def input secure {
     type syslog_tcp
     framing auto
@@ -32,7 +32,7 @@ def input secure {
 
 mTLS (clients must present a cert signed by the configured CA):
 
-```
+```limpid
 def input mtls_relay {
     type syslog_tcp
     tls {
