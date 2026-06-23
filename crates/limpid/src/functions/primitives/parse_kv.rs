@@ -156,3 +156,87 @@ fn parse_kv_pairs(input: &str, sep: u8) -> Vec<(String, String)> {
 
     pairs
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pairs(input: &str, sep: u8) -> Vec<(String, String)> {
+        parse_kv_pairs(input, sep)
+    }
+
+    #[test]
+    fn basic_space_separated_pairs() {
+        let p = pairs("a=1 b=2 c=3", b' ');
+        assert_eq!(
+            p,
+            vec![
+                ("a".into(), "1".into()),
+                ("b".into(), "2".into()),
+                ("c".into(), "3".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn quoted_value_preserves_internal_separator() {
+        // Vendor logs (FortiGate, ASA) wrap multi-word values in
+        // quotes. The hand-rolled quote loop must include the
+        // separator byte verbatim INSIDE quotes.
+        let p = pairs(r#"a="hello world" b=2"#, b' ');
+        assert_eq!(
+            p,
+            vec![("a".into(), "hello world".into()), ("b".into(), "2".into())]
+        );
+    }
+
+    #[test]
+    fn escaped_quote_inside_quoted_value() {
+        // `\"` inside quotes must be consumed as two bytes (escape
+        // + quote) so the value continues. Otherwise an embedded
+        // quoted literal would terminate the value early.
+        let p = pairs(r#"msg="he said \"hi\"" k=v"#, b' ');
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[0].0, "msg");
+        assert!(p[0].1.contains("he said"), "got: {}", p[0].1);
+        assert_eq!(p[1], ("k".into(), "v".into()));
+    }
+
+    #[test]
+    fn custom_separator_byte() {
+        // The separator override is exercised via the second arg;
+        // call parse_kv_pairs directly with `;` to pin the byte.
+        let p = pairs("a=1;b=2;c=3", b';');
+        assert_eq!(p.len(), 3);
+    }
+
+    #[test]
+    fn trailing_equals_yields_empty_value() {
+        let p = pairs("a=", b' ');
+        assert_eq!(p, vec![("a".into(), String::new())]);
+    }
+
+    #[test]
+    fn bare_key_no_equals_is_skipped() {
+        let p = pairs("a key=v", b' ');
+        // "a" has no `=` so it's consumed-and-skipped per the
+        // current behaviour; key=v survives.
+        assert_eq!(p, vec![("key".into(), "v".into())]);
+    }
+
+    #[test]
+    fn multibyte_utf8_in_value_survives_safe_slice() {
+        // safe_slice is the UTF-8 boundary protector. A naive byte
+        // slice across `日本語` would panic; safe_slice clamps to a
+        // boundary. Pin that the parse succeeds AND the value is
+        // recoverable as the original string.
+        let p = pairs("name=日本語 next=v", b' ');
+        assert_eq!(p, vec![("name".into(), "日本語".into()), ("next".into(), "v".into())]);
+    }
+
+    #[test]
+    fn repeated_separators_collapse() {
+        let p = pairs("a=1   b=2", b' ');
+        assert_eq!(p, vec![("a".into(), "1".into()), ("b".into(), "2".into())]);
+    }
+}
