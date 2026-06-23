@@ -72,10 +72,22 @@ pub struct DiskQueueReceiver {
     state: Arc<Mutex<DiskQueueState>>,
     notify: Arc<tokio::sync::Notify>,
     closed: Arc<AtomicBool>,
-    /// Current read segment sequence.
+    /// In-memory read cursor — the next byte to read. Advances as
+    /// `recv()` returns events; NOT persisted on disk between recv
+    /// and ack. A crash between recv and ack rolls back to the
+    /// acked cursor below, so the unacked event replays on restart
+    /// (at-least-once contract — matches Kafka/RabbitMQ).
     read_seq: u64,
-    /// Current byte offset within the read segment.
     read_offset: u64,
+    /// Persisted cursor — the last byte the consumer has explicitly
+    /// acknowledged as processed. `save_cursor` is only called after
+    /// `ack()` advances this; segment files below `acked_seq` are
+    /// also deleted by `ack()`. The pre-fix code saved the read
+    /// cursor immediately on each `recv()`, which made the disk
+    /// queue at-most-once: a crash mid-write lost the in-flight
+    /// event because the cursor said it had been consumed.
+    acked_seq: u64,
+    acked_offset: u64,
     dir: PathBuf,
 }
 
@@ -115,6 +127,11 @@ pub fn create_disk_queue(
             closed,
             read_seq,
             read_offset,
+            // Boot up with acked == read: anything before
+            // `read_offset` was acked by a previous run (that's
+            // what `recover_state` returned).
+            acked_seq: read_seq,
+            acked_offset: read_offset,
             dir,
         },
     ))
@@ -175,6 +192,57 @@ impl DiskQueueReceiver {
         self.try_read_next()
     }
 
+    /// Commit progress to disk: persist the cursor and reclaim fully-
+    /// consumed segments. Called by the queue consumer after each
+    /// event's disposition is decided (delivered, routed to secondary,
+    /// or dropped — all three are "done from this queue's POV").
+    ///
+    /// Before this hook existed the disk queue was at-most-once on
+    /// crashes: `recv()` advanced and persisted the cursor in one
+    /// shot, so a crash between the event being read and the consumer
+    /// actually writing it downstream lost the event. The contract is
+    /// now at-least-once — a crash mid-write replays the un-acked
+    /// event on restart (matches Kafka/RabbitMQ). Downstreams that
+    /// can't tolerate duplicates need idempotent ingestion; the
+    /// queue documents this.
+    pub fn ack(&mut self) {
+        if self.acked_seq == self.read_seq && self.acked_offset == self.read_offset {
+            // Idempotent ack — nothing new to commit. Cheap no-op
+            // path so callers can ack defensively after every event
+            // even if a prior ack already covered the position
+            // (e.g. drain-loop polling the empty tail).
+            return;
+        }
+
+        // Delete every fully-consumed segment whose seq is strictly
+        // below the new acked seq. We held them through recv() so
+        // crash-replay could find the in-flight event; once ack
+        // advances past them they're permanently consumed.
+        for stale_seq in self.acked_seq..self.read_seq {
+            let seg_path = segment_path(&self.dir, stale_seq);
+            if let Err(e) = fs::remove_file(&seg_path) {
+                // Missing file is acceptable (segment may have been
+                // GC'd already); other errors are operator-visible
+                // but non-fatal — leaving the segment around just
+                // wastes disk, not correctness.
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!(
+                        "disk queue: failed to remove consumed segment {}: {}",
+                        stale_seq, e
+                    );
+                } else {
+                    debug!("disk queue: removed consumed segment {}", stale_seq);
+                }
+            } else {
+                debug!("disk queue: removed consumed segment {}", stale_seq);
+            }
+        }
+
+        self.acked_seq = self.read_seq;
+        self.acked_offset = self.read_offset;
+        save_cursor(&self.dir, self.acked_seq, self.acked_offset);
+    }
+
     fn try_read_next(&mut self) -> Option<Event> {
         loop {
             let seg_path = segment_path(&self.dir, self.read_seq);
@@ -227,7 +295,14 @@ impl DiskQueueReceiver {
                 }
 
                 self.read_offset += bytes_read as u64;
-                save_cursor(&self.dir, self.read_seq, self.read_offset);
+                // Do NOT save_cursor here. The cursor on disk only
+                // advances when the consumer calls `ack()`, after the
+                // event has been successfully handed off downstream.
+                // Returning here with the in-memory `read_offset`
+                // already moved gives the recv side an in-flight
+                // position; if the process crashes before `ack()`,
+                // restart re-reads from `acked_offset` and replays
+                // this event.
 
                 if let Some(event) = Event::from_json(trimmed) {
                     return Some(event);
@@ -246,19 +321,16 @@ impl DiskQueueReceiver {
             };
 
             if self.read_seq < write_seq {
-                // Delete consumed segment
-                if let Err(e) = fs::remove_file(&seg_path) {
-                    warn!(
-                        "disk queue: failed to remove consumed segment {}: {}",
-                        self.read_seq, e
-                    );
-                } else {
-                    debug!("disk queue: removed consumed segment {}", self.read_seq);
-                }
+                // Advance the in-memory read cursor to the next
+                // segment, but do NOT delete the current one or save
+                // the cursor yet — both are tied to `ack()`. The
+                // current segment may still hold the in-flight event
+                // (the one most recently returned by `recv()` but not
+                // yet acked); deleting it now would lose that event
+                // on crash-and-replay.
                 self.read_seq += 1;
                 self.read_offset = 0;
                 self.sync_read_seq();
-                save_cursor(&self.dir, self.read_seq, self.read_offset);
                 continue; // loop instead of recurse
             }
 
@@ -666,5 +738,91 @@ mod tests {
         std::fs::write(cursor_path(dir.path()), "not-a-cursor").unwrap();
         let (seq, off) = load_cursor(dir.path());
         assert_eq!((seq, off), (0, 0));
+    }
+
+    // ---------- ack / replay invariants ----------
+
+    #[tokio::test]
+    async fn unacked_recv_replays_on_reopen() {
+        // Regression: pre-fix the disk queue saved the cursor inside
+        // `recv()` immediately on each event, so the queue claimed
+        // events as consumed before the consumer had a chance to
+        // ship them downstream. A crash between recv and write lost
+        // the event because the on-disk cursor was already past it.
+        // The fix delays cursor persistence until `ack()`, so the
+        // un-acked event is replayed on the next open.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+
+        {
+            let (tx, mut rx) = create_disk_queue(path, 0).unwrap();
+            tx.send(make_event("<134>e1")).await;
+            tx.send(make_event("<134>e2")).await;
+            // Receive e1 but don't ack — simulates a process that
+            // started shipping it and crashed before completing.
+            let e1 = rx.recv().await.unwrap();
+            assert_eq!(String::from_utf8_lossy(&e1.ingress), "<134>e1");
+            // rx is dropped here without `ack()`.
+        }
+
+        {
+            let (_tx, mut rx) = create_disk_queue(path, 0).unwrap();
+            let e1 = rx.recv().await.unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&e1.ingress),
+                "<134>e1",
+                "unacked event must replay on reopen (at-least-once contract)",
+            );
+            // And e2 follows in order.
+            let e2 = rx.recv().await.unwrap();
+            assert_eq!(String::from_utf8_lossy(&e2.ingress), "<134>e2");
+        }
+    }
+
+    #[tokio::test]
+    async fn ack_persists_cursor_so_acked_event_does_not_replay() {
+        // Baseline of the contract above: once ack runs, the
+        // persisted cursor is past the acked event, so reopen
+        // resumes from the next un-acked event.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+
+        {
+            let (tx, mut rx) = create_disk_queue(path, 0).unwrap();
+            tx.send(make_event("<134>e1")).await;
+            tx.send(make_event("<134>e2")).await;
+            let e1 = rx.recv().await.unwrap();
+            assert_eq!(String::from_utf8_lossy(&e1.ingress), "<134>e1");
+            rx.ack();
+            // Now drop without acking e2.
+        }
+
+        {
+            let (_tx, mut rx) = create_disk_queue(path, 0).unwrap();
+            // Cursor is past e1, so the next recv starts at e2.
+            let next = rx.recv().await.unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&next.ingress),
+                "<134>e2",
+                "ack must persist the cursor; acked event must not replay",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ack_is_idempotent_when_nothing_new_to_commit() {
+        // ack() is a no-op when acked == read. The drain loop and
+        // any defensive consumer-side double-ack should incur no
+        // disk write and no error.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let (tx, mut rx) = create_disk_queue(path, 0).unwrap();
+        tx.send(make_event("<134>only")).await;
+        let _ = rx.recv().await.unwrap();
+        rx.ack();
+        // Second ack with nothing new to commit must be a clean
+        // no-op (no double-delete attempts, no panic).
+        rx.ack();
+        rx.ack();
     }
 }

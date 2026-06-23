@@ -289,6 +289,24 @@ impl QueueReceiver {
             ReceiverInner::Disk(rx) => rx.try_recv().map(SinkInput::Owned),
         }
     }
+
+    /// Commit the most recent `recv()` as processed. For the disk
+    /// backend this advances the persisted cursor and reclaims
+    /// fully-consumed segments — the actual durability hook. For the
+    /// memory backend this is a no-op (mpsc removes events on
+    /// `recv()`; there is no separate persistent cursor to advance).
+    ///
+    /// The consumer is expected to call `ack()` after every event's
+    /// final disposition is decided — delivered, routed to secondary,
+    /// or given up on (= "dropped" with retries exhausted). All three
+    /// dispositions mean the event no longer needs to live in the
+    /// queue. Skipping the call is safe (= the next call's progress
+    /// covers it) but unnecessarily defers cursor commits.
+    pub fn ack(&mut self) {
+        if let ReceiverInner::Disk(rx) = &mut self.inner {
+            rx.ack();
+        }
+    }
 }
 
 /// Create a sender/receiver pair.
@@ -448,6 +466,17 @@ pub async fn run_queue_consumer(
                 match input {
                     Some(input) => {
                         write_with_retry(writer.as_ref(), input, &retry_config, &secondary_sender, &name, &metrics, tap.as_ref()).await;
+                        // Acknowledge the event regardless of
+                        // disposition (delivered, routed to
+                        // secondary, or retries exhausted): from
+                        // this queue's POV the event has been
+                        // processed. For disk queues this is the
+                        // durability commit — `recv()` returned the
+                        // event with an in-memory cursor only, the
+                        // persisted cursor advances here. Skipping
+                        // the call on a crash gives at-least-once
+                        // replay on restart.
+                        receiver.ack();
                     }
                     None => {
                         info!("output '{}': queue closed", name);
@@ -491,6 +520,10 @@ async fn drain_remaining(
             tap,
         )
         .await;
+        // Mirror the steady-state ack contract: each event's
+        // disposition is committed to disk before we move on, so a
+        // crash mid-drain still replays exactly the un-acked tail.
+        receiver.ack();
         count += 1;
     }
     if count > 0 {
