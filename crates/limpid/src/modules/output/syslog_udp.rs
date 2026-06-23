@@ -12,8 +12,7 @@ use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::syslog_peers::{
-    PEER_CONNECT_TIMEOUT, PEER_WRITE_TIMEOUT, Peer, PeerList, SyslogPayload,
-    parse_host_port,
+    PEER_CONNECT_TIMEOUT, PEER_WRITE_TIMEOUT, Peer, PeerList, SyslogPayload, parse_host_port,
 };
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
 
@@ -147,9 +146,7 @@ impl Output for SyslogUdpOutput {
                             tokio::net::lookup_host(address.as_str()),
                         )
                         .await
-                        .with_context(|| {
-                            format!("syslog_udp lookup {} timed out", address)
-                        })?
+                        .with_context(|| format!("syslog_udp lookup {} timed out", address))?
                         .with_context(|| format!("syslog_udp lookup {}", address))?
                         .collect();
                         if resolved.is_empty() {

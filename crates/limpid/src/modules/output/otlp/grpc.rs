@@ -433,21 +433,15 @@ impl OtlpGrpcOutput {
                     let rejected = outcome.rejected.min(count);
                     let written = count - rejected;
                     if written > 0 {
-                        metrics
-                            .events_written
-                            .fetch_add(written, Ordering::Relaxed);
+                        metrics.events_written.fetch_add(written, Ordering::Relaxed);
                     }
                     if rejected > 0 {
-                        metrics
-                            .events_failed
-                            .fetch_add(rejected, Ordering::Relaxed);
+                        metrics.events_failed.fetch_add(rejected, Ordering::Relaxed);
                     }
                 }
                 Err(e) => {
                     tracing::warn!("otlp_grpc flush timer: send failed ({})", e);
-                    metrics
-                        .events_failed
-                        .fetch_add(count, Ordering::Relaxed);
+                    metrics.events_failed.fetch_add(count, Ordering::Relaxed);
                 }
             }
         });
@@ -971,7 +965,9 @@ mod tests {
         let listener = tokio::net::TcpListener::from_std(listener).unwrap();
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
-        let svc = PartialSuccessLogs { rejected_per_call: 2 };
+        let svc = PartialSuccessLogs {
+            rejected_per_call: 2,
+        };
         let server = tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
                 .add_service(LogsServiceServer::new(svc))
@@ -1015,8 +1011,14 @@ mod tests {
         // 3 events total: 2 rejected → events_failed, 1 accepted → events_written.
         let written = output.metrics.events_written.load(Ordering::Relaxed);
         let failed = output.metrics.events_failed.load(Ordering::Relaxed);
-        assert_eq!(written, 1, "expected 1 written, got {written} (failed={failed})");
-        assert_eq!(failed, 2, "expected 2 failed, got {failed} (written={written})");
+        assert_eq!(
+            written, 1,
+            "expected 1 written, got {written} (failed={failed})"
+        );
+        assert_eq!(
+            failed, 2,
+            "expected 2 failed, got {failed} (written={written})"
+        );
     }
 
     #[tokio::test]

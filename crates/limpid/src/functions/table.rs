@@ -256,13 +256,7 @@ impl TableStore {
     }
 
     /// Upsert with an explicit TTL override (None = no expiry).
-    pub fn upsert(
-        &self,
-        table_name: &str,
-        key: &str,
-        value: OwnedValue,
-        expire: Option<Duration>,
-    ) {
+    pub fn upsert(&self, table_name: &str, key: &str, value: OwnedValue, expire: Option<Duration>) {
         let table_lock = match self.tables.get(table_name) {
             Some(t) => t,
             None => {

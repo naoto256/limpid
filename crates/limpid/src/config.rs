@@ -532,11 +532,12 @@ mod tests {
             return None;
         }
         if let Some(parent) = sys.parent()
-            && !parent.exists() {
-                // /usr/share/limpid may not exist in CI; try to create
-                // the whole chain. Fall through on EACCES.
-                let _ = std::fs::create_dir_all(parent);
-            }
+            && !parent.exists()
+        {
+            // /usr/share/limpid may not exist in CI; try to create
+            // the whole chain. Fall through on EACCES.
+            let _ = std::fs::create_dir_all(parent);
+        }
         std::os::unix::fs::symlink(target, sys).ok()
     }
 

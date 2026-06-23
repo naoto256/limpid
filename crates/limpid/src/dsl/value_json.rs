@@ -161,10 +161,7 @@ pub fn json_to_value(v: &JsonValue) -> Result<OwnedValue> {
 /// start.
 ///
 /// Applies the same `$bytes_b64` marker recognition as [`json_to_value`].
-pub fn json_to_value_in<'bump>(
-    v: &JsonValue,
-    arena: &EventArena<'bump>,
-) -> Result<Value<'bump>> {
+pub fn json_to_value_in<'bump>(v: &JsonValue, arena: &EventArena<'bump>) -> Result<Value<'bump>> {
     match v {
         JsonValue::Null => Ok(Value::Null),
         JsonValue::Bool(b) => Ok(Value::Bool(*b)),
@@ -183,8 +180,7 @@ pub fn json_to_value_in<'bump>(
         }
         JsonValue::String(s) => Ok(Value::String(arena.alloc_str(s))),
         JsonValue::Array(a) => {
-            let mut out =
-                bumpalo::collections::Vec::with_capacity_in(a.len(), arena.bump());
+            let mut out = bumpalo::collections::Vec::with_capacity_in(a.len(), arena.bump());
             for item in a {
                 out.push(json_to_value_in(item, arena)?);
             }
@@ -461,7 +457,10 @@ mod tests {
     #[test]
     fn nested_object_with_bytes_inside() {
         let mut inner = Map::new();
-        inner.insert("blob".into(), OwnedValue::Bytes(Bytes::from_static(b"\x00\xff")));
+        inner.insert(
+            "blob".into(),
+            OwnedValue::Bytes(Bytes::from_static(b"\x00\xff")),
+        );
         let mut outer = Map::new();
         outer.insert("payload".into(), OwnedValue::Object(inner));
         let v = OwnedValue::Object(outer);
@@ -492,8 +491,7 @@ mod tests {
         // converting back to OwnedValue for comparison).
         let bump = bumpalo::Bump::new();
         let arena = EventArena::new(&bump);
-        let json: JsonValue =
-            serde_json::from_str(r#"{"a":1,"b":"hi","c":[1,2,3]}"#).unwrap();
+        let json: JsonValue = serde_json::from_str(r#"{"a":1,"b":"hi","c":[1,2,3]}"#).unwrap();
         let view = json_to_value_in(&json, &arena).unwrap();
         let owned = view.to_owned_value();
         let from_owned = json_to_value(&json).unwrap();
@@ -512,14 +510,8 @@ mod tests {
     fn direct_serialize_scalar_shapes() {
         // Integers stay i64 (not "1234"-as-string); floats stay
         // numbers; booleans / null are JSON natives.
-        assert_eq!(
-            direct_to_json_string(&OwnedValue::Int(42)).unwrap(),
-            "42"
-        );
-        assert_eq!(
-            direct_to_json_string(&OwnedValue::Int(-1)).unwrap(),
-            "-1"
-        );
+        assert_eq!(direct_to_json_string(&OwnedValue::Int(42)).unwrap(), "42");
+        assert_eq!(direct_to_json_string(&OwnedValue::Int(-1)).unwrap(), "-1");
         assert_eq!(
             direct_to_json_string(&OwnedValue::Float(2.5)).unwrap(),
             "2.5"
@@ -528,10 +520,7 @@ mod tests {
             direct_to_json_string(&OwnedValue::Bool(true)).unwrap(),
             "true"
         );
-        assert_eq!(
-            direct_to_json_string(&OwnedValue::Null).unwrap(),
-            "null"
-        );
+        assert_eq!(direct_to_json_string(&OwnedValue::Null).unwrap(), "null");
         assert_eq!(
             direct_to_json_string(&OwnedValue::String("hi".into())).unwrap(),
             "\"hi\""
@@ -602,7 +591,10 @@ mod tests {
         // Bytes deep inside the tree must still surface via marker so
         // the wire form stays self-describing for the round-trip path.
         let mut inner = Map::new();
-        inner.insert("blob".into(), OwnedValue::Bytes(Bytes::from_static(b"\x00\xff")));
+        inner.insert(
+            "blob".into(),
+            OwnedValue::Bytes(Bytes::from_static(b"\x00\xff")),
+        );
         let mut outer = Map::new();
         outer.insert("payload".into(), OwnedValue::Object(inner));
         let v = OwnedValue::Object(outer);

@@ -26,8 +26,8 @@ pub fn register(reg: &mut FunctionRegistry) {
         FunctionSig::fixed(&[FieldType::Any], FieldType::String),
         |arena, args, _event| {
             ensure_no_bytes(&args[0])?;
-            let s = serde_json::to_string(&args[0])
-                .map_err(|e| anyhow::anyhow!("to_json(): {e}"))?;
+            let s =
+                serde_json::to_string(&args[0]).map_err(|e| anyhow::anyhow!("to_json(): {e}"))?;
             Ok(Value::String(arena.alloc_str(&s)))
         },
     );

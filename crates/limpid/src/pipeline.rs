@@ -579,20 +579,15 @@ fn exec_pipeline_stmt<'bump>(
                         for a in args {
                             evaluated_args.push(eval_expr(a, &current, ctx.funcs, ctx.arena)?);
                         }
-                        let arg_repr: Vec<String> = evaluated_args
-                            .iter()
-                            .map(|v| v.to_string())
-                            .collect();
+                        let arg_repr: Vec<String> =
+                            evaluated_args.iter().map(|v| v.to_string()).collect();
 
                         // Snapshot the heap-owned form before the
                         // registry consumes the borrowed event — the
                         // Err arm needs a stable, arena-independent
                         // event for the DLQ context.
                         let backup_owned = current.to_owned();
-                        match ctx
-                            .registry
-                            .call(name, &evaluated_args, current, ctx.arena)
-                        {
+                        match ctx.registry.call(name, &evaluated_args, current, ctx.arena) {
                             Ok(Some(e)) => {
                                 out.trace.push(TraceEntry {
                                     stage: "process".into(),
@@ -749,12 +744,8 @@ fn exec_pipeline_stmt<'bump>(
                 if arm.pattern.is_none() {
                     return exec_pipeline_branch_body(&arm.body, event, ctx, out);
                 }
-                let pattern_val = eval_expr(
-                    arm.pattern.as_ref().unwrap(),
-                    &event,
-                    ctx.funcs,
-                    ctx.arena,
-                )?;
+                let pattern_val =
+                    eval_expr(arm.pattern.as_ref().unwrap(), &event, ctx.funcs, ctx.arena)?;
                 if values_match(&disc_val, &pattern_val) {
                     return exec_pipeline_branch_body(&arm.body, event, ctx, out);
                 }
@@ -890,7 +881,16 @@ def pipeline p {
             "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         );
         let sinks: HashMap<String, Arc<dyn Output>> = HashMap::new();
-        let result = run_pipeline(pipeline, &event, &cfg, &funcs, None, &sinks, &mut bumpalo::Bump::new()).unwrap();
+        let result = run_pipeline(
+            pipeline,
+            &event,
+            &cfg,
+            &funcs,
+            None,
+            &sinks,
+            &mut bumpalo::Bump::new(),
+        )
+        .unwrap();
         assert_eq!(result.termination, PipelineTermination::Errored);
         let ctx = result.errored.expect("errored context must be populated");
         assert_eq!(ctx.pipeline, "p");
@@ -941,7 +941,16 @@ def pipeline p {
             "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         );
         let sinks: HashMap<String, Arc<dyn Output>> = HashMap::new();
-        let result = run_pipeline(pipeline, &event, &cfg, &funcs, None, &sinks, &mut bumpalo::Bump::new()).unwrap();
+        let result = run_pipeline(
+            pipeline,
+            &event,
+            &cfg,
+            &funcs,
+            None,
+            &sinks,
+            &mut bumpalo::Bump::new(),
+        )
+        .unwrap();
         assert_eq!(result.termination, PipelineTermination::Errored);
         let ctx = result.errored.expect("errored context must be populated");
         assert_eq!(ctx.pipeline, "p");
@@ -984,7 +993,16 @@ def pipeline p {
             "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         );
         let sinks: HashMap<String, Arc<dyn Output>> = HashMap::new();
-        let result = run_pipeline(pipeline, &event, &cfg, &funcs, None, &sinks, &mut bumpalo::Bump::new()).unwrap();
+        let result = run_pipeline(
+            pipeline,
+            &event,
+            &cfg,
+            &funcs,
+            None,
+            &sinks,
+            &mut bumpalo::Bump::new(),
+        )
+        .unwrap();
         assert_eq!(result.termination, PipelineTermination::Errored);
         let ctx = result.errored.expect("errored context must be populated");
         assert_eq!(ctx.pipeline, "p");
@@ -1073,7 +1091,12 @@ def pipeline p {
         )
         .unwrap();
         assert_eq!(result.termination, PipelineTermination::Finished);
-        assert_eq!(result.outputs.len(), 1, "expected 1 output, got {}", result.outputs.len());
+        assert_eq!(
+            result.outputs.len(),
+            1,
+            "expected 1 output, got {}",
+            result.outputs.len()
+        );
         let (name, sink_input) = &result.outputs[0];
         assert_eq!(name, "o");
         assert!(

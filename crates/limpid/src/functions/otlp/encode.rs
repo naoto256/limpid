@@ -245,15 +245,11 @@ fn expect_object<'a, 'bump: 'a>(v: &'a Value<'bump>, ctx: &str) -> Result<Entrie
 }
 
 fn lookup<'bump>(entries: Entries<'bump>, key: &str) -> Option<Value<'bump>> {
-    entries
-        .iter()
-        .find(|(k, _)| *k == key)
-        .map(|(_, v)| *v)
+    entries.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
 }
 
 fn string_field(entries: Entries<'_>, key: &str) -> Option<String> {
-    lookup(entries, key)
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
+    lookup(entries, key).and_then(|v| v.as_str().map(|s| s.to_string()))
 }
 
 fn u32_field(entries: Entries<'_>, key: &str) -> Option<u32> {
@@ -311,10 +307,7 @@ where
 // prost → HashLit (arena-backed)
 // ---------------------------------------------------------------------------
 
-fn resourcelog_to_hashlit<'bump>(
-    arena: &EventArena<'bump>,
-    rl: &ResourceLogs,
-) -> Value<'bump> {
+fn resourcelog_to_hashlit<'bump>(arena: &EventArena<'bump>, rl: &ResourceLogs) -> Value<'bump> {
     let mut b = ObjectBuilder::new(arena);
     if let Some(r) = &rl.resource {
         b.push("resource", resource_to_hashlit(arena, r));
@@ -362,10 +355,7 @@ fn scope_logs_to_hashlit<'bump>(arena: &EventArena<'bump>, sl: &ScopeLogs) -> Va
     b.finish()
 }
 
-fn scope_to_hashlit<'bump>(
-    arena: &EventArena<'bump>,
-    s: &InstrumentationScope,
-) -> Value<'bump> {
+fn scope_to_hashlit<'bump>(arena: &EventArena<'bump>, s: &InstrumentationScope) -> Value<'bump> {
     let mut b = ObjectBuilder::new(arena);
     if !s.name.is_empty() {
         b.push("name", Value::String(arena.alloc_str(&s.name)));

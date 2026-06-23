@@ -165,7 +165,10 @@ fn insert_path<'bump>(
     }
 }
 
-fn materialise<'bump>(arena: &EventArena<'bump>, tree: BTreeMap<String, Node<'bump>>) -> Value<'bump> {
+fn materialise<'bump>(
+    arena: &EventArena<'bump>,
+    tree: BTreeMap<String, Node<'bump>>,
+) -> Value<'bump> {
     let mut builder = ObjectBuilder::with_capacity(arena, tree.len());
     for (k, v) in tree {
         let key_ref = arena.alloc_str(&k);
@@ -195,19 +198,28 @@ mod tests {
         Ok(value_to_json(&nested))
     }
 
-    fn json_to_value<'bump>(arena: &'bump EventArena<'bump>, v: &serde_json::Value) -> Value<'bump> {
+    fn json_to_value<'bump>(
+        arena: &'bump EventArena<'bump>,
+        v: &serde_json::Value,
+    ) -> Value<'bump> {
         match v {
             serde_json::Value::Null => Value::Null,
             serde_json::Value::Bool(b) => Value::Bool(*b),
             serde_json::Value::Number(n) => {
-                if let Some(i) = n.as_i64() { Value::Int(i) }
-                else if let Some(f) = n.as_f64() { Value::Float(f) }
-                else { Value::Null }
+                if let Some(i) = n.as_i64() {
+                    Value::Int(i)
+                } else if let Some(f) = n.as_f64() {
+                    Value::Float(f)
+                } else {
+                    Value::Null
+                }
             }
             serde_json::Value::String(s) => Value::String(arena.alloc_str(s)),
             serde_json::Value::Array(items) => {
                 let mut b = ArrayBuilder::with_capacity(arena, items.len());
-                for i in items { b.push(json_to_value(arena, i)); }
+                for i in items {
+                    b.push(json_to_value(arena, i));
+                }
                 b.finish()
             }
             serde_json::Value::Object(map) => {
@@ -235,7 +247,8 @@ mod tests {
                 format!("[{}]", parts.join(","))
             }
             Value::Object(entries) => {
-                let parts: Vec<String> = entries.iter()
+                let parts: Vec<String> = entries
+                    .iter()
                     .map(|(k, v)| format!("\"{}\":{}", k, value_to_json(v)))
                     .collect();
                 format!("{{{}}}", parts.join(","))
@@ -255,8 +268,9 @@ mod tests {
     fn merges_sibling_keys() {
         // Sibling dotted keys with a common prefix collapse together.
         let out = parse_and_nest(
-            r#"{"id.orig_h":"1.1.1.1","id.orig_p":80,"id.resp_h":"2.2.2.2","ts":123}"#
-        ).unwrap();
+            r#"{"id.orig_h":"1.1.1.1","id.orig_p":80,"id.resp_h":"2.2.2.2","ts":123}"#,
+        )
+        .unwrap();
         // BTreeMap orders keys lexicographically.
         assert_eq!(
             out,
@@ -308,12 +322,14 @@ mod tests {
         // Without the limit, this would recurse 100-deep into insert_path
         // and ultimately enable stack-overflow DoS for attacker-controlled
         // JSON. With the limit, we bail loud and fast.
-        let key: String = (0..100).map(|i| format!("a{i}")).collect::<Vec<_>>().join(".");
+        let key: String = (0..100)
+            .map(|i| format!("a{i}"))
+            .collect::<Vec<_>>()
+            .join(".");
         let json = format!(r#"{{"{}":1}}"#, key);
         let err = parse_and_nest(&json).unwrap_err();
         assert!(
-            err.to_string().contains("dotted segments")
-                && err.to_string().contains("limit"),
+            err.to_string().contains("dotted segments") && err.to_string().contains("limit"),
             "expected segment-depth error, got: {}",
             err
         );
@@ -338,7 +354,10 @@ mod tests {
     #[test]
     fn accepts_depth_at_segment_limit() {
         // Exactly 32 segments — at the limit but not over. Should succeed.
-        let key: String = (0..32).map(|i| format!("a{i}")).collect::<Vec<_>>().join(".");
+        let key: String = (0..32)
+            .map(|i| format!("a{i}"))
+            .collect::<Vec<_>>()
+            .join(".");
         let json = format!(r#"{{"{}":1}}"#, key);
         let out = parse_and_nest(&json).expect("32-segment key should be accepted");
         assert!(out.starts_with("{\"a0\":{"));

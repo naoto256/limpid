@@ -31,9 +31,7 @@ fn inner_block_schema(
     inner_block_schema_of(&spec.kind)
 }
 
-fn inner_block_schema_of(
-    kind: &PropertyValueKind,
-) -> Option<&'static [PropertySpec]> {
+fn inner_block_schema_of(kind: &PropertyValueKind) -> Option<&'static [PropertySpec]> {
     match kind {
         PropertyValueKind::Block(s) => Some(s),
         PropertyValueKind::BlockMap(s) => Some(s),
@@ -115,8 +113,7 @@ fn analyze_property(
     // block was schema-declared). Recomputing per-key against the
     // current schema level — and descending into the inner spec when
     // we enter a block — fixes that.
-    let schema_owned =
-        parent_schema.is_some_and(|s| schema_declares_key(s, property_key(prop)));
+    let schema_owned = parent_schema.is_some_and(|s| schema_declares_key(s, property_key(prop)));
 
     match prop {
         Property::KeyValue {
@@ -141,8 +138,7 @@ fn analyze_property(
             // FuncCall, etc.) still gets walked by `check_types` so
             // unknown-function / type-mismatch diagnostics inside
             // template bodies continue to surface.
-            let skip_expr_types =
-                schema_owned && matches!(expr.kind, ExprKind::Ident(_));
+            let skip_expr_types = schema_owned && matches!(expr.kind, ExprKind::Ident(_));
             if !skip_expr_types {
                 expr_types::check_types(
                     expr,
@@ -170,8 +166,8 @@ fn analyze_property(
             // at this level, we pass `None` so inner keys evaluate
             // against no schema (and therefore aren't "owned") —
             // expression-level diagnostics will run on them.
-            let inner_schema = parent_schema
-                .and_then(|s| inner_block_schema(s, property_key(prop)));
+            let inner_schema =
+                parent_schema.and_then(|s| inner_block_schema(s, property_key(prop)));
             for inner in properties {
                 analyze_property(
                     inner,

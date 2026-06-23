@@ -110,7 +110,8 @@ impl OwnedValue {
             OwnedValue::Bytes(b) => Value::Bytes(arena.alloc_bytes(b)),
             OwnedValue::Timestamp(dt) => Value::Timestamp(*dt),
             OwnedValue::Array(items) => {
-                let mut out = bumpalo::collections::Vec::with_capacity_in(items.len(), arena.bump());
+                let mut out =
+                    bumpalo::collections::Vec::with_capacity_in(items.len(), arena.bump());
                 for item in items {
                     out.push(item.view_in(arena));
                 }
@@ -352,9 +353,9 @@ impl<'bump> Value<'bump> {
             Value::String(s) => OwnedValue::String(CompactString::from(s)),
             Value::Bytes(b) => OwnedValue::Bytes(Bytes::copy_from_slice(b)),
             Value::Timestamp(dt) => OwnedValue::Timestamp(dt),
-            Value::Array(items) => OwnedValue::Array(
-                items.iter().map(|v| v.to_owned_value()).collect(),
-            ),
+            Value::Array(items) => {
+                OwnedValue::Array(items.iter().map(|v| v.to_owned_value()).collect())
+            }
             Value::Object(entries) => {
                 let mut map = Map::with_capacity(entries.len());
                 for (k, v) in entries {
@@ -507,10 +508,7 @@ impl<'bump> Value<'bump> {
     /// in insertion order).
     pub fn get(&self, key: &str) -> Option<Value<'bump>> {
         match self {
-            Value::Object(entries) => entries
-                .iter()
-                .find(|(k, _)| *k == key)
-                .map(|(_, v)| *v),
+            Value::Object(entries) => entries.iter().find(|(k, _)| *k == key).map(|(_, v)| *v),
             _ => None,
         }
     }

@@ -759,7 +759,10 @@ mod tests {
             .unwrap();
         let msg = err.to_string();
         assert!(msg.contains("plain") && msg.contains("tls"), "{msg}");
-        assert!(!msg.contains("password_file"), "must not leak file-path: {msg}");
+        assert!(
+            !msg.contains("password_file"),
+            "must not leak file-path: {msg}"
+        );
     }
 
     #[test]

@@ -30,7 +30,10 @@ impl Module for StdoutOutput {
         Some(STDOUT_OUTPUT_SCHEMA)
     }
 
-    fn from_properties(_name: &str, _properties: &crate::modules::ModuleProperties) -> Result<Self> {
+    fn from_properties(
+        _name: &str,
+        _properties: &crate::modules::ModuleProperties,
+    ) -> Result<Self> {
         Ok(Self {
             metrics: Arc::new(OutputMetrics::default()),
         })
