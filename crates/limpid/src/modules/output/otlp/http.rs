@@ -464,6 +464,19 @@ impl Output for OtlpHttpOutput {
         })
         .await
     }
+
+    async fn shutdown(&self) -> Result<()> {
+        // Abort any pending timer so it cannot race with us for the
+        // buffer lock. Then drain whatever is left in one final
+        // send. Without this the queue consumer's `shutdown()` call
+        // would race the timer and the in-flight events could be
+        // dropped between the timer's abort (via `Drop`) and the
+        // process exit.
+        if let Some(h) = self.flush_handle.lock().await.take() {
+            h.abort();
+        }
+        self.flush().await
+    }
 }
 
 impl OtlpHttpOutput {
@@ -1466,6 +1479,68 @@ mod tests {
         assert_eq!(
             failed, 0,
             "events retained for retry must NOT be counted as failed yet (got {failed})",
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_flushes_pending_batch_buffer() {
+        // Regression mirror of `output http`: when batch_size > 1 the
+        // queue-side `write()` returns Ok once the event is in the
+        // buffer, so the memory queue considers it delivered. If the
+        // daemon shuts down before the batch fills, Drop alone aborts
+        // the timer and leaks the buffer. `shutdown()` aborts the
+        // timer and runs one final flush.
+        let (addr, received, server) = run_http_collector("http_protobuf").await;
+        let endpoint = format!("http://{}/v1/logs", addr);
+        let mut props = one_peer_props(&endpoint);
+        props.push(prop_str("protocol", "http_protobuf"));
+        // Large batch + long timer: nothing but `shutdown()` can
+        // drain this buffer.
+        props.push(prop_int("batch_size", 100));
+        props.push(prop_str("batch_timeout", "30s"));
+        let output = OtlpHttpOutput::from_properties("test", &mp(&props)).unwrap();
+
+        // Drive the batched path with two render→write round trips.
+        let arena_bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&arena_bump);
+        for ts in [1u64, 2u64] {
+            let ev = event_with_egress(singleton_bytes(ts));
+            let payload = output.render(&ev.view_in(&arena), &arena).unwrap();
+            output.write(payload).await.unwrap();
+        }
+        assert_eq!(
+            output.inner.batch.lock().await.len(),
+            2,
+            "writes must land in the buffer (batch_size and timer both far away)"
+        );
+        assert!(received.lock().await.is_empty());
+
+        output.shutdown().await.unwrap();
+
+        assert_eq!(
+            output.inner.batch.lock().await.len(),
+            0,
+            "shutdown() must drain the buffer"
+        );
+
+        for _ in 0..50 {
+            if !received.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        server.abort();
+        let got = received.lock().await.clone();
+        assert_eq!(got.len(), 1, "shutdown flush must POST exactly once");
+        let record_count: usize = got[0]
+            .resource_logs
+            .iter()
+            .flat_map(|rl| rl.scope_logs.iter())
+            .map(|sl| sl.log_records.len())
+            .sum();
+        assert_eq!(
+            record_count, 2,
+            "shutdown POST must carry both buffered records",
         );
     }
 
