@@ -10,6 +10,11 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased] - 0.7.8
 
+### Internal — End-to-end timeout-firing tests for the 0.7.8 export and TLS-handshake timeouts
+
+The three timeout constants introduced in 0.7.8 — `GRPC_REQUEST_TIMEOUT` / `HTTP_REQUEST_TIMEOUT` (30 s, on the OTLP sinks) and `TLS_HANDSHAKE_TIMEOUT` (10 s, on `input syslog_tcp`) — previously had bound-check assertions only. A regression that removed the `tokio::time::timeout(…)` wrap, or pointed it at a much larger duration, would not have been caught by a constant-value check. Three new paused-time tests (`export_timeout_fires_against_stalled_peer` in each of `output/otlp/grpc.rs` and `output/otlp/http.rs`, plus `tls_handshake_timeout_fires_against_stalled_client` in `input/syslog_tcp.rs`) exercise the actual firing path against a stalled TCP peer / client. Each uses `tokio::time::advance` past the documented timeout and asserts the call surfaces a timeout-flavoured error rather than hanging. `tokio`'s `test-util` feature is added to `[dev-dependencies]` to enable virtual time control. No production code change.
+
+
 ### Fixed — `output http` / `otlp_http` render a placeholder when error bodies are gzip/brotli/deflate encoded
 
 limpid's `reqwest` build excludes the `gzip` / `brotli` / `deflate` decompression features, so when a peer (or upstream proxy) returns an error response with `Content-Encoding: gzip` the still-compressed bytes were running through `from_utf8_lossy` and ending up as replacement-char soup in the daemon log. The shared `error_snippet` helper in `modules/output/http_util.rs` now inspects `Content-Encoding` and substitutes `<gzip-encoded body, N bytes>` (or whatever the advertised encoding is) when it's not `identity`. The byte count is retained so an operator can still see the peer is returning *something*. `identity`, missing header, and the existing 4 KiB cap path all keep their previous behaviour.
