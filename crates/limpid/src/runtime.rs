@@ -100,11 +100,32 @@ impl Runtime {
             metrics_registry.register_output(name, created.metrics);
             tap.register(&format!("output {}", name)).await;
 
-            output_receivers.push((receiver, created.writer, retry_config, output_metrics));
+            output_receivers.push((
+                name.clone(),
+                receiver,
+                created.writer,
+                retry_config,
+                output_metrics,
+            ));
+        }
+
+        // Validate every output's `secondary` reference up front,
+        // before we spawn consumer tasks. See `validate_secondary_refs`
+        // for the two failure modes (typo, self-reference) that used
+        // to slip through silently.
+        {
+            let known: std::collections::HashSet<&str> =
+                output_senders.keys().map(String::as_str).collect();
+            validate_secondary_refs(
+                output_receivers
+                    .iter()
+                    .map(|(n, _, _, rc, _)| (n.as_str(), rc.secondary.as_deref())),
+                &known,
+            )?;
         }
 
         // Start queue consumers (no metrics counting here — output does it)
-        for (receiver, writer, retry_config, output_metrics) in output_receivers {
+        for (_name, receiver, writer, retry_config, output_metrics) in output_receivers {
             let secondary_sender = retry_config
                 .secondary
                 .as_ref()
@@ -326,6 +347,48 @@ impl Runtime {
             }
         }
     }
+}
+
+/// Reject misconfigured `secondary` references before any consumer task starts.
+///
+/// `secondary` lookup at queue-consumer spawn time was
+/// `output_senders.get(s).cloned()` — a `None` for either reason
+/// silently disabled the safety net. Two operator-visible failure
+/// modes:
+///
+/// - **typo** (`secondary foo_typo` where no `foo_typo` exists): the
+///   queue consumer just logs "no secondary" and drops the event.
+///   The operator configured a safety net and got nothing.
+/// - **self-reference** (`secondary <own_name>`): exhausted-retry
+///   events get routed back into the same queue, looping forever on
+///   any poison event. Worse on disk-backed queues (each loop
+///   re-persists to the tail).
+///
+/// Both are config errors. Surface them at startup so the daemon
+/// doesn't pretend to be healthy.
+fn validate_secondary_refs<'a>(
+    refs: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+    known_outputs: &std::collections::HashSet<&str>,
+) -> Result<()> {
+    for (name, secondary) in refs {
+        let Some(target) = secondary else { continue };
+        if target == name {
+            return Err(anyhow::anyhow!(
+                "output '{name}': secondary cannot reference itself; \
+                 a self-referential secondary would form an infinite \
+                 retry loop on a poison event"
+            ));
+        }
+        if !known_outputs.contains(target) {
+            let mut listed: Vec<&str> = known_outputs.iter().copied().collect();
+            listed.sort_unstable();
+            return Err(anyhow::anyhow!(
+                "output '{name}': secondary '{target}' is not a known output; \
+                 configured outputs: {listed:?}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -751,5 +814,66 @@ mod tests {
         // All 8 events should have been attributed to the shared worker.
         assert_eq!(worker.metrics.events_received.load(Ordering::Relaxed), 8);
         assert_eq!(worker.metrics.events_dropped.load(Ordering::Relaxed), 8);
+    }
+
+    fn known<'a>(names: &[&'a str]) -> std::collections::HashSet<&'a str> {
+        names.iter().copied().collect()
+    }
+
+    #[test]
+    fn validate_secondary_refs_accepts_unset() {
+        // Baseline: outputs without a `secondary` configured pass
+        // through cleanly.
+        let refs = [("primary", None), ("backup", None)];
+        let known = known(&["primary", "backup"]);
+        validate_secondary_refs(refs.iter().copied(), &known).unwrap();
+    }
+
+    #[test]
+    fn validate_secondary_refs_accepts_resolved_target() {
+        // Baseline: a `secondary` that names a real, different
+        // output passes.
+        let refs = [("primary", Some("backup")), ("backup", None)];
+        let known = known(&["primary", "backup"]);
+        validate_secondary_refs(refs.iter().copied(), &known).unwrap();
+    }
+
+    #[test]
+    fn validate_secondary_refs_rejects_self_reference() {
+        // Regression: self-reference used to silently route
+        // exhausted-retry events back into the same queue, looping
+        // forever on a poison event (worse on disk-backed queues).
+        let refs = [("primary", Some("primary"))];
+        let known = known(&["primary"]);
+        let err = validate_secondary_refs(refs.iter().copied(), &known)
+            .expect_err("self-reference must fail validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("primary") && msg.contains("itself"),
+            "expected self-reference message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_secondary_refs_rejects_unknown_target() {
+        // Regression: a typo'd secondary name used to silently
+        // disable the safety net at queue-consumer spawn time —
+        // `output_senders.get(s).cloned()` returned None and the
+        // consumer dropped failed events with "no secondary".
+        let refs = [("primary", Some("backup_typo"))];
+        let known = known(&["primary", "backup"]);
+        let err = validate_secondary_refs(refs.iter().copied(), &known)
+            .expect_err("unknown secondary must fail validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("backup_typo") && msg.contains("not a known output"),
+            "expected unknown-target message, got: {msg}"
+        );
+        // Operator-friendly: surface the actual configured names so
+        // the typo is easy to spot.
+        assert!(
+            msg.contains("backup"),
+            "error must list known outputs to aid debugging; got: {msg}"
+        );
     }
 }
