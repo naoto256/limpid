@@ -265,3 +265,199 @@ fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
         .with_context(|| format!("failed to parse key from: {}", path))?;
     Ok(key)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    struct PemSet {
+        _dir: TempDir,
+        cert: String,
+        key: String,
+        ca_cert: String,
+        // Independent cert that does NOT match `key` — used to force
+        // rustls's cert↔key consistency check to reject.
+        mismatched_cert: String,
+    }
+
+    fn gen_pems() -> PemSet {
+        let dir = TempDir::new().unwrap();
+        // Primary cert + key + CA.
+        let key_pair = rcgen::KeyPair::generate().expect("key gen");
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        params.is_ca = rcgen::IsCa::ExplicitNoCa;
+        let cert = params.self_signed(&key_pair).unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
+
+        // Separate self-signed cert used both as the CA root and as a
+        // mismatched-cert source for the consistency-check test. The
+        // path is the same file; consumers pick whichever role.
+        let ca_kp = rcgen::KeyPair::generate().unwrap();
+        let ca_params = rcgen::CertificateParams::new(vec!["alt".to_string()]).unwrap();
+        let ca_cert = ca_params.self_signed(&ca_kp).unwrap();
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+
+        PemSet {
+            cert: cert_path.display().to_string(),
+            key: key_path.display().to_string(),
+            ca_cert: ca_path.display().to_string(),
+            mismatched_cert: ca_path.display().to_string(),
+            _dir: dir,
+        }
+    }
+
+    // ---------- build_server_config ----------
+
+    #[tokio::test]
+    async fn server_config_without_ca_skips_client_auth() {
+        let p = gen_pems();
+        let cfg = TlsConfig {
+            cert_path: p.cert.clone(),
+            key_path: p.key.clone(),
+            ca_path: None,
+        };
+        let server_cfg = build_server_config(&cfg).await.expect("build ok");
+        assert!(Arc::strong_count(&server_cfg) >= 1);
+    }
+
+    #[tokio::test]
+    async fn server_config_with_ca_enables_client_auth() {
+        let p = gen_pems();
+        let cfg = TlsConfig {
+            cert_path: p.cert.clone(),
+            key_path: p.key.clone(),
+            ca_path: Some(p.ca_cert.clone()),
+        };
+        let server_cfg = build_server_config(&cfg).await.expect("build ok");
+        assert!(Arc::strong_count(&server_cfg) >= 1);
+    }
+
+    #[tokio::test]
+    async fn server_config_rejects_missing_cert_file() {
+        let p = gen_pems();
+        let cfg = TlsConfig {
+            cert_path: "/nonexistent/cert.pem".into(),
+            key_path: p.key.clone(),
+            ca_path: None,
+        };
+        let err = build_server_config(&cfg).await.expect_err("must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cert") || msg.contains("read"),
+            "expected cert-read error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_config_rejects_missing_key_file() {
+        let p = gen_pems();
+        let cfg = TlsConfig {
+            cert_path: p.cert.clone(),
+            key_path: "/nonexistent/key.pem".into(),
+            ca_path: None,
+        };
+        let err = build_server_config(&cfg).await.expect_err("must fail");
+        assert!(err.to_string().contains("key") || err.to_string().contains("read"));
+    }
+
+    #[tokio::test]
+    async fn server_config_rejects_mismatched_cert_and_key() {
+        // Hand rustls a cert whose subject public key does NOT match
+        // the configured private key. rustls's `with_single_cert` is
+        // documented to verify this pairing; a regression that swapped
+        // it for a non-checking variant would let TLS handshake fail
+        // at runtime instead of config-load.
+        let p = gen_pems();
+        let cfg = TlsConfig {
+            cert_path: p.mismatched_cert.clone(),
+            key_path: p.key.clone(),
+            ca_path: None,
+        };
+        let err = build_server_config(&cfg).await.expect_err("must fail");
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("server config")
+                || err.to_string().to_ascii_lowercase().contains("key"),
+            "expected pairing-rejection error, got: {err}"
+        );
+    }
+
+    // ---------- build_client_config_sync ----------
+
+    #[test]
+    fn client_config_no_ca_no_identity_uses_webpki_roots() {
+        let cfg = ClientTlsConfig {
+            ca_path: None,
+            cert_path: None,
+            key_path: None,
+        };
+        let _ = build_client_config_sync(&cfg).expect("build ok");
+    }
+
+    #[test]
+    fn client_config_with_custom_ca() {
+        let p = gen_pems();
+        let cfg = ClientTlsConfig {
+            ca_path: Some(p.ca_cert.clone()),
+            cert_path: None,
+            key_path: None,
+        };
+        let _ = build_client_config_sync(&cfg).expect("build ok");
+    }
+
+    #[test]
+    fn client_config_with_mtls_identity() {
+        let p = gen_pems();
+        let cfg = ClientTlsConfig {
+            ca_path: Some(p.ca_cert.clone()),
+            cert_path: Some(p.cert.clone()),
+            key_path: Some(p.key.clone()),
+        };
+        let _ = build_client_config_sync(&cfg).expect("build ok");
+    }
+
+    #[test]
+    fn client_config_rejects_cert_without_key() {
+        let p = gen_pems();
+        let cfg = ClientTlsConfig {
+            ca_path: None,
+            cert_path: Some(p.cert.clone()),
+            key_path: None,
+        };
+        let err = build_client_config_sync(&cfg).expect_err("must fail");
+        assert!(
+            err.to_string().contains("cert and key"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn client_config_rejects_key_without_cert() {
+        let p = gen_pems();
+        let cfg = ClientTlsConfig {
+            ca_path: None,
+            cert_path: None,
+            key_path: Some(p.key.clone()),
+        };
+        let err = build_client_config_sync(&cfg).expect_err("must fail");
+        assert!(err.to_string().contains("cert and key"));
+    }
+
+    #[test]
+    fn client_config_rejects_unreadable_ca() {
+        let cfg = ClientTlsConfig {
+            ca_path: Some("/nonexistent/ca.pem".into()),
+            cert_path: None,
+            key_path: None,
+        };
+        let err = build_client_config_sync(&cfg).expect_err("must fail");
+        assert!(
+            err.to_string().contains("read") || err.to_string().contains("cert"),
+            "got: {err}"
+        );
+    }
+}
