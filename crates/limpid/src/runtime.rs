@@ -595,15 +595,56 @@ async fn run_pipeline_with_outputs(
     // `events_finished` / `events_discarded` decision still observes
     // the original semantics (Finished AND emitted ≥1 output → finished).
     let outputs = std::mem::take(&mut result.outputs);
+    let mut failed_outputs: Vec<String> = Vec::new();
     for (output_name, sink_input) in outputs {
         if let Some(sender) = ctx.output_senders.get(&output_name) {
-            sender.send(sink_input).await;
+            if !sender.send(sink_input).await {
+                // QueueSender::send already bumped per-output
+                // `events_failed` on the !ok branch — that gives the
+                // operator per-output visibility. Collect the names
+                // here so the pipeline-level disposition (below)
+                // routes the event through the DLQ instead of
+                // counting it as `events_finished`.
+                error!(
+                    "pipeline '{}': enqueue to output '{}' failed \
+                     (queue closed or disk write error)",
+                    pipeline.name, output_name
+                );
+                failed_outputs.push(output_name);
+            }
         } else {
+            // Unknown output name slipped past startup validation —
+            // bug, but recoverable: treat as an enqueue failure so
+            // the event still hits the DLQ.
             error!(
                 "pipeline '{}': output '{}' not found",
                 pipeline.name, output_name
             );
+            failed_outputs.push(output_name);
         }
+    }
+
+    // Any enqueue failure overrides the termination: the pipeline
+    // body finished, but the event never reached (some of) the
+    // configured downstream queues. Routing through the existing
+    // `Errored` termination path gives the operator the same
+    // recovery affordances as a `process` error — DLQ entry plus an
+    // `events_errored` increment — instead of a silent
+    // `events_finished` count on an event that was effectively lost.
+    if !failed_outputs.is_empty() {
+        let reason = format!(
+            "output enqueue failed for: {} (queue closed, disk write error, \
+             or unknown output)",
+            failed_outputs.join(", ")
+        );
+        result.termination = crate::pipeline::PipelineTermination::Errored;
+        result.errored = Some(crate::pipeline::ErroredEventContext {
+            timestamp: chrono::Utc::now(),
+            pipeline: pipeline.name.clone(),
+            process: "(output enqueue)".to_string(),
+            reason,
+            event: event.to_owned(),
+        });
     }
 
     Ok(result)
@@ -656,34 +697,8 @@ async fn process_event(
                         // when termination == Errored; defend with a
                         // log if the contract somehow breaks.
                         if let Some(err_ctx) = result.errored {
-                            match &ctx.error_log {
-                                Some(writer) => {
-                                    if let Err(e) = writer.write(&err_ctx).await {
-                                        worker
-                                            .metrics
-                                            .events_errored_unwritable
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        error!(
-                                            event_record = %err_ctx.to_jsonl(),
-                                            "error_log: write failed: {} — record below for manual recovery",
-                                            e
-                                        );
-                                    }
-                                }
-                                None => {
-                                    // No DLQ configured — surface the
-                                    // record as a structured tracing
-                                    // line so the failure data is
-                                    // never silently lost. Operators
-                                    // can grep / `journalctl | jq` it.
-                                    error!(
-                                        event_record = %err_ctx.to_jsonl(),
-                                        "pipeline '{}': process '{}' errored; configure `control {{ error_log \"...\" }}` for file-based DLQ",
-                                        err_ctx.pipeline,
-                                        err_ctx.process
-                                    );
-                                }
-                            }
+                            write_errored_to_dlq(&err_ctx, &worker.metrics, ctx.error_log.as_ref())
+                                .await;
                         } else {
                             error!(
                                 "pipeline '{}': Errored termination without error context — bug",
@@ -707,8 +722,76 @@ async fn process_event(
                 }
             }
             Err(e) => {
-                error!("pipeline '{}': {}", worker.def.name, e);
+                // Pipeline body raised a runtime error that wasn't
+                // caught by `process` (= came out of expression
+                // evaluation in `error <expr>`, process arguments,
+                // switch discriminant/pattern, or `if` condition).
+                // Pre-fix this branch only logged and the event
+                // disappeared without an `events_errored` increment
+                // or a DLQ entry — operators had no replay path,
+                // contradicting the documented runtime-error
+                // contract. Route through the same DLQ path as
+                // `PipelineTermination::Errored` so the metric +
+                // file record stay consistent across both shapes
+                // of runtime error.
+                worker
+                    .metrics
+                    .events_errored
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let err_ctx = crate::pipeline::ErroredEventContext {
+                    timestamp: chrono::Utc::now(),
+                    pipeline: worker.def.name.clone(),
+                    process: "(pipeline body)".to_string(),
+                    reason: e.to_string(),
+                    event: event.to_owned(),
+                };
+                write_errored_to_dlq(&err_ctx, &worker.metrics, ctx.error_log.as_ref()).await;
             }
+        }
+    }
+}
+
+/// Persist an errored event to the dead-letter queue, or — if no
+/// `error_log` is configured — emit a structured tracing line so the
+/// record never disappears silently.
+///
+/// Shared by both runtime-error shapes the orchestrator surfaces:
+/// `PipelineTermination::Errored` (a `process` raised an error mid-
+/// pipeline) and an `Err` return from `run_pipeline` itself
+/// (expression evaluation under `error`/`if`/`switch`/process args
+/// raised an error). Keeping the two on the same routing helper
+/// guarantees the operator-visible behaviour stays in lockstep:
+/// same JSONL on disk, same `events_errored` counter, same
+/// `events_errored_unwritable` semantics when the DLQ write itself
+/// fails.
+async fn write_errored_to_dlq(
+    err_ctx: &crate::pipeline::ErroredEventContext,
+    worker_metrics: &PipelineMetrics,
+    error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+) {
+    match error_log {
+        Some(writer) => {
+            if let Err(e) = writer.write(err_ctx).await {
+                worker_metrics
+                    .events_errored_unwritable
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                error!(
+                    event_record = %err_ctx.to_jsonl(),
+                    "error_log: write failed: {} — record below for manual recovery",
+                    e
+                );
+            }
+        }
+        None => {
+            // No DLQ configured — surface the record as a structured
+            // tracing line so the failure data is never silently
+            // lost. Operators can grep / `journalctl | jq` it.
+            error!(
+                event_record = %err_ctx.to_jsonl(),
+                "pipeline '{}': process '{}' errored; configure `control {{ error_log \"...\" }}` for file-based DLQ",
+                err_ctx.pipeline,
+                err_ctx.process
+            );
         }
     }
 }
@@ -955,5 +1038,65 @@ mod tests {
             msg.contains("backup"),
             "error must list known outputs to aid debugging; got: {msg}"
         );
+    }
+
+    fn make_err_ctx(reason: &str) -> crate::pipeline::ErroredEventContext {
+        let addr = std::net::SocketAddr::from_str("127.0.0.1:0").unwrap();
+        let ev = Event::new(Bytes::from_static(b"test-event"), addr);
+        crate::pipeline::ErroredEventContext {
+            timestamp: chrono::Utc::now(),
+            pipeline: "test_pipeline".to_string(),
+            process: "(test process)".to_string(),
+            reason: reason.to_string(),
+            event: ev,
+        }
+    }
+
+    #[tokio::test]
+    async fn write_errored_to_dlq_writes_to_configured_error_log() {
+        // The shared DLQ-routing helper feeds the writer when one is
+        // configured. Pin that the failure JSONL actually lands in
+        // the file — this is the recovery path operators rely on.
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("dlq.jsonl");
+        let writer = Arc::new(crate::error_log::ErrorLogWriter::new(log_path.clone()));
+        let metrics = PipelineMetrics::default();
+        let err_ctx = make_err_ctx("simulated runtime error");
+
+        write_errored_to_dlq(&err_ctx, &metrics, Some(&writer)).await;
+
+        // Errored counter is bumped at the caller (worker.metrics);
+        // the helper itself only writes. Verify the JSONL is on disk.
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            contents.contains("simulated runtime error"),
+            "DLQ file must contain the reason; got: {contents}"
+        );
+        assert!(
+            contents.contains("test_pipeline"),
+            "DLQ file must name the pipeline; got: {contents}"
+        );
+        assert_eq!(
+            metrics.events_errored_unwritable.load(Ordering::Relaxed),
+            0,
+            "unwritable counter must not bump on a successful write"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_errored_to_dlq_without_writer_does_not_panic() {
+        // Baseline: when `error_log` isn't configured, the helper
+        // emits a structured tracing line instead. The structured
+        // line is observed via `tracing` subscribers in operator
+        // setups; the test here pins the no-panic contract so the
+        // logged-only branch can't regress to an unwrap somewhere.
+        let metrics = PipelineMetrics::default();
+        let err_ctx = make_err_ctx("no DLQ configured");
+
+        write_errored_to_dlq(&err_ctx, &metrics, None).await;
+
+        // Sanity: no metric is touched on this branch (the caller
+        // already bumped events_errored before calling us).
+        assert_eq!(metrics.events_errored_unwritable.load(Ordering::Relaxed), 0,);
     }
 }

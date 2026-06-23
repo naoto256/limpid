@@ -238,9 +238,25 @@ impl QueueSender {
                 false
             }
         };
-        if ok && let Some(m) = &self.metrics {
-            m.events_received
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(m) = &self.metrics {
+            if ok {
+                m.events_received
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                // Enqueue failure: memory-queue receiver dropped (=
+                // consumer task gone, daemon usually shutting down),
+                // disk-queue serialise/write error, or
+                // Rendered-on-Disk routing bug above. From this
+                // sender's POV the event never made it into the
+                // queue and can't be retried by the consumer (the
+                // consumer never sees it). Bump `events_failed` so
+                // the per-output enqueue failure is visible in
+                // metrics; the pipeline-side caller additionally
+                // routes the lost event through the dead-letter
+                // path.
+                m.events_failed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         ok
     }
