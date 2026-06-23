@@ -97,9 +97,6 @@ impl ErrorLogWriter {
         Ok(())
     }
 
-    /// Append one JSONL record for `ctx`. Errors here are surfaced to
-    /// the caller (runtime layer) which counts them in
-    /// `events_errored_unwritable` and falls back to tracing.
     /// Persist a rendered buffer entry that survived an
     /// [`Output::shutdown`] flush failure (BC-4 / PR-P).
     ///
@@ -138,6 +135,9 @@ impl ErrorLogWriter {
         self.write(&ctx).await
     }
 
+    /// Append one JSONL record for `ctx`. Errors here are surfaced to
+    /// the caller (runtime layer) which counts them in
+    /// `events_errored_unwritable` and falls back to tracing.
     pub async fn write(&self, ctx: &ErroredEventContext) -> Result<()> {
         let mut line = ctx.to_jsonl();
         line.push('\n');
