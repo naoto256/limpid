@@ -478,7 +478,11 @@ impl OtlpHttpOutput {
             return Ok(());
         }
         let count = drained.len() as u64;
-        let result = send_batch(&self.inner, drained).await;
+        // Clone for the send so the original is available for
+        // restoration on transport error. `Bytes::clone` is a cheap
+        // refcount bump (no payload copy), so this scales linearly
+        // with batch length rather than with batch byte size.
+        let result = send_batch(&self.inner, drained.clone()).await;
         match result {
             Ok(outcome) => {
                 let rejected = outcome.rejected.min(count);
@@ -496,9 +500,18 @@ impl OtlpHttpOutput {
                 Ok(())
             }
             Err(e) => {
-                self.metrics
-                    .events_failed
-                    .fetch_add(count, Ordering::Relaxed);
+                // Transport error: put the drained batch back into
+                // the buffer for retry instead of dropping it. The
+                // queue layer counts Rendered payloads as failed and
+                // does not replay them (see queue/mod.rs), so this
+                // is the only chance these events have. `output
+                // http` does the same (PR limpid#33); OTLP was the
+                // odd one out. Do NOT bump events_failed here — the
+                // events are retained, not permanently rejected.
+                let mut batch = self.inner.batch.lock().await;
+                let new_events = std::mem::take(&mut *batch);
+                *batch = drained;
+                batch.extend(new_events);
                 Err(e)
             }
         }
@@ -526,7 +539,7 @@ impl OtlpHttpOutput {
                 return;
             }
             let count = drained.len() as u64;
-            match send_batch(&inner, drained).await {
+            match send_batch(&inner, drained.clone()).await {
                 Ok(outcome) => {
                     let rejected = outcome.rejected.min(count);
                     let written = count - rejected;
@@ -538,8 +551,19 @@ impl OtlpHttpOutput {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("otlp_http flush timer: send failed ({})", e);
-                    metrics.events_failed.fetch_add(count, Ordering::Relaxed);
+                    // Same retention contract as the write-triggered
+                    // flush above: put the drained batch back so the
+                    // next write or timer firing can retry, instead
+                    // of silently dropping events here.
+                    tracing::warn!(
+                        "otlp_http flush timer: send failed ({}) — {} events returned to buffer",
+                        e,
+                        count
+                    );
+                    let mut buf = inner.batch.lock().await;
+                    let new_events = std::mem::take(&mut *buf);
+                    *buf = drained;
+                    buf.extend(new_events);
                 }
             }
         });
@@ -1383,6 +1407,66 @@ mod tests {
         assert_eq!(batch_len, 0, "Owned event must not land in the batch");
         let timer_armed = output.flush_handle.lock().await.is_some();
         assert!(!timer_armed, "Owned event must not arm the flush timer");
+    }
+
+    #[tokio::test]
+    async fn flush_failure_restores_batch_to_buffer() {
+        // Regression: `flush()` used to drain the batch and, on
+        // transport failure, just bump events_failed and drop the
+        // drained events. `output http` retained them for retry; OTLP
+        // was the odd one out. The fix restores the drained batch
+        // into the buffer so the next write or timer firing has a
+        // chance to ship them.
+        let mut props = one_peer_props("http://127.0.0.1:1");
+        props.push(prop_int("batch_size", 2));
+        props.push(prop_str("batch_timeout", "30s"));
+        // Single attempt against the unreachable peer so the test
+        // doesn't sit through the default retry backoff.
+        props.push(Property::Block {
+            key: "retry".into(),
+            key_span: None,
+            properties: vec![
+                prop_int("max_attempts", 1),
+                prop_str("initial_wait", "1ms"),
+                prop_str("max_wait", "1ms"),
+            ],
+        });
+        let output = OtlpHttpOutput::from_properties("test", &mp(&props)).unwrap();
+
+        // First write fills the buffer below batch_size — no flush.
+        let arena_bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&arena_bump);
+        let e1 = event_with_egress(singleton_bytes(1));
+        let p1 = output.render(&e1.view_in(&arena), &arena).unwrap();
+        output.write(p1).await.unwrap();
+        assert_eq!(output.inner.batch.lock().await.len(), 1);
+
+        // Second write tips the batch over batch_size, triggers
+        // flush() against the unreachable peer, which must Err.
+        let e2 = event_with_egress(singleton_bytes(2));
+        let p2 = output.render(&e2.view_in(&arena), &arena).unwrap();
+        let err = output
+            .write(p2)
+            .await
+            .expect_err("flush against unreachable peer must fail");
+        assert!(
+            err.to_string().contains("otlp_http"),
+            "expected ship error, got: {err}"
+        );
+
+        // Regression assertion: both events must still be in the
+        // buffer (old code dropped them; the events_failed counter
+        // would have been bumped to 2).
+        let batch_len = output.inner.batch.lock().await.len();
+        assert_eq!(
+            batch_len, 2,
+            "flush failure must put the drained batch back into the buffer",
+        );
+        let failed = output.metrics.events_failed.load(Ordering::Relaxed);
+        assert_eq!(
+            failed, 0,
+            "events retained for retry must NOT be counted as failed yet (got {failed})",
+        );
     }
 
     #[test]
