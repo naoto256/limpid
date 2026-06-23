@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use crate::dsl::arena::EventArena;
 use crate::dsl::ast::*;
-use crate::dsl::eval::{eval_expr, is_truthy, value_to_string, values_match};
+use crate::dsl::eval::{eval_expr, select_if_branch, select_switch_arm, value_to_string};
 use crate::dsl::exec::{ExecResult, ProcessError, ProcessRegistry, exec_process_body};
 use crate::dsl::value::Value;
 use crate::event::{BorrowedEvent, OwnedEvent};
@@ -736,41 +736,23 @@ fn exec_pipeline_stmt<'bump>(
             finished()
         }
 
-        PipelineStatement::If(if_chain) => exec_pipeline_if(if_chain, event, ctx, out),
+        PipelineStatement::If(if_chain) => {
+            match select_if_branch(if_chain, |c| eval_expr(c, &event, ctx.funcs, ctx.arena))? {
+                Some(body) => exec_pipeline_branch_body(body, event, ctx, out),
+                None => cont(event),
+            }
+        }
 
         PipelineStatement::Switch(discriminant, arms) => {
             let disc_val = eval_expr(discriminant, &event, ctx.funcs, ctx.arena)?;
-            for arm in arms {
-                if arm.pattern.is_none() {
-                    return exec_pipeline_branch_body(&arm.body, event, ctx, out);
-                }
-                let pattern_val =
-                    eval_expr(arm.pattern.as_ref().unwrap(), &event, ctx.funcs, ctx.arena)?;
-                if values_match(&disc_val, &pattern_val) {
-                    return exec_pipeline_branch_body(&arm.body, event, ctx, out);
-                }
+            match select_switch_arm(&disc_val, arms, |e| {
+                eval_expr(e, &event, ctx.funcs, ctx.arena)
+            })? {
+                Some(body) => exec_pipeline_branch_body(body, event, ctx, out),
+                None => cont(event),
             }
-            cont(event)
         }
     }
-}
-
-fn exec_pipeline_if<'bump>(
-    if_chain: &IfChain,
-    event: BorrowedEvent<'bump>,
-    ctx: &PipelineExecCtx<'_, 'bump>,
-    out: &mut PipelineExecOut<'_>,
-) -> Result<(Option<BorrowedEvent<'bump>>, PipelineTermination)> {
-    for (condition, body) in &if_chain.branches {
-        let cond_val = eval_expr(condition, &event, ctx.funcs, ctx.arena)?;
-        if is_truthy(&cond_val) {
-            return exec_pipeline_branch_body(body, event, ctx, out);
-        }
-    }
-    if let Some(else_body) = &if_chain.else_body {
-        return exec_pipeline_branch_body(else_body, event, ctx, out);
-    }
-    Ok((Some(event), PipelineTermination::Finished))
 }
 
 fn exec_pipeline_branch_body<'bump>(

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use anyhow::{Result, bail};
 
 use super::arena::EventArena;
-use super::ast::{BinOp, BlockArg, Expr, ExprKind, TemplateFragment, UnaryOp};
+use super::ast::{BinOp, BlockArg, BranchBody, Expr, ExprKind, IfChain, SwitchStmtArm, TemplateFragment, UnaryOp};
 use super::value::{ArrayBuilder, ObjectBuilder, Value};
 use crate::event::BorrowedEvent;
 use crate::functions::FunctionRegistry;
@@ -660,11 +660,64 @@ pub fn values_match(left: &Value<'_>, right: &Value<'_>) -> bool {
     }
 }
 
-/// True if `v` is truthy under DSL rules. Re-exported for callers that
-/// previously imported this from `eval` directly; the canonical
-/// implementation lives on [`Value::is_truthy`].
-pub fn is_truthy(v: &Value<'_>) -> bool {
-    v.is_truthy()
+/// Select the matching arm body of a statement-form `switch`.
+///
+/// Walks `arms` in source order and returns the body of the first arm
+/// whose pattern equals `disc_val` (per [`values_match`]). A `default`
+/// arm (`pattern.is_none()`) is returned immediately if encountered —
+/// `--check` enforces `default` as the last arm so only a trailing
+/// default can be hit this way, matching the documented
+/// `docs/src/dsl-syntax.md` dispatch contract.
+///
+/// Returns `None` when no pattern matched and no `default` is present.
+///
+/// Pure dispatch logic: the caller supplies `eval_pattern` to evaluate
+/// each arm's pattern expression against its execution context (with or
+/// without a `LocalScope`, with whichever funcs/arena), and is
+/// responsible for executing the returned body. Lets the pipeline and
+/// process executors share one first-match algorithm without coupling
+/// to either context.
+pub fn select_switch_arm<'bump, 'a, F>(
+    disc_val: &Value<'bump>,
+    arms: &'a [SwitchStmtArm],
+    mut eval_pattern: F,
+) -> Result<Option<&'a [BranchBody]>>
+where
+    F: FnMut(&Expr) -> Result<Value<'bump>>,
+{
+    for arm in arms {
+        let Some(pattern) = arm.pattern.as_ref() else {
+            return Ok(Some(&arm.body));
+        };
+        if values_match(disc_val, &eval_pattern(pattern)?) {
+            return Ok(Some(&arm.body));
+        }
+    }
+    Ok(None)
+}
+
+/// Select the matching branch body of an `if`/`else if`/`else` chain.
+///
+/// Walks `chain.branches` in source order and returns the first body
+/// whose condition evaluates truthy (per [`Value::is_truthy`]). Falls
+/// back to `chain.else_body` if no condition matched, returning `None`
+/// when both produce nothing.
+///
+/// Same pure-dispatch shape as [`select_switch_arm`]: the caller
+/// supplies `eval_condition` and executes the returned body.
+pub fn select_if_branch<'bump, 'a, F>(
+    chain: &'a IfChain,
+    mut eval_condition: F,
+) -> Result<Option<&'a [BranchBody]>>
+where
+    F: FnMut(&Expr) -> Result<Value<'bump>>,
+{
+    for (condition, body) in &chain.branches {
+        if eval_condition(condition)?.is_truthy() {
+            return Ok(Some(body));
+        }
+    }
+    Ok(chain.else_body.as_deref())
 }
 
 /// String coercion used by templates, format() placeholders, and any
@@ -1168,15 +1221,13 @@ mod tests {
 
     #[test]
     fn test_is_truthy() {
-        let _bump = ::bumpalo::Bump::new();
-        let _arena = EventArena::new(&_bump);
-        assert!(!is_truthy(&Value::Null));
-        assert!(!is_truthy(&Value::Bool(false)));
-        assert!(is_truthy(&Value::Bool(true)));
-        assert!(!is_truthy(&Value::String("")));
-        assert!(is_truthy(&Value::String("x")));
-        assert!(!is_truthy(&Value::Int(0)));
-        assert!(is_truthy(&Value::Int(1)));
+        assert!(!Value::Null.is_truthy());
+        assert!(!Value::Bool(false).is_truthy());
+        assert!(Value::Bool(true).is_truthy());
+        assert!(!Value::String("").is_truthy());
+        assert!(Value::String("x").is_truthy());
+        assert!(!Value::Int(0).is_truthy());
+        assert!(Value::Int(1).is_truthy());
     }
 
     #[test]
