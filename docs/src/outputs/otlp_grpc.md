@@ -64,7 +64,7 @@ Each `peer` block configures one collector endpoint:
 
 | Per-peer property | Required | Description |
 |-------------------|----------|-------------|
-| `endpoint` | yes | gRPC server URL. `https://` selects TLS, `http://` selects plaintext. The `LogsService.Export` path is implicit. |
+| `endpoint` | yes | gRPC server URL. `https://` selects TLS, `http://` selects plaintext. The `LogsService.Export` path is implicit. A `tls { ... }` block is rejected at config-load time if this is not an `https://` URL — tonic only negotiates TLS on https endpoints, so a tls block on a plaintext endpoint would silently ship in clear text. |
 | `tls.ca` | no | Custom CA certificate file (PEM) for this peer. Falls back to the system root store if omitted. |
 | `tls.cert`, `tls.key` | no (paired) | Client certificate and private key for mTLS, as separate PEM files (chmod 600 the key). Both must be present together. |
 

@@ -137,5 +137,5 @@ The merging modes are wire-efficiency optimisations; if your batch sizes are mod
 ## Notes
 
 - `http_protobuf` is the canonical OTLP wire form; `http_json` serializes per the OTLP/JSON canonical mapping (camelCase, u64-as-string, bytes-as-hex).
-- `verify false` skips certificate verification — development only.
+- `verify false` skips certificate verification — development only. limpid emits a `tracing::warn!` once per `https://` peer at startup when `verify false` is in effect so the misconfiguration is greppable in the daemon log. Has no effect on `http://` endpoints (no TLS to verify).
 - For gRPC transport see [otlp_grpc](./otlp_grpc.md).
