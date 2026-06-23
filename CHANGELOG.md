@@ -10,6 +10,16 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased] - 0.7.8
 
+### Fixed — `output syslog_udp` walks every resolved address on connect, restoring DNS-level failover
+
+The 0.7.8 family-aware bind rewrite kept v6-only destinations working but regressed DNS failover: `lookup_host(host:port).next()` committed to the first resolved `SocketAddr` and gave up if that one didn't connect. Pre-0.7.8 `socket.connect(host:port)` walked the whole resolution list internally and succeeded on the first reachable address — common during a partial v6 outage or a stale AAAA record on a dual-stack host. The connect path now iterates every resolved `SocketAddr`, binding a fresh ephemeral socket of the matching family per attempt and breaking on first success. On exhaustion the most recent error is returned with both the original hostname and the specific address that failed, so an operator can see which records were tried.
+
+
+### Fixed — `output kafka` reports PLAIN-without-TLS before reading the password file
+
+A misconfiguration with both a broken `password_file` path and `mechanism plain` without a `tls { ... }` block surfaced the file-read error first, masking the more important credentials-on-the-wire problem. The operator would fix the file path, get the daemon to start, and only then discover their PLAIN config was unsafe. `kafka.rs` now does a cheap pre-check on the mechanism ident before `parse_sasl_block` touches the filesystem, so the PLAIN-without-TLS diagnostic always fires first. The post-parse `require_tls_for_plain` guard stays as a belt-and-braces check, and the new pre-check explicitly avoids leaking the password-file path into the error wording. Two new tests cover both branches.
+
+
 ### Internal — `limpidctl check`: OneOf schema edge cases documented + multi-block guard
 
 Two follow-ups on the OneOf branch-picking logic that landed in 0.7.8. (1) `check_one_of` now documents — with a regression test — the deliberate fallback to `OneOfMismatch` when 0 or 2+ variants structurally match. Two-scalar-variant OneOf given a wrong-type literal (e.g. `OneOf[String, Int]` with a Bool) keeps the "expected String | Int, got Bool" wording, which is more useful than picking one variant's TypeMismatch and hiding that the other shape was also allowed. (2) `inner_block_schema_of` in `check/outputs.rs` previously returned the first block-shaped OneOf variant via `find_map`. Today only `OneOf[Block(TLS_CLIENT_BLOCK_PROPERTIES), String]` exists, so "first block wins" is unambiguous — but a future `OneOf[Block(A), Block(B)]` (e.g. inline tls vs inline mTLS configs) would silently validate against the wrong schema. The function now returns `None` when more than one block-shaped variant exists, falling back to expression-level checks until a per-OneOf resolution rule is encoded explicitly. No user-visible behaviour change today.

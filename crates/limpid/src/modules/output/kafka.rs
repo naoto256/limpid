@@ -226,13 +226,47 @@ fn parse_sasl_block(name: &str, properties: &[Property]) -> Result<Option<SaslCo
     }))
 }
 
-/// Reject `mechanism plain` without a `tls { ... }` block — SASL/PLAIN
-/// transmits the username and password in clear text on the wire, so
-/// the only safe transport is TLS (Kafka and Confluent both document
-/// this requirement: "TLS/SSL encryption should always be used if SASL
-/// mechanism is PLAIN"). If the operator wants plain-text Kafka, the
-/// supported path is `scram_sha_256` / `scram_sha_512`, which use a
-/// challenge-response and never put the password on the wire.
+fn plain_without_tls_error(name: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "output '{}': sasl mechanism 'plain' requires a tls {{ ... }} block — PLAIN puts credentials in clear text on the wire and must run over TLS. Use scram_sha_256 or scram_sha_512 if TLS is not available.",
+        name
+    )
+}
+
+/// Cheap pre-check that fires BEFORE `parse_sasl_block` reads the
+/// password file from disk. If the operator has both a broken
+/// `password_file` path and `mechanism plain` without TLS, the file
+/// I/O error masks the more important diagnostic (the
+/// credentials-on-the-wire problem), and fixing the path only
+/// exposes the second error after the fact. Surfacing the TLS
+/// requirement first lets the operator see the deeper issue without
+/// guessing which fix to apply first.
+fn pre_check_plain_requires_tls(
+    name: &str,
+    properties: &[Property],
+    tls: Option<&ClientTlsConfig>,
+) -> Result<()> {
+    let Some(sasl_block) = props::get_block(properties, "sasl") else {
+        return Ok(());
+    };
+    let Some(mechanism) = props::get_ident(sasl_block, "mechanism") else {
+        return Ok(());
+    };
+    if mechanism == "plain" && tls.is_none() {
+        return Err(plain_without_tls_error(name));
+    }
+    Ok(())
+}
+
+/// Post-parse guard: reject `mechanism plain` without a `tls { ... }`
+/// block. SASL/PLAIN transmits the username and password in clear text
+/// on the wire, so the only safe transport is TLS (Kafka and Confluent
+/// both document this requirement: "TLS/SSL encryption should always be
+/// used if SASL mechanism is PLAIN"). If the operator wants plain-text
+/// Kafka, the supported path is `scram_sha_256` / `scram_sha_512`,
+/// which use a challenge-response and never put the password on the
+/// wire. Kept as a belt-and-braces check after `pre_check_plain_requires_tls`
+/// in case future refactors reorder or skip the pre-check.
 fn require_tls_for_plain(
     name: &str,
     sasl: Option<&SaslConfig>,
@@ -242,10 +276,7 @@ fn require_tls_for_plain(
         && s.mechanism == "PLAIN"
         && tls.is_none()
     {
-        anyhow::bail!(
-            "output '{}': sasl mechanism 'plain' requires a tls {{ ... }} block — PLAIN puts credentials in clear text on the wire and must run over TLS. Use scram_sha_256 or scram_sha_512 if TLS is not available.",
-            name
-        );
+        return Err(plain_without_tls_error(name));
     }
     Ok(())
 }
@@ -328,6 +359,10 @@ impl Module for KafkaOutput {
         });
 
         let tls = parse_tls_block(name, properties)?;
+        // Pre-check before reading the password file so a broken
+        // `password_file` path doesn't mask the more important
+        // PLAIN-without-TLS error.
+        pre_check_plain_requires_tls(name, properties, tls.as_ref())?;
         let sasl = parse_sasl_block(name, properties)?;
         require_tls_for_plain(name, sasl.as_ref(), tls.as_ref())?;
 
@@ -684,5 +719,60 @@ mod tests {
     #[test]
     fn require_tls_for_plain_accepts_no_sasl() {
         require_tls_for_plain("k", None, None).unwrap();
+    }
+
+    // ---- pre_check_plain_requires_tls (ordering guard) ----
+
+    #[test]
+    fn pre_check_plain_requires_tls_fires_before_password_file_read() {
+        // Regression guard for the audit finding A2: if both the
+        // password_file path is broken AND the operator wrote
+        // `mechanism plain` without a tls block, the pre-check
+        // surfaces the TLS requirement *first*. Without the pre-
+        // check the file-read error from parse_sasl_block would mask
+        // the more important credentials-on-the-wire problem.
+        let props = vec![block(
+            "sasl",
+            vec![
+                ident_prop("mechanism", "plain"),
+                str_prop("username", "u"),
+                str_prop("password_file", "/nonexistent/does/not/exist.txt"),
+            ],
+        )];
+        // No TLS block, plain mechanism: pre-check must fire here
+        // and we must NEVER hit the file-read in parse_sasl_block.
+        let err = pre_check_plain_requires_tls("k", &props, None)
+            .err()
+            .unwrap();
+        let msg = err.to_string();
+        assert!(msg.contains("plain") && msg.contains("tls"), "{msg}");
+        assert!(!msg.contains("password_file"), "must not leak file-path: {msg}");
+    }
+
+    #[test]
+    fn pre_check_plain_passes_when_tls_block_present() {
+        let props = vec![block(
+            "sasl",
+            vec![
+                ident_prop("mechanism", "plain"),
+                str_prop("username", "u"),
+                str_prop("password_file", "/nonexistent/does/not/exist.txt"),
+            ],
+        )];
+        let tls = empty_tls();
+        pre_check_plain_requires_tls("k", &props, Some(&tls)).unwrap();
+    }
+
+    #[test]
+    fn pre_check_plain_passes_for_scram_without_tls() {
+        let props = vec![block(
+            "sasl",
+            vec![
+                ident_prop("mechanism", "scram_sha_512"),
+                str_prop("username", "u"),
+                str_prop("password_file", "/nonexistent/does/not/exist.txt"),
+            ],
+        )];
+        pre_check_plain_requires_tls("k", &props, None).unwrap();
     }
 }
