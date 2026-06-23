@@ -130,7 +130,7 @@ OTLP receivers accept an `ExportLogsServiceRequest` with multiple `ResourceLogs`
 | `resource` | merge same-Resource Events into one ResourceLogs | + linear Resource scan | smaller |
 | `scope` | merge same-(Resource, Scope) into one ScopeLogs | + Scope scan inside each Resource | smallest |
 
-Resource / Scope equality is order-insensitive on attributes — proto3 does not promise a canonical attribute order on the wire, so attribute lists are sorted by key before comparison.
+Resource / Scope equality is order-insensitive on attributes — proto3 does not promise a canonical attribute order on the wire, so attribute lists are sorted by key before comparison. Two entries that share a Resource but declare *different non-empty* `schema_url`s are kept in separate ResourceLogs buckets (same rule for ScopeLogs): they describe the same resource under different schemas, and merging them would silently drop one declaration.
 
 The merging modes are wire-efficiency optimisations; if your batch sizes are modest (hundreds of Events), `none` is fine. For collector → SaaS hops where every byte counts, `scope` is usually the right choice.
 
