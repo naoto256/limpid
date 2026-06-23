@@ -598,17 +598,16 @@ async fn run_pipeline_with_outputs(
     let mut failed_outputs: Vec<String> = Vec::new();
     for (output_name, sink_input) in outputs {
         if let Some(sender) = ctx.output_senders.get(&output_name) {
-            if !sender.send(sink_input).await {
+            if let Err(e) = sender.send(sink_input).await {
                 // QueueSender::send already bumped per-output
-                // `events_failed` on the !ok branch — that gives the
+                // `events_failed` on the Err branch — that gives the
                 // operator per-output visibility. Collect the names
                 // here so the pipeline-level disposition (below)
                 // routes the event through the DLQ instead of
                 // counting it as `events_finished`.
                 error!(
-                    "pipeline '{}': enqueue to output '{}' failed \
-                     (queue closed or disk write error)",
-                    pipeline.name, output_name
+                    "pipeline '{}': enqueue to output '{}' failed: {}",
+                    pipeline.name, output_name, e
                 );
                 failed_outputs.push(output_name);
             }
