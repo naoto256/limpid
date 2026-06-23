@@ -30,7 +30,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -132,8 +132,24 @@ impl Input for JournalInput {
         // Channel payload: (entry-as-JSON-bytes, cursor)
         let (entry_tx, mut entry_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, String)>(1024);
 
+        // The reader is parked inside `spawn_blocking`, so `abort()`
+        // on the handle below is effectively a no-op once execution
+        // begins (tokio only cancels not-yet-started blocking tasks).
+        // Signal shutdown explicitly via an atomic flag the reader
+        // polls between journal reads, so an idle reader exits within
+        // bounded latency instead of leaking until the next entry —
+        // which may never arrive on a quiet system.
+        let reader_shutdown = Arc::new(AtomicBool::new(false));
+        let reader_shutdown_for_thread = Arc::clone(&reader_shutdown);
+
         let journal_handle = tokio::task::spawn_blocking(move || {
-            run_journal_reader(matches, state_file, poll_interval, entry_tx)
+            run_journal_reader(
+                matches,
+                state_file,
+                poll_interval,
+                entry_tx,
+                reader_shutdown_for_thread,
+            )
         });
 
         loop {
@@ -143,6 +159,10 @@ impl Input for JournalInput {
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         info!("journal: shutting down");
+                        // Tell the blocking reader to exit; `abort()`
+                        // alone would not (the reader is already
+                        // running on a blocking thread).
+                        reader_shutdown.store(true, Ordering::Relaxed);
                         journal_handle.abort();
                         break;
                     }
@@ -248,12 +268,35 @@ fn collect_entry_fields(journal: &mut Journal) -> Result<JsonMap<String, JsonVal
     Ok(map)
 }
 
+/// Sleep up to `total` but wake early when `shutdown` is set.
+///
+/// The journal reader's idle path used to be a plain
+/// `std::thread::sleep(poll_interval)`, which on a quiet system
+/// could nap for the full poll interval — and crucially could not
+/// see the orchestrator's shutdown signal during that nap, because
+/// `spawn_blocking` tasks can't be aborted once running. Sleeping
+/// in small quanta and re-checking the flag bounds shutdown latency
+/// to roughly one quantum regardless of `poll_interval`.
+fn interruptible_sleep(shutdown: &AtomicBool, total: Duration) {
+    const QUANTUM: Duration = Duration::from_millis(100);
+    let mut remaining = total;
+    while remaining > Duration::ZERO {
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        let nap = remaining.min(QUANTUM);
+        std::thread::sleep(nap);
+        remaining = remaining.saturating_sub(nap);
+    }
+}
+
 /// Synchronous journal reader running in a blocking thread.
 fn run_journal_reader(
     matches: Vec<String>,
     state_file: Option<PathBuf>,
     poll_interval: Duration,
     tx: tokio::sync::mpsc::Sender<(Vec<u8>, String)>,
+    shutdown: Arc<AtomicBool>,
 ) {
     let mut journal = match OpenOptions::default().open() {
         Ok(j) => j,
@@ -296,6 +339,9 @@ fn run_journal_reader(
     }
 
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         match journal.next() {
             Ok(n) if n > 0 => {
                 let map = match collect_entry_fields(&mut journal) {
@@ -327,13 +373,92 @@ fn run_journal_reader(
             }
             Ok(_) => {
                 // No more entries, wait
-                std::thread::sleep(poll_interval);
+                interruptible_sleep(&shutdown, poll_interval);
             }
             Err(e) => {
                 warn!("journal: read error: {}", e);
-                std::thread::sleep(poll_interval);
+                interruptible_sleep(&shutdown, poll_interval);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn interruptible_sleep_returns_promptly_when_flag_set_before_call() {
+        // Defensive baseline: if the flag is already set before the
+        // sleep starts, the loop never naps. Latency must be near
+        // zero.
+        let shutdown = AtomicBool::new(true);
+        let started = Instant::now();
+        interruptible_sleep(&shutdown, Duration::from_secs(60));
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "pre-set flag must short-circuit immediately; took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn interruptible_sleep_wakes_within_one_quantum_when_flag_flips() {
+        // Regression: the previous reader used plain
+        // `std::thread::sleep(poll_interval)`, so on an idle host the
+        // shutdown signal couldn't preempt the nap. With chunked
+        // sleeps re-checking the flag, the wake-up latency is bounded
+        // by one QUANTUM (~100ms) regardless of how long the caller
+        // asked us to sleep.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flip = Arc::clone(&shutdown);
+
+        // Flip the flag from another thread mid-sleep.
+        let flipper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            flip.store(true, Ordering::Relaxed);
+        });
+
+        let started = Instant::now();
+        // Ask for a 30 s sleep that we'd never tolerate in shutdown.
+        interruptible_sleep(&shutdown, Duration::from_secs(30));
+        let elapsed = started.elapsed();
+        flipper.join().unwrap();
+
+        // Wake-up must happen well under one second: at most one
+        // QUANTUM (100 ms) after the flip at 150 ms = ~250 ms upper
+        // bound. Allow generous slack for CI scheduling jitter.
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "flag flip must interrupt the sleep; took {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "should not return before the first quantum elapses; took {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn interruptible_sleep_completes_full_duration_without_signal() {
+        // Sanity: when the flag never flips, the helper actually
+        // sleeps roughly the requested time.
+        let shutdown = AtomicBool::new(false);
+        let started = Instant::now();
+        interruptible_sleep(&shutdown, Duration::from_millis(250));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(240),
+            "should sleep close to requested duration; took {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "should not over-sleep wildly; took {:?}",
+            elapsed
+        );
     }
 }
 
