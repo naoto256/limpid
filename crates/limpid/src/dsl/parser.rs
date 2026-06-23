@@ -509,7 +509,7 @@ fn parse_switch_arm_generic<F>(
     pair: Pair<Rule>,
     file_id: u32,
     mut parse_body: F,
-) -> Result<SwitchArm>
+) -> Result<SwitchStmtArm>
 where
     F: FnMut(Pair<Rule>, u32) -> Result<BranchBody>,
 {
@@ -529,7 +529,7 @@ where
         .map(|p| parse_body(p, file_id))
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(SwitchArm { pattern, body })
+    Ok(SwitchStmtArm { pattern, body })
 }
 
 // ---------------------------------------------------------------------------

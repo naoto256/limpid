@@ -124,7 +124,7 @@ pub enum ProcessStatement {
     /// `if cond { ... } else if cond { ... } else { ... }`
     If(IfChain),
     /// `switch expr { "val" { ... } default { ... } }`
-    Switch(Expr, Vec<SwitchArm>),
+    Switch(Expr, Vec<SwitchStmtArm>),
     /// `try { ... } catch { ... }`
     TryCatch(Vec<ProcessStatement>, Vec<ProcessStatement>),
     /// Expression statement: `table_upsert(...)`, `table_delete(...)`, etc.
@@ -233,7 +233,7 @@ pub enum PipelineStatement {
     /// `if cond { ... } else if cond { ... } else { ... }`
     If(IfChain),
     /// `switch expr { ... }`
-    Switch(Expr, Vec<SwitchArm>),
+    Switch(Expr, Vec<SwitchStmtArm>),
 }
 
 /// An element within a `process a | b | { ... }` chain in a pipeline.
@@ -265,12 +265,28 @@ pub enum BranchBody {
     Pipeline(PipelineStatement),
 }
 
+/// One arm of a `switch` construct. Generic over body type so the
+/// statement-form switch (body = `Vec<BranchBody>`, run for side effects)
+/// and the expression-form switch (body = [`Expr`], evaluated to a value)
+/// share one definition. The `pattern: Option<Expr>` shape — `None` for
+/// `default` — is the only structural commonality the analyzer cares
+/// about, so default-position / duplicate-default checks operate on the
+/// generic form without touching the body.
+///
+/// Concrete forms are the type aliases [`SwitchStmtArm`] /
+/// [`SwitchExprArm`]; downstream code should write those rather than
+/// `SwitchArm<...>` directly.
 #[derive(Debug, Clone)]
-pub struct SwitchArm {
+pub struct SwitchArm<B> {
     /// `None` for `default`
     pub pattern: Option<Expr>,
-    pub body: Vec<BranchBody>,
+    pub body: B,
 }
+
+/// Arm of the statement-form `switch <expr> { ... }` inside a pipeline
+/// or process body — body is a list of branch statements run for their
+/// side effects (workspace mutation, routing, etc.).
+pub type SwitchStmtArm = SwitchArm<Vec<BranchBody>>;
 
 // ---------------------------------------------------------------------------
 // Assign targets
@@ -487,15 +503,12 @@ pub enum ExprKind {
     },
 }
 
-/// One arm of a [`ExprKind::SwitchExpr`]. `pattern = None` is the
-/// `default` arm; otherwise the arm's pattern expression is compared
-/// against the scrutinee value (using the same equality semantics as
-/// statement-form switch).
-#[derive(Debug, Clone)]
-pub struct SwitchExprArm {
-    pub pattern: Option<Expr>,
-    pub body: Expr,
-}
+/// Arm of the expression-form `switch <expr> { ... }` — body is a
+/// single [`Expr`] that the switch evaluates to when this arm matches.
+/// `pattern = None` is the `default` arm; otherwise the pattern is
+/// compared against the scrutinee using the same equality semantics as
+/// the statement-form switch.
+pub type SwitchExprArm = SwitchArm<Expr>;
 
 #[derive(Debug, Clone)]
 pub enum TemplateFragment {
