@@ -202,6 +202,11 @@ struct Inner {
 }
 
 pub struct HttpOutput {
+    /// Operator-facing instance name (the `def output <name>` ident).
+    /// Used in the BC-4 / PR-P shutdown-recovery `process` field so
+    /// `error_log` records can be grouped by output instance, mirroring
+    /// PR-O's `(output <name>)` retry-exhausted records.
+    name: String,
     inner: Arc<Inner>,
     batch_size: usize,
     flush_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -385,6 +390,7 @@ impl Module for HttpOutput {
         let peer_state = peers.iter().map(|_| PeerState::default()).collect();
 
         Ok(Self {
+            name: name.to_string(),
             inner: Arc::new(Inner {
                 peers,
                 peer_state,
@@ -483,12 +489,43 @@ impl Output for HttpOutput {
         .await
     }
 
-    async fn shutdown(&self) -> Result<()> {
+    async fn shutdown(
+        &self,
+        error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+    ) -> Result<()> {
         // Cancel any pending timer first so it doesn't race with us
         // for the buffer lock and end up double-flushing an
         // already-empty buffer.
         self.cancel_timer().await;
-        self.flush().await
+        match self.flush().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // BC-4 / PR-P: PR-F's `flush()` restored the drained
+                // batch into `self.inner.batch` on Err. Without
+                // recovery the buffer would be dropped together with
+                // the output instance as the daemon exits. When the
+                // operator opted in to `control { error_log "..." }`
+                // we persist each rendered body as a synthetic DLQ
+                // record so a `jq | inject` recipe can replay them
+                // later. `error_log` unset preserves 0.7.7 behaviour
+                // (the queue consumer logs a warn and the bytes are
+                // lost).
+                if let Some(writer) = error_log {
+                    let payloads: Vec<bytes::Bytes> =
+                        std::mem::take(&mut *self.inner.batch.lock().await)
+                            .into_iter()
+                            .map(|s| bytes::Bytes::from(s.into_bytes()))
+                            .collect();
+                    crate::modules::write_shutdown_buffer_to_error_log(
+                        writer, &self.name, payloads, &e,
+                    )
+                    .await;
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 }
 
@@ -1355,7 +1392,7 @@ mod tests {
         // Server has nothing yet — neither write triggered a flush.
         assert!(received.lock().await.is_empty());
 
-        output.shutdown().await.unwrap();
+        output.shutdown(None).await.unwrap();
 
         // Buffer drained.
         assert_eq!(
@@ -1379,5 +1416,215 @@ mod tests {
             body.contains("ev1") && body.contains("ev2"),
             "shutdown POST must carry the buffered events; got: {body}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // BC-4 / PR-P: shutdown-time buffer-loss recovery via `error_log`.
+    // -----------------------------------------------------------------------
+
+    async fn run_failing_collector() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        use axum::{Router, http::StatusCode, response::IntoResponse, routing::post};
+        async fn fail(_: axum::body::Bytes) -> impl IntoResponse {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/", post(fail));
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, handle)
+    }
+
+    /// shutdown flush fails + error_log set → buffered rendered bodies
+    /// land in the DLQ as `(output http shutdown)` records so a
+    /// `jq | inject` recipe can replay them.
+    #[tokio::test]
+    async fn shutdown_failure_with_error_log_persists_buffer() {
+        let (addr, server) = run_failing_collector().await;
+        let url = format!("http://{}/", addr);
+        let output = HttpOutput::from_properties(
+            "myout",
+            &mp(&[
+                peer_block(&url),
+                prop_int("batch_size", 100),
+                prop_str("batch_timeout", "30s"),
+            ]),
+        )
+        .unwrap();
+
+        // Drop two events into the buffer (no flush triggered).
+        output
+            .write(RenderedPayload::new(HttpPayload { msg: "ev1".into() }))
+            .await
+            .unwrap();
+        output
+            .write(RenderedPayload::new(HttpPayload { msg: "ev2".into() }))
+            .await
+            .unwrap();
+        assert_eq!(output.inner.batch.lock().await.len(), 2);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("errored.jsonl");
+        let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
+
+        // shutdown -> flush() POSTs once, server returns 500, flush
+        // restores the buffer; the shutdown override drains it into
+        // error_log and returns Ok so the consumer treats the daemon
+        // as cleanly stopped.
+        output.shutdown(Some(&writer)).await.unwrap();
+        server.abort();
+
+        assert_eq!(
+            output.inner.batch.lock().await.len(),
+            0,
+            "shutdown recovery must drain the buffer"
+        );
+
+        let body = tokio::fs::read_to_string(&path).await.unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2, "expected one DLQ record per buffered body");
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["process"], "(output myout shutdown)");
+            assert!(
+                v["reason"].as_str().unwrap().contains("shutdown flush"),
+                "got: {}",
+                v["reason"]
+            );
+            assert!(v["event"]["ingress"].is_string() || v["event"]["ingress"].is_object());
+        }
+        let recovered: String = lines
+            .iter()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["event"]["ingress"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(
+            recovered.contains("ev1") && recovered.contains("ev2"),
+            "got: {recovered}"
+        );
+    }
+
+    /// shutdown flush fails + error_log unset → preserve 0.7.7
+    /// behaviour: the override surfaces the error, the queue consumer
+    /// (not exercised here) logs `warn!` and the buffer is lost on
+    /// process exit. No DLQ writes possible.
+    #[tokio::test]
+    async fn shutdown_failure_without_error_log_matches_077() {
+        let (addr, server) = run_failing_collector().await;
+        let url = format!("http://{}/", addr);
+        let output = HttpOutput::from_properties(
+            "test",
+            &mp(&[
+                peer_block(&url),
+                prop_int("batch_size", 100),
+                prop_str("batch_timeout", "30s"),
+            ]),
+        )
+        .unwrap();
+        output
+            .write(RenderedPayload::new(HttpPayload { msg: "ev1".into() }))
+            .await
+            .unwrap();
+
+        let err = output.shutdown(None).await.expect_err("flush must Err");
+        server.abort();
+        // The flush error propagates up so the queue consumer warns
+        // exactly as it did in 0.7.7 — no panic, no recovery.
+        assert!(
+            err.to_string().contains("http") || err.to_string().contains("500"),
+            "got: {err}"
+        );
+        // Buffer left intact (= PR-F retain-on-failure contract).
+        assert_eq!(output.inner.batch.lock().await.len(), 1);
+    }
+
+    /// shutdown flush succeeds + error_log set → success path is
+    /// completely unchanged from PR-F. The DLQ writer must not be
+    /// touched (regression check: a stray write would change the
+    /// operator's audit trail).
+    #[tokio::test]
+    async fn shutdown_success_does_not_touch_error_log() {
+        let (addr, received, server) = run_echo_collector().await;
+        let url = format!("http://{}/", addr);
+        let output = HttpOutput::from_properties(
+            "test",
+            &mp(&[
+                peer_block(&url),
+                prop_int("batch_size", 100),
+                prop_str("batch_timeout", "30s"),
+            ]),
+        )
+        .unwrap();
+        output
+            .write(RenderedPayload::new(HttpPayload { msg: "ev1".into() }))
+            .await
+            .unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("errored.jsonl");
+        let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
+
+        output.shutdown(Some(&writer)).await.unwrap();
+
+        for _ in 0..50 {
+            if !received.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        server.abort();
+        assert_eq!(received.lock().await.len(), 1);
+        assert!(
+            !path.exists(),
+            "error_log file must not be touched on a clean shutdown"
+        );
+    }
+
+    /// error_log itself fails during shutdown recovery → warn-and-drop,
+    /// no recursion. Use a path under a non-existent directory so the
+    /// `OpenOptions::create` call inside `ErrorLogWriter::write` fails
+    /// on every record. The shutdown override must still complete
+    /// successfully (we already accepted the loss) instead of looping
+    /// or panicking.
+    #[tokio::test]
+    async fn shutdown_recovery_writer_failure_does_not_recurse() {
+        let (addr, server) = run_failing_collector().await;
+        let url = format!("http://{}/", addr);
+        let output = HttpOutput::from_properties(
+            "test",
+            &mp(&[
+                peer_block(&url),
+                prop_int("batch_size", 100),
+                prop_str("batch_timeout", "30s"),
+            ]),
+        )
+        .unwrap();
+        output
+            .write(RenderedPayload::new(HttpPayload { msg: "ev1".into() }))
+            .await
+            .unwrap();
+        output
+            .write(RenderedPayload::new(HttpPayload { msg: "ev2".into() }))
+            .await
+            .unwrap();
+
+        // Parent dir does not exist → every `write_shutdown_payload`
+        // call returns Err. The helper must warn and continue rather
+        // than abort or loop.
+        let writer = Arc::new(crate::error_log::ErrorLogWriter::new(
+            std::path::PathBuf::from("/nonexistent/limpid-test-dir/errored.jsonl"),
+        ));
+
+        output.shutdown(Some(&writer)).await.unwrap();
+        server.abort();
+        // Buffer is drained either way (we took() before attempting
+        // the DLQ write); the contract is that we don't crash.
+        assert_eq!(output.inner.batch.lock().await.len(), 0);
     }
 }

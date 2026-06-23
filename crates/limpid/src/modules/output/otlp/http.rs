@@ -153,6 +153,9 @@ struct Inner {
 }
 
 pub struct OtlpHttpOutput {
+    /// Operator-facing instance name; surfaced on PR-P shutdown-recovery
+    /// records as `(output <name> shutdown)`.
+    name: String,
     inner: Arc<Inner>,
     batch_size: usize,
     flush_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -398,6 +401,7 @@ impl Module for OtlpHttpOutput {
         let retry_config = RetryConfig::from_output_properties(properties)?;
 
         Ok(Self {
+            name: name.to_string(),
             inner: Arc::new(Inner {
                 peers,
                 peer_state,
@@ -465,7 +469,10 @@ impl Output for OtlpHttpOutput {
         .await
     }
 
-    async fn shutdown(&self) -> Result<()> {
+    async fn shutdown(
+        &self,
+        error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+    ) -> Result<()> {
         // Abort any pending timer so it cannot race with us for the
         // buffer lock. Then drain whatever is left in one final
         // send. Without this the queue consumer's `shutdown()` call
@@ -475,7 +482,25 @@ impl Output for OtlpHttpOutput {
         if let Some(h) = self.flush_handle.lock().await.take() {
             h.abort();
         }
-        self.flush().await
+        match self.flush().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // BC-4 / PR-P: drain the put-back batch into
+                // `error_log` when configured; preserve 0.7.7
+                // (warn + drop via the queue consumer) when not.
+                if let Some(writer) = error_log {
+                    let payloads: Vec<bytes::Bytes> =
+                        std::mem::take(&mut *self.inner.batch.lock().await);
+                    crate::modules::write_shutdown_buffer_to_error_log(
+                        writer, &self.name, payloads, &e,
+                    )
+                    .await;
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 }
 
@@ -1515,7 +1540,7 @@ mod tests {
         );
         assert!(received.lock().await.is_empty());
 
-        output.shutdown().await.unwrap();
+        output.shutdown(None).await.unwrap();
 
         assert_eq!(
             output.inner.batch.lock().await.len(),
@@ -1670,5 +1695,113 @@ mod tests {
         }])];
         let output = OtlpHttpOutput::from_properties("o", &mp(&props)).unwrap();
         assert_eq!(output.inner.peers.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // BC-4 / PR-P: shutdown-time buffer-loss recovery via `error_log`.
+    // -----------------------------------------------------------------------
+
+    fn shutdown_recovery_props(endpoint: &str) -> Vec<Property> {
+        let mut props = one_peer_props(endpoint);
+        props.push(prop_str("protocol", "http_protobuf"));
+        props.push(prop_int("batch_size", 100));
+        props.push(prop_str("batch_timeout", "30s"));
+        // Single attempt, minimal wait → flush against an unreachable
+        // peer fails quickly.
+        props.push(Property::Block {
+            key: "retry".into(),
+            key_span: None,
+            properties: vec![
+                prop_int("max_attempts", 1),
+                prop_str("initial_wait", "1ms"),
+                prop_str("max_wait", "1ms"),
+            ],
+        });
+        props
+    }
+
+    async fn buffer_two(output: &OtlpHttpOutput) {
+        let arena_bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&arena_bump);
+        for ts in [1u64, 2u64] {
+            let ev = event_with_egress(singleton_bytes(ts));
+            let payload = output.render(&ev.view_in(&arena), &arena).unwrap();
+            output.write(payload).await.unwrap();
+        }
+        assert_eq!(output.inner.batch.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_failure_with_error_log_persists_buffer() {
+        let props = shutdown_recovery_props("http://127.0.0.1:1/v1/logs");
+        let output = OtlpHttpOutput::from_properties("myout", &mp(&props)).unwrap();
+        buffer_two(&output).await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("errored.jsonl");
+        let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
+
+        output.shutdown(Some(&writer)).await.unwrap();
+        assert_eq!(output.inner.batch.lock().await.len(), 0);
+
+        let body = tokio::fs::read_to_string(&path).await.unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["process"], "(output myout shutdown)");
+            assert!(v["reason"].as_str().unwrap().contains("shutdown flush"));
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_failure_without_error_log_matches_077() {
+        let props = shutdown_recovery_props("http://127.0.0.1:1/v1/logs");
+        let output = OtlpHttpOutput::from_properties("test", &mp(&props)).unwrap();
+        buffer_two(&output).await;
+
+        let err = output.shutdown(None).await.expect_err("flush must Err");
+        assert!(err.to_string().contains("otlp_http"), "got: {err}");
+        assert_eq!(output.inner.batch.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_success_does_not_touch_error_log() {
+        let (addr, received, server) = run_http_collector("http_protobuf").await;
+        let endpoint = format!("http://{}/v1/logs", addr);
+        let mut props = one_peer_props(&endpoint);
+        props.push(prop_str("protocol", "http_protobuf"));
+        props.push(prop_int("batch_size", 100));
+        props.push(prop_str("batch_timeout", "30s"));
+        let output = OtlpHttpOutput::from_properties("test", &mp(&props)).unwrap();
+        buffer_two(&output).await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("errored.jsonl");
+        let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
+
+        output.shutdown(Some(&writer)).await.unwrap();
+        for _ in 0..50 {
+            if !received.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        server.abort();
+        assert!(!received.lock().await.is_empty(), "shutdown must POST");
+        assert!(!path.exists(), "DLQ must stay untouched on clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn shutdown_recovery_writer_failure_does_not_recurse() {
+        let props = shutdown_recovery_props("http://127.0.0.1:1/v1/logs");
+        let output = OtlpHttpOutput::from_properties("test", &mp(&props)).unwrap();
+        buffer_two(&output).await;
+
+        let writer = Arc::new(crate::error_log::ErrorLogWriter::new(
+            std::path::PathBuf::from("/nonexistent/limpid-otlp-http-test/errored.jsonl"),
+        ));
+        output.shutdown(Some(&writer)).await.unwrap();
+        assert_eq!(output.inner.batch.lock().await.len(), 0);
     }
 }

@@ -385,7 +385,18 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     /// Errors are surfaced for logging but the consumer continues
     /// the shutdown sequence regardless — there is no further retry
     /// path available at this point.
-    async fn shutdown(&self) -> Result<()> {
+    ///
+    /// `error_log` is the operator-configured DLQ writer (BC-4 /
+    /// PR-P). Batched outputs that override this method use it to
+    /// persist buffer contents that survive a failed final flush —
+    /// the parallel of PR-O's retry-exhausted recovery on the
+    /// per-event path. `None` preserves the 0.7.7 behaviour
+    /// (warn + drop). Implementations that hold no buffer ignore
+    /// the argument.
+    async fn shutdown(
+        &self,
+        _error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+    ) -> Result<()> {
         Ok(())
     }
 }
@@ -447,6 +458,36 @@ where
         Err(e) => {
             metrics.events_failed.fetch_add(1, Ordering::Relaxed);
             Err(e)
+        }
+    }
+}
+
+/// Shared helper: walk the leftover rendered payloads from a failed
+/// shutdown flush and write each to the configured `error_log` (BC-4 /
+/// PR-P). On per-record write failure we warn and continue — the loop
+/// must not recurse back into the DLQ on its own failures, otherwise
+/// a broken `error_log` path would spin a tight error loop at
+/// shutdown. Called from each batched output's `shutdown()` override
+/// (`http`, `otlp_http`, `otlp_grpc`); the per-output indirection
+/// only differs in how their internal buffer is normalised to
+/// `Vec<Bytes>`.
+pub async fn write_shutdown_buffer_to_error_log(
+    writer: &Arc<crate::error_log::ErrorLogWriter>,
+    output_name: &str,
+    payloads: Vec<bytes::Bytes>,
+    flush_err: &anyhow::Error,
+) {
+    let reason = format!("shutdown flush failed: {}", flush_err);
+    for payload in payloads {
+        if let Err(write_err) = writer
+            .write_shutdown_payload(output_name, payload, &reason)
+            .await
+        {
+            tracing::warn!(
+                "output '{}': error_log write during shutdown failed: {} — dropping event",
+                output_name,
+                write_err
+            );
         }
     }
 }
@@ -743,8 +784,11 @@ impl OutputWriter for OutputWriterWrapper {
         }
     }
 
-    async fn shutdown(&self) -> anyhow::Result<()> {
-        self.0.shutdown().await
+    async fn shutdown(
+        &self,
+        error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+    ) -> anyhow::Result<()> {
+        self.0.shutdown(error_log).await
     }
 }
 

@@ -453,7 +453,14 @@ pub trait OutputWriter: Send + Sync + 'static {
     /// to the underlying `Output::shutdown` for `OutputWriterWrapper`;
     /// default no-op for any future writer kind that holds no
     /// internal buffer.
-    async fn shutdown(&self) -> anyhow::Result<()> {
+    ///
+    /// `error_log` is the DLQ writer the consumer was launched with
+    /// — batched outputs use it to persist buffer entries that
+    /// survive a failed final flush (BC-4 / PR-P).
+    async fn shutdown(
+        &self,
+        _error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -519,7 +526,7 @@ pub async fn run_queue_consumer(
     // flush timer and leak those events; tell the output to drain
     // itself before we exit. Both break paths above (shutdown signal
     // and queue-closed) come through here so the contract is uniform.
-    if let Err(e) = writer.shutdown().await {
+    if let Err(e) = writer.shutdown(error_log.as_ref()).await {
         warn!("output '{}': shutdown flush failed: {}", name, e);
     }
 
