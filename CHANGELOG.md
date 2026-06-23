@@ -10,6 +10,11 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased] - 0.7.8
 
+### Fixed — `sum()` decides accumulator type from the whole array, not the first Float
+
+The 0.7.8 i64-overflow fix tripped on `[i64::MAX, 1, 0.5]`: the second integer overflowed the i64 accumulator before the third element (a Float) had a chance to promote the result. The eventual return type was clearly going to be `Float`, but the operator got a hard error instead of the float total they were summing toward. `sum()` now pre-scans the array for any Float and picks the accumulator type up front — Int-only arrays still use a checked `i64` accumulator (overflow surfaces a typed error with a remediation hint suggesting `* 1.0` promotion); any-Float arrays use a single `f64` accumulator and follow IEEE 754 semantics (overflow saturates to ±Infinity, NaN propagates). The expression-functions doc note is corrected at the same time — the prior `map(...) { |x| x as f64 }` suggestion referenced an `as` cast operator the limpid DSL does not implement; the working idiom is `map(...) { |x| x * 1.0 }`. Five new tests cover the boundary (mixed int+float past i64::MAX, float-only, float overflow → +Inf, NaN propagation, and the remediation hint in the overflow error).
+
+
 ### Fixed — `output otlp_http` now warns loudly when `verify false` is paired with an https endpoint
 
 `output http` already emits a one-line, greppable `tracing::warn!` when `verify false` is paired with an https URL, so operators can audit the daemon log for MITM-vulnerable peers. `output otlp_http` exposes the identical `verify` knob but had no such warning — `verify false` toggled `danger_accept_invalid_certs(true)` silently, so the same security-relevant misconfiguration was visible in one output and invisible in the other. The warn now fires once per https peer at startup with the same wording as the `output http` message.
