@@ -41,3 +41,33 @@ pub(crate) async fn read_body_capped(mut response: reqwest::Response, cap: usize
     }
     buf
 }
+
+/// Build a human-readable snippet of an error response body for the
+/// failure diagnostic, capped at `cap` bytes of input and
+/// `max_chars` characters of output. When the peer (or an upstream
+/// proxy) advertises a Content-Encoding limpid doesn't decode —
+/// limpid's `reqwest` is built without the `gzip` / `brotli` /
+/// `deflate` features, so `Response::chunk()` returns the still-
+/// encoded raw bytes — surface a placeholder instead of running
+/// `from_utf8_lossy` over compressed gibberish that ends up as
+/// �replacement-char soup in the daemon log. The raw byte count is
+/// kept in the placeholder so an operator can tell "the peer is
+/// returning something, just not something we can render".
+pub(crate) async fn error_snippet(
+    response: reqwest::Response,
+    cap: usize,
+    max_chars: usize,
+) -> String {
+    let encoding = response
+        .headers()
+        .get(reqwest::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_ascii_lowercase());
+    let raw = read_body_capped(response, cap).await;
+    match encoding.as_deref() {
+        Some(enc) if !enc.is_empty() && enc != "identity" => {
+            format!("<{}-encoded body, {} bytes>", enc, raw.len())
+        }
+        _ => String::from_utf8_lossy(&raw).chars().take(max_chars).collect(),
+    }
+}

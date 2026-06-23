@@ -10,6 +10,11 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased] - 0.7.8
 
+### Fixed — `output http` / `otlp_http` render a placeholder when error bodies are gzip/brotli/deflate encoded
+
+limpid's `reqwest` build excludes the `gzip` / `brotli` / `deflate` decompression features, so when a peer (or upstream proxy) returns an error response with `Content-Encoding: gzip` the still-compressed bytes were running through `from_utf8_lossy` and ending up as replacement-char soup in the daemon log. The shared `error_snippet` helper in `modules/output/http_util.rs` now inspects `Content-Encoding` and substitutes `<gzip-encoded body, N bytes>` (or whatever the advertised encoding is) when it's not `identity`. The byte count is retained so an operator can still see the peer is returning *something*. `identity`, missing header, and the existing 4 KiB cap path all keep their previous behaviour.
+
+
 ### Fixed — `output syslog_udp` walks every resolved address on connect, restoring DNS-level failover
 
 The 0.7.8 family-aware bind rewrite kept v6-only destinations working but regressed DNS failover: `lookup_host(host:port).next()` committed to the first resolved `SocketAddr` and gave up if that one didn't connect. Pre-0.7.8 `socket.connect(host:port)` walked the whole resolution list internally and succeeded on the first reachable address — common during a partial v6 outage or a stale AAAA record on a dual-stack host. The connect path now iterates every resolved `SocketAddr`, binding a fresh ephemeral socket of the matching family per attempt and breaking on first success. On exhaustion the most recent error is returned with both the original hostname and the specific address that failed, so an operator can see which records were tried.
