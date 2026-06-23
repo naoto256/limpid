@@ -601,6 +601,72 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_path_component_replaces_unix_separator() {
+        assert_eq!(sanitize_path_component("a/b/c"), "a_b_c");
+    }
+
+    #[test]
+    fn sanitize_path_component_replaces_windows_separator() {
+        // Backslash must be sanitised on every platform, not just
+        // Windows — a Windows-style path leaking into the limpid
+        // value pool would otherwise let an attacker (or a typo)
+        // smuggle in a path-component break on Linux too. Pre-fix
+        // audits flagged that the existing
+        // render_template_sanitises_every_interpolation case used a
+        // value with neither `/` nor `\` and so didn't actually pin
+        // the backslash branch; pin it here.
+        assert_eq!(sanitize_path_component("a\\b\\c"), "a_b_c");
+    }
+
+    #[test]
+    fn sanitize_path_component_replaces_mixed_separators() {
+        // A value containing both forward and back slashes (e.g. a
+        // raw vendor field that mixes Windows + Unix paths) must
+        // strip BOTH; a regression that narrowed replace() to a
+        // single character would let the unfiltered side through.
+        assert_eq!(sanitize_path_component("a/b\\c/d\\e"), "a_b_c_d_e");
+    }
+
+    #[test]
+    fn sanitize_path_component_leaves_dots_alone() {
+        // Operators rely on dots for FQDN-style filenames; the
+        // sanitiser must NOT eat them. Regression guard against an
+        // over-aggressive future "also strip `.`" change that would
+        // silently corrupt `web01.example.com.log` into `web01_example_com_log`.
+        assert_eq!(
+            sanitize_path_component("web01.example.com"),
+            "web01.example.com"
+        );
+    }
+
+    #[test]
+    fn render_template_sanitises_backslash_from_workspace() {
+        // End-to-end pin: a workspace value containing `\` (which a
+        // Windows-origin vendor field might carry) must be
+        // sanitised in the rendered template, not pass through. The
+        // existing workspace-reference test happens to use a value
+        // with `/` only; this one closes the backslash branch.
+        use crate::dsl::OwnedValue;
+        let out = make_output(ek(ExprKind::Template(vec![
+            TemplateFragment::Literal("/var/log/".into()),
+            TemplateFragment::Interp(ek(ExprKind::Ident(vec![
+                "workspace".into(),
+                "winpath".into(),
+            ]))),
+            TemplateFragment::Literal(".log".into()),
+        ])));
+        let mut event = Event::new(
+            Bytes::from("x"),
+            "192.168.1.10:514".parse::<SocketAddr>().unwrap(),
+        );
+        event
+            .workspace
+            .insert("winpath".into(), OwnedValue::String("C:\\Users\\bob".into()));
+        let (rendered, _) = render_path_owned(&out, &event).unwrap();
+        assert_eq!(rendered, "/var/log/C:_Users_bob.log");
+    }
+
+    #[test]
     fn render_template_errors_on_empty_interpolation() {
         // Template `/var/log/${workspace.empty}.log` with empty value would
         // produce `/var/log/.log` — almost never the operator's intent.
