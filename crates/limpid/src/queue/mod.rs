@@ -585,3 +585,238 @@ async fn write_with_retry(
     }
     false
 }
+
+#[cfg(test)]
+mod write_with_retry_tests {
+    use super::*;
+    use bytes::Bytes;
+    use std::net::SocketAddr;
+    use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
+
+    /// Programmable mock: each call to `consume` pops the next result
+    /// from `script`; if the script is empty, returns Ok. Records the
+    /// number of consume invocations for assertions.
+    struct ScriptedWriter {
+        script: Mutex<Vec<anyhow::Result<()>>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedWriter {
+        fn new(script: Vec<anyhow::Result<()>>) -> Self {
+            Self {
+                script: Mutex::new(script),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OutputWriter for ScriptedWriter {
+        async fn consume(&self, _input: SinkInput) -> anyhow::Result<()> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut s = self.script.lock().unwrap();
+            if s.is_empty() {
+                Ok(())
+            } else {
+                s.remove(0)
+            }
+        }
+    }
+
+    fn fast_cfg(max_attempts: u32) -> RetryConfig {
+        RetryConfig {
+            max_attempts,
+            initial_wait: std::time::Duration::from_millis(1),
+            max_wait: std::time::Duration::from_millis(1),
+            backoff: BackoffStrategy::Fixed,
+            secondary: None,
+        }
+    }
+
+    fn owned_event() -> Event {
+        Event::new(
+            Bytes::from_static(b"x"),
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        )
+    }
+
+    fn rendered_event() -> SinkInput {
+        SinkInput::Rendered(RenderedPayload::new(()))
+    }
+
+    fn fresh_metrics() -> crate::metrics::OutputMetrics {
+        crate::metrics::OutputMetrics::default()
+    }
+
+    #[tokio::test]
+    async fn owned_succeeds_on_first_attempt_counts_no_retries() {
+        let w = ScriptedWriter::new(vec![Ok(())]);
+        let m = fresh_metrics();
+        let ok = write_with_retry(
+            &w,
+            SinkInput::Owned(owned_event()),
+            &fast_cfg(3),
+            &None,
+            "test",
+            &m,
+            None,
+        )
+        .await;
+        assert!(ok);
+        assert_eq!(w.calls(), 1);
+        assert_eq!(m.retries.load(Ordering::Relaxed), 0);
+        assert_eq!(m.events_failed.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn owned_retries_then_succeeds() {
+        let w = ScriptedWriter::new(vec![
+            Err(anyhow::anyhow!("transient 1")),
+            Err(anyhow::anyhow!("transient 2")),
+            Ok(()),
+        ]);
+        let m = fresh_metrics();
+        let ok = write_with_retry(
+            &w,
+            SinkInput::Owned(owned_event()),
+            &fast_cfg(5),
+            &None,
+            "test",
+            &m,
+            None,
+        )
+        .await;
+        assert!(ok);
+        assert_eq!(w.calls(), 3, "expected 1 + 2 retries");
+        assert_eq!(m.retries.load(Ordering::Relaxed), 2);
+        assert_eq!(m.events_failed.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn owned_exhausts_retries_bumps_events_failed() {
+        let w = ScriptedWriter::new(vec![
+            Err(anyhow::anyhow!("permanent")),
+            Err(anyhow::anyhow!("permanent")),
+            Err(anyhow::anyhow!("permanent")),
+        ]);
+        let m = fresh_metrics();
+        let ok = write_with_retry(
+            &w,
+            SinkInput::Owned(owned_event()),
+            &fast_cfg(3),
+            &None,
+            "test",
+            &m,
+            None,
+        )
+        .await;
+        assert!(!ok);
+        assert_eq!(w.calls(), 3);
+        assert_eq!(m.events_failed.load(Ordering::Relaxed), 1);
+        assert_eq!(m.retries.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn rendered_failure_skips_retries_and_logs() {
+        // Rendered payloads cannot be retried (the Box<dyn Any>
+        // payload was consumed by the first consume call). The
+        // retry-loop must take exactly one shot and then bump
+        // events_failed once with the "rendered payload, no retry"
+        // warn — never loop. A regression that mistakenly retries a
+        // Rendered would panic or silently no-op since the closure
+        // has nothing left to consume.
+        let w = ScriptedWriter::new(vec![Err(anyhow::anyhow!("nope"))]);
+        let m = fresh_metrics();
+        let ok = write_with_retry(
+            &w,
+            rendered_event(),
+            &fast_cfg(5), // 5 allowed but only 1 attempt should happen
+            &None,
+            "test",
+            &m,
+            None,
+        )
+        .await;
+        assert!(!ok);
+        assert_eq!(w.calls(), 1, "Rendered must NOT retry, got {} calls", w.calls());
+        assert_eq!(m.events_failed.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn owned_exhausted_routes_to_secondary() {
+        // After retries exhaust, the Owned event must reach the
+        // secondary queue. A regression that dropped the secondary
+        // routing or swapped the secondary->primary direction would
+        // make the secondary silently dead.
+        let w = ScriptedWriter::new(vec![
+            Err(anyhow::anyhow!("e1")),
+            Err(anyhow::anyhow!("e2")),
+        ]);
+        let m = fresh_metrics();
+        let (sec_tx, mut sec_rx) = create_queue(
+            "secondary".into(),
+            QueueConfig {
+                queue_type: QueueType::Memory,
+                capacity: 8,
+                overflow: OverflowStrategy::Block,
+            },
+        )
+        .unwrap();
+        let secondary = Some(sec_tx);
+        let ok = write_with_retry(
+            &w,
+            SinkInput::Owned(owned_event()),
+            &fast_cfg(2),
+            &secondary,
+            "primary",
+            &m,
+            None,
+        )
+        .await;
+        assert!(!ok);
+        let routed = sec_rx.try_recv();
+        assert!(
+            matches!(routed, Some(SinkInput::Owned(_))),
+            "secondary did not receive the routed event"
+        );
+    }
+
+    #[tokio::test]
+    async fn rendered_exhausted_does_not_route_to_secondary() {
+        // A Rendered failure with a configured secondary must NOT
+        // route — there's no owned event to forward. The function
+        // logs the "cannot route" error and drops. A regression that
+        // sent SinkInput::Rendered to the secondary would corrupt the
+        // secondary's invariants (only Owned is serialisable on disk
+        // queues, and a Rendered on a memory secondary would still be
+        // an orphan since the original payload was consumed).
+        let w = ScriptedWriter::new(vec![Err(anyhow::anyhow!("rendered fail"))]);
+        let m = fresh_metrics();
+        let (sec_tx, mut sec_rx) = create_queue(
+            "secondary".into(),
+            QueueConfig {
+                queue_type: QueueType::Memory,
+                capacity: 8,
+                overflow: OverflowStrategy::Block,
+            },
+        )
+        .unwrap();
+        let secondary = Some(sec_tx);
+        let _ = write_with_retry(
+            &w,
+            rendered_event(),
+            &fast_cfg(5),
+            &secondary,
+            "primary",
+            &m,
+            None,
+        )
+        .await;
+        assert!(sec_rx.try_recv().is_none(), "Rendered must NOT route");
+        assert_eq!(m.events_failed.load(Ordering::Relaxed), 1);
+    }
+}
