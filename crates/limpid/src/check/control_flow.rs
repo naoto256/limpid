@@ -10,7 +10,7 @@
 //! Catch bodies pre-bind `workspace._error` as `String` to mirror the
 //! runtime convention.
 
-use crate::dsl::ast::{BranchBody, IfChain, ProcessStatement, SwitchArm};
+use crate::dsl::ast::{BranchBody, IfChain, ProcessStatement, SwitchStmtArm};
 use crate::functions::FunctionRegistry;
 use crate::modules::schema::FieldType;
 use crate::pipeline::CompiledConfig;
@@ -89,7 +89,7 @@ pub(super) fn analyze_if_chain(
 /// every input; without one we add the starting bindings as the implicit
 /// "fell through" branch.
 pub(super) fn analyze_switch(
-    arms: &[SwitchArm],
+    arms: &[SwitchStmtArm],
     pipeline_name: &str,
     config: &CompiledConfig,
     registry: &FunctionRegistry,
@@ -175,7 +175,7 @@ pub(super) fn analyze_inline_if(
 
 /// `switch` inside a process body — process-statement bodies only.
 pub(super) fn analyze_inline_switch(
-    arms: &[SwitchArm],
+    arms: &[SwitchStmtArm],
     pipeline_name: &str,
     registry: &FunctionRegistry,
     bindings: &mut Bindings,
