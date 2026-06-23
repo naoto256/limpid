@@ -10,14 +10,79 @@
 //! Catch bodies pre-bind `workspace._error` as `String` to mirror the
 //! runtime convention.
 
-use crate::dsl::ast::{BranchBody, IfChain, ProcessStatement, SwitchStmtArm};
+use crate::dsl::ast::{BranchBody, IfChain, ProcessStatement, SwitchArm, SwitchStmtArm};
 use crate::functions::FunctionRegistry;
 use crate::modules::schema::FieldType;
 use crate::pipeline::CompiledConfig;
 
 use super::bindings::{Bindings, intersect_branches};
 use super::expr_types;
-use super::{Diagnostic, analyze_pipeline_stmt, analyze_process_stmt};
+use super::{DiagKind, Diagnostic, analyze_pipeline_stmt, analyze_process_stmt};
+
+/// Reject `switch` constructs whose `default` arm isn't last or
+/// appears more than once.
+///
+/// The runtime walks arms in source order and dispatches at the first
+/// match — `default` matches everything, so any arm after a `default`
+/// is unreachable. Two failure modes:
+///
+/// - **default not last** (e.g. `default { … } case 1 { … }`): every
+///   event hits the `default` arm and the trailing arms never run.
+///   Operators reading the source see "case 1 is configured" and
+///   reasonably expect it to fire; silent unreachability misleads.
+/// - **multiple defaults**: ambiguous, only the first runs. Almost
+///   certainly an operator typo (intended one `default` plus a pattern
+///   arm).
+///
+/// Both surface as `DiagKind::Dataflow` errors so `--check` blocks the
+/// deploy. The runtime behaviour is unchanged — this is a pre-load
+/// gate, not a behavioural fix.
+///
+/// Generic over the arm body type so the same helper covers both
+/// statement-form (`SwitchStmtArm`, called from this file) and
+/// expression-form (`SwitchExprArm`, called from `expr_types` and
+/// `function`) switches; the check looks at `pattern.is_some()` only
+/// and never touches the body.
+pub(super) fn validate_switch_default_position<B>(
+    arms: &[SwitchArm<B>],
+    pipeline_name: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut first_default: Option<usize> = None;
+    for (i, arm) in arms.iter().enumerate() {
+        if arm.pattern.is_some() {
+            continue;
+        }
+        match first_default {
+            None => {
+                first_default = Some(i);
+                if i + 1 < arms.len() {
+                    diagnostics.push(Diagnostic::error_kind(
+                        DiagKind::Dataflow,
+                        format!(
+                            "`switch` in pipeline '{pipeline_name}': `default` arm \
+                             is at position {i} of {n} but must be the last arm; \
+                             the {trailing} arm(s) after `default` are unreachable \
+                             (the runtime dispatches at the first match)",
+                            n = arms.len(),
+                            trailing = arms.len() - i - 1,
+                        ),
+                    ));
+                }
+            }
+            Some(prev) => {
+                diagnostics.push(Diagnostic::error_kind(
+                    DiagKind::Dataflow,
+                    format!(
+                        "`switch` in pipeline '{pipeline_name}': multiple `default` \
+                         arms (positions {prev} and {i}); only one is allowed and \
+                         only the first runs"
+                    ),
+                ));
+            }
+        }
+    }
+}
 
 /// `if`/`else if`/`else` chain at *pipeline* statement level — branches
 /// can contain pipeline statements (`output o`, `process p`, etc.) as
@@ -97,6 +162,7 @@ pub(super) fn analyze_switch(
     bindings: &mut Bindings,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    validate_switch_default_position(arms, pipeline_name, diagnostics);
     let starting = bindings.clone();
     let mut results: Vec<Bindings> = Vec::with_capacity(arms.len() + 1);
     let mut has_default = false;
@@ -181,6 +247,7 @@ pub(super) fn analyze_inline_switch(
     bindings: &mut Bindings,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    validate_switch_default_position(arms, pipeline_name, diagnostics);
     let starting = bindings.clone();
     let mut results: Vec<Bindings> = Vec::with_capacity(arms.len() + 1);
     let mut has_default = false;
