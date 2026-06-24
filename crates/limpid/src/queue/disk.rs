@@ -199,8 +199,8 @@ impl DiskQueueReceiver {
 
     /// Commit progress to disk: persist the cursor and reclaim fully-
     /// consumed segments. Called by the queue consumer after each
-    /// event's disposition is decided (delivered, routed to secondary,
-    /// or dropped — all three are "done from this queue's POV").
+    /// event's disposition is decided (delivered or dropped — both
+    /// are "done from this queue's POV").
     ///
     /// Before this hook existed the disk queue was at-most-once on
     /// crashes: `recv()` advanced and persisted the cursor in one

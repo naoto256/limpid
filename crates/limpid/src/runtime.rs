@@ -109,12 +109,6 @@ impl Runtime {
             ));
         }
 
-        // Note: misconfigured `secondary` references (typo,
-        // self-reference, indirect cycle) are rejected earlier by
-        // `CompiledConfig::validate` (called on line 50). That same
-        // validator runs on the `--check` path (PR-X), so pre-deploy
-        // gating and runtime startup now reject the same configs.
-
         // Optional dead-letter queue for events that fail in `process`
         // or that an output drops after exhausting retries (BC-3
         // recovery, PR-O). `control { error_log "..." }` opts in to
@@ -143,10 +137,6 @@ impl Runtime {
 
         // Start queue consumers (no metrics counting here — output does it)
         for (_name, receiver, writer, retry_config, output_metrics) in output_receivers {
-            let secondary_sender = retry_config
-                .secondary
-                .as_ref()
-                .and_then(|s| output_senders.get(s).cloned());
             let shutdown = shutdown_rx.clone();
             let tap_clone = tap.clone();
             let error_log_for_consumer = error_log.as_ref().map(Arc::clone);
@@ -155,7 +145,6 @@ impl Runtime {
                     receiver,
                     writer,
                     retry_config,
-                    secondary_sender,
                     Some(tap_clone),
                     output_metrics,
                     error_log_for_consumer,
@@ -349,11 +338,6 @@ impl Runtime {
         }
     }
 }
-
-// `validate_secondary_refs` moved to `CompiledConfig::validate_secondary_refs`
-// in `pipeline.rs` (PR-X), so the `--check` path catches secondary typos
-// and cycles before deploy. Runtime startup picks up the same checks via
-// `CompiledConfig::validate` above.
 
 // ---------------------------------------------------------------------------
 // Global subsystem initialization
@@ -863,14 +847,6 @@ mod tests {
         assert_eq!(worker.metrics.events_received.load(Ordering::Relaxed), 8);
         assert_eq!(worker.metrics.events_dropped.load(Ordering::Relaxed), 8);
     }
-
-    // `validate_secondary_refs` coverage moved to
-    // `pipeline.rs::tests::secondary_refs_*` after the validator was
-    // hoisted onto the `--check` path (PR-X). Those tests drive the
-    // same five cases (unknown target, self-reference, 2-hop cycle,
-    // 3-hop cycle, valid chain) through `CompiledConfig::validate`,
-    // which is exactly what runtime startup also calls — so the
-    // behavior contract is preserved.
 
     fn make_err_ctx(reason: &str) -> crate::pipeline::ErroredEventContext {
         let addr = std::net::SocketAddr::from_str("127.0.0.1:0").unwrap();
