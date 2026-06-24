@@ -1,6 +1,6 @@
 # Schema Validation
 
-> **Scope.** Structural validation of the DSL config itself — switch `default` placement, `secondary` cycle detection, recovery readiness, and the other analyzer checks added across the 0.7.x cycle — is the job of `limpid --check` (see [CLI](./cli.md#options)). This page is about the complementary problem: validating the **emitted payload** against the downstream schema the destination expects.
+> **Scope.** Structural validation of the DSL config itself — switch `default` placement, recovery readiness, and the other analyzer checks added across the 0.7.x cycle — is the job of `limpid --check` (see [CLI](./cli.md#options)). This page is about the complementary problem: validating the **emitted payload** against the downstream schema the destination expects.
 
 limpid does not ship a schema validator. There is no `limpidctl validate`, no built-in OCSF / ECS / ASIM / CIM check, and no schema-annotation syntax in the DSL. Validation is performed by piping `tap --json` output into whichever validator matches the schema your downstream expects:
 

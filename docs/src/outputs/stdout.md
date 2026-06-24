@@ -19,4 +19,4 @@ None.
 - Each event is written as one line (`egress` bytes + newline).
 - Not recommended for production use — use [file](./file.md) or [syslog_tcp](./syslog-tcp.md) instead.
 - Useful with `--test-pipeline` for seeing processed output.
-- Common queue / retry / secondary properties — see [Queue and retry](./README.md#queue-and-retry).
+- Common queue / retry properties — see [Queue and retry](./README.md#queue-and-retry).
