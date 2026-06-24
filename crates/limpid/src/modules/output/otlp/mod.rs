@@ -2,9 +2,11 @@
 //! ([`http`] = `output otlp_http`, [`grpc`] = `output otlp_grpc`) own
 //! their own DSL schema, transport client, and ship path. The bits
 //! that are genuinely transport-agnostic — batch-level merging,
-//! Resource / Scope equality, the retry block schema, the per-Event
-//! payload type — live here so both transports stay byte-equivalent at
-//! the OTLP wire layer regardless of which one a pipeline picks.
+//! Resource / Scope equality, the per-Event payload type — live here
+//! so both transports stay byte-equivalent at the OTLP wire layer
+//! regardless of which one a pipeline picks. The `retry { ... }`
+//! block schema lives in `crate::queue` because every output (not
+//! just OTLP) accepts it.
 //!
 //! Each Event's `egress` is expected to be the singleton ResourceLogs
 //! protobuf bytes produced by `otlp.encode_resourcelog_protobuf` —
@@ -44,8 +46,6 @@ use opentelemetry_proto::tonic::{
     resource::v1::Resource,
 };
 use prost::Message;
-
-use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 
 /// Transport-success outcome from a single OTLP export call.
 ///
@@ -94,37 +94,6 @@ impl BatchLevel {
         }
     }
 }
-
-pub(crate) const OTLP_RETRY_BLOCK_PROPERTIES: &[PropertySpec] = &[
-    PropertySpec {
-        name: "max_attempts",
-        required: false,
-        repeatable: false,
-        exclusive_group: None,
-        kind: PropertyValueKind::Int,
-    },
-    PropertySpec {
-        name: "initial_wait",
-        required: false,
-        repeatable: false,
-        exclusive_group: None,
-        kind: PropertyValueKind::Duration,
-    },
-    PropertySpec {
-        name: "max_wait",
-        required: false,
-        repeatable: false,
-        exclusive_group: None,
-        kind: PropertyValueKind::Duration,
-    },
-    PropertySpec {
-        name: "backoff",
-        required: false,
-        repeatable: false,
-        exclusive_group: None,
-        kind: PropertyValueKind::Enum(&["fixed", "exponential"]),
-    },
-];
 
 /// Decode a drained batch of per-Event ResourceLogs proto bytes and
 /// wrap them in one `ExportLogsServiceRequest`, merging per

@@ -81,6 +81,83 @@ pub const QUEUE_PROPERTY_SPEC: PropertySpec = PropertySpec {
 };
 
 // ---------------------------------------------------------------------------
+// Declarative schema for the per-output `retry { ... }` sub-block and
+// the `secondary <name>` property
+// ---------------------------------------------------------------------------
+//
+// Both surfaces are honored by `RetryConfig::from_output_properties`
+// (below) for *every* output the queue consumer drives — the runtime
+// has always read `retry` and `secondary` uniformly. Historically only
+// the two OTLP outputs declared them in their `property_schema()`, so
+// non-OTLP configs that set `retry { ... }` or `secondary <name>` got
+// hard-failed at `--check` time as "unknown property" even though the
+// runtime would happily accept them. Hoisting the schema here and
+// splicing the two consts into every output's schema closes that gap
+// without touching the runtime — schema acceptance now matches the
+// runtime's existing intent.
+//
+// Sub-property names mirror the keys read by
+// `RetryConfig::from_output_properties`; renames stay in lock-step
+// with the parser because both definitions live in this file.
+
+const RETRY_BLOCK_PROPERTIES: &[PropertySpec] = &[
+    PropertySpec {
+        name: "max_attempts",
+        required: false,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::Int,
+    },
+    PropertySpec {
+        name: "initial_wait",
+        required: false,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::Duration,
+    },
+    PropertySpec {
+        name: "max_wait",
+        required: false,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::Duration,
+    },
+    PropertySpec {
+        name: "backoff",
+        required: false,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::Enum(&["fixed", "exponential"]),
+    },
+];
+
+/// `retry { ... }` sub-block specification shared by every output
+/// Module's property schema. Splice alongside [`QUEUE_PROPERTY_SPEC`].
+pub const RETRY_PROPERTY_SPEC: PropertySpec = PropertySpec {
+    name: "retry",
+    required: false,
+    repeatable: false,
+    exclusive_group: None,
+    kind: PropertyValueKind::Block(RETRY_BLOCK_PROPERTIES),
+};
+
+/// `secondary <name>` property specification shared by every output
+/// Module's property schema. Splice alongside [`QUEUE_PROPERTY_SPEC`].
+///
+/// The value is read by `props::get_ident` at runtime; schema-wise
+/// `PropertyValueKind::String` accepts bare idents, string literals,
+/// and templates — the wider shape is fine because the runtime then
+/// resolves the value against the set of declared output names and
+/// rejects unknowns / self-references / cycles in `runtime.rs`.
+pub const SECONDARY_PROPERTY_SPEC: PropertySpec = PropertySpec {
+    name: "secondary",
+    required: false,
+    repeatable: false,
+    exclusive_group: None,
+    kind: PropertyValueKind::String,
+};
+
+// ---------------------------------------------------------------------------
 // SinkInput — what flows over the per-output queue
 // ---------------------------------------------------------------------------
 //
@@ -1261,5 +1338,160 @@ mod write_with_retry_tests {
         .await;
         assert_eq!(disposition, WriteDisposition::Dropped);
         assert_eq!(m.events_failed.load(Ordering::Relaxed), 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Schema-splice regression tests
+// ---------------------------------------------------------------------------
+//
+// Pre-PR-T, only the two OTLP outputs declared `retry` and `secondary`
+// in their `property_schema()` even though `RetryConfig::from_output_properties`
+// reads both for *every* output. The tests below pin the post-PR-T
+// invariant: every non-OTLP output's schema accepts a `retry { ... }`
+// block and a `secondary <name>` property without raising
+// `UnknownKey`. Adding a third output schema later is then a hard
+// failure here if the splice is forgotten.
+#[cfg(test)]
+mod schema_splice_tests {
+    use super::{BackoffStrategy, RetryConfig};
+    use crate::dsl::ast::{Expr, ExprKind, Property};
+    use crate::dsl::schema::{PropertySpec, SchemaError, SchemaErrorKind, validate};
+    use crate::modules::Module;
+    use crate::modules::output::file::FileOutput;
+    use crate::modules::output::http::HttpOutput;
+    use crate::modules::output::otlp::grpc::OtlpGrpcOutput;
+    use crate::modules::output::otlp::http::OtlpHttpOutput;
+    use crate::modules::output::stdout::StdoutOutput;
+    use crate::modules::output::syslog_tcp::SyslogTcpOutput;
+    use crate::modules::output::syslog_udp::SyslogUdpOutput;
+    use crate::modules::output::unix_socket::UnixSocketOutput;
+
+    #[cfg(feature = "kafka")]
+    use crate::modules::output::kafka::KafkaOutput;
+
+    fn kv(key: &str, kind: ExprKind) -> Property {
+        Property::KeyValue {
+            key: key.into(),
+            key_span: None,
+            value: Expr::spanless(kind),
+            value_span: None,
+        }
+    }
+
+    fn block(key: &str, properties: Vec<Property>) -> Property {
+        Property::Block {
+            key: key.into(),
+            key_span: None,
+            properties,
+        }
+    }
+
+    /// `retry { max_attempts 3 initial_wait "100ms" max_wait "5s" backoff exponential }`
+    fn full_retry_block() -> Property {
+        block(
+            "retry",
+            vec![
+                kv("max_attempts", ExprKind::IntLit(3)),
+                kv("initial_wait", ExprKind::StringLit("100ms".into())),
+                kv("max_wait", ExprKind::StringLit("5s".into())),
+                kv("backoff", ExprKind::Ident(vec!["exponential".into()])),
+            ],
+        )
+    }
+
+    fn secondary_prop() -> Property {
+        kv("secondary", ExprKind::Ident(vec!["fallback".into()]))
+    }
+
+    /// Filter out `UnknownKey` errors for the splice contract — other
+    /// errors (e.g. missing required keys we didn't supply for the
+    /// schema under test) are off-topic for this test.
+    fn unknown_key_errs(errs: &[SchemaError]) -> Vec<&SchemaError> {
+        errs.iter()
+            .filter(|e| matches!(e.kind, SchemaErrorKind::UnknownKey))
+            .collect()
+    }
+
+    fn assert_accepts(schema: &[PropertySpec], output_name: &str) {
+        let props = vec![full_retry_block(), secondary_prop()];
+        let errs = validate(&props, schema);
+        let unknown = unknown_key_errs(&errs);
+        assert!(
+            unknown.is_empty(),
+            "output '{}': retry / secondary should be accepted by schema, \
+             got UnknownKey errors for: {:?}",
+            output_name,
+            unknown.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn every_output_schema_accepts_retry_and_secondary() {
+        // The full matrix lives in one test so adding a new output
+        // either splices the common consts into its schema or fails
+        // this test loudly.
+        assert_accepts(StdoutOutput::property_schema().unwrap(), "stdout");
+        assert_accepts(FileOutput::property_schema().unwrap(), "file");
+        assert_accepts(HttpOutput::property_schema().unwrap(), "http");
+        assert_accepts(SyslogTcpOutput::property_schema().unwrap(), "syslog_tcp");
+        assert_accepts(SyslogUdpOutput::property_schema().unwrap(), "syslog_udp");
+        assert_accepts(UnixSocketOutput::property_schema().unwrap(), "unix_socket");
+        assert_accepts(OtlpGrpcOutput::property_schema().unwrap(), "otlp_grpc");
+        assert_accepts(OtlpHttpOutput::property_schema().unwrap(), "otlp_http");
+        #[cfg(feature = "kafka")]
+        assert_accepts(KafkaOutput::property_schema().unwrap(), "kafka");
+    }
+
+    /// Inside the `retry { ... }` block, the four documented keys must
+    /// be the only accepted ones across every output schema —
+    /// confirms the hoist into `crate::queue` keeps the OTLP-era block
+    /// shape exactly (no key drift).
+    #[test]
+    fn retry_block_rejects_unknown_inner_key_in_all_outputs() {
+        let bad_retry = block("retry", vec![kv("typo", ExprKind::IntLit(1))]);
+        let props = vec![bad_retry];
+        #[allow(unused_mut)]
+        let mut schemas: Vec<(&[PropertySpec], &str)> = vec![
+            (StdoutOutput::property_schema().unwrap(), "stdout"),
+            (FileOutput::property_schema().unwrap(), "file"),
+            (HttpOutput::property_schema().unwrap(), "http"),
+            (SyslogTcpOutput::property_schema().unwrap(), "syslog_tcp"),
+            (SyslogUdpOutput::property_schema().unwrap(), "syslog_udp"),
+            (UnixSocketOutput::property_schema().unwrap(), "unix_socket"),
+            (OtlpGrpcOutput::property_schema().unwrap(), "otlp_grpc"),
+            (OtlpHttpOutput::property_schema().unwrap(), "otlp_http"),
+        ];
+        #[cfg(feature = "kafka")]
+        schemas.push((KafkaOutput::property_schema().unwrap(), "kafka"));
+        for (schema, name) in schemas {
+            let errs = validate(&props, schema);
+            let typo_err = errs
+                .iter()
+                .find(|e| matches!(e.kind, SchemaErrorKind::UnknownKey) && e.key == "typo");
+            assert!(
+                typo_err.is_some(),
+                "output '{}': retry block should reject unknown inner key 'typo', got errs={:?}",
+                name,
+                errs.iter().map(|e| (&e.kind, &e.key)).collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    /// `RetryConfig::from_output_properties` parses identical retry +
+    /// secondary props on a non-OTLP output (kafka here) into the
+    /// same fields the OTLP outputs have always populated. Anchors
+    /// the "runtime behavior already matched, schema just caught up"
+    /// invariant.
+    #[test]
+    fn retry_config_parser_reads_same_fields_for_non_otlp_outputs() {
+        let props = vec![full_retry_block(), secondary_prop()];
+        let cfg = RetryConfig::from_output_properties(&props)
+            .expect("retry block parses for non-OTLP output");
+        assert_eq!(cfg.max_attempts, 3);
+        assert_eq!(cfg.initial_wait, std::time::Duration::from_millis(100));
+        assert_eq!(cfg.max_wait, std::time::Duration::from_secs(5));
+        assert!(matches!(cfg.backoff, BackoffStrategy::Exponential));
+        assert_eq!(cfg.secondary.as_deref(), Some("fallback"));
     }
 }
