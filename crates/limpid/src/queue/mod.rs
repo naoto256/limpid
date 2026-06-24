@@ -17,7 +17,6 @@ use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
-use crate::modules::RenderedPayload;
 
 // ---------------------------------------------------------------------------
 // Declarative schema for the per-output `queue { ... }` sub-block
@@ -139,33 +138,16 @@ pub const RETRY_PROPERTY_SPEC: PropertySpec = PropertySpec {
 };
 
 // ---------------------------------------------------------------------------
-// SinkInput — what flows over the per-output queue
+// Queue item — every queue (memory + disk) now carries `Event` end-to-end
 // ---------------------------------------------------------------------------
 //
-// The pipeline → output sink transport carries either a pre-rendered,
-// sink-specific payload (memory-queue hot path) or an `OwnedEvent`
-// (disk-queue persist, control-socket inject — cold paths where the
-// event must be serializable). The pipeline picks at the output
-// statement based on each output's queue type.
-
-/// Item carried by an output queue.
-pub enum SinkInput {
-    /// Disk-queue persist / inject path. Serialisable, outlives the
-    /// pipeline's per-event arena.
-    Owned(Event),
-    /// Memory-queue hot path. Type-erased payload built by
-    /// `Output::render`; the matching `Output::write` downcasts it.
-    Rendered(RenderedPayload),
-}
-
-/// Memory-vs-disk queue discriminator surfaced on `CompiledConfig` so
-/// the pipeline can pick `SinkInput::Owned` (disk persist) vs
-/// `SinkInput::Rendered` (memory hot path) at the `output` statement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QueueKind {
-    Memory,
-    Disk,
-}
+// Before this change the queue distinguished between a pre-rendered sink
+// payload (memory hot path) and an `OwnedEvent` (disk persist / inject).
+// After this change the queue uniformly carries `Event`; rendering moves from
+// the pipeline-side (enqueue time) to the consumer-side (send time,
+// inside each sink's `Output::consume`). Memory and disk queues are
+// distinguished only by the `SenderInner` variant — there is no
+// `QueueKind` tag because the pipeline never branches on it.
 
 /// Configuration for an output queue.
 #[derive(Debug, Clone)]
@@ -197,20 +179,6 @@ impl Default for QueueConfig {
 }
 
 impl QueueConfig {
-    /// Light-weight scan: peek at an output's properties and return
-    /// the queue kind without parsing capacities or paths. Used at
-    /// `CompiledConfig` build time to populate the per-output queue
-    /// kind map driving pipeline output dispatch.
-    pub fn kind_from_output_properties(output_props: &[Property]) -> QueueKind {
-        if let Some(block) = props::get_block(output_props, "queue")
-            && matches!(props::get_ident(block, "type").as_deref(), Some("disk"))
-        {
-            QueueKind::Disk
-        } else {
-            QueueKind::Memory
-        }
-    }
-
     /// Parse from an output definition's `queue { ... }` block.
     pub fn from_output_properties(
         output_name: &str,
@@ -254,9 +222,12 @@ pub enum OverflowStrategy {
 #[derive(Clone)]
 pub struct QueueSender {
     inner: SenderInner,
+    // 0.8 metrics will surface queue-level counters (depth, enqueue
+    // pressure) that need a label distinct from the output name.
+    // Holding the Arc<String> avoids re-plumbing it then; the per-queue
+    // allocation is trivial.
+    #[allow(dead_code)]
     name: Arc<String>,
-    #[allow(dead_code)] // surfaced via `kind()` for future memory/disk-aware callers
-    kind: QueueKind,
     /// Optional metrics — if set, `send()` increments `events_received` on success.
     /// Set by the runtime after the output module's metrics handle is available.
     metrics: Option<Arc<crate::metrics::OutputMetrics>>,
@@ -264,42 +235,26 @@ pub struct QueueSender {
 
 #[derive(Clone)]
 enum SenderInner {
-    Memory(tokio::sync::mpsc::Sender<SinkInput>),
+    Memory(tokio::sync::mpsc::Sender<Event>),
     Disk(disk::DiskQueueSender),
 }
 
 impl QueueSender {
-    /// Memory or disk discriminator. The pipeline reads this to decide
-    /// between the render hot-path (memory) and the owned/serialise
-    /// path (disk).
-    #[allow(dead_code)] // currently consumed via the `kind` map on CompiledConfig
-    pub fn kind(&self) -> QueueKind {
-        self.kind
-    }
-
-    /// Send a `SinkInput` into the queue.
+    /// Send an `Event` into the queue.
     ///
-    /// Disk queues only accept `SinkInput::Owned(...)` because the
-    /// `Rendered` variant holds a `Box<dyn Any>` payload which has no
-    /// serialisable shape. Pipeline-output dispatch (`pipeline.rs`)
-    /// already gates this by inspecting `kind()` at the output
-    /// statement; the `Rendered`-on-Disk arm here is a defence-in-depth
-    /// log+drop so a programmer mistake elsewhere doesn't silently
-    /// corrupt the persist path.
-    pub async fn send(&self, input: SinkInput) -> Result<(), QueueSendError> {
-        let result: Result<(), QueueSendError> = match (&self.inner, input) {
-            (SenderInner::Memory(tx), input) => {
-                tx.send(input).await.map_err(|_| QueueSendError::ChannelClosed)
-            }
-            (SenderInner::Disk(tx), SinkInput::Owned(ev)) => tx.send(ev).await,
-            (SenderInner::Disk(_), SinkInput::Rendered(_)) => {
-                error!(
-                    "queue '{}': pipeline routed a Rendered payload to a disk-persist queue \
-                     — this is a programmer bug; dropping event",
-                    self.name
-                );
-                Err(QueueSendError::RenderedOnDisk)
-            }
+    /// Both queue kinds carry `Event` end-to-end after this change: memory
+    /// queues forward the event to the consumer where the configured
+    /// output renders it inside `Output::consume`, and disk queues
+    /// serialise the same `Event` to JSON for replay. There is no
+    /// longer a `Rendered`-vs-`Owned` discriminator at this level
+    /// because the queue does not see sink-specific payloads anymore.
+    pub async fn send(&self, event: Event) -> Result<(), QueueSendError> {
+        let result: Result<(), QueueSendError> = match &self.inner {
+            SenderInner::Memory(tx) => tx
+                .send(event)
+                .await
+                .map_err(|_| QueueSendError::ChannelClosed),
+            SenderInner::Disk(tx) => tx.send(event).await,
         };
         if let Some(m) = &self.metrics {
             if result.is_ok() {
@@ -308,8 +263,7 @@ impl QueueSender {
             } else {
                 // Enqueue failure: memory-queue receiver dropped (=
                 // consumer task gone, daemon usually shutting down),
-                // disk-queue serialise/write error, or
-                // Rendered-on-Disk routing bug above. From this
+                // or disk-queue serialise/write error. From this
                 // sender's POV the event never made it into the
                 // queue and can't be retried by the consumer (the
                 // consumer never sees it). Bump `events_failed` so
@@ -322,13 +276,6 @@ impl QueueSender {
             }
         }
         result
-    }
-
-    /// Convenience: send an `OwnedEvent` regardless of queue kind.
-    /// Used by the cold paths (control-socket inject) that already hold
-    /// an owned event and don't go through the render path.
-    pub async fn send_owned(&self, event: Event) -> Result<(), QueueSendError> {
-        self.send(SinkInput::Owned(event)).await
     }
 
     /// Attach output metrics so subsequent `send()` calls count `events_received`.
@@ -349,22 +296,22 @@ pub struct QueueReceiver {
 }
 
 enum ReceiverInner {
-    Memory(tokio::sync::mpsc::Receiver<SinkInput>),
+    Memory(tokio::sync::mpsc::Receiver<Event>),
     Disk(disk::DiskQueueReceiver),
 }
 
 impl QueueReceiver {
-    pub async fn recv(&mut self) -> Option<SinkInput> {
+    pub async fn recv(&mut self) -> Option<Event> {
         match &mut self.inner {
             ReceiverInner::Memory(rx) => rx.recv().await,
-            ReceiverInner::Disk(rx) => rx.recv().await.map(SinkInput::Owned),
+            ReceiverInner::Disk(rx) => rx.recv().await,
         }
     }
 
-    pub fn try_recv(&mut self) -> Option<SinkInput> {
+    pub fn try_recv(&mut self) -> Option<Event> {
         match &mut self.inner {
             ReceiverInner::Memory(rx) => rx.try_recv().ok(),
-            ReceiverInner::Disk(rx) => rx.try_recv().map(SinkInput::Owned),
+            ReceiverInner::Disk(rx) => rx.try_recv(),
         }
     }
 
@@ -401,7 +348,6 @@ pub fn create_queue(
                 QueueSender {
                     inner: SenderInner::Memory(tx),
                     name: Arc::clone(&name),
-                    kind: QueueKind::Memory,
                     metrics: None,
                 },
                 QueueReceiver {
@@ -416,7 +362,6 @@ pub fn create_queue(
                 QueueSender {
                     inner: SenderInner::Disk(tx),
                     name: Arc::clone(&name),
-                    kind: QueueKind::Disk,
                     metrics: None,
                 },
                 QueueReceiver {
@@ -479,48 +424,16 @@ pub enum BackoffStrategy {
     Fixed,
 }
 
-/// Narrow `dyn`-safe adapter the queue consumer holds onto an output
-/// through. Lives separately from [`Output`] (in `modules::mod`) on
-/// purpose: `Output` carries `render`, which takes a `BorrowedEvent`
-/// tied to the per-event arena — that lifetime makes the trait object
-/// non-object-safe for the queue's `Box<dyn _>` storage, and the
-/// hot-path `render` isn't called from the queue side anyway.
-///
-/// Currently the only implementer is `modules::OutputWriterWrapper`,
-/// which forwards `consume` to the underlying `Arc<dyn Output>`. The
-/// trait is intentionally 1-impl: it exists as a **dyn-safety
-/// boundary**, not as an extension point, and stays that shape until
-/// a second writer kind appears (e.g. a side-channel sink that
-/// consumes `SinkInput` without going through a full `Output`).
-///
-/// `SinkInput` discriminates between a pipeline-rendered payload
-/// (memory-queue hot path) and an `OwnedEvent` (disk-queue replay,
-/// control-socket inject). Implementors dispatch on the variant.
-#[async_trait::async_trait]
-pub trait OutputWriter: Send + Sync + 'static {
-    async fn consume(&self, input: SinkInput) -> anyhow::Result<()>;
-
-    /// Drain any buffered events before the consumer stops. Forwarded
-    /// to the underlying `Output::shutdown` for `OutputWriterWrapper`;
-    /// default no-op for any future writer kind that holds no
-    /// internal buffer.
-    ///
-    /// `error_log` is the DLQ writer the consumer was launched with
-    /// — batched outputs use it to persist buffer entries that
-    /// survive a failed final flush (BC-4 / PR-P).
-    async fn shutdown(
-        &self,
-        _error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
 /// Run a queue consumer that drains events and writes them to an output.
+///
+/// Takes `Arc<dyn Output>` directly: after this change the `Output` trait is
+/// already dyn-safe (the lifetime-bound `render` method was removed in
+/// the trait collapse), so the earlier adapter trait that wrapped it
+/// purely to hide that lifetime is no longer needed.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_queue_consumer(
     mut receiver: QueueReceiver,
-    writer: Box<dyn OutputWriter>,
+    writer: Arc<dyn crate::modules::Output>,
     retry_config: RetryConfig,
     tap: Option<crate::tap::TapRegistry>,
     metrics: Arc<crate::metrics::OutputMetrics>,
@@ -544,14 +457,14 @@ pub async fn run_queue_consumer(
 
             input = receiver.recv() => {
                 match input {
-                    Some(input) => {
+                    Some(event) => {
                         // `error_log` recovery is performed inside
                         // `write_with_retry`; the disposition is
                         // ignored here because the caller-side
                         // per-disposition metrics breakdown is not yet
                         // implemented (deferred to the 0.8 metrics
                         // rework).
-                        let _ = write_with_retry(writer.as_ref(), input, &retry_config, &name, &metrics, tap.as_ref(), error_log.as_ref()).await;
+                        let _ = write_with_retry(writer.as_ref(), event, &retry_config, &name, &metrics, tap.as_ref(), error_log.as_ref()).await;
                         // Acknowledge the event regardless of
                         // disposition (delivered or retries exhausted):
                         // from this queue's POV the event has been
@@ -587,7 +500,7 @@ pub async fn run_queue_consumer(
 #[allow(clippy::too_many_arguments)]
 async fn drain_remaining(
     receiver: &mut QueueReceiver,
-    writer: &dyn OutputWriter,
+    writer: &dyn crate::modules::Output,
     retry_config: &RetryConfig,
     name: &str,
     metrics: &crate::metrics::OutputMetrics,
@@ -595,12 +508,12 @@ async fn drain_remaining(
     error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
 ) {
     let mut count = 0u64;
-    while let Some(input) = receiver.try_recv() {
+    while let Some(event) = receiver.try_recv() {
         // Disposition ignored: same rationale as the steady-state
         // loop — drain just needs to ack each event.
         let _ = write_with_retry(
             writer,
-            input,
+            event,
             retry_config,
             name,
             metrics,
@@ -625,19 +538,17 @@ async fn drain_remaining(
 /// Returns a [`WriteDisposition`] indicating whether the event was
 /// delivered, persisted to `error_log` for recovery, or dropped.
 ///
-/// Retry semantics:
-/// - `SinkInput::Owned(event)` is cloneable, so each attempt re-runs the
-///   write with the same event up to `max_attempts`.
-/// - `SinkInput::Rendered(payload)` consumes the (`Box<dyn Any>`)
-///   payload on the first call into `OutputWriter::consume` and is not
-///   re-buildable from the consumer, so on failure we fall through
-///   immediately. Operators who need full retry semantics on a sink
-///   should configure a disk queue (which always carries
-///   `SinkInput::Owned`).
+/// Retry semantics (after this change): the queue always carries `Event` so
+/// every attempt re-runs against the same event up to `max_attempts`.
+/// Render failures (signalled by [`crate::modules::RenderError`])
+/// bypass retries and go straight to DLQ — the render output is
+/// deterministic on the event, so retrying would only repeat the same
+/// failure. Transport / write failures continue to consume the retry
+/// budget as before.
 #[allow(clippy::too_many_arguments)]
 async fn write_with_retry(
-    writer: &dyn OutputWriter,
-    input: SinkInput,
+    writer: &dyn crate::modules::Output,
+    event: Event,
     config: &RetryConfig,
     name: &str,
     metrics: &crate::metrics::OutputMetrics,
@@ -646,41 +557,32 @@ async fn write_with_retry(
 ) -> WriteDisposition {
     use std::sync::atomic::Ordering;
 
-    // Fast-split: extract the optional Owned event (used for tap emit
-    // and retry/error_log fallback) without consuming the input we
-    // hand to the writer on the first attempt.
-    let mut owned_for_retry: Option<Event> = match &input {
-        SinkInput::Owned(ev) => Some(ev.clone()),
-        SinkInput::Rendered(_) => None,
-    };
-
-    if let Some(tap) = tap
-        && let Some(ev) = &owned_for_retry
-    {
-        tap.emit(&format!("output {}", name), ev).await;
+    if let Some(tap) = tap {
+        tap.emit(&format!("output {}", name), &event).await;
     }
 
-    let mut next_attempt: Option<SinkInput> = Some(input);
     let mut attempt = 0u32;
     let mut wait = config.initial_wait;
 
     loop {
-        let this = match next_attempt.take() {
-            Some(i) => i,
-            None => break,
-        };
-        let is_owned = matches!(this, SinkInput::Owned(_));
-        match writer.consume(this).await {
+        match writer.consume(&event).await {
             Ok(()) => return WriteDisposition::Delivered,
             Err(e) => {
+                // Render errors are deterministic on the event — no
+                // amount of retrying will salvage a broken template.
+                // Route straight to DLQ with a distinct `reason` so
+                // operators can tell render failures apart from
+                // transport exhaustion.
+                let is_render_err = e.downcast_ref::<crate::modules::RenderError>().is_some();
+
                 attempt += 1;
-                metrics.retries.fetch_add(1, Ordering::Relaxed);
-                if attempt >= config.max_attempts || !is_owned {
-                    if !is_owned {
-                        warn!(
-                            "output '{}': write failed (rendered payload, no retry): {}",
-                            name, e
-                        );
+                if !is_render_err {
+                    metrics.retries.fetch_add(1, Ordering::Relaxed);
+                }
+
+                if is_render_err || attempt >= config.max_attempts {
+                    if is_render_err {
+                        error!("output '{}': render failed: {}", name, e);
                     } else {
                         error!(
                             "output '{}': write failed after {} attempts: {}",
@@ -688,24 +590,18 @@ async fn write_with_retry(
                         );
                     }
                     metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-                    // Recovery routing (BC-3 / PR-O):
-                    //   1. error_log configured + Owned available →
-                    //      write a JSONL record mirroring the pipeline
-                    //      DLQ format. Success returns
-                    //      `DroppedToRecovery`; failure warns and falls
-                    //      through to `Dropped`.
-                    //   2. neither path captured the payload → preserve
-                    //      the existing `Dropped` behaviour
-                    //      (warn + give up). The `Rendered` case (no
-                    //      owned payload to capture) also collapses
-                    //      here.
-                    if let (Some(writer), Some(ev)) = (error_log, owned_for_retry.take()) {
+                    let reason = if is_render_err {
+                        format!("render failed: {}", e)
+                    } else {
+                        format!("output write failed after {} attempts: {}", attempt, e)
+                    };
+                    if let Some(writer) = error_log {
                         let ctx = crate::pipeline::ErroredEventContext {
                             timestamp: chrono::Utc::now(),
                             pipeline: String::new(),
                             process: format!("(output {})", name),
-                            reason: format!("output write failed after {} attempts: {}", attempt, e),
-                            event: ev,
+                            reason,
+                            event: event.clone(),
                         };
                         match writer.write(&ctx).await {
                             Ok(()) => return WriteDisposition::DroppedToRecovery,
@@ -718,10 +614,7 @@ async fn write_with_retry(
                         }
                     } else {
                         // No recovery path configured.
-                        error!(
-                            "output '{}': dropping event (no error_log)",
-                            name
-                        );
+                        error!("output '{}': dropping event (no error_log)", name);
                     }
                     return WriteDisposition::Dropped;
                 }
@@ -734,24 +627,15 @@ async fn write_with_retry(
                     BackoffStrategy::Exponential => (wait * 2).min(config.max_wait),
                     BackoffStrategy::Fixed => wait,
                 };
-                // Rebuild the next-attempt input from the cloned owned
-                // event we kept aside.
-                if let Some(ev) = owned_for_retry.as_ref() {
-                    next_attempt = Some(SinkInput::Owned(ev.clone()));
-                } else {
-                    break;
-                }
             }
         }
     }
-    // Loop ran out of next-attempt inputs without a return — treated
-    // as dropped, matching the previous `false` fall-through.
-    WriteDisposition::Dropped
 }
 
 #[cfg(test)]
 mod write_with_retry_tests {
     use super::*;
+    use crate::modules::{HasMetrics, Output};
     use bytes::Bytes;
     use std::net::SocketAddr;
     use std::sync::Mutex;
@@ -763,6 +647,7 @@ mod write_with_retry_tests {
     struct ScriptedWriter {
         script: Mutex<Vec<anyhow::Result<()>>>,
         calls: std::sync::atomic::AtomicUsize,
+        metrics: Arc<crate::metrics::OutputMetrics>,
     }
 
     impl ScriptedWriter {
@@ -770,6 +655,7 @@ mod write_with_retry_tests {
             Self {
                 script: Mutex::new(script),
                 calls: std::sync::atomic::AtomicUsize::new(0),
+                metrics: Arc::new(crate::metrics::OutputMetrics::default()),
             }
         }
         fn calls(&self) -> usize {
@@ -777,9 +663,16 @@ mod write_with_retry_tests {
         }
     }
 
+    impl HasMetrics for ScriptedWriter {
+        type Stats = crate::metrics::OutputMetrics;
+        fn metrics(&self) -> Arc<crate::metrics::OutputMetrics> {
+            Arc::clone(&self.metrics)
+        }
+    }
+
     #[async_trait::async_trait]
-    impl OutputWriter for ScriptedWriter {
-        async fn consume(&self, _input: SinkInput) -> anyhow::Result<()> {
+    impl Output for ScriptedWriter {
+        async fn consume(&self, _event: &Event) -> anyhow::Result<()> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             let mut s = self.script.lock().unwrap();
             if s.is_empty() { Ok(()) } else { s.remove(0) }
@@ -802,10 +695,6 @@ mod write_with_retry_tests {
         )
     }
 
-    fn rendered_event() -> SinkInput {
-        SinkInput::Rendered(RenderedPayload::new(()))
-    }
-
     fn fresh_metrics() -> crate::metrics::OutputMetrics {
         crate::metrics::OutputMetrics::default()
     }
@@ -816,7 +705,7 @@ mod write_with_retry_tests {
         let m = fresh_metrics();
         let disposition = write_with_retry(
             &w,
-            SinkInput::Owned(owned_event()),
+            owned_event(),
             &fast_cfg(3),
             "test",
             &m,
@@ -840,7 +729,7 @@ mod write_with_retry_tests {
         let m = fresh_metrics();
         let disposition = write_with_retry(
             &w,
-            SinkInput::Owned(owned_event()),
+            owned_event(),
             &fast_cfg(5),
             "test",
             &m,
@@ -864,7 +753,7 @@ mod write_with_retry_tests {
         let m = fresh_metrics();
         let disposition = write_with_retry(
             &w,
-            SinkInput::Owned(owned_event()),
+            owned_event(),
             &fast_cfg(3),
             "test",
             &m,
@@ -877,37 +766,6 @@ mod write_with_retry_tests {
         assert_eq!(w.calls(), 3);
         assert_eq!(m.events_failed.load(Ordering::Relaxed), 1);
         assert_eq!(m.retries.load(Ordering::Relaxed), 3);
-    }
-
-    #[tokio::test]
-    async fn rendered_failure_skips_retries_and_logs() {
-        // Rendered payloads cannot be retried (the Box<dyn Any>
-        // payload was consumed by the first consume call). The
-        // retry-loop must take exactly one shot and then bump
-        // events_failed once with the "rendered payload, no retry"
-        // warn — never loop. A regression that mistakenly retries a
-        // Rendered would panic or silently no-op since the closure
-        // has nothing left to consume.
-        let w = ScriptedWriter::new(vec![Err(anyhow::anyhow!("nope"))]);
-        let m = fresh_metrics();
-        let disposition = write_with_retry(
-            &w,
-            rendered_event(),
-            &fast_cfg(5), // 5 allowed but only 1 attempt should happen
-            "test",
-            &m,
-            None,
-            None,
-        )
-        .await;
-        assert_eq!(disposition, WriteDisposition::Dropped);
-        assert_eq!(
-            w.calls(),
-            1,
-            "Rendered must NOT retry, got {} calls",
-            w.calls()
-        );
-        assert_eq!(m.events_failed.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -925,7 +783,7 @@ mod write_with_retry_tests {
         .unwrap();
         drop(rx);
         let err = tx
-            .send(SinkInput::Owned(owned_event()))
+            .send(owned_event())
             .await
             .expect_err("send to closed memory channel must fail");
         assert!(
@@ -935,46 +793,125 @@ mod write_with_retry_tests {
         );
     }
 
+    /// Writer that always returns a `RenderError`-wrapped error — used
+    /// to drive the "render-err goes straight to DLQ" path.
+    struct RenderFailWriter {
+        metrics: Arc<crate::metrics::OutputMetrics>,
+    }
+
+    impl RenderFailWriter {
+        fn new() -> Self {
+            Self {
+                metrics: Arc::new(crate::metrics::OutputMetrics::default()),
+            }
+        }
+    }
+
+    impl HasMetrics for RenderFailWriter {
+        type Stats = crate::metrics::OutputMetrics;
+        fn metrics(&self) -> Arc<crate::metrics::OutputMetrics> {
+            Arc::clone(&self.metrics)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Output for RenderFailWriter {
+        async fn consume(&self, _event: &Event) -> anyhow::Result<()> {
+            Err(crate::modules::RenderError::new(anyhow::anyhow!(
+                "intentional render failure"
+            ))
+            .into())
+        }
+    }
+
     #[tokio::test]
-    async fn queue_sender_send_returns_rendered_on_disk_when_misrouted() {
-        // Routing a Rendered payload to a disk queue is a programmer
-        // bug — the disk sink only accepts serialisable Owned events.
-        // The send must return QueueSendError::RenderedOnDisk so the
-        // pipeline-level DLQ path is taken.
+    async fn render_err_goes_straight_to_dlq() {
+        // Render errors bypass retry and route directly to recovery:
+        // a RenderError from `consume` bypasses the
+        // retry budget and lands directly in the DLQ. Exactly 1 call,
+        // 0 retries counted, events_failed += 1, JSONL record's reason
+        // contains "render failed".
         let dir = tempfile::tempdir().unwrap();
-        let (tx, _rx) = create_queue(
-            "disk".into(),
-            QueueConfig {
-                queue_type: QueueType::Disk {
-                    path: dir.path().to_string_lossy().into_owned(),
-                    max_size: 0,
-                },
-                capacity: 4,
-                overflow: OverflowStrategy::Block,
-            },
+        let path = dir.path().join("errored.jsonl");
+        let el = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
+        let m = fresh_metrics();
+        let disposition = write_with_retry(
+            &RenderFailWriter::new(),
+            owned_event(),
+            &fast_cfg(5),
+            "primary",
+            &m,
+            None,
+            Some(&el),
         )
-        .unwrap();
-        let err = tx
-            .send(rendered_event())
-            .await
-            .expect_err("Rendered-on-Disk must fail");
+        .await;
+        assert_eq!(disposition, WriteDisposition::DroppedToRecovery);
+        assert_eq!(m.events_failed.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            m.retries.load(Ordering::Relaxed),
+            0,
+            "render error must not count as a retry"
+        );
+        let body = tokio::fs::read_to_string(&path).await.unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v["process"], "(output primary)");
         assert!(
-            matches!(err, QueueSendError::RenderedOnDisk),
-            "expected RenderedOnDisk, got {:?}",
-            err
+            v["reason"].as_str().unwrap().contains("render failed"),
+            "reason should mark render failure, got: {}",
+            v["reason"]
         );
     }
 
-    // ---- BC-3 error_log recovery routing (PR-O) ----
+    #[tokio::test]
+    async fn render_err_with_no_error_log_returns_dropped() {
+        // Same render-err shape but no DLQ configured: behave like the
+        // legacy unrecoverable drop path — `Dropped`, events_failed += 1,
+        // no retries.
+        let m = fresh_metrics();
+        let disposition = write_with_retry(
+            &RenderFailWriter::new(),
+            owned_event(),
+            &fast_cfg(5),
+            "primary",
+            &m,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(disposition, WriteDisposition::Dropped);
+        assert_eq!(m.events_failed.load(Ordering::Relaxed), 1);
+        assert_eq!(m.retries.load(Ordering::Relaxed), 0);
+    }
+
+    // ---- retry-exhausted recovery routing ----
 
     /// Stub writer that *always* refuses the write — every test below
     /// drives the retry-exhaustion path, so the underlying writer just
     /// has to fail predictably without any per-test scripting.
-    struct AlwaysFailWriter;
+    struct AlwaysFailWriter {
+        metrics: Arc<crate::metrics::OutputMetrics>,
+    }
+
+    impl AlwaysFailWriter {
+        fn new() -> Self {
+            Self {
+                metrics: Arc::new(crate::metrics::OutputMetrics::default()),
+            }
+        }
+    }
+
+    impl HasMetrics for AlwaysFailWriter {
+        type Stats = crate::metrics::OutputMetrics;
+        fn metrics(&self) -> Arc<crate::metrics::OutputMetrics> {
+            Arc::clone(&self.metrics)
+        }
+    }
 
     #[async_trait::async_trait]
-    impl OutputWriter for AlwaysFailWriter {
-        async fn consume(&self, _input: SinkInput) -> anyhow::Result<()> {
+    impl Output for AlwaysFailWriter {
+        async fn consume(&self, _event: &Event) -> anyhow::Result<()> {
             Err(anyhow::anyhow!("permanent failure"))
         }
     }
@@ -991,15 +928,15 @@ mod write_with_retry_tests {
 
     #[tokio::test]
     async fn error_log_persists_and_returns_dropped_to_recovery() {
-        // BC-3 happy path: retries exhaust, `error_log` captures the
+        // Retry-exhausted recovery happy path: retries exhaust, `error_log` captures the
         // payload. Must report `DroppedToRecovery` and the JSONL file
         // must contain one record carrying the original ingress.
         let dir = tempfile::tempdir().unwrap();
         let (el, path) = error_log_in(&dir);
         let m = fresh_metrics();
         let disposition = write_with_retry(
-            &AlwaysFailWriter,
-            SinkInput::Owned(owned_event()),
+            &AlwaysFailWriter::new(),
+            owned_event(),
             &fast_cfg(2),
             "primary",
             &m,
@@ -1020,14 +957,14 @@ mod write_with_retry_tests {
 
     #[tokio::test]
     async fn no_error_log_preserves_existing_dropped_behavior() {
-        // BC-3 regression anchor for the 0.7.7 baseline: with no
+        // Boundary-contract regression anchor for the 0.7.7 baseline: with no
         // `error_log` configured, retry-exhaustion must still surface
         // `Dropped`. The warn line is observable in logs but not
         // asserted here.
         let m = fresh_metrics();
         let disposition = write_with_retry(
-            &AlwaysFailWriter,
-            SinkInput::Owned(owned_event()),
+            &AlwaysFailWriter::new(),
+            owned_event(),
             &fast_cfg(2),
             "primary",
             &m,
@@ -1041,7 +978,7 @@ mod write_with_retry_tests {
 
     #[tokio::test]
     async fn error_log_write_failure_falls_back_to_dropped_without_recursion() {
-        // BC-3 last-resort path: error_log is configured but its
+        // Last-resort recovery path: error_log is configured but its
         // parent dir does not exist, so `write()` returns Err. The
         // function must warn and return `Dropped` (NOT
         // `DroppedToRecovery`), and must not retry the error_log write
@@ -1053,8 +990,8 @@ mod write_with_retry_tests {
         let el = Arc::new(crate::error_log::ErrorLogWriter::new(bad_path));
         let m = fresh_metrics();
         let disposition = write_with_retry(
-            &AlwaysFailWriter,
-            SinkInput::Owned(owned_event()),
+            &AlwaysFailWriter::new(),
+            owned_event(),
             &fast_cfg(2),
             "primary",
             &m,
@@ -1071,10 +1008,11 @@ mod write_with_retry_tests {
 // Schema-splice regression tests
 // ---------------------------------------------------------------------------
 //
-// Pre-PR-T, only the two OTLP outputs declared `retry` in their
-// `property_schema()` even though `RetryConfig::from_output_properties`
-// reads it for *every* output. The tests below pin the post-PR-T
-// invariant: every non-OTLP output's schema accepts a `retry { ... }`
+// Before the retry-schema splice, only the two OTLP outputs declared
+// `retry` in their `property_schema()` even though
+// `RetryConfig::from_output_properties` reads it for *every* output.
+// The tests below pin the invariant: every non-OTLP output's schema
+// accepts a `retry { ... }`
 // block without raising `UnknownKey`. Adding a third output schema
 // later is then a hard failure here if the splice is forgotten.
 #[cfg(test)]

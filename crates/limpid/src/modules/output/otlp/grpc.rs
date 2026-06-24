@@ -57,17 +57,16 @@ use opentelemetry_proto::tonic::collector::logs::v1::{
 use tokio::sync::Mutex;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
-use crate::dsl::arena::EventArena;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
-use crate::event::{BorrowedEvent, Event};
+use crate::event::Event;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::syslog_peers::{PEER_COOLDOWN, iter_peers_block};
-use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
+use crate::modules::{HasMetrics, Module, Output};
 use crate::queue::{BackoffStrategy, RetryConfig};
 
-use super::{BatchLevel, OtlpPayload, decode_drained_to_request};
+use super::{BatchLevel, decode_drained_to_request};
 
 /// Upper bound on a single gRPC export. A stalled collector (TCP
 /// connection accepted but no HEADERS frame returned) would otherwise
@@ -111,14 +110,23 @@ struct Inner {
     /// because the queue layer's per-event retry only re-pushes the
     /// most recent Event).
     retry_config: RetryConfig,
-    /// Buffered per-Event singleton ResourceLogs proto bytes.
-    batch: Mutex<Vec<Bytes>>,
+    /// Buffered events awaiting flush. Render happens at flush time
+    /// (batch buffers retain Event until flush) so per-event render
+    /// failures can be routed to DLQ on their own without dropping the
+    /// rest of the batch.
+    batch: Mutex<Vec<Event>>,
+    /// Operator-facing instance name; surfaced on shutdown-flush
+    /// recovery and render-failure records.
+    name: String,
+    /// `error_log` writer injected at construction time by the
+    /// runtime via `OutputBuilderWithErrorLog::from_properties_with_error_log`.
+    /// Used by the flush path to route per-event render failures and
+    /// shutdown-flush leftovers into the DLQ.
+    error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+    metrics: Arc<OutputMetrics>,
 }
 
 pub struct OtlpGrpcOutput {
-    /// Operator-facing instance name; surfaced on PR-P shutdown-recovery
-    /// records as `(output <name> shutdown)`.
-    name: String,
     inner: Arc<Inner>,
     batch_size: usize,
     flush_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -269,6 +277,18 @@ impl Module for OtlpGrpcOutput {
     }
 
     fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
+        <Self as crate::modules::OutputBuilderWithErrorLog>::from_properties_with_error_log(
+            name, properties, None,
+        )
+    }
+}
+
+impl crate::modules::OutputBuilderWithErrorLog for OtlpGrpcOutput {
+    fn from_properties_with_error_log(
+        name: &str,
+        properties: &crate::modules::ModuleProperties,
+        error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+    ) -> Result<Self> {
         let properties = properties.user_properties();
 
         let batch_size = props::get_positive_int(properties, "batch_size")?.unwrap_or(1) as usize;
@@ -306,8 +326,8 @@ impl Module for OtlpGrpcOutput {
 
         let retry_config = RetryConfig::from_output_properties(properties)?;
 
+        let metrics = Arc::new(OutputMetrics::default());
         Ok(Self {
-            name: name.to_string(),
             inner: Arc::new(Inner {
                 peers,
                 peer_state,
@@ -317,10 +337,13 @@ impl Module for OtlpGrpcOutput {
                 batch_timeout,
                 retry_config,
                 batch: Mutex::new(Vec::new()),
+                name: name.to_string(),
+                error_log,
+                metrics: Arc::clone(&metrics),
             }),
             batch_size,
             flush_handle: Mutex::new(None),
-            metrics: Arc::new(OutputMetrics::default()),
+            metrics,
         })
     }
 }
@@ -334,74 +357,41 @@ impl HasMetrics for OtlpGrpcOutput {
 
 #[async_trait::async_trait]
 impl Output for OtlpGrpcOutput {
-    fn render(
-        &self,
-        event: &BorrowedEvent<'_>,
-        _arena: &EventArena<'_>,
-    ) -> Result<RenderedPayload> {
-        Ok(RenderedPayload::new(OtlpPayload {
-            egress: event.egress.clone(),
-        }))
-    }
-
-    async fn write(&self, payload: RenderedPayload) -> Result<()> {
-        let payload: OtlpPayload = payload.downcast()?;
-        let proto = payload.egress;
+    /// Batched-buffer rendering: buffer the `Event` (no render yet), decide
+    /// flush-or-arm-timer. Render happens later in `flush()`.
+    async fn consume(&self, event: &Event) -> Result<()> {
         let mut batch = self.inner.batch.lock().await;
-        batch.push(proto);
+        batch.push(event.clone());
         let should_flush = batch.len() >= self.batch_size;
         drop(batch);
-
         if should_flush {
-            self.flush().await?;
+            self.flush().await
         } else {
             self.ensure_flush_timer().await;
+            Ok(())
         }
-        Ok(())
-    }
-
-    /// Owned-event path (disk-queue replay, control-socket inject). The
-    /// queue consumer needs a per-event ship verdict — Ok ⇒ drop from
-    /// the queue, Err ⇒ retry / disk-replay — so routing
-    /// Owned events through the batched buffer would silently merge them
-    /// into a later flush and the caller would lose the verdict. Ship
-    /// inline here, bypassing the batch.
-    async fn write_owned(&self, event: &Event) -> Result<()> {
-        crate::modules::ship_owned_inline(self, event, &self.metrics, |payload| async move {
-            let payload: OtlpPayload = payload.downcast()?;
-            send_batch(&self.inner, vec![payload.egress])
-                .await
-                .map(|o| o.rejected)
-        })
-        .await
     }
 
     async fn shutdown(
         &self,
         error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
     ) -> Result<()> {
-        // Same contract as `otlp_http::shutdown`: abort the timer to
-        // avoid a race for the buffer lock, then drain in one final
-        // send. Without this the queue consumer's shutdown call
-        // races the timer task, and either Drop's abort or the
-        // process exit can leave the in-flight buffer behind.
         if let Some(h) = self.flush_handle.lock().await.take() {
             h.abort();
         }
         match self.flush().await {
             Ok(()) => Ok(()),
             Err(e) => {
-                // BC-4 / PR-P: `flush()` restored the drained batch
-                // into `self.inner.batch` on transport error. Drain
-                // it into `error_log` when the operator opted in;
-                // otherwise return Err and preserve 0.7.7 behaviour
-                // (queue consumer logs a warn and the buffer is
-                // lost).
+                // Shutdown-flush recovery: drain leftover `Event`s into
+                // `error_log` carrying real source/ingress/received_at.
                 if let Some(writer) = error_log {
-                    let payloads: Vec<bytes::Bytes> =
+                    let events: Vec<Event> =
                         std::mem::take(&mut *self.inner.batch.lock().await);
-                    crate::modules::write_shutdown_buffer_to_error_log(
-                        writer, &self.name, payloads, &e,
+                    crate::modules::write_shutdown_events_to_error_log(
+                        writer,
+                        &self.inner.name,
+                        events,
+                        &e,
                     )
                     .await;
                     Ok(())
@@ -415,19 +405,92 @@ impl Output for OtlpGrpcOutput {
 
 impl OtlpGrpcOutput {
     async fn flush(&self) -> Result<()> {
-        let drained: Vec<Bytes> = {
-            let mut batch = self.inner.batch.lock().await;
-            std::mem::take(&mut *batch)
+        let batch: Vec<Event> = {
+            let mut buf = self.inner.batch.lock().await;
+            std::mem::take(&mut *buf)
         };
-        if drained.is_empty() {
+        self.inner.flush_events(batch).await
+    }
+
+    async fn ensure_flush_timer(&self) {
+        let mut handle = self.flush_handle.lock().await;
+        if let Some(h) = handle.as_ref()
+            && !h.is_finished()
+        {
+            return;
+        }
+
+        let inner = Arc::clone(&self.inner);
+        let new_handle = tokio::spawn(async move {
+            tokio::time::sleep(inner.batch_timeout).await;
+            let batch: Vec<Event> = {
+                let mut buf = inner.batch.lock().await;
+                std::mem::take(&mut *buf)
+            };
+            if let Err(e) = inner.flush_events(batch).await {
+                tracing::warn!("otlp_grpc flush timer: {}", e);
+            }
+        });
+        *handle = Some(new_handle);
+    }
+}
+
+impl Inner {
+    /// Render each buffered event, route per-event render failures to
+    /// DLQ, ship the rest via `send_batch`. On transport failure
+    /// restore the un-rendered events to the buffer for retry.
+    async fn flush_events(&self, batch: Vec<Event>) -> Result<()> {
+        if batch.is_empty() {
             return Ok(());
         }
-        let count = drained.len() as u64;
-        // Clone for the send so the original survives for retry
-        // restoration on transport error. `Bytes::clone` is a
-        // refcount bump, no payload copy.
-        let result = send_batch(&self.inner, drained.clone()).await;
-        match result {
+        let mut payloads: Vec<Bytes> = Vec::with_capacity(batch.len());
+        let mut shippable: Vec<Event> = Vec::with_capacity(batch.len());
+        let mut render_failures: Vec<(Event, anyhow::Error)> = Vec::new();
+        for ev in batch {
+            // OTLP render is a refcount bump on `event.egress` — same
+            // body as `OtlpGrpcOutput::render` above.
+            let res: Result<Bytes> = Ok(ev.egress.clone());
+            match res {
+                Ok(p) => {
+                    payloads.push(p);
+                    shippable.push(ev);
+                }
+                Err(e) => render_failures.push((ev, e)),
+            }
+        }
+        if !render_failures.is_empty() {
+            let error_log = self.error_log.as_ref();
+            for (ev, err) in render_failures {
+                self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                if let Some(writer) = &error_log {
+                    let ctx = crate::pipeline::ErroredEventContext {
+                        timestamp: chrono::Utc::now(),
+                        pipeline: String::new(),
+                        process: format!("(output {})", self.name),
+                        reason: format!("render failed during batch flush: {}", err),
+                        event: ev,
+                    };
+                    if let Err(write_err) = writer.write(&ctx).await {
+                        tracing::warn!(
+                            "output '{}': error_log write failed during batch render: {}",
+                            self.name,
+                            write_err
+                        );
+                    }
+                } else {
+                    tracing::error!(
+                        "output '{}': render failed during batch flush ({}); dropping event (no error_log)",
+                        self.name,
+                        err
+                    );
+                }
+            }
+        }
+        if payloads.is_empty() {
+            return Ok(());
+        }
+        let count = payloads.len() as u64;
+        match send_batch(self, payloads.clone()).await {
             Ok(outcome) => {
                 let rejected = outcome.rejected.min(count);
                 let written = count - rejected;
@@ -444,69 +507,13 @@ impl OtlpGrpcOutput {
                 Ok(())
             }
             Err(e) => {
-                // Transport error: put the drained batch back into
-                // the buffer for retry instead of dropping it.
-                // Mirrors `output http` (PR limpid#33) and the
-                // sibling `otlp_http` write-flush path. Do NOT bump
-                // events_failed — the events are retained, not
-                // permanently rejected.
-                let mut batch = self.inner.batch.lock().await;
-                let new_events = std::mem::take(&mut *batch);
-                *batch = drained;
-                batch.extend(new_events);
+                let mut buf = self.batch.lock().await;
+                let new_events = std::mem::take(&mut *buf);
+                *buf = shippable;
+                buf.extend(new_events);
                 Err(e)
             }
         }
-    }
-
-    async fn ensure_flush_timer(&self) {
-        let mut handle = self.flush_handle.lock().await;
-        if let Some(h) = handle.as_ref()
-            && !h.is_finished()
-        {
-            return;
-        }
-
-        let inner = Arc::clone(&self.inner);
-        let metrics = Arc::clone(&self.metrics);
-        let new_handle = tokio::spawn(async move {
-            tokio::time::sleep(inner.batch_timeout).await;
-            let drained: Vec<Bytes> = {
-                let mut batch = inner.batch.lock().await;
-                std::mem::take(&mut *batch)
-            };
-            if drained.is_empty() {
-                return;
-            }
-            let count = drained.len() as u64;
-            match send_batch(&inner, drained.clone()).await {
-                Ok(outcome) => {
-                    let rejected = outcome.rejected.min(count);
-                    let written = count - rejected;
-                    if written > 0 {
-                        metrics.events_written.fetch_add(written, Ordering::Relaxed);
-                    }
-                    if rejected > 0 {
-                        metrics.events_failed.fetch_add(rejected, Ordering::Relaxed);
-                    }
-                }
-                Err(e) => {
-                    // Same retention contract as the write-triggered
-                    // flush: return the drained batch to the buffer
-                    // for the next write or timer firing to retry.
-                    tracing::warn!(
-                        "otlp_grpc flush timer: send failed ({}) — {} events returned to buffer",
-                        e,
-                        count
-                    );
-                    let mut buf = inner.batch.lock().await;
-                    let new_events = std::mem::take(&mut *buf);
-                    *buf = drained;
-                    buf.extend(new_events);
-                }
-            }
-        });
-        *handle = Some(new_handle);
     }
 }
 
@@ -916,6 +923,11 @@ mod tests {
         e
     }
 
+    /// Test shim mirroring the queue consumer's `consume` call.
+    async fn consume(output: &OtlpGrpcOutput, ev: &Event) -> Result<()> {
+        output.consume(ev).await
+    }
+
     async fn wait_for<T>(mut probe: impl FnMut() -> Option<T>) -> T {
         for _ in 0..50 {
             if let Some(v) = probe() {
@@ -967,11 +979,9 @@ mod tests {
         let mut props = one_peer_props(&endpoint);
         props.push(prop_int("batch_size", 1));
         let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
-        output
-            .write_owned(&event_with_egress(singleton_bytes(
+        consume(&output, &event_with_egress(singleton_bytes(
                 1_700_000_000_000_000_000,
-            )))
-            .await
+            ))).await
             .unwrap();
 
         let probe = || {
@@ -1043,19 +1053,9 @@ mod tests {
         props.push(prop_int("batch_size", 3));
         let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
 
-        let mut payloads: Vec<RenderedPayload> = Vec::new();
         for i in 0..3 {
             let ev = event_with_egress(singleton_bytes(1_000_000_000 + i));
-            let payload = {
-                let bump = bumpalo::Bump::new();
-                let arena = EventArena::new(&bump);
-                let bev = ev.view_in(&arena);
-                output.render(&bev, &arena).unwrap()
-            };
-            payloads.push(payload);
-        }
-        for p in payloads {
-            output.write(p).await.unwrap();
+            consume(&output, &ev).await.unwrap();
         }
         // Give the inline flush a moment.
         for _ in 0..50 {
@@ -1084,24 +1084,18 @@ mod tests {
 
     #[tokio::test]
     async fn drop_aborts_pending_flush_timer() {
-        // The flush timer is only armed by the Rendered (memory hot
-        // path) buffer write — Owned events bypass the batch entirely
-        // (see `write_owned`) so they never arm the timer. Drive the
-        // timer via the Rendered path here.
+        // The flush timer is armed by `consume_event` while the buffer
+        // is below `batch_size`. Drop must abort it so the spawned
+        // task doesn't leak past process exit.
         let mut props = one_peer_props("http://127.0.0.1:1");
         props.push(prop_int("batch_size", 1024));
         props.push(prop_str("batch_timeout", "30s"));
         let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
-        let ev = event_with_egress(singleton_bytes(1));
-        let payload = {
-            let bump = bumpalo::Bump::new();
-            let arena = EventArena::new(&bump);
-            let bev = ev.view_in(&arena);
-            output.render(&bev, &arena).unwrap()
-        };
-        output.write(payload).await.unwrap();
+        consume(&output, &event_with_egress(singleton_bytes(1)))
+            .await
+            .unwrap();
         let handle_before = output.flush_handle.lock().await.is_some();
-        assert!(handle_before, "Rendered write must arm the flush timer");
+        assert!(handle_before, "consume_event must arm the flush timer");
         drop(output);
     }
 
@@ -1149,9 +1143,7 @@ mod tests {
         });
         let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
         let send = tokio::spawn(async move {
-            output
-                .write_owned(&event_with_egress(singleton_bytes(1)))
-                .await
+            consume(&output, &event_with_egress(singleton_bytes(1))).await
         });
 
         // Let the spawned future reach the timeout-wrapped await,
@@ -1175,39 +1167,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_owned_bypasses_batch_buffer() {
-        // Owned events ship inline rather than landing in the batch
-        // buffer, so the queue consumer's per-event Ok/Err contract is
-        // honored (Err → disk-replay / retry). Use an
-        // unreachable endpoint and large batch_size so the only way
-        // the assertion can fail is if write_owned routed through the
-        // batch instead of bypassing it.
+    async fn consume_event_buffers_below_batch_size() {
+        // `consume` always buffers under `batch_size > 1`, arming the
+        // deferred-flush timer. (Before this change the Owned-event
+        // path bypassed the buffer; now there is no separate path —
+        // every event lands in the buffer for batching.)
         let mut props = one_peer_props("http://127.0.0.1:1");
         props.push(prop_int("batch_size", 1024));
         props.push(prop_str("batch_timeout", "30s"));
-        // Single attempt with no backoff so the test finishes fast.
-        props.push(Property::Block {
-            key: "retry".into(),
-            key_span: None,
-            properties: vec![
-                prop_int("max_attempts", 1),
-                prop_str("initial_wait", "1ms"),
-                prop_str("max_wait", "1ms"),
-            ],
-        });
         let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
-        let err = output
-            .write_owned(&event_with_egress(singleton_bytes(1)))
+        consume(&output, &event_with_egress(singleton_bytes(1)))
             .await
-            .expect_err("send must fail against unreachable peer");
-        assert!(
-            err.to_string().contains("otlp_grpc"),
-            "expected ship error, got: {err}"
-        );
+            .expect("buffering a single event must succeed");
         let batch_len = output.inner.batch.lock().await.len();
-        assert_eq!(batch_len, 0, "Owned event must not land in the batch");
+        assert_eq!(batch_len, 1, "event must sit in the buffer");
         let timer_armed = output.flush_handle.lock().await.is_some();
-        assert!(!timer_armed, "Owned event must not arm the flush timer");
+        assert!(timer_armed, "consume_event must arm the flush timer");
     }
 
     #[tokio::test]
@@ -1242,12 +1217,10 @@ mod tests {
         props.push(prop_str("batch_timeout", "30s"));
         let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
 
-        let arena_bump = bumpalo::Bump::new();
-        let arena = EventArena::new(&arena_bump);
         for ts in [1u64, 2u64] {
-            let ev = event_with_egress(singleton_bytes(ts));
-            let payload = output.render(&ev.view_in(&arena), &arena).unwrap();
-            output.write(payload).await.unwrap();
+            consume(&output, &event_with_egress(singleton_bytes(ts)))
+                .await
+                .unwrap();
         }
         assert_eq!(
             output.inner.batch.lock().await.len(),
@@ -1306,17 +1279,12 @@ mod tests {
         });
         let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
 
-        let arena_bump = bumpalo::Bump::new();
-        let arena = EventArena::new(&arena_bump);
-        let e1 = event_with_egress(singleton_bytes(1));
-        let p1 = output.render(&e1.view_in(&arena), &arena).unwrap();
-        output.write(p1).await.unwrap();
+        consume(&output, &event_with_egress(singleton_bytes(1)))
+            .await
+            .unwrap();
         assert_eq!(output.inner.batch.lock().await.len(), 1);
 
-        let e2 = event_with_egress(singleton_bytes(2));
-        let p2 = output.render(&e2.view_in(&arena), &arena).unwrap();
-        let err = output
-            .write(p2)
+        let err = consume(&output, &event_with_egress(singleton_bytes(2)))
             .await
             .expect_err("flush against unreachable peer must fail");
         assert!(
@@ -1337,7 +1305,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // BC-4 / PR-P: shutdown-time buffer-loss recovery via `error_log`.
+    // Shutdown-flush recovery: shutdown-time buffer-loss recovery via `error_log`.
     // -----------------------------------------------------------------------
 
     fn shutdown_recovery_props(endpoint: &str) -> Vec<Property> {
@@ -1359,20 +1327,19 @@ mod tests {
     }
 
     async fn buffer_two(output: &OtlpGrpcOutput) {
-        let arena_bump = bumpalo::Bump::new();
-        let arena = EventArena::new(&arena_bump);
         for ts in [1u64, 2u64] {
-            let ev = event_with_egress(singleton_bytes(ts));
-            let p = output.render(&ev.view_in(&arena), &arena).unwrap();
-            output.write(p).await.unwrap();
+            consume(output, &event_with_egress(singleton_bytes(ts)))
+                .await
+                .unwrap();
         }
         assert_eq!(output.inner.batch.lock().await.len(), 2);
     }
 
     #[tokio::test]
     async fn shutdown_failure_with_error_log_persists_buffer() {
-        // Unreachable peer → flush() fails inside shutdown and PR-F
-        // restores the batch into the buffer. The new recovery path
+        // Unreachable peer → flush() fails inside shutdown and the
+        // retain-on-failure path restores the batch into the buffer.
+        // The new recovery path
         // drains it into the operator-configured `error_log` and the
         // override returns Ok so the consumer treats the daemon as
         // cleanly stopped.
@@ -1460,5 +1427,28 @@ mod tests {
         ));
         output.shutdown(Some(&writer)).await.unwrap();
         assert_eq!(output.inner.batch.lock().await.len(), 0);
+    }
+
+    /// Constructor-time error_log injection — see the matching test
+    /// in `output::http` for the rationale.
+    #[tokio::test]
+    async fn constructor_injects_error_log_into_inner() {
+        use crate::modules::OutputBuilderWithErrorLog;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("errored.jsonl");
+        let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path));
+
+        let output = OtlpGrpcOutput::from_properties_with_error_log(
+            "test",
+            &mp(&one_peer_props("http://127.0.0.1:1")),
+            Some(Arc::clone(&writer)),
+        )
+        .unwrap();
+        let stored = output.inner.error_log.as_ref().expect("error_log must be set");
+        assert!(
+            Arc::ptr_eq(stored, &writer),
+            "constructor must store the exact Arc passed in"
+        );
     }
 }

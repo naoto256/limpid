@@ -30,10 +30,10 @@ use crate::dsl::ast::{Expr, ExprKind, TemplateFragment};
 use crate::dsl::eval::{eval_expr, value_to_string};
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
-use crate::event::BorrowedEvent;
+use crate::event::{BorrowedEvent, Event};
 use crate::functions::FunctionRegistry;
 use crate::metrics::OutputMetrics;
-use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
+use crate::modules::{HasMetrics, Module, Output, RenderError};
 
 const FILE_OUTPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
@@ -155,17 +155,37 @@ impl Output for FileOutput {
         self.funcs = Some(funcs);
     }
 
-    fn render(&self, event: &BorrowedEvent<'_>, arena: &EventArena<'_>) -> Result<RenderedPayload> {
-        let (resolved, is_dynamic) = self.render_path_in(event, arena)?;
-        Ok(RenderedPayload::new(FilePayload {
-            egress: event.egress.clone(),
-            path: resolved,
-            is_dynamic,
-        }))
+    async fn consume(&self, event: &Event) -> Result<()> {
+        // Render the path template against a transient per-event
+        // arena, then hand the resolved payload to the async write
+        // helper. The arena scope closes before the `await` so the
+        // resulting future stays `Send` (bumpalo's `Bump` is !Sync).
+        //
+        // Path-render errors are wrapped in `RenderError` so the queue
+        // consumer (`write_with_retry`) downcasts and routes them
+        // straight to DLQ without burning the retry budget — a broken
+        // template is deterministic on the event.
+        let payload = {
+            let bump = bumpalo::Bump::new();
+            let arena = EventArena::new(&bump);
+            let bevent = event.view_in(&arena);
+            match self.render_path_in(&bevent, &arena) {
+                Ok((resolved, is_dynamic)) => FilePayload {
+                    egress: event.egress.clone(),
+                    path: resolved,
+                    is_dynamic,
+                },
+                Err(e) => return Err(RenderError::new(e).into()),
+            }
+        };
+        self.write_payload(payload).await
     }
+}
 
-    async fn write(&self, payload: RenderedPayload) -> Result<()> {
-        let payload: FilePayload = payload.downcast()?;
+impl FileOutput {
+    /// Append the rendered payload to its resolved path. Private —
+    /// reached only from [`Output::consume`].
+    async fn write_payload(&self, payload: FilePayload) -> Result<()> {
         let resolved = payload.path;
         let is_dynamic = payload.is_dynamic;
         let path = PathBuf::from(&resolved);

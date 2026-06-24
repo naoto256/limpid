@@ -30,15 +30,6 @@ pub enum QueueSendError {
     #[error("queue receiver dropped (channel closed)")]
     ChannelClosed,
 
-    /// The pipeline routed a `SinkInput::Rendered` payload onto a
-    /// disk-persist queue. Disk queues only carry serialisable
-    /// `Owned` events; `Rendered` carries a non-serialisable
-    /// `Box<dyn Any>`. Pipeline dispatch already gates this — hitting
-    /// this variant means a programmer mistake elsewhere routed a
-    /// rendered payload to a disk sink.
-    #[error("rendered payload routed to a disk-persist queue (programmer bug)")]
-    RenderedOnDisk,
-
     /// Disk queue failed to serialise the event to JSON before
     /// writing. The underlying error is preserved for logging.
     #[error("disk queue: failed to serialize event: {0}")]
@@ -74,7 +65,7 @@ impl QueueSendError {
 ///
 /// `#[must_use]` so a caller can't silently throw the disposition
 /// away — that's exactly the bug shape this refactor is meant to
-/// prevent. PR-O added [`DroppedToRecovery`] to distinguish payloads
+/// prevent. [`DroppedToRecovery`] distinguishes payloads
 /// persisted to `error_log` for replay from unrecoverable drops;
 /// `#[non_exhaustive]` remains so future routing work can extend
 /// without churning match sites.
@@ -96,8 +87,8 @@ pub enum WriteDisposition {
     /// `consume` ultimately failed and the payload was persisted to
     /// the configured `error_log` JSONL file for manual recovery.
     /// Distinguishes the "payload survives on disk" outcome from the
-    /// unrecoverable [`Dropped`] case so PR-Q metrics can count
-    /// recoverable losses separately.
+    /// unrecoverable [`Dropped`] case so recovery-routing metrics can
+    /// count recoverable losses separately.
     ///
     /// [`Dropped`]: WriteDisposition::Dropped
     DroppedToRecovery,

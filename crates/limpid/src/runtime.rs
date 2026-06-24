@@ -18,7 +18,7 @@ use crate::dsl::props;
 use crate::event::Event;
 use crate::functions::FunctionRegistry;
 use crate::metrics::{MetricsRegistry, PipelineMetrics};
-use crate::modules::{self, HasMetrics, ModuleRegistry, Output};
+use crate::modules::{self, HasMetrics, ModuleRegistry};
 use crate::pipeline::CompiledConfig;
 use crate::queue::{self, QueueConfig, QueueSender, RetryConfig};
 use crate::tap::TapRegistry;
@@ -53,9 +53,36 @@ impl Runtime {
         let mut metrics_registry = MetricsRegistry::new();
         let tap = TapRegistry::new();
 
+        // Optional dead-letter queue for events that fail in `process`
+        // or that an output drops after exhausting retries
+        // (retry-exhausted recovery). `control { error_log "..." }` opts in to
+        // file-based recovery; when unset, the runtime falls back to a
+        // structured tracing line for the pipeline path and a plain
+        // `Dropped` disposition for the output path. The path is
+        // validated at startup (parent dir reachable) so operator typos
+        // surface before the first failure event.
+        //
+        // Built *before* outputs are constructed so each batched output
+        // (`http`, `otlp_http`, `otlp_grpc`) receives the handle via its
+        // constructor — no post-construction setter, no interior
+        // mutability. Non-batched outputs ignore the parameter; the
+        // queue consumer threads `error_log` in via `write_with_retry`
+        // for retry-exhausted recovery.
+        let error_log_path = config
+            .global_blocks
+            .get("control")
+            .and_then(|p| props::get_string(p, "error_log"));
+        let error_log = match error_log_path {
+            Some(p) => {
+                let writer = crate::error_log::ErrorLogWriter::new(PathBuf::from(p));
+                writer.validate_at_startup().await?;
+                Some(Arc::new(writer))
+            }
+            None => None,
+        };
+
         // --- 1. Create outputs (each output owns its own OutputMetrics) ---
         let mut output_senders: HashMap<String, QueueSender> = HashMap::new();
-        let mut output_sinks: HashMap<String, Arc<dyn Output>> = HashMap::new();
         let mut output_receivers = Vec::new();
 
         for (name, output_def) in &config.outputs {
@@ -68,11 +95,13 @@ impl Runtime {
             // `output_def.properties` is a `ModuleProperties`: it carries the
             // resolved `type` already, so `create_output` doesn't take a
             // separate type_name argument (and can't be passed one — the
-            // strip is the whole point).
+            // strip is the whole point). `error_log` is threaded in so
+            // batched outputs can stash it at construction time.
             let created = match registry.create_output(
                 name,
                 &output_def.properties,
                 Arc::clone(&func_registry),
+                error_log.as_ref().map(Arc::clone),
             ) {
                 Ok(c) => c,
                 Err(e) => {
@@ -93,7 +122,6 @@ impl Runtime {
             // Attach metrics so QueueSender::send counts events_received.
             sender.attach_metrics(Arc::clone(&created.metrics));
             output_senders.insert(name.clone(), sender);
-            output_sinks.insert(name.clone(), Arc::clone(&created.output));
 
             // Collect metrics handle (output owns the data, we just hold a reference)
             let output_metrics = Arc::clone(&created.metrics);
@@ -103,37 +131,11 @@ impl Runtime {
             output_receivers.push((
                 name.clone(),
                 receiver,
-                created.writer,
+                created.output,
                 retry_config,
                 output_metrics,
             ));
         }
-
-        // Optional dead-letter queue for events that fail in `process`
-        // or that an output drops after exhausting retries (BC-3
-        // recovery, PR-O). `control { error_log "..." }` opts in to
-        // file-based recovery; when unset, the runtime falls back to a
-        // structured tracing line for the pipeline path and a plain
-        // `Dropped` disposition for the output path. The path is
-        // validated at startup (parent dir reachable) so operator typos
-        // surface before the first failure event.
-        //
-        // Built *before* output consumers spawn so each consumer can
-        // hold an `Arc` reference for retry-exhausted recovery; the
-        // same handle is later passed into the pipeline context for
-        // process-error DLQ writes.
-        let error_log_path = config
-            .global_blocks
-            .get("control")
-            .and_then(|p| props::get_string(p, "error_log"));
-        let error_log = match error_log_path {
-            Some(p) => {
-                let writer = crate::error_log::ErrorLogWriter::new(PathBuf::from(p));
-                writer.validate_at_startup().await?;
-                Some(Arc::new(writer))
-            }
-            None => None,
-        };
 
         // Start queue consumers (no metrics counting here — output does it)
         for (_name, receiver, writer, retry_config, output_metrics) in output_receivers {
@@ -155,7 +157,6 @@ impl Runtime {
         }
 
         let output_senders = Arc::new(output_senders);
-        let output_sinks = Arc::new(output_sinks);
 
         // --- 2. Group pipelines by input ---
         //
@@ -214,7 +215,6 @@ impl Runtime {
             let workers: Arc<Vec<Arc<PipelineWorker>>> = Arc::new(pipelines);
             let ctx = PipelineContext {
                 output_senders: Arc::clone(&output_senders),
-                output_sinks: Arc::clone(&output_sinks),
                 config: Arc::clone(&config),
                 funcs: Arc::clone(&func_registry),
                 tap: tap.clone(),
@@ -390,15 +390,12 @@ pub(crate) fn init_tables(config: &CompiledConfig) -> Result<crate::functions::t
 
 struct PipelineContext {
     output_senders: Arc<HashMap<String, QueueSender>>,
-    /// Output sinks, looked up by `run_pipeline` to render a payload
-    /// against the per-event arena (memory-queue hot path).
-    output_sinks: Arc<HashMap<String, Arc<dyn Output>>>,
     config: Arc<CompiledConfig>,
     funcs: Arc<FunctionRegistry>,
     tap: TapRegistry,
     /// Dead-letter queue writer used for: (1) `process` runtime
-    /// errors, (2) output retry-exhausted payloads (PR-O), (3)
-    /// batched-output shutdown-flush leftovers (PR-P). `None` when
+    /// errors, (2) output retry-exhausted payloads, (3)
+    /// batched-output shutdown-flush leftovers. `None` when
     /// `control { error_log }` is unset — falls back to a structured
     /// `tracing::error!` line for each case.
     error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
@@ -497,14 +494,13 @@ async fn run_pipeline_with_outputs(
         &ctx.config,
         &ctx.funcs,
         Some(&ctx.tap),
-        &ctx.output_sinks,
         bump,
     )?;
 
-    // Drain the per-event outputs vec into the queues. Each output is
-    // pre-routed to either `SinkInput::Rendered` (memory queue hot
-    // path) or `SinkInput::Owned` (disk persist path) by the pipeline
-    // executor at the `output` statement.
+    // Drain the per-event outputs vec into the queues. After this
+    // change every output statement enqueues a plain `OwnedEvent`
+    // regardless of the queue kind; render happens consumer-side
+    // inside each sink's `Output::consume`.
     //
     // `result.had_outputs` was set inside `run_pipeline` *before* the
     // vec was moved out here, so the downstream
@@ -512,9 +508,9 @@ async fn run_pipeline_with_outputs(
     // the original semantics (Finished AND emitted ≥1 output → finished).
     let outputs = std::mem::take(&mut result.outputs);
     let mut failed_outputs: Vec<String> = Vec::new();
-    for (output_name, sink_input) in outputs {
+    for (output_name, event) in outputs {
         if let Some(sender) = ctx.output_senders.get(&output_name) {
-            if let Err(e) = sender.send(sink_input).await {
+            if let Err(e) = sender.send(event).await {
                 // QueueSender::send already bumped per-output
                 // `events_failed` on the Err branch — that gives the
                 // operator per-output visibility. Collect the names
@@ -795,7 +791,6 @@ mod tests {
         let cfg = CompiledConfig::from_config(parse_config("").unwrap()).unwrap();
         let ctx_a = PipelineContext {
             output_senders: Arc::new(HashMap::new()),
-            output_sinks: Arc::new(HashMap::new()),
             config: Arc::new(cfg.clone()),
             funcs: Arc::new(FunctionRegistry::new()),
             tap: tap.clone(),
@@ -803,7 +798,6 @@ mod tests {
         };
         let ctx_b = PipelineContext {
             output_senders: Arc::clone(&ctx_a.output_senders),
-            output_sinks: Arc::clone(&ctx_a.output_sinks),
             config: Arc::clone(&ctx_a.config),
             funcs: Arc::clone(&ctx_a.funcs),
             tap: tap.clone(),

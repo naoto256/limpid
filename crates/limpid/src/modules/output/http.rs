@@ -58,15 +58,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tokio::sync::Mutex;
 
-use crate::dsl::arena::EventArena;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
-use crate::event::{BorrowedEvent, Event};
+use crate::event::Event;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::http_util::{ERROR_BODY_BYTE_CAP, error_snippet};
 use crate::modules::output::syslog_peers::{PEER_COOLDOWN, iter_peers_block};
-use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
+use crate::modules::{HasMetrics, Module, Output};
 use crate::tls::ClientTlsConfig;
 
 const HTTP_PEER_SCHEMA: &[PropertySpec] = &[
@@ -168,10 +167,6 @@ const HTTP_OUTPUT_SCHEMA: &[PropertySpec] = &[
     crate::queue::QUEUE_PROPERTY_SPEC,
 ];
 
-struct HttpPayload {
-    msg: String,
-}
-
 struct HttpPeer {
     url: String,
     client: reqwest::Client,
@@ -199,15 +194,25 @@ struct Inner {
     headers: Vec<(String, String)>,
     batch_timeout: Duration,
     compress: bool,
-    batch: Mutex<Vec<String>>,
+    /// Buffered events awaiting flush. Render happens at flush time
+    /// (batch buffers retain Event until flush) so a per-event render
+    /// failure can be routed to DLQ on its own without dropping the
+    /// rest of the batch.
+    batch: Mutex<Vec<Event>>,
+    /// Operator-facing instance name; surfaced on shutdown-flush
+    /// recovery and render-failure records.
+    name: String,
+    /// `error_log` writer injected at construction time by the
+    /// runtime via `OutputBuilderWithErrorLog::from_properties_with_error_log`.
+    /// Used by the flush path to route per-event render failures and
+    /// shutdown-flush leftovers into the DLQ. `None` when the
+    /// operator did not configure `control { error_log "..." }` —
+    /// the flush path then falls back to a `tracing::error!` line.
+    error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+    metrics: Arc<OutputMetrics>,
 }
 
 pub struct HttpOutput {
-    /// Operator-facing instance name (the `def output <name>` ident).
-    /// Used in the BC-4 / PR-P shutdown-recovery `process` field so
-    /// `error_log` records can be grouped by output instance, mirroring
-    /// PR-O's `(output <name>)` retry-exhausted records.
-    name: String,
     inner: Arc<Inner>,
     batch_size: usize,
     flush_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -336,6 +341,23 @@ impl Module for HttpOutput {
     }
 
     fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
+        // Delegates to the error_log-aware ctor with `None` so the
+        // bare `Module::from_properties` path (used by unit tests and
+        // direct callers) still works; the runtime always goes
+        // through `OutputBuilderWithErrorLog::from_properties_with_error_log`
+        // to inject the operator-configured writer.
+        <Self as crate::modules::OutputBuilderWithErrorLog>::from_properties_with_error_log(
+            name, properties, None,
+        )
+    }
+}
+
+impl crate::modules::OutputBuilderWithErrorLog for HttpOutput {
+    fn from_properties_with_error_log(
+        name: &str,
+        properties: &crate::modules::ModuleProperties,
+        error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+    ) -> Result<Self> {
         let properties = properties.user_properties();
 
         // Parse the configured method into a typed `reqwest::Method`
@@ -390,8 +412,8 @@ impl Module for HttpOutput {
 
         let peer_state = peers.iter().map(|_| PeerState::default()).collect();
 
+        let metrics = Arc::new(OutputMetrics::default());
         Ok(Self {
-            name: name.to_string(),
             inner: Arc::new(Inner {
                 peers,
                 peer_state,
@@ -402,10 +424,13 @@ impl Module for HttpOutput {
                 batch_timeout,
                 compress,
                 batch: Mutex::new(Vec::with_capacity(batch_size.max(1))),
+                name: name.to_string(),
+                error_log,
+                metrics: Arc::clone(&metrics),
             }),
             batch_size,
             flush_handle: Mutex::new(None),
-            metrics: Arc::new(OutputMetrics::default()),
+            metrics,
         })
     }
 }
@@ -419,33 +444,23 @@ impl HasMetrics for HttpOutput {
 
 #[async_trait::async_trait]
 impl Output for HttpOutput {
-    fn render(
-        &self,
-        event: &BorrowedEvent<'_>,
-        _arena: &EventArena<'_>,
-    ) -> Result<RenderedPayload> {
-        // The HTTP body is text — building the `String` here (a small,
-        // unavoidable allocation for the request body) keeps the
-        // serialisation cost on the pipeline thread instead of the
-        // sink consumer thread, but does not duplicate any work.
-        let msg = String::from_utf8_lossy(&event.egress).into_owned();
-        Ok(RenderedPayload::new(HttpPayload { msg }))
-    }
-
-    async fn write(&self, payload: RenderedPayload) -> Result<()> {
-        let payload: HttpPayload = payload.downcast()?;
-        let msg = payload.msg;
-
+    /// Batched-buffer rendering: buffer the `Event` (no render yet), decide
+    /// flush-or-arm-timer. Render happens later in `flush()` so a
+    /// per-event render failure is routed to DLQ on its own without
+    /// dropping the rest of the batch. Returns `Ok(())` as soon as the
+    /// event is durably enqueued into the in-memory batch buffer;
+    /// the actual HTTP transport may run later inside `flush()` and
+    /// surface its error to the next `consume` call.
+    async fn consume(&self, event: &Event) -> Result<()> {
         if self.batch_size <= 1 {
-            self.inner.send_batch(&[msg]).await?;
-            self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
+            // Short-circuit: render + ship a single event inline.
+            // Mirrors the prior `batch_size <= 1` fast path.
+            return self.consume_singleton(event).await;
         }
 
-        // Batching mode
         let should_flush = {
             let mut buf = self.inner.batch.lock().await;
-            buf.push(msg);
+            buf.push(event.clone());
             buf.len() >= self.batch_size
         };
 
@@ -454,40 +469,16 @@ impl Output for HttpOutput {
             let res = self.flush().await;
             if res.is_err() {
                 // flush() put the batch back into the buffer on
-                // failure. Without re-arming the timer the batch
-                // would sit there until the next write() arrives —
-                // which may never come, since the queue layer
-                // counted this event as failed (Rendered payloads
-                // don't retry; see queue/mod.rs). The operator then
-                // sees events_failed += 1 but the batch is still
-                // pending in our buffer with no timer to drain it.
-                // Re-arm so the stuck batch retries after
-                // batch_timeout, restoring "no event silently lost
-                // in the HTTP buffer".
+                // failure. Re-arm so batch_timeout drives a retry
+                // — without it the stuck batch would sit there
+                // until the next consume arrives.
                 self.reset_timer().await;
             }
-            res?;
+            res
         } else {
             self.reset_timer().await;
+            Ok(())
         }
-
-        Ok(())
-    }
-
-    /// Owned-event path (disk-queue replay, control-socket inject). The
-    /// queue consumer needs a per-event ship verdict; routing Owned
-    /// events through the batched buffer would silently merge them into
-    /// a later flush and the caller would lose the verdict. Ship inline
-    /// here, bypassing the batch (same disposition as the
-    /// `batch_size <= 1` short-circuit in `write`).
-    async fn write_owned(&self, event: &Event) -> Result<()> {
-        crate::modules::ship_owned_inline(self, event, &self.metrics, |payload| async move {
-            let payload: HttpPayload = payload.downcast()?;
-            // Plain HTTP has no partial-success concept; either the
-            // POST succeeds end-to-end or it errors. Always Ok(0).
-            self.inner.send_batch(&[payload.msg]).await.map(|()| 0)
-        })
-        .await
     }
 
     async fn shutdown(
@@ -501,24 +492,21 @@ impl Output for HttpOutput {
         match self.flush().await {
             Ok(()) => Ok(()),
             Err(e) => {
-                // BC-4 / PR-P: PR-F's `flush()` restored the drained
-                // batch into `self.inner.batch` on Err. Without
-                // recovery the buffer would be dropped together with
-                // the output instance as the daemon exits. When the
-                // operator opted in to `control { error_log "..." }`
-                // we persist each rendered body as a synthetic DLQ
-                // record so a `jq | inject` recipe can replay them
-                // later. `error_log` unset preserves 0.7.7 behaviour
-                // (the queue consumer logs a warn and the bytes are
-                // lost).
+                // Shutdown-flush recovery (batch buffers retain Event
+                // until flush): `flush()` restored the
+                // drained batch into `self.inner.batch` on Err. When
+                // the operator opted in to `control { error_log "..." }`
+                // we persist each buffered `Event` as a DLQ record
+                // carrying real source/ingress/received_at (no
+                // synthetic Event construction).
                 if let Some(writer) = error_log {
-                    let payloads: Vec<bytes::Bytes> =
-                        std::mem::take(&mut *self.inner.batch.lock().await)
-                            .into_iter()
-                            .map(|s| bytes::Bytes::from(s.into_bytes()))
-                            .collect();
-                    crate::modules::write_shutdown_buffer_to_error_log(
-                        writer, &self.name, payloads, &e,
+                    let events: Vec<Event> =
+                        std::mem::take(&mut *self.inner.batch.lock().await);
+                    crate::modules::write_shutdown_events_to_error_log(
+                        writer,
+                        &self.inner.name,
+                        events,
+                        &e,
                     )
                     .await;
                     Ok(())
@@ -531,6 +519,21 @@ impl Output for HttpOutput {
 }
 
 impl HttpOutput {
+    /// Render+ship one event inline (used by both the `batch_size <= 1`
+    /// short-circuit and shared with the singleton path). Render errors
+    /// are wrapped in `RenderError` so the queue consumer routes them
+    /// straight to DLQ; transport errors propagate normally for the
+    /// retry budget.
+    async fn consume_singleton(&self, event: &Event) -> Result<()> {
+        let msg = match render_event(event) {
+            Ok(m) => m,
+            Err(e) => return Err(crate::modules::RenderError::new(e).into()),
+        };
+        self.inner.send_batch(&[msg]).await?;
+        self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     async fn flush(&self) -> Result<()> {
         let batch = {
             let mut buf = self.inner.batch.lock().await;
@@ -539,24 +542,7 @@ impl HttpOutput {
             }
             std::mem::take(&mut *buf)
         };
-
-        let count = batch.len();
-        match self.inner.send_batch(&batch).await {
-            Ok(()) => {
-                self.metrics
-                    .events_written
-                    .fetch_add(count as u64, Ordering::Relaxed);
-                Ok(())
-            }
-            Err(e) => {
-                // Put events back for retry
-                let mut buf = self.inner.batch.lock().await;
-                let new_events = std::mem::take(&mut *buf);
-                *buf = batch;
-                buf.extend(new_events);
-                Err(e)
-            }
-        }
+        self.inner.flush_events(batch).await
     }
 
     async fn cancel_timer(&self) {
@@ -572,11 +558,9 @@ impl HttpOutput {
             h.abort();
         }
         let inner = Arc::clone(&self.inner);
-        let metrics = Arc::clone(&self.metrics);
         let timeout = self.inner.batch_timeout;
         *handle = Some(tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
-
             let batch = {
                 let mut buf = inner.batch.lock().await;
                 if buf.is_empty() {
@@ -584,28 +568,101 @@ impl HttpOutput {
                 }
                 std::mem::take(&mut *buf)
             };
-
-            let count = batch.len();
-            if let Err(e) = inner.send_batch(&batch).await {
-                tracing::warn!(
-                    "http output: timer flush failed: {} — {} events returned to buffer",
-                    e,
-                    count
-                );
-                let mut buf = inner.batch.lock().await;
-                let new_events = std::mem::take(&mut *buf);
-                *buf = batch;
-                buf.extend(new_events);
-            } else {
-                metrics
-                    .events_written
-                    .fetch_add(count as u64, Ordering::Relaxed);
+            if let Err(e) = inner.flush_events(batch).await {
+                tracing::warn!("http output: timer flush failed: {}", e);
             }
         }));
     }
 }
 
+/// Render a single event into its HTTP body string. Mirrors the body
+/// of `HttpOutput::render` but operates on an owned `Event` so it can
+/// be called from the consumer-side flush path without setting up the
+/// borrowed-view arena.
+fn render_event(event: &Event) -> Result<String> {
+    Ok(String::from_utf8_lossy(&event.egress).into_owned())
+}
+
 impl Inner {
+    /// Render each buffered event, route per-event render failures to
+    /// DLQ (skipping them in the batch), then ship the remaining
+    /// rendered bodies. On transport failure the un-rendered events
+    /// are restored to the buffer (rendering re-runs on retry; render
+    /// is cheap text-extraction here).
+    async fn flush_events(&self, batch: Vec<Event>) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        // Partition: render-success → messages, render-failure → DLQ.
+        let mut messages: Vec<String> = Vec::with_capacity(batch.len());
+        let mut shippable: Vec<Event> = Vec::with_capacity(batch.len());
+        let mut render_failures: Vec<(Event, anyhow::Error)> = Vec::new();
+        for ev in batch {
+            match render_event(&ev) {
+                Ok(m) => {
+                    messages.push(m);
+                    shippable.push(ev);
+                }
+                Err(e) => render_failures.push((ev, e)),
+            }
+        }
+        if !render_failures.is_empty() {
+            // Route each render failure to DLQ on its own. Reuse the
+            // shared shutdown helper's per-event write recipe.
+            let error_log = self.error_log.as_ref();
+            for (ev, err) in render_failures {
+                self.metrics
+                    .events_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Some(writer) = &error_log {
+                    let ctx = crate::pipeline::ErroredEventContext {
+                        timestamp: chrono::Utc::now(),
+                        pipeline: String::new(),
+                        process: format!("(output {})", self.name),
+                        reason: format!("render failed during batch flush: {}", err),
+                        event: ev,
+                    };
+                    if let Err(write_err) = writer.write(&ctx).await {
+                        tracing::warn!(
+                            "output '{}': error_log write failed during batch render: {}",
+                            self.name,
+                            write_err
+                        );
+                    }
+                } else {
+                    tracing::error!(
+                        "output '{}': render failed during batch flush ({}); dropping event (no error_log)",
+                        self.name,
+                        err
+                    );
+                }
+            }
+        }
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let count = messages.len() as u64;
+        match self.send_batch(&messages).await {
+            Ok(()) => {
+                self.metrics
+                    .events_written
+                    .fetch_add(count, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) => {
+                // Transport error: restore the shippable events into
+                // the buffer so the next consume_event / timer firing
+                // can retry. Do NOT bump events_failed — they're
+                // retained, not permanently rejected.
+                let mut buf = self.batch.lock().await;
+                let new_events = std::mem::take(&mut *buf);
+                *buf = shippable;
+                buf.extend(new_events);
+                Err(e)
+            }
+        }
+    }
+
     /// Ship `messages` to one of the configured peers, rotating to the
     /// next peer in round-robin order. A peer that fails the request
     /// is cooled down for `PEER_COOLDOWN` and skipped on subsequent
@@ -711,6 +768,9 @@ impl Drop for HttpOutput {
         if let Some(h) = self.flush_handle.get_mut().take() {
             h.abort();
         }
+        // Best-effort warn on leaked buffered events. Holding an Arc
+        // here would block the warn under contention; try_lock is the
+        // right behaviour for a Drop path.
         if let Ok(buf) = self.inner.batch.try_lock()
             && !buf.is_empty()
         {
@@ -845,6 +905,12 @@ mod tests {
         e
     }
 
+    /// Test shim mirroring the queue consumer's call into
+    /// `Output::consume`.
+    async fn consume(output: &HttpOutput, ev: &Event) -> Result<()> {
+        output.consume(ev).await
+    }
+
     async fn run_echo_collector() -> (
         SocketAddr,
         Arc<Mutex<Vec<String>>>,
@@ -889,9 +955,7 @@ mod tests {
             &mp(&[peer_block(&url), prop_int("batch_size", 1)]),
         )
         .unwrap();
-        output
-            .write_owned(&event_with("hello-single"))
-            .await
+        consume(&output, &event_with("hello-single")).await
             .unwrap();
         for _ in 0..50 {
             if !received.lock().await.is_empty() {
@@ -920,8 +984,7 @@ mod tests {
         ];
         let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
         for i in 0..9 {
-            output
-                .write_owned(&event_with(&format!("rr-{}", i)))
+            consume(&output, &event_with(&format!("rr-{}", i)))
                 .await
                 .unwrap();
         }
@@ -972,10 +1035,10 @@ mod tests {
         // First send goes to A (cursor 0), fails, A cools down.
         // The queue layer would normally re-send; here we just send
         // again and expect B to take it (cursor advances to 1).
-        let first = output.write_owned(&event_with("rr-fail")).await;
+        let first = consume(&output, &event_with("rr-fail")).await;
         assert!(first.is_err(), "first attempt should fail (peer A is 500)");
         // Second event goes to peer B (next in rotation, A cooled).
-        output.write_owned(&event_with("rr-ok")).await.unwrap();
+        consume(&output, &event_with("rr-ok")).await.unwrap();
         s_a.abort();
         s_b.abort();
     }
@@ -1084,7 +1147,7 @@ mod tests {
             ident_prop("method", "PATCH"),
         ];
         let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
-        output.write_owned(&event_with("hello")).await.unwrap();
+        consume(&output, &event_with("hello")).await.unwrap();
         for _ in 0..50 {
             if !received.lock().await.is_empty() {
                 break;
@@ -1122,9 +1185,7 @@ mod tests {
         let url = format!("http://{}/", addr);
         let props = vec![peer_block(&url), prop_int("batch_size", 1)];
         let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
-        let err = output
-            .write_owned(&event_with("hello"))
-            .await
+        let err = consume(&output, &event_with("hello")).await
             .expect_err("500 must surface as Err");
         server.abort();
         let msg = err.to_string();
@@ -1176,9 +1237,7 @@ mod tests {
         let url = format!("http://{}/", addr);
         let props = vec![peer_block(&url), prop_int("batch_size", 1)];
         let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
-        let err = output
-            .write_owned(&event_with("hello"))
-            .await
+        let err = consume(&output, &event_with("hello")).await
             .expect_err("502 must surface as Err");
         server.abort();
         let msg = err.to_string();
@@ -1215,7 +1274,7 @@ mod tests {
         let props = vec![peer_block(&url), prop_int("batch_size", 1)];
         let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
         let pre_call = Instant::now();
-        let _ = output.write_owned(&event_with("hello")).await;
+        let _ = consume(&output, &event_with("hello")).await;
         let cooldown_until = output.inner.peer_state[0]
             .cooldown_until
             .lock()
@@ -1238,24 +1297,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_owned_bypasses_batch_buffer() {
-        // Owned events ship inline rather than landing in the batch
-        // buffer, so the queue consumer's per-event Ok/Err contract is
-        // honored. Verify the buffer stays empty and no flush timer is
-        // armed even with batch_size > 1.
+    async fn singleton_batch_size_ships_inline_without_buffering() {
+        // When `batch_size <= 1`, `consume` short-circuits through the
+        // singleton path that renders + ships in one shot (no buffer,
+        // no timer). Mirrors the prior `write_owned` bypass behaviour
+        // but for the unified queue path.
         let mut props = vec![peer_block("http://127.0.0.1:1/")];
-        props.push(prop_int("batch_size", 1024));
-        props.push(prop_str("batch_timeout", "30s"));
+        props.push(prop_int("batch_size", 1));
         let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
-        let err = output
-            .write_owned(&event_with("bypass"))
+        let err = consume(&output, &event_with("singleton"))
             .await
             .expect_err("send must fail against unreachable peer");
         assert!(err.to_string().contains("http"), "got: {err}");
         let batch_len = output.inner.batch.lock().await.len();
-        assert_eq!(batch_len, 0, "Owned event must not land in the batch");
+        assert_eq!(
+            batch_len, 0,
+            "singleton path must not land the event in the batch"
+        );
         let timer_armed = output.flush_handle.lock().await.is_some();
-        assert!(!timer_armed, "Owned event must not arm the flush timer");
+        assert!(
+            !timer_armed,
+            "singleton path must not arm the flush timer"
+        );
     }
 
     #[tokio::test]
@@ -1312,12 +1375,12 @@ mod tests {
         ];
         let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
 
-        // Two writes → triggers should_flush → first POST is the
-        // failing one → Err propagates and the batch is restored.
-        let p1 = RenderedPayload::new(HttpPayload { msg: "e1".into() });
-        output.write(p1).await.unwrap();
-        let p2 = RenderedPayload::new(HttpPayload { msg: "e2".into() });
-        let err = output.write(p2).await.expect_err("first flush must fail");
+        // Two consume_event calls → triggers should_flush → first POST
+        // is the failing one → Err propagates and the batch is restored.
+        consume(&output, &event_with("e1")).await.unwrap();
+        let err = consume(&output, &event_with("e2"))
+            .await
+            .expect_err("first flush must fail");
         assert!(
             err.to_string().contains("http") || err.to_string().contains("500"),
             "got: {err}"
@@ -1381,10 +1444,8 @@ mod tests {
         )
         .unwrap();
 
-        let p1 = RenderedPayload::new(HttpPayload { msg: "ev1".into() });
-        output.write(p1).await.unwrap();
-        let p2 = RenderedPayload::new(HttpPayload { msg: "ev2".into() });
-        output.write(p2).await.unwrap();
+        consume(&output, &event_with("ev1")).await.unwrap();
+        consume(&output, &event_with("ev2")).await.unwrap();
         assert_eq!(
             output.inner.batch.lock().await.len(),
             2,
@@ -1420,7 +1481,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // BC-4 / PR-P: shutdown-time buffer-loss recovery via `error_log`.
+    // Shutdown-flush recovery: shutdown-time buffer-loss recovery via `error_log`.
     // -----------------------------------------------------------------------
 
     async fn run_failing_collector() -> (SocketAddr, tokio::task::JoinHandle<()>) {
@@ -1455,14 +1516,8 @@ mod tests {
         .unwrap();
 
         // Drop two events into the buffer (no flush triggered).
-        output
-            .write(RenderedPayload::new(HttpPayload { msg: "ev1".into() }))
-            .await
-            .unwrap();
-        output
-            .write(RenderedPayload::new(HttpPayload { msg: "ev2".into() }))
-            .await
-            .unwrap();
+        consume(&output, &event_with("ev1")).await.unwrap();
+        consume(&output, &event_with("ev2")).await.unwrap();
         assert_eq!(output.inner.batch.lock().await.len(), 2);
 
         let dir = tempfile::TempDir::new().unwrap();
@@ -1528,10 +1583,7 @@ mod tests {
             ]),
         )
         .unwrap();
-        output
-            .write(RenderedPayload::new(HttpPayload { msg: "ev1".into() }))
-            .await
-            .unwrap();
+        consume(&output, &event_with("ev1")).await.unwrap();
 
         let err = output.shutdown(None).await.expect_err("flush must Err");
         server.abort();
@@ -1541,12 +1593,13 @@ mod tests {
             err.to_string().contains("http") || err.to_string().contains("500"),
             "got: {err}"
         );
-        // Buffer left intact (= PR-F retain-on-failure contract).
+        // Buffer left intact (= retain-on-failure contract).
         assert_eq!(output.inner.batch.lock().await.len(), 1);
     }
 
     /// shutdown flush succeeds + error_log set → success path is
-    /// completely unchanged from PR-F. The DLQ writer must not be
+    /// completely unchanged from the prior retain-on-failure path.
+    /// The DLQ writer must not be
     /// touched (regression check: a stray write would change the
     /// operator's audit trail).
     #[tokio::test]
@@ -1562,10 +1615,7 @@ mod tests {
             ]),
         )
         .unwrap();
-        output
-            .write(RenderedPayload::new(HttpPayload { msg: "ev1".into() }))
-            .await
-            .unwrap();
+        consume(&output, &event_with("ev1")).await.unwrap();
 
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("errored.jsonl");
@@ -1606,14 +1656,8 @@ mod tests {
             ]),
         )
         .unwrap();
-        output
-            .write(RenderedPayload::new(HttpPayload { msg: "ev1".into() }))
-            .await
-            .unwrap();
-        output
-            .write(RenderedPayload::new(HttpPayload { msg: "ev2".into() }))
-            .await
-            .unwrap();
+        consume(&output, &event_with("ev1")).await.unwrap();
+        consume(&output, &event_with("ev2")).await.unwrap();
 
         // Parent dir does not exist → every `write_shutdown_payload`
         // call returns Err. The helper must warn and continue rather
@@ -1627,5 +1671,35 @@ mod tests {
         // Buffer is drained either way (we took() before attempting
         // the DLQ write); the contract is that we don't crash.
         assert_eq!(output.inner.batch.lock().await.len(), 0);
+    }
+
+    /// Constructor-time error_log injection (replaces the prior
+    /// `attach_error_log(&self, ...)` setter). The runtime always
+    /// goes through `OutputBuilderWithErrorLog::from_properties_with_error_log`;
+    /// this test pins that the writer ends up on the Inner field so
+    /// subsequent flush paths (render-failure routing, shutdown
+    /// recovery) can reach it without any post-construction wiring.
+    #[tokio::test]
+    async fn constructor_injects_error_log_into_inner() {
+        use crate::modules::OutputBuilderWithErrorLog;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("errored.jsonl");
+        let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path));
+
+        let output = HttpOutput::from_properties_with_error_log(
+            "test",
+            &mp(&[peer_block("http://127.0.0.1:1/"), prop_int("batch_size", 8)]),
+            Some(Arc::clone(&writer)),
+        )
+        .unwrap();
+        // The Inner's `error_log` field must point at the same writer
+        // the runtime would have handed to us — no Mutex, no None
+        // window between construction and consumer spawn.
+        let stored = output.inner.error_log.as_ref().expect("error_log must be set");
+        assert!(
+            Arc::ptr_eq(stored, &writer),
+            "constructor must store the exact Arc passed in"
+        );
     }
 }

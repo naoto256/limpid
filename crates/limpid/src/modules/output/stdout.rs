@@ -4,13 +4,11 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use anyhow::Result;
-use bytes::Bytes;
 
-use crate::dsl::arena::EventArena;
 use crate::dsl::schema::PropertySpec;
-use crate::event::BorrowedEvent;
+use crate::event::Event;
 use crate::metrics::OutputMetrics;
-use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
+use crate::modules::{HasMetrics, Module, Output};
 
 /// `output stdout` has no module-specific properties; only the
 /// common `retry { ... } / queue { ... }` sub-blocks apply.
@@ -21,11 +19,6 @@ const STDOUT_OUTPUT_SCHEMA: &[PropertySpec] = &[
 
 pub struct StdoutOutput {
     metrics: Arc<OutputMetrics>,
-}
-
-/// Per-event payload: just the egress bytes (refcounted clone).
-struct StdoutPayload {
-    egress: Bytes,
 }
 
 impl Module for StdoutOutput {
@@ -52,19 +45,12 @@ impl HasMetrics for StdoutOutput {
 
 #[async_trait::async_trait]
 impl Output for StdoutOutput {
-    fn render(
-        &self,
-        event: &BorrowedEvent<'_>,
-        _arena: &EventArena<'_>,
-    ) -> Result<RenderedPayload> {
-        Ok(RenderedPayload::new(StdoutPayload {
-            egress: event.egress.clone(),
-        }))
-    }
-
-    async fn write(&self, payload: RenderedPayload) -> Result<()> {
-        let payload: StdoutPayload = payload.downcast()?;
-        let msg = String::from_utf8_lossy(&payload.egress);
+    async fn consume(&self, event: &Event) -> Result<()> {
+        // Trivial sink: no template rendering, no transport batching —
+        // print the egress bytes directly. `String::from_utf8_lossy`
+        // is the same egress→stdout step the previous `write` path
+        // ran; only the `RenderedPayload` plumbing is gone.
+        let msg = String::from_utf8_lossy(&event.egress);
         println!("{}", msg);
         self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
         Ok(())

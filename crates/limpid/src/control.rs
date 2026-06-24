@@ -546,11 +546,12 @@ async fn handle_inject(
                 sent
             }
             Target::Output(tx) => {
-                // Inject is a cold path that always carries an
-                // `OwnedEvent`; route it as `SinkInput::Owned` so disk
-                // queues persist correctly and memory queues take the
-                // default `write_owned` path (transient render).
-                let sent = tx.send_owned(event).await.is_ok();
+                // Inject is a cold path that hands an OwnedEvent
+                // straight to the output's queue. After this change
+                // every queue carries `Event` end-to-end, so there is no
+                // longer a separate `send_owned` codepath — `send`
+                // is the only entry.
+                let sent = tx.send(event).await.is_ok();
                 if sent && let Some(m) = tx.metrics() {
                     m.events_injected
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
