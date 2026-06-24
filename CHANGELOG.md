@@ -10,6 +10,78 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased] - 0.7.8
 
+### Fixed — `output http`: stuck batch after a failed flush no longer waits for the next `write()`
+
+When `flush()` returned `Err`, the batch was placed back into the in-memory buffer but the flush timer was not re-armed. The stuck batch then sat in the buffer until the next `write()` arrived — which on a quiet pipeline might be never — while the queue layer had already counted the events as failed (Rendered payloads do not retry). The operator saw `events_failed += 1` yet the data still lived in the HTTP buffer with no schedule to drain it. The flush timer is now re-armed on the `Err` branch so `batch_timeout` drives the retry, restoring the "no event silently parked in the HTTP buffer" invariant. Regression test covers the `should_flush` failure path.
+
+
+### Fixed — `limpid-prometheus`: exporter scrape against a wedged daemon is bounded at 5 s
+
+The Prometheus exporter previously used `std::os::unix::net::UnixStream` + blocking `BufRead::lines()` from inside async hyper handlers. A wedged limpid daemon — accepting the control-socket connection but never writing a reply — pinned a tokio worker thread until the daemon answered, with no upper bound; slow / stuck scrapes silently starved the exporter's runtime and Prometheus scrapes piled up on the broken peer. The control-socket query is now `tokio::net::UnixStream` + `AsyncBufReadExt` and the entire connect+write+read sequence is wrapped in `tokio::time::timeout(QUERY_TIMEOUT = 5 s, …)`. A scrape hitting the cap returns an error body and the next scrape gets a fresh attempt instead of waiting behind the old one. 5 s is well above local control-socket latency (typical < 1 ms) and well below Prometheus' usual `scrape_timeout` (10 s).
+
+
+### Fixed — `input tail`: saved offset zero now resumes from 0, and send failure rewinds the cursor
+
+Two silent data-loss bugs on the cursor-persistence side, fixed together. (1) `load_position().unwrap_or(0)` plus a follow-up `if offset == 0` collapsed "no state file" and "saved `Some(0)`" into the same path, sending the cursor to EOF and skipping every line appended between the save and the next start — the typical recovery shape after rotate/truncate. The path now keeps the `Option<u64>`: `Some(n)` resumes from `n` (including 0), `None` falls back to EOF. (2) `read_new_lines` advanced `current_offset` past each line before sending it downstream. If `tx.send()` failed (consumer gone) the loop broke out and `run()` persisted the already-advanced offset, silently dropping the un-sent line. The send-failure path now mirrors the incomplete-line rewind so the line is retried on the next poll.
+
+
+### Fixed — `input journal`: blocking reader exits promptly on shutdown while idle
+
+The journal input runs its libsystemd-backed reader inside `tokio::task::spawn_blocking`, and on shutdown the orchestrator called `journal_handle.abort()`. tokio's abort cannot cancel a `spawn_blocking` task that has already started executing, so the reader's only escape route was the next `tx.blocking_send()` returning `Err` — which requires a fresh journal entry to arrive. On a quiet host that may not happen for a long time, leaving the blocking thread (and its journald file handle) parked indefinitely past daemon shutdown. Shutdown is now signalled explicitly via an `Arc<AtomicBool>` the reader polls between iterations, and the per-poll sleep is replaced with `interruptible_sleep` that naps in 100 ms quanta re-checking the same flag. Shutdown latency is bounded by one quantum regardless of `poll_interval`.
+
+
+### Fixed — `output http` / `otlp_http` / `otlp_grpc`: in-memory batch is flushed on shutdown
+
+The three batched sinks return `Ok` from `write()` once the event lands in their in-memory buffer (so the memory queue counts it as delivered), and the flush either happens when `batch_size` is hit or when the per-output timer fires. On daemon shutdown those sinks' `Drop` impl aborted the timer and the process exited with the buffer contents still resident; the existing log line claiming events "will be re-delivered from queue" is not true for the memory queue. `Drop` cannot fix this because it is synchronous and the sink I/O is async. `Output` gains an async `shutdown()` hook with a default no-op, overridden on the three batched sinks to abort the timer and run one final flush. `run_queue_consumer` calls it once the consume loop exits, so both the shutdown-signal and queue-closed break paths fall through the same shutdown call.
+
+
+### Fixed — `runtime`: queue-enqueue and pipeline eval-error failures now reach the DLQ
+
+Two High pipeline-side error-path gaps closed together. (1) `run_pipeline_with_outputs` discarded the bool returned by `QueueSender::send`. On enqueue failure (memory-queue receiver dropped, disk serialise/write error, Rendered-on-Disk routing bug) the pipeline counted the event as `events_finished` even though it had reached neither the queue nor the secondary nor the error log — the event was effectively deleted in silence. The bool is now captured, failed output names collected, and termination overridden to `Errored` so the existing Errored-arm DLQ machinery catches it. The per-output `events_failed` metric is also bumped so operators see the failure on each output's dashboard regardless of the pipeline-level routing decision. (2) `process_event` matched `Err(e)` returned from `run_pipeline` with a log-only branch — no `events_errored` bump, no DLQ entry — breaking the docs' promise that runtime errors go to `events_errored` and the error log. Both paths now construct an `ErroredEventContext` and route through a shared `write_errored_to_dlq` helper.
+
+
+### Fixed — `queue`: disk cursor commits on consumer ack, not on `recv()`
+
+High-severity audit finding. The disk queue saved its read cursor inside `recv()` immediately after each event was returned, so from the queue's POV the event was consumed before the queue consumer even handed it off downstream. A crash between `recv` and the output write lost the event: on restart the persisted cursor sat past the un-shipped record and it was never replayed — defeating the "retry / restart re-delivers" contract the disk queue exists for. The queue now follows the standard durable-queue contract (Kafka/RabbitMQ shape): `recv()` only advances an in-memory cursor, and a new `ack()` hook persists progress + reclaims consumed segments. The queue consumer calls `ack()` after every event's disposition is decided — delivered, routed to secondary, or retries exhausted — so the on-disk cursor only moves once the event has reached a terminal state. Memory-queue's `ack()` is a no-op. This shifts the disk queue from at-most-once to at-least-once; downstream sinks that can't tolerate duplicates need idempotent ingestion.
+
+
+### Fixed — `queue`: retry-exhausted and unrecoverable payloads now flow to `error_log`
+
+Output retry exhausted with no usable secondary path previously dropped the payload silently — the consumer ack'd, the event left the disk queue's replay window, and only a `tracing::warn!` plus an `events_failed` increment remained. Same shape when a secondary was configured but its enqueue also failed: the original event was already consumed and the failure was log-only. Retry exhaustion (and failed-secondary fall-through) now write the payload as a JSONL record to the configured `control { error_log "..." }` — the same DLQ that pipeline / process eval errors flow into. Output-failed records ride the same writer with `pipeline=""` and `process="(output <name>)"` as the discriminator, so operators reading the DLQ stream see them alongside pipeline failures. When no `error_log` is configured the previous warn-only fallback is preserved (no regression).
+
+
+### Fixed — `output http` / `otlp_http` / `otlp_grpc`: shutdown-flush failures drain to `error_log`
+
+The batched outputs' final `shutdown()` flush retained the in-memory buffer on failure for "retry", but there is no next retry tick at process exit — so the retained buffer was equivalent to dropping the events. The shutdown trait signature now takes an optional `&Arc<ErrorLogWriter>`; when the final flush fails the helper walks the remaining buffer items and persists each as an `ErroredEventContext` with `process="(output <name> shutdown)"` (distinct from the retry-exhausted discriminator so operators can tell mid-stream from at-shutdown failures). When `error_log` is not configured the shutdown error propagates unchanged (0.7.7 parity); when the error_log writer itself fails the helper swallows the secondary error to avoid recursion and the original shutdown error still surfaces.
+
+
+### Behavior changes (non-breaking)
+
+#### Outputs: `retry { ... }` and `secondary <name>` are now accepted on every output type
+
+The runtime has always honoured `retry { ... }` and `secondary <name>` on every output (the queue layer reads them uniformly via `RetryConfig::from_output_properties`), but the property schema only declared them on `output otlp_grpc` and `output otlp_http`. Writing either property on `kafka`, `file`, `http`, `stdout`, `syslog_tcp`, `syslog_udp`, or `unix_socket` failed `--check` with "unknown property", even though the documented `outputs/README.md` examples implied they were universally available. The schema was the gap, not the runtime and not the docs. `RETRY_PROPERTY_SPEC` and `SECONDARY_PROPERTY_SPEC` are now lifted into `queue/mod.rs` and spliced into every output's schema; the prior OTLP-local `RETRY_BLOCK_PROPERTIES` (with `max_attempts` / `initial_wait` / `max_wait` / `backoff`) is preserved unchanged for the existing call sites.
+
+
+### Upgrading — additional configs that now fail-fast (0.7.8 cycle, second batch)
+
+Four further config shapes are rejected at parse / startup time in 0.7.8. Each is individually described in the `Fixed —` entries above; this list is a single place for operators to scan before upgrading.
+
+- **`secondary <name>` referencing an unknown output, or forming a cycle (direct or indirect).** A typo (`secondary foo_typo` with no matching output) used to silently disconnect the safety net; a self-reference (`secondary <own_name>`) or a multi-hop cycle (`A -> B -> A`, `A -> B -> C -> A`, …) used to loop poison events forever on retry exhaustion and, on disk-backed queues, grow the queue file unboundedly. Both shapes are now rejected at runtime startup. Unknown-target errors list the configured output names; cycle errors report the full cycle path so the operator can see which edge to remove.
+- **`switch` arms with `default` not last, or with more than one `default`.** The runtime walks arms in source order and `default` matches everything, so any arm after a `default` is unreachable and multiple defaults are ambiguous (only the first runs). Pre-0.7.8 `--check` was silent on this shape — configs that meant "case 6 → tcp, otherwise null" but accidentally put `default` first sent every event to the default branch with no diagnostic. Both shapes now fail `--check` as `DiagKind::Dataflow` errors. Remediation: move `default` to the last arm and remove duplicates.
+- **Recovery-dependent outputs without a configured `control { error_log "..." }`** now emit a `--check` warning. The retry-exhaustion and shutdown-flush recovery paths added in this cycle only activate when `error_log` is configured; an operator who configures `retry { ... }`, `secondary <name>`, or any batched output (`http` / `otlp_http` / `otlp_grpc`) but forgets `error_log` gets the same 0.7.7 silent-drop behaviour. The new warning fires once per affected configuration. Under plain `--check` the warning is informational; under `--check --strict-warnings` (and `--ultra-strict`) it is promoted to a hard fail per the existing strict-warnings ladder.
+- **`secondary "name"` (quoted string) is rejected.** The newly-broadened `SECONDARY_PROPERTY_SPEC` initially accepted any string-shaped scalar (string literal, template, bare ident), but the runtime reads the secondary via `props::get_ident` — bare-ident only. A quoted `secondary "fallback"` therefore passed `--check` while the runtime silently dropped the secondary on the floor (and the `recovery_readiness` warning stayed silent because it walks the same `get_ident`). A new `PropertyValueKind::Ident` variant gates the spec and only `ExprKind::Ident` with a single segment is accepted; string literals, templates, and dotted paths fail with TypeMismatch ("a bare identifier (output name, not a quoted string)"). Remediation: drop the quotes — `secondary fallback`.
+
+
+### Internal — Unified switch / if-chain dispatch across pipeline and process contexts
+
+The runtime executed switch and if-chain dispatch twice — once for pipeline context (`pipeline.rs` PipelineStatement::Switch / `exec_pipeline_if`) and once for process context (`dsl/exec.rs` ProcessStatement::Switch / `exec_if_chain_process`). Both walked arms / branches in source order with first-match semantics; the divergence was entirely in the surrounding execution context. The dispatch algorithm is now factored into two pure helpers in `dsl/eval.rs` (`select_switch_arm` and `select_if_branch`) that take an `eval_*` closure capturing the caller's context-specific state and return the matched body as a slice for the caller to execute. `exec_pipeline_if` and `exec_if_chain_process` are eliminated outright; the per-context dispatch shrinks to a 4-line match. The free `is_truthy` wrapper in `eval.rs` is also removed; the canonical `Value::is_truthy` impl stands alone. No user-visible behaviour change.
+
+
+### Internal — Queue I/O boundary functions return typed outcomes instead of `bool`
+
+`QueueSender::send`, `DiskQueueSender::send`, and `write_with_retry` previously returned `bool`, where `false` could mean any of several distinct things (queue closed, disk write failed, serialization failed, retry exhausted, secondary handed-off) and callers had no type-level signal that the value mattered. Two new outcome types in `queue/outcome.rs` replace the booleans: `QueueSendError` (an enum of the failure modes) and `WriteDisposition` (`Delivered` / `RoutedToSecondary` / `Dropped`, later extended with `DroppedToRecovery` for the `error_log` routing path). Both are `#[non_exhaustive]` and `WriteDisposition` is `#[must_use]`, so call sites are forced to handle the disposition and future variants will surface as compiler errors. No operator-visible behaviour change at the time of this refactor — it is the type-level foundation the subsequent recovery-routing fixes build on.
+
+
 ### Fixed — `output otlp_grpc` / `output otlp_http`: route `partial_success.rejected_log_records` to `events_failed`
 
 When the OTLP receiver returned 2xx-equivalent with `partial_success.rejected_log_records > 0`, both transports counted the entire batch as `events_written`, hiding server-side data loss from operator dashboards. `otlp_grpc` parsed the response and logged a warning but did not split the metric; `otlp_http` did not parse the response body at all. The OTLP transport-success path now splits the batch's events between `events_written` (accepted) and `events_failed` (rejected) using the receiver's `partial_success.rejected_log_records`. `otlp_http` learned to decode the response body in both protobuf and JSON forms — peers returning empty bodies or undecodable bodies are still treated as fully accepted (the lenient default). Selective re-send of *only* the rejected records remains queued for a later release, as documented in the existing `send_once` doc comments; this change is purely metrics accuracy.
