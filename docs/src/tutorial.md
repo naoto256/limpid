@@ -67,11 +67,11 @@ After editing the config, reload the daemon to pick up the change — either `su
 
 FortiGate `traffic` events are too noisy to forward to AMA, but you still want them in the on-disk archive for after-the-fact investigation. So: archive everything, then drop FortiGate traffic, then forward what's left.
 
-To recognise a FortiGate traffic event you need to parse the FortiGate event into a shape you can branch on. The `include` directive can pull in DSL parts from the shipped snippet library at `/usr/share/limpid/snippets/`. Suppose a FortiGate parser is provided as `parsers/fortigate.limpid` and exposes a `parse_fortigate` process that fills `workspace.limpid.*` (limpid's canonical intermediate — OCSF-shaped, see [Process Design Guide](./processing/design-guide.md#use-workspacelimpid-as-the-canonical-intermediate)) from a FortiGate event. The activity kind lands at `workspace.limpid.activity_name`. (The set of shipped snippets will grow over time — see [Snippet Library](./snippets/README.md) for what is available today.)
+To recognise a FortiGate traffic event you need to parse the FortiGate event into a shape you can branch on. The `include` directive can pull in DSL parts from the shipped snippet library at `/usr/share/limpid/snippets/`. The FortiGate CEF parser is provided as `parsers/parse_fortigate_cef.limpid` and exposes a `parse_fortigate_cef` process that fills `workspace.limpid.*` (limpid's canonical intermediate — OCSF-shaped, see [Process Design Guide](./processing/design-guide.md#use-workspacelimpid-as-the-canonical-intermediate)) from a FortiGate CEF event. Before it builds the canonical intermediate, the parser also leaves the raw CEF header / extensions in `workspace.cef.*`; in particular the FortiGate `cat=<category>:<subtype>` extension lands at `workspace.cef.cat` (e.g. `traffic:forward`, `utm:ips`, `event:system`) and is the reliable key for routing. (The set of shipped snippets will grow over time — see [Snippet Library](./snippets/README.md) for what is available today.)
 
 ```limpid
 // /etc/limpid/limpid.conf  — add at the top
-include "/usr/share/limpid/snippets/parsers/fortigate.limpid"
+include "/usr/share/limpid/snippets/parsers/parse_fortigate_cef.limpid"
 
 def input fw_tcp {
     type syslog_tcp
@@ -91,10 +91,10 @@ def output ama {
 
 def pipeline main {
     input fw_tcp
-    output archive                                          // everything goes to disk
-    process parse_fortigate                                 // populate workspace.limpid.*
-    if workspace.limpid.activity_name == "traffic" { drop } // drop the noise
-    output ama                                              // only the survivors reach AMA
+    output archive                                            // everything goes to disk
+    process parse_fortigate_cef                               // populate workspace.cef.* + workspace.limpid.*
+    if workspace.cef.cat == "traffic:forward" { drop }        // drop the noise
+    output ama                                                // only the survivors reach AMA
 }
 ```
 
@@ -104,7 +104,7 @@ The first is the magic from Step 2. Even though the `process` and `if drop` afte
 
 The second is what the pipeline body actually contains: an `input`, two `output`s, a `process`, and an `if/drop`. There is no separate "filter" or "router" abstraction — routing decisions live in the pipeline as ordinary statements, in the order they execute. That mirrors how you'd describe the pipeline in words: "archive everything, parse it as FortiGate, drop traffic events, forward the rest to AMA."
 
-Worth one more note: `parse_fortigate` populates `workspace.limpid.activity_name`, which the `if` then reads. The daemon itself knows nothing about FortiGate — that knowledge lives entirely in the snippet, which maps the FortiGate event into limpid's canonical intermediate.
+Worth one more note: `parse_fortigate_cef` populates `workspace.cef.cat` (from the FortiGate `cat=` extension) on its way to building `workspace.limpid.*`, and the `if` reads from `workspace.cef.cat`. The daemon itself knows nothing about FortiGate — that knowledge lives entirely in the snippet, which maps the FortiGate event into limpid's canonical intermediate.
 
 ## Step 4 — Confirm the drop is actually happening
 
@@ -126,13 +126,15 @@ Now start with the counters:
 ```bash
 $ sudo limpidctl stats
 Pipelines:
-  main                         15234 received     14102 finished      1132 dropped         0 discarded
+  main                         15234 received     14102 finished      1132 dropped         0 discarded         0 errored
 Inputs:
   fw_tcp                       15234 received         0 invalid         0 injected
 Outputs:
-  archive                      15234 received     15234 written         0 failed
-  ama                          14102 received     14102 written         0 failed
+  archive                      15234 received         0 injected     15234 written         0 failed         0 retries
+  ama                          14102 received         0 injected     14102 written         0 failed         0 retries
 ```
+
+(The `errored` column on the pipelines row only appears once at least one event has errored — until then limpid omits it. Each output row carries the full five-metric set: `received`, `injected`, `written`, `failed`, `retries`.)
 
 15,234 events came in. `archive` got all of them. `ama` got 14,102 — short by exactly the 1,132 events the pipeline dropped. The shape matches: the drop is firing, and nothing is silently leaking to AMA.
 
@@ -162,7 +164,7 @@ The config is growing. The conventional layout: one file per module under `input
 
 ```limpid
 // /etc/limpid/limpid.conf
-include "/usr/share/limpid/snippets/parsers/fortigate.limpid"
+include "/usr/share/limpid/snippets/parsers/parse_fortigate_cef.limpid"
 
 include "inputs/*.limpid"
 include "outputs/*.limpid"
@@ -170,6 +172,7 @@ include "pipelines/*.limpid"
 
 control {
     socket "/var/run/limpid/control.sock"
+    error_log "/var/log/limpid/error_log.jsonl"
 }
 ```
 
@@ -203,8 +206,8 @@ def output ama {
 def pipeline main {
     input fw_tcp
     output archive
-    process parse_fortigate
-    if workspace.limpid.activity_name == "traffic" { drop }
+    process parse_fortigate_cef
+    if workspace.cef.cat == "traffic:forward" { drop }
     output ama
 }
 ```
@@ -221,7 +224,7 @@ The requirement changes: AMA *does* want visibility into FortiGate traffic event
 
 Dropping is no longer the right operation. Instead, dedup: forward the first event for each `(src, dst)` pair, suppress the rest until the entry expires.
 
-`parse_fortigate` already populated `workspace.limpid.src_endpoint.ip` and `workspace.limpid.dst_endpoint.ip` (the snippet maps the FortiGate CEF event into limpid's canonical intermediate, which is OCSF-shaped — see [Process Design Guide → canonical intermediate](./processing/design-guide.md#use-workspacelimpid-as-the-canonical-intermediate)). We need somewhere to remember which pairs we have seen recently — that's what limpid's in-memory tables are for. Declare a table in `limpid.conf` (the `table` block must live in the main config), then write the process that consults and updates it.
+`parse_fortigate_cef` already populated `workspace.limpid.src_endpoint.ip` and `workspace.limpid.dst_endpoint.ip` (the snippet maps the FortiGate CEF event into limpid's canonical intermediate, which is OCSF-shaped — see [Process Design Guide → canonical intermediate](./processing/design-guide.md#use-workspacelimpid-as-the-canonical-intermediate)). We need somewhere to remember which pairs we have seen recently — that's what limpid's in-memory tables are for. Declare a table in `limpid.conf` (the `table` block must live in the main config), then write the process that consults and updates it.
 
 ```limpid
 // /etc/limpid/limpid.conf  — add the table block
@@ -236,7 +239,7 @@ table {
 ```limpid
 // /etc/limpid/processes/dedup_fortigate_traffic.limpid
 def process dedup_fortigate_traffic {
-    if workspace.limpid.activity_name == "traffic" {
+    if workspace.cef.cat == "traffic:forward" {
         let key = workspace.limpid.src_endpoint.ip + "|" + workspace.limpid.dst_endpoint.ip
         if table_lookup("traffic_seen", key) != null {
             drop
@@ -251,16 +254,16 @@ def process dedup_fortigate_traffic {
 def pipeline main {
     input fw_tcp
     output archive
-    process parse_fortigate | dedup_fortigate_trafic
+    process parse_fortigate_cef | dedup_fortigate_trafic
     output ama
 }
 ```
 
 A few things to read:
 
-- `process A | B` chains processes left to right — the event flows through `parse_fortigate` first, then `dedup_fortigate_traffic`. Equivalent to writing them on two `process` lines; the `|` form just reads more naturally when several processes line up.
-- `workspace.limpid.src_endpoint.ip` and `workspace.limpid.dst_endpoint.ip` exist because `parse_fortigate` ran first. Pipeline order is real order — what comes earlier has populated the canonical intermediate by the time later steps run.
-- `let key = ...` is a process-local scratch variable — scoped to this process invocation, gone when the event leaves. The binding can hold any value type (scalar, Object, or Array); for an Object, `key.x` reads through the binding the same way `workspace.x.y` does. The binding *name* itself is a single identifier (`let foo.bar = ...` is rejected — write into `workspace.*` if you need a path target).
+- `process A | B` chains processes left to right — the event flows through `parse_fortigate_cef` first, then `dedup_fortigate_traffic`. Equivalent to writing them on two `process` lines; the `|` form just reads more naturally when several processes line up.
+- `workspace.limpid.src_endpoint.ip` and `workspace.limpid.dst_endpoint.ip` exist because `parse_fortigate_cef` ran first. Pipeline order is real order — what comes earlier has populated the canonical intermediate by the time later steps run.
+- `let key = ...` is a process-local scratch variable — scoped to this process invocation, gone when the event leaves. The binding can hold any value type (scalar, Object, or Array); for an Object, `key.x` reads through the binding the same way `workspace.x.y` does. The binding *name* itself is a single identifier (`let foo.bar = ...` is a parse error — the `let` LHS is a single identifier in the grammar; write into `workspace.*` if you need a path target).
 - `table_upsert` resets the TTL on every call, so a flow that keeps appearing keeps being suppressed; the dedup window only opens up once a flow has been quiet for five minutes (`ttl 300` on the table).
 - The table is in-memory and lost on daemon restart. That's usually fine for dedup — at worst, the first batch after restart is forwarded normally instead of being suppressed. See [table functions](./functions/expression-functions.md#table-functions) for the full surface (`table_lookup` / `table_upsert` / `table_delete`).
 - `archive` still sees every event — it sits before the dedup process, and Step 3's deep-copy guarantee keeps it that way.
@@ -276,7 +279,7 @@ $ limpid --check --config /etc/limpid/limpid.conf
 error: unknown process 'dedup_fortigate_trafic' referenced in pipeline 'main'
   --> /etc/limpid/pipelines/main.limpid:5:30
    |
- 5 |     process parse_fortigate | dedup_fortigate_trafic
+ 5 |     process parse_fortigate_cef | dedup_fortigate_trafic
    |                              ^^^^^^^^^^^^^^^^^^^^^^^ no such process is defined
    |
    = help: did you mean `dedup_fortigate_traffic`?
@@ -286,8 +289,8 @@ Caught it. The pipeline reference is missing an `f` in `traffic`. Fix the typo i
 
 ```bash
 $ limpid --check --config /etc/limpid/limpid.conf
-Configuration OK
-  1 input(s), 2 output(s), 2 process(es), 1 pipeline(s)
+checking /etc/limpid/limpid.conf: 5 file(s), 1 input(s), 2 output(s), 2 process(es), 1 pipeline(s)
+/etc/limpid/limpid.conf: Configuration OK (1 pipeline(s), 2 process(es); dataflow check passed)
 ```
 
 Now reload — `sudo systemctl reload limpid`. The new config takes effect atomically; if it had failed to parse or start at this point, limpid would have rolled back to the previous configuration automatically. There is no half-loaded state to recover from.
@@ -335,3 +338,4 @@ From here:
 - [Process Design Guide](./processing/design-guide.md) — patterns for writing your own processes
 - [Pipelines](./pipelines/README.md) — `if`/`switch` routing, multi-output, `drop` vs `finish`
 - [Operations → CLI](./operations/cli.md) — the full surface of `limpidctl`
+- [Error Log (DLQ)](./operations/error-log.md) — where retry-exhausted, secondary-failed, and shutdown-flush payloads land when you declare `control { error_log }`

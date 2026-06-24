@@ -16,12 +16,9 @@ Input modules receive log messages from external sources and feed them into pipe
 
 ## Common properties
 
-All input types support:
+Each `def input` block declares its type via the `type <name>` clause; see the per-input pages for the property set each type accepts.
 
-| Property | Description |
-|----------|-------------|
-| `type` | Input type name (required) |
-| `rate_limit` | Maximum events per second (optional) |
+`rate_limit` (maximum events per second) is supported per input — see the per-input pages for which inputs expose it (currently the `syslog_*` and `otlp_*` receivers).
 
 ## Usage in pipelines
 

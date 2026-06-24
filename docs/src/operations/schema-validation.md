@@ -1,5 +1,7 @@
 # Schema Validation
 
+> **Scope.** Structural validation of the DSL config itself — switch `default` placement, `secondary` cycle detection, recovery readiness, and the other analyzer checks added across the 0.7.x cycle — is the job of `limpid --check` (see [CLI](./cli.md#options)). This page is about the complementary problem: validating the **emitted payload** against the downstream schema the destination expects.
+
 limpid does not ship a schema validator. There is no `limpidctl validate`, no built-in OCSF / ECS / ASIM / CIM check, and no schema-annotation syntax in the DSL. Validation is performed by piping `tap --json` output into whichever validator matches the schema your downstream expects:
 
 ```bash
@@ -175,7 +177,7 @@ Anything that reads JSONL from stdin and exits non-zero on failure works. The co
 - **One event per line.** Each line is a complete [Event JSON](./tap.md#usage) object.
 - **Exit code 0 = all good, non-zero = reject.** For streaming validators, prefer printing per-event diagnostics to stderr and keeping the process alive; let a supervising process aggregate.
 - **No assumptions about key order.** `tap --json` does not guarantee key order across versions; schema validators don't care, but ad-hoc `grep` pipelines might.
-- **Workspace keys.** Structured fields built by the pipeline live under `workspace.<key>`. Use the key names your DSL actually assigns; `limpid --check --graph` shows which workspace keys each output observes.
+- **Workspace keys.** Structured fields built by the pipeline live under `workspace.<key>`. Use the key names your DSL actually assigns; inspect a live sample with `limpidctl tap output <name> --json | jq '.workspace | keys'` to confirm the actual key set.
 - **Non-JSON wire formats.** If the final wire format is protobuf, Avro, or similar, serialize with your existing producer and validate the bytes (e.g. `.egress` piped through `protoc --decode`).
 
 ## Related design decisions

@@ -58,3 +58,4 @@ detected and does not enter cooldown.
   [syslog_tcp](./syslog-tcp.md) (with optional per-peer TLS) or
   [http](./http.md) with a disk queue.
 - Each peer's socket is bound to an ephemeral local port on first use.
+- Common queue / retry / secondary properties — see [Queue and retry](./README.md#queue-and-retry).
