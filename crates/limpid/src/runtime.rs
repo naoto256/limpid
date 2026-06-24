@@ -109,20 +109,11 @@ impl Runtime {
             ));
         }
 
-        // Validate every output's `secondary` reference up front,
-        // before we spawn consumer tasks. See `validate_secondary_refs`
-        // for the two failure modes (typo, self-reference) that used
-        // to slip through silently.
-        {
-            let known: std::collections::HashSet<&str> =
-                output_senders.keys().map(String::as_str).collect();
-            validate_secondary_refs(
-                output_receivers
-                    .iter()
-                    .map(|(n, _, _, rc, _)| (n.as_str(), rc.secondary.as_deref())),
-                &known,
-            )?;
-        }
+        // Note: misconfigured `secondary` references (typo,
+        // self-reference, indirect cycle) are rejected earlier by
+        // `CompiledConfig::validate` (called on line 50). That same
+        // validator runs on the `--check` path (PR-X), so pre-deploy
+        // gating and runtime startup now reject the same configs.
 
         // Optional dead-letter queue for events that fail in `process`
         // or that an output drops after exhausting retries (BC-3
@@ -359,81 +350,10 @@ impl Runtime {
     }
 }
 
-/// Reject misconfigured `secondary` references before any consumer task starts.
-///
-/// `secondary` lookup at queue-consumer spawn time was
-/// `output_senders.get(s).cloned()` — a `None` for either reason
-/// silently disabled the safety net. Two operator-visible failure
-/// modes:
-///
-/// - **typo** (`secondary foo_typo` where no `foo_typo` exists): the
-///   queue consumer just logs "no secondary" and drops the event.
-///   The operator configured a safety net and got nothing.
-/// - **self-reference** (`secondary <own_name>`): exhausted-retry
-///   events get routed back into the same queue, looping forever on
-///   any poison event. Worse on disk-backed queues (each loop
-///   re-persists to the tail).
-///
-/// Both are config errors. Surface them at startup so the daemon
-/// doesn't pretend to be healthy.
-fn validate_secondary_refs<'a>(
-    refs: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
-    known_outputs: &std::collections::HashSet<&str>,
-) -> Result<()> {
-    // First pass: per-edge checks (typo + direct self-reference).
-    // Collect the edge map at the same time for the cycle pass below.
-    let mut edges: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-    for (name, secondary) in refs {
-        let Some(target) = secondary else { continue };
-        if target == name {
-            return Err(anyhow::anyhow!(
-                "output '{name}': secondary cannot reference itself; \
-                 a self-referential secondary would form an infinite \
-                 retry loop on a poison event"
-            ));
-        }
-        if !known_outputs.contains(target) {
-            let mut listed: Vec<&str> = known_outputs.iter().copied().collect();
-            listed.sort_unstable();
-            return Err(anyhow::anyhow!(
-                "output '{name}': secondary '{target}' is not a known output; \
-                 configured outputs: {listed:?}"
-            ));
-        }
-        edges.insert(name, target);
-    }
-
-    // Second pass: indirect cycle detection (A→B→A, A→B→C→A, …).
-    // Same poison-event ping-pong as the direct self-reference case;
-    // on disk-backed queues each loop iteration also re-persists the
-    // event, so the cycle grows the queue files unboundedly. With at
-    // most one outgoing edge per node (each output has a single
-    // `secondary`), the chain from any node is deterministic and
-    // either terminates at a node without a secondary or revisits a
-    // node — visit each starting node in turn and break on the first
-    // repeat.
-    for &start in edges.keys() {
-        let mut visited: Vec<&str> = vec![start];
-        let mut cursor = start;
-        while let Some(&next) = edges.get(cursor) {
-            if let Some(repeat_idx) = visited.iter().position(|n| *n == next) {
-                // Build the cycle path for an operator-friendly error.
-                let mut cycle: Vec<&str> = visited[repeat_idx..].to_vec();
-                cycle.push(next);
-                return Err(anyhow::anyhow!(
-                    "secondary cycle detected ({path}); a cycle would form an \
-                     infinite retry loop on a poison event, and on disk-backed \
-                     queues each iteration re-persists the event",
-                    path = cycle.join(" -> "),
-                ));
-            }
-            visited.push(next);
-            cursor = next;
-        }
-    }
-
-    Ok(())
-}
+// `validate_secondary_refs` moved to `CompiledConfig::validate_secondary_refs`
+// in `pipeline.rs` (PR-X), so the `--check` path catches secondary typos
+// and cycles before deploy. Runtime startup picks up the same checks via
+// `CompiledConfig::validate` above.
 
 // ---------------------------------------------------------------------------
 // Global subsystem initialization
@@ -944,112 +864,13 @@ mod tests {
         assert_eq!(worker.metrics.events_dropped.load(Ordering::Relaxed), 8);
     }
 
-    fn known<'a>(names: &[&'a str]) -> std::collections::HashSet<&'a str> {
-        names.iter().copied().collect()
-    }
-
-    #[test]
-    fn validate_secondary_refs_accepts_unset() {
-        // Baseline: outputs without a `secondary` configured pass
-        // through cleanly.
-        let refs = [("primary", None), ("backup", None)];
-        let known = known(&["primary", "backup"]);
-        validate_secondary_refs(refs.iter().copied(), &known).unwrap();
-    }
-
-    #[test]
-    fn validate_secondary_refs_accepts_resolved_target() {
-        // Baseline: a `secondary` that names a real, different
-        // output passes.
-        let refs = [("primary", Some("backup")), ("backup", None)];
-        let known = known(&["primary", "backup"]);
-        validate_secondary_refs(refs.iter().copied(), &known).unwrap();
-    }
-
-    #[test]
-    fn validate_secondary_refs_rejects_self_reference() {
-        // Regression: self-reference used to silently route
-        // exhausted-retry events back into the same queue, looping
-        // forever on a poison event (worse on disk-backed queues).
-        let refs = [("primary", Some("primary"))];
-        let known = known(&["primary"]);
-        let err = validate_secondary_refs(refs.iter().copied(), &known)
-            .expect_err("self-reference must fail validation");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("primary") && msg.contains("itself"),
-            "expected self-reference message, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn validate_secondary_refs_rejects_indirect_cycle_two_node() {
-        // Horizontal expansion of the self-reference finding: A→B→A
-        // is the same poison-event ping-pong as A→A, just with one
-        // hop in between. Per-edge check passes (each target is
-        // valid + not self), but the cycle still grows disk-backed
-        // queues unboundedly under repeated retry exhaustion.
-        let refs = [("primary", Some("backup")), ("backup", Some("primary"))];
-        let known = known(&["primary", "backup"]);
-        let err = validate_secondary_refs(refs.iter().copied(), &known)
-            .expect_err("two-node secondary cycle must fail validation");
-        let msg = err.to_string();
-        assert!(msg.contains("cycle"), "expected cycle error, got: {msg}");
-        // Operator-friendly: the cycle path must be shown so the
-        // operator can see which secondary edge to remove.
-        assert!(
-            msg.contains("primary") && msg.contains("backup"),
-            "cycle error must name involved outputs; got: {msg}"
-        );
-    }
-
-    #[test]
-    fn validate_secondary_refs_rejects_indirect_cycle_three_node() {
-        // A→B→C→A — same shape with one more hop. Pin that the
-        // cycle detector follows the chain beyond two nodes.
-        let refs = [("a", Some("b")), ("b", Some("c")), ("c", Some("a"))];
-        let known = known(&["a", "b", "c"]);
-        let err = validate_secondary_refs(refs.iter().copied(), &known)
-            .expect_err("three-node secondary cycle must fail validation");
-        assert!(
-            err.to_string().contains("cycle"),
-            "expected cycle error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_secondary_refs_accepts_acyclic_chain() {
-        // Baseline: A→B→C is a valid dead-letter chain (anything
-        // exhausted on A spills to B, anything exhausted on B
-        // spills to C, and C has no secondary so events that
-        // exhaust on C are dropped). No cycle, must pass.
-        let refs = [("a", Some("b")), ("b", Some("c")), ("c", None)];
-        let known = known(&["a", "b", "c"]);
-        validate_secondary_refs(refs.iter().copied(), &known).unwrap();
-    }
-
-    #[test]
-    fn validate_secondary_refs_rejects_unknown_target() {
-        // Regression: a typo'd secondary name used to silently
-        // disable the safety net at queue-consumer spawn time —
-        // `output_senders.get(s).cloned()` returned None and the
-        // consumer dropped failed events with "no secondary".
-        let refs = [("primary", Some("backup_typo"))];
-        let known = known(&["primary", "backup"]);
-        let err = validate_secondary_refs(refs.iter().copied(), &known)
-            .expect_err("unknown secondary must fail validation");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("backup_typo") && msg.contains("not a known output"),
-            "expected unknown-target message, got: {msg}"
-        );
-        // Operator-friendly: surface the actual configured names so
-        // the typo is easy to spot.
-        assert!(
-            msg.contains("backup"),
-            "error must list known outputs to aid debugging; got: {msg}"
-        );
-    }
+    // `validate_secondary_refs` coverage moved to
+    // `pipeline.rs::tests::secondary_refs_*` after the validator was
+    // hoisted onto the `--check` path (PR-X). Those tests drive the
+    // same five cases (unknown target, self-reference, 2-hop cycle,
+    // 3-hop cycle, valid chain) through `CompiledConfig::validate`,
+    // which is exactly what runtime startup also calls — so the
+    // behavior contract is preserved.
 
     fn make_err_ctx(reason: &str) -> crate::pipeline::ErroredEventContext {
         let addr = std::net::SocketAddr::from_str("127.0.0.1:0").unwrap();

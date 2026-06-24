@@ -43,7 +43,7 @@ def output reliable {
 }
 ```
 
-`retry` is accepted by every output type. `secondary` takes a **bare identifier** referencing another `def output` — quoted strings are rejected at `--check`.
+`retry` is accepted by every output type. `secondary` takes a **bare identifier** referencing another `def output` — quoted strings are rejected at `--check`. A `secondary` that names an unknown output, references itself, or forms an indirect cycle (`A -> B -> A`, `A -> B -> C -> A`, …) is also rejected at `--check` so the misconfiguration is caught before deploy.
 
 ### Memory queue (default)
 
