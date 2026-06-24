@@ -73,7 +73,7 @@ A log forwarder runs unattended on production paths, and any mistake compounds q
 
 - **Undo after deployment.** Configuration reload is atomic: a new configuration that fails to parse, type-check, or start is rolled back; the previous configuration keeps running while the operator sees a diagnostic. The daemon never enters a half-loaded state.
 
-- **Fail soft, surface clearly.** Output queues retry with backoff, fall back to a secondary destination for dead-letter routing, and optionally persist to disk so a crash does not lose events in flight. Shutdown reports the count of events still buffered rather than letting them disappear silently.
+- **Fail soft, surface clearly.** Output queues retry with backoff, fall back to a secondary destination for dead-letter routing, and optionally persist to disk so a crash does not lose events in flight. `control { error_log }` is the terminal recovery sink (PR-O / PR-P): retry-exhausted payloads, secondary-destination failures, and shutdown-flush failures all land in it as JSONL rather than disappearing. `--check --strict-warnings` enforces that recovery-dependent configs declare an `error_log`. Shutdown reports the count of events still buffered rather than letting them disappear silently.
 
 **Why:** a daemon that processes production traffic 24/7 cannot afford a *"well, redeploy and hope"* recovery story, and an opaque daemon cannot be operated safely even when it is technically working. The cost of these affordances — more code paths, more CLI surface, more documentation, more API — is paid up front. The benefit is paid every time something goes wrong, and every time an operator wonders *"is the pipeline doing what I think it is?"* without that question being a costly investigation.
 

@@ -22,10 +22,23 @@ limpid --debug --config /etc/limpid/limpid.conf
 | Flag | Description |
 |------|-------------|
 | `--config <path>` | Main configuration file (default: `/etc/limpid/limpid.conf`) |
-| `--check` | Validate configuration and exit |
+| `--check` | Validate configuration and exit. Exit codes: `0` clean, `1` errors, `2` warnings present with `--strict-warnings`. |
+| `--strict-warnings` | When combined with `--check`, treat any warning (recovery readiness, etc.) as a non-zero exit (`2`). Useful in CI to gate on warnings without failing on the absence of warnings. |
+| `--ultra-strict` | When combined with `--check`, additionally promote informational analyzer notices to warnings before the `--strict-warnings` exit calculation. Use sparingly — intended for the strictest pre-merge gates. |
+| `--graph[=mermaid\|dot\|ascii]` | Print the configured pipeline graph (nodes + edges) and exit. Format defaults to `mermaid`; `dot` (Graphviz) and `ascii` are also accepted. Composes with `--check`: validation runs first, the graph is printed on success. |
 | `--test-pipeline <name>` | Test a named pipeline with sample data |
 | `--input <json>` | Sample event for test mode (JSON) |
 | `--debug` | Enable trace-level logging |
+
+`--check` prints a per-file header line and a final status footer:
+
+```
+$ limpid --check --config /etc/limpid/limpid.conf
+checking /etc/limpid/limpid.conf: 4 inputs, 6 processes, 3 outputs, 2 pipelines
+/etc/limpid/limpid.conf: Configuration OK (0 errors, 0 warnings)
+```
+
+CI integration: combine `--check --strict-warnings` and treat exit `2` as a gate failure distinct from exit `1` (hard errors).
 
 ### Test mode input format
 
@@ -50,6 +63,8 @@ All keys except `ingress` are optional. `source` is the canonical `{ip, port}` o
 | `source: {ip, port}` | exact |
 
 When `source` is present but malformed (legacy `"ip:port"` string, wrong types, port out of range), `--test-pipeline` errors out loudly — operators migrating from the 0.5.5 form should see the failure, not silently get a wrong default. The Event has no facility / severity fields — the `<PRI>` byte lives inside `ingress` / `egress`, and pipelines that need its numeric value call `syslog.extract_pri(...)`.
+
+`received_at` in the input JSON is **ignored** in test mode — `--test-pipeline` constructs the Event with `Event::new`, which stamps `received_at` to the current wall-clock. Only `ingress`, `source`, and `workspace` are honoured. When piping `tap --json` output into `--test-pipeline`, be aware that the captured timestamp will not be reproduced.
 
 ## limpidctl
 

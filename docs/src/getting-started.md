@@ -61,8 +61,11 @@ include "pipelines/*.limpid"
 
 control {
     socket "/var/run/limpid/control.sock"
+    error_log "/var/log/limpid/error_log.jsonl"
 }
 ```
+
+`error_log` is the daemon-wide recovery sink: payloads that retry-exhaust, fail their secondary fallback, or fail the shutdown flush are persisted there as JSONL instead of being silently dropped. Recommended whenever a pipeline uses retry, a secondary output, or batched outputs; `limpid --check --strict-warnings` will warn if a recovery-dependent config omits it. See [Error Log (DLQ)](./operations/error-log.md) for the format and rotation guidance.
 
 **/etc/limpid/inputs/syslog.limpid:**
 ```
@@ -92,8 +95,8 @@ def pipeline main {
 
 ```bash
 limpid --check --config /etc/limpid/limpid.conf
-# Configuration OK
-#   1 input(s), 1 output(s), 0 process(es), 1 pipeline(s)
+# checking /etc/limpid/limpid.conf: 4 file(s), 1 input(s), 1 output(s), 0 process(es), 1 pipeline(s)
+# /etc/limpid/limpid.conf: Configuration OK (1 pipeline(s), 0 process(es); dataflow check passed)
 ```
 
 ### 3. Test with sample data

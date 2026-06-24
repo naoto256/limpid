@@ -45,7 +45,7 @@ control {
 | Property | Default | Effect |
 |----------|---------|--------|
 | `socket` | `/var/run/limpid/control.sock` | Unix socket path consumed by `limpidctl` and `limpid-prometheus`. |
-| `error_log` | *(unset)* | JSONL file appended to when a `process` raises a runtime error. When unset, the runtime falls back to a structured `tracing::error!` line so the failure data is never silently lost. See [Error Log (DLQ)](./operations/error-log.md) for the record format and replay recipe. |
+| `error_log` | *(unset)* | JSONL file appended to when a `process` raises a runtime error. When unset, the runtime falls back to a structured `tracing::error!` line so the failure data is never silently lost. Strongly recommended when any output declares `retry`, `secondary`, or is a batched OTLP/HTTP output — `--check` warns (see [Error Log → recovery dependency](./operations/error-log.md)). See [Error Log (DLQ)](./operations/error-log.md) for the record format and replay recipe. |
 
 The whole block is optional — daemon starts with the defaults if it's omitted.
 

@@ -1,6 +1,6 @@
 # User-defined Processes
 
-limpid ships a [Snippet Library](../snippets/README.md) of pre-built processes for common parsing / mapping work (debuts in v0.7.0, expanded in v0.7.1). Sooner or later you'll hit a situation the library doesn't cover — a vendor format we haven't shipped, a one-off enrichment, a dedup or rate-limit shape that's specific to your environment — and want to write your own. This page covers how.
+limpid ships a [Snippet Library](../snippets/README.md) of pre-built processes for common parsing / mapping work (introduced in v0.7.0, expanded across the 0.7.x line). Sooner or later you'll hit a situation the library doesn't cover — a vendor format we haven't shipped, a one-off enrichment, a dedup or rate-limit shape that's specific to your environment — and want to write your own. This page covers how.
 
 You define a process with `def process <name> { ... }`. Inside the body you call functions, assign to event slots and workspace, branch with `if` / `switch` / `try`, transform arrays with the block-arg primitives (`map`, `filter`, `find`, `reduce`), and call other processes by name.
 
@@ -125,6 +125,26 @@ Rule of thumb: if the catch block has nothing useful to do besides stamp `worksp
 ### drop
 
 `drop` terminates the event immediately and counts it as `events_dropped`. It is fundamentally a routing decision and is documented in [Pipelines → Routing](../pipelines/routing.md); using it inside a process body is allowed as a concession (see [Processing → process vs routing](./README.md#process-vs-routing)).
+
+### error
+
+`error` is the intentional fail-fast statement — it raises an error from inside a process body and the event is set aside in the [error log](../operations/error-log.md) (DLQ), incrementing `events_errored`. Use the bare form to raise with a default message, or `error <expr>` to attach an operator-readable message:
+
+```limpid
+def process parse_asa {
+    workspace.syslog = syslog.parse(ingress)
+    let mid = regex_extract(workspace.syslog.msg, "%ASA-\\d-(\\d+):")
+    switch mid {
+        "605004" { process parse_asa_auth_success }
+        "605005" { process parse_asa_auth_failure }
+        default  { error "parse_asa: unsupported message ID ${mid}: ${workspace.syslog.msg}" }
+    }
+}
+```
+
+`drop` and `error` are deliberate opposites: `drop` is a silent discard (event counted as filtered-out, no DLQ entry), `error` is a loud signal (event preserved in the DLQ for operator inspection and replay). Reach for `error` when the parser hits vocabulary it does not handle — the loud-fail-fast policy that runs through the [snippet library](../snippets/README.md#loud-fail-fast-on-unsupported-vocabulary) is built on top of this statement.
+
+When `error` fires inside a `try` block, the catch body sees the message via the reserved name `error` — same surface as any other primitive that bails — so `try { ... error "msg" ... } catch { workspace.failure_reason = error }` works as expected.
 
 ## Arrays
 

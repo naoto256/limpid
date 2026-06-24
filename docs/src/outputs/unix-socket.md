@@ -21,3 +21,4 @@ def output local_forward {
 
 - Connection is established on first use and reused.
 - Automatically reconnects if the connection breaks.
+- Common queue / retry / secondary properties — see [Queue and retry](./README.md#queue-and-retry).

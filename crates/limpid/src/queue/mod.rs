@@ -576,10 +576,13 @@ pub async fn run_queue_consumer(
             input = receiver.recv() => {
                 match input {
                     Some(input) => {
-                        // Disposition is intentionally ignored here:
-                        // delivered / routed-to-secondary / dropped
-                        // all ack-and-continue from this consumer's
-                        // POV. PR-O / PR-P will fan out on it.
+                        // Fan-out (secondary routing + error_log
+                        // recovery) is performed inside
+                        // `write_with_retry`; the disposition is
+                        // ignored here because the caller-side
+                        // per-disposition metrics breakdown is not yet
+                        // implemented (deferred to the 0.8 metrics
+                        // rework).
                         let _ = write_with_retry(writer.as_ref(), input, &retry_config, &secondary_sender, &name, &metrics, tap.as_ref(), error_log.as_ref()).await;
                         // Acknowledge the event regardless of
                         // disposition (delivered, routed to

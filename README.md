@@ -21,16 +21,17 @@ lake in OCSF format. With limpid, that is just chaining three things:
 ```limpid
 def pipeline fortigate_to_security_lake {
     input   fortigate_syslog
-    process parse_fortigate | compose_ocsf_finding
+    process parse_fortigate_cef | compose_ocsf
     output  security_lake
 }
 ```
 
 The flow is right there in the config. Bytes arrive on `fortigate_syslog`;
-`parse_fortigate` extracts structured fields; `compose_ocsf_finding`
-shapes those fields into an OCSF Detection Finding; the result leaves
-through `security_lake`. No hidden behavior. No plugin to install. No
-separate "transform" config.
+`parse_fortigate_cef` extracts structured fields into the canonical
+`workspace.limpid.*` intermediate; `compose_ocsf` dispatches on
+`workspace.limpid.class_uid` and emits the matching OCSF JSON; the
+result leaves through `security_lake`. No hidden behavior. No plugin
+to install. No separate "transform" config.
 
 In limpid, anything you want to do to a log on its way from input to
 output is achieved by freely combining `process`es.
@@ -39,23 +40,25 @@ output is achieved by freely combining `process`es.
 
 A reusable chunk of pipeline logic — small, named, drop-in. You write
 them yourself, or you include them from the snippet library (a curated
-collection that debuts in **v0.7.0** and expands substantially in
-**v0.7.1**: 22 vendor parsers (SIEM + OSS NDR), 2
+collection introduced in **v0.7.0** and expanded across the 0.7.x
+line: 24 vendor parsers (SIEM + OSS NDR), 2
 transport parsers, the OCSF 1.3.0 27-class composer, and shared
 helper functions; full list in
 [Snippet Library](docs/src/snippets/README.md)). Here is what an OCSF
 Detection Finding composer leaf looks like under the hood:
 
 ```limpid
-def process compose_ocsf_finding {
-    workspace.ocsf = {
+def process compose_ocsf_detection_finding {
+    let activity = workspace.limpid.activity_id
+    egress = to_json(null_omit({
+        class_uid:    2004,                     // Detection Finding
         category_uid: 2,                        // Findings
-        class_uid:    200401,                   // Detection Finding
-        time:         workspace.cef.rt,
-        severity_id:  workspace.cef.severity_level,
+        activity_id:  activity,
+        type_uid:     2004 * 100 + activity,
+        time:         coalesce(workspace.limpid.time, received_at),
+        severity_id:  workspace.limpid.severity_id,
         // ...
-    }
-    egress = to_json(workspace.ocsf)
+    }))
 }
 ```
 
@@ -77,9 +80,15 @@ whole pipeline.
 A few we have already covered:
 
 - **Composable pieces.** Pipelines are chains of small named processes
-  — `parse_fortigate | compose_ocsf_finding | route_by_severity`. Each
+  — `parse_fortigate_cef | compose_ocsf | route_by_severity`. Each
   piece is one responsibility, swappable, and reusable across
   pipelines.
+
+- **Durable recovery sink, built in.** `control { error_log "..." }`
+  persists payloads that retry-exhaust, lose their secondary fallback,
+  or fail the shutdown flush — operators get the recovery guarantee
+  without writing their own DLQ wiring. `--check --strict-warnings`
+  enforces it on configs that need it.
 
 - **Visible flow.** Read the config and you know what the pipeline
   does. No implicit parsers that fire because input "looks like JSON".
@@ -157,6 +166,18 @@ cargo build --release -p limpid -p limpidctl -p limpid-prometheus
 limpid --check --config /etc/limpid/limpid.conf     # static analysis
 limpid --config /etc/limpid/limpid.conf             # run the daemon
 ```
+
+Other useful flags during config development:
+
+- `--check --strict-warnings` — promote analyzer warnings to errors
+  (for example, missing `control { error_log }` on configs that depend
+  on recovery).
+- `--check --ultra-strict` — turn on every optional lint, including
+  style-level findings, for the most thorough pre-deploy gate.
+- `--graph[=mermaid|dot|ascii]` — render the resolved pipeline graph
+  for review or for pasting into a PR description.
+- `--test-pipeline <name> --input '<json>'` — run a single Event
+  through one named pipeline without binding any sockets.
 
 See the [Getting Started guide](docs/src/getting-started.md) for
 installation, .deb packaging, and systemd integration.
@@ -240,14 +261,15 @@ migration table.
 
 Curated parser / composer / filter library, installed under
 `/usr/share/limpid/snippets/` and `include`-able by absolute path.
-Debuts in **v0.7.0**, with the transport layer split out as its own
-snippet category in **v0.7.1**:
+Introduced in **v0.7.0**, with the transport layer split out as its
+own snippet category in **v0.7.1** and the vendor lineup expanded
+across the 0.7.x line:
 
 - **Transport parsers (2, v0.7.1)** — `parse_syslog` (RFC 3164 /
   5424 syslog wire) · `parse_journald` (systemd journald JSON).
   These populate `workspace.<transport>.*` and feed any vocabulary
   parser downstream via an inline bridge.
-- **Vendor parsers (22)** — security devices / cloud audit:
+- **Vendor parsers (24)** — security devices / cloud audit:
   `parse_fortigate_cef` · `parse_fortigate_syslog` ·
   `parse_paloalto_cef` · `parse_paloalto_syslog` · `parse_asa` ·
   `parse_cloudtrail` · `parse_juniper_srx_sd_syslog` (Junos
@@ -283,7 +305,9 @@ logs into a SIEM / data lake in OCSF form. Full reference:
 There are several types of expression functions you can call from
 inside a `process` body:
 
-- **Generic parsers** — `parse_json` · `parse_kv` · `csv_parse`
+- **Generic parsers** — `parse_json` · `parse_kv` · `csv_parse` ·
+  `nest_dotted_keys` (lift flat dotted keys from Zeek / Filebeat-style
+  inputs into a nested object)
 - **Regex** — `regex_match` · `regex_extract` · `regex_parse` ·
   `regex_replace`
 - **String predicates** — `contains` · `starts_with` · `ends_with`

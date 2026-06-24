@@ -104,7 +104,12 @@ def pipeline main {
 
 `events_discarded` indicates a possible misconfiguration — the event went through the pipeline but was never sent anywhere.
 
-`events_errored` indicates either an explicit `error` statement or a pipeline-runtime failure (regex compile error, unknown-identifier panic at runtime, type mismatch, …). The event is *not* forwarded downstream — at the failure point the runtime has no way to produce a correct egress, and the pre-0.5 behaviour of forwarding the original `ingress` silently turned wrap / enrichment bugs into data-shape regressions at the receiving SIEM. Instead, the event is routed to the [error log](../operations/error-log.md) so operators can inspect, fix the offending config, and replay.
+`events_errored` is the unified failure counter (PR-I consolidated all of these into one metric + DLQ path). Two layers contribute:
+
+- **Process body runtime errors** — regex compile failure, unknown identifier at runtime, type mismatch, or an explicit `error` statement inside a `def process` body.
+- **Pipeline-skeleton expression-evaluation errors and output enqueue failures** — failure to evaluate the condition expression of an `if` / `switch` / `error` at the pipeline level, plus output enqueue failures (queue closed, disk write error, unknown output).
+
+In every case the event is *not* forwarded downstream — at the failure point the runtime has no way to produce a correct egress, and the pre-0.5 behaviour of forwarding the original `ingress` silently turned wrap / enrichment bugs into data-shape regressions at the receiving SIEM. Instead, the event is routed to the [error log](../operations/error-log.md) so operators can inspect, fix the offending config, and replay.
 
 `events_errored_unwritable` is the subset where the DLQ write itself failed (disk full, permissions, rotation race). The runtime falls back to a structured `tracing::error!` line, but operators should alarm on this counter — a non-zero value means the replay path may be incomplete.
 

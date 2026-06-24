@@ -33,6 +33,8 @@ Input → Process → Process → ... → output(copy) → Process → output(co
 
 Each output has an async queue. Pipelines run synchronously (one event at a time), but outputs are decoupled via queues so downstream bottlenecks don't block the pipeline.
 
+When an output exhausts its retries, its secondary destination also fails, or shutdown can't drain the queue in time, the payload is persisted as JSONL to the daemon-wide `control { error_log "..." }` sink rather than being silently dropped. The recovery story is part of the daemon, not a per-output afterthought — see [Error Log (DLQ)](./operations/error-log.md).
+
 ## At a glance
 
 ```

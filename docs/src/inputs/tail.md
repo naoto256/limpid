@@ -25,8 +25,8 @@ def input app_log {
 
 The tail input detects two forms of log rotation:
 
-- **Inode change** — the file was replaced (e.g., `logrotate` with `copytruncate`)
-- **File truncation** — the file was truncated to zero
+- **Inode change** — the file was replaced (e.g., `logrotate` without `copytruncate` — the new file gets a fresh inode)
+- **File truncation** — the file was truncated to zero (e.g., `logrotate` with `copytruncate`, which preserves the inode and truncates in place)
 
 In both cases, reading resets to the beginning of the new file.
 
@@ -35,4 +35,4 @@ In both cases, reading resets to the beginning of the new file.
 - On first start without a `state_file`, reading begins at the end of the file (new data only).
 - Empty lines are skipped.
 - Incomplete lines (no trailing newline) are held until the next poll.
-- The source address for tail events is `127.0.0.1`.
+- The source address for tail events is `127.0.0.1:0` (a placeholder address with port 0; tail has no network peer).

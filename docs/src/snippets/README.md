@@ -8,12 +8,13 @@ their config — no parser to write from scratch, no recompile when
 a vendor adds a field (the snippet is plain DSL: edit the file and
 SIGHUP).
 
-> **Status — v0.7.0:** the library debuts in this release with 11
-> parsers, the OCSF 1.3.0 27-class composer, the replay-shape
-> composer, and one filter. Coverage will grow over the 0.7.x
-> point-release line.
+> **Status:** the snippet library was introduced in v0.7.0 and has
+> expanded across the 0.7.x line. It currently ships 26 vendor
+> parsers, the OCSF 1.3.0 27-class composer, the RFC 5424 and
+> replay-shape composers, one filter, and several reusable
+> functions. Coverage continues to grow on the 0.7.x cadence.
 
-## What ships in v0.7.0 / v0.7.1
+## Snippet library
 
 ### Parsers
 
@@ -88,6 +89,16 @@ SIGHUP).
   operators on non-UTC senders can fork the snippet and substitute.
   For RFC 5424 / OTLP / OCSF input use the built-in
   `parse_datetime_rfc3339` primitive directly.
+- `functions/http_method_activity_id.limpid` —
+  `http_method_activity_id(method) → Int`. HTTP request method
+  (`GET` / `POST` / `PUT` / `DELETE` / `HEAD` / `OPTIONS` /
+  `CONNECT` / `TRACE`) → OCSF 4002 HTTP Activity `activity_id`,
+  with `99` (Other) for anything outside the OCSF 1.3.0 enumeration.
+- `functions/proto_num.limpid` — `proto_num(name) → Int | null`.
+  Transport-layer protocol name (case-insensitive `tcp` / `udp` /
+  `icmp` / …) → IANA protocol number for OCSF
+  `connection_info.protocol_num`. Returns `null` rather than a
+  wrong guess for unknown names.
 
 ## Quick start
 
@@ -153,7 +164,7 @@ positional CSV columns).
 
 The contract is documented in [Process Design Guide → Use
 `workspace.limpid` as the canonical
-intermediate](../processing/user-defined.md#assignments). New
+intermediate](../processing/design-guide.md#use-workspacelimpid-as-the-canonical-intermediate). New
 parsers follow it; out-of-tree vendor parsers should follow it too
 so they compose cleanly with `compose_ocsf`.
 

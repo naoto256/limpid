@@ -45,7 +45,7 @@ Conventions matching `journalctl`:
 
 - field names preserved as journald exposes them (`PRIORITY`, `_PID`,
   `__REALTIME_TIMESTAMP`, `SYSLOG_IDENTIFIER`, `MESSAGE`, …)
-- field order: insertion order from libsystemd
+- field order: insertion order from libsystemd is preserved through the read path. JSON object key order on the wire is a serialisation detail and is not guaranteed to byte-match `journalctl -o json`.
 - UTF-8-clean values: JSON strings
 - non-UTF-8 byte values (rare; e.g. `COREDUMP`): JSON array of integers
   `[104, 101, 108, 108, 111]`

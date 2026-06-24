@@ -136,4 +136,5 @@ behaviour.
 - TLS connectors are built at startup. Errors in CA / cert / key file
   loading or PEM parsing fail-fast before the daemon starts accepting
   events.
+- Common queue / retry / secondary properties — see [Queue and retry](./README.md#queue-and-retry).
 - For UDP, see [syslog_udp](./syslog-udp.md).

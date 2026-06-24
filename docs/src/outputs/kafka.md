@@ -110,8 +110,8 @@ the wire — the only safe transport is TLS. limpid rejects this
 combination at config-load time:
 
 ```
-output kafka {
-    name "lake"
+def output lake {
+    type kafka
     brokers "..."
     topic "events"
     sasl {

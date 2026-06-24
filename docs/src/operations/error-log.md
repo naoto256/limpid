@@ -97,11 +97,28 @@ One JSON object per line:
 |-------|---------|
 | `timestamp` | RFC3339 with nanosecond precision; wall-clock at which the error was raised. |
 | `reason` | Stringified `ProcessError`. Stable enough for `grep` / classification but not a stable API. |
-| `process` | Failed process. A named `def process` invocation surfaces its name; an inline `process { ... }` block surfaces `(inline)`. |
-| `pipeline` | Pipeline name (`def pipeline <name>`). |
+| `process` | Failed process or recovery-path discriminator. A named `def process` invocation surfaces its name; an inline `process { ... }` block surfaces `(inline)`. For records originating from an output's recovery path the value is one of four discriminators: `(output <name>)` — retry exhausted (PR-O); `(output <name> shutdown)` — batched output's shutdown drain (PR-P); `(pipeline)` — explicit `error` from pipeline routing; `(output enqueue)` — output enqueue failure (PR-I). |
+| `pipeline` | Pipeline name (`def pipeline <name>`). Empty for output-originated records (`(output ...)`, `(output ... shutdown)`, `(output enqueue)`); populated only when the record originates inside a pipeline. |
 | `event.source` | Originating peer as `{ip, port}` object. Same shape as `tap --json` and as the DSL `source` ident. |
 | `event.received_at` | i64 unix nanoseconds (matches OTLP `time_unix_nano`). Same shape as `tap --json`. |
 | `event.ingress` | Original wire bytes. UTF-8-clean payloads serialise as a JSON string; non-UTF-8 payloads use the `$bytes_b64` marker the rest of the JSON layer already uses for `tap --json`. |
+
+Example `reason` values across the discriminators: `"unknown identifier: timestamp"` (process runtime error), `"output retry exhausted after 5 attempts: connection refused"` (`(output <name>)`), `"output shutting down; draining queue"` (`(output <name> shutdown)`), `"output queue full; enqueue failed"` (`(output enqueue)`).
+
+## Recovery paths into the DLQ
+
+The DLQ receives records from four distinct paths. The `process` field above is the discriminator:
+
+1. **Process runtime error / explicit `error`** — a `process` statement raised an error, or pipeline routing executed `error <expr?>`. `process` is the failed `def process` name (or `(inline)`), or `(pipeline)` for pipeline-level `error`. `pipeline` is populated. (Original behaviour.)
+2. **Output retry exhausted** (PR-O) — an output exhausted its `retry` budget against the destination. `process = "(output <name>)"`, `pipeline` empty. The event carries the post-pipeline `egress` that the output attempted to deliver.
+3. **Batched output shutdown drain** (PR-P) — a batched output (`otlp_*`, `http`) was shut down while events were still buffered and could not flush them. `process = "(output <name> shutdown)"`, `pipeline` empty. Synthetic-event metadata constraints apply: `received_at` reflects the shutdown moment for events that never carried their own; per-event source / workspace state may be a representative of the batch rather than per-record.
+4. **Output enqueue failure** (PR-I) — the pipeline could not hand an event to an output's queue (queue full, output stopped). `process = "(output enqueue)"`, `pipeline` empty. The record preserves the event as it was at the pipeline → output boundary.
+
+All four paths converge on the same JSONL file and the same replay recipe — `jq` on the `process` field selects which recovery path you are replaying.
+
+### Recovery readiness check (`--check`)
+
+Since 0.7.8 (PR-R), `limpid --check` emits a recovery-readiness warning when any output declares `retry`, declares a `secondary`, or is a batched OTLP/HTTP output and the `control { error_log }` is unset. Without `error_log`, recovery paths 2–4 above fall back to `tracing::error!` and the records are only recoverable through journald — sufficient for triage, but harder to replay. The warning catches the missing configuration before the first failure.
 
 `event.egress` and `event.workspace` are intentionally **not** included — at the failure point they may hold partial state from earlier processes in the chain, which would confuse `inject --json` replay. The replay path re-runs the pipeline from scratch on `ingress`.
 
