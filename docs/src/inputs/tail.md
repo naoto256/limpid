@@ -36,3 +36,4 @@ In both cases, reading resets to the beginning of the new file.
 - Empty lines are skipped.
 - Incomplete lines (no trailing newline) are held until the next poll.
 - The source address for tail events is `127.0.0.1:0` (a placeholder address with port 0; tail has no network peer).
+- Since 0.7.8, the persisted offset advances only after the pipeline worker finishes processing the corresponding line. A crash mid-processing leaves the on-disk cursor at the last *processed* offset, so the next start re-reads any in-flight lines — this is the at-least-once recovery contract documented under [Recovery readiness](../operations/error-log.md#recovery-readiness-check---check).
