@@ -9,8 +9,8 @@
 //!    body branch for `if`/`switch`/`error <expr>`/process-args eval
 //!    failures, surfaced as `(pipeline body)`).
 //! 2. **Output retry exhausted** — `queue/mod.rs` consumer routes the
-//!    payload here after the retry budget is spent and no secondary
-//!    is available, surfaced as `(output <name>)` (PR-O).
+//!    payload here after the retry budget is spent, surfaced as
+//!    `(output <name>)` (PR-O).
 //! 3. **Output enqueue failures** — `runtime.rs` could not hand an
 //!    event to an output's queue (queue closed, disk write error,
 //!    unknown output), surfaced as `(output enqueue)` (PR-I).
