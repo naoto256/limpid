@@ -211,8 +211,8 @@ def pipeline p { input i; output o }
 
     #[test]
     fn no_warning_for_plain_file_output_without_recovery_shape() {
-        // file output, no retry, no secondary, not batched → no
-        // recovery-worthy path exists, so error_log is irrelevant.
+        // file output, no retry, not batched → no recovery-worthy
+        // path exists, so error_log is irrelevant.
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o {
