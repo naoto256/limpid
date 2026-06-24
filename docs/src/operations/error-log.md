@@ -123,6 +123,8 @@ Since 0.7.8 (PR-R), `limpid --check` emits a recovery-readiness warning when any
 
 Since 0.7.8 (PR-X), `--check` also hard-fails when any output declares a `secondary` that names an unknown output, references itself, or forms an indirect cycle (A→B→A, A→B→C→A, …) — the same checks runtime startup performs, hoisted forward so CI gates a deploy before the daemon refuses to boot.
 
+Since 0.7.8, the cursor a `tail` / `journal` input persists to its `state_file` advances on **pipeline-worker completion**, not on channel hand-off. A crash mid-processing now leaves the on-disk cursor pointing to the last *processed* line, so the next start re-reads any events that were in flight — closing the previous at-most-once gap and moving recovery toward at-least-once. Events still in transit on the output queue at the moment of crash are recovered through `error_log` (paths 4–5 above), not the input cursor.
+
 `event.egress` and `event.workspace` are intentionally **not** included — at the failure point they may hold partial state from earlier processes in the chain, which would confuse `inject --json` replay. The replay path re-runs the pipeline from scratch on `ingress`.
 
 Format stability: pre-1.0 we may add new top-level fields, and existing keys may still be reshaped if the underlying DSL changes (the `event.source` field changed from a flat `"ip:port"` string to a `{ip, port}` object in v0.5.6, alongside the corresponding DSL change). After 1.0 the format will be locked.

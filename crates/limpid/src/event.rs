@@ -33,10 +33,125 @@ use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use crate::dsl::arena::EventArena;
 use crate::dsl::value::{Map, OwnedValue, Value};
 use crate::dsl::value_json::{json_to_value, value_to_json};
+
+// ===========================================================================
+// Ack token — input → pipeline-worker-completion ack
+// ===========================================================================
+//
+// Tail / journal inputs persist a cursor (file offset / journal cursor) so a
+// daemon restart resumes near where it left off. Pre-fix that cursor was
+// advanced the instant `tx.send(event).await` succeeded — i.e. as soon as the
+// event reached the pipeline-worker channel. If the daemon crashed before the
+// worker ran the pipeline, the cursor on disk pointed PAST events that had
+// never been processed, and a restart silently skipped them.
+//
+// The fix moves the cursor advance to "pipeline worker finished with the
+// event". The token below is the carrier: a `Drop`-fired ack that the input
+// embeds in each event it emits, and that fires automatically when the last
+// reference to the event is released — typically when `process_event` returns
+// in `runtime::run_pipeline_workers`. All termination shapes (Finished,
+// Dropped, Errored, even a panic that unwinds the worker task) ack the same
+// way because the mechanism is `Drop`, not an explicit call.
+//
+// Why `Drop`-fired rather than explicit `event.ack()`:
+//   - Adds nothing to the pipeline code path (no plumbing through every
+//     branch, no risk of missing a termination variant on a future change).
+//   - Naturally fans out: if the same `OwnedEvent` is shared across multiple
+//     fan-in workers via `&Event`, the single Arc fires once on the outer
+//     scope drop — i.e. after every worker has run.
+//   - Naturally degrades for inputs that don't use it: `OwnedEvent::new`
+//     constructs with `ack: None`, and `drop_ack()` is a no-op.
+//
+// The token is held under an `Arc` so cloning is cheap when the runtime
+// clones an event for a DLQ side-band; only the LAST surviving clone fires
+// the ack. In practice the DLQ write completes inside `process_event` (the
+// `write_errored_to_dlq` call is `.await`-ed) so this currently matters only
+// for the disk-queue persist path (see below).
+//
+// Disk-queue path: when `pipeline::run_pipeline` routes an event to a disk-
+// backed output, it builds the `SinkInput::Owned` from a `BorrowedEvent::
+// to_owned()` — a freshly-constructed `OwnedEvent` with `ack: None`. So the
+// disk-queue copy does NOT extend the ack; the cursor advances when the
+// pipeline-worker channel hand-off completes, which is "memory-queue
+// enqueued / disk-queue mpsc handed-off". The remaining tail of disk
+// persistence is operator-territory: the disk-queue itself fsyncs on its own
+// cadence and surfaces its own metrics. Closing that final gap is out of
+// scope for this change — see `docs/operations/error-log.md` for the
+// recovery-readiness contract.
+
+/// Acknowledgement message sent back from the pipeline worker to the input.
+///
+/// Carries the input-defined position (typically a file offset for tail or a
+/// journald cursor for journal) so the input's ack-reader task can advance
+/// its watermark and persist the new position to its state file.
+#[derive(Debug, Clone)]
+pub enum AckPosition {
+    /// Byte offset within a tail'd file.
+    Offset(u64),
+    /// Opaque cursor token from a systemd journal entry. Constructed
+    /// only when the `journal` cargo feature is enabled.
+    #[allow(dead_code)]
+    Cursor(String),
+}
+
+/// Drop-fired ack handle. Constructed by the input layer and embedded into
+/// the event; when the last reference to the containing event is released,
+/// the handle's `Drop` impl sends the carried `AckPosition` over the input's
+/// ack channel.
+///
+/// The send is fire-and-forget (`try_send`): if the input has already shut
+/// down and the receiver was dropped, the ack is harmlessly lost — the input
+/// will restart at the last persisted (older-or-equal) watermark and re-read
+/// the event, which is the at-least-once contract we want anyway.
+#[derive(Debug)]
+pub struct AckHandle {
+    /// Interior mutability so the input's send-failure path can `disarm`
+    /// through a shared `Arc`. `std::sync::Mutex<Option<_>>` is cheap for
+    /// a one-shot signal — contention is impossible by construction (the
+    /// only writer is the disarm call and the only reader is Drop).
+    position: std::sync::Mutex<Option<AckPosition>>,
+    /// `tokio::sync::mpsc::UnboundedSender` — unbounded because the ack
+    /// channel must never apply backpressure on the pipeline worker; if it
+    /// did, a slow ack-reader could deadlock the whole pipeline. Memory
+    /// growth is bounded by the input → pipeline channel queue depth, which
+    /// is already a configurable backpressure point (`queue_size`).
+    tx: tokio::sync::mpsc::UnboundedSender<AckPosition>,
+}
+
+impl AckHandle {
+    pub fn new(position: AckPosition, tx: tokio::sync::mpsc::UnboundedSender<AckPosition>) -> Self {
+        Self {
+            position: std::sync::Mutex::new(Some(position)),
+            tx,
+        }
+    }
+
+    /// Cancel the pending ack so `Drop` will not fire. Used by inputs on
+    /// the un-recoverable send-failure path: the event never reached the
+    /// pipeline, so advancing the cursor based on its position would
+    /// silently drop the line. The line will be re-read on the next poll
+    /// once the input rewinds its read offset.
+    pub fn disarm(&self) {
+        if let Ok(mut g) = self.position.lock() {
+            *g = None;
+        }
+    }
+}
+
+impl Drop for AckHandle {
+    fn drop(&mut self) {
+        let pos = self.position.lock().ok().and_then(|mut g| g.take());
+        if let Some(pos) = pos {
+            // Receiver-gone is the expected shutdown shape; ignore.
+            let _ = self.tx.send(pos);
+        }
+    }
+}
 
 // ===========================================================================
 // Owned (boundary) event
@@ -58,6 +173,14 @@ pub struct OwnedEvent {
     pub ingress: Bytes,
     pub egress: Bytes,
     pub workspace: HashMap<String, OwnedValue>,
+    /// Optional drop-fired ack used by inputs that persist a cursor
+    /// (tail / journal). `None` for inputs that don't have a position to
+    /// advance (syslog, OTLP, unix_socket, …) and for events synthesised
+    /// by the boundary (DLQ replay, control-plane inject, `--test-pipeline`).
+    /// Skipped on JSON serialisation by design — the wire form is
+    /// runtime-only state with no persistent meaning.
+    #[allow(dead_code)] // read via Drop; field exists solely to control lifetime
+    pub ack: Option<Arc<AckHandle>>,
 }
 
 impl OwnedEvent {
@@ -68,6 +191,24 @@ impl OwnedEvent {
             egress: ingress.clone(),
             ingress,
             workspace: HashMap::new(),
+            ack: None,
+        }
+    }
+
+    /// Variant of [`new`] that embeds a drop-fired ack token.
+    ///
+    /// Called by tail / journal inputs (the only inputs with a cursor to
+    /// advance). The pipeline-worker layer never inspects `ack`: it fires
+    /// automatically when the last surviving clone of this event drops at
+    /// the end of `runtime::process_event`.
+    pub fn with_ack(ingress: Bytes, source: SocketAddr, ack: Arc<AckHandle>) -> Self {
+        Self {
+            received_at: Utc::now(),
+            source,
+            egress: ingress.clone(),
+            ingress,
+            workspace: HashMap::new(),
+            ack: Some(ack),
         }
     }
 
@@ -175,6 +316,10 @@ impl OwnedEvent {
             ingress,
             egress,
             workspace: HashMap::new(),
+            // Deserialised events are by definition past the input boundary
+            // (DLQ replay, control-plane inject) — no upstream cursor to
+            // advance, so no ack token.
+            ack: None,
         };
 
         if let Some(workspace) = v.get("workspace")
@@ -244,6 +389,14 @@ impl<'bump> BorrowedEvent<'bump> {
             ingress: self.ingress.clone(),
             egress: self.egress.clone(),
             workspace,
+            // BorrowedEvent does not carry an ack — it's the per-event arena
+            // view. Cloning back to owned for DLQ / disk-queue persistence
+            // produces a fresh OwnedEvent whose lifetime is decoupled from
+            // the original ack. The original OwnedEvent (held one frame up
+            // in `process_event`) still owns the Arc and fires the ack on
+            // its own scope exit, which is exactly the "pipeline-worker
+            // completion" semantics we want.
+            ack: None,
         }
     }
 
