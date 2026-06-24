@@ -34,8 +34,8 @@ limpid --debug --config /etc/limpid/limpid.conf
 
 ```
 $ limpid --check --config /etc/limpid/limpid.conf
-checking /etc/limpid/limpid.conf: 4 inputs, 6 processes, 3 outputs, 2 pipelines
-/etc/limpid/limpid.conf: Configuration OK (0 errors, 0 warnings)
+checking /etc/limpid/limpid.conf: 5 file(s), 3 input(s), 2 output(s), 2 process(es), 2 pipeline(s)
+/etc/limpid/limpid.conf: Configuration OK (2 pipeline(s), 2 process(es); dataflow check passed)
 ```
 
 CI integration: combine `--check --strict-warnings` and treat exit `2` as a gate failure distinct from exit `1` (hard errors).

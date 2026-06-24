@@ -136,11 +136,12 @@ struct Inner {
     batch_level: BatchLevel,
     headers: Vec<(String, String)>,
     batch_timeout: Duration,
-    /// Per-batch retry policy. The shared `RetryConfig` parser used by
-    /// the file / syslog_tcp / http outputs reads `retry { max_attempts
-    /// initial_wait max_wait backoff }` from the output's properties;
-    /// we re-use it so every limpid output speaks the same retry
-    /// vocabulary.
+    /// Per-batch retry policy. The shared `RetryConfig` parser
+    /// (`crate::queue::RETRY_PROPERTY_SPEC`) is spliced into every
+    /// output's schema by the queue layer, so OTLP speaks the same
+    /// `retry { max_attempts initial_wait max_wait backoff }`
+    /// vocabulary as the rest of the outputs — no module-local
+    /// duplicate of the property spec.
     ///
     /// Internal retry matters for OTLP specifically because it batches
     /// Events from multiple `write()` calls — without an internal

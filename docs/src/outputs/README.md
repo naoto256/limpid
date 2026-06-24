@@ -65,7 +65,7 @@ If the secondary enqueue itself fails, or no `secondary` is configured, the payl
 
 ### Recovery (error_log)
 
-The daemon-wide [`control { error_log "..." }`](../configuration.md) block names a JSONL file that catches payloads the queue/retry/secondary chain could not place. Three paths feed it:
+The daemon-wide [`control { error_log "..." }`](../operations/error-log.md) block names a JSONL file that catches payloads the queue/retry/secondary chain could not place. Three paths feed it:
 
 - the `secondary` enqueue itself failed,
 - no `secondary` was configured and the retry budget was exhausted,

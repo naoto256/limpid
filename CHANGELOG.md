@@ -10,6 +10,16 @@ runtime shape converge. After 1.0, changes will follow semver strictly.
 
 ## [Unreleased] - 0.7.8
 
+### Fixed — `output otlp_http` / `output otlp_grpc`: retain drained batch on mid-stream flush failure
+
+When `flush()` returned `Err` mid-stream, both OTLP transports dropped the events they had just drained from the in-memory buffer — the per-Event ResourceLogs bytes were popped to build the request, the request failed, and the bytes were discarded with only a `tracing::warn!`. The retry budget did not apply (the queue layer had already counted the events as delivered when `write()` returned `Ok` into the batch buffer), so the next flush started from a fresh buffer and the drained payload was silently lost. The drained batch is now restored to the in-memory buffer on `Err`; `events_failed` is **not** bumped (the events have not actually been rejected by the peer, only deferred), and the next flush picks them up alongside whatever has accumulated since. Aligns the mid-stream failure shape with the existing shutdown-flush behaviour (PR-P): events stay in the buffer until either a successful flush or shutdown drains them — never dropped silently.
+
+
+### Fixed — `output syslog_tcp` / `output syslog_udp`: peer cooldown anchored on failure-completion time
+
+The peer-rotation cooldown timestamp on both syslog outputs was being captured *before* the connect / send attempt, the same shape `output http` already fixed in 0.7.8 (commit `e0484e9`) and `output otlp_grpc` / `output otlp_http` picked up via the sibling fix below. A peer that timed out mid-send recorded a cooldown that was already most of the `PEER_COOLDOWN` window in the past, so the immediately-following datagram / connection attempt reselected the same bad peer instead of rotating away. The cooldown timestamp now derives from a fresh `Instant::now()` captured on the failure branch after the failing call returns, matching the rest of the rotation-aware outputs and giving the cooldown window the wall-clock distance it needs to actually shift load to a healthy peer.
+
+
 ### Fixed — `output http`: stuck batch after a failed flush no longer waits for the next `write()`
 
 When `flush()` returned `Err`, the batch was placed back into the in-memory buffer but the flush timer was not re-armed. The stuck batch then sat in the buffer until the next `write()` arrived — which on a quiet pipeline might be never — while the queue layer had already counted the events as failed (Rendered payloads do not retry). The operator saw `events_failed += 1` yet the data still lived in the HTTP buffer with no schedule to drain it. The flush timer is now re-armed on the `Err` branch so `batch_timeout` drives the retry, restoring the "no event silently parked in the HTTP buffer" invariant. Regression test covers the `should_flush` failure path.

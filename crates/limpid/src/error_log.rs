@@ -1,9 +1,27 @@
-//! Dead-letter queue (DLQ) writer for events that fail in `process`.
+//! Dead-letter queue (DLQ) writer for events that fail their main-flow
+//! disposition.
 //!
-//! When a pipeline `process` raises a runtime error, the event is
-//! pulled out of the main flow and routed here as a JSONL record.
-//! Operators can then audit failures, fix the offending config or
-//! parser, and replay the original events via:
+//! This writer is invoked from four producer sites — the `process`
+//! discriminator on each record names which one wrote it:
+//!
+//! 1. **Process runtime errors** — a `process` body raised an error
+//!    (`runtime.rs::process_event` Errored arm + the sibling pipeline-
+//!    body branch for `if`/`switch`/`error <expr>`/process-args eval
+//!    failures, surfaced as `(pipeline body)`).
+//! 2. **Output retry exhausted** — `queue/mod.rs` consumer routes the
+//!    payload here after the retry budget is spent and no secondary
+//!    is available, surfaced as `(output <name>)` (PR-O).
+//! 3. **Output enqueue failures** — `runtime.rs` could not hand an
+//!    event to an output's queue (queue closed, disk write error,
+//!    unknown output), surfaced as `(output enqueue)` (PR-I).
+//! 4. **Batched-output shutdown-flush leftovers** — `modules/mod.rs`
+//!    walks the remaining buffer of a batched output that could not
+//!    flush at shutdown, surfaced as `(output <name> shutdown)` (PR-P).
+//!
+//! All four converge on this same JSONL file, the same replay recipe,
+//! and the same `events_errored` / `events_errored_unwritable` counter
+//! pair. Operators can then audit failures, fix the offending config
+//! or parser, and replay the original events via:
 //!
 //! ```bash
 //! jq -c '.event' /var/log/limpid/errored.jsonl \
