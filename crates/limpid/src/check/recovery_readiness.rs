@@ -6,8 +6,8 @@
 //! `control { error_log "..." }` is set. With `error_log` missing the
 //! runtime falls back to the 0.7.7 behaviour (log + metric only, no
 //! replay-able record on disk) — so an operator writing a config with
-//! retry / secondary / batched outputs and *no* `error_log` silently
-//! voids the safety net those features were added to provide.
+//! retry / batched outputs and *no* `error_log` silently voids the
+//! safety net those features were added to provide.
 //!
 //! This module raises one [`Level::Warning`] when:
 //!
@@ -15,8 +15,6 @@
 //! 2. at least one `def output` either:
 //!    - declares a `retry { ... }` block (= invokes the
 //!      [`write_with_retry`] recovery routing path), OR
-//!    - names a `secondary <other>` fallback (= relies on the same
-//!      routing path), OR
 //!    - is a batched output type (`http`, `otlp_http`, `otlp_grpc`)
 //!      whose [`Output::shutdown`] implementation drains the buffer
 //!      to `error_log` on flush failure.
@@ -57,21 +55,14 @@ fn error_log_configured(config: &CompiledConfig) -> bool {
 
 /// Categorise *why* a given output needs `error_log` for full
 /// recovery. Returns `None` when the output has no recovery-worthy
-/// shape (e.g. a plain `file` output with no retry / secondary).
+/// shape (e.g. a plain `file` output with no retry).
 fn recovery_reason(output: &crate::dsl::ast::OutputDef) -> Option<&'static str> {
     let props_view = output.properties.user_properties();
 
     // Retry block present → enters write_with_retry, which routes
-    // exhausted attempts through error_log when no secondary captures
-    // them (BC-3 / PR-O).
+    // exhausted attempts through error_log (BC-3 / PR-O).
     if props::get_block(props_view, "retry").is_some() {
         return Some("retry");
-    }
-
-    // Secondary configured → same routing path: if the secondary
-    // enqueue itself fails, the payload falls through to error_log.
-    if props::get_ident(props_view, "secondary").is_some() {
-        return Some("secondary");
     }
 
     // Batched output: shutdown flush failures drain to error_log
@@ -119,9 +110,9 @@ pub(super) fn analyze_all(config: &CompiledConfig, diags: &mut Vec<Diagnostic>) 
         "config has outputs that depend on `error_log` for failure recovery, \
          but `control {{ error_log \"...\" }}` is not configured. \
          Affected outputs: {}. \
-         On retry exhaustion, secondary-output failure, or shutdown flush failure, \
-         the original payload will be dropped silently (log + metric only, no \
-         replay-able record). To enable recovery, add:\n    \
+         On retry exhaustion or shutdown flush failure, the original payload \
+         will be dropped silently (log + metric only, no replay-able record). \
+         To enable recovery, add:\n    \
          control {{\n        error_log \"/var/log/limpid/error_log.jsonl\"\n    }}",
         summary,
     );
@@ -177,31 +168,6 @@ def pipeline p { input i; output o }
         let ws = recovery_warnings(&diags);
         assert_eq!(ws.len(), 1, "expected exactly one recovery warning, got: {:?}", diags);
         assert!(ws[0].message.contains("`o` (retry)"), "got: {}", ws[0].message);
-    }
-
-    #[test]
-    fn warns_when_secondary_configured_without_error_log() {
-        let src = r#"
-def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output primary {
-    type syslog_tcp
-    peer { host "h" port 1 }
-    secondary fallback
-}
-def output fallback {
-    type file
-    path "/tmp/fallback.log"
-}
-def pipeline p { input i; output primary }
-"#;
-        let diags = analyze_str(src);
-        let ws = recovery_warnings(&diags);
-        assert_eq!(ws.len(), 1, "got: {:?}", diags);
-        assert!(
-            ws[0].message.contains("`primary` (secondary)"),
-            "got: {}",
-            ws[0].message
-        );
     }
 
     #[test]

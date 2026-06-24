@@ -70,7 +70,7 @@ impl QueueSendError {
 
 /// Disposition of an event after `write_with_retry`. Type-encoded
 /// version of the function's previous doc comment ("true on success,
-/// false if event was dropped/sent to secondary").
+/// false if event was dropped").
 ///
 /// `#[must_use]` so a caller can't silently throw the disposition
 /// away — that's exactly the bug shape this refactor is meant to
@@ -87,24 +87,17 @@ pub enum WriteDisposition {
     /// `OutputWriter::consume` returned `Ok(())` on some attempt.
     Delivered,
 
-    /// `consume` ultimately failed but the original `Owned` event was
-    /// successfully forwarded to the configured secondary queue.
-    RoutedToSecondary,
-
     /// `consume` ultimately failed and the event was not handed off:
-    /// retries exhausted with no secondary configured, the secondary
-    /// send itself failed, or the payload was `Rendered` (not
-    /// re-routable). The consumer treats all three as "done from the
-    /// queue's POV" and acks anyway.
+    /// retries exhausted with no `error_log` configured, or the
+    /// payload was `Rendered` (not re-routable). The consumer treats
+    /// both as "done from the queue's POV" and acks anyway.
     Dropped,
 
-    /// `consume` ultimately failed, the event could not be routed to a
-    /// secondary queue (none configured, or the secondary enqueue
-    /// itself failed), and the payload was persisted to the configured
-    /// `error_log` JSONL file for manual recovery. Distinguishes the
-    /// "payload survives on disk" outcome from the unrecoverable
-    /// [`Dropped`] case so PR-Q metrics can count recoverable losses
-    /// separately.
+    /// `consume` ultimately failed and the payload was persisted to
+    /// the configured `error_log` JSONL file for manual recovery.
+    /// Distinguishes the "payload survives on disk" outcome from the
+    /// unrecoverable [`Dropped`] case so PR-Q metrics can count
+    /// recoverable losses separately.
     ///
     /// [`Dropped`]: WriteDisposition::Dropped
     DroppedToRecovery,
