@@ -20,6 +20,6 @@ def input local {
 ## Notes
 
 - The socket file is created with mode `0666` (world-writable) so any local process can send messages.
-- If a stale socket file exists, it is removed on startup (with symlink detection for safety).
+- If the configured `path` is a symlink, the input refuses to start (it will not follow the link). Otherwise, stale socket files at that path are removed automatically on startup.
 - PRI validation is enforced on all messages.
 - Works with the `logger` command: `logger "hello from limpid"`

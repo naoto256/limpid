@@ -492,9 +492,11 @@ struct PipelineContext {
     config: Arc<CompiledConfig>,
     funcs: Arc<FunctionRegistry>,
     tap: TapRegistry,
-    /// Dead-letter queue writer for events that fail in `process`.
-    /// `None` when the operator hasn't configured `error_log` — the
-    /// runtime then falls back to a structured `tracing::error!` line.
+    /// Dead-letter queue writer used for: (1) `process` runtime
+    /// errors, (2) output retry-exhausted payloads (PR-O), (3)
+    /// batched-output shutdown-flush leftovers (PR-P). `None` when
+    /// `control { error_log }` is unset — falls back to a structured
+    /// `tracing::error!` line for each case.
     error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
 }
 

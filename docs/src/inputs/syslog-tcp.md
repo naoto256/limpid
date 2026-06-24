@@ -82,7 +82,7 @@ Framing detection runs after the TLS handshake when `tls` is configured.
 ## Notes
 
 - PRI validation is enforced on all messages.
-- Idle connections are closed after 300 seconds.
+- Idle connections are closed after 300 seconds (applied uniformly to framing detection, length-prefix read, and payload read — any 5-minute gap at any read stage drops the connection).
 - Maximum message size: 1 MiB.
 - Connections exceeding `max_connections` are rejected immediately.
 - TLS server config (cert / key / CA loading + parsing) happens at

@@ -230,6 +230,16 @@ switch workspace.cef.device_vendor {
 
 Arm bodies are statements valid in the surrounding body, same rule as `if`. There is no fall-through and no need for an explicit `break`.
 
+Position rule: `default` must be the last arm and may appear at most once; `--check` rejects otherwise (since 0.7.8). For example, the following is rejected:
+
+```limpid
+// NG — `default` is not last
+switch source.ip {
+    default     { output archive }
+    "192.0.2.1" { output fw01 }
+}
+```
+
 There is also an **expression form** of `switch` — each arm body is one expression rather than a statement list, and the matching arm's value is the value of the whole `switch`. Used inside `def function` bodies and anywhere a value is expected:
 
 ```limpid

@@ -87,5 +87,7 @@ Identical semantics to the [otlp_http batch_level](./otlp_http.md#batch_level) �
 ## Notes
 
 - `partial_success` on the response (rejected log records) is logged as a warning. The internal `retry { … }` block does not branch on `partial_success` — it retries the whole batch on transport failures only. A finer "retry just the rejects" policy is queued for a later release.
+- On a transport error during a partial-success flush, the drained batch is restored to the in-memory buffer so the rejected records are not lost to the next attempt (PR-F).
+- At shutdown, if a final flush fails unrecoverably, the remaining buffered ResourceLogs are drained to `control { error_log "..." }` (PR-P) — one DLQ record per rendered request body. Without `error_log` the daemon falls back to 0.7.7 behaviour (warn + drop); shutdown-path DLQ records carry a synthetic source and the shutdown time as `received_at` because the envelope `Event` is dropped at `write()` Ok. See [Queue and retry → Recovery (error_log)](./README.md#recovery-error_log).
 - Server TLS uses rustls (aws-lc-rs provider). System root certificates are loaded via tonic's `tls-roots`; supply `tls { ca }` to add a custom CA on top.
 - For HTTP transport see [otlp_http](./otlp_http.md).

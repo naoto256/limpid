@@ -24,19 +24,19 @@ read that and explains the OTLP-specific reading on top.
 
 ## 1. Scope
 
-| Aspect | Current (0.7.6) |
+| Aspect | Current (0.7.8) |
 |---|---|
 | Signal | **logs** only — no traces, no metrics, no profiles |
-| Transports | HTTP/JSON, HTTP/protobuf, gRPC (all three; output side split into `output otlp_http` / `output otlp_grpc` as of 0.7.6) |
+| Transports | HTTP/JSON, HTTP/protobuf, gRPC (all three; output side split into `output otlp_http` / `output otlp_grpc` introduced in 0.7.6; in 0.7.8 plaintext `http://` with `tls { ... }` is now rejected at parse time — see CHANGELOG 0.7.8) |
 | Direction | input *and* output (so collector-to-collector relay works) |
-| TLS | server-side TLS / mTLS on every input (`otlp_http`, `otlp_grpc`); client-side TLS / mTLS on every output (per-peer `tls { ca cert key }` on both `output otlp_http` and `output otlp_grpc` as of 0.7.6) |
+| TLS | server-side TLS / mTLS on every input (`otlp_http`, `otlp_grpc`); client-side TLS / mTLS on every output (per-peer `tls { ca cert key }` on both `output otlp_http` and `output otlp_grpc`; introduced in 0.7.6, with 0.7.8 adding fail-fast rejection of plaintext `http://` URLs that pair a `tls { ... }` block) |
 | Versioning | OTLP 1.4 wire (the proto3 schema as of opentelemetry-proto 0.27) |
 
 Traces and metrics share the same wire envelope shape but use different
 proto messages, so the input / output skeleton from logs is reusable.
-v0.5.0 ships logs first because that is where limpid's existing pipeline
-identity lives — every other limpid module produces or consumes log
-records.
+The 0.5.x line shipped logs first because that is where limpid's existing
+pipeline identity lives — every other limpid module produces or consumes
+log records.
 
 ---
 
@@ -366,9 +366,10 @@ that expose no usable source time (or where the source clock is
 known-bad and you want to ignore it) are handled in the composer by
 overriding the default — Rust never sees the decision.
 
-This is also why `received_at` was renamed in v0.5.0: a forwarder
-must not silently conflate wall-clock and source-clock semantics. See
-the breaking change entry in [CHANGELOG.md](../../CHANGELOG.md).
+This is also why the `Event.timestamp` → `Event.received_at` rename
+that landed in v0.5.0 was made: a forwarder must not silently conflate
+wall-clock and source-clock semantics. See the breaking change entry in
+[CHANGELOG.md](../../CHANGELOG.md).
 
 ### 5.4 Resource attributes are user-authored
 
@@ -405,8 +406,8 @@ producer's "High" means OTLP 13 (WARN) for some vendors and OTLP 17
 (ERROR) for others. limpid does not bake any mapping into Rust;
 snippets carry the table.
 
-The reference snippet library that landed in v0.7.0 (and expanded in
-v0.7.1) ships opinionated mappings for common vendors — see
+The reference snippet library that landed in v0.7.0 (and was expanded
+across the 0.7.x line) ships opinionated mappings for common vendors — see
 [Snippet Library](./snippets/README.md). Authors of new snippets
 follow the table conventions documented there.
 
@@ -426,10 +427,12 @@ spec does not say.
 
 **What's queued.** The OTel Collector has an `otlp` exporter mode
 where rejected records get logged-and-dropped, and another where they
-trigger the whole batch's failure path. limpid currently does the
-former. A configurable selective-drop / dead-letter mode is queued
-for v0.5.x; the transport retry that landed in v0.5.0 is the
-"hard failure" half.
+trigger the whole batch's failure path. In 0.7.8 the rejected subset
+is split out into `events_failed` (separate from `events_written`) so
+the loss is visible on dashboards; the `control { error_log }` path
+landed in the 0.7.x cycle as the dead-letter route. Selective re-send
+of only the rejected records remains future work (tracked in
+`send_once` doc comments).
 
 ### 5.7 Body format is the snippet's call
 
@@ -452,7 +455,7 @@ work, and avoids fighting the OTLP attribute namespace.
 
 ## 6. What limpid intentionally does *not* do
 
-These are not "queued for v0.5.x" — they are out of scope for
+These are not "queued for a later 0.x release" — they are out of scope for
 limpid's identity as a forwarder. Issues asking for them will be
 closed with a link here.
 
@@ -484,7 +487,7 @@ fields pointing at an OpenTelemetry Schema URL (e.g.,
 `https://opentelemetry.io/schemas/1.27.0`). Most backends ignore
 them. limpid leaves them empty. A future config-level
 `schema_url "..."` directive is plausible if it becomes a real
-ask; it is not v0.5.0.
+ask; it is not part of the 0.5.0 → 0.7.x cycle.
 
 ---
 
@@ -524,12 +527,13 @@ being a per-record concern.
 
 Because the event time is what the source claimed, not what the
 forwarder observed. The two are not the same thing, and conflating
-them was the v0.5.0 breaking change that motivated the rename. See
-§5.3 and the [CHANGELOG entry](../../CHANGELOG.md) for v0.5.0.
+them motivated the `Event.timestamp` → `Event.received_at` rename
+that landed in v0.5.0. See §5.3 and the
+[CHANGELOG entry](../../CHANGELOG.md) for v0.5.0.
 
 ### *"Can I send Resource attributes from the input layer?"*
 
-Not in v0.5.0. Inputs do not interpret payloads (Principle 2). The
+Not in the 0.5.0 → 0.7.x cycle. Inputs do not interpret payloads (Principle 2). The
 parser snippet that runs in the process layer extracts the source's
 identity into workspace fields; the composer snippet then writes
 them into the Resource. If the same one-Resource pipeline is
@@ -557,4 +561,4 @@ section reference and the wire trace.
 | How do I configure the input / output? | [otlp_http](./inputs/otlp-http.md), [otlp_grpc](./inputs/otlp-grpc.md), [otlp_http output](./outputs/otlp_http.md), [otlp_grpc output](./outputs/otlp_grpc.md) |
 | What primitives are in the `otlp.*` namespace? | [Built-in Functions](./functions/expression-functions.md#otlp---opentelemetry-protocol-logs-signal) |
 | What are the design principles this builds on? | [Design Principles](./design-principles.md) |
-| What changed in v0.5.0 specifically? | [CHANGELOG](../../CHANGELOG.md) (covers the `Event.timestamp` → `Event.received_at` migration) |
+| What changed in v0.5.0 specifically? | [CHANGELOG](../../CHANGELOG.md) (covers the `Event.timestamp` → `Event.received_at` rename that landed in v0.5.0) |

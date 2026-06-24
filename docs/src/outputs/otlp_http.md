@@ -138,4 +138,5 @@ The merging modes are wire-efficiency optimisations; if your batch sizes are mod
 
 - `http_protobuf` is the canonical OTLP wire form; `http_json` serializes per the OTLP/JSON canonical mapping (camelCase, u64-as-string, bytes-as-hex).
 - `verify false` skips certificate verification — development only. limpid emits a `tracing::warn!` once per `https://` peer at startup when `verify false` is in effect so the misconfiguration is greppable in the daemon log. Has no effect on `http://` endpoints (no TLS to verify).
+- At shutdown, if a final flush of the remaining buffered ResourceLogs fails unrecoverably, the buffer is drained to `control { error_log "..." }` (PR-P), one DLQ record per rendered request body. Without `error_log` the daemon falls back to 0.7.7 behaviour (warn + drop); because the in-memory queue drops the source `Event` envelope at `write()` Ok, shutdown-path DLQ records carry a synthetic source and the shutdown time as `received_at`. See [Queue and retry → Recovery (error_log)](./README.md#recovery-error_log).
 - For gRPC transport see [otlp_grpc](./otlp_grpc.md).

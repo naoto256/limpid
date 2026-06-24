@@ -39,9 +39,11 @@ def output reliable {
         backoff exponential                // exponential (default) | fixed
     }
 
-    secondary fallback_output              // optional failover target
+    secondary fallback_output              // optional failover target (bare ident)
 }
 ```
+
+`retry` is accepted by every output type. `secondary` takes a **bare identifier** referencing another `def output` — quoted strings are rejected at `--check`.
 
 ### Memory queue (default)
 
@@ -58,6 +60,18 @@ Events are persisted to a Write-Ahead Log (WAL) on disk. Survives process restar
 ### Secondary output
 
 When all retry attempts are exhausted, the event is forwarded to the `secondary` output instead of being dropped. Useful for dead-letter queues.
+
+If the secondary enqueue itself fails, or no `secondary` is configured, the payload is written to `control { error_log "..." }` (see [Recovery (error_log)](#recovery-error_log) below). Without `error_log`, the event is dropped with a `tracing::warn!` and an `events_failed` counter increment only.
+
+### Recovery (error_log)
+
+The daemon-wide [`control { error_log "..." }`](../configuration.md) block names a JSONL file that catches payloads the queue/retry/secondary chain could not place. Three paths feed it:
+
+- the `secondary` enqueue itself failed,
+- no `secondary` was configured and the retry budget was exhausted,
+- a batched output (e.g. `http`, `otlp_http`, `otlp_grpc`) failed to flush its remaining buffer at shutdown.
+
+Each line is one rendered payload. When `error_log` is unset the daemon falls back to 0.7.7-compatible behaviour (warn + drop), and `limpid --check` emits a warning so the operator notices the silent drop path.
 
 ## Usage in pipelines
 

@@ -41,6 +41,8 @@ The split between `received` and `injected` keeps "real" traffic distinguishable
 
 `received - injected` = events delivered via pipelines. `received - written - failed` ≈ events pending in the queue (useful for disk queues).
 
+`events_failed` counts every event whose final state was retry-exhausted (including OTLP `partial_success.rejected_log_records`). Of those, the ones actually lost are only the records that hit a DLQ write failure or had no DLQ configured — when `control { error_log }` is set, exhausted events are persisted into the DLQ for replay. Evaluate `events_failed` in combination with the DLQ contents (and `events_errored_unwritable`); the `--check` recovery-readiness warning (see [Error Log → Recovery readiness check](./error-log.md#recovery-readiness-check---check)) flags the no-`error_log` case at configuration time so the interpretation of `events_failed` stays unambiguous in production.
+
 ## Viewing metrics
 
 ### Command line

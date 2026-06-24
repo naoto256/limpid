@@ -21,6 +21,8 @@ This page is the reference for every built-in. Operators can also declare their 
 
 ## Call syntax
 
+Errors raised by these primitives (a `parse_json` on malformed input, a `to_int` overflow, a `regex_*` compile failure, …) propagate to the surrounding `try` block when one is in scope; without `try`, the error flows through the pipeline's error path and the event lands in the configured [error log](../operations/error-log.md) (DLQ), with `events_errored` incremented. The same routing applies to errors raised from inside user-defined functions and processes — primitive failure, [`error` statement](../processing/user-defined.md#error), or analyzer-detected runtime fault all share the one path.
+
 ### Bare statements vs assignments
 
 A parser function returns a `Value::Object` whose keys are taken from the parse — `hostname`, `appname`, `msg` for `syslog.parse`; `version`, `name`, `severity`, plus CEF extension keys (`src`, `dst`, `act`, …) for `cef.parse`; whatever the source JSON contains for `parse_json`. There are two ways to consume that object inside a process body.
@@ -188,7 +190,7 @@ workspace.otlp = {
         ]
     },
     scope_logs: [{
-        scope: { name: "limpid", version: "0.5.0" },
+        scope: { name: "limpid", version: version() },
         log_records: [{
             time_unix_nano: workspace.event_time_ns,
             severity_number: 9,                   // 9=INFO, 13=WARN, 17=ERROR, 21=FATAL
@@ -579,6 +581,19 @@ When array compaction is what you want, use
 `filter(arr) { |x| x != null }` — the block-arg `filter` covers
 this without a dedicated `compact` primitive.
 
+### nest_dotted_keys(value)
+
+Convert flat-dotted Object keys into nested Object structure. `{"id.orig_h": "1.2.3.4", "id.orig_p": 53}` becomes `{"id": {"orig_h": "1.2.3.4", "orig_p": 53}}`. Useful for normalising upstream shapes that flatten nested fields with `.` separators (Zeek logs, Filebeat-shipped pipelines, some OpenTelemetry exporters) into the nested form that composers and downstream consumers expect.
+
+```limpid
+workspace.zeek = parse_json(ingress)
+workspace.zeek = nest_dotted_keys(workspace.zeek)
+// {"id.orig_h": "1.2.3.4", "id.orig_p": 53, "ts": 1700000000}
+// → {"id": {"orig_h": "1.2.3.4", "orig_p": 53}, "ts": 1700000000}
+```
+
+Non-Object inputs (arrays, scalars, `null`) pass through unchanged — the function recurses through Array elements and nested Objects but only rewrites string keys that contain `.`. A key like `"a.b"` that conflicts with a sibling already at `"a"` (or a deeper nest that tries to descend into a leaf scalar) is a loud error rather than a silent overwrite, so an upstream shape change surfaces in the DLQ instead of corrupting downstream records.
+
 ## Hash functions
 
 ### md5(str) / sha1(str) / sha256(str)
@@ -685,7 +700,7 @@ Equivalent to `compact` for null removal: `filter(arr) { |x| x != null }` drops 
 
 ### find(array) { |x| predicate }
 
-First element where the block returns truthy, or `null` if no match. Replaces the v0.7.3 `find_by(arr, key, value)` — the new form composes for arbitrary predicates:
+First element where the block returns truthy, or `null` if no match. An earlier `find_by(arr, key, value)` shape was removed in the 0.7.x cycle; the block-arg form composes for arbitrary predicates:
 
 ```limpid
 workspace.process = find(workspace.evidence) { |e| e.entityType == "Process" }
@@ -750,9 +765,17 @@ let highest_severity = max(map(workspace.alerts) { |a| a.severity })
 Name positional captures: take an `Array` of values and an `Array` of string keys (same length), produce an `Object` keyed by name. Length mismatch is a **loud failure** — the typical use is naming parser captures, where a drift is almost always a parser-shape bug the operator wants to hear about.
 
 ```limpid
-let cap = regex_parse_groups(ingress, "(\\S+) (\\S+) (\\S+)")
+// Hand-built positional captures from three regex_extract calls, named in one step.
+let cap = [
+    regex_extract(ingress, "user=(\\S+)"),
+    regex_extract(ingress, "host=(\\S+)"),
+    regex_extract(ingress, "action=(\\S+)")
+]
 workspace.fields = entitle(cap, ["user", "host", "action"])
+// → workspace.fields.user, workspace.fields.host, workspace.fields.action
 ```
+
+For named captures from a single regex pass, reach for [`regex_parse`](#regex_parsestr-pattern) instead — it returns an Object directly, no `entitle` needed.
 
 ### path(obj, key1, key2, ...)
 
@@ -965,7 +988,7 @@ Useful for tagging events with the forwarder's identity (e.g. when several limpi
 
 ### version()
 
-Returns the limpid daemon's version string, baked in at compile time (e.g. `"0.5.0"`).
+Returns the limpid daemon's version string, baked in at compile time (e.g. `"0.7.8"`).
 
 ```limpid
 workspace.processed_by_version = version()

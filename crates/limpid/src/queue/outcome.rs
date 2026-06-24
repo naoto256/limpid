@@ -17,9 +17,10 @@ use std::io;
 /// path inside `QueueSender::send` / `DiskQueueSender::send` that was
 /// previously returning `bool` = `false`.
 ///
-/// `#[non_exhaustive]` so downstream PRs (PR-O / PR-P recovery
-/// routing) can add variants without it being a breaking change for
-/// match-on-self callers; current callers in-tree match exhaustively.
+/// `#[non_exhaustive]` so future recovery-routing work can add
+/// variants without breaking external matches; downstream code should
+/// use `Result` patterns that accept new variants forward-compatibly.
+/// Current callers in-tree match exhaustively.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum QueueSendError {
@@ -73,9 +74,12 @@ impl QueueSendError {
 ///
 /// `#[must_use]` so a caller can't silently throw the disposition
 /// away — that's exactly the bug shape this refactor is meant to
-/// prevent. `#[non_exhaustive]` so PR-O / PR-P can add finer
-/// dispositions (e.g. distinguishing rendered-no-retry from
-/// retries-exhausted) without churning every match site.
+/// prevent. PR-O added [`DroppedToRecovery`] to distinguish payloads
+/// persisted to `error_log` for replay from unrecoverable drops;
+/// `#[non_exhaustive]` remains so future routing work can extend
+/// without churning match sites.
+///
+/// [`DroppedToRecovery`]: WriteDisposition::DroppedToRecovery
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 #[non_exhaustive]

@@ -88,7 +88,7 @@ def process ama_rewrite {
 
 def pipeline ama_forward {
     input ama_tcp
-    process filter_chargen | filter_fortinet_traffic | ama_rewrite
+    process filter_fortinet_traffic | ama_rewrite
     output ama
 }
 ```
