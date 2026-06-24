@@ -81,20 +81,17 @@ pub const QUEUE_PROPERTY_SPEC: PropertySpec = PropertySpec {
 };
 
 // ---------------------------------------------------------------------------
-// Declarative schema for the per-output `retry { ... }` sub-block and
-// the `secondary <name>` property
+// Declarative schema for the per-output `retry { ... }` sub-block
 // ---------------------------------------------------------------------------
 //
-// Both surfaces are honored by `RetryConfig::from_output_properties`
-// (below) for *every* output the queue consumer drives — the runtime
-// has always read `retry` and `secondary` uniformly. Historically only
-// the two OTLP outputs declared them in their `property_schema()`, so
-// non-OTLP configs that set `retry { ... }` or `secondary <name>` got
-// hard-failed at `--check` time as "unknown property" even though the
-// runtime would happily accept them. Hoisting the schema here and
-// splicing the two consts into every output's schema closes that gap
-// without touching the runtime — schema acceptance now matches the
-// runtime's existing intent.
+// Honored by `RetryConfig::from_output_properties` (below) for *every*
+// output the queue consumer drives. Historically only the two OTLP
+// outputs declared `retry` in their `property_schema()`, so non-OTLP
+// configs that set `retry { ... }` got hard-failed at `--check` time
+// as "unknown property" even though the runtime would happily accept
+// them. Hoisting the schema here and splicing the const into every
+// output's schema closes that gap without touching the runtime —
+// schema acceptance now matches the runtime's existing intent.
 //
 // Sub-property names mirror the keys read by
 // `RetryConfig::from_output_properties`; renames stay in lock-step
@@ -139,26 +136,6 @@ pub const RETRY_PROPERTY_SPEC: PropertySpec = PropertySpec {
     repeatable: false,
     exclusive_group: None,
     kind: PropertyValueKind::Block(RETRY_BLOCK_PROPERTIES),
-};
-
-/// `secondary <name>` property specification shared by every output
-/// Module's property schema. Splice alongside [`QUEUE_PROPERTY_SPEC`].
-///
-/// The value is read by `props::get_ident` at runtime, which only
-/// accepts a bare ident — `secondary "fallback"` (string literal) or
-/// `secondary $tpl` (template) would silently return `None`, disabling
-/// the fallback route without any schema-level signal (I-4 violation
-/// caught by the boundary-contract audit). `PropertyValueKind::Ident`
-/// rejects those shapes at `--check` time so the operator sees the
-/// mismatch up front. The runtime still resolves the resulting ident
-/// against the set of declared output names and rejects unknowns /
-/// self-references / cycles in `runtime.rs`.
-pub const SECONDARY_PROPERTY_SPEC: PropertySpec = PropertySpec {
-    name: "secondary",
-    required: false,
-    repeatable: false,
-    exclusive_group: None,
-    kind: PropertyValueKind::Ident,
 };
 
 // ---------------------------------------------------------------------------
@@ -1352,13 +1329,12 @@ mod write_with_retry_tests {
 // Schema-splice regression tests
 // ---------------------------------------------------------------------------
 //
-// Pre-PR-T, only the two OTLP outputs declared `retry` and `secondary`
-// in their `property_schema()` even though `RetryConfig::from_output_properties`
-// reads both for *every* output. The tests below pin the post-PR-T
+// Pre-PR-T, only the two OTLP outputs declared `retry` in their
+// `property_schema()` even though `RetryConfig::from_output_properties`
+// reads it for *every* output. The tests below pin the post-PR-T
 // invariant: every non-OTLP output's schema accepts a `retry { ... }`
-// block and a `secondary <name>` property without raising
-// `UnknownKey`. Adding a third output schema later is then a hard
-// failure here if the splice is forgotten.
+// block without raising `UnknownKey`. Adding a third output schema
+// later is then a hard failure here if the splice is forgotten.
 #[cfg(test)]
 mod schema_splice_tests {
     use super::{BackoffStrategy, RetryConfig};
@@ -1407,10 +1383,6 @@ mod schema_splice_tests {
         )
     }
 
-    fn secondary_prop() -> Property {
-        kv("secondary", ExprKind::Ident(vec!["fallback".into()]))
-    }
-
     /// Filter out `UnknownKey` errors for the splice contract — other
     /// errors (e.g. missing required keys we didn't supply for the
     /// schema under test) are off-topic for this test.
@@ -1421,12 +1393,12 @@ mod schema_splice_tests {
     }
 
     fn assert_accepts(schema: &[PropertySpec], output_name: &str) {
-        let props = vec![full_retry_block(), secondary_prop()];
+        let props = vec![full_retry_block()];
         let errs = validate(&props, schema);
         let unknown = unknown_key_errs(&errs);
         assert!(
             unknown.is_empty(),
-            "output '{}': retry / secondary should be accepted by schema, \
+            "output '{}': retry should be accepted by schema, \
              got UnknownKey errors for: {:?}",
             output_name,
             unknown.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
@@ -1434,9 +1406,9 @@ mod schema_splice_tests {
     }
 
     #[test]
-    fn every_output_schema_accepts_retry_and_secondary() {
+    fn every_output_schema_accepts_retry() {
         // The full matrix lives in one test so adding a new output
-        // either splices the common consts into its schema or fails
+        // either splices the common const into its schema or fails
         // this test loudly.
         assert_accepts(StdoutOutput::property_schema().unwrap(), "stdout");
         assert_accepts(FileOutput::property_schema().unwrap(), "file");
@@ -1485,135 +1457,18 @@ mod schema_splice_tests {
         }
     }
 
-    /// I-4 invariant guard: `secondary` is read at runtime by
-    /// `props::get_ident`, which silently discards anything that
-    /// isn't a bare ident. The schema must reject string literals
-    /// and templates so the operator sees the mismatch at `--check`
-    /// time rather than booting with a silently-disabled fallback
-    /// route. Covers every output's shared schema in one pass.
-    #[test]
-    fn secondary_rejects_non_ident_shapes_in_all_outputs() {
-        #[allow(unused_mut)]
-        let mut schemas: Vec<(&[PropertySpec], &str)> = vec![
-            (StdoutOutput::property_schema().unwrap(), "stdout"),
-            (FileOutput::property_schema().unwrap(), "file"),
-            (HttpOutput::property_schema().unwrap(), "http"),
-            (SyslogTcpOutput::property_schema().unwrap(), "syslog_tcp"),
-            (SyslogUdpOutput::property_schema().unwrap(), "syslog_udp"),
-            (UnixSocketOutput::property_schema().unwrap(), "unix_socket"),
-            (OtlpGrpcOutput::property_schema().unwrap(), "otlp_grpc"),
-            (OtlpHttpOutput::property_schema().unwrap(), "otlp_http"),
-        ];
-        #[cfg(feature = "kafka")]
-        schemas.push((KafkaOutput::property_schema().unwrap(), "kafka"));
-
-        // Each bad shape must produce a TypeMismatch on the `secondary`
-        // key — UnknownKey would mean the splice itself broke (covered
-        // by the accept-test above), other errs are fine to ignore.
-        let bad_shapes: Vec<(Property, &str)> = vec![
-            (
-                kv("secondary", ExprKind::StringLit("fallback".into())),
-                "string literal",
-            ),
-            (
-                kv(
-                    "secondary",
-                    ExprKind::Template(vec![
-                        crate::dsl::ast::TemplateFragment::Literal("fall".into()),
-                        crate::dsl::ast::TemplateFragment::Interp(Expr::spanless(
-                            ExprKind::Ident(vec!["env".into(), "FB".into()]),
-                        )),
-                    ]),
-                ),
-                "template",
-            ),
-            (
-                kv(
-                    "secondary",
-                    ExprKind::Ident(vec!["pkg".into(), "fallback".into()]),
-                ),
-                "multi-segment ident",
-            ),
-        ];
-
-        for (schema, name) in &schemas {
-            for (bad, shape_label) in &bad_shapes {
-                let errs = validate(std::slice::from_ref(bad), schema);
-                let mismatch = errs.iter().find(|e| {
-                    e.key == "secondary"
-                        && matches!(e.kind, SchemaErrorKind::TypeMismatch { .. })
-                });
-                assert!(
-                    mismatch.is_some(),
-                    "output '{}': secondary {} should be rejected by schema, \
-                     got errs={:?}",
-                    name,
-                    shape_label,
-                    errs.iter().map(|e| (&e.kind, &e.key)).collect::<Vec<_>>(),
-                );
-            }
-        }
-    }
-
-    /// Companion to the negative test: bare-ident form (the only valid
-    /// shape) and absence must both pass without a `secondary`-keyed
-    /// error. Pins the post-fix accept range so the schema stays a
-    /// faithful mirror of what `props::get_ident` reads at runtime.
-    #[test]
-    fn secondary_accepts_bare_ident_and_absence_in_all_outputs() {
-        #[allow(unused_mut)]
-        let mut schemas: Vec<(&[PropertySpec], &str)> = vec![
-            (StdoutOutput::property_schema().unwrap(), "stdout"),
-            (FileOutput::property_schema().unwrap(), "file"),
-            (HttpOutput::property_schema().unwrap(), "http"),
-            (SyslogTcpOutput::property_schema().unwrap(), "syslog_tcp"),
-            (SyslogUdpOutput::property_schema().unwrap(), "syslog_udp"),
-            (UnixSocketOutput::property_schema().unwrap(), "unix_socket"),
-            (OtlpGrpcOutput::property_schema().unwrap(), "otlp_grpc"),
-            (OtlpHttpOutput::property_schema().unwrap(), "otlp_http"),
-        ];
-        #[cfg(feature = "kafka")]
-        schemas.push((KafkaOutput::property_schema().unwrap(), "kafka"));
-
-        for (schema, name) in &schemas {
-            // Bare ident — must pass.
-            let with_ident = vec![secondary_prop()];
-            let errs = validate(&with_ident, schema);
-            let bad = errs.iter().find(|e| e.key == "secondary");
-            assert!(
-                bad.is_none(),
-                "output '{}': bare-ident secondary should be accepted, got {:?}",
-                name,
-                bad,
-            );
-
-            // Absent — must pass.
-            let empty: Vec<Property> = vec![];
-            let errs = validate(&empty, schema);
-            let bad = errs.iter().find(|e| e.key == "secondary");
-            assert!(
-                bad.is_none(),
-                "output '{}': absent secondary should be accepted, got {:?}",
-                name,
-                bad,
-            );
-        }
-    }
-
-    /// `RetryConfig::from_output_properties` parses identical retry +
-    /// secondary props on a non-OTLP output (kafka here) into the
-    /// same fields the OTLP outputs have always populated. Anchors
-    /// the "runtime behavior already matched, schema just caught up"
-    /// invariant.
+    /// `RetryConfig::from_output_properties` parses retry props on a
+    /// non-OTLP output (kafka here) into the same fields the OTLP
+    /// outputs have always populated. Anchors the "runtime behavior
+    /// already matched, schema just caught up" invariant.
     #[test]
     fn retry_config_parser_reads_same_fields_for_non_otlp_outputs() {
-        let props = vec![full_retry_block(), secondary_prop()];
+        let props = vec![full_retry_block()];
         let cfg = RetryConfig::from_output_properties(&props)
             .expect("retry block parses for non-OTLP output");
         assert_eq!(cfg.max_attempts, 3);
         assert_eq!(cfg.initial_wait, std::time::Duration::from_millis(100));
         assert_eq!(cfg.max_wait, std::time::Duration::from_secs(5));
         assert!(matches!(cfg.backoff, BackoffStrategy::Exponential));
-        assert_eq!(cfg.secondary.as_deref(), Some("fallback"));
     }
 }

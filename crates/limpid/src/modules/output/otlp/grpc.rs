@@ -197,7 +197,6 @@ const OTLP_GRPC_OUTPUT_SCHEMA: &[PropertySpec] = &[
         kind: PropertyValueKind::StringMap,
     },
     crate::queue::RETRY_PROPERTY_SPEC,
-    crate::queue::SECONDARY_PROPERTY_SPEC,
     crate::queue::QUEUE_PROPERTY_SPEC,
 ];
 
@@ -363,7 +362,7 @@ impl Output for OtlpGrpcOutput {
 
     /// Owned-event path (disk-queue replay, control-socket inject). The
     /// queue consumer needs a per-event ship verdict — Ok ⇒ drop from
-    /// the queue, Err ⇒ retry / disk-replay / secondary — so routing
+    /// the queue, Err ⇒ retry / disk-replay — so routing
     /// Owned events through the batched buffer would silently merge them
     /// into a later flush and the caller would lose the verdict. Ship
     /// inline here, bypassing the batch.
@@ -1179,7 +1178,7 @@ mod tests {
     async fn write_owned_bypasses_batch_buffer() {
         // Owned events ship inline rather than landing in the batch
         // buffer, so the queue consumer's per-event Ok/Err contract is
-        // honored (Err → disk-replay / retry / secondary). Use an
+        // honored (Err → disk-replay / retry). Use an
         // unreachable endpoint and large batch_size so the only way
         // the assertion can fail is if write_owned routed through the
         // batch instead of bypassing it.

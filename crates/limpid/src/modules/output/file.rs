@@ -66,7 +66,6 @@ const FILE_OUTPUT_SCHEMA: &[PropertySpec] = &[
         kind: PropertyValueKind::String,
     },
     crate::queue::RETRY_PROPERTY_SPEC,
-    crate::queue::SECONDARY_PROPERTY_SPEC,
     crate::queue::QUEUE_PROPERTY_SPEC,
 ];
 
