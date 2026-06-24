@@ -97,28 +97,29 @@ One JSON object per line:
 |-------|---------|
 | `timestamp` | RFC3339 with nanosecond precision; wall-clock at which the error was raised. |
 | `reason` | Stringified `ProcessError`. Stable enough for `grep` / classification but not a stable API. |
-| `process` | Failed process or recovery-path discriminator. A named `def process` invocation surfaces its name; an inline `process { ... }` block surfaces `(inline)`. For records originating from an output's recovery path the value is one of four discriminators: `(output <name>)` — retry exhausted (PR-O); `(output <name> shutdown)` — batched output's shutdown drain (PR-P); `(pipeline)` — explicit `error` from pipeline routing; `(output enqueue)` — output enqueue failure (PR-I). |
-| `pipeline` | Pipeline name (`def pipeline <name>`). Empty for output-originated records (`(output ...)`, `(output ... shutdown)`, `(output enqueue)`); populated only when the record originates inside a pipeline. |
+| `process` | Failed process or recovery-path discriminator. A named `def process` invocation surfaces its name; an inline `process { ... }` block surfaces `(inline)`. For records originating from an output's or pipeline-skeleton's recovery path the value is one of five discriminators: `(output <name>)` — retry exhausted (PR-O); `(output <name> shutdown)` — batched output's shutdown drain (PR-P); `(pipeline)` — explicit `error` statement from pipeline routing; `(pipeline body)` — pipeline-skeleton expression eval failure (`if` condition, `switch` discriminant, `error <expr>` arg, or `process` function args); `(output enqueue)` — output enqueue failure (PR-I). |
+| `pipeline` | Pipeline name (`def pipeline <name>`). Empty for output-originated retry / shutdown records (`(output <name>)`, `(output <name> shutdown)`). Populated for the in-pipeline shapes: process runtime errors, `(pipeline)`, `(pipeline body)`, and `(output enqueue)` — the latter carries the name of the pipeline that failed to hand the event off. |
 | `event.source` | Originating peer as `{ip, port}` object. Same shape as `tap --json` and as the DSL `source` ident. |
 | `event.received_at` | i64 unix nanoseconds (matches OTLP `time_unix_nano`). Same shape as `tap --json`. |
 | `event.ingress` | Original wire bytes. UTF-8-clean payloads serialise as a JSON string; non-UTF-8 payloads use the `$bytes_b64` marker the rest of the JSON layer already uses for `tap --json`. |
 
-Example `reason` values across the discriminators: `"unknown identifier: timestamp"` (process runtime error), `"output retry exhausted after 5 attempts: connection refused"` (`(output <name>)`), `"output shutting down; draining queue"` (`(output <name> shutdown)`), `"output queue full; enqueue failed"` (`(output enqueue)`).
+Example `reason` values across the discriminators: `"unknown identifier: timestamp"` (process runtime error), `"output retry exhausted after 5 attempts: connection refused"` (`(output <name>)`), `"output shutting down; draining queue"` (`(output <name> shutdown)`), `"unsupported subtype: vpc-flow-v3"` (`(pipeline)` — explicit `error <expr>`), `"unknown identifier: workspace.cef.severityy"` (`(pipeline body)` — expression eval in an `if`/`switch`/process-args slot), `"output enqueue failed for: mysink (queue closed, disk write error, or unknown output)"` (`(output enqueue)`).
 
 ## Recovery paths into the DLQ
 
-The DLQ receives records from four distinct paths. The `process` field above is the discriminator:
+The DLQ receives records from five distinct paths. The `process` field above is the discriminator:
 
 1. **Process runtime error / explicit `error`** — a `process` statement raised an error, or pipeline routing executed `error <expr?>`. `process` is the failed `def process` name (or `(inline)`), or `(pipeline)` for pipeline-level `error`. `pipeline` is populated. (Original behaviour.)
-2. **Output retry exhausted** (PR-O) — an output exhausted its `retry` budget against the destination. `process = "(output <name>)"`, `pipeline` empty. The event carries the post-pipeline `egress` that the output attempted to deliver.
-3. **Batched output shutdown drain** (PR-P) — a batched output (`otlp_*`, `http`) was shut down while events were still buffered and could not flush them. `process = "(output <name> shutdown)"`, `pipeline` empty. Synthetic-event metadata constraints apply: `received_at` reflects the shutdown moment for events that never carried their own; per-event source / workspace state may be a representative of the batch rather than per-record.
-4. **Output enqueue failure** (PR-I) — the pipeline could not hand an event to an output's queue (queue full, output stopped). `process = "(output enqueue)"`, `pipeline` empty. The record preserves the event as it was at the pipeline → output boundary.
+2. **Pipeline-skeleton eval failure** — an expression embedded in the pipeline skeleton itself raised an error: an `if` condition, a `switch` discriminant, the argument of an explicit `error <expr>` statement, or one of the arguments passed to a `process` function call. These eval slots run outside of any `process { ... }` body, so the existing process-error path does not catch them; the orchestrator routes them through the same DLQ writer with `process = "(pipeline body)"`. `pipeline` is populated. The reason carries the underlying expression error verbatim.
+3. **Output retry exhausted** (PR-O) — an output exhausted its `retry` budget against the destination. `process = "(output <name>)"`, `pipeline` empty. The event carries the post-pipeline `egress` that the output attempted to deliver.
+4. **Batched output shutdown drain** (PR-P) — a batched output (`otlp_*`, `http`) was shut down while events were still buffered and could not flush them. `process = "(output <name> shutdown)"`, `pipeline` empty. Synthetic-event metadata constraints apply: `received_at` reflects the shutdown moment for events that never carried their own; per-event source / workspace state may be a representative of the batch rather than per-record.
+5. **Output enqueue failure** (PR-I) — the pipeline could not hand an event to an output's queue (queue full, unknown output, disk-queue write error). `process = "(output enqueue)"`, and `pipeline` is the name of the pipeline that failed to enqueue — the only output-discriminator shape that keeps the originating pipeline name. The record preserves the event as it was at the pipeline → output boundary.
 
-All four paths converge on the same JSONL file and the same replay recipe — `jq` on the `process` field selects which recovery path you are replaying.
+All five paths converge on the same JSONL file and the same replay recipe — `jq` on the `process` field selects which recovery path you are replaying.
 
 ### Recovery readiness check (`--check`)
 
-Since 0.7.8 (PR-R), `limpid --check` emits a recovery-readiness warning when any output declares `retry`, declares a `secondary`, or is a batched OTLP/HTTP output and the `control { error_log }` is unset. Without `error_log`, recovery paths 2–4 above fall back to `tracing::error!` and the records are only recoverable through journald — sufficient for triage, but harder to replay. The warning catches the missing configuration before the first failure.
+Since 0.7.8 (PR-R), `limpid --check` emits a recovery-readiness warning when any output declares `retry`, declares a `secondary`, or is a batched OTLP/HTTP output and the `control { error_log }` is unset. Without `error_log`, recovery paths 3–5 above fall back to `tracing::error!` and the records are only recoverable through journald — sufficient for triage, but harder to replay. The warning catches the missing configuration before the first failure.
 
 `event.egress` and `event.workspace` are intentionally **not** included — at the failure point they may hold partial state from earlier processes in the chain, which would confuse `inject --json` replay. The replay path re-runs the pipeline from scratch on `ingress`.
 
@@ -172,7 +173,7 @@ Tail the live file with `jq` to watch new failures arrive:
 tail -F /var/log/limpid/errored.jsonl | jq -c '{ts: .timestamp, process, reason}'
 ```
 
-The `process` field is the single discriminator that tells you which of the four [recovery paths](#recovery-paths-into-the-dlq) emitted the record. A representative line per path:
+The `process` field is the single discriminator that tells you which of the five [recovery paths](#recovery-paths-into-the-dlq) emitted the record. A representative line per path:
 
 ```jsonc
 // 1. Process runtime error / explicit `error` — `pipeline` is populated.
@@ -180,17 +181,20 @@ The `process` field is the single discriminator that tells you which of the four
 {"process":"(inline)","pipeline":"fortinet_in","reason":"parse_json failed: expected `}` at line 1 column 87", ...}
 {"process":"(pipeline)","pipeline":"audit_in","reason":"unsupported subtype: vpc-flow-v3", ...}
 
-// 2. Output retry exhausted (PR-O) — `pipeline` empty.
+// 2. Pipeline-skeleton eval failure — `pipeline` is populated.
+{"process":"(pipeline body)","pipeline":"journal_forward","reason":"unknown identifier: workspace.cef.severityy", ...}
+
+// 3. Output retry exhausted (PR-O) — `pipeline` empty.
 {"process":"(output mysink)","pipeline":"","reason":"output write failed after 5 attempts: connection refused", ...}
 
-// 3. Batched output shutdown drain (PR-P) — `pipeline` empty.
+// 4. Batched output shutdown drain (PR-P) — `pipeline` empty.
 {"process":"(output otlp_main shutdown)","pipeline":"","reason":"shutdown flush failed: deadline exceeded", ...}
 
-// 4. Output enqueue failure (PR-I) — `pipeline` empty.
-{"process":"(output mysink)","pipeline":"","reason":"output enqueue failed for: mysink (queue closed, disk write error, or output stopped)", ...}
+// 5. Output enqueue failure (PR-I) — `pipeline` carries the originating pipeline.
+{"process":"(output mysink)","pipeline":"mypipe","reason":"output enqueue failed for: mysink (queue closed, disk write error, or unknown output)", ...}
 ```
 
-Note the asymmetry: paths 2–4 have an empty `pipeline` field, because by the time the event reached the output it had already left its source pipeline. Always filter on `process` (not `pipeline`) when you want to scope by recovery path.
+Note the asymmetry: paths 3 and 4 have an empty `pipeline` field, because by the time the event reached the output it had already left its source pipeline. Paths 1, 2, and 5 keep `pipeline` populated. For path-3/4 records, filter on `process` (not `pipeline`). For path-5 records, either filter is valid — `process == "(output enqueue)"` scopes by the recovery shape, `pipeline == "<name>"` scopes by the originating pipeline.
 
 ### 2. Triage flow
 
@@ -226,6 +230,7 @@ A flat curve over the last 5 minutes means the upstream issue resolved itself �
 | `(output <name>)` (retry exhausted) | backend down, network partition, auth expired, sustained backpressure | downstream health, `events_failed` / `retries` on the output ([Metrics](./metrics.md)) |
 | `(output <name> shutdown)` | daemon `kill -9` or restart while a batched output (`otlp_*`, `http`) still had buffered events | `journalctl -u limpid` around the shutdown window |
 | `(output enqueue)` | output queue full, output task stopped, disk-backed queue write error | output `events_received` vs. `events_written`, disk space, queue config |
+| `(pipeline body)` | typo in an `if` condition / `switch` discriminant, undefined workspace key referenced from a `process` arg or an `error <expr>` slot | the `reason` string + the pipeline DSL around the failing expression |
 | `<pipeline_process_name>` / `(inline)` / `(pipeline)` | DSL bug, parser blowup on a new input shape, missing-required-field contract violation | the `reason` string + the offending `event.ingress` payload |
 
 **Step 4 — transient vs. permanent.** Replay is only safe for *transient* causes — the kind where re-running the pipeline now will succeed. Apply this rule:

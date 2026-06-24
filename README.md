@@ -410,8 +410,7 @@ is built for a different default: pipelines that are *legible*,
   [Packaging](docs/src/operations/packaging.md) ·
   [systemd](docs/src/operations/systemd.md)
 - [OTLP — design rationale](docs/src/otlp.md)
-- [Migrating from rsyslog](docs/src/operations/migration.md) ·
-  [Upgrading to 0.3](docs/src/operations/upgrade-0.3.md)
+- [Migrating from rsyslog](docs/src/operations/migration.md)
 
 ## License
 

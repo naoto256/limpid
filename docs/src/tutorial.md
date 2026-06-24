@@ -168,6 +168,7 @@ include "/usr/share/limpid/snippets/parsers/parse_fortigate_cef.limpid"
 
 include "inputs/*.limpid"
 include "outputs/*.limpid"
+include "processes/*.limpid"
 include "pipelines/*.limpid"
 
 control {
@@ -214,7 +215,7 @@ def pipeline main {
 
 The pipeline body itself is unchanged from Step 3 — only the surrounding files moved.
 
-(There is no `processes/` directory yet — we don't have any user-defined processes to put there. That changes in Step 6.)
+(The `include "processes/*.limpid"` line is reserved for Step 6 — we don't have any user-defined processes to drop in there yet. Glob includes resolve to zero files quietly, so the line is harmless until Step 6 populates the directory.)
 
 Glob includes resolve relative to the main config file's directory. The directory layout is a convention; you could put everything in one file (and we did, until now). See [Main Configuration](./configuration.md) for the global blocks and include rules.
 
@@ -289,7 +290,7 @@ Caught it. The pipeline reference is missing an `f` in `traffic`. Fix the typo i
 
 ```bash
 $ limpid --check --config /etc/limpid/limpid.conf
-checking /etc/limpid/limpid.conf: 5 file(s), 1 input(s), 2 output(s), 2 process(es), 1 pipeline(s)
+checking /etc/limpid/limpid.conf: 7 file(s), 1 input(s), 2 output(s), 2 process(es), 1 pipeline(s)
 /etc/limpid/limpid.conf: Configuration OK (1 pipeline(s), 2 process(es); dataflow check passed)
 ```
 

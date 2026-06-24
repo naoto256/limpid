@@ -61,7 +61,7 @@ def pipeline main {
 
     // Parse and rewrite egress
     process {
-        workspace.cef = cef.parse(workspace.syslog.msg)
+        workspace.cef = cef.parse(ingress)
         workspace.geo = geoip(workspace.cef.src)
         egress = to_json(workspace)
     }

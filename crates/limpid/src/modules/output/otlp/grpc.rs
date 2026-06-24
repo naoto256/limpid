@@ -101,8 +101,15 @@ struct Inner {
     batch_level: BatchLevel,
     headers: Vec<(String, String)>,
     batch_timeout: Duration,
-    /// Per-batch retry policy — see [`super::http`] for the
-    /// rationale.
+    /// Per-batch retry policy. The shared `RetryConfig` parser
+    /// (`crate::queue::RETRY_PROPERTY_SPEC`) is spliced into every
+    /// output's schema by the queue layer, so `otlp_grpc` speaks the
+    /// same `retry { max_attempts initial_wait max_wait backoff }`
+    /// vocabulary as the rest of the outputs — see [`super::http`]
+    /// for the batched-output rationale (without an internal retry,
+    /// one transient ship failure loses the whole drained batch
+    /// because the queue layer's per-event retry only re-pushes the
+    /// most recent Event).
     retry_config: RetryConfig,
     /// Buffered per-Event singleton ResourceLogs proto bytes.
     batch: Mutex<Vec<Bytes>>,
