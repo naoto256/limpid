@@ -91,10 +91,20 @@ use crate::dsl::value_json::{json_to_value, value_to_json};
 /// its watermark and persist the new position to its state file.
 #[derive(Debug, Clone)]
 pub enum AckPosition {
-    /// Byte offset within a tail'd file.
-    Offset(u64),
+    /// Byte offset within a tail'd file, namespaced by the tail input's
+    /// `generation` counter. The generation bumps on every rotation /
+    /// truncation, so a late ack from a worker still holding an
+    /// `AckHandle` for the previous file is detectable by the input and
+    /// silently dropped — preventing it from poisoning the post-rotation
+    /// watermark (a silent data-loss path: a stale ack interpreted under
+    /// the new file's byte namespace would mark bytes 0..old_offset as
+    /// already-processed on the next start).
+    Offset { generation: u64, offset: u64 },
     /// Opaque cursor token from a systemd journal entry. Constructed
-    /// only when the `journal` cargo feature is enabled.
+    /// only when the `journal` cargo feature is enabled. Cursors are
+    /// globally monotonic within a boot ID (and uniquely identify an
+    /// entry across boots), so they do not need a generation namespace
+    /// the way file offsets do.
     #[allow(dead_code)]
     Cursor(String),
 }
