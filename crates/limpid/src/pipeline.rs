@@ -27,7 +27,7 @@ use crate::dsl::value::Value;
 use crate::event::{BorrowedEvent, OwnedEvent};
 use crate::functions::FunctionRegistry;
 use crate::modules::{ModuleRegistry, Output};
-use crate::queue::{QueueKind, SinkInput};
+use crate::queue::{QueueKind, RetryConfig, SinkInput};
 use crate::tap::TapRegistry;
 
 // ---------------------------------------------------------------------------
@@ -134,6 +134,105 @@ impl CompiledConfig {
                 self.validate_pipeline_stmt(name, stmt)?;
             }
         }
+        self.validate_secondary_refs()?;
+        Ok(())
+    }
+
+    /// Reject misconfigured `secondary` references before runtime startup.
+    ///
+    /// Hoisted onto the `--check` path (PR-X) so pre-deploy validation
+    /// catches the same failure modes that `Runtime::start` already
+    /// rejected at process start:
+    ///
+    /// - **typo** (`secondary foo_typo` where no `foo_typo` exists):
+    ///   the queue consumer's `output_senders.get(s).cloned()` returns
+    ///   `None` and silently drops exhausted-retry events with
+    ///   "no secondary" — the operator configured a safety net and got
+    ///   nothing.
+    /// - **self-reference** (`secondary <own_name>`): exhausted-retry
+    ///   events get routed back into the same queue, looping forever
+    ///   on any poison event. Worse on disk-backed queues (each loop
+    ///   re-persists to the tail).
+    /// - **indirect cycle** (A→B→A, A→B→C→A, …): same poison-event
+    ///   ping-pong as direct self-reference, with extra hops; on
+    ///   disk-backed queues each loop iteration re-persists the
+    ///   event, growing the queue files unboundedly.
+    ///
+    /// With at most one outgoing edge per node (each output has a
+    /// single `secondary`), the chain from any node is deterministic
+    /// and either terminates at a node without a secondary or revisits
+    /// a node — visit each starting node in turn and break on the first
+    /// repeat.
+    fn validate_secondary_refs(&self) -> Result<()> {
+        let known: std::collections::HashSet<&str> =
+            self.outputs.keys().map(String::as_str).collect();
+
+        // Parse each output's retry config to extract the `secondary`
+        // reference. Errors here are config-shape errors (e.g. wrong
+        // type for a known key) and surface to the operator the same
+        // way the runtime startup parse used to.
+        let mut edges: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::new();
+        for (name, output_def) in &self.outputs {
+            let retry_config =
+                RetryConfig::from_output_properties(output_def.properties.user_properties())?;
+            let Some(target) = retry_config.secondary else {
+                continue;
+            };
+            if target == *name {
+                bail!(
+                    "output '{name}': secondary cannot reference itself; \
+                     a self-referential secondary would form an infinite \
+                     retry loop on a poison event"
+                );
+            }
+            if !known.contains(target.as_str()) {
+                let mut listed: Vec<&str> = known.iter().copied().collect();
+                listed.sort_unstable();
+                bail!(
+                    "output '{name}': secondary '{target}' is not a known output; \
+                     configured outputs: {listed:?}"
+                );
+            }
+            // Stash the edge keyed on the borrowed `&str` from `self.outputs`
+            // so cycle traversal can compare against `known`.
+            let owner: &str = self
+                .outputs
+                .get_key_value(name)
+                .map(|(k, _)| k.as_str())
+                .expect("name comes from self.outputs iter");
+            let target_ref: &str = self
+                .outputs
+                .get_key_value(target.as_str())
+                .map(|(k, _)| k.as_str())
+                .expect("target verified against known above");
+            edges.insert(owner, target_ref);
+        }
+
+        // Indirect cycle detection (A→B→A, A→B→C→A, …). Visit
+        // starting nodes in sorted order so the cycle path in the
+        // error message is deterministic across runs.
+        let mut starts: Vec<&str> = edges.keys().copied().collect();
+        starts.sort_unstable();
+        for start in starts {
+            let mut visited: Vec<&str> = vec![start];
+            let mut cursor = start;
+            while let Some(&next) = edges.get(cursor) {
+                if let Some(repeat_idx) = visited.iter().position(|n| *n == next) {
+                    let mut cycle: Vec<&str> = visited[repeat_idx..].to_vec();
+                    cycle.push(next);
+                    bail!(
+                        "secondary cycle detected ({path}); a cycle would form an \
+                         infinite retry loop on a poison event, and on disk-backed \
+                         queues each iteration re-persists the event",
+                        path = cycle.join(" -> "),
+                    );
+                }
+                visited.push(next);
+                cursor = next;
+            }
+        }
+
         Ok(())
     }
 
@@ -828,6 +927,124 @@ def pipeline p {
             "unexpected error: {}",
             err
         );
+    }
+
+    // --- secondary-ref validation (hoisted onto `--check`, PR-X) -----------
+    //
+    // These tests drive `CompiledConfig::validate` directly — the same
+    // function `--check` and runtime startup both call — to pin the
+    // five cases the validator must reject or accept. Behavior contract
+    // is identical to the previous `validate_secondary_refs` unit tests
+    // in `runtime.rs`, just driven through DSL configs now.
+
+    #[test]
+    fn secondary_refs_accepts_valid_chain() {
+        // Baseline: A→B→C is a valid dead-letter chain (no cycle,
+        // C has no secondary so events that exhaust on C drop).
+        let src = r#"
+def input i { type syslog_udp bind "0.0.0.0:5140" }
+def output a { type file path "/tmp/a.log" secondary b }
+def output b { type file path "/tmp/b.log" secondary c }
+def output c { type file path "/tmp/c.log" }
+def pipeline p { input i output a drop }
+"#;
+        let cfg = compile(src).unwrap();
+        cfg.validate(&ModuleRegistry::new())
+            .expect("acyclic chain must validate");
+    }
+
+    #[test]
+    fn secondary_refs_rejects_unknown_target() {
+        // Regression: a typo'd `secondary` name used to silently
+        // disable the safety net at queue-consumer spawn time
+        // (`output_senders.get(s)` returned None and the consumer
+        // dropped exhausted-retry events with "no secondary").
+        let src = r#"
+def input i { type syslog_udp bind "0.0.0.0:5140" }
+def output primary { type file path "/tmp/p.log" secondary backup_typo }
+def output backup { type file path "/tmp/b.log" }
+def pipeline p { input i output primary drop }
+"#;
+        let cfg = compile(src).unwrap();
+        let err = cfg
+            .validate(&ModuleRegistry::new())
+            .expect_err("unknown secondary must fail --check")
+            .to_string();
+        assert!(
+            err.contains("backup_typo") && err.contains("not a known output"),
+            "expected unknown-target message, got: {err}"
+        );
+        // Operator-friendly: list the configured names so the typo
+        // is easy to spot.
+        assert!(
+            err.contains("backup"),
+            "error must list known outputs to aid debugging; got: {err}"
+        );
+    }
+
+    #[test]
+    fn secondary_refs_rejects_self_reference() {
+        // Regression: self-reference used to silently route
+        // exhausted-retry events back into the same queue,
+        // looping forever on a poison event (worse on
+        // disk-backed queues — each loop re-persists the event).
+        let src = r#"
+def input i { type syslog_udp bind "0.0.0.0:5140" }
+def output primary { type file path "/tmp/p.log" secondary primary }
+def pipeline p { input i output primary drop }
+"#;
+        let cfg = compile(src).unwrap();
+        let err = cfg
+            .validate(&ModuleRegistry::new())
+            .expect_err("self-reference must fail --check")
+            .to_string();
+        assert!(
+            err.contains("primary") && err.contains("itself"),
+            "expected self-reference message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn secondary_refs_rejects_two_node_cycle() {
+        // A→B→A is the same poison-event ping-pong as A→A with one
+        // extra hop. Per-edge check passes (each target is valid
+        // and not self), but the cycle still grows disk-backed
+        // queues unboundedly under repeated retry exhaustion.
+        let src = r#"
+def input i { type syslog_udp bind "0.0.0.0:5140" }
+def output primary { type file path "/tmp/p.log" secondary backup }
+def output backup { type file path "/tmp/b.log" secondary primary }
+def pipeline p { input i output primary drop }
+"#;
+        let cfg = compile(src).unwrap();
+        let err = cfg
+            .validate(&ModuleRegistry::new())
+            .expect_err("two-node cycle must fail --check")
+            .to_string();
+        assert!(err.contains("cycle"), "expected cycle error, got: {err}");
+        assert!(
+            err.contains("primary") && err.contains("backup"),
+            "cycle error must name involved outputs; got: {err}"
+        );
+    }
+
+    #[test]
+    fn secondary_refs_rejects_three_node_cycle() {
+        // A→B→C→A — one more hop. Pin that the cycle detector
+        // follows the chain beyond two nodes.
+        let src = r#"
+def input i { type syslog_udp bind "0.0.0.0:5140" }
+def output a { type file path "/tmp/a.log" secondary b }
+def output b { type file path "/tmp/b.log" secondary c }
+def output c { type file path "/tmp/c.log" secondary a }
+def pipeline p { input i output a drop }
+"#;
+        let cfg = compile(src).unwrap();
+        let err = cfg
+            .validate(&ModuleRegistry::new())
+            .expect_err("three-node cycle must fail --check")
+            .to_string();
+        assert!(err.contains("cycle"), "expected cycle error, got: {err}");
     }
 
     #[test]
