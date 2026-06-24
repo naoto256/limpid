@@ -125,6 +125,19 @@ impl Input for TailInput {
         let mut acked_offset = read_offset;
         let mut last_inode = get_inode(&self.path);
 
+        // Generation namespace for `AckPosition::Offset`. Bumps on every
+        // rotation / truncation so that late acks still travelling inside
+        // pipeline workers (carrying an `Arc<AckHandle>` for the *previous*
+        // file) can be distinguished from acks issued under the current
+        // file's byte namespace. Without this, an Arc<AckHandle> held by a
+        // slow worker over a rotation would fire after the offsets reset,
+        // sending an old absolute offset back to the input which would then
+        // save it as the *new* file's watermark — silently skipping bytes
+        // 0..old_offset on the next start (the data-loss case the PR-W
+        // stale-ack drain did not cover, since drain only sees acks already
+        // queued, not those still in flight inside the pipeline).
+        let mut generation: u64 = 0;
+
         // Unbounded ack channel — see `AckHandle` for the rationale
         // (backpressure here would deadlock the pipeline).
         let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<AckPosition>();
@@ -142,7 +155,7 @@ impl Input for TailInput {
                         // event still on the wire (un-acked) is intentionally
                         // left for re-read on next boot — that's the
                         // at-least-once contract.
-                        if let Some(hi) = drain_acks_into_watermark(&mut ack_rx) {
+                        if let Some(hi) = drain_acks_into_watermark(&mut ack_rx, generation) {
                             acked_offset = acked_offset.max(hi);
                         }
                         self.save_position(acked_offset);
@@ -153,8 +166,8 @@ impl Input for TailInput {
                 // Also wake on ack so a quiet file with active downstream
                 // still flushes the watermark in a timely fashion.
                 Some(pos) = ack_rx.recv() => {
-                    if let Some(new_off) = ack_offset(&pos) {
-                        let hi = drain_remaining_acks(&mut ack_rx, new_off);
+                    if let Some(new_off) = ack_offset_for_generation(&pos, generation) {
+                        let hi = drain_remaining_acks(&mut ack_rx, new_off, generation);
                         // Monotonic guard: an out-of-order ack must not
                         // roll the watermark backwards.
                         if hi > acked_offset {
@@ -162,6 +175,11 @@ impl Input for TailInput {
                             self.save_position(acked_offset);
                         }
                     }
+                    // Late acks from a previous generation (i.e. a worker
+                    // that finished an event from before the most recent
+                    // rotation / truncation) are silently dropped here —
+                    // their absolute byte offset is meaningless under the
+                    // current file.
                     continue;
                 }
             }
@@ -187,9 +205,15 @@ impl Input for TailInput {
                 );
                 read_offset = 0;
                 acked_offset = 0;
-                // Discard stray acks from the pre-rotation file so they
-                // don't poison the post-rotation watermark.
-                let _ = drain_acks_into_watermark(&mut ack_rx);
+                // Bump generation BEFORE draining: queued acks from the
+                // previous file are still tagged with the previous
+                // generation, so the drain call below will reject them
+                // (they no longer match `generation`). The bump also makes
+                // any AckHandle still held inside a pipeline worker
+                // (= not yet in the queue) generate a mismatching ack on
+                // its eventual drop — caught by the recv branch above.
+                generation = generation.wrapping_add(1);
+                let _ = drain_acks_into_watermark(&mut ack_rx, generation);
                 last_inode = current_inode;
             } else if meta.len() < read_offset {
                 info!(
@@ -198,7 +222,8 @@ impl Input for TailInput {
                 );
                 read_offset = 0;
                 acked_offset = 0;
-                let _ = drain_acks_into_watermark(&mut ack_rx);
+                generation = generation.wrapping_add(1);
+                let _ = drain_acks_into_watermark(&mut ack_rx, generation);
             }
 
             // No new data
@@ -209,7 +234,7 @@ impl Input for TailInput {
             // Read new lines. The returned offset is the *emitted*
             // position; we update `read_offset` but NOT `acked_offset`.
             match self
-                .read_new_lines(read_offset, &tx, source_addr, ack_tx.clone())
+                .read_new_lines(read_offset, &tx, source_addr, ack_tx.clone(), generation)
                 .await
             {
                 Ok(new_offset) => {
@@ -221,7 +246,7 @@ impl Input for TailInput {
             }
 
             // Opportunistic drain of acks accumulated during the read pass.
-            if let Some(hi) = drain_acks_into_watermark(&mut ack_rx)
+            if let Some(hi) = drain_acks_into_watermark(&mut ack_rx, generation)
                 && hi > acked_offset
             {
                 acked_offset = hi;
@@ -233,23 +258,32 @@ impl Input for TailInput {
     }
 }
 
-/// Extract the file offset from an `AckPosition` issued by this input.
-/// Always `Offset(_)` for tail; the `Cursor(_)` variant is journald-only.
-fn ack_offset(pos: &AckPosition) -> Option<u64> {
+/// Extract the file offset from an `AckPosition` issued by this input,
+/// but only if its generation matches the input's current generation.
+/// Acks from a previous generation are stale (= rotation / truncation
+/// happened after the AckHandle was created) and must be ignored —
+/// their absolute byte offset no longer addresses the current file.
+fn ack_offset_for_generation(pos: &AckPosition, current_generation: u64) -> Option<u64> {
     match pos {
-        AckPosition::Offset(o) => Some(*o),
+        AckPosition::Offset { generation, offset } if *generation == current_generation => {
+            Some(*offset)
+        }
+        AckPosition::Offset { .. } => None,
         AckPosition::Cursor(_) => None,
     }
 }
 
 /// Drain everything currently in the ack channel and return the highest
-/// offset seen, or `None` if the channel was empty. Non-blocking.
+/// offset seen, or `None` if the channel was empty. Non-blocking. Acks
+/// from generations other than `current_generation` are silently
+/// discarded (see [`ack_offset_for_generation`]).
 fn drain_acks_into_watermark(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<AckPosition>,
+    current_generation: u64,
 ) -> Option<u64> {
     let mut hi: Option<u64> = None;
     while let Ok(pos) = rx.try_recv() {
-        if let Some(o) = ack_offset(&pos) {
+        if let Some(o) = ack_offset_for_generation(&pos, current_generation) {
             hi = Some(hi.map_or(o, |cur| cur.max(o)));
         }
     }
@@ -261,10 +295,11 @@ fn drain_acks_into_watermark(
 fn drain_remaining_acks(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<AckPosition>,
     initial: u64,
+    current_generation: u64,
 ) -> u64 {
     let mut hi = initial;
     while let Ok(pos) = rx.try_recv() {
-        if let Some(o) = ack_offset(&pos) {
+        if let Some(o) = ack_offset_for_generation(&pos, current_generation) {
             hi = hi.max(o);
         }
     }
@@ -278,6 +313,7 @@ impl TailInput {
         tx: &tokio::sync::mpsc::Sender<Event>,
         source_addr: std::net::SocketAddr,
         ack_tx: tokio::sync::mpsc::UnboundedSender<AckPosition>,
+        generation: u64,
     ) -> Result<u64> {
         let file = tokio::fs::File::open(&self.path)
             .await
@@ -321,7 +357,10 @@ impl TailInput {
             // no state file is configured. Branching on `state_file` here
             // would add a config-dependent code path for negligible win.
             let ack = Arc::new(AckHandle::new(
-                AckPosition::Offset(current_offset),
+                AckPosition::Offset {
+                    generation,
+                    offset: current_offset,
+                },
                 ack_tx.clone(),
             ));
             let event = Event::with_ack(
@@ -441,7 +480,7 @@ mod tests {
         let input = make_input(&path, None);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
 
-        let next_off = input.read_new_lines(0, &tx, dummy_addr(), dummy_ack_tx()).await.unwrap();
+        let next_off = input.read_new_lines(0, &tx, dummy_addr(), dummy_ack_tx(), 0).await.unwrap();
         assert_eq!(next_off, 12);
         let e1 = rx.recv().await.unwrap();
         assert_eq!(&e1.ingress[..], b"line1");
@@ -462,7 +501,7 @@ mod tests {
         let input = make_input(&path, None);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
 
-        let next_off = input.read_new_lines(0, &tx, dummy_addr(), dummy_ack_tx()).await.unwrap();
+        let next_off = input.read_new_lines(0, &tx, dummy_addr(), dummy_ack_tx(), 0).await.unwrap();
         // First line was complete (9 bytes incl. \n); the partial
         // 7 bytes after must be rewound. Next offset = 9.
         assert_eq!(next_off, 9, "partial line must be rewound");
@@ -485,7 +524,7 @@ mod tests {
         let input = make_input(&path, None);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
 
-        let off1 = input.read_new_lines(0, &tx, dummy_addr(), dummy_ack_tx()).await.unwrap();
+        let off1 = input.read_new_lines(0, &tx, dummy_addr(), dummy_ack_tx(), 0).await.unwrap();
         let _ = rx.recv().await; // drain "complete"
         // Writer appends the newline.
         {
@@ -495,7 +534,7 @@ mod tests {
                 .unwrap();
             f.write_all(b"\n").unwrap();
         }
-        let off2 = input.read_new_lines(off1, &tx, dummy_addr(), dummy_ack_tx()).await.unwrap();
+        let off2 = input.read_new_lines(off1, &tx, dummy_addr(), dummy_ack_tx(), 0).await.unwrap();
         assert_eq!(off2, 17);
         let e = rx.recv().await.unwrap();
         assert_eq!(&e.ingress[..], b"partial");
@@ -600,7 +639,7 @@ mod tests {
         // Close the receiver so the first send fails.
         drop(rx);
 
-        let next_off = input.read_new_lines(0, &tx, dummy_addr(), dummy_ack_tx()).await.unwrap();
+        let next_off = input.read_new_lines(0, &tx, dummy_addr(), dummy_ack_tx(), 0).await.unwrap();
         assert_eq!(
             next_off, 0,
             "send failure must rewind so the un-sent line is retried",
@@ -626,7 +665,7 @@ mod tests {
         let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<AckPosition>();
 
         let _ = input
-            .read_new_lines(0, &tx, dummy_addr(), ack_tx)
+            .read_new_lines(0, &tx, dummy_addr(), ack_tx, 0)
             .await
             .unwrap();
 
@@ -642,8 +681,8 @@ mod tests {
         // the post-line positions: 2 (after "a\n") and 5 (after "bb\n").
         let mut offsets = Vec::new();
         while let Ok(pos) = ack_rx.try_recv() {
-            if let AckPosition::Offset(o) = pos {
-                offsets.push(o);
+            if let AckPosition::Offset { offset, .. } = pos {
+                offsets.push(offset);
             }
         }
         offsets.sort();
@@ -670,7 +709,7 @@ mod tests {
         let (ack_tx, _ack_rx) = tokio::sync::mpsc::unbounded_channel::<AckPosition>();
 
         let _ = input
-            .read_new_lines(0, &tx, dummy_addr(), ack_tx)
+            .read_new_lines(0, &tx, dummy_addr(), ack_tx, 0)
             .await
             .unwrap();
 
@@ -700,7 +739,7 @@ mod tests {
         let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<AckPosition>();
 
         let next_off = input
-            .read_new_lines(0, &tx, dummy_addr(), ack_tx)
+            .read_new_lines(0, &tx, dummy_addr(), ack_tx, 0)
             .await
             .unwrap();
         assert_eq!(next_off, 0, "send failure must rewind the read offset");
@@ -722,7 +761,10 @@ mod tests {
         // event, drop the event, observe the position on the ack
         // channel. This pins the contract the input layer relies on.
         let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<AckPosition>();
-        let handle = Arc::new(AckHandle::new(AckPosition::Offset(42), ack_tx));
+        let handle = Arc::new(AckHandle::new(
+            AckPosition::Offset { generation: 0, offset: 42 },
+            ack_tx,
+        ));
         let event = Event::with_ack(
             Bytes::from_static(b"x"),
             dummy_addr(),
@@ -733,8 +775,8 @@ mod tests {
         drop(event);
         drop(handle);
         match ack_rx.recv().await {
-            Some(AckPosition::Offset(42)) => {}
-            other => panic!("expected Offset(42), got {:?}", other),
+            Some(AckPosition::Offset { generation: 0, offset: 42 }) => {}
+            other => panic!("expected Offset {{ generation: 0, offset: 42 }}, got {:?}", other),
         }
     }
 
@@ -743,7 +785,10 @@ mod tests {
         // Sibling to the above: disarm() must convert Drop into a no-op
         // so the receiver sees nothing.
         let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<AckPosition>();
-        let handle = Arc::new(AckHandle::new(AckPosition::Offset(99), ack_tx));
+        let handle = Arc::new(AckHandle::new(
+            AckPosition::Offset { generation: 0, offset: 99 },
+            ack_tx,
+        ));
         handle.disarm();
         drop(handle);
         // Give the runtime a tick — if a spurious ack were to arrive,
@@ -755,6 +800,125 @@ mod tests {
             "disarmed handle must not emit on drop; got {:?}",
             got
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Generation-gated ack drop — coverage for the rotation data-loss
+    // path that PR-W's queued-only stale-ack drain did not cover.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn drain_acks_ignores_previous_generation_offsets() {
+        // The hot path: a worker that was still holding an AckHandle for
+        // a pre-rotation event drops it AFTER the input bumped its
+        // generation. The bumped generation must reject the late ack so
+        // its old absolute offset is not folded into the post-rotation
+        // watermark. Pre-fix, the old offset would silently mark the
+        // new file as "already read up to N", skipping bytes 0..N on the
+        // next start.
+        let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<AckPosition>();
+
+        // Simulate a worker dropping its handle after the input rotated:
+        // the AckHandle was constructed under generation 0, but the
+        // input's current generation is now 1.
+        let stale = Arc::new(AckHandle::new(
+            AckPosition::Offset { generation: 0, offset: 999_999 },
+            ack_tx.clone(),
+        ));
+        drop(stale);
+        // And a fresh post-rotation ack under generation 1.
+        let fresh = Arc::new(AckHandle::new(
+            AckPosition::Offset { generation: 1, offset: 42 },
+            ack_tx.clone(),
+        ));
+        drop(fresh);
+
+        let hi = drain_acks_into_watermark(&mut ack_rx, 1);
+        assert_eq!(
+            hi,
+            Some(42),
+            "stale-generation ack must be silently dropped; only the \
+             current-generation offset folds into the watermark",
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_remaining_acks_skips_previous_generation() {
+        // Sibling of the above for the seeded-drain path (= the recv
+        // branch in `run`'s select loop). A queued stale ack must not
+        // pull the watermark forward by its own offset, even when the
+        // seeded `initial` is smaller than the stale offset.
+        let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<AckPosition>();
+        let stale = Arc::new(AckHandle::new(
+            AckPosition::Offset { generation: 0, offset: 9_000 },
+            ack_tx.clone(),
+        ));
+        let fresh = Arc::new(AckHandle::new(
+            AckPosition::Offset { generation: 7, offset: 50 },
+            ack_tx.clone(),
+        ));
+        drop(stale);
+        drop(fresh);
+
+        let hi = drain_remaining_acks(&mut ack_rx, 10, 7);
+        assert_eq!(
+            hi, 50,
+            "seeded drain at generation 7 must ignore the gen-0 ack and \
+             return max(initial=10, fresh=50)",
+        );
+    }
+
+    #[tokio::test]
+    async fn ack_offset_for_generation_filters_mismatched_acks() {
+        // Direct unit pin on the predicate the run loop relies on. A
+        // matching generation returns the offset; a mismatched
+        // generation (= previous file) returns None so the caller
+        // discards the value rather than treating it as a current-file
+        // byte position.
+        let match_ = AckPosition::Offset { generation: 3, offset: 100 };
+        let mismatch = AckPosition::Offset { generation: 2, offset: 100 };
+        let cursor = AckPosition::Cursor("ignored".into());
+
+        assert_eq!(ack_offset_for_generation(&match_, 3), Some(100));
+        assert_eq!(
+            ack_offset_for_generation(&mismatch, 3),
+            None,
+            "previous-generation offset must be filtered out",
+        );
+        assert_eq!(
+            ack_offset_for_generation(&cursor, 3),
+            None,
+            "Cursor variant is journald-only and must not surface as a tail offset",
+        );
+    }
+
+    #[tokio::test]
+    async fn read_new_lines_stamps_events_with_current_generation() {
+        // The boundary: events emitted under generation N must carry
+        // ack handles tagged with N. This is what makes the receive-
+        // side filter work; without it, the predicate above would have
+        // nothing to bite on.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        std::fs::write(&path, b"x\n").unwrap();
+        let input = make_input(&path, None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<AckPosition>();
+
+        let _ = input
+            .read_new_lines(0, &tx, dummy_addr(), ack_tx, 4)
+            .await
+            .unwrap();
+        let e = rx.recv().await.unwrap();
+        drop(e);
+
+        match ack_rx.try_recv() {
+            Ok(AckPosition::Offset { generation, offset }) => {
+                assert_eq!(generation, 4, "ack must carry the caller's generation");
+                assert_eq!(offset, 2, "ack offset must be post-line");
+            }
+            other => panic!("expected Offset {{ generation: 4, .. }}, got {:?}", other),
+        }
     }
 
     #[test]
