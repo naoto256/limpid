@@ -144,17 +144,21 @@ pub const RETRY_PROPERTY_SPEC: PropertySpec = PropertySpec {
 /// `secondary <name>` property specification shared by every output
 /// Module's property schema. Splice alongside [`QUEUE_PROPERTY_SPEC`].
 ///
-/// The value is read by `props::get_ident` at runtime; schema-wise
-/// `PropertyValueKind::String` accepts bare idents, string literals,
-/// and templates — the wider shape is fine because the runtime then
-/// resolves the value against the set of declared output names and
-/// rejects unknowns / self-references / cycles in `runtime.rs`.
+/// The value is read by `props::get_ident` at runtime, which only
+/// accepts a bare ident — `secondary "fallback"` (string literal) or
+/// `secondary $tpl` (template) would silently return `None`, disabling
+/// the fallback route without any schema-level signal (I-4 violation
+/// caught by the boundary-contract audit). `PropertyValueKind::Ident`
+/// rejects those shapes at `--check` time so the operator sees the
+/// mismatch up front. The runtime still resolves the resulting ident
+/// against the set of declared output names and rejects unknowns /
+/// self-references / cycles in `runtime.rs`.
 pub const SECONDARY_PROPERTY_SPEC: PropertySpec = PropertySpec {
     name: "secondary",
     required: false,
     repeatable: false,
     exclusive_group: None,
-    kind: PropertyValueKind::String,
+    kind: PropertyValueKind::Ident,
 };
 
 // ---------------------------------------------------------------------------
@@ -1474,6 +1478,121 @@ mod schema_splice_tests {
                 "output '{}': retry block should reject unknown inner key 'typo', got errs={:?}",
                 name,
                 errs.iter().map(|e| (&e.kind, &e.key)).collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    /// I-4 invariant guard: `secondary` is read at runtime by
+    /// `props::get_ident`, which silently discards anything that
+    /// isn't a bare ident. The schema must reject string literals
+    /// and templates so the operator sees the mismatch at `--check`
+    /// time rather than booting with a silently-disabled fallback
+    /// route. Covers every output's shared schema in one pass.
+    #[test]
+    fn secondary_rejects_non_ident_shapes_in_all_outputs() {
+        #[allow(unused_mut)]
+        let mut schemas: Vec<(&[PropertySpec], &str)> = vec![
+            (StdoutOutput::property_schema().unwrap(), "stdout"),
+            (FileOutput::property_schema().unwrap(), "file"),
+            (HttpOutput::property_schema().unwrap(), "http"),
+            (SyslogTcpOutput::property_schema().unwrap(), "syslog_tcp"),
+            (SyslogUdpOutput::property_schema().unwrap(), "syslog_udp"),
+            (UnixSocketOutput::property_schema().unwrap(), "unix_socket"),
+            (OtlpGrpcOutput::property_schema().unwrap(), "otlp_grpc"),
+            (OtlpHttpOutput::property_schema().unwrap(), "otlp_http"),
+        ];
+        #[cfg(feature = "kafka")]
+        schemas.push((KafkaOutput::property_schema().unwrap(), "kafka"));
+
+        // Each bad shape must produce a TypeMismatch on the `secondary`
+        // key — UnknownKey would mean the splice itself broke (covered
+        // by the accept-test above), other errs are fine to ignore.
+        let bad_shapes: Vec<(Property, &str)> = vec![
+            (
+                kv("secondary", ExprKind::StringLit("fallback".into())),
+                "string literal",
+            ),
+            (
+                kv(
+                    "secondary",
+                    ExprKind::Template(vec![
+                        crate::dsl::ast::TemplateFragment::Literal("fall".into()),
+                        crate::dsl::ast::TemplateFragment::Interp(Expr::spanless(
+                            ExprKind::Ident(vec!["env".into(), "FB".into()]),
+                        )),
+                    ]),
+                ),
+                "template",
+            ),
+            (
+                kv(
+                    "secondary",
+                    ExprKind::Ident(vec!["pkg".into(), "fallback".into()]),
+                ),
+                "multi-segment ident",
+            ),
+        ];
+
+        for (schema, name) in &schemas {
+            for (bad, shape_label) in &bad_shapes {
+                let errs = validate(std::slice::from_ref(bad), schema);
+                let mismatch = errs.iter().find(|e| {
+                    e.key == "secondary"
+                        && matches!(e.kind, SchemaErrorKind::TypeMismatch { .. })
+                });
+                assert!(
+                    mismatch.is_some(),
+                    "output '{}': secondary {} should be rejected by schema, \
+                     got errs={:?}",
+                    name,
+                    shape_label,
+                    errs.iter().map(|e| (&e.kind, &e.key)).collect::<Vec<_>>(),
+                );
+            }
+        }
+    }
+
+    /// Companion to the negative test: bare-ident form (the only valid
+    /// shape) and absence must both pass without a `secondary`-keyed
+    /// error. Pins the post-fix accept range so the schema stays a
+    /// faithful mirror of what `props::get_ident` reads at runtime.
+    #[test]
+    fn secondary_accepts_bare_ident_and_absence_in_all_outputs() {
+        #[allow(unused_mut)]
+        let mut schemas: Vec<(&[PropertySpec], &str)> = vec![
+            (StdoutOutput::property_schema().unwrap(), "stdout"),
+            (FileOutput::property_schema().unwrap(), "file"),
+            (HttpOutput::property_schema().unwrap(), "http"),
+            (SyslogTcpOutput::property_schema().unwrap(), "syslog_tcp"),
+            (SyslogUdpOutput::property_schema().unwrap(), "syslog_udp"),
+            (UnixSocketOutput::property_schema().unwrap(), "unix_socket"),
+            (OtlpGrpcOutput::property_schema().unwrap(), "otlp_grpc"),
+            (OtlpHttpOutput::property_schema().unwrap(), "otlp_http"),
+        ];
+        #[cfg(feature = "kafka")]
+        schemas.push((KafkaOutput::property_schema().unwrap(), "kafka"));
+
+        for (schema, name) in &schemas {
+            // Bare ident — must pass.
+            let with_ident = vec![secondary_prop()];
+            let errs = validate(&with_ident, schema);
+            let bad = errs.iter().find(|e| e.key == "secondary");
+            assert!(
+                bad.is_none(),
+                "output '{}': bare-ident secondary should be accepted, got {:?}",
+                name,
+                bad,
+            );
+
+            // Absent — must pass.
+            let empty: Vec<Property> = vec![];
+            let errs = validate(&empty, schema);
+            let bad = errs.iter().find(|e| e.key == "secondary");
+            assert!(
+                bad.is_none(),
+                "output '{}': absent secondary should be accepted, got {:?}",
+                name,
+                bad,
             );
         }
     }

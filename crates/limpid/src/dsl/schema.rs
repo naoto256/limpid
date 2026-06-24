@@ -53,6 +53,15 @@ pub enum PropertyValueKind {
     /// `framing { octet_counting | non_transparent }`, `queue.type
     /// { memory | disk }`, etc.
     Enum(&'static [&'static str]),
+    /// Bare ident only — string literals and templates are rejected at
+    /// schema-check time. Used where the value must be the *name* of
+    /// another declared entity (e.g. `secondary <output_name>` cross-
+    /// references another `def output`). The runtime resolver reads it
+    /// with `props::get_ident`, which silently drops anything that
+    /// isn't a bare ident — accepting `String` here would let
+    /// `secondary "fallback"` pass `--check` and then silently disable
+    /// the fallback route at runtime (I-4 violation).
+    Ident,
     /// Nested block. The slice describes the inner schema; the
     /// validator recurses.
     Block(&'static [PropertySpec]),
@@ -83,6 +92,7 @@ impl PropertyValueKind {
             PropertyValueKind::Duration => "Duration",
             PropertyValueKind::Size => "Size",
             PropertyValueKind::Enum(_) => "Ident",
+            PropertyValueKind::Ident => "Ident",
             PropertyValueKind::Block(_) => "Block",
             PropertyValueKind::BlockMap(_) => "BlockMap",
             PropertyValueKind::StringMap => "StringMap",
@@ -615,6 +625,13 @@ fn check_value(
                 }
             }
             _ => mismatch("an identifier"),
+        },
+        PropertyValueKind::Ident => match &value.kind {
+            ExprKind::Ident(parts) if parts.len() == 1 => None,
+            // Multi-segment idents (`a.b`) aren't valid names for
+            // cross-referenced entities either — reject them the same
+            // way bare-only enums do.
+            _ => mismatch("a bare identifier (output name, not a quoted string)"),
         },
         PropertyValueKind::Block(_)
         | PropertyValueKind::BlockMap(_)
