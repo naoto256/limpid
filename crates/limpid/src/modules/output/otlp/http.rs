@@ -68,7 +68,7 @@ use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
 use crate::queue::{BackoffStrategy, RetryConfig};
 use crate::tls::ClientTlsConfig;
 
-use super::{BatchLevel, OTLP_RETRY_BLOCK_PROPERTIES, OtlpPayload, decode_drained_to_request};
+use super::{BatchLevel, OtlpPayload, decode_drained_to_request};
 
 /// Upper bound on a single HTTP export — connect, TLS handshake,
 /// request body send, response headers, response body. A peer that
@@ -247,13 +247,8 @@ const OTLP_HTTP_OUTPUT_SCHEMA: &[PropertySpec] = &[
         exclusive_group: None,
         kind: PropertyValueKind::StringMap,
     },
-    PropertySpec {
-        name: "retry",
-        required: false,
-        repeatable: false,
-        exclusive_group: None,
-        kind: PropertyValueKind::Block(OTLP_RETRY_BLOCK_PROPERTIES),
-    },
+    crate::queue::RETRY_PROPERTY_SPEC,
+    crate::queue::SECONDARY_PROPERTY_SPEC,
     crate::queue::QUEUE_PROPERTY_SPEC,
 ];
 

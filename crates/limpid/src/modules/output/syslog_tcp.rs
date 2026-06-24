@@ -112,6 +112,8 @@ const SYSLOG_TCP_OUTPUT_SCHEMA: &[PropertySpec] = &[
         exclusive_group: Some("destination"),
         kind: PropertyValueKind::Block(SYSLOG_TCP_PEERS_SCHEMA),
     },
+    crate::queue::RETRY_PROPERTY_SPEC,
+    crate::queue::SECONDARY_PROPERTY_SPEC,
     crate::queue::QUEUE_PROPERTY_SPEC,
 ];
 

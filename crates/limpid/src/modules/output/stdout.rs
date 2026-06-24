@@ -12,9 +12,14 @@ use crate::event::BorrowedEvent;
 use crate::metrics::OutputMetrics;
 use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
 
-/// `output stdout` has no module-specific properties; only the common
-/// `queue { ... }` sub-block applies.
-const STDOUT_OUTPUT_SCHEMA: &[PropertySpec] = &[crate::queue::QUEUE_PROPERTY_SPEC];
+/// `output stdout` has no module-specific properties; only the
+/// common `retry { ... } / secondary <name> / queue { ... }`
+/// sub-blocks apply.
+const STDOUT_OUTPUT_SCHEMA: &[PropertySpec] = &[
+    crate::queue::RETRY_PROPERTY_SPEC,
+    crate::queue::SECONDARY_PROPERTY_SPEC,
+    crate::queue::QUEUE_PROPERTY_SPEC,
+];
 
 pub struct StdoutOutput {
     metrics: Arc<OutputMetrics>,
