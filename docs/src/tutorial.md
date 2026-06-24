@@ -339,4 +339,4 @@ From here:
 - [Process Design Guide](./processing/design-guide.md) — patterns for writing your own processes
 - [Pipelines](./pipelines/README.md) — `if`/`switch` routing, multi-output, `drop` vs `finish`
 - [Operations → CLI](./operations/cli.md) — the full surface of `limpidctl`
-- [Error Log (DLQ)](./operations/error-log.md) — where retry-exhausted, secondary-failed, and shutdown-flush payloads land when you declare `control { error_log }`
+- [Error Log (DLQ)](./operations/error-log.md) — where retry-exhausted and shutdown-flush payloads land when you declare `control { error_log }`

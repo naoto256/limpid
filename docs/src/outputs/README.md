@@ -38,12 +38,10 @@ def output reliable {
         max_wait "5m"                      // default: 60s
         backoff exponential                // exponential (default) | fixed
     }
-
-    secondary fallback_output              // optional failover target (bare ident)
 }
 ```
 
-`retry` is accepted by every output type. `secondary` takes a **bare identifier** referencing another `def output` — quoted strings are rejected at `--check`. A `secondary` that names an unknown output, references itself, or forms an indirect cycle (`A -> B -> A`, `A -> B -> C -> A`, …) is also rejected at `--check` so the misconfiguration is caught before deploy.
+`retry` is accepted by every output type. Retry-exhausted payloads are persisted to `control { error_log "..." }` (see [Recovery (error_log)](#recovery-error_log) below) when configured; otherwise they are dropped with a `tracing::warn!` and an `events_failed` counter increment.
 
 ### Memory queue (default)
 
@@ -57,18 +55,11 @@ Events are persisted to a Write-Ahead Log (WAL) on disk. Survives process restar
 - `max_size` limits total disk usage (oldest consumed segments are deleted)
 - Cursor position is saved atomically
 
-### Secondary output
-
-When all retry attempts are exhausted, the event is forwarded to the `secondary` output instead of being dropped. Useful for dead-letter queues.
-
-If the secondary enqueue itself fails, or no `secondary` is configured, the payload is written to `control { error_log "..." }` (see [Recovery (error_log)](#recovery-error_log) below). Without `error_log`, the event is dropped with a `tracing::warn!` and an `events_failed` counter increment only.
-
 ### Recovery (error_log)
 
-The daemon-wide [`control { error_log "..." }`](../operations/error-log.md) block names a JSONL file that catches payloads the queue/retry/secondary chain could not place. Three paths feed it:
+The daemon-wide [`control { error_log "..." }`](../operations/error-log.md) block names a JSONL file that catches payloads the queue/retry chain could not place. Two paths feed it:
 
-- the `secondary` enqueue itself failed,
-- no `secondary` was configured and the retry budget was exhausted,
+- the retry budget was exhausted,
 - a batched output (e.g. `http`, `otlp_http`, `otlp_grpc`) failed to flush its remaining buffer at shutdown.
 
 Each line is one rendered payload. When `error_log` is unset the daemon falls back to 0.7.7-compatible behaviour (warn + drop), and `limpid --check` emits a warning so the operator notices the silent drop path.

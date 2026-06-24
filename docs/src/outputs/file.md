@@ -78,4 +78,4 @@ Parent directories are created automatically.
 
 - Each line is one event's `egress` bytes followed by a newline.
 - For log rotation, use `logrotate` with `copytruncate` or `create` + SIGHUP.
-- Common queue / retry / secondary properties — see [Queue and retry](./README.md#queue-and-retry).
+- Common queue / retry properties — see [Queue and retry](./README.md#queue-and-retry).

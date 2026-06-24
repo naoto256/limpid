@@ -85,10 +85,10 @@ A few we have already covered:
   pipelines.
 
 - **Durable recovery sink, built in.** `control { error_log "..." }`
-  persists payloads that retry-exhaust, lose their secondary fallback,
-  or fail the shutdown flush — operators get the recovery guarantee
-  without writing their own DLQ wiring. `--check --strict-warnings`
-  enforces it on configs that need it.
+  persists payloads that retry-exhaust or fail the shutdown flush —
+  operators get the recovery guarantee without writing their own DLQ
+  wiring. `--check --strict-warnings` enforces it on configs that
+  need it.
 
 - **Visible flow.** Read the config and you know what the pipeline
   does. No implicit parsers that fire because input "looks like JSON".
