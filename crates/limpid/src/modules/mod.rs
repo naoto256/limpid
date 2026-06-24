@@ -11,65 +11,63 @@ pub mod input;
 pub mod output;
 pub mod schema;
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
 
-use crate::dsl::arena::EventArena;
 use crate::dsl::ast::{Expr, ExprKind, Property};
 use crate::dsl::schema::{self as property_schema, PropertySpec};
 use crate::dsl::span::Span;
-use crate::event::{BorrowedEvent, Event};
+use crate::event::Event;
 use crate::functions::FunctionRegistry;
 use crate::metrics::{InputMetrics, OutputMetrics};
-use crate::queue::{OutputWriter, SinkInput};
 
 // ---------------------------------------------------------------------------
-// RenderedPayload — type-erased per-event sink payload
+// RenderError — marker for render-vs-write error disambiguation
+// (render errors bypass retry and route directly to recovery)
 // ---------------------------------------------------------------------------
 //
-// Outputs participate in the pipeline's hot path (v0.6.0) by
-// rendering a sink-specific payload from a `BorrowedEvent` (no
-// `to_owned()` round-trip). The pipeline-internal channel between
-// pipeline and sink consumer carries a `RenderedPayload` (this type)
-// for memory queues and an `OwnedEvent` for disk-persisted queues.
+// `Output::consume` returns `anyhow::Result<()>` — the consumer
+// (`write_with_retry`) used to assume every Err was a transport failure
+// and apply the retry budget. After this change each sink's `consume` runs
+// render internally (the trait no longer carries a `render` method);
+// render failures are deterministic on the event so retrying only
+// delays the DLQ landing without changing the outcome.
 //
-// `Box<dyn Any + Send>` is the simplest dyn-safe transport for a
-// heterogeneous payload — each concrete sink defines its own
-// `Payload` struct (e.g. `FilePayload { egress, path }`) and downcasts
-// inside `write`. Per-event cost is one heap alloc for the box plus
-// whatever the payload struct contains internally; same order as the
-// previous `to_owned()` workspace clone but without copying the
-// workspace `HashMap` on every event.
+// `RenderError` is the in-band tag that lets sinks signal "render
+// failed permanently, skip retries" while keeping `consume`'s return
+// type a plain `Result<()>`. Sinks wrap their internal render error in
+// `RenderError::new(e)` before returning; `write_with_retry`
+// downcasts on `anyhow::Error::downcast_ref::<RenderError>()` and
+// routes straight to DLQ.
 
-/// Opaque payload produced by `Output::render` and consumed by
-/// `Output::write`. Holds a sink-specific concrete type behind
-/// `Box<dyn Any + Send>`.
-pub struct RenderedPayload(Box<dyn Any + Send>);
+/// Render-error sentinel. Wraps any underlying `anyhow::Error` raised
+/// by a sink's internal render step. Detected by `write_with_retry`
+/// via `anyhow::Error::downcast_ref::<RenderError>()` so the retry
+/// budget is bypassed.
+#[derive(Debug)]
+pub struct RenderError(pub anyhow::Error);
 
-impl RenderedPayload {
-    pub fn new<T: Any + Send>(value: T) -> Self {
-        Self(Box::new(value))
-    }
-
-    /// Recover the concrete payload type. Returns an error if the
-    /// stored type does not match `T` — this can only happen if the
-    /// pipeline misroutes a payload to the wrong sink, which would be
-    /// an internal bug.
-    pub fn downcast<T: Any>(self) -> Result<T> {
-        self.0
-            .downcast::<T>()
-            .map(|b| *b)
-            .map_err(|_| anyhow::anyhow!("RenderedPayload downcast type mismatch"))
+impl RenderError {
+    pub fn new(e: anyhow::Error) -> Self {
+        Self(e)
     }
 }
 
-impl std::fmt::Debug for RenderedPayload {
+impl std::fmt::Display for RenderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("RenderedPayload(<opaque>)")
+        // Forward to the inner error so the JSONL `reason` field stays
+        // operator-friendly (`render failed: <inner>` already prefixes
+        // in `write_with_retry`).
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for RenderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
     }
 }
 
@@ -328,40 +326,33 @@ pub trait Input: Module + HasMetrics<Stats = InputMetrics> + Send + 'static {
 /// — `Module::from_properties` requires `Self: Sized` (factory return),
 /// which would forbid `dyn Output`. Construction sites add the
 /// `Module` bound where they need it (see `register_output_type`),
-/// but the `dyn Output` we hand to the pipeline executor (for hot-path
-/// `render`) and to the queue consumer (for `write` / `write_owned`)
-/// stays object-safe.
+/// but the `dyn Output` we hand to the queue consumer stays
+/// object-safe.
+///
+/// After this change the trait is a single per-event entry point: each sink
+/// decides internally whether to ship the event inline (file, stdout,
+/// syslog_tcp, syslog_udp, kafka, unix_socket) or buffer for a later
+/// batched flush (http, otlp_http, otlp_grpc). The earlier
+/// `render → write` decomposition is now per-sink implementation
+/// detail (private helpers) — the trait no longer constrains its
+/// shape.
 #[async_trait::async_trait]
 pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
-    /// Hot path: build a sink-specific `RenderedPayload` from a borrowed
-    /// view of the event. Any DSL evaluation needed (e.g. path templates)
-    /// happens against the pipeline's per-event arena, so the payload
-    /// can capture `String` / `Bytes` results without paying for a
-    /// `to_owned` round-trip on the event's `workspace`.
-    fn render(&self, event: &BorrowedEvent<'_>, arena: &EventArena<'_>) -> Result<RenderedPayload>;
-
-    /// Hot path: consume a `RenderedPayload` produced by `render` and
-    /// perform the actual I/O. Each sink downcasts the payload to its
-    /// own concrete type internally.
-    async fn write(&self, payload: RenderedPayload) -> Result<()>;
-
-    /// Cold path (Disk-queue replay, control-socket inject): consume an
-    /// `OwnedEvent` directly. Default impl builds a transient arena,
-    /// views the event into it, calls `render`, then `write`. Sinks
-    /// with a faster owned-path may override.
+    /// Per-event entry point called by the queue consumer
+    /// (`write_with_retry`). Sinks own the full event lifecycle:
+    /// render (when applicable), serialise, ship — or buffer for a
+    /// batched flush. Return:
     ///
-    /// The arena/borrowed-event scope is closed before the `await` on
-    /// `write` so the resulting future stays `Send` (bumpalo's `Bump`
-    /// is !Sync).
-    async fn write_owned(&self, event: &Event) -> Result<()> {
-        let payload = {
-            let bump = bumpalo::Bump::new();
-            let arena = EventArena::new(&bump);
-            let bevent = event.view_in(&arena);
-            self.render(&bevent, &arena)?
-        };
-        self.write(payload).await
-    }
+    /// - `Ok(())` — event accepted (delivered, or durably enqueued
+    ///   into the sink's own batch buffer for a future flush).
+    /// - `Err(e)` — failure. If `e` is `crate::modules::RenderError`,
+    ///   the consumer treats it as a permanent failure on this event
+    ///   and routes straight to DLQ without consuming the retry
+    ///   budget (render errors bypass retry and route directly to
+    ///   recovery). Any other `Err` is treated as
+    ///   a transient transport failure and counted against
+    ///   `RetryConfig::max_attempts`.
+    async fn consume(&self, event: &Event) -> Result<()>;
 
     /// Called once after construction to hand the output a reference to
     /// the pipeline's `FunctionRegistry`. Outputs that evaluate DSL
@@ -386,10 +377,10 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     /// the shutdown sequence regardless — there is no further retry
     /// path available at this point.
     ///
-    /// `error_log` is the operator-configured DLQ writer (BC-4 /
-    /// PR-P). Batched outputs that override this method use it to
-    /// persist buffer contents that survive a failed final flush —
-    /// the parallel of PR-O's retry-exhausted recovery on the
+    /// `error_log` is the operator-configured DLQ writer used by the
+    /// shutdown-flush recovery path. Batched outputs that override this
+    /// method use it to persist buffer contents that survive a failed
+    /// final flush — the parallel of retry-exhausted recovery on the
     /// per-event path. `None` preserves the 0.7.7 behaviour
     /// (warn + drop). Implementations that hold no buffer ignore
     /// the argument.
@@ -401,88 +392,28 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     }
 }
 
-/// Helper for `Output::write_owned` overrides that ship a single Owned
-/// event inline, bypassing any internal buffer. Renders the event in a
-/// transient arena (same scope discipline as the default impl), awaits
-/// the caller-supplied `ship` closure, then updates the
-/// `events_written` / `events_failed` counters on the metrics handle.
-///
-/// The closure returns `Result<u64>` where the `u64` is the number of
-/// records the server acknowledged as rejected (OTLP's
-/// `partial_success.rejected_log_records`; always 0 for outputs that
-/// have no equivalent concept, like `output http`). For a single Owned
-/// event a non-zero rejection means the server processed the request
-/// but refused our one record — transport-success, data-loss — so
-/// we count it as `events_failed` even though the call returns Ok
-/// (the queue layer must not retry; the server already said no).
-///
-/// The batched outputs (`otlp_grpc`, `otlp_http`, `output http`)
-/// each need to override `write_owned` so the queue consumer's
-/// per-event `Ok`/`Err` contract is honored (disk-replay events
-/// would otherwise be merged into a batched flush and the verdict
-/// would be lost). They differ only in the `ship` body — payload
-/// downcast and the per-module `send_batch` shape — so the
-/// scaffolding lives here once.
-pub async fn ship_owned_inline<O, F, Fut>(
-    output: &O,
-    event: &Event,
-    metrics: &OutputMetrics,
-    ship: F,
-) -> Result<()>
-where
-    O: Output + ?Sized,
-    F: FnOnce(RenderedPayload) -> Fut,
-    Fut: std::future::Future<Output = Result<u64>>,
-{
-    use std::sync::atomic::Ordering;
-
-    let payload = {
-        let bump = bumpalo::Bump::new();
-        let arena = EventArena::new(&bump);
-        let bevent = event.view_in(&arena);
-        output.render(&bevent, &arena)?
-    };
-    match ship(payload).await {
-        Ok(0) => {
-            metrics.events_written.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-        Ok(_rejected) => {
-            // Transport said OK, server rejected the single record we
-            // sent. Count as failed so dashboards reflect the data
-            // loss; return Ok so the queue does not retry — the
-            // server already refused this exact bytes.
-            metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-        Err(e) => {
-            metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-            Err(e)
-        }
-    }
-}
-
-/// Shared helper: walk the leftover rendered payloads from a failed
-/// shutdown flush and write each to the configured `error_log` (BC-4 /
-/// PR-P). On per-record write failure we warn and continue — the loop
-/// must not recurse back into the DLQ on its own failures, otherwise
-/// a broken `error_log` path would spin a tight error loop at
-/// shutdown. Called from each batched output's `shutdown()` override
-/// (`http`, `otlp_http`, `otlp_grpc`); the per-output indirection
-/// only differs in how their internal buffer is normalised to
-/// `Vec<Bytes>`.
-pub async fn write_shutdown_buffer_to_error_log(
+/// Shared helper: walk the leftover `Event`s from a failed batched-
+/// output shutdown flush and write each to the configured `error_log`.
+/// Each record carries the original `Event` (real `source`, `ingress`,
+/// `received_at`) — no synthetic payload construction. On per-record
+/// write failure we warn and continue, so a broken `error_log` path
+/// can't spin a tight error loop at shutdown.
+pub async fn write_shutdown_events_to_error_log(
     writer: &Arc<crate::error_log::ErrorLogWriter>,
     output_name: &str,
-    payloads: Vec<bytes::Bytes>,
+    events: Vec<Event>,
     flush_err: &anyhow::Error,
 ) {
     let reason = format!("shutdown flush failed: {}", flush_err);
-    for payload in payloads {
-        if let Err(write_err) = writer
-            .write_shutdown_payload(output_name, payload, &reason)
-            .await
-        {
+    for ev in events {
+        let ctx = crate::pipeline::ErroredEventContext {
+            timestamp: chrono::Utc::now(),
+            pipeline: String::new(),
+            process: format!("(output {} shutdown)", output_name),
+            reason: reason.clone(),
+            event: ev,
+        };
+        if let Err(write_err) = writer.write(&ctx).await {
             tracing::warn!(
                 "output '{}': error_log write during shutdown failed: {} — dropping event",
                 output_name,
@@ -502,15 +433,16 @@ pub struct CreatedInput {
     pub metrics: Arc<InputMetrics>,
 }
 
-/// Returned by output factory: the writer + metrics handle.
+/// Returned by output factory: the constructed sink + metrics handle.
 ///
-/// `output` is the `Arc<dyn Output>` so the pipeline executor can call
-/// `render` on the hot path; `writer` is a thin `OutputWriter` adapter
-/// that the queue consumer uses to call `write` (or `write_owned` for
-/// disk-replay paths). Both share the same underlying instance.
+/// `output` is the `Arc<dyn Output>` handed to the queue consumer
+/// (which calls `Output::consume` directly — after this change there is no
+/// intermediate `OutputWriter` adapter trait). Batched outputs that
+/// need the operator-configured `error_log` receive it as a
+/// constructor argument via the factory; no post-construction setter
+/// remains on the trait.
 pub struct CreatedOutput {
     pub output: Arc<dyn Output>,
-    pub writer: Box<dyn OutputWriter>,
     pub metrics: Arc<OutputMetrics>,
 }
 
@@ -530,7 +462,14 @@ type InputFactory = Box<
 >;
 
 type OutputFactory = Box<
-    dyn Fn(&str, &ModuleProperties, Arc<FunctionRegistry>) -> Result<CreatedOutput> + Send + Sync,
+    dyn Fn(
+            &str,
+            &ModuleProperties,
+            Arc<FunctionRegistry>,
+            Option<Arc<crate::error_log::ErrorLogWriter>>,
+        ) -> Result<CreatedOutput>
+        + Send
+        + Sync,
 >;
 
 struct InputEntry {
@@ -595,7 +534,12 @@ impl ModuleRegistry {
         schema: Option<&'static [PropertySpec]>,
         factory: F,
     ) where
-        F: Fn(&str, &ModuleProperties, Arc<FunctionRegistry>) -> Result<CreatedOutput>
+        F: Fn(
+                &str,
+                &ModuleProperties,
+                Arc<FunctionRegistry>,
+                Option<Arc<crate::error_log::ErrorLogWriter>>,
+            ) -> Result<CreatedOutput>
             + Send
             + Sync
             + 'static,
@@ -659,6 +603,7 @@ impl ModuleRegistry {
         name: &str,
         properties: &ModuleProperties,
         funcs: Arc<FunctionRegistry>,
+        error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
     ) -> Result<CreatedOutput> {
         let type_name = properties.type_name();
         let entry = self
@@ -673,7 +618,7 @@ impl ModuleRegistry {
                 ));
             }
         }
-        (entry.factory)(name, properties, funcs)
+        (entry.factory)(name, properties, funcs, error_log)
     }
 }
 
@@ -712,9 +657,9 @@ pub fn register_builtins(registry: &mut ModuleRegistry) {
     register_output_type::<output::file::FileOutput>(registry, "file");
     register_output_type::<output::unix_socket::UnixSocketOutput>(registry, "unix_socket");
     register_output_type::<output::syslog_tcp::SyslogTcpOutput>(registry, "syslog_tcp");
-    register_output_type::<output::http::HttpOutput>(registry, "http");
-    register_output_type::<output::otlp::http::OtlpHttpOutput>(registry, "otlp_http");
-    register_output_type::<output::otlp::grpc::OtlpGrpcOutput>(registry, "otlp_grpc");
+    register_batched_output_type::<output::http::HttpOutput>(registry, "http");
+    register_batched_output_type::<output::otlp::http::OtlpHttpOutput>(registry, "otlp_http");
+    register_batched_output_type::<output::otlp::grpc::OtlpGrpcOutput>(registry, "otlp_grpc");
     register_output_type::<output::syslog_udp::SyslogUdpOutput>(registry, "syslog_udp");
     register_output_type::<output::stdout::StdoutOutput>(registry, "stdout");
     #[cfg(feature = "kafka")]
@@ -759,37 +704,57 @@ where
     registry.register_output(
         type_name,
         T::property_schema(),
-        |name, properties: &ModuleProperties, funcs| {
+        // `_error_log` is unused: non-batched outputs (file, stdout,
+        // syslog_tcp, syslog_udp, kafka, unix_socket) get DLQ routing
+        // for retry-exhausted events through the queue consumer's
+        // `write_with_retry`, not through their own internal buffers.
+        // Only the 3 batched outputs (http, otlp_http, otlp_grpc)
+        // need a constructor-time `error_log` handle; those register
+        // via [`register_batched_output_type`] below.
+        |name, properties: &ModuleProperties, funcs, _error_log| {
             let mut output = T::from_properties(name, properties)?;
             output.attach_funcs(funcs);
             let metrics = HasMetrics::metrics(&output);
             let output_arc: Arc<dyn Output> = Arc::new(output);
             Ok(CreatedOutput {
-                output: Arc::clone(&output_arc),
-                writer: Box::new(OutputWriterWrapper(output_arc)),
+                output: output_arc,
                 metrics,
             })
         },
     );
 }
 
-struct OutputWriterWrapper(Arc<dyn Output>);
+/// Trait marker for the 3 batched outputs (`http`, `otlp_http`,
+/// `otlp_grpc`) that consume `error_log` at construction time. Lives
+/// next to `Module` rather than on it so non-batched outputs aren't
+/// forced to carry an unused method, and so the `Input` half of the
+/// `Module` trait isn't polluted with output-only plumbing.
+pub trait OutputBuilderWithErrorLog: Module {
+    fn from_properties_with_error_log(
+        name: &str,
+        properties: &ModuleProperties,
+        error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+    ) -> Result<Self>;
+}
 
-#[async_trait::async_trait]
-impl OutputWriter for OutputWriterWrapper {
-    async fn consume(&self, input: SinkInput) -> anyhow::Result<()> {
-        match input {
-            SinkInput::Rendered(payload) => self.0.write(payload).await,
-            SinkInput::Owned(event) => self.0.write_owned(&event).await,
-        }
-    }
-
-    async fn shutdown(
-        &self,
-        error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
-    ) -> anyhow::Result<()> {
-        self.0.shutdown(error_log).await
-    }
+fn register_batched_output_type<T>(registry: &mut ModuleRegistry, type_name: &str)
+where
+    T: OutputBuilderWithErrorLog + Output + Sync + 'static,
+{
+    registry.register_output(
+        type_name,
+        T::property_schema(),
+        |name, properties: &ModuleProperties, funcs, error_log| {
+            let mut output = T::from_properties_with_error_log(name, properties, error_log)?;
+            output.attach_funcs(funcs);
+            let metrics = HasMetrics::metrics(&output);
+            let output_arc: Arc<dyn Output> = Arc::new(output);
+            Ok(CreatedOutput {
+                output: output_arc,
+                metrics,
+            })
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -26,17 +26,16 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 
-use crate::dsl::arena::EventArena;
 use crate::dsl::ast::{ExprKind, Property};
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
-use crate::event::BorrowedEvent;
+use crate::event::Event;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::syslog_peers::{
     PEER_CONNECT_TIMEOUT, PEER_HANDSHAKE_TIMEOUT, PEER_WRITE_TIMEOUT, Peer, PeerList,
     SyslogFraming, SyslogPayload, parse_host_port, write_framed,
 };
-use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
+use crate::modules::{HasMetrics, Module, Output};
 use crate::tls::{ClientTlsConfig, build_client_config_sync};
 
 // ---------------------------------------------------------------------------
@@ -333,18 +332,21 @@ impl HasMetrics for SyslogTcpOutput {
 
 #[async_trait::async_trait]
 impl Output for SyslogTcpOutput {
-    fn render(
-        &self,
-        event: &BorrowedEvent<'_>,
-        _arena: &EventArena<'_>,
-    ) -> Result<RenderedPayload> {
-        Ok(RenderedPayload::new(SyslogPayload {
+    async fn consume(&self, event: &Event) -> Result<()> {
+        // Syslog-TCP has no per-event template work — the payload is
+        // just the egress bytes. Build it inline and hand it to the
+        // private write helper.
+        let payload = SyslogPayload {
             egress: event.egress.clone(),
-        }))
+        };
+        self.write_payload(payload).await
     }
+}
 
-    async fn write(&self, payload: RenderedPayload) -> Result<()> {
-        let payload: SyslogPayload = payload.downcast()?;
+impl SyslogTcpOutput {
+    /// Send one syslog frame via the peer-rotation helper. Private —
+    /// reached only from [`Output::consume`].
+    async fn write_payload(&self, payload: SyslogPayload) -> Result<()> {
         let framing = self.framing;
         let metrics = Arc::clone(&self.metrics);
         let connectors = self.connectors.clone();

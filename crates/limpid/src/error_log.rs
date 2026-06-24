@@ -10,13 +10,21 @@
 //!    failures, surfaced as `(pipeline body)`).
 //! 2. **Output retry exhausted** — `queue/mod.rs` consumer routes the
 //!    payload here after the retry budget is spent, surfaced as
-//!    `(output <name>)` (PR-O).
+//!    `(output <name>)`.
 //! 3. **Output enqueue failures** — `runtime.rs` could not hand an
 //!    event to an output's queue (queue closed, disk write error,
-//!    unknown output), surfaced as `(output enqueue)` (PR-I).
+//!    unknown output), surfaced as `(output enqueue)`.
 //! 4. **Batched-output shutdown-flush leftovers** — `modules/mod.rs`
-//!    walks the remaining buffer of a batched output that could not
-//!    flush at shutdown, surfaced as `(output <name> shutdown)` (PR-P).
+//!    walks the remaining `Vec<Event>` buffer of a batched output that
+//!    could not flush at shutdown and routes each through the normal
+//!    `write()` path with the real source/ingress/received_at, surfaced
+//!    as `(output <name> shutdown)`. Before this change the path
+//!    synthesised an `Event` from the rendered bytes; now the buffer
+//!    is `Vec<Event>` already so no synthetic construction is needed.
+//! 5. **Batched-output per-event render failures** — `modules/output/*.rs`
+//!    routes events that fail `render()` during a batched flush
+//!    through the same writer with `reason = "render failed during
+//!    batch flush: ..."`, surfaced as `(output <name>)`.
 //!
 //! All four converge on this same JSONL file, the same replay recipe,
 //! and the same `events_errored` / `events_errored_unwritable` counter
@@ -43,16 +51,13 @@
 //! `tokio::sync::Mutex` before opening the file. The serialisation
 //! is inside the `error_log` boundary, not at the kernel layer.
 
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
-use crate::event::Event;
 use crate::pipeline::ErroredEventContext;
 
 /// Writer for the configured `error_log` JSONL file.
@@ -113,44 +118,6 @@ impl ErrorLogWriter {
             );
         }
         Ok(())
-    }
-
-    /// Persist a rendered buffer entry that survived an
-    /// [`Output::shutdown`] flush failure (BC-4 / PR-P).
-    ///
-    /// The batched outputs (`http`, `otlp_http`, `otlp_grpc`) carry
-    /// rendered bytes in their in-memory buffer; by the time the
-    /// shutdown flush fails, the originating `OwnedEvent` is long gone
-    /// (the memory queue already counted the per-event `write()` as
-    /// delivered). We synthesise a minimal `OwnedEvent` carrying the
-    /// rendered payload as `ingress` so the existing
-    /// [`ErroredEventContext`] schema and `error_log` JSONL format are
-    /// reused verbatim. The `process` field is set to
-    /// `"(output <name> shutdown)"` so operators can distinguish
-    /// shutdown-recovery records from PR-O's retry-exhausted records
-    /// (which use `"(output <name>)"`).
-    ///
-    /// `source` is set to `127.0.0.1:0` — a marker that matches the
-    /// daemon's other synthetic events (control-socket inject,
-    /// `--test-pipeline`). `received_at` defaults to "now"; the
-    /// `timestamp` field on the outer context already records the
-    /// shutdown wall-clock.
-    pub async fn write_shutdown_payload(
-        &self,
-        output_name: &str,
-        payload: Bytes,
-        reason: &str,
-    ) -> Result<()> {
-        let source: SocketAddr = "127.0.0.1:0".parse().expect("static addr parses");
-        let event = Event::new(payload, source);
-        let ctx = ErroredEventContext {
-            timestamp: chrono::Utc::now(),
-            pipeline: String::new(),
-            process: format!("(output {} shutdown)", output_name),
-            reason: reason.to_string(),
-            event,
-        };
-        self.write(&ctx).await
     }
 
     /// Append one JSONL record for `ctx`. Errors here are surfaced to

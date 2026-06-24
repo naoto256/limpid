@@ -34,17 +34,15 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 
-use crate::dsl::arena::EventArena;
 use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
-use crate::event::BorrowedEvent;
+use crate::event::Event;
 use crate::metrics::OutputMetrics;
-use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
+use crate::modules::{HasMetrics, Module, Output};
 use crate::tls::ClientTlsConfig;
 
 /// Supported SASL mechanisms. The DSL spelling is underscore-separated
@@ -308,11 +306,6 @@ fn security_protocol(has_tls: bool, has_sasl: bool) -> Option<&'static str> {
     }
 }
 
-struct KafkaPayload {
-    egress: Bytes,
-    key: Option<String>,
-}
-
 pub struct KafkaOutput {
     producer: FutureProducer,
     topic: String,
@@ -432,22 +425,15 @@ impl HasMetrics for KafkaOutput {
 
 #[async_trait::async_trait]
 impl Output for KafkaOutput {
-    fn render(
-        &self,
-        event: &BorrowedEvent<'_>,
-        _arena: &EventArena<'_>,
-    ) -> Result<RenderedPayload> {
-        let key = self.resolve_key_borrowed(event);
-        Ok(RenderedPayload::new(KafkaPayload {
-            egress: event.egress.clone(),
-            key,
-        }))
-    }
+    async fn consume(&self, event: &Event) -> Result<()> {
+        // Render the key inline against the owned event. Kafka's
+        // payload (egress bytes + optional key) is light enough that
+        // we skip the `RenderedPayload` boxing entirely.
+        let key = self.resolve_key(event);
+        let egress = event.egress.clone();
 
-    async fn write(&self, payload: RenderedPayload) -> Result<()> {
-        let payload: KafkaPayload = payload.downcast()?;
-        let mut record = FutureRecord::to(&self.topic).payload(payload.egress.as_ref());
-        if let Some(ref k) = payload.key {
+        let mut record = FutureRecord::to(&self.topic).payload(egress.as_ref());
+        if let Some(ref k) = key {
             record = record.key(k);
         }
 
@@ -470,13 +456,18 @@ impl Drop for KafkaOutput {
 }
 
 impl KafkaOutput {
-    fn resolve_key_borrowed(&self, event: &BorrowedEvent<'_>) -> Option<String> {
+    /// Compute the optional Kafka message key from `event`. Returns
+    /// `None` when no `key_field` is configured or when the referenced
+    /// workspace entry is missing / non-string. Reads owned-event
+    /// state directly after this change (no `BorrowedEvent` indirection).
+    fn resolve_key(&self, event: &Event) -> Option<String> {
         let kf = self.key_field.as_ref()?;
         let value = match kf {
             KeyField::Source => event.source.ip().to_string(),
-            KeyField::Field(name) => event
-                .workspace_get(name)
-                .and_then(|v| v.as_str().map(|s| s.to_string()))?,
+            KeyField::Field(name) => event.workspace.get(name).and_then(|v| match v {
+                crate::dsl::value::OwnedValue::String(s) => Some(s.clone()),
+                _ => None,
+            })?,
         };
         Some(value)
     }

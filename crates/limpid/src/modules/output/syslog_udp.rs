@@ -6,15 +6,14 @@ use std::sync::atomic::Ordering;
 use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
 
-use crate::dsl::arena::EventArena;
 use crate::dsl::ast::Property;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
-use crate::event::BorrowedEvent;
+use crate::event::Event;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::syslog_peers::{
     PEER_CONNECT_TIMEOUT, PEER_WRITE_TIMEOUT, Peer, PeerList, SyslogPayload, parse_host_port,
 };
-use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
+use crate::modules::{HasMetrics, Module, Output};
 
 const SYSLOG_UDP_PEER_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
@@ -107,18 +106,22 @@ impl HasMetrics for SyslogUdpOutput {
 
 #[async_trait::async_trait]
 impl Output for SyslogUdpOutput {
-    fn render(
-        &self,
-        event: &BorrowedEvent<'_>,
-        _arena: &EventArena<'_>,
-    ) -> Result<RenderedPayload> {
-        Ok(RenderedPayload::new(SyslogPayload {
+    async fn consume(&self, event: &Event) -> Result<()> {
+        // Syslog-UDP has no per-event template work — the payload is
+        // just the egress bytes. Build it inline and hand it to the
+        // private write helper.
+        let payload = SyslogPayload {
             egress: event.egress.clone(),
-        }))
+        };
+        self.write_payload(payload).await
     }
+}
 
-    async fn write(&self, payload: RenderedPayload) -> Result<()> {
-        let payload: SyslogPayload = payload.downcast()?;
+impl SyslogUdpOutput {
+    /// Send one rendered datagram via the peer-rotation helper.
+    /// Private — used only by [`Output::consume`] and unit tests that
+    /// drive the transport directly without constructing an `Event`.
+    async fn write_payload(&self, payload: SyslogPayload) -> Result<()> {
         let metrics = Arc::clone(&self.metrics);
         let result = self
             .peers
@@ -423,11 +426,15 @@ mod tests {
         )
         .expect("build");
 
-        // Hand-craft a RenderedPayload the way the runtime does.
-        let payload = RenderedPayload::new(SyslogPayload {
+        // Hand-craft a SyslogPayload the way the runtime would after
+        // its inline render step.
+        let payload = SyslogPayload {
             egress: Bytes::from_static(b"<134>hello-v6"),
-        });
-        output.write(payload).await.expect("write should succeed");
+        };
+        output
+            .write_payload(payload)
+            .await
+            .expect("write should succeed");
 
         // Read one datagram off the listener.
         let mut buf = [0u8; 64];
