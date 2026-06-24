@@ -41,7 +41,7 @@ use tracing::{error, info, warn};
 
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
-use crate::event::Event;
+use crate::event::{AckHandle, AckPosition, Event};
 use crate::metrics::InputMetrics;
 use crate::modules::{HasMetrics, Input, Module};
 
@@ -152,6 +152,16 @@ impl Input for JournalInput {
             )
         });
 
+        // Ack channel: pipeline workers drop the per-event AckHandle on
+        // completion, which sends the carried journald cursor back here.
+        // Cursors are opaque strings (not numeric), so the watermark is
+        // simply "the most recent cursor we saw acked" — journald
+        // guarantees forward progression within a single boot ID, and
+        // saving an older cursor is harmless (re-read on restart). For
+        // multi-boot timelines the cursor still uniquely identifies the
+        // entry, so this remains correct under journalctl semantics.
+        let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<AckPosition>();
+
         loop {
             tokio::select! {
                 biased;
@@ -164,7 +174,29 @@ impl Input for JournalInput {
                         // running on a blocking thread).
                         reader_shutdown.store(true, Ordering::Relaxed);
                         journal_handle.abort();
+                        // Drain in-flight acks one last time so the
+                        // most-recent processed cursor lands on disk.
+                        if let Some(last) = drain_cursor_acks(&mut ack_rx)
+                            && let Some(ref sf) = self.state_file
+                        {
+                            save_cursor(sf, &last);
+                        }
                         break;
+                    }
+                }
+
+                Some(pos) = ack_rx.recv() => {
+                    if let AckPosition::Cursor(mut cur) = pos {
+                        // Coalesce any other acks already queued so we
+                        // don't fsync-spam on a busy pipeline. The last
+                        // one wins (journald cursors are monotonic
+                        // forward within a boot ID).
+                        while let Ok(AckPosition::Cursor(next)) = ack_rx.try_recv() {
+                            cur = next;
+                        }
+                        if let Some(ref sf) = self.state_file {
+                            save_cursor(sf, &cur);
+                        }
                     }
                 }
 
@@ -172,13 +204,27 @@ impl Input for JournalInput {
                     match entry {
                         Some((bytes, cursor)) => {
                             metrics.events_received.fetch_add(1, Ordering::Relaxed);
-                            let event = Event::new(Bytes::from(bytes), source_addr);
-                            if tx.send(event).await.is_err() {
+                            let ack = Arc::new(AckHandle::new(
+                                AckPosition::Cursor(cursor),
+                                ack_tx.clone(),
+                            ));
+                            let event = Event::with_ack(
+                                Bytes::from(bytes),
+                                source_addr,
+                                Arc::clone(&ack),
+                            );
+                            if let Err(send_err) = tx.send(event).await {
+                                // Disarm so the un-processed event's
+                                // ack does NOT advance the cursor.
+                                ack.disarm();
+                                drop(send_err);
                                 break;
                             }
-                            if let Some(ref sf) = self.state_file {
-                                save_cursor(sf, &cursor);
-                            }
+                            // Cursor persistence happens via the ack
+                            // branch above, not here — pre-fix this
+                            // block saved the cursor on send-success,
+                            // which is the at-most-once gap we're
+                            // closing.
                         }
                         None => break,
                     }
@@ -188,6 +234,20 @@ impl Input for JournalInput {
 
         Ok(())
     }
+}
+
+/// Drain the ack channel and return the most-recent cursor (or None if
+/// empty). Used at shutdown to flush an in-flight watermark.
+fn drain_cursor_acks(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AckPosition>,
+) -> Option<String> {
+    let mut last: Option<String> = None;
+    while let Ok(pos) = rx.try_recv() {
+        if let AckPosition::Cursor(c) = pos {
+            last = Some(c);
+        }
+    }
+    last
 }
 
 /// Encode one journal entry's fields into a `serde_json::Value`
@@ -439,6 +499,69 @@ mod tests {
             "should not return before the first quantum elapses; took {:?}",
             elapsed
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Cursor-ack drain helpers — coverage for the at-most-once gap fix
+    // -----------------------------------------------------------------
+    //
+    // We can't exercise the full `run()` without a live libsystemd
+    // journal, but the cursor-watermark logic is isolated in
+    // `drain_cursor_acks` and the AckHandle drop semantics — both of
+    // which are independent of the journal feature.
+
+    #[tokio::test]
+    async fn drain_cursor_acks_returns_most_recent_cursor() {
+        // The journal cursor channel is drained at shutdown so the
+        // last-seen cursor lands on disk before exit. Coalescing rule:
+        // the most recent cursor wins (journald cursors are monotonic
+        // forward within a boot ID).
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AckPosition>();
+        tx.send(AckPosition::Cursor("c1".into())).unwrap();
+        tx.send(AckPosition::Cursor("c2".into())).unwrap();
+        tx.send(AckPosition::Cursor("c3".into())).unwrap();
+        assert_eq!(drain_cursor_acks(&mut rx), Some("c3".into()));
+    }
+
+    #[tokio::test]
+    async fn drain_cursor_acks_returns_none_on_empty_channel() {
+        // Shutdown drain must not block, and must not synthesise a
+        // value when there is nothing to flush — the caller treats
+        // None as "no cursor to save", preserving the prior watermark.
+        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AckPosition>();
+        assert_eq!(drain_cursor_acks(&mut rx), None);
+    }
+
+    #[tokio::test]
+    async fn ack_handle_with_cursor_fires_on_drop() {
+        // The journal ack path piggy-backs on the same AckHandle drop
+        // mechanism as tail; the only difference is the AckPosition
+        // variant. Pin that the Cursor variant survives the round-trip
+        // through Drop intact.
+        let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<AckPosition>();
+        let handle = Arc::new(AckHandle::new(
+            AckPosition::Cursor("s=abc;i=1".into()),
+            ack_tx,
+        ));
+        drop(handle);
+        match ack_rx.recv().await {
+            Some(AckPosition::Cursor(c)) => assert_eq!(c, "s=abc;i=1"),
+            other => panic!("expected Cursor variant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn save_cursor_then_load_round_trips() {
+        // The cursor watermark must survive a write+read round-trip.
+        // Pre-fix this was exercised on every event; post-fix it runs
+        // only on ack arrival or shutdown, so pinning the
+        // serialisation contract independently is even more important
+        // (regressions would now be visible only after the next
+        // restart).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cursor");
+        save_cursor(&path, "s=zzz;i=42");
+        assert_eq!(load_cursor(&path), Some("s=zzz;i=42".into()));
     }
 
     #[test]

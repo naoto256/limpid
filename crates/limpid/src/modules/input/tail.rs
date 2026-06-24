@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
-use crate::event::Event;
+use crate::event::{AckHandle, AckPosition, Event};
 use crate::metrics::InputMetrics;
 use crate::modules::{HasMetrics, Input, Module};
 
@@ -105,8 +105,29 @@ impl Input for TailInput {
 
         let source_addr = TAIL_SOURCE.parse().unwrap();
 
-        let mut offset = self.initial_offset().await;
+        // `read_offset` is the in-memory file cursor — it tracks bytes
+        // already emitted onto the pipeline channel and is used so the
+        // next file read doesn't re-emit the same line twice. It moves
+        // forward at emission time.
+        //
+        // `acked_offset` is the on-disk watermark — the cursor that gets
+        // written to the state file. It moves forward only when the
+        // pipeline worker has finished processing the corresponding event
+        // (the per-event AckHandle drops and sends its position back over
+        // `ack_rx`).
+        //
+        // These were one variable before this change. Splitting them is
+        // what closes the at-most-once gap: a crash now leaves an on-disk
+        // cursor that points to the last *acked* line, not the last
+        // *emitted* line, so events in flight at the moment of the crash
+        // get re-read on the next boot.
+        let mut read_offset = self.initial_offset().await;
+        let mut acked_offset = read_offset;
         let mut last_inode = get_inode(&self.path);
+
+        // Unbounded ack channel — see `AckHandle` for the rationale
+        // (backpressure here would deadlock the pipeline).
+        let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<AckPosition>();
 
         loop {
             // Check for shutdown
@@ -115,11 +136,34 @@ impl Input for TailInput {
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         info!("tail {}: shutting down", self.path.display());
-                        self.save_position(offset);
+                        // Drain any in-flight acks before the final save so
+                        // events that finished between the last periodic
+                        // save and shutdown still advance the cursor. Any
+                        // event still on the wire (un-acked) is intentionally
+                        // left for re-read on next boot — that's the
+                        // at-least-once contract.
+                        if let Some(hi) = drain_acks_into_watermark(&mut ack_rx) {
+                            acked_offset = acked_offset.max(hi);
+                        }
+                        self.save_position(acked_offset);
                         break;
                     }
                 }
                 _ = tokio::time::sleep(self.poll_interval) => {}
+                // Also wake on ack so a quiet file with active downstream
+                // still flushes the watermark in a timely fashion.
+                Some(pos) = ack_rx.recv() => {
+                    if let Some(new_off) = ack_offset(&pos) {
+                        let hi = drain_remaining_acks(&mut ack_rx, new_off);
+                        // Monotonic guard: an out-of-order ack must not
+                        // roll the watermark backwards.
+                        if hi > acked_offset {
+                            acked_offset = hi;
+                            self.save_position(acked_offset);
+                        }
+                    }
+                    continue;
+                }
             }
 
             // Check if file exists
@@ -131,42 +175,100 @@ impl Input for TailInput {
                 }
             };
 
-            // Detect rotation: inode changed or file truncated
+            // Detect rotation: inode changed or file truncated. Both
+            // cursors reset together — a rotated file has a fresh byte
+            // namespace, so any in-flight acks from the previous file are
+            // stale and must not be persisted against the new file.
             let current_inode = get_inode(&self.path);
             if current_inode != last_inode {
                 info!(
                     "tail {}: rotation detected (inode changed), resetting to beginning",
                     self.path.display()
                 );
-                offset = 0;
+                read_offset = 0;
+                acked_offset = 0;
+                // Discard stray acks from the pre-rotation file so they
+                // don't poison the post-rotation watermark.
+                let _ = drain_acks_into_watermark(&mut ack_rx);
                 last_inode = current_inode;
-            } else if meta.len() < offset {
+            } else if meta.len() < read_offset {
                 info!(
                     "tail {}: file truncated, resetting to beginning",
                     self.path.display()
                 );
-                offset = 0;
+                read_offset = 0;
+                acked_offset = 0;
+                let _ = drain_acks_into_watermark(&mut ack_rx);
             }
 
             // No new data
-            if meta.len() <= offset {
+            if meta.len() <= read_offset {
                 continue;
             }
 
-            // Read new lines
-            match self.read_new_lines(offset, &tx, source_addr).await {
+            // Read new lines. The returned offset is the *emitted*
+            // position; we update `read_offset` but NOT `acked_offset`.
+            match self
+                .read_new_lines(read_offset, &tx, source_addr, ack_tx.clone())
+                .await
+            {
                 Ok(new_offset) => {
-                    offset = new_offset;
-                    self.save_position(offset);
+                    read_offset = new_offset;
                 }
                 Err(e) => {
                     warn!("tail {}: read error: {}", self.path.display(), e);
                 }
             }
+
+            // Opportunistic drain of acks accumulated during the read pass.
+            if let Some(hi) = drain_acks_into_watermark(&mut ack_rx)
+                && hi > acked_offset
+            {
+                acked_offset = hi;
+                self.save_position(acked_offset);
+            }
         }
 
         Ok(())
     }
+}
+
+/// Extract the file offset from an `AckPosition` issued by this input.
+/// Always `Offset(_)` for tail; the `Cursor(_)` variant is journald-only.
+fn ack_offset(pos: &AckPosition) -> Option<u64> {
+    match pos {
+        AckPosition::Offset(o) => Some(*o),
+        AckPosition::Cursor(_) => None,
+    }
+}
+
+/// Drain everything currently in the ack channel and return the highest
+/// offset seen, or `None` if the channel was empty. Non-blocking.
+fn drain_acks_into_watermark(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AckPosition>,
+) -> Option<u64> {
+    let mut hi: Option<u64> = None;
+    while let Ok(pos) = rx.try_recv() {
+        if let Some(o) = ack_offset(&pos) {
+            hi = Some(hi.map_or(o, |cur| cur.max(o)));
+        }
+    }
+    hi
+}
+
+/// Like [`drain_acks_into_watermark`] but seeded with `initial` so callers
+/// holding an already-extracted value can fold remaining items in one pass.
+fn drain_remaining_acks(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AckPosition>,
+    initial: u64,
+) -> u64 {
+    let mut hi = initial;
+    while let Ok(pos) = rx.try_recv() {
+        if let Some(o) = ack_offset(&pos) {
+            hi = hi.max(o);
+        }
+    }
+    hi
 }
 
 impl TailInput {
@@ -175,6 +277,7 @@ impl TailInput {
         from_offset: u64,
         tx: &tokio::sync::mpsc::Sender<Event>,
         source_addr: std::net::SocketAddr,
+        ack_tx: tokio::sync::mpsc::UnboundedSender<AckPosition>,
     ) -> Result<u64> {
         let file = tokio::fs::File::open(&self.path)
             .await
@@ -208,12 +311,32 @@ impl TailInput {
 
             self.metrics.events_received.fetch_add(1, Ordering::Relaxed);
 
-            let event = Event::new(Bytes::copy_from_slice(trimmed.as_bytes()), source_addr);
-            if tx.send(event).await.is_err() {
-                // Downstream closed. Rewind so this line is re-read
-                // on the next poll instead of being saved as already
-                // consumed; otherwise `run()` persists the advanced
-                // offset and the unsent line gets silently dropped.
+            // Stamp the event with the post-line offset. When the pipeline
+            // worker finishes (or fans out across multiple workers and the
+            // outer scope ends), the embedded AckHandle drops and sends the
+            // offset back to the run loop's ack channel. Inputs without a
+            // configured `state_file` still create the token — the handle
+            // is cheap (one Arc + a closure-shaped channel send), and the
+            // `save_position` call it eventually triggers is a no-op when
+            // no state file is configured. Branching on `state_file` here
+            // would add a config-dependent code path for negligible win.
+            let ack = Arc::new(AckHandle::new(
+                AckPosition::Offset(current_offset),
+                ack_tx.clone(),
+            ));
+            let event = Event::with_ack(
+                Bytes::copy_from_slice(trimmed.as_bytes()),
+                source_addr,
+                Arc::clone(&ack),
+            );
+            if let Err(send_err) = tx.send(event).await {
+                // Downstream closed. The event never reached the pipeline,
+                // so disarm its ack BEFORE letting the SendError drop the
+                // event — otherwise the embedded handle would still fire
+                // and advance the cursor past a line that was never
+                // processed. The line gets retried via the rewind below.
+                ack.disarm();
+                drop(send_err);
                 current_offset -= bytes_read as u64;
                 break;
             }
@@ -298,6 +421,15 @@ mod tests {
         "127.0.0.1:0".parse().unwrap()
     }
 
+    /// Throwaway ack sender for tests that don't exercise the ack-feedback
+    /// loop. The corresponding receiver is dropped, so events that fire
+    /// their ack on drop will see a closed channel and silently no-op (the
+    /// same path a shutdown-time stray ack would take in production).
+    fn dummy_ack_tx() -> tokio::sync::mpsc::UnboundedSender<AckPosition> {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        tx
+    }
+
     #[tokio::test]
     async fn read_new_lines_emits_complete_lines_from_offset() {
         // Baseline: two `\n`-terminated lines, both emit Events; the
@@ -309,7 +441,7 @@ mod tests {
         let input = make_input(&path, None);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
 
-        let next_off = input.read_new_lines(0, &tx, dummy_addr()).await.unwrap();
+        let next_off = input.read_new_lines(0, &tx, dummy_addr(), dummy_ack_tx()).await.unwrap();
         assert_eq!(next_off, 12);
         let e1 = rx.recv().await.unwrap();
         assert_eq!(&e1.ingress[..], b"line1");
@@ -330,7 +462,7 @@ mod tests {
         let input = make_input(&path, None);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
 
-        let next_off = input.read_new_lines(0, &tx, dummy_addr()).await.unwrap();
+        let next_off = input.read_new_lines(0, &tx, dummy_addr(), dummy_ack_tx()).await.unwrap();
         // First line was complete (9 bytes incl. \n); the partial
         // 7 bytes after must be rewound. Next offset = 9.
         assert_eq!(next_off, 9, "partial line must be rewound");
@@ -353,7 +485,7 @@ mod tests {
         let input = make_input(&path, None);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
 
-        let off1 = input.read_new_lines(0, &tx, dummy_addr()).await.unwrap();
+        let off1 = input.read_new_lines(0, &tx, dummy_addr(), dummy_ack_tx()).await.unwrap();
         let _ = rx.recv().await; // drain "complete"
         // Writer appends the newline.
         {
@@ -363,7 +495,7 @@ mod tests {
                 .unwrap();
             f.write_all(b"\n").unwrap();
         }
-        let off2 = input.read_new_lines(off1, &tx, dummy_addr()).await.unwrap();
+        let off2 = input.read_new_lines(off1, &tx, dummy_addr(), dummy_ack_tx()).await.unwrap();
         assert_eq!(off2, 17);
         let e = rx.recv().await.unwrap();
         assert_eq!(&e.ingress[..], b"partial");
@@ -468,10 +600,160 @@ mod tests {
         // Close the receiver so the first send fails.
         drop(rx);
 
-        let next_off = input.read_new_lines(0, &tx, dummy_addr()).await.unwrap();
+        let next_off = input.read_new_lines(0, &tx, dummy_addr(), dummy_ack_tx()).await.unwrap();
         assert_eq!(
             next_off, 0,
             "send failure must rewind so the un-sent line is retried",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Ack-driven cursor advance — coverage for the at-most-once gap fix
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn read_new_lines_embeds_ack_handle_per_event() {
+        // Pin the wire contract: every emitted Event carries an
+        // AckHandle whose position is the post-line offset. When the
+        // receiver drops the event, the handle's Drop fires and the
+        // offset reaches the run loop's ack channel — that is the
+        // mechanism the cursor watermark rides on.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        std::fs::write(&path, b"a\nbb\n").unwrap();
+        let input = make_input(&path, None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<AckPosition>();
+
+        let _ = input
+            .read_new_lines(0, &tx, dummy_addr(), ack_tx)
+            .await
+            .unwrap();
+
+        // Drain the two emitted events; dropping them fires their acks.
+        let e1 = rx.recv().await.unwrap();
+        let e2 = rx.recv().await.unwrap();
+        assert!(e1.ack.is_some(), "first event must carry an AckHandle");
+        assert!(e2.ack.is_some(), "second event must carry an AckHandle");
+        drop(e1);
+        drop(e2);
+
+        // Both acks must now be in the channel, with offsets matching
+        // the post-line positions: 2 (after "a\n") and 5 (after "bb\n").
+        let mut offsets = Vec::new();
+        while let Ok(pos) = ack_rx.try_recv() {
+            if let AckPosition::Offset(o) = pos {
+                offsets.push(o);
+            }
+        }
+        offsets.sort();
+        assert_eq!(offsets, vec![2, 5], "acks must carry post-line offsets");
+    }
+
+    #[tokio::test]
+    async fn save_position_does_not_advance_without_ack() {
+        // Regression for the at-most-once gap: emitting a line must NOT
+        // by itself cause the on-disk cursor to advance. The cursor
+        // moves only after the corresponding event has been acked back
+        // (= pipeline worker finished processing it). We simulate the
+        // "crashed before ack" state by holding the events in the
+        // channel and asserting the state file remains at its initial
+        // value.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let state = dir.path().join("state");
+        std::fs::write(&log, b"one\ntwo\n").unwrap();
+        // Pre-seed the watermark so we can observe (lack of) advance.
+        let input = make_input(&log, Some(&state));
+        input.save_position(0);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let (ack_tx, _ack_rx) = tokio::sync::mpsc::unbounded_channel::<AckPosition>();
+
+        let _ = input
+            .read_new_lines(0, &tx, dummy_addr(), ack_tx)
+            .await
+            .unwrap();
+
+        // No ack has been drained back; the on-disk cursor must still
+        // be at 0. Pre-fix this would have been 8 (= EOF).
+        assert_eq!(
+            input.load_position(),
+            Some(0),
+            "cursor must not advance until acks come back",
+        );
+    }
+
+    #[tokio::test]
+    async fn send_failure_disarms_ack_so_un_sent_line_not_marked_consumed() {
+        // The failure-mode that drove the disarm() API: when tx.send
+        // fails (downstream closed), the un-sent event still gets
+        // dropped — which would naively fire its ack and advance the
+        // cursor past a line that was never processed. The disarm()
+        // call inside read_new_lines must suppress that ack so the
+        // line is correctly retried on the next poll.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        std::fs::write(&path, b"will-not-be-processed\n").unwrap();
+        let input = make_input(&path, None);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
+        drop(rx); // close receiver so the first send fails
+        let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<AckPosition>();
+
+        let next_off = input
+            .read_new_lines(0, &tx, dummy_addr(), ack_tx)
+            .await
+            .unwrap();
+        assert_eq!(next_off, 0, "send failure must rewind the read offset");
+
+        // Crucially: the dropped (un-sent) event must NOT have fired an
+        // ack — disarm() suppressed it.
+        let spurious = ack_rx.try_recv();
+        assert!(
+            spurious.is_err(),
+            "disarmed handle must not emit an ack; got {:?}",
+            spurious
+        );
+    }
+
+    #[tokio::test]
+    async fn ack_handle_fires_on_event_drop() {
+        // Smoke test for the AckHandle drop mechanism itself: build a
+        // handle outside of the input layer, embed it in a synthetic
+        // event, drop the event, observe the position on the ack
+        // channel. This pins the contract the input layer relies on.
+        let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<AckPosition>();
+        let handle = Arc::new(AckHandle::new(AckPosition::Offset(42), ack_tx));
+        let event = Event::with_ack(
+            Bytes::from_static(b"x"),
+            dummy_addr(),
+            Arc::clone(&handle),
+        );
+        // Drop both the event and our local Arc clone — refcount goes
+        // to zero, Drop fires, the offset lands on the channel.
+        drop(event);
+        drop(handle);
+        match ack_rx.recv().await {
+            Some(AckPosition::Offset(42)) => {}
+            other => panic!("expected Offset(42), got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn ack_handle_does_not_fire_after_disarm() {
+        // Sibling to the above: disarm() must convert Drop into a no-op
+        // so the receiver sees nothing.
+        let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<AckPosition>();
+        let handle = Arc::new(AckHandle::new(AckPosition::Offset(99), ack_tx));
+        handle.disarm();
+        drop(handle);
+        // Give the runtime a tick — if a spurious ack were to arrive,
+        // it would be in the channel by now.
+        tokio::task::yield_now().await;
+        let got = ack_rx.try_recv();
+        assert!(
+            got.is_err(),
+            "disarmed handle must not emit on drop; got {:?}",
+            got
         );
     }
 

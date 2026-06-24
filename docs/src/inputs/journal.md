@@ -93,3 +93,4 @@ compose_ocsf` to ship OCSF Authentication events instead.
 - The cursor is saved atomically (write-to-temp + rename).
 - The source address for journal events is `127.0.0.1:0` (placeholder; the
   meaningful host metadata lives inside the JSON as `_HOSTNAME`).
+- Since 0.7.8, the persisted cursor advances only after the pipeline worker finishes processing the corresponding entry. In-flight entries at the moment of a crash are re-read on the next start — the at-least-once recovery contract documented under [Recovery readiness](../operations/error-log.md#recovery-readiness-check---check).
