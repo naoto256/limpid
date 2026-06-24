@@ -119,7 +119,9 @@ All five paths converge on the same JSONL file and the same replay recipe — `j
 
 ### Recovery readiness check (`--check`)
 
-Since 0.7.8 (PR-R), `limpid --check` emits a recovery-readiness warning when any output declares `retry`, declares a `secondary`, or is a batched OTLP/HTTP output and the `control { error_log }` is unset. Without `error_log`, recovery paths 3–5 above fall back to `tracing::error!` and the records are only recoverable through journald — sufficient for triage, but harder to replay. The warning catches the missing configuration before the first failure.
+Since 0.7.8 (PR-R), `limpid --check` emits a recovery-readiness warning when any output declares `retry`, declares a `secondary`, or is a batched OTLP/HTTP output and the `control { error_log }` is unset. Without `error_log`, recovery paths 3–5 above fall back to a `tracing::warn!`/`error!` line that names the output but **does not serialize the event payload** — the record itself is dropped and is not recoverable from journald. (Paths 1–2 are different: `write_errored_to_dlq` does emit the full JSONL on a tracing line when `error_log` is unset, so for process errors `journalctl | jq` still works as a fallback — just harder to replay than a dedicated file.) The warning catches the missing configuration before the first failure.
+
+Since 0.7.8 (PR-X), `--check` also hard-fails when any output declares a `secondary` that names an unknown output, references itself, or forms an indirect cycle (A→B→A, A→B→C→A, …) — the same checks runtime startup performs, hoisted forward so CI gates a deploy before the daemon refuses to boot.
 
 `event.egress` and `event.workspace` are intentionally **not** included — at the failure point they may hold partial state from earlier processes in the chain, which would confuse `inject --json` replay. The replay path re-runs the pipeline from scratch on `ingress`.
 
