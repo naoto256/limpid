@@ -17,8 +17,6 @@ use std::collections::HashMap;
 use anyhow::{Result, bail};
 use tracing::trace;
 
-use std::sync::Arc;
-
 use crate::dsl::arena::EventArena;
 use crate::dsl::ast::*;
 use crate::dsl::eval::{eval_expr, select_if_branch, select_switch_arm, value_to_string};
@@ -26,8 +24,7 @@ use crate::dsl::exec::{ExecResult, ProcessError, ProcessRegistry, exec_process_b
 use crate::dsl::value::Value;
 use crate::event::{BorrowedEvent, OwnedEvent};
 use crate::functions::FunctionRegistry;
-use crate::modules::{ModuleRegistry, Output};
-use crate::queue::{QueueKind, SinkInput};
+use crate::modules::ModuleRegistry;
 use crate::tap::TapRegistry;
 
 // ---------------------------------------------------------------------------
@@ -47,11 +44,6 @@ pub struct CompiledConfig {
     /// as built-in primitives.
     pub functions: HashMap<String, FunctionDef>,
     pub global_blocks: HashMap<String, Vec<Property>>,
-    /// Per-output queue kind, derived from each output's `queue { type }`.
-    /// Drives the pipeline's output-statement dispatch: `Memory` outputs
-    /// take the render hot path (`SinkInput::Rendered`), `Disk` outputs
-    /// take the owned-event persist path (`SinkInput::Owned`).
-    pub outputs_queue_kind: HashMap<String, QueueKind>,
 }
 
 impl CompiledConfig {
@@ -102,14 +94,6 @@ impl CompiledConfig {
             global_blocks.insert(block.name, block.properties);
         }
 
-        let mut outputs_queue_kind: HashMap<String, QueueKind> = HashMap::new();
-        for (name, output_def) in &outputs {
-            let kind = crate::queue::QueueConfig::kind_from_output_properties(
-                output_def.properties.user_properties(),
-            );
-            outputs_queue_kind.insert(name.clone(), kind);
-        }
-
         let compiled = Self {
             inputs,
             outputs,
@@ -117,7 +101,6 @@ impl CompiledConfig {
             pipelines,
             functions,
             global_blocks,
-            outputs_queue_kind,
         };
         Ok(compiled)
     }
@@ -307,7 +290,7 @@ impl ErroredEventContext {
 /// Result of running an event through a pipeline.
 pub struct PipelineRunResult {
     pub trace: Vec<TraceEntry>,
-    pub outputs: Vec<(String, SinkInput)>,
+    pub outputs: Vec<(String, OwnedEvent)>,
     /// True iff at least one `output` statement was reached during
     /// execution (i.e. `outputs` was non-empty *before* the runtime
     /// drained it into the per-output queues). Needed because the
@@ -404,18 +387,17 @@ impl DslProcessRegistry<'_> {
 
 /// Run a single event through a pipeline definition.
 ///
-/// `output_sinks` maps output names to their concrete `Output` instances
-/// so the `output` statement can call `render` directly on the per-event
-/// arena (no `to_owned()` round-trip on the workspace). Outputs that
-/// aren't in the map (or that map to a disk queue) fall back to the
-/// owned-event path.
+/// After this change the executor never resolves an output sink — the `output`
+/// statement just enqueues the owned event, and render happens
+/// consumer-side inside each sink's `Output::consume`. The previous
+/// `output_sinks: &HashMap<String, Arc<dyn Output>>` parameter is gone
+/// as part of that cleanup.
 pub fn run_pipeline(
     pipeline: &PipelineDef,
     event: &OwnedEvent,
     config: &CompiledConfig,
     funcs: &FunctionRegistry,
     tap: Option<&TapRegistry>,
-    output_sinks: &HashMap<String, Arc<dyn Output>>,
     bump: &mut bumpalo::Bump,
 ) -> Result<PipelineRunResult> {
     let registry = DslProcessRegistry::new(&config.processes, funcs, tap);
@@ -450,8 +432,6 @@ pub fn run_pipeline(
         registry: &registry,
         funcs,
         arena: &arena,
-        outputs_queue_kind: &config.outputs_queue_kind,
-        output_sinks,
     };
     let mut exec_out = PipelineExecOut {
         trace: &mut trace_entries,
@@ -484,12 +464,6 @@ struct PipelineExecCtx<'a, 'bump: 'a> {
     registry: &'a DslProcessRegistry<'a>,
     funcs: &'a FunctionRegistry,
     arena: &'bump EventArena<'bump>,
-    /// Queue kind per output (Memory → render hot path,
-    /// Disk → owned-event persist path).
-    outputs_queue_kind: &'a HashMap<String, QueueKind>,
-    /// Concrete `Output` instances looked up at the `output` statement
-    /// to render a sink-specific payload from the borrowed event.
-    output_sinks: &'a HashMap<String, Arc<dyn Output>>,
 }
 
 /// Mutable accumulators threaded through the pipeline executor:
@@ -502,7 +476,7 @@ struct PipelineExecCtx<'a, 'bump: 'a> {
 /// per-event arena boundary on the way out of `run_pipeline`.
 struct PipelineExecOut<'a> {
     trace: &'a mut Vec<TraceEntry>,
-    outputs: &'a mut Vec<(String, SinkInput)>,
+    outputs: &'a mut Vec<(String, OwnedEvent)>,
     errored: &'a mut Option<ErroredEventContext>,
 }
 
@@ -679,40 +653,12 @@ fn exec_pipeline_stmt<'bump>(
                 label: format!("→ {}", name),
                 detail: String::new(),
             });
-            // Pick render hot-path or owned persist-path based on the
-            // output's queue type. Memory queues take a sink-specific
-            // `RenderedPayload` built against the per-event arena;
-            // disk-persist queues take an `OwnedEvent` because the
-            // payload must outlive the arena and survive a process
-            // restart via JSONL serialisation.
-            let kind = ctx
-                .outputs_queue_kind
-                .get(name)
-                .copied()
-                .unwrap_or(QueueKind::Memory);
-            let sink_input = match kind {
-                QueueKind::Disk => SinkInput::Owned(event.to_owned()),
-                QueueKind::Memory => match ctx.output_sinks.get(name) {
-                    Some(sink) => match sink.render(&event, ctx.arena) {
-                        Ok(payload) => SinkInput::Rendered(payload),
-                        Err(e) => {
-                            tracing::warn!(
-                                "output '{}': render failed ({}); falling back to owned-event path",
-                                name,
-                                e
-                            );
-                            SinkInput::Owned(event.to_owned())
-                        }
-                    },
-                    None => {
-                        // No registered sink (e.g. tests, --test-pipeline,
-                        // or --check). Fall back to the owned-event form
-                        // so callers can still inspect outputs.
-                        SinkInput::Owned(event.to_owned())
-                    }
-                },
-            };
-            out.outputs.push((name.clone(), sink_input));
+            // Every output statement enqueues a plain `OwnedEvent`.
+            // The queue no longer distinguishes between a rendered
+            // payload and an owned event — both memory and disk queues
+            // carry `Event` end-to-end, and render runs consumer-side
+            // inside each sink's `Output::consume`.
+            out.outputs.push((name.clone(), event.to_owned()));
             cont(event)
         }
 
@@ -862,14 +808,12 @@ def pipeline p {
             Bytes::from_static(b"original payload"),
             "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         );
-        let sinks: HashMap<String, Arc<dyn Output>> = HashMap::new();
         let result = run_pipeline(
             pipeline,
             &event,
             &cfg,
             &funcs,
             None,
-            &sinks,
             &mut bumpalo::Bump::new(),
         )
         .unwrap();
@@ -922,14 +866,12 @@ def pipeline p {
             Bytes::from_static(b"payload"),
             "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         );
-        let sinks: HashMap<String, Arc<dyn Output>> = HashMap::new();
         let result = run_pipeline(
             pipeline,
             &event,
             &cfg,
             &funcs,
             None,
-            &sinks,
             &mut bumpalo::Bump::new(),
         )
         .unwrap();
@@ -974,14 +916,12 @@ def pipeline p {
             Bytes::from_static(b"payload"),
             "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         );
-        let sinks: HashMap<String, Arc<dyn Output>> = HashMap::new();
         let result = run_pipeline(
             pipeline,
             &event,
             &cfg,
             &funcs,
             None,
-            &sinks,
             &mut bumpalo::Bump::new(),
         )
         .unwrap();
@@ -997,106 +937,12 @@ def pipeline p {
         assert!(result.outputs.is_empty());
     }
 
-    #[test]
-    fn render_failure_falls_back_to_owned_sink_input() {
-        // The memory-queue render path catches a sink's `render` Err
-        // and falls back to `SinkInput::Owned(event.to_owned())` so
-        // the pipeline never drops an event because of a renderer
-        // bug. Mock an Output whose render() always errors, dispatch
-        // through run_pipeline, and assert the output_sinks list
-        // contains an Owned variant — not Rendered, not empty.
-        use crate::event::{BorrowedEvent, Event, OwnedEvent};
-        use crate::functions::{FunctionRegistry, register_builtins, table::TableStore};
-        use crate::metrics::OutputMetrics;
-        use crate::modules::{HasMetrics, Output, RenderedPayload};
-        use bytes::Bytes;
-        use std::net::SocketAddr;
-
-        struct AlwaysFailRender {
-            metrics: Arc<OutputMetrics>,
-        }
-        impl HasMetrics for AlwaysFailRender {
-            type Stats = OutputMetrics;
-            fn metrics(&self) -> Arc<OutputMetrics> {
-                Arc::clone(&self.metrics)
-            }
-        }
-        #[async_trait::async_trait]
-        impl Output for AlwaysFailRender {
-            fn render(
-                &self,
-                _event: &BorrowedEvent<'_>,
-                _arena: &crate::dsl::arena::EventArena<'_>,
-            ) -> anyhow::Result<RenderedPayload> {
-                anyhow::bail!("intentional render failure")
-            }
-            async fn write(&self, _payload: RenderedPayload) -> anyhow::Result<()> {
-                unreachable!("write must not be called when render errored")
-            }
-        }
-
-        let src = r#"
-def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type stdout }
-def pipeline p {
-    input i
-    output o
-}
-"#;
-        let cfg = compile(src).unwrap();
-        let pipeline = cfg.pipelines.get("p").unwrap();
-        let mut funcs = FunctionRegistry::new();
-        let store = TableStore::from_configs(vec![]).unwrap();
-        register_builtins(&mut funcs, store);
-
-        // Replace `o`'s sink with the mock so render() errors.
-        let mut sinks: HashMap<String, Arc<dyn Output>> = HashMap::new();
-        sinks.insert(
-            "o".into(),
-            Arc::new(AlwaysFailRender {
-                metrics: Arc::new(OutputMetrics::default()),
-            }) as Arc<dyn Output>,
-        );
-
-        let event = OwnedEvent::new(
-            Bytes::from_static(b"payload"),
-            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-        );
-        let result = run_pipeline(
-            pipeline,
-            &event,
-            &cfg,
-            &funcs,
-            None,
-            &sinks,
-            &mut bumpalo::Bump::new(),
-        )
-        .unwrap();
-        assert_eq!(result.termination, PipelineTermination::Finished);
-        assert_eq!(
-            result.outputs.len(),
-            1,
-            "expected 1 output, got {}",
-            result.outputs.len()
-        );
-        let (name, sink_input) = &result.outputs[0];
-        assert_eq!(name, "o");
-        assert!(
-            matches!(sink_input, SinkInput::Owned(_)),
-            "render failure must fall back to Owned, got Rendered"
-        );
-        // Round-trip: the Owned event's ingress must equal what we fed.
-        if let SinkInput::Owned(ev) = sink_input {
-            assert_eq!(&ev.ingress[..], b"payload");
-        }
-        // Drop unused name to keep clippy happy in case the assert
-        // above doesn't reference it.
-        let _ = name;
-        let _: &Event = match sink_input {
-            SinkInput::Owned(e) => e,
-            SinkInput::Rendered(_) => unreachable!(),
-        };
-    }
+    // This restructure deleted `render_failure_falls_back_to_owned_sink_input`.
+    // The pipeline-side render-Err → Owned fallback no longer exists;
+    // render now runs consumer-side inside each sink's `Output::consume`
+    // and a render failure routes straight to the DLQ via
+    // `RenderError` (see `queue::mod::write_with_retry_tests::
+    // render_err_goes_straight_to_dlq`).
 
     #[test]
     fn validate_accepts_fan_in_when_all_inputs_exist() {

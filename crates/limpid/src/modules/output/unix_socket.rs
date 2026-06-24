@@ -10,13 +10,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
-use crate::dsl::arena::EventArena;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
-use crate::event::BorrowedEvent;
+use crate::event::Event;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::persistent_conn::{PersistentConn, write_with_reconnect};
-use crate::modules::{HasMetrics, Module, Output, RenderedPayload};
+use crate::modules::{HasMetrics, Module, Output};
 
 const UNIX_SOCKET_OUTPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
@@ -29,10 +28,6 @@ const UNIX_SOCKET_OUTPUT_SCHEMA: &[PropertySpec] = &[
     crate::queue::RETRY_PROPERTY_SPEC,
     crate::queue::QUEUE_PROPERTY_SPEC,
 ];
-
-struct UnixSocketPayload {
-    egress: Bytes,
-}
 
 pub struct UnixSocketOutput {
     pub path: PathBuf,
@@ -66,19 +61,11 @@ impl HasMetrics for UnixSocketOutput {
 
 #[async_trait::async_trait]
 impl Output for UnixSocketOutput {
-    fn render(
-        &self,
-        event: &BorrowedEvent<'_>,
-        _arena: &EventArena<'_>,
-    ) -> Result<RenderedPayload> {
-        Ok(RenderedPayload::new(UnixSocketPayload {
-            egress: event.egress.clone(),
-        }))
-    }
-
-    async fn write(&self, payload: RenderedPayload) -> Result<()> {
-        let payload: UnixSocketPayload = payload.downcast()?;
-        write_with_reconnect(self, &self.conn, &self.metrics, &payload.egress).await
+    async fn consume(&self, event: &Event) -> Result<()> {
+        // No template rendering — the egress bytes are the payload.
+        // `write_with_reconnect` handles the reconnect-on-failure
+        // semantics via the `PersistentConn` impl below.
+        write_with_reconnect(self, &self.conn, &self.metrics, &event.egress).await
     }
 }
 

@@ -62,10 +62,6 @@ pub(crate) struct SendOutcome {
     pub rejected: u64,
 }
 
-pub(crate) struct OtlpPayload {
-    pub(crate) egress: Bytes,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BatchLevel {
     /// One ResourceLogs entry per buffered Event — pure concat, no
