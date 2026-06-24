@@ -361,10 +361,11 @@ responsibility is split across three layers:
   observed_time_unix_nano ← received_at
   ```
 
-Standard `compose_otlp_*` snippets ship with this mapping. Sources
+Users assemble a HashLit (typically in `workspace.otlp`) and encode
+via `otlp.encode_resourcelog_protobuf` — see [OTLP function reference](./functions/expression-functions.md#otlp---opentelemetry-protocol-logs-signal). Sources
 that expose no usable source time (or where the source clock is
-known-bad and you want to ignore it) are handled in the composer by
-overriding the default — Rust never sees the decision.
+known-bad and you want to ignore it) are handled in the composing
+expression by overriding the default — Rust never sees the decision.
 
 This is also why the `Event.timestamp` → `Event.received_at` rename
 that landed in v0.5.0 was made: a forwarder must not silently conflate
@@ -425,14 +426,14 @@ to the same receiver and get the same rejection. A "selective
 retry" mechanism would imply the rejection was transient, which the
 spec does not say.
 
-**What's queued.** The OTel Collector has an `otlp` exporter mode
-where rejected records get logged-and-dropped, and another where they
-trigger the whole batch's failure path. In 0.7.8 the rejected subset
-is split out into `events_failed` (separate from `events_written`) so
-the loss is visible on dashboards; the `control { error_log }` path
-landed in the 0.7.x cycle as the dead-letter route. Selective re-send
-of only the rejected records remains future work (tracked in
-`send_once` doc comments).
+**What limpid does today.** In 0.7.8 the rejected subset is split out
+into `events_failed` (separate from `events_written`) so the loss is
+visible on dashboards, and the `control { error_log }` path landed in
+the same cycle as the dead-letter route for retry-exhausted /
+shutdown-flush payloads. Selective re-send of *only* the rejected
+records on a `partial_success` reply remains future work (tracked in
+`send_once` doc comments) — today the rejected count drives metrics
+only, not retry shape.
 
 ### 5.7 Body format is the snippet's call
 
