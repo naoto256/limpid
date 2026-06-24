@@ -40,6 +40,7 @@ pub mod graph;
 mod module_props;
 mod outputs;
 mod parser_effects;
+mod recovery_readiness;
 pub mod render;
 pub mod suggestions;
 
@@ -290,6 +291,7 @@ pub fn analyze(config: &CompiledConfig, _source_map: &SourceMap) -> Vec<Diagnost
     function::check_all_functions(config, &registry, &mut diagnostics);
     module_props::analyze_all(config, &module_registry, &mut diagnostics);
     global_props::analyze_all(config, &mut diagnostics);
+    recovery_readiness::analyze_all(config, &mut diagnostics);
     for (name, pipeline) in &config.pipelines {
         analyze_pipeline(
             name,
