@@ -55,6 +55,20 @@ Two High pipeline-side error-path gaps closed together. (1) `run_pipeline_with_o
 High-severity audit finding. The disk queue saved its read cursor inside `recv()` immediately after each event was returned, so from the queue's POV the event was consumed before the queue consumer even handed it off downstream. A crash between `recv` and the output write lost the event: on restart the persisted cursor sat past the un-shipped record and it was never replayed — defeating the "retry / restart re-delivers" contract the disk queue exists for. The queue now follows the standard durable-queue contract (Kafka/RabbitMQ shape): `recv()` only advances an in-memory cursor, and a new `ack()` hook persists progress + reclaims consumed segments. The queue consumer calls `ack()` after every event's disposition is decided — delivered, routed to secondary, or retries exhausted — so the on-disk cursor only moves once the event has reached a terminal state. Memory-queue's `ack()` is a no-op. This shifts the disk queue from at-most-once to at-least-once; downstream sinks that can't tolerate duplicates need idempotent ingestion.
 
 
+### Fixed — `queue`: disk cursor uses per-event ack position (regression fix)
+
+The `DiskQueueReceiver::ack()` method introduced in this cycle saved the
+receiver's current `read_seq` / `read_offset` instead of the position of the
+event whose handle was being acked. With batched outputs holding multiple
+`(Event, QueueAckHandle)` pairs in flight, a single event ack advanced the
+cursor past **all** buffered events; a crash before the remaining events
+flushed silently lost them — defeating the at-least-once guarantee the same
+cycle's "disk cursor commits on consumer ack" entry advertised.
+`QueueAckHandle` now carries its position, the receiver tracks an in-flight
+position queue, and the persisted cursor only advances through the contiguous
+acked prefix from the front. Memory queue is unaffected (no persistent cursor).
+
+
 ### Fixed — `queue`: retry-exhausted and unrecoverable payloads now flow to `error_log`
 
 Output retry exhausted with no usable secondary path previously dropped the payload silently — the consumer ack'd, the event left the disk queue's replay window, and only a `tracing::warn!` plus an `events_failed` increment remained. Same shape when a secondary was configured but its enqueue also failed: the original event was already consumed and the failure was log-only. Retry exhaustion (and failed-secondary fall-through) now write the payload as a JSONL record to the configured `control { error_log "..." }` — the same DLQ that pipeline / process eval errors flow into. Output-failed records ride the same writer with `pipeline=""` and `process="(output <name>)"` as the discriminator, so operators reading the DLQ stream see them alongside pipeline failures. When no `error_log` is configured the previous warn-only fallback is preserved (no regression).

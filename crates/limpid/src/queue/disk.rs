@@ -10,6 +10,7 @@
 //! This survives process restarts: on startup, the consumer resumes
 //! from the cursor position.
 
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -19,9 +20,24 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, error, warn};
 
 use crate::event::Event;
+use crate::queue::AckPosition;
 
 const SEGMENT_MAX_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB per segment
 const NEWLINE: u8 = b'\n';
+
+/// One in-flight (read but not yet acked) event tracked by
+/// [`DiskQueueReceiver`]. `start_*` is the position the
+/// [`AckPosition::Disk`] handle quotes; `end_*` is the position the
+/// persisted cursor lands on once this event reaches the front of the
+/// contiguous acked prefix and is popped.
+#[derive(Debug, Clone, Copy)]
+struct InFlight {
+    start_seq: u64,
+    start_offset: u64,
+    end_seq: u64,
+    end_offset: u64,
+    acked: bool,
+}
 
 /// Shared state for disk queue.
 struct DiskQueueState {
@@ -88,6 +104,22 @@ pub struct DiskQueueReceiver {
     /// event because the cursor said it had been consumed.
     acked_seq: u64,
     acked_offset: u64,
+    /// In-flight position tracker. Each entry carries the event's
+    /// `(start_seq, start_offset)` — the position the
+    /// [`AckPosition::Disk`] handle quotes back to identify *which*
+    /// event is being acked — alongside the `(end_seq, end_offset)`
+    /// the persisted cursor must land on once that event is done
+    /// (= the position of the NEXT event after it). Cursor only
+    /// advances through the contiguous `acked=true` prefix popped
+    /// from the front, so an out-of-order ack (= batched output
+    /// resolving handles in flush order, not in receive order) holds
+    /// the cursor back until the earlier in-flight events also
+    /// resolve. Pre-fix this state did not exist; ack saved
+    /// `self.read_seq` / `self.read_offset` — the position of the
+    /// NEXT event to read — and any single ack from anywhere in the
+    /// in-flight batch silently advanced past every still-pending
+    /// event.
+    in_flight_positions: VecDeque<InFlight>,
     dir: PathBuf,
 }
 
@@ -132,6 +164,7 @@ pub fn create_disk_queue(
             // what `recover_state` returned).
             acked_seq: read_seq,
             acked_offset: read_offset,
+            in_flight_positions: VecDeque::new(),
             dir,
         },
     ))
@@ -175,7 +208,7 @@ impl DiskQueueSender {
 }
 
 impl DiskQueueReceiver {
-    pub async fn recv(&mut self) -> Option<Event> {
+    pub async fn recv(&mut self) -> Option<(Event, AckPosition)> {
         loop {
             // Register for notification BEFORE checking — prevents missed-wakeup race.
             // Clone the Arc to avoid borrowing self across the await.
@@ -183,8 +216,8 @@ impl DiskQueueReceiver {
             let notified = notify.notified();
             tokio::pin!(notified);
 
-            if let Some(event) = self.try_read_next() {
-                return Some(event);
+            if let Some(pair) = self.try_read_next() {
+                return Some(pair);
             }
             if self.closed.load(Ordering::Acquire) {
                 return self.try_read_next();
@@ -193,29 +226,72 @@ impl DiskQueueReceiver {
         }
     }
 
-    pub fn try_recv(&mut self) -> Option<Event> {
+    pub fn try_recv(&mut self) -> Option<(Event, AckPosition)> {
         self.try_read_next()
     }
 
-    /// Commit progress to disk: persist the cursor and reclaim fully-
-    /// consumed segments. Called by the queue consumer after each
-    /// event's disposition is decided (delivered or dropped — both
-    /// are "done from this queue's POV").
+    /// Commit a specific event's position to the in-flight tracker
+    /// and, if it completes the contiguous acked prefix from the
+    /// front, advance the persisted cursor through that prefix and
+    /// reclaim fully-consumed segments.
     ///
-    /// Before this hook existed the disk queue was at-most-once on
-    /// crashes: `recv()` advanced and persisted the cursor in one
-    /// shot, so a crash between the event being read and the consumer
-    /// actually writing it downstream lost the event. The contract is
-    /// now at-least-once — a crash mid-write replays the un-acked
-    /// event on restart (matches Kafka/RabbitMQ). Downstreams that
-    /// can't tolerate duplicates need idempotent ingestion; the
-    /// queue documents this.
-    pub fn ack(&mut self) {
-        if self.acked_seq == self.read_seq && self.acked_offset == self.read_offset {
-            // Idempotent ack — nothing new to commit. Cheap no-op
-            // path so callers can ack defensively after every event
-            // even if a prior ack already covered the position
-            // (e.g. drain-loop polling the empty tail).
+    /// Pre-fix the receiver had `ack(&mut self)` that just saved
+    /// `self.read_seq` / `self.read_offset` — but those fields point
+    /// at the NEXT event to read, not the event being acked. With
+    /// batched outputs holding multiple `(Event, QueueAckHandle)`
+    /// pairs in flight, a single event's ack would advance the
+    /// persisted cursor past every still-in-flight event in the
+    /// buffer; a crash before flush silently lost the rest, defeating
+    /// the at-least-once contract. Position is now captured at recv
+    /// time and threaded through the handle, so ack_to commits the
+    /// right position regardless of resolve order.
+    pub fn ack_to(&mut self, seq: u64, offset: u64) {
+        // Look up the position in the in-flight queue and mark it
+        // acked. A miss means the consumer fed us a position we never
+        // handed out (or one we have already advanced past) — both
+        // shapes are bugs; warn and refuse to advance the cursor so
+        // we cannot accidentally widen a cursor jump on bad input.
+        let mut found = false;
+        for entry in self.in_flight_positions.iter_mut() {
+            if entry.start_seq == seq && entry.start_offset == offset {
+                entry.acked = true;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            warn!(
+                "disk queue: ack_to for unknown position seq={} offset={} \
+                 (already advanced past, or never issued); cursor unchanged",
+                seq, offset,
+            );
+            return;
+        }
+
+        // Pop the contiguous acked prefix from the front; the last
+        // entry popped wins the cursor advance — and we land on its
+        // *end* position (= the next byte to read after that event),
+        // not its start position. Landing on the start would replay
+        // the acked event on next open.
+        let mut advanced = None;
+        while let Some(front) = self.in_flight_positions.front() {
+            if !front.acked {
+                break;
+            }
+            let popped = self.in_flight_positions.pop_front().unwrap();
+            advanced = Some((popped.end_seq, popped.end_offset));
+        }
+
+        let Some((new_seq, new_offset)) = advanced else {
+            // The acked position was not at the front and no
+            // contiguous prefix completed; cursor stays put until
+            // the earlier in-flight entries also ack.
+            return;
+        };
+
+        if new_seq == self.acked_seq && new_offset == self.acked_offset {
+            // Idempotent — defensive no-op (matches the pre-fix
+            // contract for drain-loop polling against the empty tail).
             return;
         }
 
@@ -223,7 +299,7 @@ impl DiskQueueReceiver {
         // below the new acked seq. We held them through recv() so
         // crash-replay could find the in-flight event; once ack
         // advances past them they're permanently consumed.
-        for stale_seq in self.acked_seq..self.read_seq {
+        for stale_seq in self.acked_seq..new_seq {
             let seg_path = segment_path(&self.dir, stale_seq);
             if let Err(e) = fs::remove_file(&seg_path) {
                 // Missing file is acceptable (segment may have been
@@ -243,12 +319,12 @@ impl DiskQueueReceiver {
             }
         }
 
-        self.acked_seq = self.read_seq;
-        self.acked_offset = self.read_offset;
+        self.acked_seq = new_seq;
+        self.acked_offset = new_offset;
         save_cursor(&self.dir, self.acked_seq, self.acked_offset);
     }
 
-    fn try_read_next(&mut self) -> Option<Event> {
+    fn try_read_next(&mut self) -> Option<(Event, AckPosition)> {
         loop {
             let seg_path = segment_path(&self.dir, self.read_seq);
             if !seg_path.exists() {
@@ -299,18 +375,43 @@ impl DiskQueueReceiver {
                     continue;
                 }
 
+                // Capture the position of THIS event (= the position
+                // BEFORE we advance past it) so the ack handle can be
+                // matched back to the contiguous-prefix tracker.
+                // Pre-fix the receiver acked using `read_seq` /
+                // `read_offset` AFTER the advance, which named the
+                // NEXT event's position, not this one's — and under
+                // batched outputs that mismatch silently advanced the
+                // cursor past in-flight events.
+                let start_seq = self.read_seq;
+                let start_offset = self.read_offset;
                 self.read_offset += bytes_read as u64;
+                let end_seq = self.read_seq;
+                let end_offset = self.read_offset;
                 // Do NOT save_cursor here. The cursor on disk only
-                // advances when the consumer calls `ack()`, after the
-                // event has been successfully handed off downstream.
-                // Returning here with the in-memory `read_offset`
-                // already moved gives the recv side an in-flight
-                // position; if the process crashes before `ack()`,
-                // restart re-reads from `acked_offset` and replays
-                // this event.
+                // advances when the consumer calls `ack_to`, after
+                // the event has been successfully handed off
+                // downstream. Returning here with the in-memory
+                // `read_offset` already moved gives the recv side an
+                // in-flight position; if the process crashes before
+                // ack, restart re-reads from `acked_offset` and
+                // replays this event.
 
                 if let Some(event) = Event::from_json(trimmed) {
-                    return Some(event);
+                    self.in_flight_positions.push_back(InFlight {
+                        start_seq,
+                        start_offset,
+                        end_seq,
+                        end_offset,
+                        acked: false,
+                    });
+                    return Some((
+                        event,
+                        AckPosition::Disk {
+                            seq: start_seq,
+                            offset: start_offset,
+                        },
+                    ));
                 }
 
                 warn!(
@@ -575,10 +676,10 @@ mod tests {
         tx.send(make_event("<134>msg1")).await.unwrap();
         tx.send(make_event("<134>msg2")).await.unwrap();
 
-        let e1 = rx.recv().await.unwrap();
+        let (e1, _p1) = rx.recv().await.unwrap();
         assert_eq!(String::from_utf8_lossy(&e1.ingress), "<134>msg1");
 
-        let e2 = rx.recv().await.unwrap();
+        let (e2, _p2) = rx.recv().await.unwrap();
         assert_eq!(String::from_utf8_lossy(&e2.ingress), "<134>msg2");
     }
 
@@ -603,9 +704,9 @@ mod tests {
             let (_tx, mut rx) = create_disk_queue(path, 0).unwrap();
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let e1 = rx.recv().await.unwrap();
+                let (e1, _) = rx.recv().await.unwrap();
                 assert_eq!(String::from_utf8_lossy(&e1.ingress), "<134>persist1");
-                let e2 = rx.recv().await.unwrap();
+                let (e2, _) = rx.recv().await.unwrap();
                 assert_eq!(String::from_utf8_lossy(&e2.ingress), "<134>persist2");
             });
         }
@@ -765,22 +866,29 @@ mod tests {
             tx.send(make_event("<134>e2")).await.unwrap();
             // Receive e1 but don't ack — simulates a process that
             // started shipping it and crashed before completing.
-            let e1 = rx.recv().await.unwrap();
+            let (e1, _) = rx.recv().await.unwrap();
             assert_eq!(String::from_utf8_lossy(&e1.ingress), "<134>e1");
-            // rx is dropped here without `ack()`.
+            // rx is dropped here without `ack_to`.
         }
 
         {
             let (_tx, mut rx) = create_disk_queue(path, 0).unwrap();
-            let e1 = rx.recv().await.unwrap();
+            let (e1, _) = rx.recv().await.unwrap();
             assert_eq!(
                 String::from_utf8_lossy(&e1.ingress),
                 "<134>e1",
                 "unacked event must replay on reopen (at-least-once contract)",
             );
             // And e2 follows in order.
-            let e2 = rx.recv().await.unwrap();
+            let (e2, _) = rx.recv().await.unwrap();
             assert_eq!(String::from_utf8_lossy(&e2.ingress), "<134>e2");
+        }
+    }
+
+    fn unwrap_disk_position(p: AckPosition) -> (u64, u64) {
+        match p {
+            AckPosition::Disk { seq, offset } => (seq, offset),
+            AckPosition::Memory => panic!("expected Disk position, got Memory"),
         }
     }
 
@@ -796,16 +904,17 @@ mod tests {
             let (tx, mut rx) = create_disk_queue(path, 0).unwrap();
             tx.send(make_event("<134>e1")).await.unwrap();
             tx.send(make_event("<134>e2")).await.unwrap();
-            let e1 = rx.recv().await.unwrap();
+            let (e1, p1) = rx.recv().await.unwrap();
             assert_eq!(String::from_utf8_lossy(&e1.ingress), "<134>e1");
-            rx.ack();
+            let (seq, off) = unwrap_disk_position(p1);
+            rx.ack_to(seq, off);
             // Now drop without acking e2.
         }
 
         {
             let (_tx, mut rx) = create_disk_queue(path, 0).unwrap();
             // Cursor is past e1, so the next recv starts at e2.
-            let next = rx.recv().await.unwrap();
+            let (next, _) = rx.recv().await.unwrap();
             assert_eq!(
                 String::from_utf8_lossy(&next.ingress),
                 "<134>e2",
@@ -816,18 +925,160 @@ mod tests {
 
     #[tokio::test]
     async fn ack_is_idempotent_when_nothing_new_to_commit() {
-        // ack() is a no-op when acked == read. The drain loop and
+        // ack_to is a no-op when acked == read. The drain loop and
         // any defensive consumer-side double-ack should incur no
         // disk write and no error.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
         let (tx, mut rx) = create_disk_queue(path, 0).unwrap();
         tx.send(make_event("<134>only")).await.unwrap();
-        let _ = rx.recv().await.unwrap();
-        rx.ack();
-        // Second ack with nothing new to commit must be a clean
-        // no-op (no double-delete attempts, no panic).
-        rx.ack();
-        rx.ack();
+        let (_e, p) = rx.recv().await.unwrap();
+        let (seq, off) = unwrap_disk_position(p);
+        rx.ack_to(seq, off);
+        // Second ack with the same position is unknown (already
+        // popped from in_flight), warns, and does not advance.
+        rx.ack_to(seq, off);
+        rx.ack_to(seq, off);
+    }
+
+    // ---------- positional ack regression tests ----------
+
+    #[tokio::test]
+    async fn disk_ack_out_of_order_advances_only_contiguous_prefix() {
+        // Receive A, B, C, then ack C, then B, then A.
+        // Cursor must stay put after C-ack and B-ack (front not yet
+        // acked), then jump straight past C once A — the front — is
+        // acked. This is the regression: pre-fix any single ack
+        // would have saved `read_seq`/`read_offset`, which after
+        // three recvs already pointed past C.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+
+        let (tx, mut rx) = create_disk_queue(path, 0).unwrap();
+        tx.send(make_event("<134>A")).await.unwrap();
+        tx.send(make_event("<134>B")).await.unwrap();
+        tx.send(make_event("<134>C")).await.unwrap();
+
+        let (_a, pa) = rx.recv().await.unwrap();
+        let (_b, pb) = rx.recv().await.unwrap();
+        let (_c, pc) = rx.recv().await.unwrap();
+
+        let (a_seq, a_off) = unwrap_disk_position(pa);
+        let (b_seq, b_off) = unwrap_disk_position(pb);
+        let (c_seq, c_off) = unwrap_disk_position(pc);
+
+        // Snapshot the end position of C (= the read cursor after
+        // recv returned C) so we can compare the persisted cursor
+        // after A is acked.
+        let c_end_seq = rx.read_seq;
+        let c_end_offset = rx.read_offset;
+
+        // ack C → cursor stays at boot value (front is A, not acked).
+        rx.ack_to(c_seq, c_off);
+        let (seq, off) = load_cursor(dir.path());
+        assert_eq!(
+            (seq, off),
+            (0, 0),
+            "ack C with A,B still in flight must not advance cursor",
+        );
+
+        // ack B → still no advance.
+        rx.ack_to(b_seq, b_off);
+        let (seq, off) = load_cursor(dir.path());
+        assert_eq!(
+            (seq, off),
+            (0, 0),
+            "ack B with A still in flight must not advance cursor",
+        );
+
+        // ack A → cursor jumps past C (the end of the contiguous
+        // acked prefix), so a reopen would resume past C.
+        rx.ack_to(a_seq, a_off);
+        let (seq, off) = load_cursor(dir.path());
+        assert_eq!(
+            (seq, off),
+            (c_end_seq, c_end_offset),
+            "front ack must advance through the full contiguous prefix",
+        );
+        assert!(rx.in_flight_positions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disk_ack_in_order_advances_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let (tx, mut rx) = create_disk_queue(path, 0).unwrap();
+
+        for i in 0..3 {
+            tx.send(make_event(&format!("<134>e{i}"))).await.unwrap();
+        }
+
+        for _ in 0..3 {
+            let (_e, p) = rx.recv().await.unwrap();
+            let (seq, off) = unwrap_disk_position(p);
+            // Cursor must land on the END of the just-acked event
+            // (= where the next read would resume), not its start.
+            let expected_end = (rx.read_seq, rx.read_offset);
+            rx.ack_to(seq, off);
+            let (cseq, coff) = load_cursor(dir.path());
+            assert_eq!((cseq, coff), expected_end);
+        }
+        assert!(rx.in_flight_positions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_acks_bounded_under_sustained_load() {
+        // After every event is acked, the in-flight tracker must be
+        // empty — a leak there would grow O(N) with sustained load.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let (tx, mut rx) = create_disk_queue(path, 0).unwrap();
+
+        for i in 0..1000 {
+            tx.send(make_event(&format!("<134>e{i}"))).await.unwrap();
+        }
+        let mut positions = Vec::with_capacity(1000);
+        for _ in 0..1000 {
+            let (_e, p) = rx.recv().await.unwrap();
+            positions.push(unwrap_disk_position(p));
+        }
+        // Ack in receive order — the simplest fast path.
+        for (seq, off) in positions {
+            rx.ack_to(seq, off);
+        }
+        assert!(
+            rx.in_flight_positions.is_empty(),
+            "in_flight_positions leaked: {} entries left",
+            rx.in_flight_positions.len(),
+        );
+    }
+
+    #[tokio::test]
+    async fn ack_for_unknown_position_warns_not_advances() {
+        // A position the receiver never handed out (or already
+        // popped) must NOT advance the cursor — it's a no-op + warn.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let (tx, mut rx) = create_disk_queue(path, 0).unwrap();
+
+        tx.send(make_event("<134>e1")).await.unwrap();
+        let (_e, p) = rx.recv().await.unwrap();
+        let (real_seq, real_off) = unwrap_disk_position(p);
+        let expected_end = (rx.read_seq, rx.read_offset);
+
+        // Ack a position no recv ever produced.
+        rx.ack_to(real_seq + 999, 42);
+        let (seq, off) = load_cursor(dir.path());
+        assert_eq!(
+            (seq, off),
+            (0, 0),
+            "unknown-position ack must not advance the cursor",
+        );
+
+        // The real one still works — and lands on the END of the
+        // event, not its start.
+        rx.ack_to(real_seq, real_off);
+        let (seq, off) = load_cursor(dir.path());
+        assert_eq!((seq, off), expected_end);
     }
 }

@@ -307,6 +307,22 @@ impl QueueSender {
     }
 }
 
+/// Position of an event in its queue, captured at `recv()` time and
+/// carried through the event's lifetime on a [`QueueAckHandle`]. The
+/// consumer feeds it back to the receiver via `ack_to`, which uses it
+/// to advance the on-disk cursor only through the contiguous prefix of
+/// acked positions — so out-of-order acks from a batched output do not
+/// silently advance past still-in-flight events.
+///
+/// Memory queues have no persistent cursor, so the [`AckPosition::Memory`]
+/// variant carries no data — it exists only so the handle's type does
+/// not need to know which backend produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AckPosition {
+    Memory,
+    Disk { seq: u64, offset: u64 },
+}
+
 /// Handle for receiving events from a queue.
 pub struct QueueReceiver {
     inner: ReceiverInner,
@@ -319,35 +335,60 @@ enum ReceiverInner {
 }
 
 impl QueueReceiver {
-    pub async fn recv(&mut self) -> Option<Event> {
+    /// Receive the next event, paired with the position that must be
+    /// fed back via `ack_to` once the event reaches a terminal
+    /// disposition. The position is captured at the moment of read,
+    /// not at ack time — that distinction is what makes the disk
+    /// cursor correct under batched, out-of-order acks.
+    pub async fn recv(&mut self) -> Option<(Event, AckPosition)> {
         match &mut self.inner {
-            ReceiverInner::Memory(rx) => rx.recv().await,
+            ReceiverInner::Memory(rx) => rx.recv().await.map(|e| (e, AckPosition::Memory)),
             ReceiverInner::Disk(rx) => rx.recv().await,
         }
     }
 
-    pub fn try_recv(&mut self) -> Option<Event> {
+    pub fn try_recv(&mut self) -> Option<(Event, AckPosition)> {
         match &mut self.inner {
-            ReceiverInner::Memory(rx) => rx.try_recv().ok(),
+            ReceiverInner::Memory(rx) => rx.try_recv().ok().map(|e| (e, AckPosition::Memory)),
             ReceiverInner::Disk(rx) => rx.try_recv(),
         }
     }
 
-    /// Commit the most recent `recv()` as processed. For the disk
-    /// backend this advances the persisted cursor and reclaims
-    /// fully-consumed segments — the actual durability hook. For the
-    /// memory backend this is a no-op (mpsc removes events on
-    /// `recv()`; there is no separate persistent cursor to advance).
+    /// Commit a specific event's position as processed. For the disk
+    /// backend this records the ack against the in-flight position
+    /// queue and, when the position is the front of the queue (or
+    /// completes a contiguous acked prefix from the front), advances
+    /// the persisted cursor through that prefix and reclaims
+    /// fully-consumed segments. For the memory backend this is a
+    /// no-op (mpsc removes events on `recv()`; there is no separate
+    /// persistent cursor to advance).
     ///
-    /// The consumer is expected to call `ack()` after every event's
-    /// final disposition is decided — delivered or given up on
-    /// (= "dropped" with retries exhausted). Both dispositions mean
-    /// the event no longer needs to live in the queue. Skipping the
-    /// call is safe (= the next call's progress covers it) but
-    /// unnecessarily defers cursor commits.
-    pub fn ack(&mut self) {
-        if let ReceiverInner::Disk(rx) = &mut self.inner {
-            rx.ack();
+    /// The consumer is expected to call `ack_to(position)` after
+    /// every event's final disposition is decided — delivered, routed
+    /// to recovery, or dropped. Calling out of order is safe: the
+    /// disk receiver only persists through positions that are
+    /// contiguously acked from the front, so a late-arriving early
+    /// ack will still hold the cursor back correctly.
+    pub fn ack_to(&mut self, position: AckPosition) {
+        match (&mut self.inner, position) {
+            (ReceiverInner::Memory(_), AckPosition::Memory) => {}
+            (ReceiverInner::Disk(rx), AckPosition::Disk { seq, offset }) => {
+                rx.ack_to(seq, offset);
+            }
+            (ReceiverInner::Memory(_), AckPosition::Disk { .. }) => {
+                debug_assert!(
+                    false,
+                    "ack_to: Disk position fed to memory receiver — backend mismatch",
+                );
+                warn!("queue: ack_to received Disk position on a memory receiver (ignored)");
+            }
+            (ReceiverInner::Disk(_), AckPosition::Memory) => {
+                debug_assert!(
+                    false,
+                    "ack_to: Memory position fed to disk receiver — backend mismatch",
+                );
+                warn!("queue: ack_to received Memory position on a disk receiver (ignored)");
+            }
         }
     }
 }
@@ -495,7 +536,16 @@ pub enum AckDisposition {
 /// `debug_assert!`s the contract was met.
 #[derive(Debug)]
 pub struct QueueAckHandle {
-    tx: Option<tokio::sync::mpsc::UnboundedSender<AckDisposition>>,
+    tx: Option<tokio::sync::mpsc::UnboundedSender<(AckPosition, AckDisposition)>>,
+    /// Position the handle's event occupied in the source queue,
+    /// captured at `recv()` time. Pre-fix the disk receiver advanced
+    /// its cursor to `self.read_*` at ack time, which under batched
+    /// outputs meant "all in-flight events", not "this event" — a
+    /// single ack from anywhere in the batch could advance the cursor
+    /// past still-in-flight events and silently lose them on crash.
+    /// Carrying the position on the handle decouples cursor commit
+    /// from in-flight order.
+    position: AckPosition,
     /// True once an explicit `resolve_*` ran. Read in `Drop` to
     /// distinguish "resolved cleanly" (silence the debug_assert) from
     /// "dropped without resolve" (fire the assert + send `Dropped`).
@@ -503,18 +553,34 @@ pub struct QueueAckHandle {
 }
 
 impl QueueAckHandle {
-    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<AckDisposition>) -> Self {
+    pub fn new(
+        tx: tokio::sync::mpsc::UnboundedSender<(AckPosition, AckDisposition)>,
+        position: AckPosition,
+    ) -> Self {
         Self {
             tx: Some(tx),
+            position,
             resolved: false,
         }
+    }
+
+    /// The position this handle's event occupies in the source queue.
+    /// Returned alongside the [`AckDisposition`] when the handle
+    /// resolves, so the queue consumer can drive `ack_to(position)`
+    /// on the matching receiver. Currently only used in tests; kept
+    /// public so a future output that wants to log / route on
+    /// position (e.g. structured tracing of disk-cursor pressure)
+    /// does not have to add a new accessor.
+    #[allow(dead_code)]
+    pub fn position(&self) -> AckPosition {
+        self.position
     }
 
     /// Signal that the event was durably delivered. Consumes the handle.
     pub fn resolve_delivered(mut self) {
         self.resolved = true;
         if let Some(tx) = self.tx.take() {
-            let _ = tx.send(AckDisposition::Delivered);
+            let _ = tx.send((self.position, AckDisposition::Delivered));
         }
     }
 
@@ -523,16 +589,31 @@ impl QueueAckHandle {
     pub fn resolve_recovered(mut self) {
         self.resolved = true;
         if let Some(tx) = self.tx.take() {
-            let _ = tx.send(AckDisposition::Recovered);
+            let _ = tx.send((self.position, AckDisposition::Recovered));
         }
     }
 
     /// Test-only constructor returning the handle and the receiving
     /// half of its ack channel, so tests can assert on the disposition.
     #[cfg(test)]
-    pub fn for_test() -> (Self, tokio::sync::mpsc::UnboundedReceiver<AckDisposition>) {
+    pub fn for_test() -> (
+        Self,
+        tokio::sync::mpsc::UnboundedReceiver<(AckPosition, AckDisposition)>,
+    ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (Self::new(tx), rx)
+        (Self::new(tx, AckPosition::Memory), rx)
+    }
+
+    /// Test-only constructor that also sets the carried position.
+    #[cfg(test)]
+    pub fn for_test_with_position(
+        position: AckPosition,
+    ) -> (
+        Self,
+        tokio::sync::mpsc::UnboundedReceiver<(AckPosition, AckDisposition)>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (Self::new(tx, position), rx)
     }
 }
 
@@ -544,7 +625,7 @@ impl Drop for QueueAckHandle {
              — bug: outputs MUST explicitly resolve their disposition"
         );
         if let Some(tx) = self.tx.take() {
-            let _ = tx.send(AckDisposition::Dropped);
+            let _ = tx.send((self.position, AckDisposition::Dropped));
         }
     }
 }
@@ -572,7 +653,7 @@ pub async fn run_queue_consumer(
     let name = Arc::clone(&receiver.name);
     info!("output '{}': queue consumer started", name);
     let (ack_tx, mut ack_rx) =
-        tokio::sync::mpsc::unbounded_channel::<AckDisposition>();
+        tokio::sync::mpsc::unbounded_channel::<(AckPosition, AckDisposition)>();
     let mut in_flight: usize = 0;
     let mut accepting = true;
 
@@ -593,11 +674,11 @@ pub async fn run_queue_consumer(
                     // (which drains batched buffers and resolves the
                     // handles parked inside them) and only then
                     // draining the ack channel.
-                    while let Some(event) = receiver.try_recv() {
+                    while let Some((event, position)) = receiver.try_recv() {
                         if let Some(tap) = &tap {
                             tap.emit(&format!("output {}", name), &event).await;
                         }
-                        let handle = QueueAckHandle::new(ack_tx.clone());
+                        let handle = QueueAckHandle::new(ack_tx.clone(), position);
                         in_flight += 1;
                         if let Err(e) = writer.consume(&event, handle).await {
                             tracing::error!(
@@ -613,9 +694,13 @@ pub async fn run_queue_consumer(
                 }
             }
 
-            Some(disposition) = ack_rx.recv() => {
+            Some((position, disposition)) = ack_rx.recv() => {
                 handle_ack_disposition(disposition, &name, &metrics);
-                receiver.ack();
+                // Dropped disposition advances the cursor the same as Delivered:
+                // panic-mid-handle event loss is the pre-0.7.7 semantic and is
+                // out of scope for this regression fix; full panic recovery is
+                // a separate cycle.
+                receiver.ack_to(position);
                 in_flight = in_flight.saturating_sub(1);
                 // Natural queue-closure exit: the receiver returned
                 // None, we stopped accepting, and the last in-flight
@@ -631,11 +716,11 @@ pub async fn run_queue_consumer(
 
             input = receiver.recv(), if accepting => {
                 match input {
-                    Some(event) => {
+                    Some((event, position)) => {
                         if let Some(tap) = &tap {
                             tap.emit(&format!("output {}", name), &event).await;
                         }
-                        let handle = QueueAckHandle::new(ack_tx.clone());
+                        let handle = QueueAckHandle::new(ack_tx.clone(), position);
                         in_flight += 1;
                         if let Err(e) = writer.consume(&event, handle).await {
                             // Reaching here means the output returned an
@@ -678,9 +763,9 @@ pub async fn run_queue_consumer(
         warn!("output '{}': shutdown flush failed: {}", name, e);
     }
     drop(ack_tx);
-    while let Some(disposition) = ack_rx.recv().await {
+    while let Some((position, disposition)) = ack_rx.recv().await {
         handle_ack_disposition(disposition, &name, &metrics);
-        receiver.ack();
+        receiver.ack_to(position);
         in_flight = in_flight.saturating_sub(1);
     }
     if in_flight != 0 {
@@ -836,7 +921,10 @@ mod consumer_lifecycle_tests {
     async fn ack_handle_resolve_delivered_sends_delivered() {
         let (handle, mut rx) = QueueAckHandle::for_test();
         handle.resolve_delivered();
-        assert_eq!(rx.recv().await, Some(AckDisposition::Delivered));
+        assert_eq!(
+            rx.recv().await,
+            Some((AckPosition::Memory, AckDisposition::Delivered))
+        );
         assert_eq!(rx.recv().await, None);
     }
 
@@ -844,8 +932,26 @@ mod consumer_lifecycle_tests {
     async fn ack_handle_resolve_recovered_sends_recovered() {
         let (handle, mut rx) = QueueAckHandle::for_test();
         handle.resolve_recovered();
-        assert_eq!(rx.recv().await, Some(AckDisposition::Recovered));
+        assert_eq!(
+            rx.recv().await,
+            Some((AckPosition::Memory, AckDisposition::Recovered))
+        );
         assert_eq!(rx.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn ack_handle_carries_position_through_resolve() {
+        // Positions captured at recv time must travel back unchanged
+        // through `resolve_delivered` — this is the core of the
+        // positional-ack fix.
+        let position = AckPosition::Disk {
+            seq: 7,
+            offset: 4242,
+        };
+        let (handle, mut rx) = QueueAckHandle::for_test_with_position(position);
+        assert_eq!(handle.position(), position);
+        handle.resolve_delivered();
+        assert_eq!(rx.recv().await, Some((position, AckDisposition::Delivered)));
     }
 
     /// Dropping a handle without resolving sends `Dropped` so the
@@ -857,7 +963,10 @@ mod consumer_lifecycle_tests {
     async fn ack_handle_drop_without_resolve_sends_dropped_in_release() {
         let (handle, mut rx) = QueueAckHandle::for_test();
         drop(handle);
-        assert_eq!(rx.recv().await, Some(AckDisposition::Dropped));
+        assert_eq!(
+            rx.recv().await,
+            Some((AckPosition::Memory, AckDisposition::Dropped))
+        );
     }
 
     #[cfg(debug_assertions)]
@@ -1097,6 +1206,30 @@ mod consumer_lifecycle_tests {
         // metrics stay at 0 and the writer's is at 3.
         assert_eq!(writer.metrics.events_failed.load(Ordering::Relaxed), 3);
         assert_eq!(metrics.events_failed.load(Ordering::Relaxed), 0);
+    }
+
+    /// `ack_to(AckPosition::Memory)` on a memory-backed receiver is a
+    /// silent no-op: the mpsc channel already consumed the event on
+    /// recv, there is no persistent cursor to advance. This is the
+    /// contract every memory-queue consumer relies on; a regression
+    /// that, e.g., panicked here would break every non-disk output
+    /// the moment the consumer loop tried to commit an ack.
+    #[tokio::test]
+    async fn memory_queue_ack_to_is_noop() {
+        let (sender, mut receiver) = create_queue(
+            "mem".into(),
+            QueueConfig {
+                queue_type: QueueType::Memory,
+                capacity: 4,
+            },
+        )
+        .unwrap();
+        sender.send(owned_event()).await.unwrap();
+        let (_e, position) = receiver.recv().await.unwrap();
+        assert_eq!(position, AckPosition::Memory);
+        receiver.ack_to(position);
+        // A second ack on the same position is still a clean no-op.
+        receiver.ack_to(AckPosition::Memory);
     }
 }
 
