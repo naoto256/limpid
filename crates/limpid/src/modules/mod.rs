@@ -366,30 +366,42 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     /// override this to stash the registry. Default: no-op.
     fn attach_funcs(&mut self, _funcs: Arc<FunctionRegistry>) {}
 
-    /// Drain any internal buffer before the queue consumer stops.
+    /// Called once when the daemon is shutting down, before the queue
+    /// consumer exits. The output is responsible for draining any
+    /// internal buffer it still holds, making a best-effort attempt to
+    /// ship the contents, and resolving every ack handle it has taken
+    /// ownership of via `consume`.
     ///
-    /// `Drop` cannot do this because it is synchronous and the
-    /// sink-side I/O is async. Batched outputs (`http`, `otlp_http`,
-    /// `otlp_grpc`) collect events in an in-memory buffer between
-    /// flushes, and on a clean shutdown those events would otherwise
-    /// be dropped: the memory queue already counted them as
-    /// delivered when the per-event `write()` returned `Ok`, the
-    /// flush timer is aborted by `Drop`, and the daemon exits with
-    /// the buffer contents still resident in memory. Override to
-    /// flush before returning. Default impl is a no-op for unbatched
-    /// sinks.
+    /// Per-handle disposition rules mirror the steady-state contract:
+    /// - successful final delivery → `resolve_delivered()`
+    /// - routed to DLQ (`error_log`) after a failed final flush or a
+    ///   per-event render error → `resolve_recovered()`
+    /// - no DLQ configured and the flush failed → log loudly and
+    ///   `resolve_recovered()` anyway; leaking the handle would let
+    ///   `Drop` fire `Dropped` (= silent loss attributed to a bug),
+    ///   which is worse than an explicit, logged best-effort recovery.
     ///
-    /// Errors are surfaced for logging but the consumer continues
-    /// the shutdown sequence regardless — there is no further retry
-    /// path available at this point.
+    /// `Drop` cannot do this work because it is synchronous and the
+    /// sink-side I/O is async. The queue consumer calls `shutdown`
+    /// BEFORE waiting for in-flight handles to resolve — handles
+    /// parked inside a batched output's buffer can only be resolved
+    /// from inside this method, so the reverse ordering would
+    /// deadlock.
+    ///
+    /// After `shutdown` returns the consumer expects every handle the
+    /// output ever held to be resolved. Any still-unresolved handle
+    /// fires `Dropped` on its way out and is counted as a bug-attributed
+    /// silent loss.
+    ///
+    /// Errors are surfaced for logging but the consumer continues the
+    /// shutdown sequence regardless — there is no further retry path
+    /// available at this point.
     ///
     /// `error_log` is the operator-configured DLQ writer used by the
-    /// shutdown-flush recovery path. Batched outputs that override this
-    /// method use it to persist buffer contents that survive a failed
-    /// final flush — the parallel of retry-exhausted recovery on the
-    /// per-event path. `None` preserves the 0.7.7 behaviour
-    /// (warn + drop). Implementations that hold no buffer ignore
-    /// the argument.
+    /// shutdown-flush recovery path. `None` falls back to the
+    /// warn-and-recover behaviour above. Implementations that hold no
+    /// buffer (unbatched sinks) ignore the argument and use the
+    /// default no-op impl.
     async fn shutdown(
         &self,
         _error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,

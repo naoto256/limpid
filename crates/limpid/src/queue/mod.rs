@@ -583,13 +583,16 @@ pub async fn run_queue_consumer(
             _ = shutdown.changed(), if accepting => {
                 if *shutdown.borrow() {
                     info!("output '{}': shutting down, draining queue", name);
-                    // Stop accepting new receiver events; keep draining
-                    // the ack channel until all in-flight handles
-                    // resolve. The `try_recv` walk below feeds any
-                    // already-queued events into the output one last
-                    // time so they don't survive the restart with the
-                    // queue still pointing at them.
-                    accepting = false;
+                    // Feed any events already buffered on the receiver
+                    // into the output one last time so they don't
+                    // survive the restart with the queue still pointing
+                    // at them. The output owns the per-event lifecycle
+                    // from here; we exit the select loop and let the
+                    // shutdown phase below resolve every in-flight
+                    // handle by calling `writer.shutdown()` first
+                    // (which drains batched buffers and resolves the
+                    // handles parked inside them) and only then
+                    // draining the ack channel.
                     while let Some(event) = receiver.try_recv() {
                         if let Some(tap) = &tap {
                             tap.emit(&format!("output {}", name), &event).await;
@@ -606,13 +609,7 @@ pub async fn run_queue_consumer(
                             metrics.events_failed.fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    // All previously-acked events left `in_flight == 0`
-                    // before shutdown fired; there's nothing left to wait
-                    // on, so exit the select loop straight into the
-                    // post-loop drain phase.
-                    if in_flight == 0 {
-                        break;
-                    }
+                    break;
                 }
             }
 
@@ -620,6 +617,13 @@ pub async fn run_queue_consumer(
                 handle_ack_disposition(disposition, &name, &metrics);
                 receiver.ack();
                 in_flight = in_flight.saturating_sub(1);
+                // Natural queue-closure exit: the receiver returned
+                // None, we stopped accepting, and the last in-flight
+                // handle just resolved. Shutdown does NOT exit here —
+                // it breaks straight out of the select arm above so
+                // the post-loop `writer.shutdown()` can drain batched
+                // buffers (which is the only thing that can resolve
+                // their parked handles).
                 if !accepting && in_flight == 0 {
                     break;
                 }
@@ -662,10 +666,14 @@ pub async fn run_queue_consumer(
         }
     }
 
-    // Shutdown phase: tell the output to drain its in-memory buffers.
-    // The output resolves any remaining handles inside `shutdown()`
-    // (via DLQ or final delivery), feeding the ack channel; we then
-    // drain remaining dispositions to advance the cursor.
+    // Shutdown phase. Ordering matters: call `writer.shutdown()` FIRST
+    // so batched outputs drain their internal `(Event, QueueAckHandle)`
+    // buffers (final flush + per-event DLQ routing as needed),
+    // resolving every still-held handle. Only then drain the ack
+    // channel for cursor advancement. The reversed ordering (wait for
+    // in_flight == 0 before calling shutdown) deadlocks: the buffered
+    // handles are exactly what `writer.shutdown()` resolves, so the
+    // wait can never make progress on its own.
     if let Err(e) = writer.shutdown(error_log.as_ref()).await {
         warn!("output '{}': shutdown flush failed: {}", name, e);
     }
@@ -673,6 +681,14 @@ pub async fn run_queue_consumer(
     while let Some(disposition) = ack_rx.recv().await {
         handle_ack_disposition(disposition, &name, &metrics);
         receiver.ack();
+        in_flight = in_flight.saturating_sub(1);
+    }
+    if in_flight != 0 {
+        tracing::error!(
+            "output '{}': consumer exiting with {} unresolved handle(s) — bug",
+            name,
+            in_flight,
+        );
     }
 
     info!("output '{}': queue consumer stopped", name);
@@ -926,6 +942,161 @@ mod consumer_lifecycle_tests {
         let _ = shutdown.send(true);
         handle.await.unwrap();
         assert!(metrics.events_failed.load(Ordering::Relaxed) >= 1);
+    }
+
+    // ---- batched-output shutdown ordering ----
+
+    /// A batched-output mock: `consume` parks the ack handle in an
+    /// internal buffer without resolving it (= the steady-state
+    /// contract for a real batched output below `batch_size`). Only
+    /// `shutdown()` drains the buffer and resolves every handle. This
+    /// is exactly the shape that deadlocked the consumer when the
+    /// previous ordering waited for `in_flight == 0` BEFORE calling
+    /// `shutdown()`.
+    struct BatchedMockWriter {
+        buffer: tokio::sync::Mutex<Vec<QueueAckHandle>>,
+        shutdown_mode: ShutdownMode,
+        shutdown_called: std::sync::atomic::AtomicBool,
+        consume_calls: std::sync::atomic::AtomicUsize,
+        metrics: Arc<crate::metrics::OutputMetrics>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ShutdownMode {
+        /// Final flush succeeds: resolve every parked handle as Delivered.
+        DeliverAll,
+        /// Final flush fails: route every parked event to DLQ — but we
+        /// only have handles here (no Event captured), so we resolve as
+        /// Recovered to mirror the real shutdown DLQ path.
+        FailAll,
+    }
+
+    impl BatchedMockWriter {
+        fn new(mode: ShutdownMode) -> Self {
+            Self {
+                buffer: tokio::sync::Mutex::new(Vec::new()),
+                shutdown_mode: mode,
+                shutdown_called: std::sync::atomic::AtomicBool::new(false),
+                consume_calls: std::sync::atomic::AtomicUsize::new(0),
+                metrics: Arc::new(crate::metrics::OutputMetrics::default()),
+            }
+        }
+    }
+
+    impl HasMetrics for BatchedMockWriter {
+        type Stats = crate::metrics::OutputMetrics;
+        fn metrics(&self) -> Arc<crate::metrics::OutputMetrics> {
+            Arc::clone(&self.metrics)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Output for BatchedMockWriter {
+        async fn consume(&self, _event: &Event, ack: QueueAckHandle) -> anyhow::Result<()> {
+            self.consume_calls.fetch_add(1, Ordering::Relaxed);
+            self.buffer.lock().await.push(ack);
+            Ok(())
+        }
+
+        async fn shutdown(
+            &self,
+            _error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+        ) -> anyhow::Result<()> {
+            self.shutdown_called.store(true, Ordering::Relaxed);
+            let leftovers = std::mem::take(&mut *self.buffer.lock().await);
+            match self.shutdown_mode {
+                ShutdownMode::DeliverAll => {
+                    for ack in leftovers {
+                        ack.resolve_delivered();
+                    }
+                }
+                ShutdownMode::FailAll => {
+                    for ack in leftovers {
+                        // Mirror the real shutdown DLQ recovery path:
+                        // failed final flush → resolve Recovered after
+                        // routing each event to error_log.
+                        self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                        ack.resolve_recovered();
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// The ordering fix: outputs that hold handles inside an internal
+    /// buffer until `shutdown()` runs must see `writer.shutdown()`
+    /// called BEFORE the consumer waits for in-flight to drain. The
+    /// old code reversed this and would have hung on a batched output.
+    /// Here we verify the consumer exits cleanly and every event's ack
+    /// disposition was reported (= the `Delivered` count on the
+    /// metrics path is bumped by the output itself, but the consumer
+    /// must have processed each disposition in the post-loop drain).
+    #[tokio::test]
+    async fn shutdown_drains_batched_buffer_before_consumer_exits() {
+        let writer = Arc::new(BatchedMockWriter::new(ShutdownMode::DeliverAll));
+        let metrics = Arc::new(crate::metrics::OutputMetrics::default());
+        let (sender, shutdown, handle) =
+            spawn_consumer(writer.clone() as Arc<dyn Output>, Arc::clone(&metrics)).await;
+        for _ in 0..5 {
+            sender.send(owned_event()).await.unwrap();
+        }
+        // Give the consumer time to pull every event into the
+        // writer's internal buffer (no flush — `consume` parks the
+        // handles unresolved).
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(writer.consume_calls.load(Ordering::Relaxed), 5);
+
+        let _ = shutdown.send(true);
+
+        // The consumer must terminate without external help. If the
+        // ordering reverts to "wait for in_flight == 0 before calling
+        // shutdown()", this await blocks forever and the test times
+        // out — that is the deadlock the fix prevents.
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("consumer must exit within 2s after shutdown")
+            .expect("consumer task panicked");
+
+        assert!(
+            writer.shutdown_called.load(Ordering::Relaxed),
+            "writer.shutdown() must have been called"
+        );
+        // Delivered dispositions: no failures bumped by the consumer.
+        assert_eq!(metrics.events_failed.load(Ordering::Relaxed), 0);
+    }
+
+    /// Shutdown DLQ routing: when the writer's `shutdown()` body fails
+    /// its final flush and routes each buffered event to the error
+    /// log, every handle resolves as `Recovered`. The consumer must
+    /// drain those dispositions and exit cleanly.
+    #[tokio::test]
+    async fn shutdown_routes_failed_batch_to_dlq() {
+        let writer = Arc::new(BatchedMockWriter::new(ShutdownMode::FailAll));
+        let metrics = Arc::new(crate::metrics::OutputMetrics::default());
+        let (sender, shutdown, handle) =
+            spawn_consumer(writer.clone() as Arc<dyn Output>, Arc::clone(&metrics)).await;
+        for _ in 0..3 {
+            sender.send(owned_event()).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(writer.consume_calls.load(Ordering::Relaxed), 3);
+
+        let _ = shutdown.send(true);
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("consumer must exit within 2s")
+            .expect("consumer task panicked");
+
+        assert!(writer.shutdown_called.load(Ordering::Relaxed));
+        // Each event's failure is bumped on the writer's metrics
+        // (where real outputs track it). The consumer's per-event
+        // metrics object is the same struct, but bumped on a
+        // different path: `Recovered` does NOT touch the consumer's
+        // counter (see `handle_ack_disposition`). So the consumer's
+        // metrics stay at 0 and the writer's is at 3.
+        assert_eq!(writer.metrics.events_failed.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics.events_failed.load(Ordering::Relaxed), 0);
     }
 }
 
