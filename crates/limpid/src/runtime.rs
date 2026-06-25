@@ -550,20 +550,30 @@ async fn run_pipeline_with_outputs(
     // recovery affordances as a `process` error — DLQ entry plus an
     // `events_errored` increment — instead of a silent
     // `events_finished` count on an event that was effectively lost.
+    //
+    // The DLQ records are emitted **per failed output** so each one
+    // can be replayed independently through
+    // `limpidctl inject output <name>` — joining them into one
+    // multi-output record would force the operator to re-run every
+    // sibling sink for one enqueue failure.
     if !failed_outputs.is_empty() {
-        let reason = format!(
-            "output enqueue failed for: {} (queue closed, disk write error, \
-             or unknown output)",
-            failed_outputs.join(", ")
-        );
+        let reason = "output enqueue failed (queue closed, disk write \
+             error, or unknown output)"
+            .to_string();
         result.termination = crate::pipeline::PipelineTermination::Errored;
-        result.errored = Some(crate::pipeline::ErroredEventContext {
-            timestamp: chrono::Utc::now(),
-            pipeline: pipeline.name.clone(),
-            process: "(output enqueue)".to_string(),
-            reason,
-            event: event.to_owned(),
-        });
+        let owned = event.to_owned();
+        for output_name in failed_outputs {
+            result
+                .errored
+                .push(crate::pipeline::ErroredEventContext::Output {
+                    timestamp: chrono::Utc::now(),
+                    pipeline: pipeline.name.clone(),
+                    site: format!("{} enqueue", output_name),
+                    reason: reason.clone(),
+                    output_name: output_name.clone(),
+                    event: crate::pipeline::OutputEvent::from_owned(&owned),
+                });
+        }
     }
 
     Ok(result)
@@ -611,18 +621,27 @@ async fn process_event(
                             .metrics
                             .events_errored
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        // Route the original event to the DLQ. The
-                        // pipeline guarantees `errored` is populated
-                        // when termination == Errored; defend with a
-                        // log if the contract somehow breaks.
-                        if let Some(err_ctx) = result.errored {
-                            write_errored_to_dlq(&err_ctx, &worker.metrics, ctx.error_log.as_ref())
-                                .await;
-                        } else {
+                        // Drain every accumulated DLQ record. For a
+                        // pipeline-side failure this is exactly one
+                        // record; for a runtime-side per-failed-output
+                        // enqueue failure it is one record per output.
+                        // The metric increments once per pipeline run
+                        // (= one logical event lost), independent of
+                        // the record count, matching prior semantics.
+                        if result.errored.is_empty() {
                             error!(
                                 "pipeline '{}': Errored termination without error context — bug",
                                 worker.def.name
                             );
+                        } else {
+                            for err_ctx in &result.errored {
+                                write_errored_to_dlq(
+                                    err_ctx,
+                                    &worker.metrics,
+                                    ctx.error_log.as_ref(),
+                                )
+                                .await;
+                            }
                         }
                     }
                     PipelineTermination::Finished => {
@@ -657,12 +676,13 @@ async fn process_event(
                     .metrics
                     .events_errored
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let err_ctx = crate::pipeline::ErroredEventContext {
+                let owned = event.to_owned();
+                let err_ctx = crate::pipeline::ErroredEventContext::Process {
                     timestamp: chrono::Utc::now(),
                     pipeline: worker.def.name.clone(),
-                    process: "(pipeline body)".to_string(),
+                    site: "(pipeline body)".to_string(),
                     reason: e.to_string(),
-                    event: event.to_owned(),
+                    event: crate::pipeline::ProcessEvent::from_owned(&owned),
                 };
                 write_errored_to_dlq(&err_ctx, &worker.metrics, ctx.error_log.as_ref()).await;
             }
@@ -707,9 +727,9 @@ async fn write_errored_to_dlq(
             // lost. Operators can grep / `journalctl | jq` it.
             error!(
                 event_record = %err_ctx.to_jsonl(),
-                "pipeline '{}': process '{}' errored; configure `control {{ error_log \"...\" }}` for file-based DLQ",
-                err_ctx.pipeline,
-                err_ctx.process
+                "pipeline '{}': site '{}' errored; configure `control {{ error_log \"...\" }}` for file-based DLQ",
+                err_ctx.pipeline(),
+                err_ctx.site()
             );
         }
     }
@@ -853,12 +873,12 @@ mod tests {
     fn make_err_ctx(reason: &str) -> crate::pipeline::ErroredEventContext {
         let addr = std::net::SocketAddr::from_str("127.0.0.1:0").unwrap();
         let ev = Event::new(Bytes::from_static(b"test-event"), addr);
-        crate::pipeline::ErroredEventContext {
+        crate::pipeline::ErroredEventContext::Process {
             timestamp: chrono::Utc::now(),
             pipeline: "test_pipeline".to_string(),
-            process: "(test process)".to_string(),
+            site: "(test process)".to_string(),
             reason: reason.to_string(),
-            event: ev,
+            event: crate::pipeline::ProcessEvent::from_owned(&ev),
         }
     }
 
@@ -911,5 +931,67 @@ mod tests {
         // Sanity: no metric is touched on this branch (the caller
         // already bumped events_errored before calling us).
         assert_eq!(metrics.events_errored_unwritable.load(Ordering::Relaxed), 0,);
+    }
+
+    #[tokio::test]
+    async fn output_enqueue_failure_splits_one_dlq_record_per_failed_output() {
+        // When a pipeline lists multiple `output` targets and none of
+        // them resolve at runtime (= unknown output names slipped past
+        // startup validation, or queues were torn down), the enqueue
+        // path must produce ONE DLQ record per failed output rather
+        // than a single joined record. That lets the operator replay
+        // each output independently via
+        // `limpidctl inject output <name>` without re-running sibling
+        // sinks that were already fine.
+        use crate::pipeline::ErroredEventContext;
+        let def = pipeline_def(
+            "def pipeline p { input i; output sink_a; output sink_b; finish }",
+        );
+
+        let cfg = CompiledConfig::from_config(parse_config("").unwrap()).unwrap();
+        let ctx = PipelineContext {
+            // Empty output_senders → every `output` statement falls
+            // into the "unknown output" arm and is reported as a
+            // failed enqueue. This is exactly the codepath the runtime
+            // is meant to split per-output.
+            output_senders: Arc::new(HashMap::new()),
+            config: Arc::new(cfg),
+            funcs: Arc::new(FunctionRegistry::new()),
+            tap: TapRegistry::new(),
+            error_log: None,
+        };
+
+        let addr = SocketAddr::from_str("127.0.0.1:0").unwrap();
+        let event = Event::new(Bytes::from_static(b"payload"), addr);
+        let mut bump = bumpalo::Bump::new();
+        let result = run_pipeline_with_outputs(&def, &event, &ctx, &mut bump)
+            .await
+            .expect("run_pipeline_with_outputs should not propagate");
+
+        assert_eq!(
+            result.termination,
+            crate::pipeline::PipelineTermination::Errored
+        );
+        assert_eq!(
+            result.errored.len(),
+            2,
+            "two failed outputs must produce two DLQ records"
+        );
+        let mut names: Vec<String> = result
+            .errored
+            .iter()
+            .map(|ctx| match ctx {
+                ErroredEventContext::Output {
+                    output_name, site, ..
+                } => {
+                    assert!(site.ends_with(" enqueue"), "unexpected site: {site}");
+                    assert_eq!(*site, format!("{} enqueue", output_name));
+                    output_name.clone()
+                }
+                other => panic!("expected Output variant, got {:?}", other),
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["sink_a".to_string(), "sink_b".to_string()]);
     }
 }
