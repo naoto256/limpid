@@ -1719,11 +1719,17 @@ mod tests {
         assert_eq!(lines.len(), 2);
         for line in &lines {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
-            assert_eq!(v["process"], "(output myout)");
+            assert_eq!(v["schema_version"], 2);
+            assert_eq!(v["kind"], "output");
+            assert_eq!(v["output"]["name"], "myout");
             // The reason carries the underlying transport error from
             // `flush_events`; the exact wording is implementation
             // detail.
             assert!(v["event"]["ingress"].is_string() || v["event"]["ingress"].is_object());
+            assert!(
+                v["event"]["egress"].is_string() || v["event"]["egress"].is_object(),
+                "Output records must carry egress for inject-output replay"
+            );
         }
     }
 

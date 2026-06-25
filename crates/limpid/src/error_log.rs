@@ -158,12 +158,12 @@ mod tests {
             "partial".into(),
             OwnedValue::String("from earlier process".into()),
         );
-        ErroredEventContext {
+        ErroredEventContext::Process {
             timestamp: chrono::DateTime::from_timestamp_nanos(1_700_000_000_000_000_000),
             pipeline: "p".into(),
-            process: "wrap".into(),
+            site: "wrap".into(),
             reason: "unknown identifier: timestamp".into(),
-            event,
+            event: crate::pipeline::ProcessEvent::from_owned(&event),
         }
     }
 
@@ -179,11 +179,14 @@ mod tests {
         assert_eq!(lines.len(), 2);
         for line in &lines {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["schema_version"], 2);
+            assert_eq!(v["kind"], "process");
             assert_eq!(v["pipeline"], "p");
-            assert_eq!(v["process"], "wrap");
+            assert_eq!(v["process"]["name"], "wrap");
+            assert!(v["output"].is_null());
             assert!(v["reason"].as_str().unwrap().contains("timestamp"));
-            // event sub-object keeps only source / received_at / ingress —
-            // egress and workspace are intentionally omitted.
+            // event sub-object keeps only source / received_at / ingress
+            // for Process records — egress and workspace are omitted.
             let event = &v["event"];
             assert!(event.get("source").is_some());
             assert!(event.get("received_at").is_some());
@@ -234,8 +237,22 @@ mod tests {
             Bytes::from(big),
             "10.0.0.1:514".parse::<SocketAddr>().unwrap(),
         );
-        let mut ctx = ctx();
-        ctx.event = big_event;
+        let ctx = match ctx() {
+            ErroredEventContext::Process {
+                timestamp,
+                pipeline,
+                site,
+                reason,
+                ..
+            } => ErroredEventContext::Process {
+                timestamp,
+                pipeline,
+                site,
+                reason,
+                event: crate::pipeline::ProcessEvent::from_owned(&big_event),
+            },
+            _ => unreachable!("ctx() returns Process"),
+        };
         let ctx = Arc::new(ctx);
 
         let mut handles = Vec::new();
