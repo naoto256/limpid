@@ -13,7 +13,7 @@ use crate::metrics::OutputMetrics;
 use crate::modules::output::syslog_peers::{
     PEER_CONNECT_TIMEOUT, PEER_WRITE_TIMEOUT, Peer, PeerList, SyslogPayload, parse_host_port,
 };
-use crate::modules::{HasMetrics, Module, Output, OutputBuilderWithErrorLog};
+use crate::modules::{HasMetrics, Module, Output};
 use crate::queue::{QueueAckHandle, RetryConfig};
 
 const SYSLOG_UDP_PEER_SCHEMA: &[PropertySpec] = &[
@@ -73,16 +73,10 @@ impl Module for SyslogUdpOutput {
         Some(SYSLOG_UDP_OUTPUT_SCHEMA)
     }
 
-    fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
-        Self::from_properties_with_error_log(name, properties, None)
-    }
-}
-
-impl OutputBuilderWithErrorLog for SyslogUdpOutput {
-    fn from_properties_with_error_log(
+    fn from_properties(
         name: &str,
         properties: &crate::modules::ModuleProperties,
-        error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+        ctx: &crate::modules::BuildContext,
     ) -> Result<Self> {
         let retry = RetryConfig::from_output_properties(properties.user_properties())?;
         let properties = properties.user_properties();
@@ -91,7 +85,7 @@ impl OutputBuilderWithErrorLog for SyslogUdpOutput {
             name: name.to_string(),
             peers: PeerList::new(peers),
             retry,
-            error_log,
+            error_log: ctx.error_log.as_ref().map(Arc::clone),
             metrics: Arc::new(OutputMetrics::default()),
         })
     }
@@ -336,7 +330,7 @@ mod tests {
 
     #[test]
     fn build_accepts_single_peer() {
-        let u = SyslogUdpOutput::build("u", &mp(&[peer("h", 1)])).expect("ok");
+        let u = SyslogUdpOutput::build("u", &mp(&[peer("h", 1)]), &crate::modules::BuildContext::for_testing()).expect("ok");
         assert_eq!(u.peers.len(), 1);
         assert_eq!(u.peers.peers()[0].address(), "h:1");
     }
@@ -349,6 +343,7 @@ mod tests {
                 "peer",
                 vec![kv("host", ExprKind::StringLit("h".into()))],
             )]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .expect("ok");
         assert_eq!(u.peers.peers()[0].address(), "h:514");
@@ -359,6 +354,7 @@ mod tests {
         let u = SyslogUdpOutput::build(
             "u",
             &mp(&[block("peers", vec![peer("a", 1), peer("b", 2)])]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .expect("ok");
         assert_eq!(u.peers.len(), 2);
@@ -368,7 +364,7 @@ mod tests {
 
     #[test]
     fn build_rejects_missing_destination() {
-        let err = SyslogUdpOutput::build("u", &mp(&[]))
+        let err = SyslogUdpOutput::build("u", &mp(&[]), &crate::modules::BuildContext::for_testing())
             .err()
             .expect("missing destination");
         assert!(
@@ -385,7 +381,7 @@ mod tests {
             "per",
             vec![kv("host", ExprKind::StringLit("h".into()))],
         )];
-        let err = SyslogUdpOutput::build("u", &mp(&props))
+        let err = SyslogUdpOutput::build("u", &mp(&props), &crate::modules::BuildContext::for_testing())
             .err()
             .expect("typo");
         let msg = err.to_string();
@@ -395,7 +391,7 @@ mod tests {
     #[test]
     fn build_rejects_peer_and_peers_together() {
         let props = vec![peer("a", 1), block("peers", vec![peer("b", 2)])];
-        let err = SyslogUdpOutput::build("u", &mp(&props))
+        let err = SyslogUdpOutput::build("u", &mp(&props), &crate::modules::BuildContext::for_testing())
             .err()
             .expect("should fail");
         let msg = err.to_string();
@@ -413,7 +409,7 @@ mod tests {
         // silently take the first `peer` block and discard the
         // `peers` block. Belt-and-braces.
         let props = vec![peer("a", 1), block("peers", vec![peer("b", 2)])];
-        let err = SyslogUdpOutput::from_properties("u", &mp(&props))
+        let err = SyslogUdpOutput::from_properties("u", &mp(&props), &crate::modules::BuildContext::for_testing())
             .err()
             .expect("from_properties should reject both blocks");
         let msg = err.to_string();
@@ -422,7 +418,7 @@ mod tests {
 
     #[test]
     fn build_rejects_empty_peers_block() {
-        let err = SyslogUdpOutput::from_properties("u", &mp(&[block("peers", vec![])]))
+        let err = SyslogUdpOutput::from_properties("u", &mp(&[block("peers", vec![])]), &crate::modules::BuildContext::for_testing())
             .err()
             .expect("should fail");
         assert!(
@@ -444,7 +440,7 @@ mod tests {
     #[test]
     fn build_rejects_peer_missing_host() {
         let props = vec![block("peer", vec![kv("port", ExprKind::IntLit(514))])];
-        let err = SyslogUdpOutput::build("u", &mp(&props))
+        let err = SyslogUdpOutput::build("u", &mp(&props), &crate::modules::BuildContext::for_testing())
             .err()
             .expect("should fail");
         assert!(err.to_string().contains("host"), "{}", err);
@@ -475,6 +471,7 @@ mod tests {
                     kv("port", ExprKind::IntLit(port)),
                 ],
             )]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .expect("build");
 

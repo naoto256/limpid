@@ -65,7 +65,7 @@ use crate::event::Event;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::http_util::{ERROR_BODY_BYTE_CAP, error_snippet};
 use crate::modules::output::syslog_peers::{PEER_COOLDOWN, iter_peers_block};
-use crate::modules::{HasMetrics, Module, Output, OutputBuilderWithErrorLog};
+use crate::modules::{HasMetrics, Module, Output};
 use crate::queue::{QueueAckHandle, RetryConfig};
 use crate::tls::ClientTlsConfig;
 
@@ -212,7 +212,7 @@ struct Inner {
     /// entirely here.
     retry: RetryConfig,
     /// `error_log` writer injected at construction time by the
-    /// runtime via `OutputBuilderWithErrorLog::from_properties_with_error_log`.
+    /// runtime via `BuildContext` in `from_properties`.
     /// Used by the flush path to route per-event render failures and
     /// shutdown-flush leftovers into the DLQ. `None` when the
     /// operator did not configure `control { error_log "..." }` —
@@ -349,22 +349,12 @@ impl Module for HttpOutput {
         Some(HTTP_OUTPUT_SCHEMA)
     }
 
-    fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
-        // Delegates to the error_log-aware ctor with `None` so the
-        // bare `Module::from_properties` path (used by unit tests and
-        // direct callers) still works; the runtime always goes
-        // through `OutputBuilderWithErrorLog::from_properties_with_error_log`
-        // to inject the operator-configured writer.
-        <Self as OutputBuilderWithErrorLog>::from_properties_with_error_log(name, properties, None)
-    }
-}
-
-impl OutputBuilderWithErrorLog for HttpOutput {
-    fn from_properties_with_error_log(
+    fn from_properties(
         name: &str,
         properties: &crate::modules::ModuleProperties,
-        error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+        ctx: &crate::modules::BuildContext,
     ) -> Result<Self> {
+        let error_log = ctx.error_log.as_ref().map(Arc::clone);
         let properties = properties.user_properties();
 
         // Parse the configured method into a typed `reqwest::Method`
@@ -917,7 +907,7 @@ mod tests {
 
     #[test]
     fn requires_peer_or_peers_block() {
-        let err = HttpOutput::from_properties("o", &mp(&[])).err().unwrap();
+        let err = HttpOutput::from_properties("o", &mp(&[]), &crate::modules::BuildContext::for_testing()).err().unwrap();
         assert!(
             err.to_string().contains("'peer {") && err.to_string().contains("'peers {"),
             "unexpected: {err}"
@@ -931,14 +921,14 @@ mod tests {
             key_span: None,
             properties: vec![],
         }];
-        let err = HttpOutput::from_properties("o", &mp(&props)).err().unwrap();
+        let err = HttpOutput::from_properties("o", &mp(&props), &crate::modules::BuildContext::for_testing()).err().unwrap();
         assert!(err.to_string().contains("url"), "unexpected: {err}");
     }
 
     #[test]
     fn accepts_single_peer_shorthand() {
         let props = vec![peer_block("http://x:8080/")];
-        let output = HttpOutput::from_properties("o", &mp(&props)).unwrap();
+        let output = HttpOutput::from_properties("o", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
         assert_eq!(output.inner.peers.len(), 1);
         assert_eq!(output.inner.peers[0].url, "http://x:8080/");
     }
@@ -950,7 +940,7 @@ mod tests {
             peer_block("http://b:8080/"),
             peer_block("http://c:8080/"),
         ])];
-        let output = HttpOutput::from_properties("o", &mp(&props)).unwrap();
+        let output = HttpOutput::from_properties("o", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
         assert_eq!(output.inner.peers.len(), 3);
         assert_eq!(output.inner.peers[2].url, "http://c:8080/");
     }
@@ -969,7 +959,7 @@ mod tests {
                 },
             ],
         }];
-        let err = HttpOutput::from_properties("o", &mp(&props)).err().unwrap();
+        let err = HttpOutput::from_properties("o", &mp(&props), &crate::modules::BuildContext::for_testing()).err().unwrap();
         assert!(
             err.to_string().contains("cert and key"),
             "unexpected: {err}"
@@ -1048,6 +1038,7 @@ mod tests {
         let output = HttpOutput::from_properties(
             "test",
             &mp(&[peer_block(&url), prop_int("batch_size", 1)]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
         consume(&output, &event_with("hello-single")).await
@@ -1077,7 +1068,7 @@ mod tests {
             ]),
             prop_int("batch_size", 1),
         ];
-        let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
+        let output = HttpOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
         for i in 0..9 {
             consume(&output, &event_with(&format!("rr-{}", i)))
                 .await
@@ -1128,7 +1119,7 @@ mod tests {
         ];
         let mut props = props;
         props.push(fast_retry_block());
-        let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
+        let output = HttpOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
         // First send goes to A (cursor 0), fails. With max_attempts=1
         // the failure routes to Recovered (DLQ). A is cooled down.
         let first = consume(&output, &event_with("rr-fail")).await;
@@ -1153,7 +1144,7 @@ mod tests {
             peer_block("http://example.com/"),
             ident_prop("method", "CARRIER PIGEON"),
         ];
-        let err = HttpOutput::from_properties("test", &mp(&props))
+        let err = HttpOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing())
             .err()
             .expect("invalid method must reject");
         let msg = err.to_string();
@@ -1204,7 +1195,7 @@ mod tests {
         // `verify false` must NOT discard the client identity. Old
         // behaviour: tls block silently ignored; reqwest builds a
         // plain client without the identity → mTLS broken at runtime.
-        let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
+        let output = HttpOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
         assert_eq!(output.inner.peers.len(), 1);
     }
 
@@ -1246,7 +1237,7 @@ mod tests {
             prop_int("batch_size", 1),
             ident_prop("method", "PATCH"),
         ];
-        let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
+        let output = HttpOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
         consume(&output, &event_with("hello")).await.unwrap();
         for _ in 0..50 {
             if !received.lock().await.is_empty() {
@@ -1284,7 +1275,7 @@ mod tests {
 
         let url = format!("http://{}/", addr);
         let props = vec![peer_block(&url), prop_int("batch_size", 1)];
-        let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
+        let output = HttpOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
         // `consume` resolves the ack and swallows the underlying
         // transport error inside its DLQ-routing path.
         // Hit `Inner::send_batch` directly so we can still assert on
@@ -1340,7 +1331,7 @@ mod tests {
 
         let url = format!("http://{}/", addr);
         let props = vec![peer_block(&url), prop_int("batch_size", 1)];
-        let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
+        let output = HttpOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
         let err = output
             .inner
             .send_batch(&["hello".to_string()])
@@ -1379,7 +1370,7 @@ mod tests {
 
         let url = format!("http://{}/", addr);
         let props = vec![peer_block(&url), prop_int("batch_size", 1), fast_retry_block()];
-        let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
+        let output = HttpOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
         let pre_call = Instant::now();
         let _ = consume(&output, &event_with("hello")).await;
         let cooldown_until = output.inner.peer_state[0]
@@ -1412,7 +1403,7 @@ mod tests {
         let mut props = vec![peer_block("http://127.0.0.1:1/")];
         props.push(prop_int("batch_size", 1));
         props.push(fast_retry_block());
-        let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
+        let output = HttpOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
         let err = consume(&output, &event_with("singleton"))
             .await
             .expect_err("send must fail against unreachable peer");
@@ -1462,12 +1453,11 @@ mod tests {
             prop_str("batch_timeout", "10s"),
             fast_retry_block(),
         ];
-        let output = <HttpOutput as OutputBuilderWithErrorLog>::from_properties_with_error_log(
-            "test",
-            &mp(&props),
-            Some(Arc::clone(&writer)),
-        )
-        .unwrap();
+        let ctx = crate::modules::BuildContext {
+            funcs: Arc::new(crate::functions::FunctionRegistry::new()),
+            error_log: Some(Arc::clone(&writer)),
+        };
+        let output = HttpOutput::from_properties("test", &mp(&props), &ctx).unwrap();
 
         // First consume parks the event with no flush. Watch the ack
         // channel: it must NOT resolve until the flush actually runs.
@@ -1513,6 +1503,7 @@ mod tests {
                 prop_int("batch_size", 2),
                 prop_str("batch_timeout", "10s"),
             ]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
         let (ack, mut rx) = QueueAckHandle::for_test();
@@ -1557,6 +1548,7 @@ mod tests {
                 prop_int("batch_size", 100),
                 prop_str("batch_timeout", "30s"),
             ]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
 
@@ -1624,7 +1616,11 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("errored.jsonl");
         let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
-        let output = <HttpOutput as OutputBuilderWithErrorLog>::from_properties_with_error_log(
+        let ctx = crate::modules::BuildContext {
+            funcs: Arc::new(crate::functions::FunctionRegistry::new()),
+            error_log: Some(Arc::clone(&writer)),
+        };
+        let output = HttpOutput::from_properties(
             "myout",
             &mp(&[
                 peer_block(&url),
@@ -1632,7 +1628,7 @@ mod tests {
                 prop_str("batch_timeout", "30s"),
                 fast_retry_block(),
             ]),
-            Some(Arc::clone(&writer)),
+            &ctx,
         )
         .unwrap();
 
@@ -1688,6 +1684,7 @@ mod tests {
                 prop_str("batch_timeout", "30s"),
                 fast_retry_block(),
             ]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
         consume(&output, &event_with("ev1")).await.unwrap();
@@ -1715,6 +1712,7 @@ mod tests {
                 prop_int("batch_size", 100),
                 prop_str("batch_timeout", "30s"),
             ]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
         consume(&output, &event_with("ev1")).await.unwrap();
@@ -1757,6 +1755,7 @@ mod tests {
                 prop_str("batch_timeout", "30s"),
                 fast_retry_block(),
             ]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
         consume(&output, &event_with("ev1")).await.unwrap();
@@ -1778,22 +1777,25 @@ mod tests {
 
     /// Constructor-time error_log injection (replaces the prior
     /// `attach_error_log(&self, ...)` setter). The runtime always
-    /// goes through `OutputBuilderWithErrorLog::from_properties_with_error_log`;
-    /// this test pins that the writer ends up on the Inner field so
-    /// subsequent flush paths (render-failure routing, shutdown
-    /// recovery) can reach it without any post-construction wiring.
+    /// goes through `from_properties` with a `BuildContext` carrying
+    /// the `error_log`; this test pins that the writer ends up on the
+    /// Inner field so subsequent flush paths (render-failure routing,
+    /// shutdown recovery) can reach it without any post-construction
+    /// wiring.
     #[tokio::test]
     async fn constructor_injects_error_log_into_inner() {
-        use crate::modules::OutputBuilderWithErrorLog;
-
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("errored.jsonl");
         let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path));
 
-        let output = HttpOutput::from_properties_with_error_log(
+        let ctx = crate::modules::BuildContext {
+            funcs: Arc::new(crate::functions::FunctionRegistry::new()),
+            error_log: Some(Arc::clone(&writer)),
+        };
+        let output = HttpOutput::from_properties(
             "test",
             &mp(&[peer_block("http://127.0.0.1:1/"), prop_int("batch_size", 8)]),
-            Some(Arc::clone(&writer)),
+            &ctx,
         )
         .unwrap();
         // The Inner's `error_log` field must point at the same writer

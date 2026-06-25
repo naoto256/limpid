@@ -42,7 +42,7 @@ use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
-use crate::modules::{HasMetrics, Module, Output, OutputBuilderWithErrorLog};
+use crate::modules::{HasMetrics, Module, Output};
 use crate::queue::{QueueAckHandle, RetryConfig};
 use crate::tls::ClientTlsConfig;
 
@@ -330,17 +330,12 @@ impl Module for KafkaOutput {
         Some(KAFKA_OUTPUT_SCHEMA)
     }
 
-    fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
-        Self::from_properties_with_error_log(name, properties, None)
-    }
-}
-
-impl OutputBuilderWithErrorLog for KafkaOutput {
-    fn from_properties_with_error_log(
+    fn from_properties(
         name: &str,
         properties: &crate::modules::ModuleProperties,
-        error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+        ctx: &crate::modules::BuildContext,
     ) -> Result<Self> {
+        let error_log = ctx.error_log.as_ref().map(Arc::clone);
         let retry = RetryConfig::from_output_properties(properties.user_properties())?;
         let properties = properties.user_properties();
         let brokers = props::get_string(properties, "brokers")
