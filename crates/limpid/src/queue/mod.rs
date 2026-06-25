@@ -5,13 +5,10 @@
 //! - **Disk queue**: WAL-based, survives restarts, configurable max size
 
 pub mod disk;
-pub mod outcome;
 
 use std::sync::Arc;
 
-use tracing::{error, info, warn};
-
-pub use outcome::{QueueSendError, WriteDisposition};
+use tracing::{info, warn};
 
 use crate::dsl::ast::Property;
 use crate::dsl::props;
@@ -155,8 +152,40 @@ pub struct QueueConfig {
     pub queue_type: QueueType,
     /// Maximum number of events for memory queue / segment config for disk queue.
     pub capacity: usize,
-    #[allow(dead_code)] // will be wired when backpressure config is exposed in DSL
-    pub overflow: OverflowStrategy,
+}
+
+/// Why a queue enqueue failed. Each variant corresponds to a code
+/// path inside `QueueSender::send` / `DiskQueueSender::send`.
+///
+/// `#[non_exhaustive]` so future recovery-routing work can add
+/// variants without breaking external matches; downstream code should
+/// use `Result` patterns that accept new variants forward-compatibly.
+/// Current callers in-tree match exhaustively.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum QueueSendError {
+    /// Memory queue's receiving end was dropped (consumer task gone,
+    /// daemon usually shutting down). Comes from
+    /// `tokio::sync::mpsc::Sender::send().await.is_err()`.
+    #[error("queue receiver dropped (channel closed)")]
+    ChannelClosed,
+
+    /// Disk queue failed to serialise the event to JSON before
+    /// writing. The underlying error is preserved for logging.
+    #[error("disk queue: failed to serialize event: {0}")]
+    Serialize(#[from] serde_json::Error),
+
+    /// `tokio::task::spawn_blocking` returned a `JoinError` while the
+    /// disk queue was performing the synchronous segment write.
+    #[error("disk queue: write task failed: {0}")]
+    JoinError(#[from] tokio::task::JoinError),
+
+    /// Disk queue segment write failed — covers open/append/flush
+    /// errors inside `write_to_segment`. The helper currently
+    /// collapses the specific I/O error onto its own error log; this
+    /// variant signals only that the write didn't land.
+    #[error("disk queue: segment write failed")]
+    DiskWrite,
 }
 
 #[derive(Debug, Clone)]
@@ -173,7 +202,6 @@ impl Default for QueueConfig {
         Self {
             queue_type: QueueType::Memory,
             capacity: 65536,
-            overflow: OverflowStrategy::Block,
         }
     }
 }
@@ -201,21 +229,11 @@ impl QueueConfig {
             Ok(QueueConfig {
                 queue_type,
                 capacity,
-                ..Default::default()
             })
         } else {
             Ok(QueueConfig::default())
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // DropNewest will be wirable via DSL queue config
-pub enum OverflowStrategy {
-    /// Block the pipeline until space is available (backpressure).
-    Block,
-    /// Drop the newest event (the one being sent).
-    DropNewest,
 }
 
 /// Handle for sending events into a queue. Cheaply cloneable.
@@ -394,6 +412,16 @@ impl Default for RetryConfig {
 }
 
 impl RetryConfig {
+    /// Compute the next sleep duration given the current one, applying
+    /// the configured backoff. Shared by every output's internal retry
+    /// loop so the doubling-then-clamp policy is defined once.
+    pub fn next_wait(&self, current: std::time::Duration) -> std::time::Duration {
+        match self.backoff {
+            BackoffStrategy::Exponential => current.saturating_mul(2).min(self.max_wait),
+            BackoffStrategy::Fixed => current,
+        }
+    }
+
     /// Parse from an output definition's properties (retry block).
     pub fn from_output_properties(output_props: &[Property]) -> anyhow::Result<Self> {
         let mut config = Self::default();
@@ -424,216 +452,264 @@ pub enum BackoffStrategy {
     Fixed,
 }
 
+// ---------------------------------------------------------------------------
+// Ack lifecycle
+// ---------------------------------------------------------------------------
+//
+// Previously the queue consumer advanced the disk-queue cursor (`ack`)
+// immediately after `Output::consume` returned `Ok` — which for batched
+// outputs only means "event accepted into the in-memory buffer", not
+// "event shipped". A daemon crash between accept and flush silently
+// lost every event in the batch (the cursor said "delivered", the
+// buffer was gone).
+//
+// The current flow gives each event a `QueueAckHandle`. Outputs hold
+// the handle until the event's final disposition is known and call
+// `resolve_delivered()` or `resolve_recovered()` (= "routed to DLQ").
+// The handle's destruction sends one [`AckDisposition`] back to the
+// consumer, which then advances the queue cursor. A handle that drops
+// without an explicit resolve sends `Dropped` and (in debug builds)
+// fires a `debug_assert!` — that path is reserved for bugs / panics /
+// shutdown fall-through, never the steady-state contract.
+
+/// Final disposition of an event as far as the queue is concerned.
+/// Reported back from the output via [`QueueAckHandle`] so the consumer
+/// can advance the cursor and update per-disposition metrics breakdowns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckDisposition {
+    /// Event was durably shipped to its destination.
+    Delivered,
+    /// Event was routed to the DLQ (`error_log`).
+    Recovered,
+    /// Event was dropped without explicit disposition (bug / panic /
+    /// shutdown fallthrough). Should not occur on healthy paths.
+    Dropped,
+}
+
+/// Handle handed to an [`crate::modules::Output`] alongside each event.
+/// The output is responsible for calling `resolve_delivered` or
+/// `resolve_recovered` once the event's final disposition is decided —
+/// including across batched flushes that may resolve a handle long
+/// after `consume` returned `Ok`. The handle's `Drop` impl falls back
+/// to [`AckDisposition::Dropped`] for the unhealthy paths, and
+/// `debug_assert!`s the contract was met.
+#[derive(Debug)]
+pub struct QueueAckHandle {
+    tx: Option<tokio::sync::mpsc::UnboundedSender<AckDisposition>>,
+    /// True once an explicit `resolve_*` ran. Read in `Drop` to
+    /// distinguish "resolved cleanly" (silence the debug_assert) from
+    /// "dropped without resolve" (fire the assert + send `Dropped`).
+    resolved: bool,
+}
+
+impl QueueAckHandle {
+    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<AckDisposition>) -> Self {
+        Self {
+            tx: Some(tx),
+            resolved: false,
+        }
+    }
+
+    /// Signal that the event was durably delivered. Consumes the handle.
+    pub fn resolve_delivered(mut self) {
+        self.resolved = true;
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(AckDisposition::Delivered);
+        }
+    }
+
+    /// Signal that the event was routed to the DLQ (retry exhausted,
+    /// render error, shutdown leftover). Consumes the handle.
+    pub fn resolve_recovered(mut self) {
+        self.resolved = true;
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(AckDisposition::Recovered);
+        }
+    }
+
+    /// Test-only constructor returning the handle and the receiving
+    /// half of its ack channel, so tests can assert on the disposition.
+    #[cfg(test)]
+    pub fn for_test() -> (Self, tokio::sync::mpsc::UnboundedReceiver<AckDisposition>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (Self::new(tx), rx)
+    }
+}
+
+impl Drop for QueueAckHandle {
+    fn drop(&mut self) {
+        debug_assert!(
+            self.resolved,
+            "QueueAckHandle dropped without explicit resolve_delivered / resolve_recovered \
+             — bug: outputs MUST explicitly resolve their disposition"
+        );
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(AckDisposition::Dropped);
+        }
+    }
+}
+
 /// Run a queue consumer that drains events and writes them to an output.
 ///
-/// Takes `Arc<dyn Output>` directly: after this change the `Output` trait is
-/// already dyn-safe (the lifetime-bound `render` method was removed in
-/// the trait collapse), so the earlier adapter trait that wrapped it
-/// purely to hide that lifetime is no longer needed.
+/// The consumer does not own retry / DLQ logic — each `Output` runs
+/// its own per-event retry loop and resolves a [`QueueAckHandle`]
+/// when the event's final disposition is decided. The consumer's job
+/// is purely "hand each event + handle to the output, then advance
+/// the queue cursor when its disposition comes back". The cursor
+/// only advances after the output's handle resolves, which for
+/// batched outputs happens at flush time, not at buffer-accept time.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_queue_consumer(
     mut receiver: QueueReceiver,
     writer: Arc<dyn crate::modules::Output>,
-    retry_config: RetryConfig,
     tap: Option<crate::tap::TapRegistry>,
     metrics: Arc<crate::metrics::OutputMetrics>,
     error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    use std::sync::atomic::Ordering;
+
     let name = Arc::clone(&receiver.name);
     info!("output '{}': queue consumer started", name);
+    let (ack_tx, mut ack_rx) =
+        tokio::sync::mpsc::unbounded_channel::<AckDisposition>();
+    let mut in_flight: usize = 0;
+    let mut accepting = true;
 
     loop {
         tokio::select! {
             biased;
 
-            _ = shutdown.changed() => {
+            _ = shutdown.changed(), if accepting => {
                 if *shutdown.borrow() {
                     info!("output '{}': shutting down, draining queue", name);
-                    drain_remaining(&mut receiver, writer.as_ref(), &retry_config, &name, &metrics, tap.as_ref(), error_log.as_ref()).await;
+                    // Stop accepting new receiver events; keep draining
+                    // the ack channel until all in-flight handles
+                    // resolve. The `try_recv` walk below feeds any
+                    // already-queued events into the output one last
+                    // time so they don't survive the restart with the
+                    // queue still pointing at them.
+                    accepting = false;
+                    while let Some(event) = receiver.try_recv() {
+                        if let Some(tap) = &tap {
+                            tap.emit(&format!("output {}", name), &event).await;
+                        }
+                        let handle = QueueAckHandle::new(ack_tx.clone());
+                        in_flight += 1;
+                        if let Err(e) = writer.consume(&event, handle).await {
+                            tracing::error!(
+                                "output '{}': consume returned Err during drain: {} \
+                                 (bug — disposition signalled via handle)",
+                                name,
+                                e
+                            );
+                            metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    // All previously-acked events left `in_flight == 0`
+                    // before shutdown fired; there's nothing left to wait
+                    // on, so exit the select loop straight into the
+                    // post-loop drain phase.
+                    if in_flight == 0 {
+                        break;
+                    }
+                }
+            }
+
+            Some(disposition) = ack_rx.recv() => {
+                handle_ack_disposition(disposition, &name, &metrics);
+                receiver.ack();
+                in_flight = in_flight.saturating_sub(1);
+                if !accepting && in_flight == 0 {
                     break;
                 }
             }
 
-            input = receiver.recv() => {
+            input = receiver.recv(), if accepting => {
                 match input {
                     Some(event) => {
-                        // `error_log` recovery is performed inside
-                        // `write_with_retry`; the disposition is
-                        // ignored here because the caller-side
-                        // per-disposition metrics breakdown is not yet
-                        // implemented (deferred to the 0.8 metrics
-                        // rework).
-                        let _ = write_with_retry(writer.as_ref(), event, &retry_config, &name, &metrics, tap.as_ref(), error_log.as_ref()).await;
-                        // Acknowledge the event regardless of
-                        // disposition (delivered or retries exhausted):
-                        // from this queue's POV the event has been
-                        // processed. For disk queues this is the
-                        // durability commit — `recv()` returned the
-                        // event with an in-memory cursor only, the
-                        // persisted cursor advances here. Skipping
-                        // the call on a crash gives at-least-once
-                        // replay on restart.
-                        receiver.ack();
+                        if let Some(tap) = &tap {
+                            tap.emit(&format!("output {}", name), &event).await;
+                        }
+                        let handle = QueueAckHandle::new(ack_tx.clone());
+                        in_flight += 1;
+                        if let Err(e) = writer.consume(&event, handle).await {
+                            // Reaching here means the output returned an
+                            // error from `consume` itself — by the
+                            // ack-handle contract that signals a bug
+                            // (the output failed to take ownership of
+                            // the lifecycle). The handle's Drop impl
+                            // fires `Dropped` via the channel; we just
+                            // log so operators can investigate.
+                            tracing::error!(
+                                "output '{}': consume returned Err: {} \
+                                 (bug — disposition signalled via handle)",
+                                name,
+                                e
+                            );
+                            metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     None => {
                         info!("output '{}': queue closed", name);
-                        break;
+                        accepting = false;
+                        if in_flight == 0 {
+                            break;
+                        }
                     }
                 }
             }
         }
     }
 
-    // Batched sinks hold an in-memory buffer that queue-side `write()`
-    // has already counted as delivered. Drop alone would abort the
-    // flush timer and leak those events; tell the output to drain
-    // itself before we exit. Both break paths above (shutdown signal
-    // and queue-closed) come through here so the contract is uniform.
+    // Shutdown phase: tell the output to drain its in-memory buffers.
+    // The output resolves any remaining handles inside `shutdown()`
+    // (via DLQ or final delivery), feeding the ack channel; we then
+    // drain remaining dispositions to advance the cursor.
     if let Err(e) = writer.shutdown(error_log.as_ref()).await {
         warn!("output '{}': shutdown flush failed: {}", name, e);
+    }
+    drop(ack_tx);
+    while let Some(disposition) = ack_rx.recv().await {
+        handle_ack_disposition(disposition, &name, &metrics);
+        receiver.ack();
     }
 
     info!("output '{}': queue consumer stopped", name);
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn drain_remaining(
-    receiver: &mut QueueReceiver,
-    writer: &dyn crate::modules::Output,
-    retry_config: &RetryConfig,
+fn handle_ack_disposition(
+    disposition: AckDisposition,
     name: &str,
     metrics: &crate::metrics::OutputMetrics,
-    tap: Option<&crate::tap::TapRegistry>,
-    error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
 ) {
-    let mut count = 0u64;
-    while let Some(event) = receiver.try_recv() {
-        // Disposition ignored: same rationale as the steady-state
-        // loop — drain just needs to ack each event.
-        let _ = write_with_retry(
-            writer,
-            event,
-            retry_config,
-            name,
-            metrics,
-            tap,
-            error_log,
-        )
-        .await;
-        // Mirror the steady-state ack contract: each event's
-        // disposition is committed to disk before we move on, so a
-        // crash mid-drain still replays exactly the un-acked tail.
-        receiver.ack();
-        count += 1;
-    }
-    if count > 0 {
-        info!(
-            "output '{}': drained {} events during shutdown",
-            name, count
-        );
-    }
-}
-
-/// Returns a [`WriteDisposition`] indicating whether the event was
-/// delivered, persisted to `error_log` for recovery, or dropped.
-///
-/// Retry semantics (after this change): the queue always carries `Event` so
-/// every attempt re-runs against the same event up to `max_attempts`.
-/// Render failures (signalled by [`crate::modules::RenderError`])
-/// bypass retries and go straight to DLQ — the render output is
-/// deterministic on the event, so retrying would only repeat the same
-/// failure. Transport / write failures continue to consume the retry
-/// budget as before.
-#[allow(clippy::too_many_arguments)]
-async fn write_with_retry(
-    writer: &dyn crate::modules::Output,
-    event: Event,
-    config: &RetryConfig,
-    name: &str,
-    metrics: &crate::metrics::OutputMetrics,
-    tap: Option<&crate::tap::TapRegistry>,
-    error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
-) -> WriteDisposition {
     use std::sync::atomic::Ordering;
-
-    if let Some(tap) = tap {
-        tap.emit(&format!("output {}", name), &event).await;
-    }
-
-    let mut attempt = 0u32;
-    let mut wait = config.initial_wait;
-
-    loop {
-        match writer.consume(&event).await {
-            Ok(()) => return WriteDisposition::Delivered,
-            Err(e) => {
-                // Render errors are deterministic on the event — no
-                // amount of retrying will salvage a broken template.
-                // Route straight to DLQ with a distinct `reason` so
-                // operators can tell render failures apart from
-                // transport exhaustion.
-                let is_render_err = e.downcast_ref::<crate::modules::RenderError>().is_some();
-
-                attempt += 1;
-                if !is_render_err {
-                    metrics.retries.fetch_add(1, Ordering::Relaxed);
-                }
-
-                if is_render_err || attempt >= config.max_attempts {
-                    if is_render_err {
-                        error!("output '{}': render failed: {}", name, e);
-                    } else {
-                        error!(
-                            "output '{}': write failed after {} attempts: {}",
-                            name, attempt, e
-                        );
-                    }
-                    metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-                    let reason = if is_render_err {
-                        format!("render failed: {}", e)
-                    } else {
-                        format!("output write failed after {} attempts: {}", attempt, e)
-                    };
-                    if let Some(writer) = error_log {
-                        let ctx = crate::pipeline::ErroredEventContext {
-                            timestamp: chrono::Utc::now(),
-                            pipeline: String::new(),
-                            process: format!("(output {})", name),
-                            reason,
-                            event: event.clone(),
-                        };
-                        match writer.write(&ctx).await {
-                            Ok(()) => return WriteDisposition::DroppedToRecovery,
-                            Err(write_err) => {
-                                warn!(
-                                    "output '{}': error_log write failed: {} — dropping event",
-                                    name, write_err
-                                );
-                            }
-                        }
-                    } else {
-                        // No recovery path configured.
-                        error!("output '{}': dropping event (no error_log)", name);
-                    }
-                    return WriteDisposition::Dropped;
-                }
-                warn!(
-                    "output '{}': write failed (attempt {}/{}): {} — retrying in {:?}",
-                    name, attempt, config.max_attempts, e, wait
-                );
-                tokio::time::sleep(wait).await;
-                wait = match config.backoff {
-                    BackoffStrategy::Exponential => (wait * 2).min(config.max_wait),
-                    BackoffStrategy::Fixed => wait,
-                };
-            }
+    match disposition {
+        AckDisposition::Delivered => {
+            // The output bumped `events_written` itself on the success
+            // path; nothing to do here. Kept explicit so the
+            // per-disposition metrics breakdown has an obvious hook
+            // when 0.8 lands.
+        }
+        AckDisposition::Recovered => {
+            // The output bumped `events_failed` on the recovery path
+            // (retry exhausted / render error / shutdown leftover).
+            // Same rationale as `Delivered`.
+        }
+        AckDisposition::Dropped => {
+            tracing::error!(
+                "output '{}': event dropped without explicit disposition (bug)",
+                name
+            );
+            metrics
+                .events_failed
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 }
 
 #[cfg(test)]
-mod write_with_retry_tests {
+mod consumer_lifecycle_tests {
     use super::*;
     use crate::modules::{HasMetrics, Output};
     use bytes::Bytes;
@@ -641,17 +717,33 @@ mod write_with_retry_tests {
     use std::sync::Mutex;
     use std::sync::atomic::Ordering;
 
-    /// Programmable mock: each call to `consume` pops the next result
-    /// from `script`; if the script is empty, returns Ok. Records the
-    /// number of consume invocations for assertions.
+    fn owned_event() -> Event {
+        Event::new(
+            Bytes::from_static(b"x"),
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        )
+    }
+
+    /// Programmable mock: each call to `consume` pops the next outcome
+    /// from `script` and resolves the handle accordingly. The script
+    /// vocabulary mirrors the per-event ack-lifecycle a real output
+    /// reaches: `Delivered` resolves the handle as delivered, and
+    /// `Bug` returns Err WITHOUT resolving the handle (exercise the
+    /// consumer's fallthrough).
+    #[derive(Clone, Copy)]
+    enum Outcome {
+        Delivered,
+        Bug,
+    }
+
     struct ScriptedWriter {
-        script: Mutex<Vec<anyhow::Result<()>>>,
+        script: Mutex<Vec<Outcome>>,
         calls: std::sync::atomic::AtomicUsize,
         metrics: Arc<crate::metrics::OutputMetrics>,
     }
 
     impl ScriptedWriter {
-        fn new(script: Vec<anyhow::Result<()>>) -> Self {
+        fn new(script: Vec<Outcome>) -> Self {
             Self {
                 script: Mutex::new(script),
                 calls: std::sync::atomic::AtomicUsize::new(0),
@@ -672,112 +764,41 @@ mod write_with_retry_tests {
 
     #[async_trait::async_trait]
     impl Output for ScriptedWriter {
-        async fn consume(&self, _event: &Event) -> anyhow::Result<()> {
+        async fn consume(&self, _event: &Event, ack: QueueAckHandle) -> anyhow::Result<()> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            let mut s = self.script.lock().unwrap();
-            if s.is_empty() { Ok(()) } else { s.remove(0) }
+            let next = {
+                let mut s = self.script.lock().unwrap();
+                if s.is_empty() {
+                    Outcome::Delivered
+                } else {
+                    s.remove(0)
+                }
+            };
+            match next {
+                Outcome::Delivered => {
+                    ack.resolve_delivered();
+                    Ok(())
+                }
+                Outcome::Bug => {
+                    // Drop the handle without resolve — exercises the
+                    // consumer's Dropped-fallthrough path. Returning
+                    // Err signals the bug.
+                    drop(ack);
+                    Err(anyhow::anyhow!("scripted bug"))
+                }
+            }
         }
     }
 
-    fn fast_cfg(max_attempts: u32) -> RetryConfig {
-        RetryConfig {
-            max_attempts,
-            initial_wait: std::time::Duration::from_millis(1),
-            max_wait: std::time::Duration::from_millis(1),
-            backoff: BackoffStrategy::Fixed,
-        }
-    }
-
-    fn owned_event() -> Event {
-        Event::new(
-            Bytes::from_static(b"x"),
-            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-        )
-    }
-
-    fn fresh_metrics() -> crate::metrics::OutputMetrics {
-        crate::metrics::OutputMetrics::default()
-    }
-
-    #[tokio::test]
-    async fn owned_succeeds_on_first_attempt_counts_no_retries() {
-        let w = ScriptedWriter::new(vec![Ok(())]);
-        let m = fresh_metrics();
-        let disposition = write_with_retry(
-            &w,
-            owned_event(),
-            &fast_cfg(3),
-            "test",
-            &m,
-            None,
-            None,
-        )
-        .await;
-        assert_eq!(disposition, WriteDisposition::Delivered);
-        assert_eq!(w.calls(), 1);
-        assert_eq!(m.retries.load(Ordering::Relaxed), 0);
-        assert_eq!(m.events_failed.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn owned_retries_then_succeeds() {
-        let w = ScriptedWriter::new(vec![
-            Err(anyhow::anyhow!("transient 1")),
-            Err(anyhow::anyhow!("transient 2")),
-            Ok(()),
-        ]);
-        let m = fresh_metrics();
-        let disposition = write_with_retry(
-            &w,
-            owned_event(),
-            &fast_cfg(5),
-            "test",
-            &m,
-            None,
-            None,
-        )
-        .await;
-        assert_eq!(disposition, WriteDisposition::Delivered);
-        assert_eq!(w.calls(), 3, "expected 1 + 2 retries");
-        assert_eq!(m.retries.load(Ordering::Relaxed), 2);
-        assert_eq!(m.events_failed.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn owned_exhausts_retries_bumps_events_failed() {
-        let w = ScriptedWriter::new(vec![
-            Err(anyhow::anyhow!("permanent")),
-            Err(anyhow::anyhow!("permanent")),
-            Err(anyhow::anyhow!("permanent")),
-        ]);
-        let m = fresh_metrics();
-        let disposition = write_with_retry(
-            &w,
-            owned_event(),
-            &fast_cfg(3),
-            "test",
-            &m,
-            None,
-            None,
-        )
-        .await;
-        // No error_log configured -> Dropped.
-        assert_eq!(disposition, WriteDisposition::Dropped);
-        assert_eq!(w.calls(), 3);
-        assert_eq!(m.events_failed.load(Ordering::Relaxed), 1);
-        assert_eq!(m.retries.load(Ordering::Relaxed), 3);
-    }
+    // ---- queue boundary error tests ----
 
     #[tokio::test]
     async fn queue_sender_send_returns_channel_closed_when_receiver_dropped() {
-        // Memory queue with a dropped receiver — send must surface
-        // QueueSendError::ChannelClosed, not silently succeed.
         let (tx, rx) = create_queue(
             "mem".into(),
             QueueConfig {
                 queue_type: QueueType::Memory,
                 capacity: 4,
-                overflow: OverflowStrategy::Block,
             },
         )
         .unwrap();
@@ -793,214 +814,118 @@ mod write_with_retry_tests {
         );
     }
 
-    /// Writer that always returns a `RenderError`-wrapped error — used
-    /// to drive the "render-err goes straight to DLQ" path.
-    struct RenderFailWriter {
+    // ---- QueueAckHandle unit tests ----
+
+    #[tokio::test]
+    async fn ack_handle_resolve_delivered_sends_delivered() {
+        let (handle, mut rx) = QueueAckHandle::for_test();
+        handle.resolve_delivered();
+        assert_eq!(rx.recv().await, Some(AckDisposition::Delivered));
+        assert_eq!(rx.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn ack_handle_resolve_recovered_sends_recovered() {
+        let (handle, mut rx) = QueueAckHandle::for_test();
+        handle.resolve_recovered();
+        assert_eq!(rx.recv().await, Some(AckDisposition::Recovered));
+        assert_eq!(rx.recv().await, None);
+    }
+
+    /// Dropping a handle without resolving sends `Dropped` so the
+    /// consumer can still advance the cursor (avoiding queue stall on
+    /// a buggy output) and bumps `events_failed`. The debug_assert
+    /// path is exercised by `debug_assert_panics_on_handle_drop_without_resolve`.
+    #[cfg(not(debug_assertions))]
+    #[tokio::test]
+    async fn ack_handle_drop_without_resolve_sends_dropped_in_release() {
+        let (handle, mut rx) = QueueAckHandle::for_test();
+        drop(handle);
+        assert_eq!(rx.recv().await, Some(AckDisposition::Dropped));
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "QueueAckHandle dropped without explicit resolve")]
+    async fn debug_assert_panics_on_handle_drop_without_resolve() {
+        let (handle, _rx) = QueueAckHandle::for_test();
+        drop(handle);
+    }
+
+    // ---- consumer loop ack-bookkeeping ----
+
+    /// Build a queue + spawn the consumer driving `writer`. Returns the
+    /// sender, a shutdown signal, and the join handle.
+    async fn spawn_consumer(
+        writer: Arc<dyn Output>,
         metrics: Arc<crate::metrics::OutputMetrics>,
-    }
-
-    impl RenderFailWriter {
-        fn new() -> Self {
-            Self {
-                metrics: Arc::new(crate::metrics::OutputMetrics::default()),
-            }
-        }
-    }
-
-    impl HasMetrics for RenderFailWriter {
-        type Stats = crate::metrics::OutputMetrics;
-        fn metrics(&self) -> Arc<crate::metrics::OutputMetrics> {
-            Arc::clone(&self.metrics)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Output for RenderFailWriter {
-        async fn consume(&self, _event: &Event) -> anyhow::Result<()> {
-            Err(crate::modules::RenderError::new(anyhow::anyhow!(
-                "intentional render failure"
-            ))
-            .into())
-        }
+    ) -> (
+        QueueSender,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (sender, receiver) = create_queue(
+            "test".into(),
+            QueueConfig {
+                queue_type: QueueType::Memory,
+                capacity: 16,
+            },
+        )
+        .unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(run_queue_consumer(
+            receiver,
+            writer,
+            None,
+            metrics,
+            None,
+            shutdown_rx,
+        ));
+        (sender, shutdown_tx, handle)
     }
 
     #[tokio::test]
-    async fn render_err_goes_straight_to_dlq() {
-        // Render errors bypass retry and route directly to recovery:
-        // a RenderError from `consume` bypasses the
-        // retry budget and lands directly in the DLQ. Exactly 1 call,
-        // 0 retries counted, events_failed += 1, JSONL record's reason
-        // contains "render failed".
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("errored.jsonl");
-        let el = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
-        let m = fresh_metrics();
-        let disposition = write_with_retry(
-            &RenderFailWriter::new(),
-            owned_event(),
-            &fast_cfg(5),
-            "primary",
-            &m,
-            None,
-            Some(&el),
-        )
-        .await;
-        assert_eq!(disposition, WriteDisposition::DroppedToRecovery);
-        assert_eq!(m.events_failed.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            m.retries.load(Ordering::Relaxed),
-            0,
-            "render error must not count as a retry"
-        );
-        let body = tokio::fs::read_to_string(&path).await.unwrap();
-        let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines.len(), 1);
-        let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(v["process"], "(output primary)");
-        assert!(
-            v["reason"].as_str().unwrap().contains("render failed"),
-            "reason should mark render failure, got: {}",
-            v["reason"]
-        );
-    }
-
-    #[tokio::test]
-    async fn render_err_with_no_error_log_returns_dropped() {
-        // Same render-err shape but no DLQ configured: behave like the
-        // legacy unrecoverable drop path — `Dropped`, events_failed += 1,
-        // no retries.
-        let m = fresh_metrics();
-        let disposition = write_with_retry(
-            &RenderFailWriter::new(),
-            owned_event(),
-            &fast_cfg(5),
-            "primary",
-            &m,
-            None,
-            None,
-        )
-        .await;
-        assert_eq!(disposition, WriteDisposition::Dropped);
-        assert_eq!(m.events_failed.load(Ordering::Relaxed), 1);
-        assert_eq!(m.retries.load(Ordering::Relaxed), 0);
-    }
-
-    // ---- retry-exhausted recovery routing ----
-
-    /// Stub writer that *always* refuses the write — every test below
-    /// drives the retry-exhaustion path, so the underlying writer just
-    /// has to fail predictably without any per-test scripting.
-    struct AlwaysFailWriter {
-        metrics: Arc<crate::metrics::OutputMetrics>,
-    }
-
-    impl AlwaysFailWriter {
-        fn new() -> Self {
-            Self {
-                metrics: Arc::new(crate::metrics::OutputMetrics::default()),
-            }
+    async fn consumer_acks_each_delivered_event() {
+        let writer = Arc::new(ScriptedWriter::new(vec![
+            Outcome::Delivered,
+            Outcome::Delivered,
+            Outcome::Delivered,
+        ]));
+        let metrics = Arc::new(crate::metrics::OutputMetrics::default());
+        let (sender, shutdown, handle) =
+            spawn_consumer(writer.clone() as Arc<dyn Output>, Arc::clone(&metrics)).await;
+        for _ in 0..3 {
+            sender.send(owned_event()).await.unwrap();
         }
+        // Tickle shutdown so the consumer wraps up; it must still
+        // process the events already on the queue.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let _ = shutdown.send(true);
+        handle.await.unwrap();
+        assert_eq!(writer.calls(), 3);
+        // Delivered dispositions do not bump `events_failed`.
+        assert_eq!(metrics.events_failed.load(Ordering::Relaxed), 0);
     }
 
-    impl HasMetrics for AlwaysFailWriter {
-        type Stats = crate::metrics::OutputMetrics;
-        fn metrics(&self) -> Arc<crate::metrics::OutputMetrics> {
-            Arc::clone(&self.metrics)
+    #[tokio::test]
+    async fn consumer_handles_bug_path_via_drop_fallthrough() {
+        // The bug path drops the handle without resolving — Drop sends
+        // `Dropped`, and Drop's debug_assert fires on debug builds. We
+        // only run this assertion in release builds (panics in debug
+        // would make the test fail). The path still exists and is
+        // counted; we just don't materialise the panic here.
+        if cfg!(debug_assertions) {
+            return;
         }
-    }
-
-    #[async_trait::async_trait]
-    impl Output for AlwaysFailWriter {
-        async fn consume(&self, _event: &Event) -> anyhow::Result<()> {
-            Err(anyhow::anyhow!("permanent failure"))
-        }
-    }
-
-    fn error_log_in(dir: &tempfile::TempDir) -> (Arc<crate::error_log::ErrorLogWriter>, PathBuf) {
-        let path = dir.path().join("errored.jsonl");
-        (
-            Arc::new(crate::error_log::ErrorLogWriter::new(path.clone())),
-            path,
-        )
-    }
-
-    use std::path::PathBuf;
-
-    #[tokio::test]
-    async fn error_log_persists_and_returns_dropped_to_recovery() {
-        // Retry-exhausted recovery happy path: retries exhaust, `error_log` captures the
-        // payload. Must report `DroppedToRecovery` and the JSONL file
-        // must contain one record carrying the original ingress.
-        let dir = tempfile::tempdir().unwrap();
-        let (el, path) = error_log_in(&dir);
-        let m = fresh_metrics();
-        let disposition = write_with_retry(
-            &AlwaysFailWriter::new(),
-            owned_event(),
-            &fast_cfg(2),
-            "primary",
-            &m,
-            None,
-            Some(&el),
-        )
-        .await;
-        assert_eq!(disposition, WriteDisposition::DroppedToRecovery);
-        let body = tokio::fs::read_to_string(&path).await.unwrap();
-        let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines.len(), 1, "expected exactly one JSONL record");
-        let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(v["process"], "(output primary)");
-        assert!(v["reason"].as_str().unwrap().contains("permanent failure"));
-        assert!(v["event"].get("ingress").is_some());
-        assert_eq!(m.events_failed.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn no_error_log_preserves_existing_dropped_behavior() {
-        // Boundary-contract regression anchor for the 0.7.7 baseline: with no
-        // `error_log` configured, retry-exhaustion must still surface
-        // `Dropped`. The warn line is observable in logs but not
-        // asserted here.
-        let m = fresh_metrics();
-        let disposition = write_with_retry(
-            &AlwaysFailWriter::new(),
-            owned_event(),
-            &fast_cfg(2),
-            "primary",
-            &m,
-            None,
-            None,
-        )
-        .await;
-        assert_eq!(disposition, WriteDisposition::Dropped);
-        assert_eq!(m.events_failed.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn error_log_write_failure_falls_back_to_dropped_without_recursion() {
-        // Last-resort recovery path: error_log is configured but its
-        // parent dir does not exist, so `write()` returns Err. The
-        // function must warn and return `Dropped` (NOT
-        // `DroppedToRecovery`), and must not retry the error_log write
-        // or panic.
-        let dir = tempfile::tempdir().unwrap();
-        // Point at a path whose parent is missing — write() will fail
-        // at open time. ErrorLogWriter::new doesn't validate eagerly.
-        let bad_path = dir.path().join("missing-subdir/errored.jsonl");
-        let el = Arc::new(crate::error_log::ErrorLogWriter::new(bad_path));
-        let m = fresh_metrics();
-        let disposition = write_with_retry(
-            &AlwaysFailWriter::new(),
-            owned_event(),
-            &fast_cfg(2),
-            "primary",
-            &m,
-            None,
-            Some(&el),
-        )
-        .await;
-        assert_eq!(disposition, WriteDisposition::Dropped);
-        assert_eq!(m.events_failed.load(Ordering::Relaxed), 1);
+        let writer = Arc::new(ScriptedWriter::new(vec![Outcome::Bug]));
+        let metrics = Arc::new(crate::metrics::OutputMetrics::default());
+        let (sender, shutdown, handle) =
+            spawn_consumer(writer.clone() as Arc<dyn Output>, Arc::clone(&metrics)).await;
+        sender.send(owned_event()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let _ = shutdown.send(true);
+        handle.await.unwrap();
+        assert!(metrics.events_failed.load(Ordering::Relaxed) >= 1);
     }
 }
 

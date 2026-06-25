@@ -63,8 +63,8 @@ use crate::event::Event;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::http_util::{ERROR_BODY_BYTE_CAP, error_snippet};
 use crate::modules::output::syslog_peers::{PEER_COOLDOWN, iter_peers_block};
-use crate::modules::{HasMetrics, Module, Output};
-use crate::queue::{BackoffStrategy, RetryConfig};
+use crate::modules::{HasMetrics, Module, Output, OutputBuilderWithErrorLog};
+use crate::queue::{BackoffStrategy, QueueAckHandle, RetryConfig};
 use crate::tls::ClientTlsConfig;
 
 use super::{BatchLevel, decode_drained_to_request};
@@ -148,11 +148,11 @@ struct Inner {
     /// drained batch (the queue layer's per-event retry only re-pushes
     /// the most recent Event).
     retry_config: RetryConfig,
-    /// Buffered events awaiting flush. Render happens at flush time
-    /// (batch buffers retain Event until flush) so per-event render
-    /// failures can be routed to DLQ on their own without dropping the
-    /// rest of the batch.
-    batch: Mutex<Vec<Event>>,
+    /// Buffered events awaiting flush, paired with their queue ack
+    /// handles. Render happens at flush time so per-event render
+    /// failures route to DLQ on their own; the ack resolves at flush
+    /// time (delivered / recovered) — never at `consume` return.
+    batch: Mutex<Vec<(Event, QueueAckHandle)>>,
     /// Operator-facing instance name; surfaced on shutdown-flush
     /// recovery and render-failure records.
     name: String,
@@ -358,13 +358,11 @@ impl Module for OtlpHttpOutput {
     }
 
     fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
-        <Self as crate::modules::OutputBuilderWithErrorLog>::from_properties_with_error_log(
-            name, properties, None,
-        )
+        <Self as OutputBuilderWithErrorLog>::from_properties_with_error_log(name, properties, None)
     }
 }
 
-impl crate::modules::OutputBuilderWithErrorLog for OtlpHttpOutput {
+impl OutputBuilderWithErrorLog for OtlpHttpOutput {
     fn from_properties_with_error_log(
         name: &str,
         properties: &crate::modules::ModuleProperties,
@@ -447,68 +445,64 @@ impl HasMetrics for OtlpHttpOutput {
 
 #[async_trait::async_trait]
 impl Output for OtlpHttpOutput {
-    /// Batched-buffer rendering: buffer the `Event` (no render yet), decide
-    /// flush-or-arm-timer. Render happens later in `flush()` so a
-    /// per-event render failure is routed to DLQ on its own without
-    /// dropping the rest of the batch.
-    async fn consume(&self, event: &Event) -> Result<()> {
+    async fn consume(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
         let mut batch = self.inner.batch.lock().await;
-        batch.push(event.clone());
+        batch.push((event.clone(), ack));
         let should_flush = batch.len() >= self.batch_size;
         drop(batch);
         if should_flush {
-            self.flush().await
+            self.flush().await;
         } else {
             self.ensure_flush_timer().await;
-            Ok(())
         }
+        Ok(())
     }
 
     async fn shutdown(
         &self,
         error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
     ) -> Result<()> {
-        // Abort any pending timer so it cannot race with us for the
-        // buffer lock. Then drain whatever is left in one final
-        // send.
         if let Some(h) = self.flush_handle.lock().await.take() {
             h.abort();
         }
-        match self.flush().await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // Shutdown-flush recovery: drain leftover `Event`s into
-                // `error_log` carrying real source/ingress/received_at;
-                // preserve 0.7.7 (warn + drop via the queue consumer)
-                // when not configured.
-                if let Some(writer) = error_log {
-                    let events: Vec<Event> =
-                        std::mem::take(&mut *self.inner.batch.lock().await);
-                    crate::modules::write_shutdown_events_to_error_log(
-                        writer,
-                        &self.inner.name,
-                        events,
-                        &e,
-                    )
-                    .await;
-                    Ok(())
-                } else {
-                    Err(e)
+        self.flush().await;
+        let leftovers = std::mem::take(&mut *self.inner.batch.lock().await);
+        if !leftovers.is_empty() {
+            let err = anyhow::anyhow!("shutdown leftover after final flush");
+            if let Some(writer) = error_log {
+                crate::modules::write_shutdown_events_to_error_log(
+                    writer,
+                    &self.inner.name,
+                    leftovers,
+                    &err,
+                )
+                .await;
+            } else {
+                tracing::warn!(
+                    "output '{}': {} events dropped at shutdown (no error_log)",
+                    self.inner.name,
+                    leftovers.len()
+                );
+                for (_, ack) in leftovers {
+                    self.inner
+                        .metrics
+                        .events_failed
+                        .fetch_add(1, Ordering::Relaxed);
+                    ack.resolve_recovered();
                 }
             }
         }
+        Ok(())
     }
 }
 
 impl OtlpHttpOutput {
-    /// Drain the current batch, build an ExportLogsServiceRequest, and
-    /// ship it. No-op if the buffer is empty.
-    async fn flush(&self) -> Result<()> {
-        let batch: Vec<Event> = {
+    async fn flush(&self) {
+        let batch = {
             let mut buf = self.inner.batch.lock().await;
             std::mem::take(&mut *buf)
         };
-        self.inner.flush_events(batch).await
+        self.inner.flush_events(batch).await;
     }
 
     /// Schedule (or refresh) a deferred flush so events do not sit in
@@ -524,74 +518,55 @@ impl OtlpHttpOutput {
         let inner = Arc::clone(&self.inner);
         let new_handle = tokio::spawn(async move {
             tokio::time::sleep(inner.batch_timeout).await;
-            let batch: Vec<Event> = {
+            let batch = {
                 let mut buf = inner.batch.lock().await;
                 std::mem::take(&mut *buf)
             };
-            if let Err(e) = inner.flush_events(batch).await {
-                tracing::warn!("otlp_http flush timer: {}", e);
-            }
+            inner.flush_events(batch).await;
         });
         *handle = Some(new_handle);
     }
 }
 
 impl Inner {
-    /// Render each buffered event, route per-event render failures to
-    /// DLQ (skipping them in the batch), then ship the remaining
-    /// payloads via `send_batch`. On transport failure the un-rendered
-    /// events are restored to the buffer for retry.
-    async fn flush_events(&self, batch: Vec<Event>) -> Result<()> {
+    /// Drain + ship one batch, resolving each handle to its final
+    /// disposition. Infallible: every entry has its disposition
+    /// committed before this returns. Per-event render failures route
+    /// to DLQ (Recovered); the rest go through `send_batch` (which
+    /// owns its own retry budget). On transport exhaust the shippable
+    /// subset routes to DLQ as Recovered. Partial-success rejects from
+    /// the collector are counted as Recovered too (the spec doesn't
+    /// tell us which records were rejected, so we attribute the
+    /// rejection to the first N entries; metrics totals are accurate
+    /// even if per-event attribution is approximate).
+    async fn flush_events(&self, batch: Vec<(Event, QueueAckHandle)>) {
         if batch.is_empty() {
-            return Ok(());
+            return;
         }
         let mut payloads: Vec<Bytes> = Vec::with_capacity(batch.len());
-        let mut shippable: Vec<Event> = Vec::with_capacity(batch.len());
-        let mut render_failures: Vec<(Event, anyhow::Error)> = Vec::new();
-        for ev in batch {
+        let mut shippable: Vec<(Event, QueueAckHandle)> = Vec::with_capacity(batch.len());
+        let mut render_failures: Vec<(Event, QueueAckHandle, anyhow::Error)> = Vec::new();
+        for (ev, ack) in batch {
             match render_event(&ev) {
                 Ok(p) => {
                     payloads.push(p);
-                    shippable.push(ev);
+                    shippable.push((ev, ack));
                 }
-                Err(e) => render_failures.push((ev, e)),
+                Err(e) => render_failures.push((ev, ack, e)),
             }
         }
-        if !render_failures.is_empty() {
-            let error_log = self.error_log.as_ref();
-            for (ev, err) in render_failures {
-                self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-                if let Some(writer) = &error_log {
-                    let ctx = crate::pipeline::ErroredEventContext {
-                        timestamp: chrono::Utc::now(),
-                        pipeline: String::new(),
-                        process: format!("(output {})", self.name),
-                        reason: format!("render failed during batch flush: {}", err),
-                        event: ev,
-                    };
-                    if let Err(write_err) = writer.write(&ctx).await {
-                        tracing::warn!(
-                            "output '{}': error_log write failed during batch render: {}",
-                            self.name,
-                            write_err
-                        );
-                    }
-                } else {
-                    tracing::error!(
-                        "output '{}': render failed during batch flush ({}); dropping event (no error_log)",
-                        self.name,
-                        err
-                    );
-                }
-            }
+        for (ev, ack, err) in render_failures {
+            let reason = format!("render failed during batch flush: {}", err);
+            crate::modules::route_event_to_dlq(self.error_log.as_ref(), &self.name, &ev, &reason)
+                .await;
+            self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+            ack.resolve_recovered();
         }
         if payloads.is_empty() {
-            return Ok(());
+            return;
         }
-        let count = payloads.len() as u64;
-        // Clone payloads so the originals survive for buffer restore
-        // on transport error. `Bytes::clone` is a refcount bump.
-        match send_batch(self, payloads.clone()).await {
+        let count = shippable.len() as u64;
+        match send_batch(self, payloads).await {
             Ok(outcome) => {
                 let rejected = outcome.rejected.min(count);
                 let written = count - rejected;
@@ -605,17 +580,43 @@ impl Inner {
                         .events_failed
                         .fetch_add(rejected, Ordering::Relaxed);
                 }
-                Ok(())
+                // Partial-success attribution: the OTLP spec does not
+                // identify which records were rejected, so we approximate
+                // by routing the trailing `rejected` entries to the DLQ
+                // and resolving the rest as Delivered. Metric totals
+                // are accurate either way.
+                let split = (count - rejected) as usize;
+                let mut iter = shippable.into_iter();
+                for (_, ack) in iter.by_ref().take(split) {
+                    ack.resolve_delivered();
+                }
+                for (ev, ack) in iter {
+                    let reason = "collector reported partial_success rejection".to_string();
+                    crate::modules::route_event_to_dlq(
+                        self.error_log.as_ref(),
+                        &self.name,
+                        &ev,
+                        &reason,
+                    )
+                    .await;
+                    ack.resolve_recovered();
+                }
             }
             Err(e) => {
-                // Restore the shippable events for retry (the queue
-                // layer's per-event retry only re-pushes the latest
-                // event; OTLP batches need internal retention).
-                let mut buf = self.batch.lock().await;
-                let new_events = std::mem::take(&mut *buf);
-                *buf = shippable;
-                buf.extend(new_events);
-                Err(e)
+                // send_batch's retry budget already exhausted. DLQ
+                // every event and resolve Recovered.
+                let reason = format!("flush failed: {}", e);
+                for (ev, ack) in shippable {
+                    crate::modules::route_event_to_dlq(
+                        self.error_log.as_ref(),
+                        &self.name,
+                        &ev,
+                        &reason,
+                    )
+                    .await;
+                    self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                    ack.resolve_recovered();
+                }
             }
         }
     }
@@ -1020,8 +1021,18 @@ mod tests {
     }
 
     /// Test shim mirroring the queue consumer's `consume` call.
+    /// Synthesises a 0.7.x-style `Result<()>` from the new ack handle:
+    /// - `Ok(())` — Delivered, or no disposition yet (parked).
+    /// - `Err(...)` — Recovered (DLQ-routed).
     async fn consume(output: &OtlpHttpOutput, ev: &Event) -> Result<()> {
-        output.consume(ev).await
+        let (ack, mut rx) = QueueAckHandle::for_test();
+        let _ = output.consume(ev, ack).await;
+        match rx.try_recv() {
+            Ok(crate::queue::AckDisposition::Delivered) => Ok(()),
+            Ok(crate::queue::AckDisposition::Recovered) => Err(anyhow::anyhow!("recovered to DLQ")),
+            Ok(crate::queue::AckDisposition::Dropped) => Err(anyhow::anyhow!("dropped")),
+            Err(_) => Ok(()),
+        }
     }
 
     async fn wait_for<T>(mut probe: impl FnMut() -> Option<T>) -> T {
@@ -1259,10 +1270,10 @@ mod tests {
         let output = OtlpHttpOutput::from_properties("test", &mp(&props)).unwrap();
         let err = consume(&output, &event_with_egress(singleton_bytes(456))).await
             .expect_err("send must fail after retries exhausted");
-        assert!(
-            err.to_string().contains("503") || err.to_string().contains("HTTP"),
-            "unexpected error after retry exhaustion: {err}"
-        );
+        // The underlying transport error is consumed by the
+        // DLQ-routing path; the test only sees the Recovered
+        // disposition surfaced by the shim.
+        assert!(err.to_string().contains("recovered"), "got: {err}");
         server.abort();
     }
 
@@ -1376,7 +1387,14 @@ mod tests {
 
         for i in 0..3 {
             let ev = event_with_egress(singleton_bytes(900_000_000 + i));
-            consume(&output, &ev).await.unwrap();
+            // With batch_size=3 the per-event disposition isn't observable
+            // via the test shim's freshly-allocated handle channel — the
+            // first two events stay buffered (handle held by the output)
+            // and the third triggers an inline flush whose per-event
+            // outcome can be Delivered OR Recovered depending on the
+            // partial-success split order. The metric counts (asserted
+            // below) are the contract under test.
+            let _ = consume(&output, &ev).await;
         }
         for _ in 0..50 {
             if output.metrics.events_written.load(Ordering::Relaxed)
@@ -1439,18 +1457,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flush_failure_restores_batch_to_buffer() {
-        // Regression: `flush()` used to drain the batch and, on
-        // transport failure, just bump events_failed and drop the
-        // drained events. `output http` retained them for retry; OTLP
-        // was the odd one out. The fix restores the drained batch
-        // into the buffer so the next write or timer firing has a
-        // chance to ship them.
+    async fn flush_failure_routes_batch_to_dlq_and_resolves_recovered() {
+        // When a batch flush exhausts the per-flush retry budget,
+        // every entry routes to the DLQ and its ack handle resolves
+        // as Recovered. Buffer must be empty afterwards — no more
+        // "restore on failure"; the queue cursor advances when the
+        // ack channel fires.
         let mut props = one_peer_props("http://127.0.0.1:1");
         props.push(prop_int("batch_size", 2));
         props.push(prop_str("batch_timeout", "30s"));
-        // Single attempt against the unreachable peer so the test
-        // doesn't sit through the default retry backoff.
         props.push(Property::Block {
             key: "retry".into(),
             key_span: None,
@@ -1462,34 +1477,23 @@ mod tests {
         });
         let output = OtlpHttpOutput::from_properties("test", &mp(&props)).unwrap();
 
-        // First consume fills the buffer below batch_size — no flush.
-        consume(&output, &event_with_egress(singleton_bytes(1)))
+        let (ack1, mut rx1) = QueueAckHandle::for_test();
+        output
+            .consume(&event_with_egress(singleton_bytes(1)), ack1)
             .await
             .unwrap();
-        assert_eq!(output.inner.batch.lock().await.len(), 1);
-
-        // Second consume tips the batch over batch_size, triggers
-        // flush() against the unreachable peer, which must Err.
-        let err = consume(&output, &event_with_egress(singleton_bytes(2)))
+        assert!(rx1.try_recv().is_err(), "buffered → not yet resolved");
+        let (ack2, mut rx2) = QueueAckHandle::for_test();
+        output
+            .consume(&event_with_egress(singleton_bytes(2)), ack2)
             .await
-            .expect_err("flush against unreachable peer must fail");
-        assert!(
-            err.to_string().contains("otlp_http"),
-            "expected ship error, got: {err}"
-        );
-
-        // Regression assertion: both events must still be in the
-        // buffer (old code dropped them; the events_failed counter
-        // would have been bumped to 2).
-        let batch_len = output.inner.batch.lock().await.len();
+            .unwrap();
+        assert_eq!(rx1.recv().await, Some(crate::queue::AckDisposition::Recovered));
+        assert_eq!(rx2.recv().await, Some(crate::queue::AckDisposition::Recovered));
         assert_eq!(
-            batch_len, 2,
-            "flush failure must put the drained batch back into the buffer",
-        );
-        let failed = output.metrics.events_failed.load(Ordering::Relaxed);
-        assert_eq!(
-            failed, 0,
-            "events retained for retry must NOT be counted as failed yet (got {failed})",
+            output.inner.batch.lock().await.len(),
+            0,
+            "buffer must be empty — handles already resolved",
         );
     }
 
@@ -1636,24 +1640,12 @@ mod tests {
         let result = send.await.unwrap();
         stall.abort();
 
-        let err = result.expect_err("stalled peer must surface as Err");
-        // Walk the anyhow chain; reqwest's timeout shows up as
-        // `error sending request for url (...): operation timed out`
-        // in the underlying reqwest::Error, while the top-level
-        // anyhow context says "POST ... failed".
-        let mut chain_text = String::new();
-        let mut current: &dyn std::error::Error = err.as_ref();
-        chain_text.push_str(&current.to_string());
-        while let Some(src) = current.source() {
-            chain_text.push_str(" -> ");
-            chain_text.push_str(&src.to_string());
-            current = src;
-        }
-        let chain_lower = chain_text.to_ascii_lowercase();
-        assert!(
-            chain_lower.contains("timed out") || chain_lower.contains("timeout"),
-            "expected timeout-flavoured error somewhere in the chain, got: {chain_text}"
-        );
+        let err = result.expect_err("stalled peer must surface as Recovered");
+        // The underlying timeout error is consumed by the
+        // DLQ-routing path; the shim only surfaces the Recovered
+        // disposition. Asserting the timeout pin still works on the
+        // raw `send_batch` path elsewhere.
+        assert!(err.to_string().contains("recovered"), "got: {err}");
     }
 
     #[test]
@@ -1714,12 +1706,16 @@ mod tests {
     #[tokio::test]
     async fn shutdown_failure_with_error_log_persists_buffer() {
         let props = shutdown_recovery_props("http://127.0.0.1:1/v1/logs");
-        let output = OtlpHttpOutput::from_properties("myout", &mp(&props)).unwrap();
-        buffer_two(&output).await;
-
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("errored.jsonl");
         let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
+        let output = OtlpHttpOutput::from_properties_with_error_log(
+            "myout",
+            &mp(&props),
+            Some(Arc::clone(&writer)),
+        )
+        .unwrap();
+        buffer_two(&output).await;
 
         output.shutdown(Some(&writer)).await.unwrap();
         assert_eq!(output.inner.batch.lock().await.len(), 0);
@@ -1729,20 +1725,23 @@ mod tests {
         assert_eq!(lines.len(), 2);
         for line in &lines {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
-            assert_eq!(v["process"], "(output myout shutdown)");
-            assert!(v["reason"].as_str().unwrap().contains("shutdown flush"));
+            assert_eq!(v["process"], "(output myout)");
+            // The reason carries the underlying transport error from
+            // `flush_events`; the exact wording is implementation
+            // detail.
+            assert!(v["event"]["ingress"].is_string() || v["event"]["ingress"].is_object());
         }
     }
 
     #[tokio::test]
-    async fn shutdown_failure_without_error_log_matches_077() {
+    async fn shutdown_failure_without_error_log_returns_ok() {
+        // Shutdown is infallible from the caller's POV.
         let props = shutdown_recovery_props("http://127.0.0.1:1/v1/logs");
         let output = OtlpHttpOutput::from_properties("test", &mp(&props)).unwrap();
         buffer_two(&output).await;
 
-        let err = output.shutdown(None).await.expect_err("flush must Err");
-        assert!(err.to_string().contains("otlp_http"), "got: {err}");
-        assert_eq!(output.inner.batch.lock().await.len(), 2);
+        output.shutdown(None).await.expect("shutdown is infallible");
+        assert_eq!(output.inner.batch.lock().await.len(), 0);
     }
 
     #[tokio::test]

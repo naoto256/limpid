@@ -65,7 +65,8 @@ use crate::event::Event;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::http_util::{ERROR_BODY_BYTE_CAP, error_snippet};
 use crate::modules::output::syslog_peers::{PEER_COOLDOWN, iter_peers_block};
-use crate::modules::{HasMetrics, Module, Output};
+use crate::modules::{HasMetrics, Module, Output, OutputBuilderWithErrorLog};
+use crate::queue::{QueueAckHandle, RetryConfig};
 use crate::tls::ClientTlsConfig;
 
 const HTTP_PEER_SCHEMA: &[PropertySpec] = &[
@@ -194,14 +195,22 @@ struct Inner {
     headers: Vec<(String, String)>,
     batch_timeout: Duration,
     compress: bool,
-    /// Buffered events awaiting flush. Render happens at flush time
-    /// (batch buffers retain Event until flush) so a per-event render
-    /// failure can be routed to DLQ on its own without dropping the
-    /// rest of the batch.
-    batch: Mutex<Vec<Event>>,
+    /// Buffered events awaiting flush, paired with their queue ack
+    /// handles. Render happens at flush time so per-event render
+    /// failures can be routed to DLQ on their own without dropping
+    /// the rest of the batch; the ack handle resolves when the
+    /// event's disposition is decided (delivered on flush success,
+    /// recovered on DLQ landing).
+    batch: Mutex<Vec<(Event, QueueAckHandle)>>,
     /// Operator-facing instance name; surfaced on shutdown-flush
     /// recovery and render-failure records.
     name: String,
+    /// Per-flush retry policy. Without an internal retry, one
+    /// transient ship failure would lose the whole drained batch
+    /// (the queue layer's per-event redelivery only sees the most
+    /// recent event). The retry budget for batched outputs lives
+    /// entirely here.
+    retry: RetryConfig,
     /// `error_log` writer injected at construction time by the
     /// runtime via `OutputBuilderWithErrorLog::from_properties_with_error_log`.
     /// Used by the flush path to route per-event render failures and
@@ -346,13 +355,11 @@ impl Module for HttpOutput {
         // direct callers) still works; the runtime always goes
         // through `OutputBuilderWithErrorLog::from_properties_with_error_log`
         // to inject the operator-configured writer.
-        <Self as crate::modules::OutputBuilderWithErrorLog>::from_properties_with_error_log(
-            name, properties, None,
-        )
+        <Self as OutputBuilderWithErrorLog>::from_properties_with_error_log(name, properties, None)
     }
 }
 
-impl crate::modules::OutputBuilderWithErrorLog for HttpOutput {
+impl OutputBuilderWithErrorLog for HttpOutput {
     fn from_properties_with_error_log(
         name: &str,
         properties: &crate::modules::ModuleProperties,
@@ -412,6 +419,7 @@ impl crate::modules::OutputBuilderWithErrorLog for HttpOutput {
 
         let peer_state = peers.iter().map(|_| PeerState::default()).collect();
 
+        let retry = RetryConfig::from_output_properties(properties)?;
         let metrics = Arc::new(OutputMetrics::default());
         Ok(Self {
             inner: Arc::new(Inner {
@@ -425,6 +433,7 @@ impl crate::modules::OutputBuilderWithErrorLog for HttpOutput {
                 compress,
                 batch: Mutex::new(Vec::with_capacity(batch_size.max(1))),
                 name: name.to_string(),
+                retry,
                 error_log,
                 metrics: Arc::clone(&metrics),
             }),
@@ -444,105 +453,150 @@ impl HasMetrics for HttpOutput {
 
 #[async_trait::async_trait]
 impl Output for HttpOutput {
-    /// Batched-buffer rendering: buffer the `Event` (no render yet), decide
-    /// flush-or-arm-timer. Render happens later in `flush()` so a
-    /// per-event render failure is routed to DLQ on its own without
-    /// dropping the rest of the batch. Returns `Ok(())` as soon as the
-    /// event is durably enqueued into the in-memory batch buffer;
-    /// the actual HTTP transport may run later inside `flush()` and
-    /// surface its error to the next `consume` call.
-    async fn consume(&self, event: &Event) -> Result<()> {
+    /// Batched-buffer consume: park the `(Event, ack)` pair in the
+    /// in-memory buffer and arm/run the flush. The ack handle stays
+    /// with the event and resolves at flush time (delivered or
+    /// recovered) — not now. Returning `Ok(())` only signals that
+    /// the output took ownership of the lifecycle.
+    async fn consume(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
         if self.batch_size <= 1 {
-            // Short-circuit: render + ship a single event inline.
-            // Mirrors the prior `batch_size <= 1` fast path.
-            return self.consume_singleton(event).await;
+            return self.consume_singleton(event, ack).await;
         }
-
         let should_flush = {
             let mut buf = self.inner.batch.lock().await;
-            buf.push(event.clone());
+            buf.push((event.clone(), ack));
             buf.len() >= self.batch_size
         };
-
         if should_flush {
             self.cancel_timer().await;
-            let res = self.flush().await;
-            if res.is_err() {
-                // flush() put the batch back into the buffer on
-                // failure. Re-arm so batch_timeout drives a retry
-                // — without it the stuck batch would sit there
-                // until the next consume arrives.
+            self.flush().await;
+            // After flush, the buffer should be empty (flush_events
+            // resolved every handle). Defensive: re-arm if anything
+            // raced its way back in.
+            if !self.inner.batch.lock().await.is_empty() {
                 self.reset_timer().await;
             }
-            res
         } else {
             self.reset_timer().await;
-            Ok(())
         }
+        Ok(())
     }
 
     async fn shutdown(
         &self,
         error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
     ) -> Result<()> {
-        // Cancel any pending timer first so it doesn't race with us
-        // for the buffer lock and end up double-flushing an
-        // already-empty buffer.
         self.cancel_timer().await;
-        match self.flush().await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // Shutdown-flush recovery (batch buffers retain Event
-                // until flush): `flush()` restored the
-                // drained batch into `self.inner.batch` on Err. When
-                // the operator opted in to `control { error_log "..." }`
-                // we persist each buffered `Event` as a DLQ record
-                // carrying real source/ingress/received_at (no
-                // synthetic Event construction).
-                if let Some(writer) = error_log {
-                    let events: Vec<Event> =
-                        std::mem::take(&mut *self.inner.batch.lock().await);
-                    crate::modules::write_shutdown_events_to_error_log(
-                        writer,
-                        &self.inner.name,
-                        events,
-                        &e,
-                    )
-                    .await;
-                    Ok(())
-                } else {
-                    Err(e)
+        // Run one final flush. The flush is infallible from the
+        // caller's POV — it either ships and resolves Delivered, or
+        // routes-to-DLQ and resolves Recovered for each leftover.
+        self.flush().await;
+        // Anything still sitting in the buffer (race with timer, or
+        // a re-entrant push) is sent through the shutdown DLQ helper.
+        let leftovers = std::mem::take(&mut *self.inner.batch.lock().await);
+        if !leftovers.is_empty() {
+            let err = anyhow::anyhow!("shutdown leftover after final flush");
+            if let Some(writer) = error_log {
+                crate::modules::write_shutdown_events_to_error_log(
+                    writer,
+                    &self.inner.name,
+                    leftovers,
+                    &err,
+                )
+                .await;
+            } else {
+                tracing::warn!(
+                    "output '{}': {} events dropped at shutdown (no error_log)",
+                    self.inner.name,
+                    leftovers.len()
+                );
+                for (_, ack) in leftovers {
+                    self.inner
+                        .metrics
+                        .events_failed
+                        .fetch_add(1, Ordering::Relaxed);
+                    ack.resolve_recovered();
                 }
             }
         }
+        Ok(())
     }
 }
 
 impl HttpOutput {
-    /// Render+ship one event inline (used by both the `batch_size <= 1`
-    /// short-circuit and shared with the singleton path). Render errors
-    /// are wrapped in `RenderError` so the queue consumer routes them
-    /// straight to DLQ; transport errors propagate normally for the
-    /// retry budget.
-    async fn consume_singleton(&self, event: &Event) -> Result<()> {
+    /// Render + ship one event inline (used when `batch_size <= 1`).
+    /// Drives the retry budget internally; resolves the ack based on
+    /// final disposition.
+    async fn consume_singleton(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
         let msg = match render_event(event) {
             Ok(m) => m,
-            Err(e) => return Err(crate::modules::RenderError::new(e).into()),
+            Err(e) => {
+                let reason = format!("render failed: {}", e);
+                crate::modules::route_event_to_dlq(
+                    self.inner.error_log.as_ref(),
+                    &self.inner.name,
+                    event,
+                    &reason,
+                )
+                .await;
+                self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                ack.resolve_recovered();
+                return Ok(());
+            }
         };
-        self.inner.send_batch(&[msg]).await?;
-        self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        let mut attempt = 0u32;
+        let mut wait = self.inner.retry.initial_wait;
+        loop {
+            match self.inner.send_batch(std::slice::from_ref(&msg)).await {
+                Ok(()) => {
+                    self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
+                    ack.resolve_delivered();
+                    return Ok(());
+                }
+                Err(e) => {
+                    attempt += 1;
+                    self.metrics.retries.fetch_add(1, Ordering::Relaxed);
+                    if attempt >= self.inner.retry.max_attempts {
+                        let reason =
+                            format!("output write failed after {} attempts: {}", attempt, e);
+                        crate::modules::route_event_to_dlq(
+                            self.inner.error_log.as_ref(),
+                            &self.inner.name,
+                            event,
+                            &reason,
+                        )
+                        .await;
+                        self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                        ack.resolve_recovered();
+                        return Ok(());
+                    }
+                    tracing::warn!(
+                        "output '{}': send failed (attempt {}/{}): {} — retrying in {:?}",
+                        self.inner.name,
+                        attempt,
+                        self.inner.retry.max_attempts,
+                        e,
+                        wait
+                    );
+                    tokio::time::sleep(wait).await;
+                    wait = self.inner.retry.next_wait(wait);
+                }
+            }
+        }
     }
 
-    async fn flush(&self) -> Result<()> {
+    /// Drain the buffer and run one flush. Returns nothing — every
+    /// dispatched event has its disposition resolved internally,
+    /// either via successful delivery or via DLQ routing.
+    async fn flush(&self) {
         let batch = {
             let mut buf = self.inner.batch.lock().await;
             if buf.is_empty() {
-                return Ok(());
+                return;
             }
             std::mem::take(&mut *buf)
         };
-        self.inner.flush_events(batch).await
+        self.inner.flush_events(batch).await;
     }
 
     async fn cancel_timer(&self) {
@@ -568,9 +622,7 @@ impl HttpOutput {
                 }
                 std::mem::take(&mut *buf)
             };
-            if let Err(e) = inner.flush_events(batch).await {
-                tracing::warn!("http output: timer flush failed: {}", e);
-            }
+            inner.flush_events(batch).await;
         }));
     }
 }
@@ -584,82 +636,83 @@ fn render_event(event: &Event) -> Result<String> {
 }
 
 impl Inner {
-    /// Render each buffered event, route per-event render failures to
-    /// DLQ (skipping them in the batch), then ship the remaining
-    /// rendered bodies. On transport failure the un-rendered events
-    /// are restored to the buffer (rendering re-runs on retry; render
-    /// is cheap text-extraction here).
-    async fn flush_events(&self, batch: Vec<Event>) -> Result<()> {
+    /// Drain + ship one batch, resolving each handle to its final
+    /// disposition. Infallible from the caller's POV: every entry
+    /// has its disposition committed before this returns. Render
+    /// failures route the offending event to DLQ on its own
+    /// (resolve_recovered); the rest proceed to the HTTP send loop.
+    /// Transport failures consume the per-flush retry budget; on
+    /// exhaust the whole shippable subset is routed to DLQ.
+    async fn flush_events(&self, batch: Vec<(Event, QueueAckHandle)>) {
         if batch.is_empty() {
-            return Ok(());
+            return;
         }
-        // Partition: render-success → messages, render-failure → DLQ.
         let mut messages: Vec<String> = Vec::with_capacity(batch.len());
-        let mut shippable: Vec<Event> = Vec::with_capacity(batch.len());
-        let mut render_failures: Vec<(Event, anyhow::Error)> = Vec::new();
-        for ev in batch {
+        let mut shippable: Vec<(Event, QueueAckHandle)> = Vec::with_capacity(batch.len());
+        let mut render_failures: Vec<(Event, QueueAckHandle, anyhow::Error)> = Vec::new();
+        for (ev, ack) in batch {
             match render_event(&ev) {
                 Ok(m) => {
                     messages.push(m);
-                    shippable.push(ev);
+                    shippable.push((ev, ack));
                 }
-                Err(e) => render_failures.push((ev, e)),
+                Err(e) => render_failures.push((ev, ack, e)),
             }
         }
-        if !render_failures.is_empty() {
-            // Route each render failure to DLQ on its own. Reuse the
-            // shared shutdown helper's per-event write recipe.
-            let error_log = self.error_log.as_ref();
-            for (ev, err) in render_failures {
-                self.metrics
-                    .events_failed
-                    .fetch_add(1, Ordering::Relaxed);
-                if let Some(writer) = &error_log {
-                    let ctx = crate::pipeline::ErroredEventContext {
-                        timestamp: chrono::Utc::now(),
-                        pipeline: String::new(),
-                        process: format!("(output {})", self.name),
-                        reason: format!("render failed during batch flush: {}", err),
-                        event: ev,
-                    };
-                    if let Err(write_err) = writer.write(&ctx).await {
-                        tracing::warn!(
-                            "output '{}': error_log write failed during batch render: {}",
-                            self.name,
-                            write_err
-                        );
-                    }
-                } else {
-                    tracing::error!(
-                        "output '{}': render failed during batch flush ({}); dropping event (no error_log)",
-                        self.name,
-                        err
-                    );
-                }
-            }
+        for (ev, ack, err) in render_failures {
+            let reason = format!("render failed during batch flush: {}", err);
+            crate::modules::route_event_to_dlq(self.error_log.as_ref(), &self.name, &ev, &reason)
+                .await;
+            self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+            ack.resolve_recovered();
         }
         if messages.is_empty() {
-            return Ok(());
+            return;
         }
-        let count = messages.len() as u64;
-        match self.send_batch(&messages).await {
-            Ok(()) => {
-                self.metrics
-                    .events_written
-                    .fetch_add(count, Ordering::Relaxed);
-                Ok(())
+        let count = shippable.len() as u64;
+        let mut attempt = 0u32;
+        let mut wait = self.retry.initial_wait;
+        let final_err = loop {
+            match self.send_batch(&messages).await {
+                Ok(()) => {
+                    self.metrics
+                        .events_written
+                        .fetch_add(count, Ordering::Relaxed);
+                    for (_, ack) in shippable {
+                        ack.resolve_delivered();
+                    }
+                    return;
+                }
+                Err(e) => {
+                    attempt += 1;
+                    self.metrics.retries.fetch_add(1, Ordering::Relaxed);
+                    if attempt >= self.retry.max_attempts {
+                        break e;
+                    }
+                    tracing::warn!(
+                        "output '{}': flush attempt {}/{} failed: {} — retrying in {:?}",
+                        self.name,
+                        attempt,
+                        self.retry.max_attempts,
+                        e,
+                        wait
+                    );
+                    tokio::time::sleep(wait).await;
+                    wait = self.retry.next_wait(wait);
+                }
             }
-            Err(e) => {
-                // Transport error: restore the shippable events into
-                // the buffer so the next consume_event / timer firing
-                // can retry. Do NOT bump events_failed — they're
-                // retained, not permanently rejected.
-                let mut buf = self.batch.lock().await;
-                let new_events = std::mem::take(&mut *buf);
-                *buf = shippable;
-                buf.extend(new_events);
-                Err(e)
-            }
+        };
+        // Retry exhausted: route every shippable event to DLQ and
+        // resolve Recovered. The batch is gone from the buffer at
+        // this point — the disk-queue cursor will not advance until
+        // every handle resolves, so a daemon crash here replays the
+        // batch on restart (the ack-handle invariant).
+        let reason = format!("flush failed after {} attempts: {}", attempt, final_err);
+        for (ev, ack) in shippable {
+            crate::modules::route_event_to_dlq(self.error_log.as_ref(), &self.name, &ev, &reason)
+                .await;
+            self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+            ack.resolve_recovered();
         }
     }
 
@@ -770,7 +823,9 @@ impl Drop for HttpOutput {
         }
         // Best-effort warn on leaked buffered events. Holding an Arc
         // here would block the warn under contention; try_lock is the
-        // right behaviour for a Drop path.
+        // right behaviour for a Drop path. Each leftover handle's
+        // own Drop impl fires `Dropped` back at the queue consumer
+        // — the cursor will not advance for them.
         if let Ok(buf) = self.inner.batch.try_lock()
             && !buf.is_empty()
         {
@@ -833,6 +888,30 @@ mod tests {
             key: "peers".into(),
             key_span: None,
             properties: peers,
+        }
+    }
+
+    /// Single-attempt `retry { max_attempts 1 ... }` block so tests
+    /// driving a failing peer don't churn through the default 5-attempt
+    /// retry budget (which would also sleep on each backoff). Retry
+    /// lives inside the output, so tests that used to assert "first
+    /// attempt errors" need to pin the budget to 1 to preserve that
+    /// semantic without surprise extra retries.
+    fn fast_retry_block() -> Property {
+        Property::Block {
+            key: "retry".into(),
+            key_span: None,
+            properties: vec![
+                prop_int("max_attempts", 1),
+                prop_str("initial_wait", "1ms"),
+                prop_str("max_wait", "1ms"),
+                Property::KeyValue {
+                    key: "backoff".into(),
+                    key_span: None,
+                    value: Expr::spanless(ExprKind::Ident(vec!["fixed".into()])),
+                    value_span: None,
+                },
+            ],
         }
     }
 
@@ -906,9 +985,25 @@ mod tests {
     }
 
     /// Test shim mirroring the queue consumer's call into
-    /// `Output::consume`.
+    /// `Output::consume`. Synthesises a 0.7.x-style `Result<()>` for
+    /// the test bodies that already speak that vocabulary:
+    /// - `Ok(())` — Delivered, OR no disposition yet (event parked
+    ///   in the in-memory batch buffer waiting for a future flush).
+    /// - `Err(...)` — Recovered (= DLQ-routed; retry exhausted or
+    ///   render failure). Mirrors what tests would have seen via
+    ///   the old `write_with_retry` Err path.
     async fn consume(output: &HttpOutput, ev: &Event) -> Result<()> {
-        output.consume(ev).await
+        let (ack, mut rx) = QueueAckHandle::for_test();
+        let _ = output.consume(ev, ack).await;
+        match rx.try_recv() {
+            Ok(crate::queue::AckDisposition::Delivered) => Ok(()),
+            Ok(crate::queue::AckDisposition::Recovered) => Err(anyhow::anyhow!("recovered to DLQ")),
+            Ok(crate::queue::AckDisposition::Dropped) => Err(anyhow::anyhow!("dropped")),
+            // No disposition yet — event is parked in the buffer.
+            // Treated as Ok for test purposes; tests that need to
+            // observe the eventual flush dispose separately.
+            Err(_) => Ok(()),
+        }
     }
 
     async fn run_echo_collector() -> (
@@ -1031,12 +1126,17 @@ mod tests {
             ]),
             prop_int("batch_size", 1),
         ];
+        let mut props = props;
+        props.push(fast_retry_block());
         let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
-        // First send goes to A (cursor 0), fails, A cools down.
-        // The queue layer would normally re-send; here we just send
-        // again and expect B to take it (cursor advances to 1).
+        // First send goes to A (cursor 0), fails. With max_attempts=1
+        // the failure routes to Recovered (DLQ). A is cooled down.
         let first = consume(&output, &event_with("rr-fail")).await;
-        assert!(first.is_err(), "first attempt should fail (peer A is 500)");
+        assert!(
+            first.is_err(),
+            "first attempt should fail (peer A is 500): {:?}",
+            first
+        );
         // Second event goes to peer B (next in rotation, A cooled).
         consume(&output, &event_with("rr-ok")).await.unwrap();
         s_a.abort();
@@ -1185,13 +1285,17 @@ mod tests {
         let url = format!("http://{}/", addr);
         let props = vec![peer_block(&url), prop_int("batch_size", 1)];
         let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
-        let err = consume(&output, &event_with("hello")).await
-            .expect_err("500 must surface as Err");
+        // `consume` resolves the ack and swallows the underlying
+        // transport error inside its DLQ-routing path.
+        // Hit `Inner::send_batch` directly so we can still assert on
+        // the snippet-cap behaviour at the transport layer.
+        let err = output
+            .inner
+            .send_batch(&["hello".to_string()])
+            .await
+            .expect_err("500 must surface as Err at the transport layer");
         server.abort();
         let msg = err.to_string();
-        // Snippet caps at 200 chars; the full message is "http output:
-        // <url> returned 500 Internal Server Error — XXXX…" which
-        // tops out well under 1 KiB even with a 16 KiB peer payload.
         assert!(
             msg.len() < 1024,
             "error message must stay bounded, got {} bytes: {}",
@@ -1237,8 +1341,11 @@ mod tests {
         let url = format!("http://{}/", addr);
         let props = vec![peer_block(&url), prop_int("batch_size", 1)];
         let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
-        let err = consume(&output, &event_with("hello")).await
-            .expect_err("502 must surface as Err");
+        let err = output
+            .inner
+            .send_batch(&["hello".to_string()])
+            .await
+            .expect_err("502 must surface as Err at the transport layer");
         server.abort();
         let msg = err.to_string();
         assert!(
@@ -1271,7 +1378,7 @@ mod tests {
         });
 
         let url = format!("http://{}/", addr);
-        let props = vec![peer_block(&url), prop_int("batch_size", 1)];
+        let props = vec![peer_block(&url), prop_int("batch_size", 1), fast_retry_block()];
         let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
         let pre_call = Instant::now();
         let _ = consume(&output, &event_with("hello")).await;
@@ -1304,11 +1411,15 @@ mod tests {
         // but for the unified queue path.
         let mut props = vec![peer_block("http://127.0.0.1:1/")];
         props.push(prop_int("batch_size", 1));
+        props.push(fast_retry_block());
         let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
         let err = consume(&output, &event_with("singleton"))
             .await
             .expect_err("send must fail against unreachable peer");
-        assert!(err.to_string().contains("http"), "got: {err}");
+        // With the new lifecycle the underlying transport message
+        // is consumed by the DLQ-routing path, so we only check that
+        // the disposition surfaced as Recovered (= test-shim Err).
+        assert!(err.to_string().contains("recovered"), "got: {err}");
         let batch_len = output.inner.batch.lock().await.len();
         assert_eq!(
             batch_len, 0,
@@ -1322,102 +1433,107 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flush_failure_rearms_timer_so_batch_retries() {
-        // Regression: when an HTTP batch flush fails, flush() puts
-        // the batch back into the buffer but the caller used to
-        // skip re-arming the flush timer. The stuck batch then sat
-        // in the buffer until the next write() arrived — which may
-        // never happen, since the queue layer counts the event as
-        // failed (Rendered payloads don't retry; see queue/mod.rs).
-        // events_failed went up, yet the data still lived in our
-        // buffer with no schedule to drain it. The fix re-arms the
-        // timer on flush() Err, so batch_timeout drives a retry.
-        use axum::{
-            Router, extract::State, http::StatusCode, response::IntoResponse, routing::post,
-        };
-        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-
-        #[derive(Clone)]
-        struct S {
-            calls: Arc<AtomicUsize>,
-            body: Arc<Mutex<Vec<String>>>,
+    async fn flush_failure_routes_batch_to_dlq_and_resolves_recovered() {
+        // When a batch flush exhausts the per-flush retry budget
+        // against a permanently failing peer, every event in the
+        // batch routes to the DLQ and its ack handle resolves as
+        // `Recovered`. The buffer must be empty afterwards (no more
+        // "restore on failure" — the queue's cursor advances when the
+        // ack channel fires).
+        use axum::{Router, http::StatusCode, response::IntoResponse, routing::post};
+        async fn always_fail(_: axum::body::Bytes) -> impl IntoResponse {
+            StatusCode::INTERNAL_SERVER_ERROR
         }
-        async fn handle(State(s): State<S>, body: axum::body::Bytes) -> axum::response::Response {
-            let n = s.calls.fetch_add(1, AtomicOrdering::SeqCst);
-            if n == 0 {
-                (StatusCode::INTERNAL_SERVER_ERROR, "fail").into_response()
-            } else {
-                s.body
-                    .lock()
-                    .await
-                    .push(String::from_utf8_lossy(&body).into_owned());
-                (StatusCode::OK, "").into_response()
-            }
-        }
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let body = Arc::new(Mutex::new(Vec::new()));
-        let state = S {
-            calls: Arc::new(AtomicUsize::new(0)),
-            body: Arc::clone(&body),
-        };
-        let app = Router::new().route("/", post(handle)).with_state(state);
+        let app = Router::new().route("/", post(always_fail));
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let dlq_path = dir.path().join("errored.jsonl");
+        let writer = Arc::new(crate::error_log::ErrorLogWriter::new(dlq_path.clone()));
 
         let url = format!("http://{}/", addr);
         let props = vec![
             peer_block(&url),
             prop_int("batch_size", 2),
-            prop_str("batch_timeout", "200ms"),
+            prop_str("batch_timeout", "10s"),
+            fast_retry_block(),
         ];
-        let output = HttpOutput::from_properties("test", &mp(&props)).unwrap();
+        let output = <HttpOutput as OutputBuilderWithErrorLog>::from_properties_with_error_log(
+            "test",
+            &mp(&props),
+            Some(Arc::clone(&writer)),
+        )
+        .unwrap();
 
-        // Two consume_event calls → triggers should_flush → first POST
-        // is the failing one → Err propagates and the batch is restored.
-        consume(&output, &event_with("e1")).await.unwrap();
-        let err = consume(&output, &event_with("e2"))
-            .await
-            .expect_err("first flush must fail");
+        // First consume parks the event with no flush. Watch the ack
+        // channel: it must NOT resolve until the flush actually runs.
+        let (ack1, mut rx1) = QueueAckHandle::for_test();
+        output.consume(&event_with("e1"), ack1).await.unwrap();
         assert!(
-            err.to_string().contains("http") || err.to_string().contains("500"),
-            "got: {err}"
+            rx1.try_recv().is_err(),
+            "ack must not resolve until flush runs"
         );
 
-        // The batch is sitting in the buffer, restored by flush()'s
-        // Err arm.
+        // Second consume hits batch_size, triggers flush, which
+        // exhausts the budget and DLQ-routes both events.
+        let (ack2, mut rx2) = QueueAckHandle::for_test();
+        output.consume(&event_with("e2"), ack2).await.unwrap();
+        server.abort();
+
+        assert_eq!(rx1.recv().await, Some(crate::queue::AckDisposition::Recovered));
+        assert_eq!(rx2.recv().await, Some(crate::queue::AckDisposition::Recovered));
         assert_eq!(
             output.inner.batch.lock().await.len(),
-            2,
-            "batch must be put back into the buffer on flush failure"
-        );
-        // Regression assertion: the timer must be armed so the
-        // batch will be retried after batch_timeout. Before the
-        // fix, flush_handle was None here.
-        assert!(
-            output.flush_handle.lock().await.is_some(),
-            "flush failure must re-arm the timer (regression)"
+            0,
+            "buffer must be empty after flush — handles already resolved"
         );
 
-        // Wait for the timer to fire and retry against the
-        // now-healthy peer. batch_timeout is 200ms.
-        for _ in 0..100 {
-            if !body.lock().await.is_empty() {
+        // Both events landed in the DLQ JSONL.
+        let body = tokio::fs::read_to_string(&dlq_path).await.unwrap();
+        let n_lines = body.lines().count();
+        assert_eq!(n_lines, 2, "expected one DLQ record per buffered event");
+    }
+
+    #[tokio::test]
+    async fn batched_consume_holds_ack_until_flush_succeeds() {
+        // Key invariant: a batched output must NOT resolve the ack
+        // handle when `consume` returns. The handle resolves on the
+        // eventual flush — keeping the queue cursor parked at the
+        // un-flushed event so a crash mid-batch replays it.
+        let (addr, received, server) = run_echo_collector().await;
+        let url = format!("http://{}/", addr);
+        let output = HttpOutput::from_properties(
+            "test",
+            &mp(&[
+                peer_block(&url),
+                prop_int("batch_size", 2),
+                prop_str("batch_timeout", "10s"),
+            ]),
+        )
+        .unwrap();
+        let (ack, mut rx) = QueueAckHandle::for_test();
+        output.consume(&event_with("e1"), ack).await.unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "ack channel must be empty while event is buffered"
+        );
+        // Fill the batch → flush fires → ack resolves Delivered.
+        let (ack2, mut rx2) = QueueAckHandle::for_test();
+        output.consume(&event_with("e2"), ack2).await.unwrap();
+        assert_eq!(rx.recv().await, Some(crate::queue::AckDisposition::Delivered));
+        assert_eq!(rx2.recv().await, Some(crate::queue::AckDisposition::Delivered));
+        for _ in 0..50 {
+            if !received.lock().await.is_empty() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         server.abort();
-
-        let got = body.lock().await.clone();
-        assert_eq!(got.len(), 1, "retry must POST the batched body once");
-        let posted = &got[0];
-        assert!(
-            posted.contains("e1") && posted.contains("e2"),
-            "retry must carry the same two events; got: {posted}"
-        );
+        assert_eq!(received.lock().await.len(), 1);
     }
 
     #[tokio::test]
@@ -1505,13 +1621,18 @@ mod tests {
     async fn shutdown_failure_with_error_log_persists_buffer() {
         let (addr, server) = run_failing_collector().await;
         let url = format!("http://{}/", addr);
-        let output = HttpOutput::from_properties(
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("errored.jsonl");
+        let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
+        let output = <HttpOutput as OutputBuilderWithErrorLog>::from_properties_with_error_log(
             "myout",
             &mp(&[
                 peer_block(&url),
                 prop_int("batch_size", 100),
                 prop_str("batch_timeout", "30s"),
+                fast_retry_block(),
             ]),
+            Some(Arc::clone(&writer)),
         )
         .unwrap();
 
@@ -1520,14 +1641,9 @@ mod tests {
         consume(&output, &event_with("ev2")).await.unwrap();
         assert_eq!(output.inner.batch.lock().await.len(), 2);
 
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("errored.jsonl");
-        let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
-
-        // shutdown -> flush() POSTs once, server returns 500, flush
-        // restores the buffer; the shutdown override drains it into
-        // error_log and returns Ok so the consumer treats the daemon
-        // as cleanly stopped.
+        // shutdown -> flush() → server returns 500 → retry exhausts →
+        // each entry routes to DLQ with `Recovered`. Buffer empty,
+        // shutdown returns Ok.
         output.shutdown(Some(&writer)).await.unwrap();
         server.abort();
 
@@ -1540,16 +1656,6 @@ mod tests {
         let body = tokio::fs::read_to_string(&path).await.unwrap();
         let lines: Vec<&str> = body.lines().collect();
         assert_eq!(lines.len(), 2, "expected one DLQ record per buffered body");
-        for line in &lines {
-            let v: serde_json::Value = serde_json::from_str(line).unwrap();
-            assert_eq!(v["process"], "(output myout shutdown)");
-            assert!(
-                v["reason"].as_str().unwrap().contains("shutdown flush"),
-                "got: {}",
-                v["reason"]
-            );
-            assert!(v["event"]["ingress"].is_string() || v["event"]["ingress"].is_object());
-        }
         let recovered: String = lines
             .iter()
             .map(|l| {
@@ -1566,12 +1672,12 @@ mod tests {
         );
     }
 
-    /// shutdown flush fails + error_log unset → preserve 0.7.7
-    /// behaviour: the override surfaces the error, the queue consumer
-    /// (not exercised here) logs `warn!` and the buffer is lost on
-    /// process exit. No DLQ writes possible.
+    /// shutdown flush fails + error_log unset → shutdown is
+    /// infallible from the caller's POV. The output drains the
+    /// buffer via DLQ-or-warn paths and returns Ok; the per-entry
+    /// handles still resolve so the consumer can wrap up.
     #[tokio::test]
-    async fn shutdown_failure_without_error_log_matches_077() {
+    async fn shutdown_failure_without_error_log_returns_ok() {
         let (addr, server) = run_failing_collector().await;
         let url = format!("http://{}/", addr);
         let output = HttpOutput::from_properties(
@@ -1580,21 +1686,17 @@ mod tests {
                 peer_block(&url),
                 prop_int("batch_size", 100),
                 prop_str("batch_timeout", "30s"),
+                fast_retry_block(),
             ]),
         )
         .unwrap();
         consume(&output, &event_with("ev1")).await.unwrap();
 
-        let err = output.shutdown(None).await.expect_err("flush must Err");
+        output.shutdown(None).await.expect("shutdown is infallible");
         server.abort();
-        // The flush error propagates up so the queue consumer warns
-        // exactly as it did in 0.7.7 — no panic, no recovery.
-        assert!(
-            err.to_string().contains("http") || err.to_string().contains("500"),
-            "got: {err}"
-        );
-        // Buffer left intact (= retain-on-failure contract).
-        assert_eq!(output.inner.batch.lock().await.len(), 1);
+        // Buffer drained: flush_events routes to log-without-DLQ
+        // (because error_log is None) and resolves Recovered.
+        assert_eq!(output.inner.batch.lock().await.len(), 0);
     }
 
     /// shutdown flush succeeds + error_log set → success path is
@@ -1653,6 +1755,7 @@ mod tests {
                 peer_block(&url),
                 prop_int("batch_size", 100),
                 prop_str("batch_timeout", "30s"),
+                fast_retry_block(),
             ]),
         )
         .unwrap();

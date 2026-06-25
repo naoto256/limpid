@@ -20,7 +20,7 @@ use crate::functions::FunctionRegistry;
 use crate::metrics::{MetricsRegistry, PipelineMetrics};
 use crate::modules::{self, HasMetrics, ModuleRegistry};
 use crate::pipeline::CompiledConfig;
-use crate::queue::{self, QueueConfig, QueueSender, RetryConfig};
+use crate::queue::{self, QueueConfig, QueueSender};
 use crate::tap::TapRegistry;
 
 pub struct Runtime {
@@ -88,8 +88,9 @@ impl Runtime {
         for (name, output_def) in &config.outputs {
             let queue_config =
                 QueueConfig::from_output_properties(name, output_def.properties.user_properties())?;
-            let retry_config =
-                RetryConfig::from_output_properties(output_def.properties.user_properties())?;
+            // Retry config is parsed by each output's
+            // `from_properties_with_error_log` (outputs own retry +
+            // DLQ). The runtime no longer needs a copy here.
             let (mut sender, receiver) = queue::create_queue(name.clone(), queue_config)?;
 
             // `output_def.properties` is a `ModuleProperties`: it carries the
@@ -132,13 +133,12 @@ impl Runtime {
                 name.clone(),
                 receiver,
                 created.output,
-                retry_config,
                 output_metrics,
             ));
         }
 
         // Start queue consumers (no metrics counting here — output does it)
-        for (_name, receiver, writer, retry_config, output_metrics) in output_receivers {
+        for (_name, receiver, writer, output_metrics) in output_receivers {
             let shutdown = shutdown_rx.clone();
             let tap_clone = tap.clone();
             let error_log_for_consumer = error_log.as_ref().map(Arc::clone);
@@ -146,7 +146,6 @@ impl Runtime {
                 queue::run_queue_consumer(
                     receiver,
                     writer,
-                    retry_config,
                     Some(tap_clone),
                     output_metrics,
                     error_log_for_consumer,
