@@ -42,7 +42,8 @@ use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
-use crate::modules::{HasMetrics, Module, Output};
+use crate::modules::{HasMetrics, Module, Output, OutputBuilderWithErrorLog};
+use crate::queue::{QueueAckHandle, RetryConfig};
 use crate::tls::ClientTlsConfig;
 
 /// Supported SASL mechanisms. The DSL spelling is underscore-separated
@@ -307,10 +308,13 @@ fn security_protocol(has_tls: bool, has_sasl: bool) -> Option<&'static str> {
 }
 
 pub struct KafkaOutput {
+    name: String,
     producer: FutureProducer,
     topic: String,
     key_field: Option<KeyField>,
     queue_timeout: Duration,
+    retry: RetryConfig,
+    error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
     metrics: Arc<OutputMetrics>,
 }
 
@@ -327,6 +331,17 @@ impl Module for KafkaOutput {
     }
 
     fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
+        Self::from_properties_with_error_log(name, properties, None)
+    }
+}
+
+impl OutputBuilderWithErrorLog for KafkaOutput {
+    fn from_properties_with_error_log(
+        name: &str,
+        properties: &crate::modules::ModuleProperties,
+        error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+    ) -> Result<Self> {
+        let retry = RetryConfig::from_output_properties(properties.user_properties())?;
         let properties = properties.user_properties();
         let brokers = props::get_string(properties, "brokers")
             .ok_or_else(|| anyhow::anyhow!("output '{}': kafka requires 'brokers'", name))?;
@@ -407,10 +422,13 @@ impl Module for KafkaOutput {
             .with_context(|| format!("output '{}': failed to create Kafka producer", name))?;
 
         Ok(Self {
+            name: name.to_string(),
             producer,
             topic,
             key_field,
             queue_timeout,
+            retry,
+            error_log,
             metrics: Arc::new(OutputMetrics::default()),
         })
     }
@@ -425,10 +443,51 @@ impl HasMetrics for KafkaOutput {
 
 #[async_trait::async_trait]
 impl Output for KafkaOutput {
-    async fn consume(&self, event: &Event) -> Result<()> {
-        // Render the key inline against the owned event. Kafka's
-        // payload (egress bytes + optional key) is light enough that
-        // we skip the `RenderedPayload` boxing entirely.
+    async fn consume(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
+        let mut attempt = 0u32;
+        let mut wait = self.retry.initial_wait;
+        loop {
+            match self.try_send(event).await {
+                Ok(()) => {
+                    self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
+                    ack.resolve_delivered();
+                    return Ok(());
+                }
+                Err(e) => {
+                    attempt += 1;
+                    self.metrics.retries.fetch_add(1, Ordering::Relaxed);
+                    if attempt >= self.retry.max_attempts {
+                        let reason =
+                            format!("output write failed after {} attempts: {}", attempt, e);
+                        crate::modules::route_event_to_dlq(
+                            self.error_log.as_ref(),
+                            &self.name,
+                            event,
+                            &reason,
+                        )
+                        .await;
+                        self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                        ack.resolve_recovered();
+                        return Ok(());
+                    }
+                    tracing::warn!(
+                        "output '{}': write failed (attempt {}/{}): {} — retrying in {:?}",
+                        self.name,
+                        attempt,
+                        self.retry.max_attempts,
+                        e,
+                        wait
+                    );
+                    tokio::time::sleep(wait).await;
+                    wait = self.retry.next_wait(wait);
+                }
+            }
+        }
+    }
+}
+
+impl KafkaOutput {
+    async fn try_send(&self, event: &Event) -> Result<()> {
         let key = self.resolve_key(event);
         let egress = event.egress.clone();
 
@@ -441,8 +500,6 @@ impl Output for KafkaOutput {
             .send(record, self.queue_timeout)
             .await
             .map_err(|(e, _)| anyhow::anyhow!("kafka produce failed: {}", e))?;
-
-        self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }

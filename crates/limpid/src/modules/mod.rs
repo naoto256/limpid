@@ -338,21 +338,27 @@ pub trait Input: Module + HasMetrics<Stats = InputMetrics> + Send + 'static {
 /// shape.
 #[async_trait::async_trait]
 pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
-    /// Per-event entry point called by the queue consumer
-    /// (`write_with_retry`). Sinks own the full event lifecycle:
-    /// render (when applicable), serialise, ship — or buffer for a
-    /// batched flush. Return:
+    /// Per-event entry point. The output owns the complete delivery
+    /// lifecycle: render, batch, retry, route-to-DLQ on failure, and
+    /// resolve the ack handle. Until the handle resolves, the queue
+    /// treats the event as in-flight and will replay it on restart
+    /// (disk queue) or count it lost (memory queue on shutdown).
     ///
-    /// - `Ok(())` — event accepted (delivered, or durably enqueued
-    ///   into the sink's own batch buffer for a future flush).
-    /// - `Err(e)` — failure. If `e` is `crate::modules::RenderError`,
-    ///   the consumer treats it as a permanent failure on this event
-    ///   and routes straight to DLQ without consuming the retry
-    ///   budget (render errors bypass retry and route directly to
-    ///   recovery). Any other `Err` is treated as
-    ///   a transient transport failure and counted against
-    ///   `RetryConfig::max_attempts`.
-    async fn consume(&self, event: &Event) -> Result<()>;
+    /// - On successful delivery: call `ack.resolve_delivered()`.
+    /// - On DLQ recovery (retry exhausted / render error / shutdown
+    ///   leftover): call `ack.resolve_recovered()`.
+    ///
+    /// `Ok(())` does NOT mean the event was delivered — it means the
+    /// output accepted ownership of the lifecycle. Actual disposition
+    /// is signalled through the handle. For batched outputs, `consume`
+    /// returns `Ok(())` after the event has been accepted into the
+    /// buffer (with its handle held); the handle resolves on the
+    /// eventual flush, not now.
+    ///
+    /// `Err(e)` indicates a programmer bug — the output failed to
+    /// take ownership of the lifecycle. The queue consumer logs the
+    /// error and the handle's `Drop` impl fires `Dropped`.
+    async fn consume(&self, event: &Event, ack: crate::queue::QueueAckHandle) -> Result<()>;
 
     /// Called once after construction to hand the output a reference to
     /// the pipeline's `FunctionRegistry`. Outputs that evaluate DSL
@@ -392,20 +398,21 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     }
 }
 
-/// Shared helper: walk the leftover `Event`s from a failed batched-
-/// output shutdown flush and write each to the configured `error_log`.
-/// Each record carries the original `Event` (real `source`, `ingress`,
-/// `received_at`) — no synthetic payload construction. On per-record
-/// write failure we warn and continue, so a broken `error_log` path
-/// can't spin a tight error loop at shutdown.
+/// Shared helper: walk the leftover `(Event, QueueAckHandle)` entries
+/// from a failed batched-output shutdown flush. Each event becomes one
+/// DLQ record (carrying the real `source`, `ingress`, `received_at`)
+/// and its handle is resolved as `Recovered`. On per-record write
+/// failure we warn and continue, then still resolve the handle so the
+/// queue cursor can advance — staying parked at a broken `error_log`
+/// path would block the queue forever.
 pub async fn write_shutdown_events_to_error_log(
     writer: &Arc<crate::error_log::ErrorLogWriter>,
     output_name: &str,
-    events: Vec<Event>,
+    events: Vec<(Event, crate::queue::QueueAckHandle)>,
     flush_err: &anyhow::Error,
 ) {
     let reason = format!("shutdown flush failed: {}", flush_err);
-    for ev in events {
+    for (ev, ack) in events {
         let ctx = crate::pipeline::ErroredEventContext {
             timestamp: chrono::Utc::now(),
             pipeline: String::new(),
@@ -420,6 +427,42 @@ pub async fn write_shutdown_events_to_error_log(
                 write_err
             );
         }
+        ack.resolve_recovered();
+    }
+}
+
+/// Per-event DLQ writer shared by every output's `consume` body. Writes
+/// one `ErroredEventContext` record carrying the original event and a
+/// human-readable reason; warns and continues if the writer itself
+/// fails (no recursion / loops). Does NOT touch the ack handle —
+/// callers resolve as `Recovered` after this returns.
+pub async fn route_event_to_dlq(
+    error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+    output_name: &str,
+    event: &Event,
+    reason: &str,
+) {
+    if let Some(writer) = error_log {
+        let ctx = crate::pipeline::ErroredEventContext {
+            timestamp: chrono::Utc::now(),
+            pipeline: String::new(),
+            process: format!("(output {})", output_name),
+            reason: reason.to_string(),
+            event: event.clone(),
+        };
+        if let Err(write_err) = writer.write(&ctx).await {
+            tracing::warn!(
+                "output '{}': error_log write failed: {} — dropping event",
+                output_name,
+                write_err
+            );
+        }
+    } else {
+        tracing::error!(
+            "output '{}': dropping event (no error_log): {}",
+            output_name,
+            reason
+        );
     }
 }
 
@@ -653,17 +696,35 @@ pub fn register_builtins(registry: &mut ModuleRegistry) {
     #[cfg(feature = "journal")]
     register_input_type::<input::journal::JournalInput>(registry, "journal");
 
-    // Outputs
-    register_output_type::<output::file::FileOutput>(registry, "file");
-    register_output_type::<output::unix_socket::UnixSocketOutput>(registry, "unix_socket");
-    register_output_type::<output::syslog_tcp::SyslogTcpOutput>(registry, "syslog_tcp");
-    register_batched_output_type::<output::http::HttpOutput>(registry, "http");
-    register_batched_output_type::<output::otlp::http::OtlpHttpOutput>(registry, "otlp_http");
-    register_batched_output_type::<output::otlp::grpc::OtlpGrpcOutput>(registry, "otlp_grpc");
-    register_output_type::<output::syslog_udp::SyslogUdpOutput>(registry, "syslog_udp");
-    register_output_type::<output::stdout::StdoutOutput>(registry, "stdout");
+    // Outputs — every output owns its own retry + DLQ routing, so
+    // every output type goes through the error_log-aware factory. The
+    // dedicated `register_batched_output_type` helper collapsed into
+    // `register_output_type_with_error_log` below.
+    register_output_type_with_error_log::<output::file::FileOutput>(registry, "file");
+    register_output_type_with_error_log::<output::unix_socket::UnixSocketOutput>(
+        registry,
+        "unix_socket",
+    );
+    register_output_type_with_error_log::<output::syslog_tcp::SyslogTcpOutput>(
+        registry,
+        "syslog_tcp",
+    );
+    register_output_type_with_error_log::<output::http::HttpOutput>(registry, "http");
+    register_output_type_with_error_log::<output::otlp::http::OtlpHttpOutput>(
+        registry,
+        "otlp_http",
+    );
+    register_output_type_with_error_log::<output::otlp::grpc::OtlpGrpcOutput>(
+        registry,
+        "otlp_grpc",
+    );
+    register_output_type_with_error_log::<output::syslog_udp::SyslogUdpOutput>(
+        registry,
+        "syslog_udp",
+    );
+    register_output_type_with_error_log::<output::stdout::StdoutOutput>(registry, "stdout");
     #[cfg(feature = "kafka")]
-    register_output_type::<output::kafka::KafkaOutput>(registry, "kafka");
+    register_output_type_with_error_log::<output::kafka::KafkaOutput>(registry, "kafka");
 
     // No built-in processes — v0.3.0 removed the native process
     // layer. Schema-specific parsers are DSL functions (`syslog.parse`,
@@ -697,37 +758,13 @@ where
     );
 }
 
-fn register_output_type<T>(registry: &mut ModuleRegistry, type_name: &str)
-where
-    T: Module + Output + Sync + 'static,
-{
-    registry.register_output(
-        type_name,
-        T::property_schema(),
-        // `_error_log` is unused: non-batched outputs (file, stdout,
-        // syslog_tcp, syslog_udp, kafka, unix_socket) get DLQ routing
-        // for retry-exhausted events through the queue consumer's
-        // `write_with_retry`, not through their own internal buffers.
-        // Only the 3 batched outputs (http, otlp_http, otlp_grpc)
-        // need a constructor-time `error_log` handle; those register
-        // via [`register_batched_output_type`] below.
-        |name, properties: &ModuleProperties, funcs, _error_log| {
-            let mut output = T::from_properties(name, properties)?;
-            output.attach_funcs(funcs);
-            let metrics = HasMetrics::metrics(&output);
-            let output_arc: Arc<dyn Output> = Arc::new(output);
-            Ok(CreatedOutput {
-                output: output_arc,
-                metrics,
-            })
-        },
-    );
-}
-
-/// Trait marker for the 3 batched outputs (`http`, `otlp_http`,
-/// `otlp_grpc`) that consume `error_log` at construction time. Lives
-/// next to `Module` rather than on it so non-batched outputs aren't
-/// forced to carry an unused method, and so the `Input` half of the
+/// Trait marker for outputs that consume the configured `error_log` at
+/// construction time. Every output owns its own retry + DLQ routing,
+/// so every output type implements this trait — the previously-named
+/// `register_batched_output_type` collapsed into the universal
+/// `register_output_type_with_error_log` below.
+///
+/// Lives next to `Module` rather than on it so the `Input` half of the
 /// `Module` trait isn't polluted with output-only plumbing.
 pub trait OutputBuilderWithErrorLog: Module {
     fn from_properties_with_error_log(
@@ -737,7 +774,7 @@ pub trait OutputBuilderWithErrorLog: Module {
     ) -> Result<Self>;
 }
 
-fn register_batched_output_type<T>(registry: &mut ModuleRegistry, type_name: &str)
+fn register_output_type_with_error_log<T>(registry: &mut ModuleRegistry, type_name: &str)
 where
     T: OutputBuilderWithErrorLog + Output + Sync + 'static,
 {

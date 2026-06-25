@@ -33,7 +33,8 @@ use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::{BorrowedEvent, Event};
 use crate::functions::FunctionRegistry;
 use crate::metrics::OutputMetrics;
-use crate::modules::{HasMetrics, Module, Output, RenderError};
+use crate::modules::{HasMetrics, Module, Output, OutputBuilderWithErrorLog, RenderError};
+use crate::queue::{QueueAckHandle, RetryConfig};
 
 const FILE_OUTPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
@@ -80,6 +81,7 @@ struct FilePayload {
 }
 
 pub struct FileOutput {
+    name: String,
     /// Parsed path expression. A plain `Expr::StringLit` means a static
     /// path; `Expr::Template` requires per-event evaluation.
     path: Expr,
@@ -89,6 +91,8 @@ pub struct FileOutput {
     /// Tracks which paths have been created (for applying mode/owner/group once)
     created_paths: Mutex<HashSet<PathBuf>>,
     funcs: Option<Arc<FunctionRegistry>>,
+    retry: RetryConfig,
+    error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
     metrics: Arc<OutputMetrics>,
 }
 
@@ -98,6 +102,17 @@ impl Module for FileOutput {
     }
 
     fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
+        Self::from_properties_with_error_log(name, properties, None)
+    }
+}
+
+impl OutputBuilderWithErrorLog for FileOutput {
+    fn from_properties_with_error_log(
+        name: &str,
+        properties: &crate::modules::ModuleProperties,
+        error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+    ) -> Result<Self> {
+        let retry = RetryConfig::from_output_properties(properties.user_properties())?;
         let properties = properties.user_properties();
         let path = props::get_expr(properties, "path")
             .ok_or_else(|| anyhow::anyhow!("output '{}': file requires 'path'", name))?
@@ -131,12 +146,15 @@ impl Module for FileOutput {
         let group = props::get_string(properties, "group");
 
         Ok(Self {
+            name: name.to_string(),
             path,
             mode,
             owner,
             group,
             created_paths: Mutex::new(HashSet::new()),
             funcs: None,
+            retry,
+            error_log,
             metrics: Arc::new(OutputMetrics::default()),
         })
     }
@@ -155,30 +173,85 @@ impl Output for FileOutput {
         self.funcs = Some(funcs);
     }
 
-    async fn consume(&self, event: &Event) -> Result<()> {
-        // Render the path template against a transient per-event
-        // arena, then hand the resolved payload to the async write
-        // helper. The arena scope closes before the `await` so the
-        // resulting future stays `Send` (bumpalo's `Bump` is !Sync).
-        //
-        // Path-render errors are wrapped in `RenderError` so the queue
-        // consumer (`write_with_retry`) downcasts and routes them
-        // straight to DLQ without burning the retry budget — a broken
-        // template is deterministic on the event.
-        let payload = {
+    async fn consume(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
+        // Per-event lifecycle: render → write (with internal retry) →
+        // resolve. Render failures are deterministic on the event and
+        // route straight to DLQ without burning the retry budget;
+        // transport / I/O failures consume `retry.max_attempts` and
+        // then land in DLQ on exhaust.
+        let payload_res = {
             let bump = bumpalo::Bump::new();
             let arena = EventArena::new(&bump);
             let bevent = event.view_in(&arena);
-            match self.render_path_in(&bevent, &arena) {
-                Ok((resolved, is_dynamic)) => FilePayload {
-                    egress: event.egress.clone(),
-                    path: resolved,
-                    is_dynamic,
-                },
-                Err(e) => return Err(RenderError::new(e).into()),
+            self.render_path_in(&bevent, &arena)
+        };
+        let payload = match payload_res {
+            Ok((resolved, is_dynamic)) => FilePayload {
+                egress: event.egress.clone(),
+                path: resolved,
+                is_dynamic,
+            },
+            Err(e) => {
+                let reason = format!("render failed: {}", RenderError::new(e));
+                crate::modules::route_event_to_dlq(
+                    self.error_log.as_ref(),
+                    &self.name,
+                    event,
+                    &reason,
+                )
+                .await;
+                self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                ack.resolve_recovered();
+                return Ok(());
             }
         };
-        self.write_payload(payload).await
+
+        let mut attempt = 0u32;
+        let mut wait = self.retry.initial_wait;
+        loop {
+            // Clone the payload's path/dynamic flag for each attempt;
+            // `egress` is a refcounted `Bytes` so the actual buffer
+            // isn't duplicated.
+            let attempt_payload = FilePayload {
+                egress: payload.egress.clone(),
+                path: payload.path.clone(),
+                is_dynamic: payload.is_dynamic,
+            };
+            match self.write_payload(attempt_payload).await {
+                Ok(()) => {
+                    ack.resolve_delivered();
+                    return Ok(());
+                }
+                Err(e) => {
+                    attempt += 1;
+                    self.metrics.retries.fetch_add(1, Ordering::Relaxed);
+                    if attempt >= self.retry.max_attempts {
+                        let reason =
+                            format!("output write failed after {} attempts: {}", attempt, e);
+                        crate::modules::route_event_to_dlq(
+                            self.error_log.as_ref(),
+                            &self.name,
+                            event,
+                            &reason,
+                        )
+                        .await;
+                        self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                        ack.resolve_recovered();
+                        return Ok(());
+                    }
+                    tracing::warn!(
+                        "output '{}': write failed (attempt {}/{}): {} — retrying in {:?}",
+                        self.name,
+                        attempt,
+                        self.retry.max_attempts,
+                        e,
+                        wait
+                    );
+                    tokio::time::sleep(wait).await;
+                    wait = self.retry.next_wait(wait);
+                }
+            }
+        }
     }
 }
 
@@ -546,12 +619,15 @@ mod tests {
 
     fn make_output(path: Expr) -> FileOutput {
         FileOutput {
+            name: "test".into(),
             path,
             mode: None,
             owner: None,
             group: None,
             created_paths: Mutex::new(HashSet::new()),
             funcs: Some(funcs()),
+            retry: RetryConfig::default(),
+            error_log: None,
             metrics: Arc::new(OutputMetrics::default()),
         }
     }
