@@ -1,39 +1,55 @@
 //! Dead-letter queue (DLQ) writer for events that fail their main-flow
 //! disposition.
 //!
-//! This writer is invoked from four producer sites — the `process`
-//! discriminator on each record names which one wrote it:
+//! Records are sum-typed (`schema_version: 2`): every record carries a
+//! `kind` discriminator (`"process"` or `"output"`) and a per-kind block
+//! (`process: { name }` or `output: { name }`) naming the failure site.
+//! The Output flavor additionally carries the rendered `egress` in
+//! `event.egress`; the Process flavor only has `event.{source,
+//! received_at, ingress}`.
 //!
-//! 1. **Process runtime errors** — a `process` body raised an error
-//!    (`runtime.rs::process_event` Errored arm + the sibling pipeline-
-//!    body branch for `if`/`switch`/`error <expr>`/process-args eval
-//!    failures, surfaced as `(pipeline body)`).
-//! 2. **Output retry exhausted** — `queue/mod.rs` consumer routes the
-//!    payload here after the retry budget is spent, surfaced as
-//!    `(output <name>)`.
-//! 3. **Output enqueue failures** — `runtime.rs` could not hand an
-//!    event to an output's queue (queue closed, disk write error,
-//!    unknown output), surfaced as `(output enqueue)`.
-//! 4. **Batched-output shutdown-flush leftovers** — `modules/mod.rs`
-//!    walks the remaining `Vec<Event>` buffer of a batched output that
-//!    could not flush at shutdown and routes each through the normal
-//!    `write()` path with the real source/ingress/received_at, surfaced
-//!    as `(output <name> shutdown)`. Before this change the path
-//!    synthesised an `Event` from the rendered bytes; now the buffer
-//!    is `Vec<Event>` already so no synthetic construction is needed.
-//! 5. **Batched-output per-event render failures** — `modules/output/*.rs`
-//!    routes events that fail `render()` during a batched flush
-//!    through the same writer with `reason = "render failed during
-//!    batch flush: ..."`, surfaced as `(output <name>)`.
+//! Seven producer sites map to the two flavors:
 //!
-//! All four converge on this same JSONL file, the same replay recipe,
-//! and the same `events_errored` / `events_errored_unwritable` counter
-//! pair. Operators can then audit failures, fix the offending config
-//! or parser, and replay the original events via:
+//! Process flavor (= pipeline-side failures; replay via `inject input`):
+//!
+//! 1. **`<process_name>`** — an explicit `process` body raised an error
+//!    via `error <expr>` or a process-internal failure.
+//! 2. **`(inline)`** — an inline `process { ... }` block raised
+//!    similarly.
+//! 3. **`(pipeline body)`** — `if`/`switch`/`error <expr>`/process-args
+//!    eval failed before reaching a process body.
+//! 4. **`(pipeline)`** — `error <expr>` at the pipeline (statement)
+//!    level raised.
+//!
+//! Output flavor (= sink-side failures; replay via `inject output`):
+//!
+//! 5. **`<output_name>`** — output retry budget exhausted (= sink-side).
+//!    A batched output's per-event render failure inside `flush()` is
+//!    also routed here with `reason = "render failed during batch
+//!    flush: ..."`.
+//! 6. **`<output_name> shutdown`** — batched output's `shutdown()`
+//!    walks any remaining `Vec<Event>` buffer entries (one per event)
+//!    through this writer.
+//! 7. **`<output_name> enqueue`** — `runtime.rs` could not hand an
+//!    event to the named output's queue (queue closed, disk write
+//!    error, unknown output). Per-failed-output split: a pipeline-eval
+//!    result with N failed-output enqueues produces N records.
+//!
+//! All seven converge on this same JSONL file and the same
+//! `events_errored` / `events_errored_unwritable` counter pair.
+//! Operators audit failures, fix the offending config or parser, and
+//! replay the original events. Replay tooling is flavor-aware:
 //!
 //! ```bash
-//! jq -c '.event' /var/log/limpid/errored.jsonl \
-//!     | limpidctl inject input <name> --json
+//! # Process flavor: re-enter at the input layer; the pipeline reruns
+//! # against the original ingress bytes.
+//! jq -c 'select(.kind == "process") | .event' /var/log/limpid/errored.jsonl \
+//!     | limpidctl inject input <input-name> --json
+//!
+//! # Output flavor: re-deliver the pre-rendered event directly to the
+//! # named output's queue; the sink re-routes via its own `consume()`.
+//! jq -c 'select(.kind == "output") | .event' /var/log/limpid/errored.jsonl \
+//!     | limpidctl inject output <output-name> --json
 //! ```
 //!
 //! Per-write `OpenOptions::create(true).append(true)` is used by
