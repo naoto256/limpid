@@ -233,58 +233,272 @@ pub enum PipelineTermination {
     Errored,
 }
 
-/// Failure context surfaced when a pipeline terminates with [`PipelineTermination::Errored`].
+/// Sum-type failure context surfaced when an event is routed to the
+/// dead-letter queue.
 ///
-/// The `event` carries the **original** ingress / source / received_at
-/// (egress and workspace are intentionally not snapshotted — at the
-/// point of failure they may hold partial state from earlier processes
-/// in the chain, which would confuse `inject --json` replay). Replay
-/// re-runs the pipeline from scratch on `event`.
+/// Two flavors distinguish *where* the failure occurred and therefore
+/// what `event` snapshot is meaningful for replay:
+///
+/// - [`Process`](ErroredEventContext::Process) — a `process` step (named
+///   `def process` invocation, inline `process { ... }` block, or a
+///   top-level `error` statement) failed during pipeline execution.
+///   The captured [`ProcessEvent`] holds the original ingress / source /
+///   received_at; egress is not snapshotted because at the failure
+///   point it may hold partial output of an earlier process in the
+///   chain, which would confuse replay. Replay re-runs the pipeline
+///   from scratch via `limpidctl inject input <pipeline_input>`.
+///
+/// - [`Output`](ErroredEventContext::Output) — an output sink failed to
+///   accept the event (queue enqueue failure on the runtime side, retry
+///   exhaustion on the sink side, or batched shutdown drain). The
+///   captured [`OutputEvent`] holds both ingress AND egress, because
+///   the pipeline body already finished and the egress is the rendered
+///   payload the sink was about to write. Replay routes through
+///   `limpidctl inject output <output_name>` and the sink's
+///   `consume()` re-runs internal routing.
+///
+/// The Output flavor records *only* the output name — never an
+/// address, destination, path, key, topic, partition, endpoint,
+/// URL, peer, or any other sink-specific routing metadata. Replay
+/// sends the event back through
+/// the named output's `consume()`, which re-routes internally.
 #[derive(Debug, Clone)]
-pub struct ErroredEventContext {
-    /// Wall-clock at which the error was raised.
-    pub timestamp: chrono::DateTime<chrono::Utc>,
-    /// Pipeline name (from `def pipeline <name>`).
-    pub pipeline: String,
-    /// Failed process: a named `def process` invocation surfaces its
-    /// name; an inline `process { ... }` block surfaces `(inline)`.
-    pub process: String,
-    /// Stringified `ProcessError` / `anyhow::Error` from the failure.
-    pub reason: String,
-    /// Pre-failure event with original ingress / source / received_at.
-    /// Heap-owned so it can outlive the per-event arena that produced it.
-    pub event: OwnedEvent,
+pub enum ErroredEventContext {
+    Process {
+        /// Wall-clock at which the error was raised.
+        timestamp: chrono::DateTime<chrono::Utc>,
+        /// Pipeline name (from `def pipeline <name>`).
+        pipeline: String,
+        /// Failure site: `<process_name>` for an explicit `def process`
+        /// invocation, `(inline)` for an inline `process { ... }` block,
+        /// `(pipeline)` for an explicit `error` statement at pipeline
+        /// scope, or `(pipeline body)` for a runtime error raised by
+        /// expression evaluation outside any process.
+        site: String,
+        /// Stringified `ProcessError` / `anyhow::Error` from the failure.
+        reason: String,
+        /// Pre-failure event snapshot (ingress / source / received_at only).
+        event: ProcessEvent,
+    },
+    Output {
+        /// Wall-clock at which the error was raised.
+        timestamp: chrono::DateTime<chrono::Utc>,
+        /// Pipeline name — empty for runtime-side enqueue failures
+        /// (the runtime accumulates one record per failed output, with
+        /// no single pipeline ownership beyond the dispatch context;
+        /// kept blank rather than misattributed).
+        pipeline: String,
+        /// Failure site: `<output_name>` for retry exhaustion,
+        /// `<output_name> shutdown` for batched shutdown drain, or
+        /// `<output_name> enqueue` for runtime enqueue failure.
+        site: String,
+        /// Stringified failure reason.
+        reason: String,
+        /// Output name — the *only* sink-routing metadata captured.
+        /// Replay = `limpidctl inject output <output_name>`.
+        output_name: String,
+        /// Event snapshot (ingress + egress + source + received_at).
+        event: OutputEvent,
+    },
+}
+
+/// Process-flavor event snapshot for the DLQ.
+///
+/// Carries only the fields needed to re-run the pipeline from scratch:
+/// the original ingress bytes, the source socket, and the input
+/// timestamp. Egress is not captured because at a process failure
+/// point it may hold partial output of an earlier process step.
+#[derive(Debug, Clone)]
+pub struct ProcessEvent {
+    pub source: std::net::SocketAddr,
+    pub received_at: chrono::DateTime<chrono::Utc>,
+    pub ingress: bytes::Bytes,
+}
+
+/// Output-flavor event snapshot for the DLQ.
+///
+/// Carries both ingress and egress: the pipeline body already finished
+/// and produced an egress payload — replay through `inject output`
+/// hands the egress directly to the sink's `consume()` for
+/// re-rendering / re-shipping.
+#[derive(Debug, Clone)]
+pub struct OutputEvent {
+    pub source: std::net::SocketAddr,
+    pub received_at: chrono::DateTime<chrono::Utc>,
+    pub ingress: bytes::Bytes,
+    pub egress: bytes::Bytes,
+}
+
+impl ProcessEvent {
+    /// Snapshot the process-flavor fields from an [`OwnedEvent`].
+    pub fn from_owned(ev: &OwnedEvent) -> Self {
+        Self {
+            source: ev.source,
+            received_at: ev.received_at,
+            ingress: ev.ingress.clone(),
+        }
+    }
+}
+
+impl OutputEvent {
+    /// Snapshot the output-flavor fields from an [`OwnedEvent`].
+    pub fn from_owned(ev: &OwnedEvent) -> Self {
+        Self {
+            source: ev.source,
+            received_at: ev.received_at,
+            ingress: ev.ingress.clone(),
+            egress: ev.egress.clone(),
+        }
+    }
 }
 
 impl ErroredEventContext {
+    /// Pipeline name accessor (empty string for runtime-side Output records).
+    pub fn pipeline(&self) -> &str {
+        match self {
+            Self::Process { pipeline, .. } | Self::Output { pipeline, .. } => pipeline,
+        }
+    }
+
+    /// Failure-site accessor.
+    pub fn site(&self) -> &str {
+        match self {
+            Self::Process { site, .. } | Self::Output { site, .. } => site,
+        }
+    }
+
     /// Serialise as a single-line JSON record for the dead-letter queue.
     ///
-    /// The `event` sub-object only carries `source` / `received_at` /
-    /// `ingress` — exactly the fields `OwnedEvent::from_json` (and
-    /// therefore `limpidctl inject --json`) needs to reconstruct a fresh
-    /// event. `egress` is omitted because at the failure point it may
-    /// be a partial result of earlier processes in the chain;
-    /// `workspace` is omitted for the same reason. Replay should
-    /// rebuild both from scratch.
+    /// Layout (v2 — hard break from v1):
     ///
-    /// Format is operator-stable: pre-1.0 we may add new top-level
-    /// fields, but `timestamp` / `reason` / `process` / `pipeline` /
-    /// `event` keep their current shape so existing
-    /// `jq | inject` recipes survive.
+    /// ```text
+    /// {
+    ///   "schema_version": 2,
+    ///   "timestamp": "<RFC3339 nanos UTC>",
+    ///   "reason": "<error msg>",
+    ///   "pipeline": "<def pipeline name or empty>",
+    ///   "kind": "process" | "output",
+    ///   "process": { "name": "<process_name>" },   // kind=process only
+    ///   "output":  { "name": "<output_name>" },    // kind=output only
+    ///   "event": {
+    ///     "source": { "ip": ..., "port": ... },
+    ///     "received_at": <unix nanos>,
+    ///     "ingress": "...",
+    ///     "egress":  "..."                         // kind=output only
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// `schema_version: 2` is the operator-visible discriminator for
+    /// the v0.7.8 schema break. Output records intentionally carry
+    /// *only* `{ name }` — no address, dest, path, key, topic,
+    /// partition, endpoint, URL, peer, target, or workspace. Replay
+    /// (`limpidctl inject output <name>`) hands the event back to the
+    /// sink's `consume()`, which re-routes internally.
     pub fn to_jsonl(&self) -> String {
-        let mut event_json = self.event.to_json_value();
-        if let serde_json::Value::Object(ref mut map) = event_json {
-            map.remove("egress");
-            map.remove("workspace");
+        // Rebuild a minimal Event so we can reuse the canonical
+        // `to_json_value` serialiser for source / received_at /
+        // ingress / egress. We construct it from the snapshot rather
+        // than carrying a full OwnedEvent so we never accidentally
+        // leak workspace fragments into the DLQ.
+        let (timestamp, pipeline, kind_block, reason, event_json) = match self {
+            Self::Process {
+                timestamp,
+                pipeline,
+                site,
+                reason,
+                event,
+            } => {
+                let ev = OwnedEvent {
+                    received_at: event.received_at,
+                    source: event.source,
+                    ingress: event.ingress.clone(),
+                    egress: event.ingress.clone(),
+                    workspace: std::collections::HashMap::new(),
+                    ack: None,
+                };
+                let mut event_json = ev.to_json_value();
+                if let serde_json::Value::Object(ref mut map) = event_json {
+                    // ProcessEvent has no egress concept — strip it so
+                    // replay recipes treat absence as "build egress
+                    // from ingress at deserialisation time"
+                    // (`Event::from_json` already does that).
+                    map.remove("egress");
+                    map.remove("workspace");
+                }
+                (
+                    *timestamp,
+                    pipeline,
+                    serde_json::json!({
+                        "kind": "process",
+                        "process": { "name": site },
+                    }),
+                    reason,
+                    event_json,
+                )
+            }
+            Self::Output {
+                timestamp,
+                pipeline,
+                site: _,
+                reason,
+                output_name,
+                event,
+            } => {
+                let ev = OwnedEvent {
+                    received_at: event.received_at,
+                    source: event.source,
+                    ingress: event.ingress.clone(),
+                    egress: event.egress.clone(),
+                    workspace: std::collections::HashMap::new(),
+                    ack: None,
+                };
+                let mut event_json = ev.to_json_value();
+                if let serde_json::Value::Object(ref mut map) = event_json {
+                    // Output records must never carry workspace —
+                    // any sink-specific routing metadata is forbidden
+                    // by the DLQ schema contract (replay re-routes
+                    // via the sink's own `consume()` path).
+                    map.remove("workspace");
+                }
+                (
+                    *timestamp,
+                    pipeline,
+                    serde_json::json!({
+                        "kind": "output",
+                        "output": { "name": output_name },
+                    }),
+                    reason,
+                    event_json,
+                )
+            }
+        };
+
+        // Merge kind discriminator block + per-kind name block into
+        // the top-level record. Using a Map keeps key ordering stable.
+        let mut record = serde_json::Map::new();
+        record.insert("schema_version".into(), serde_json::json!(2));
+        record.insert(
+            "timestamp".into(),
+            serde_json::Value::String(
+                timestamp.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            ),
+        );
+        record.insert(
+            "reason".into(),
+            serde_json::Value::String(reason.clone()),
+        );
+        record.insert(
+            "pipeline".into(),
+            serde_json::Value::String(pipeline.clone()),
+        );
+        if let serde_json::Value::Object(kb) = kind_block {
+            for (k, v) in kb {
+                record.insert(k, v);
+            }
         }
-        let record = serde_json::json!({
-            "timestamp": self.timestamp.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-            "reason": self.reason,
-            "process": self.process,
-            "pipeline": self.pipeline,
-            "event": event_json,
-        });
-        record.to_string()
+        record.insert("event".into(), event_json);
+        serde_json::Value::Object(record).to_string()
     }
 }
 
@@ -302,11 +516,13 @@ pub struct PipelineRunResult {
     /// `events_discarded` (Finished AND emitted nothing).
     pub had_outputs: bool,
     pub termination: PipelineTermination,
-    /// Populated iff `termination == Errored`. The runtime layer writes
-    /// this to the configured dead-letter queue (`error_log`) or, if
-    /// none is configured, emits a structured `tracing::error!` line
-    /// with the same payload.
-    pub errored: Option<ErroredEventContext>,
+    /// DLQ records accumulated during this run. Non-empty iff
+    /// `termination == Errored` from a pipeline-side failure, or when
+    /// the runtime layer appends per-failed-output enqueue records
+    /// (one per failed output). The runtime drains each record into
+    /// the configured `error_log`, or — when none is configured —
+    /// emits one structured `tracing::error!` line per record.
+    pub errored: Vec<ErroredEventContext>,
 }
 
 /// A process registry backed by compiled DSL process definitions.
@@ -427,7 +643,7 @@ pub fn run_pipeline(
     let arena = EventArena::new(bump);
     let bevent = event.view_in(&arena);
 
-    let mut errored: Option<ErroredEventContext> = None;
+    let mut errored: Vec<ErroredEventContext> = Vec::new();
     let exec_ctx = PipelineExecCtx {
         pipeline_name: &pipeline.name,
         registry: &registry,
@@ -478,7 +694,7 @@ struct PipelineExecCtx<'a, 'bump: 'a> {
 struct PipelineExecOut<'a> {
     trace: &'a mut Vec<TraceEntry>,
     outputs: &'a mut Vec<(String, OwnedEvent)>,
-    errored: &'a mut Option<ErroredEventContext>,
+    errored: &'a mut Vec<ErroredEventContext>,
 }
 
 /// Execute a pipeline body (sequence of pipeline statements).
@@ -532,12 +748,12 @@ fn exec_pipeline_stmt<'bump>(
             // Cross to owned form for the DLQ context (which must
             // outlive the per-event arena).
             let owned = event.to_owned();
-            *out.errored = Some(ErroredEventContext {
+            out.errored.push(ErroredEventContext::Process {
                 timestamp: chrono::Utc::now(),
                 pipeline: ctx.pipeline_name.to_string(),
-                process: "(pipeline)".to_string(),
+                site: "(pipeline)".to_string(),
                 reason: msg,
-                event: owned,
+                event: ProcessEvent::from_owned(&owned),
             });
             Ok((None, PipelineTermination::Errored))
         }
@@ -594,12 +810,12 @@ fn exec_pipeline_stmt<'bump>(
                                     label: name.clone(),
                                     detail: format!("error: {} (event → error_log)", e),
                                 });
-                                *out.errored = Some(ErroredEventContext {
+                                out.errored.push(ErroredEventContext::Process {
                                     timestamp: chrono::Utc::now(),
                                     pipeline: ctx.pipeline_name.to_string(),
-                                    process: name.clone(),
+                                    site: name.clone(),
                                     reason: e.to_string(),
-                                    event: backup_owned,
+                                    event: ProcessEvent::from_owned(&backup_owned),
                                 });
                                 return Ok((None, PipelineTermination::Errored));
                             }
@@ -631,12 +847,12 @@ fn exec_pipeline_stmt<'bump>(
                                     label: "(inline)".into(),
                                     detail: format!("error: {} (event → error_log)", e),
                                 });
-                                *out.errored = Some(ErroredEventContext {
+                                out.errored.push(ErroredEventContext::Process {
                                     timestamp: chrono::Utc::now(),
                                     pipeline: ctx.pipeline_name.to_string(),
-                                    process: "(inline)".to_string(),
+                                    site: "(inline)".to_string(),
                                     reason: e.to_string(),
-                                    event: backup_owned,
+                                    event: ProcessEvent::from_owned(&backup_owned),
                                 });
                                 return Ok((None, PipelineTermination::Errored));
                             }
@@ -819,20 +1035,38 @@ def pipeline p {
         )
         .unwrap();
         assert_eq!(result.termination, PipelineTermination::Errored);
-        let ctx = result.errored.expect("errored context must be populated");
-        assert_eq!(ctx.pipeline, "p");
-        assert_eq!(ctx.process, "wrap");
-        assert!(
-            ctx.reason.contains("unknown identifier"),
-            "unexpected reason: {}",
-            ctx.reason
-        );
-        assert_eq!(&ctx.event.ingress[..], b"original payload");
+        assert_eq!(result.errored.len(), 1);
+        let ctx = &result.errored[0];
+        match ctx {
+            ErroredEventContext::Process {
+                pipeline,
+                site,
+                reason,
+                event,
+                ..
+            } => {
+                assert_eq!(pipeline, "p");
+                assert_eq!(site, "wrap");
+                assert!(
+                    reason.contains("unknown identifier"),
+                    "unexpected reason: {}",
+                    reason
+                );
+                assert_eq!(&event.ingress[..], b"original payload");
+            }
+            other => panic!("expected Process variant, got {:?}", other),
+        }
         assert!(result.outputs.is_empty());
         let line = ctx.to_jsonl();
+        assert!(line.contains("\"schema_version\":2"));
+        assert!(line.contains("\"kind\":\"process\""));
         assert!(line.contains("\"pipeline\":\"p\""));
-        assert!(line.contains("\"process\":\"wrap\""));
+        assert!(line.contains("\"name\":\"wrap\""));
         assert!(line.contains("original payload"));
+        // ProcessEvent has no egress in the serialised event block.
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(v["event"]["egress"].is_null());
+        assert!(v["output"].is_null());
     }
 
     #[test]
@@ -877,14 +1111,20 @@ def pipeline p {
         )
         .unwrap();
         assert_eq!(result.termination, PipelineTermination::Errored);
-        let ctx = result.errored.expect("errored context must be populated");
-        assert_eq!(ctx.pipeline, "p");
-        assert_eq!(ctx.process, "refuse");
-        assert!(
-            ctx.reason.contains("I refuse"),
-            "unexpected reason: {}",
-            ctx.reason
-        );
+        assert_eq!(result.errored.len(), 1);
+        match &result.errored[0] {
+            ErroredEventContext::Process {
+                pipeline,
+                site,
+                reason,
+                ..
+            } => {
+                assert_eq!(pipeline, "p");
+                assert_eq!(site, "refuse");
+                assert!(reason.contains("I refuse"), "unexpected reason: {}", reason);
+            }
+            other => panic!("expected Process variant, got {:?}", other),
+        }
         assert!(result.outputs.is_empty());
     }
 
@@ -927,14 +1167,24 @@ def pipeline p {
         )
         .unwrap();
         assert_eq!(result.termination, PipelineTermination::Errored);
-        let ctx = result.errored.expect("errored context must be populated");
-        assert_eq!(ctx.pipeline, "p");
-        assert_eq!(ctx.process, "(pipeline)");
-        assert!(
-            ctx.reason.contains("blocked at pipeline gate"),
-            "unexpected reason: {}",
-            ctx.reason
-        );
+        assert_eq!(result.errored.len(), 1);
+        match &result.errored[0] {
+            ErroredEventContext::Process {
+                pipeline,
+                site,
+                reason,
+                ..
+            } => {
+                assert_eq!(pipeline, "p");
+                assert_eq!(site, "(pipeline)");
+                assert!(
+                    reason.contains("blocked at pipeline gate"),
+                    "unexpected reason: {}",
+                    reason
+                );
+            }
+            other => panic!("expected Process variant, got {:?}", other),
+        }
         assert!(result.outputs.is_empty());
     }
 
@@ -959,5 +1209,245 @@ def pipeline p {
 "#;
         let cfg = compile(src).unwrap();
         cfg.validate(&ModuleRegistry::new()).unwrap();
+    }
+
+    // ---------------------------------------------------------------------
+    // DLQ sum-type tests
+    // ---------------------------------------------------------------------
+
+    fn sample_owned_event() -> crate::event::OwnedEvent {
+        use bytes::Bytes;
+        use std::net::SocketAddr;
+        let mut ev = crate::event::OwnedEvent::new(
+            Bytes::from_static(b"hello"),
+            "10.0.0.1:514".parse::<SocketAddr>().unwrap(),
+        );
+        ev.egress = Bytes::from_static(b"goodbye");
+        ev
+    }
+
+    #[test]
+    fn process_variant_jsonl_has_no_egress_no_output_block() {
+        let ctx = ErroredEventContext::Process {
+            timestamp: chrono::DateTime::from_timestamp_nanos(1_700_000_000_000_000_000),
+            pipeline: "p".into(),
+            site: "wrap".into(),
+            reason: "boom".into(),
+            event: ProcessEvent::from_owned(&sample_owned_event()),
+        };
+        let line = ctx.to_jsonl();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["schema_version"], 2);
+        assert_eq!(v["kind"], "process");
+        assert_eq!(v["pipeline"], "p");
+        assert_eq!(v["reason"], "boom");
+        assert_eq!(v["process"]["name"], "wrap");
+        assert!(v["output"].is_null(), "Process must not carry output block");
+        assert_eq!(v["event"]["ingress"], "hello");
+        assert!(
+            v["event"]["egress"].is_null(),
+            "Process event must omit egress"
+        );
+        assert!(v["event"]["workspace"].is_null());
+    }
+
+    #[test]
+    fn output_variant_jsonl_carries_egress_and_output_block() {
+        let ctx = ErroredEventContext::Output {
+            timestamp: chrono::DateTime::from_timestamp_nanos(1_700_000_000_000_000_000),
+            pipeline: String::new(),
+            site: "sink enqueue".into(),
+            reason: "queue closed".into(),
+            output_name: "sink".into(),
+            event: OutputEvent::from_owned(&sample_owned_event()),
+        };
+        let line = ctx.to_jsonl();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["schema_version"], 2);
+        assert_eq!(v["kind"], "output");
+        assert_eq!(v["pipeline"], "");
+        assert_eq!(v["output"]["name"], "sink");
+        assert!(
+            v["process"].is_null(),
+            "Output must not carry process block"
+        );
+        assert_eq!(v["event"]["ingress"], "hello");
+        assert_eq!(v["event"]["egress"], "goodbye");
+        assert!(v["event"]["workspace"].is_null());
+    }
+
+    #[test]
+    fn output_variant_jsonl_must_not_carry_sink_routing_metadata() {
+        // Pin the DLQ no-address contract: the Output record carries
+        // ONLY `{ name }`. No address, dest, path, key, topic,
+        // partition, endpoint, url, peer, target, or workspace at any
+        // level.
+        let ctx = ErroredEventContext::Output {
+            timestamp: chrono::Utc::now(),
+            pipeline: "p".into(),
+            site: "sink".into(),
+            reason: "retry exhausted".into(),
+            output_name: "sink".into(),
+            event: OutputEvent::from_owned(&sample_owned_event()),
+        };
+        let line = ctx.to_jsonl();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let forbidden = [
+            "address",
+            "dest",
+            "path",
+            "key",
+            "topic",
+            "partition",
+            "endpoint",
+            "url",
+            "peer",
+            "target",
+            "workspace",
+        ];
+        for f in forbidden {
+            assert!(
+                v.get(f).is_none(),
+                "top-level must not carry forbidden field {}",
+                f
+            );
+            assert!(
+                v["output"].get(f).is_none(),
+                "output block must not carry forbidden field {}",
+                f
+            );
+            assert!(
+                v["event"].get(f).is_none(),
+                "event block must not carry forbidden field {}",
+                f
+            );
+        }
+        // output block must have *only* `name`.
+        let obj = v["output"].as_object().expect("output is an object");
+        assert_eq!(obj.len(), 1, "output block must carry only `name`");
+        assert!(obj.contains_key("name"));
+    }
+
+    #[test]
+    fn output_variant_round_trip_via_event_from_json() {
+        // The Output event sub-object must be replayable through
+        // `Event::from_json` so `limpidctl inject output --json` can
+        // reconstruct the egress payload end-to-end.
+        let ctx = ErroredEventContext::Output {
+            timestamp: chrono::Utc::now(),
+            pipeline: String::new(),
+            site: "sink enqueue".into(),
+            reason: "queue closed".into(),
+            output_name: "sink".into(),
+            event: OutputEvent::from_owned(&sample_owned_event()),
+        };
+        let line = ctx.to_jsonl();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let event_str = serde_json::to_string(&v["event"]).unwrap();
+        let replayed =
+            crate::event::Event::from_json(&event_str).expect("event sub-object must replay");
+        assert_eq!(&replayed.ingress[..], b"hello");
+        assert_eq!(&replayed.egress[..], b"goodbye");
+    }
+
+    #[test]
+    fn process_variant_round_trip_via_event_from_json() {
+        let ctx = ErroredEventContext::Process {
+            timestamp: chrono::Utc::now(),
+            pipeline: "p".into(),
+            site: "wrap".into(),
+            reason: "boom".into(),
+            event: ProcessEvent::from_owned(&sample_owned_event()),
+        };
+        let line = ctx.to_jsonl();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let event_str = serde_json::to_string(&v["event"]).unwrap();
+        let replayed =
+            crate::event::Event::from_json(&event_str).expect("event sub-object must replay");
+        // Process events omit egress on the wire — Event::from_json
+        // backfills egress from ingress so replay through `inject input`
+        // sees a self-consistent starting state.
+        assert_eq!(&replayed.ingress[..], b"hello");
+        assert_eq!(&replayed.egress[..], b"hello");
+    }
+
+    #[test]
+    fn process_variant_named_process_site_selection() {
+        // Named `def process` invocation surfaces site = "<process_name>".
+        use crate::event::OwnedEvent;
+        use crate::functions::{FunctionRegistry, register_builtins, table::TableStore};
+        use bytes::Bytes;
+        use std::net::SocketAddr;
+
+        let src = r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def process wrap { egress = strftime(timestamp, "%Y", "UTC") }
+def pipeline p { input i; process wrap; output o }
+"#;
+        let cfg = compile(src).unwrap();
+        let pipeline = cfg.pipelines.get("p").unwrap();
+        let mut funcs = FunctionRegistry::new();
+        let store = TableStore::from_configs(vec![]).unwrap();
+        register_builtins(&mut funcs, store);
+        let event = OwnedEvent::new(
+            Bytes::from_static(b"x"),
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        );
+        let result = run_pipeline(
+            pipeline,
+            &event,
+            &cfg,
+            &funcs,
+            None,
+            &mut bumpalo::Bump::new(),
+        )
+        .unwrap();
+        assert_eq!(result.errored.len(), 1);
+        assert!(
+            matches!(&result.errored[0], ErroredEventContext::Process { site, .. } if site == "wrap")
+        );
+    }
+
+    #[test]
+    fn process_variant_inline_site_selection() {
+        // Inline `process { ... }` block surfaces site = "(inline)".
+        use crate::event::OwnedEvent;
+        use crate::functions::{FunctionRegistry, register_builtins, table::TableStore};
+        use bytes::Bytes;
+        use std::net::SocketAddr;
+
+        let src = r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p {
+    input i
+    process { egress = strftime(timestamp, "%Y", "UTC") }
+    output o
+}
+"#;
+        let cfg = compile(src).unwrap();
+        let pipeline = cfg.pipelines.get("p").unwrap();
+        let mut funcs = FunctionRegistry::new();
+        let store = TableStore::from_configs(vec![]).unwrap();
+        register_builtins(&mut funcs, store);
+        let event = OwnedEvent::new(
+            Bytes::from_static(b"x"),
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        );
+        let result = run_pipeline(
+            pipeline,
+            &event,
+            &cfg,
+            &funcs,
+            None,
+            &mut bumpalo::Bump::new(),
+        )
+        .unwrap();
+        assert_eq!(result.errored.len(), 1);
+        assert!(matches!(
+            &result.errored[0],
+            ErroredEventContext::Process { site, .. } if site == "(inline)"
+        ));
     }
 }

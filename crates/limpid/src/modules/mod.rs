@@ -456,12 +456,13 @@ pub async fn write_shutdown_events_to_error_log(
 ) {
     let reason = format!("shutdown flush failed: {}", flush_err);
     for (ev, ack) in events {
-        let ctx = crate::pipeline::ErroredEventContext {
+        let ctx = crate::pipeline::ErroredEventContext::Output {
             timestamp: chrono::Utc::now(),
             pipeline: String::new(),
-            process: format!("(output {} shutdown)", output_name),
+            site: format!("{} shutdown", output_name),
             reason: reason.clone(),
-            event: ev,
+            output_name: output_name.to_string(),
+            event: crate::pipeline::OutputEvent::from_owned(&ev),
         };
         if let Err(write_err) = writer.write(&ctx).await {
             tracing::warn!(
@@ -486,12 +487,13 @@ pub async fn route_event_to_dlq(
     reason: &str,
 ) {
     if let Some(writer) = error_log {
-        let ctx = crate::pipeline::ErroredEventContext {
+        let ctx = crate::pipeline::ErroredEventContext::Output {
             timestamp: chrono::Utc::now(),
             pipeline: String::new(),
-            process: format!("(output {})", output_name),
+            site: output_name.to_string(),
             reason: reason.to_string(),
-            event: event.clone(),
+            output_name: output_name.to_string(),
+            event: crate::pipeline::OutputEvent::from_owned(event),
         };
         if let Err(write_err) = writer.write(&ctx).await {
             tracing::warn!(

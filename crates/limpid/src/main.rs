@@ -509,9 +509,11 @@ fn run_test(config_path: &str, pipeline_name: &str, input_json: Option<&str>) ->
     // layer (`process_event`); --test-pipeline prints the would-be
     // JSONL line so the same recipe (`jq -c '.event' | inject`) can
     // be rehearsed against the trace.
-    if let Some(ref err_ctx) = result.errored {
+    if !result.errored.is_empty() {
         println!();
-        println!("[error_log]  {}", err_ctx.to_jsonl());
+        for err_ctx in &result.errored {
+            println!("[error_log]  {}", err_ctx.to_jsonl());
+        }
     }
 
     Ok(())
