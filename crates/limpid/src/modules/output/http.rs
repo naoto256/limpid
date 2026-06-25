@@ -986,9 +986,11 @@ mod tests {
         let (ack, mut rx) = QueueAckHandle::for_test();
         let _ = output.consume(ev, ack).await;
         match rx.try_recv() {
-            Ok(crate::queue::AckDisposition::Delivered) => Ok(()),
-            Ok(crate::queue::AckDisposition::Recovered) => Err(anyhow::anyhow!("recovered to DLQ")),
-            Ok(crate::queue::AckDisposition::Dropped) => Err(anyhow::anyhow!("dropped")),
+            Ok((_, crate::queue::AckDisposition::Delivered)) => Ok(()),
+            Ok((_, crate::queue::AckDisposition::Recovered)) => {
+                Err(anyhow::anyhow!("recovered to DLQ"))
+            }
+            Ok((_, crate::queue::AckDisposition::Dropped)) => Err(anyhow::anyhow!("dropped")),
             // No disposition yet — event is parked in the buffer.
             // Treated as Ok for test purposes; tests that need to
             // observe the eventual flush dispose separately.
@@ -1474,8 +1476,14 @@ mod tests {
         output.consume(&event_with("e2"), ack2).await.unwrap();
         server.abort();
 
-        assert_eq!(rx1.recv().await, Some(crate::queue::AckDisposition::Recovered));
-        assert_eq!(rx2.recv().await, Some(crate::queue::AckDisposition::Recovered));
+        assert!(matches!(
+            rx1.recv().await,
+            Some((_, crate::queue::AckDisposition::Recovered))
+        ));
+        assert!(matches!(
+            rx2.recv().await,
+            Some((_, crate::queue::AckDisposition::Recovered))
+        ));
         assert_eq!(
             output.inner.batch.lock().await.len(),
             0,
@@ -1515,8 +1523,14 @@ mod tests {
         // Fill the batch → flush fires → ack resolves Delivered.
         let (ack2, mut rx2) = QueueAckHandle::for_test();
         output.consume(&event_with("e2"), ack2).await.unwrap();
-        assert_eq!(rx.recv().await, Some(crate::queue::AckDisposition::Delivered));
-        assert_eq!(rx2.recv().await, Some(crate::queue::AckDisposition::Delivered));
+        assert!(matches!(
+            rx.recv().await,
+            Some((_, crate::queue::AckDisposition::Delivered))
+        ));
+        assert!(matches!(
+            rx2.recv().await,
+            Some((_, crate::queue::AckDisposition::Delivered))
+        ));
         for _ in 0..50 {
             if !received.lock().await.is_empty() {
                 break;

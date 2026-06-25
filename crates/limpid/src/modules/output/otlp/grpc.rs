@@ -916,9 +916,11 @@ mod tests {
         let (ack, mut rx) = QueueAckHandle::for_test();
         let _ = output.consume(ev, ack).await;
         match rx.try_recv() {
-            Ok(crate::queue::AckDisposition::Delivered) => Ok(()),
-            Ok(crate::queue::AckDisposition::Recovered) => Err(anyhow::anyhow!("recovered to DLQ")),
-            Ok(crate::queue::AckDisposition::Dropped) => Err(anyhow::anyhow!("dropped")),
+            Ok((_, crate::queue::AckDisposition::Delivered)) => Ok(()),
+            Ok((_, crate::queue::AckDisposition::Recovered)) => {
+                Err(anyhow::anyhow!("recovered to DLQ"))
+            }
+            Ok((_, crate::queue::AckDisposition::Dropped)) => Err(anyhow::anyhow!("dropped")),
             Err(_) => Ok(()),
         }
     }
@@ -1284,8 +1286,14 @@ mod tests {
             .consume(&event_with_egress(singleton_bytes(2)), ack2)
             .await
             .unwrap();
-        assert_eq!(rx1.recv().await, Some(crate::queue::AckDisposition::Recovered));
-        assert_eq!(rx2.recv().await, Some(crate::queue::AckDisposition::Recovered));
+        assert!(matches!(
+            rx1.recv().await,
+            Some((_, crate::queue::AckDisposition::Recovered))
+        ));
+        assert!(matches!(
+            rx2.recv().await,
+            Some((_, crate::queue::AckDisposition::Recovered))
+        ));
         assert_eq!(output.inner.batch.lock().await.len(), 0);
     }
 
