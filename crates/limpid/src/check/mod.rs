@@ -640,7 +640,10 @@ def pipeline p { input i; output o }
     }
 
     #[test]
-    fn syslog_parse_binds_known_workspace_keys() {
+    fn output_workspace_ref_is_rejected_even_when_bound_upstream() {
+        // Output config cannot reference `workspace.*` regardless of
+        // whether an upstream process bound the key. Transport-side
+        // routing must be derived from event-intrinsic fields only.
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type syslog_tcp peer { host "${workspace.msg}" port 1 } }
@@ -651,28 +654,24 @@ def pipeline p {
 }
 "#;
         let diags = analyze_str(src);
-        assert!(errors(&diags).is_empty(), "got: {:?}", diags);
-    }
-
-    #[test]
-    fn parse_json_with_defaults_narrows_to_declared_keys() {
-        let src = r#"
-def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type syslog_tcp peer { host "${workspace.usr}" port 1 } }
-def pipeline p {
-    input i
-    process { parse_json(ingress, {user: "anon"}) }
-    output o
-}
-"#;
-        let diags = analyze_str(src);
         let errs = errors(&diags);
         assert_eq!(errs.len(), 1, "got: {:?}", diags);
-        assert!(errs[0].message.contains("workspace.usr"));
+        assert!(errs[0].message.contains("workspace.msg"));
+        assert!(errs[0].message.contains("not addressable from output config"));
+        let help = errs[0].help.as_deref().unwrap_or("");
+        assert!(
+            help.contains("event-intrinsic"),
+            "migration hint missing: {}",
+            help
+        );
     }
 
     #[test]
-    fn parse_json_without_defaults_wildcards() {
+    fn output_workspace_ref_is_rejected_when_upstream_wildcards() {
+        // `parse_json` without defaults flips the analyzer wildcard
+        // flag, which used to admit any workspace reference. With
+        // workspace removed from output config, even wildcard
+        // contexts produce a hard reject.
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type syslog_tcp peer { host "${workspace.anything}" port 1 } }
@@ -683,7 +682,9 @@ def pipeline p {
 }
 "#;
         let diags = analyze_str(src);
-        assert!(errors(&diags).is_empty(), "got: {:?}", diags);
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "got: {:?}", diags);
+        assert!(errs[0].message.contains("workspace.anything"));
     }
 
     // ----- branch intersection -------------------------------------------
@@ -709,7 +710,10 @@ def pipeline p {
     }
 
     #[test]
-    fn if_else_with_both_branches_binding_is_guaranteed() {
+    fn output_workspace_ref_is_rejected_even_when_both_branches_bind() {
+        // Both-branch binding used to qualify the reference as
+        // "guaranteed". With workspace removed from output config,
+        // even both-branch bindings produce a hard reject.
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type syslog_tcp peer { host "${workspace.tag}" port 1 } }
@@ -726,7 +730,9 @@ def pipeline p {
 }
 "#;
         let diags = analyze_str(src);
-        assert!(errors(&diags).is_empty(), "got: {:?}", diags);
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "got: {:?}", diags);
+        assert!(errs[0].message.contains("workspace.tag"));
     }
 
     // ----- operator type checks ------------------------------------------
@@ -918,7 +924,68 @@ def pipeline p { input i; output o }
     }
 
     #[test]
-    fn unresolved_workspace_ref_suggests_near_match() {
+    fn output_workspace_ref_is_rejected_in_file_path_template() {
+        // The structural rule applies to every sink, not just syslog.
+        // file output's `path` template (= the historical home of
+        // workspace-dependent dynamic paths) is hard-rejected like
+        // every other output property.
+        let src = r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type file path "/var/log/${workspace.tenant}/app.log" }
+def pipeline p {
+    input i
+    process { parse_json(ingress) }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "got: {:?}", diags);
+        assert!(errs[0].message.contains("workspace.tenant"));
+    }
+
+    #[test]
+    fn output_egress_ref_is_rejected_in_path_template() {
+        // `egress` is the wire bytes pipeline body sets; allowing
+        // output config to interpolate it would re-introduce the
+        // same "pipeline body indirectly controls routing" hazard
+        // `workspace.*` removal addresses.
+        let src = r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type file path "/var/log/${egress}.log" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "got: {:?}", diags);
+        assert!(errs[0].message.contains("egress"));
+        assert!(errs[0].message.contains("pipeline-mutable state"));
+    }
+
+    #[test]
+    fn output_bare_workspace_ref_is_rejected() {
+        // `${workspace}` without a subpath used to slip past the
+        // analyzer's `path.len() < 2` guard. The rule now is
+        // "pipeline-mutable idents are not visible from output
+        // config", regardless of subpath depth.
+        let src = r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type file path "/var/log/${to_json(workspace)}.log" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        let errs = errors(&diags);
+        assert_eq!(errs.len(), 1, "got: {:?}", diags);
+        assert!(errs[0].message.contains("workspace"));
+    }
+
+    #[test]
+    fn output_workspace_ref_help_is_migration_hint_not_suggestion() {
+        // Per-typo levenshtein suggestions (`did you mean workspace.msg?`)
+        // are gone now that workspace is structurally disallowed in
+        // output config. Every rejection carries the same migration
+        // hint pointing at event-intrinsic fields and pipeline-level
+        // routing.
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type syslog_tcp peer { host "${workspace.mssg}" port 1 } }
@@ -932,23 +999,10 @@ def pipeline p {
         let errs = errors(&diags);
         assert_eq!(errs.len(), 1, "got: {:?}", diags);
         let help = errs[0].help.as_deref().expect("should have help line");
-        assert!(help.contains("workspace.msg"), "help was: {}", help);
-    }
-
-    #[test]
-    fn unresolved_workspace_ref_silent_when_nothing_close() {
-        let src = r#"
-def input i { type syslog_tcp bind "0.0.0.0:514" }
-def output o { type syslog_tcp peer { host "${workspace.completely_unrelated_zzz}" port 1 } }
-def pipeline p { input i; output o }
-"#;
-        let diags = analyze_str(src);
-        let errs = errors(&diags);
-        assert_eq!(errs.len(), 1, "got: {:?}", diags);
         assert!(
-            errs[0].help.is_none(),
-            "should not suggest when nothing close: help={:?}",
-            errs[0].help
+            help.contains("event-intrinsic") && !help.contains("did you mean"),
+            "help was: {}",
+            help
         );
     }
 

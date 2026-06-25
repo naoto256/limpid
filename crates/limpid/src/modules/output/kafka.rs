@@ -113,9 +113,13 @@ const KAFKA_OUTPUT_SCHEMA: &[PropertySpec] = &[
         exclusive_group: None,
         kind: PropertyValueKind::Enum(&["0", "1", "all"]),
     },
-    // `key` accepts the magic value `source` or any user-chosen
-    // field name (`workspace.tenant` etc.). String, not Enum, since
-    // the field-name half is open.
+    // `key` accepts only the magic value `source` (= partition by
+    // event source IP). Pipeline-mutable selectors like
+    // `workspace.tenant` are rejected — see the bail in
+    // `from_properties`. Kept as String rather than Enum so the
+    // schema-level error message can match the runtime parse error
+    // (`must be 'source'`) rather than splitting it across two
+    // diagnostic categories.
     PropertySpec {
         name: "key",
         required: false,
@@ -318,11 +322,15 @@ pub struct KafkaOutput {
     metrics: Arc<OutputMetrics>,
 }
 
-/// Which event field to use as the Kafka partition key.
+/// Which event-intrinsic field to use as the Kafka partition key.
+///
+/// Only event-intrinsic fields are accepted: the partition key cannot
+/// depend on pipeline-internal workspace state. Operators who need
+/// per-tenant partition ordering must split the traffic into separate
+/// outputs at the pipeline body level, each with its own static topic.
 #[derive(Debug, Clone)]
 enum KeyField {
     Source,
-    Field(String),
 }
 
 impl Module for KafkaOutput {
@@ -370,10 +378,19 @@ impl Module for KafkaOutput {
             None => Duration::from_secs(5),
         };
 
-        let key_field = props::get_ident(properties, "key").map(|k| match k.as_str() {
-            "source" => KeyField::Source,
-            other => KeyField::Field(other.to_string()),
-        });
+        let key_field = match props::get_ident(properties, "key") {
+            Some(k) if k == "source" => Some(KeyField::Source),
+            Some(other) => anyhow::bail!(
+                "output '{}': kafka `key` must be `source` (got `{}`). \
+                 Per-tenant or per-field partitioning by pipeline-internal \
+                 workspace state is no longer supported; split the traffic \
+                 into separate kafka outputs from the pipeline body and \
+                 give each a static topic.",
+                name,
+                other,
+            ),
+            None => None,
+        };
 
         let tls = parse_tls_block(name, properties)?;
         // Pre-check before reading the password file so a broken
@@ -509,17 +526,12 @@ impl Drop for KafkaOutput {
 
 impl KafkaOutput {
     /// Compute the optional Kafka message key from `event`. Returns
-    /// `None` when no `key_field` is configured or when the referenced
-    /// workspace entry is missing / non-string. Reads owned-event
-    /// state directly after this change (no `BorrowedEvent` indirection).
+    /// `None` when no `key_field` is configured. Reads only
+    /// event-intrinsic fields (never pipeline-internal workspace).
     fn resolve_key(&self, event: &Event) -> Option<String> {
         let kf = self.key_field.as_ref()?;
         let value = match kf {
             KeyField::Source => event.source.ip().to_string(),
-            KeyField::Field(name) => event.workspace.get(name).and_then(|v| match v {
-                crate::dsl::value::OwnedValue::String(s) => Some(s.clone()),
-                _ => None,
-            })?,
         };
         Some(value)
     }
@@ -554,6 +566,40 @@ mod tests {
 
     fn ident_prop(key: &str, val: &str) -> Property {
         kv(key, ExprKind::Ident(vec![val.into()]))
+    }
+
+    fn mp(props: &[Property]) -> crate::modules::ModuleProperties {
+        crate::modules::ModuleProperties::from_parts("kafka", props.to_vec())
+    }
+
+    // ---- key field migration -----------------------------------------
+
+    #[test]
+    fn from_properties_rejects_arbitrary_key_field_with_migration_hint() {
+        // Previously the kafka output accepted any ident as `key`,
+        // looking up `event.workspace.<ident>` at send time. That
+        // capability is gone; only the event-intrinsic `source`
+        // selector remains, and any other value bails with a
+        // migration message.
+        let props = vec![
+            str_prop("brokers", "localhost:9092"),
+            str_prop("topic", "t"),
+            ident_prop("key", "user_id"),
+        ];
+        let err = KafkaOutput::from_properties(
+            "k",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .expect("constructor must reject pipeline-mutable key field");
+        let msg = err.to_string();
+        assert!(msg.contains("`source`"), "msg: {}", msg);
+        assert!(
+            msg.contains("separate kafka outputs from the pipeline body"),
+            "msg: {}",
+            msg,
+        );
     }
 
     // ---- security_protocol selector ----

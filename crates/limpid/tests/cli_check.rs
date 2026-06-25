@@ -6,7 +6,8 @@
 //! path — bare unit tests on `run_check` would skip exit codes.
 
 use std::fs;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
@@ -752,4 +753,159 @@ fn check_self_inclusion_is_rejected() {
     // a24de11 unified "self-inclusion" with general cycle detection;
     // a file including itself is a cycle of length 1.
     assert!(stderr.contains("cycle"), "stderr: {}", stderr);
+}
+
+// ---- daemon startup analyzer enforcement -----------------------------
+//
+// `--check` and daemon startup share the same compile-validate-analyze
+// spine via `compile_and_analyze` in `main.rs`. These tests pin that
+// contract: an operator who skips `--check` and launches the daemon
+// directly hits the same analyzer rejection (= no "valid for daemon,
+// rejected by --check" asymmetry).
+
+fn run_daemon_attempt(config: &std::path::Path) -> std::process::Output {
+    // Drive `limpid <conf>` without `--check`. For analyzer-rejected
+    // configs the process bails at `compile_and_analyze` (= before any
+    // I/O) in milliseconds. A 5-second polling timeout guards against
+    // a future regression where the daemon accepts a config we expect
+    // to reject and proceeds to bind listeners: without this the test
+    // would block the suite indefinitely. The poll interval is short
+    // enough that the happy (= reject) path still finishes in tens of
+    // ms.
+    let mut child = Command::new(limpid_bin())
+        .arg("--config")
+        .arg(config)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn limpid");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .expect("failed to capture daemon output");
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "daemon did not exit within 5s for config {} — analyzer regression?",
+                        config.display(),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => panic!("try_wait error: {}", e),
+        }
+    }
+}
+
+#[test]
+fn daemon_startup_rejects_workspace_in_output_config() {
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("daemon_workspace.conf");
+    fs::write(
+        &conf,
+        r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type syslog_tcp peer { host "${workspace.tag}" port 1 } }
+def pipeline p {
+    input i
+    process { syslog.parse(ingress) }
+    output o
+}
+"#,
+    )
+    .unwrap();
+
+    let out = run_daemon_attempt(&conf);
+    assert!(
+        !out.status.success(),
+        "daemon must reject config that `--check` would reject; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("workspace.tag"),
+        "expected analyzer-style diagnostic on daemon path; stderr: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("rejected by analyzer"),
+        "expected `compile_and_analyze` bail message; stderr: {}",
+        stderr
+    );
+}
+
+#[test]
+fn daemon_startup_rejects_egress_reference_in_output_config() {
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("daemon_egress.conf");
+    fs::write(
+        &conf,
+        r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type file path "/var/log/${egress}.log" }
+def pipeline p { input i; output o }
+"#,
+    )
+    .unwrap();
+
+    let out = run_daemon_attempt(&conf);
+    assert!(
+        !out.status.success(),
+        "daemon must reject pipeline-mutable refs; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("egress") && stderr.contains("pipeline-mutable state"),
+        "expected pipeline-mutable diagnostic; stderr: {}",
+        stderr
+    );
+}
+
+#[test]
+fn daemon_and_check_reject_same_workspace_config() {
+    // Asymmetry sentinel: if `--check` produces an error message for
+    // an output workspace reference but daemon startup happily
+    // accepts the same file (or vice versa), this test fails — making
+    // it impossible to silently regress the structural rule (= what
+    // happens when a future analyzer rule is added but daemon path
+    // forgets to re-run analyze).
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("symmetric.conf");
+    fs::write(
+        &conf,
+        r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type file path "/var/log/${workspace.tenant}.log" }
+def pipeline p {
+    input i
+    process { parse_json(ingress) }
+    output o
+}
+"#,
+    )
+    .unwrap();
+
+    let check_out = run_check(&conf);
+    let check_stderr = String::from_utf8(check_out.stderr).unwrap();
+    assert!(!check_out.status.success(), "--check must reject");
+
+    let daemon_out = run_daemon_attempt(&conf);
+    let daemon_stderr = String::from_utf8(daemon_out.stderr).unwrap();
+    assert!(!daemon_out.status.success(), "daemon must also reject");
+
+    // Both surfaces must mention the offending reference.
+    assert!(
+        check_stderr.contains("workspace.tenant") && daemon_stderr.contains("workspace.tenant"),
+        "asymmetric rejection:\n--check stderr: {}\ndaemon stderr: {}",
+        check_stderr,
+        daemon_stderr,
+    );
 }
