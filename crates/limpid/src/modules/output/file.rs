@@ -33,7 +33,7 @@ use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::{BorrowedEvent, Event};
 use crate::functions::FunctionRegistry;
 use crate::metrics::OutputMetrics;
-use crate::modules::{HasMetrics, Module, Output, OutputBuilderWithErrorLog, RenderError};
+use crate::modules::{HasMetrics, Module, Output, RenderError};
 use crate::queue::{QueueAckHandle, RetryConfig};
 
 const FILE_OUTPUT_SCHEMA: &[PropertySpec] = &[
@@ -90,7 +90,7 @@ pub struct FileOutput {
     group: Option<String>,
     /// Tracks which paths have been created (for applying mode/owner/group once)
     created_paths: Mutex<HashSet<PathBuf>>,
-    funcs: Option<Arc<FunctionRegistry>>,
+    funcs: Arc<FunctionRegistry>,
     retry: RetryConfig,
     error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
     metrics: Arc<OutputMetrics>,
@@ -101,17 +101,13 @@ impl Module for FileOutput {
         Some(FILE_OUTPUT_SCHEMA)
     }
 
-    fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
-        Self::from_properties_with_error_log(name, properties, None)
-    }
-}
-
-impl OutputBuilderWithErrorLog for FileOutput {
-    fn from_properties_with_error_log(
+    fn from_properties(
         name: &str,
         properties: &crate::modules::ModuleProperties,
-        error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+        ctx: &crate::modules::BuildContext,
     ) -> Result<Self> {
+        let error_log = ctx.error_log.as_ref().map(Arc::clone);
+        let funcs = Arc::clone(&ctx.funcs);
         let retry = RetryConfig::from_output_properties(properties.user_properties())?;
         let properties = properties.user_properties();
         let path = props::get_expr(properties, "path")
@@ -152,7 +148,7 @@ impl OutputBuilderWithErrorLog for FileOutput {
             owner,
             group,
             created_paths: Mutex::new(HashSet::new()),
-            funcs: None,
+            funcs,
             retry,
             error_log,
             metrics: Arc::new(OutputMetrics::default()),
@@ -169,10 +165,6 @@ impl HasMetrics for FileOutput {
 
 #[async_trait::async_trait]
 impl Output for FileOutput {
-    fn attach_funcs(&mut self, funcs: Arc<FunctionRegistry>) {
-        self.funcs = Some(funcs);
-    }
-
     async fn consume(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
         // Per-event lifecycle: render → write (with internal retry) →
         // resolve. Render failures are deterministic on the event and
@@ -354,12 +346,7 @@ impl FileOutput {
         match &self.path.kind {
             ExprKind::StringLit(s) => Ok((s.clone(), false)),
             ExprKind::Template(fragments) => {
-                let funcs = self.funcs.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "output file: FunctionRegistry not attached — \
-                         dynamic path template requires attach_funcs() before render"
-                    )
-                })?;
+                let funcs = &self.funcs;
                 let mut out = String::new();
                 for frag in fragments {
                     match frag {
@@ -625,7 +612,7 @@ mod tests {
             owner: None,
             group: None,
             created_paths: Mutex::new(HashSet::new()),
-            funcs: Some(funcs()),
+            funcs: funcs(),
             retry: RetryConfig::default(),
             error_log: None,
             metrics: Arc::new(OutputMetrics::default()),
@@ -831,16 +818,6 @@ mod tests {
             "unexpected error: {}",
             err
         );
-    }
-
-    #[test]
-    fn render_template_errors_without_attached_funcs() {
-        let mut out = make_output(ek(ExprKind::Template(vec![TemplateFragment::Interp(ek(
-            ExprKind::Ident(vec!["source".into()]),
-        ))])));
-        out.funcs = None;
-        let err = render_path_owned(&out, &event_with_workspace()).unwrap_err();
-        assert!(err.to_string().contains("FunctionRegistry not attached"));
     }
 
     #[test]

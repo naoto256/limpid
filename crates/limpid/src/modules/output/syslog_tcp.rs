@@ -35,7 +35,7 @@ use crate::modules::output::syslog_peers::{
     PEER_CONNECT_TIMEOUT, PEER_HANDSHAKE_TIMEOUT, PEER_WRITE_TIMEOUT, Peer, PeerList,
     SyslogFraming, SyslogPayload, parse_host_port, write_framed,
 };
-use crate::modules::{HasMetrics, Module, Output, OutputBuilderWithErrorLog};
+use crate::modules::{HasMetrics, Module, Output};
 use crate::queue::{QueueAckHandle, RetryConfig};
 use crate::tls::{ClientTlsConfig, build_client_config_sync};
 
@@ -182,17 +182,12 @@ impl Module for SyslogTcpOutput {
         Some(SYSLOG_TCP_OUTPUT_SCHEMA)
     }
 
-    fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
-        Self::from_properties_with_error_log(name, properties, None)
-    }
-}
-
-impl OutputBuilderWithErrorLog for SyslogTcpOutput {
-    fn from_properties_with_error_log(
+    fn from_properties(
         name: &str,
         properties: &crate::modules::ModuleProperties,
-        error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+        ctx: &crate::modules::BuildContext,
     ) -> Result<Self> {
+        let error_log = ctx.error_log.as_ref().map(Arc::clone);
         let retry = RetryConfig::from_output_properties(properties.user_properties())?;
         let properties = properties.user_properties();
         let framing = parse_framing(name, properties)?;
@@ -577,7 +572,7 @@ mod tests {
     #[test]
     fn build_accepts_single_peer() {
         let props = vec![peer_plain("127.0.0.1", 514)];
-        let tcp = SyslogTcpOutput::build("relay", &mp(&props)).expect("should build");
+        let tcp = SyslogTcpOutput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing()).expect("should build");
         assert_eq!(tcp.peers.len(), 1);
         assert_eq!(tcp.peers.peers()[0].address(), "127.0.0.1:514");
         assert_eq!(tcp.framing, SyslogFraming::OctetCounting);
@@ -591,7 +586,7 @@ mod tests {
             "peer",
             vec![kv("host", ExprKind::StringLit("127.0.0.1".into()))],
         )];
-        let tcp = SyslogTcpOutput::build("relay", &mp(&props)).expect("should build");
+        let tcp = SyslogTcpOutput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing()).expect("should build");
         assert_eq!(tcp.peers.peers()[0].address(), "127.0.0.1:514");
     }
 
@@ -601,7 +596,7 @@ mod tests {
             "peers",
             vec![peer_plain("a", 514), peer_plain("b", 1514)],
         )];
-        let tcp = SyslogTcpOutput::build("relay", &mp(&props)).expect("should build");
+        let tcp = SyslogTcpOutput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing()).expect("should build");
         assert_eq!(tcp.peers.len(), 2);
         assert_eq!(tcp.peers.peers()[0].address(), "a:514");
         assert_eq!(tcp.peers.peers()[1].address(), "b:1514");
@@ -613,7 +608,7 @@ mod tests {
             peer_plain("h", 1),
             kv("framing", ExprKind::Ident(vec!["non_transparent".into()])),
         ];
-        let tcp = SyslogTcpOutput::build("relay", &mp(&props)).expect("should build");
+        let tcp = SyslogTcpOutput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing()).expect("should build");
         assert_eq!(tcp.framing, SyslogFraming::NonTransparent);
     }
 
@@ -623,7 +618,7 @@ mod tests {
             peer_plain("h", 1),
             kv("framing", ExprKind::Ident(vec!["non_trasnaprent".into()])),
         ];
-        let err = SyslogTcpOutput::build("relay", &mp(&props))
+        let err = SyslogTcpOutput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing())
             .err()
             .expect("should fail");
         let msg = err.to_string();
@@ -641,7 +636,7 @@ mod tests {
             "per",
             vec![kv("host", ExprKind::StringLit("h".into()))],
         )];
-        let err = SyslogTcpOutput::build("relay", &mp(&props))
+        let err = SyslogTcpOutput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing())
             .err()
             .expect("should fail");
         let msg = err.to_string();
@@ -658,7 +653,7 @@ mod tests {
                 kv("port", ExprKind::StringLit("five-fourteen".into())),
             ],
         )];
-        let err = SyslogTcpOutput::build("relay", &mp(&props))
+        let err = SyslogTcpOutput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing())
             .err()
             .expect("should fail");
         let msg = err.to_string();
@@ -672,7 +667,7 @@ mod tests {
             block("per", vec![kv("host", ExprKind::StringLit("h".into()))]),
             kv("framing", ExprKind::Ident(vec!["xx".into()])),
         ];
-        let err = SyslogTcpOutput::build("relay", &mp(&props))
+        let err = SyslogTcpOutput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing())
             .err()
             .expect("should fail");
         let msg = err.to_string();
@@ -686,7 +681,7 @@ mod tests {
             peer_plain("a", 514),
             block("peers", vec![peer_plain("b", 514)]),
         ];
-        let err = SyslogTcpOutput::build("relay", &mp(&props))
+        let err = SyslogTcpOutput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing())
             .err()
             .expect("should fail");
         let msg = err.to_string();
@@ -705,7 +700,7 @@ mod tests {
             peer_plain("a", 514),
             block("peers", vec![peer_plain("b", 514)]),
         ];
-        let err = SyslogTcpOutput::from_properties("relay", &mp(&props))
+        let err = SyslogTcpOutput::from_properties("relay", &mp(&props), &crate::modules::BuildContext::for_testing())
             .err()
             .expect("from_properties should reject both blocks");
         let msg = err.to_string();
@@ -714,7 +709,7 @@ mod tests {
 
     #[test]
     fn build_rejects_missing_destination() {
-        let err = SyslogTcpOutput::build("relay", &mp(&[]))
+        let err = SyslogTcpOutput::build("relay", &mp(&[]), &crate::modules::BuildContext::for_testing())
             .err()
             .expect("should fail");
         assert!(
@@ -727,7 +722,7 @@ mod tests {
 
     #[test]
     fn build_rejects_empty_peers_block() {
-        let err = SyslogTcpOutput::from_properties("relay", &mp(&[block("peers", vec![])]))
+        let err = SyslogTcpOutput::from_properties("relay", &mp(&[block("peers", vec![])]), &crate::modules::BuildContext::for_testing())
             .err()
             .expect("should fail");
         assert!(
@@ -749,7 +744,7 @@ mod tests {
     #[test]
     fn build_rejects_peer_missing_host() {
         let props = vec![block("peer", vec![kv("port", ExprKind::IntLit(514))])];
-        let err = SyslogTcpOutput::build("relay", &mp(&props))
+        let err = SyslogTcpOutput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing())
             .err()
             .expect("should fail");
         assert!(err.to_string().contains("host"), "{}", err);
@@ -758,7 +753,7 @@ mod tests {
     #[test]
     fn from_properties_directly_still_works_for_existing_call_sites() {
         let props = vec![peer_plain("h", 1)];
-        let tcp = SyslogTcpOutput::from_properties("relay", &mp(&props)).expect("should build");
+        let tcp = SyslogTcpOutput::from_properties("relay", &mp(&props), &crate::modules::BuildContext::for_testing()).expect("should build");
         assert_eq!(tcp.peers.peers()[0].address(), "h:1");
     }
 
@@ -772,6 +767,7 @@ mod tests {
         let output = SyslogTcpOutput::build(
             "relay",
             &mp(&[peer_with_tls("example.com", 6514, ca_block(&files.cert))]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .expect("should build");
         let peer0 = &output.peers.peers()[0];
@@ -789,6 +785,7 @@ mod tests {
                 6514,
                 mtls_block(&files.cert, &files.key, &files.cert),
             )]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .expect("should build");
         let tls = output.peers.peers()[0].tls.as_ref().unwrap();
@@ -815,6 +812,7 @@ mod tests {
                     kv("tls", ExprKind::Ident(vec!["my_p".into()])),
                 ),
             ]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .expect("should build");
         assert_eq!(
@@ -837,6 +835,7 @@ mod tests {
                 6514,
                 kv("tls", ExprKind::Ident(vec!["missing".into()])),
             )]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .err()
         .expect("should fail");
@@ -852,6 +851,7 @@ mod tests {
                 6514,
                 tls_block(vec![kv("cert", ExprKind::StringLit("x.crt".into()))]),
             )]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .err()
         .expect("should fail");
@@ -867,6 +867,7 @@ mod tests {
                 6514,
                 tls_block(vec![kv("key", ExprKind::StringLit("x.key".into()))]),
             )]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .err()
         .expect("should fail");
@@ -903,6 +904,7 @@ mod tests {
                     ],
                 ),
             ]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .expect("should build");
         assert_eq!(output.peers.len(), 3);
@@ -924,6 +926,7 @@ mod tests {
                     peer_with_tls_default_port("plain.example.com", None),
                 ],
             )]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .expect("should build");
         // TLS peer → 6514 (RFC 5425), plain peer → 514 (RFC 6587).

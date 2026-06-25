@@ -167,7 +167,11 @@ impl Module for OtlpHttpInput {
         Some(OTLP_HTTP_INPUT_SCHEMA)
     }
 
-    fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
+    fn from_properties(
+        name: &str,
+        properties: &crate::modules::ModuleProperties,
+        _ctx: &crate::modules::BuildContext,
+    ) -> Result<Self> {
         let properties = properties.user_properties();
         let tls_config =
             TlsConfig::from_properties_block(&format!("input '{}'", name), properties)?;
@@ -464,7 +468,7 @@ mod tests {
 
     #[test]
     fn defaults_have_no_request_throttles() {
-        let i = OtlpHttpInput::from_properties("o", &mp(&[])).unwrap();
+        let i = OtlpHttpInput::from_properties("o", &mp(&[]), &crate::modules::BuildContext::for_testing()).unwrap();
         assert_eq!(i.bind_addr, "0.0.0.0:4318");
         assert_eq!(i.body_limit, DEFAULT_BODY_LIMIT_BYTES);
         assert_eq!(i.rate_limit, None);
@@ -480,6 +484,7 @@ mod tests {
                 prop_int("request_rate_limit", 100),
                 prop_int("max_concurrent_requests", 32),
             ]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
         assert_eq!(i.request_rate_limit, Some(100));
@@ -491,7 +496,7 @@ mod tests {
         // get_strictly_positive_int forbids 0; the property is
         // documented as "off when absent", so 0 is meaningless.
         let err =
-            OtlpHttpInput::from_properties("o", &mp(&[prop_int("max_concurrent_requests", 0)]))
+            OtlpHttpInput::from_properties("o", &mp(&[prop_int("max_concurrent_requests", 0)]), &crate::modules::BuildContext::for_testing())
                 .err()
                 .unwrap();
         assert!(
@@ -502,16 +507,16 @@ mod tests {
 
     #[test]
     fn body_limit_accepts_size_suffix() {
-        let i = OtlpHttpInput::from_properties("o", &mp(&[prop_str("body_limit", "1MB")])).unwrap();
+        let i = OtlpHttpInput::from_properties("o", &mp(&[prop_str("body_limit", "1MB")]), &crate::modules::BuildContext::for_testing()).unwrap();
         assert_eq!(i.body_limit, 1024 * 1024);
         let i =
-            OtlpHttpInput::from_properties("o", &mp(&[prop_str("body_limit", "64MB")])).unwrap();
+            OtlpHttpInput::from_properties("o", &mp(&[prop_str("body_limit", "64MB")]), &crate::modules::BuildContext::for_testing()).unwrap();
         assert_eq!(i.body_limit, 64 * 1024 * 1024);
     }
 
     #[test]
     fn body_limit_zero_is_rejected() {
-        let err = OtlpHttpInput::from_properties("o", &mp(&[prop_str("body_limit", "0")]))
+        let err = OtlpHttpInput::from_properties("o", &mp(&[prop_str("body_limit", "0")]), &crate::modules::BuildContext::for_testing())
             .err()
             .unwrap();
         assert!(
@@ -524,7 +529,7 @@ mod tests {
     #[test]
     fn body_limit_unrecognised_format_propagates_parse_error() {
         // parse_size's own error wording carries through.
-        let err = OtlpHttpInput::from_properties("o", &mp(&[prop_str("body_limit", "huge")]))
+        let err = OtlpHttpInput::from_properties("o", &mp(&[prop_str("body_limit", "huge")]), &crate::modules::BuildContext::for_testing())
             .err()
             .unwrap();
         assert!(
@@ -570,7 +575,7 @@ mod tests {
 
     #[test]
     fn defaults_have_no_tls() {
-        let i = OtlpHttpInput::from_properties("o", &mp(&[])).unwrap();
+        let i = OtlpHttpInput::from_properties("o", &mp(&[]), &crate::modules::BuildContext::for_testing()).unwrap();
         assert!(i.tls_config.is_none());
     }
 
@@ -583,6 +588,7 @@ mod tests {
                 "tls",
                 vec![prop_str("cert", &files.cert), prop_str("key", &files.key)],
             )]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
         let tls = i.tls_config.as_ref().expect("tls present");
@@ -604,6 +610,7 @@ mod tests {
                     prop_str("ca", &files.cert),
                 ],
             )]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
         let tls = i.tls_config.as_ref().expect("tls present");
@@ -616,6 +623,7 @@ mod tests {
         let err = OtlpHttpInput::from_properties(
             "o",
             &mp(&[prop_block("tls", vec![prop_str("key", &files.key)])]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .err()
         .unwrap();
@@ -654,6 +662,7 @@ mod tests {
                 prop_str("bind", &addr.to_string()),
                 prop_str("body_limit", "256"),
             ]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
         let (tx, _rx) = mpsc::channel(8);
@@ -745,6 +754,7 @@ mod tests {
                 prop_str("bind", &addr.to_string()),
                 prop_str("body_limit", "1KB"),
             ]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
         let (tx, mut rx) = mpsc::channel(8);
@@ -779,13 +789,13 @@ mod tests {
 
     #[test]
     fn rate_limit_is_parsed_as_positive_int() {
-        let i = OtlpHttpInput::from_properties("o", &mp(&[prop_int("rate_limit", 5000)])).unwrap();
+        let i = OtlpHttpInput::from_properties("o", &mp(&[prop_int("rate_limit", 5000)]), &crate::modules::BuildContext::for_testing()).unwrap();
         assert_eq!(i.rate_limit, Some(5000));
     }
 
     #[test]
     fn rate_limit_zero_is_rejected() {
-        let err = OtlpHttpInput::from_properties("o", &mp(&[prop_int("rate_limit", 0)]))
+        let err = OtlpHttpInput::from_properties("o", &mp(&[prop_int("rate_limit", 0)]), &crate::modules::BuildContext::for_testing())
             .err()
             .unwrap();
         assert!(err.to_string().contains("rate_limit"), "unexpected: {err}");
@@ -820,6 +830,7 @@ mod tests {
                 prop_str("bind", &addr.to_string()),
                 prop_int("rate_limit", 5),
             ]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
         let (tx, mut rx) = mpsc::channel(64);
@@ -925,6 +936,7 @@ mod tests {
                 // taken the semaphore permit.
                 prop_int("request_rate_limit", 1),
             ]),
+            &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
         let (tx, mut rx) = mpsc::channel(8);

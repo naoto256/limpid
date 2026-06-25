@@ -69,7 +69,11 @@ impl Module for TailInput {
         Some(TAIL_INPUT_SCHEMA)
     }
 
-    fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
+    fn from_properties(
+        name: &str,
+        properties: &crate::modules::ModuleProperties,
+        _ctx: &crate::modules::BuildContext,
+    ) -> Result<Self> {
         let properties = properties.user_properties();
         let path = props::get_string(properties, "path")
             .ok_or_else(|| anyhow::anyhow!("input '{}': tail requires 'path'", name))?;

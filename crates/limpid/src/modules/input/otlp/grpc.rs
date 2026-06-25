@@ -91,7 +91,11 @@ impl Module for OtlpGrpcInput {
         Some(OTLP_GRPC_INPUT_SCHEMA)
     }
 
-    fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
+    fn from_properties(
+        name: &str,
+        properties: &crate::modules::ModuleProperties,
+        _ctx: &crate::modules::BuildContext,
+    ) -> Result<Self> {
         let properties = properties.user_properties();
         let bind =
             props::get_string(properties, "bind").unwrap_or_else(|| "0.0.0.0:4317".to_string());
@@ -278,7 +282,7 @@ mod tests {
 
     #[test]
     fn defaults_bind_address_no_rate_limit_no_tls() {
-        let i = OtlpGrpcInput::from_properties("o", &mp(&[])).unwrap();
+        let i = OtlpGrpcInput::from_properties("o", &mp(&[]), &crate::modules::BuildContext::for_testing()).unwrap();
         assert_eq!(i.bind_addr, "0.0.0.0:4317");
         assert_eq!(i.rate_limit, None);
         assert!(i.tls.is_none());
@@ -292,7 +296,7 @@ mod tests {
             value: crate::dsl::ast::Expr::spanless(crate::dsl::ast::ExprKind::IntLit(2500)),
             value_span: None,
         };
-        let i = OtlpGrpcInput::from_properties("o", &mp(&[prop])).unwrap();
+        let i = OtlpGrpcInput::from_properties("o", &mp(&[prop]), &crate::modules::BuildContext::for_testing()).unwrap();
         assert_eq!(i.rate_limit, Some(2500));
     }
 
@@ -335,7 +339,7 @@ mod tests {
     #[test]
     fn tls_block_records_cert_key() {
         let props = vec![tls_block("/c.pem", "/k.pem", None)];
-        let i = OtlpGrpcInput::from_properties("o", &mp(&props)).unwrap();
+        let i = OtlpGrpcInput::from_properties("o", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
         let tls = i.tls.expect("tls present");
         assert_eq!(tls.cert_path, "/c.pem");
         assert_eq!(tls.key_path, "/k.pem");
@@ -345,7 +349,7 @@ mod tests {
     #[test]
     fn tls_block_records_ca_for_mtls() {
         let props = vec![tls_block("/c.pem", "/k.pem", Some("/ca.pem"))];
-        let i = OtlpGrpcInput::from_properties("o", &mp(&props)).unwrap();
+        let i = OtlpGrpcInput::from_properties("o", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
         let tls = i.tls.expect("tls present");
         assert_eq!(tls.ca_path.as_deref(), Some("/ca.pem"));
     }
@@ -364,7 +368,7 @@ mod tests {
                 value_span: None,
             }],
         }];
-        let err = OtlpGrpcInput::from_properties("o", &mp(&props))
+        let err = OtlpGrpcInput::from_properties("o", &mp(&props), &crate::modules::BuildContext::for_testing())
             .err()
             .unwrap();
         assert!(
