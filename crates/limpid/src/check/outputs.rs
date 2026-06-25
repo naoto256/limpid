@@ -1,11 +1,19 @@
-//! Output-side reference checks: every `workspace.*` reference in an
-//! output property must correspond to a key produced upstream.
+//! Output-side reference checks: output config templates may only
+//! reference event-intrinsic fields (`source`, `received_at`,
+//! `ingress`). Pipeline-mutable state (`workspace`, `egress`,
+//! `error`) is structurally not addressable from output config —
+//! letting transport metadata depend on pipeline-body output would
+//! re-introduce the same hazard `workspace.*` removal addressed.
 //!
-//! Walks every property's value expression, collects the workspace
-//! references (idents, property accesses, template `${…}` interps,
-//! function-call args, binary/unary subexpressions, hash literals),
-//! and emits an Error per unresolved key. Levenshtein-based "did you
-//! mean" hints are attached when a near match exists.
+//! Walks every property's value expression, collects ident references
+//! (idents, property accesses, template `${…}` interps, function-call
+//! args, binary/unary subexpressions, hash literals), and emits a
+//! hard-reject Error per pipeline-only reference with a migration
+//! hint pointing at event-intrinsic fields and pipeline-level
+//! routing. Daemon startup and reload run the same analyzer via
+//! `compile_and_analyze` in `main.rs`, so this rule applies on every
+//! load surface — there is no "valid for daemon, rejected by
+//! --check" asymmetry.
 
 use crate::dsl::ast::{Expr, ExprKind, OutputDef, Property, walk_children};
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
@@ -15,7 +23,7 @@ use crate::modules::ModuleRegistry;
 
 use super::bindings::Bindings;
 use super::module_props::schema_declares_key;
-use super::{DiagKind, Diagnostic, expr_types, suggestions};
+use super::{DiagKind, Diagnostic, expr_types};
 
 /// When descending into a `Property::Block`, look up the inner schema
 /// for that block's key in the parent schema (if any). Returns the
@@ -150,11 +158,10 @@ fn analyze_property(
                 );
             }
             collect_workspace_refs(expr, &mut |path| {
-                check_workspace_reference(
+                check_pipeline_only_reference(
                     path,
                     output_name,
                     pipeline_name,
-                    bindings,
                     *value_span,
                     diagnostics,
                 );
@@ -183,35 +190,44 @@ fn analyze_property(
     }
 }
 
-fn check_workspace_reference(
+/// Reserved idents that the pipeline body produces or mutates. They
+/// stay invisible to output config so transport metadata can't
+/// indirectly depend on pipeline-body output.
+///
+/// `ingress`, `source`, `received_at` are intentionally absent: those
+/// are input-layer immutables that output templates may legitimately
+/// read.
+const PIPELINE_ONLY_IDENTS: &[&str] = &["workspace", "egress", "error"];
+
+fn check_pipeline_only_reference(
     path: &[String],
     output_name: &str,
     pipeline_name: &str,
-    bindings: &Bindings,
     span: Option<Span>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    // Only `workspace.*` references with at least one segment under
-    // workspace are interesting — reserved idents (ingress / source /
-    // timestamp / error / egress) are always present.
-    if path.first().map(String::as_str) != Some("workspace") || path.len() < 2 {
+    // Reject both `<reserved>.<subpath>` and the bare `<reserved>`
+    // reference (= `${workspace}` or function args like
+    // `${to_json(workspace)}`); the rule is "this ident is not visible
+    // here", not "specific subpaths are checked".
+    let Some(head) = path.first() else { return };
+    if !PIPELINE_ONLY_IDENTS.contains(&head.as_str()) {
         return;
     }
-    if !bindings.workspace_visible(path) {
-        let joined = path.join(".");
-        let mut diag = Diagnostic::error_kind(
-            DiagKind::UnknownIdent,
-            format!(
-                "[pipeline {}] output `{}` references `{}` which is not produced by any upstream module",
-                pipeline_name, output_name, joined,
-            ),
-        )
-        .with_span(span);
-        if let Some(near) = suggestions::near_workspace_path(&joined, bindings) {
-            diag = diag.with_help(format!("did you mean `{}`?", near));
-        }
-        diagnostics.push(diag);
-    }
+    let joined = path.join(".");
+    let diag = Diagnostic::error_kind(
+        DiagKind::UnknownIdent,
+        format!(
+            "[pipeline {}] output `{}` references `{}`: pipeline-mutable state is not addressable from output config",
+            pipeline_name, output_name, joined,
+        ),
+    )
+    .with_span(span)
+    .with_help(
+        "transport metadata must use event-intrinsic fields (source, received_at, ingress) only; \
+         route per-tenant or per-event traffic via separate outputs from the pipeline body".to_string(),
+    );
+    diagnostics.push(diag);
 }
 
 fn collect_workspace_refs(expr: &Expr, cb: &mut dyn FnMut(&[String])) {

@@ -120,6 +120,7 @@ impl CompiledConfig {
         Ok(())
     }
 
+
     fn validate_pipeline_stmt(&self, pipeline_name: &str, stmt: &PipelineStatement) -> Result<()> {
         match stmt {
             PipelineStatement::Input(input_names) => {

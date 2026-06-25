@@ -152,14 +152,60 @@ fn refuse_root_unless_overridden() -> Result<()> {
     Ok(())
 }
 
-/// Daemon mode: start the tokio runtime and run the log pipeline.
+/// Load a config file from disk and run the full compile-validate-
+/// analyze spine, returning the [`CompiledConfig`] only when every
+/// error-level analyzer diagnostic is clean.
+///
+/// Used by both daemon startup and reload so the runtime sees exactly
+/// the same valid-config contract operators get from `--check`. Without
+/// this shared spine, the daemon would accept configs that `--check`
+/// rejects — silently re-introducing the "analyzer rule not enforced
+/// in production" gap this restructure was meant to close. Adding a
+/// new analyzer rule automatically applies to the daemon here; no
+/// per-rule duplicate validator needs to be plumbed into
+/// `Runtime::start`.
+///
+/// Every diagnostic is rendered to stderr via
+/// [`check::render::render_diagnostic`] (= the same snippet+caret
+/// shape `--check` uses) so an operator who launched the daemon in
+/// the foreground sees identical diagnostic text. Errors halt the
+/// load; warnings are rendered but do not fail. Operators who want
+/// warnings to fail must run `--check --strict-warnings` (or
+/// `--ultra-strict`) as a pre-deployment gate; the daemon stays
+/// conservative about which level halts startup.
+fn compile_and_analyze(config_file: &Path) -> Result<CompiledConfig> {
+    let (config, source_map) = config::load_config_with_source_map(config_file)
+        .context("configuration error")?;
+    let compiled = CompiledConfig::from_config(config)?;
+    let mut registry = crate::modules::ModuleRegistry::new();
+    crate::modules::register_builtins(&mut registry);
+    compiled.validate(&registry)?;
+
+    let diagnostics = check::analyze(&compiled, &source_map);
+    let mut errors = 0usize;
+    for d in &diagnostics {
+        if matches!(d.level, check::Level::Error) {
+            errors += 1;
+        }
+        check::render::render_diagnostic(d, &source_map);
+    }
+    if errors > 0 {
+        anyhow::bail!(
+            "configuration rejected by analyzer: {} error(s) — fix the configuration or run \
+             `limpid --check {}` for full diagnostics",
+            errors,
+            config_file.display(),
+        );
+    }
+    Ok(compiled)
+}
+
 fn run_daemon(config_path: &str) -> Result<()> {
     refuse_root_unless_overridden()?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let config_file = Path::new(config_path).to_path_buf();
-        let config = config::load_config(&config_file).context("configuration error")?;
-        let compiled = CompiledConfig::from_config(config)?;
+        let compiled = compile_and_analyze(&config_file)?;
 
         let mut runtime = runtime::Runtime::start(compiled, config_file).await?;
 
@@ -178,19 +224,20 @@ fn run_daemon(config_path: &str) -> Result<()> {
                     // start.
                     let old_config = runtime.compiled_config();
 
-                    // Load and validate the new config from disk. Errors
-                    // here are recoverable: keep the running config and log.
-                    let new_compiled =
-                        match config::load_config(&file).and_then(CompiledConfig::from_config) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                tracing::error!(
-                                    "reload: invalid configuration: {} — keeping current",
-                                    e
-                                );
-                                continue;
-                            }
-                        };
+                    // Load + validate + analyze the new config from disk.
+                    // Any analyzer error (= what `--check` would reject) is
+                    // a recoverable failure: log the diagnostics and keep
+                    // the running config.
+                    let new_compiled = match compile_and_analyze(&file) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!(
+                                "reload: invalid configuration: {} — keeping current",
+                                e
+                            );
+                            continue;
+                        }
+                    };
 
                     // Shutdown old, start new.
                     // Note: brief downtime occurs while ports are released and re-bound.
