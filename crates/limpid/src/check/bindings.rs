@@ -20,10 +20,13 @@
 //!   only paths bound on every branch survive, with their types
 //!   merged via [`FieldType::union`].
 //!
-//! The analyzer never rejects unknown `workspace.*` reads outright (the
-//! runtime returns `Null`), but the dataflow pass emits a warning when
-//! an output template references a workspace key that no upstream
-//! module produces.
+//! Inside a pipeline body (`process { ... }`, `if`/`switch` branches),
+//! the analyzer never rejects unknown `workspace.*` reads outright —
+//! the runtime returns `Null` for missing keys. Inside an `output`
+//! config, however, references to pipeline-mutable state
+//! (`workspace`, `egress`, `error`) are hard-rejected by
+//! [`super::outputs::check_pipeline_only_reference`] regardless of
+//! upstream binding status.
 
 use std::collections::HashMap;
 
@@ -57,9 +60,7 @@ impl Bindings {
         self.workspace.insert(path.join("."), ty);
     }
 
-    /// Get the type of a `workspace.<path>` if bound. Does not consult
-    /// the wildcard flag — callers that want "is this readable at all?"
-    /// should use [`Bindings::workspace_visible`].
+    /// Get the type of a `workspace.<path>` if bound.
     pub fn get_workspace(&self, path: &[String]) -> Option<&FieldType> {
         self.workspace.get(&path.join("."))
     }
@@ -69,18 +70,6 @@ impl Bindings {
     /// near-match candidates for unbound references.
     pub fn workspace_keys(&self) -> impl Iterator<Item = &String> {
         self.workspace.keys()
-    }
-
-    /// True when `workspace.<path>` is either explicitly bound, bound
-    /// via an ancestor (Object), or admitted by the wildcard flag.
-    pub fn workspace_visible(&self, path: &[String]) -> bool {
-        if self.wildcard {
-            return true;
-        }
-        let joined = path.join(".");
-        self.workspace
-            .keys()
-            .any(|p| p == &joined || joined.starts_with(&format!("{}.", p)))
     }
 
     /// Mark the workspace as wildcarded — the analyzer no longer knows
@@ -193,23 +182,6 @@ mod tests {
             b.get_workspace(&["workspace".into(), "x".into()]),
             Some(&FieldType::String)
         );
-        assert!(b.workspace_visible(&["workspace".into(), "x".into()]));
-    }
-
-    #[test]
-    fn workspace_ancestor_visibility() {
-        // Binding `workspace.user` as Object makes nested reads pass
-        // visibility checks — the analyzer can't know the inner shape.
-        let mut b = Bindings::new();
-        b.bind_workspace(&["workspace".into(), "user".into()], FieldType::Object);
-        assert!(b.workspace_visible(&["workspace".into(), "user".into(), "id".into()]));
-    }
-
-    #[test]
-    fn wildcard_admits_anything() {
-        let mut b = Bindings::new();
-        b.set_workspace_wildcard();
-        assert!(b.workspace_visible(&["workspace".into(), "anything".into()]));
     }
 
     #[test]

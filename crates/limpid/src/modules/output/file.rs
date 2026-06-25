@@ -8,10 +8,15 @@
 //!
 //! Dynamic path templates use the DSL's native `${expr}` interpolation,
 //! e.g. `path "/var/log/${source.ip}/${strftime(timestamp, "%Y-%m-%d")}.log"`.
-//! Any DSL expression works (identifiers, function calls, string concat).
-//! Interpolations that dereference `workspace.*` are sanitised to strip
-//! `/`, `\`, and `..` so untrusted event data can't escape into sibling
-//! directories; other interpolations render verbatim.
+//! Templates may reference event-intrinsic fields (`source.*`,
+//! `received_at`, etc.) and pure functions. Pipeline-mutable state
+//! (`workspace`, `egress`, `error`) is rejected by the analyzer in
+//! `crates/limpid/src/check/outputs.rs`; daemon startup and reload
+//! invoke the same analyzer via `compile_and_analyze` in `main.rs`,
+//! so the generic expression evaluator only ever sees pre-validated
+//! references at runtime. Path components are sanitised so
+//! interpolated values can't introduce `/`, `\`, or `..` segments
+//! that would escape into sibling directories.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -322,7 +327,7 @@ impl FileOutput {
     ///
     /// 1. Per-interpolation: every `${...}` result has `/` and `\`
     ///    replaced with `_`, regardless of the wrapping expression
-    ///    (`${workspace.x}`, `${lower(workspace.x)}`, `${a + b}` —
+    ///    (`${source.ip}`, `${lower(received_at)}`, `${a + b}` —
     ///    all treated alike). An empty interpolation result is
     ///    rejected up front. The invariant is "one interpolation =
     ///    one path component"; directory structure must be expressed
@@ -336,7 +341,7 @@ impl FileOutput {
     ///
     /// 3. Trailing-slash reject: a rendered path that ends in `/`
     ///    (no filename component) errors before the auto-mkdir runs,
-    ///    so a stray template like `/var/log/${workspace.host}/`
+    ///    so a stray template like `/var/log/${source.ip}/`
     ///    cannot create empty directories silently.
     fn render_path_in(
         &self,
@@ -356,8 +361,8 @@ impl FileOutput {
                             // Pass 1: per-interp `/` `\` → `_` and reject empty.
                             // An empty interp would silently produce paths like
                             // `/foo//bar` or `/foo/.log` that almost never reflect
-                            // operator intent — usually a null workspace value or
-                            // a Pass-2 collapse of `${"..": something}`.
+                            // operator intent — usually a null event-intrinsic
+                            // value or a Pass-2 collapse of `${"..": something}`.
                             if rendered.is_empty() {
                                 anyhow::bail!(
                                     "output file: interpolation evaluated to empty string \

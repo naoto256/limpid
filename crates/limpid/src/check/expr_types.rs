@@ -148,8 +148,9 @@ fn ident_type(parts: &[String], bindings: &Bindings) -> FieldType {
                 }
             }
             // Unknown leaf — Any prevents false positives in type
-            // checks. The presence check (visible-from-output) is
-            // separate and runs on `workspace_visible`.
+            // checks. Workspace references in output config are
+            // rejected at parse time, so this fallthrough handles
+            // process-body / pipeline-internal reads only.
             return FieldType::Any;
         }
         _ => {}
