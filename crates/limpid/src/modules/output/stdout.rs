@@ -8,7 +8,7 @@ use anyhow::Result;
 use crate::dsl::schema::PropertySpec;
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
-use crate::modules::{HasMetrics, Module, Output, OutputBuilderWithErrorLog};
+use crate::modules::{HasMetrics, Module, Output};
 use crate::queue::{QueueAckHandle, RetryConfig};
 
 /// `output stdout` has no module-specific properties; only the
@@ -33,22 +33,13 @@ impl Module for StdoutOutput {
     fn from_properties(
         name: &str,
         properties: &crate::modules::ModuleProperties,
-    ) -> Result<Self> {
-        Self::from_properties_with_error_log(name, properties, None)
-    }
-}
-
-impl OutputBuilderWithErrorLog for StdoutOutput {
-    fn from_properties_with_error_log(
-        name: &str,
-        properties: &crate::modules::ModuleProperties,
-        error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+        ctx: &crate::modules::BuildContext,
     ) -> Result<Self> {
         let retry = RetryConfig::from_output_properties(properties.user_properties())?;
         Ok(Self {
             name: name.to_string(),
             retry,
-            error_log,
+            error_log: ctx.error_log.as_ref().map(Arc::clone),
             metrics: Arc::new(OutputMetrics::default()),
         })
     }

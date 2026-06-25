@@ -63,7 +63,7 @@ use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::syslog_peers::{PEER_COOLDOWN, iter_peers_block};
-use crate::modules::{HasMetrics, Module, Output, OutputBuilderWithErrorLog};
+use crate::modules::{HasMetrics, Module, Output};
 use crate::queue::{BackoffStrategy, QueueAckHandle, RetryConfig};
 
 use super::{BatchLevel, decode_drained_to_request};
@@ -118,7 +118,7 @@ struct Inner {
     /// recovery and render-failure records.
     name: String,
     /// `error_log` writer injected at construction time by the
-    /// runtime via `OutputBuilderWithErrorLog::from_properties_with_error_log`.
+    /// runtime via `BuildContext` in `from_properties`.
     /// Used by the flush path to route per-event render failures and
     /// shutdown-flush leftovers into the DLQ.
     error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
@@ -275,17 +275,12 @@ impl Module for OtlpGrpcOutput {
         Some(OTLP_GRPC_OUTPUT_SCHEMA)
     }
 
-    fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
-        <Self as OutputBuilderWithErrorLog>::from_properties_with_error_log(name, properties, None)
-    }
-}
-
-impl OutputBuilderWithErrorLog for OtlpGrpcOutput {
-    fn from_properties_with_error_log(
+    fn from_properties(
         name: &str,
         properties: &crate::modules::ModuleProperties,
-        error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+        ctx: &crate::modules::BuildContext,
     ) -> Result<Self> {
+        let error_log = ctx.error_log.as_ref().map(Arc::clone);
         let properties = properties.user_properties();
 
         let batch_size = props::get_positive_int(properties, "batch_size")?.unwrap_or(1) as usize;
@@ -718,7 +713,7 @@ mod tests {
 
     #[test]
     fn requires_peer_or_peers_block() {
-        let err = OtlpGrpcOutput::from_properties("o", &mp(&[]))
+        let err = OtlpGrpcOutput::from_properties("o", &mp(&[]), &crate::modules::BuildContext::for_testing())
             .err()
             .unwrap();
         assert!(
@@ -734,7 +729,7 @@ mod tests {
             key_span: None,
             properties: vec![prop_str("endpoint", "http://x:4317")],
         }];
-        let output = OtlpGrpcOutput::from_properties("o", &mp(&props)).unwrap();
+        let output = OtlpGrpcOutput::from_properties("o", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
         assert_eq!(output.inner.peers.len(), 1);
         assert_eq!(output.inner.peers[0].endpoint, "http://x:4317");
     }
@@ -742,7 +737,7 @@ mod tests {
     #[test]
     fn rejects_peers_block_with_no_peer() {
         let props = vec![peers_block_with(vec![])];
-        let err = OtlpGrpcOutput::from_properties("o", &mp(&props))
+        let err = OtlpGrpcOutput::from_properties("o", &mp(&props), &crate::modules::BuildContext::for_testing())
             .err()
             .unwrap();
         assert!(err.to_string().contains("at least one peer"));
@@ -751,7 +746,7 @@ mod tests {
     #[tokio::test]
     async fn accepts_plain_http_endpoint() {
         let output =
-            OtlpGrpcOutput::from_properties("o", &mp(&one_peer_props("http://localhost:4317")))
+            OtlpGrpcOutput::from_properties("o", &mp(&one_peer_props("http://localhost:4317")), &crate::modules::BuildContext::for_testing())
                 .unwrap();
         assert_eq!(output.inner.peers.len(), 1);
     }
@@ -776,7 +771,7 @@ mod tests {
                 },
             ],
         }])];
-        let err = OtlpGrpcOutput::from_properties("o", &mp(&props))
+        let err = OtlpGrpcOutput::from_properties("o", &mp(&props), &crate::modules::BuildContext::for_testing())
             .err()
             .unwrap();
         let msg = err.to_string();
@@ -803,7 +798,7 @@ mod tests {
                 },
             ],
         }])];
-        let output = OtlpGrpcOutput::from_properties("o", &mp(&props)).unwrap();
+        let output = OtlpGrpcOutput::from_properties("o", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
         assert_eq!(output.inner.peers.len(), 1);
     }
 
@@ -812,6 +807,7 @@ mod tests {
         let output = OtlpGrpcOutput::from_properties(
             "o",
             &mp(&one_peer_props("https://collector.example.com:4317")),
+            &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
         assert_eq!(output.inner.peers.len(), 1);
@@ -823,7 +819,7 @@ mod tests {
             peer_block("http://a:4317"),
             peer_block("http://b:4317"),
         ])];
-        let output = OtlpGrpcOutput::from_properties("o", &mp(&props)).unwrap();
+        let output = OtlpGrpcOutput::from_properties("o", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
         assert_eq!(output.inner.peers.len(), 2);
         assert_eq!(output.inner.peers[0].endpoint, "http://a:4317");
     }
@@ -842,7 +838,7 @@ mod tests {
                 },
             ],
         }])];
-        let err = OtlpGrpcOutput::from_properties("o", &mp(&props))
+        let err = OtlpGrpcOutput::from_properties("o", &mp(&props), &crate::modules::BuildContext::for_testing())
             .err()
             .unwrap();
         assert!(err.to_string().contains("cert and key"));
@@ -851,14 +847,14 @@ mod tests {
     #[tokio::test]
     async fn batch_level_default_is_none() {
         let output =
-            OtlpGrpcOutput::from_properties("o", &mp(&one_peer_props("http://x"))).unwrap();
+            OtlpGrpcOutput::from_properties("o", &mp(&one_peer_props("http://x")), &crate::modules::BuildContext::for_testing()).unwrap();
         assert!(matches!(output.inner.batch_level, BatchLevel::None));
     }
 
     #[tokio::test]
     async fn batch_size_defaults_to_one() {
         let output =
-            OtlpGrpcOutput::from_properties("o", &mp(&one_peer_props("http://x"))).unwrap();
+            OtlpGrpcOutput::from_properties("o", &mp(&one_peer_props("http://x")), &crate::modules::BuildContext::for_testing()).unwrap();
         assert_eq!(output.batch_size, 1);
     }
 
@@ -873,7 +869,7 @@ mod tests {
                 prop_str("initial_wait", "100ms"),
             ],
         });
-        let output = OtlpGrpcOutput::from_properties("o", &mp(&props)).unwrap();
+        let output = OtlpGrpcOutput::from_properties("o", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
         assert_eq!(output.inner.retry_config.max_attempts, 2);
     }
 
@@ -977,7 +973,7 @@ mod tests {
         let endpoint = format!("http://{}", addr);
         let mut props = one_peer_props(&endpoint);
         props.push(prop_int("batch_size", 1));
-        let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
+        let output = OtlpGrpcOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
         consume(&output, &event_with_egress(singleton_bytes(
                 1_700_000_000_000_000_000,
             ))).await
@@ -1050,7 +1046,7 @@ mod tests {
         // exactly 3 events; receiver rejects 2 of them.
         let mut props = one_peer_props(&endpoint);
         props.push(prop_int("batch_size", 3));
-        let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
+        let output = OtlpGrpcOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
 
         for i in 0..3 {
             let ev = event_with_egress(singleton_bytes(1_000_000_000 + i));
@@ -1096,7 +1092,7 @@ mod tests {
         let mut props = one_peer_props("http://127.0.0.1:1");
         props.push(prop_int("batch_size", 1024));
         props.push(prop_str("batch_timeout", "30s"));
-        let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
+        let output = OtlpGrpcOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
         consume(&output, &event_with_egress(singleton_bytes(1)))
             .await
             .unwrap();
@@ -1147,7 +1143,7 @@ mod tests {
                 prop_str("max_wait", "1ms"),
             ],
         });
-        let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
+        let output = OtlpGrpcOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
         let send = tokio::spawn(async move {
             consume(&output, &event_with_egress(singleton_bytes(1))).await
         });
@@ -1177,7 +1173,7 @@ mod tests {
         let mut props = one_peer_props("http://127.0.0.1:1");
         props.push(prop_int("batch_size", 1024));
         props.push(prop_str("batch_timeout", "30s"));
-        let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
+        let output = OtlpGrpcOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
         consume(&output, &event_with_egress(singleton_bytes(1)))
             .await
             .expect("buffering a single event must succeed");
@@ -1217,7 +1213,7 @@ mod tests {
         // Large batch + long timer: only shutdown drains the buffer.
         props.push(prop_int("batch_size", 100));
         props.push(prop_str("batch_timeout", "30s"));
-        let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
+        let output = OtlpGrpcOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
 
         for ts in [1u64, 2u64] {
             consume(&output, &event_with_egress(singleton_bytes(ts)))
@@ -1275,7 +1271,7 @@ mod tests {
                 prop_str("max_wait", "1ms"),
             ],
         });
-        let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
+        let output = OtlpGrpcOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
 
         let (ack1, mut rx1) = QueueAckHandle::for_test();
         output
@@ -1333,12 +1329,11 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("errored.jsonl");
         let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
-        let output = OtlpGrpcOutput::from_properties_with_error_log(
-            "myout",
-            &mp(&props),
-            Some(Arc::clone(&writer)),
-        )
-        .unwrap();
+        let ctx = crate::modules::BuildContext {
+            funcs: Arc::new(crate::functions::FunctionRegistry::new()),
+            error_log: Some(Arc::clone(&writer)),
+        };
+        let output = OtlpGrpcOutput::from_properties("myout", &mp(&props), &ctx).unwrap();
         buffer_two(&output).await;
 
         output.shutdown(Some(&writer)).await.unwrap();
@@ -1358,7 +1353,7 @@ mod tests {
     async fn shutdown_failure_without_error_log_returns_ok() {
         // Shutdown is infallible.
         let props = shutdown_recovery_props("http://127.0.0.1:1");
-        let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
+        let output = OtlpGrpcOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
         buffer_two(&output).await;
 
         output.shutdown(None).await.expect("shutdown is infallible");
@@ -1389,7 +1384,7 @@ mod tests {
         let mut props = one_peer_props(&endpoint);
         props.push(prop_int("batch_size", 100));
         props.push(prop_str("batch_timeout", "30s"));
-        let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
+        let output = OtlpGrpcOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
         buffer_two(&output).await;
 
         let dir = tempfile::TempDir::new().unwrap();
@@ -1406,7 +1401,7 @@ mod tests {
         // error_log writer itself fails on every record (parent dir
         // missing). Helper must warn + continue, never loop or panic.
         let props = shutdown_recovery_props("http://127.0.0.1:1");
-        let output = OtlpGrpcOutput::from_properties("test", &mp(&props)).unwrap();
+        let output = OtlpGrpcOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
         buffer_two(&output).await;
 
         let writer = Arc::new(crate::error_log::ErrorLogWriter::new(
@@ -1420,16 +1415,18 @@ mod tests {
     /// in `output::http` for the rationale.
     #[tokio::test]
     async fn constructor_injects_error_log_into_inner() {
-        use crate::modules::OutputBuilderWithErrorLog;
-
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("errored.jsonl");
         let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path));
 
-        let output = OtlpGrpcOutput::from_properties_with_error_log(
+        let ctx = crate::modules::BuildContext {
+            funcs: Arc::new(crate::functions::FunctionRegistry::new()),
+            error_log: Some(Arc::clone(&writer)),
+        };
+        let output = OtlpGrpcOutput::from_properties(
             "test",
             &mp(&one_peer_props("http://127.0.0.1:1")),
-            Some(Arc::clone(&writer)),
+            &ctx,
         )
         .unwrap();
         let stored = output.inner.error_log.as_ref().expect("error_log must be set");

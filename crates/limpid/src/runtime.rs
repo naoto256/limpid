@@ -81,6 +81,14 @@ impl Runtime {
             None => None,
         };
 
+        // Single bundle threaded into every Input/Output factory. Future
+        // build-time dependencies (transport-key registry, metrics hooks)
+        // land as new fields on this struct rather than as new parameters.
+        let build_ctx = crate::modules::BuildContext {
+            funcs: Arc::clone(&func_registry),
+            error_log: error_log.as_ref().map(Arc::clone),
+        };
+
         // --- 1. Create outputs (each output owns its own OutputMetrics) ---
         let mut output_senders: HashMap<String, QueueSender> = HashMap::new();
         let mut output_receivers = Vec::new();
@@ -88,21 +96,21 @@ impl Runtime {
         for (name, output_def) in &config.outputs {
             let queue_config =
                 QueueConfig::from_output_properties(name, output_def.properties.user_properties())?;
-            // Retry config is parsed by each output's
-            // `from_properties_with_error_log` (outputs own retry +
-            // DLQ). The runtime no longer needs a copy here.
+            // Retry config is parsed by each output's `from_properties`
+            // (outputs own retry + DLQ). The runtime no longer needs a
+            // copy here.
             let (mut sender, receiver) = queue::create_queue(name.clone(), queue_config)?;
 
             // `output_def.properties` is a `ModuleProperties`: it carries the
             // resolved `type` already, so `create_output` doesn't take a
             // separate type_name argument (and can't be passed one — the
-            // strip is the whole point). `error_log` is threaded in so
-            // batched outputs can stash it at construction time.
+            // strip is the whole point). `BuildContext` carries `funcs` and
+            // the optional `error_log` so outputs can stash them at
+            // construction time.
             let created = match registry.create_output(
                 name,
                 &output_def.properties,
-                Arc::clone(&func_registry),
-                error_log.as_ref().map(Arc::clone),
+                &build_ctx,
             ) {
                 Ok(c) => c,
                 Err(e) => {
@@ -232,6 +240,7 @@ impl Runtime {
             let created = match registry.create_input(
                 &input_name,
                 &input_def.properties,
+                &build_ctx,
                 event_tx,
                 shutdown_rx.clone(),
             ) {

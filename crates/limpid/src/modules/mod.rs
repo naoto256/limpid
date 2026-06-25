@@ -21,8 +21,41 @@ use crate::dsl::ast::{Expr, ExprKind, Property};
 use crate::dsl::schema::{self as property_schema, PropertySpec};
 use crate::dsl::span::Span;
 use crate::event::Event;
-use crate::functions::FunctionRegistry;
 use crate::metrics::{InputMetrics, OutputMetrics};
+
+// ---------------------------------------------------------------------------
+// BuildContext — build-time dependencies threaded to every module factory
+// ---------------------------------------------------------------------------
+
+/// Build-time dependencies provided by the runtime to every Input
+/// and Output factory. Constructed once at startup, threaded into
+/// every `Module::from_properties` call.
+///
+/// Fields are `Option<>` where the dependency is optional config
+/// (e.g. `error_log` is None when the operator did not configure
+/// `control { error_log "..." }`). `funcs` is always present once
+/// the function registry is built (= early in runtime startup,
+/// before module construction).
+///
+/// Forward-compatible: future transport-key registry / metrics
+/// hooks / etc. land as new fields. Modules consume what they need
+/// and ignore the rest.
+#[derive(Clone)]
+pub struct BuildContext {
+    pub funcs: Arc<crate::functions::FunctionRegistry>,
+    pub error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+}
+
+impl BuildContext {
+    /// Test-only ctor with a no-op funcs registry and no error_log.
+    #[cfg(test)]
+    pub fn for_testing() -> Self {
+        Self {
+            funcs: Arc::new(crate::functions::FunctionRegistry::new()),
+            error_log: None,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // RenderError — marker for render-vs-write error disambiguation
@@ -274,7 +307,11 @@ pub trait Module: Sized {
     /// validation (if any) has already run; cross-field rules ("at
     /// least one of address or host+port") still belong here — those
     /// are semantic, not shape-level.
-    fn from_properties(name: &str, properties: &ModuleProperties) -> Result<Self>;
+    fn from_properties(
+        name: &str,
+        properties: &ModuleProperties,
+        ctx: &BuildContext,
+    ) -> Result<Self>;
 
     /// Validation + construction entry. The runtime's registry path
     /// already validates the schema before invoking the factory, so
@@ -283,14 +320,14 @@ pub trait Module: Sized {
     /// loud validation surface.
     #[allow(dead_code)] // used by module unit tests; production path
     // validates inside `ModuleRegistry::create_*`
-    fn build(name: &str, properties: &ModuleProperties) -> Result<Self> {
+    fn build(name: &str, properties: &ModuleProperties, ctx: &BuildContext) -> Result<Self> {
         if let Some(spec) = Self::property_schema() {
             let errs = property_schema::validate(properties.user_properties(), spec);
             if !errs.is_empty() {
                 anyhow::bail!(format_module_schema_errors(name, &errs));
             }
         }
-        Self::from_properties(name, properties)
+        Self::from_properties(name, properties, ctx)
     }
 }
 
@@ -359,12 +396,6 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     /// take ownership of the lifecycle. The queue consumer logs the
     /// error and the handle's `Drop` impl fires `Dropped`.
     async fn consume(&self, event: &Event, ack: crate::queue::QueueAckHandle) -> Result<()>;
-
-    /// Called once after construction to hand the output a reference to
-    /// the pipeline's `FunctionRegistry`. Outputs that evaluate DSL
-    /// expressions at write time (e.g. `${...}` templates in a path)
-    /// override this to stash the registry. Default: no-op.
-    fn attach_funcs(&mut self, _funcs: Arc<FunctionRegistry>) {}
 
     /// Called once when the daemon is shutting down, before the queue
     /// consumer exits. The output is responsible for draining any
@@ -509,6 +540,7 @@ type InputFactory = Box<
     dyn Fn(
             &str,
             &ModuleProperties,
+            &BuildContext,
             mpsc::Sender<Event>,
             tokio::sync::watch::Receiver<bool>,
         ) -> Result<CreatedInput>
@@ -517,14 +549,7 @@ type InputFactory = Box<
 >;
 
 type OutputFactory = Box<
-    dyn Fn(
-            &str,
-            &ModuleProperties,
-            Arc<FunctionRegistry>,
-            Option<Arc<crate::error_log::ErrorLogWriter>>,
-        ) -> Result<CreatedOutput>
-        + Send
-        + Sync,
+    dyn Fn(&str, &ModuleProperties, &BuildContext) -> Result<CreatedOutput> + Send + Sync,
 >;
 
 struct InputEntry {
@@ -567,6 +592,7 @@ impl ModuleRegistry {
         F: Fn(
                 &str,
                 &ModuleProperties,
+                &BuildContext,
                 mpsc::Sender<Event>,
                 tokio::sync::watch::Receiver<bool>,
             ) -> Result<CreatedInput>
@@ -589,12 +615,7 @@ impl ModuleRegistry {
         schema: Option<&'static [PropertySpec]>,
         factory: F,
     ) where
-        F: Fn(
-                &str,
-                &ModuleProperties,
-                Arc<FunctionRegistry>,
-                Option<Arc<crate::error_log::ErrorLogWriter>>,
-            ) -> Result<CreatedOutput>
+        F: Fn(&str, &ModuleProperties, &BuildContext) -> Result<CreatedOutput>
             + Send
             + Sync
             + 'static,
@@ -634,6 +655,7 @@ impl ModuleRegistry {
         &self,
         name: &str,
         properties: &ModuleProperties,
+        ctx: &BuildContext,
         tx: mpsc::Sender<Event>,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<CreatedInput> {
@@ -650,15 +672,14 @@ impl ModuleRegistry {
                 ));
             }
         }
-        (entry.factory)(name, properties, tx, shutdown)
+        (entry.factory)(name, properties, ctx, tx, shutdown)
     }
 
     pub fn create_output(
         &self,
         name: &str,
         properties: &ModuleProperties,
-        funcs: Arc<FunctionRegistry>,
-        error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+        ctx: &BuildContext,
     ) -> Result<CreatedOutput> {
         let type_name = properties.type_name();
         let entry = self
@@ -673,7 +694,7 @@ impl ModuleRegistry {
                 ));
             }
         }
-        (entry.factory)(name, properties, funcs, error_log)
+        (entry.factory)(name, properties, ctx)
     }
 }
 
@@ -708,35 +729,19 @@ pub fn register_builtins(registry: &mut ModuleRegistry) {
     #[cfg(feature = "journal")]
     register_input_type::<input::journal::JournalInput>(registry, "journal");
 
-    // Outputs — every output owns its own retry + DLQ routing, so
-    // every output type goes through the error_log-aware factory. The
-    // dedicated `register_batched_output_type` helper collapsed into
-    // `register_output_type_with_error_log` below.
-    register_output_type_with_error_log::<output::file::FileOutput>(registry, "file");
-    register_output_type_with_error_log::<output::unix_socket::UnixSocketOutput>(
-        registry,
-        "unix_socket",
-    );
-    register_output_type_with_error_log::<output::syslog_tcp::SyslogTcpOutput>(
-        registry,
-        "syslog_tcp",
-    );
-    register_output_type_with_error_log::<output::http::HttpOutput>(registry, "http");
-    register_output_type_with_error_log::<output::otlp::http::OtlpHttpOutput>(
-        registry,
-        "otlp_http",
-    );
-    register_output_type_with_error_log::<output::otlp::grpc::OtlpGrpcOutput>(
-        registry,
-        "otlp_grpc",
-    );
-    register_output_type_with_error_log::<output::syslog_udp::SyslogUdpOutput>(
-        registry,
-        "syslog_udp",
-    );
-    register_output_type_with_error_log::<output::stdout::StdoutOutput>(registry, "stdout");
+    // Outputs — every output owns its own retry + DLQ routing.
+    // Build-time dependencies (`error_log`, `funcs`) arrive via
+    // `BuildContext` in `from_properties`.
+    register_output_type::<output::file::FileOutput>(registry, "file");
+    register_output_type::<output::unix_socket::UnixSocketOutput>(registry, "unix_socket");
+    register_output_type::<output::syslog_tcp::SyslogTcpOutput>(registry, "syslog_tcp");
+    register_output_type::<output::http::HttpOutput>(registry, "http");
+    register_output_type::<output::otlp::http::OtlpHttpOutput>(registry, "otlp_http");
+    register_output_type::<output::otlp::grpc::OtlpGrpcOutput>(registry, "otlp_grpc");
+    register_output_type::<output::syslog_udp::SyslogUdpOutput>(registry, "syslog_udp");
+    register_output_type::<output::stdout::StdoutOutput>(registry, "stdout");
     #[cfg(feature = "kafka")]
-    register_output_type_with_error_log::<output::kafka::KafkaOutput>(registry, "kafka");
+    register_output_type::<output::kafka::KafkaOutput>(registry, "kafka");
 
     // No built-in processes — v0.3.0 removed the native process
     // layer. Schema-specific parsers are DSL functions (`syslog.parse`,
@@ -752,12 +757,12 @@ where
     registry.register_input(
         type_name,
         T::property_schema(),
-        |name, properties: &ModuleProperties, tx, shutdown| {
+        |name, properties: &ModuleProperties, ctx, tx, shutdown| {
             // The registry has already run schema validation before
             // calling this closure (when a schema is declared); here we
             // only build the concrete value, so `from_properties` is
             // the right entry point.
-            let input = T::from_properties(name, properties)?;
+            let input = T::from_properties(name, properties, ctx)?;
             let metrics = HasMetrics::metrics(&input);
             let input_name = name.to_string();
             let handle = tokio::spawn(async move {
@@ -770,32 +775,15 @@ where
     );
 }
 
-/// Trait marker for outputs that consume the configured `error_log` at
-/// construction time. Every output owns its own retry + DLQ routing,
-/// so every output type implements this trait — the previously-named
-/// `register_batched_output_type` collapsed into the universal
-/// `register_output_type_with_error_log` below.
-///
-/// Lives next to `Module` rather than on it so the `Input` half of the
-/// `Module` trait isn't polluted with output-only plumbing.
-pub trait OutputBuilderWithErrorLog: Module {
-    fn from_properties_with_error_log(
-        name: &str,
-        properties: &ModuleProperties,
-        error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
-    ) -> Result<Self>;
-}
-
-fn register_output_type_with_error_log<T>(registry: &mut ModuleRegistry, type_name: &str)
+fn register_output_type<T>(registry: &mut ModuleRegistry, type_name: &str)
 where
-    T: OutputBuilderWithErrorLog + Output + Sync + 'static,
+    T: Module + Output + Sync + 'static,
 {
     registry.register_output(
         type_name,
         T::property_schema(),
-        |name, properties: &ModuleProperties, funcs, error_log| {
-            let mut output = T::from_properties_with_error_log(name, properties, error_log)?;
-            output.attach_funcs(funcs);
+        |name, properties: &ModuleProperties, ctx| {
+            let output = T::from_properties(name, properties, ctx)?;
             let metrics = HasMetrics::metrics(&output);
             let output_arc: Arc<dyn Output> = Arc::new(output);
             Ok(CreatedOutput {

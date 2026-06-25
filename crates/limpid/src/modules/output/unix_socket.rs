@@ -16,7 +16,7 @@ use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::persistent_conn::{PersistentConn, write_with_reconnect};
-use crate::modules::{HasMetrics, Module, Output, OutputBuilderWithErrorLog};
+use crate::modules::{HasMetrics, Module, Output};
 use crate::queue::{QueueAckHandle, RetryConfig};
 
 const UNIX_SOCKET_OUTPUT_SCHEMA: &[PropertySpec] = &[
@@ -45,16 +45,10 @@ impl Module for UnixSocketOutput {
         Some(UNIX_SOCKET_OUTPUT_SCHEMA)
     }
 
-    fn from_properties(name: &str, properties: &crate::modules::ModuleProperties) -> Result<Self> {
-        Self::from_properties_with_error_log(name, properties, None)
-    }
-}
-
-impl OutputBuilderWithErrorLog for UnixSocketOutput {
-    fn from_properties_with_error_log(
+    fn from_properties(
         name: &str,
         properties: &crate::modules::ModuleProperties,
-        error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+        ctx: &crate::modules::BuildContext,
     ) -> Result<Self> {
         let retry = RetryConfig::from_output_properties(properties.user_properties())?;
         let properties = properties.user_properties();
@@ -65,7 +59,7 @@ impl OutputBuilderWithErrorLog for UnixSocketOutput {
             path: PathBuf::from(path),
             conn: Mutex::new(None),
             retry,
-            error_log,
+            error_log: ctx.error_log.as_ref().map(Arc::clone),
             metrics: Arc::new(OutputMetrics::default()),
         })
     }
