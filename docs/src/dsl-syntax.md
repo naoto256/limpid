@@ -114,15 +114,18 @@ def process tag {
 
 `${expr}` accepts any expression valid in the DSL: identifiers, workspace paths (`workspace.geo.country`), function calls (`lower(workspace.host)`, `strftime(received_at, "%Y")`), string concatenation with `+`, even nested string literals (`"${"${a}${b}"}"`). To embed a literal `${`, escape with `\${`.
 
-Inside `${...}` you have access to the full event:
+**Visibility differs by surface.** Inside a process body or pipeline expression (the example above), the full event is in scope. Inside an output config (`path` on `output file`, `key` on `output kafka`, etc.) the analyzer + daemon hard-reject `workspace`, `egress`, and `error` references — output config templates may only reference event-intrinsic fields (`source`, `received_at`, `ingress`). Routing decisions that depend on pipeline-mutable state belong in the pipeline body, not the output config; see [outputs/file → Dynamic path templates](./outputs/file.md#dynamic-path-templates) for the pipeline-body routing pattern.
 
-| Name | Type | Meaning |
-|------|------|---------|
-| `received_at` | Timestamp | Wall-clock at which the event was received |
-| `source` | Object `{ ip: String, port: Int }` | Peer address. Use `source.ip` for the IP string and `source.port` for the integer port; bare `source` returns the whole object |
-| `egress`, `ingress` | String / Bytes | Event byte buffers |
-| `error` | String | Error message inside a `catch` body (otherwise null) |
-| `workspace.xxx`, `workspace.xxx.yyy` | (varies) | Named workspace values (nested lookup is supported) |
+Inside `${...}` the identifiers available are:
+
+| Name | Type | Meaning | Available in output config? |
+|------|------|---------|------------------------------|
+| `received_at` | Timestamp | Wall-clock at which the event was received | Yes |
+| `source` | Object `{ ip: String, port: Int }` | Peer address. Use `source.ip` for the IP string and `source.port` for the integer port; bare `source` returns the whole object | Yes |
+| `ingress` | String / Bytes | Raw bytes as received from the input | Yes |
+| `egress` | String / Bytes | Wire bytes assembled by the pipeline | **No** (pipeline-mutable; rejected by analyzer) |
+| `error` | String | Error message inside a `catch` body (otherwise null) | **No** (pipeline-mutable; rejected by analyzer) |
+| `workspace.xxx`, `workspace.xxx.yyy` | (varies) | Named workspace values (nested lookup is supported) | **No** (pipeline-mutable; rejected by analyzer) |
 
 All [built-in functions](./functions/expression-functions.md) — `strftime`, `lower`, `regex_extract`, `to_json`, `geoip`, and the parsers — are callable from inside `${...}`.
 

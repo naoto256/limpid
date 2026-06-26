@@ -30,9 +30,15 @@ def input system {
 
 ## Wire format
 
-`ingress` is **byte-identical to one line of `journalctl -o json`** — limpid
-invents no format here (LOTL: Living Off The Land). One journal entry → one
-`Event`, with `ingress` carrying a single-line UTF-8 JSON object.
+`ingress` is shaped to be **journalctl-`-o json`-compatible for the
+fields libsystemd exposes** — limpid invents no format here (LOTL: Living
+Off The Land). One journal entry → one `Event`, with `ingress` carrying a
+single-line UTF-8 JSON object. The shape matches `journalctl -o json` on
+field set and values, with two known divergences: `__SEQNUM` /
+`__SEQNUM_ID` (newer `journalctl`) are **not surfaced** because the
+systemd-0.10.x crate exposes no equivalent API, and JSON object key order
+is libsystemd's insertion order — not guaranteed to byte-match
+`journalctl -o json`.
 
 ```
 {"__CURSOR":"s=abc...","__REALTIME_TIMESTAMP":"1714400000000000",

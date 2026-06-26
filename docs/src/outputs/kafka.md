@@ -61,7 +61,7 @@ def output authenticated {
 | `topic` | yes | — | Target topic name |
 | `compression` | no | `none` | `none`, `gzip`, `snappy`, `lz4`, `zstd` |
 | `acks` | no | `all` | `0` (fire-and-forget), `1` (leader only), `all` (all replicas) |
-| `key` | no | none | Event value to use as partition key |
+| `key` | no | none | Partition key. Only the literal `source` (= source IP address) is accepted; any other identifier is rejected at config-load time. See [Partition key](#partition-key). |
 | `queue_timeout` | no | `5s` | Max wait when rdkafka's internal queue is full |
 | `tls` | no | — | TLS block (see [tls block](#tls-block)). Omit for plaintext. |
 | `sasl` | no | — | SASL block (see [sasl block](#sasl-block)). Omit for no auth. |
@@ -138,14 +138,31 @@ footing.
 
 ## Partition key
 
-The `key` property determines which event field is used as the Kafka partition key. Events with the same key go to the same partition (ordering guarantee).
+The `key` property determines which event field is used as the Kafka partition key. Only the literal value `source` is accepted — events from the same source IP go to the same partition (per-source ordering). Any other identifier (including `workspace.*` paths that earlier limpid releases used for per-tenant or per-field partitioning) is rejected at config-load time with a migration message.
 
 | Value | Key source |
 |-------|------------|
-| `source` | Source IP address |
-| any other identifier | Named workspace value (must be a string) — for example `workspace.cef.device_vendor` or a custom field set by an earlier process |
+| `source` | Source IP address (event-intrinsic, always available) |
 
-If the specified field is missing or null, the event is sent without a key (round-robin across partitions).
+If `key` is omitted, the event is sent without a partition key (round-robin across partitions).
+
+For per-tenant or per-content partitioning, split traffic into separate `output kafka` blocks from the pipeline body and give each one its own `topic` (or its own broker cluster):
+
+```
+def output kafka_apac { type kafka brokers "..." topic "logs-apac" }
+def output kafka_emea { type kafka brokers "..." topic "logs-emea" }
+
+def pipeline route {
+    input syslog_udp
+    process parse_fortigate | classify_region   // sets workspace.region
+    switch workspace.region {
+        "apac" { output kafka_apac }
+        "emea" { output kafka_emea }
+    }
+}
+```
+
+Routing decisions stay in the pipeline body; the output configs stay static and addressable.
 
 ## Notes
 
