@@ -104,7 +104,7 @@ def pipeline main {
 
 `events_discarded` indicates a possible misconfiguration — the event went through the pipeline but was never sent anywhere.
 
-`events_errored` is the unified failure counter (PR-I consolidated all of these into one metric + DLQ path). Two layers contribute:
+`events_errored` is the unified failure counter — every pipeline-side failure shape is consolidated into this metric and into the same DLQ path. Two layers contribute:
 
 - **Process body runtime errors** — regex compile failure, unknown identifier at runtime, type mismatch, or an explicit `error` statement inside a `def process` body.
 - **Pipeline-skeleton expression-evaluation errors and output enqueue failures** — failure to evaluate the condition expression of an `if` / `switch` / `error` at the pipeline level, plus output enqueue failures (queue closed, disk write error, unknown output).
