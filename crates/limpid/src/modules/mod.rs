@@ -461,8 +461,7 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
 /// has headroom inside the runtime-level shutdown budget. This is a
 /// daemon invariant tied to the runtime contract, not an operator knob —
 /// if you raise this, raise the runtime shutdown timeout in lockstep.
-pub const SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(3);
+pub const SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Shared shutdown-time disposition for a batch whose single best-effort
 /// send attempt failed (transport error or deadline elapsed). Every
