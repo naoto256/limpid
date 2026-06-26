@@ -151,7 +151,7 @@ If the specified field is missing or null, the event is sent without a key (roun
 
 - rdkafka handles batching and compression internally — no manual batch configuration needed (unlike [http](./http.md)).
 - On shutdown, the producer flushes pending messages (up to 5 seconds).
-- The internal delivery timeout (`message.timeout.ms`) is 30 seconds. If a message can't be delivered within that time, it's returned as an error and limpid's [queue retry](./README.md#queue-and-retry) handles re-delivery.
+- The internal delivery timeout (`message.timeout.ms`) is 30 seconds. If a message can't be delivered within that time, it's returned as an error and the output's `retry { ... }` budget (driven inside `consume()`) handles re-delivery. On retry exhaustion the payload routes to `control { error_log "..." }` as an Output-flavor DLQ record; see [Outputs → Recovery (error_log)](./README.md#recovery-error_log).
 
 ## Example
 

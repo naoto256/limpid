@@ -123,9 +123,10 @@ after expiry, the peer is reconnected and the cooldown is cleared on
 success or extended on failure.
 
 If every peer is cooled-down (or fails within the same write call), the
-write returns an error and the queued retry path handles the rest. See
-the [queue](../outputs/README.md#queue-and-retry) section for retry
-behaviour.
+write returns an error and the output's `retry { ... }` budget (driven
+inside `consume()`) handles re-delivery. On retry exhaustion the payload
+routes to `control { error_log "..." }` as an Output-flavor DLQ record;
+see [Outputs → Recovery (error_log)](../outputs/README.md#recovery-error_log).
 
 ## Notes
 

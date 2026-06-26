@@ -70,7 +70,7 @@ Each `peer` block configures one target endpoint:
 | `tls.ca` | no | Custom CA certificate file (PEM) for this peer. Falls back to the system root store if omitted. |
 | `tls.cert`, `tls.key` | no (paired) | Client certificate and private key for mTLS, as separate PEM files (chmod 600 the key). Both must be present together. |
 
-On each send the rotation picks the next available peer (cooldown expired) and tries it. On failure that peer is marked cooled-down for ~5 s and subsequent sends rotate past it until the cooldown expires. When every peer is currently cooled the rotation falls back to the cursor start — the queue layer's per-event retry then handles re-delivery.
+On each send the rotation picks the next available peer (cooldown expired) and tries it. On failure that peer is marked cooled-down for ~5 s and subsequent sends rotate past it until the cooldown expires. When every peer is currently cooled the rotation falls back to the cursor start — the output's per-flush retry budget (driven inside `consume()`) then handles re-delivery without dropping the drained batch.
 
 ### headers block
 
@@ -92,11 +92,11 @@ When `batch_size > 1`, events are buffered and sent in a single HTTP request bod
 - `batch_size` events have accumulated, or
 - `batch_timeout` has elapsed since the last event (debounce timer)
 
-On flush failure, events are returned to the buffer for retry by the queue.
+On flush failure the events are returned to the in-memory buffer; the output's per-flush retry loop drives re-delivery on the next `batch_timeout` tick (the queue layer cannot re-push a buffered batch — its cursor only advances when each event's ack handle resolves at flush time).
 
 ### Shutdown
 
-When the daemon stops, a final flush is attempted for any partial batch. If that flush fails unrecoverably, the buffered request body is drained to `control { error_log "..." }`, one DLQ record per rendered body. Without `error_log` configured, behaviour matches 0.7.7 (warn + drop). Because the in-memory queue drops the source `Event` envelope as soon as `write()` returns `Ok`, the original metadata cannot be reconstructed at shutdown — DLQ records emitted on this path carry a synthetic source and the shutdown time as `received_at`.
+When the daemon stops, a final flush is attempted for any partial batch. If that flush fails unrecoverably, the buffered events are drained to `control { error_log "..." }` as one Output-flavor DLQ record per still-parked event — `event.source`, `event.received_at`, `event.ingress`, and `event.egress` reflect the original per-event provenance because the batched output parks the source `Event` alongside its `QueueAckHandle` until the flush resolves. Without `error_log` configured, behaviour matches 0.7.7 (warn + drop without serialising the payload).
 
 - Common queue / retry properties — see [Queue and retry](./README.md#queue-and-retry).
 - Recovery / DLQ behaviour for shutdown-flush leftovers — see [Queue and retry → Recovery (error_log)](./README.md#recovery-error_log).
