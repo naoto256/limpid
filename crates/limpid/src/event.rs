@@ -549,23 +549,23 @@ mod boundary_tests {
     }
 
     #[test]
-    fn from_json_preserves_received_at_to_seconds_precision() {
-        // received_at is serialised as an i64 Unix-seconds in the v0.5.6+
-        // wire form. Recovery must reproduce the original timestamp to
-        // at least seconds precision (sub-second is intentionally
-        // dropped; pin it so a future "promote to ms" change is an
-        // explicit decision rather than a silent regression).
+    fn from_json_round_trips_received_at_nanos() {
+        // received_at is serialised as i64 unix nanoseconds (OTLP
+        // `time_unix_nano` parity) by `to_json_value` and decoded with
+        // the same precision by `from_json`. Pin the full-nanosecond
+        // round-trip so a future "drop sub-second" change is an
+        // explicit decision rather than a silent regression.
         let mut original = OwnedEvent::new(
             Bytes::from_static(b"x"),
             "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         );
         original.received_at =
-            chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+            chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(1_700_000_000_123_456_789);
         let json = serde_json::to_string(&original.to_json_value()).unwrap();
         let recovered = OwnedEvent::from_json(&json).unwrap();
         assert_eq!(
-            recovered.received_at.timestamp(),
-            original.received_at.timestamp()
+            recovered.received_at.timestamp_nanos_opt(),
+            original.received_at.timestamp_nanos_opt()
         );
     }
 }
