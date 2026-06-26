@@ -74,15 +74,14 @@ use crate::dsl::value_json::{json_to_value, value_to_json};
 // for the disk-queue persist path (see below).
 //
 // Disk-queue path: when `pipeline::run_pipeline` routes an event to a disk-
-// backed output, it builds the `SinkInput::Owned` from a `BorrowedEvent::
-// to_owned()` — a freshly-constructed `OwnedEvent` with `ack: None`. So the
-// disk-queue copy does NOT extend the ack; the cursor advances when the
-// pipeline-worker channel hand-off completes, which is "memory-queue
-// enqueued / disk-queue mpsc handed-off". The remaining tail of disk
-// persistence is operator-territory: the disk-queue itself fsyncs on its own
-// cadence and surfaces its own metrics. Closing that final gap is out of
-// scope for this change — see `docs/operations/error-log.md` for the
-// recovery-readiness contract.
+// backed output, the runtime hands `QueueSender::send` a freshly-owned
+// `Event` (built via `BorrowedEvent::to_owned()` with `ack: None`). The
+// disk-queue copy does NOT extend the input-side ack; instead the queue's
+// own ack lifecycle (per `QueueAckHandle` / `ack_to`) advances the disk
+// cursor when each event's `consume` disposition resolves. The disk queue
+// flushes each segment write but does not call an explicit fsync — closing
+// that final durability gap is operator-territory (see
+// `docs/operations/error-log.md` for the recovery-readiness contract).
 
 /// Acknowledgement message sent back from the pipeline worker to the input.
 ///

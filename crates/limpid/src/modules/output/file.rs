@@ -322,8 +322,10 @@ impl FileOutput {
     /// where `is_dynamic` is true when the template had any interpolated
     /// fragments (used to decide whether to `mkdir -p` the parent).
     ///
-    /// Three safety passes (each rejects rather than silently rewrites,
-    /// per Principle 1):
+    /// Three safety passes — pass 1 normalises `/` and `\` to `_`
+    /// inside each interpolation result so an injected value cannot
+    /// introduce a directory boundary; passes 2 and 3 reject (per
+    /// Principle 1) on traversal and trailing-slash shapes:
     ///
     /// 1. Per-interpolation: every `${...}` result has `/` and `\`
     ///    replaced with `_`, regardless of the wrapping expression
@@ -409,10 +411,10 @@ impl FileOutput {
     }
 }
 
-/// Pass 1: per-interpolation sanitisation. Strip `/` and `\` so an
-/// interpolation cannot expand into multiple path components or a
-/// Windows path separator. `.` is left alone — operators rely on dots
-/// for FQDN-style filenames (`web01.example.com.log`).
+/// Pass 1: per-interpolation sanitisation. Replace `/` and `\` with
+/// `_` so an interpolation cannot expand into multiple path components
+/// or a Windows path separator. `.` is left alone — operators rely on
+/// dots for FQDN-style filenames (`web01.example.com.log`).
 fn sanitize_path_component(s: &str) -> String {
     s.replace(['/', '\\'], "_")
 }

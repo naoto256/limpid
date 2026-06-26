@@ -3,12 +3,19 @@
 //! Design:
 //! - Events are serialized to JSON and appended to segment files
 //! - Each segment is a file named `seg-{sequence}.wal`
-//! - A cursor file (`cursor`) tracks the current read position
-//! - Old segments are deleted once fully consumed
-//! - Max total size is enforced; oldest unread segments are dropped if exceeded
+//! - A cursor file (`cursor`) persists the acked position — the last
+//!   byte the consumer explicitly acknowledged, not the in-flight read
+//!   position. Restart replays from this cursor for at-least-once.
+//! - Segments below the acked position are deleted once `ack_to`
+//!   advances through them; unread segments are never deleted.
+//! - Max total size is enforced by dropping the oldest consumed
+//!   segments (= those before the current read cursor); the read
+//!   cursor's own segment and any unread segments are protected even
+//!   when the cap is exceeded, so an undersized `max_size` cannot
+//!   silently drop pending events.
 //!
 //! This survives process restarts: on startup, the consumer resumes
-//! from the cursor position.
+//! from the acked cursor position.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -97,8 +104,8 @@ pub struct DiskQueueReceiver {
     read_offset: u64,
     /// Persisted cursor — the last byte the consumer has explicitly
     /// acknowledged as processed. `save_cursor` is only called after
-    /// `ack()` advances this; segment files below `acked_seq` are
-    /// also deleted by `ack()`. The pre-fix code saved the read
+    /// `ack_to` advances this; segment files below `acked_seq` are
+    /// also deleted by `ack_to`. An earlier version saved the read
     /// cursor immediately on each `recv()`, which made the disk
     /// queue at-most-once: a crash mid-write lost the in-flight
     /// event because the cursor said it had been consumed.
@@ -429,7 +436,7 @@ impl DiskQueueReceiver {
             if self.read_seq < write_seq {
                 // Advance the in-memory read cursor to the next
                 // segment, but do NOT delete the current one or save
-                // the cursor yet — both are tied to `ack()`. The
+                // the cursor yet — both are tied to `ack_to`. The
                 // current segment may still hold the in-flight event
                 // (the one most recently returned by `recv()` but not
                 // yet acked); deleting it now would lose that event
@@ -850,12 +857,12 @@ mod tests {
 
     #[tokio::test]
     async fn unacked_recv_replays_on_reopen() {
-        // Regression: pre-fix the disk queue saved the cursor inside
-        // `recv()` immediately on each event, so the queue claimed
-        // events as consumed before the consumer had a chance to
-        // ship them downstream. A crash between recv and write lost
-        // the event because the on-disk cursor was already past it.
-        // The fix delays cursor persistence until `ack()`, so the
+        // Regression: an earlier disk-queue version saved the cursor
+        // inside `recv()` immediately on each event, so the queue
+        // claimed events as consumed before the consumer had a chance
+        // to ship them downstream. A crash between recv and write
+        // lost the event because the on-disk cursor was already past
+        // it. Cursor persistence is now deferred to `ack_to`, so the
         // un-acked event is replayed on the next open.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();

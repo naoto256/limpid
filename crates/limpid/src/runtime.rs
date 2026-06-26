@@ -55,19 +55,22 @@ impl Runtime {
 
         // Optional dead-letter queue for events that fail in `process`
         // or that an output drops after exhausting retries
-        // (retry-exhausted recovery). `control { error_log "..." }` opts in to
-        // file-based recovery; when unset, the runtime falls back to a
-        // structured tracing line for the pipeline path and a plain
-        // `Dropped` disposition for the output path. The path is
-        // validated at startup (parent dir reachable) so operator typos
-        // surface before the first failure event.
+        // (retry-exhausted recovery). `control { error_log "..." }`
+        // opts in to file-based recovery; when unset, the runtime
+        // falls back to a structured `tracing::warn!` / `error!` line
+        // (pipeline path emits the full JSONL on the tracing line; the
+        // output path emits the failure summary without the full
+        // payload). The path is validated at startup (parent dir
+        // reachable) so operator typos surface before the first
+        // failure event.
         //
         // Built *before* outputs are constructed so each batched output
-        // (`http`, `otlp_http`, `otlp_grpc`) receives the handle via its
-        // constructor — no post-construction setter, no interior
+        // (`http`, `otlp_http`, `otlp_grpc`) receives the handle via
+        // its constructor — no post-construction setter, no interior
         // mutability. Non-batched outputs ignore the parameter; the
-        // queue consumer threads `error_log` in via `write_with_retry`
-        // for retry-exhausted recovery.
+        // queue consumer hands `error_log` to `run_queue_consumer`,
+        // which routes the retry-exhausted payload to the DLQ once
+        // each handle resolves.
         let error_log_path = config
             .global_blocks
             .get("control")

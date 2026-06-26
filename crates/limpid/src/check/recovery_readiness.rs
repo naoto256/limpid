@@ -13,8 +13,9 @@
 //!
 //! 1. `control { error_log "..." }` is not configured, AND
 //! 2. at least one `def output` either:
-//!    - declares a `retry { ... }` block (= invokes the
-//!      [`write_with_retry`] recovery routing path), OR
+//!    - declares a `retry { ... }` block (= enters the output's
+//!      retry-exhausted recovery path that routes the payload to
+//!      `error_log`), OR
 //!    - is a batched output type (`http`, `otlp_http`, `otlp_grpc`)
 //!      whose [`Output::shutdown`] implementation drains the buffer
 //!      to `error_log` on flush failure.
@@ -39,7 +40,7 @@ use super::{DiagKind, Diagnostic, Level};
 /// Output `type` names whose `Output::shutdown` impl drains pending
 /// batch buffers to the configured `error_log` on flush failure.
 /// Kept in lockstep with the modules that override the default
-/// no-op `shutdown` in `OutputWriter`.
+/// no-op `shutdown` on the `modules::Output` trait.
 const OUTPUT_TYPES_WITH_SHUTDOWN_DRAIN: &[&str] = &["http", "otlp_http", "otlp_grpc"];
 
 /// Returns `true` when the operator has set `control { error_log "..." }`.
@@ -59,8 +60,8 @@ fn error_log_configured(config: &CompiledConfig) -> bool {
 fn recovery_reason(output: &crate::dsl::ast::OutputDef) -> Option<&'static str> {
     let props_view = output.properties.user_properties();
 
-    // Retry block present → enters write_with_retry, which routes
-    // retry-exhausted attempts through error_log.
+    // Retry block present → enters the output's retry-exhausted
+    // recovery path, which routes the payload through error_log.
     if props::get_block(props_view, "retry").is_some() {
         return Some("retry");
     }

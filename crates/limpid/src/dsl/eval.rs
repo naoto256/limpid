@@ -1035,8 +1035,9 @@ mod tests {
             Value::String("42 ms")
         );
 
-        // Number + Number still numeric (no regression). numeric_op uses f64
-        // internally, so the result is Number(7.0), not Number(7).
+        // Int + Int stays numeric (no regression). numeric_op widens to
+        // f64 internally; an integer-valued finite result coerces back
+        // to Value::Int, so `as_f64()` returns the same f64 either way.
         let expr = e(ExprKind::BinOp(
             Box::new(e(ExprKind::IntLit(3))),
             BinOp::Add,

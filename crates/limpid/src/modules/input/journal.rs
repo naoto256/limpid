@@ -2,10 +2,12 @@
 //!
 //! Wire format (LOTL — Living Off The Land):
 //! `ingress` is one journald entry serialised as a single-line UTF-8
-//! JSON object, equivalent to one line of `journalctl -o json`. The
-//! field set and values match journalctl byte-for-byte; key order
-//! within the JSON object is not guaranteed to match (JSON object
-//! ordering is a serialisation detail).
+//! JSON object, shaped to be journalctl-`-o json`-compatible for the
+//! fields libsystemd exposes. Field values match journalctl, but
+//! `__SEQNUM` / `__SEQNUM_ID` (newer journalctl) are not surfaced
+//! because the libsystemd crate doesn't expose them. Key order is
+//! insertion order from libsystemd and is not guaranteed to match
+//! journalctl's output ordering.
 //!
 //! - field names preserved as journald exposes them (`PRIORITY`,
 //!   `_PID`, `__REALTIME_TIMESTAMP`, `SYSLOG_IDENTIFIER`, `MESSAGE`, …)
@@ -253,7 +255,8 @@ fn drain_cursor_acks(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AckPosition>)
 }
 
 /// Encode one journal entry's fields into a `serde_json::Value`
-/// equivalent to `journalctl -o json` output.
+/// shaped to be journalctl-`-o json`-compatible for the fields
+/// libsystemd exposes (= see caveats below).
 ///
 /// - field name (always UTF-8 by journald spec) → JSON object key
 /// - UTF-8-clean field value → JSON string

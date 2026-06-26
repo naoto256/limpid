@@ -47,9 +47,10 @@
 //! for `PEER_COOLDOWN` (5 s, shared with the syslog / otlp outputs)
 //! and subsequent sends rotate past it until the cooldown expires.
 //! Within a single send the rotation falls back to the cursor start
-//! when every peer is cooled (single-peer retry path) — the queue
-//! layer's per-event retry then handles re-delivery on persistent
-//! failure.
+//! when every peer is cooled (single-peer retry path) — the output's
+//! own retry loop (driven by `retry { ... }`) then handles re-delivery
+//! on persistent failure. The queue layer advances its cursor when the
+//! ack handle resolves, not when `consume` returns.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -185,7 +186,8 @@ impl Default for PeerState {
     }
 }
 
-/// Shared state between write() and the flush timer task.
+/// Shared state between `consume()` (= the queue consumer's hand-off
+/// into the buffer) and the flush timer task.
 struct Inner {
     peers: Vec<HttpPeer>,
     peer_state: Vec<PeerState>,
@@ -207,9 +209,9 @@ struct Inner {
     name: String,
     /// Per-flush retry policy. Without an internal retry, one
     /// transient ship failure would lose the whole drained batch
-    /// (the queue layer's per-event redelivery only sees the most
-    /// recent event). The retry budget for batched outputs lives
-    /// entirely here.
+    /// (the queue layer cannot re-push a buffered batch — its cursor
+    /// only advances when each event's ack handle resolves). The
+    /// retry budget for batched outputs lives entirely here.
     retry: RetryConfig,
     /// `error_log` writer injected at construction time by the
     /// runtime via `BuildContext` in `from_properties`.
@@ -617,10 +619,9 @@ impl HttpOutput {
     }
 }
 
-/// Render a single event into its HTTP body string. Mirrors the body
-/// of `HttpOutput::render` but operates on an owned `Event` so it can
-/// be called from the consumer-side flush path without setting up the
-/// borrowed-view arena.
+/// Render a single event into its HTTP body string. Called from the
+/// consumer-side flush path on an owned `Event`, so no borrowed-view
+/// arena setup is required.
 fn render_event(event: &Event) -> Result<String> {
     Ok(String::from_utf8_lossy(&event.egress).into_owned())
 }
@@ -710,8 +711,8 @@ impl Inner {
     /// next peer in round-robin order. A peer that fails the request
     /// is cooled down for `PEER_COOLDOWN` and skipped on subsequent
     /// flushes. When every peer is currently cooled the rotation falls
-    /// back to the cursor start — the queue layer's per-event retry
-    /// then handles longer-term re-delivery.
+    /// back to the cursor start — the per-flush retry loop on `Inner`
+    /// then handles longer-term re-delivery without dropping the batch.
     async fn send_batch(&self, messages: &[String]) -> Result<()> {
         let body_str = messages.join("\n");
 
@@ -1008,8 +1009,7 @@ mod tests {
     /// - `Ok(())` — Delivered, OR no disposition yet (event parked
     ///   in the in-memory batch buffer waiting for a future flush).
     /// - `Err(...)` — Recovered (= DLQ-routed; retry exhausted or
-    ///   render failure). Mirrors what tests would have seen via
-    ///   the old `write_with_retry` Err path.
+    ///   render failure).
     async fn consume(output: &HttpOutput, ev: &Event) -> Result<()> {
         let (ack, mut rx) = QueueAckHandle::for_test();
         let _ = output.consume(ev, ack).await;

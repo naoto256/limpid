@@ -106,9 +106,9 @@ struct Inner {
     /// same `retry { max_attempts initial_wait max_wait backoff }`
     /// vocabulary as the rest of the outputs — see [`super::http`]
     /// for the batched-output rationale (without an internal retry,
-    /// one transient ship failure loses the whole drained batch
-    /// because the queue layer's per-event retry only re-pushes the
-    /// most recent Event).
+    /// one transient ship failure loses the whole drained batch —
+    /// the queue layer cannot re-push a buffered batch; its cursor
+    /// only advances when each event's ack handle resolves).
     retry_config: RetryConfig,
     /// Buffered events awaiting flush, paired with their queue ack
     /// handles. Render happens at flush time; handles resolve on
@@ -1147,9 +1147,9 @@ mod tests {
 
     #[tokio::test]
     async fn drop_aborts_pending_flush_timer() {
-        // The flush timer is armed by `consume_event` while the buffer
-        // is below `batch_size`. Drop must abort it so the spawned
-        // task doesn't leak past process exit.
+        // The flush timer is armed by `consume` while the buffer is
+        // below `batch_size`. Drop must abort it so the spawned task
+        // doesn't leak past process exit.
         let mut props = one_peer_props("http://127.0.0.1:1");
         props.push(prop_int("batch_size", 1024));
         props.push(prop_str("batch_timeout", "30s"));
@@ -1257,17 +1257,18 @@ mod tests {
         let batch_len = output.inner.batch.lock().await.len();
         assert_eq!(batch_len, 1, "event must sit in the buffer");
         let timer_armed = output.flush_handle.lock().await.is_some();
-        assert!(timer_armed, "consume_event must arm the flush timer");
+        assert!(timer_armed, "consume must arm the flush timer");
     }
 
     #[tokio::test]
     async fn shutdown_flushes_pending_batch_buffer() {
         // Regression mirror of `output http` / `otlp_http`: when
-        // batch_size > 1 the queue-side `write()` returns Ok once
-        // the event is in the buffer, so the memory queue considers
-        // it delivered. If the daemon shuts down before the batch
-        // fills, Drop alone aborts the timer and leaks the buffer.
-        // `shutdown()` aborts the timer and runs one final flush.
+        // batch_size > 1 `consume()` parks the event + ack handle in
+        // the buffer; the queue layer cannot advance its cursor until
+        // the handle resolves at flush time. If the daemon shuts down
+        // before the batch fills, Drop alone aborts the timer and
+        // leaks the buffer. `shutdown()` aborts the timer and runs
+        // one final flush (or DLQ drain).
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
