@@ -476,41 +476,18 @@ impl Output for HttpOutput {
 
     async fn shutdown(
         &self,
-        error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+        _error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
     ) -> Result<()> {
+        // Order: cancel the timer first so it cannot race in another
+        // flush, then take the buffer in one shot, then run the
+        // shutdown-mode flush which owns the entire disposition
+        // (Delivered on success, DLQ + Recovered otherwise). The
+        // queue consumer has already stopped pushing into us by the
+        // time `shutdown` is called, so there is no re-entrant-push
+        // race to defend against here.
         self.cancel_timer().await;
-        // Run one final flush. The flush is infallible from the
-        // caller's POV — it either ships and resolves Delivered, or
-        // routes-to-DLQ and resolves Recovered for each leftover.
-        self.flush().await;
-        // Anything still sitting in the buffer (race with timer, or
-        // a re-entrant push) is sent through the shutdown DLQ helper.
-        let leftovers = std::mem::take(&mut *self.inner.batch.lock().await);
-        if !leftovers.is_empty() {
-            let err = anyhow::anyhow!("shutdown leftover after final flush");
-            if let Some(writer) = error_log {
-                crate::modules::write_shutdown_events_to_error_log(
-                    writer,
-                    &self.inner.name,
-                    leftovers,
-                    &err,
-                )
-                .await;
-            } else {
-                tracing::warn!(
-                    "output '{}': {} events dropped at shutdown (no error_log)",
-                    self.inner.name,
-                    leftovers.len()
-                );
-                for (_, ack) in leftovers {
-                    self.inner
-                        .metrics
-                        .events_failed
-                        .fetch_add(1, Ordering::Relaxed);
-                    ack.resolve_recovered();
-                }
-            }
-        }
+        let batch = std::mem::take(&mut *self.inner.batch.lock().await);
+        self.inner.flush_events_at_shutdown(batch).await;
         Ok(())
     }
 }
@@ -704,6 +681,82 @@ impl Inner {
                 .await;
             self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
             ack.resolve_recovered();
+        }
+    }
+
+    /// Shutdown single-attempt flush; never uses the steady-state retry
+    /// budget. Render failures route per-event to DLQ as before; the
+    /// shippable subset gets one `send_batch` call wrapped in
+    /// `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT`. The `shippable` vector is held
+    /// in this frame across the `timeout()` boundary so an `Elapsed`
+    /// outcome does NOT drop it — otherwise the inner handles would
+    /// fire `QueueAckHandle::Drop` and be counted as silent loss.
+    async fn flush_events_at_shutdown(&self, batch: Vec<(Event, QueueAckHandle)>) {
+        if batch.is_empty() {
+            return;
+        }
+        let mut messages: Vec<String> = Vec::with_capacity(batch.len());
+        let mut shippable: Vec<(Event, QueueAckHandle)> = Vec::with_capacity(batch.len());
+        let mut render_failures: Vec<(Event, QueueAckHandle, anyhow::Error)> = Vec::new();
+        for (ev, ack) in batch {
+            match render_event(&ev) {
+                Ok(m) => {
+                    messages.push(m);
+                    shippable.push((ev, ack));
+                }
+                Err(e) => render_failures.push((ev, ack, e)),
+            }
+        }
+        for (ev, ack, err) in render_failures {
+            let reason = format!("render failed during shutdown flush: {}", err);
+            crate::modules::route_event_to_dlq(self.error_log.as_ref(), &self.name, &ev, &reason)
+                .await;
+            self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+            ack.resolve_recovered();
+        }
+        if messages.is_empty() {
+            return;
+        }
+        let count = shippable.len() as u64;
+        let send_outcome = tokio::time::timeout(
+            crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT,
+            self.send_batch(&messages),
+        )
+        .await;
+        match send_outcome {
+            Ok(Ok(())) => {
+                self.metrics
+                    .events_written
+                    .fetch_add(count, Ordering::Relaxed);
+                for (_, ack) in shippable {
+                    ack.resolve_delivered();
+                }
+            }
+            Ok(Err(send_err)) => {
+                let err = anyhow::anyhow!("transport error: {}", send_err);
+                crate::modules::route_shutdown_batch_to_dlq(
+                    self.error_log.as_ref(),
+                    &self.metrics,
+                    &self.name,
+                    shippable,
+                    &err,
+                )
+                .await;
+            }
+            Err(_elapsed) => {
+                let err = anyhow::anyhow!(
+                    "deadline exceeded after {:?} during shutdown flush",
+                    crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT
+                );
+                crate::modules::route_shutdown_batch_to_dlq(
+                    self.error_log.as_ref(),
+                    &self.metrics,
+                    &self.name,
+                    shippable,
+                    &err,
+                )
+                .await;
+            }
         }
     }
 
