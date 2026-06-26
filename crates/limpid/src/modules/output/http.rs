@@ -907,7 +907,13 @@ mod tests {
 
     #[test]
     fn requires_peer_or_peers_block() {
-        let err = HttpOutput::from_properties("o", &mp(&[]), &crate::modules::BuildContext::for_testing()).err().unwrap();
+        let err = HttpOutput::from_properties(
+            "o",
+            &mp(&[]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .unwrap();
         assert!(
             err.to_string().contains("'peer {") && err.to_string().contains("'peers {"),
             "unexpected: {err}"
@@ -921,14 +927,25 @@ mod tests {
             key_span: None,
             properties: vec![],
         }];
-        let err = HttpOutput::from_properties("o", &mp(&props), &crate::modules::BuildContext::for_testing()).err().unwrap();
+        let err = HttpOutput::from_properties(
+            "o",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .unwrap();
         assert!(err.to_string().contains("url"), "unexpected: {err}");
     }
 
     #[test]
     fn accepts_single_peer_shorthand() {
         let props = vec![peer_block("http://x:8080/")];
-        let output = HttpOutput::from_properties("o", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
+        let output = HttpOutput::from_properties(
+            "o",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
         assert_eq!(output.inner.peers.len(), 1);
         assert_eq!(output.inner.peers[0].url, "http://x:8080/");
     }
@@ -940,7 +957,12 @@ mod tests {
             peer_block("http://b:8080/"),
             peer_block("http://c:8080/"),
         ])];
-        let output = HttpOutput::from_properties("o", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
+        let output = HttpOutput::from_properties(
+            "o",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
         assert_eq!(output.inner.peers.len(), 3);
         assert_eq!(output.inner.peers[2].url, "http://c:8080/");
     }
@@ -959,7 +981,13 @@ mod tests {
                 },
             ],
         }];
-        let err = HttpOutput::from_properties("o", &mp(&props), &crate::modules::BuildContext::for_testing()).err().unwrap();
+        let err = HttpOutput::from_properties(
+            "o",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .unwrap();
         assert!(
             err.to_string().contains("cert and key"),
             "unexpected: {err}"
@@ -1043,8 +1071,7 @@ mod tests {
             &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
-        consume(&output, &event_with("hello-single")).await
-            .unwrap();
+        consume(&output, &event_with("hello-single")).await.unwrap();
         for _ in 0..50 {
             if !received.lock().await.is_empty() {
                 break;
@@ -1070,7 +1097,12 @@ mod tests {
             ]),
             prop_int("batch_size", 1),
         ];
-        let output = HttpOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
+        let output = HttpOutput::from_properties(
+            "test",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
         for i in 0..9 {
             consume(&output, &event_with(&format!("rr-{}", i)))
                 .await
@@ -1121,7 +1153,12 @@ mod tests {
         ];
         let mut props = props;
         props.push(fast_retry_block());
-        let output = HttpOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
+        let output = HttpOutput::from_properties(
+            "test",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
         // First send goes to A (cursor 0), fails. With max_attempts=1
         // the failure routes to Recovered (DLQ). A is cooled down.
         let first = consume(&output, &event_with("rr-fail")).await;
@@ -1146,9 +1183,13 @@ mod tests {
             peer_block("http://example.com/"),
             ident_prop("method", "CARRIER PIGEON"),
         ];
-        let err = HttpOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing())
-            .err()
-            .expect("invalid method must reject");
+        let err = HttpOutput::from_properties(
+            "test",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .expect("invalid method must reject");
         let msg = err.to_string();
         assert!(msg.contains("invalid http method"), "got: {msg}");
         assert!(msg.contains("CARRIER PIGEON"), "got: {msg}");
@@ -1197,7 +1238,12 @@ mod tests {
         // `verify false` must NOT discard the client identity. Old
         // behaviour: tls block silently ignored; reqwest builds a
         // plain client without the identity → mTLS broken at runtime.
-        let output = HttpOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
+        let output = HttpOutput::from_properties(
+            "test",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
         assert_eq!(output.inner.peers.len(), 1);
     }
 
@@ -1239,7 +1285,12 @@ mod tests {
             prop_int("batch_size", 1),
             ident_prop("method", "PATCH"),
         ];
-        let output = HttpOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
+        let output = HttpOutput::from_properties(
+            "test",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
         consume(&output, &event_with("hello")).await.unwrap();
         for _ in 0..50 {
             if !received.lock().await.is_empty() {
@@ -1277,7 +1328,12 @@ mod tests {
 
         let url = format!("http://{}/", addr);
         let props = vec![peer_block(&url), prop_int("batch_size", 1)];
-        let output = HttpOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
+        let output = HttpOutput::from_properties(
+            "test",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
         // `consume` resolves the ack and swallows the underlying
         // transport error inside its DLQ-routing path.
         // Hit `Inner::send_batch` directly so we can still assert on
@@ -1333,7 +1389,12 @@ mod tests {
 
         let url = format!("http://{}/", addr);
         let props = vec![peer_block(&url), prop_int("batch_size", 1)];
-        let output = HttpOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
+        let output = HttpOutput::from_properties(
+            "test",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
         let err = output
             .inner
             .send_batch(&["hello".to_string()])
@@ -1371,8 +1432,17 @@ mod tests {
         });
 
         let url = format!("http://{}/", addr);
-        let props = vec![peer_block(&url), prop_int("batch_size", 1), fast_retry_block()];
-        let output = HttpOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
+        let props = vec![
+            peer_block(&url),
+            prop_int("batch_size", 1),
+            fast_retry_block(),
+        ];
+        let output = HttpOutput::from_properties(
+            "test",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
         let pre_call = Instant::now();
         let _ = consume(&output, &event_with("hello")).await;
         let cooldown_until = output.inner.peer_state[0]
@@ -1405,7 +1475,12 @@ mod tests {
         let mut props = vec![peer_block("http://127.0.0.1:1/")];
         props.push(prop_int("batch_size", 1));
         props.push(fast_retry_block());
-        let output = HttpOutput::from_properties("test", &mp(&props), &crate::modules::BuildContext::for_testing()).unwrap();
+        let output = HttpOutput::from_properties(
+            "test",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
         let err = consume(&output, &event_with("singleton"))
             .await
             .expect_err("send must fail against unreachable peer");
@@ -1419,10 +1494,7 @@ mod tests {
             "singleton path must not land the event in the batch"
         );
         let timer_armed = output.flush_handle.lock().await.is_some();
-        assert!(
-            !timer_armed,
-            "singleton path must not arm the flush timer"
-        );
+        assert!(!timer_armed, "singleton path must not arm the flush timer");
     }
 
     #[tokio::test]
@@ -1815,7 +1887,11 @@ mod tests {
         // The Inner's `error_log` field must point at the same writer
         // the runtime would have handed to us — no Mutex, no None
         // window between construction and consumer spawn.
-        let stored = output.inner.error_log.as_ref().expect("error_log must be set");
+        let stored = output
+            .inner
+            .error_log
+            .as_ref()
+            .expect("error_log must be set");
         assert!(
             Arc::ptr_eq(stored, &writer),
             "constructor must store the exact Arc passed in"

@@ -468,7 +468,12 @@ mod tests {
 
     #[test]
     fn defaults_have_no_request_throttles() {
-        let i = OtlpHttpInput::from_properties("o", &mp(&[]), &crate::modules::BuildContext::for_testing()).unwrap();
+        let i = OtlpHttpInput::from_properties(
+            "o",
+            &mp(&[]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
         assert_eq!(i.bind_addr, "0.0.0.0:4318");
         assert_eq!(i.body_limit, DEFAULT_BODY_LIMIT_BYTES);
         assert_eq!(i.rate_limit, None);
@@ -495,10 +500,13 @@ mod tests {
     fn zero_concurrency_is_rejected() {
         // get_strictly_positive_int forbids 0; the property is
         // documented as "off when absent", so 0 is meaningless.
-        let err =
-            OtlpHttpInput::from_properties("o", &mp(&[prop_int("max_concurrent_requests", 0)]), &crate::modules::BuildContext::for_testing())
-                .err()
-                .unwrap();
+        let err = OtlpHttpInput::from_properties(
+            "o",
+            &mp(&[prop_int("max_concurrent_requests", 0)]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .unwrap();
         assert!(
             err.to_string().contains("max_concurrent_requests"),
             "unexpected: {err}"
@@ -507,18 +515,31 @@ mod tests {
 
     #[test]
     fn body_limit_accepts_size_suffix() {
-        let i = OtlpHttpInput::from_properties("o", &mp(&[prop_str("body_limit", "1MB")]), &crate::modules::BuildContext::for_testing()).unwrap();
+        let i = OtlpHttpInput::from_properties(
+            "o",
+            &mp(&[prop_str("body_limit", "1MB")]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
         assert_eq!(i.body_limit, 1024 * 1024);
-        let i =
-            OtlpHttpInput::from_properties("o", &mp(&[prop_str("body_limit", "64MB")]), &crate::modules::BuildContext::for_testing()).unwrap();
+        let i = OtlpHttpInput::from_properties(
+            "o",
+            &mp(&[prop_str("body_limit", "64MB")]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
         assert_eq!(i.body_limit, 64 * 1024 * 1024);
     }
 
     #[test]
     fn body_limit_zero_is_rejected() {
-        let err = OtlpHttpInput::from_properties("o", &mp(&[prop_str("body_limit", "0")]), &crate::modules::BuildContext::for_testing())
-            .err()
-            .unwrap();
+        let err = OtlpHttpInput::from_properties(
+            "o",
+            &mp(&[prop_str("body_limit", "0")]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .unwrap();
         assert!(
             err.to_string()
                 .contains("body_limit must be greater than 0"),
@@ -529,9 +550,13 @@ mod tests {
     #[test]
     fn body_limit_unrecognised_format_propagates_parse_error() {
         // parse_size's own error wording carries through.
-        let err = OtlpHttpInput::from_properties("o", &mp(&[prop_str("body_limit", "huge")]), &crate::modules::BuildContext::for_testing())
-            .err()
-            .unwrap();
+        let err = OtlpHttpInput::from_properties(
+            "o",
+            &mp(&[prop_str("body_limit", "huge")]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .unwrap();
         assert!(
             err.to_string().contains("invalid size"),
             "unexpected: {err}"
@@ -575,7 +600,12 @@ mod tests {
 
     #[test]
     fn defaults_have_no_tls() {
-        let i = OtlpHttpInput::from_properties("o", &mp(&[]), &crate::modules::BuildContext::for_testing()).unwrap();
+        let i = OtlpHttpInput::from_properties(
+            "o",
+            &mp(&[]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
         assert!(i.tls_config.is_none());
     }
 
@@ -789,15 +819,24 @@ mod tests {
 
     #[test]
     fn rate_limit_is_parsed_as_positive_int() {
-        let i = OtlpHttpInput::from_properties("o", &mp(&[prop_int("rate_limit", 5000)]), &crate::modules::BuildContext::for_testing()).unwrap();
+        let i = OtlpHttpInput::from_properties(
+            "o",
+            &mp(&[prop_int("rate_limit", 5000)]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
         assert_eq!(i.rate_limit, Some(5000));
     }
 
     #[test]
     fn rate_limit_zero_is_rejected() {
-        let err = OtlpHttpInput::from_properties("o", &mp(&[prop_int("rate_limit", 0)]), &crate::modules::BuildContext::for_testing())
-            .err()
-            .unwrap();
+        let err = OtlpHttpInput::from_properties(
+            "o",
+            &mp(&[prop_int("rate_limit", 0)]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .unwrap();
         assert!(err.to_string().contains("rate_limit"), "unexpected: {err}");
     }
 

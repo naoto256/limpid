@@ -802,9 +802,7 @@ fn handle_ack_disposition(
                 "output '{}': event dropped without explicit disposition (bug)",
                 name
             );
-            metrics
-                .events_failed
-                .fetch_add(1, Ordering::Relaxed);
+            metrics.events_failed.fetch_add(1, Ordering::Relaxed);
         }
     }
 }

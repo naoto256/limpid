@@ -599,4 +599,3 @@ fn warning(pipeline: &str, message: String, span: Option<Span>) -> Diagnostic {
         help: None,
     }
 }
-

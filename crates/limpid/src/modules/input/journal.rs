@@ -242,9 +242,7 @@ impl Input for JournalInput {
 
 /// Drain the ack channel and return the most-recent cursor (or None if
 /// empty). Used at shutdown to flush an in-flight watermark.
-fn drain_cursor_acks(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AckPosition>,
-) -> Option<String> {
+fn drain_cursor_acks(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AckPosition>) -> Option<String> {
     let mut last: Option<String> = None;
     while let Ok(pos) = rx.try_recv() {
         if let AckPosition::Cursor(c) = pos {

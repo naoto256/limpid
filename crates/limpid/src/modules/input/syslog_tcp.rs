@@ -1066,7 +1066,12 @@ mod tests {
 
     #[test]
     fn build_plaintext_defaults_to_port_514() {
-        let i = SyslogTcpInput::build("relay", &mp(&[]), &crate::modules::BuildContext::for_testing()).expect("should build");
+        let i = SyslogTcpInput::build(
+            "relay",
+            &mp(&[]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .expect("should build");
         assert_eq!(i.bind_addr, "0.0.0.0:514");
         assert!(i.tls_config.is_none());
     }
@@ -1081,7 +1086,12 @@ mod tests {
                 kv("key", ExprKind::StringLit(files.key.clone())),
             ],
         )];
-        let i = SyslogTcpInput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing()).expect("should build");
+        let i = SyslogTcpInput::build(
+            "relay",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .expect("should build");
         assert_eq!(i.bind_addr, "0.0.0.0:6514");
         let tls = i.tls_config.as_ref().expect("tls present");
         assert_eq!(tls.cert_path, files.cert);
@@ -1100,7 +1110,12 @@ mod tests {
                 kv("ca", ExprKind::StringLit(files.cert.clone())),
             ],
         )];
-        let i = SyslogTcpInput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing()).expect("should build");
+        let i = SyslogTcpInput::build(
+            "relay",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .expect("should build");
         let tls = i.tls_config.as_ref().expect("tls present");
         assert_eq!(tls.ca_path.as_deref(), Some(files.cert.as_str()));
     }
@@ -1112,9 +1127,13 @@ mod tests {
             "tls",
             vec![kv("key", ExprKind::StringLit(files.key))],
         )];
-        let err = SyslogTcpInput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing())
-            .err()
-            .expect("should fail");
+        let err = SyslogTcpInput::build(
+            "relay",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .expect("should fail");
         assert!(err.to_string().to_lowercase().contains("cert"), "{}", err);
     }
 
@@ -1131,7 +1150,12 @@ mod tests {
                 ],
             ),
         ];
-        let i = SyslogTcpInput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing()).expect("should build");
+        let i = SyslogTcpInput::build(
+            "relay",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .expect("should build");
         assert_eq!(i.bind_addr, "127.0.0.1:9999");
     }
 
