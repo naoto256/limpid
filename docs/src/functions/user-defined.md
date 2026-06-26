@@ -33,18 +33,30 @@ The name must be a bare identifier. `def function normalize_proto { ... }` is al
 
 ## Where they can be called from
 
-Anywhere an expression is evaluated — there's no callsite restriction:
+Anywhere an expression is evaluated — there's no callsite restriction on the function dispatch itself:
 
 - **Process bodies**: `workspace.limpid.severity_id = normalize_severity(workspace.cef.severity)`.
 - **Pipeline-level conditions**: `if is_critical(workspace.limpid.severity_id) { output urgent }`.
-- **`output` templates**: `path "/var/log/limpid/${normalize_proto(workspace.cef.proto)}/events.log"`.
+- **`output` templates over event-intrinsic args**: `path "/var/log/limpid/${normalize_proto(source.port)}/events.log"` — the function call itself is fine; what *its arguments* may reference is restricted by the surrounding surface (output config rejects `workspace`, `egress`, `error`; see [DSL Syntax → String interpolation](../dsl-syntax.md#string-interpolation)). To route on a pipeline-mutable value, branch in the pipeline body and select between outputs whose own templates only reference event-intrinsic fields:
+  ```
+  def output proto_tcp { type file path "/var/log/limpid/tcp/events.log" }
+  def output proto_udp { type file path "/var/log/limpid/udp/events.log" }
+  def pipeline split {
+      input syslog_udp
+      process parse_cef                                  // sets workspace.cef.proto
+      switch normalize_proto(workspace.cef.proto) {
+          "tcp" { output proto_tcp }
+          "udp" { output proto_udp }
+      }
+  }
+  ```
 - **HashLit values**: `workspace.limpid = { severity_id: normalize_severity(...), ... }`.
 - **Function arguments**: `lower(normalize_proto(workspace.cef.proto))`.
 - **Binary operands**: `if double_score(s) > threshold { ... }`.
 
-The purity contract restricts the **body** of the function (no Event reads, no side effects). The call site is unrestricted: it operates in the surrounding expression's evaluation context, which can read the Event normally and pass concrete values into the function.
+The purity contract restricts the **body** of the function (no Event reads, no side effects). The call site is dispatch-wise unrestricted: it operates in the surrounding expression's evaluation context, which can read whatever that surface allows (full Event in process bodies / pipeline expressions; event-intrinsic only in output config templates) and pass concrete values into the function.
 
-The mental model is the same as built-in primitives: `lower()` and `regex_match()` don't care where they're called from (pipeline `if` conditions, output `path` templates, process bodies — all valid). User-defined `normalize_proto()` is no different. Both are dispatched through `FunctionRegistry::call` with already-evaluated arguments. The only operator-visible difference is that `def function` lets you ship a vendor-agnostic mapping in the DSL itself, without touching Rust.
+The mental model is the same as built-in primitives: `lower()` and `regex_match()` don't care where they're called from. User-defined `normalize_proto()` is no different. Both are dispatched through `FunctionRegistry::call` with already-evaluated arguments. The only operator-visible difference is that `def function` lets you ship a vendor-agnostic mapping in the DSL itself, without touching Rust.
 
 ## When to reach for it
 
@@ -88,7 +100,7 @@ For non-trivial computations, factor intermediate values into `let` bindings:
 
 ```
 def function normalize(s) {
-    let trimmed = trim(s)
+    let trimmed = regex_replace(s, "^\\s+|\\s+$", "")
     let lowered = lower(trimmed)
     regex_replace(lowered, "\\s+", " ")
 }
@@ -185,7 +197,7 @@ Rule of thumb: **if the result is a single value the caller wants to embed somew
 A typical vendor parser uses several small functions to canonicalise vendor-specific values into OCSF-shape:
 
 ```
-// _common/severity.limpid
+// functions/normalize_severity.limpid
 def function normalize_severity(s) {
     switch lower(s) {
         "critical" { 5 }
@@ -196,7 +208,7 @@ def function normalize_severity(s) {
     }
 }
 
-// _common/proto.limpid
+// functions/normalize_proto.limpid
 def function normalize_proto(num) {
     switch num {
         6 { "tcp" }
@@ -206,7 +218,7 @@ def function normalize_proto(num) {
     }
 }
 
-// parsers/fortigate.limpid
+// parsers/parse_fortigate_cef.limpid
 def process parse_fortigate_cef_traffic {
     workspace.limpid = {
         class_uid: 4001,

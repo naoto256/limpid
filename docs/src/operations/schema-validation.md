@@ -184,7 +184,7 @@ Anything that reads JSONL from stdin and exits non-zero on failure works. The co
 
 This approach is consistent with two existing limpid patterns:
 
-- **Record and replay.** limpid has no `limpidctl record` / `limpidctl replay`. Recording is `tap --json > file.jsonl`; replay is `inject --json --replay-timing < file.jsonl`. Two primitives, one pipe, no third subcommand. See [Debug Tap](./tap.md#replay-with-tap--inject).
+- **Record and replay.** limpid has no `limpidctl record` / `limpidctl replay`. Recording is `tap <kind> <name> --json > file.jsonl` (kind is `input` / `process` / `output`); replay is `inject input <name> --json --replay-timing < file.jsonl` (or `inject output <name>` for sink-side recovery). Two primitives, one pipe, no third subcommand. See [Debug Tap](./tap.md#replay-with-tap--inject).
 - **Principle 1 — Zero hidden behavior.** A bundled validator would run "in the background" on behalf of the user. The pipe form makes every check an explicit command with an observable exit status.
 - **Principle 3 — Domain knowledge ships as DSL snippets.** OCSF, ECS, ASIM, CIM — these are domain specifications. Their maintenance lives outside the daemon by design.
 

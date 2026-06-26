@@ -215,7 +215,7 @@ def pipeline main {
 
 The pipeline body itself is unchanged from Step 3 — only the surrounding files moved.
 
-(The `include "processes/*.limpid"` line is reserved for Step 6 — we don't have any user-defined processes to drop in there yet. Glob includes resolve to zero files quietly, so the line is harmless until Step 6 populates the directory.)
+(The `include "processes/*.limpid"` line is reserved for Step 6 — we don't have any user-defined processes to drop in there yet. The current loader **errors** if a glob matches zero files, so add the line only after Step 6 has placed at least one `.limpid` file in `processes/`.)
 
 Glob includes resolve relative to the main config file's directory. The directory layout is a convention; you could put everything in one file (and we did, until now). See [Main Configuration](./configuration.md) for the global blocks and include rules.
 
@@ -315,7 +315,7 @@ Pipelines:
   main                        278941 received     10117 finished    268824 dropped         0 discarded
 ```
 
-`tap --json` and `inject --json` are symmetric — every Event captured by one is consumable by the other, with `received_at` and `source` preserved. Add `--replay-timing` to play back at the original cadence, or `--replay-timing=10x` to compress an hour of traffic into six minutes. This makes "what would this config change have done last Tuesday?" a routine question.
+`tap <kind> <name> --json` and `inject input <name> --json` (or `inject output <name>` for sink-side replay) are symmetric — every Event captured by one is consumable by the other, with `received_at` and `source` preserved. Add `--replay-timing` to play back at the original cadence, or `--replay-timing=10x` to compress an hour of traffic into six minutes. This makes "what would this config change have done last Tuesday?" a routine question.
 
 ## Where to next
 
@@ -330,7 +330,7 @@ And along the way you've picked up the operator-side tools that come with limpid
 
 - `limpidctl tap` and `limpidctl stats` for seeing what is flowing where, live, with no redeploy,
 - `limpid --check` for catching configuration mistakes before they reach the daemon, with automatic rollback if a reload fails anyway,
-- `limpidctl tap --json` + `limpidctl inject --json --replay-timing` for capturing real traffic and replaying it through any configuration after the fact.
+- `limpidctl tap <kind> <name> --json` + `limpidctl inject input <name> --json --replay-timing` (or `inject output <name>` for sink-side replay) for capturing real traffic and replaying it through any configuration after the fact.
 
 From here:
 
