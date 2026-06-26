@@ -33,6 +33,7 @@ pub fn register(reg: &mut FunctionRegistry) {
         name: "parse_kv",
         produces: Vec::new(),
         wildcards: true,
+        defaults_arg_indices: &[1, 2],
     });
 }
 

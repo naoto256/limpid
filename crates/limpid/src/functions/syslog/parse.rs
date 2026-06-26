@@ -52,6 +52,7 @@ pub fn register(reg: &mut FunctionRegistry) {
             FieldSpec::new(&["workspace", "msg"], FieldType::String),
         ],
         wildcards: false,
+        defaults_arg_indices: &[1],
     });
 }
 
