@@ -1,11 +1,11 @@
-//! Module system: traits, registry, and implementations for input, output,
-//! and process modules.
+//! Module system: traits, registry, and implementations for input and
+//! output modules. (Processes are DSL functions or `def process`
+//! blocks evaluated by the pipeline executor — not modules — so they
+//! live outside this layer.)
 //!
 //! `ModuleRegistry` maps type names to factory functions.
 //! Runtime resolves type names from DSL config through the registry
 //! instead of hardcoded match arms.
-//!
-//! This is the extension point for future dynamic (.so) module loading.
 
 pub mod input;
 pub mod output;
@@ -62,24 +62,24 @@ impl BuildContext {
 // (render errors bypass retry and route directly to recovery)
 // ---------------------------------------------------------------------------
 //
-// `Output::consume` returns `anyhow::Result<()>` — the consumer
-// (`write_with_retry`) used to assume every Err was a transport failure
-// and apply the retry budget. After this change each sink's `consume` runs
-// render internally (the trait no longer carries a `render` method);
-// render failures are deterministic on the event so retrying only
+// `Output::consume` returns `anyhow::Result<()>` and runs render
+// internally — the trait carries no separate `render` method.
+// Render failures are deterministic on the event, so retrying only
 // delays the DLQ landing without changing the outcome.
 //
 // `RenderError` is the in-band tag that lets sinks signal "render
 // failed permanently, skip retries" while keeping `consume`'s return
 // type a plain `Result<()>`. Sinks wrap their internal render error in
-// `RenderError::new(e)` before returning; `write_with_retry`
-// downcasts on `anyhow::Error::downcast_ref::<RenderError>()` and
-// routes straight to DLQ.
+// `RenderError::new(e)` before returning, and the consumer-side path
+// that drives retries / DLQ landing checks
+// `anyhow::Error::downcast_ref::<RenderError>()` to bypass the retry
+// budget and route straight to the error log.
 
 /// Render-error sentinel. Wraps any underlying `anyhow::Error` raised
-/// by a sink's internal render step. Detected by `write_with_retry`
-/// via `anyhow::Error::downcast_ref::<RenderError>()` so the retry
-/// budget is bypassed.
+/// by a sink's internal render step. Detected by the consumer-side
+/// retry / DLQ path via
+/// `anyhow::Error::downcast_ref::<RenderError>()` so the retry budget
+/// is bypassed and the payload is routed straight to `error_log`.
 #[derive(Debug)]
 pub struct RenderError(pub anyhow::Error);
 
@@ -92,8 +92,8 @@ impl RenderError {
 impl std::fmt::Display for RenderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Forward to the inner error so the JSONL `reason` field stays
-        // operator-friendly (`render failed: <inner>` already prefixes
-        // in `write_with_retry`).
+        // operator-friendly; the consumer-side path that catches
+        // RenderError already prefixes the `render failed:` framing.
         write!(f, "{}", self.0)
     }
 }
@@ -523,12 +523,11 @@ pub struct CreatedInput {
 
 /// Returned by output factory: the constructed sink + metrics handle.
 ///
-/// `output` is the `Arc<dyn Output>` handed to the queue consumer
-/// (which calls `Output::consume` directly — after this change there is no
-/// intermediate `OutputWriter` adapter trait). Batched outputs that
-/// need the operator-configured `error_log` receive it as a
-/// constructor argument via the factory; no post-construction setter
-/// remains on the trait.
+/// `output` is the `Arc<dyn Output>` handed to the queue consumer,
+/// which calls `Output::consume` directly — there is no intermediate
+/// adapter trait. Batched outputs that need the operator-configured
+/// `error_log` receive it as a constructor argument via the factory;
+/// no post-construction setter remains on the trait.
 pub struct CreatedOutput {
     pub output: Arc<dyn Output>,
     pub metrics: Arc<OutputMetrics>,

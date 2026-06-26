@@ -3,8 +3,10 @@
 //!
 //! The boundary between **owned** and **borrowed (arena)** event forms
 //! is drawn at [`run_pipeline`]: the function takes an [`OwnedEvent`]
-//! (which is what the input layer / channel hands over), creates a
-//! per-event [`bumpalo::Bump`], and views the event into the arena.
+//! (which is what the input layer / channel hands over) along with a
+//! caller-owned `&mut bumpalo::Bump`, and views the event into that
+//! arena. The runtime owns the bump so it can amortise allocation
+//! across many events instead of paying a fresh allocator per event.
 //! Everything inside the pipeline executor — eval, exec, function
 //! dispatch — operates on [`BorrowedEvent<'bump>`]. At each output sink
 //! and at each error path we cross back to the heap by calling
@@ -1186,10 +1188,9 @@ def pipeline p {
 
     // This restructure deleted `render_failure_falls_back_to_owned_sink_input`.
     // The pipeline-side render-Err → Owned fallback no longer exists;
-    // render now runs consumer-side inside each sink's `Output::consume`
-    // and a render failure routes straight to the DLQ via
-    // `RenderError` (see `queue::mod::write_with_retry_tests::
-    // render_err_goes_straight_to_dlq`).
+    // render now runs consumer-side inside each sink's `Output::consume`,
+    // and a render failure tagged with `RenderError` routes straight to
+    // the DLQ from the consumer loop without retrying.
 
     #[test]
     fn validate_accepts_fan_in_when_all_inputs_exist() {

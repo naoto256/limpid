@@ -3,7 +3,8 @@
 //! Features:
 //! - Follows file appends (poll-based, no inotify dependency)
 //! - Detects log rotation (inode change or file truncation)
-//! - Persists read position to a state file for restart recovery
+//! - Persists the acked file offset (not the in-flight read position)
+//!   to a state file, so an unacked event is replayed on restart
 //!
 //! Properties:
 //!   path        "/var/log/auth.log"           — required

@@ -7,9 +7,10 @@
 //! * `--check` (the analyzer) — to surface unknown keys, missing
 //!   required ones, type-mismatched values, and out-of-set enum values
 //!   as loud diagnostics *before* the daemon is started; and
-//! * runtime (`Module::from_properties`) — to fail fast with the same
-//!   wording when a config slips past `--check` (e.g. someone runs the
-//!   daemon directly).
+//! * runtime (the module registry's build path, before each
+//!   `Module::from_properties` factory runs) — to fail fast with the
+//!   same wording when a config slips past `--check` (e.g. someone
+//!   runs the daemon directly).
 //!
 //! Single source of truth: the validator never invents semantics the
 //! analyzer or the runtime don't share. If `framing` accepts
@@ -43,11 +44,13 @@ pub enum PropertyValueKind {
     /// idioms without forcing a config rewrite.
     Bool,
     /// String literal parseable by `props::parse_duration` (`1s`, `5m`,
-    /// `100ms`). The validator accepts any string shape and only
-    /// rejects parse failures — that keeps the rule "schema does
-    /// shape, runtime does semantics" intact.
+    /// `100ms`). Unlike the plain `String` kind, Duration accepts only
+    /// `StringLit` — `Template` and bare `Ident` are rejected, since
+    /// the parser needs a fixed literal it can hand to the duration
+    /// parser at analyzer time. Parse failures are flagged the same way.
     Duration,
     /// String literal parseable by `props::parse_size` (`1GB`, `512MB`).
+    /// Same `StringLit`-only restriction as [`Duration`].
     Size,
     /// Bare ident whose value must be one of the listed strings.
     /// `framing { octet_counting | non_transparent }`, `queue.type

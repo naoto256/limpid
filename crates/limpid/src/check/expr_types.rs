@@ -302,9 +302,9 @@ pub fn check_types(
 /// any reserved event ident, `let` binding, or `workspace.*` path.
 ///
 /// Multi-segment idents starting with `workspace` are skipped here —
-/// the dataflow check (`outputs::check_workspace_visibility`) owns the
-/// "workspace key not produced upstream" diagnostic so we don't
-/// double-flag.
+/// the output-config gate (`outputs::check_pipeline_only_reference`)
+/// owns the "pipeline-mutable state referenced from output config"
+/// diagnostic so we don't double-flag.
 ///
 /// Special-case: bare `timestamp` was the reserved Event-time ident
 /// pre-0.5; surface a targeted hint pointing at the rename rather

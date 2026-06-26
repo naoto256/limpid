@@ -50,8 +50,8 @@ pub(crate) trait PersistentConn: Sync {
     async fn write_frame(&self, stream: &mut Self::Stream, payload: &Bytes) -> Result<()>;
 }
 
-/// Write `event` through a persistent stream, reconnecting once if the
-/// cached stream is stale. Bumps `events_written` on success.
+/// Write `payload` through a persistent stream, reconnecting once if
+/// the cached stream is stale. Bumps `events_written` on success.
 ///
 /// On the fast path (cached stream, write succeeds) `connect` is never
 /// invoked. A single failed write triggers one reconnect attempt; if

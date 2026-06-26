@@ -1,8 +1,9 @@
 //! Source span + multi-file source map for diagnostic rendering.
 //!
 //! A [`Span`] is a `(file_id, start, end)` byte range. The `file_id`
-//! lets the (future) include loader attribute spans across multiple
-//! physical files; in single-file usage `file_id` is always `0`.
+//! lets the include loader in [`crate::config`] attribute spans
+//! across multiple physical files; in single-file usage `file_id` is
+//! always `0`.
 //!
 //! [`SourceMap`] owns the source text for each registered file and
 //! resolves a `Span` into a [`ResolvedSpan`] (`path`, 1-based `line`,

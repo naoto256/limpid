@@ -150,7 +150,8 @@ pub const RETRY_PROPERTY_SPEC: PropertySpec = PropertySpec {
 #[derive(Debug, Clone)]
 pub struct QueueConfig {
     pub queue_type: QueueType,
-    /// Maximum number of events for memory queue / segment config for disk queue.
+    /// Maximum number of events for the memory queue. Ignored by the disk
+    /// queue, which is sized in bytes via `QueueType::Disk { max_size }`.
     pub capacity: usize,
 }
 
