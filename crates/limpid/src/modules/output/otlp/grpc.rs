@@ -364,38 +364,17 @@ impl Output for OtlpGrpcOutput {
 
     async fn shutdown(
         &self,
-        error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+        _error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
     ) -> Result<()> {
+        // Order: abort the deferred flush timer, take the buffer in one
+        // shot, then run the shutdown-mode flush which owns the entire
+        // disposition. The queue consumer has stopped pushing by the
+        // time `shutdown` is called, so no re-entrant-push race.
         if let Some(h) = self.flush_handle.lock().await.take() {
             h.abort();
         }
-        self.flush().await;
-        let leftovers = std::mem::take(&mut *self.inner.batch.lock().await);
-        if !leftovers.is_empty() {
-            let err = anyhow::anyhow!("shutdown leftover after final flush");
-            if let Some(writer) = error_log {
-                crate::modules::write_shutdown_events_to_error_log(
-                    writer,
-                    &self.inner.name,
-                    leftovers,
-                    &err,
-                )
-                .await;
-            } else {
-                tracing::warn!(
-                    "output '{}': {} events dropped at shutdown (no error_log)",
-                    self.inner.name,
-                    leftovers.len()
-                );
-                for (_, ack) in leftovers {
-                    self.inner
-                        .metrics
-                        .events_failed
-                        .fetch_add(1, Ordering::Relaxed);
-                    ack.resolve_recovered();
-                }
-            }
-        }
+        let batch = std::mem::take(&mut *self.inner.batch.lock().await);
+        self.inner.flush_events_at_shutdown(batch).await;
         Ok(())
     }
 }
@@ -497,6 +476,93 @@ impl Inner {
                     self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
                     ack.resolve_recovered();
                 }
+            }
+        }
+    }
+
+    /// Shutdown single-attempt flush; never uses the steady-state retry
+    /// budget. Partial successes are honoured (the rejected tail goes to
+    /// DLQ with the `partial_success` reason — distinct from transport
+    /// failure), and the shippable subset gets one `send_batch` call
+    /// wrapped in `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT`. The `shippable`
+    /// vector is held in this frame across the `timeout()` boundary so
+    /// an `Elapsed` outcome does NOT drop it — otherwise the inner
+    /// handles would fire `QueueAckHandle::Drop` and be counted as
+    /// silent loss.
+    async fn flush_events_at_shutdown(&self, batch: Vec<(Event, QueueAckHandle)>) {
+        if batch.is_empty() {
+            return;
+        }
+        let mut payloads: Vec<Bytes> = Vec::with_capacity(batch.len());
+        let mut shippable: Vec<(Event, QueueAckHandle)> = Vec::with_capacity(batch.len());
+        for (ev, ack) in batch {
+            payloads.push(ev.egress.clone());
+            shippable.push((ev, ack));
+        }
+        if payloads.is_empty() {
+            return;
+        }
+        let count = shippable.len() as u64;
+        let send_outcome = tokio::time::timeout(
+            crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT,
+            send_batch(self, payloads),
+        )
+        .await;
+        match send_outcome {
+            Ok(Ok(outcome)) => {
+                let rejected = outcome.rejected.min(count);
+                let written = count - rejected;
+                if written > 0 {
+                    self.metrics
+                        .events_written
+                        .fetch_add(written, Ordering::Relaxed);
+                }
+                if rejected > 0 {
+                    self.metrics
+                        .events_failed
+                        .fetch_add(rejected, Ordering::Relaxed);
+                }
+                let split = (count - rejected) as usize;
+                let mut iter = shippable.into_iter();
+                for (_, ack) in iter.by_ref().take(split) {
+                    ack.resolve_delivered();
+                }
+                for (ev, ack) in iter {
+                    let reason = "collector reported partial_success rejection".to_string();
+                    crate::modules::route_event_to_dlq(
+                        self.error_log.as_ref(),
+                        &self.name,
+                        &ev,
+                        &reason,
+                    )
+                    .await;
+                    ack.resolve_recovered();
+                }
+            }
+            Ok(Err(send_err)) => {
+                let err = anyhow::anyhow!("transport error: {}", send_err);
+                crate::modules::route_shutdown_batch_to_dlq(
+                    self.error_log.as_ref(),
+                    &self.metrics,
+                    &self.name,
+                    shippable,
+                    &err,
+                )
+                .await;
+            }
+            Err(_elapsed) => {
+                let err = anyhow::anyhow!(
+                    "deadline exceeded after {:?} during shutdown flush",
+                    crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT
+                );
+                crate::modules::route_shutdown_batch_to_dlq(
+                    self.error_log.as_ref(),
+                    &self.metrics,
+                    &self.name,
+                    shippable,
+                    &err,
+                )
+                .await;
             }
         }
     }
