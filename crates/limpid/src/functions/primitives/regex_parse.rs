@@ -64,6 +64,7 @@ pub fn register(reg: &mut FunctionRegistry) {
         name: "regex_parse",
         produces: Vec::new(),
         wildcards: true,
+        defaults_arg_indices: &[],
     });
 }
 
