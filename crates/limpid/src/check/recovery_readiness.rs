@@ -146,7 +146,8 @@ mod tests {
             .iter()
             .filter(|d| {
                 d.level == Level::Warning
-                    && d.message.contains("depend on `error_log` for failure recovery")
+                    && d.message
+                        .contains("depend on `error_log` for failure recovery")
             })
             .collect()
     }
@@ -166,8 +167,17 @@ def pipeline p { input i; output o }
 "#;
         let diags = analyze_str(src);
         let ws = recovery_warnings(&diags);
-        assert_eq!(ws.len(), 1, "expected exactly one recovery warning, got: {:?}", diags);
-        assert!(ws[0].message.contains("`o` (retry)"), "got: {}", ws[0].message);
+        assert_eq!(
+            ws.len(),
+            1,
+            "expected exactly one recovery warning, got: {:?}",
+            diags
+        );
+        assert!(
+            ws[0].message.contains("`o` (retry)"),
+            "got: {}",
+            ws[0].message
+        );
     }
 
     #[test]
@@ -186,7 +196,11 @@ def pipeline p { input i; output o }
         let diags = analyze_str(src);
         let ws = recovery_warnings(&diags);
         assert_eq!(ws.len(), 1, "got: {:?}", diags);
-        assert!(ws[0].message.contains("`o` (batched)"), "got: {}", ws[0].message);
+        assert!(
+            ws[0].message.contains("`o` (batched)"),
+            "got: {}",
+            ws[0].message
+        );
     }
 
     #[test]
@@ -248,8 +262,21 @@ def pipeline p { input i; output a }
 "#;
         let diags = analyze_str(src);
         let ws = recovery_warnings(&diags);
-        assert_eq!(ws.len(), 1, "expected single coalesced warning, got: {:?}", diags);
-        assert!(ws[0].message.contains("`a` (retry)"), "got: {}", ws[0].message);
-        assert!(ws[0].message.contains("`b` (batched)"), "got: {}", ws[0].message);
+        assert_eq!(
+            ws.len(),
+            1,
+            "expected single coalesced warning, got: {:?}",
+            diags
+        );
+        assert!(
+            ws[0].message.contains("`a` (retry)"),
+            "got: {}",
+            ws[0].message
+        );
+        assert!(
+            ws[0].message.contains("`b` (batched)"),
+            "got: {}",
+            ws[0].message
+        );
     }
 }

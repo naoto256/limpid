@@ -657,7 +657,11 @@ def pipeline p {
         let errs = errors(&diags);
         assert_eq!(errs.len(), 1, "got: {:?}", diags);
         assert!(errs[0].message.contains("workspace.msg"));
-        assert!(errs[0].message.contains("not addressable from output config"));
+        assert!(
+            errs[0]
+                .message
+                .contains("not addressable from output config")
+        );
         let help = errs[0].help.as_deref().unwrap_or("");
         assert!(
             help.contains("event-intrinsic"),

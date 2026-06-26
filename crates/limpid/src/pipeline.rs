@@ -120,7 +120,6 @@ impl CompiledConfig {
         Ok(())
     }
 
-
     fn validate_pipeline_stmt(&self, pipeline_name: &str, stmt: &PipelineStatement) -> Result<()> {
         match stmt {
             PipelineStatement::Input(input_names) => {
@@ -484,10 +483,7 @@ impl ErroredEventContext {
                 timestamp.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
             ),
         );
-        record.insert(
-            "reason".into(),
-            serde_json::Value::String(reason.clone()),
-        );
+        record.insert("reason".into(), serde_json::Value::String(reason.clone()));
         record.insert(
             "pipeline".into(),
             serde_json::Value::String(pipeline.clone()),

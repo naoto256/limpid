@@ -330,7 +330,12 @@ mod tests {
 
     #[test]
     fn build_accepts_single_peer() {
-        let u = SyslogUdpOutput::build("u", &mp(&[peer("h", 1)]), &crate::modules::BuildContext::for_testing()).expect("ok");
+        let u = SyslogUdpOutput::build(
+            "u",
+            &mp(&[peer("h", 1)]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .expect("ok");
         assert_eq!(u.peers.len(), 1);
         assert_eq!(u.peers.peers()[0].address(), "h:1");
     }
@@ -364,9 +369,10 @@ mod tests {
 
     #[test]
     fn build_rejects_missing_destination() {
-        let err = SyslogUdpOutput::build("u", &mp(&[]), &crate::modules::BuildContext::for_testing())
-            .err()
-            .expect("missing destination");
+        let err =
+            SyslogUdpOutput::build("u", &mp(&[]), &crate::modules::BuildContext::for_testing())
+                .err()
+                .expect("missing destination");
         assert!(
             err.to_string()
                 .contains("either 'peer' or 'peers' is required"),
@@ -381,9 +387,13 @@ mod tests {
             "per",
             vec![kv("host", ExprKind::StringLit("h".into()))],
         )];
-        let err = SyslogUdpOutput::build("u", &mp(&props), &crate::modules::BuildContext::for_testing())
-            .err()
-            .expect("typo");
+        let err = SyslogUdpOutput::build(
+            "u",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .expect("typo");
         let msg = err.to_string();
         assert!(msg.contains("per") && msg.contains("peer"), "{}", msg);
     }
@@ -391,9 +401,13 @@ mod tests {
     #[test]
     fn build_rejects_peer_and_peers_together() {
         let props = vec![peer("a", 1), block("peers", vec![peer("b", 2)])];
-        let err = SyslogUdpOutput::build("u", &mp(&props), &crate::modules::BuildContext::for_testing())
-            .err()
-            .expect("should fail");
+        let err = SyslogUdpOutput::build(
+            "u",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .expect("should fail");
         let msg = err.to_string();
         assert!(msg.contains("exclusive group"), "{}", msg);
         assert!(msg.contains("peer") && msg.contains("peers"), "{}", msg);
@@ -409,18 +423,26 @@ mod tests {
         // silently take the first `peer` block and discard the
         // `peers` block. Belt-and-braces.
         let props = vec![peer("a", 1), block("peers", vec![peer("b", 2)])];
-        let err = SyslogUdpOutput::from_properties("u", &mp(&props), &crate::modules::BuildContext::for_testing())
-            .err()
-            .expect("from_properties should reject both blocks");
+        let err = SyslogUdpOutput::from_properties(
+            "u",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .expect("from_properties should reject both blocks");
         let msg = err.to_string();
         assert!(msg.contains("mutually exclusive"), "{}", msg);
     }
 
     #[test]
     fn build_rejects_empty_peers_block() {
-        let err = SyslogUdpOutput::from_properties("u", &mp(&[block("peers", vec![])]), &crate::modules::BuildContext::for_testing())
-            .err()
-            .expect("should fail");
+        let err = SyslogUdpOutput::from_properties(
+            "u",
+            &mp(&[block("peers", vec![])]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .expect("should fail");
         assert!(
             err.to_string()
                 .contains("peers block must contain at least one peer"),
@@ -440,9 +462,13 @@ mod tests {
     #[test]
     fn build_rejects_peer_missing_host() {
         let props = vec![block("peer", vec![kv("port", ExprKind::IntLit(514))])];
-        let err = SyslogUdpOutput::build("u", &mp(&props), &crate::modules::BuildContext::for_testing())
-            .err()
-            .expect("should fail");
+        let err = SyslogUdpOutput::build(
+            "u",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .expect("should fail");
         assert!(err.to_string().contains("host"), "{}", err);
     }
 
