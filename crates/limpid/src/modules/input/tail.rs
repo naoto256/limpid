@@ -137,7 +137,7 @@ impl Input for TailInput {
         // slow worker over a rotation would fire after the offsets reset,
         // sending an old absolute offset back to the input which would then
         // save it as the *new* file's watermark — silently skipping bytes
-        // 0..old_offset on the next start (the data-loss case the PR-W
+        // 0..old_offset on the next start (the data-loss case the earlier
         // stale-ack drain did not cover, since drain only sees acks already
         // queued, not those still in flight inside the pipeline).
         let mut generation: u64 = 0;
@@ -831,7 +831,7 @@ mod tests {
 
     // -----------------------------------------------------------------
     // Generation-gated ack drop — coverage for the rotation data-loss
-    // path that PR-W's queued-only stale-ack drain did not cover.
+    // path that the earlier queued-only stale-ack drain did not cover.
     // -----------------------------------------------------------------
 
     #[tokio::test]

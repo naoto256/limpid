@@ -96,7 +96,7 @@ On flush failure, events are returned to the buffer for retry by the queue.
 
 ### Shutdown
 
-When the daemon stops, a final flush is attempted for any partial batch. If that flush fails unrecoverably, the buffered request body is drained to `control { error_log "..." }` (PR-P), one DLQ record per rendered body. Without `error_log` configured, behaviour matches 0.7.7 (warn + drop). Because the in-memory queue drops the source `Event` envelope as soon as `write()` returns `Ok`, the original metadata cannot be reconstructed at shutdown — DLQ records emitted on this path carry a synthetic source and the shutdown time as `received_at`.
+When the daemon stops, a final flush is attempted for any partial batch. If that flush fails unrecoverably, the buffered request body is drained to `control { error_log "..." }`, one DLQ record per rendered body. Without `error_log` configured, behaviour matches 0.7.7 (warn + drop). Because the in-memory queue drops the source `Event` envelope as soon as `write()` returns `Ok`, the original metadata cannot be reconstructed at shutdown — DLQ records emitted on this path carry a synthetic source and the shutdown time as `received_at`.
 
 - Common queue / retry properties — see [Queue and retry](./README.md#queue-and-retry).
 - Recovery / DLQ behaviour for shutdown-flush leftovers — see [Queue and retry → Recovery (error_log)](./README.md#recovery-error_log).
