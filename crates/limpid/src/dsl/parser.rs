@@ -677,16 +677,17 @@ fn fold_by_precedence(operands: &mut Vec<Expr>, operators: &mut Vec<BinOp>) -> R
         );
     }
 
-    // Find lowest precedence operator (rightmost for left-associativity)
+    // Split at the rightmost operator of minimum precedence so the left side
+    // folds first — that yields a left-associative tree, e.g. `1 - 2 - 3`
+    // becomes `(1 - 2) - 3`, not `1 - (2 - 3)`.
     let min_prec = operators
         .iter()
         .map(precedence)
         .min()
         .expect("operators non-empty: caller only enters this branch with >= 1 operator");
-    // Find the *last* operator with that precedence (left-associative: fold left, so find first)
     let idx = operators
         .iter()
-        .position(|op| precedence(op) == min_prec)
+        .rposition(|op| precedence(op) == min_prec)
         .expect("min_prec was just computed from operators, so at least one matches");
 
     let op = operators.remove(idx);
@@ -1265,6 +1266,57 @@ def pipeline test {
             },
             _ => panic!("expected Pipeline definition"),
         }
+    }
+
+    #[test]
+    fn test_parse_binop_left_associative_same_precedence() {
+        // `1 - 2 - 3` must parse as `(1 - 2) - 3`, not `1 - (2 - 3)`.
+        // The eval-side numeric ops are non-commutative for Sub/Div, so the
+        // tree shape is observable in the final value.
+        let src = r#"
+def pipeline p {
+    input a
+    process inline | {
+        workspace.x = 1 - 2 - 3
+    }
+    drop
+}
+"#;
+        let config = parse_config(src).unwrap();
+        let pipeline = match &config.definitions[0] {
+            Definition::Pipeline(def) => def,
+            _ => panic!("expected Pipeline"),
+        };
+        let chain = match &pipeline.body[1] {
+            PipelineStatement::ProcessChain(chain) => chain,
+            _ => panic!("expected ProcessChain"),
+        };
+        let stmts = match &chain[1] {
+            ProcessChainElement::Inline(stmts) => stmts,
+            _ => panic!("expected Inline"),
+        };
+        let rhs = match &stmts[0] {
+            ProcessStatement::Assign(_, expr) => expr,
+            _ => panic!("expected Assign"),
+        };
+        // Expect: BinOp(BinOp(1, Sub, 2), Sub, 3)
+        let (outer_l, outer_op, outer_r) = match &rhs.kind {
+            ExprKind::BinOp(l, op, r) => (l, op, r),
+            other => panic!("expected outer BinOp, got {:?}", other),
+        };
+        assert_eq!(*outer_op, BinOp::Sub);
+        assert!(
+            matches!(&outer_r.kind, ExprKind::IntLit(3)),
+            "right child must be the trailing literal 3, got {:?}",
+            outer_r.kind
+        );
+        let (inner_l, inner_op, inner_r) = match &outer_l.kind {
+            ExprKind::BinOp(l, op, r) => (l, op, r),
+            other => panic!("expected inner BinOp on the left, got {:?}", other),
+        };
+        assert_eq!(*inner_op, BinOp::Sub);
+        assert!(matches!(&inner_l.kind, ExprKind::IntLit(1)));
+        assert!(matches!(&inner_r.kind, ExprKind::IntLit(2)));
     }
 
     #[test]
