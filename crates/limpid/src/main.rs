@@ -174,8 +174,8 @@ fn refuse_root_unless_overridden() -> Result<()> {
 /// `--ultra-strict`) as a pre-deployment gate; the daemon stays
 /// conservative about which level halts startup.
 fn compile_and_analyze(config_file: &Path) -> Result<CompiledConfig> {
-    let (config, source_map) = config::load_config_with_source_map(config_file)
-        .context("configuration error")?;
+    let (config, source_map) =
+        config::load_config_with_source_map(config_file).context("configuration error")?;
     let compiled = CompiledConfig::from_config(config)?;
     let mut registry = crate::modules::ModuleRegistry::new();
     crate::modules::register_builtins(&mut registry);

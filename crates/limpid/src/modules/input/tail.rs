@@ -484,7 +484,10 @@ mod tests {
         let input = make_input(&path, None);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
 
-        let next_off = input.read_new_lines(0, &tx, dummy_addr(), dummy_ack_tx(), 0).await.unwrap();
+        let next_off = input
+            .read_new_lines(0, &tx, dummy_addr(), dummy_ack_tx(), 0)
+            .await
+            .unwrap();
         assert_eq!(next_off, 12);
         let e1 = rx.recv().await.unwrap();
         assert_eq!(&e1.ingress[..], b"line1");
@@ -505,7 +508,10 @@ mod tests {
         let input = make_input(&path, None);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
 
-        let next_off = input.read_new_lines(0, &tx, dummy_addr(), dummy_ack_tx(), 0).await.unwrap();
+        let next_off = input
+            .read_new_lines(0, &tx, dummy_addr(), dummy_ack_tx(), 0)
+            .await
+            .unwrap();
         // First line was complete (9 bytes incl. \n); the partial
         // 7 bytes after must be rewound. Next offset = 9.
         assert_eq!(next_off, 9, "partial line must be rewound");
@@ -528,7 +534,10 @@ mod tests {
         let input = make_input(&path, None);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
 
-        let off1 = input.read_new_lines(0, &tx, dummy_addr(), dummy_ack_tx(), 0).await.unwrap();
+        let off1 = input
+            .read_new_lines(0, &tx, dummy_addr(), dummy_ack_tx(), 0)
+            .await
+            .unwrap();
         let _ = rx.recv().await; // drain "complete"
         // Writer appends the newline.
         {
@@ -538,7 +547,10 @@ mod tests {
                 .unwrap();
             f.write_all(b"\n").unwrap();
         }
-        let off2 = input.read_new_lines(off1, &tx, dummy_addr(), dummy_ack_tx(), 0).await.unwrap();
+        let off2 = input
+            .read_new_lines(off1, &tx, dummy_addr(), dummy_ack_tx(), 0)
+            .await
+            .unwrap();
         assert_eq!(off2, 17);
         let e = rx.recv().await.unwrap();
         assert_eq!(&e.ingress[..], b"partial");
@@ -643,7 +655,10 @@ mod tests {
         // Close the receiver so the first send fails.
         drop(rx);
 
-        let next_off = input.read_new_lines(0, &tx, dummy_addr(), dummy_ack_tx(), 0).await.unwrap();
+        let next_off = input
+            .read_new_lines(0, &tx, dummy_addr(), dummy_ack_tx(), 0)
+            .await
+            .unwrap();
         assert_eq!(
             next_off, 0,
             "send failure must rewind so the un-sent line is retried",
@@ -766,21 +781,26 @@ mod tests {
         // channel. This pins the contract the input layer relies on.
         let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<AckPosition>();
         let handle = Arc::new(AckHandle::new(
-            AckPosition::Offset { generation: 0, offset: 42 },
+            AckPosition::Offset {
+                generation: 0,
+                offset: 42,
+            },
             ack_tx,
         ));
-        let event = Event::with_ack(
-            Bytes::from_static(b"x"),
-            dummy_addr(),
-            Arc::clone(&handle),
-        );
+        let event = Event::with_ack(Bytes::from_static(b"x"), dummy_addr(), Arc::clone(&handle));
         // Drop both the event and our local Arc clone — refcount goes
         // to zero, Drop fires, the offset lands on the channel.
         drop(event);
         drop(handle);
         match ack_rx.recv().await {
-            Some(AckPosition::Offset { generation: 0, offset: 42 }) => {}
-            other => panic!("expected Offset {{ generation: 0, offset: 42 }}, got {:?}", other),
+            Some(AckPosition::Offset {
+                generation: 0,
+                offset: 42,
+            }) => {}
+            other => panic!(
+                "expected Offset {{ generation: 0, offset: 42 }}, got {:?}",
+                other
+            ),
         }
     }
 
@@ -790,7 +810,10 @@ mod tests {
         // so the receiver sees nothing.
         let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<AckPosition>();
         let handle = Arc::new(AckHandle::new(
-            AckPosition::Offset { generation: 0, offset: 99 },
+            AckPosition::Offset {
+                generation: 0,
+                offset: 99,
+            },
             ack_tx,
         ));
         handle.disarm();
@@ -826,13 +849,19 @@ mod tests {
         // the AckHandle was constructed under generation 0, but the
         // input's current generation is now 1.
         let stale = Arc::new(AckHandle::new(
-            AckPosition::Offset { generation: 0, offset: 999_999 },
+            AckPosition::Offset {
+                generation: 0,
+                offset: 999_999,
+            },
             ack_tx.clone(),
         ));
         drop(stale);
         // And a fresh post-rotation ack under generation 1.
         let fresh = Arc::new(AckHandle::new(
-            AckPosition::Offset { generation: 1, offset: 42 },
+            AckPosition::Offset {
+                generation: 1,
+                offset: 42,
+            },
             ack_tx.clone(),
         ));
         drop(fresh);
@@ -854,11 +883,17 @@ mod tests {
         // seeded `initial` is smaller than the stale offset.
         let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<AckPosition>();
         let stale = Arc::new(AckHandle::new(
-            AckPosition::Offset { generation: 0, offset: 9_000 },
+            AckPosition::Offset {
+                generation: 0,
+                offset: 9_000,
+            },
             ack_tx.clone(),
         ));
         let fresh = Arc::new(AckHandle::new(
-            AckPosition::Offset { generation: 7, offset: 50 },
+            AckPosition::Offset {
+                generation: 7,
+                offset: 50,
+            },
             ack_tx.clone(),
         ));
         drop(stale);
@@ -879,8 +914,14 @@ mod tests {
         // generation (= previous file) returns None so the caller
         // discards the value rather than treating it as a current-file
         // byte position.
-        let match_ = AckPosition::Offset { generation: 3, offset: 100 };
-        let mismatch = AckPosition::Offset { generation: 2, offset: 100 };
+        let match_ = AckPosition::Offset {
+            generation: 3,
+            offset: 100,
+        };
+        let mismatch = AckPosition::Offset {
+            generation: 2,
+            offset: 100,
+        };
         let cursor = AckPosition::Cursor("ignored".into());
 
         assert_eq!(ack_offset_for_generation(&match_, 3), Some(100));

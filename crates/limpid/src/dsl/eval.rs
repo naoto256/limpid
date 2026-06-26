@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use anyhow::{Result, bail};
 
 use super::arena::EventArena;
-use super::ast::{BinOp, BlockArg, BranchBody, Expr, ExprKind, IfChain, SwitchStmtArm, TemplateFragment, UnaryOp};
+use super::ast::{
+    BinOp, BlockArg, BranchBody, Expr, ExprKind, IfChain, SwitchStmtArm, TemplateFragment, UnaryOp,
+};
 use super::value::{ArrayBuilder, ObjectBuilder, Value};
 use crate::event::BorrowedEvent;
 use crate::functions::FunctionRegistry;

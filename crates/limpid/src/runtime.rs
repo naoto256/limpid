@@ -107,11 +107,7 @@ impl Runtime {
             // strip is the whole point). `BuildContext` carries `funcs` and
             // the optional `error_log` so outputs can stash them at
             // construction time.
-            let created = match registry.create_output(
-                name,
-                &output_def.properties,
-                &build_ctx,
-            ) {
+            let created = match registry.create_output(name, &output_def.properties, &build_ctx) {
                 Ok(c) => c,
                 Err(e) => {
                     error!(
@@ -137,12 +133,7 @@ impl Runtime {
             metrics_registry.register_output(name, created.metrics);
             tap.register(&format!("output {}", name)).await;
 
-            output_receivers.push((
-                name.clone(),
-                receiver,
-                created.output,
-                output_metrics,
-            ));
+            output_receivers.push((name.clone(), receiver, created.output, output_metrics));
         }
 
         // Start queue consumers (no metrics counting here — output does it)
@@ -944,9 +935,7 @@ mod tests {
         // `limpidctl inject output <name>` without re-running sibling
         // sinks that were already fine.
         use crate::pipeline::ErroredEventContext;
-        let def = pipeline_def(
-            "def pipeline p { input i; output sink_a; output sink_b; finish }",
-        );
+        let def = pipeline_def("def pipeline p { input i; output sink_a; output sink_b; finish }");
 
         let cfg = CompiledConfig::from_config(parse_config("").unwrap()).unwrap();
         let ctx = PipelineContext {

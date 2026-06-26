@@ -11,7 +11,9 @@ use thiserror::Error;
 
 use super::arena::EventArena;
 use super::ast::*;
-use super::eval::{LocalScope, eval_expr_with_scope, select_if_branch, select_switch_arm, value_to_string};
+use super::eval::{
+    LocalScope, eval_expr_with_scope, select_if_branch, select_switch_arm, value_to_string,
+};
 use super::value::Value;
 use crate::event::BorrowedEvent;
 use crate::functions::FunctionRegistry;

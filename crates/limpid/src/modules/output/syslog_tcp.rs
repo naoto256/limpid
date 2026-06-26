@@ -572,7 +572,12 @@ mod tests {
     #[test]
     fn build_accepts_single_peer() {
         let props = vec![peer_plain("127.0.0.1", 514)];
-        let tcp = SyslogTcpOutput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing()).expect("should build");
+        let tcp = SyslogTcpOutput::build(
+            "relay",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .expect("should build");
         assert_eq!(tcp.peers.len(), 1);
         assert_eq!(tcp.peers.peers()[0].address(), "127.0.0.1:514");
         assert_eq!(tcp.framing, SyslogFraming::OctetCounting);
@@ -586,7 +591,12 @@ mod tests {
             "peer",
             vec![kv("host", ExprKind::StringLit("127.0.0.1".into()))],
         )];
-        let tcp = SyslogTcpOutput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing()).expect("should build");
+        let tcp = SyslogTcpOutput::build(
+            "relay",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .expect("should build");
         assert_eq!(tcp.peers.peers()[0].address(), "127.0.0.1:514");
     }
 
@@ -596,7 +606,12 @@ mod tests {
             "peers",
             vec![peer_plain("a", 514), peer_plain("b", 1514)],
         )];
-        let tcp = SyslogTcpOutput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing()).expect("should build");
+        let tcp = SyslogTcpOutput::build(
+            "relay",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .expect("should build");
         assert_eq!(tcp.peers.len(), 2);
         assert_eq!(tcp.peers.peers()[0].address(), "a:514");
         assert_eq!(tcp.peers.peers()[1].address(), "b:1514");
@@ -608,7 +623,12 @@ mod tests {
             peer_plain("h", 1),
             kv("framing", ExprKind::Ident(vec!["non_transparent".into()])),
         ];
-        let tcp = SyslogTcpOutput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing()).expect("should build");
+        let tcp = SyslogTcpOutput::build(
+            "relay",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .expect("should build");
         assert_eq!(tcp.framing, SyslogFraming::NonTransparent);
     }
 
@@ -618,9 +638,13 @@ mod tests {
             peer_plain("h", 1),
             kv("framing", ExprKind::Ident(vec!["non_trasnaprent".into()])),
         ];
-        let err = SyslogTcpOutput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing())
-            .err()
-            .expect("should fail");
+        let err = SyslogTcpOutput::build(
+            "relay",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .expect("should fail");
         let msg = err.to_string();
         assert!(msg.contains("framing"), "{}", msg);
         assert!(
@@ -636,9 +660,13 @@ mod tests {
             "per",
             vec![kv("host", ExprKind::StringLit("h".into()))],
         )];
-        let err = SyslogTcpOutput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing())
-            .err()
-            .expect("should fail");
+        let err = SyslogTcpOutput::build(
+            "relay",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .expect("should fail");
         let msg = err.to_string();
         assert!(msg.contains("unknown property 'per'"), "{}", msg);
         assert!(msg.contains("peer"), "did-you-mean missing: {}", msg);
@@ -653,9 +681,13 @@ mod tests {
                 kv("port", ExprKind::StringLit("five-fourteen".into())),
             ],
         )];
-        let err = SyslogTcpOutput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing())
-            .err()
-            .expect("should fail");
+        let err = SyslogTcpOutput::build(
+            "relay",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .expect("should fail");
         let msg = err.to_string();
         assert!(msg.contains("port"), "{}", msg);
         assert!(msg.contains("integer"), "{}", msg);
@@ -667,9 +699,13 @@ mod tests {
             block("per", vec![kv("host", ExprKind::StringLit("h".into()))]),
             kv("framing", ExprKind::Ident(vec!["xx".into()])),
         ];
-        let err = SyslogTcpOutput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing())
-            .err()
-            .expect("should fail");
+        let err = SyslogTcpOutput::build(
+            "relay",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .expect("should fail");
         let msg = err.to_string();
         assert!(msg.contains("per"), "{}", msg);
         assert!(msg.contains("framing"), "{}", msg);
@@ -681,9 +717,13 @@ mod tests {
             peer_plain("a", 514),
             block("peers", vec![peer_plain("b", 514)]),
         ];
-        let err = SyslogTcpOutput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing())
-            .err()
-            .expect("should fail");
+        let err = SyslogTcpOutput::build(
+            "relay",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .expect("should fail");
         let msg = err.to_string();
         assert!(msg.contains("exclusive group"), "{}", msg);
         assert!(msg.contains("peer") && msg.contains("peers"), "{}", msg);
@@ -700,18 +740,26 @@ mod tests {
             peer_plain("a", 514),
             block("peers", vec![peer_plain("b", 514)]),
         ];
-        let err = SyslogTcpOutput::from_properties("relay", &mp(&props), &crate::modules::BuildContext::for_testing())
-            .err()
-            .expect("from_properties should reject both blocks");
+        let err = SyslogTcpOutput::from_properties(
+            "relay",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .expect("from_properties should reject both blocks");
         let msg = err.to_string();
         assert!(msg.contains("mutually exclusive"), "{}", msg);
     }
 
     #[test]
     fn build_rejects_missing_destination() {
-        let err = SyslogTcpOutput::build("relay", &mp(&[]), &crate::modules::BuildContext::for_testing())
-            .err()
-            .expect("should fail");
+        let err = SyslogTcpOutput::build(
+            "relay",
+            &mp(&[]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .expect("should fail");
         assert!(
             err.to_string()
                 .contains("either 'peer' or 'peers' is required"),
@@ -722,9 +770,13 @@ mod tests {
 
     #[test]
     fn build_rejects_empty_peers_block() {
-        let err = SyslogTcpOutput::from_properties("relay", &mp(&[block("peers", vec![])]), &crate::modules::BuildContext::for_testing())
-            .err()
-            .expect("should fail");
+        let err = SyslogTcpOutput::from_properties(
+            "relay",
+            &mp(&[block("peers", vec![])]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .expect("should fail");
         assert!(
             err.to_string()
                 .contains("peers block must contain at least one peer"),
@@ -744,16 +796,25 @@ mod tests {
     #[test]
     fn build_rejects_peer_missing_host() {
         let props = vec![block("peer", vec![kv("port", ExprKind::IntLit(514))])];
-        let err = SyslogTcpOutput::build("relay", &mp(&props), &crate::modules::BuildContext::for_testing())
-            .err()
-            .expect("should fail");
+        let err = SyslogTcpOutput::build(
+            "relay",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .expect("should fail");
         assert!(err.to_string().contains("host"), "{}", err);
     }
 
     #[test]
     fn from_properties_directly_still_works_for_existing_call_sites() {
         let props = vec![peer_plain("h", 1)];
-        let tcp = SyslogTcpOutput::from_properties("relay", &mp(&props), &crate::modules::BuildContext::for_testing()).expect("should build");
+        let tcp = SyslogTcpOutput::from_properties(
+            "relay",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .expect("should build");
         assert_eq!(tcp.peers.peers()[0].address(), "h:1");
     }
 

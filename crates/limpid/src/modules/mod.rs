@@ -550,9 +550,8 @@ type InputFactory = Box<
         + Sync,
 >;
 
-type OutputFactory = Box<
-    dyn Fn(&str, &ModuleProperties, &BuildContext) -> Result<CreatedOutput> + Send + Sync,
->;
+type OutputFactory =
+    Box<dyn Fn(&str, &ModuleProperties, &BuildContext) -> Result<CreatedOutput> + Send + Sync>;
 
 struct InputEntry {
     factory: InputFactory,
