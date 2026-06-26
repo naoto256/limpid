@@ -43,7 +43,7 @@ Identical to [`otlp_http`](./otlp-http.md): one LogRecord becomes one Event with
 
 ## Reply
 
-The handler returns an empty `ExportLogsServiceResponse` on full success. If some LogRecords could not be re-encoded (very rare), the response carries `partial_success` with `rejected_log_records` set so the sender can retry just those — matching the OTLP collector convention.
+The handler returns an empty `ExportLogsServiceResponse` on full success. If some LogRecords could not be re-encoded (very rare), the response carries `partial_success` with `rejected_log_records` set so the sender can account for the rejected records — matching the OTLP collector convention. limpid itself does not treat partial-success rejects as a selective-retry primitive (the same policy on the outbound side, documented under [otlp_grpc § Notes](../outputs/otlp_grpc.md#notes)).
 
 ```protobuf
 message ExportLogsServiceResponse {

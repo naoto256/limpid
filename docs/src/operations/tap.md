@@ -80,7 +80,7 @@ On success, `limpidctl inject` prints the number of events injected:
 
 ### Replay with tap → inject
 
-Because `tap --json` and `inject --json` share the same Event JSON schema, you can record traffic from one daemon and replay it into another (or back into the same one):
+Because `tap <kind> <name> --json` and `inject input <name> --json` (or `inject output <name>`) share the same Event JSON schema, you can record traffic from one daemon and replay it into another (or back into the same one):
 
 ```bash
 # Capture 1000 events from a live input
@@ -94,7 +94,7 @@ This is useful for reproducing parse failures, load-testing a new pipeline, or s
 
 ### Replaying with original timing
 
-By default, `inject --json` streams events as fast as stdin allows. That is fine for reproducing a single parse failure, but it does not reproduce workloads where timing matters — rate-limit behaviour, output backpressure under spikes, or filter saturation all depend on the **cadence** of incoming events, not just their content.
+By default, `inject input <name> --json` streams events as fast as stdin allows. That is fine for reproducing a single parse failure, but it does not reproduce workloads where timing matters — rate-limit behaviour, output backpressure under spikes, or filter saturation all depend on the **cadence** of incoming events, not just their content.
 
 `--replay-timing` replays events with the same wall-clock gaps they had at capture time, using each event's top-level `received_at` field (emitted by `tap --json`):
 

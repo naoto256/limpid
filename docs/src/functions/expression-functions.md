@@ -114,9 +114,18 @@ egress = syslog.set_pri(egress, 16, 6)   // local0.info
 Returns the leading `<PRI>` value as a number (0-191), or `null` when no valid PRI is present.
 
 ```limpid
-let pri = syslog.extract_pri(ingress)
-if pri != null and pri < 8 {
-    output alert        // emergencies and alerts
+// In a process, extract the value onto workspace …
+def process tag_pri {
+    workspace.syslog.pri = syslog.extract_pri(ingress)
+}
+
+// … then route in the pipeline body.
+def pipeline ingest {
+    input syslog_udp
+    process tag_pri
+    if workspace.syslog.pri != null and workspace.syslog.pri < 8 {
+        output alert        // emergencies and alerts
+    }
 }
 ```
 

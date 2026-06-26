@@ -19,7 +19,7 @@ It contains `include` directives and global blocks (`geoip`, `control`, `table`)
 ```
 include "inputs/*.limpid"          // glob
 include "outputs/ama.limpid"       // single file
-include "/usr/share/limpid/snippets/parsers/fortigate.limpid"   // shipped snippet
+include "/usr/share/limpid/snippets/parsers/parse_fortigate_cef.limpid"   // shipped snippet
 ```
 
 Rules:

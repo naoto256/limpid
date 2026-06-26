@@ -108,7 +108,7 @@ The following shapes compile, pass tests, and are wrong. They compile because th
 
 ### Stateful processes
 
-A `def process` that carries state across events — a counter, a cache, a "last seen" timestamp — cannot be reused across pipelines safely, cannot be replayed with `inject --json`, and cannot be reasoned about without knowing the history of traffic.
+A `def process` that carries state across events — a counter, a cache, a "last seen" timestamp — cannot be reused across pipelines safely, cannot be replayed with `inject input <name> --json`, and cannot be reasoned about without knowing the history of traffic.
 
 If you need dedup, rate-limiting, or aggregation, use a primitive that limpid ships as an explicit stateful construct (e.g. `table_lookup` + `table_upsert` backed by a declared `table`), not ad-hoc mutation inside a process body. The state is then named, observable, and owned by something other than the process.
 
@@ -167,7 +167,7 @@ The question "function or process?" has a clean answer:
 
 | Situation | Write it as |
 |-----------|-------------|
-| Pure computation, no side effects, takes arguments → returns a value, vendor-agnostic | **`def function`** in the DSL (or `_common/*.limpid`) |
+| Pure computation, no side effects, takes arguments → returns a value, vendor-agnostic | **`def function`** in the DSL (or under the shipped `functions/*.limpid`) |
 | Pure computation but the daemon should ship it (built-in availability, performance) | A built-in function in Rust (contribute upstream) |
 | Depends on a specific schema spec (RFC 5424, CEF, OCSF, …) | A namespaced built-in (`syslog.xxx`) if shipping with the daemon, otherwise a `def process` in a snippet |
 | Reads or writes `egress`, `workspace`, or `ingress` directly | A `def process` |
@@ -175,7 +175,7 @@ The question "function or process?" has a clean answer:
 | Recursive | A `def process` (`def function` rejects recursion at `--check` time) |
 | Operator-specific policy (facility rewrite, vendor filter, site-specific routing) | Always a `def process`, defined close to the pipeline that uses it |
 
-A snippet library (for example, the v0.7.0 `_common/*.limpid` + `parsers/*.limpid` + `composers/*.limpid` collection that ships under `/usr/share/limpid/snippets/`) mixes the three: `def function` for vendor-agnostic mappings (severity, proto, action), `def process` for the parser / composer bodies that consume Event state and write to `workspace.limpid`, and built-in primitives (`syslog.parse`, `cef.parse`, `to_json`, `regex_*`) as the building blocks underneath.
+A snippet library (the `functions/*.limpid` + `parsers/parse_*.limpid` + `composers/compose_*.limpid` collection that ships under `/usr/share/limpid/snippets/`) mixes the three: `def function` files under `functions/` for vendor-agnostic mappings (severity, proto, action), `def process` files under `parsers/parse_*` for vendor parsers and under `composers/compose_*` for the per-class composer bodies that consume Event state and write to `workspace.limpid`, and built-in primitives (`syslog.parse`, `cef.parse`, `to_json`, `regex_*`) as the building blocks underneath.
 
 ## Writing for a snippet library
 
@@ -183,15 +183,15 @@ If your process is intended to ship in a library (vendor parsers, OCSF composers
 
 ### One schema per file
 
-The library's organising axis is the **schema** a snippet implements. For vendor parsers, a schema is a *(vendor, format)* pair — `parsers/fortigate_cef.limpid` is one schema (FortiGate's CEF field model), `parsers/fortigate_syslog.limpid` is another (FortiGate's KV-over-syslog field model). The two share a vendor name but their field shapes, dispatchers, and subtype handling are different enough that the FortiGate documentation itself splits them into separate references; the snippet library follows.
+The library's organising axis is the **schema** a snippet implements. For vendor parsers, a schema is a *(vendor, format)* pair — `parsers/parse_fortigate_cef.limpid` is one schema (FortiGate's CEF field model), `parsers/parse_fortigate_syslog.limpid` is another (FortiGate's KV-over-syslog field model). The two share a vendor name but their field shapes, dispatchers, and subtype handling are different enough that the FortiGate documentation itself splits them into separate references; the snippet library follows.
 
-For OCSF composers, the schema *is* the class — `composers/ocsf_network_activity.limpid`, `composers/ocsf_detection_finding.limpid`. OCSF is vendor- and format-independent on purpose, so per-class is the natural unit.
+For OCSF composers, the schema is the class. The library ships a single dispatcher per emit format (`composers/compose_ocsf.limpid`) that branches on the OCSF class id (`workspace.limpid.class_uid`) to assemble the right shape per event, so vendors that feed multiple OCSF classes can share one composer entry point.
 
 The contents of one file:
 
 - The leaf parsers (or the per-class composer body).
 - The dispatcher (subtype dispatcher for parsers, the schema-level `compose_ocsf` for composers).
-- Helpers that are specific to this schema. Helpers shared across multiple schemas live under `_common/` and are included as needed.
+- Helpers that are specific to this schema. Helpers shared across multiple schemas live under `functions/` and are included as needed.
 
 A vendor's "any format" entry point (e.g. `parse_fortigate` that detects format and routes to the right `(vendor, format)` parser) is a thin shim that includes both per-schema files and dispatches between them — that shim is the only place the vendor-without-format abstraction lives.
 
