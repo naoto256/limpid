@@ -1914,6 +1914,195 @@ mod tests {
         assert_eq!(output.inner.batch.lock().await.len(), 0);
     }
 
+    /// Counts every POST the failing collector receives so the test
+    /// can assert how many attempts the shutdown actually made.
+    async fn run_counting_failing_collector() -> (
+        SocketAddr,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{
+            Router, extract::State, http::StatusCode, response::IntoResponse, routing::post,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        #[derive(Clone)]
+        struct AppState {
+            count: Arc<AtomicUsize>,
+        }
+        async fn handle(State(s): State<AppState>) -> impl IntoResponse {
+            s.count.fetch_add(1, AtomicOrdering::Relaxed);
+            (StatusCode::INTERNAL_SERVER_ERROR, "")
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route("/", post(handle)).with_state(AppState {
+            count: Arc::clone(&count),
+        });
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, count, server)
+    }
+
+    /// Regression for the 0.7.8 shutdown panic / silent loss: at shutdown
+    /// the batched flush MUST NOT consume the steady-state retry budget.
+    /// We configure `max_attempts=5` with `200ms` waits — a budget that,
+    /// if reused, would clearly visit the peer five times. The shutdown
+    /// must POST exactly once, complete promptly, drain the buffer to
+    /// the DLQ, and resolve every handle as `Recovered`.
+    #[tokio::test]
+    async fn shutdown_does_not_burn_steady_state_retry_budget() {
+        let (addr, post_count, server) = run_counting_failing_collector().await;
+        let url = format!("http://{}/", addr);
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("errored.jsonl");
+        let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
+        let ctx = crate::modules::BuildContext {
+            funcs: Arc::new(crate::functions::FunctionRegistry::new()),
+            error_log: Some(Arc::clone(&writer)),
+        };
+        let retry = Property::Block {
+            key: "retry".into(),
+            key_span: None,
+            properties: vec![
+                prop_int("max_attempts", 5),
+                prop_str("initial_wait", "200ms"),
+                prop_str("max_wait", "200ms"),
+                Property::KeyValue {
+                    key: "backoff".into(),
+                    key_span: None,
+                    value: Expr::spanless(ExprKind::Ident(vec!["fixed".into()])),
+                    value_span: None,
+                },
+            ],
+        };
+        let output = HttpOutput::from_properties(
+            "myout",
+            &mp(&[
+                peer_block(&url),
+                prop_int("batch_size", 100),
+                prop_str("batch_timeout", "30s"),
+                retry,
+            ]),
+            &ctx,
+        )
+        .unwrap();
+
+        consume(&output, &event_with("ev1")).await.unwrap();
+        consume(&output, &event_with("ev2")).await.unwrap();
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(2), output.shutdown(Some(&writer)))
+            .await
+            .expect("shutdown must complete inside the runtime budget")
+            .unwrap();
+        let elapsed = started.elapsed();
+        server.abort();
+
+        let posts = post_count.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            posts, 1,
+            "shutdown reused the steady-state retry budget ({} attempts); expected exactly 1",
+            posts
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "shutdown took {:?} — must be bounded by SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT",
+            elapsed
+        );
+        assert_eq!(output.inner.batch.lock().await.len(), 0);
+        let body = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(
+            body.lines().count(),
+            2,
+            "both buffered events must land in the DLQ"
+        );
+    }
+
+    /// Bind a TCP listener that completes the handshake but never reads
+    /// the request body or sends a response — the closest in-process
+    /// reproduction of the bug repro's unreachable peer. Held connections
+    /// are kept alive in the spawned task until it is aborted.
+    async fn run_stalled_listener() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        (addr, server)
+    }
+
+    /// Regression for the panic root cause: at shutdown the single send
+    /// attempt MUST be wrapped in a bounded timeout, otherwise an
+    /// unreachable peer (TCP accepts but never replies) outlasts the
+    /// runtime's 10s shutdown deadline, the task is aborted, and the
+    /// in-flight `shippable: Vec<(Event, QueueAckHandle)>` is dropped
+    /// without resolving — firing `QueueAckHandle::Drop` and silently
+    /// losing the events.
+    ///
+    /// Asserts that the elapsed deadline branch routes every event to
+    /// the DLQ and resolves `Recovered`, and that shutdown returns
+    /// inside `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT` plus a small margin.
+    #[tokio::test]
+    async fn shutdown_bounded_by_attempt_timeout_against_stalled_peer() {
+        let (addr, server) = run_stalled_listener().await;
+        let url = format!("http://{}/", addr);
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("errored.jsonl");
+        let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
+        let ctx = crate::modules::BuildContext {
+            funcs: Arc::new(crate::functions::FunctionRegistry::new()),
+            error_log: Some(Arc::clone(&writer)),
+        };
+        let output = HttpOutput::from_properties(
+            "myout",
+            &mp(&[
+                peer_block(&url),
+                prop_int("batch_size", 100),
+                prop_str("batch_timeout", "30s"),
+                fast_retry_block(),
+            ]),
+            &ctx,
+        )
+        .unwrap();
+
+        consume(&output, &event_with("ev1")).await.unwrap();
+        consume(&output, &event_with("ev2")).await.unwrap();
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT + Duration::from_secs(2),
+            output.shutdown(Some(&writer)),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        server.abort();
+
+        result
+            .expect("shutdown must return before runtime would have aborted us")
+            .unwrap();
+        assert!(
+            elapsed < crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT + Duration::from_secs(1),
+            "shutdown took {:?} — must be bounded by SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT",
+            elapsed
+        );
+        assert_eq!(output.inner.batch.lock().await.len(), 0);
+
+        let body = tokio::fs::read_to_string(&path).await.unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2, "both events must reach the DLQ");
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("deadline exceeded"),
+            "DLQ records must carry the elapsed-deadline reason, got: {joined}"
+        );
+    }
+
     /// Constructor-time error_log injection (replaces the prior
     /// `attach_error_log(&self, ...)` setter). The runtime always
     /// goes through `from_properties` with a `BuildContext` carrying
