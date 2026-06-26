@@ -534,20 +534,23 @@ fn parse_replay_factor(spec: &str) -> Result<f64, String> {
 }
 
 /// Pull the top-level `received_at` field out of an Event JSON line
-/// and parse it as RFC3339. Returns a clear error so callers can abort
+/// and parse it as i64 unix nanoseconds — matches `Event::to_json_value`
+/// and OTLP `time_unix_nano`. Returns a clear error so callers can abort
 /// — silently skipping would violate the "zero hidden behavior"
 /// principle.
 fn extract_timestamp(line: &str) -> Result<DateTime<Utc>, String> {
     let v: serde_json::Value =
         serde_json::from_str(line).map_err(|e| format!("not valid JSON: {}", e))?;
-    let ts = v
+    let nanos = v
         .get("received_at")
         .ok_or_else(|| "event has no top-level `received_at` field".to_string())?
-        .as_str()
-        .ok_or_else(|| "`received_at` field is not a string".to_string())?;
-    DateTime::parse_from_rfc3339(ts)
-        .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|e| format!("`received_at` is not RFC3339 ({}): {:?}", e, ts))
+        .as_i64()
+        .ok_or_else(|| {
+            "`received_at` is not an i64 (expected unix nanoseconds, matching \
+             `Event::to_json_value` / OTLP `time_unix_nano`)"
+                .to_string()
+        })?;
+    Ok(DateTime::<Utc>::from_timestamp_nanos(nanos))
 }
 
 /// Tracks the wall-clock anchor used to gate replay sleeps.
@@ -658,10 +661,15 @@ mod tests {
     }
 
     #[test]
-    fn extract_timestamp_reads_rfc3339_field() {
-        let line = r#"{"received_at":"2024-01-02T03:04:05Z","ingress":"hi","source":{"ip":"127.0.0.1","port":514},"egress":"hi"}"#;
-        let ts = extract_timestamp(line).unwrap();
-        assert_eq!(ts.to_rfc3339(), "2024-01-02T03:04:05+00:00");
+    fn extract_timestamp_reads_i64_nanos_field() {
+        // 2024-01-02T03:04:05.123456789Z in unix nanoseconds.
+        let nanos: i64 = 1_704_164_645_123_456_789;
+        let line = format!(
+            r#"{{"received_at":{},"source":{{"ip":"127.0.0.1","port":514}},"ingress":"hi","egress":"hi"}}"#,
+            nanos
+        );
+        let ts = extract_timestamp(&line).unwrap();
+        assert_eq!(ts.timestamp_nanos_opt().unwrap(), nanos);
     }
 
     #[test]
@@ -669,14 +677,37 @@ mod tests {
         // Missing field
         let line = r#"{"ingress":"hi","source":{"ip":"127.0.0.1","port":514},"egress":"hi"}"#;
         assert!(extract_timestamp(line).is_err());
-        // Wrong type
-        let line = r#"{"received_at":1234,"ingress":"hi"}"#;
+        // Wrong type: string (the old wire form; no longer accepted —
+        // mirrors `Event::from_json`, which is also i64-only).
+        let line = r#"{"received_at":"2024-01-02T03:04:05Z"}"#;
         assert!(extract_timestamp(line).is_err());
-        // Bad format
-        let line = r#"{"received_at":"yesterday"}"#;
+        // Wrong type: JSON number that doesn't fit i64 (float). Guards
+        // against a silent truncation if someone wires up an f64 producer.
+        let line = r#"{"received_at":1.5}"#;
         assert!(extract_timestamp(line).is_err());
         // Not JSON
         assert!(extract_timestamp("not json at all").is_err());
+    }
+
+    #[test]
+    fn extract_timestamp_matches_canonical_event_json_shape() {
+        // Fixture mirrors the full canonical shape emitted by
+        // `OwnedEvent::to_json_value` (see `crates/limpid/src/event.rs`):
+        // top-level `received_at` is i64 unix nanoseconds (OTLP
+        // `time_unix_nano` parity), `source` is the v0.5.6+ object form
+        // `{ip, port}`, and `ingress` / `egress` are plain JSON strings
+        // (`bytes_to_json` emits the `$bytes_b64` marker only for
+        // non-UTF-8 payloads). This is the regression guard for the
+        // `tap --json | inject --json --replay-timing` round-trip.
+        // The cross-crate contract itself is covered by
+        // `crates/limpid/src/event.rs::from_json_round_trips_received_at_nanos`.
+        let nanos: i64 = 1_704_164_645_123_456_789;
+        let line = format!(
+            r#"{{"received_at":{},"source":{{"ip":"127.0.0.1","port":514}},"ingress":"hi","egress":"hi"}}"#,
+            nanos
+        );
+        let ts = extract_timestamp(&line).unwrap();
+        assert_eq!(ts.timestamp_nanos_opt().unwrap(), nanos);
     }
 
     #[test]
