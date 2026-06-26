@@ -57,12 +57,15 @@ Events are persisted to a Write-Ahead Log (WAL) on disk. Survives process restar
 
 ### Recovery (error_log)
 
-The daemon-wide [`control { error_log "..." }`](../operations/error-log.md) block names a JSONL file that catches payloads the queue/retry chain could not place. Two paths feed it:
+The daemon-wide [`control { error_log "..." }`](../operations/error-log.md) block names a JSONL file that catches payloads the queue/retry chain could not place. Three sink-side paths feed it as Output-flavor records (`kind: "output"`):
 
-- the retry budget was exhausted,
-- a batched output (e.g. `http`, `otlp_http`, `otlp_grpc`) failed to flush its remaining buffer at shutdown.
+- the output's `retry { ... }` budget was exhausted,
+- a batched output (`http`, `otlp_http`, `otlp_grpc`) failed to flush its remaining buffer at shutdown (one record per still-parked event),
+- the runtime could not hand an event to the output's queue at the pipeline → output boundary (queue closed, disk-queue write error, unknown output).
 
-Each line is one rendered payload. When `error_log` is unset the daemon falls back to 0.7.7-compatible behaviour (warn + drop), and `limpid --check` emits a warning so the operator notices the silent drop path.
+Each line is one per-event record carrying `event.egress` (= the pre-rendered bytes the sink had built). Replay via `limpidctl inject output <name> --json` hands the event back to the sink's `consume()` path — no pipeline re-run, no re-render. See [Error Log → Output flavor](../operations/error-log.md#output-flavor) for the full record shape and producer-site catalog.
+
+When `error_log` is unset, Output-flavor records fall back to a name-only `tracing::warn!` / `error!` line that does **not** serialize the event payload — the data is effectively dropped. `limpid --check` emits a recovery-readiness warning so the operator notices the silent drop path before the first failure.
 
 ## Usage in pipelines
 

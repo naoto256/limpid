@@ -2,7 +2,7 @@
 
 Forwards events to one or more OpenTelemetry collectors / OTLP-compatible SaaS backends over OTLP/HTTP, in either `http_protobuf` (default) or `http_json` wire format. Multiple peers are tried in round-robin order with per-peer cooldown on failure.
 
-Each Event's `egress` is expected to be the singleton ResourceLogs protobuf bytes produced by [`otlp.encode_resourcelog_protobuf`](../functions/expression-functions.md#otlp). The output buffers these per-Event ResourceLogs, flushes on `batch_size` or `batch_timeout`, wraps the batch in an `ExportLogsServiceRequest`, and ships it.
+Each Event's `egress` is expected to be the singleton ResourceLogs protobuf bytes produced by [`otlp.encode_resourcelog_protobuf`](../functions/expression-functions.md#otlpencode_resourcelog_protobufhashlit--bytes). The output buffers these per-Event ResourceLogs, flushes on `batch_size` or `batch_timeout`, wraps the batch in an `ExportLogsServiceRequest`, and ships it.
 
 > Why limpid's OTLP behaves the way it does — Resource attributes are user-authored not auto-detected, `partial_success` is not retried selectively, `batch_level` is wire-only and semantically null — is documented in [OTLP — design rationale](../otlp.md). The reference table below covers *how* to configure; the design page covers *why* the defaults are what they are.
 
@@ -138,6 +138,6 @@ The merging modes are wire-efficiency optimisations; if your batch sizes are mod
 
 - `http_protobuf` is the canonical OTLP wire form; `http_json` serializes per the OTLP/JSON canonical mapping (camelCase, u64-as-string, bytes-as-hex).
 - `verify false` skips certificate verification — development only. limpid emits a `tracing::warn!` once per `https://` peer at startup when `verify false` is in effect so the misconfiguration is greppable in the daemon log. Has no effect on `http://` endpoints (no TLS to verify).
-- At shutdown, if a final flush of the remaining buffered ResourceLogs fails unrecoverably, the buffer is drained to `control { error_log "..." }`, one DLQ record per rendered request body. Without `error_log` the daemon falls back to 0.7.7 behaviour (warn + drop); because the in-memory queue drops the source `Event` envelope at `write()` Ok, shutdown-path DLQ records carry a synthetic source and the shutdown time as `received_at`. See [Queue and retry → Recovery (error_log)](./README.md#recovery-error_log).
+- At shutdown, if a final flush of the remaining buffered ResourceLogs fails unrecoverably, the buffered events are drained to `control { error_log "..." }` as one Output-flavor DLQ record per still-parked event — `event.source`, `event.received_at`, `event.ingress`, and `event.egress` reflect the original per-event provenance because the batched output parks the source `Event` alongside its `QueueAckHandle` until the flush resolves. Without `error_log` the daemon falls back to 0.7.7 behaviour (warn + drop without serialising the payload). See [Queue and retry → Recovery (error_log)](./README.md#recovery-error_log).
 - Common queue / retry properties — see [Queue and retry](./README.md#queue-and-retry).
 - For gRPC transport see [otlp_grpc](./otlp_grpc.md).
