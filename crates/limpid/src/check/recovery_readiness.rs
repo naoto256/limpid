@@ -1,8 +1,8 @@
 //! Cross-cutting `--check` warning: configurations that rely on the
 //! `error_log` for failure recovery while leaving it unconfigured.
 //!
-//! Several recovery paths added in 0.7.8 (PR-O retry-exhausted recovery,
-//! PR-P shutdown-flush drain) only persist the original payload when
+//! Several recovery paths added in 0.7.8 (retry-exhausted recovery and
+//! the batched-output shutdown-flush drain) only persist the original payload when
 //! `control { error_log "..." }` is set. With `error_log` missing the
 //! runtime falls back to the 0.7.7 behaviour (log + metric only, no
 //! replay-able record on disk) — so an operator writing a config with
@@ -60,13 +60,13 @@ fn recovery_reason(output: &crate::dsl::ast::OutputDef) -> Option<&'static str> 
     let props_view = output.properties.user_properties();
 
     // Retry block present → enters write_with_retry, which routes
-    // exhausted attempts through error_log (BC-3 / PR-O).
+    // retry-exhausted attempts through error_log.
     if props::get_block(props_view, "retry").is_some() {
         return Some("retry");
     }
 
-    // Batched output: shutdown flush failures drain to error_log
-    // (BC-4 / PR-P). Detected by the output's `type` rather than by
+    // Batched output: shutdown flush failures drain to error_log.
+    // Detected by the output's `type` rather than by
     // a property name because "batched-ness" is an implementation
     // property of the module, not a config shape.
     if OUTPUT_TYPES_WITH_SHUTDOWN_DRAIN.contains(&output.properties.type_name()) {
