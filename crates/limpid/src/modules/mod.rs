@@ -403,6 +403,20 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     /// ship the contents, and resolving every ack handle it has taken
     /// ownership of via `consume`.
     ///
+    /// **Contract**: every `QueueAckHandle` the output has taken
+    /// ownership of MUST be resolved (to `Delivered` or `Recovered`)
+    /// before this method returns. Any handle still parked in a local
+    /// buffer or future will be dropped when the runtime-level shutdown
+    /// timeout aborts the task, which fires `Dropped` (= silent loss
+    /// attributed to a bug). Batched outputs MUST NOT reuse their
+    /// steady-state retry budget here — the runtime caps the entire
+    /// shutdown sequence at `runtime::Daemon::SHUTDOWN_TIMEOUT` (10s),
+    /// and a retry loop that outlasts it will be killed mid-flight.
+    /// Use a single bounded attempt (e.g.
+    /// `tokio::time::timeout(SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT, ...)`)
+    /// and route the unsent leftovers to the DLQ via
+    /// `route_shutdown_batch_to_dlq`.
+    ///
     /// Per-handle disposition rules mirror the steady-state contract:
     /// - successful final delivery → `resolve_delivered()`
     /// - routed to DLQ (`error_log`) after a failed final flush or a
@@ -441,37 +455,73 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     }
 }
 
-/// Shared helper: walk the leftover `(Event, QueueAckHandle)` entries
-/// from a failed batched-output shutdown flush. Each event becomes one
-/// DLQ record (carrying the real `source`, `ingress`, `received_at`)
-/// and its handle is resolved as `Recovered`. On per-record write
-/// failure we warn and continue, then still resolve the handle so the
-/// queue cursor can advance — staying parked at a broken `error_log`
-/// path would block the queue forever.
-pub async fn write_shutdown_events_to_error_log(
-    writer: &Arc<crate::error_log::ErrorLogWriter>,
+/// Per-attempt deadline for the single shutdown flush a batched output
+/// is allowed. Deliberately shorter than `runtime::Daemon::SHUTDOWN_TIMEOUT`
+/// (10s) so the DLQ drain that follows a failed / timed-out send still
+/// has headroom inside the runtime-level shutdown budget. This is a
+/// daemon invariant tied to the runtime contract, not an operator knob —
+/// if you raise this, raise the runtime shutdown timeout in lockstep.
+pub const SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(3);
+
+/// Shared shutdown-time disposition for a batch whose single best-effort
+/// send attempt failed (transport error or deadline elapsed). Every
+/// `(Event, QueueAckHandle)` entry is:
+///
+/// 1. Counted in `events_failed`.
+/// 2. Routed to the DLQ when `error_log` is `Some` (per-record write
+///    failure → warn and continue; the cursor must keep advancing).
+/// 3. Resolved as `Recovered` so the queue's ack-handle invariant holds
+///    and the handle's `Drop` does NOT fire `Dropped` (which would be
+///    silent loss attributed to a bug).
+///
+/// When `error_log` is `None` we log loudly and resolve `Recovered`
+/// anyway — keeping the handle parked is strictly worse than an
+/// explicit, logged best-effort recovery.
+pub async fn route_shutdown_batch_to_dlq(
+    error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+    metrics: &OutputMetrics,
     output_name: &str,
     events: Vec<(Event, crate::queue::QueueAckHandle)>,
     flush_err: &anyhow::Error,
 ) {
-    let reason = format!("shutdown flush failed: {}", flush_err);
-    for (ev, ack) in events {
-        let ctx = crate::pipeline::ErroredEventContext::Output {
-            timestamp: chrono::Utc::now(),
-            pipeline: String::new(),
-            site: format!("{} shutdown", output_name),
-            reason: reason.clone(),
-            output_name: output_name.to_string(),
-            event: crate::pipeline::OutputEvent::from_owned(&ev),
-        };
-        if let Err(write_err) = writer.write(&ctx).await {
-            tracing::warn!(
-                "output '{}': error_log write during shutdown failed: {} — dropping event",
-                output_name,
-                write_err
-            );
+    use std::sync::atomic::Ordering;
+
+    if events.is_empty() {
+        return;
+    }
+    if let Some(writer) = error_log {
+        let reason = format!("shutdown flush failed: {}", flush_err);
+        for (ev, ack) in events {
+            let ctx = crate::pipeline::ErroredEventContext::Output {
+                timestamp: chrono::Utc::now(),
+                pipeline: String::new(),
+                site: format!("{} shutdown", output_name),
+                reason: reason.clone(),
+                output_name: output_name.to_string(),
+                event: crate::pipeline::OutputEvent::from_owned(&ev),
+            };
+            if let Err(write_err) = writer.write(&ctx).await {
+                tracing::warn!(
+                    "output '{}': error_log write during shutdown failed: {} — dropping event",
+                    output_name,
+                    write_err
+                );
+            }
+            metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+            ack.resolve_recovered();
         }
-        ack.resolve_recovered();
+    } else {
+        tracing::warn!(
+            "output '{}': {} events dropped at shutdown (no error_log): {}",
+            output_name,
+            events.len(),
+            flush_err
+        );
+        for (_, ack) in events {
+            metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+            ack.resolve_recovered();
+        }
     }
 }
 
