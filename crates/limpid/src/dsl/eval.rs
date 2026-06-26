@@ -1063,6 +1063,55 @@ mod tests {
     }
 
     #[test]
+    fn test_eval_text_to_value_left_associative_div() {
+        // End-to-end regression: parse `10 / 2 / 5` from source text and
+        // confirm the *value* is 1, not 25. The pre-fix parser produced a
+        // right-associative tree that evaluated to `10 / (2 / 5) = 25` —
+        // the existing chained-add test built the AST by hand and missed
+        // this whole path. Div is non-commutative, so the tree shape is
+        // visible in the final scalar.
+        use crate::dsl::parser::parse_config;
+        let src = r#"
+def pipeline p {
+    input a
+    process inline | {
+        workspace.x = 10 / 2 / 5
+    }
+    drop
+}
+"#;
+        let config = parse_config(src).unwrap();
+        let pipeline = match &config.definitions[0] {
+            Definition::Pipeline(def) => def,
+            _ => panic!("expected Pipeline"),
+        };
+        let chain = match &pipeline.body[1] {
+            PipelineStatement::ProcessChain(chain) => chain,
+            _ => panic!("expected ProcessChain"),
+        };
+        let stmts = match &chain[1] {
+            ProcessChainElement::Inline(stmts) => stmts,
+            _ => panic!("expected Inline"),
+        };
+        let expr = match &stmts[0] {
+            ProcessStatement::Assign(_, expr) => expr,
+            _ => panic!("expected Assign"),
+        };
+
+        let _bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&_bump);
+        let ev = make_event();
+        let bev = ev.view_in(&arena);
+        let f = make_funcs();
+        let result = eval_expr(expr, &bev, &f, &arena).unwrap();
+        assert_eq!(
+            result.as_f64(),
+            Some(1.0),
+            "10 / 2 / 5 must be (10/2)/5 = 1, not 10/(2/5) = 25"
+        );
+    }
+
+    #[test]
     fn test_eval_binop_logical() {
         let _bump = ::bumpalo::Bump::new();
         let arena = EventArena::new(&_bump);
