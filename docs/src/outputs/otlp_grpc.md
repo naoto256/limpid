@@ -2,7 +2,7 @@
 
 Forwards events to one or more OpenTelemetry collectors / OTLP-compatible SaaS backends over OTLP/gRPC. Multiple peers are tried in round-robin order with per-peer cooldown on failure.
 
-Each Event's `egress` is expected to be the singleton ResourceLogs protobuf bytes produced by [`otlp.encode_resourcelog_protobuf`](../functions/expression-functions.md#otlp). The output buffers these per-Event ResourceLogs, flushes on `batch_size` or `batch_timeout`, wraps the batch in an `ExportLogsServiceRequest`, and ships it.
+Each Event's `egress` is expected to be the singleton ResourceLogs protobuf bytes produced by [`otlp.encode_resourcelog_protobuf`](../functions/expression-functions.md#otlpencode_resourcelog_protobufhashlit--bytes). The output buffers these per-Event ResourceLogs, flushes on `batch_size` or `batch_timeout`, wraps the batch in an `ExportLogsServiceRequest`, and ships it.
 
 > Why limpid's OTLP behaves the way it does — Resource attributes are user-authored not auto-detected, `partial_success` is not retried selectively, `batch_level` is wire-only and semantically null — is documented in [OTLP — design rationale](../otlp.md). The reference table below covers *how* to configure; the design page covers *why* the defaults are what they are.
 
@@ -88,7 +88,7 @@ Identical semantics to the [otlp_http batch_level](./otlp_http.md#batch_level) �
 
 - `partial_success` on the response (rejected log records) is logged as a warning. The internal `retry { … }` block does not branch on `partial_success` — it retries the whole batch on transport failures only. A finer "retry just the rejects" policy is queued for a later release.
 - On a transport error during a partial-success flush, the drained batch is restored to the in-memory buffer so the rejected records are not lost to the next attempt.
-- At shutdown, if a final flush fails unrecoverably, the remaining buffered ResourceLogs are drained to `control { error_log "..." }` — one DLQ record per rendered request body. Without `error_log` the daemon falls back to 0.7.7 behaviour (warn + drop); shutdown-path DLQ records carry a synthetic source and the shutdown time as `received_at` because the envelope `Event` is dropped at `write()` Ok. See [Queue and retry → Recovery (error_log)](./README.md#recovery-error_log).
+- At shutdown, if a final flush fails unrecoverably, the buffered events are drained to `control { error_log "..." }` as one Output-flavor DLQ record per still-parked event — `event.source`, `event.received_at`, `event.ingress`, and `event.egress` reflect the original per-event provenance because the batched output parks the source `Event` alongside its `QueueAckHandle` until the flush resolves. Without `error_log` the daemon falls back to 0.7.7 behaviour (warn + drop without serialising the payload). See [Queue and retry → Recovery (error_log)](./README.md#recovery-error_log).
 - Common queue / retry properties — see [Queue and retry](./README.md#queue-and-retry).
 - Server TLS uses rustls (aws-lc-rs provider). System root certificates are loaded via tonic's `tls-roots`; supply `tls { ca }` to add a custom CA on top.
 - For HTTP transport see [otlp_http](./otlp_http.md).
