@@ -146,6 +146,17 @@ impl FunctionSig {
 ///
 /// Parsers are registered alongside their implementation; the analyzer
 /// looks them up via [`FunctionRegistry::parser`].
+///
+/// # Defaults arg contract
+///
+/// `defaults_arg_indices` declares the positional slots where a
+/// `defaults` HashLit may appear in the call shape. The analyzer scans
+/// exactly those slots (in order) and uses the first HashLit it finds.
+/// Mirror the runtime impl's call shape: if the impl accepts the
+/// HashLit at more than one position (parse_kv accepts both
+/// `parse_kv(text, defaults)` and `parse_kv(text, sep, defaults)`),
+/// list every slot. Parsers without a defaults arg leave the slice
+/// empty.
 #[derive(Debug, Clone)]
 pub struct ParserInfo {
     pub namespace: Option<&'static str>,
@@ -157,6 +168,12 @@ pub struct ParserInfo {
     /// than statically known (parse_json, parse_kv, parse_cef
     /// extensions, etc.).
     pub wildcards: bool,
+    /// Positional indices where a `defaults` HashLit may appear. The
+    /// analyzer scans these slots and uses the first HashLit found to
+    /// pin precise workspace keys; if none match, wildcard parsers fall
+    /// back to a wildcard workspace. Empty for parsers that don't take
+    /// a defaults arg (e.g. `regex_parse`).
+    pub defaults_arg_indices: &'static [usize],
 }
 
 // ---------------------------------------------------------------------------
