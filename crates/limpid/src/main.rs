@@ -301,9 +301,10 @@ fn run_daemon(config_path: &str) -> Result<()> {
 /// - `0` — analyzer is clean (warnings allowed unless `--strict-warnings`)
 /// - `1` — at least one error-level diagnostic (including warnings
 ///   promoted by `--ultra-strict`)
-/// - `2` — `--strict-warnings` set and at least one warning was emitted
-///   (errors also exit 2 under `--strict-warnings` so CI sees a single
-///   "non-zero means investigate" signal)
+/// - `2` — `--strict-warnings` set and at least one warning was
+///   emitted (errors still exit 1; the `2` channel is reserved for
+///   the warning-only outcome so CI can tell warnings apart from
+///   hard errors)
 ///
 /// `--ultra-strict` and `--strict-warnings` are orthogonal:
 /// - `--strict-warnings` alone: exit code change only (2 on any warning)

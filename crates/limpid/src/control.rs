@@ -2,7 +2,9 @@
 //! other management tools.
 //!
 //! Protocol: line-based over Unix stream socket.
-//! All responses except `tap` are JSON.
+//! Command-level responses are JSON, except `tap` (event-stream text)
+//! and a small set of protocol-error responses (server-too-busy,
+//! command-too-long) that fall back to a plain-text line.
 //!
 //! Commands:
 //!   health                      — {"status":"ok","uptime_seconds":N}

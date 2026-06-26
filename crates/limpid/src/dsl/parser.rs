@@ -17,9 +17,9 @@ pub struct LimpidParser;
 /// Parse a complete configuration string into a `Config` AST.
 ///
 /// Spans in the resulting AST are tagged with `file_id = 0`. Callers
-/// that need multi-file attribution (the include loader, eventually)
-/// should use [`parse_config_with_file_id`] and feed the matching id
-/// into the [`crate::dsl::span::SourceMap`].
+/// that need multi-file attribution (e.g. the include loader in
+/// [`crate::config`]) should use [`parse_config_with_file_id`] and
+/// feed the matching id into the [`crate::dsl::span::SourceMap`].
 #[allow(dead_code)] // used extensively by tests; kept public for eventual lib surface
 pub fn parse_config(input: &str) -> Result<Config> {
     parse_config_with_file_id(input, 0)

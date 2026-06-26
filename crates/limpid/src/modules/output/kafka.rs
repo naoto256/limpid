@@ -402,7 +402,9 @@ impl Module for KafkaOutput {
 
         // message.timeout.ms: rdkafka's internal delivery timeout (includes retries to broker).
         // Separate from queue_timeout which is the wait time when the internal queue is full.
-        // If delivery fails after this timeout, limpid's queue retry mechanism handles re-delivery.
+        // If delivery fails after this timeout, the Kafka output's own `consume`
+        // path (driven by `retry { ... }`) handles re-delivery; the queue layer
+        // only advances its cursor once each ack handle resolves.
         let mut client = ClientConfig::new();
         client
             .set("bootstrap.servers", &brokers)

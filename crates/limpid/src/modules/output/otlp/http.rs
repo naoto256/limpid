@@ -143,10 +143,10 @@ struct Inner {
     /// duplicate of the property spec.
     ///
     /// Internal retry matters for OTLP specifically because it batches
-    /// Events from multiple `write()` calls — without an internal
+    /// Events from multiple `consume()` calls — without an internal
     /// retry, a single transient ship failure would lose the whole
-    /// drained batch (the queue layer's per-event retry only re-pushes
-    /// the most recent Event).
+    /// drained batch (the queue layer cannot re-push a buffered batch;
+    /// its cursor only advances when each event's ack handle resolves).
     retry_config: RetryConfig,
     /// Buffered events awaiting flush, paired with their queue ack
     /// handles. Render happens at flush time so per-event render
@@ -618,10 +618,9 @@ impl Inner {
 }
 
 /// Render a single Event into its OTLP `ResourceLogs` proto bytes —
-/// just a refcount bump on `event.egress`. Mirrors the body of
-/// `OtlpHttpOutput::render` / `OtlpGrpcOutput::render` so the
-/// consumer-side flush path can call it directly without setting up
-/// a borrowed-view arena.
+/// just a refcount bump on `event.egress`. Called from the
+/// consumer-side flush path on an owned `Event`, so no borrowed-view
+/// arena setup is required.
 fn render_event(event: &Event) -> Result<Bytes> {
     Ok(event.egress.clone())
 }
@@ -1500,8 +1499,8 @@ mod tests {
 
     #[tokio::test]
     async fn drop_aborts_pending_flush_timer() {
-        // The flush timer is armed by `consume_event` when the buffer
-        // is below `batch_size`. Drop must abort the timer so the
+        // The flush timer is armed by `consume` when the buffer is
+        // below `batch_size`. Drop must abort the timer so the
         // process exit doesn't leak the spawned task.
         let mut props = one_peer_props("http://127.0.0.1:1");
         props.push(prop_int("batch_size", 1024));
@@ -1599,12 +1598,13 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_flushes_pending_batch_buffer() {
-        // Regression mirror of `output http`: when batch_size > 1 the
-        // queue-side `write()` returns Ok once the event is in the
-        // buffer, so the memory queue considers it delivered. If the
-        // daemon shuts down before the batch fills, Drop alone aborts
-        // the timer and leaks the buffer. `shutdown()` aborts the
-        // timer and runs one final flush.
+        // Regression mirror of `output http`: when batch_size > 1
+        // `consume()` parks the event + ack handle in the buffer; the
+        // queue layer cannot advance its cursor until the handle
+        // resolves at flush time. If the daemon shuts down before the
+        // batch fills, Drop alone aborts the timer and leaks the
+        // buffer. `shutdown()` aborts the timer and runs one final
+        // flush (or DLQ drain) so every parked handle resolves.
         let (addr, received, server) = run_http_collector("http_protobuf").await;
         let endpoint = format!("http://{}/v1/logs", addr);
         let mut props = one_peer_props(&endpoint);
@@ -1620,7 +1620,7 @@ mod tests {
         )
         .unwrap();
 
-        // Drive the batched path via consume_event.
+        // Drive the batched path via consume.
         for ts in [1u64, 2u64] {
             consume(&output, &event_with_egress(singleton_bytes(ts)))
                 .await

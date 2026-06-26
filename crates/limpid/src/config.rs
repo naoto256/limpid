@@ -2,9 +2,11 @@
 //!
 //! Includes support two source trees:
 //!
-//! 1. **Config root** — the directory of the top-level config file. All
-//!    relative `include` paths resolve here, and canonicalised results
-//!    must stay inside the root so `..` escapes are impossible.
+//! 1. **Config root** — the directory of the top-level config file.
+//!    Relative `include` paths resolve against the *including* file's
+//!    directory (so a snippet's `include "./helper"` finds a sibling
+//!    of the snippet), and every canonicalised result must stay inside
+//!    the root so `..` escapes are impossible.
 //! 2. **System snippet tree** ([`SYSTEM_SNIPPET_DIR`], default
 //!    `/usr/share/limpid/snippets`) — read-only packager-provided
 //!    library files. Absolute paths pointing under this tree are
