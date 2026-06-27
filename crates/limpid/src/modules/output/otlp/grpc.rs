@@ -362,6 +362,15 @@ impl Output for OtlpGrpcOutput {
         Ok(())
     }
 
+    /// Drain-time per-event entry: park into the buffer; the post-loop
+    /// `shutdown()` call drains it bounded. No flush trigger here — the
+    /// shutdown contract forbids the steady-state retry path.
+    async fn consume_shutdown(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
+        let mut buf = self.inner.batch.lock().await;
+        buf.push((event.clone(), ack));
+        Ok(())
+    }
+
     async fn shutdown(
         &self,
         _error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,

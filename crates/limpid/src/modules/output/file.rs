@@ -250,6 +250,73 @@ impl Output for FileOutput {
             }
         }
     }
+
+    async fn consume_shutdown(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
+        let payload_res = {
+            let bump = bumpalo::Bump::new();
+            let arena = EventArena::new(&bump);
+            let bevent = event.view_in(&arena);
+            self.render_path_in(&bevent, &arena)
+        };
+        let payload = match payload_res {
+            Ok((resolved, is_dynamic)) => FilePayload {
+                egress: event.egress.clone(),
+                path: resolved,
+                is_dynamic,
+            },
+            Err(e) => {
+                let reason = format!("render failed: {}", RenderError::new(e));
+                crate::modules::route_event_to_dlq(
+                    self.error_log.as_ref(),
+                    &self.name,
+                    event,
+                    &reason,
+                )
+                .await;
+                self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                ack.resolve_recovered();
+                return Ok(());
+            }
+        };
+        match tokio::time::timeout(
+            crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT,
+            self.write_payload(payload),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                ack.resolve_delivered();
+            }
+            Ok(Err(e)) => {
+                let reason = format!("shutdown write failed: {}", e);
+                crate::modules::route_event_to_dlq(
+                    self.error_log.as_ref(),
+                    &self.name,
+                    event,
+                    &reason,
+                )
+                .await;
+                self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                ack.resolve_recovered();
+            }
+            Err(_) => {
+                let reason = format!(
+                    "shutdown write timed out after {:?}",
+                    crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT
+                );
+                crate::modules::route_event_to_dlq(
+                    self.error_log.as_ref(),
+                    &self.name,
+                    event,
+                    &reason,
+                )
+                .await;
+                self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                ack.resolve_recovered();
+            }
+        }
+        Ok(())
+    }
 }
 
 impl FileOutput {

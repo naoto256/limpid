@@ -681,9 +681,15 @@ pub async fn run_queue_consumer(
                         }
                         let handle = QueueAckHandle::new(ack_tx.clone(), position);
                         in_flight += 1;
-                        if let Err(e) = writer.consume(&event, handle).await {
+                        // `consume_shutdown` (not `consume`) — the
+                        // shutdown contract forbids the steady-state
+                        // retry path. Unbatched outputs ship once
+                        // bounded then DLQ; batched outputs buffer
+                        // only and let the post-loop `writer.shutdown()`
+                        // drain bounded. See `Output::consume_shutdown`.
+                        if let Err(e) = writer.consume_shutdown(&event, handle).await {
                             tracing::error!(
-                                "output '{}': consume returned Err during drain: {} \
+                                "output '{}': consume_shutdown returned Err during drain: {} \
                                  (bug — disposition signalled via handle)",
                                 name,
                                 e
@@ -887,6 +893,14 @@ mod consumer_lifecycle_tests {
                     Err(anyhow::anyhow!("scripted bug"))
                 }
             }
+        }
+
+        async fn consume_shutdown(
+            &self,
+            event: &Event,
+            ack: QueueAckHandle,
+        ) -> anyhow::Result<()> {
+            self.consume(event, ack).await
         }
     }
 
@@ -1101,6 +1115,19 @@ mod consumer_lifecycle_tests {
     #[async_trait::async_trait]
     impl Output for BatchedMockWriter {
         async fn consume(&self, _event: &Event, ack: QueueAckHandle) -> anyhow::Result<()> {
+            self.consume_calls.fetch_add(1, Ordering::Relaxed);
+            self.buffer.lock().await.push(ack);
+            Ok(())
+        }
+
+        async fn consume_shutdown(
+            &self,
+            _event: &Event,
+            ack: QueueAckHandle,
+        ) -> anyhow::Result<()> {
+            // Batched mock: park into the same buffer that shutdown()
+            // will drain. No flush trigger — mirrors the real batched
+            // outputs' shutdown contract.
             self.consume_calls.fetch_add(1, Ordering::Relaxed);
             self.buffer.lock().await.push(ack);
             Ok(())
