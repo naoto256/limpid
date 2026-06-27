@@ -219,6 +219,12 @@ impl Input for TailInput {
                 // its eventual drop — caught by the recv branch above.
                 generation = generation.wrapping_add(1);
                 let _ = drain_acks_into_watermark(&mut ack_rx, generation);
+                // Persist the reset before the next read can advance
+                // the in-memory cursor. A crash here without the
+                // write would let the state file's stale offset
+                // (from the previous file) silently skip the head
+                // of the new file on restart.
+                self.save_position(acked_offset);
                 last_inode = current_inode;
             } else if meta.len() < read_offset {
                 info!(
@@ -229,6 +235,11 @@ impl Input for TailInput {
                 acked_offset = 0;
                 generation = generation.wrapping_add(1);
                 let _ = drain_acks_into_watermark(&mut ack_rx, generation);
+                // Same persistence reason as the rotation branch
+                // above — without this write a crash before the
+                // next ack would leave the state file pointing past
+                // the truncated file's new contents.
+                self.save_position(acked_offset);
             }
 
             // No new data
