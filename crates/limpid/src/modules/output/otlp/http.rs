@@ -558,6 +558,25 @@ impl Output for OtlpHttpOutput {
 }
 
 impl Inner {
+    /// Yield when cooperative shutdown is observed — used in
+    /// `tokio::select!` against the transport future so a stalled
+    /// peer cannot trap the actor task with the batch on its stack
+    /// past the runtime shutdown deadline. See
+    /// `crate::modules::output::http::Inner::wait_until_shutdown`
+    /// for the lost-wake guarantee.
+    async fn wait_until_shutdown(&self) {
+        loop {
+            if self.is_shutting_down.load(Ordering::Acquire) {
+                return;
+            }
+            let notified = self.flush_notify.notified();
+            if self.is_shutting_down.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     /// Drain + ship one batch, resolving each handle to its final
     /// disposition. Infallible: every entry has its disposition
     /// committed before this returns. Per-event render failures route
@@ -595,7 +614,23 @@ impl Inner {
             return;
         }
         let count = shippable.len() as u64;
-        match send_batch(self, payloads).await {
+        // Race the transport against shutdown: a stalled collector
+        // (HTTP accept + no response) would otherwise hold the actor
+        // past the runtime shutdown deadline, dropping shippable
+        // unresolved on abort. See http.rs::flush_events for the
+        // mirrored pattern.
+        let send_outcome = tokio::select! {
+            biased;
+            res = send_batch(self, payloads) => Some(res),
+            _ = self.wait_until_shutdown() => None,
+        };
+        let send_result = match send_outcome {
+            Some(res) => res,
+            None => Err(anyhow!(
+                "shutdown cancelled in-flight OTLP/HTTP send"
+            )),
+        };
+        match send_result {
             Ok(outcome) => {
                 let rejected = outcome.rejected.min(count);
                 let written = count - rejected;

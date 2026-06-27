@@ -453,6 +453,20 @@ impl Output for OtlpGrpcOutput {
 
 
 impl Inner {
+    /// Yield on cooperative shutdown — see `http::Inner::wait_until_shutdown`.
+    async fn wait_until_shutdown(&self) {
+        loop {
+            if self.is_shutting_down.load(Ordering::Acquire) {
+                return;
+            }
+            let notified = self.flush_notify.notified();
+            if self.is_shutting_down.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     /// Drain + ship one batch, resolving each handle to its final
     /// disposition. Mirrors the http counterpart's ack-handle
     /// semantics: infallible to the caller, per-event DLQ routing on
@@ -475,7 +489,19 @@ impl Inner {
             return;
         }
         let count = shippable.len() as u64;
-        match send_batch(self, payloads).await {
+        // Race the transport against shutdown — see http.rs.
+        let send_outcome = tokio::select! {
+            biased;
+            res = send_batch(self, payloads) => Some(res),
+            _ = self.wait_until_shutdown() => None,
+        };
+        let send_result = match send_outcome {
+            Some(res) => res,
+            None => Err(anyhow!(
+                "shutdown cancelled in-flight OTLP/gRPC send"
+            )),
+        };
+        match send_result {
             Ok(outcome) => {
                 let rejected = outcome.rejected.min(count);
                 let written = count - rejected;
