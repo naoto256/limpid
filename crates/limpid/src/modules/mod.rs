@@ -397,6 +397,42 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     /// error and the handle's `Drop` impl fires `Dropped`.
     async fn consume(&self, event: &Event, ack: crate::queue::QueueAckHandle) -> Result<()>;
 
+    /// Drain-time variant of `consume`: called by the queue consumer
+    /// for events still buffered in the receiver AFTER the shutdown
+    /// signal was observed. Unlike `consume`, this MUST NOT use the
+    /// steady-state retry budget — the runtime caps the entire
+    /// shutdown sequence at `runtime::Daemon::SHUTDOWN_TIMEOUT` (10s),
+    /// and a retry loop (`consume_singleton` / `flush_events` with
+    /// exponential backoff) that outlasts it gets killed mid-flight,
+    /// dropping `QueueAckHandle`s unresolved.
+    ///
+    /// Contract:
+    /// - Unbatched outputs: single bounded send attempt (wrap
+    ///   transport in `tokio::time::timeout(SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT, ...)`
+    ///   when blocking I/O is possible), no retry, no exponential
+    ///   backoff `sleep`.
+    /// - Batched outputs: push the `(event, ack)` pair into the
+    ///   buffer that the post-loop `shutdown()` call will drain
+    ///   bounded. Do NOT trigger a steady-state flush (`flush_events`
+    ///   with retry budget) from here — buffer only, defer the
+    ///   bounded final flush to `shutdown()`.
+    /// - On successful delivery (unbatched only): `ack.resolve_delivered()`.
+    /// - On failure (transport / timeout / render): route to DLQ via
+    ///   `route_event_to_dlq` and `ack.resolve_recovered()`.
+    /// - `Ok(())` signals the output took lifecycle ownership; actual
+    ///   disposition flows through the handle.
+    ///
+    /// This is a required method (no default) deliberately: a default
+    /// that forwarded to `consume` would silently re-introduce the
+    /// steady-state retry path the shutdown contract forbids. Forcing
+    /// every output to implement it is the compile-error-driven
+    /// guarantee that the drain path stays bounded.
+    async fn consume_shutdown(
+        &self,
+        event: &Event,
+        ack: crate::queue::QueueAckHandle,
+    ) -> Result<()>;
+
     /// Called once when the daemon is shutting down, before the queue
     /// consumer exits. The output is responsible for draining any
     /// internal buffer it still holds, making a best-effort attempt to
@@ -462,6 +498,42 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
 /// daemon invariant tied to the runtime contract, not an operator knob —
 /// if you raise this, raise the runtime shutdown timeout in lockstep.
 pub const SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Helper for unbatched `Output::consume_shutdown` implementations: given
+/// the result of a single bounded send attempt, finalize the event's
+/// disposition under the shutdown contract (no retry, no backoff).
+///
+/// - `Ok(())` → `events_written++`, ack `Delivered`.
+/// - `Err(e)` → DLQ via `route_event_to_dlq`, `events_failed++`, ack
+///   `Recovered`. Never `Dropped` — the handle is always resolved.
+///
+/// Callers are responsible for wrapping their send in
+/// `tokio::time::timeout(SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT, ...)` when the
+/// transport can block (TCP / TLS / HTTPS / Unix socket) and folding the
+/// `Elapsed` error into `Err`. Sync writes (`stdout`) and best-effort
+/// fire-and-forget transports may pass the raw result directly.
+pub async fn finalize_shutdown_singleton_disposition(
+    result: Result<()>,
+    error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+    metrics: &OutputMetrics,
+    output_name: &str,
+    event: &Event,
+    ack: crate::queue::QueueAckHandle,
+) {
+    use std::sync::atomic::Ordering;
+    match result {
+        Ok(()) => {
+            metrics.events_written.fetch_add(1, Ordering::Relaxed);
+            ack.resolve_delivered();
+        }
+        Err(e) => {
+            let reason = format!("shutdown send failed: {}", e);
+            route_event_to_dlq(error_log, output_name, event, &reason).await;
+            metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+            ack.resolve_recovered();
+        }
+    }
+}
 
 /// Shared shutdown-time disposition for a batch whose single best-effort
 /// send attempt failed (transport error or deadline elapsed). Every

@@ -114,6 +114,31 @@ impl Output for UnixSocketOutput {
             }
         }
     }
+
+    async fn consume_shutdown(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
+        let result = match tokio::time::timeout(
+            crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT,
+            write_with_reconnect(self, &self.conn, &self.metrics, &event.egress),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(anyhow::anyhow!(
+                "timed out after {:?}",
+                crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT
+            )),
+        };
+        crate::modules::finalize_shutdown_singleton_disposition(
+            result,
+            self.error_log.as_ref(),
+            &self.metrics,
+            &self.name,
+            event,
+            ack,
+        )
+        .await;
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]

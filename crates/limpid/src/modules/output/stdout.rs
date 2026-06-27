@@ -107,4 +107,26 @@ impl Output for StdoutOutput {
             }
         }
     }
+
+    async fn consume_shutdown(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
+        match self.write_event(event) {
+            Ok(()) => {
+                self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
+                ack.resolve_delivered();
+            }
+            Err(e) => {
+                let reason = format!("shutdown write failed: {}", e);
+                crate::modules::route_event_to_dlq(
+                    self.error_log.as_ref(),
+                    &self.name,
+                    event,
+                    &reason,
+                )
+                .await;
+                self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                ack.resolve_recovered();
+            }
+        }
+        Ok(())
+    }
 }
