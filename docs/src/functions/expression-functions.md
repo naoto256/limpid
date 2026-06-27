@@ -201,7 +201,7 @@ workspace.otlp = {
     scope_logs: [{
         scope: { name: "limpid", version: version() },
         log_records: [{
-            time_unix_nano: workspace.event_time_ns,
+            time_unix_nano: workspace.event_time_ns,  // populated upstream; coalesce with received_at in real composers — see [otlp.md §4.3](../otlp.md#43-whether-the-originating-timestamp-is-in-time_unix_nano-or-observed_time_unix_nano)
             severity_number: 9,                   // 9=INFO, 13=WARN, 17=ERROR, 21=FATAL
             severity_text: "INFO",
             body: { string_value: workspace.message },
