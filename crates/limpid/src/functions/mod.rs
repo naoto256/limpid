@@ -133,6 +133,11 @@ impl FunctionSig {
 // Parser trait
 // ---------------------------------------------------------------------------
 
+/// Shape-aware defaults extractor for parsers whose defaults slot
+/// depends on the types of preceding args. See [`ParserInfo`].
+pub type DefaultsArgExtractor =
+    for<'a> fn(&'a [crate::dsl::ast::Expr]) -> Option<&'a Vec<(String, crate::dsl::ast::Expr)>>;
+
 /// Static metadata about a parser-style function (one that returns a
 /// `Value::Object` whose keys merge into `event.workspace`).
 ///
@@ -152,11 +157,25 @@ impl FunctionSig {
 /// `defaults_arg_indices` declares the positional slots where a
 /// `defaults` HashLit may appear in the call shape. The analyzer scans
 /// exactly those slots (in order) and uses the first HashLit it finds.
-/// Mirror the runtime impl's call shape: if the impl accepts the
-/// HashLit at more than one position (parse_kv accepts both
-/// `parse_kv(text, defaults)` and `parse_kv(text, sep, defaults)`),
-/// list every slot. Parsers without a defaults arg leave the slice
-/// empty.
+/// This default scan fits parsers with a single fixed defaults
+/// position (`parse_json`, `parse_syslog`, `parse_cef`, ...) where any
+/// HashLit at the declared slot is unambiguously the defaults arg.
+///
+/// Parsers whose call shape allows defaults at more than one position
+/// only when an earlier arg has a specific type (e.g.
+/// `parse_kv(text, sep_string, defaults)` only allows defaults at
+/// `args[2]` when `args[1]` is a string separator) MUST provide a
+/// `defaults_arg_extractor`. The extractor encodes the parser's real
+/// call-shape rules so the analyzer doesn't extract defaults from a
+/// runtime-invalid call shape — for example, `parse_kv(text, int_lit,
+/// hashlit)` would silently narrow workspace via the HashLit at
+/// `args[2]` even though the runtime rejects the call because
+/// `args[1]` is not a separator string. The extractor returns `None`
+/// for both valid-no-defaults and invalid-shape calls; the wildcard
+/// fallback below handles both the same way.
+///
+/// Parsers without a defaults arg (`regex_parse`) leave the slice
+/// empty and set the extractor to `None`.
 #[derive(Debug, Clone)]
 pub struct ParserInfo {
     pub namespace: Option<&'static str>,
@@ -172,8 +191,17 @@ pub struct ParserInfo {
     /// analyzer scans these slots and uses the first HashLit found to
     /// pin precise workspace keys; if none match, wildcard parsers fall
     /// back to a wildcard workspace. Empty for parsers that don't take
-    /// a defaults arg (e.g. `regex_parse`).
+    /// a defaults arg (e.g. `regex_parse`). Ignored when
+    /// `defaults_arg_extractor` is `Some` — that field takes precedence
+    /// for parsers with shape-dependent defaults positions.
     pub defaults_arg_indices: &'static [usize],
+    /// Optional shape-aware defaults extractor for parsers whose
+    /// defaults slot depends on the types of preceding args (e.g.
+    /// `parse_kv` accepts `args[2]` as defaults only when `args[1]` is
+    /// a string separator). When `Some`, the extractor fully replaces
+    /// the `defaults_arg_indices` scan; when `None`, the analyzer uses
+    /// the default index-list behavior described above.
+    pub defaults_arg_extractor: Option<DefaultsArgExtractor>,
 }
 
 // ---------------------------------------------------------------------------

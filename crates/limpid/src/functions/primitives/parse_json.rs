@@ -23,6 +23,7 @@ pub fn register(reg: &mut FunctionRegistry) {
         produces: Vec::new(),
         wildcards: true,
         defaults_arg_indices: &[1],
+        defaults_arg_extractor: None,
     });
 }
 

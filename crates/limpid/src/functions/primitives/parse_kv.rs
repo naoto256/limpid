@@ -14,6 +14,7 @@ use anyhow::{Result, bail};
 
 use super::parse_json::{apply_defaults, type_name};
 use super::val_to_str;
+use crate::dsl::ast::{Expr, ExprKind};
 use crate::functions::{FunctionRegistry, FunctionSig, ParserInfo};
 
 const DEFAULT_SEP: u8 = b' ';
@@ -33,8 +34,53 @@ pub fn register(reg: &mut FunctionRegistry) {
         name: "parse_kv",
         produces: Vec::new(),
         wildcards: true,
+        // Retained for documentation; the extractor below takes over
+        // the actual scan because parse_kv's defaults position depends
+        // on the type of `args[1]`.
         defaults_arg_indices: &[1, 2],
+        defaults_arg_extractor: Some(extract_defaults),
     });
+}
+
+/// Mirrors `parse_kv_impl`'s call-shape rules so the analyzer only
+/// narrows workspace for calls the runtime will actually accept:
+///
+/// * `parse_kv(text)` — no defaults
+/// * `parse_kv(text, defaults_hashlit)` — args[1] is the HashLit
+/// * `parse_kv(text, separator_string)` — separator only, no defaults
+/// * `parse_kv(text, separator_string, defaults_hashlit)` — args[2] is the HashLit
+///
+/// Any other shape (e.g. `parse_kv(text, int_lit, hashlit)` or
+/// `parse_kv(text, hashlit, hashlit)`) is rejected by `parse_kv_impl`
+/// at runtime; the analyzer therefore returns `None` here so the
+/// wildcard fallback kicks in instead of narrowing workspace based on
+/// a HashLit that the runtime will never honour.
+fn extract_defaults(args: &[Expr]) -> Option<&Vec<(String, Expr)>> {
+    fn hash_at(args: &[Expr], i: usize) -> Option<&Vec<(String, Expr)>> {
+        match args.get(i).map(|e| &e.kind) {
+            Some(ExprKind::HashLit(entries)) => Some(entries),
+            _ => None,
+        }
+    }
+    fn is_separator_string(args: &[Expr], i: usize) -> bool {
+        matches!(
+            args.get(i).map(|e| &e.kind),
+            Some(ExprKind::StringLit(_) | ExprKind::Template(_))
+        )
+    }
+
+    match args.len() {
+        // `parse_kv(text)` — no defaults available
+        0..=1 => None,
+        // `parse_kv(text, x)` — defaults only if x is a HashLit
+        2 => hash_at(args, 1),
+        // `parse_kv(text, sep, defaults)` — args[1] must be a
+        // string-shaped separator; otherwise the runtime rejects the
+        // call regardless of what `args[2]` holds.
+        3 if is_separator_string(args, 1) => hash_at(args, 2),
+        // Any other 3-arg shape is invalid at runtime; do not narrow.
+        _ => None,
+    }
 }
 
 fn parse_kv_impl<'bump>(

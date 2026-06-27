@@ -36,21 +36,26 @@ pub(super) fn apply_parser_effects(
     // Defaults arg (HashLit): every declared key becomes a workspace
     // binding too, with type inferred from the literal value. This is
     // the "user-declared schema" knob that lets parse_json / parse_kv
-    // narrow the wildcard to a precise key set. The registry declares
-    // which positional slots may hold the HashLit — parse_kv accepts
-    // it at both args[1] (2-arg form) and args[2] (3-arg form), so the
-    // scan walks the slots in order and takes the first match.
-    let defaults_entries = info.defaults_arg_indices.iter().find_map(|&i| {
-        if let Some(Expr {
-            kind: ExprKind::HashLit(entries),
-            ..
-        }) = args.get(i)
-        {
-            Some(entries)
-        } else {
-            None
-        }
-    });
+    // narrow the wildcard to a precise key set. Parsers whose defaults
+    // position depends on the type of earlier args (parse_kv) supply a
+    // shape-aware extractor; everyone else falls back to the
+    // index-list scan, which takes the first HashLit at any declared
+    // slot.
+    let defaults_entries = if let Some(extractor) = info.defaults_arg_extractor {
+        extractor(args)
+    } else {
+        info.defaults_arg_indices.iter().find_map(|&i| {
+            if let Some(Expr {
+                kind: ExprKind::HashLit(entries),
+                ..
+            }) = args.get(i)
+            {
+                Some(entries)
+            } else {
+                None
+            }
+        })
+    };
     if let Some(entries) = defaults_entries {
         for (k, v) in entries {
             let path = vec!["workspace".to_string(), k.clone()];
@@ -153,6 +158,34 @@ mod tests {
             Some(&FieldType::String)
         );
         assert!(!bindings.is_workspace_wildcard());
+    }
+
+    // parse_kv with a non-string second arg + HashLit third arg is
+    // not a valid runtime call shape — `parse_kv_impl` bails because
+    // `args[1]` must be a String separator when `args[2]` is present
+    // (`(Some(Object), Some(_))` falls into the catch-all bail arm).
+    // The shape-aware extractor refuses to narrow from either
+    // HashLit; the wildcard fallback then keeps downstream
+    // `workspace.*` reads admissible at `--check` time, but no
+    // *specific* key set is pinned. Pre-fix, the index-list scan
+    // picked up the HashLit at `args[1]` and narrowed the workspace
+    // to {ignored}, so downstream reads of `workspace.user` would
+    // fail `--check` for a call that would have bailed at runtime
+    // anyway.
+    #[test]
+    fn parse_kv_invalid_three_arg_shape_falls_back_to_wildcard() {
+        let reg = registry();
+        let mut bindings = Bindings::new();
+        let args = vec![
+            ident("ingress"),
+            hash(&[("ignored", string(""))]),
+            hash(&[("user", string(""))]),
+        ];
+        apply_parser_effects(None, "parse_kv", &args, &reg, &mut bindings);
+        assert!(
+            bindings.is_workspace_wildcard(),
+            "invalid call shape must not pin a key set; fall back to wildcard"
+        );
     }
 
     // parse_kv with no defaults HashLit anywhere → wildcard, matching
