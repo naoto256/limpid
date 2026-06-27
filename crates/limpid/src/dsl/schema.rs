@@ -78,6 +78,21 @@ pub enum PropertyValueKind {
 }
 
 impl PropertyValueKind {
+    /// Whether this variant's outer property shape is `Property::Block`
+    /// (block-shaped) versus `Property::KeyValue` (scalar-shaped).
+    /// Used by `check_one_of` to decide which `OneOf` variants are
+    /// *structural* matches for the actual property — independent of
+    /// whatever inner content errors the variant's full validator
+    /// produced.
+    fn expects_block_outer_shape(self) -> bool {
+        matches!(
+            self,
+            PropertyValueKind::Block(_)
+                | PropertyValueKind::BlockMap(_)
+                | PropertyValueKind::StringMap
+        )
+    }
+
     fn label(self) -> &'static str {
         match self {
             PropertyValueKind::String => "String",
@@ -422,11 +437,15 @@ fn check_one_of(
     // Ident, got Block" which is actively misleading when the user
     // wrote a Block and the real problem is one missing inner key.
     //
-    // A structural failure shows up as `ExpectedBlock` (variant wanted
-    // a block, got a scalar) or `ExpectedValue` (variant wanted a
-    // scalar, got a block). Any other error kind means the variant
-    // recognised the outer shape and is reporting a content-level
-    // problem.
+    // Structural match is decided by comparing the variant's expected
+    // outer shape (`Block` / `BlockMap` / `StringMap` → block-shaped;
+    // everything else → scalar-shaped) against the actual `Property`
+    // variant. Earlier this filter walked the per-variant error list
+    // looking for `ExpectedBlock` / `ExpectedValue` kinds, which
+    // misclassified variants that fit the outer shape but produced an
+    // inner `ExpectedValue` (e.g. a nested scalar key whose value
+    // shape was wrong) — those nested errors disqualified the variant
+    // even though its outer shape matched.
     //
     // When 0 or 2+ variants structurally match we deliberately
     // collapse to `OneOfMismatch`:
@@ -441,16 +460,12 @@ fn check_one_of(
     //     `OneOfMismatch { expected: ["String", "Int"], actual:
     //     "Bool" }` reads as "expected String | Int, got Bool" which
     //     names all valid forms in one line.
-    let structural_matches: Vec<&Vec<SchemaError>> = per_variant
+    let actual_is_block = matches!(prop, Property::Block { .. });
+    let structural_matches: Vec<&Vec<SchemaError>> = variants
         .iter()
-        .filter(|errs| {
-            !errs.iter().any(|e| {
-                matches!(
-                    e.kind,
-                    SchemaErrorKind::ExpectedBlock | SchemaErrorKind::ExpectedValue
-                )
-            })
-        })
+        .zip(per_variant.iter())
+        .filter(|(kind, _)| kind.expects_block_outer_shape() == actual_is_block)
+        .map(|(_, errs)| errs)
         .collect();
 
     if let [only] = structural_matches.as_slice() {
@@ -1177,6 +1192,59 @@ mod tests {
         );
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(matches!(errs[0].kind, SchemaErrorKind::MissingRequired));
+        assert_eq!(errs[0].key, "cert");
+    }
+
+    #[test]
+    fn one_of_surfaces_inner_nested_value_error_when_block_variant_matches() {
+        // Regression: the structural-match filter used to look at the
+        // per-variant error list for `ExpectedBlock` / `ExpectedValue`
+        // kinds. That misclassified variants whose outer shape DID
+        // match but whose inner content produced an `ExpectedValue` —
+        // e.g. an inline block where a scalar inner key was instead
+        // written as a sub-block. The fix decides structural match
+        // from the variant's expected outer shape vs. the actual
+        // `Property` variant, so nested errors inside an otherwise-
+        // matching block variant no longer disqualify it.
+        const INNER: &[PropertySpec] = &[PropertySpec {
+            name: "cert",
+            required: true,
+            repeatable: false,
+            exclusive_group: None,
+            kind: PropertyValueKind::String,
+        }];
+        const S: &[PropertySpec] = &[PropertySpec {
+            name: "tls",
+            required: false,
+            repeatable: false,
+            exclusive_group: None,
+            kind: PropertyValueKind::OneOf(&[
+                PropertyValueKind::Block(INNER),
+                PropertyValueKind::Enum(&["profile_a"]),
+            ]),
+        }];
+        // Inline block where `cert` is written as a sub-block instead
+        // of a String value. The Block variant should structurally
+        // match and surface its inner `ExpectedValue` error rather
+        // than collapse to a generic `OneOfMismatch`.
+        let errs = validate(
+            &[Property::Block {
+                key: "tls".into(),
+                key_span: None,
+                properties: vec![Property::Block {
+                    key: "cert".into(),
+                    key_span: None,
+                    properties: vec![],
+                }],
+            }],
+            S,
+        );
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            matches!(errs[0].kind, SchemaErrorKind::ExpectedValue),
+            "expected ExpectedValue, got {:?}",
+            errs[0].kind
+        );
         assert_eq!(errs[0].key, "cert");
     }
 
