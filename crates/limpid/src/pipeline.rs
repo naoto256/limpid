@@ -284,10 +284,9 @@ pub enum ErroredEventContext {
     Output {
         /// Wall-clock at which the error was raised.
         timestamp: chrono::DateTime<chrono::Utc>,
-        /// Pipeline name — empty for runtime-side enqueue failures
-        /// (the runtime accumulates one record per failed output, with
-        /// no single pipeline ownership beyond the dispatch context;
-        /// kept blank rather than misattributed).
+        /// Pipeline name when known. Runtime-side enqueue failures carry
+        /// the dispatching pipeline; sink-side retry / shutdown records
+        /// leave this blank because they no longer have pipeline context.
         pipeline: String,
         /// Failure site: `<output_name>` for retry exhaustion,
         /// `<output_name> shutdown` for batched shutdown drain, or
