@@ -509,9 +509,19 @@ async fn run_pipeline_with_outputs(
     // `events_finished` / `events_discarded` decision still observes
     // the original semantics (Finished AND emitted ≥1 output → finished).
     let outputs = std::mem::take(&mut result.outputs);
-    let mut failed_outputs: Vec<String> = Vec::new();
+    // Each failed enqueue carries the per-output `OwnedEvent`
+    // snapshot so the DLQ record reflects the value the pipeline
+    // produced for that sink. The input event the function received
+    // is not equivalent: the pipeline may have produced a different
+    // egress for the output, and `inject output` replay must
+    // preserve the bytes the sink would have shipped.
+    let mut failed_outputs: Vec<(String, crate::event::OwnedEvent)> = Vec::new();
     for (output_name, event) in outputs {
         if let Some(sender) = ctx.output_senders.get(&output_name) {
+            // Clone before send: the sender consumes `event`. `OwnedEvent`
+            // clone is cheap (Bytes are refcounted; workspace cost
+            // scales with the per-event populated keys).
+            let snapshot = event.clone();
             if let Err(e) = sender.send(event).await {
                 // QueueSender::send already bumped per-output
                 // `events_failed` on the Err branch — that gives the
@@ -523,7 +533,7 @@ async fn run_pipeline_with_outputs(
                     "pipeline '{}': enqueue to output '{}' failed: {}",
                     pipeline.name, output_name, e
                 );
-                failed_outputs.push(output_name);
+                failed_outputs.push((output_name, snapshot));
             }
         } else {
             // Unknown output name slipped past startup validation —
@@ -533,7 +543,7 @@ async fn run_pipeline_with_outputs(
                 "pipeline '{}': output '{}' not found",
                 pipeline.name, output_name
             );
-            failed_outputs.push(output_name);
+            failed_outputs.push((output_name, event));
         }
     }
 
@@ -555,8 +565,7 @@ async fn run_pipeline_with_outputs(
              error, or unknown output)"
             .to_string();
         result.termination = crate::pipeline::PipelineTermination::Errored;
-        let owned = event.to_owned();
-        for output_name in failed_outputs {
+        for (output_name, snapshot) in failed_outputs {
             result
                 .errored
                 .push(crate::pipeline::ErroredEventContext::Output {
@@ -565,7 +574,7 @@ async fn run_pipeline_with_outputs(
                     site: format!("{} enqueue", output_name),
                     reason: reason.clone(),
                     output_name: output_name.clone(),
-                    event: crate::pipeline::OutputEvent::from_owned(&owned),
+                    event: crate::pipeline::OutputEvent::from_owned(&snapshot),
                 });
         }
     }
