@@ -506,14 +506,15 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_extension_keys_last_one_wins() {
+    fn duplicate_extension_keys_first_one_wins() {
         // Some vendors emit the same key twice (intentionally for
         // multi-value sources, accidentally for buggy templates).
-        // The parser collapses to a single emission; pin the
-        // last-one-wins semantics so an operator can rely on the
-        // observable shape. A regression that flipped to
-        // first-one-wins or panicked would change downstream
-        // pipelines silently.
+        // `ObjectBuilder` does not deduplicate, so both `src` entries
+        // are emitted in source order; `lookup` returns the first
+        // match, making the observable semantics first-one-wins. Pin
+        // it here so a future change to dedup or reverse insertion
+        // order is a visible, intentional break instead of a silent
+        // downstream-pipeline behaviour flip.
         let bump = ::bumpalo::Bump::new();
         let arena = EventArena::new(&bump);
         let owned = dummy_event();
@@ -525,11 +526,7 @@ mod tests {
         let Value::Object(entries) = v else {
             panic!("expected Object");
         };
-        // Whichever wins, only one `src` entry should be observable
-        // via lookup (which returns the first match). Confirm at
-        // least that the parse succeeded with both src and dst
-        // distinguishable.
-        assert!(lookup(entries, "src").is_some());
+        assert_eq!(lookup(entries, "src"), Some(Value::String("10.0.0.1")));
         assert_eq!(lookup(entries, "dst"), Some(Value::String("8.8.8.8")));
     }
 }
