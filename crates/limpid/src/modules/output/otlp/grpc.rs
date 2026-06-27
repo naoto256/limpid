@@ -403,21 +403,16 @@ impl HasMetrics for OtlpGrpcOutput {
 #[async_trait::async_trait]
 impl Output for OtlpGrpcOutput {
     async fn consume(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
+        // Hand the (event, ack) off to the actor — see
+        // `http::HttpOutput::consume` for rationale.
         let should_flush = {
             let mut batch = self.inner.batch.lock().await;
             batch.push((event.clone(), ack));
             batch.len() >= self.batch_size
         };
         if should_flush {
-            // Threshold-triggered flush runs on the queue consumer's
-            // own task (not abort-prone); preserves the prior
-            // contract that handles are resolved before `consume`
-            // returns when a full batch is flushed inline.
-            let batch = std::mem::take(&mut *self.inner.batch.lock().await);
-            self.inner.flush_events(batch).await;
+            self.inner.flush_notify.notify_one();
         }
-        // Timer-driven flush is owned by the long-lived flusher
-        // actor's `select!`. No spawned per-flush timer task.
         Ok(())
     }
 
@@ -1119,6 +1114,39 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
+    async fn consume_and_wait_disposition(
+        output: &OtlpGrpcOutput,
+        ev: &Event,
+        timeout: Duration,
+    ) -> Result<crate::queue::AckDisposition> {
+        let (ack, mut rx) = QueueAckHandle::for_test();
+        output.consume(ev, ack).await?;
+        match tokio::time::timeout(timeout, rx.recv()).await {
+            Ok(Some((_, disp))) => Ok(disp),
+            Ok(None) => Err(anyhow::anyhow!("ack channel closed unexpectedly")),
+            Err(_) => Err(anyhow::anyhow!(
+                "actor did not resolve ack within {:?}",
+                timeout
+            )),
+        }
+    }
+
+    #[allow(dead_code)]
+    async fn consume_with_handle(
+        output: &OtlpGrpcOutput,
+        ev: &Event,
+    ) -> Result<
+        tokio::sync::mpsc::UnboundedReceiver<(
+            crate::queue::AckPosition,
+            crate::queue::AckDisposition,
+        )>,
+    > {
+        let (ack, rx) = QueueAckHandle::for_test();
+        output.consume(ev, ack).await?;
+        Ok(rx)
+    }
+
     async fn wait_for<T>(mut probe: impl FnMut() -> Option<T>) -> T {
         for _ in 0..50 {
             if let Some(v) = probe() {
@@ -1356,31 +1384,42 @@ mod tests {
                 prop_str("max_wait", "1ms"),
             ],
         });
-        let output = OtlpGrpcOutput::from_properties(
-            "test",
-            &mp(&props),
-            &crate::modules::BuildContext::for_testing(),
-        )
-        .unwrap();
-        let send =
-            tokio::spawn(
-                async move { consume(&output, &event_with_egress(singleton_bytes(1))).await },
-            );
+        let output = Arc::new(
+            OtlpGrpcOutput::from_properties(
+                "test",
+                &mp(&props),
+                &crate::modules::BuildContext::for_testing(),
+            )
+            .unwrap(),
+        );
 
-        // Let the spawned future reach the timeout-wrapped await,
-        // then advance virtual time past GRPC_REQUEST_TIMEOUT so the
-        // timeout fires. The TCP connect happens on real I/O; a short
-        // wall-clock yield keeps the test from racing the connect.
-        for _ in 0..20 {
+        let (ack, mut rx) = QueueAckHandle::for_test();
+        output
+            .consume(&event_with_egress(singleton_bytes(1)), ack)
+            .await
+            .unwrap();
+
+        // Let the actor wake, take the batch, and reach the
+        // GRPC_REQUEST_TIMEOUT-wrapped send_batch await.
+        for _ in 0..50 {
             tokio::task::yield_now().await;
         }
         tokio::time::advance(GRPC_REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
 
-        let result = send.await.unwrap();
+        let (_, disp) = rx
+            .recv()
+            .await
+            .expect("ack must resolve, not drop unresolved");
+        assert!(
+            matches!(disp, crate::queue::AckDisposition::Recovered),
+            "stalled peer must surface as Recovered, got {:?}",
+            disp
+        );
+        let _ = output.shutdown(None).await;
         stall.abort();
-
-        let err = result.expect_err("stalled peer must surface as Recovered");
-        assert!(err.to_string().contains("recovered"), "got: {err}");
     }
 
     #[tokio::test]
