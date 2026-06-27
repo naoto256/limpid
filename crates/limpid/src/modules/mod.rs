@@ -402,9 +402,9 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     /// signal was observed. Unlike `consume`, this MUST NOT use the
     /// steady-state retry budget — the runtime caps the entire
     /// shutdown sequence at `runtime::Daemon::SHUTDOWN_TIMEOUT` (10s),
-    /// and a retry loop (`consume_singleton` / `flush_events` with
-    /// exponential backoff) that outlasts it gets killed mid-flight,
-    /// dropping `QueueAckHandle`s unresolved.
+    /// and a steady-state retry loop (e.g. `flush_events`'s
+    /// exponential backoff path) that outlasts it gets killed
+    /// mid-flight, dropping `QueueAckHandle`s unresolved.
     ///
     /// Contract:
     /// - Unbatched outputs: single bounded send attempt (wrap
