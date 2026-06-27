@@ -53,11 +53,11 @@
 //! ack handle resolves, not when `consume` returns.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::dsl::ast::Property;
 use crate::dsl::props;
@@ -187,7 +187,7 @@ impl Default for PeerState {
 }
 
 /// Shared state between `consume()` (= the queue consumer's hand-off
-/// into the buffer) and the flush timer task.
+/// into the buffer) and the flusher actor task.
 struct Inner {
     peers: Vec<HttpPeer>,
     peer_state: Vec<PeerState>,
@@ -221,12 +221,29 @@ struct Inner {
     /// the flush path then falls back to a `tracing::error!` line.
     error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
     metrics: Arc<OutputMetrics>,
+    /// Threshold-driven flush trigger. `consume()` calls
+    /// `notify_one()` when the buffer crosses `batch_size`; the
+    /// flusher actor's `select!` wakes and drains.
+    flush_notify: Notify,
+    /// Co-operative cancel flag. `shutdown()` sets this to true
+    /// before notifying the actor; both the actor loop and the
+    /// in-flight `flush_events` retry loop check it so they exit
+    /// without burning the full retry budget.
+    is_shutting_down: AtomicBool,
 }
 
 pub struct HttpOutput {
     inner: Arc<Inner>,
     batch_size: usize,
-    flush_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Long-lived flusher actor handle. The actor task owns the
+    /// timer + flush-driven flush lifecycle. It is deliberately
+    /// NEVER `abort()`-ed — the audit found that abort()ing a task
+    /// that holds the batch on its stack across an `.await` boundary
+    /// drops every parked `QueueAckHandle` unresolved (debug panic,
+    /// release silent loss). `shutdown()` signals the actor via
+    /// `is_shutting_down` + `flush_notify.notify_waiters()` and
+    /// joins it bounded by `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT`.
+    actor_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     metrics: Arc<OutputMetrics>,
 }
 
@@ -413,26 +430,89 @@ impl Module for HttpOutput {
 
         let retry = RetryConfig::from_output_properties(properties)?;
         let metrics = Arc::new(OutputMetrics::default());
+        let inner = Arc::new(Inner {
+            peers,
+            peer_state,
+            cursor: AtomicUsize::new(0),
+            method,
+            content_type,
+            headers,
+            batch_timeout,
+            compress,
+            batch: Mutex::new(Vec::with_capacity(batch_size.max(1))),
+            name: name.to_string(),
+            retry,
+            error_log,
+            metrics: Arc::clone(&metrics),
+            flush_notify: Notify::new(),
+            is_shutting_down: AtomicBool::new(false),
+        });
+
+        // Spawn the flusher actor only for true batching mode. For
+        // `batch_size <= 1` (single-event ship), `consume()` routes
+        // straight to `consume_singleton` and the buffer is unused —
+        // an actor would do nothing but consume a task slot.
+        let actor_handle = if batch_size > 1 {
+            let actor_inner = Arc::clone(&inner);
+            Some(tokio::spawn(async move {
+                flusher_actor_loop(actor_inner).await;
+            }))
+        } else {
+            None
+        };
+
         Ok(Self {
-            inner: Arc::new(Inner {
-                peers,
-                peer_state,
-                cursor: AtomicUsize::new(0),
-                method,
-                content_type,
-                headers,
-                batch_timeout,
-                compress,
-                batch: Mutex::new(Vec::with_capacity(batch_size.max(1))),
-                name: name.to_string(),
-                retry,
-                error_log,
-                metrics: Arc::clone(&metrics),
-            }),
+            inner,
             batch_size,
-            flush_handle: Mutex::new(None),
+            actor_handle: Mutex::new(actor_handle),
             metrics,
         })
+    }
+}
+
+/// Long-lived flusher actor. Drains the buffer on either of three
+/// triggers: threshold-driven `flush_notify`, timer-driven
+/// `batch_timeout` sleep, or shutdown via `is_shutting_down`.
+///
+/// **Never `abort()`-ed**. The audit (2026-06-27) found that prior
+/// versions spawned a per-flush timer task that held a stack-local
+/// `Vec<(Event, QueueAckHandle)>` across `flush_events.await`, and
+/// `shutdown()` would `abort()` that task — dropping every parked
+/// handle unresolved (debug `debug_assert!(resolved)` panic, release
+/// silent `Dropped` loss). The actor here owns the entire batched
+/// lifecycle; abort surface is one handle for the whole output, and
+/// `shutdown()` joins it gracefully via `is_shutting_down` +
+/// `notify_waiters()`.
+async fn flusher_actor_loop(inner: Arc<Inner>) {
+    loop {
+        if inner.is_shutting_down.load(Ordering::Acquire) {
+            break;
+        }
+        // Race the three triggers. `biased` makes shutdown the
+        // priority arm so a `notify_waiters()` race with a
+        // threshold notify still exits cleanly.
+        let sleep_fut = tokio::time::sleep(inner.batch_timeout);
+        tokio::pin!(sleep_fut);
+        tokio::select! {
+            biased;
+            _ = inner.flush_notify.notified() => {}
+            _ = &mut sleep_fut => {}
+        }
+        if inner.is_shutting_down.load(Ordering::Acquire) {
+            break;
+        }
+        let batch = {
+            let mut buf = inner.batch.lock().await;
+            std::mem::take(&mut *buf)
+        };
+        if !batch.is_empty() {
+            // `flush_events` resolves every handle (Delivered on
+            // success, Recovered on retry-exhausted DLQ). It checks
+            // `is_shutting_down` between retry attempts so a
+            // shutdown signal collapses the retry budget to one
+            // attempt instead of burning the full backoff window.
+            inner.flush_events(batch).await;
+        }
     }
 }
 
@@ -460,17 +540,15 @@ impl Output for HttpOutput {
             buf.len() >= self.batch_size
         };
         if should_flush {
-            self.cancel_timer().await;
-            self.flush().await;
-            // After flush, the buffer should be empty (flush_events
-            // resolved every handle). Defensive: re-arm if anything
-            // raced its way back in.
-            if !self.inner.batch.lock().await.is_empty() {
-                self.reset_timer().await;
-            }
-        } else {
-            self.reset_timer().await;
+            // Threshold reached: nudge the flusher actor. The actor
+            // does the take + flush; this `consume` returns
+            // immediately. No `flush()` inline here — that would
+            // make `consume` itself the abort target the timer task
+            // used to be.
+            self.inner.flush_notify.notify_one();
         }
+        // No timer reset — the actor's `select!` already races the
+        // batch_timeout sleep.
         Ok(())
     }
 
@@ -492,16 +570,44 @@ impl Output for HttpOutput {
         &self,
         _error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
     ) -> Result<()> {
-        // Order: cancel the timer first so it cannot race in another
-        // flush, then take the buffer in one shot, then run the
-        // shutdown-mode flush which owns the entire disposition
-        // (Delivered on success, DLQ + Recovered otherwise). The
-        // queue consumer has already stopped pushing into us by the
-        // time `shutdown` is called, so there is no re-entrant-push
-        // race to defend against here.
-        self.cancel_timer().await;
-        let batch = std::mem::take(&mut *self.inner.batch.lock().await);
-        self.inner.flush_events_at_shutdown(batch).await;
+        // 1. Signal cooperative shutdown so the actor's `select!`
+        //    wakes (via `notify_waiters`) and any in-flight
+        //    `flush_events` retry sleep exits early via the
+        //    `is_shutting_down` check.
+        self.inner.is_shutting_down.store(true, Ordering::Release);
+        self.inner.flush_notify.notify_waiters();
+
+        // 2. Bounded join of the flusher actor. If the actor is
+        //    currently mid-`flush_events`, the cooperative-cancel in
+        //    the retry loop collapses its retry to one attempt;
+        //    `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT` (3s) is the deadline.
+        //    Critical: do NOT `abort()` on timeout — the actor's
+        //    stack-local batch would drop handles unresolved (the
+        //    audited bug). On timeout we just leave the actor task
+        //    to finish naturally; whatever it has not yet flushed is
+        //    still in the buffer (events queued via
+        //    `consume_shutdown` after the actor exited) and step 3
+        //    handles those.
+        let handle_opt = self.actor_handle.lock().await.take();
+        if let Some(h) = handle_opt {
+            let _ = tokio::time::timeout(
+                crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT,
+                h,
+            )
+            .await;
+        }
+
+        // 3. Drain whatever the actor did not pick up — anything
+        //    pushed via `consume_shutdown` after the actor exited,
+        //    plus any in-flight batch the actor was unable to flush
+        //    (those handles are still held by the actor task's
+        //    stack frame; we cannot reach them from here, so we
+        //    accept that narrow loss window in exchange for not
+        //    abort()-ing the actor). `flush_events_at_shutdown`
+        //    does one bounded send attempt then routes the rest to
+        //    DLQ + Recovered.
+        let leftover = std::mem::take(&mut *self.inner.batch.lock().await);
+        self.inner.flush_events_at_shutdown(leftover).await;
         Ok(())
     }
 }
@@ -568,46 +674,6 @@ impl HttpOutput {
         }
     }
 
-    /// Drain the buffer and run one flush. Returns nothing — every
-    /// dispatched event has its disposition resolved internally,
-    /// either via successful delivery or via DLQ routing.
-    async fn flush(&self) {
-        let batch = {
-            let mut buf = self.inner.batch.lock().await;
-            if buf.is_empty() {
-                return;
-            }
-            std::mem::take(&mut *buf)
-        };
-        self.inner.flush_events(batch).await;
-    }
-
-    async fn cancel_timer(&self) {
-        let mut handle = self.flush_handle.lock().await;
-        if let Some(h) = handle.take() {
-            h.abort();
-        }
-    }
-
-    async fn reset_timer(&self) {
-        let mut handle = self.flush_handle.lock().await;
-        if let Some(h) = handle.take() {
-            h.abort();
-        }
-        let inner = Arc::clone(&self.inner);
-        let timeout = self.inner.batch_timeout;
-        *handle = Some(tokio::spawn(async move {
-            tokio::time::sleep(timeout).await;
-            let batch = {
-                let mut buf = inner.batch.lock().await;
-                if buf.is_empty() {
-                    return;
-                }
-                std::mem::take(&mut *buf)
-            };
-            inner.flush_events(batch).await;
-        }));
-    }
 }
 
 /// Render a single event into its HTTP body string. Called from the
@@ -669,6 +735,16 @@ impl Inner {
                     attempt += 1;
                     self.metrics.retries.fetch_add(1, Ordering::Relaxed);
                     if attempt >= self.retry.max_attempts {
+                        break e;
+                    }
+                    // Cooperative shutdown cancel: if `shutdown()`
+                    // signalled mid-retry, abandon the budget and
+                    // route the shippable batch straight to DLQ.
+                    // Burning the full backoff window would outlast
+                    // the runtime's 10s shutdown timeout and leak
+                    // the stack-local handles when the task is
+                    // aborted by the runtime.
+                    if self.is_shutting_down.load(Ordering::Acquire) {
                         break e;
                     }
                     tracing::warn!(
@@ -876,7 +952,18 @@ async fn send_once(peer: &HttpPeer, inner: &Inner, body: &[u8]) -> Result<()> {
 
 impl Drop for HttpOutput {
     fn drop(&mut self) {
-        if let Some(h) = self.flush_handle.get_mut().take() {
+        // Signal the actor cooperatively before falling back to
+        // abort — `shutdown()` should have already done this and
+        // joined, but Drop is the last-resort path (Output dropped
+        // without an explicit `shutdown()` call, e.g. config
+        // teardown in tests). The actor's stack-local batch on a
+        // bare abort would drop handles unresolved; calling
+        // `is_shutting_down` and `notify_waiters` here gives it a
+        // chance to exit cleanly first, even though we cannot await
+        // its completion from a sync Drop.
+        self.inner.is_shutting_down.store(true, Ordering::Release);
+        self.inner.flush_notify.notify_waiters();
+        if let Some(h) = self.actor_handle.get_mut().take() {
             h.abort();
         }
         // Best-effort warn on leaked buffered events. Holding an Arc
@@ -1560,8 +1647,11 @@ mod tests {
             batch_len, 0,
             "singleton path must not land the event in the batch"
         );
-        let timer_armed = output.flush_handle.lock().await.is_some();
-        assert!(!timer_armed, "singleton path must not arm the flush timer");
+        let actor_spawned = output.actor_handle.lock().await.is_some();
+        assert!(
+            !actor_spawned,
+            "singleton path (batch_size <= 1) must not spawn the flusher actor"
+        );
     }
 
     #[tokio::test]
