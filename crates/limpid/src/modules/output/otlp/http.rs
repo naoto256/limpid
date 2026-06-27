@@ -61,7 +61,7 @@ use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
-use crate::modules::output::http_util::{ERROR_BODY_BYTE_CAP, error_snippet};
+use crate::modules::output::http_util::{ERROR_BODY_BYTE_CAP, error_snippet, read_body_capped};
 use crate::modules::output::syslog_peers::{PEER_COOLDOWN, iter_peers_block};
 use crate::modules::{HasMetrics, Module, Output};
 use crate::queue::{BackoffStrategy, QueueAckHandle, RetryConfig};
@@ -75,6 +75,17 @@ use super::{BatchLevel, decode_drained_to_request};
 /// flush future open indefinitely and starve the rotation/retry path.
 /// Matches the gRPC side.
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Upper bound on the success-response body that the partial_success
+/// decoder will buffer. `ExportLogsServiceResponse` is normally a few
+/// dozen bytes (just `rejected_log_records` + an optional short
+/// `error_message`); 64 KiB leaves room for a verbose collector
+/// without giving a malicious or misconfigured peer a way to drive
+/// the daemon into out-of-memory by streaming gigabytes back on a
+/// 2xx reply. Bytes beyond the cap are dropped and the response is
+/// treated as fully accepted — the same fallback shape we use when
+/// the body cannot be decoded.
+const SUCCESS_BODY_BYTE_CAP: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HttpProtocol {
@@ -936,7 +947,14 @@ async fn send_once(
     // collectors into ship errors. Same semantics as
     // `otlp_grpc::send_once` so the two transports report identical
     // metrics for identical receiver behaviour.
-    let body_bytes = resp.bytes().await.unwrap_or_default();
+    //
+    // `read_body_capped` instead of `Response::bytes()` so a peer
+    // returning an oversized 2xx body cannot drive the daemon into
+    // out-of-memory. Bytes beyond the cap are dropped; the truncated
+    // buffer either decodes cleanly (typical case — the partial-
+    // success record is tiny) or fails to decode and we fall through
+    // to the "fully accepted" branch below.
+    let body_bytes = read_body_capped(resp, SUCCESS_BODY_BYTE_CAP).await;
     let rejected = if body_bytes.is_empty() {
         0
     } else {
