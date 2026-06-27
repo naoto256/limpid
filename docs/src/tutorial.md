@@ -61,7 +61,7 @@ def pipeline main {
 
 `output` is **non-terminal**: an event passes through `output archive` and continues to `output ama`. There is one more piece of magic in this — but it only becomes visible in Step 3, so we'll come back to it then.
 
-After editing the config, reload the daemon to pick up the change — either `sudo systemctl reload limpid` or `sudo kill -HUP $(pidof limpid)`. The same applies after every step from here on; we won't repeat the instruction. If the new config fails to parse or start, limpid keeps the previous configuration running and reports the diagnostic — there is no half-loaded state to recover from.
+After editing the config, reload the daemon to pick up the change — either `sudo systemctl reload limpid` or `sudo kill -HUP $(pidof limpid)`. The same applies after every step from here on; we won't repeat the instruction. If the new config fails to parse or start, limpid keeps the existing runtime intact and reports the diagnostic — there is no half-loaded state to recover from. When the new config *does* validate, the old runtime is torn down and the new one rebinds: brief downtime for new connections, while the old runtime drains established connections; persistent disk queues survive the cycle.
 
 ## Step 3 — Parse, then drop the noise
 
@@ -294,7 +294,7 @@ checking /etc/limpid/limpid.conf: 7 file(s), 1 input(s), 2 output(s), 2 process(
 /etc/limpid/limpid.conf: Configuration OK (1 pipeline(s), 2 process(es); dataflow check passed)
 ```
 
-Now reload — `sudo systemctl reload limpid`. The new config takes effect atomically; if it had failed to parse or start at this point, limpid would have rolled back to the previous configuration automatically. There is no half-loaded state to recover from.
+Now reload — `sudo systemctl reload limpid`. limpid validates the new config first; if it had failed to parse or start, the existing runtime would have stayed up untouched. On a successful validate, the old runtime is torn down and the new one rebinds — expect brief downtime for new connections while the old runtime drains established ones. Persistent disk queues survive the cycle; memory queues and in-flight events are best-effort drained. There is no half-loaded state to recover from.
 
 Run `--check` in CI on every config change. Type errors, unknown identifiers, unreachable pipelines, and similar mistakes are all surfaced here with line and column before they ever reach the daemon.
 

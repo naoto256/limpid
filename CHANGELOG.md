@@ -97,7 +97,7 @@ Test coverage additions backfill paths that the 0.7.8 audit pass identified as u
 
 ### Fixed — `output otlp_http` / `output otlp_grpc`: retain drained batch on mid-stream flush failure
 
-When `flush()` returned `Err` mid-stream, both OTLP transports dropped the events they had just drained from the in-memory buffer — the per-Event ResourceLogs bytes were popped to build the request, the request failed, and the bytes were discarded with only a `tracing::warn!`. The retry budget did not apply (the queue layer had already counted the events as delivered when `write()` returned `Ok` into the batch buffer), so the next flush started from a fresh buffer and the drained payload was silently lost. The drained batch is now restored to the in-memory buffer on `Err`; `events_failed` is **not** bumped (the events have not actually been rejected by the peer, only deferred), and the next flush picks them up alongside whatever has accumulated since. Aligns the mid-stream failure shape with the existing shutdown-flush behaviour (PR-P): events stay in the buffer until either a successful flush or shutdown drains them — never dropped silently.
+When `flush()` returned `Err` mid-stream, both OTLP transports dropped the events they had just drained from the in-memory buffer — the per-Event ResourceLogs bytes were popped to build the request, the request failed, and the bytes were discarded with only a `tracing::warn!`. The retry budget did not apply (the queue layer had already counted the events as delivered when `write()` returned `Ok` into the batch buffer), so the next flush started from a fresh buffer and the drained payload was silently lost. The drained batch is now restored to the in-memory buffer on `Err`; `events_failed` is **not** bumped (the events have not actually been rejected by the peer, only deferred), and the next flush picks them up alongside whatever has accumulated since. Aligns the mid-stream failure shape with the existing shutdown-flush behaviour: events stay in the buffer until either a successful flush or shutdown drains them — never dropped silently.
 
 
 ### Fixed — `output syslog_tcp` / `output syslog_udp`: peer cooldown anchored on failure-completion time
@@ -2231,7 +2231,7 @@ all three OTLP wire formats supported:
   Each LogRecord becomes one Event with `ingress` set to a singleton
   ResourceLogs (1 Resource + 1 Scope + 1 LogRecord), preserving full
   upstream context per Principle 2.
-- **Output**: [`otlp`](docs/src/outputs/otlp.md) with
+- **Output**: [`otlp`](docs/src/otlp.md) with
   `protocol "http_json" | "http_protobuf" | "grpc"`, `batch_size`,
   `batch_timeout`, `headers {}`, and TLS via system roots / custom CA.
 - **Primitives** (in the new `otlp.*` namespace):

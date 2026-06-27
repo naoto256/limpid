@@ -71,7 +71,7 @@ A log forwarder runs unattended on production paths, and any mistake compounds q
 
 - **Replay later for investigation.** Captured events can be re-run through any configuration — yesterday's production traffic against today's pipeline change — without involving the production source. CI exercises the same path with a single sample event.
 
-- **Undo after deployment.** Configuration reload is atomic: a new configuration that fails to parse, type-check, or start is rolled back; the previous configuration keeps running while the operator sees a diagnostic. The daemon never enters a half-loaded state.
+- **Undo after deployment.** Configuration reload is validate-first: a new configuration that fails to parse, type-check, or start is refused, and the existing runtime keeps serving while the operator sees a diagnostic. A *valid* reload tears down the old runtime and rebinds — brief downtime for new connections while the old runtime drains established connections; persistent disk queues survive the cycle (memory queues and in-flight events are best-effort drained). The daemon never enters a half-loaded state.
 
 - **Fail soft, surface clearly.** Output queues retry with backoff and optionally persist to disk so a crash does not lose events in flight. `control { error_log }` is the terminal recovery sink: retry-exhausted payloads and shutdown-flush failures land in it as JSONL rather than disappearing. `--check --strict-warnings` enforces that recovery-dependent configs declare an `error_log`. Shutdown reports the count of events still buffered rather than letting them disappear silently.
 

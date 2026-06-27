@@ -123,8 +123,9 @@ cargo deb -p limpid
 # Install over existing
 sudo dpkg -i target/debian/limpid_*.deb
 
-# Reload (no downtime)
+# Reload (brief downtime for new connections; established
+# connections drain via the old runtime, disk queues persist)
 sudo systemctl reload limpid
 ```
 
-`systemctl reload` sends SIGHUP, which triggers a hot reload with automatic rollback on failure. Existing queue data and in-flight events are preserved.
+`systemctl reload` sends SIGHUP. limpid validates the new config first and keeps the existing runtime untouched on failure. On a successful validate, the old runtime is shut down and the new one rebinds — expect brief downtime for new connections while the old runtime drains established TCP/HTTP/gRPC connections. Persistent disk queue data survives the cycle; memory queues and in-flight events are best-effort drained.

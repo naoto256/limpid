@@ -9,13 +9,14 @@ a vendor adds a field (the snippet is plain DSL: edit the file and
 SIGHUP).
 
 > **Status:** the snippet library was introduced in v0.7.0 and has
-> expanded across the 0.7.x line. It currently ships 31 parser files
+> expanded across the 0.7.x line. It currently ships 26 parser files
 > (vendor parsers — FortiGate / ASA / Checkpoint / Palo Alto / Sysmon /
-> CloudTrail / Okta / Azure Activity / K8s audit / AWS GuardDuty /
-> VPC Flow / … — plus the transport parsers `parse_syslog` and
-> `parse_journald`), the OCSF 1.3.0 27-class composer, the RFC 5424
-> and replay-shape composers, one filter, and several reusable
-> functions. Coverage continues to grow on the 0.7.x cadence.
+> CloudTrail / Zeek / Suricata / OCSF / Juniper SRX / ... — plus the
+> transport parsers `parse_syslog` and `parse_journald`), the OCSF
+> 1.3.0 27-class composer, the RFC 5424 and replay-shape composers,
+> one filter, and several reusable functions. See the table below
+> for the full current inventory; coverage continues to grow on the
+> 0.7.x cadence.
 
 ## Snippet library
 

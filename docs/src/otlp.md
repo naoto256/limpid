@@ -431,12 +431,20 @@ spec does not say.
 
 **What limpid does today.** In 0.7.8 the rejected subset is split out
 into `events_failed` (separate from `events_written`) so the loss is
-visible on dashboards, and the `control { error_log }` path landed in
-the same cycle as the dead-letter route for retry-exhausted /
-shutdown-flush payloads. Selective re-send of *only* the rejected
-records on a `partial_success` reply remains future work (tracked in
-`send_once` doc comments) — today the rejected count drives metrics
-only, not retry shape.
+visible on dashboards, **and the trailing N events (N =
+`rejected_log_records`) are routed to `control { error_log }` as
+Output-flavor DLQ records** (`reason = "collector reported
+partial_success rejection"`) for inspection and operator-driven
+replay — sharing the same dead-letter sink as retry-exhausted /
+shutdown-flush payloads. Attribution is approximate (the OTLP
+response gives a count, not identities — limpid splits along the
+trailing N entries; see the per-output notes in
+[`otlp_grpc`](./outputs/otlp_grpc.md) /
+[`otlp_http`](./outputs/otlp_http.md) for the caveat). Selective
+*automatic* re-send of only the rejected records on a
+`partial_success` reply remains future work (tracked in `send_once`
+doc comments) — today the rejected count drives metrics and DLQ
+routing, not in-pipeline retry shape.
 
 ### 5.7 Body format is the snippet's call
 

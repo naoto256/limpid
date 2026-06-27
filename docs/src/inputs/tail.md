@@ -1,6 +1,6 @@
 # tail
 
-Follows a log file, emitting each new line as an event. Detects log rotation and optionally persists the read position across restarts.
+Follows a log file, emitting each new line as an event. Detects log rotation and optionally persists the **acked offset** across restarts — see the `state_file` property below for the at-least-once semantics that follow from this.
 
 ## Configuration
 
@@ -18,7 +18,7 @@ def input app_log {
 | Property | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `path` | yes | — | Path to the file to follow |
-| `state_file` | no | none | Path to persist read position (survives restarts) |
+| `state_file` | no | none | Path to persist the **acked file offset** (the highest offset whose downstream pipeline ack has fired). The read cursor may run ahead of the acked offset for in-flight events; on restart, anything between the acked offset and the prior read cursor is re-read, so delivery is **at-least-once**. |
 | `poll_interval` | no | `1s` | How often to check for new data |
 
 ## Rotation detection
