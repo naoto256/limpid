@@ -469,8 +469,9 @@ impl Module for OtlpHttpOutput {
 }
 
 /// Long-lived flusher actor — same lifecycle pattern as the http
-/// output. Never `abort()`-ed. See `crate::modules::output::http`
-/// for the rationale.
+/// output. `shutdown()` never aborts it; `Drop` is a last-resort
+/// signal-then-abort fallback (sync Drop cannot `.await`). See
+/// `crate::modules::output::http` for the full rationale.
 async fn flusher_actor_loop(inner: Arc<Inner>) {
     loop {
         if inner.is_shutting_down.load(Ordering::Acquire) {
@@ -1759,11 +1760,12 @@ mod tests {
 
     #[tokio::test]
     async fn consume_event_buffers_below_batch_size() {
-        // `consume` always buffers under `batch_size > 1`, arming the
-        // deferred-flush timer. (Before this change the Owned-event
-        // path bypassed the buffer; now there is no separate
-        // Owned-event path — every event lands in the buffer for OTLP
-        // batching.)
+        // `consume` always buffers under `batch_size > 1`; the
+        // long-lived flusher actor will drain on `batch_timeout`
+        // or on a threshold `flush_notify`. (Before this refactor
+        // a per-flush spawned timer task was armed here instead;
+        // it was the abort surface the audit caught. The actor is
+        // already spawned at construction.)
         let mut props = one_peer_props("http://127.0.0.1:1");
         props.push(prop_int("batch_size", 1024));
         props.push(prop_str("batch_timeout", "30s"));
@@ -1781,7 +1783,7 @@ mod tests {
         let actor_spawned = output.actor_handle.lock().await.is_some();
         assert!(
             actor_spawned,
-            "flusher actor must be spawned and driving the timer"
+            "the long-lived flusher actor must be available to drain on batch_timeout or notify"
         );
     }
 

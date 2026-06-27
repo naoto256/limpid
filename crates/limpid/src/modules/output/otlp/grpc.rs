@@ -1423,10 +1423,12 @@ mod tests {
 
     #[tokio::test]
     async fn consume_event_buffers_below_batch_size() {
-        // `consume` always buffers under `batch_size > 1`, arming the
-        // deferred-flush timer. (Before this change the Owned-event
-        // path bypassed the buffer; now there is no separate path —
-        // every event lands in the buffer for batching.)
+        // `consume` always buffers under `batch_size > 1`; the
+        // long-lived flusher actor drains on `batch_timeout` or on
+        // a threshold `flush_notify`. (Before this refactor a
+        // per-flush spawned timer task was armed here — the abort
+        // surface the audit caught. The actor is already spawned
+        // at construction.)
         let mut props = one_peer_props("http://127.0.0.1:1");
         props.push(prop_int("batch_size", 1024));
         props.push(prop_str("batch_timeout", "30s"));
@@ -1441,8 +1443,11 @@ mod tests {
             .expect("buffering a single event must succeed");
         let batch_len = output.inner.batch.lock().await.len();
         assert_eq!(batch_len, 1, "event must sit in the buffer");
-        let timer_armed = output.actor_handle.lock().await.is_some();
-        assert!(timer_armed, "consume must arm the flush timer");
+        let actor_spawned = output.actor_handle.lock().await.is_some();
+        assert!(
+            actor_spawned,
+            "the long-lived flusher actor must be available to drain on batch_timeout or notify"
+        );
     }
 
     #[tokio::test]

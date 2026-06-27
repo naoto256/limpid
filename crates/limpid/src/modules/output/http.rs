@@ -583,11 +583,11 @@ impl Output for HttpOutput {
     /// Drain-time per-event entry: park the `(event, ack)` pair in the
     /// buffer that the post-loop `shutdown()` call will drain bounded.
     /// Deliberately does NOT trigger a flush from here — that would
-    /// re-enter the steady-state retry path (`consume_singleton` /
-    /// `flush_events` exponential backoff) which the shutdown contract
-    /// forbids. The buffer holds the handle until `shutdown()` resolves
-    /// it via `flush_events_at_shutdown`'s bounded single attempt + DLQ
-    /// route.
+    /// re-enter the steady-state retry path (the old inline-singleton /
+    /// `flush_events` exponential backoff loops) which the shutdown
+    /// contract forbids. The buffer holds the handle until `shutdown()`
+    /// resolves it via `flush_events_at_shutdown`'s bounded single
+    /// attempt + DLQ route.
     async fn consume_shutdown(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
         let mut buf = self.inner.batch.lock().await;
         buf.push((event.clone(), ack));
@@ -2339,13 +2339,13 @@ mod tests {
 
     /// `Output::consume_shutdown` on a batched http output MUST park
     /// the (event, ack) into the buffer without touching the
-    /// steady-state retry / consume_singleton path. The follow-up
-    /// `shutdown()` is the only place handles resolve.
+    /// steady-state retry path. The follow-up `shutdown()` is the
+    /// only place handles resolve.
     #[tokio::test]
     async fn consume_shutdown_buffers_for_batched_http() {
         // Unreachable peer: the goal is to verify *no* network call
-        // happens on `consume_shutdown` itself; if it accidentally
-        // routed to `consume_singleton`, the retry sleep would burn
+        // happens on `consume_shutdown` itself; any accidental
+        // routing to the steady-state send + retry loop would burn
         // attempts here.
         let dir = tempfile::TempDir::new().unwrap();
         let writer = Arc::new(crate::error_log::ErrorLogWriter::new(
