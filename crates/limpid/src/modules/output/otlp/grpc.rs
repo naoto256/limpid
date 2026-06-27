@@ -46,7 +46,7 @@
 //! not the cooldown, protects the single-peer-just-failed case.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -54,7 +54,7 @@ use bytes::Bytes;
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, logs_service_client::LogsServiceClient,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 use crate::dsl::ast::Property;
@@ -123,12 +123,23 @@ struct Inner {
     /// shutdown-flush leftovers into the DLQ.
     error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
     metrics: Arc<OutputMetrics>,
+    /// Threshold-driven flush trigger; the flusher actor's `select!`
+    /// wakes on this notify when `consume()` crosses `batch_size`.
+    flush_notify: Notify,
+    /// Cooperative shutdown flag. See `super::http` for details.
+    is_shutting_down: AtomicBool,
 }
 
 pub struct OtlpGrpcOutput {
     inner: Arc<Inner>,
     batch_size: usize,
-    flush_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Long-lived flusher actor handle. Replaces the prior per-flush
+    /// spawned timer task that held the stack-local batch across
+    /// `flush_events.await` and was `abort()`-ed by `shutdown()`,
+    /// dropping every parked `QueueAckHandle` unresolved (audit
+    /// 2026-06-27). Never `abort()`-ed; joined cooperatively by
+    /// `shutdown()` via `is_shutting_down` + `notify_waiters`.
+    actor_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     metrics: Arc<OutputMetrics>,
 }
 
@@ -319,24 +330,66 @@ impl Module for OtlpGrpcOutput {
         let retry_config = RetryConfig::from_output_properties(properties)?;
 
         let metrics = Arc::new(OutputMetrics::default());
+        let inner = Arc::new(Inner {
+            peers,
+            peer_state,
+            cursor: AtomicUsize::new(0),
+            batch_level,
+            headers,
+            batch_timeout,
+            retry_config,
+            batch: Mutex::new(Vec::new()),
+            name: name.to_string(),
+            error_log,
+            metrics: Arc::clone(&metrics),
+            flush_notify: Notify::new(),
+            is_shutting_down: AtomicBool::new(false),
+        });
+
+        // Skip the spawn when called outside a Tokio runtime (= tests
+        // that exercise `from_properties` parsing only).
+        let actor_handle = if tokio::runtime::Handle::try_current().is_ok() {
+            let actor_inner = Arc::clone(&inner);
+            Some(tokio::spawn(async move {
+                flusher_actor_loop(actor_inner).await;
+            }))
+        } else {
+            None
+        };
+
         Ok(Self {
-            inner: Arc::new(Inner {
-                peers,
-                peer_state,
-                cursor: AtomicUsize::new(0),
-                batch_level,
-                headers,
-                batch_timeout,
-                retry_config,
-                batch: Mutex::new(Vec::new()),
-                name: name.to_string(),
-                error_log,
-                metrics: Arc::clone(&metrics),
-            }),
+            inner,
             batch_size,
-            flush_handle: Mutex::new(None),
+            actor_handle: Mutex::new(actor_handle),
             metrics,
         })
+    }
+}
+
+/// Long-lived flusher actor; same pattern as the http output. See
+/// `crate::modules::output::http` for rationale.
+async fn flusher_actor_loop(inner: Arc<Inner>) {
+    loop {
+        if inner.is_shutting_down.load(Ordering::Acquire) {
+            break;
+        }
+        let sleep_fut = tokio::time::sleep(inner.batch_timeout);
+        tokio::pin!(sleep_fut);
+        tokio::select! {
+            biased;
+            _ = inner.flush_notify.notified() => {}
+            _ = &mut sleep_fut => {}
+        }
+        if inner.is_shutting_down.load(Ordering::Acquire) {
+            break;
+        }
+        let batch = {
+            let mut buf = inner.batch.lock().await;
+            std::mem::take(&mut *buf)
+        };
+        if !batch.is_empty() {
+            inner.flush_events(batch).await;
+        }
     }
 }
 
@@ -350,15 +403,21 @@ impl HasMetrics for OtlpGrpcOutput {
 #[async_trait::async_trait]
 impl Output for OtlpGrpcOutput {
     async fn consume(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
-        let mut batch = self.inner.batch.lock().await;
-        batch.push((event.clone(), ack));
-        let should_flush = batch.len() >= self.batch_size;
-        drop(batch);
+        let should_flush = {
+            let mut batch = self.inner.batch.lock().await;
+            batch.push((event.clone(), ack));
+            batch.len() >= self.batch_size
+        };
         if should_flush {
-            self.flush().await;
-        } else {
-            self.ensure_flush_timer().await;
+            // Threshold-triggered flush runs on the queue consumer's
+            // own task (not abort-prone); preserves the prior
+            // contract that handles are resolved before `consume`
+            // returns when a full batch is flushed inline.
+            let batch = std::mem::take(&mut *self.inner.batch.lock().await);
+            self.inner.flush_events(batch).await;
         }
+        // Timer-driven flush is owned by the long-lived flusher
+        // actor's `select!`. No spawned per-flush timer task.
         Ok(())
     }
 
@@ -375,48 +434,23 @@ impl Output for OtlpGrpcOutput {
         &self,
         _error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
     ) -> Result<()> {
-        // Order: abort the deferred flush timer, take the buffer in one
-        // shot, then run the shutdown-mode flush which owns the entire
-        // disposition. The queue consumer has stopped pushing by the
-        // time `shutdown` is called, so no re-entrant-push race.
-        if let Some(h) = self.flush_handle.lock().await.take() {
-            h.abort();
+        // Cooperative shutdown: same pattern as http / otlp_http.
+        self.inner.is_shutting_down.store(true, Ordering::Release);
+        self.inner.flush_notify.notify_waiters();
+        let handle_opt = self.actor_handle.lock().await.take();
+        if let Some(h) = handle_opt {
+            let _ = tokio::time::timeout(
+                crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT,
+                h,
+            )
+            .await;
         }
-        let batch = std::mem::take(&mut *self.inner.batch.lock().await);
-        self.inner.flush_events_at_shutdown(batch).await;
+        let leftover = std::mem::take(&mut *self.inner.batch.lock().await);
+        self.inner.flush_events_at_shutdown(leftover).await;
         Ok(())
     }
 }
 
-impl OtlpGrpcOutput {
-    async fn flush(&self) {
-        let batch = {
-            let mut buf = self.inner.batch.lock().await;
-            std::mem::take(&mut *buf)
-        };
-        self.inner.flush_events(batch).await;
-    }
-
-    async fn ensure_flush_timer(&self) {
-        let mut handle = self.flush_handle.lock().await;
-        if let Some(h) = handle.as_ref()
-            && !h.is_finished()
-        {
-            return;
-        }
-
-        let inner = Arc::clone(&self.inner);
-        let new_handle = tokio::spawn(async move {
-            tokio::time::sleep(inner.batch_timeout).await;
-            let batch = {
-                let mut buf = inner.batch.lock().await;
-                std::mem::take(&mut *buf)
-            };
-            inner.flush_events(batch).await;
-        });
-        *handle = Some(new_handle);
-    }
-}
 
 impl Inner {
     /// Drain + ship one batch, resolving each handle to its final
@@ -579,7 +613,11 @@ impl Inner {
 
 impl Drop for OtlpGrpcOutput {
     fn drop(&mut self) {
-        if let Some(h) = self.flush_handle.get_mut().take() {
+        // Signal cooperatively before falling back to abort; see
+        // `http::HttpOutput::drop` for rationale.
+        self.inner.is_shutting_down.store(true, Ordering::Release);
+        self.inner.flush_notify.notify_waiters();
+        if let Some(h) = self.actor_handle.get_mut().take() {
             h.abort();
         }
         if let Ok(buf) = self.inner.batch.try_lock()
@@ -632,6 +670,10 @@ async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<super::SendOut
             }
         };
         if attempt + 1 >= max_attempts {
+            break err;
+        }
+        // Cooperative shutdown cancel — see http.rs.
+        if inner.is_shutting_down.load(Ordering::Acquire) {
             break err;
         }
         attempt += 1;
@@ -1237,8 +1279,8 @@ mod tests {
         consume(&output, &event_with_egress(singleton_bytes(1)))
             .await
             .unwrap();
-        let handle_before = output.flush_handle.lock().await.is_some();
-        assert!(handle_before, "consume_event must arm the flush timer");
+        let handle_before = output.actor_handle.lock().await.is_some();
+        assert!(handle_before, "flusher actor must be spawned");
         drop(output);
     }
 
@@ -1331,7 +1373,7 @@ mod tests {
             .expect("buffering a single event must succeed");
         let batch_len = output.inner.batch.lock().await.len();
         assert_eq!(batch_len, 1, "event must sit in the buffer");
-        let timer_armed = output.flush_handle.lock().await.is_some();
+        let timer_armed = output.actor_handle.lock().await.is_some();
         assert!(timer_armed, "consume must arm the flush timer");
     }
 
