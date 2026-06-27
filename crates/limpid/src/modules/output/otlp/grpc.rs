@@ -1286,13 +1286,14 @@ mod tests {
             // With batch_size=3 the per-event disposition isn't observable
             // via the test shim's freshly-allocated handle channel — the
             // first two events stay buffered (handle held by the output)
-            // and the third triggers an inline flush whose per-event
-            // outcome can be Delivered OR Recovered depending on the
-            // partial-success split order. The metric counts (asserted
-            // below) are the contract under test.
+            // and the third reaches the batch threshold and wakes the
+            // actor; the actor's per-event outcome can be Delivered OR
+            // Recovered depending on the partial-success split order.
+            // The metric counts (asserted below) are the contract under
+            // test.
             let _ = consume(&output, &ev).await;
         }
-        // Give the inline flush a moment.
+        // Give the actor flush a moment.
         for _ in 0..50 {
             if output.metrics.events_written.load(Ordering::Relaxed)
                 + output.metrics.events_failed.load(Ordering::Relaxed)
@@ -1455,10 +1456,11 @@ mod tests {
         // Regression mirror of `output http` / `otlp_http`: when
         // batch_size > 1 `consume()` parks the event + ack handle in
         // the buffer; the queue layer cannot advance its cursor until
-        // the handle resolves at flush time. If the daemon shuts down
-        // before the batch fills, Drop alone aborts the timer and
-        // leaks the buffer. `shutdown()` aborts the timer and runs
-        // one final flush (or DLQ drain).
+        // the handle resolves at flush time. If shutdown happens
+        // before the batch fills or before the actor's batch_timeout
+        // wake, `shutdown()` must signal/join the actor and
+        // final-drain any leftover buffer with one bounded send
+        // attempt (or DLQ drain).
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
