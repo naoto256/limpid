@@ -48,7 +48,7 @@
 //!
 //! # Output flavor: re-deliver the pre-rendered event directly to the
 //! # named output's queue; the sink re-routes via its own `consume()`.
-//! jq -c 'select(.kind == "output") | .event' /var/log/limpid/errored.jsonl \
+//! jq -c 'select(.kind == "output" and .output.name == "<output-name>") | .event' /var/log/limpid/errored.jsonl \
 //!     | limpidctl inject output <output-name> --json
 //! ```
 //!
