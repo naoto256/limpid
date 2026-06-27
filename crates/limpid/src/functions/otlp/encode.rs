@@ -270,6 +270,7 @@ fn u64_field(entries: Entries<'_>, key: &str) -> Option<u64> {
     lookup(entries, key).and_then(|v| match v {
         Value::Int(n) if n >= 0 => Some(n as u64),
         Value::Float(f) if f.is_finite() && f >= 0.0 && f.fract() == 0.0 => Some(f as u64),
+        Value::Timestamp(dt) => dt.timestamp_nanos_opt().and_then(|n| u64::try_from(n).ok()),
         _ => None,
     })
 }
@@ -479,4 +480,38 @@ fn anyvalue_to_hashlit<'bump>(arena: &EventArena<'bump>, av: &AnyValue) -> Value
         }
     }
     b.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{DateTime, TimeZone, Utc};
+
+    #[test]
+    fn u64_field_accepts_timestamp_value() {
+        let dt: DateTime<Utc> = Utc.timestamp_opt(1_700_000_000, 123_456_789).unwrap();
+        let expected = dt.timestamp_nanos_opt().unwrap() as u64;
+        let entries: &[(&str, Value<'_>)] = &[("time_unix_nano", Value::Timestamp(dt))];
+        assert_eq!(u64_field(entries, "time_unix_nano"), Some(expected));
+    }
+
+    #[test]
+    fn u64_field_rejects_pre_epoch_timestamp() {
+        let dt: DateTime<Utc> = Utc.timestamp_opt(-1, 0).unwrap();
+        let entries: &[(&str, Value<'_>)] = &[("time_unix_nano", Value::Timestamp(dt))];
+        assert_eq!(u64_field(entries, "time_unix_nano"), None);
+    }
+
+    #[test]
+    fn log_record_carries_timestamp_nanos_on_wire() {
+        let dt: DateTime<Utc> = Utc.timestamp_opt(1_700_000_000, 123_456_789).unwrap();
+        let expected = dt.timestamp_nanos_opt().unwrap() as u64;
+        let entries: &[(&str, Value<'_>)] = &[
+            ("time_unix_nano", Value::Timestamp(dt)),
+            ("observed_time_unix_nano", Value::Timestamp(dt)),
+        ];
+        let lr = hashlit_to_log_record(&Value::Object(entries)).unwrap();
+        assert_eq!(lr.time_unix_nano, expected);
+        assert_eq!(lr.observed_time_unix_nano, expected);
+    }
 }
