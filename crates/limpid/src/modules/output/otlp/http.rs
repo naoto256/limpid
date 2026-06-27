@@ -842,7 +842,11 @@ async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<super::SendOut
             err,
             wait,
         );
-        tokio::time::sleep(wait).await;
+        // Race the sleep against a shutdown wake — see http.rs.
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = inner.flush_notify.notified() => {}
+        }
         if matches!(cfg.backoff, BackoffStrategy::Exponential) {
             // saturating_mul is the safe doubling: `Duration * 2`
             // panics on overflow (~584 years), and while the practical

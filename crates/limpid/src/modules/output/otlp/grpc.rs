@@ -684,7 +684,11 @@ async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<super::SendOut
             err,
             wait,
         );
-        tokio::time::sleep(wait).await;
+        // Race the sleep against a shutdown wake — see http.rs.
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = inner.flush_notify.notified() => {}
+        }
         if matches!(cfg.backoff, BackoffStrategy::Exponential) {
             wait = wait.saturating_mul(2).min(cfg.max_wait);
         }
