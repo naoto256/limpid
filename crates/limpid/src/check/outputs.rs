@@ -157,8 +157,8 @@ fn analyze_property(
             // `egress`, or `error`. Anything dotted IS a runtime
             // reference and must still be rejected by the
             // pipeline-only-state check.
-            let skip_expr_types = schema_owned
-                && matches!(&expr.kind, ExprKind::Ident(parts) if parts.len() == 1);
+            let skip_expr_types =
+                schema_owned && matches!(&expr.kind, ExprKind::Ident(parts) if parts.len() == 1);
             if !skip_expr_types {
                 expr_types::check_types(
                     expr,
