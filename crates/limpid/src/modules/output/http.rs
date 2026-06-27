@@ -253,12 +253,12 @@ pub struct HttpOutput {
     ///   exit cleanly before the abort lands; in practice the
     ///   runtime calls `shutdown()` before drop in production.
     ///
-    /// The audit (2026-06-27) found that prior versions abort()-ed
-    /// a per-flush *timer* task that held the stack-local batch
-    /// across `flush_events.await` — dropping every parked
-    /// `QueueAckHandle` unresolved. The structural fix moves the
-    /// abort surface to this single actor handle and keeps `abort()`
-    /// off the `shutdown()` path entirely.
+    /// Earlier versions of this output spawned a per-flush *timer*
+    /// task that held the stack-local batch across
+    /// `flush_events.await`; when `shutdown()` abort()-ed that task
+    /// every parked `QueueAckHandle` dropped unresolved. The
+    /// structural fix moves the abort surface to this single actor
+    /// handle and keeps `abort()` off the `shutdown()` path entirely.
     actor_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     metrics: Arc<OutputMetrics>,
 }
@@ -500,10 +500,10 @@ impl Module for HttpOutput {
 /// `.await`. See `HttpOutput::actor_handle` for the full lifecycle
 /// contract.
 ///
-/// The audit (2026-06-27) found that prior versions abort()-ed a
-/// per-flush *timer* task that held a stack-local
-/// `Vec<(Event, QueueAckHandle)>` across `flush_events.await`,
-/// dropping every parked handle unresolved
+/// Earlier versions spawned a per-flush *timer* task that held a
+/// stack-local `Vec<(Event, QueueAckHandle)>` across
+/// `flush_events.await`, and `shutdown()` would abort()-ing it
+/// dropped every parked handle unresolved
 /// (debug `debug_assert!(resolved)` panic, release silent `Dropped`
 /// loss). Consolidating the timer + flush lifecycle into this single
 /// actor and keeping `abort()` off the `shutdown()` path is the
@@ -561,9 +561,10 @@ impl Output for HttpOutput {
         // `batch_timeout`, or on `is_shutting_down`. The queue
         // consumer's task is NEVER held in a `send_batch.await`
         // here — that separation is what makes shutdown observable
-        // independently of the consumer (the prior audit caught
-        // that an inline flush on the consumer's task blocked it
-        // from reaching its own shutdown observation). Works for
+        // independently of the consumer. (An earlier implementation
+        // performed an inline flush on the consumer's task and
+        // blocked the consumer from reaching its own shutdown
+        // observation.) Works for
         // both batched (`batch_size > 1`) and singleton
         // (`batch_size <= 1`) modes — for the latter the actor
         // flushes a one-element batch on each notify.
@@ -713,12 +714,13 @@ impl Inner {
             // Race the transport against the shutdown signal. A
             // stalled peer (= TCP accepted but never responds) holds
             // `send_batch().await` past the runtime shutdown deadline
-            // — the actor task gets aborted with the stack-local
-            // shippable Vec, dropping every parked QueueAckHandle
-            // unresolved (the audited bug). With the race, a
-            // `shutdown()` mid-flight cancels the send future
-            // (reqwest cancels the connection on drop) and falls
-            // through to the DLQ + Recovered path below.
+            // — without the race the actor task gets aborted with
+            // the stack-local shippable Vec, dropping every parked
+            // QueueAckHandle unresolved (the unresolved-handle
+            // regression). With the race, a `shutdown()` mid-flight
+            // cancels the send future (reqwest cancels the connection
+            // on drop) and falls through to the DLQ + Recovered path
+            // below.
             let send_outcome = tokio::select! {
                 biased;
                 res = self.send_batch(&messages) => Some(res),
@@ -1707,7 +1709,7 @@ mod tests {
         // `batch_size <= 1` no longer takes a separate inline path —
         // every event flows through the flusher actor, which keeps
         // the queue consumer's task off the transport `await` (the
-        // 0.7.8 audit blocker). Each consume pushes one event,
+        // shutdown lifecycle regression). Each consume pushes one event,
         // notifies the actor (threshold=1), the actor takes the
         // 1-element batch and ships. The peer is unreachable so the
         // disposition lands as Recovered via the DLQ path.
@@ -2331,9 +2333,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Regression tests for the 2026-06-27 shutdown-lifecycle audit
+    // Regression tests for shutdown lifecycle handle ownership
     // (consume_shutdown trait dispatch + cooperative cancel + actor
-    // model). These pin the new contracts so future refactors don't
+    // model). These pin the contracts so future refactors don't
     // silently re-introduce the leak.
     // -----------------------------------------------------------------
 
@@ -2403,10 +2405,10 @@ mod tests {
     /// `is_shutting_down` is set — burning the full retry budget
     /// outlasts the runtime's 10s shutdown deadline and the abort
     /// drops the stack-local batch with handles unresolved (= the
-    /// audited bug). With `max_attempts=5` + `initial_wait=1s` (long
-    /// enough to span the runtime budget), shutdown must still
-    /// complete inside `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT` and every ack
-    /// must resolve.
+    /// unresolved-handle regression). With `max_attempts=5` +
+    /// `initial_wait=1s` (long enough to span the runtime budget),
+    /// shutdown must still complete inside
+    /// `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT` and every ack must resolve.
     #[tokio::test]
     async fn cooperative_cancel_collapses_retry_during_shutdown() {
         let (addr, _post_count, server) = run_counting_failing_collector().await;
@@ -2714,13 +2716,14 @@ mod tests {
         );
     }
 
-    /// Singleton (`batch_size <= 1`) actor + shutdown race. After
-    /// the audit, batch_size=1 no longer goes through an inline
-    /// retry path on the queue consumer's task — every event flows
-    /// through the actor, so the same bounded-shutdown contract
-    /// applies. consume() pushes one event (threshold reached at
-    /// 1), the actor wakes, enters send_batch, shutdown signals,
-    /// the handle resolves to Recovered via DLQ.
+    /// Singleton (`batch_size <= 1`) actor + shutdown race. In
+    /// the current implementation batch_size=1 no longer takes a
+    /// separate inline retry path on the queue consumer's task —
+    /// every event flows through the actor, so the same bounded-
+    /// shutdown contract applies. consume() pushes one event
+    /// (threshold reached at 1), the actor wakes, enters
+    /// send_batch, shutdown signals, the handle resolves to
+    /// Recovered via DLQ.
     #[tokio::test]
     async fn singleton_actor_send_cancels_on_shutdown_against_stalled_peer() {
         let (addr, server) = run_stalled_listener().await;

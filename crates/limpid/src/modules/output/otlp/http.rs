@@ -178,8 +178,8 @@ pub struct OtlpHttpOutput {
     /// Long-lived flusher actor handle. Replaces the prior
     /// per-flush timer task that held the stack-local batch across
     /// `flush_events.await` and was `abort()`-ed by `shutdown()` —
-    /// dropping every parked `QueueAckHandle` unresolved (audit
-    /// 2026-06-27). `shutdown()` joins this actor cooperatively
+    /// dropping every parked `QueueAckHandle` unresolved.
+    /// `shutdown()` joins this actor cooperatively
     /// via `is_shutting_down` + `notify_waiters` and NEVER aborts
     /// it; `Drop` is a last-resort fallback that signals then
     /// aborts (sync Drop cannot `.await`). See
@@ -1763,10 +1763,10 @@ mod tests {
     async fn consume_event_buffers_below_batch_size() {
         // `consume` always buffers under `batch_size > 1`; the
         // long-lived flusher actor will drain on `batch_timeout`
-        // or on a threshold `flush_notify`. (Before this refactor
-        // a per-flush spawned timer task was armed here instead;
-        // it was the abort surface the audit caught. The actor is
-        // already spawned at construction.)
+        // or on a threshold `flush_notify`. (An earlier version
+        // armed a per-flush spawned timer task here instead; that
+        // was the old abort surface. The actor is already spawned
+        // at construction.)
         let mut props = one_peer_props("http://127.0.0.1:1");
         props.push(prop_int("batch_size", 1024));
         props.push(prop_str("batch_timeout", "30s"));
