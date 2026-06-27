@@ -18,7 +18,7 @@ sudo limpidctl tap process enrich_fortigate
 sudo limpidctl list
 ```
 
-By default, tap emits each event's `egress` bytes as a line of text. Add `--json` to emit the full Event (received_at, source, ingress, egress, workspace) as one JSON object per line:
+By default, tap emits each event's `egress` bytes as a line of text. Add `--json` to emit the full Event as one JSON object per line. Top-level keys are `received_at`, `source`, `ingress`, and `egress`; `workspace` is included only when non-empty, so jq expressions should defensively use `.workspace // {}` if a pipeline may emit events without workspace fields:
 
 ```bash
 # Full Event JSON, one per line — pipe to jq for inspection

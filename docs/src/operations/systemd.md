@@ -80,7 +80,8 @@ sudo systemctl stop limpid
 # Restart (brief downtime)
 sudo systemctl restart limpid
 
-# Reload configuration (no downtime for existing connections)
+# Reload configuration (brief downtime for new connections;
+# existing connections drain via the old runtime, disk queues persist)
 sudo systemctl reload limpid
 
 # Status

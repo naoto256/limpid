@@ -60,12 +60,23 @@ Events are persisted to a Write-Ahead Log (WAL) on disk. Survives process restar
 The daemon-wide [`control { error_log "..." }`](../operations/error-log.md) block names a JSONL file that catches payloads the queue/retry chain could not place. Three sink-side paths feed it as Output-flavor records (`kind: "output"`):
 
 - the output's `retry { ... }` budget was exhausted,
-- a batched output (`http`, `otlp_http`, `otlp_grpc`) failed to flush its remaining buffer at shutdown (one record per still-parked event),
+- a batched output (`http`, `otlp_http`, `otlp_grpc`) failed to flush its remaining buffer during **graceful shutdown** (one record per still-parked event; see the shutdown / SIGKILL caveat below),
 - the runtime could not hand an event to the output's queue at the pipeline → output boundary (queue closed, disk-queue write error, unknown output).
 
-Each line is one per-event record carrying `event.egress` (= the pre-rendered bytes the sink had built). Replay via `limpidctl inject output <name> --json` hands the event back to the sink's `consume()` path — no pipeline re-run, no re-render. See [Error Log → Output flavor](../operations/error-log.md#output-flavor) for the full record shape and producer-site catalog.
+Each line is one per-event record carrying `event.egress` — the **pipeline-produced payload** at the moment it was handed to the sink (`egress` starts as a clone of `ingress` and is overwritten as the pipeline's process bodies run). Replay via `limpidctl inject output <name> --json` re-injects the event into the named sink's `consume()` path — the pipeline is **bypassed**, but the sink's own transport-level rendering (batched encode, HTTP body framing, OTLP `ResourceLogs` packing, etc.) **does** re-run. See [Error Log → Output flavor](../operations/error-log.md#output-flavor) for the full record shape and producer-site catalog.
 
 When `error_log` is unset, Output-flavor records fall back to a name-only `tracing::warn!` / `error!` line that does **not** serialize the event payload — the data is effectively dropped. `limpid --check` emits a recovery-readiness warning so the operator notices the silent drop path before the first failure.
+
+> **Graceful shutdown vs. SIGKILL.** The shutdown-drain path above
+> only fires on **graceful** shutdown — `SIGTERM`, `SIGHUP` reload,
+> `systemctl stop`, or an explicit `shutdown()` call. The bounded
+> final drain runs one attempt per parked payload with a 3-second
+> `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT` (plus the per-actor in-flight
+> cancel); drain failures land in the error log as Output-flavor
+> `Recovered` records. **`SIGKILL` (`kill -9`) cannot run this
+> path** — actor tasks are aborted and their stack-local buffers go
+> with them. Operators should not send `SIGKILL` directly to the
+> daemon; keep systemd's `KillSignal=SIGTERM` default in place.
 
 ## Usage in pipelines
 

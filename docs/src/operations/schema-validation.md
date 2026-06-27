@@ -74,7 +74,7 @@ When a new downstream appears with a schema nobody has seen before, the integrat
 
 ## Recipes
 
-All recipes assume `limpidctl tap output <name> --json` is producing the pipeline's final serialized output — the same Event JSON described in [Debug Tap](./tap.md). Each event is one line, with `received_at`, `source`, `ingress`, `egress`, and `workspace` top-level keys; structured output fields live under `workspace`.
+All recipes assume `limpidctl tap output <name> --json` is producing the pipeline's final serialized output — the same Event JSON described in [Debug Tap](./tap.md). Each event is one line, with `received_at`, `source`, `ingress`, and `egress` top-level keys; `workspace` is included only when the pipeline populated it (use `.workspace // {}` in jq when in doubt). Structured output fields, when present, live under `workspace`.
 
 ### OCSF (JSON Schema)
 
@@ -166,7 +166,7 @@ Restart=always
 
 A few operational notes:
 
-- **Back-pressure.** `tap` is lossless toward the subscriber: if the validator lags, pipe-buffer back-pressure will propagate into the tap reader task. For high-volume outputs, sample before validating: `jq -c 'select((now * 1000 | floor) % 100 == 0)'` or similar. Validation is a statistical check, not an audit — sampling is fine.
+- **Back-pressure.** `tap` is **best-effort**, not lossless: the broadcast channel drops lagged subscribers and emits a warning line in the tap stream rather than blocking the pipeline. A slow validator will see a truncated stream. Sample before validating on high-volume outputs (`jq -c 'select((now * 1000 | floor) % 100 == 0)'` or similar), and do not rely on `tap` for full delivery — validation here is a statistical signal, not a delivery contract.
 - **Failure routing.** A validator's exit code only reports the first bad document unless you use a batch-tolerant mode (`ajv validate --all-errors -`). For monitoring, emit a counter per rejection rather than terminating the stream.
 - **Zero cost when nothing subscribes.** Tap points cost one atomic load per event when no subscriber is attached (see [Debug Tap](./tap.md)). Turning validation off is as cheap as stopping the service.
 

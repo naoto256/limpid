@@ -201,12 +201,14 @@ workspace.otlp = {
     scope_logs: [{
         scope: { name: "limpid", version: version() },
         log_records: [{
-            time_unix_nano: workspace.event_time_ns,  // populated upstream; coalesce with received_at in real composers — see [otlp.md §4.3](../otlp.md#43-whether-the-originating-timestamp-is-in-time_unix_nano-or-observed_time_unix_nano)
+            time_unix_nano: coalesce(workspace.event_time_ns, received_at),  // defensive: fall back to ingest time if upstream did not populate event_time_ns — see [otlp.md §4.3](../otlp.md#43-whether-the-originating-timestamp-is-in-time_unix_nano-or-observed_time_unix_nano)
             severity_number: 9,                   // 9=INFO, 13=WARN, 17=ERROR, 21=FATAL
             severity_text: "INFO",
             body: { string_value: workspace.message },
             attributes: [
-                { key: "source.address", value: { string_value: source } }
+                // `source` is an Object { ip, port }; AnyValue.string_value
+                // is string-only, so interpolate the components into a string.
+                { key: "source.address", value: { string_value: "${source.ip}:${source.port}" } }
             ]
         }]
     }]
@@ -241,7 +243,14 @@ def process redact_pii {
 ### otlp.encode_resourcelog_json(hashlit) → String
 
 Encode as canonical OTLP/JSON (camelCase, u64-as-string, bytes-as-hex).
-For the [`otlp_http` output](../outputs/otlp_http.md) / [`otlp_grpc` output](../outputs/otlp_grpc.md) `http_json` protocol.
+For **standalone OTLP/JSON serialisation** — e.g. shipping OTLP/JSON
+manually through `output http` to a non-OTLP-aware HTTP receiver.
+
+> The `otlp_http` output's `http_json` protocol does **not** consume
+> this encoding directly: it re-encodes from protobuf to JSON inside
+> the output. Pipelines targeting `otlp_http` (regardless of
+> `http_json` / `http_protobuf` choice) should keep using
+> `otlp.encode_resourcelog_protobuf` for the egress bytes.
 
 ### otlp.decode_resourcelog_json(s) → Object
 

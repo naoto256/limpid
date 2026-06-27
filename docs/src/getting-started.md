@@ -56,7 +56,6 @@ sudo mkdir -p /etc/limpid/{inputs,outputs,processes,pipelines}
 ```
 include "inputs/*.limpid"
 include "outputs/*.limpid"
-include "processes/*.limpid"
 include "pipelines/*.limpid"
 
 control {
@@ -64,6 +63,12 @@ control {
     error_log "/var/log/limpid/error_log.jsonl"
 }
 ```
+
+> Glob `include` directives require at least one matching file — limpid
+> rejects a zero-match glob at load time to catch typos. Add
+> `include "processes/*.limpid"` *after* you create your first process
+> snippet under `processes/`. The same applies to any other empty
+> directory.
 
 `error_log` is the daemon-wide recovery sink: payloads that retry-exhaust or fail the shutdown flush are persisted there as JSONL instead of being silently dropped. Recommended whenever a pipeline uses retry or batched outputs; `limpid --check --strict-warnings` will warn if a recovery-dependent config omits it. See [Error Log (DLQ)](./operations/error-log.md) for the format and rotation guidance.
 
@@ -95,7 +100,7 @@ def pipeline main {
 
 ```bash
 limpid --check --config /etc/limpid/limpid.conf
-# checking /etc/limpid/limpid.conf: 4 file(s), 1 input(s), 1 output(s), 0 process(es), 1 pipeline(s)
+# checking /etc/limpid/limpid.conf: 3 file(s), 1 input(s), 1 output(s), 0 process(es), 1 pipeline(s)
 # /etc/limpid/limpid.conf: Configuration OK (1 pipeline(s), 0 process(es); dataflow check passed)
 ```
 

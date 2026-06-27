@@ -14,7 +14,7 @@ rsyslog configs are cryptic. syslog-ng is verbose. fluentd needs plugins for eve
 - **Non-terminal outputs** — send to multiple destinations without copy-plugin hacks
 - **Fan-out by design** — multiple pipelines can share the same input, each with independent processing
 - **Hot reload** — `SIGHUP` reloads configuration with automatic rollback on failure
-- **Instant shutdown** — graceful SIGTERM handling with configurable timeout
+- **Instant shutdown** — graceful SIGTERM handling with a fixed 10s shutdown deadline
 
 ## Architecture
 

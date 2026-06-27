@@ -94,7 +94,7 @@ A pipeline-side failure (process body raised, pipeline-skeleton eval failed, exp
 
 ### Output flavor
 
-A sink-side failure (retry budget exhausted, batched-output shutdown drain, runtime-side enqueue failure) emits an Output record. Replay hands the pre-rendered payload directly to the named output's queue — the sink re-routes via its own `consume()` path, no pipeline re-run.
+A sink-side failure (retry budget exhausted, batched-output shutdown drain, runtime-side enqueue failure) emits an Output record. The serialised `event.egress` is the **pipeline-produced payload** — the value `egress` held at the moment the sink was handed the event, after any process bodies overwrote the initial `ingress` clone. Replay hands the event back to the named output's `consume()` path: the pipeline is **bypassed**, but the sink's transport-level rendering (batched encode, HTTP body framing, OTLP packing, …) still re-runs.
 
 ```json
 {
@@ -157,7 +157,7 @@ Process flavor (4 sites — replay via `inject input`):
 Output flavor (3 sites — replay via `inject output`):
 
 5. **`<output_name>`** — the output exhausted its `retry { ... }` budget against the destination. A batched output's per-event render failure inside `flush()` is also routed here with `reason = "render failed during batch flush: ..."`. `pipeline` is empty.
-6. **`<output_name> shutdown`** — a batched output (`http`, `otlp_http`, `otlp_grpc`) was shut down with events still buffered and the final flush failed. The `shutdown()` impl walks the remaining `(Event, QueueAckHandle)` buffer entries (one record per parked event) through this writer. `pipeline` is empty. The per-event `source`, `received_at`, `ingress`, and `egress` come from the original `Event` that was parked in the buffer at `consume()` time; nothing is synthesised. (Earlier 0.7.7 drafts of this flavor carried synthetic shutdown-time metadata; the 0.7.8 ack-lifecycle work parks the source `Event` alongside the ack handle so each shutdown-drain record now reflects the real per-event provenance.)
+6. **`<output_name> shutdown`** — a batched output (`http`, `otlp_http`, `otlp_grpc`) was **gracefully shut down** (`SIGTERM`, `SIGHUP` reload, `systemctl stop`, or an explicit `shutdown()` API call) with events still buffered and the bounded final drain failed. The drain runs one flush attempt per payload bounded by `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT` (3 s) plus a per-actor in-flight cancel; transport timeout, in-flight cancel, or retry exhaustion all route here. The `shutdown()` impl walks the remaining `(Event, QueueAckHandle)` buffer entries (one record per parked event) through this writer. `pipeline` is empty. The per-event `source`, `received_at`, `ingress`, and `egress` come from the original `Event` that was parked in the buffer at `consume()` time; nothing is synthesised. (Earlier 0.7.7 drafts of this flavor carried synthetic shutdown-time metadata; the 0.7.8 ack-lifecycle work parks the source `Event` alongside the ack handle so each shutdown-drain record now reflects the real per-event provenance.) **`SIGKILL` (`kill -9`) cannot reach this path** — actor tasks are aborted and the stack-local buffer is lost without an error_log write. Production deployments must not send `SIGKILL` directly to the daemon; keep systemd's `KillSignal=SIGTERM` default.
 7. **`<output_name> enqueue`** — `runtime.rs` could not hand an event to the named output's queue (queue closed, disk-queue write error, unknown output). `pipeline` is the name of the originating pipeline — the only Output-flavor site that keeps it populated. Per-failed-output split: a single pipeline-eval result with N failed-output enqueues produces N records (one per failing output).
 
 The `reason` field distinguishes sites 5 / 6 / 7 within a single output name: retry exhaustion uses `"output write failed after N attempts: ..."`, shutdown drain uses `"shutdown flush failed: ..."`, enqueue failure uses `"output enqueue failed (queue closed, disk write error, or unknown output)"`. A batched output's per-event render failure inside `flush()` uses `"render failed during batch flush: ..."`. The runbook's [root-cause heuristics table](#step-3--root-cause-heuristics-by-site) lists the full patterns.
@@ -309,7 +309,7 @@ A flat curve over the last 5 minutes means the upstream issue resolved itself �
 |---|---|---|---|---|
 | `output` | `<output_name>` | `output write failed after N attempts: …` | backend down, network partition, auth expired, sustained backpressure | downstream health, `events_failed` / `retries` on the output ([Metrics](./metrics.md)) |
 | `output` | `<output_name>` | `render failed during batch flush: …` | render bug, missing workspace key the renderer depended on (rare; deterministic) | the failing process / template, not the output |
-| `output` | `<output_name>` | `shutdown flush failed: …` | daemon `kill -9` or restart while a batched output (`otlp_*`, `http`) still had buffered events | `journalctl -u limpid` around the shutdown window |
+| `output` | `<output_name>` | `shutdown flush failed: …` | **graceful** shutdown (`SIGTERM` / `SIGHUP` / `systemctl stop`) while a batched output (`otlp_*`, `http`) still had buffered events and the bounded 3 s drain attempt did not succeed. Note: `SIGKILL` (`kill -9`) does **not** reach this path — it leaves no DLQ record at all. | `journalctl -u limpid` around the shutdown window |
 | `output` | `<output_name>` | `output enqueue failed (queue closed, disk write error, or unknown output)` | output queue full, output task stopped, disk-backed queue write error, unknown output name in the pipeline body | output `events_received` vs `events_written`, disk space, queue config |
 | `process` | `(pipeline body)` | varies | typo in an `if` condition / `switch` discriminant, undefined workspace key referenced from a `process` arg or an `error <expr>` slot | the `reason` string + the pipeline DSL around the failing expression |
 | `process` | `<process_name>` / `(inline)` / `(pipeline)` | varies | DSL bug, parser blowup on a new input shape, missing-required-field contract violation | the `reason` string + the offending `event.ingress` payload |
@@ -421,7 +421,15 @@ This is useful for confirming the JSONL shape, the `kind` / per-kind name discri
 
 ## When the DLQ write itself fails
 
-`events_errored_unwritable` counts the cases where the daemon raised an error trying to write to the configured `error_log` file (disk full, permissions, NFS hiccup, rotation race). The runtime falls back to `tracing::error!` with the full JSONL record on the standard log channel so the data is still preserved — but this is alarm-level: a non-zero counter means the replay path may be incomplete, and the next failure may not have a corresponding line in the file.
+`events_errored_unwritable` counts the cases where the daemon raised an error trying to write a **runtime-side** DLQ record to the configured `error_log` file (disk full, permissions, NFS hiccup, rotation race). The runtime-side path covers both Process-flavor records (process body raised / explicit `error <expr>`) and the output-enqueue subset of Output-flavor records — both routed through `runtime::write_errored_to_dlq`. The runtime falls back to `tracing::error!` with the full JSONL record on the standard log channel so the data is still preserved — but this is alarm-level: a non-zero counter means the replay path may be incomplete, and the next failure may not have a corresponding line in the file.
+
+> **Scope gap.** Sink-side Output-flavor DLQ write failures (retry
+> exhaustion or shutdown drain routed via `route_event_to_dlq` in
+> `modules/mod.rs`) currently emit a `tracing::warn` but do **not**
+> bump `events_errored_unwritable`. Operators monitoring this counter
+> should also alert on `error_log`-write `warn` lines from outputs to
+> catch sink-side DLQ failures. Closing this gap is queued for a later
+> release.
 
 Investigate immediately:
 
