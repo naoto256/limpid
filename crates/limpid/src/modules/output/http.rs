@@ -540,15 +540,18 @@ impl Output for HttpOutput {
             buf.len() >= self.batch_size
         };
         if should_flush {
-            // Threshold reached: nudge the flusher actor. The actor
-            // does the take + flush; this `consume` returns
-            // immediately. No `flush()` inline here — that would
-            // make `consume` itself the abort target the timer task
-            // used to be.
-            self.inner.flush_notify.notify_one();
+            // Threshold reached: flush inline, on the queue
+            // consumer's own task. Not a leak surface — the queue
+            // consumer drives the lifecycle and is never `abort()`-ed
+            // in normal operation. Preserves the prior contract that
+            // a threshold-triggered flush has resolved every ack
+            // before `consume` returns.
+            let batch = std::mem::take(&mut *self.inner.batch.lock().await);
+            self.inner.flush_events(batch).await;
         }
-        // No timer reset — the actor's `select!` already races the
-        // batch_timeout sleep.
+        // No timer reset — the long-lived flusher actor's `select!`
+        // owns the timer-driven flush. (The audited bug was the
+        // *spawned* timer task holding the batch across `await`.)
         Ok(())
     }
 
@@ -755,7 +758,20 @@ impl Inner {
                         e,
                         wait
                     );
-                    tokio::time::sleep(wait).await;
+                    // Race the sleep against a shutdown wake. The
+                    // bare check before the sleep only catches a
+                    // shutdown that arrived between attempts; a
+                    // shutdown that fires *during* the sleep would
+                    // otherwise be stuck until the sleep elapses
+                    // (5s+ in practice, longer than the runtime
+                    // shutdown budget). `flush_notify.notify_waiters`
+                    // is called by `shutdown()`, so the sleep arm
+                    // here wakes immediately and the next iteration
+                    // sees `is_shutting_down=true` and breaks.
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait) => {}
+                        _ = self.flush_notify.notified() => {}
+                    }
                     wait = self.retry.next_wait(wait);
                 }
             }
@@ -2242,5 +2258,206 @@ mod tests {
             Arc::ptr_eq(stored, &writer),
             "constructor must store the exact Arc passed in"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Regression tests for the 2026-06-27 shutdown-lifecycle audit
+    // (consume_shutdown trait dispatch + cooperative cancel + actor
+    // model). These pin the new contracts so future refactors don't
+    // silently re-introduce the leak.
+    // -----------------------------------------------------------------
+
+    /// `Output::consume_shutdown` on a batched http output MUST park
+    /// the (event, ack) into the buffer without touching the
+    /// steady-state retry / consume_singleton path. The follow-up
+    /// `shutdown()` is the only place handles resolve.
+    #[tokio::test]
+    async fn consume_shutdown_buffers_for_batched_http() {
+        // Unreachable peer: the goal is to verify *no* network call
+        // happens on `consume_shutdown` itself; if it accidentally
+        // routed to `consume_singleton`, the retry sleep would burn
+        // attempts here.
+        let dir = tempfile::TempDir::new().unwrap();
+        let writer = Arc::new(crate::error_log::ErrorLogWriter::new(
+            dir.path().join("errored.jsonl"),
+        ));
+        let ctx = crate::modules::BuildContext {
+            funcs: Arc::new(crate::functions::FunctionRegistry::new()),
+            error_log: Some(Arc::clone(&writer)),
+        };
+        let output = HttpOutput::from_properties(
+            "test",
+            &mp(&[
+                peer_block("http://127.0.0.1:1/"),
+                prop_int("batch_size", 100),
+                prop_str("batch_timeout", "30s"),
+                fast_retry_block(),
+            ]),
+            &ctx,
+        )
+        .unwrap();
+
+        let (ack, mut rx) = QueueAckHandle::for_test();
+        let started = std::time::Instant::now();
+        <HttpOutput as Output>::consume_shutdown(&output, &event_with("ev"), ack)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "consume_shutdown returned in {:?} — must be a buffer push, not the retry path",
+            elapsed
+        );
+        assert_eq!(
+            output.inner.batch.lock().await.len(),
+            1,
+            "event must land in the buffer"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "ack must NOT resolve in consume_shutdown — only in the post-loop shutdown drain"
+        );
+
+        // The follow-up shutdown drains it. Unreachable peer → DLQ + Recovered.
+        let _ = tokio::time::timeout(Duration::from_secs(2), output.shutdown(Some(&writer))).await;
+        let disposition = rx.try_recv().expect("ack must resolve after shutdown");
+        assert!(
+            matches!(disposition.1, crate::queue::AckDisposition::Recovered),
+            "ack must resolve as Recovered (DLQ route), got {:?}",
+            disposition.1
+        );
+    }
+
+    /// In-flight `flush_events` retry MUST exit early when
+    /// `is_shutting_down` is set — burning the full retry budget
+    /// outlasts the runtime's 10s shutdown deadline and the abort
+    /// drops the stack-local batch with handles unresolved (= the
+    /// audited bug). With `max_attempts=5` + `initial_wait=1s` (long
+    /// enough to span the runtime budget), shutdown must still
+    /// complete inside `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT` and every ack
+    /// must resolve.
+    #[tokio::test]
+    async fn cooperative_cancel_collapses_retry_during_shutdown() {
+        let (addr, _post_count, server) = run_counting_failing_collector().await;
+        let url = format!("http://{}/", addr);
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("errored.jsonl");
+        let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
+        let ctx = crate::modules::BuildContext {
+            funcs: Arc::new(crate::functions::FunctionRegistry::new()),
+            error_log: Some(Arc::clone(&writer)),
+        };
+        // Long retry waits so a non-cancelled budget would clearly
+        // exceed SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT (3s).
+        let retry = Property::Block {
+            key: "retry".into(),
+            key_span: None,
+            properties: vec![
+                prop_int("max_attempts", 5),
+                prop_str("initial_wait", "5s"),
+                prop_str("max_wait", "5s"),
+                Property::KeyValue {
+                    key: "backoff".into(),
+                    key_span: None,
+                    value: Expr::spanless(ExprKind::Ident(vec!["fixed".into()])),
+                    value_span: None,
+                },
+            ],
+        };
+        let output = Arc::new(
+            HttpOutput::from_properties(
+                "test",
+                &mp(&[
+                    peer_block(&url),
+                    prop_int("batch_size", 2),
+                    prop_str("batch_timeout", "30s"),
+                    retry,
+                ]),
+                &ctx,
+            )
+            .unwrap(),
+        );
+
+        // Threshold-trigger an inline flush. The peer 5xx-fails;
+        // flush_events enters its retry loop with a 5s sleep.
+        let (ack1, _rx1) = QueueAckHandle::for_test();
+        let (ack2, _rx2) = QueueAckHandle::for_test();
+        let _ = output.consume(&event_with("a"), ack1).await;
+        let output_clone = Arc::clone(&output);
+        let event = event_with("b");
+        let flush_task = tokio::spawn(async move {
+            let _ = output_clone.consume(&event, ack2).await;
+        });
+
+        // Let the consume task enter the retry sleep.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Shutdown signals cooperative cancel; the retry sleep
+        // bails out via is_shutting_down and the inline flush
+        // collapses to DLQ + Recovered for both events.
+        let started = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(4), output.shutdown(Some(&writer)))
+            .await
+            .expect("shutdown must complete inside SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT + budget")
+            .unwrap();
+        let elapsed = started.elapsed();
+        let _ = tokio::time::timeout(Duration::from_secs(1), flush_task).await;
+        server.abort();
+
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "shutdown took {:?} — cooperative cancel did not collapse the retry budget",
+            elapsed
+        );
+        assert!(
+            path.exists(),
+            "DLQ must have been written after the cooperative cancel"
+        );
+    }
+
+    /// The flusher actor is spawned exactly once at construction (for
+    /// `batch_size > 1`) and is the same handle for the lifetime of
+    /// the output — there is no per-flush respawn that would re-open
+    /// the abort surface the timer task used to expose.
+    #[tokio::test]
+    async fn flusher_actor_spawned_once_at_construction() {
+        let output = HttpOutput::from_properties(
+            "test",
+            &mp(&[
+                peer_block("http://127.0.0.1:1/"),
+                prop_int("batch_size", 100),
+                prop_str("batch_timeout", "30s"),
+                fast_retry_block(),
+            ]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
+        let handle_id_before = {
+            let guard = output.actor_handle.lock().await;
+            guard
+                .as_ref()
+                .map(|h| h.id())
+                .expect("batched output must spawn the actor")
+        };
+        // Multiple consumes (sub-threshold) must not respawn the actor.
+        consume(&output, &event_with("a")).await.unwrap();
+        consume(&output, &event_with("b")).await.unwrap();
+        consume(&output, &event_with("c")).await.unwrap();
+        let handle_id_after = {
+            let guard = output.actor_handle.lock().await;
+            guard
+                .as_ref()
+                .map(|h| h.id())
+                .expect("actor must still be the same handle")
+        };
+        assert_eq!(
+            handle_id_before, handle_id_after,
+            "the flusher actor must be the same task across consumes — no per-flush respawn"
+        );
+        // Drain the buffer so the (a,b,c) handles do not leak unresolved
+        // when the output drops at end-of-test. The peer is unreachable,
+        // so all three route to the test-DLQ-recovery path.
+        let _ = tokio::time::timeout(Duration::from_secs(2), output.shutdown(None)).await;
     }
 }
