@@ -895,11 +895,7 @@ mod consumer_lifecycle_tests {
             }
         }
 
-        async fn consume_shutdown(
-            &self,
-            event: &Event,
-            ack: QueueAckHandle,
-        ) -> anyhow::Result<()> {
+        async fn consume_shutdown(&self, event: &Event, ack: QueueAckHandle) -> anyhow::Result<()> {
             self.consume(event, ack).await
         }
     }

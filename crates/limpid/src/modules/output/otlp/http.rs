@@ -538,11 +538,7 @@ impl Output for OtlpHttpOutput {
         self.inner.flush_notify.notify_waiters();
         let handle_opt = self.actor_handle.lock().await.take();
         if let Some(h) = handle_opt {
-            let _ = tokio::time::timeout(
-                crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT,
-                h,
-            )
-            .await;
+            let _ = tokio::time::timeout(crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT, h).await;
         }
         let leftover = std::mem::take(&mut *self.inner.batch.lock().await);
         self.inner.flush_events_at_shutdown(leftover).await;
@@ -619,9 +615,7 @@ impl Inner {
         };
         let send_result = match send_outcome {
             Some(res) => res,
-            None => Err(anyhow!(
-                "shutdown cancelled in-flight OTLP/HTTP send"
-            )),
+            None => Err(anyhow!("shutdown cancelled in-flight OTLP/HTTP send")),
         };
         match send_result {
             Ok(outcome) => {
