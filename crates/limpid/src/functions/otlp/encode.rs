@@ -34,6 +34,8 @@
 //! `{ bytes_value: <Bytes> }`. Each AnyValue must hold exactly one
 //! variant.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::{Result, anyhow, bail};
 use prost::Message;
 
@@ -156,8 +158,12 @@ fn hashlit_to_scope(v: &Value<'_>) -> Result<InstrumentationScope> {
 fn hashlit_to_log_record(v: &Value<'_>) -> Result<LogRecord> {
     let entries = expect_object(v, "LogRecord")?;
     Ok(LogRecord {
-        time_unix_nano: u64_field(entries, "time_unix_nano").unwrap_or(0),
-        observed_time_unix_nano: u64_field(entries, "observed_time_unix_nano").unwrap_or(0),
+        time_unix_nano: timestamp_u64_field(entries, "time_unix_nano", &WARNED_TIME_UNIX_NANO),
+        observed_time_unix_nano: timestamp_u64_field(
+            entries,
+            "observed_time_unix_nano",
+            &WARNED_OBSERVED_TIME_UNIX_NANO,
+        ),
         severity_number: i32_field(entries, "severity_number").unwrap_or(0),
         severity_text: string_field(entries, "severity_text").unwrap_or_default(),
         body: opt_field(entries, "body", hashlit_to_anyvalue)?,
@@ -266,13 +272,38 @@ fn i32_field(entries: Entries<'_>, key: &str) -> Option<i32> {
         .map(|n| n as i32)
 }
 
-fn u64_field(entries: Entries<'_>, key: &str) -> Option<u64> {
-    lookup(entries, key).and_then(|v| match v {
+fn coerce_u64(v: Value<'_>) -> Option<u64> {
+    match v {
         Value::Int(n) if n >= 0 => Some(n as u64),
         Value::Float(f) if f.is_finite() && f >= 0.0 && f.fract() == 0.0 => Some(f as u64),
         Value::Timestamp(dt) => dt.timestamp_nanos_opt().and_then(|n| u64::try_from(n).ok()),
         _ => None,
-    })
+    }
+}
+
+static WARNED_TIME_UNIX_NANO: AtomicBool = AtomicBool::new(false);
+static WARNED_OBSERVED_TIME_UNIX_NANO: AtomicBool = AtomicBool::new(false);
+
+/// Same coercion as `u64_field`, but distinguishes "key absent" (silent —
+/// legitimate per OTLP, the receiver may fill the timestamp server-side)
+/// from "key present but uncoercible" (warn once per process, then stay
+/// silent so a broken upstream cannot flood logs at wire rate).
+fn timestamp_u64_field(entries: Entries<'_>, key: &str, warned: &AtomicBool) -> u64 {
+    let Some(v) = lookup(entries, key) else {
+        return 0;
+    };
+    if let Some(n) = coerce_u64(v) {
+        return n;
+    }
+    if !warned.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            field = key,
+            value_type = v.type_name(),
+            "otlp.encode_resourcelog_*: {key} present but uncoercible to u64 nanos; \
+             encoding 0 on the wire. Further occurrences will not be logged for this field."
+        );
+    }
+    0
 }
 
 fn bytes_field(entries: Entries<'_>, key: &str) -> Option<Vec<u8>> {
@@ -488,18 +519,16 @@ mod tests {
     use chrono::{DateTime, TimeZone, Utc};
 
     #[test]
-    fn u64_field_accepts_timestamp_value() {
+    fn coerce_u64_accepts_timestamp_value() {
         let dt: DateTime<Utc> = Utc.timestamp_opt(1_700_000_000, 123_456_789).unwrap();
         let expected = dt.timestamp_nanos_opt().unwrap() as u64;
-        let entries: &[(&str, Value<'_>)] = &[("time_unix_nano", Value::Timestamp(dt))];
-        assert_eq!(u64_field(entries, "time_unix_nano"), Some(expected));
+        assert_eq!(coerce_u64(Value::Timestamp(dt)), Some(expected));
     }
 
     #[test]
-    fn u64_field_rejects_pre_epoch_timestamp() {
+    fn coerce_u64_rejects_pre_epoch_timestamp() {
         let dt: DateTime<Utc> = Utc.timestamp_opt(-1, 0).unwrap();
-        let entries: &[(&str, Value<'_>)] = &[("time_unix_nano", Value::Timestamp(dt))];
-        assert_eq!(u64_field(entries, "time_unix_nano"), None);
+        assert_eq!(coerce_u64(Value::Timestamp(dt)), None);
     }
 
     #[test]
@@ -513,5 +542,34 @@ mod tests {
         let lr = hashlit_to_log_record(&Value::Object(entries)).unwrap();
         assert_eq!(lr.time_unix_nano, expected);
         assert_eq!(lr.observed_time_unix_nano, expected);
+    }
+
+    #[test]
+    fn timestamp_field_missing_key_is_silent_zero() {
+        let warned = AtomicBool::new(false);
+        let entries: &[(&str, Value<'_>)] = &[];
+        assert_eq!(timestamp_u64_field(entries, "time_unix_nano", &warned), 0);
+        assert!(
+            !warned.load(Ordering::Relaxed),
+            "missing key is legitimate; warn flag must stay clear"
+        );
+    }
+
+    #[test]
+    fn timestamp_field_uncoercible_warns_once_then_silent() {
+        let warned = AtomicBool::new(false);
+        let entries: &[(&str, Value<'_>)] = &[("time_unix_nano", Value::String("not a number"))];
+        assert_eq!(timestamp_u64_field(entries, "time_unix_nano", &warned), 0);
+        assert!(
+            warned.load(Ordering::Relaxed),
+            "first uncoercible value must flip the warn flag"
+        );
+        let flag_before = warned.load(Ordering::Relaxed);
+        assert_eq!(timestamp_u64_field(entries, "time_unix_nano", &warned), 0);
+        assert_eq!(
+            warned.load(Ordering::Relaxed),
+            flag_before,
+            "subsequent uncoercible values must not re-flip the flag"
+        );
     }
 }
