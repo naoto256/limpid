@@ -8,11 +8,11 @@
 //!   position. Restart replays from this cursor for at-least-once.
 //! - Segments below the acked position are deleted once `ack_to`
 //!   advances through them; unread segments are never deleted.
-//! - Max total size is enforced by dropping the oldest consumed
-//!   segments (= those before the current read cursor); the read
-//!   cursor's own segment and any unread segments are protected even
-//!   when the cap is exceeded, so an undersized `max_size` cannot
-//!   silently drop pending events.
+//! - Max total size is enforced by dropping the oldest acked
+//!   segments (= those below the acked cursor); segments at or above
+//!   the acked cursor are protected (they may still hold in-flight
+//!   events whose ack handles have not resolved), so an undersized
+//!   `max_size` cannot silently drop pending events.
 //!
 //! This survives process restarts: on startup, the consumer resumes
 //! from the acked cursor position.
@@ -770,20 +770,21 @@ mod tests {
 
     #[test]
     fn enforce_max_size_deletes_oldest_consumed_segments_until_under_cap() {
-        // 5 segments seq=0..4, each 1024 bytes; cap = 2048, reader is
-        // sitting on seq=4 (everything before consumed). Caller must
-        // delete seq=0, 1, 2 to fit; seq=3 might or might not be
-        // removed depending on order, but seq=4 (== current_read_seq)
-        // must stay because it's the live read target.
+        // 5 segments seq=0..4, each 1024 bytes; cap = 2048, acked
+        // cursor at seq=4 (everything below has been acked). Caller
+        // must delete seq=0, 1, 2 to fit; seq=3 might or might not be
+        // removed depending on order, but seq=4 (== current_acked_seq)
+        // must stay because it may still contain data at or after
+        // the persisted acked cursor.
         let dir = tempfile::tempdir().unwrap();
         for s in 0..5u64 {
             make_segment(dir.path(), s, 1024);
         }
-        enforce_max_size(dir.path(), 2048, /* current_read_seq */ 4, 4);
-        // seq < 4 may be deleted; seq=4 MUST stay (live read segment).
+        enforce_max_size(dir.path(), 2048, /* current_acked_seq */ 4, 4);
+        // seq < 4 may be deleted; seq=4 MUST stay (boundary segment).
         assert!(
             segment_exists(dir.path(), 4),
-            "live read segment must not be deleted"
+            "acked-cursor boundary segment must not be deleted"
         );
     }
 

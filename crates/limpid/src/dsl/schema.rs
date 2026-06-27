@@ -1157,13 +1157,12 @@ mod tests {
 
     #[test]
     fn one_of_surfaces_inner_block_error_when_block_variant_matches() {
-        // The motivating CodeRabbit case: OneOf[Block(inner_schema),
-        // Ident]. The user wrote a Block but forgot a required inner
-        // key. The Block variant matches structurally and reports
-        // MissingRequired; the Ident variant fails with ExpectedValue
-        // (structural). Exactly one structural match → return the
-        // Block variant's inner error rather than a vague
-        // "expected Block | Ident, got Block".
+        // OneOf[Block(inner_schema), Ident] where the user wrote a
+        // Block but forgot a required inner key. The Block variant
+        // matches structurally and reports MissingRequired; the Ident
+        // variant fails with ExpectedValue (structural). Exactly one
+        // structural match → return the Block variant's inner error
+        // rather than a vague "expected Block | Ident, got Block".
         const INNER: &[PropertySpec] = &[PropertySpec {
             name: "cert",
             required: true,
