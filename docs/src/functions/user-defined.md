@@ -29,7 +29,7 @@ def process parse_fortigate_cef_traffic {
 
 A call to `normalize_proto(x)` looks like any other function call — there's no marker at the call site that says "this is user-defined." The analyzer arity-checks it the same as a built-in, and a typo in the name surfaces the same way (`unknown function`, near-match suggestion).
 
-The name must be a bare identifier. `def function normalize_proto { ... }` is allowed; `def function foo.bar { ... }` is **not** — the dot namespace is reserved for schema-bound built-ins (`syslog.parse`, `cef.parse`, `otlp.encode_resourcelog_protobuf`, …) where the prefix names a specific schema specification (RFC 5424, ArcSight CEF, OCSF, …). User-defined functions are vendor-agnostic by design, so they always live in the flat namespace. See the [*Schema-specific functions live under a schema namespace*](../design-principles.md#schema-specific-functions-live-under-a-schema-namespace) operating rule for the rationale.
+The name must be a bare identifier. `def function normalize_proto() { ... }` is allowed; `def function foo.bar() { ... }` is **not** — the dot namespace is reserved for schema-bound built-ins (`syslog.parse`, `cef.parse`, `otlp.encode_resourcelog_protobuf`, …) where the prefix names a specific schema specification (RFC 5424, ArcSight CEF, OCSF, …). User-defined functions are vendor-agnostic by design, so they always live in the flat namespace. See the [*Schema-specific functions live under a schema namespace*](../design-principles.md#schema-specific-functions-live-under-a-schema-namespace) operating rule for the rationale.
 
 ## Where they can be called from
 

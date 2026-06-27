@@ -216,8 +216,8 @@ ingress
 ┌──────────────────────┐
 │  vendor parsers      │
 │  parse_fortigate_cef,│ ─► workspace.limpid.*    — canonical intermediate
-│  parse_paloalto_csv, │                            (OCSF-shaped, not strict)
-│  parse_mde_alert, …  │
+│  parse_paloalto_cef, │                            (OCSF-shaped, not strict)
+│  parse_cloudtrail, … │
 └──────────────────────┘
    │
    ▼
@@ -232,7 +232,7 @@ egress
 ```
 
 - **Format primitives** (`syslog.parse`, `cef.parse`, `parse_kv`, `parse_json`, `csv_parse`) capture raw bytes into a format-specific namespace (`workspace.syslog`, `workspace.cef`, …). They know nothing about vendors or downstream schemas.
-- **Vendor parsers** (`parse_fortigate_cef`, `parse_paloalto_csv`, `parse_mde_alert`) read the format namespace and write canonical fields under `workspace.limpid.*`. This is the only layer that knows both the vendor's quirks and the canonical shape.
+- **Vendor parsers** (`parse_fortigate_cef`, `parse_paloalto_cef`, `parse_cloudtrail`, `parse_ocsf`, …) read the format namespace and write canonical fields under `workspace.limpid.*`. This is the only layer that knows both the vendor's quirks and the canonical shape. (The shipped set grows on the 0.7.x cadence — see [Snippet Library](../snippets/README.md) for the current inventory.)
 - **Composers** (`compose_ocsf_network_activity`, `compose_ocsf_detection_finding`, `compose_ecs_network`, …) read `workspace.limpid.*` and serialise to `egress` in their target wire schema. They are vendor-unaware on purpose: they pluck `workspace.limpid.src_endpoint.ip` regardless of whether it came from a FortiGate or a Palo Alto event.
 
 The payoffs:

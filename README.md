@@ -120,11 +120,15 @@ you live with a log pipeline:
   ```
 
 
-- **Edit. Save. Reload. Mistake? It rolls back.** `SIGHUP` swaps the
-  config atomically. A typo, an unknown identifier, a missing include —
-  the daemon refuses the new config, prints a diagnostic, keeps the
-  previous one running. Iterating on production pipelines stops being
-  scary.
+- **Edit. Save. Reload. Mistake? It rolls back.** `SIGHUP` validates
+  the new config first. A typo, an unknown identifier, a missing
+  include — the daemon refuses the new config, prints a diagnostic,
+  keeps the existing runtime intact. A *valid* reload tears down the
+  old runtime and rebinds — brief downtime for *new* connections; the
+  old runtime drains established TCP/HTTP/gRPC connections and disk
+  queues persist across the cycle (memory queues and in-flight events
+  are best-effort drained). Iterating on production pipelines stops
+  being scary.
 
 - **Yesterday's traffic, today's config.** Capture an hour of real
   events with `tap --json`; edit the pipeline; replay through `inject
@@ -172,8 +176,10 @@ Other useful flags during config development:
 - `--check --strict-warnings` — promote analyzer warnings to errors
   (for example, missing `control { error_log }` on configs that depend
   on recovery).
-- `--check --ultra-strict` — turn on every optional lint, including
-  style-level findings, for the most thorough pre-deploy gate.
+- `--check --ultra-strict` — promote unknown-identifier warnings to
+  errors. This is the only opt-in lint upgrade today; it is *not* a
+  generic style-level fail-on-warn. For "any warning fails CI" use
+  `--strict-warnings`.
 - `--graph[=mermaid|dot|ascii]` — render the resolved pipeline graph
   for review or for pasting into a PR description.
 - `--test-pipeline <name> --input '<json>'` — run a single Event
