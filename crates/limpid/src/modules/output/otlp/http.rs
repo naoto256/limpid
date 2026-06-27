@@ -180,7 +180,11 @@ pub struct OtlpHttpOutput {
     /// `flush_events.await` and was `abort()`-ed by `shutdown()` —
     /// dropping every parked `QueueAckHandle` unresolved (audit
     /// 2026-06-27). `shutdown()` joins this actor cooperatively
-    /// via `is_shutting_down` + `notify_waiters`; never `abort()`-ed.
+    /// via `is_shutting_down` + `notify_waiters` and NEVER aborts
+    /// it; `Drop` is a last-resort fallback that signals then
+    /// aborts (sync Drop cannot `.await`). See
+    /// `crate::modules::output::http::HttpOutput::actor_handle`
+    /// for the full lifecycle contract.
     actor_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     metrics: Arc<OutputMetrics>,
 }
@@ -1726,10 +1730,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drop_aborts_pending_flush_timer() {
-        // The flush timer is armed by `consume` when the buffer is
-        // below `batch_size`. Drop must abort the timer so the
-        // process exit doesn't leak the spawned task.
+    async fn drop_aborts_idle_flusher_actor() {
+        // `consume` buffers events below `batch_size`; the long-
+        // lived flusher actor sleeps on `batch_timeout` waiting for
+        // the next notify. Drop must signal cooperative shutdown
+        // and then abort (last-resort, since sync Drop cannot
+        // `.await` the actor) so test teardown does not leave the
+        // spawned actor running past output drop.
         let mut props = one_peer_props("http://127.0.0.1:1");
         props.push(prop_int("batch_size", 1024));
         props.push(prop_str("batch_timeout", "30s"));

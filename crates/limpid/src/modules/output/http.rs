@@ -236,13 +236,29 @@ pub struct HttpOutput {
     inner: Arc<Inner>,
     batch_size: usize,
     /// Long-lived flusher actor handle. The actor task owns the
-    /// timer + flush-driven flush lifecycle. It is deliberately
-    /// NEVER `abort()`-ed — the audit found that abort()ing a task
-    /// that holds the batch on its stack across an `.await` boundary
-    /// drops every parked `QueueAckHandle` unresolved (debug panic,
-    /// release silent loss). `shutdown()` signals the actor via
-    /// `is_shutting_down` + `flush_notify.notify_waiters()` and
-    /// joins it bounded by `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT`.
+    /// timer + flush-driven flush lifecycle.
+    ///
+    /// **Lifecycle contract**:
+    /// - **Normal operation (`shutdown()`)**: NEVER aborts the
+    ///   actor. It signals cooperative shutdown via
+    ///   `is_shutting_down` + `flush_notify.notify_waiters()` and
+    ///   joins it bounded by `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT`. The
+    ///   actor resolves every stack-local handle (Delivered /
+    ///   Recovered via DLQ) before exiting.
+    /// - **`Drop` fallback (last-resort)**: sync `Drop` cannot
+    ///   `.await` the actor, so it signals first then calls
+    ///   `abort()` as a last resort. This path is for teardown
+    ///   scenarios where `shutdown()` was not invoked (e.g. config
+    ///   reload in tests). The signal gives the actor a chance to
+    ///   exit cleanly before the abort lands; in practice the
+    ///   runtime calls `shutdown()` before drop in production.
+    ///
+    /// The audit (2026-06-27) found that prior versions abort()-ed
+    /// a per-flush *timer* task that held the stack-local batch
+    /// across `flush_events.await` — dropping every parked
+    /// `QueueAckHandle` unresolved. The structural fix moves the
+    /// abort surface to this single actor handle and keeps `abort()`
+    /// off the `shutdown()` path entirely.
     actor_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     metrics: Arc<OutputMetrics>,
 }
@@ -478,15 +494,20 @@ impl Module for HttpOutput {
 /// triggers: threshold-driven `flush_notify`, timer-driven
 /// `batch_timeout` sleep, or shutdown via `is_shutting_down`.
 ///
-/// **Never `abort()`-ed**. The audit (2026-06-27) found that prior
-/// versions spawned a per-flush timer task that held a stack-local
-/// `Vec<(Event, QueueAckHandle)>` across `flush_events.await`, and
-/// `shutdown()` would `abort()` that task — dropping every parked
-/// handle unresolved (debug `debug_assert!(resolved)` panic, release
-/// silent `Dropped` loss). The actor here owns the entire batched
-/// lifecycle; abort surface is one handle for the whole output, and
-/// `shutdown()` joins it gracefully via `is_shutting_down` +
-/// `notify_waiters()`.
+/// **`shutdown()` never aborts this actor** — it signals
+/// cooperative shutdown and joins bounded. `Drop` is a last-resort
+/// fallback that signals then aborts, since sync `Drop` cannot
+/// `.await`. See `HttpOutput::actor_handle` for the full lifecycle
+/// contract.
+///
+/// The audit (2026-06-27) found that prior versions abort()-ed a
+/// per-flush *timer* task that held a stack-local
+/// `Vec<(Event, QueueAckHandle)>` across `flush_events.await`,
+/// dropping every parked handle unresolved
+/// (debug `debug_assert!(resolved)` panic, release silent `Dropped`
+/// loss). Consolidating the timer + flush lifecycle into this single
+/// actor and keeping `abort()` off the `shutdown()` path is the
+/// structural fix.
 async fn flusher_actor_loop(inner: Arc<Inner>) {
     loop {
         if inner.is_shutting_down.load(Ordering::Acquire) {
