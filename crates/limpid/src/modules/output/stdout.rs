@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::dsl::schema::PropertySpec;
 use crate::event::Event;
@@ -54,12 +54,18 @@ impl HasMetrics for StdoutOutput {
 
 impl StdoutOutput {
     /// Pure write step — extracted so `consume` can drive the retry
-    /// loop without duplicating the print. Returns `Err` only for
-    /// genuine I/O failures; stdout is unbuffered for our purposes so
-    /// this almost always succeeds.
+    /// loop without duplicating the print. Goes through
+    /// `io::stdout().lock()` + `writeln!` rather than the `println!`
+    /// macro: `println!` panics on a broken pipe (the canonical case
+    /// is `limpid | head` where `head` exits before draining stdout),
+    /// which would tear down the daemon mid-run. The locked-write
+    /// path surfaces the I/O error here instead so the retry / DLQ
+    /// path in `consume` decides the disposition.
     fn write_event(&self, event: &Event) -> Result<()> {
+        use std::io::Write;
         let msg = String::from_utf8_lossy(&event.egress);
-        println!("{}", msg);
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "{}", msg).context("stdout write failed")?;
         Ok(())
     }
 }
