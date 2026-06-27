@@ -502,25 +502,18 @@ impl HasMetrics for OtlpHttpOutput {
 #[async_trait::async_trait]
 impl Output for OtlpHttpOutput {
     async fn consume(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
+        // Hand the (event, ack) off to the actor. No inline flush —
+        // see `http::HttpOutput::consume` for rationale (inline
+        // flush on the queue consumer's task blocks the consumer
+        // from reaching its own shutdown observation).
         let should_flush = {
             let mut batch = self.inner.batch.lock().await;
             batch.push((event.clone(), ack));
             batch.len() >= self.batch_size
         };
         if should_flush {
-            // Threshold reached: flush inline, on the queue
-            // consumer's own task. This is NOT a leak surface — the
-            // queue consumer is the lifecycle driver, never
-            // `abort()`-ed in normal operation. Synchronous flush
-            // also preserves `consume`'s pre-actor contract that the
-            // ack handle has resolved by the time it returns when
-            // the batch is flushed inline.
-            let batch = std::mem::take(&mut *self.inner.batch.lock().await);
-            self.inner.flush_events(batch).await;
+            self.inner.flush_notify.notify_one();
         }
-        // No timer arming — the long-lived flusher actor's `select!`
-        // owns the timer-driven flush. (The audited bug was the
-        // *spawned* timer task holding the batch across `await`.)
         Ok(())
     }
 
@@ -1259,6 +1252,43 @@ mod tests {
         }
     }
 
+    /// Push an event via `consume()` and await the actor's resolution.
+    /// Returns the final disposition (Delivered / Recovered / Dropped).
+    async fn consume_and_wait_disposition(
+        output: &OtlpHttpOutput,
+        ev: &Event,
+        timeout: Duration,
+    ) -> Result<crate::queue::AckDisposition> {
+        let (ack, mut rx) = QueueAckHandle::for_test();
+        output.consume(ev, ack).await?;
+        match tokio::time::timeout(timeout, rx.recv()).await {
+            Ok(Some((_, disp))) => Ok(disp),
+            Ok(None) => Err(anyhow::anyhow!("ack channel closed unexpectedly")),
+            Err(_) => Err(anyhow::anyhow!(
+                "actor did not resolve ack within {:?}",
+                timeout
+            )),
+        }
+    }
+
+    /// Lower-level helper: push an event and hand back the ack receiver
+    /// so paused-time tests can interleave `tokio::time::advance` with
+    /// the receive.
+    #[allow(dead_code)]
+    async fn consume_with_handle(
+        output: &OtlpHttpOutput,
+        ev: &Event,
+    ) -> Result<
+        tokio::sync::mpsc::UnboundedReceiver<(
+            crate::queue::AckPosition,
+            crate::queue::AckDisposition,
+        )>,
+    > {
+        let (ack, rx) = QueueAckHandle::for_test();
+        output.consume(ev, ack).await?;
+        Ok(rx)
+    }
+
     async fn wait_for<T>(mut probe: impl FnMut() -> Option<T>) -> T {
         for _ in 0..50 {
             if let Some(v) = probe() {
@@ -1411,9 +1441,18 @@ mod tests {
         )
         .unwrap();
 
-        consume(&output, &event_with_egress(singleton_bytes(123)))
-            .await
-            .unwrap();
+        let disp = consume_and_wait_disposition(
+            &output,
+            &event_with_egress(singleton_bytes(123)),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(disp, crate::queue::AckDisposition::Delivered),
+            "expected Delivered, got {:?}",
+            disp
+        );
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
         server.abort();
     }
@@ -1467,9 +1506,18 @@ mod tests {
             &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
-        consume(&output, &event_with_egress(singleton_bytes(42)))
-            .await
-            .unwrap();
+        let disp = consume_and_wait_disposition(
+            &output,
+            &event_with_egress(singleton_bytes(42)),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(disp, crate::queue::AckDisposition::Delivered),
+            "expected Delivered after rotation, got {:?}",
+            disp
+        );
 
         s_a.abort();
         s_b.abort();
@@ -1509,13 +1557,18 @@ mod tests {
             &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
-        let err = consume(&output, &event_with_egress(singleton_bytes(456)))
-            .await
-            .expect_err("send must fail after retries exhausted");
-        // The underlying transport error is consumed by the
-        // DLQ-routing path; the test only sees the Recovered
-        // disposition surfaced by the shim.
-        assert!(err.to_string().contains("recovered"), "got: {err}");
+        let disp = consume_and_wait_disposition(
+            &output,
+            &event_with_egress(singleton_bytes(456)),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(disp, crate::queue::AckDisposition::Recovered),
+            "send must fail after retries exhausted → Recovered, got {:?}",
+            disp
+        );
         server.abort();
     }
 
@@ -1923,31 +1976,50 @@ mod tests {
                 prop_str("max_wait", "1ms"),
             ],
         });
-        let output = OtlpHttpOutput::from_properties(
-            "test",
-            &mp(&props),
-            &crate::modules::BuildContext::for_testing(),
-        )
-        .unwrap();
-        let send =
-            tokio::spawn(
-                async move { consume(&output, &event_with_egress(singleton_bytes(1))).await },
-            );
+        let output = Arc::new(
+            OtlpHttpOutput::from_properties(
+                "test",
+                &mp(&props),
+                &crate::modules::BuildContext::for_testing(),
+            )
+            .unwrap(),
+        );
 
-        for _ in 0..20 {
+        // Push the event via consume; consume returns immediately
+        // (buffer + notify), the actor picks it up and enters
+        // send_batch against the stalled peer.
+        let (ack, mut rx) = QueueAckHandle::for_test();
+        output
+            .consume(&event_with_egress(singleton_bytes(1)), ack)
+            .await
+            .unwrap();
+
+        // Let the actor wake, take the batch, and enter the HTTP
+        // request future.
+        for _ in 0..50 {
             tokio::task::yield_now().await;
         }
+        // Advance past HTTP_REQUEST_TIMEOUT so reqwest's per-request
+        // timer fires. The send returns Err, flush_events routes to
+        // DLQ + Recovered, and the actor resolves the ack.
         tokio::time::advance(HTTP_REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
 
-        let result = send.await.unwrap();
+        let (_, disp) = rx
+            .recv()
+            .await
+            .expect("ack must resolve, not drop unresolved");
+        assert!(
+            matches!(disp, crate::queue::AckDisposition::Recovered),
+            "stalled peer must surface as Recovered, got {:?}",
+            disp
+        );
+        // Keep output alive past the actor's completion; explicit
+        // shutdown so its actor exits cleanly.
+        let _ = output.shutdown(None).await;
         stall.abort();
-
-        let err = result.expect_err("stalled peer must surface as Recovered");
-        // The underlying timeout error is consumed by the
-        // DLQ-routing path; the shim only surfaces the Recovered
-        // disposition. Asserting the timeout pin still works on the
-        // raw `send_batch` path elsewhere.
-        assert!(err.to_string().contains("recovered"), "got: {err}");
     }
 
     #[test]
