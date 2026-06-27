@@ -207,9 +207,12 @@ example, sets only `time_unix_nano` from the journal entry's
 
 limpid's snippet convention is:
 
-- `time_unix_nano = workspace.event_time` (the source-claimed time
+- `time_unix_nano = workspace.event_time_ns` (the source-claimed time
   the parser extracted from the wire — `syslog_timestamp`, `cef_rt`,
-  etc.)
+  etc.). Composer snippets should `coalesce(workspace.event_time_ns,
+  received_at)` defensively: an absent key encodes as `timeUnixNano: 0`
+  on the wire (proto3 default), and the encoder does not warn on
+  absent keys — only on present-but-uncoercible values.
 - `observed_time_unix_nano = received_at` only when the snippet
   explicitly chooses to populate it; not auto-set
 

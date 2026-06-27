@@ -81,6 +81,14 @@ The output expects `egress` to already be valid singleton ResourceLogs proto byt
 
 ```
 def process compose_otlp_from_ocsf {
+    // Source-claimed time is expected to be populated upstream (here by
+    // parse_fortigate) into workspace.event_time_ns — see
+    // [§ 4.3](../otlp.md#43-whether-the-originating-timestamp-is-in-time_unix_nano-or-observed_time_unix_nano).
+    // Fall back to received_at when the wire had no parseable timestamp;
+    // without this guard a missing key encodes as timeUnixNano: 0 on the
+    // wire and silently drops the event's time at the receiver.
+    workspace.event_time_ns = coalesce(workspace.event_time_ns, received_at)
+
     workspace.otlp = {
         resource: { attributes: [
             { key: "service.name", value: { string_value: workspace.limpid.metadata.product.name } }
