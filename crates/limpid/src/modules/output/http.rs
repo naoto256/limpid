@@ -573,24 +573,29 @@ impl Output for HttpOutput {
         &self,
         _error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
     ) -> Result<()> {
-        // 1. Signal cooperative shutdown so the actor's `select!`
-        //    wakes (via `notify_waiters`) and any in-flight
-        //    `flush_events` retry sleep exits early via the
-        //    `is_shutting_down` check.
+        // 1. Signal cooperative shutdown. `is_shutting_down`
+        //    propagates to the actor's outer `select!`, to the
+        //    retry sleep race, and (via the transport-cancel race
+        //    in `flush_events`) to the in-flight `send_batch` call
+        //    itself. `notify_waiters` wakes every current `.notified()`
+        //    awaiter so a stalled peer's transport future is dropped
+        //    immediately rather than blocking until its read timeout.
         self.inner.is_shutting_down.store(true, Ordering::Release);
         self.inner.flush_notify.notify_waiters();
 
-        // 2. Bounded join of the flusher actor. If the actor is
-        //    currently mid-`flush_events`, the cooperative-cancel in
-        //    the retry loop collapses its retry to one attempt;
-        //    `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT` (3s) is the deadline.
-        //    Critical: do NOT `abort()` on timeout — the actor's
-        //    stack-local batch would drop handles unresolved (the
-        //    audited bug). On timeout we just leave the actor task
-        //    to finish naturally; whatever it has not yet flushed is
-        //    still in the buffer (events queued via
-        //    `consume_shutdown` after the actor exited) and step 3
-        //    handles those.
+        // 2. Bounded join of the flusher actor. The actor's invariant
+        //    is that EVERY stack-local `(Event, QueueAckHandle)` it
+        //    has taken is resolved (Delivered on success, Recovered on
+        //    transport cancel / retry exhaustion / DLQ recovery)
+        //    before `flush_events` returns and before the actor exits.
+        //    The cooperative cancels above guarantee the actor reaches
+        //    that exit promptly even when a peer stalls — so a healthy
+        //    actor finishes well inside `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT`.
+        //    The timeout here is a defensive guard against a future
+        //    bug (e.g. a new transport path that forgets the cancel
+        //    race); it is NOT a contract that allows unresolved
+        //    handles. We deliberately do NOT `abort()` — abort would
+        //    re-open the leak this commit set closes.
         let handle_opt = self.actor_handle.lock().await.take();
         if let Some(h) = handle_opt {
             let _ = tokio::time::timeout(
@@ -600,13 +605,12 @@ impl Output for HttpOutput {
             .await;
         }
 
-        // 3. Drain whatever the actor did not pick up — anything
-        //    pushed via `consume_shutdown` after the actor exited,
-        //    plus any in-flight batch the actor was unable to flush
-        //    (those handles are still held by the actor task's
-        //    stack frame; we cannot reach them from here, so we
-        //    accept that narrow loss window in exchange for not
-        //    abort()-ing the actor). `flush_events_at_shutdown`
+        // 3. Final drain. The buffer holds only events pushed via
+        //    `consume_shutdown` (the queue consumer's drain path
+        //    after shutdown signal) plus anything that arrived too
+        //    late for the actor's last iteration. The actor's own
+        //    in-flight batch was already resolved by `flush_events`
+        //    before the actor exited. `flush_events_at_shutdown`
         //    does one bounded send attempt then routes the rest to
         //    DLQ + Recovered.
         let leftover = std::mem::take(&mut *self.inner.batch.lock().await);
