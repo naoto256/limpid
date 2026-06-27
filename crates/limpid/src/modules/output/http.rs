@@ -694,6 +694,31 @@ impl Inner {
     /// (resolve_recovered); the rest proceed to the HTTP send loop.
     /// Transport failures consume the per-flush retry budget; on
     /// exhaust the whole shippable subset is routed to DLQ.
+    /// Yield when the cooperative shutdown signal is observed. Used
+    /// in `tokio::select!` to race the transport `send_batch` future
+    /// so a stalled peer cannot trap the actor task with the batch on
+    /// its stack past the runtime shutdown deadline.
+    ///
+    /// The double-check around `notified()` closes the lost-wake race:
+    /// if `is_shutting_down` flips between our load and the call to
+    /// `notified()`, the re-check catches it; otherwise the next
+    /// `notify_waiters()` (from `shutdown()`) wakes us.
+    async fn wait_until_shutdown(&self) {
+        loop {
+            if self.is_shutting_down.load(Ordering::Acquire) {
+                return;
+            }
+            let notified = self.flush_notify.notified();
+            if self.is_shutting_down.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+            // After the notify wake, the next iteration's `load`
+            // decides whether to return (shutdown observed) or loop
+            // (spurious wake from a threshold-driven flush nudge).
+        }
+    }
+
     async fn flush_events(&self, batch: Vec<(Event, QueueAckHandle)>) {
         if batch.is_empty() {
             return;
@@ -724,8 +749,22 @@ impl Inner {
         let mut attempt = 0u32;
         let mut wait = self.retry.initial_wait;
         let final_err = loop {
-            match self.send_batch(&messages).await {
-                Ok(()) => {
+            // Race the transport against the shutdown signal. A
+            // stalled peer (= TCP accepted but never responds) holds
+            // `send_batch().await` past the runtime shutdown deadline
+            // — the actor task gets aborted with the stack-local
+            // shippable Vec, dropping every parked QueueAckHandle
+            // unresolved (the audited bug). With the race, a
+            // `shutdown()` mid-flight cancels the send future
+            // (reqwest cancels the connection on drop) and falls
+            // through to the DLQ + Recovered path below.
+            let send_outcome = tokio::select! {
+                biased;
+                res = self.send_batch(&messages) => Some(res),
+                _ = self.wait_until_shutdown() => None,
+            };
+            match send_outcome {
+                Some(Ok(())) => {
                     self.metrics
                         .events_written
                         .fetch_add(count, Ordering::Relaxed);
@@ -734,7 +773,12 @@ impl Inner {
                     }
                     return;
                 }
-                Err(e) => {
+                None => {
+                    break anyhow::anyhow!(
+                        "shutdown cancelled in-flight send (collapsed retry budget)"
+                    );
+                }
+                Some(Err(e)) => {
                     attempt += 1;
                     self.metrics.retries.fetch_add(1, Ordering::Relaxed);
                     if attempt >= self.retry.max_attempts {
@@ -2459,5 +2503,106 @@ mod tests {
         // when the output drops at end-of-test. The peer is unreachable,
         // so all three route to the test-DLQ-recovery path.
         let _ = tokio::time::timeout(Duration::from_secs(2), output.shutdown(None)).await;
+    }
+
+    /// Audit-identified leak (2026-06-27 follow-up): the flusher actor
+    /// was mid-`send_batch().await` against a stalled peer when
+    /// `shutdown()` signalled. The previous fix collapsed retry sleeps
+    /// but not the transport call itself, so the actor sat on its
+    /// stack-local `shippable` Vec until the runtime aborted it,
+    /// dropping every parked `QueueAckHandle` unresolved (debug:
+    /// panic; release: silent loss).
+    ///
+    /// This test sets up that exact race — actor wakes via
+    /// `batch_timeout`, enters `send_batch` against a TCP listener
+    /// that accepts but never responds, `shutdown()` fires — and
+    /// asserts every handle resolves to `Recovered` (via DLQ) inside
+    /// the bounded shutdown budget.
+    #[tokio::test]
+    async fn actor_send_in_flight_cancels_on_shutdown_against_stalled_peer() {
+        let (addr, server) = run_stalled_listener().await;
+        let url = format!("http://{}/", addr);
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("errored.jsonl");
+        let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
+        let ctx = crate::modules::BuildContext {
+            funcs: Arc::new(crate::functions::FunctionRegistry::new()),
+            error_log: Some(Arc::clone(&writer)),
+        };
+        // Short timer wake + large batch_size so the actor (not
+        // consume itself) is the path that calls `send_batch`.
+        let output = Arc::new(
+            HttpOutput::from_properties(
+                "test",
+                &mp(&[
+                    peer_block(&url),
+                    prop_int("batch_size", 100),
+                    prop_str("batch_timeout", "100ms"),
+                    fast_retry_block(),
+                ]),
+                &ctx,
+            )
+            .unwrap(),
+        );
+
+        // One sub-threshold event — buffered, actor will pick it up
+        // when the timer fires. We must drive consume via the trait
+        // method (not the test shim) so the ack stays unresolved
+        // until the actor's flush_events resolves it.
+        let (ack, mut rx) = QueueAckHandle::for_test();
+        <HttpOutput as Output>::consume(&output, &event_with("ev"), ack)
+            .await
+            .unwrap();
+
+        // Give the actor time to wake, take the batch, and enter
+        // `send_batch` against the stalled peer. 200ms > batch_timeout
+        // (100ms) plus a small margin for actor wake + transport
+        // handshake. The reqwest client's 30s read timeout would be
+        // the dominant wait without our cooperative cancel.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Now call shutdown. With the cooperative transport cancel,
+        // the actor's `send_batch` future is dropped, the loop falls
+        // through to the DLQ + Recovered path, the actor exits
+        // cleanly, and shutdown joins it well within
+        // SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT.
+        let started = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), output.shutdown(Some(&writer)))
+            .await
+            .expect("shutdown must complete inside the bounded budget")
+            .unwrap();
+        let elapsed = started.elapsed();
+        server.abort();
+
+        // The runtime budget for the whole shutdown sequence is 10s;
+        // we want this case to fit well within the per-attempt
+        // bound (3s) plus a small post-actor drain margin.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown took {:?} — transport cancel did not collapse the in-flight send",
+            elapsed
+        );
+
+        // The handle must resolve (not drop). Recovered (DLQ-routed)
+        // is the expected disposition since the peer never responded.
+        let (_pos, disposition) =
+            rx.try_recv().expect("ack must resolve, not drop unresolved");
+        assert!(
+            matches!(disposition, crate::queue::AckDisposition::Recovered),
+            "expected Recovered (DLQ), got {:?}",
+            disposition
+        );
+
+        // DLQ must have the event.
+        assert!(
+            path.exists(),
+            "DLQ file must be written when transport cancel collapses the send"
+        );
+        let body = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(
+            body.lines().count(),
+            1,
+            "the single buffered event must land in the DLQ"
+        );
     }
 }
