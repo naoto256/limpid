@@ -285,12 +285,7 @@ fn coerce_u64(v: Value<'_>) -> Option<u64> {
         // u64 range and would saturate to `u64::MAX` for the same
         // reason. Out-of-range floats flow to `None` here and pick
         // up the `timestamp_u64_field` warn-once + encode-0 path.
-        Value::Float(f)
-            if f.is_finite()
-                && f >= 0.0
-                && f.fract() == 0.0
-                && f < u64::MAX as f64 =>
-        {
+        Value::Float(f) if f.is_finite() && f >= 0.0 && f.fract() == 0.0 && f < u64::MAX as f64 => {
             Some(f as u64)
         }
         Value::Timestamp(dt) => dt.timestamp_nanos_opt().and_then(|n| u64::try_from(n).ok()),

@@ -336,10 +336,7 @@ async fn query_control(socket_path: &Path, command: &str) -> Result<String, Stri
                     // with whatever bytes had been collected so far,
                     // so `/health` would 200 with a truncated body —
                     // masking a broken control socket as healthy.
-                    return Err(format!(
-                        "control socket read failed: {}",
-                        e
-                    ));
+                    return Err(format!("control socket read failed: {}", e));
                 }
             }
         }
