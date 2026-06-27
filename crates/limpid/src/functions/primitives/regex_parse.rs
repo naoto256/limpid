@@ -65,6 +65,7 @@ pub fn register(reg: &mut FunctionRegistry) {
         produces: Vec::new(),
         wildcards: true,
         defaults_arg_indices: &[],
+        defaults_arg_extractor: None,
     });
 }
 

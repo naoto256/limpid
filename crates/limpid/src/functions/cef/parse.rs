@@ -49,6 +49,7 @@ pub fn register(reg: &mut FunctionRegistry) {
         ],
         wildcards: true,
         defaults_arg_indices: &[1],
+        defaults_arg_extractor: None,
     });
 }
 
