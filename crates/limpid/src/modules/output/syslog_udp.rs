@@ -161,6 +161,50 @@ impl Output for SyslogUdpOutput {
             }
         }
     }
+
+    async fn consume_shutdown(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
+        let payload = SyslogPayload {
+            egress: event.egress.clone(),
+        };
+        let result = tokio::time::timeout(
+            crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT,
+            self.write_payload(payload),
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => {
+                ack.resolve_delivered();
+            }
+            Ok(Err(e)) => {
+                let reason = format!("shutdown write failed: {}", e);
+                crate::modules::route_event_to_dlq(
+                    self.error_log.as_ref(),
+                    &self.name,
+                    event,
+                    &reason,
+                )
+                .await;
+                self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                ack.resolve_recovered();
+            }
+            Err(_) => {
+                let reason = format!(
+                    "shutdown write timed out after {:?}",
+                    crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT
+                );
+                crate::modules::route_event_to_dlq(
+                    self.error_log.as_ref(),
+                    &self.name,
+                    event,
+                    &reason,
+                )
+                .await;
+                self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                ack.resolve_recovered();
+            }
+        }
+        Ok(())
+    }
 }
 
 impl SyslogUdpOutput {

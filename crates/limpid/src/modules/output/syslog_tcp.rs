@@ -388,6 +388,34 @@ impl Output for SyslogTcpOutput {
             }
         }
     }
+
+    async fn consume_shutdown(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
+        let payload = SyslogPayload {
+            egress: event.egress.clone(),
+        };
+        let result = match tokio::time::timeout(
+            crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT,
+            self.write_payload(payload),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(anyhow::anyhow!(
+                "timed out after {:?}",
+                crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT
+            )),
+        };
+        crate::modules::finalize_shutdown_singleton_disposition(
+            result,
+            self.error_log.as_ref(),
+            &self.metrics,
+            &self.name,
+            event,
+            ack,
+        )
+        .await;
+        Ok(())
+    }
 }
 
 impl SyslogTcpOutput {

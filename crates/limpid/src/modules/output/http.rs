@@ -474,6 +474,20 @@ impl Output for HttpOutput {
         Ok(())
     }
 
+    /// Drain-time per-event entry: park the `(event, ack)` pair in the
+    /// buffer that the post-loop `shutdown()` call will drain bounded.
+    /// Deliberately does NOT trigger a flush from here — that would
+    /// re-enter the steady-state retry path (`consume_singleton` /
+    /// `flush_events` exponential backoff) which the shutdown contract
+    /// forbids. The buffer holds the handle until `shutdown()` resolves
+    /// it via `flush_events_at_shutdown`'s bounded single attempt + DLQ
+    /// route.
+    async fn consume_shutdown(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
+        let mut buf = self.inner.batch.lock().await;
+        buf.push((event.clone(), ack));
+        Ok(())
+    }
+
     async fn shutdown(
         &self,
         _error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
