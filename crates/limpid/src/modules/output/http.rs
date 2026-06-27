@@ -602,11 +602,7 @@ impl Output for HttpOutput {
         //    re-open the leak this commit set closes.
         let handle_opt = self.actor_handle.lock().await.take();
         if let Some(h) = handle_opt {
-            let _ = tokio::time::timeout(
-                crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT,
-                h,
-            )
-            .await;
+            let _ = tokio::time::timeout(crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT, h).await;
         }
 
         // 3. Final drain. The buffer holds only events pushed via
@@ -1368,26 +1364,20 @@ mod tests {
         .unwrap();
         // First send goes to A (cursor 0), fails. With max_attempts=1
         // the failure routes to Recovered (DLQ). A is cooled down.
-        let disp1 = consume_and_wait_disposition(
-            &output,
-            &event_with("rr-fail"),
-            Duration::from_secs(2),
-        )
-        .await
-        .unwrap();
+        let disp1 =
+            consume_and_wait_disposition(&output, &event_with("rr-fail"), Duration::from_secs(2))
+                .await
+                .unwrap();
         assert!(
             matches!(disp1, crate::queue::AckDisposition::Recovered),
             "first attempt should fail (peer A is 500) → Recovered, got {:?}",
             disp1
         );
         // Second event goes to peer B (next in rotation, A cooled).
-        let disp2 = consume_and_wait_disposition(
-            &output,
-            &event_with("rr-ok"),
-            Duration::from_secs(2),
-        )
-        .await
-        .unwrap();
+        let disp2 =
+            consume_and_wait_disposition(&output, &event_with("rr-ok"), Duration::from_secs(2))
+                .await
+                .unwrap();
         assert!(
             matches!(disp2, crate::queue::AckDisposition::Delivered),
             "second send should hit peer B → Delivered, got {:?}",
@@ -1668,12 +1658,8 @@ mod tests {
         )
         .unwrap();
         let pre_call = Instant::now();
-        let _ = consume_and_wait_disposition(
-            &output,
-            &event_with("hello"),
-            Duration::from_secs(5),
-        )
-        .await;
+        let _ = consume_and_wait_disposition(&output, &event_with("hello"), Duration::from_secs(5))
+            .await;
         let cooldown_until = output.inner.peer_state[0]
             .cooldown_until
             .lock()
@@ -1713,13 +1699,10 @@ mod tests {
             &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
-        let disp = consume_and_wait_disposition(
-            &output,
-            &event_with("singleton"),
-            Duration::from_secs(2),
-        )
-        .await
-        .unwrap();
+        let disp =
+            consume_and_wait_disposition(&output, &event_with("singleton"), Duration::from_secs(2))
+                .await
+                .unwrap();
         assert!(
             matches!(disp, crate::queue::AckDisposition::Recovered),
             "send must fail against unreachable peer → Recovered, got {:?}",
@@ -1728,10 +1711,7 @@ mod tests {
         // After the actor drains the 1-element batch, the buffer
         // must be empty again.
         let batch_len = output.inner.batch.lock().await.len();
-        assert_eq!(
-            batch_len, 0,
-            "actor must drain the singleton batch"
-        );
+        assert_eq!(batch_len, 0, "actor must drain the singleton batch");
         let actor_spawned = output.actor_handle.lock().await.is_some();
         assert!(
             actor_spawned,
@@ -2610,8 +2590,9 @@ mod tests {
 
         // The handle must resolve (not drop). Recovered (DLQ-routed)
         // is the expected disposition since the peer never responded.
-        let (_pos, disposition) =
-            rx.try_recv().expect("ack must resolve, not drop unresolved");
+        let (_pos, disposition) = rx
+            .try_recv()
+            .expect("ack must resolve, not drop unresolved");
         assert!(
             matches!(disposition, crate::queue::AckDisposition::Recovered),
             "expected Recovered (DLQ), got {:?}",
