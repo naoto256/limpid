@@ -354,6 +354,7 @@ impl Output for SyslogTcpOutput {
             };
             match self.write_payload(payload).await {
                 Ok(()) => {
+                    self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
                     ack.resolve_delivered();
                     return Ok(());
                 }
@@ -419,11 +420,16 @@ impl Output for SyslogTcpOutput {
 }
 
 impl SyslogTcpOutput {
-    /// Send one syslog frame via the peer-rotation helper. Private —
-    /// reached only from [`Output::consume`].
+    /// Send one syslog frame via the peer-rotation helper. Returns
+    /// `Ok(())` on a successful write to the wire and `Err(_)`
+    /// otherwise. Disposition metrics are the caller's responsibility:
+    /// the steady-state `consume()` path bumps `events_written` on its
+    /// own `Ok` branch, and `consume_shutdown()` lets
+    /// `finalize_shutdown_singleton_disposition` bump it. Bumping here
+    /// double-counted the shutdown path because both the helper and
+    /// this method would tick the counter.
     async fn write_payload(&self, payload: SyslogPayload) -> Result<()> {
         let framing = self.framing;
-        let metrics = Arc::clone(&self.metrics);
         let connectors = self.connectors.clone();
         let result = self
             .peers
@@ -484,10 +490,7 @@ impl SyslogTcpOutput {
             .await;
 
         match result {
-            Ok(()) => {
-                metrics.events_written.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(err) => Err(anyhow::anyhow!("{}", err)),
         }
     }
