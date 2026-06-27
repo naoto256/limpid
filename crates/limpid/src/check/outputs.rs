@@ -146,7 +146,19 @@ fn analyze_property(
             // FuncCall, etc.) still gets walked by `check_types` so
             // unknown-function / type-mismatch diagnostics inside
             // template bodies continue to surface.
-            let skip_expr_types = schema_owned && matches!(expr.kind, ExprKind::Ident(_));
+            // The parser folds both bare idents (`framing
+            // non_transparent`) and dotted paths (`key_field
+            // workspace.user_id`) into the same `ExprKind::Ident`
+            // variant — `parts` length distinguishes them. The skip
+            // applies only to the single-segment case: that is the
+            // only shape that can legitimately be a schema enum
+            // variant or string-payload literal whose textual
+            // spelling happens to collide with `workspace`,
+            // `egress`, or `error`. Anything dotted IS a runtime
+            // reference and must still be rejected by the
+            // pipeline-only-state check.
+            let skip_expr_types = schema_owned
+                && matches!(&expr.kind, ExprKind::Ident(parts) if parts.len() == 1);
             if !skip_expr_types {
                 expr_types::check_types(
                     expr,
@@ -156,16 +168,31 @@ fn analyze_property(
                     *value_span,
                     diagnostics,
                 );
+                // `collect_workspace_refs` is gated on the same
+                // `skip_expr_types` condition: a schema-owned
+                // single-segment bare ident is a literal value
+                // (enum variant or string payload), not a runtime
+                // expression reading workspace / egress / error.
+                // Walking it would have the same false-positive
+                // shape `check_types` does — e.g. a property
+                // declared as `Enum` with a variant literally named
+                // `error` would be rejected by
+                // `check_pipeline_only_reference` even though it
+                // never resolves at runtime as a reference to the
+                // pipeline-only `error` ident. Dotted idents
+                // (`workspace.x`), templates, function calls, and
+                // property accesses still get walked because their
+                // value shapes fall outside the bare-ident skip.
+                collect_workspace_refs(expr, &mut |path| {
+                    check_pipeline_only_reference(
+                        path,
+                        output_name,
+                        pipeline_name,
+                        *value_span,
+                        diagnostics,
+                    );
+                });
             }
-            collect_workspace_refs(expr, &mut |path| {
-                check_pipeline_only_reference(
-                    path,
-                    output_name,
-                    pipeline_name,
-                    *value_span,
-                    diagnostics,
-                );
-            });
         }
         Property::Block { properties, .. } => {
             // Descend into the inner schema for this block's key if
