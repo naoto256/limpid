@@ -91,17 +91,18 @@ async fn handle_request(
     socket_path: &Path,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     match req.uri().path() {
-        "/health" => {
-            let body = match query_control(socket_path, "health").await {
-                Ok(s) => s,
-                Err(e) => e,
-            };
-            Ok(Response::builder()
+        "/health" => match query_control(socket_path, "health").await {
+            Ok(body) => Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "text/plain")
                 .body(Full::new(Bytes::from(body)))
-                .unwrap())
-        }
+                .unwrap()),
+            Err(e) => Ok(Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("content-type", "text/plain")
+                .body(Full::new(Bytes::from(e)))
+                .unwrap()),
+        },
         "/metrics" => {
             let body = match query_control(socket_path, "stats").await {
                 Ok(json) => match json_to_prometheus(&json) {
@@ -328,7 +329,18 @@ async fn query_control(socket_path: &Path, command: &str) -> Result<String, Stri
             match reader.read_line(&mut line).await {
                 Ok(0) => break,
                 Ok(_) => result.push_str(&line),
-                Err(_) => break,
+                Err(e) => {
+                    // Surface the read error rather than treating
+                    // mid-response failure as clean EOF. The previous
+                    // `Err(_) => break` flow returned `Ok(result)`
+                    // with whatever bytes had been collected so far,
+                    // so `/health` would 200 with a truncated body —
+                    // masking a broken control socket as healthy.
+                    return Err(format!(
+                        "control socket read failed: {}",
+                        e
+                    ));
+                }
             }
         }
         Ok::<_, String>(result)
