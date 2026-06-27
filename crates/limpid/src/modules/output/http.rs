@@ -1858,14 +1858,14 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_flushes_pending_batch_buffer() {
-        // Regression: under batch_size > 1 the queue-side `write()`
-        // returns Ok once the event is in the buffer, so the memory
-        // queue considers it delivered. If the daemon shuts down
-        // before the batch fills or the timer fires, Drop alone
-        // aborts the timer and leaks the buffered events. The fix
-        // gives Output a `shutdown()` method that the queue consumer
-        // calls once the consume loop exits, and HttpOutput
-        // overrides it to cancel the timer and run one final flush.
+        // Regression: under batch_size > 1 `consume()` parks the
+        // (event, ack) pair in the output buffer; the queue cursor
+        // cannot advance until that handle resolves. If shutdown
+        // happens before the batch fills or before the actor's
+        // batch_timeout wake, `shutdown()` must signal/join the
+        // actor and final-drain the buffer so every parked handle
+        // resolves (Delivered on flush success, Recovered on DLQ
+        // route).
         let (addr, received, server) = run_echo_collector().await;
         let url = format!("http://{}/", addr);
         let output = HttpOutput::from_properties(
@@ -2449,8 +2449,9 @@ mod tests {
             .unwrap(),
         );
 
-        // Threshold-trigger an inline flush. The peer 5xx-fails;
-        // flush_events enters its retry loop with a 5s sleep.
+        // Threshold-trigger an actor flush. The peer 5xx-fails;
+        // the actor's flush_events enters its retry loop with a 5s
+        // sleep.
         let (ack1, _rx1) = QueueAckHandle::for_test();
         let (ack2, _rx2) = QueueAckHandle::for_test();
         let _ = output.consume(&event_with("a"), ack1).await;
@@ -2460,11 +2461,11 @@ mod tests {
             let _ = output_clone.consume(&event, ack2).await;
         });
 
-        // Let the consume task enter the retry sleep.
+        // Let the actor task enter the retry sleep.
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Shutdown signals cooperative cancel; the retry sleep
-        // bails out via is_shutting_down and the inline flush
+        // bails out via is_shutting_down and the actor flush
         // collapses to DLQ + Recovered for both events.
         let started = std::time::Instant::now();
         tokio::time::timeout(Duration::from_secs(4), output.shutdown(Some(&writer)))
