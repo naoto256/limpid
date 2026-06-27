@@ -56,8 +56,19 @@ struct DiskQueueState {
     write_file: Option<fs::File>,
     /// Current write segment size.
     write_size: u64,
-    /// Current read segment sequence (updated by receiver to protect unread segments).
+    /// Current read segment sequence (updated by receiver). Tracked
+    /// for observability; the GC boundary is `acked_seq` below — the
+    /// reader can advance `read_seq` past events that have not yet
+    /// been acked, so `read_seq` alone would let `enforce_max_size`
+    /// delete a segment whose events are still in-flight.
     read_seq: u64,
+    /// Last acked segment sequence (updated by the receiver after
+    /// `ack_to` advances its acked cursor). This is the protective
+    /// boundary for `enforce_max_size`: segments below `acked_seq`
+    /// have no in-flight handles and are safe to delete; segments at
+    /// or above `acked_seq` may still hold unacked events that the
+    /// at-least-once contract guarantees to replay on restart.
+    acked_seq: u64,
 }
 
 pub struct DiskQueueSender {
@@ -151,6 +162,11 @@ pub fn create_disk_queue(
         write_file: None,
         write_size: 0,
         read_seq,
+        // Boot with acked_seq == read_seq: anything at recover time is
+        // either already acked (cursor file points past it) or never
+        // existed. Receiver's `ack_to` will advance this as the new
+        // session progresses.
+        acked_seq: read_seq,
     }));
 
     Ok((
@@ -329,6 +345,9 @@ impl DiskQueueReceiver {
         self.acked_seq = new_seq;
         self.acked_offset = new_offset;
         save_cursor(&self.dir, self.acked_seq, self.acked_offset);
+        // Propagate to shared state so `enforce_max_size` honours the
+        // at-least-once boundary on the next write-side GC pass.
+        self.sync_acked_seq();
     }
 
     fn try_read_next(&mut self) -> Option<(Event, AckPosition)> {
@@ -451,10 +470,25 @@ impl DiskQueueReceiver {
         } // end loop
     }
 
-    /// Update the shared state's read_seq so enforce_max_size can protect unread segments.
+    /// Sync the receiver's read cursor to shared state for
+    /// observability. The GC boundary in `enforce_max_size` is
+    /// `acked_seq`, not `read_seq` — see `sync_acked_seq` and the
+    /// `DiskQueueState::acked_seq` doc.
     fn sync_read_seq(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.read_seq = self.read_seq;
+        }
+    }
+
+    /// Sync the receiver's acked cursor to shared state. Called
+    /// after `ack_to` advances `self.acked_seq` so the next
+    /// `enforce_max_size` invocation (from `write_to_segment`)
+    /// honours the at-least-once boundary: segments at or above
+    /// `acked_seq` may still hold in-flight events that must replay
+    /// on restart.
+    fn sync_acked_seq(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.acked_seq = self.acked_seq;
         }
     }
 }
@@ -509,13 +543,17 @@ fn write_to_segment(state: &mut DiskQueueState, data: &[u8]) -> bool {
     }
     state.write_size += buf.len() as u64;
 
-    // Enforce max size
-    enforce_max_size(&state.dir, state.max_size, state.read_seq, state.write_seq);
+    // Enforce max size. The protective boundary is `acked_seq` —
+    // segments below it have no in-flight unacked events and are
+    // safe to delete. Using `read_seq` would let a slow consumer's
+    // unacked segment vanish: `read_seq` advances as `recv()` moves
+    // past events that have not yet been acked.
+    enforce_max_size(&state.dir, state.max_size, state.acked_seq, state.write_seq);
 
     true
 }
 
-fn enforce_max_size(dir: &Path, max_size: u64, current_read_seq: u64, _current_write_seq: u64) {
+fn enforce_max_size(dir: &Path, max_size: u64, current_acked_seq: u64, _current_write_seq: u64) {
     if max_size == 0 {
         return;
     }
@@ -551,8 +589,8 @@ fn enforce_max_size(dir: &Path, max_size: u64, current_read_seq: u64, _current_w
         if total <= max_size {
             break;
         }
-        if seq >= current_read_seq {
-            break; // don't delete unread or current segments
+        if seq >= current_acked_seq {
+            break; // don't delete segments that may still hold unacked events
         }
         let path = segment_path(dir, seq);
         if fs::remove_file(&path).is_ok() {
@@ -750,25 +788,57 @@ mod tests {
     }
 
     #[test]
-    fn enforce_max_size_never_deletes_unread_segments_even_when_over_cap() {
-        // 4 segments seq=0..3, each 1 MiB. Cap = 100 KiB, reader is
-        // ONLY at seq=0 (everything ahead is unread). enforce_max_size
-        // is forbidden from deleting unread data (= `seq >= current_read_seq`),
-        // so the function must STOP at seq=0 even though total is
-        // still over the cap. This is the data-loss invariant: an
-        // operator setting a too-small max_size must not silently lose
-        // events that haven't been processed yet.
+    fn enforce_max_size_never_deletes_unacked_segments_even_when_over_cap() {
+        // 4 segments seq=0..3, each 1 MiB. Cap = 100 KiB, acked
+        // cursor is at seq=0 (nothing has been acked yet). The
+        // boundary `seq >= current_acked_seq` forbids the function
+        // from deleting any segment that may still hold in-flight
+        // or unread events. This is the at-least-once invariant: an
+        // operator setting a too-small max_size must not silently
+        // lose events whose ack handles have not resolved.
         let dir = tempfile::tempdir().unwrap();
         for s in 0..4u64 {
             make_segment(dir.path(), s, 1024 * 1024);
         }
-        enforce_max_size(dir.path(), 100 * 1024, /* current_read_seq */ 0, 3);
-        // All 4 segments must still exist: seq=0 is current_read_seq
-        // (live), seq=1..3 are unread, NONE are deletable.
+        enforce_max_size(dir.path(), 100 * 1024, /* current_acked_seq */ 0, 3);
+        // All 4 segments must still exist: nothing is below
+        // acked_seq, so NONE are deletable.
         for s in 0..4u64 {
             assert!(
                 segment_exists(dir.path(), s),
-                "seq={s} was deleted but is at or past the read cursor"
+                "seq={s} was deleted but is at or past the acked cursor"
+            );
+        }
+    }
+
+    #[test]
+    fn enforce_max_size_protects_read_but_unacked_segments() {
+        // Regression for the at-least-once boundary: an event may be
+        // `recv()`-ed (advances `read_seq`) but not yet acked. The
+        // GC boundary must use `acked_seq`, not `read_seq` — using
+        // `read_seq` would let `enforce_max_size` delete a segment
+        // whose events are still in-flight under the contract, and
+        // the daemon would silently lose them on the next restart.
+        //
+        // 4 segments seq=0..3, each 1 MiB. Cap = 100 KiB. Reader has
+        // advanced to seq=3 (read everything), but acked_seq is
+        // still 1 (only segment 0 fully resolved). seq=1..2 must be
+        // protected even though the read cursor is past them.
+        let dir = tempfile::tempdir().unwrap();
+        for s in 0..4u64 {
+            make_segment(dir.path(), s, 1024 * 1024);
+        }
+        enforce_max_size(dir.path(), 100 * 1024, /* current_acked_seq */ 1, 3);
+        // seq=0 < acked_seq=1 → may be deleted to free space.
+        assert!(
+            !segment_exists(dir.path(), 0),
+            "seq=0 is below acked_seq, must be deletable to enforce the cap"
+        );
+        // seq=1..3 >= acked_seq=1 → MUST be preserved.
+        for s in 1..4u64 {
+            assert!(
+                segment_exists(dir.path(), s),
+                "seq={s} is at or above acked_seq=1; in-flight events must replay on restart"
             );
         }
     }
