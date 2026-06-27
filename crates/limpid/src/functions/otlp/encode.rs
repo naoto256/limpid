@@ -275,7 +275,24 @@ fn i32_field(entries: Entries<'_>, key: &str) -> Option<i32> {
 fn coerce_u64(v: Value<'_>) -> Option<u64> {
     match v {
         Value::Int(n) if n >= 0 => Some(n as u64),
-        Value::Float(f) if f.is_finite() && f >= 0.0 && f.fract() == 0.0 => Some(f as u64),
+        // `f < u64::MAX as f64` (strict less-than): `as u64` is a
+        // saturating cast since Rust 1.45, so a value that satisfies
+        // the existing finite / non-negative / integral guards but
+        // sits above the u64 range would silently saturate to
+        // `u64::MAX` and be encoded as a year-2554+ timestamp on the
+        // wire. The strict bound also rejects `u64::MAX as f64`
+        // itself: that f64 rounds up to 2^64, which is outside the
+        // u64 range and would saturate to `u64::MAX` for the same
+        // reason. Out-of-range floats flow to `None` here and pick
+        // up the `timestamp_u64_field` warn-once + encode-0 path.
+        Value::Float(f)
+            if f.is_finite()
+                && f >= 0.0
+                && f.fract() == 0.0
+                && f < u64::MAX as f64 =>
+        {
+            Some(f as u64)
+        }
         Value::Timestamp(dt) => dt.timestamp_nanos_opt().and_then(|n| u64::try_from(n).ok()),
         _ => None,
     }
@@ -542,6 +559,33 @@ mod tests {
         let lr = hashlit_to_log_record(&Value::Object(entries)).unwrap();
         assert_eq!(lr.time_unix_nano, expected);
         assert_eq!(lr.observed_time_unix_nano, expected);
+    }
+
+    #[test]
+    fn coerce_u64_rejects_oversized_float_instead_of_saturating() {
+        // `as u64` is a saturating cast since Rust 1.45: a value
+        // that satisfies the finite / non-negative / integral guards
+        // but sits above the u64 range would silently encode as
+        // `u64::MAX` on the wire (= year 2554+ in OTLP nanos). The
+        // upper-bound guard must take it through `None` instead so
+        // the warn-once + encode-0 path catches it.
+        assert_eq!(coerce_u64(Value::Float(1e30)), None);
+
+        // `u64::MAX as f64` is the saturating target itself. The
+        // f64 rounds *up* to 2^64 (= one ulp past the u64 range)
+        // because u64::MAX is not exactly representable; the strict
+        // `<` comparison must catch that boundary so the cast does
+        // not silently land at `u64::MAX`.
+        assert_eq!(coerce_u64(Value::Float(u64::MAX as f64)), None);
+
+        // Round-trip safety: a u64-fitting integral float still
+        // passes through. This literal is inside the u64 range and
+        // is representable as an integral f64 at this magnitude's
+        // spacing, so `fract() == 0.0` and the cast is safe.
+        assert_eq!(
+            coerce_u64(Value::Float(1_700_000_000_000_000_000.0)),
+            Some(1_700_000_000_000_000_000)
+        );
     }
 
     #[test]
