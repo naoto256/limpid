@@ -11,7 +11,7 @@
 //! The renderer in `check::render` consumes that to draw the rustc-
 //! style snippet + caret.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Byte range into one of the source files registered in a
 /// [`SourceMap`]. The half-open `[start, end)` form mirrors what pest
@@ -37,23 +37,12 @@ impl Span {
     /// The [`SourceMap`] resolver returns `None` for the unregistered
     /// `file_id = u32::MAX`, which the renderer degrades to a spanless
     /// single-line diagnostic — matching the old pre-span behaviour.
-    #[allow(dead_code)]
     pub const fn dummy() -> Self {
         Self {
             file_id: u32::MAX,
             start: 0,
             end: 0,
         }
-    }
-
-    #[allow(dead_code)]
-    pub const fn len(&self) -> usize {
-        self.end.saturating_sub(self.start)
-    }
-
-    #[allow(dead_code)]
-    pub const fn is_empty(&self) -> bool {
-        self.end <= self.start
     }
 }
 
@@ -117,18 +106,6 @@ impl SourceMap {
     /// assertions that include expansion did register every physical file).
     pub fn file_count(&self) -> usize {
         self.files.len()
-    }
-
-    /// Look up a registered file's source text by id.
-    #[allow(dead_code)]
-    pub fn source(&self, file_id: u32) -> Option<&str> {
-        self.files.get(file_id as usize).map(|f| f.text.as_str())
-    }
-
-    /// Look up a registered file's path by id.
-    #[allow(dead_code)]
-    pub fn path(&self, file_id: u32) -> Option<&Path> {
-        self.files.get(file_id as usize).map(|f| f.path.as_path())
     }
 
     /// Resolve a span to file path + line/col + the line's text. Returns

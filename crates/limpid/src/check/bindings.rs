@@ -89,16 +89,6 @@ impl Bindings {
         self.wildcard
     }
 
-    /// Drop every workspace binding (used for full-replacement
-    /// assignments — currently unreachable in v0.3.0 since `workspace =
-    /// expr` isn't a parser-allowed form, but kept for symmetry with
-    /// the rest of the API and for future dot-namespace flexibility).
-    #[allow(dead_code)] // reserved for `workspace = expr` full-replacement (future)
-    pub fn clear_workspace(&mut self) {
-        self.workspace.clear();
-        self.wildcard = false;
-    }
-
     // ----- let scopes ------------------------------------------------------
 
     /// Open a new `let` scope. Call at the start of every process body /

@@ -47,7 +47,7 @@ impl Runtime {
         crate::functions::register_user_functions(&mut func_registry, &config);
         let func_registry = Arc::new(func_registry);
 
-        config.validate(&registry)?;
+        config.validate()?;
         let registry = Arc::new(registry);
 
         let mut metrics_registry = MetricsRegistry::new();

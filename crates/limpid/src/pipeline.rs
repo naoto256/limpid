@@ -26,7 +26,6 @@ use crate::dsl::exec::{ExecResult, ProcessError, ProcessRegistry, exec_process_b
 use crate::dsl::value::Value;
 use crate::event::{BorrowedEvent, OwnedEvent};
 use crate::functions::FunctionRegistry;
-use crate::modules::ModuleRegistry;
 use crate::tap::TapRegistry;
 
 // ---------------------------------------------------------------------------
@@ -109,11 +108,13 @@ impl CompiledConfig {
 
     /// Validate cross-references: all referenced inputs, outputs, and processes exist.
     ///
-    /// `_builtins` is kept in the signature for callers that want to
-    /// validate against registered inputs/outputs in the future; process
-    /// names are now resolved exclusively against user-defined DSL
-    /// processes (v0.3.0 removed the native process layer).
-    pub fn validate(&self, _builtins: &ModuleRegistry) -> Result<()> {
+    /// Takes no `ModuleRegistry` — process names are resolved
+    /// exclusively against user-defined DSL processes (v0.3.0 removed
+    /// the native process layer), and inputs/outputs are validated by
+    /// construction (`ModuleRegistry::create_input`/`create_output`
+    /// already reject unknown types at build time), so there is
+    /// nothing left here that needs the registry.
+    pub fn validate(&self) -> Result<()> {
         for (name, pipeline) in &self.pipelines {
             for stmt in &pipeline.body {
                 self.validate_pipeline_stmt(name, stmt)?;
@@ -869,10 +870,7 @@ def pipeline p {
 }
 "#;
         let cfg = compile(src).unwrap();
-        let err = cfg
-            .validate(&ModuleRegistry::new())
-            .unwrap_err()
-            .to_string();
+        let err = cfg.validate().unwrap_err().to_string();
         assert!(
             err.contains("unknown input 'missing'"),
             "unexpected error: {}",
@@ -892,10 +890,7 @@ def pipeline p {
 }
 "#;
         let cfg = compile(src).unwrap();
-        let err = cfg
-            .validate(&ModuleRegistry::new())
-            .unwrap_err()
-            .to_string();
+        let err = cfg.validate().unwrap_err().to_string();
         assert!(
             err.contains("listed more than once"),
             "unexpected error: {}",
@@ -1120,7 +1115,7 @@ def pipeline p {
 }
 "#;
         let cfg = compile(src).unwrap();
-        cfg.validate(&ModuleRegistry::new()).unwrap();
+        cfg.validate().unwrap();
     }
 
     // ---------------------------------------------------------------------

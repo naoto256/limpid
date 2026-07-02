@@ -177,9 +177,7 @@ fn compile_and_analyze(config_file: &Path) -> Result<CompiledConfig> {
     let (config, source_map) =
         config::load_config_with_source_map(config_file).context("configuration error")?;
     let compiled = CompiledConfig::from_config(config)?;
-    let mut registry = crate::modules::ModuleRegistry::new();
-    crate::modules::register_builtins(&mut registry);
-    compiled.validate(&registry)?;
+    compiled.validate()?;
 
     let diagnostics = check::analyze(&compiled, &source_map);
     let mut errors = 0usize;
@@ -350,9 +348,7 @@ fn run_check(
     // Step 3: compile + validate. Errors here are syntactic / structural
     // and bubble up via anyhow; the analyzer only runs on a valid AST.
     let compiled = CompiledConfig::from_config(config)?;
-    let mut registry = crate::modules::ModuleRegistry::new();
-    crate::modules::register_builtins(&mut registry);
-    compiled.validate(&registry)?;
+    compiled.validate()?;
 
     // Step 4: run analyzer + render diagnostics. Under `--ultra-strict`
     // we post-process the diagnostics to promote unknown-ident warnings
@@ -450,13 +446,6 @@ fn run_test(config_path: &str, pipeline_name: &str, input_json: Option<&str>) ->
     let mut func_registry = FunctionRegistry::new();
     functions::register_builtins(&mut func_registry, table_store);
     functions::register_user_functions(&mut func_registry, &compiled);
-    let mut registry = crate::modules::ModuleRegistry::new();
-    crate::modules::register_builtins(&mut registry);
-
-    // `registry` exists only so `compiled.validate` can be reused later
-    // if input/output validation grows — process lookup no longer needs
-    // it (v0.3.0 removed the native process layer).
-    let _ = &registry;
 
     let event = build_test_event(input_json)?;
     // --test-pipeline runs without a live runtime; after this change

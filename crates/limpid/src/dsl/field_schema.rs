@@ -19,8 +19,6 @@
 //! property *surfaces* (`PropertySpec`); this module describes
 //! value-level *types* carried by bound names.
 
-#![allow(dead_code)]
-
 #[derive(Debug, Clone)]
 pub struct FieldSpec {
     /// Dotted path, e.g. `["workspace", "hostname"]`.
