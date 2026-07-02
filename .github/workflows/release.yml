@@ -26,7 +26,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libsystemd-dev
 
       - name: Install cargo-deb
-        run: cargo install cargo-deb
+        # Pinned + --locked so packaging tooling is reproducible; bump the
+        # pin deliberately (review the cargo-deb changelog) rather than
+        # floating to whatever crates.io serves at release time.
+        run: cargo install cargo-deb --version 3.7.0 --locked
 
       - name: Build release
         run: cargo build --release -p limpid -p limpidctl -p limpid-prometheus --features journal
