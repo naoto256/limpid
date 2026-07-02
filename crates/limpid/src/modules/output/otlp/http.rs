@@ -707,7 +707,7 @@ def output o {{
         // encoding is irrelevant to what this test pins (whether
         // danger_accept_invalid_certs reached the client builder).
         let insecure = build("verify false");
-        insecure.inner.peers[0]
+        insecure.sink.inner.policy.peers[0]
             .client
             .get(format!("https://{addr}/"))
             .send()
@@ -715,7 +715,7 @@ def output o {{
             .expect("verify false must accept the self-signed cert");
 
         let strict = build("");
-        let err = strict.inner.peers[0]
+        let err = strict.sink.inner.policy.peers[0]
             .client
             .get(format!("https://{addr}/"))
             .send()
