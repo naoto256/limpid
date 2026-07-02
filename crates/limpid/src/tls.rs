@@ -159,6 +159,22 @@ impl ClientTlsConfig {
     }
 }
 
+/// TLS protocol versions accepted by every rustls config limpid
+/// builds (server listeners and client sinks alike).
+///
+/// This is an *explicit pin* of what rustls 0.23 already defaults to:
+/// the crate only implements TLS 1.2 and 1.3, and `DEFAULT_VERSIONS`
+/// enables both — pinning changes no behaviour today. It exists so the
+/// "≥ TLS 1.2" floor is a stated property of limpid's configuration
+/// rather than an inherited library default: rustls documents that a
+/// future release may change `DEFAULT_VERSIONS`, and any such change
+/// should be a deliberate edit here, not a silent inheritance.
+/// The reqwest-based sinks (`output http`, `output otlp_http`) don't
+/// go through this module's builders; they pin the same floor via
+/// `ClientBuilder::min_tls_version`. (Security audit Low 4-3.)
+static TLS_PROTOCOL_VERSIONS: &[&rustls::SupportedProtocolVersion] =
+    &[&rustls::version::TLS13, &rustls::version::TLS12];
+
 /// Install the default rustls `CryptoProvider` (aws-lc-rs) once per
 /// process. rustls 0.23 forces explicit selection; both the OTLP gRPC
 /// input (server-side TLS) and output (client-side TLS) need it before
@@ -202,7 +218,8 @@ pub fn build_client_config_sync(tls: &ClientTlsConfig) -> Result<Arc<ClientConfi
         RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
     };
 
-    let builder = ClientConfig::builder().with_root_certificates(root_store);
+    let builder = ClientConfig::builder_with_protocol_versions(TLS_PROTOCOL_VERSIONS)
+        .with_root_certificates(root_store);
     let config = match (&tls.cert_path, &tls.key_path) {
         (Some(cert_path), Some(key_path)) => builder
             .with_client_auth_cert(load_certs(cert_path)?, load_private_key(key_path)?)
@@ -219,6 +236,11 @@ fn build_server_config_sync(
     key_path: &str,
     ca_path: Option<String>,
 ) -> Result<Arc<ServerConfig>> {
+    // The client path installs the provider before building; do the
+    // same here so `builder_with_protocol_versions` (which reads the
+    // process-default provider) can't race a bare startup sequence.
+    install_default_crypto_provider();
+
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
 
@@ -232,12 +254,12 @@ fn build_server_config_sync(
         let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
             .build()
             .context("failed to build client verifier")?;
-        ServerConfig::builder()
+        ServerConfig::builder_with_protocol_versions(TLS_PROTOCOL_VERSIONS)
             .with_client_cert_verifier(verifier)
             .with_single_cert(certs, key)
             .context("failed to build TLS server config with client auth")?
     } else {
-        ServerConfig::builder()
+        ServerConfig::builder_with_protocol_versions(TLS_PROTOCOL_VERSIONS)
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .context("failed to build TLS server config")?
@@ -259,11 +281,40 @@ fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
 }
 
 fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
+    // Warn (don't refuse) on a group/other-readable key file: refusing
+    // would brick existing deployments on upgrade, but a private key
+    // readable by other local users defeats the point of TLS/mTLS.
+    // (Security audit Low 4-3.)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = std::fs::metadata(path)
+            && key_mode_is_overshared(meta.mode())
+        {
+            tracing::warn!(
+                "tls: private key {} is readable by group/other (mode {:o}) — \
+                 restrict with `chmod 600 {}`",
+                path,
+                meta.mode() & 0o777,
+                path
+            );
+        }
+    }
+
     let bytes =
         std::fs::read(path).with_context(|| format!("failed to read key file: {}", path))?;
     let key = PrivateKeyDer::from_pem_slice(&bytes)
         .with_context(|| format!("failed to parse key from: {}", path))?;
     Ok(key)
+}
+
+/// True when a private-key file's mode grants read access beyond its
+/// owner (group-read 0o040 or other-read 0o004). Split from
+/// `load_private_key` so the predicate is unit-testable without
+/// capturing tracing output.
+#[cfg(unix)]
+fn key_mode_is_overshared(mode: u32) -> bool {
+    mode & 0o044 != 0
 }
 
 #[cfg(test)]
@@ -458,5 +509,51 @@ mod tests {
             err.to_string().contains("read") || err.to_string().contains("cert"),
             "got: {err}"
         );
+    }
+
+    // ---------- key file permission check ----------
+
+    #[test]
+    #[cfg(unix)]
+    fn key_mode_predicate_flags_group_or_other_read() {
+        // Overshared: any read bit beyond the owner.
+        assert!(key_mode_is_overshared(0o644)); // group+other read
+        assert!(key_mode_is_overshared(0o640)); // group read
+        assert!(key_mode_is_overshared(0o604)); // other read
+        assert!(key_mode_is_overshared(0o444));
+        // Owner-only shapes are fine, including the write bit.
+        assert!(!key_mode_is_overshared(0o600));
+        assert!(!key_mode_is_overshared(0o400));
+        // Group/other *write without read* is a different (weirder)
+        // misconfiguration; the read-exposure warning stays scoped to
+        // confidentiality of the key material.
+        assert!(!key_mode_is_overshared(0o622));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn load_private_key_still_loads_overshared_key() {
+        // The permission check must warn, never refuse — refusing
+        // would brick existing deployments on upgrade. Pin the
+        // load-succeeds behaviour for a 0644 key.
+        use std::os::unix::fs::PermissionsExt;
+        let p = gen_pems();
+        std::fs::set_permissions(&p.key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        load_private_key(&p.key).expect("overshared key must still load (warn-only check)");
+    }
+
+    // ---------- protocol version pin ----------
+
+    #[test]
+    fn protocol_version_pin_is_tls12_floor() {
+        // Compile-visible statement of the audit requirement: the pin
+        // must contain TLS 1.2 and 1.3 and nothing older. rustls 0.23
+        // cannot even express < 1.2, so this is a tripwire against a
+        // future edit that drops 1.2 (breaking older peers silently)
+        // or a rustls upgrade that changes what the constant means.
+        let versions: Vec<_> = TLS_PROTOCOL_VERSIONS.iter().map(|v| v.version).collect();
+        assert!(versions.contains(&rustls::ProtocolVersion::TLSv1_2));
+        assert!(versions.contains(&rustls::ProtocolVersion::TLSv1_3));
+        assert_eq!(versions.len(), 2);
     }
 }

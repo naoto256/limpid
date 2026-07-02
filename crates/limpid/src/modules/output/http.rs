@@ -328,7 +328,13 @@ fn parse_peer(name: &str, peer_props: &[Property], verify: bool) -> Result<HttpP
         );
     }
 
-    let mut client_builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
+    // Explicit ≥ TLS 1.2 floor, mirroring the rustls-side pin in
+    // `crate::tls::TLS_PROTOCOL_VERSIONS` (see the rationale there).
+    // No behaviour change with the rustls backend — it only implements
+    // 1.2 / 1.3 — but the floor is now stated, not inherited.
+    let mut client_builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .min_tls_version(reqwest::tls::Version::TLS_1_2);
 
     if !verify {
         client_builder = client_builder.danger_accept_invalid_certs(true);
