@@ -330,6 +330,82 @@ impl<C> PeerList<C> {
     }
 }
 
+/// Cursor-driven single-candidate peer rotation with per-peer failure
+/// cooldown. Shared by the batched HTTP / OTLP outputs, whose retry
+/// loop wants exactly one candidate per send attempt (`select` →
+/// attempt → `mark_success` / `mark_failure`).
+///
+/// This is deliberately NOT merged with [`PeerList::write_with_rotation_at`]:
+/// that helper tries *every* available peer within one call and owns
+/// the per-peer connection state, while this type hands out one index
+/// at a time and leaves the transport attempt to the caller — the
+/// batched outputs' retry budget (not the rotation) is what drives
+/// re-attempts there.
+pub struct RotatingPeers {
+    /// Round-robin cursor. Incremented per selection so successive
+    /// sends start at successive peers.
+    cursor: AtomicUsize,
+    /// Per-peer cooldown expiry. Same length as the caller's peer
+    /// list. Wrapped in `Mutex` because `Instant` is not
+    /// `Copy`-loadable from an atomic — but contention is low (one
+    /// short critical section per send per peer).
+    cooldown_until: Vec<Mutex<Option<Instant>>>,
+}
+
+impl RotatingPeers {
+    /// `len` is the number of peers; must be at least 1 (every
+    /// caller's config layer already rejects empty peer lists).
+    pub fn new(len: usize) -> Self {
+        Self {
+            cursor: AtomicUsize::new(0),
+            cooldown_until: (0..len).map(|_| Mutex::new(None)).collect(),
+        }
+    }
+
+    /// Pick the next candidate: rotation starts at the cursor and
+    /// walks forward looking for a peer whose cooldown has expired.
+    /// If every peer is currently cooled (typical single-peer retry
+    /// path: the peer just failed on the previous attempt) fall back
+    /// to the rotation start — the caller's retry budget is what
+    /// protects us, not the cooldown. The cooldown's actual job is to
+    /// bias *future sends* away from a known-bad peer when an
+    /// alternative exists.
+    pub async fn select(&self) -> usize {
+        let n = self.cooldown_until.len();
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
+        let now = Instant::now();
+        for offset in 0..n {
+            let candidate = (start + offset) % n;
+            let guard = self.cooldown_until[candidate].lock().await;
+            if guard.is_none_or(|until| until <= now) {
+                return candidate;
+            }
+        }
+        start
+    }
+
+    /// Reset the peer's cooldown so future selections pick it freely.
+    pub async fn mark_success(&self, idx: usize) {
+        *self.cooldown_until[idx].lock().await = None;
+    }
+
+    /// Cool the peer down for `PEER_COOLDOWN`, measured from *failure
+    /// time*, not selection time: the transport attempt may take up
+    /// to its request timeout (30s for the HTTP/OTLP outputs), which
+    /// is longer than `PEER_COOLDOWN` (5s) — anchoring on the
+    /// selection-time `Instant` could record an already-expired
+    /// cooldown and immediately reselect the same bad peer.
+    pub async fn mark_failure(&self, idx: usize) {
+        *self.cooldown_until[idx].lock().await = Some(Instant::now() + PEER_COOLDOWN);
+    }
+
+    /// Test-only view of a peer's cooldown expiry.
+    #[cfg(test)]
+    pub async fn cooldown_until(&self, idx: usize) -> Option<Instant> {
+        *self.cooldown_until[idx].lock().await
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PeerSendError {
     #[error("no peers configured")]
@@ -595,6 +671,37 @@ mod tests {
                 .load(Ordering::Relaxed),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn rotating_peers_round_robin_and_cooldown_skip() {
+        let rot = RotatingPeers::new(3);
+        // Cursor-driven rotation: successive selects walk the ring.
+        assert_eq!(rot.select().await, 0);
+        assert_eq!(rot.select().await, 1);
+        assert_eq!(rot.select().await, 2);
+        // Cool peer 0 down: the next rotation start (cursor = 0)
+        // skips it and lands on peer 1.
+        rot.mark_failure(0).await;
+        assert_eq!(rot.select().await, 1);
+        // Success resets the cooldown; peer 0 is selectable again.
+        rot.mark_success(0).await;
+        assert_eq!(rot.select().await, 1); // cursor = 1
+        assert_eq!(rot.select().await, 2); // cursor = 2
+        assert_eq!(rot.select().await, 0); // cursor = 0, no cooldown
+    }
+
+    #[tokio::test]
+    async fn rotating_peers_falls_back_to_rotation_start_when_all_cooled() {
+        // Single-peer retry path: the peer just failed, so every peer
+        // is cooled — select must still hand out a candidate (the
+        // rotation start), leaving re-attempt pacing to the caller's
+        // retry budget.
+        let rot = RotatingPeers::new(2);
+        rot.mark_failure(0).await;
+        rot.mark_failure(1).await;
+        assert_eq!(rot.select().await, 0);
+        assert_eq!(rot.select().await, 1);
     }
 
     #[tokio::test]

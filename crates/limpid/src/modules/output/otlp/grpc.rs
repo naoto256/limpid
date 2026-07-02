@@ -46,8 +46,8 @@
 //! not the cooldown, protects the single-peer-just-failed case.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
@@ -62,7 +62,7 @@ use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
-use crate::modules::output::syslog_peers::{PEER_COOLDOWN, iter_peers_block};
+use crate::modules::output::syslog_peers::{RotatingPeers, iter_peers_block};
 use crate::modules::{HasMetrics, Module, Output};
 use crate::queue::{BackoffStrategy, QueueAckHandle, RetryConfig};
 
@@ -81,22 +81,12 @@ struct GrpcPeer {
     channel: Channel,
 }
 
-struct PeerState {
-    cooldown_until: Mutex<Option<Instant>>,
-}
-
-impl Default for PeerState {
-    fn default() -> Self {
-        Self {
-            cooldown_until: Mutex::new(None),
-        }
-    }
-}
-
 struct Inner {
     peers: Vec<GrpcPeer>,
-    peer_state: Vec<PeerState>,
-    cursor: AtomicUsize,
+    /// Round-robin cursor + per-peer failure cooldown; one candidate
+    /// per send attempt. See `RotatingPeers` for the selection and
+    /// cooldown contract.
+    rotation: RotatingPeers,
     batch_level: BatchLevel,
     headers: Vec<(String, String)>,
     batch_timeout: Duration,
@@ -329,15 +319,14 @@ impl Module for OtlpGrpcOutput {
             );
         };
 
-        let peer_state = peers.iter().map(|_| PeerState::default()).collect();
+        let rotation = RotatingPeers::new(peers.len());
 
         let retry_config = RetryConfig::from_output_properties(properties)?;
 
         let metrics = Arc::new(OutputMetrics::default());
         let inner = Arc::new(Inner {
             peers,
-            peer_state,
-            cursor: AtomicUsize::new(0),
+            rotation,
             batch_level,
             headers,
             batch_timeout,
@@ -651,7 +640,6 @@ impl Drop for OtlpGrpcOutput {
 
 async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<super::SendOutcome> {
     let req = decode_drained_to_request(drained, inner.batch_level)?;
-    let n = inner.peers.len();
 
     let cfg = &inner.retry_config;
     let max_attempts = cfg.max_attempts.max(1);
@@ -659,31 +647,18 @@ async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<super::SendOut
     let mut wait = cfg.initial_wait;
 
     let final_err = loop {
-        let start = inner.cursor.fetch_add(1, Ordering::Relaxed) % n;
-        let now = Instant::now();
-        let mut idx = start;
-        for offset in 0..n {
-            let candidate = (start + offset) % n;
-            let guard = inner.peer_state[candidate].cooldown_until.lock().await;
-            if guard.is_none_or(|until| until <= now) {
-                idx = candidate;
-                break;
-            }
-        }
-
+        // One candidate per attempt; see `RotatingPeers` for the
+        // selection + cooldown contract (cooldown is measured from
+        // failure time so a slow 30s GRPC_REQUEST_TIMEOUT failure
+        // cannot record an already-expired cooldown).
+        let idx = inner.rotation.select().await;
         let err = match send_once(&inner.peers[idx], inner, &req).await {
             Ok(outcome) => {
-                *inner.peer_state[idx].cooldown_until.lock().await = None;
+                inner.rotation.mark_success(idx).await;
                 return Ok(outcome);
             }
             Err(e) => {
-                // Measure cooldown from failure time, not request start:
-                // `now` was captured before `send_once`, so for any non-
-                // trivial request latency (and especially after a 30s
-                // GRPC_REQUEST_TIMEOUT firing) `now + PEER_COOLDOWN`
-                // can already be in the past, defeating the rotation.
-                *inner.peer_state[idx].cooldown_until.lock().await =
-                    Some(Instant::now() + PEER_COOLDOWN);
+                inner.rotation.mark_failure(idx).await;
                 e
             }
         };
