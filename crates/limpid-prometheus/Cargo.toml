@@ -11,7 +11,19 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["full"] }
+# Explicit feature list instead of "full": the exporter only needs the
+# multi-thread runtime + macros (tokio::main / spawn), sockets (net),
+# buffered async I/O (io-util), timeouts (time), and the Semaphore
+# connection cap (sync). Keeping the set minimal both trims the build
+# and documents what the binary actually exercises.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
