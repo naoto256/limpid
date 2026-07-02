@@ -29,6 +29,8 @@
 //! - `parser_effects`  — parser `produces` → workspace merge
 //! - `render`          — rustc-style snippet+caret diagnostic emit
 //! - `suggestions`     — Levenshtein "did you mean" hint
+//! - `recovery_readiness` — cross-cutting warning: recovery-worthy outputs without `error_log`
+//! - `tls_verify`      — cross-cutting warning: outputs with `verify false`
 //! - `mod`             — pipeline walk + entry + Diagnostic / Level
 
 pub mod bindings;
@@ -43,6 +45,7 @@ mod parser_effects;
 mod recovery_readiness;
 pub mod render;
 pub mod suggestions;
+mod tls_verify;
 
 use crate::dsl::ast::{
     AssignTarget, Config, Definition, Expr, ExprKind, PipelineDef, PipelineStatement,
@@ -284,6 +287,7 @@ pub fn analyze(config: &CompiledConfig, _source_map: &SourceMap) -> Vec<Diagnost
     module_props::analyze_all(config, &module_registry, &mut diagnostics);
     global_props::analyze_all(config, &mut diagnostics);
     recovery_readiness::analyze_all(config, &mut diagnostics);
+    tls_verify::analyze_all(config, &mut diagnostics);
     for (name, pipeline) in &config.pipelines {
         analyze_pipeline(
             name,
