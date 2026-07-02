@@ -150,24 +150,16 @@ pub trait Module: Sized {
         if let Some(spec) = Self::property_schema() {
             let errs = property_schema::validate(properties.user_properties(), spec);
             if !errs.is_empty() {
-                anyhow::bail!(format_module_schema_errors(name, &errs));
+                anyhow::bail!(format_factory_schema_errors(
+                    "module",
+                    properties.type_name(),
+                    name,
+                    &errs
+                ));
             }
         }
         Self::from_properties(name, properties, ctx)
     }
-}
-
-/// Render a list of schema findings as a single multi-line error
-/// message suitable for `anyhow::bail!`. The caller has already
-/// identified which module the errors are for; we only describe the
-/// findings themselves.
-#[allow(dead_code)] // reachable through `Module::build` (test entry)
-fn format_module_schema_errors(name: &str, errs: &[property_schema::SchemaError]) -> String {
-    let mut out = format!("module '{}' has invalid configuration:", name);
-    for e in errs {
-        out.push_str(&format!("\n  - {}", e));
-    }
-    out
 }
 
 /// All modules expose their own metrics.
