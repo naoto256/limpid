@@ -78,34 +78,42 @@ fn ensure_socket_parent_dir(parent: &std::path::Path) {
     }
     // A pre-existing parent dir (e.g. systemd's RuntimeDirectory before
     // RuntimeDirectoryMode is honoured, or an operator-managed path) is
-    // left as-is above — its mode is not under daemon control. That
-    // means the bind->chmod TOCTOU window on the socket file itself
-    // (`ensure_socket_parent_dir` -> stale-socket removal -> `bind`)
-    // is only closed by "other users can't touch this directory" when
-    // the daemon created it. Surface the gap loudly instead of
-    // silently trusting an inherited mode: a world-writable parent
-    // lets any local user race a symlink/regular-file into the socket
-    // path during that window.
+    // left as-is above — its mode is not under daemon control. The
+    // `ControlServer::run` bind->chmod TOCTOU note below assumes "the
+    // parent directory is not world-traversable"; that assumption is
+    // guaranteed only for dirs this function created (0o750) or a
+    // packaged unit's `RuntimeDirectoryMode=0750`, not for an inherited
+    // or operator-managed path. Two distinct properties matter here:
+    // group/other WRITE lets any such user race a symlink or regular
+    // file into the socket path before `bind`; other EXECUTE (traverse)
+    // lets a user outside the daemon's group reach the socket inode at
+    // all during the bind->chmod window, even without write access.
+    // Group execute is expected and not flagged (group is the trusted
+    // socket-access group per the 0o660 chmod below).
     #[cfg(unix)]
     if let Ok(meta) = std::fs::metadata(parent) {
         use std::os::unix::fs::PermissionsExt;
         let mode = meta.permissions().mode() & 0o777;
         if parent_dir_mode_is_unsafe(mode) {
             warn!(
-                "control socket: parent dir {:?} has mode {:o} (group/other can write into it) \
-                 — this weakens the bind-time TOCTOU mitigation; expected 0o750 or tighter",
+                "control socket: parent dir {:?} has mode {:o} (group-writable and/or \
+                 world-traversable) — this weakens the bind-time TOCTOU mitigation; \
+                 expected 0o750 or tighter",
                 parent, mode
             );
         }
     }
 }
 
-/// True when group or other can write into the directory — either can
-/// race a symlink or regular file into the socket path between the
-/// daemon's stale-socket check and `UnixListener::bind`.
+/// True when the parent dir's mode breaks either TOCTOU-mitigating
+/// property the `ControlServer::run` bind->chmod comment relies on:
+/// group/other write (symlink/file race before `bind`) or other
+/// execute (an outside-the-group user can traverse to and connect the
+/// socket inode during the bind->chmod window). Group execute is not
+/// flagged — group is the socket's own trusted access group.
 #[cfg(unix)]
 fn parent_dir_mode_is_unsafe(mode: u32) -> bool {
-    mode & 0o022 != 0
+    mode & 0o023 != 0
 }
 
 pub struct ControlServer {
@@ -194,10 +202,15 @@ impl ControlServer {
         // modes instead. The window is instead covered structurally:
         // no await point separates bind from chmod (the gap is
         // microseconds of same-thread work), and the parent directory
-        // is not world-traversable — 0o750 when this daemon created it
-        // above, `RuntimeDirectory` mode from the unit file under
-        // systemd — so an attacker outside the daemon's group cannot
-        // reach the socket inode during the window at all.
+        // is expected to not be world-traversable — 0o750 when this
+        // daemon created it (`ensure_socket_parent_dir` above), or a
+        // packaged unit's `RuntimeDirectoryMode=0750` under systemd —
+        // so an attacker outside the daemon's group cannot reach the
+        // socket inode during the window at all. That guarantee does
+        // not extend to an inherited or operator-managed parent dir
+        // with a looser mode; `ensure_socket_parent_dir` warns (rather
+        // than silently trusting it) when a pre-existing parent is
+        // group-writable or world-traversable.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -928,17 +941,28 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn parent_dir_mode_unsafe_flags_group_or_other_write() {
-        // 0o755 (world-readable/traversable but not writable) cannot be
-        // raced — an untrusted user can list and stat the directory but
-        // not create a file/symlink in it. Only a write bit for group
-        // or other actually reopens the bind-time TOCTOU window.
-        assert!(!parent_dir_mode_is_unsafe(0o755));
+    fn parent_dir_mode_unsafe_flags_group_write_or_other_traverse() {
+        // 0o750 (the daemon's own target mode: group rwx, no other bits)
+        // and 0o700 (owner-only) uphold both TOCTOU-mitigating
+        // properties: no group/other write (no symlink/file race), and
+        // no other execute (an outside-the-group user can't even
+        // traverse to the socket inode during the bind->chmod window).
         assert!(!parent_dir_mode_is_unsafe(0o750));
         assert!(!parent_dir_mode_is_unsafe(0o700));
-        assert!(parent_dir_mode_is_unsafe(0o777)); // other write
+        // 0o755 is world-traversable (other execute set) even though it
+        // isn't world-writable — a user outside the daemon's group can
+        // still reach the socket inode during the window, so this must
+        // be flagged even though the earlier (narrower) write-only
+        // check would have missed it.
+        assert!(parent_dir_mode_is_unsafe(0o755));
+        assert!(parent_dir_mode_is_unsafe(0o777)); // other write + traverse
         assert!(parent_dir_mode_is_unsafe(0o770)); // group write
-        assert!(parent_dir_mode_is_unsafe(0o757)); // other write, no exec bit change
+        assert!(parent_dir_mode_is_unsafe(0o757)); // other write + traverse
+        assert!(parent_dir_mode_is_unsafe(0o751)); // other execute only, no write
+        // Group execute alone (no group/other write, no other execute)
+        // is expected and not flagged — group is the socket's own
+        // trusted access group per the 0o660 chmod.
+        assert!(!parent_dir_mode_is_unsafe(0o710));
     }
 
     #[test]
