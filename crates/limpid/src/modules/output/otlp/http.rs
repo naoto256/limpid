@@ -322,7 +322,12 @@ fn parse_peer(name: &str, peer_props: &[Property], verify: bool) -> Result<HttpP
         })
         .transpose()?;
 
-    let mut builder = reqwest::Client::builder().timeout(HTTP_REQUEST_TIMEOUT);
+    // Explicit ≥ TLS 1.2 floor, mirroring the rustls-side pin in
+    // `crate::tls::TLS_PROTOCOL_VERSIONS` (see the rationale there
+    // and the matching builder in `output http`).
+    let mut builder = reqwest::Client::builder()
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .min_tls_version(reqwest::tls::Version::TLS_1_2);
     if !verify {
         builder = builder.danger_accept_invalid_certs(true);
         if endpoint.to_ascii_lowercase().starts_with("https://") {
