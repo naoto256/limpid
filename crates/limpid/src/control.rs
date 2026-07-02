@@ -76,20 +76,13 @@ fn ensure_socket_parent_dir(parent: &std::path::Path) {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o750));
     }
-    // A pre-existing parent dir (e.g. systemd's RuntimeDirectory before
-    // RuntimeDirectoryMode is honoured, or an operator-managed path) is
-    // left as-is above — its mode is not under daemon control. The
-    // `ControlServer::run` bind->chmod TOCTOU note below assumes "the
-    // parent directory is not world-traversable"; that assumption is
-    // guaranteed only for dirs this function created (0o750) or a
-    // packaged unit's `RuntimeDirectoryMode=0750`, not for an inherited
-    // or operator-managed path. Two distinct properties matter here:
-    // group/other WRITE lets any such user race a symlink or regular
-    // file into the socket path before `bind`; other EXECUTE (traverse)
-    // lets a user outside the daemon's group reach the socket inode at
-    // all during the bind->chmod window, even without write access.
-    // Group execute is expected and not flagged (group is the trusted
-    // socket-access group per the 0o660 chmod below).
+    // A pre-existing parent dir (systemd's RuntimeDirectory, or an
+    // operator-managed path) keeps its own mode — the 0o750 tightening
+    // above only applies to dirs this call created. Rather than
+    // silently trust an inherited mode, warn when it is too loose to
+    // uphold the bind->chmod window's assumption that only the daemon's
+    // group can reach the socket inode. See `parent_dir_mode_is_unsafe`
+    // for exactly which bits break that, and why.
     #[cfg(unix)]
     if let Ok(meta) = std::fs::metadata(parent) {
         use std::os::unix::fs::PermissionsExt;
@@ -202,15 +195,11 @@ impl ControlServer {
         // modes instead. The window is instead covered structurally:
         // no await point separates bind from chmod (the gap is
         // microseconds of same-thread work), and the parent directory
-        // is expected to not be world-traversable — 0o750 when this
-        // daemon created it (`ensure_socket_parent_dir` above), or a
-        // packaged unit's `RuntimeDirectoryMode=0750` under systemd —
-        // so an attacker outside the daemon's group cannot reach the
-        // socket inode during the window at all. That guarantee does
-        // not extend to an inherited or operator-managed parent dir
-        // with a looser mode; `ensure_socket_parent_dir` warns (rather
-        // than silently trusting it) when a pre-existing parent is
-        // group-writable or world-traversable.
+        // gates who can reach the socket inode — daemon-created dirs are
+        // 0o750 and packaged units pin `RuntimeDirectoryMode=0750`, so
+        // an outside-the-group attacker cannot reach it during the
+        // window. `ensure_socket_parent_dir` warns when an inherited
+        // parent is too loose to hold that line.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
