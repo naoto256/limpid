@@ -17,8 +17,11 @@ prefix.
 │                workspace.limpid.* (currently OCSF 1.3.0;
 │                also the replay-shape composer for parser
 │                regression capture)
-└─ filters/      pre-parser noise filters (drop / pass-through
-                 by content predicate)
+├─ filters/      pre-parser noise filters (drop / pass-through
+│                by content predicate)
+└─ functions/    shared pure functions (RFC 3164 timestamp
+                 parsing, protocol-name → IANA number, HTTP
+                 method → OCSF activity_id)
 ```
 
 ## What's included (v0.7.0)

@@ -87,7 +87,7 @@ These are not principles — they are concrete consequences of the five principl
 
 ### Domain knowledge ships as DSL snippets, not Rust
 
-Typical parsing patterns — OTLP normalization, OCSF mapping, Windows Snare parsing, Apache / nginx / Cisco ASA / FortiGate log formats — are not built-in Rust modules. They are DSL snippets that users `include` from their configuration. Snippets shipped with limpid live read-only under `/usr/share/limpid/snippets/` (organized as `parsers/`, `composers/`, `_common/`); user-authored snippets live wherever the operator keeps them.
+Typical parsing patterns — OTLP normalization, OCSF mapping, Windows Snare parsing, Apache / nginx / Cisco ASA / FortiGate log formats — are not built-in Rust modules. They are DSL snippets that users `include` from their configuration. Snippets shipped with limpid live read-only under `/usr/share/limpid/snippets/` (organized as `parsers/`, `composers/`, `filters/`, `functions/`); user-authored snippets live wherever the operator keeps them.
 
 - Users can include them as-is, modify them, ignore them, or replace them
 - A specification change (e.g. OTLP version update) is a DSL edit, not a Rust release
