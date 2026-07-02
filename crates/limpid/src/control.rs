@@ -635,3 +635,189 @@ async fn handle_tap(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Protocol round-trip tests
+// ---------------------------------------------------------------------------
+//
+// `limpidctl` (crates/limpidctl/src/main.rs) and `limpid-prometheus`
+// (crates/limpid-prometheus/src/main.rs) each hand-build the command
+// strings this module's line parser above (`handle_connection`)
+// expects — there is no shared crate defining the wire grammar. These
+// tests pin that limpidctl-shaped commands are accepted by the daemon
+// parser, so a future edit to either side's string literals gets
+// caught here instead of only at runtime against a real daemon.
+//
+// Not a shared "protocol crate": the task that introduced this test
+// module deliberately rejected extracting one (over-engineering for a
+// two-writer, one-reader line protocol) — this integration test is
+// the cheaper alternative that still catches drift.
+#[cfg(test)]
+mod protocol_round_trip_tests {
+    use std::time::Duration;
+
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    use super::*;
+    use crate::dsl::parser::parse_config;
+
+    /// Spins up a real `ControlServer` on a temp-dir socket with an
+    /// empty config/metrics/tap registry (sufficient for `health` /
+    /// `stats` / `list`, and for pinning that `tap` / `inject` command
+    /// shapes reach their kind/name validation instead of being
+    /// rejected as unparseable). Returns the socket path and a
+    /// shutdown sender; the server task is aborted on drop via the
+    /// watch channel going out of scope in the caller's control, so
+    /// tests explicitly signal shutdown at the end.
+    async fn spawn_server() -> (
+        std::path::PathBuf,
+        tempfile::TempDir,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("control.sock");
+
+        let config = CompiledConfig::from_config(
+            parse_config(
+                r#"
+def input i { type syslog_tcp bind "127.0.0.1:0" }
+def output o { type stdout }
+def pipeline p { input i; output o }
+"#,
+            )
+            .expect("parse"),
+        )
+        .expect("compile");
+
+        let server = ControlServer::new(
+            Some(socket_path.to_string_lossy().into_owned()),
+            TapRegistry::new(),
+            Arc::new(MetricsRegistry::new()),
+            Arc::new(config),
+            HashMap::new(),
+            Arc::new(HashMap::new()),
+            Instant::now(),
+        );
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(server.run(shutdown_rx));
+
+        // Poll for the socket file to appear instead of a fixed sleep —
+        // bind happens early in `run` but is still async relative to
+        // this task's spawn.
+        for _ in 0..100 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(socket_path.exists(), "control socket never appeared");
+
+        (socket_path, dir, shutdown_tx)
+    }
+
+    /// Send `command` (already newline-terminated by the caller's
+    /// format string, matching how `limpidctl` calls
+    /// `writeln!(stream, "{}", command)`) and return the first
+    /// response line.
+    async fn send_command(socket_path: &std::path::Path, command: &str) -> String {
+        let mut stream = UnixStream::connect(socket_path)
+            .await
+            .expect("connect to control socket");
+        stream
+            .write_all(format!("{}\n", command).as_bytes())
+            .await
+            .expect("write command");
+        let (reader, _writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read response");
+        line
+    }
+
+    #[tokio::test]
+    async fn health_command_as_built_by_limpidctl_and_prometheus() {
+        // Both callers send the bare command with no arguments.
+        let (socket_path, _dir, shutdown_tx) = spawn_server().await;
+        let resp = send_command(&socket_path, "health").await;
+        assert!(
+            resp.contains("\"status\":\"ok\""),
+            "unexpected health response: {}",
+            resp
+        );
+        let _ = shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
+    async fn stats_command_as_built_by_limpidctl_and_prometheus() {
+        let (socket_path, _dir, shutdown_tx) = spawn_server().await;
+        let resp = send_command(&socket_path, "stats").await;
+        // Any well-formed JSON object counts as "parsed", as opposed to
+        // the `{"error":"unknown command '...'"}"` fallback.
+        assert!(
+            !resp.contains("unknown command"),
+            "stats command was not recognised: {}",
+            resp
+        );
+        let parsed: serde_json::Value = serde_json::from_str(resp.trim()).expect("valid JSON");
+        assert!(parsed.is_object(), "stats response not an object: {}", resp);
+        let _ = shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
+    async fn list_command_as_built_by_limpidctl() {
+        let (socket_path, _dir, shutdown_tx) = spawn_server().await;
+        let resp = send_command(&socket_path, "list").await;
+        assert!(
+            !resp.contains("unknown command"),
+            "list command was not recognised: {}",
+            resp
+        );
+        let parsed: serde_json::Value = serde_json::from_str(resp.trim()).expect("valid JSON");
+        assert!(parsed.is_object(), "list response not an object: {}", resp);
+        let _ = shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
+    async fn tap_command_shapes_as_built_by_limpidctl() {
+        // `limpidctl tap <kind> <name> [json]` builds exactly these two
+        // shapes (see `main()`'s `Command::Tap` arm). Both must clear
+        // the parser's `strip_prefix("tap ")` + kind/name match and
+        // reach `tap.subscribe`, which then reports "unknown tap
+        // point" for a name this test never registered — a parser
+        // rejection would instead read "expected 'tap ...'".
+        let (socket_path, _dir, shutdown_tx) = spawn_server().await;
+        for command in ["tap input i", "tap input i json"] {
+            let resp = send_command(&socket_path, command).await;
+            assert!(
+                resp.contains("unknown tap point"),
+                "command {:?} was rejected at the parser level: {}",
+                command,
+                resp
+            );
+        }
+        let _ = shutdown_tx.send(true);
+    }
+
+    #[tokio::test]
+    async fn inject_command_shapes_as_built_by_limpidctl() {
+        // `limpidctl inject <kind> <name> [json]` builds exactly these
+        // two shapes (see `main()`'s `Command::Inject` arm). Both must
+        // clear `strip_prefix("inject ")` + kind/name match and reach
+        // the sender-map lookup, which reports "unknown input" for a
+        // name this test never registered — a parser rejection would
+        // instead read "expected 'inject ...'".
+        let (socket_path, _dir, shutdown_tx) = spawn_server().await;
+        for command in ["inject input i", "inject input i json"] {
+            let resp = send_command(&socket_path, command).await;
+            assert!(
+                resp.contains("unknown input"),
+                "command {:?} was rejected at the parser level: {}",
+                command,
+                resp
+            );
+        }
+        let _ = shutdown_tx.send(true);
+    }
+}
