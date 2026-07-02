@@ -69,16 +69,22 @@ The included unit file (`packaging/limpid.service`) runs limpid as the `syslog` 
 User=syslog
 Group=syslog
 AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/lib/limpid /var/run/limpid /var/log
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+ReadWritePaths=/var/lib/limpid /var/run/limpid /var/log/limpid
 ```
 
 - `CAP_NET_BIND_SERVICE` allows binding to privileged ports (514) without root
 - `ProtectSystem=strict` makes the filesystem read-only except for explicitly allowed paths
 - `RuntimeDirectory=limpid` ensures `/var/run/limpid/` exists for the control socket
 - `ExecReload=/bin/kill -HUP $MAINPID` triggers hot reload via SIGHUP
+- `ReadWritePaths` covers only this daemon's own state/log directories; `PrivateDevices=yes` means a `/dev/log` `unix_socket` input needs an explicit `BindPaths=/dev/log` drop-in (see [systemd](./systemd.md#adding-write-paths))
 
 See [systemd](./systemd.md) for operational details.
 
