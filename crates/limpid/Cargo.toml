@@ -102,4 +102,11 @@ assets = [
     # so the .deb just needs the directory once snippets exist.
 ]
 maintainer-scripts = "../../packaging"
-systemd-units = { unit-name = "limpid", unit-scripts = "../../packaging" }
+# start = false preserves the existing "enable but don't start on first
+# install" behaviour: cargo-deb's dh_installsystemd port defaults both
+# `enable` and `start` to true when unset (see cargo-deb's
+# SystemdUnitsConfig -> dh_installsystemd::Options mapping), which would
+# silently start limpid.service as part of `#DEBHELPER#` and conflict
+# with rsyslog/syslog-ng still bound to the syslog ports on upgrade.
+# enable = true is the default and is listed explicitly for clarity.
+systemd-units = { unit-name = "limpid", unit-scripts = "../../packaging", enable = true, start = false }
