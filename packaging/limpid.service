@@ -26,6 +26,12 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 # Directories (systemd creates with correct ownership)
 RuntimeDirectory=limpid
+# Keep /run/limpid non-world-traversable: the control socket is
+# briefly umask-mode between bind and the daemon's chmod to 0660
+# (see control.rs), and this directory mode is what keeps users
+# outside the syslog group from reaching the inode in that window.
+# 0750 matches the socket's owner+group access model.
+RuntimeDirectoryMode=0750
 StateDirectory=limpid
 ConfigurationDirectory=limpid
 
