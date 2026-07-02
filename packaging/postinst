@@ -9,6 +9,15 @@ if ! getent passwd syslog >/dev/null 2>&1; then
     useradd --system --no-create-home --shell /usr/sbin/nologin -g syslog syslog
 fi
 
+# Refuse to proceed if any target is a symlink (would let a pre-staged
+# symlink redirect config/state writes outside the intended tree).
+for d in /etc/limpid /var/lib/limpid /var/log/limpid; do
+    if [ -L "$d" ]; then
+        echo "ERROR: $d is a symlink; refusing to install over it." >&2
+        exit 1
+    fi
+done
+
 # Create directories with correct ownership
 mkdir -p /etc/limpid/inputs /etc/limpid/outputs /etc/limpid/processes /etc/limpid/pipelines
 mkdir -p /var/lib/limpid /var/log/limpid
@@ -30,10 +39,14 @@ for svc in rsyslog syslog-ng td-agent fluentd; do
     fi
 done
 
-# Enable and start limpid (don't start automatically on first install)
-systemctl daemon-reload
-systemctl enable limpid
-
+# Unit enable/start is handled by the debhelper systemd-units snippet
+# below (#DEBHELPER#), generated from `systemd-units` in
+# crates/limpid/Cargo.toml (enable = true, start = false — enables the
+# unit but does not start it, so an operator running rsyslog/syslog-ng
+# on the same ports isn't disrupted by an upgrade). The debhelper
+# snippet also guards its systemctl calls with
+# `[ -d /run/systemd/system ]`, so this script no longer aborts under
+# `set -e` in containers without a running systemd.
 #DEBHELPER#
 
 echo ""
