@@ -10,7 +10,7 @@
 
 use crate::dsl::ast::{Expr, ExprKind};
 use crate::functions::FunctionRegistry;
-use crate::modules::schema::FieldType;
+use crate::dsl::field_schema::FieldType;
 
 use super::bindings::Bindings;
 

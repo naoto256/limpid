@@ -11,8 +11,13 @@
 //! struct and `Module::schema()` were removed in v0.4.0 during the
 //! analyzer rebase.
 //!
-//! The `FieldType` vocabulary lives here so it can be used from both
-//! `modules::*` and `check::*` without a cyclic include.
+//! The `FieldType` vocabulary lives in `dsl::` (not `modules::`)
+//! because its only consumers are `functions::*` (parser / function
+//! signatures) and `check::*` (the analyzer); `modules::*` has had no
+//! use of it since the v0.4.0 rebase. Not to be confused with
+//! [`crate::dsl::schema`], which validates `def input/output`
+//! property *surfaces* (`PropertySpec`); this module describes
+//! value-level *types* carried by bound names.
 
 #![allow(dead_code)]
 

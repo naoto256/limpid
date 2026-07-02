@@ -47,7 +47,7 @@ use anyhow::{Result, bail};
 use crate::dsl::arena::EventArena;
 use crate::dsl::value::{ArrayBuilder, ObjectBuilder, Value};
 use crate::functions::{FunctionRegistry, FunctionSig};
-use crate::modules::schema::FieldType;
+use crate::dsl::field_schema::FieldType;
 
 /// Maximum dotted-key segment count. Filebeat / Logstash JSON output
 /// typically flattens 2-4 levels of nesting; 32 leaves plenty of

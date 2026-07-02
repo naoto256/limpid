@@ -4,7 +4,7 @@ use crate::dsl::value::Value;
 
 use super::val_to_str;
 use crate::functions::{FunctionRegistry, FunctionSig};
-use crate::modules::schema::FieldType;
+use crate::dsl::field_schema::FieldType;
 
 fn register_predicate(
     reg: &mut FunctionRegistry,

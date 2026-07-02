@@ -48,7 +48,7 @@ use opentelemetry_proto::tonic::{
 use crate::dsl::arena::EventArena;
 use crate::dsl::value::{ObjectBuilder, Value};
 use crate::functions::{FunctionRegistry, FunctionSig};
-use crate::modules::schema::FieldType;
+use crate::dsl::field_schema::FieldType;
 
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register_in_with_sig(

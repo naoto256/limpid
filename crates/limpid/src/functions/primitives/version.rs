@@ -7,7 +7,7 @@
 
 use crate::dsl::value::Value;
 use crate::functions::{FunctionRegistry, FunctionSig};
-use crate::modules::schema::FieldType;
+use crate::dsl::field_schema::FieldType;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 

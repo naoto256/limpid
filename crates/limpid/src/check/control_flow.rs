@@ -12,7 +12,7 @@
 
 use crate::dsl::ast::{BranchBody, IfChain, ProcessStatement, SwitchArm, SwitchStmtArm};
 use crate::functions::FunctionRegistry;
-use crate::modules::schema::FieldType;
+use crate::dsl::field_schema::FieldType;
 use crate::pipeline::CompiledConfig;
 
 use super::bindings::{Bindings, intersect_branches};

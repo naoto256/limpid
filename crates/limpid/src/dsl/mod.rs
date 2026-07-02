@@ -4,6 +4,7 @@ pub mod arena;
 pub mod ast;
 pub mod eval;
 pub mod exec;
+pub mod field_schema;
 pub mod parser;
 pub mod props;
 pub mod schema;

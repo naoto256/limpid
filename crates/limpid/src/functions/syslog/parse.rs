@@ -31,7 +31,7 @@ use crate::functions::primitives::parse_json::{apply_defaults, type_name};
 use crate::functions::primitives::val_to_str;
 use crate::functions::syslog::pri::parse_leading_pri;
 use crate::functions::{FunctionRegistry, ParserInfo};
-use crate::modules::schema::{FieldSpec, FieldType};
+use crate::dsl::field_schema::{FieldSpec, FieldType};
 
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register_in("syslog", "parse", |arena, args, _event| {

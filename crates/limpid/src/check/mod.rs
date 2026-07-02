@@ -50,7 +50,7 @@ use crate::dsl::ast::{
 };
 use crate::dsl::span::{SourceMap, Span};
 use crate::functions::FunctionRegistry;
-use crate::modules::schema::FieldType;
+use crate::dsl::field_schema::FieldType;
 use crate::pipeline::CompiledConfig;
 
 use bindings::Bindings;
