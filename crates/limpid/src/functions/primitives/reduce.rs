@@ -3,9 +3,9 @@
 //! Block takes two parameters: the running accumulator and the current
 //! element. Real evaluation lives in `eval::eval_block_primitive`; this
 //! stub installs the signature and the missing-block error.
+use crate::dsl::field_schema::FieldType;
 use crate::dsl::value::Value;
 use crate::functions::{FunctionRegistry, FunctionSig};
-use crate::dsl::field_schema::FieldType;
 
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(

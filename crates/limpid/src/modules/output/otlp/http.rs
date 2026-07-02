@@ -388,7 +388,7 @@ impl Module for OtlpHttpOutput {
 
     fn from_properties(
         name: &str,
-        properties: &crate::modules::ModuleProperties,
+        properties: &crate::dsl::module_props::ModuleProperties,
         ctx: &crate::modules::BuildContext,
     ) -> Result<Self> {
         let error_log = ctx.error_log.as_ref().map(Arc::clone);
@@ -998,8 +998,8 @@ mod tests {
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use std::net::SocketAddr;
 
-    fn mp(props: &[Property]) -> crate::modules::ModuleProperties {
-        crate::modules::ModuleProperties::from_parts("otlp_http", props.to_vec())
+    fn mp(props: &[Property]) -> crate::dsl::module_props::ModuleProperties {
+        crate::dsl::module_props::ModuleProperties::from_parts("otlp_http", props.to_vec())
     }
 
     fn prop_str(key: &str, val: &str) -> Property {

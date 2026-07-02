@@ -169,7 +169,7 @@ impl Module for OtlpHttpInput {
 
     fn from_properties(
         name: &str,
-        properties: &crate::modules::ModuleProperties,
+        properties: &crate::dsl::module_props::ModuleProperties,
         _ctx: &crate::modules::BuildContext,
     ) -> Result<Self> {
         let properties = properties.user_properties();
@@ -442,8 +442,8 @@ mod tests {
     /// Mirrors what the parser produces for `def input/output ... { type otlp_http; ... }`
     /// without going through pest, so tests can drive `Module::{build,from_properties}`
     /// directly.
-    fn mp(props: &[Property]) -> crate::modules::ModuleProperties {
-        crate::modules::ModuleProperties::from_parts("otlp_http", props.to_vec())
+    fn mp(props: &[Property]) -> crate::dsl::module_props::ModuleProperties {
+        crate::dsl::module_props::ModuleProperties::from_parts("otlp_http", props.to_vec())
     }
 
     use crate::dsl::ast::{Expr, ExprKind};

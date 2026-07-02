@@ -12,8 +12,8 @@ use anyhow::bail;
 use crate::dsl::value::Value;
 
 use super::{parse_fixed_offset, val_to_str};
-use crate::functions::{FunctionRegistry, FunctionSig};
 use crate::dsl::field_schema::FieldType;
+use crate::functions::{FunctionRegistry, FunctionSig};
 
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(

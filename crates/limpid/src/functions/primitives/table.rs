@@ -12,9 +12,9 @@
 use crate::dsl::value::Value;
 
 use super::val_to_str;
+use crate::dsl::field_schema::FieldType;
 use crate::functions::table::TableStore;
 use crate::functions::{FunctionRegistry, FunctionSig};
-use crate::dsl::field_schema::FieldType;
 
 pub fn register(reg: &mut FunctionRegistry, table_store: TableStore) {
     {

@@ -14,9 +14,9 @@
 //! whose signature is registered.
 
 use crate::dsl::ast::{BinOp, Expr, ExprKind, UnaryOp, walk_children};
+use crate::dsl::field_schema::{FieldType, type_compatible};
 use crate::dsl::span::Span;
 use crate::functions::{Arity, FunctionRegistry, FunctionSig};
-use crate::dsl::field_schema::{FieldType, type_compatible};
 
 use super::bindings::Bindings;
 use super::suggestions;

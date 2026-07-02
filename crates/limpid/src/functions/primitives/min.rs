@@ -2,8 +2,8 @@
 //!
 //! Sibling of `max` — see `max::pick` for the shared comparison loop.
 
-use crate::functions::{FunctionRegistry, FunctionSig};
 use crate::dsl::field_schema::FieldType;
+use crate::functions::{FunctionRegistry, FunctionSig};
 
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(

@@ -9,8 +9,8 @@
 //! wildcard so downstream `workspace.*` reads remain admissible.
 
 use crate::dsl::ast::{Expr, ExprKind};
-use crate::functions::FunctionRegistry;
 use crate::dsl::field_schema::FieldType;
+use crate::functions::FunctionRegistry;
 
 use super::bindings::Bindings;
 

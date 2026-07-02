@@ -7,9 +7,9 @@
 //! thousands); a hashing path can land if profiles ever flag it.
 
 use crate::dsl::arena::EventArena;
+use crate::dsl::field_schema::FieldType;
 use crate::dsl::value::{ArrayBuilder, Value};
 use crate::functions::{FunctionRegistry, FunctionSig};
-use crate::dsl::field_schema::FieldType;
 
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(

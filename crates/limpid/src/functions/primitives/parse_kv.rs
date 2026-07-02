@@ -8,8 +8,8 @@
 //! separator.
 
 use crate::dsl::arena::EventArena;
-use crate::dsl::value::{ObjectBuilder, Value};
 use crate::dsl::field_schema::FieldType;
+use crate::dsl::value::{ObjectBuilder, Value};
 use anyhow::{Result, bail};
 
 use super::parse_json::{apply_defaults, type_name};

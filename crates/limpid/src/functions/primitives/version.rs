@@ -5,9 +5,9 @@
 //! with the limpid version that processed them, or populating OTLP
 //! `service.version` resource attributes.
 
+use crate::dsl::field_schema::FieldType;
 use crate::dsl::value::Value;
 use crate::functions::{FunctionRegistry, FunctionSig};
-use crate::dsl::field_schema::FieldType;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 

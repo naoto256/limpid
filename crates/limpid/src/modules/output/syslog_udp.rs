@@ -75,7 +75,7 @@ impl Module for SyslogUdpOutput {
 
     fn from_properties(
         name: &str,
-        properties: &crate::modules::ModuleProperties,
+        properties: &crate::dsl::module_props::ModuleProperties,
         ctx: &crate::modules::BuildContext,
     ) -> Result<Self> {
         let retry = RetryConfig::from_output_properties(properties.user_properties())?;
@@ -341,8 +341,8 @@ mod tests {
     /// Mirrors what the parser produces for `def input/output ... { type syslog_udp; ... }`
     /// without going through pest, so tests can drive `Module::{build,from_properties}`
     /// directly.
-    fn mp(props: &[Property]) -> crate::modules::ModuleProperties {
-        crate::modules::ModuleProperties::from_parts("syslog_udp", props.to_vec())
+    fn mp(props: &[Property]) -> crate::dsl::module_props::ModuleProperties {
+        crate::dsl::module_props::ModuleProperties::from_parts("syslog_udp", props.to_vec())
     }
 
     fn kv(key: &str, kind: ExprKind) -> Property {

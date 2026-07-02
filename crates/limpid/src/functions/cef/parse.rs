@@ -13,10 +13,10 @@ use crate::dsl::arena::EventArena;
 use crate::dsl::value::{ObjectBuilder, Value};
 use anyhow::{Result, bail};
 
+use crate::dsl::field_schema::{FieldSpec, FieldType};
 use crate::functions::primitives::parse_json::{apply_defaults, type_name};
 use crate::functions::primitives::val_to_str;
 use crate::functions::{FunctionRegistry, ParserInfo};
-use crate::dsl::field_schema::{FieldSpec, FieldType};
 
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register_in("cef", "parse", |arena, args, _event| {
