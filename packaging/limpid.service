@@ -40,6 +40,21 @@ ProtectHome=yes
 # unix socket, journald via the `journal` feature) or outputs (file,
 # kafka, HTTP, OTLP). Isolating all of these narrows the blast radius of
 # a compromised pipeline/parser without touching any codepath in use.
+#
+# PrivateDevices=yes gives the unit a private, minimal /dev, which does
+# NOT include the host's /dev/log. This is fine by default: no input
+# config ships in this package (limpid.conf.example only sets up
+# `include` directives; operators add their own `inputs/*.limpid`), so
+# the unix_socket input's `/dev/log` path
+# (crates/limpid/src/modules/input/unix_socket.rs) is opt-in, not a
+# default codepath. Operators who configure `input { type unix_socket
+# path "/dev/log" }` as a syslog(3) replacement must bind-mount the
+# host socket into the private /dev via a drop-in, e.g.:
+#   /etc/systemd/system/limpid.service.d/override.conf:
+#     [Service]
+#     BindPaths=/dev/log
+# BindPaths punches a specific, explicit hole through PrivateDevices
+# without disabling device isolation for everything else.
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes
