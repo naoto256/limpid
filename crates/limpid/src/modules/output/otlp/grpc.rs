@@ -46,7 +46,6 @@
 //! not the cooldown, protects the single-peer-just-failed case.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -54,7 +53,6 @@ use bytes::Bytes;
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, logs_service_client::LogsServiceClient,
 };
-use tokio::sync::{Mutex, Notify};
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 use crate::dsl::ast::Property;
@@ -62,9 +60,10 @@ use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
+use crate::modules::output::batched::{BatchSinkPolicy, BatchedSink, SendOutcome};
 use crate::modules::output::syslog_peers::{RotatingPeers, iter_peers_block};
 use crate::modules::{HasMetrics, Module, Output};
-use crate::queue::{BackoffStrategy, QueueAckHandle, RetryConfig};
+use crate::queue::{QueueAckHandle, RetryConfig};
 
 use super::{BatchLevel, decode_drained_to_request};
 
@@ -81,7 +80,14 @@ struct GrpcPeer {
     channel: Channel,
 }
 
-struct Inner {
+/// Transport policy plugged into the shared [`BatchedSink`] skeleton:
+/// render = refcount bump on the per-event ResourceLogs proto bytes,
+/// prepare = decode + `batch_level` merge into one
+/// `ExportLogsServiceRequest`, send = one attempt against the next
+/// rotation candidate. Buffering, retry (the shared `RetryConfig`
+/// vocabulary spliced in by the queue layer), and the shutdown
+/// lifecycle live in `crate::modules::output::batched`.
+struct OtlpGrpcSinkPolicy {
     peers: Vec<GrpcPeer>,
     /// Round-robin cursor + per-peer failure cooldown; one candidate
     /// per send attempt. See `RotatingPeers` for the selection and
@@ -89,51 +95,10 @@ struct Inner {
     rotation: RotatingPeers,
     batch_level: BatchLevel,
     headers: Vec<(String, String)>,
-    batch_timeout: Duration,
-    /// Per-batch retry policy. The shared `RetryConfig` parser
-    /// (`crate::queue::RETRY_PROPERTY_SPEC`) is spliced into every
-    /// output's schema by the queue layer, so `otlp_grpc` speaks the
-    /// same `retry { max_attempts initial_wait max_wait backoff }`
-    /// vocabulary as the rest of the outputs — see [`super::http`]
-    /// for the batched-output rationale (without an internal retry,
-    /// one transient ship failure loses the whole drained batch —
-    /// the queue layer cannot re-push a buffered batch; its cursor
-    /// only advances when each event's ack handle resolves).
-    retry_config: RetryConfig,
-    /// Buffered events awaiting flush, paired with their queue ack
-    /// handles. Render happens at flush time; handles resolve on
-    /// flush (delivered / recovered), not at `consume` return.
-    batch: Mutex<Vec<(Event, QueueAckHandle)>>,
-    /// Operator-facing instance name; surfaced on shutdown-flush
-    /// recovery and render-failure records.
-    name: String,
-    /// `error_log` writer injected at construction time by the
-    /// runtime via `BuildContext` in `from_properties`.
-    /// Used by the flush path to route per-event render failures and
-    /// shutdown-flush leftovers into the DLQ.
-    error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
-    metrics: Arc<OutputMetrics>,
-    /// Threshold-driven flush trigger; the flusher actor's `select!`
-    /// wakes on this notify when `consume()` crosses `batch_size`.
-    flush_notify: Notify,
-    /// Cooperative shutdown flag. See `super::http` for details.
-    is_shutting_down: AtomicBool,
 }
 
 pub struct OtlpGrpcOutput {
-    inner: Arc<Inner>,
-    batch_size: usize,
-    /// Long-lived flusher actor handle. Replaces the prior per-flush
-    /// spawned timer task that held the stack-local batch across
-    /// `flush_events.await` and was `abort()`-ed by `shutdown()`,
-    /// dropping every parked `QueueAckHandle` unresolved.
-    /// `shutdown()` NEVER aborts the actor; it signals
-    /// cooperatively via `is_shutting_down` + `notify_waiters` and
-    /// joins bounded. `Drop` is a last-resort fallback that signals
-    /// then aborts (sync Drop cannot `.await`). See
-    /// `crate::modules::output::http::HttpOutput::actor_handle`
-    /// for the full lifecycle contract.
-    actor_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    sink: BatchedSink<OtlpGrpcSinkPolicy>,
     metrics: Arc<OutputMetrics>,
 }
 
@@ -324,65 +289,26 @@ impl Module for OtlpGrpcOutput {
         let retry_config = RetryConfig::from_output_properties(properties)?;
 
         let metrics = Arc::new(OutputMetrics::default());
-        let inner = Arc::new(Inner {
+        let policy = OtlpGrpcSinkPolicy {
             peers,
             rotation,
             batch_level,
             headers,
+        };
+        // The shared skeleton spawns the flusher actor; see
+        // `crate::modules::output::batched` for the actor / shutdown
+        // lifecycle contract.
+        let sink = BatchedSink::new(
+            policy,
+            name,
+            batch_size,
             batch_timeout,
             retry_config,
-            batch: Mutex::new(Vec::new()),
-            name: name.to_string(),
             error_log,
-            metrics: Arc::clone(&metrics),
-            flush_notify: Notify::new(),
-            is_shutting_down: AtomicBool::new(false),
-        });
+            Arc::clone(&metrics),
+        );
 
-        // Skip the spawn when called outside a Tokio runtime (= tests
-        // that exercise `from_properties` parsing only).
-        let actor_handle = if tokio::runtime::Handle::try_current().is_ok() {
-            let actor_inner = Arc::clone(&inner);
-            Some(tokio::spawn(async move {
-                flusher_actor_loop(actor_inner).await;
-            }))
-        } else {
-            None
-        };
-
-        Ok(Self {
-            inner,
-            batch_size,
-            actor_handle: Mutex::new(actor_handle),
-            metrics,
-        })
-    }
-}
-
-/// Long-lived flusher actor; same pattern as the http output. See
-/// `crate::modules::output::http` for rationale.
-async fn flusher_actor_loop(inner: Arc<Inner>) {
-    loop {
-        if inner.is_shutting_down.load(Ordering::Acquire) {
-            break;
-        }
-        let sleep_fut = tokio::time::sleep(inner.batch_timeout);
-        tokio::pin!(sleep_fut);
-        tokio::select! {
-            biased;
-            _ = inner.flush_notify.notified() => {}
-            _ = &mut sleep_fut => {}
-        }
-        if inner.is_shutting_down.load(Ordering::Acquire) {
-            break;
-        }
-        let batch = {
-            let mut buf = inner.batch.lock().await;
-            std::mem::take(&mut *buf)
-        };
-        if !batch.is_empty() {
-            inner.flush_events(batch).await;
-        }
+        Ok(Self { sink, metrics })
     }
 }
 
@@ -395,309 +321,82 @@ impl HasMetrics for OtlpGrpcOutput {
 
 #[async_trait::async_trait]
 impl Output for OtlpGrpcOutput {
+    /// Buffer-only consume; the sink's actor owns every send. See
+    /// `BatchedSink::consume` for the hand-off rationale.
     async fn consume(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
-        // Hand the (event, ack) off to the actor — see
-        // `http::HttpOutput::consume` for rationale.
-        let should_flush = {
-            let mut batch = self.inner.batch.lock().await;
-            batch.push((event.clone(), ack));
-            batch.len() >= self.batch_size
-        };
-        if should_flush {
-            self.inner.flush_notify.notify_one();
-        }
-        Ok(())
+        self.sink.consume(event, ack).await
     }
 
-    /// Drain-time per-event entry: park into the buffer; the post-loop
-    /// `shutdown()` call drains it bounded. No flush trigger here — the
-    /// shutdown contract forbids the steady-state retry path.
+    /// Drain-time per-event entry: buffer only; the post-loop
+    /// `shutdown()` call drains it bounded. See
+    /// `BatchedSink::consume_shutdown` for the shutdown contract.
     async fn consume_shutdown(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
-        let mut buf = self.inner.batch.lock().await;
-        buf.push((event.clone(), ack));
-        Ok(())
+        self.sink.consume_shutdown(event, ack).await
     }
 
     async fn shutdown(
         &self,
         _error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
     ) -> Result<()> {
-        // Cooperative shutdown: same pattern as http / otlp_http.
-        self.inner.is_shutting_down.store(true, Ordering::Release);
-        self.inner.flush_notify.notify_waiters();
-        let handle_opt = self.actor_handle.lock().await.take();
-        if let Some(h) = handle_opt {
-            let _ = tokio::time::timeout(crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT, h).await;
-        }
-        let leftover = std::mem::take(&mut *self.inner.batch.lock().await);
-        self.inner.flush_events_at_shutdown(leftover).await;
-        Ok(())
+        self.sink.shutdown().await
     }
 }
 
-impl Inner {
-    /// Yield on cooperative shutdown — see `http::Inner::wait_until_shutdown`.
-    async fn wait_until_shutdown(&self) {
-        loop {
-            if self.is_shutting_down.load(Ordering::Acquire) {
-                return;
-            }
-            let notified = self.flush_notify.notified();
-            if self.is_shutting_down.load(Ordering::Acquire) {
-                return;
-            }
-            notified.await;
-        }
+#[async_trait::async_trait]
+impl BatchSinkPolicy for OtlpGrpcSinkPolicy {
+    type Payload = Bytes;
+    type Prepared = ExportLogsServiceRequest;
+
+    fn kind(&self) -> &'static str {
+        "otlp_grpc output"
     }
 
-    /// Drain + ship one batch, resolving each handle to its final
-    /// disposition. Mirrors the http counterpart's ack-handle
-    /// semantics: infallible to the caller, per-event DLQ routing on
-    /// render failure, per-flush retry budget on transport, and
-    /// Recovered-on-exhaust.
-    async fn flush_events(&self, batch: Vec<(Event, QueueAckHandle)>) {
-        if batch.is_empty() {
-            return;
-        }
-        // OTLP render is a refcount bump on `event.egress` — no
-        // failure path here, but we keep the same code shape as the
-        // http counterpart for future-proofing.
-        let mut payloads: Vec<Bytes> = Vec::with_capacity(batch.len());
-        let mut shippable: Vec<(Event, QueueAckHandle)> = Vec::with_capacity(batch.len());
-        for (ev, ack) in batch {
-            payloads.push(ev.egress.clone());
-            shippable.push((ev, ack));
-        }
-        if payloads.is_empty() {
-            return;
-        }
-        let count = shippable.len() as u64;
-        // Race the transport against shutdown — see http.rs.
-        let send_outcome = tokio::select! {
-            biased;
-            res = send_batch(self, payloads) => Some(res),
-            _ = self.wait_until_shutdown() => None,
-        };
-        let send_result = match send_outcome {
-            Some(res) => res,
-            None => Err(anyhow!("shutdown cancelled in-flight OTLP/gRPC send")),
-        };
-        match send_result {
+    /// Render a single Event into its OTLP `ResourceLogs` proto bytes
+    /// — just a refcount bump on `event.egress`. Infallible in
+    /// practice; the `Result` keeps per-event DLQ routing available
+    /// (the pipeline egress contract is validated in `prepare`).
+    fn render(&self, event: &Event) -> Result<Bytes> {
+        Ok(event.egress.clone())
+    }
+
+    /// Decode the drained per-event protos and merge per
+    /// `batch_level` into one request. A decode failure (= pipeline
+    /// egress is not valid ResourceLogs) is deterministic, so the
+    /// skeleton routes the batch to DLQ without burning the retry
+    /// budget.
+    fn prepare(&self, drained: Vec<Bytes>) -> Result<ExportLogsServiceRequest> {
+        decode_drained_to_request(drained, self.batch_level)
+    }
+
+    /// One send attempt against the next rotation candidate; see
+    /// `RotatingPeers` for the selection + cooldown contract
+    /// (cooldown is measured from failure time so a slow 30s
+    /// GRPC_REQUEST_TIMEOUT failure cannot record an already-expired
+    /// cooldown).
+    async fn send(&self, req: &ExportLogsServiceRequest) -> Result<SendOutcome> {
+        let idx = self.rotation.select().await;
+        match send_once(&self.peers[idx], self, req).await {
             Ok(outcome) => {
-                let rejected = outcome.rejected.min(count);
-                let written = count - rejected;
-                if written > 0 {
-                    self.metrics
-                        .events_written
-                        .fetch_add(written, Ordering::Relaxed);
-                }
-                if rejected > 0 {
-                    self.metrics
-                        .events_failed
-                        .fetch_add(rejected, Ordering::Relaxed);
-                }
-                let split = (count - rejected) as usize;
-                let mut iter = shippable.into_iter();
-                for (_, ack) in iter.by_ref().take(split) {
-                    ack.resolve_delivered();
-                }
-                for (ev, ack) in iter {
-                    let reason = "collector reported partial_success rejection".to_string();
-                    crate::modules::route_event_to_dlq(
-                        self.error_log.as_ref(),
-                        &self.name,
-                        &ev,
-                        &reason,
-                    )
-                    .await;
-                    ack.resolve_recovered();
-                }
+                self.rotation.mark_success(idx).await;
+                Ok(outcome)
             }
             Err(e) => {
-                let reason = format!("flush failed: {}", e);
-                for (ev, ack) in shippable {
-                    crate::modules::route_event_to_dlq(
-                        self.error_log.as_ref(),
-                        &self.name,
-                        &ev,
-                        &reason,
-                    )
-                    .await;
-                    self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-                    ack.resolve_recovered();
-                }
+                self.rotation.mark_failure(idx).await;
+                Err(e)
             }
         }
     }
-
-    /// Shutdown single-attempt flush; never uses the steady-state retry
-    /// budget. Partial successes are honoured (the rejected tail goes to
-    /// DLQ with the `partial_success` reason — distinct from transport
-    /// failure), and the shippable subset gets one `send_batch` call
-    /// wrapped in `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT`. The `shippable`
-    /// vector is held in this frame across the `timeout()` boundary so
-    /// an `Elapsed` outcome does NOT drop it — otherwise the inner
-    /// handles would fire `QueueAckHandle::Drop` and be counted as
-    /// silent loss.
-    async fn flush_events_at_shutdown(&self, batch: Vec<(Event, QueueAckHandle)>) {
-        if batch.is_empty() {
-            return;
-        }
-        let mut payloads: Vec<Bytes> = Vec::with_capacity(batch.len());
-        let mut shippable: Vec<(Event, QueueAckHandle)> = Vec::with_capacity(batch.len());
-        for (ev, ack) in batch {
-            payloads.push(ev.egress.clone());
-            shippable.push((ev, ack));
-        }
-        if payloads.is_empty() {
-            return;
-        }
-        let count = shippable.len() as u64;
-        let send_outcome = tokio::time::timeout(
-            crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT,
-            send_batch(self, payloads),
-        )
-        .await;
-        match send_outcome {
-            Ok(Ok(outcome)) => {
-                let rejected = outcome.rejected.min(count);
-                let written = count - rejected;
-                if written > 0 {
-                    self.metrics
-                        .events_written
-                        .fetch_add(written, Ordering::Relaxed);
-                }
-                if rejected > 0 {
-                    self.metrics
-                        .events_failed
-                        .fetch_add(rejected, Ordering::Relaxed);
-                }
-                let split = (count - rejected) as usize;
-                let mut iter = shippable.into_iter();
-                for (_, ack) in iter.by_ref().take(split) {
-                    ack.resolve_delivered();
-                }
-                for (ev, ack) in iter {
-                    let reason = "collector reported partial_success rejection".to_string();
-                    crate::modules::route_event_to_dlq(
-                        self.error_log.as_ref(),
-                        &self.name,
-                        &ev,
-                        &reason,
-                    )
-                    .await;
-                    ack.resolve_recovered();
-                }
-            }
-            Ok(Err(send_err)) => {
-                let err = anyhow::anyhow!("transport error: {}", send_err);
-                crate::modules::route_shutdown_batch_to_dlq(
-                    self.error_log.as_ref(),
-                    &self.metrics,
-                    &self.name,
-                    shippable,
-                    &err,
-                )
-                .await;
-            }
-            Err(_elapsed) => {
-                let err = anyhow::anyhow!(
-                    "deadline exceeded after {:?} during shutdown flush",
-                    crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT
-                );
-                crate::modules::route_shutdown_batch_to_dlq(
-                    self.error_log.as_ref(),
-                    &self.metrics,
-                    &self.name,
-                    shippable,
-                    &err,
-                )
-                .await;
-            }
-        }
-    }
-}
-
-impl Drop for OtlpGrpcOutput {
-    fn drop(&mut self) {
-        // Signal cooperatively before falling back to abort; see
-        // `http::HttpOutput::drop` for rationale.
-        self.inner.is_shutting_down.store(true, Ordering::Release);
-        self.inner.flush_notify.notify_waiters();
-        if let Some(h) = self.actor_handle.get_mut().take() {
-            h.abort();
-        }
-        if let Ok(buf) = self.inner.batch.try_lock()
-            && !buf.is_empty()
-        {
-            tracing::warn!(
-                "otlp_grpc output: {} events in buffer at shutdown (will be re-delivered from queue)",
-                buf.len()
-            );
-        }
-    }
-}
-
-async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<super::SendOutcome> {
-    let req = decode_drained_to_request(drained, inner.batch_level)?;
-
-    let cfg = &inner.retry_config;
-    let max_attempts = cfg.max_attempts.max(1);
-    let mut attempt = 0u32;
-    let mut wait = cfg.initial_wait;
-
-    let final_err = loop {
-        // One candidate per attempt; see `RotatingPeers` for the
-        // selection + cooldown contract (cooldown is measured from
-        // failure time so a slow 30s GRPC_REQUEST_TIMEOUT failure
-        // cannot record an already-expired cooldown).
-        let idx = inner.rotation.select().await;
-        let err = match send_once(&inner.peers[idx], inner, &req).await {
-            Ok(outcome) => {
-                inner.rotation.mark_success(idx).await;
-                return Ok(outcome);
-            }
-            Err(e) => {
-                inner.rotation.mark_failure(idx).await;
-                e
-            }
-        };
-        if attempt + 1 >= max_attempts {
-            break err;
-        }
-        // Cooperative shutdown cancel — see http.rs.
-        if inner.is_shutting_down.load(Ordering::Acquire) {
-            break err;
-        }
-        attempt += 1;
-        tracing::warn!(
-            "otlp_grpc output: ship attempt {}/{} failed: {} — retrying in {:?}",
-            attempt,
-            max_attempts,
-            err,
-            wait,
-        );
-        // Race the sleep against a shutdown wake — see http.rs.
-        tokio::select! {
-            _ = tokio::time::sleep(wait) => {}
-            _ = inner.flush_notify.notified() => {}
-        }
-        if matches!(cfg.backoff, BackoffStrategy::Exponential) {
-            wait = wait.saturating_mul(2).min(cfg.max_wait);
-        }
-    };
-    Err(final_err)
 }
 
 async fn send_once(
     peer: &GrpcPeer,
-    inner: &Inner,
+    policy: &OtlpGrpcSinkPolicy,
     req: &ExportLogsServiceRequest,
-) -> Result<super::SendOutcome> {
+) -> Result<SendOutcome> {
     let mut client = LogsServiceClient::new(peer.channel.clone());
     let mut request = tonic::Request::new(req.clone());
     let metadata = request.metadata_mut();
-    for (k, v) in &inner.headers {
+    for (k, v) in &policy.headers {
         // Lower-case the metadata key per HTTP/2 / gRPC convention;
         // tonic enforces this and will refuse `Authorization` etc.
         let key_lc = k.to_ascii_lowercase();
@@ -760,7 +459,7 @@ async fn send_once(
             }
         );
     }
-    Ok(super::SendOutcome { rejected })
+    Ok(SendOutcome { rejected })
 }
 
 // Note: `verify false` is intentionally not a property on `otlp_grpc`.
@@ -782,6 +481,8 @@ mod tests {
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use prost::Message;
     use std::net::SocketAddr;
+    use std::sync::atomic::Ordering;
+    use tokio::sync::Mutex;
 
     fn mp(props: &[Property]) -> crate::dsl::module_props::ModuleProperties {
         crate::dsl::module_props::ModuleProperties::from_parts("otlp_grpc", props.to_vec())
@@ -853,8 +554,8 @@ mod tests {
             &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
-        assert_eq!(output.inner.peers.len(), 1);
-        assert_eq!(output.inner.peers[0].endpoint, "http://x:4317");
+        assert_eq!(output.sink.inner.policy.peers.len(), 1);
+        assert_eq!(output.sink.inner.policy.peers[0].endpoint, "http://x:4317");
     }
 
     #[test]
@@ -878,7 +579,7 @@ mod tests {
             &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
-        assert_eq!(output.inner.peers.len(), 1);
+        assert_eq!(output.sink.inner.policy.peers.len(), 1);
     }
 
     #[test]
@@ -938,7 +639,7 @@ mod tests {
             &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
-        assert_eq!(output.inner.peers.len(), 1);
+        assert_eq!(output.sink.inner.policy.peers.len(), 1);
     }
 
     #[tokio::test]
@@ -949,7 +650,7 @@ mod tests {
             &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
-        assert_eq!(output.inner.peers.len(), 1);
+        assert_eq!(output.sink.inner.policy.peers.len(), 1);
     }
 
     #[tokio::test]
@@ -964,8 +665,8 @@ mod tests {
             &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
-        assert_eq!(output.inner.peers.len(), 2);
-        assert_eq!(output.inner.peers[0].endpoint, "http://a:4317");
+        assert_eq!(output.sink.inner.policy.peers.len(), 2);
+        assert_eq!(output.sink.inner.policy.peers[0].endpoint, "http://a:4317");
     }
 
     #[test]
@@ -1000,7 +701,10 @@ mod tests {
             &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
-        assert!(matches!(output.inner.batch_level, BatchLevel::None));
+        assert!(matches!(
+            output.sink.inner.policy.batch_level,
+            BatchLevel::None
+        ));
     }
 
     #[tokio::test]
@@ -1011,7 +715,7 @@ mod tests {
             &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
-        assert_eq!(output.batch_size, 1);
+        assert_eq!(output.sink.batch_size, 1);
     }
 
     #[tokio::test]
@@ -1031,7 +735,7 @@ mod tests {
             &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
-        assert_eq!(output.inner.retry_config.max_attempts, 2);
+        assert_eq!(output.sink.inner.retry.max_attempts, 2);
     }
 
     // ---- wire-level round-trip ----
@@ -1312,7 +1016,7 @@ mod tests {
         consume(&output, &event_with_egress(singleton_bytes(1)))
             .await
             .unwrap();
-        let handle_before = output.actor_handle.lock().await.is_some();
+        let handle_before = output.sink.actor_handle.lock().await.is_some();
         assert!(handle_before, "flusher actor must be spawned");
         drop(output);
     }
@@ -1416,9 +1120,9 @@ mod tests {
         consume(&output, &event_with_egress(singleton_bytes(1)))
             .await
             .expect("buffering a single event must succeed");
-        let batch_len = output.inner.batch.lock().await.len();
+        let batch_len = output.sink.inner.batch.lock().await.len();
         assert_eq!(batch_len, 1, "event must sit in the buffer");
-        let actor_spawned = output.actor_handle.lock().await.is_some();
+        let actor_spawned = output.sink.actor_handle.lock().await.is_some();
         assert!(
             actor_spawned,
             "the long-lived flusher actor must be available to drain on batch_timeout or notify"
@@ -1470,7 +1174,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            output.inner.batch.lock().await.len(),
+            output.sink.inner.batch.lock().await.len(),
             2,
             "writes must land in the buffer"
         );
@@ -1478,7 +1182,7 @@ mod tests {
         output.shutdown(None).await.unwrap();
 
         assert_eq!(
-            output.inner.batch.lock().await.len(),
+            output.sink.inner.batch.lock().await.len(),
             0,
             "shutdown() must drain the buffer"
         );
@@ -1546,7 +1250,7 @@ mod tests {
             rx2.recv().await,
             Some((_, crate::queue::AckDisposition::Recovered))
         ));
-        assert_eq!(output.inner.batch.lock().await.len(), 0);
+        assert_eq!(output.sink.inner.batch.lock().await.len(), 0);
     }
 
     // -----------------------------------------------------------------------
@@ -1577,7 +1281,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert_eq!(output.inner.batch.lock().await.len(), 2);
+        assert_eq!(output.sink.inner.batch.lock().await.len(), 2);
     }
 
     #[tokio::test]
@@ -1597,7 +1301,7 @@ mod tests {
         buffer_two(&output).await;
 
         output.shutdown(Some(&writer)).await.unwrap();
-        assert_eq!(output.inner.batch.lock().await.len(), 0);
+        assert_eq!(output.sink.inner.batch.lock().await.len(), 0);
 
         let body = tokio::fs::read_to_string(&path).await.unwrap();
         let lines: Vec<&str> = body.lines().collect();
@@ -1628,7 +1332,7 @@ mod tests {
         buffer_two(&output).await;
 
         output.shutdown(None).await.expect("shutdown is infallible");
-        assert_eq!(output.inner.batch.lock().await.len(), 0);
+        assert_eq!(output.sink.inner.batch.lock().await.len(), 0);
     }
 
     #[tokio::test]
@@ -1689,7 +1393,7 @@ mod tests {
             std::path::PathBuf::from("/nonexistent/limpid-grpc-test/errored.jsonl"),
         ));
         output.shutdown(Some(&writer)).await.unwrap();
-        assert_eq!(output.inner.batch.lock().await.len(), 0);
+        assert_eq!(output.sink.inner.batch.lock().await.len(), 0);
     }
 
     /// Constructor-time error_log injection — see the matching test
@@ -1711,6 +1415,7 @@ mod tests {
         )
         .unwrap();
         let stored = output
+            .sink
             .inner
             .error_log
             .as_ref()
