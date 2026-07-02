@@ -263,6 +263,24 @@ fn parse_peer(name: &str, peer_props: &[Property], verify: bool) -> Result<HttpP
         })
         .transpose()?;
 
+    if !verify
+        && let Some(tls) = &tls_config
+        && tls.ca_path.is_some()
+    {
+        // CA bundling is meaningless when verification is off; warn the
+        // operator so the misconfiguration is visible, then proceed
+        // with the remaining (identity) bits of the tls block. Mirrors
+        // the matching guard in `output http` — the two paths otherwise
+        // drifted on how `verify false` + `tls.ca` interacts (this
+        // path used to hard-fail on an unreadable CA even with
+        // verification disabled).
+        tracing::warn!(
+            "output '{}': peer '{}' ignores tls.ca because 'verify false' disables certificate validation",
+            name,
+            endpoint
+        );
+    }
+
     // Explicit ≥ TLS 1.2 floor, mirroring the rustls-side pin in
     // `crate::tls::TLS_PROTOCOL_VERSIONS` (see the rationale there
     // and the matching builder in `output http`).
@@ -286,7 +304,10 @@ fn parse_peer(name: &str, peer_props: &[Property], verify: bool) -> Result<HttpP
         }
     }
     if let Some(tls) = &tls_config {
-        if let Some(ca_path) = &tls.ca_path {
+        // Skip CA loading when verify is off — `danger_accept_invalid_certs`
+        // already short-circuits server-cert validation, and adding a root
+        // would be wasted work (and could mask the warning above).
+        if verify && let Some(ca_path) = &tls.ca_path {
             let pem = std::fs::read(ca_path)
                 .with_context(|| format!("output '{}': cannot read CA cert {}", name, ca_path))?;
             let cert = reqwest::Certificate::from_pem(&pem).with_context(|| {
@@ -644,6 +665,33 @@ mod tests {
             err.to_string().contains("'peer {") && err.to_string().contains("'peers {"),
             "unexpected: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn verify_false_ignores_unreadable_tls_ca() {
+        // Regression: this path used to load `tls.ca` unconditionally,
+        // so `verify false` + an unreadable CA hard-failed at
+        // `from_properties` instead of matching `output http`, where
+        // the same combination warns-and-continues. Point at a CA path
+        // that cannot exist and confirm construction still succeeds.
+        let src = r#"
+def output o {
+    type otlp_http
+    peer {
+        endpoint "https://example.com/v1/logs"
+        tls { ca "/nonexistent/does-not-exist.pem" }
+    }
+    verify false
+}
+"#;
+        let cfg = crate::dsl::parser::parse_config(src).expect("parse");
+        let compiled = crate::pipeline::CompiledConfig::from_config(cfg).expect("compile");
+        OtlpHttpOutput::from_properties(
+            "o",
+            &compiled.outputs["o"].properties,
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .expect("verify false must ignore an unreadable tls.ca");
     }
 
     #[tokio::test]
