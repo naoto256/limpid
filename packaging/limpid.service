@@ -47,14 +47,19 @@ ProtectHome=yes
 # `include` directives; operators add their own `inputs/*.limpid`), so
 # the unix_socket input's `/dev/log` path
 # (crates/limpid/src/modules/input/unix_socket.rs) is opt-in, not a
-# default codepath. Operators who configure `input { type unix_socket
-# path "/dev/log" }` as a syslog(3) replacement must bind-mount the
-# host socket into the private /dev via a drop-in, e.g.:
+# default codepath. That input creates its own socket via
+# `UnixDatagram::bind()` rather than connecting to an existing one, so
+# `BindPaths=` (which surfaces an existing host path into the private
+# namespace) cannot make a socket limpid creates inside the sandbox
+# visible to host processes writing to /dev/log — the two would sit in
+# disjoint mount namespaces. Operators who configure `input { type
+# unix_socket path "/dev/log" }` as a syslog(3) replacement must
+# disable device isolation for this unit via a drop-in, e.g.:
 #   /etc/systemd/system/limpid.service.d/override.conf:
 #     [Service]
-#     BindPaths=/dev/log
-# BindPaths punches a specific, explicit hole through PrivateDevices
-# without disabling device isolation for everything else.
+#     PrivateDevices=no
+# (/dev/log is also commonly a symlink on the host, which the
+# unix_socket input refuses to bind over — remove it first if present.)
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes

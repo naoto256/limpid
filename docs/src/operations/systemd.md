@@ -152,13 +152,15 @@ If your file outputs write to directories outside the defaults, add them to `Rea
 ReadWritePaths=/var/log/limpid /path/to/other/output/dir
 ```
 
-If you configure a `unix_socket` input at `/dev/log` as a syslog(3) replacement, `PrivateDevices=yes` keeps it out of reach unless you also bind it in:
+If you configure a `unix_socket` input at `/dev/log` as a syslog(3) replacement, `PrivateDevices=yes` isolates limpid's socket in a private `/dev` that host processes writing to `/dev/log` can't reach — `BindPaths` doesn't fix this, since limpid *creates* the socket rather than connecting to an existing one. Disable device isolation for this unit instead:
 
 ```ini
 # /etc/systemd/system/limpid.service.d/override.conf
 [Service]
-BindPaths=/dev/log
+PrivateDevices=no
 ```
+
+(`/dev/log` is also commonly a symlink on the host; the `unix_socket` input refuses to bind over one, so remove it first if present.)
 
 Then reload systemd:
 

@@ -84,7 +84,7 @@ ReadWritePaths=/var/lib/limpid /var/run/limpid /var/log/limpid
 - `ProtectSystem=strict` makes the filesystem read-only except for explicitly allowed paths
 - `RuntimeDirectory=limpid` ensures `/var/run/limpid/` exists for the control socket
 - `ExecReload=/bin/kill -HUP $MAINPID` triggers hot reload via SIGHUP
-- `ReadWritePaths` covers only this daemon's own state/log directories; `PrivateDevices=yes` means a `/dev/log` `unix_socket` input needs an explicit `BindPaths=/dev/log` drop-in (see [systemd](./systemd.md#adding-write-paths))
+- `ReadWritePaths` covers only this daemon's own state/log directories; `PrivateDevices=yes` means a `/dev/log` `unix_socket` input needs a `PrivateDevices=no` drop-in (see [systemd](./systemd.md#adding-write-paths))
 
 See [systemd](./systemd.md) for operational details.
 
