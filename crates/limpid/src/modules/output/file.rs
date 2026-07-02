@@ -359,11 +359,32 @@ impl FileOutput {
             }
         };
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await?;
+        // Fourth safety pass, complementing the three path-rendering
+        // passes in `render_path_in` (interpolation sanitising, `..`
+        // reject, trailing-slash reject): refuse to write through a
+        // symlink at the final path component. The rendering passes
+        // stop an event from *composing* an escaping path; O_NOFOLLOW
+        // stops a pre-planted symlink at a legitimately-composed path
+        // from redirecting the append to an arbitrary file (classic
+        // local symlink attack on a writable log directory). Scope is
+        // the final component only — that is the file this output
+        // creates and owns; symlinked *parent directories* are a
+        // deployment topology choice and stay under the operator's
+        // control.
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW);
+        let mut file = options.open(&path).await.map_err(|e| {
+            // ELOOP is how open(2) reports O_NOFOLLOW hitting a
+            // symlink; surface it as an explicit refusal so the DLQ
+            // reason names the attack instead of a cryptic errno.
+            #[cfg(unix)]
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                return anyhow::anyhow!("refusing to follow symlink at output path: {}", resolved);
+            }
+            anyhow::Error::from(e)
+        })?;
 
         let msg = String::from_utf8_lossy(&payload.egress);
         let mut buf = Vec::with_capacity(msg.len() + 1);
@@ -917,5 +938,57 @@ mod tests {
         assert!(check_no_traversal("/var/log/..").is_err());
         // Standalone ..
         assert!(check_no_traversal("..").is_err());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn write_payload_refuses_symlink_at_final_component() {
+        // Fourth safety pass (O_NOFOLLOW): a pre-planted symlink at
+        // the output path must produce an explicit refusal, not a
+        // silent append to the symlink's target. The rendered path is
+        // clean — only the filesystem object at it is hostile — so
+        // none of the three rendering passes can catch this.
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("target.log");
+        let link = dir.path().join("out.log");
+        std::fs::write(&target, b"pre-existing").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let out = make_output(ek(ExprKind::StringLit(link.display().to_string())));
+        let err = out
+            .write_payload(FilePayload {
+                egress: Bytes::from("hello"),
+                path: link.display().to_string(),
+                is_dynamic: false,
+            })
+            .await
+            .expect_err("symlink at output path must be refused");
+        assert!(
+            err.to_string().contains("refusing to follow symlink"),
+            "DLQ reason must name the refusal, got: {err}"
+        );
+        // The target file must be untouched.
+        assert_eq!(std::fs::read(&target).unwrap(), b"pre-existing");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn write_payload_appends_to_regular_file() {
+        // Companion to the symlink-refusal test: O_NOFOLLOW must not
+        // disturb the normal create-and-append path.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("plain.log");
+
+        let out = make_output(ek(ExprKind::StringLit(path.display().to_string())));
+        for _ in 0..2 {
+            out.write_payload(FilePayload {
+                egress: Bytes::from("hello"),
+                path: path.display().to_string(),
+                is_dynamic: false,
+            })
+            .await
+            .expect("regular file write must succeed");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello\nhello\n");
     }
 }
