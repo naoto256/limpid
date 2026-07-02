@@ -53,17 +53,16 @@
 //! ack handle resolves, not when `consume` returns.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::sync::{Mutex, Notify};
 
 use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
+use crate::modules::output::batched::{BatchSinkPolicy, BatchedSink, SendOutcome};
 use crate::modules::output::http_util::{ERROR_BODY_BYTE_CAP, error_snippet};
 use crate::modules::output::syslog_peers::{RotatingPeers, iter_peers_block};
 use crate::modules::{HasMetrics, Module, Output};
@@ -174,9 +173,12 @@ struct HttpPeer {
     client: reqwest::Client,
 }
 
-/// Shared state between `consume()` (= the queue consumer's hand-off
-/// into the buffer) and the flusher actor task.
-struct Inner {
+/// Transport policy plugged into the shared [`BatchedSink`] skeleton:
+/// render = lossy UTF-8 of `event.egress`, prepare = newline join +
+/// optional gzip, send = one attempt against the next rotation
+/// candidate. Buffering, retry, and the shutdown lifecycle live in
+/// `crate::modules::output::batched`.
+struct HttpSinkPolicy {
     peers: Vec<HttpPeer>,
     /// Round-robin cursor + per-peer failure cooldown; one candidate
     /// per send attempt. See `RotatingPeers` for the selection and
@@ -185,71 +187,11 @@ struct Inner {
     method: reqwest::Method,
     content_type: String,
     headers: Vec<(String, String)>,
-    batch_timeout: Duration,
     compress: bool,
-    /// Buffered events awaiting flush, paired with their queue ack
-    /// handles. Render happens at flush time so per-event render
-    /// failures can be routed to DLQ on their own without dropping
-    /// the rest of the batch; the ack handle resolves when the
-    /// event's disposition is decided (delivered on flush success,
-    /// recovered on DLQ landing).
-    batch: Mutex<Vec<(Event, QueueAckHandle)>>,
-    /// Operator-facing instance name; surfaced on shutdown-flush
-    /// recovery and render-failure records.
-    name: String,
-    /// Per-flush retry policy. Without an internal retry, one
-    /// transient ship failure would lose the whole drained batch
-    /// (the queue layer cannot re-push a buffered batch — its cursor
-    /// only advances when each event's ack handle resolves). The
-    /// retry budget for batched outputs lives entirely here.
-    retry: RetryConfig,
-    /// `error_log` writer injected at construction time by the
-    /// runtime via `BuildContext` in `from_properties`.
-    /// Used by the flush path to route per-event render failures and
-    /// shutdown-flush leftovers into the DLQ. `None` when the
-    /// operator did not configure `control { error_log "..." }` —
-    /// the flush path then falls back to a `tracing::error!` line.
-    error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
-    metrics: Arc<OutputMetrics>,
-    /// Threshold-driven flush trigger. `consume()` calls
-    /// `notify_one()` when the buffer crosses `batch_size`; the
-    /// flusher actor's `select!` wakes and drains.
-    flush_notify: Notify,
-    /// Co-operative cancel flag. `shutdown()` sets this to true
-    /// before notifying the actor; both the actor loop and the
-    /// in-flight `flush_events` retry loop check it so they exit
-    /// without burning the full retry budget.
-    is_shutting_down: AtomicBool,
 }
 
 pub struct HttpOutput {
-    inner: Arc<Inner>,
-    batch_size: usize,
-    /// Long-lived flusher actor handle. The actor task owns the
-    /// timer + flush-driven flush lifecycle.
-    ///
-    /// **Lifecycle contract**:
-    /// - **Normal operation (`shutdown()`)**: NEVER aborts the
-    ///   actor. It signals cooperative shutdown via
-    ///   `is_shutting_down` + `flush_notify.notify_waiters()` and
-    ///   joins it bounded by `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT`. The
-    ///   actor resolves every stack-local handle (Delivered /
-    ///   Recovered via DLQ) before exiting.
-    /// - **`Drop` fallback (last-resort)**: sync `Drop` cannot
-    ///   `.await` the actor, so it signals first then calls
-    ///   `abort()` as a last resort. This path is for teardown
-    ///   scenarios where `shutdown()` was not invoked (e.g. config
-    ///   reload in tests). The signal gives the actor a chance to
-    ///   exit cleanly before the abort lands; in practice the
-    ///   runtime calls `shutdown()` before drop in production.
-    ///
-    /// Earlier versions of this output spawned a per-flush *timer*
-    /// task that held the stack-local batch across
-    /// `flush_events.await`; when `shutdown()` abort()-ed that task
-    /// every parked `QueueAckHandle` dropped unresolved. The
-    /// structural fix moves the abort surface to this single actor
-    /// handle and keeps `abort()` off the `shutdown()` path entirely.
-    actor_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    sink: BatchedSink<HttpSinkPolicy>,
     metrics: Arc<OutputMetrics>,
 }
 
@@ -446,97 +388,29 @@ impl Module for HttpOutput {
 
         let retry = RetryConfig::from_output_properties(properties)?;
         let metrics = Arc::new(OutputMetrics::default());
-        let inner = Arc::new(Inner {
+        let policy = HttpSinkPolicy {
             peers,
             rotation,
             method,
             content_type,
             headers,
-            batch_timeout,
             compress,
-            batch: Mutex::new(Vec::with_capacity(batch_size.max(1))),
-            name: name.to_string(),
+        };
+        // The shared skeleton spawns the flusher actor that owns
+        // every send — both batched flushes and singleton
+        // (`batch_size <= 1`). See `crate::modules::output::batched`
+        // for the actor / shutdown lifecycle contract.
+        let sink = BatchedSink::new(
+            policy,
+            name,
+            batch_size,
+            batch_timeout,
             retry,
             error_log,
-            metrics: Arc::clone(&metrics),
-            flush_notify: Notify::new(),
-            is_shutting_down: AtomicBool::new(false),
-        });
+            Arc::clone(&metrics),
+        );
 
-        // The flusher actor owns every send — both batched flushes
-        // and singleton (`batch_size <= 1`) — so the queue
-        // consumer's task is never blocked in a `send_batch.await`.
-        // That separation is what makes the actor's
-        // `wait_until_shutdown` race effective: shutdown can be
-        // observed independently of whatever the consumer is doing.
-        // Spawn unconditionally except when there is no runtime (=
-        // parsing-only unit tests outside `#[tokio::test]`).
-        let actor_handle = if tokio::runtime::Handle::try_current().is_ok() {
-            let actor_inner = Arc::clone(&inner);
-            Some(tokio::spawn(async move {
-                flusher_actor_loop(actor_inner).await;
-            }))
-        } else {
-            None
-        };
-
-        Ok(Self {
-            inner,
-            batch_size,
-            actor_handle: Mutex::new(actor_handle),
-            metrics,
-        })
-    }
-}
-
-/// Long-lived flusher actor. Drains the buffer on either of three
-/// triggers: threshold-driven `flush_notify`, timer-driven
-/// `batch_timeout` sleep, or shutdown via `is_shutting_down`.
-///
-/// **`shutdown()` never aborts this actor** — it signals
-/// cooperative shutdown and joins bounded. `Drop` is a last-resort
-/// fallback that signals then aborts, since sync `Drop` cannot
-/// `.await`. See `HttpOutput::actor_handle` for the full lifecycle
-/// contract.
-///
-/// Earlier versions spawned a per-flush *timer* task that held a
-/// stack-local `Vec<(Event, QueueAckHandle)>` across
-/// `flush_events.await`, and `shutdown()` would abort()-ing it
-/// dropped every parked handle unresolved
-/// (debug `debug_assert!(resolved)` panic, release silent `Dropped`
-/// loss). Consolidating the timer + flush lifecycle into this single
-/// actor and keeping `abort()` off the `shutdown()` path is the
-/// structural fix.
-async fn flusher_actor_loop(inner: Arc<Inner>) {
-    loop {
-        if inner.is_shutting_down.load(Ordering::Acquire) {
-            break;
-        }
-        // Race the three triggers. `biased` makes shutdown the
-        // priority arm so a `notify_waiters()` race with a
-        // threshold notify still exits cleanly.
-        let sleep_fut = tokio::time::sleep(inner.batch_timeout);
-        tokio::pin!(sleep_fut);
-        tokio::select! {
-            biased;
-            _ = inner.flush_notify.notified() => {}
-            _ = &mut sleep_fut => {}
-        }
-        if inner.is_shutting_down.load(Ordering::Acquire) {
-            break;
-        }
-        let batch = {
-            let mut buf = inner.batch.lock().await;
-            std::mem::take(&mut *buf)
-        };
-        if !batch.is_empty() {
-            // `flush_events` resolves every handle (Delivered on
-            // success, Recovered on retry-exhausted DLQ). It checks
-            // `is_shutting_down` between retry attempts so a
-            // shutdown signal collapses the retry budget to one
-            // attempt instead of burning the full backoff window.
-            inner.flush_events(batch).await;
-        }
+        Ok(Self { sink, metrics })
     }
 }
 
@@ -550,338 +424,54 @@ impl HasMetrics for HttpOutput {
 #[async_trait::async_trait]
 impl Output for HttpOutput {
     /// Batched-buffer consume: park the `(Event, ack)` pair in the
-    /// in-memory buffer and arm/run the flush. The ack handle stays
-    /// with the event and resolves at flush time (delivered or
-    /// recovered) — not now. Returning `Ok(())` only signals that
-    /// the output took ownership of the lifecycle.
+    /// sink buffer; the ack handle resolves at flush time (delivered
+    /// or recovered) — not now. Returning `Ok(())` only signals that
+    /// the output took ownership of the lifecycle. See
+    /// `BatchedSink::consume` for the actor hand-off rationale.
     async fn consume(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
-        // Hand the (event, ack) off to the actor and return. The
-        // actor drains the buffer on `flush_notify`, on
-        // `batch_timeout`, or on `is_shutting_down`. The queue
-        // consumer's task is NEVER held in a `send_batch.await`
-        // here — that separation is what makes shutdown observable
-        // independently of the consumer. (An earlier implementation
-        // performed an inline flush on the consumer's task and
-        // blocked the consumer from reaching its own shutdown
-        // observation.) Works for
-        // both batched (`batch_size > 1`) and singleton
-        // (`batch_size <= 1`) modes — for the latter the actor
-        // flushes a one-element batch on each notify.
-        let should_flush = {
-            let mut buf = self.inner.batch.lock().await;
-            buf.push((event.clone(), ack));
-            buf.len() >= self.batch_size
-        };
-        if should_flush {
-            self.inner.flush_notify.notify_one();
-        }
-        // The actor's `select!` already races the `batch_timeout`
-        // sleep — no separate timer to arm.
-        Ok(())
+        self.sink.consume(event, ack).await
     }
 
-    /// Drain-time per-event entry: park the `(event, ack)` pair in the
-    /// buffer that the post-loop `shutdown()` call will drain bounded.
-    /// Deliberately does NOT trigger a flush from here — that would
-    /// re-enter the steady-state retry path (the old inline-singleton /
-    /// `flush_events` exponential backoff loops) which the shutdown
-    /// contract forbids. The buffer holds the handle until `shutdown()`
-    /// resolves it via `flush_events_at_shutdown`'s bounded single
-    /// attempt + DLQ route.
+    /// Drain-time per-event entry: buffer only; the post-loop
+    /// `shutdown()` call drains it bounded. See
+    /// `BatchedSink::consume_shutdown` for the shutdown contract.
     async fn consume_shutdown(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
-        let mut buf = self.inner.batch.lock().await;
-        buf.push((event.clone(), ack));
-        Ok(())
+        self.sink.consume_shutdown(event, ack).await
     }
 
     async fn shutdown(
         &self,
         _error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
     ) -> Result<()> {
-        // 1. Signal cooperative shutdown. `is_shutting_down`
-        //    propagates to the actor's outer `select!`, to the
-        //    retry sleep race, and (via the transport-cancel race
-        //    in `flush_events`) to the in-flight `send_batch` call
-        //    itself. `notify_waiters` wakes every current `.notified()`
-        //    awaiter so a stalled peer's transport future is dropped
-        //    immediately rather than blocking until its read timeout.
-        self.inner.is_shutting_down.store(true, Ordering::Release);
-        self.inner.flush_notify.notify_waiters();
-
-        // 2. Bounded join of the flusher actor. The actor's invariant
-        //    is that EVERY stack-local `(Event, QueueAckHandle)` it
-        //    has taken is resolved (Delivered on success, Recovered on
-        //    transport cancel / retry exhaustion / DLQ recovery)
-        //    before `flush_events` returns and before the actor exits.
-        //    The cooperative cancels above guarantee the actor reaches
-        //    that exit promptly even when a peer stalls — so a healthy
-        //    actor finishes well inside `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT`.
-        //    The timeout here is a defensive guard against a future
-        //    bug (e.g. a new transport path that forgets the cancel
-        //    race); it is NOT a contract that allows unresolved
-        //    handles. We deliberately do NOT `abort()` — abort would
-        //    re-open the leak this commit set closes.
-        let handle_opt = self.actor_handle.lock().await.take();
-        if let Some(h) = handle_opt {
-            let _ = tokio::time::timeout(crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT, h).await;
-        }
-
-        // 3. Final drain. The buffer holds only events pushed via
-        //    `consume_shutdown` (the queue consumer's drain path
-        //    after shutdown signal) plus anything that arrived too
-        //    late for the actor's last iteration. The actor's own
-        //    in-flight batch was already resolved by `flush_events`
-        //    before the actor exited. `flush_events_at_shutdown`
-        //    does one bounded send attempt then routes the rest to
-        //    DLQ + Recovered.
-        let leftover = std::mem::take(&mut *self.inner.batch.lock().await);
-        self.inner.flush_events_at_shutdown(leftover).await;
-        Ok(())
+        self.sink.shutdown().await
     }
 }
 
-/// Render a single event into its HTTP body string. Called from the
-/// consumer-side flush path on an owned `Event`, so no borrowed-view
-/// arena setup is required.
-fn render_event(event: &Event) -> Result<String> {
-    Ok(String::from_utf8_lossy(&event.egress).into_owned())
-}
+#[async_trait::async_trait]
+impl BatchSinkPolicy for HttpSinkPolicy {
+    type Payload = String;
+    type Prepared = Vec<u8>;
 
-impl Inner {
-    /// Drain + ship one batch, resolving each handle to its final
-    /// disposition. Infallible from the caller's POV: every entry
-    /// has its disposition committed before this returns. Render
-    /// failures route the offending event to DLQ on its own
-    /// (resolve_recovered); the rest proceed to the HTTP send loop.
-    /// Transport failures consume the per-flush retry budget; on
-    /// exhaust the whole shippable subset is routed to DLQ.
-    /// Yield when the cooperative shutdown signal is observed. Used
-    /// in `tokio::select!` to race the transport `send_batch` future
-    /// so a stalled peer cannot trap the actor task with the batch on
-    /// its stack past the runtime shutdown deadline.
-    ///
-    /// The double-check around `notified()` closes the lost-wake race:
-    /// if `is_shutting_down` flips between our load and the call to
-    /// `notified()`, the re-check catches it; otherwise the next
-    /// `notify_waiters()` (from `shutdown()`) wakes us.
-    async fn wait_until_shutdown(&self) {
-        loop {
-            if self.is_shutting_down.load(Ordering::Acquire) {
-                return;
-            }
-            let notified = self.flush_notify.notified();
-            if self.is_shutting_down.load(Ordering::Acquire) {
-                return;
-            }
-            notified.await;
-            // After the notify wake, the next iteration's `load`
-            // decides whether to return (shutdown observed) or loop
-            // (spurious wake from a threshold-driven flush nudge).
-        }
+    fn kind(&self) -> &'static str {
+        "http output"
     }
 
-    async fn flush_events(&self, batch: Vec<(Event, QueueAckHandle)>) {
-        if batch.is_empty() {
-            return;
-        }
-        let mut messages: Vec<String> = Vec::with_capacity(batch.len());
-        let mut shippable: Vec<(Event, QueueAckHandle)> = Vec::with_capacity(batch.len());
-        let mut render_failures: Vec<(Event, QueueAckHandle, anyhow::Error)> = Vec::new();
-        for (ev, ack) in batch {
-            match render_event(&ev) {
-                Ok(m) => {
-                    messages.push(m);
-                    shippable.push((ev, ack));
-                }
-                Err(e) => render_failures.push((ev, ack, e)),
-            }
-        }
-        for (ev, ack, err) in render_failures {
-            let reason = format!("render failed during batch flush: {}", err);
-            crate::modules::route_event_to_dlq(self.error_log.as_ref(), &self.name, &ev, &reason)
-                .await;
-            self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-            ack.resolve_recovered();
-        }
-        if messages.is_empty() {
-            return;
-        }
-        let count = shippable.len() as u64;
-        let mut attempt = 0u32;
-        let mut wait = self.retry.initial_wait;
-        let final_err = loop {
-            // Race the transport against the shutdown signal. A
-            // stalled peer (= TCP accepted but never responds) holds
-            // `send_batch().await` past the runtime shutdown deadline
-            // — without the race the actor task gets aborted with
-            // the stack-local shippable Vec, dropping every parked
-            // QueueAckHandle unresolved (the unresolved-handle
-            // regression). With the race, a `shutdown()` mid-flight
-            // cancels the send future (reqwest cancels the connection
-            // on drop) and falls through to the DLQ + Recovered path
-            // below.
-            let send_outcome = tokio::select! {
-                biased;
-                res = self.send_batch(&messages) => Some(res),
-                _ = self.wait_until_shutdown() => None,
-            };
-            match send_outcome {
-                Some(Ok(())) => {
-                    self.metrics
-                        .events_written
-                        .fetch_add(count, Ordering::Relaxed);
-                    for (_, ack) in shippable {
-                        ack.resolve_delivered();
-                    }
-                    return;
-                }
-                None => {
-                    break anyhow::anyhow!(
-                        "shutdown cancelled in-flight send (collapsed retry budget)"
-                    );
-                }
-                Some(Err(e)) => {
-                    attempt += 1;
-                    self.metrics.retries.fetch_add(1, Ordering::Relaxed);
-                    if attempt >= self.retry.max_attempts {
-                        break e;
-                    }
-                    // Cooperative shutdown cancel: if `shutdown()`
-                    // signalled mid-retry, abandon the budget and
-                    // route the shippable batch straight to DLQ.
-                    // Burning the full backoff window would outlast
-                    // the runtime's 10s shutdown timeout and leak
-                    // the stack-local handles when the task is
-                    // aborted by the runtime.
-                    if self.is_shutting_down.load(Ordering::Acquire) {
-                        break e;
-                    }
-                    tracing::warn!(
-                        "output '{}': flush attempt {}/{} failed: {} — retrying in {:?}",
-                        self.name,
-                        attempt,
-                        self.retry.max_attempts,
-                        e,
-                        wait
-                    );
-                    // Race the sleep against a shutdown wake. The
-                    // bare check before the sleep only catches a
-                    // shutdown that arrived between attempts; a
-                    // shutdown that fires *during* the sleep would
-                    // otherwise be stuck until the sleep elapses
-                    // (5s+ in practice, longer than the runtime
-                    // shutdown budget). `flush_notify.notify_waiters`
-                    // is called by `shutdown()`, so the sleep arm
-                    // here wakes immediately and the next iteration
-                    // sees `is_shutting_down=true` and breaks.
-                    tokio::select! {
-                        _ = tokio::time::sleep(wait) => {}
-                        _ = self.flush_notify.notified() => {}
-                    }
-                    wait = self.retry.next_wait(wait);
-                }
-            }
-        };
-        // Retry exhausted: route every shippable event to DLQ and
-        // resolve Recovered. The batch is gone from the buffer at
-        // this point — the disk-queue cursor will not advance until
-        // every handle resolves, so a daemon crash here replays the
-        // batch on restart (the ack-handle invariant).
-        let reason = format!("flush failed after {} attempts: {}", attempt, final_err);
-        for (ev, ack) in shippable {
-            crate::modules::route_event_to_dlq(self.error_log.as_ref(), &self.name, &ev, &reason)
-                .await;
-            self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-            ack.resolve_recovered();
-        }
+    /// Render a single event into its HTTP body string. Called from
+    /// the flush path on an owned `Event`, so no borrowed-view arena
+    /// setup is required. Kept fallible (the lossy conversion itself
+    /// cannot fail) so per-event DLQ routing stays available if a
+    /// stricter render is ever introduced.
+    fn render(&self, event: &Event) -> Result<String> {
+        Ok(String::from_utf8_lossy(&event.egress).into_owned())
     }
 
-    /// Shutdown single-attempt flush; never uses the steady-state retry
-    /// budget. Render failures route per-event to DLQ as before; the
-    /// shippable subset gets one `send_batch` call wrapped in
-    /// `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT`. The `shippable` vector is held
-    /// in this frame across the `timeout()` boundary so an `Elapsed`
-    /// outcome does NOT drop it — otherwise the inner handles would
-    /// fire `QueueAckHandle::Drop` and be counted as silent loss.
-    async fn flush_events_at_shutdown(&self, batch: Vec<(Event, QueueAckHandle)>) {
-        if batch.is_empty() {
-            return;
-        }
-        let mut messages: Vec<String> = Vec::with_capacity(batch.len());
-        let mut shippable: Vec<(Event, QueueAckHandle)> = Vec::with_capacity(batch.len());
-        let mut render_failures: Vec<(Event, QueueAckHandle, anyhow::Error)> = Vec::new();
-        for (ev, ack) in batch {
-            match render_event(&ev) {
-                Ok(m) => {
-                    messages.push(m);
-                    shippable.push((ev, ack));
-                }
-                Err(e) => render_failures.push((ev, ack, e)),
-            }
-        }
-        for (ev, ack, err) in render_failures {
-            let reason = format!("render failed during shutdown flush: {}", err);
-            crate::modules::route_event_to_dlq(self.error_log.as_ref(), &self.name, &ev, &reason)
-                .await;
-            self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-            ack.resolve_recovered();
-        }
-        if messages.is_empty() {
-            return;
-        }
-        let count = shippable.len() as u64;
-        let send_outcome = tokio::time::timeout(
-            crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT,
-            self.send_batch(&messages),
-        )
-        .await;
-        match send_outcome {
-            Ok(Ok(())) => {
-                self.metrics
-                    .events_written
-                    .fetch_add(count, Ordering::Relaxed);
-                for (_, ack) in shippable {
-                    ack.resolve_delivered();
-                }
-            }
-            Ok(Err(send_err)) => {
-                let err = anyhow::anyhow!("transport error: {}", send_err);
-                crate::modules::route_shutdown_batch_to_dlq(
-                    self.error_log.as_ref(),
-                    &self.metrics,
-                    &self.name,
-                    shippable,
-                    &err,
-                )
-                .await;
-            }
-            Err(_elapsed) => {
-                let err = anyhow::anyhow!(
-                    "deadline exceeded after {:?} during shutdown flush",
-                    crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT
-                );
-                crate::modules::route_shutdown_batch_to_dlq(
-                    self.error_log.as_ref(),
-                    &self.metrics,
-                    &self.name,
-                    shippable,
-                    &err,
-                )
-                .await;
-            }
-        }
-    }
-
-    /// Ship `messages` to one of the configured peers, rotating to the
-    /// next peer in round-robin order. A peer that fails the request
-    /// is cooled down for `PEER_COOLDOWN` and skipped on subsequent
-    /// flushes. When every peer is currently cooled the rotation falls
-    /// back to the cursor start — the per-flush retry loop on `Inner`
-    /// then handles longer-term re-delivery without dropping the batch.
-    async fn send_batch(&self, messages: &[String]) -> Result<()> {
+    /// Join the batch bodies and optionally gzip. Runs once per flush
+    /// (the skeleton prepares before its retry loop), so compression
+    /// is not re-done per attempt — the transformation is
+    /// deterministic, so the wire bytes are identical either way.
+    fn prepare(&self, messages: Vec<String>) -> Result<Vec<u8>> {
         let body_str = messages.join("\n");
-
-        let body: Vec<u8> = if self.compress {
+        if self.compress {
             use flate2::Compression;
             use flate2::write::GzEncoder;
             use std::io::Write;
@@ -891,17 +481,26 @@ impl Inner {
                 .context("http output: gzip compression failed")?;
             encoder
                 .finish()
-                .context("http output: gzip finalization failed")?
+                .context("http output: gzip finalization failed")
         } else {
-            body_str.into_bytes()
-        };
+            Ok(body_str.into_bytes())
+        }
+    }
 
+    /// One send attempt against the next rotation candidate. A peer
+    /// that fails is cooled down for `PEER_COOLDOWN` and skipped on
+    /// subsequent sends; when every peer is cooled the rotation falls
+    /// back to the cursor start — the skeleton's per-flush retry loop
+    /// then handles longer-term re-delivery without dropping the
+    /// batch. Plain HTTP has no partial-success concept, so success
+    /// reports `rejected: 0` (= the whole batch is Delivered).
+    async fn send(&self, body: &Vec<u8>) -> Result<SendOutcome> {
         let idx = self.rotation.select().await;
         let peer = &self.peers[idx];
-        match send_once(peer, self, &body).await {
+        match send_once(peer, self, body).await {
             Ok(()) => {
                 self.rotation.mark_success(idx).await;
-                Ok(())
+                Ok(SendOutcome { rejected: 0 })
             }
             Err(e) => {
                 self.rotation.mark_failure(idx).await;
@@ -911,16 +510,16 @@ impl Inner {
     }
 }
 
-async fn send_once(peer: &HttpPeer, inner: &Inner, body: &[u8]) -> Result<()> {
-    let mut request = peer.client.request(inner.method.clone(), &peer.url);
+async fn send_once(peer: &HttpPeer, policy: &HttpSinkPolicy, body: &[u8]) -> Result<()> {
+    let mut request = peer.client.request(policy.method.clone(), &peer.url);
 
-    request = request.header("Content-Type", &inner.content_type);
+    request = request.header("Content-Type", &policy.content_type);
 
-    if inner.compress {
+    if policy.compress {
         request = request.header("Content-Encoding", "gzip");
     }
 
-    for (key, value) in &inner.headers {
+    for (key, value) in &policy.headers {
         request = request.header(key.as_str(), value.as_str());
     }
 
@@ -951,37 +550,8 @@ async fn send_once(peer: &HttpPeer, inner: &Inner, body: &[u8]) -> Result<()> {
     Ok(())
 }
 
-impl Drop for HttpOutput {
-    fn drop(&mut self) {
-        // Signal the actor cooperatively before falling back to
-        // abort — `shutdown()` should have already done this and
-        // joined, but Drop is the last-resort path (Output dropped
-        // without an explicit `shutdown()` call, e.g. config
-        // teardown in tests). The actor's stack-local batch on a
-        // bare abort would drop handles unresolved; calling
-        // `is_shutting_down` and `notify_waiters` here gives it a
-        // chance to exit cleanly first, even though we cannot await
-        // its completion from a sync Drop.
-        self.inner.is_shutting_down.store(true, Ordering::Release);
-        self.inner.flush_notify.notify_waiters();
-        if let Some(h) = self.actor_handle.get_mut().take() {
-            h.abort();
-        }
-        // Best-effort warn on leaked buffered events. Holding an Arc
-        // here would block the warn under contention; try_lock is the
-        // right behaviour for a Drop path. Each leftover handle's
-        // own Drop impl fires `Dropped` back at the queue consumer
-        // — the cursor will not advance for them.
-        if let Ok(buf) = self.inner.batch.try_lock()
-            && !buf.is_empty()
-        {
-            tracing::warn!(
-                "http output: {} events in buffer lost on shutdown (will be re-delivered from queue)",
-                buf.len()
-            );
-        }
-    }
-}
+// Drop lifecycle (cooperative signal → last-resort abort) lives on
+// `BatchedSink`; `HttpOutput` needs no Drop of its own.
 
 #[cfg(test)]
 mod tests {
@@ -991,6 +561,7 @@ mod tests {
     use crate::modules::output::syslog_peers::PEER_COOLDOWN;
     use std::net::SocketAddr;
     use std::time::Instant;
+    use tokio::sync::Mutex;
 
     fn mp(props: &[Property]) -> crate::dsl::module_props::ModuleProperties {
         crate::dsl::module_props::ModuleProperties::from_parts("http", props.to_vec())
@@ -1104,8 +675,8 @@ mod tests {
             &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
-        assert_eq!(output.inner.peers.len(), 1);
-        assert_eq!(output.inner.peers[0].url, "http://x:8080/");
+        assert_eq!(output.sink.inner.policy.peers.len(), 1);
+        assert_eq!(output.sink.inner.policy.peers[0].url, "http://x:8080/");
     }
 
     #[test]
@@ -1121,8 +692,8 @@ mod tests {
             &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
-        assert_eq!(output.inner.peers.len(), 3);
-        assert_eq!(output.inner.peers[2].url, "http://c:8080/");
+        assert_eq!(output.sink.inner.policy.peers.len(), 3);
+        assert_eq!(output.sink.inner.policy.peers[2].url, "http://c:8080/");
     }
 
     #[test]
@@ -1478,7 +1049,7 @@ def output o {{
             &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
-        assert_eq!(output.inner.peers.len(), 1);
+        assert_eq!(output.sink.inner.policy.peers.len(), 1);
     }
 
     #[tokio::test]
@@ -1662,11 +1233,12 @@ def output o {{
         .unwrap();
         // `consume` resolves the ack and swallows the underlying
         // transport error inside its DLQ-routing path.
-        // Hit `Inner::send_batch` directly so we can still assert on
-        // the snippet-cap behaviour at the transport layer.
-        let err = output
-            .inner
-            .send_batch(&["hello".to_string()])
+        // Hit the policy's prepare + send directly so we can still
+        // assert on the snippet-cap behaviour at the transport layer.
+        let policy = &output.sink.inner.policy;
+        let body = policy.prepare(vec!["hello".to_string()]).unwrap();
+        let err = policy
+            .send(&body)
             .await
             .expect_err("500 must surface as Err at the transport layer");
         server.abort();
@@ -1721,9 +1293,10 @@ def output o {{
             &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
-        let err = output
-            .inner
-            .send_batch(&["hello".to_string()])
+        let policy = &output.sink.inner.policy;
+        let body = policy.prepare(vec!["hello".to_string()]).unwrap();
+        let err = policy
+            .send(&body)
             .await
             .expect_err("502 must surface as Err at the transport layer");
         server.abort();
@@ -1773,7 +1346,9 @@ def output o {{
         let _ = consume_and_wait_disposition(&output, &event_with("hello"), Duration::from_secs(5))
             .await;
         let cooldown_until = output
+            .sink
             .inner
+            .policy
             .rotation
             .cooldown_until(0)
             .await
@@ -1823,9 +1398,9 @@ def output o {{
         );
         // After the actor drains the 1-element batch, the buffer
         // must be empty again.
-        let batch_len = output.inner.batch.lock().await.len();
+        let batch_len = output.sink.inner.batch.lock().await.len();
         assert_eq!(batch_len, 0, "actor must drain the singleton batch");
-        let actor_spawned = output.actor_handle.lock().await.is_some();
+        let actor_spawned = output.sink.actor_handle.lock().await.is_some();
         assert!(
             actor_spawned,
             "the flusher actor is spawned for every batch_size (singleton included)"
@@ -1892,7 +1467,7 @@ def output o {{
             Some((_, crate::queue::AckDisposition::Recovered))
         ));
         assert_eq!(
-            output.inner.batch.lock().await.len(),
+            output.sink.inner.batch.lock().await.len(),
             0,
             "buffer must be empty after flush — handles already resolved"
         );
@@ -1976,7 +1551,7 @@ def output o {{
         consume(&output, &event_with("ev1")).await.unwrap();
         consume(&output, &event_with("ev2")).await.unwrap();
         assert_eq!(
-            output.inner.batch.lock().await.len(),
+            output.sink.inner.batch.lock().await.len(),
             2,
             "events must sit in the buffer (batch_size and timer both far away)"
         );
@@ -1987,7 +1562,7 @@ def output o {{
 
         // Buffer drained.
         assert_eq!(
-            output.inner.batch.lock().await.len(),
+            output.sink.inner.batch.lock().await.len(),
             0,
             "shutdown() must drain the buffer"
         );
@@ -2056,7 +1631,7 @@ def output o {{
         // Drop two events into the buffer (no flush triggered).
         consume(&output, &event_with("ev1")).await.unwrap();
         consume(&output, &event_with("ev2")).await.unwrap();
-        assert_eq!(output.inner.batch.lock().await.len(), 2);
+        assert_eq!(output.sink.inner.batch.lock().await.len(), 2);
 
         // shutdown -> flush() → server returns 500 → retry exhausts →
         // each entry routes to DLQ with `Recovered`. Buffer empty,
@@ -2065,7 +1640,7 @@ def output o {{
         server.abort();
 
         assert_eq!(
-            output.inner.batch.lock().await.len(),
+            output.sink.inner.batch.lock().await.len(),
             0,
             "shutdown recovery must drain the buffer"
         );
@@ -2114,7 +1689,7 @@ def output o {{
         server.abort();
         // Buffer drained: flush_events routes to log-without-DLQ
         // (because error_log is None) and resolves Recovered.
-        assert_eq!(output.inner.batch.lock().await.len(), 0);
+        assert_eq!(output.sink.inner.batch.lock().await.len(), 0);
     }
 
     /// shutdown flush succeeds + error_log set → success path is
@@ -2193,7 +1768,7 @@ def output o {{
         server.abort();
         // Buffer is drained either way (we took() before attempting
         // the DLQ write); the contract is that we don't crash.
-        assert_eq!(output.inner.batch.lock().await.len(), 0);
+        assert_eq!(output.sink.inner.batch.lock().await.len(), 0);
     }
 
     /// Counts every POST the failing collector receives so the test
@@ -2226,6 +1801,65 @@ def output o {{
             let _ = axum::serve(listener, app).await;
         });
         (addr, count, server)
+    }
+
+    /// Pins the steady-state retry budget: `max_attempts = N` means
+    /// exactly N send attempts (the first try + N-1 retries) before
+    /// the batch routes to DLQ as Recovered. Guards the shared
+    /// `BatchedSink` retry loop against off-by-one drift — the http
+    /// and otlp outputs historically counted attempts with different
+    /// (but equivalent) arithmetic, and this test keeps the unified
+    /// loop honest.
+    #[tokio::test]
+    async fn retry_budget_makes_exactly_max_attempts_sends() {
+        let (addr, post_count, server) = run_counting_failing_collector().await;
+        let url = format!("http://{}/", addr);
+        let retry = Property::Block {
+            key: "retry".into(),
+            key_span: None,
+            properties: vec![
+                prop_int("max_attempts", 3),
+                prop_str("initial_wait", "1ms"),
+                prop_str("max_wait", "1ms"),
+                Property::KeyValue {
+                    key: "backoff".into(),
+                    key_span: None,
+                    value: Expr::spanless(ExprKind::Ident(vec!["fixed".into()])),
+                    value_span: None,
+                },
+            ],
+        };
+        let output = HttpOutput::from_properties(
+            "test",
+            &mp(&[peer_block(&url), prop_int("batch_size", 1), retry]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
+
+        let disp =
+            consume_and_wait_disposition(&output, &event_with("retry-pin"), Duration::from_secs(5))
+                .await
+                .unwrap();
+        server.abort();
+        assert!(
+            matches!(disp, crate::queue::AckDisposition::Recovered),
+            "budget exhaust must resolve Recovered, got {:?}",
+            disp
+        );
+        let posts = post_count.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            posts, 3,
+            "max_attempts=3 must make exactly 3 send attempts, got {}",
+            posts
+        );
+        assert_eq!(
+            output
+                .metrics
+                .retries
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "the retries metric counts every failed attempt"
+        );
     }
 
     /// Regression for the 0.7.8 shutdown panic / silent loss: at shutdown
@@ -2294,7 +1928,7 @@ def output o {{
             "shutdown took {:?} — must be bounded by SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT",
             elapsed
         );
-        assert_eq!(output.inner.batch.lock().await.len(), 0);
+        assert_eq!(output.sink.inner.batch.lock().await.len(), 0);
         let body = tokio::fs::read_to_string(&path).await.unwrap();
         assert_eq!(
             body.lines().count(),
@@ -2373,7 +2007,7 @@ def output o {{
             "shutdown took {:?} — must be bounded by SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT",
             elapsed
         );
-        assert_eq!(output.inner.batch.lock().await.len(), 0);
+        assert_eq!(output.sink.inner.batch.lock().await.len(), 0);
 
         let body = tokio::fs::read_to_string(&path).await.unwrap();
         let lines: Vec<&str> = body.lines().collect();
@@ -2412,6 +2046,7 @@ def output o {{
         // the runtime would have handed to us — no Mutex, no None
         // window between construction and consumer spawn.
         let stored = output
+            .sink
             .inner
             .error_log
             .as_ref()
@@ -2472,7 +2107,7 @@ def output o {{
             elapsed
         );
         assert_eq!(
-            output.inner.batch.lock().await.len(),
+            output.sink.inner.batch.lock().await.len(),
             1,
             "event must land in the buffer"
         );
@@ -2597,7 +2232,7 @@ def output o {{
         )
         .unwrap();
         let handle_id_before = {
-            let guard = output.actor_handle.lock().await;
+            let guard = output.sink.actor_handle.lock().await;
             guard
                 .as_ref()
                 .map(|h| h.id())
@@ -2608,7 +2243,7 @@ def output o {{
         consume(&output, &event_with("b")).await.unwrap();
         consume(&output, &event_with("c")).await.unwrap();
         let handle_id_after = {
-            let guard = output.actor_handle.lock().await;
+            let guard = output.sink.actor_handle.lock().await;
             guard
                 .as_ref()
                 .map(|h| h.id())

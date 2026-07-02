@@ -47,20 +47,10 @@ use opentelemetry_proto::tonic::{
 };
 use prost::Message;
 
-/// Transport-success outcome from a single OTLP export call.
-///
-/// `rejected` is the number of LogRecords the receiver acknowledged
-/// as not-stored via OTLP's `partial_success.rejected_log_records`.
-/// The HTTP 2xx / gRPC OK is still a transport success — the receiver
-/// processed the request, it just refused some records (typically
-/// quota / schema / size violations). limpid does not retry rejected
-/// records (selective re-send is queued for a later release); the
-/// counter split lets `events_failed` reflect the data loss so
-/// operator dashboards stay accurate.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct SendOutcome {
-    pub rejected: u64,
-}
+// The per-export `SendOutcome` (partial-success rejected count) lives
+// in `crate::modules::output::batched` — it is the shared batched-sink
+// vocabulary, not an OTLP-only concept (plain HTTP reports
+// `rejected: 0`).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BatchLevel {

@@ -1,5 +1,6 @@
 //! Output modules: write processed events to external destinations.
 
+pub(crate) mod batched;
 pub mod file;
 pub mod http;
 pub(crate) mod http_util;
