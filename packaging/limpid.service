@@ -15,7 +15,14 @@ RestartSec=5
 # Run as dedicated user
 User=syslog
 Group=syslog
+# AmbientCapabilities grants the capability at process start;
+# CapabilityBoundingSet caps what the process can ever hold (e.g. across
+# a re-exec or a dropped-then-regained ambient set). Without an explicit
+# bounding set, the default is "all capabilities the service's uid could
+# reach", which is far wider than the one capability limpid actually
+# needs to bind syslog's privileged ports (514/tcp, 514/udp, etc).
 AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 # Directories (systemd creates with correct ownership)
 RuntimeDirectory=limpid
@@ -26,7 +33,61 @@ ConfigurationDirectory=limpid
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/lib/limpid /var/run/limpid /var/log
+# limpid does not use /tmp, real devices (other than the standard null/
+# zero/random handed to every service by PrivateDevices), kernel tunables,
+# kernel modules, kernel log access (kmsg), cgroup management, wall-clock
+# adjustment, or hostname changes for any of its inputs (syslog UDP/TCP/
+# unix socket, journald via the `journal` feature) or outputs (file,
+# kafka, HTTP, OTLP). Isolating all of these narrows the blast radius of
+# a compromised pipeline/parser without touching any codepath in use.
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+# Address families actually opened by limpid:
+#   AF_UNIX    - syslog unix-socket input, control socket (/var/run/limpid),
+#                and the journald `journal` feature's libsystemd calls
+#                (sd_journal_open reads journal files directly, but
+#                libsystemd internally may touch AF_UNIX for its own
+#                bookkeeping; no AF_NETLINK usage was found in the journal
+#                input (crates/limpid/src/modules/input/journal.rs) or
+#                anywhere else in the tree, so AF_NETLINK is intentionally
+#                left out below)
+#   AF_INET/6  - syslog UDP/TCP input+output, kafka, HTTP, OTLP (HTTP/gRPC)
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# @system-service is systemd's curated allowlist for long-running daemons;
+# it already includes madvise/mmap/futex/epoll/etc used by tokio and by
+# aws-lc-rs (rustls's crypto backend, used for the HTTP/OTLP outputs and
+# journal/kafka TLS). Not verified against the optional `kafka` feature's
+# librdkafka (a C library with its own compression codecs); if a build
+# with `--features kafka` fails under this filter, drop it there first.
+SystemCallFilter=@system-service
+# MemoryDenyWriteExecute is deliberately omitted: limpid optionally links
+# librdkafka (C, `kafka` feature, cmake-build) whose bundled compression
+# codecs (zstd/lz4/snappy) are not audited here for W^X-violating runtime
+# codegen. Flagging as uncertain per the hardening brief rather than
+# guessing; revisit once the kafka build path can be tested on real
+# hardware.
+UMask=0027
+# The control socket is created with explicit 0o660 permissions in
+# control.rs (see crates/limpid/src/control.rs:135,
+# std::fs::set_permissions after bind), so UMask does not affect it.
+ReadWritePaths=/var/lib/limpid /var/run/limpid /var/log/limpid
+# Only /var/log/limpid (this daemon's own log directory) is writable by
+# default; ProtectSystem=strict makes the rest of the filesystem
+# read-only. Operators using the `file` output to write elsewhere must
+# add a drop-in, e.g.:
+#   /etc/systemd/system/limpid.service.d/override.conf:
+#     [Service]
+#     ReadWritePaths=/var/log/limpid /path/to/other/output/dir
 
 [Install]
 WantedBy=multi-user.target
