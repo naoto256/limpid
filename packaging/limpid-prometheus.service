@@ -11,14 +11,46 @@ ExecStart=/usr/bin/limpid-prometheus --bind ${LIMPID_PROMETHEUS_BIND} --socket $
 Restart=on-failure
 RestartSec=5
 
-# Run as same user as limpid (needs access to control socket)
-User=syslog
-Group=syslog
+# limpid-prometheus only reads limpid's control socket (stats/health
+# over AF_UNIX, see crates/limpid-prometheus/src/main.rs) and serves
+# HTTP on --bind; it never writes to disk, so it does not need a
+# dedicated uid/StateDirectory the way limpid.service does.
+# DynamicUser=yes allocates a throwaway system user per-start instead
+# of running as the shared `syslog` account; SupplementaryGroups=syslog
+# is the one thing still needed from that account, since the control
+# socket at /var/run/limpid is group-owned syslog with mode 0o660
+# (crates/limpid/src/control.rs:135) and this process must read it.
+DynamicUser=yes
+SupplementaryGroups=syslog
 
 # Security hardening
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
+# No capabilities are needed: --bind here defaults to a high port
+# (9100) and CAP_NET_BIND_SERVICE is only required for the <1024
+# syslog listener ports that limpid.service (not this exporter) binds.
+CapabilityBoundingSet=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+# AF_UNIX for the control-socket client connection, AF_INET/AF_INET6
+# for the Prometheus HTTP listener (--bind). No AF_NETLINK: this
+# process opens no netlink sockets anywhere in main.rs.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# @system-service covers tokio + hyper, both pure-Rust with no native
+# codec dependencies (unlike limpid.service's optional kafka feature),
+# so this filter is lower-risk here than on the main daemon.
+SystemCallFilter=@system-service
 
 [Install]
 WantedBy=multi-user.target
