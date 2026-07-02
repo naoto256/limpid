@@ -40,9 +40,9 @@ for svc in rsyslog syslog-ng td-agent fluentd; do
 done
 
 # Unit enable/start is handled by the debhelper systemd-units snippet
-# below (#DEBHELPER#), generated from `systemd-units` in
-# crates/limpid/Cargo.toml (enable = true, start = false — enables the
-# unit but does not start it, so an operator running rsyslog/syslog-ng
+# inserted below at the DEBHELPER marker, generated from `systemd-units`
+# in crates/limpid/Cargo.toml (enable = true, start = false — enables
+# the unit but does not start it, so an operator running rsyslog/syslog-ng
 # on the same ports isn't disrupted by an upgrade). The debhelper
 # snippet also guards its systemctl calls with
 # `[ -d /run/systemd/system ]`, so this script no longer aborts under
