@@ -118,6 +118,65 @@ enum TapKind {
     },
 }
 
+/// True when `name` is a valid limpid identifier: `[A-Za-z_][A-Za-z0-9_]*`,
+/// matching the daemon-side DSL `ident` rule (see `dsl/limpid.pest`).
+/// Input / process / output names can only ever be idents, so anything
+/// else — whitespace, newlines, control characters — cannot name a
+/// tap/inject target and would only serve to smuggle extra tokens (or
+/// extra protocol lines) into the line-based control command.
+/// Validating client-side yields a clear error before any bytes are
+/// sent, instead of a confusing daemon-side parse failure.
+fn is_valid_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Exit(2) — usage-error convention, same as the --replay-timing
+/// checks — unless `name` is a valid identifier.
+fn require_valid_name(name: &str) {
+    if !is_valid_name(name) {
+        eprintln!(
+            "error: invalid name {:?}: expected an identifier ([A-Za-z_][A-Za-z0-9_]*), \
+             matching the daemon's input/process/output name grammar",
+            name
+        );
+        std::process::exit(2);
+    }
+}
+
+/// The daemon's protocol-level failure shape: a plain-text line
+/// starting with `error:` (server busy, command too long, unknown
+/// tap point, ...). Returns the message after the prefix. JSON
+/// responses (`{...}`) never match.
+fn daemon_error_line(response: &str) -> Option<&str> {
+    response.trim().strip_prefix("error:")
+}
+
+/// Exit(1) if `response` is a daemon `error:` line. Applied to every
+/// query-style command (list / stats / health) so scripts can rely on
+/// the exit code — mirrors the inject path's existing handling.
+fn exit_on_daemon_error(response: &str) {
+    if let Some(rest) = daemon_error_line(response) {
+        eprintln!("error:{}", rest);
+        std::process::exit(1);
+    }
+}
+
+/// True when a `health` response reports a healthy daemon. Anything
+/// else — unparseable body, missing field, non-"ok" status — counts
+/// as unhealthy, so `limpidctl health` can gate scripts and probes
+/// via its exit code instead of forcing them to parse the output.
+fn health_is_ok(json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(|s| s == "ok"))
+        .unwrap_or(false)
+}
+
 fn main() {
     // Restore the default SIGPIPE disposition so writes to a closed
     // downstream pipe terminate the process via signal instead of
@@ -140,6 +199,7 @@ fn main() {
                 TapKind::Process { name, json } => ("process", name, json),
                 TapKind::Output { name, json } => ("output", name, json),
             };
+            require_valid_name(&name);
             let command = if json {
                 format!("tap {} {} json", kind_str, name)
             } else {
@@ -149,6 +209,7 @@ fn main() {
         }
         Command::List { json } => {
             let response = query_command(&cli.socket, "list");
+            exit_on_daemon_error(&response);
             if json {
                 print!("{}", response);
             } else {
@@ -157,6 +218,7 @@ fn main() {
         }
         Command::Stats { json } => {
             let response = query_command(&cli.socket, "stats");
+            exit_on_daemon_error(&response);
             if json {
                 print!("{}", response);
             } else {
@@ -176,6 +238,7 @@ fn main() {
                     replay_timing,
                 } => ("output", name, json, replay_timing),
             };
+            require_valid_name(&name);
             let replay = match replay_timing {
                 None => None,
                 Some(spec) => {
@@ -203,10 +266,18 @@ fn main() {
         }
         Command::Health { json } => {
             let response = query_command(&cli.socket, "health");
+            exit_on_daemon_error(&response);
             if json {
                 print!("{}", response);
             } else {
                 format_health(&response);
+            }
+            // Non-zero exit for anything but an explicit healthy
+            // status, so probes (systemd, k8s, shell `&&` chains) can
+            // use the exit code without parsing the body. Printed
+            // output above is preserved either way.
+            if !health_is_ok(&response) {
+                std::process::exit(1);
             }
         }
     }
@@ -633,6 +704,59 @@ impl ReplayState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn valid_names_match_daemon_ident_grammar() {
+        // Mirrors `ident = (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")*`
+        // in the daemon's dsl/limpid.pest.
+        assert!(is_valid_name("firewall"));
+        assert!(is_valid_name("fw_01"));
+        assert!(is_valid_name("_internal"));
+        assert!(is_valid_name("A"));
+    }
+
+    #[test]
+    fn invalid_names_rejected_before_send() {
+        // Empty / leading digit — not idents.
+        assert!(!is_valid_name(""));
+        assert!(!is_valid_name("1fw"));
+        // Whitespace and newlines could smuggle extra tokens or extra
+        // protocol lines into the line-based control command.
+        assert!(!is_valid_name("fw json"));
+        assert!(!is_valid_name("fw\ninject output x"));
+        assert!(!is_valid_name("fw\t"));
+        // Control characters and non-ASCII.
+        assert!(!is_valid_name("fw\x07"));
+        assert!(!is_valid_name("fw-01")); // dash is not in the grammar
+        assert!(!is_valid_name("ファイアウォール"));
+    }
+
+    #[test]
+    fn daemon_error_lines_detected() {
+        assert_eq!(
+            daemon_error_line("error: unknown tap point 'x'\n"),
+            Some(" unknown tap point 'x'")
+        );
+        assert_eq!(
+            daemon_error_line("error: control socket busy (too many concurrent connections)"),
+            Some(" control socket busy (too many concurrent connections)")
+        );
+        // JSON responses never match.
+        assert_eq!(daemon_error_line(r#"{"status":"ok"}"#), None);
+        assert_eq!(daemon_error_line(""), None);
+    }
+
+    #[test]
+    fn health_ok_requires_explicit_ok_status() {
+        assert!(health_is_ok(r#"{"status":"ok","uptime_seconds":5}"#));
+        // Anything else is unhealthy: wrong status, missing field,
+        // wrong type, unparseable, empty.
+        assert!(!health_is_ok(r#"{"status":"degraded"}"#));
+        assert!(!health_is_ok(r#"{"uptime_seconds":5}"#));
+        assert!(!health_is_ok(r#"{"status":1}"#));
+        assert!(!health_is_ok("not json"));
+        assert!(!health_is_ok(""));
+    }
 
     #[test]
     fn parse_factor_accepts_realtime_aliases() {
