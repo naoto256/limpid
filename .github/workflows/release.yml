@@ -69,6 +69,17 @@ jobs:
           fi
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
 
+      - name: Generate checksums
+        # SHA256SUMS lets consumers verify asset integrity offline
+        # (`sha256sum -c SHA256SUMS`). Basenames (not paths) so the
+        # check works from the download directory. Cryptographic
+        # provenance (attest-build-provenance) is a separate decision:
+        # it needs the `id-token: write` permission, so it is left to
+        # an explicit owner call rather than bundled here.
+        run: |
+          cd target/debian
+          sha256sum *.deb > SHA256SUMS
+
       - name: Upload to GitHub Release
         env:
           # Pre-installed gh CLI on the runner authenticates with the
@@ -83,6 +94,7 @@ jobs:
           # `steps.notes.outputs.name`.
           RELEASE_TITLE: ${{ steps.notes.outputs.name }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" target/debian/*.deb \
+          gh release create "${GITHUB_REF_NAME}" \
+            target/debian/*.deb target/debian/SHA256SUMS \
             --title "$RELEASE_TITLE" \
             --notes-file RELEASE_NOTES.md
