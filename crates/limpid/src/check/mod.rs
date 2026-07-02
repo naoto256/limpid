@@ -92,7 +92,6 @@ pub enum DiagKind {
     /// them separately.
     PropertySchema,
     /// Catch-all for diagnostics that don't fit the above buckets.
-    #[allow(dead_code)]
     Other,
 }
 
@@ -134,20 +133,6 @@ impl Diagnostic {
         }
     }
 
-    /// Warning with `DiagKind::Other`. Prefer [`Diagnostic::warning_kind`]
-    /// so `--ultra-strict` can classify the diagnostic correctly. Kept
-    /// for render-layer test ergonomics.
-    #[allow(dead_code)]
-    pub fn warning(message: impl Into<String>) -> Self {
-        Self {
-            level: Level::Warning,
-            kind: DiagKind::Other,
-            message: message.into(),
-            span: None,
-            help: None,
-        }
-    }
-
     pub fn warning_kind(kind: DiagKind, message: impl Into<String>) -> Self {
         Self {
             level: Level::Warning,
@@ -158,6 +143,13 @@ impl Diagnostic {
         }
     }
 
+    /// Info-level diagnostic. No current call site constructs one, but
+    /// `Level::Info` is real render/severity-counting infrastructure
+    /// (`check::render` maps it to `"note"` + a distinct color;
+    /// `run_check`'s severity counter matches it as a no-op bucket) —
+    /// this is the only constructor for that level, so removing it
+    /// would make `Level::Info` permanently unreachable rather than
+    /// just currently unused.
     #[allow(dead_code)]
     pub fn info(message: impl Into<String>) -> Self {
         Self {

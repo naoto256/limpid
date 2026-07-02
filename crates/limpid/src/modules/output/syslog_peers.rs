@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -240,14 +238,20 @@ impl<C> PeerList<C> {
         }
     }
 
+    /// Test-only accessors — production code drives rotation through
+    /// `write_with_rotation_now`/`_at` and never inspects the peer
+    /// list or per-peer metrics directly.
+    #[cfg(test)]
     pub fn peers(&self) -> &[Peer] {
         &self.peers
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.peers.len()
     }
 
+    #[cfg(test)]
     pub fn peer_metrics(&self) -> &[Arc<PeerMetrics>] {
         &self.metrics
     }

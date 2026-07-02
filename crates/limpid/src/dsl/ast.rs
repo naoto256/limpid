@@ -332,7 +332,6 @@ impl Expr {
     /// Wrap `kind` with a placeholder span ([`Span::dummy`]). Used by
     /// AST rebuilds and test fixtures where the original source location
     /// isn't meaningful.
-    #[allow(dead_code)]
     pub fn spanless(kind: ExprKind) -> Self {
         Self {
             kind,

@@ -566,13 +566,13 @@ impl QueueAckHandle {
     }
 
     /// The position this handle's event occupies in the source queue.
-    /// Returned alongside the [`AckDisposition`] when the handle
-    /// resolves, so the queue consumer can drive `ack_to(position)`
-    /// on the matching receiver. Currently only used in tests; kept
-    /// public so a future output that wants to log / route on
-    /// position (e.g. structured tracing of disk-cursor pressure)
-    /// does not have to add a new accessor.
-    #[allow(dead_code)]
+    /// Test-only accessor — no production caller needs it today (the
+    /// queue consumer reads `position` off the resolved
+    /// `(AckPosition, AckDisposition)` tuple instead). Re-add
+    /// `#[allow(dead_code)] pub` if a real caller shows up; until then
+    /// keeping it `#[cfg(test)]` avoids carrying unreachable public
+    /// API surface.
+    #[cfg(test)]
     pub fn position(&self) -> AckPosition {
         self.position
     }

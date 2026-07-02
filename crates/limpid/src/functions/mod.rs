@@ -391,14 +391,6 @@ impl FunctionRegistry {
         self.parsers.get(&key)
     }
 
-    /// Iterate over every registered parser. Used by the analyzer to
-    /// drive the `process_expr_stmt` merge rule for bare `parse_*(text)`
-    /// statements.
-    #[allow(dead_code)] // exposed for a future `--check --list-parsers` flag
-    pub fn parsers(&self) -> impl Iterator<Item = &ParserInfo> {
-        self.parsers.values()
-    }
-
     /// Dispatch a function call. `namespace = None` hits the flat
     /// primitive registry; `Some(ns)` hits the namespaced registry.
     /// Missing entries produce distinct error messages so users can tell

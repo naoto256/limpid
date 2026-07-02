@@ -62,7 +62,6 @@ pub enum PropertyValueKind {
     /// Open block whose keys are user-defined identifiers and whose
     /// values must each be a nested block conforming to the given schema.
     /// `tls { profile_a { ca "..." } profile_b { ca "..." cert "..." key "..." } }`
-    #[allow(dead_code)]
     BlockMap(&'static [PropertySpec]),
     /// Open block whose keys are user-defined identifiers (HTTP
     /// header names, k8s-style labels, etc.) and whose values must
@@ -73,7 +72,6 @@ pub enum PropertyValueKind {
     StringMap,
     /// Value can be one of multiple shapes. Used for keys that accept
     /// either an inline block or a reference identifier.
-    #[allow(dead_code)]
     OneOf(&'static [PropertyValueKind]),
 }
 
