@@ -410,9 +410,11 @@ impl Module for OtlpHttpOutput {
 
         let headers = props::get_string_map(properties, "headers");
 
-        let verify = props::get_ident(properties, "verify")
-            .map(|s| s != "false")
-            .unwrap_or(true);
+        // Read through `get_bool`, NOT `get_ident` — the parser emits
+        // `ExprKind::BoolLit` for `verify false`, which `get_ident`
+        // never matches (same v0.7.9 fix as `output http`; see the
+        // comment there).
+        let verify = props::get_bool(properties, "verify").unwrap_or(true);
 
         // Single-peer shorthand (`peer { endpoint ... }`) or multi-peer
         // (`peers { peer { ... } ... }`). The schema's exclusive_group
@@ -1052,6 +1054,89 @@ mod tests {
         assert!(
             err.to_string().contains("'peer {") && err.to_string().contains("'peers {"),
             "unexpected: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parser_spelled_verify_false_disables_certificate_verification() {
+        // Regression for the v0.7.9 get_bool fix (mirrors the same
+        // test on `output http`): `verify false` in a real config file
+        // parses as `ExprKind::BoolLit(false)`, which the old
+        // `props::get_ident` read never matched — the toggle was
+        // silently ignored. Pin DSL source → parser → from_properties
+        // → reqwest client by hitting an HTTPS server with a
+        // self-signed cert: the `verify false` client must connect,
+        // the default client must fail on the certificate.
+        use axum::{Router, http::StatusCode, routing::any};
+        use rcgen::{CertificateParams, KeyPair};
+
+        // axum-server's rustls needs a process-level CryptoProvider;
+        // production installs it via the same helper.
+        crate::tls::install_default_crypto_provider();
+
+        let key_pair = KeyPair::generate().unwrap();
+        let params = CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+
+        let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem(
+            cert.pem().into_bytes(),
+            key_pair.serialize_pem().into_bytes(),
+        )
+        .await
+        .unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/", any(|| async { StatusCode::OK }));
+        let server = tokio::spawn(async move {
+            let _ = axum_server::from_tcp_rustls(listener, rustls_config)
+                .serve(app.into_make_service())
+                .await;
+        });
+
+        let build = |verify_line: &str| {
+            let src = format!(
+                r#"
+def output o {{
+    type otlp_http
+    peer {{ endpoint "https://{addr}/" }}
+    {verify_line}
+}}
+"#
+            );
+            let cfg = crate::dsl::parser::parse_config(&src).expect("parse");
+            let compiled = crate::pipeline::CompiledConfig::from_config(cfg).expect("compile");
+            OtlpHttpOutput::from_properties(
+                "o",
+                &compiled.outputs["o"].properties,
+                &crate::modules::BuildContext::for_testing(),
+            )
+            .unwrap()
+        };
+
+        // Exercise the built reqwest clients directly: the OTLP wire
+        // encoding is irrelevant to what this test pins (whether
+        // danger_accept_invalid_certs reached the client builder).
+        let insecure = build("verify false");
+        insecure.inner.peers[0]
+            .client
+            .get(format!("https://{addr}/"))
+            .send()
+            .await
+            .expect("verify false must accept the self-signed cert");
+
+        let strict = build("");
+        let err = strict.inner.peers[0]
+            .client
+            .get(format!("https://{addr}/"))
+            .send()
+            .await
+            .expect_err("default client must reject the self-signed cert");
+        server.abort();
+        let msg = format!("{:#}", anyhow::Error::from(err)).to_ascii_lowercase();
+        assert!(
+            msg.contains("certificate") || msg.contains("unknownissuer"),
+            "expected a certificate-verification failure, got: {msg}"
         );
     }
 

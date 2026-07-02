@@ -419,9 +419,13 @@ impl Module for HttpOutput {
             .unwrap_or(false);
         let headers = props::get_string_map(properties, "headers");
 
-        let verify = props::get_ident(properties, "verify")
-            .map(|s| s != "false")
-            .unwrap_or(true);
+        // Read through `get_bool`, NOT `get_ident`: the parser emits
+        // `ExprKind::BoolLit` for `verify false` (the pest `atom` rule
+        // tries `bool_lit` before `ident_path`), so a `get_ident` read
+        // never matches and silently falls back to the default. That
+        // exact bug shipped until v0.7.9 — `verify false` was ignored
+        // and verification stayed on.
+        let verify = props::get_bool(properties, "verify").unwrap_or(true);
 
         // Single-peer shorthand (`peer { url ... }`) or multi-peer
         // (`peers { peer { ... } ... }`). The schema's exclusive_group
@@ -1432,6 +1436,20 @@ mod tests {
         assert!(msg.contains("CARRIER PIGEON"), "got: {msg}");
     }
 
+    /// Parse a DSL config source through the real parser and hand back
+    /// the named output's `ModuleProperties`. Regression tests below use
+    /// this instead of the hand-built `ident_prop` / `prop_str` AST
+    /// helpers: hand-built ASTs encode `verify false` as
+    /// `ExprKind::Ident(["false"])`, but the pest grammar produces
+    /// `ExprKind::BoolLit(false)` — the two shapes diverged for years
+    /// and the runtime only handled the shape that never occurs in a
+    /// real config file (the v0.7.9 `get_bool` fix).
+    fn parsed_output_props(src: &str, name: &str) -> crate::modules::ModuleProperties {
+        let cfg = crate::dsl::parser::parse_config(src).expect("config should parse");
+        let compiled = crate::pipeline::CompiledConfig::from_config(cfg).expect("compile");
+        compiled.outputs[name].properties.clone()
+    }
+
     #[test]
     fn verify_false_with_client_identity_parses_ok() {
         // Even with `verify false`, a tls block carrying client
@@ -1441,6 +1459,10 @@ mod tests {
         // a corporate CA they don't want to bundle). Generate a real
         // ephemeral cert/key with rcgen so the test exercises
         // reqwest's identity loader, not just the config plumbing.
+        //
+        // Goes through the real parser (not the `ident_prop` helper)
+        // so `verify false` arrives as the `BoolLit` the grammar
+        // actually produces.
         use rcgen::{CertificateParams, KeyPair};
         use tempfile::TempDir;
 
@@ -1454,34 +1476,125 @@ mod tests {
         std::fs::write(&cert_path, cert.pem()).unwrap();
         std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
 
-        let props = vec![
-            Property::Block {
-                key: "peer".into(),
-                key_span: None,
-                properties: vec![
-                    prop_str("url", "https://example.com/"),
-                    Property::Block {
-                        key: "tls".into(),
-                        key_span: None,
-                        properties: vec![
-                            prop_str("cert", cert_path.to_str().unwrap()),
-                            prop_str("key", key_path.to_str().unwrap()),
-                        ],
-                    },
-                ],
-            },
-            ident_prop("verify", "false"),
-        ];
+        let src = format!(
+            r#"
+def output o {{
+    type http
+    peer {{
+        url "https://example.com/"
+        tls {{
+            cert "{}"
+            key "{}"
+        }}
+    }}
+    verify false
+}}
+"#,
+            cert_path.display(),
+            key_path.display()
+        );
         // `verify false` must NOT discard the client identity. Old
         // behaviour: tls block silently ignored; reqwest builds a
         // plain client without the identity → mTLS broken at runtime.
         let output = HttpOutput::from_properties(
-            "test",
-            &mp(&props),
+            "o",
+            &parsed_output_props(&src, "o"),
             &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
         assert_eq!(output.inner.peers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn parser_spelled_verify_false_disables_certificate_verification() {
+        // Regression for the v0.7.9 get_bool fix. `verify false` in a
+        // real config file parses as `ExprKind::BoolLit(false)`; the
+        // old `props::get_ident` read never matched that shape, so the
+        // toggle was silently ignored and verification stayed on. Pin
+        // the whole chain — DSL source → parser → from_properties →
+        // reqwest client — by hitting an HTTPS server whose
+        // self-signed certificate no root store would accept:
+        //
+        //   verify false  → send succeeds (danger_accept_invalid_certs)
+        //   default       → send fails on the certificate
+        //
+        // The second half proves the first didn't pass because of an
+        // over-permissive default client.
+        use axum::{Router, http::StatusCode, routing::post};
+        use rcgen::{CertificateParams, KeyPair};
+
+        // axum-server's rustls needs a process-level CryptoProvider;
+        // production installs it via the same helper.
+        crate::tls::install_default_crypto_provider();
+
+        let key_pair = KeyPair::generate().unwrap();
+        let params = CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+
+        let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem(
+            cert.pem().into_bytes(),
+            key_pair.serialize_pem().into_bytes(),
+        )
+        .await
+        .unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/", post(|| async { StatusCode::OK }));
+        let server = tokio::spawn(async move {
+            let _ = axum_server::from_tcp_rustls(listener, rustls_config)
+                .serve(app.into_make_service())
+                .await;
+        });
+
+        let src_insecure = format!(
+            r#"
+def output o {{
+    type http
+    peer {{ url "https://{addr}/" }}
+    batch_size 1
+    verify false
+}}
+"#
+        );
+        let insecure = HttpOutput::from_properties(
+            "o",
+            &parsed_output_props(&src_insecure, "o"),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
+        insecure
+            .inner
+            .send_batch(&["hello".to_string()])
+            .await
+            .expect("verify false must accept the self-signed cert");
+
+        let src_default = format!(
+            r#"
+def output o {{
+    type http
+    peer {{ url "https://{addr}/" }}
+    batch_size 1
+}}
+"#
+        );
+        let strict = HttpOutput::from_properties(
+            "o",
+            &parsed_output_props(&src_default, "o"),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
+        let err = strict
+            .inner
+            .send_batch(&["hello".to_string()])
+            .await
+            .expect_err("default client must reject the self-signed cert");
+        server.abort();
+        let msg = format!("{:#}", err).to_ascii_lowercase();
+        assert!(
+            msg.contains("certificate") || msg.contains("unknownissuer"),
+            "expected a certificate-verification failure, got: {msg}"
+        );
     }
 
     #[tokio::test]
