@@ -77,7 +77,7 @@ PrivateTmp=yes
 PrivateDevices=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallFilter=@system-service
-ReadWritePaths=/var/lib/limpid /var/run/limpid /var/log/limpid
+ReadWritePaths=/var/log/limpid
 ```
 
 - `CAP_NET_BIND_SERVICE` allows binding to privileged ports (514) without root
