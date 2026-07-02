@@ -1693,7 +1693,7 @@ def output o {{
 
         // Push the event via consume; consume returns immediately
         // (buffer + notify), the actor picks it up and enters
-        // send_batch against the stalled peer.
+        // send against the stalled peer.
         let (ack, mut rx) = QueueAckHandle::for_test();
         output
             .consume(&event_with_egress(singleton_bytes(1)), ack)
