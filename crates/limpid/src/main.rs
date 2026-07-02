@@ -463,18 +463,20 @@ fn run_test(config_path: &str, pipeline_name: &str, input_json: Option<&str>) ->
     // the pipeline executor no longer takes an `output_sinks` map at all
     // (render moved consumer-side, see `pipeline::run_pipeline`).
     let mut bump = bumpalo::Bump::new();
+    let mut trace = Vec::new();
     let result = run_pipeline(
         pipeline_def,
         &event,
         &compiled,
         &func_registry,
         None,
+        Some(&mut trace),
         &mut bump,
     )?;
 
     // Display trace
     println!("=== Pipeline: {} ===", pipeline_name);
-    for entry in &result.trace {
+    for entry in &trace {
         let label = if entry.label.is_empty() {
             String::new()
         } else {

@@ -500,8 +500,12 @@ impl ErroredEventContext {
 }
 
 /// Result of running an event through a pipeline.
+///
+/// Execution trace is no longer carried here — see `run_pipeline`'s
+/// `trace: Option<&mut Vec<TraceEntry>>` parameter. `--test-pipeline`
+/// passes its own `Vec` and reads it back directly after the call;
+/// the daemon hot path passes `None` and never allocates one.
 pub struct PipelineRunResult {
-    pub trace: Vec<TraceEntry>,
     pub outputs: Vec<(String, OwnedEvent)>,
     /// True iff at least one `output` statement was reached during
     /// execution (i.e. `outputs` was non-empty *before* the runtime
@@ -606,25 +610,40 @@ impl DslProcessRegistry<'_> {
 /// consumer-side inside each sink's `Output::consume`. The previous
 /// `output_sinks: &HashMap<String, Arc<dyn Output>>` parameter is gone
 /// as part of that cleanup.
+///
+/// `trace` collects a human-readable execution trace for
+/// `--test-pipeline` (see `main.rs::run_test`). Pass `None` on the
+/// daemon hot path (`runtime.rs::run_pipeline_with_outputs`) — every
+/// trace push site (and the `format!`/`to_string` calls that build
+/// its fields) is gated on `trace.is_some()` so no throwaway
+/// formatting work runs when nothing will read it. The collected
+/// entries live in the caller's `Vec`; `PipelineRunResult` does not
+/// carry them.
 pub fn run_pipeline(
     pipeline: &PipelineDef,
     event: &OwnedEvent,
     config: &CompiledConfig,
     funcs: &FunctionRegistry,
     tap: Option<&TapRegistry>,
+    trace: Option<&mut Vec<TraceEntry>>,
     bump: &mut bumpalo::Bump,
 ) -> Result<PipelineRunResult> {
     let registry = DslProcessRegistry::new(&config.processes, funcs, tap);
-    let mut trace_entries = Vec::new();
+    let mut trace = trace;
     let mut outputs = Vec::new();
 
     // Log initial state — formatted from `event` while it's still in
-    // owned form, before we view it into the arena.
-    trace_entries.push(TraceEntry {
-        stage: "input".into(),
-        label: String::new(),
-        detail: format!("ingress: {}", String::from_utf8_lossy(&event.ingress)),
-    });
+    // owned form, before we view it into the arena. The `format!` /
+    // `from_utf8_lossy` here only run when a caller actually wants a
+    // trace (--test-pipeline); the daemon hot path passes `None` and
+    // skips this entirely.
+    if let Some(trace) = trace.as_mut() {
+        trace.push(TraceEntry {
+            stage: "input".into(),
+            label: String::new(),
+            detail: format!("ingress: {}", String::from_utf8_lossy(&event.ingress)),
+        });
+    }
 
     // Per-event arena. The entire `Value` tree built during execution
     // (HashLits, parser outputs, workspace mutations) lives in `bump`
@@ -648,7 +667,7 @@ pub fn run_pipeline(
         arena: &arena,
     };
     let mut exec_out = PipelineExecOut {
-        trace: &mut trace_entries,
+        trace,
         outputs: &mut outputs,
         errored: &mut errored,
     };
@@ -656,7 +675,6 @@ pub fn run_pipeline(
 
     let had_outputs = !outputs.is_empty();
     Ok(PipelineRunResult {
-        trace: trace_entries,
         outputs,
         had_outputs,
         termination,
@@ -689,9 +707,29 @@ struct PipelineExecCtx<'a, 'bump: 'a> {
 /// Outputs and errored contexts are heap-owned — they cross the
 /// per-event arena boundary on the way out of `run_pipeline`.
 struct PipelineExecOut<'a> {
-    trace: &'a mut Vec<TraceEntry>,
+    /// `Some` only on the `--test-pipeline` path (see `run_pipeline`'s
+    /// `trace` parameter). `None` on the daemon hot path, where no
+    /// caller ever reads `PipelineRunResult::trace` — keeping this an
+    /// `Option` (rather than always allocating a `Vec`) lets every
+    /// push site below skip its `format!` / `to_string` formatting
+    /// work entirely when tracing isn't requested, instead of
+    /// computing throwaway `String`s on every event just to push them
+    /// into a `Vec` nobody drains.
+    trace: Option<&'a mut Vec<TraceEntry>>,
     outputs: &'a mut Vec<(String, OwnedEvent)>,
     errored: &'a mut Vec<ErroredEventContext>,
+}
+
+impl PipelineExecOut<'_> {
+    /// Push a trace entry, built lazily from `f`, iff tracing is
+    /// enabled. `f` is only invoked when `trace` is `Some`, so the
+    /// `format!`/`to_string` work that builds `TraceEntry` fields
+    /// never runs on the daemon hot path.
+    fn push_trace(&mut self, f: impl FnOnce() -> TraceEntry) {
+        if let Some(trace) = self.trace.as_deref_mut() {
+            trace.push(f());
+        }
+    }
 }
 
 /// Execute a pipeline body (sequence of pipeline statements).
@@ -737,7 +775,7 @@ fn exec_pipeline_stmt<'bump>(
                 ctx.pipeline_name,
                 msg
             );
-            out.trace.push(TraceEntry {
+            out.push_trace(|| TraceEntry {
                 stage: "error".into(),
                 label: msg.clone(),
                 detail: "event → error_log".into(),
@@ -767,8 +805,6 @@ fn exec_pipeline_stmt<'bump>(
                         for a in args {
                             evaluated_args.push(eval_expr(a, &current, ctx.funcs, ctx.arena)?);
                         }
-                        let arg_repr: Vec<String> =
-                            evaluated_args.iter().map(|v| v.to_string()).collect();
 
                         // Snapshot the heap-owned form before the
                         // registry consumes the borrowed event — the
@@ -777,11 +813,19 @@ fn exec_pipeline_stmt<'bump>(
                         let backup_owned = current.to_owned();
                         match ctx.registry.call(name, &evaluated_args, current, ctx.arena) {
                             Ok(Some(e)) => {
-                                out.trace.push(TraceEntry {
+                                // `arg_repr` (a `Vec<String>` built via
+                                // `Value::to_string`) is only needed
+                                // for the trace label, so it's built
+                                // inside the closure — skipped
+                                // entirely when `out.trace` is `None`
+                                // (the daemon hot path).
+                                out.push_trace(|| TraceEntry {
                                     stage: "process".into(),
                                     label: if args.is_empty() {
                                         name.clone()
                                     } else {
+                                        let arg_repr: Vec<String> =
+                                            evaluated_args.iter().map(|v| v.to_string()).collect();
                                         format!("{}({})", name, arg_repr.join(", "))
                                     },
                                     detail: "ok".into(),
@@ -789,7 +833,7 @@ fn exec_pipeline_stmt<'bump>(
                                 current = e;
                             }
                             Ok(None) => {
-                                out.trace.push(TraceEntry {
+                                out.push_trace(|| TraceEntry {
                                     stage: "process".into(),
                                     label: name.clone(),
                                     detail: "dropped".into(),
@@ -802,7 +846,7 @@ fn exec_pipeline_stmt<'bump>(
                                     name,
                                     e
                                 );
-                                out.trace.push(TraceEntry {
+                                out.push_trace(|| TraceEntry {
                                     stage: "process".into(),
                                     label: name.clone(),
                                     detail: format!("error: {} (event → error_log)", e),
@@ -822,7 +866,7 @@ fn exec_pipeline_stmt<'bump>(
                         let backup_owned = current.to_owned();
                         match exec_process_body(body, current, ctx.registry, ctx.funcs, ctx.arena) {
                             Ok(ExecResult::Continue(e)) => {
-                                out.trace.push(TraceEntry {
+                                out.push_trace(|| TraceEntry {
                                     stage: "process".into(),
                                     label: "(inline)".into(),
                                     detail: "ok".into(),
@@ -830,7 +874,7 @@ fn exec_pipeline_stmt<'bump>(
                                 current = e;
                             }
                             Ok(ExecResult::Dropped) => {
-                                out.trace.push(TraceEntry {
+                                out.push_trace(|| TraceEntry {
                                     stage: "process".into(),
                                     label: "(inline)".into(),
                                     detail: "dropped".into(),
@@ -839,7 +883,7 @@ fn exec_pipeline_stmt<'bump>(
                             }
                             Err(e) => {
                                 tracing::warn!("inline process: {} — event routed to error_log", e);
-                                out.trace.push(TraceEntry {
+                                out.push_trace(|| TraceEntry {
                                     stage: "process".into(),
                                     label: "(inline)".into(),
                                     detail: format!("error: {} (event → error_log)", e),
@@ -862,7 +906,7 @@ fn exec_pipeline_stmt<'bump>(
 
         PipelineStatement::Output(name) => {
             trace!(target: "limpid::pipeline", "output → {}", name);
-            out.trace.push(TraceEntry {
+            out.push_trace(|| TraceEntry {
                 stage: "output".into(),
                 label: format!("→ {}", name),
                 detail: String::new(),
@@ -878,7 +922,7 @@ fn exec_pipeline_stmt<'bump>(
 
         PipelineStatement::Drop => {
             trace!(target: "limpid::pipeline", "drop");
-            out.trace.push(TraceEntry {
+            out.push_trace(|| TraceEntry {
                 stage: "drop".into(),
                 label: String::new(),
                 detail: String::new(),
@@ -888,7 +932,7 @@ fn exec_pipeline_stmt<'bump>(
 
         PipelineStatement::Finish => {
             trace!(target: "limpid::pipeline", "finish");
-            out.trace.push(TraceEntry {
+            out.push_trace(|| TraceEntry {
                 stage: "finish".into(),
                 label: String::new(),
                 detail: String::new(),
@@ -1028,6 +1072,7 @@ def pipeline p {
             &cfg,
             &funcs,
             None,
+            None,
             &mut bumpalo::Bump::new(),
         )
         .unwrap();
@@ -1104,6 +1149,7 @@ def pipeline p {
             &cfg,
             &funcs,
             None,
+            None,
             &mut bumpalo::Bump::new(),
         )
         .unwrap();
@@ -1159,6 +1205,7 @@ def pipeline p {
             &event,
             &cfg,
             &funcs,
+            None,
             None,
             &mut bumpalo::Bump::new(),
         )
@@ -1396,6 +1443,7 @@ def pipeline p { input i; process wrap; output o }
             &cfg,
             &funcs,
             None,
+            None,
             &mut bumpalo::Bump::new(),
         )
         .unwrap();
@@ -1436,6 +1484,7 @@ def pipeline p {
             &event,
             &cfg,
             &funcs,
+            None,
             None,
             &mut bumpalo::Bump::new(),
         )

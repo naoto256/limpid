@@ -490,12 +490,17 @@ async fn run_pipeline_with_outputs(
     ctx: &PipelineContext,
     bump: &mut bumpalo::Bump,
 ) -> Result<crate::pipeline::PipelineRunResult> {
+    // No `--test-pipeline` trace collector on the daemon hot path —
+    // passing `None` skips every trace push (and the `format!` /
+    // `to_string` work behind it) in `run_pipeline`, since nothing
+    // here reads `PipelineRunResult::trace`.
     let mut result = crate::pipeline::run_pipeline(
         pipeline,
         event,
         &ctx.config,
         &ctx.funcs,
         Some(&ctx.tap),
+        None,
         bump,
     )?;
 
