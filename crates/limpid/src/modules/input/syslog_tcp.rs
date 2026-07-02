@@ -163,7 +163,7 @@ impl Module for SyslogTcpInput {
 
     fn from_properties(
         name: &str,
-        properties: &crate::modules::ModuleProperties,
+        properties: &crate::dsl::module_props::ModuleProperties,
         _ctx: &crate::modules::BuildContext,
     ) -> anyhow::Result<Self> {
         let properties = properties.user_properties();
@@ -969,8 +969,8 @@ mod tests {
         }
     }
 
-    fn mp(props: &[Property]) -> crate::modules::ModuleProperties {
-        crate::modules::ModuleProperties::from_parts("syslog_tcp", props.to_vec())
+    fn mp(props: &[Property]) -> crate::dsl::module_props::ModuleProperties {
+        crate::dsl::module_props::ModuleProperties::from_parts("syslog_tcp", props.to_vec())
     }
 
     fn kv(key: &str, kind: ExprKind) -> Property {

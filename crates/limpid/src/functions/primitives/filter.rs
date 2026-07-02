@@ -3,9 +3,9 @@
 //! See `map.rs` for the dispatch story (real evaluation in
 //! `eval::eval_block_primitive`; this stub installs the signature and
 //! loud-fails when the block is omitted).
+use crate::dsl::field_schema::FieldType;
 use crate::dsl::value::Value;
 use crate::functions::{FunctionRegistry, FunctionSig};
-use crate::dsl::field_schema::FieldType;
 
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(

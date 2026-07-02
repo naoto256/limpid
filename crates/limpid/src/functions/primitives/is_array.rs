@@ -13,9 +13,9 @@
 //! Rule of Three triggers — `is_array` alone covers the array-input
 //! pre-check pattern, which is the immediate need.
 
+use crate::dsl::field_schema::FieldType;
 use crate::dsl::value::Value;
 use crate::functions::{FunctionRegistry, FunctionSig};
-use crate::dsl::field_schema::FieldType;
 
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(

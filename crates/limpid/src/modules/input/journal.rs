@@ -88,7 +88,7 @@ impl Module for JournalInput {
 
     fn from_properties(
         _name: &str,
-        properties: &crate::modules::ModuleProperties,
+        properties: &crate::dsl::module_props::ModuleProperties,
         _ctx: &crate::modules::BuildContext,
     ) -> Result<Self> {
         let properties = properties.user_properties();

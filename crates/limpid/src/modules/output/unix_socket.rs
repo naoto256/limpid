@@ -47,7 +47,7 @@ impl Module for UnixSocketOutput {
 
     fn from_properties(
         name: &str,
-        properties: &crate::modules::ModuleProperties,
+        properties: &crate::dsl::module_props::ModuleProperties,
         ctx: &crate::modules::BuildContext,
     ) -> Result<Self> {
         let retry = RetryConfig::from_output_properties(properties.user_properties())?;

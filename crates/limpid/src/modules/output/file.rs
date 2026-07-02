@@ -108,7 +108,7 @@ impl Module for FileOutput {
 
     fn from_properties(
         name: &str,
-        properties: &crate::modules::ModuleProperties,
+        properties: &crate::dsl::module_props::ModuleProperties,
         ctx: &crate::modules::BuildContext,
     ) -> Result<Self> {
         let error_log = ctx.error_log.as_ref().map(Arc::clone);

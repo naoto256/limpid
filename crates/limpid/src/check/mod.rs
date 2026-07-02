@@ -48,9 +48,9 @@ use crate::dsl::ast::{
     AssignTarget, Config, Definition, Expr, ExprKind, PipelineDef, PipelineStatement,
     ProcessChainElement, ProcessDef, ProcessStatement,
 };
+use crate::dsl::field_schema::FieldType;
 use crate::dsl::span::{SourceMap, Span};
 use crate::functions::FunctionRegistry;
-use crate::dsl::field_schema::FieldType;
 use crate::pipeline::CompiledConfig;
 
 use bindings::Bindings;

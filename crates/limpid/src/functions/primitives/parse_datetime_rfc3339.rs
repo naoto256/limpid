@@ -40,9 +40,9 @@ use anyhow::bail;
 use chrono::Utc;
 
 use super::val_to_str;
+use crate::dsl::field_schema::FieldType;
 use crate::dsl::value::Value;
 use crate::functions::{FunctionRegistry, FunctionSig};
-use crate::dsl::field_schema::FieldType;
 
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(

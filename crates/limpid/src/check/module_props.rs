@@ -9,12 +9,12 @@
 //! attached.
 //!
 //! The `type` indirection is consumed by the parser when it constructs
-//! the [`crate::modules::ModuleProperties`] wrapper for the def block;
+//! the [`crate::dsl::module_props::ModuleProperties`] wrapper for the def block;
 //! the analyzer reads `def.properties.type_name()` and validates only
 //! `def.properties.user_properties()`. The previous "strip `type` from
 //! a raw `Vec<Property>` before validating" pattern was the source of
 //! the v0.7.2 asymmetry bug where the runtime forgot the strip — see
-//! the [`crate::modules::ModuleProperties`] type docs for the
+//! the [`crate::dsl::module_props::ModuleProperties`] type docs for the
 //! structural fix that landed in 0.7.3.
 
 use crate::dsl::ast::{InputDef, OutputDef};

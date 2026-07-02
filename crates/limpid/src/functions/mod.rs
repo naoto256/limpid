@@ -52,9 +52,9 @@ use anyhow::Result;
 
 use crate::dsl::arena::EventArena;
 use crate::dsl::ast::FunctionDef;
+use crate::dsl::field_schema::{FieldSpec, FieldType};
 use crate::dsl::value::Value;
 use crate::event::BorrowedEvent;
-use crate::dsl::field_schema::{FieldSpec, FieldType};
 
 // ---------------------------------------------------------------------------
 // Function signatures

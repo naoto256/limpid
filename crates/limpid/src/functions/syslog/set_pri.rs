@@ -11,10 +11,10 @@ use crate::dsl::arena::EventArena;
 use crate::dsl::value::Value;
 use anyhow::{Result, bail};
 
+use crate::dsl::field_schema::FieldType;
 use crate::functions::primitives::val_to_str;
 use crate::functions::syslog::pri::parse_leading_pri;
 use crate::functions::{FunctionRegistry, FunctionSig};
-use crate::dsl::field_schema::FieldType;
 
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register_in_with_sig(

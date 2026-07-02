@@ -184,7 +184,7 @@ impl Module for SyslogTcpOutput {
 
     fn from_properties(
         name: &str,
-        properties: &crate::modules::ModuleProperties,
+        properties: &crate::dsl::module_props::ModuleProperties,
         ctx: &crate::modules::BuildContext,
     ) -> Result<Self> {
         let error_log = ctx.error_log.as_ref().map(Arc::clone);
@@ -530,8 +530,8 @@ mod tests {
         }
     }
 
-    fn mp(props: &[Property]) -> crate::modules::ModuleProperties {
-        crate::modules::ModuleProperties::from_parts("syslog_tcp", props.to_vec())
+    fn mp(props: &[Property]) -> crate::dsl::module_props::ModuleProperties {
+        crate::dsl::module_props::ModuleProperties::from_parts("syslog_tcp", props.to_vec())
     }
 
     fn kv(key: &str, kind: ExprKind) -> Property {

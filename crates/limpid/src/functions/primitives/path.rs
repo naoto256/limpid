@@ -15,9 +15,9 @@
 
 use anyhow::bail;
 
+use crate::dsl::field_schema::FieldType;
 use crate::dsl::value::Value;
 use crate::functions::{Arity, FunctionRegistry, FunctionSig};
-use crate::dsl::field_schema::FieldType;
 
 pub fn register(reg: &mut FunctionRegistry) {
     // Manual signature: first slot Any (object / null fallthrough),

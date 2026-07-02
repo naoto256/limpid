@@ -113,7 +113,7 @@ fn parse_input_def(pair: Pair<Rule>, file_id: u32) -> Result<InputDef> {
     let raw_properties = inner
         .map(|p| parse_property(p, file_id))
         .collect::<Result<Vec<_>>>()?;
-    let properties = crate::modules::ModuleProperties::parse(raw_properties)
+    let properties = crate::dsl::module_props::ModuleProperties::parse(raw_properties)
         .map_err(|e| anyhow::anyhow!("input '{}': {}", name, e))?;
     Ok(InputDef { name, properties })
 }
@@ -125,7 +125,7 @@ fn parse_output_def(pair: Pair<Rule>, file_id: u32) -> Result<OutputDef> {
     let raw_properties = inner
         .map(|p| parse_property(p, file_id))
         .collect::<Result<Vec<_>>>()?;
-    let properties = crate::modules::ModuleProperties::parse(raw_properties)
+    let properties = crate::dsl::module_props::ModuleProperties::parse(raw_properties)
         .map_err(|e| anyhow::anyhow!("output '{}': {}", name, e))?;
     Ok(OutputDef { name, properties })
 }

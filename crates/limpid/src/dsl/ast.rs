@@ -50,16 +50,16 @@ pub struct InputDef {
     pub name: String,
     /// Type-enforced property surface. `type` lives in
     /// `properties.type_name()`; the Module impl sees only
-    /// `properties.user_properties()`. See [`crate::modules::ModuleProperties`]
+    /// `properties.user_properties()`. See [`crate::dsl::module_props::ModuleProperties`]
     /// for the structural invariant that motivates the wrapper.
-    pub properties: crate::modules::ModuleProperties,
+    pub properties: crate::dsl::module_props::ModuleProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct OutputDef {
     pub name: String,
     /// Same invariant as [`InputDef::properties`].
-    pub properties: crate::modules::ModuleProperties,
+    pub properties: crate::dsl::module_props::ModuleProperties,
 }
 
 /// A key-value property or nested block inside input/output definitions.
