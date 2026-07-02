@@ -112,6 +112,45 @@ pub fn get_ident(props: &[Property], key: &str) -> Option<String> {
     None
 }
 
+/// Get a boolean value for a key.
+///
+/// Accepts both spellings the schema validator
+/// ([`crate::dsl::schema`], `PropertyValueKind::Bool`) admits:
+///
+/// - `ExprKind::BoolLit` — what the pest grammar actually produces for
+///   `verify false` (`bool_lit` wins over `ident_path` in the `atom`
+///   rule, so a bare `true` / `false` never parses as an ident);
+/// - `ExprKind::Ident(["true"])` / `Ident(["false"])` — hand-built
+///   ASTs (test helpers, potential future programmatic config).
+///
+/// Reading Bool-kind properties through [`get_ident`] is a bug: the
+/// parser emits `BoolLit`, `get_ident` returns `None`, and the caller
+/// silently falls back to its default (this is exactly how
+/// `verify false` was ignored until v0.7.9 — see `output http` /
+/// `output otlp_http`).
+pub fn get_bool(props: &[Property], key: &str) -> Option<bool> {
+    for prop in props {
+        if let Property::KeyValue {
+            key: k,
+            value: expr,
+            ..
+        } = prop
+            && k == key
+        {
+            return match &expr.kind {
+                ExprKind::BoolLit(b) => Some(*b),
+                ExprKind::Ident(parts) if parts.len() == 1 => match parts[0].as_str() {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => None,
+                },
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
 /// Get an integer value for a key.
 pub fn get_int(props: &[Property], key: &str) -> Option<i64> {
     for prop in props {
@@ -256,5 +295,53 @@ pub fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
             )
         })?;
         Ok(std::time::Duration::from_millis(n))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kv(key: &str, kind: ExprKind) -> Property {
+        Property::KeyValue {
+            key: key.to_string(),
+            key_span: None,
+            value: Expr::spanless(kind),
+            value_span: None,
+        }
+    }
+
+    #[test]
+    fn get_bool_reads_bool_lit() {
+        // The form the pest grammar actually produces for `verify false`.
+        let props = vec![kv("verify", ExprKind::BoolLit(false))];
+        assert_eq!(get_bool(&props, "verify"), Some(false));
+        let props = vec![kv("verify", ExprKind::BoolLit(true))];
+        assert_eq!(get_bool(&props, "verify"), Some(true));
+    }
+
+    #[test]
+    fn get_bool_reads_legacy_ident_spelling() {
+        // Hand-built ASTs (test helpers) encode booleans as bare idents;
+        // the schema validator admits this form, so get_bool must too.
+        let props = vec![kv("verify", ExprKind::Ident(vec!["false".into()]))];
+        assert_eq!(get_bool(&props, "verify"), Some(false));
+        let props = vec![kv("verify", ExprKind::Ident(vec!["true".into()]))];
+        assert_eq!(get_bool(&props, "verify"), Some(true));
+    }
+
+    #[test]
+    fn get_bool_rejects_non_bool_shapes() {
+        assert_eq!(get_bool(&[], "verify"), None);
+        let props = vec![kv("verify", ExprKind::StringLit("false".into()))];
+        assert_eq!(get_bool(&props, "verify"), None);
+        let props = vec![kv("verify", ExprKind::Ident(vec!["yes".into()]))];
+        assert_eq!(get_bool(&props, "verify"), None);
+        // Multi-segment ident path is not a boolean.
+        let props = vec![kv(
+            "verify",
+            ExprKind::Ident(vec!["a".into(), "false".into()]),
+        )];
+        assert_eq!(get_bool(&props, "verify"), None);
     }
 }
