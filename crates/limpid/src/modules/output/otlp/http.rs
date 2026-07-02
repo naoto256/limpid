@@ -45,8 +45,8 @@
 //! picks the next available peer.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
@@ -62,7 +62,7 @@ use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::http_util::{ERROR_BODY_BYTE_CAP, error_snippet, read_body_capped};
-use crate::modules::output::syslog_peers::{PEER_COOLDOWN, iter_peers_block};
+use crate::modules::output::syslog_peers::{RotatingPeers, iter_peers_block};
 use crate::modules::{HasMetrics, Module, Output};
 use crate::queue::{BackoffStrategy, QueueAckHandle, RetryConfig};
 use crate::tls::ClientTlsConfig;
@@ -119,29 +119,12 @@ struct HttpPeer {
     client: reqwest::Client,
 }
 
-struct PeerState {
-    cooldown_until: Mutex<Option<Instant>>,
-}
-
-impl Default for PeerState {
-    fn default() -> Self {
-        Self {
-            cooldown_until: Mutex::new(None),
-        }
-    }
-}
-
 struct Inner {
     peers: Vec<HttpPeer>,
-    /// Per-peer cooldown state. Same length as `peers`. Wrapped in
-    /// `Mutex` because `Instant` is not `Copy`-loadable from an atomic
-    /// — but contention is low (one short critical section per flush
-    /// per peer).
-    peer_state: Vec<PeerState>,
-    /// Round-robin cursor. Incremented per flush so successive flushes
-    /// start at successive peers; the rotation inside one flush handles
-    /// retries.
-    cursor: AtomicUsize,
+    /// Round-robin cursor + per-peer failure cooldown; one candidate
+    /// per send attempt. See `RotatingPeers` for the selection and
+    /// cooldown contract.
+    rotation: RotatingPeers,
     protocol: HttpProtocol,
     batch_level: BatchLevel,
     headers: Vec<(String, String)>,
@@ -440,15 +423,14 @@ impl Module for OtlpHttpOutput {
             );
         };
 
-        let peer_state = peers.iter().map(|_| PeerState::default()).collect();
+        let rotation = RotatingPeers::new(peers.len());
 
         let retry_config = RetryConfig::from_output_properties(properties)?;
 
         let metrics = Arc::new(OutputMetrics::default());
         let inner = Arc::new(Inner {
             peers,
-            peer_state,
-            cursor: AtomicUsize::new(0),
+            rotation,
             protocol,
             batch_level,
             headers,
@@ -826,7 +808,6 @@ impl Drop for OtlpHttpOutput {
 
 async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<super::SendOutcome> {
     let req = decode_drained_to_request(drained, inner.batch_level)?;
-    let n = inner.peers.len();
 
     let cfg = &inner.retry_config;
     let max_attempts = cfg.max_attempts.max(1);
@@ -834,41 +815,18 @@ async fn send_batch(inner: &Inner, drained: Vec<Bytes>) -> Result<super::SendOut
     let mut wait = cfg.initial_wait;
 
     let final_err = loop {
-        // Pick the next peer to try. Rotation starts at `cursor` and
-        // walks forward looking for one whose cooldown has expired. If
-        // every peer is currently cooled (typical single-peer retry
-        // path: the peer just failed on the previous attempt) fall
-        // back to the rotation start — the retry budget is what
-        // protects us, not the cooldown. The cooldown's actual job is
-        // to bias *future flushes* away from a known-bad peer when an
-        // alternative exists.
-        let start = inner.cursor.fetch_add(1, Ordering::Relaxed) % n;
-        let now = Instant::now();
-        let mut idx = start;
-        for offset in 0..n {
-            let candidate = (start + offset) % n;
-            let guard = inner.peer_state[candidate].cooldown_until.lock().await;
-            if guard.is_none_or(|until| until <= now) {
-                idx = candidate;
-                break;
-            }
-        }
-
+        // One candidate per attempt; see `RotatingPeers` for the
+        // selection + cooldown contract (cooldown is measured from
+        // failure time so a slow 30s HTTP_REQUEST_TIMEOUT failure
+        // cannot record an already-expired cooldown).
+        let idx = inner.rotation.select().await;
         let err = match send_once(&inner.peers[idx], inner, &req).await {
             Ok(outcome) => {
-                // Reset cooldown on success so future flushes pick
-                // this peer freely.
-                *inner.peer_state[idx].cooldown_until.lock().await = None;
+                inner.rotation.mark_success(idx).await;
                 return Ok(outcome);
             }
             Err(e) => {
-                // Measure cooldown from failure time, not request start:
-                // `now` was captured before `send_once`, so for any non-
-                // trivial request latency (and especially after a 30s
-                // HTTP_REQUEST_TIMEOUT firing) `now + PEER_COOLDOWN`
-                // can already be in the past, defeating the rotation.
-                *inner.peer_state[idx].cooldown_until.lock().await =
-                    Some(Instant::now() + PEER_COOLDOWN);
+                inner.rotation.mark_failure(idx).await;
                 e
             }
         };
@@ -1004,6 +962,7 @@ mod tests {
     use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use std::net::SocketAddr;
+    use std::sync::atomic::AtomicUsize;
 
     fn mp(props: &[Property]) -> crate::dsl::module_props::ModuleProperties {
         crate::dsl::module_props::ModuleProperties::from_parts("otlp_http", props.to_vec())

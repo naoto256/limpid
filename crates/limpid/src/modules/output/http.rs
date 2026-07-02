@@ -53,8 +53,8 @@
 //! ack handle resolves, not when `consume` returns.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::sync::{Mutex, Notify};
@@ -65,7 +65,7 @@ use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::http_util::{ERROR_BODY_BYTE_CAP, error_snippet};
-use crate::modules::output::syslog_peers::{PEER_COOLDOWN, iter_peers_block};
+use crate::modules::output::syslog_peers::{RotatingPeers, iter_peers_block};
 use crate::modules::{HasMetrics, Module, Output};
 use crate::queue::{QueueAckHandle, RetryConfig};
 use crate::tls::ClientTlsConfig;
@@ -174,24 +174,14 @@ struct HttpPeer {
     client: reqwest::Client,
 }
 
-struct PeerState {
-    cooldown_until: Mutex<Option<Instant>>,
-}
-
-impl Default for PeerState {
-    fn default() -> Self {
-        Self {
-            cooldown_until: Mutex::new(None),
-        }
-    }
-}
-
 /// Shared state between `consume()` (= the queue consumer's hand-off
 /// into the buffer) and the flusher actor task.
 struct Inner {
     peers: Vec<HttpPeer>,
-    peer_state: Vec<PeerState>,
-    cursor: AtomicUsize,
+    /// Round-robin cursor + per-peer failure cooldown; one candidate
+    /// per send attempt. See `RotatingPeers` for the selection and
+    /// cooldown contract.
+    rotation: RotatingPeers,
     method: reqwest::Method,
     content_type: String,
     headers: Vec<(String, String)>,
@@ -452,14 +442,13 @@ impl Module for HttpOutput {
             );
         };
 
-        let peer_state = peers.iter().map(|_| PeerState::default()).collect();
+        let rotation = RotatingPeers::new(peers.len());
 
         let retry = RetryConfig::from_output_properties(properties)?;
         let metrics = Arc::new(OutputMetrics::default());
         let inner = Arc::new(Inner {
             peers,
-            peer_state,
-            cursor: AtomicUsize::new(0),
+            rotation,
             method,
             content_type,
             headers,
@@ -907,36 +896,15 @@ impl Inner {
             body_str.into_bytes()
         };
 
-        let n = self.peers.len();
-        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
-        let now = Instant::now();
-
-        // Pick the next non-cooled peer in rotation; if every peer is
-        // cooled, fall back to the rotation start (the queue layer's
-        // retry then handles the persistent-failure case).
-        let mut idx = start;
-        for offset in 0..n {
-            let candidate = (start + offset) % n;
-            let guard = self.peer_state[candidate].cooldown_until.lock().await;
-            if guard.is_none_or(|until| until <= now) {
-                idx = candidate;
-                break;
-            }
-        }
-
+        let idx = self.rotation.select().await;
         let peer = &self.peers[idx];
         match send_once(peer, self, &body).await {
             Ok(()) => {
-                *self.peer_state[idx].cooldown_until.lock().await = None;
+                self.rotation.mark_success(idx).await;
                 Ok(())
             }
             Err(e) => {
-                // Cool down relative to the *failure time*, not request
-                // start. With a 30s request timeout and a 5s cooldown,
-                // measuring from `now` could record an already-expired
-                // cooldown and immediately reselect the same bad peer.
-                *self.peer_state[idx].cooldown_until.lock().await =
-                    Some(Instant::now() + PEER_COOLDOWN);
+                self.rotation.mark_failure(idx).await;
                 Err(e)
             }
         }
@@ -1020,7 +988,9 @@ mod tests {
     use super::*;
     use crate::dsl::ast::{Expr, ExprKind, Property};
     use crate::event::Event;
+    use crate::modules::output::syslog_peers::PEER_COOLDOWN;
     use std::net::SocketAddr;
+    use std::time::Instant;
 
     fn mp(props: &[Property]) -> crate::dsl::module_props::ModuleProperties {
         crate::dsl::module_props::ModuleProperties::from_parts("http", props.to_vec())
@@ -1802,9 +1772,10 @@ def output o {{
         let pre_call = Instant::now();
         let _ = consume_and_wait_disposition(&output, &event_with("hello"), Duration::from_secs(5))
             .await;
-        let cooldown_until = output.inner.peer_state[0]
-            .cooldown_until
-            .lock()
+        let cooldown_until = output
+            .inner
+            .rotation
+            .cooldown_until(0)
             .await
             .expect("cooldown must be set after failure");
         server.abort();
