@@ -27,8 +27,14 @@ targets = [
     { triple = "x86_64-apple-darwin" },
     { triple = "aarch64-apple-darwin" },
 ]
-# Include every workspace member's full dep closure (default, made explicit).
-all-features = false
+# Include every workspace member's full dep closure, including
+# optional/off-by-default features (`journal`, `kafka`). Release builds
+# enable `--features journal` (.github/workflows/release.yml), which
+# pulls in the `systemd` crate; with `all-features = false` that whole
+# dep closure was silently exempt from license/advisories/bans/sources
+# checks. `true` ensures every feature-gated dep that can ship in a
+# release binary is actually audited.
+all-features = true
 
 [licenses]
 # Confidence floor for SPDX expression matching. cargo-deny's default is
@@ -42,8 +48,8 @@ confidence-threshold = 0.93
 # - MIT / Apache-2.0 / BSD-{2,3}-Clause / ISC / 0BSD / Zlib: permissive,
 #   attribution-only or weaker. Compatible with limpid's MIT OR Apache-2.0
 #   distribution.
-# - Unicode-3.0 / Unicode-DFS-2016: governs the Unicode tables in icu_*,
-#   unicode-ident, unicode-* crates. Permissive with attribution.
+# - Unicode-3.0: governs the Unicode tables in icu_*, unicode-ident,
+#   unicode-* crates. Permissive with attribution.
 # - CC0-1.0: public-domain dedication; treated as permissive.
 #
 # Deliberately NOT listed (would need explicit re-evaluation if a dep
@@ -71,12 +77,29 @@ allow = [
     # attribution license for datasets — compatible with limpid's
     # redistribution posture.
     "CDLA-Permissive-2.0",
+    # Unlicense: public-domain dedication with a permissive fallback —
+    # same obligations-free family as 0BSD / CC0. Reached via
+    # cstr-argument <- systemd (journal feature). Compatible with
+    # limpid's redistribution posture.
+    "Unlicense",
 ]
 
-# Per-crate exceptions go here as needed (e.g. a single utility crate
-# with an SPDX expression cargo-deny can't fully parse). Empty for now —
-# add with rationale if a finding requires it.
-exceptions = []
+# Per-crate exceptions: licenses accepted for a specific crate only,
+# without admitting them workspace-wide. Each entry MUST carry a
+# rationale comment and the condition under which it can be removed.
+#
+# systemd / libsystemd-sys (LGPL-2.1-or-later WITH GCC-exception-2.0):
+# the `journal` feature is opt-in; these crates are thin binding
+# wrappers around libsystemd, which stays dynamically linked — only the
+# wrapper code itself is statically linked into limpid. The
+# workspace-wide LGPL-avoidance policy above is unchanged; this is a
+# deliberate two-crate exception, not a policy shift. Remove both
+# entries if/when the journald reader migrates to an MIT/Apache-family
+# implementation.
+exceptions = [
+    { crate = "systemd", allow = ["LGPL-2.1-or-later WITH GCC-exception-2.0"] },
+    { crate = "libsystemd-sys", allow = ["LGPL-2.1-or-later WITH GCC-exception-2.0"] },
+]
 
 [advisories]
 # RustSec database — checked at every audit. `version = 2` is the
