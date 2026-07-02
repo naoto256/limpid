@@ -76,6 +76,36 @@ fn ensure_socket_parent_dir(parent: &std::path::Path) {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o750));
     }
+    // A pre-existing parent dir (e.g. systemd's RuntimeDirectory before
+    // RuntimeDirectoryMode is honoured, or an operator-managed path) is
+    // left as-is above — its mode is not under daemon control. That
+    // means the bind->chmod TOCTOU window on the socket file itself
+    // (`ensure_socket_parent_dir` -> stale-socket removal -> `bind`)
+    // is only closed by "other users can't touch this directory" when
+    // the daemon created it. Surface the gap loudly instead of
+    // silently trusting an inherited mode: a world-writable parent
+    // lets any local user race a symlink/regular-file into the socket
+    // path during that window.
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::metadata(parent) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if parent_dir_mode_is_unsafe(mode) {
+            warn!(
+                "control socket: parent dir {:?} has mode {:o} (group/other can write into it) \
+                 — this weakens the bind-time TOCTOU mitigation; expected 0o750 or tighter",
+                parent, mode
+            );
+        }
+    }
+}
+
+/// True when group or other can write into the directory — either can
+/// race a symlink or regular file into the socket path between the
+/// daemon's stale-socket check and `UnixListener::bind`.
+#[cfg(unix)]
+fn parent_dir_mode_is_unsafe(mode: u32) -> bool {
+    mode & 0o022 != 0
 }
 
 pub struct ControlServer {
@@ -894,5 +924,42 @@ mod tests {
         ensure_socket_parent_dir(&parent);
         let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755, "pre-existing dir mode must be preserved");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn parent_dir_mode_unsafe_flags_group_or_other_write() {
+        // 0o755 (world-readable/traversable but not writable) cannot be
+        // raced — an untrusted user can list and stat the directory but
+        // not create a file/symlink in it. Only a write bit for group
+        // or other actually reopens the bind-time TOCTOU window.
+        assert!(!parent_dir_mode_is_unsafe(0o755));
+        assert!(!parent_dir_mode_is_unsafe(0o750));
+        assert!(!parent_dir_mode_is_unsafe(0o700));
+        assert!(parent_dir_mode_is_unsafe(0o777)); // other write
+        assert!(parent_dir_mode_is_unsafe(0o770)); // group write
+        assert!(parent_dir_mode_is_unsafe(0o757)); // other write, no exec bit change
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ensure_socket_parent_dir_warns_on_unsafe_preexisting_mode() {
+        // Regression pin for the loud-warn path: a pre-existing,
+        // group-writable parent dir must not be silently trusted.
+        // `tracing_test` isn't a dependency here, so this test only
+        // pins that the function doesn't panic/alter an unsafe mode
+        // (the warn! call itself is covered by the mode-detection unit
+        // test above); the mode-preservation contract still applies.
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::TempDir::new().unwrap();
+        let parent = base.path().join("unsafe-run");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        ensure_socket_parent_dir(&parent);
+        let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o777,
+            "function must not fail-fast or silently tighten an operator-managed dir"
+        );
     }
 }
