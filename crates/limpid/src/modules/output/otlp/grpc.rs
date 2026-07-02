@@ -436,9 +436,10 @@ async fn send_once(
     // events between `events_written` (accepted) and `events_failed`
     // (rejected by the server). Selective re-send of *only* the
     // rejected records is queued for a later release; the retry loop
-    // in `send_batch` handles hard failures (connection refused, 5xx,
-    // …) but not partial-success deltas, since the rejected set is a
-    // strict subset of what already shipped.
+    // now lives in the batched-sink flush path (`flush_events`), not
+    // in this policy's `send`; it handles hard failures (connection
+    // refused, 5xx, …) but not partial-success deltas, since the
+    // rejected set is a strict subset of what already shipped.
     let inner_resp = response.into_inner();
     let rejected = inner_resp
         .partial_success
@@ -1079,7 +1080,7 @@ mod tests {
             .unwrap();
 
         // Let the actor wake, take the batch, and reach the
-        // GRPC_REQUEST_TIMEOUT-wrapped send_batch await.
+        // GRPC_REQUEST_TIMEOUT-wrapped send await.
         for _ in 0..50 {
             tokio::task::yield_now().await;
         }

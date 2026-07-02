@@ -873,7 +873,7 @@ mod tests {
         )
         .unwrap();
         // Drive each event end-to-end before pushing the next, so
-        // batch_size=1 → one event per send_batch → cursor advances
+        // batch_size=1 → one event per send → cursor advances
         // once per event (= the round-robin invariant). With the
         // actor refactor, a fast sequence of `consume()` calls can
         // otherwise batch multiple events into one flush; awaiting
@@ -2260,7 +2260,7 @@ def output o {{
     }
 
     /// Audit-identified leak (2026-06-27 follow-up): the flusher actor
-    /// was mid-`send_batch().await` against a stalled peer when
+    /// was mid-`send().await` against a stalled peer when
     /// `shutdown()` signalled. The previous fix collapsed retry sleeps
     /// but not the transport call itself, so the actor sat on its
     /// stack-local `shippable` Vec until the runtime aborted it,
@@ -2268,7 +2268,7 @@ def output o {{
     /// panic; release: silent loss).
     ///
     /// This test sets up that exact race — actor wakes via
-    /// `batch_timeout`, enters `send_batch` against a TCP listener
+    /// `batch_timeout`, enters `send` against a TCP listener
     /// that accepts but never responds, `shutdown()` fires — and
     /// asserts every handle resolves to `Recovered` (via DLQ) inside
     /// the bounded shutdown budget.
@@ -2284,7 +2284,7 @@ def output o {{
             error_log: Some(Arc::clone(&writer)),
         };
         // Short timer wake + large batch_size so the actor (not
-        // consume itself) is the path that calls `send_batch`.
+        // consume itself) is the path that calls `send`.
         let output = Arc::new(
             HttpOutput::from_properties(
                 "test",
@@ -2309,14 +2309,14 @@ def output o {{
             .unwrap();
 
         // Give the actor time to wake, take the batch, and enter
-        // `send_batch` against the stalled peer. 200ms > batch_timeout
+        // `send` against the stalled peer. 200ms > batch_timeout
         // (100ms) plus a small margin for actor wake + transport
         // handshake. The reqwest client's 30s read timeout would be
         // the dominant wait without our cooperative cancel.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Now call shutdown. With the cooperative transport cancel,
-        // the actor's `send_batch` future is dropped, the loop falls
+        // the actor's `send` future is dropped, the loop falls
         // through to the DLQ + Recovered path, the actor exits
         // cleanly, and shutdown joins it well within
         // SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT.
@@ -2391,7 +2391,7 @@ def output o {{
         );
 
         // Push two events: the second hits the threshold, fires
-        // flush_notify, the actor wakes and enters send_batch
+        // flush_notify, the actor wakes and enters send
         // against the stalled peer.
         let (ack1, mut rx1) = QueueAckHandle::for_test();
         let (ack2, mut rx2) = QueueAckHandle::for_test();
@@ -2447,7 +2447,7 @@ def output o {{
     /// every event flows through the actor, so the same bounded-
     /// shutdown contract applies. consume() pushes one event
     /// (threshold reached at 1), the actor wakes, enters
-    /// send_batch, shutdown signals, the handle resolves to
+    /// send, shutdown signals, the handle resolves to
     /// Recovered via DLQ.
     #[tokio::test]
     async fn singleton_actor_send_cancels_on_shutdown_against_stalled_peer() {
