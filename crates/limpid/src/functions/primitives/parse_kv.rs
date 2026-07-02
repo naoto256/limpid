@@ -9,7 +9,7 @@
 
 use crate::dsl::arena::EventArena;
 use crate::dsl::value::{ObjectBuilder, Value};
-use crate::modules::schema::FieldType;
+use crate::dsl::field_schema::FieldType;
 use anyhow::{Result, bail};
 
 use super::parse_json::{apply_defaults, type_name};

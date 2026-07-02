@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 
-use crate::modules::schema::FieldType;
+use crate::dsl::field_schema::FieldType;
 
 /// Single source of truth for "what name resolves to what type" at a
 /// particular point in the pipeline.

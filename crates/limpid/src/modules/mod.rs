@@ -9,7 +9,6 @@
 
 pub mod input;
 pub mod output;
-pub mod schema;
 
 use std::collections::HashMap;
 use std::sync::Arc;

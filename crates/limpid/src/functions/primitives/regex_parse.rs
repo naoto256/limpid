@@ -18,7 +18,7 @@ use crate::dsl::value::{ObjectBuilder, Value};
 
 use super::{get_cached_regex, val_to_str};
 use crate::functions::{FunctionRegistry, FunctionSig, ParserInfo};
-use crate::modules::schema::FieldType;
+use crate::dsl::field_schema::FieldType;
 
 const DOT_MARKER: &str = "__DOT__";
 
