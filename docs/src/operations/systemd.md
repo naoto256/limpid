@@ -22,6 +22,7 @@ RestartSec=5
 User=syslog
 Group=syslog
 AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 RuntimeDirectory=limpid
 StateDirectory=limpid
@@ -30,11 +31,33 @@ ConfigurationDirectory=limpid
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/lib/limpid /var/run/limpid /var/log
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallFilter=@system-service
+UMask=0027
+ReadWritePaths=/var/lib/limpid /var/run/limpid /var/log/limpid
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+The full unit (`packaging/limpid.service`) carries a comment above each
+directive explaining why it's safe for limpid's inputs/outputs; this
+page shows the trimmed shape. Notably `PrivateDevices=yes` gives the
+unit a private `/dev` without the host's `/dev/log` — see [Adding write
+paths](#adding-write-paths) below for the `/dev/log` and extra
+`ReadWritePaths` drop-ins.
 
 ## Key features
 
@@ -121,10 +144,20 @@ sudo systemctl restart limpid-prometheus
 
 ## Adding write paths
 
-If your file outputs write to directories outside the defaults, add them to `ReadWritePaths`:
+If your file outputs write to directories outside the defaults, add them to `ReadWritePaths` via a drop-in rather than editing the shipped unit:
 
 ```ini
-ReadWritePaths=/var/lib/limpid /var/run/limpid /var/log /var/log/custom
+# /etc/systemd/system/limpid.service.d/override.conf
+[Service]
+ReadWritePaths=/var/log/limpid /path/to/other/output/dir
+```
+
+If you configure a `unix_socket` input at `/dev/log` as a syslog(3) replacement, `PrivateDevices=yes` keeps it out of reach unless you also bind it in:
+
+```ini
+# /etc/systemd/system/limpid.service.d/override.conf
+[Service]
+BindPaths=/dev/log
 ```
 
 Then reload systemd:
