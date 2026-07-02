@@ -7,6 +7,12 @@
 //!   limpid-prometheus                                 # defaults
 //!   limpid-prometheus --bind 0.0.0.0:9100             # custom bind
 //!   limpid-prometheus --socket /path/to/control.sock  # custom socket
+//!
+//! The HTTP endpoint has **no authentication or TLS**. The default
+//! bind is loopback-only; binding to a non-loopback address (as in
+//! the `0.0.0.0:9100` example above) assumes a trusted network — a
+//! scrape segment behind a firewall — because anyone who can reach
+//! the port can read pipeline names and event counts.
 
 use std::convert::Infallible;
 use std::fmt::Write as _;
@@ -21,8 +27,10 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixStream};
+use tokio::sync::Semaphore;
 
 /// Hard upper bound on a single control-socket round trip. limpid's
 /// control socket is local IPC and a `stats` reply is typically a few
@@ -32,6 +40,16 @@ use tokio::net::{TcpListener, UnixStream};
 /// a scrape that hits the timeout returns an error body, and the next
 /// scrape gets a fresh attempt instead of waiting behind the old one.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum concurrent HTTP connections served at once. Mirrors the
+/// daemon's own control-socket cap (`MAX_CONTROL_CONNECTIONS` in
+/// limpid's control.rs): a scrape endpoint needs one connection per
+/// Prometheus server plus a little headroom, so 8 is ample, and the
+/// cap keeps a misbehaving peer (or a slowloris-style dribble of idle
+/// connections) from accumulating unbounded tasks. Excess connections
+/// are closed immediately; the next scrape gets a fresh slot as soon
+/// as an in-flight one finishes.
+const MAX_CONCURRENT_CONNECTIONS: usize = 8;
 
 #[derive(Parser)]
 #[command(name = "limpid-prometheus", about = "Prometheus exporter for limpid")]
@@ -60,6 +78,14 @@ async fn main() {
     eprintln!("limpid-prometheus listening on http://{}", cli.bind);
     eprintln!("  control socket: {:?}", cli.socket);
 
+    serve(listener, cli.socket).await;
+}
+
+/// Accept loop, split from `main` so the connection-cap behaviour is
+/// testable against an ephemeral listener.
+async fn serve(listener: TcpListener, socket: PathBuf) {
+    let conn_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+
     loop {
         let (stream, _) = match listener.accept().await {
             Ok(s) => s,
@@ -69,10 +95,26 @@ async fn main() {
             }
         };
 
+        // At the cap: close the connection immediately (drop = RST/FIN)
+        // rather than queueing it. A stalled scrape already has
+        // QUERY_TIMEOUT bounding it, so slots recycle quickly; anything
+        // that keeps all 8 busy is a misbehaving peer, and the honest
+        // fix for the client is to retry the next scrape interval.
+        let permit = match Arc::clone(&conn_sem).try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                drop(stream);
+                continue;
+            }
+        };
+
         let io = TokioIo::new(stream);
-        let socket = cli.socket.clone();
+        let socket = socket.clone();
 
         tokio::spawn(async move {
+            // Hold the permit for the connection's lifetime; dropping
+            // it when the task ends frees the slot.
+            let _permit = permit;
             let svc = service_fn(move |req| {
                 let socket = socket.clone();
                 async move { handle_request(req, &socket).await }
@@ -354,7 +396,46 @@ async fn query_control(socket_path: &Path, command: &str) -> Result<String, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::UnixListener;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpStream, UnixListener};
+
+    #[tokio::test]
+    async fn accept_loop_closes_connections_over_the_cap() {
+        // Cap regression: MAX_CONCURRENT_CONNECTIONS idle connections
+        // (opened but never sending a request) each hold a permit via
+        // their serve_connection task; connection cap+1 must be
+        // accepted and immediately closed, not queued behind them.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Control socket path deliberately nonexistent — /health would
+        // 503, but the idle connections never send a request at all.
+        let server = tokio::spawn(serve(listener, PathBuf::from("/nonexistent/control.sock")));
+
+        // Fill every slot with idle connections. Connect sequentially:
+        // the accept loop acquires the permit synchronously right
+        // after accept, so by the time connection N+1 is accepted,
+        // connection N already holds its slot.
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT_CONNECTIONS {
+            held.push(TcpStream::connect(addr).await.unwrap());
+        }
+
+        // One over the cap: accepted, then dropped by the accept loop.
+        // The client observes a prompt close (clean EOF or a reset).
+        let mut over = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(5), over.read(&mut buf))
+            .await
+            .expect("over-cap connection must be closed promptly, not left hanging");
+        match read {
+            Ok(0) => {}  // clean FIN
+            Err(_) => {} // RST — also an immediate close
+            Ok(n) => panic!("expected close, got {} unexpected bytes", n),
+        }
+
+        server.abort();
+        drop(held);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn query_control_times_out_when_peer_stalls() {
