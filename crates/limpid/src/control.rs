@@ -59,6 +59,25 @@ const MAX_INJECT_BYTES: u64 = 16 * 1024 * 1024;
 /// Per-input inject target: event channel + metrics handle (for events_injected).
 pub type InputInjectTarget = (mpsc::Sender<Event>, Arc<crate::metrics::InputMetrics>);
 
+/// Create the control socket's parent directory if absent. When *this
+/// call* created it (bare / non-systemd runs), tighten it to 0o750 so
+/// only the daemon user and its group can reach the socket inode at
+/// all — this directory mode is the layer that covers the bind→chmod
+/// window in [`ControlServer::run`]. Under systemd the directory comes
+/// from `RuntimeDirectory=limpid` (mode pinned via
+/// `RuntimeDirectoryMode` in the unit file) and already exists here; a
+/// pre-existing directory's permissions are deliberately left alone
+/// because they may be operator-managed.
+fn ensure_socket_parent_dir(parent: &std::path::Path) {
+    let preexisting = parent.exists();
+    let _ = std::fs::create_dir_all(parent);
+    #[cfg(unix)]
+    if !preexisting {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o750));
+    }
+}
+
 pub struct ControlServer {
     socket_path: PathBuf,
     tap: TapRegistry,
@@ -93,9 +112,10 @@ impl ControlServer {
     }
 
     pub async fn run(self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-        // Ensure parent directory exists
+        // Ensure parent directory exists (see `ensure_socket_parent_dir`
+        // for the 0o750 tightening rationale).
         if let Some(parent) = self.socket_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            ensure_socket_parent_dir(parent);
         }
 
         // Remove stale socket — only if it's actually a socket (not a symlink)
@@ -128,7 +148,26 @@ impl ControlServer {
             }
         };
 
-        // Restrict socket permissions to owner + group (0o660)
+        // Restrict socket permissions to owner + group (0o660).
+        //
+        // TOCTOU note (security audit Low 3-3): between `bind` above
+        // and this chmod, the socket briefly carries umask-derived
+        // permissions (typically 0o755 under umask 022) — a local
+        // attacker who can reach the inode could connect in that
+        // window. A process-wide `libc::umask(0o117)` around the bind
+        // would close it, but was rejected: this function runs as a
+        // spawned tokio task *after* every input / output / pipeline
+        // task is already live (see `Runtime::start` — "start control
+        // socket after all metrics are registered"), so a temporary
+        // global umask races concurrent file creation in file outputs,
+        // the disk queue, and the error_log, silently flipping *their*
+        // modes instead. The window is instead covered structurally:
+        // no await point separates bind from chmod (the gap is
+        // microseconds of same-thread work), and the parent directory
+        // is not world-traversable — 0o750 when this daemon created it
+        // above, `RuntimeDirectory` mode from the unit file under
+        // systemd — so an attacker outside the daemon's group cannot
+        // reach the socket inode during the window at all.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -819,5 +858,41 @@ def pipeline p { input i; output o }
             );
         }
         let _ = shutdown_tx.send(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn parent_dir_created_by_daemon_is_group_scoped() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::TempDir::new().unwrap();
+        let parent = base.path().join("limpid-run");
+        assert!(!parent.exists());
+        ensure_socket_parent_dir(&parent);
+        let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o750,
+            "daemon-created socket dir must not be world-traversable"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn preexisting_parent_dir_permissions_left_alone() {
+        // systemd's RuntimeDirectory (or an operator) owns the mode of
+        // a directory that already exists — the daemon must not fight
+        // it.
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::TempDir::new().unwrap();
+        let parent = base.path().join("managed-run");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_socket_parent_dir(&parent);
+        let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "pre-existing dir mode must be preserved");
     }
 }
