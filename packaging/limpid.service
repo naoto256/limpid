@@ -106,14 +106,16 @@ UMask=0027
 # The control socket is created with explicit 0o660 permissions in
 # control.rs (see crates/limpid/src/control.rs:135,
 # std::fs::set_permissions after bind), so UMask does not affect it.
-ReadWritePaths=/var/lib/limpid /var/run/limpid /var/log/limpid
-# Only /var/log/limpid (this daemon's own log directory) is writable by
-# default; ProtectSystem=strict makes the rest of the filesystem
-# read-only. Operators using the `file` output to write elsewhere must
-# add a drop-in, e.g.:
+# `StateDirectory=limpid` and `RuntimeDirectory=limpid` above already
+# mount `/var/lib/limpid` and `/var/run/limpid` writable under
+# ProtectSystem=strict, so listing them here would be redundant. Only
+# `/var/log/limpid` needs an explicit ReadWritePaths entry — the rest
+# of the filesystem stays read-only. Operators using the `file` output
+# to write elsewhere must add a drop-in, e.g.:
 #   /etc/systemd/system/limpid.service.d/override.conf:
 #     [Service]
-#     ReadWritePaths=/var/log/limpid /path/to/other/output/dir
+#     ReadWritePaths=/path/to/other/output/dir
+ReadWritePaths=/var/log/limpid
 
 [Install]
 WantedBy=multi-user.target

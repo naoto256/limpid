@@ -46,7 +46,7 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallFilter=@system-service
 UMask=0027
-ReadWritePaths=/var/lib/limpid /var/run/limpid /var/log/limpid
+ReadWritePaths=/var/log/limpid
 
 [Install]
 WantedBy=multi-user.target
@@ -149,7 +149,7 @@ If your file outputs write to directories outside the defaults, add them to `Rea
 ```ini
 # /etc/systemd/system/limpid.service.d/override.conf
 [Service]
-ReadWritePaths=/var/log/limpid /path/to/other/output/dir
+ReadWritePaths=/path/to/other/output/dir
 ```
 
 If you configure a `unix_socket` input at `/dev/log` as a syslog(3) replacement, `PrivateDevices=yes` isolates limpid's socket in a private `/dev` that host processes writing to `/dev/log` can't reach — `BindPaths` doesn't fix this, since limpid *creates* the socket rather than connecting to an existing one. Disable device isolation for this unit instead:
