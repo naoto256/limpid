@@ -1104,15 +1104,29 @@ def output o {{
 }}
 "#
         );
+        // The verify toggle lives on the HttpSinkPolicy, so exercise
+        // the trait's `send` directly through it. Same code path that
+        // the skeleton's flush loop takes at runtime — just without
+        // the buffer/notify/actor scaffolding a per-event driver would
+        // need for a single fixture request.
+        use crate::modules::output::batched::BatchSinkPolicy;
         let insecure = HttpOutput::from_properties(
             "o",
             &parsed_output_props(&src_insecure, "o"),
             &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
-        insecure
+        let body = insecure
+            .sink
             .inner
-            .send_batch(&["hello".to_string()])
+            .policy
+            .prepare(vec!["hello".to_string()])
+            .unwrap();
+        insecure
+            .sink
+            .inner
+            .policy
+            .send(&body)
             .await
             .expect("verify false must accept the self-signed cert");
 
@@ -1131,9 +1145,17 @@ def output o {{
             &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
-        let err = strict
+        let body = strict
+            .sink
             .inner
-            .send_batch(&["hello".to_string()])
+            .policy
+            .prepare(vec!["hello".to_string()])
+            .unwrap();
+        let err = strict
+            .sink
+            .inner
+            .policy
+            .send(&body)
             .await
             .expect_err("default client must reject the self-signed cert");
         server.abort();
