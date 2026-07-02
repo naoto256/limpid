@@ -26,7 +26,7 @@ prefix.
 
 ## What's included (v0.7.0)
 
-### Parsers (18)
+### Parsers (26)
 
 | File | Source | OCSF class(es) emitted |
 |---|---|---|
