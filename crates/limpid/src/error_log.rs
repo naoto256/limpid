@@ -74,7 +74,146 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
+use crate::event::OwnedEvent;
 use crate::pipeline::ErroredEventContext;
+
+impl ErroredEventContext {
+    /// Serialise as a single-line JSON record for the dead-letter queue.
+    ///
+    /// Layout (v2 — hard break from v1):
+    ///
+    /// ```text
+    /// {
+    ///   "schema_version": 2,
+    ///   "timestamp": "<RFC3339 nanos UTC>",
+    ///   "reason": "<error msg>",
+    ///   "pipeline": "<def pipeline name or empty>",
+    ///   "kind": "process" | "output",
+    ///   "process": { "name": "<process_name>" },   // kind=process only
+    ///   "output":  { "name": "<output_name>" },    // kind=output only
+    ///   "event": {
+    ///     "source": { "ip": ..., "port": ... },
+    ///     "received_at": <unix nanos>,
+    ///     "ingress": "...",
+    ///     "egress":  "..."                         // kind=output only
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// `schema_version: 2` is the operator-visible discriminator for
+    /// the v0.7.8 schema break. Output records intentionally carry
+    /// *only* `{ name }` — no address, dest, path, key, topic,
+    /// partition, endpoint, URL, peer, target, or workspace. Replay
+    /// (`limpidctl inject output <name>`) hands the event back to the
+    /// sink's `consume()`, which re-routes internally.
+    ///
+    /// Lives in `error_log` (not `pipeline`) because it encodes this
+    /// module's DLQ wire format / replay contract — `ErroredEventContext`
+    /// itself stays in `pipeline` since that's where the failure sites
+    /// construct it, but the JSONL shape is `error_log`'s to own.
+    pub fn to_jsonl(&self) -> String {
+        // Rebuild a minimal Event so we can reuse the canonical
+        // `to_json_value` serialiser for source / received_at /
+        // ingress / egress. We construct it from the snapshot rather
+        // than carrying a full OwnedEvent so we never accidentally
+        // leak workspace fragments into the DLQ.
+        let (timestamp, pipeline, kind_block, reason, event_json) = match self {
+            Self::Process {
+                timestamp,
+                pipeline,
+                site,
+                reason,
+                event,
+            } => {
+                let ev = OwnedEvent {
+                    received_at: event.received_at,
+                    source: event.source,
+                    ingress: event.ingress.clone(),
+                    egress: event.ingress.clone(),
+                    workspace: std::collections::HashMap::new(),
+                    ack: None,
+                };
+                let mut event_json = ev.to_json_value();
+                if let serde_json::Value::Object(ref mut map) = event_json {
+                    // ProcessEvent has no egress concept — strip it so
+                    // replay recipes treat absence as "build egress
+                    // from ingress at deserialisation time"
+                    // (`Event::from_json` already does that).
+                    map.remove("egress");
+                    map.remove("workspace");
+                }
+                (
+                    *timestamp,
+                    pipeline,
+                    serde_json::json!({
+                        "kind": "process",
+                        "process": { "name": site },
+                    }),
+                    reason,
+                    event_json,
+                )
+            }
+            Self::Output {
+                timestamp,
+                pipeline,
+                site: _,
+                reason,
+                output_name,
+                event,
+            } => {
+                let ev = OwnedEvent {
+                    received_at: event.received_at,
+                    source: event.source,
+                    ingress: event.ingress.clone(),
+                    egress: event.egress.clone(),
+                    workspace: std::collections::HashMap::new(),
+                    ack: None,
+                };
+                let mut event_json = ev.to_json_value();
+                if let serde_json::Value::Object(ref mut map) = event_json {
+                    // Output records must never carry workspace —
+                    // any sink-specific routing metadata is forbidden
+                    // by the DLQ schema contract (replay re-routes
+                    // via the sink's own `consume()` path).
+                    map.remove("workspace");
+                }
+                (
+                    *timestamp,
+                    pipeline,
+                    serde_json::json!({
+                        "kind": "output",
+                        "output": { "name": output_name },
+                    }),
+                    reason,
+                    event_json,
+                )
+            }
+        };
+
+        // Merge kind discriminator block + per-kind name block into
+        // the top-level record. Using a Map keeps key ordering stable.
+        let mut record = serde_json::Map::new();
+        record.insert("schema_version".into(), serde_json::json!(2));
+        record.insert(
+            "timestamp".into(),
+            serde_json::Value::String(
+                timestamp.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            ),
+        );
+        record.insert("reason".into(), serde_json::Value::String(reason.clone()));
+        record.insert(
+            "pipeline".into(),
+            serde_json::Value::String(pipeline.clone()),
+        );
+        if let serde_json::Value::Object(kb) = kind_block {
+            for (k, v) in kb {
+                record.insert(k, v);
+            }
+        }
+        record.insert("event".into(), event_json);
+        serde_json::Value::Object(record).to_string()
+    }
+}
 
 /// Writer for the configured `error_log` JSONL file.
 ///
