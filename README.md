@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/naoto256/limpid/actions/workflows/ci.yml/badge.svg)](https://github.com/naoto256/limpid/actions/workflows/ci.yml)
 [![Release](https://github.com/naoto256/limpid/actions/workflows/release.yml/badge.svg)](https://github.com/naoto256/limpid/actions/workflows/release.yml)
+[![GitHub release](https://img.shields.io/github/v/release/naoto256/limpid?sort=semver&display_name=tag)](https://github.com/naoto256/limpid/releases/latest)
+[![Dependencies](https://deps.rs/repo/github/naoto256/limpid/status.svg)](https://deps.rs/repo/github/naoto256/limpid)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 **Log pipelines, limpid as intent.**
