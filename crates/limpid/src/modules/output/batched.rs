@@ -20,7 +20,10 @@
 //!
 //! - **Normal operation (`shutdown()`)**: NEVER aborts the actor. It
 //!   signals cooperative shutdown via `is_shutting_down` +
-//!   `flush_notify.notify_waiters()` and joins it bounded by
+//!   `flush_notify.notify_waiters()` (to wake the actor loop) and
+//!   `shutdown_notify.notify_waiters()` (to wake retry backoff /
+//!   `wait_until_shutdown` without conflating them with threshold
+//!   flushes), then joins the actor bounded by
 //!   `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT`. The actor resolves every
 //!   stack-local handle (Delivered / Recovered via DLQ) before
 //!   exiting.
@@ -144,8 +147,18 @@ pub(crate) struct SinkShared<P: BatchSinkPolicy> {
     metrics: Arc<OutputMetrics>,
     /// Threshold-driven flush trigger. `consume()` calls
     /// `notify_one()` when the buffer crosses `batch_size`; the
-    /// flusher actor's `select!` wakes and drains.
+    /// flusher actor's `select!` wakes and drains. **Never** used to
+    /// wake the retry backoff — see `shutdown_notify` for that.
     flush_notify: Notify,
+    /// Shutdown broadcast. `shutdown()` calls `notify_waiters()`
+    /// after setting `is_shutting_down`. Kept distinct from
+    /// `flush_notify` so that a threshold flush can't short-circuit a
+    /// retry backoff: if the retry sleep raced against `flush_notify`,
+    /// a new event arriving mid-backoff would wake the sleep and
+    /// re-fire the failing send immediately, ignoring the configured
+    /// backoff. Retry sleeps race only against this notify (and the
+    /// `is_shutting_down` check that follows).
+    shutdown_notify: Notify,
     /// Co-operative cancel flag. `shutdown()` sets this to true
     /// before notifying the actor; both the actor loop and the
     /// in-flight `flush_events` retry loop check it so they exit
@@ -175,6 +188,7 @@ impl<P: BatchSinkPolicy> BatchedSink<P> {
             error_log,
             metrics,
             flush_notify: Notify::new(),
+            shutdown_notify: Notify::new(),
             is_shutting_down: AtomicBool::new(false),
         });
         let actor_handle = if tokio::runtime::Handle::try_current().is_ok() {
@@ -232,11 +246,15 @@ impl<P: BatchSinkPolicy> BatchedSink<P> {
         //    propagates to the actor's outer `select!`, to the
         //    retry sleep race, and (via the transport-cancel race
         //    in `flush_events`) to the in-flight send call itself.
-        //    `notify_waiters` wakes every current `.notified()`
-        //    awaiter so a stalled peer's transport future is dropped
-        //    immediately rather than blocking until its read timeout.
+        //    Two notifies: `flush_notify` wakes the actor loop's
+        //    `select!`, and `shutdown_notify` wakes anything else
+        //    waiting on the shutdown signal (retry backoff sleep,
+        //    `wait_until_shutdown`). Keeping them separate lets a
+        //    threshold flush arrive without collapsing the retry
+        //    backoff — see the `shutdown_notify` field doc.
         self.inner.is_shutting_down.store(true, Ordering::Release);
         self.inner.flush_notify.notify_waiters();
+        self.inner.shutdown_notify.notify_waiters();
 
         // 2. Bounded join of the flusher actor. The actor's invariant
         //    is that EVERY stack-local `(Event, QueueAckHandle)` it
@@ -278,11 +296,12 @@ impl<P: BatchSinkPolicy> Drop for BatchedSink<P> {
         // without an explicit `shutdown()` call, e.g. config
         // teardown in tests). The actor's stack-local batch on a
         // bare abort would drop handles unresolved; setting
-        // `is_shutting_down` and `notify_waiters` here gives it a
+        // `is_shutting_down` and both notifies here gives it a
         // chance to exit cleanly first, even though we cannot await
         // its completion from a sync Drop.
         self.inner.is_shutting_down.store(true, Ordering::Release);
         self.inner.flush_notify.notify_waiters();
+        self.inner.shutdown_notify.notify_waiters();
         if let Some(h) = self.actor_handle.get_mut().take() {
             h.abort();
         }
@@ -357,7 +376,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
             if self.is_shutting_down.load(Ordering::Acquire) {
                 return;
             }
-            let notified = self.flush_notify.notified();
+            let notified = self.shutdown_notify.notified();
             if self.is_shutting_down.load(Ordering::Acquire) {
                 return;
             }
@@ -533,13 +552,21 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                     // shutdown that fires *during* the sleep would
                     // otherwise be stuck until the sleep elapses
                     // (5s+ in practice, longer than the runtime
-                    // shutdown budget). `flush_notify.notify_waiters`
+                    // shutdown budget). `shutdown_notify.notify_waiters`
                     // is called by `shutdown()`, so the sleep arm
                     // here wakes immediately and the next iteration
                     // sees `is_shutting_down=true` and breaks.
+                    //
+                    // NOT `flush_notify`: a threshold-driven flush wake
+                    // arriving mid-backoff would otherwise cut the
+                    // backoff short and re-fire the failing send
+                    // instantly, hammering a failing collector and
+                    // ignoring the configured retry pacing. Retry
+                    // pacing survives incoming traffic; only shutdown
+                    // is allowed to short-circuit it.
                     tokio::select! {
                         _ = tokio::time::sleep(wait) => {}
-                        _ = self.flush_notify.notified() => {}
+                        _ = self.shutdown_notify.notified() => {}
                     }
                     wait = self.retry.next_wait(wait);
                 }

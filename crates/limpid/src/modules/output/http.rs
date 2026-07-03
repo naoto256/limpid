@@ -1884,6 +1884,101 @@ def output o {{
         );
     }
 
+    /// Regression pin: the retry backoff sleep must NOT wake early when
+    /// a fresh `consume()` fires a threshold flush notification. Before
+    /// the fix the retry loop raced the sleep against `flush_notify`,
+    /// which `consume()` also pings when the buffer crosses
+    /// `batch_size`. Under continuous traffic that turned every retry
+    /// backoff into an instant re-send — hammering a failing collector
+    /// and ignoring `initial_wait`. Now the retry sleep only races
+    /// against `shutdown_notify`, so a new event arriving mid-backoff
+    /// enqueues silently until the sleep elapses on its own.
+    #[tokio::test]
+    async fn retry_backoff_survives_threshold_notify_race() {
+        let (addr, post_count, server) = run_counting_failing_collector().await;
+        let url = format!("http://{}/", addr);
+        // 400 ms backoff between attempts. Long enough that we can
+        // reliably observe "second attempt hasn't fired yet" through a
+        // scheduling window, short enough that the whole test finishes
+        // in about a second even without the wake bug.
+        let slow_retry = Property::Block {
+            key: "retry".into(),
+            key_span: None,
+            properties: vec![
+                prop_int("max_attempts", 2),
+                prop_str("initial_wait", "400ms"),
+                prop_str("max_wait", "400ms"),
+                Property::KeyValue {
+                    key: "backoff".into(),
+                    key_span: None,
+                    value: Expr::spanless(ExprKind::Ident(vec!["fixed".into()])),
+                    value_span: None,
+                },
+            ],
+        };
+        let output = HttpOutput::from_properties(
+            "test",
+            &mp(&[peer_block(&url), prop_int("batch_size", 1), slow_retry]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
+
+        // Kick off the first send. `batch_size=1` means the actor
+        // flushes immediately; the server 500s, and the retry loop
+        // enters `sleep(400ms)`.
+        output
+            .consume(&event_with("first"), event_ack())
+            .await
+            .unwrap();
+
+        // Wait long enough for the first attempt to reach the server
+        // and for the retry loop to be sitting in its backoff. The
+        // 400 ms window here has to comfortably cover a request round
+        // trip plus a few scheduler hops.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let after_first = post_count.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            after_first, 1,
+            "expected exactly the initial attempt to have hit the server before the notify race, got {after_first}"
+        );
+
+        // Fire the threshold-flush notify while the retry loop is
+        // asleep. Pre-fix this cut the backoff short and re-fired the
+        // send within milliseconds; post-fix it must not.
+        output
+            .consume(&event_with("second"), event_ack())
+            .await
+            .unwrap();
+
+        // Give the actor plenty of time to react to the notify but
+        // still stay under the 400 ms backoff floor.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mid_backoff = post_count.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            mid_backoff, 1,
+            "threshold-flush notify must not wake the retry backoff — expected 1 attempt still, got {mid_backoff}",
+        );
+
+        // Now wait past the 400 ms floor and let the retry actually
+        // fire. The exact count depends on how the two batches are
+        // scheduled, but the retry MUST have fired by now.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let post_backoff = post_count.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            post_backoff >= 2,
+            "retry must have fired after the backoff elapsed — got only {post_backoff}",
+        );
+
+        server.abort();
+    }
+
+    /// Cheap ack handle that discards its disposition — the sleep-race
+    /// regression above doesn't need to inspect it.
+    fn event_ack() -> crate::queue::QueueAckHandle {
+        let (h, _) = crate::queue::QueueAckHandle::for_test();
+        h
+    }
+
     /// Regression for the 0.7.8 shutdown panic / silent loss: at shutdown
     /// the batched flush MUST NOT consume the steady-state retry budget.
     /// We configure `max_attempts=5` with `200ms` waits — a budget that,
