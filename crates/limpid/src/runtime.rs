@@ -705,8 +705,8 @@ async fn process_event(
 /// Shared by both runtime-error shapes the orchestrator surfaces:
 /// `PipelineTermination::Errored` (a `process` raised an error mid-
 /// pipeline) and an `Err` return from `run_pipeline` itself
-/// (expression evaluation under `error`/`if`/`switch`/process args
-/// raised an error). Keeping the two on the same routing helper
+/// (expression evaluation under `error`/`if`/`switch` or a process
+/// body expression raised an error). Keeping the two on the same routing helper
 /// guarantees the operator-visible behaviour stays in lockstep:
 /// same JSONL on disk, same `events_errored` counter, same
 /// `events_errored_unwritable` semantics when the DLQ write itself
