@@ -304,14 +304,13 @@ impl ErrorLogWriter {
         let _guard = self.write_lock.lock().await;
         let mut opts = OpenOptions::new();
         opts.create(true).append(true);
+        // Only applied when this open creates the file; an existing
+        // DLQ file keeps whatever mode it already has (operators can
+        // tighten a pre-existing file themselves). tokio's
+        // `OpenOptions::mode` is inherent (no OpenOptionsExt trait
+        // import needed).
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            // Only applied when this open creates the file; an existing
-            // DLQ file keeps whatever mode it already has (operators can
-            // tighten a pre-existing file themselves).
-            opts.mode(0o600);
-        }
+        opts.mode(0o600);
         let mut f = opts
             .open(&self.path)
             .await
@@ -393,7 +392,12 @@ mod tests {
         let path = dir.path().join("errored.jsonl");
         let w = ErrorLogWriter::new(path.clone());
         w.write(&ctx()).await.unwrap();
-        let mode = tokio::fs::metadata(&path).await.unwrap().permissions().mode() & 0o777;
+        let mode = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600, "DLQ file must be created 0o600, got {mode:o}");
     }
 
