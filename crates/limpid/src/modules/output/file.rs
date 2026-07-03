@@ -394,7 +394,14 @@ impl FileOutput {
         self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
 
         if first_create {
-            self.apply_file_metadata(&path).await;
+            // Apply mode/owner through the open fd rather than the path.
+            // The path is already guarded by O_NOFOLLOW at open time, but
+            // set_permissions()/chown() would re-resolve the path and
+            // could follow a symlink pre-planted between open and the
+            // metadata call — closing that TOCTOU window means the mode
+            // and ownership always land on the same inode we just wrote
+            // to, never a different one.
+            self.apply_file_metadata_to_fd(&file, &path).await;
         }
 
         Ok(())
@@ -533,26 +540,43 @@ fn check_no_traversal(s: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 impl FileOutput {
-    async fn apply_file_metadata(&self, path: &Path) {
-        use std::os::unix::fs::PermissionsExt;
+    /// Apply the configured `mode`/`owner`/`group` to the just-created
+    /// file via `fchmod(2)`/`fchown(2)` on the open fd — never through
+    /// the path. The path-based `set_permissions`/`chown` we used
+    /// before could be redirected by a symlink pre-planted between
+    /// `open(O_NOFOLLOW)` and the metadata call; operating on the fd
+    /// makes that impossible, and keeps the mode/ownership riding on
+    /// the same inode `write_all` just touched. `path` here is only
+    /// used to label warnings.
+    async fn apply_file_metadata_to_fd(&self, file: &tokio::fs::File, path: &Path) {
+        use std::os::unix::io::AsRawFd;
 
-        if let Some(mode) = self.mode
-            && let Err(e) =
-                tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).await
-        {
-            tracing::warn!(
-                "output file '{}': failed to set mode: {}",
-                path.display(),
-                e
-            );
+        let mode = self.mode;
+        let owner = self.owner.clone();
+        let group = self.group.clone();
+        if mode.is_none() && owner.is_none() && group.is_none() {
+            return;
         }
+        let path = path.to_path_buf();
+        let fd = file.as_raw_fd();
 
-        if self.owner.is_some() || self.group.is_some() {
-            let owner = self.owner.clone();
-            let group = self.group.clone();
-            let path = path.to_path_buf();
+        // `spawn_blocking` runs the libc calls off the async runtime.
+        // The `File` (and therefore the fd) is borrowed by this future,
+        // and we `await` the join handle below before returning, so the
+        // fd stays valid for the entire duration of the blocking task.
+        tokio::task::spawn_blocking(move || {
+            if let Some(mode) = mode {
+                let rc = unsafe { libc::fchmod(fd, mode as libc::mode_t) };
+                if rc != 0 {
+                    tracing::warn!(
+                        "output file '{}': fchmod failed: {}",
+                        path.display(),
+                        std::io::Error::last_os_error()
+                    );
+                }
+            }
 
-            tokio::task::spawn_blocking(move || {
+            if owner.is_some() || group.is_some() {
                 let uid = owner.as_deref().and_then(|name| {
                     resolve_uid(name)
                         .inspect_err(|e| {
@@ -577,15 +601,26 @@ impl FileOutput {
                         })
                         .ok()
                 });
-                if (uid.is_some() || gid.is_some())
-                    && let Err(e) = std::os::unix::fs::chown(&path, uid, gid)
-                {
-                    tracing::warn!("output file '{}': failed to chown: {}", path.display(), e);
+                if uid.is_some() || gid.is_some() {
+                    // `fchown(-1, -1)` is a no-op, so map "not
+                    // configured" or "lookup failed" to -1 and let
+                    // libc decide whether either coordinate needs
+                    // changing.
+                    let uid_arg = uid.unwrap_or(u32::MAX);
+                    let gid_arg = gid.unwrap_or(u32::MAX);
+                    let rc = unsafe { libc::fchown(fd, uid_arg, gid_arg) };
+                    if rc != 0 {
+                        tracing::warn!(
+                            "output file '{}': fchown failed: {}",
+                            path.display(),
+                            std::io::Error::last_os_error()
+                        );
+                    }
                 }
-            })
-            .await
-            .ok();
-        }
+            }
+        })
+        .await
+        .ok();
     }
 }
 
@@ -700,10 +735,14 @@ mod tests {
     }
 
     fn make_output(path: Expr) -> FileOutput {
+        make_output_with(path, None)
+    }
+
+    fn make_output_with(path: Expr, mode: Option<u32>) -> FileOutput {
         FileOutput {
             name: "test".into(),
             path,
-            mode: None,
+            mode,
             owner: None,
             group: None,
             created_paths: Mutex::new(HashSet::new()),
@@ -990,5 +1029,54 @@ mod tests {
             .expect("regular file write must succeed");
         }
         assert_eq!(std::fs::read(&path).unwrap(), b"hello\nhello\n");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn write_payload_applies_mode_via_fchmod_to_created_file() {
+        // Regression pin for the fd-based metadata application: the
+        // configured mode must land on the file the writer just opened,
+        // and the path used to label warnings must not participate in
+        // the actual mode change (it goes through fchmod on the open
+        // fd).
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("modeful.log");
+
+        let out = make_output_with(
+            ek(ExprKind::StringLit(path.display().to_string())),
+            Some(0o640),
+        );
+        out.write_payload(FilePayload {
+            egress: Bytes::from("hi"),
+            path: path.display().to_string(),
+            is_dynamic: false,
+        })
+        .await
+        .expect("first write must succeed");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o640,
+            "fchmod must land the configured mode on the created file"
+        );
+
+        // A second write must not re-apply the mode — apply_file_metadata
+        // is gated on first_create. Externally tightening the mode
+        // between writes stays sticky, which is the operator-friendly
+        // behaviour.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        out.write_payload(FilePayload {
+            egress: Bytes::from("again"),
+            path: path.display().to_string(),
+            is_dynamic: false,
+        })
+        .await
+        .expect("second write must succeed");
+        let mode2 = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode2, 0o600,
+            "second write must not re-apply mode; operator tightening stays sticky"
+        );
     }
 }
