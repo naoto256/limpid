@@ -160,6 +160,14 @@ impl Journal {
         if rc == 0 {
             return Ok(None);
         }
+        // `rc > 0` means libsystemd populated (data, len) with a valid
+        // buffer, so `data` is non-null under the sd-journal(3) contract.
+        // Guard anyway: `slice::from_raw_parts` is UB on a null pointer
+        // even when `len == 0`, and treating a contract violation as
+        // "no more fields" degrades gracefully instead of invoking UB.
+        if data.is_null() {
+            return Ok(None);
+        }
         let blob = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len) };
         let (name, value) = match blob.iter().position(|&b| b == b'=') {
             Some(idx) => (&blob[..idx], Some(&blob[idx + 1..])),
