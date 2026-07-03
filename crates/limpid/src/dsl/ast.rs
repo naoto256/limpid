@@ -106,8 +106,9 @@ pub enum ProcessStatement {
     /// visible for the rest of the enclosing process body. Locals are
     /// bare identifiers (`name`), distinct from `workspace.name`.
     LetBinding(String, Expr),
-    /// `process name` or `process name(args...)`
-    ProcessCall(String, Vec<Expr>),
+    /// `process name` — invoke a named process. Process definitions
+    /// don't declare parameters, so calls don't carry any.
+    ProcessCall(String),
     /// `drop`
     Drop,
     /// `error` / `error <expr>` — explicit failure routing. The
@@ -239,8 +240,10 @@ pub enum PipelineStatement {
 /// An element within a `process a | b | { ... }` chain in a pipeline.
 #[derive(Debug, Clone)]
 pub enum ProcessChainElement {
-    /// Named process reference, optionally with arguments: `parse_cef`, `geoip("source")`
-    Named(String, Vec<Expr>),
+    /// Named process reference: `parse_cef`. Processes don't declare
+    /// parameters — see `ProcessDef` — so a chain-element call can't
+    /// pass any either.
+    Named(String),
     /// Inline (anonymous) process block: `{ ... }`
     Inline(Vec<ProcessStatement>),
 }

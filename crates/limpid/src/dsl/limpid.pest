@@ -172,7 +172,7 @@ process_switch_arm = {
 }
 
 process_call = {
-    kw_process ~ ident ~ ("(" ~ func_args ~ ")")?
+    kw_process ~ ident
 }
 
 process_assign = {
@@ -248,9 +248,13 @@ process_chain_element = {
   | process_ref
 }
 
-// Named process reference with optional arguments
+// Named process reference. Process definitions don't declare
+// parameters — see `def_process` — so a call site can't pass any
+// either. An older grammar accepted `foo(...)` here and the runtime
+// silently discarded the arguments after evaluating them; that
+// language surface is gone.
 process_ref = {
-    ident ~ ("(" ~ func_args ~ ")")?
+    ident
 }
 
 // Inline (anonymous) process: `{ ... }`

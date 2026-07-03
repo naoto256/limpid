@@ -116,7 +116,7 @@ fn build_pipeline_graph(name: &str, pipeline: &crate::dsl::ast::PipelineDef) -> 
                 for elem in elements {
                     proc_counter += 1;
                     let (id, label) = match elem {
-                        ProcessChainElement::Named(pname, _args) => (
+                        ProcessChainElement::Named(pname) => (
                             format!("{}_proc_{}_{}", name, proc_counter, sanitize(pname)),
                             format!("process {}", pname),
                         ),

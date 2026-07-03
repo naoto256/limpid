@@ -204,19 +204,14 @@ fn parse_process_error(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatemen
     Ok(ProcessStatement::Error(msg))
 }
 
-fn parse_process_call(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
-    let mut inner = pair.into_inner();
-    let name = inner
+fn parse_process_call(pair: Pair<Rule>, _file_id: u32) -> Result<ProcessStatement> {
+    let name = pair
+        .into_inner()
         .next()
         .expect("pest grammar invariant")
         .as_str()
         .to_string();
-    let args = if let Some(args_pair) = inner.next() {
-        parse_func_args(args_pair, file_id)?
-    } else {
-        vec![]
-    };
-    Ok(ProcessStatement::ProcessCall(name, args))
+    Ok(ProcessStatement::ProcessCall(name))
 }
 
 fn parse_process_let(pair: Pair<Rule>, file_id: u32) -> Result<ProcessStatement> {
@@ -414,18 +409,13 @@ fn parse_chain_element(pair: Pair<Rule>, file_id: u32) -> Result<ProcessChainEle
     let inner = first_inner(pair)?;
     match inner.as_rule() {
         Rule::process_ref => {
-            let mut parts = inner.into_inner();
-            let name = parts
+            let name = inner
+                .into_inner()
                 .next()
                 .expect("pest grammar invariant")
                 .as_str()
                 .to_string();
-            let args = if let Some(args_pair) = parts.next() {
-                parse_func_args(args_pair, file_id)?
-            } else {
-                vec![]
-            };
-            Ok(ProcessChainElement::Named(name, args))
+            Ok(ProcessChainElement::Named(name))
         }
         Rule::inline_process => {
             let body = inner
@@ -1161,7 +1151,7 @@ def process parse_and_enrich {
     process parse_cef
 
     if workspace.src != null {
-        process geoip("src")
+        process geoip
     }
 
     if workspace.device_vendor == "HealthCheck" {
@@ -1980,5 +1970,40 @@ def process p {
             },
             _ => panic!("expected process"),
         }
+    }
+
+    #[test]
+    fn process_call_with_arguments_is_a_parse_error_in_pipeline_chain() {
+        // Regression pin: `def process` declares no parameters, so a
+        // caller can't pass any either. An older grammar accepted
+        // `process foo("src")` and the runtime silently evaluated the
+        // arguments only to discard them — that misusage now hits the
+        // parser instead of vanishing at runtime.
+        let input = r#"
+def pipeline p {
+    input i
+    process geoip("src")
+    output o
+}
+"#;
+        assert!(
+            parse_config(input).is_err(),
+            "expected process foo(\"src\") to be a parse error in a pipeline chain"
+        );
+    }
+
+    #[test]
+    fn process_call_with_arguments_is_a_parse_error_in_process_body() {
+        // Same rule applied to the `process foo` statement inside a
+        // `def process` body.
+        let input = r#"
+def process wrap {
+    process helper("x")
+}
+"#;
+        assert!(
+            parse_config(input).is_err(),
+            "expected process helper(\"x\") to be a parse error in a process body"
+        );
     }
 }

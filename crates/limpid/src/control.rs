@@ -468,7 +468,7 @@ fn collect_pipeline_tap_points(
             PipelineStatement::ProcessChain(chain) => {
                 for elem in chain {
                     match elem {
-                        ProcessChainElement::Named(name, _) => {
+                        ProcessChainElement::Named(name) => {
                             if !processes.contains(name) {
                                 processes.push(name.clone());
                             }

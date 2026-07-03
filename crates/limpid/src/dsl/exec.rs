@@ -42,7 +42,6 @@ pub trait ProcessRegistry {
     fn call<'bump>(
         &self,
         name: &str,
-        args: &[Value<'bump>],
         event: BorrowedEvent<'bump>,
         arena: &'bump EventArena<'bump>,
     ) -> std::result::Result<Option<BorrowedEvent<'bump>>, ProcessError>;
@@ -127,13 +126,7 @@ fn exec_process_stmt<'bump>(
             Ok(ExecResult::Continue(event))
         }
 
-        ProcessStatement::ProcessCall(name, args) => {
-            let mut evaluated_args =
-                bumpalo::collections::Vec::with_capacity_in(args.len(), arena.bump());
-            for a in args {
-                evaluated_args.push(eval_expr_with_scope(a, &event, funcs, scope, arena)?);
-            }
-
+        ProcessStatement::ProcessCall(name) => {
             // Callee processes start with their own fresh LocalScope
             // inside the registry implementation (see `exec_process_body`
             // above). Our `scope` here belongs to the caller and is
@@ -159,7 +152,7 @@ fn exec_process_stmt<'bump>(
             // recovery body with the original error message exposed
             // via `workspace._error`.
             registry
-                .call(name, &evaluated_args, event, arena)
+                .call(name, event, arena)
                 .map(|opt_event| match opt_event {
                     Some(e) => ExecResult::Continue(e),
                     None => ExecResult::Dropped,
@@ -440,7 +433,6 @@ mod tests {
         fn call<'bump>(
             &self,
             _name: &str,
-            _args: &[Value<'bump>],
             event: BorrowedEvent<'bump>,
             _arena: &'bump crate::dsl::arena::EventArena<'bump>,
         ) -> Result<Option<BorrowedEvent<'bump>>, ProcessError> {
@@ -454,7 +446,6 @@ mod tests {
         fn call<'bump>(
             &self,
             _name: &str,
-            _args: &[Value<'bump>],
             _event: BorrowedEvent<'bump>,
             _arena: &'bump crate::dsl::arena::EventArena<'bump>,
         ) -> Result<Option<BorrowedEvent<'bump>>, ProcessError> {
@@ -640,7 +631,7 @@ mod tests {
         let arena = crate::dsl::arena::EventArena::new(&_bump);
         let event = make_event();
         let bevent = event.view_in(&arena);
-        let stmts = vec![ProcessStatement::ProcessCall("failing".into(), vec![])];
+        let stmts = vec![ProcessStatement::ProcessCall("failing".into())];
         let result = exec_process_body(&stmts, bevent, &FailRegistry, &make_funcs(), &arena);
         match result {
             Err(e) => assert!(
@@ -667,7 +658,7 @@ mod tests {
         let event = make_event();
         let bevent = event.view_in(&arena);
         let stmts = vec![ProcessStatement::TryCatch(
-            vec![ProcessStatement::ProcessCall("failing".into(), vec![])],
+            vec![ProcessStatement::ProcessCall("failing".into())],
             vec![ProcessStatement::Assign(
                 AssignTarget::Workspace(vec!["caught".into()]),
                 e(ExprKind::BoolLit(true)),
