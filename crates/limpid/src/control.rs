@@ -714,15 +714,18 @@ async fn handle_tap(
 // `limpidctl` (crates/limpidctl/src/main.rs) and `limpid-prometheus`
 // (crates/limpid-prometheus/src/main.rs) each hand-build the command
 // strings this module's line parser above (`handle_connection`)
-// expects — there is no shared crate defining the wire grammar. These
-// tests pin that limpidctl-shaped commands are accepted by the daemon
-// parser, so a future edit to either side's string literals gets
-// caught here instead of only at runtime against a real daemon.
+// expects — there is no shared crate defining the wire grammar.
 //
-// Not a shared "protocol crate": the task that introduced this test
-// module deliberately rejected extracting one (over-engineering for a
-// two-writer, one-reader line protocol) — this integration test is
-// the cheaper alternative that still catches drift.
+// Scope: these tests pin the *daemon-parser side* of that protocol —
+// each `#[test]` sends the exact string shape limpidctl builds today
+// and asserts the parser accepts it. A future edit to the parser that
+// tightens what it accepts (or renames a command) gets caught here.
+// The client-side literals themselves are not imported (limpidctl is
+// a separate crate), so a driver-side edit that starts sending a
+// different literal is NOT caught here — that drift is limpidctl's
+// own unit-test surface. A shared "protocol crate" was rejected as
+// over-engineering for a two-writer, one-reader line protocol; these
+// tests are the cheaper alternative that still pin the parser end.
 #[cfg(test)]
 mod protocol_round_trip_tests {
     use std::time::Duration;
