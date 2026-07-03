@@ -349,14 +349,16 @@ impl FileOutput {
             );
         }
 
-        let first_create = {
-            let mut guard = self.created_paths.lock().await;
-            if !path.exists() && !guard.contains(&path) {
-                guard.insert(path.clone());
-                true
-            } else {
-                false
-            }
+        // Sample the "have we ever created this path" flag *before*
+        // opening the file — we can't record the create yet because
+        // `open` and `write_all` may still fail (O_NOFOLLOW → ELOOP,
+        // ENOSPC, permission errors, etc.), and marking it created
+        // pre-open would leave a permanently-broken output whose
+        // mode/owner never gets applied on the next successful write.
+        // The record happens only after the write actually lands.
+        let is_new_path = {
+            let guard = self.created_paths.lock().await;
+            !path.exists() && !guard.contains(&path)
         };
 
         // Fourth safety pass, complementing the three path-rendering
@@ -392,6 +394,25 @@ impl FileOutput {
         buf.push(b'\n');
         file.write_all(&buf).await?;
         self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
+
+        // Only after the write actually succeeded do we (a) mark the
+        // path as created for this output's lifetime and (b) apply
+        // mode/owner. Doing (b) inside the same critical section as
+        // (a) means a concurrent second write for the same path can't
+        // sneak past — the first successful writer wins the
+        // metadata-apply slot, and everyone else sees the path in
+        // `created_paths` and skips it.
+        let first_create = if is_new_path {
+            let mut guard = self.created_paths.lock().await;
+            if guard.insert(path.clone()) {
+                true
+            } else {
+                // Another concurrent writer beat us to it.
+                false
+            }
+        } else {
+            false
+        };
 
         if first_create {
             // Apply mode/owner through the open fd rather than the path.
@@ -1146,6 +1167,63 @@ mod tests {
         assert!(
             !path.exists(),
             "never-polled write_payload future must not create the target file"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn failed_first_write_does_not_skip_mode_on_the_retry() {
+        // Regression pin: the `first_create` bookkeeping used to
+        // record the path *before* `open`/`write_all`. That meant a
+        // failed first attempt — e.g. O_NOFOLLOW hitting a
+        // pre-planted symlink — still marked the path as "created",
+        // so the operator's fix (remove the symlink) succeeded but
+        // the subsequent write treated the file as not-first-create
+        // and silently skipped mode/owner application. Pin that the
+        // configured mode lands on the file that eventually gets
+        // created.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("guarded.log");
+        // Point a symlink at a target somewhere outside the tempdir
+        // so `open(O_NOFOLLOW)` fails with ELOOP on the first try.
+        let symlink_target = dir.path().join("_would_be_hijacked.log");
+        std::os::unix::fs::symlink(&symlink_target, &path).unwrap();
+
+        let out = make_output_with(
+            ek(ExprKind::StringLit(path.display().to_string())),
+            Some(0o640),
+        );
+
+        // First write must fail with the symlink refusal.
+        let err = out
+            .write_payload(FilePayload {
+                egress: Bytes::from("first"),
+                path: path.display().to_string(),
+                is_dynamic: false,
+            })
+            .await
+            .expect_err("symlink at output path must be refused on first write");
+        assert!(err.to_string().contains("refusing to follow symlink"));
+
+        // Operator removes the symlink and retries.
+        std::fs::remove_file(&path).unwrap();
+        out.write_payload(FilePayload {
+            egress: Bytes::from("second"),
+            path: path.display().to_string(),
+            is_dynamic: false,
+        })
+        .await
+        .expect("second write must succeed after removing the symlink");
+
+        // The retry must be treated as first-create so the configured
+        // mode lands on the newly opened file. Pre-fix this returned
+        // 0644 (umask default) because `created_paths` already
+        // contained the path from the failed attempt.
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o640,
+            "post-fix: metadata contract must apply on the first successful write, not on the first attempt"
         );
     }
 }
