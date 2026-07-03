@@ -77,29 +77,12 @@ allow = [
     # attribution license for datasets — compatible with limpid's
     # redistribution posture.
     "CDLA-Permissive-2.0",
-    # Unlicense: public-domain dedication with a permissive fallback —
-    # same obligations-free family as 0BSD / CC0. Reached via
-    # cstr-argument <- systemd (journal feature). Compatible with
-    # limpid's redistribution posture.
-    "Unlicense",
 ]
 
 # Per-crate exceptions: licenses accepted for a specific crate only,
 # without admitting them workspace-wide. Each entry MUST carry a
 # rationale comment and the condition under which it can be removed.
-#
-# systemd / libsystemd-sys (LGPL-2.1-or-later WITH GCC-exception-2.0):
-# the `journal` feature is opt-in; these crates are thin binding
-# wrappers around libsystemd, which stays dynamically linked — only the
-# wrapper code itself is statically linked into limpid. The
-# workspace-wide LGPL-avoidance policy above is unchanged; this is a
-# deliberate two-crate exception, not a policy shift. Remove both
-# entries if/when the journald reader migrates to an MIT/Apache-family
-# implementation.
-exceptions = [
-    { crate = "systemd", allow = ["LGPL-2.1-or-later WITH GCC-exception-2.0"] },
-    { crate = "libsystemd-sys", allow = ["LGPL-2.1-or-later WITH GCC-exception-2.0"] },
-]
+exceptions = []
 
 [advisories]
 # RustSec database — checked at every audit. `version = 2` is the
