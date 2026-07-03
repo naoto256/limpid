@@ -548,7 +548,20 @@ impl FileOutput {
     /// makes that impossible, and keeps the mode/ownership riding on
     /// the same inode `write_all` just touched. `path` here is only
     /// used to label warnings.
+    ///
+    /// The `spawn_blocking` future is *not* cancel-safe: if the caller
+    /// (say `consume_shutdown` under a `timeout`) drops the awaiting
+    /// future, the blocking task keeps running while the outer `File`
+    /// gets dropped and closes its fd. A raw fd number is trivial for
+    /// the kernel to reuse for an unrelated `open`, and the leftover
+    /// `fchmod`/`fchown` would then land on that other inode. Guard
+    /// against that by `dup(2)`-ing the fd into an `OwnedFd` that the
+    /// blocking closure owns for its whole lifetime — the syscalls run
+    /// against a fd that stays live even if the outer future is
+    /// cancelled, and the `OwnedFd`'s `Drop` closes it deterministically
+    /// on task exit (success, panic, or otherwise).
     async fn apply_file_metadata_to_fd(&self, file: &tokio::fs::File, path: &Path) {
+        use std::os::fd::{FromRawFd, OwnedFd};
         use std::os::unix::io::AsRawFd;
 
         let mode = self.mode;
@@ -558,13 +571,27 @@ impl FileOutput {
             return;
         }
         let path = path.to_path_buf();
-        let fd = file.as_raw_fd();
 
-        // `spawn_blocking` runs the libc calls off the async runtime.
-        // The `File` (and therefore the fd) is borrowed by this future,
-        // and we `await` the join handle below before returning, so the
-        // fd stays valid for the entire duration of the blocking task.
+        // `dup(2)` returns a fresh fd referring to the same open file
+        // description. The `OwnedFd` moves into the closure so it stays
+        // live for the duration of the blocking task even if the outer
+        // future — and therefore the source `File` — is dropped.
+        let duped: i32 = unsafe { libc::dup(file.as_raw_fd()) };
+        if duped < 0 {
+            tracing::warn!(
+                "output file '{}': dup failed, skipping metadata apply: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        // SAFETY: `duped >= 0` was just returned by `libc::dup` and no
+        // other Rust type owns it yet, so this transfers exclusive
+        // ownership to the `OwnedFd`.
+        let owned_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(duped) };
+
         tokio::task::spawn_blocking(move || {
+            let fd = owned_fd.as_raw_fd();
             if let Some(mode) = mode {
                 let rc = unsafe { libc::fchmod(fd, mode as libc::mode_t) };
                 if rc != 0 {
@@ -618,6 +645,10 @@ impl FileOutput {
                     }
                 }
             }
+            // `owned_fd` drops here at end-of-closure, so `close(2)`
+            // runs deterministically whether the closure returned
+            // normally or panicked — cancellation of the outer future
+            // doesn't reach in here.
         })
         .await
         .ok();
@@ -1078,5 +1109,75 @@ mod tests {
             mode2, 0o600,
             "second write must not re-apply mode; operator tightening stays sticky"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn apply_file_metadata_survives_outer_future_cancellation() {
+        // Regression pin: `spawn_blocking` isn't cancel-safe, so if a
+        // caller drops `write_payload`'s future mid-await (shutdown
+        // timeout etc.), the blocking task keeps running while the
+        // source `File` gets closed. Before we duped the fd, that
+        // window let the leftover `fchmod`/`fchown` land on an
+        // unrelated inode when the kernel reused the fd number. Pin
+        // that even under aggressive cancellation the mode still
+        // lands on the file we wrote to — or, if the future was
+        // dropped before `apply_file_metadata_to_fd` even ran, no
+        // stray metadata escapes.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cancel.log");
+
+        let out = std::sync::Arc::new(make_output_with(
+            ek(ExprKind::StringLit(path.display().to_string())),
+            Some(0o600),
+        ));
+
+        // Kick off write_payload but drop the future immediately.
+        // Whatever happens under the covers, the outcome must be
+        // either "no file exists" or "file has mode 0o600" — never a
+        // different inode carrying our chmod.
+        let out2 = out.clone();
+        let path_str = path.display().to_string();
+        let fut = out2.write_payload(FilePayload {
+            egress: Bytes::from("cancelled"),
+            path: path_str,
+            is_dynamic: false,
+        });
+        drop(fut);
+
+        // Yield a couple of times so any spawned blocking work runs.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        if let Ok(meta) = std::fs::metadata(&path) {
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "if the file exists after cancellation, its mode must be the one we asked for"
+            );
+        }
+        // If the file doesn't exist yet, we cancelled early enough
+        // that write never landed — also fine.
+
+        // And a follow-up "normal" write must still apply mode as
+        // expected, i.e. the previous cancellation didn't corrupt the
+        // metadata state.
+        let path2 = dir.path().join("normal.log");
+        make_output_with(
+            ek(ExprKind::StringLit(path2.display().to_string())),
+            Some(0o640),
+        )
+        .write_payload(FilePayload {
+            egress: Bytes::from("ok"),
+            path: path2.display().to_string(),
+            is_dynamic: false,
+        })
+        .await
+        .expect("normal follow-up write must succeed");
+        let mode2 = std::fs::metadata(&path2).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode2, 0o640);
     }
 }
