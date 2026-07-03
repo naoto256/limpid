@@ -130,7 +130,7 @@ A sink-side failure (retry budget exhausted, batched-output shutdown drain, runt
 
 | Field | Meaning |
 |-------|---------|
-| `process` | `{ "name": "<site>" }` block. `name` is the failing `def process` name, `(inline)` for an inline `process { ... }` block, `(pipeline)` for a pipeline-statement `error <expr>`, or `(pipeline body)` for a pipeline-skeleton expression failure (`if` / `switch` / `error <expr>` arg / `process` function args). |
+| `process` | `{ "name": "<site>" }` block. `name` is the failing `def process` name, `(inline)` for an inline `process { ... }` block, `(pipeline)` for a pipeline-statement `error <expr>`, or `(pipeline body)` for a pipeline-skeleton expression failure (`if` condition, `switch` scrutinee, `error <expr>` argument, or a body expression evaluated inside the pipeline). |
 
 `event` carries only `{ source, received_at, ingress }` — no `egress`, no `workspace`. Replay re-runs the pipeline from scratch on `ingress`.
 
