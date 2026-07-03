@@ -421,10 +421,7 @@ fn analyze_chain_element(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     match elem {
-        ProcessChainElement::Named(name, args) => {
-            for a in args {
-                expr_types::check_types(a, pipeline_name, bindings, registry, None, diagnostics);
-            }
+        ProcessChainElement::Named(name) => {
             if let Some(pdef) = config.processes.get(name) {
                 analyze_process_body(pdef, pipeline_name, registry, bindings, diagnostics);
             } else {
@@ -548,10 +545,7 @@ pub(super) fn analyze_process_stmt(
         ProcessStatement::ExprStmt(e) => {
             expr_types::check_types(e, pipeline_name, bindings, registry, None, diagnostics);
         }
-        ProcessStatement::ProcessCall(_name, args) => {
-            for a in args {
-                expr_types::check_types(a, pipeline_name, bindings, registry, None, diagnostics);
-            }
+        ProcessStatement::ProcessCall(_name) => {
             // Process bodies were validated separately when the named
             // process was defined; we don't recurse from here.
         }

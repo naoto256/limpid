@@ -23,7 +23,6 @@ use crate::dsl::arena::EventArena;
 use crate::dsl::ast::*;
 use crate::dsl::eval::{eval_expr, select_if_branch, select_switch_arm, value_to_string};
 use crate::dsl::exec::{ExecResult, ProcessError, ProcessRegistry, exec_process_body};
-use crate::dsl::value::Value;
 use crate::event::{BorrowedEvent, OwnedEvent};
 use crate::functions::FunctionRegistry;
 use crate::tap::TapRegistry;
@@ -161,7 +160,7 @@ impl CompiledConfig {
             }
             PipelineStatement::ProcessChain(chain) => {
                 for element in chain {
-                    if let ProcessChainElement::Named(proc_name, _) = element
+                    if let ProcessChainElement::Named(proc_name) = element
                         && !self.processes.contains_key(proc_name)
                     {
                         bail!(
@@ -426,7 +425,6 @@ impl ProcessRegistry for DslProcessRegistry<'_> {
     fn call<'bump>(
         &self,
         name: &str,
-        _args: &[Value<'bump>],
         event: BorrowedEvent<'bump>,
         arena: &'bump EventArena<'bump>,
     ) -> std::result::Result<Option<BorrowedEvent<'bump>>, ProcessError> {
@@ -667,37 +665,17 @@ fn exec_pipeline_stmt<'bump>(
             let mut current = event;
             for element in chain {
                 match element {
-                    ProcessChainElement::Named(name, args) => {
-                        let mut evaluated_args = bumpalo::collections::Vec::with_capacity_in(
-                            args.len(),
-                            ctx.arena.bump(),
-                        );
-                        for a in args {
-                            evaluated_args.push(eval_expr(a, &current, ctx.funcs, ctx.arena)?);
-                        }
-
+                    ProcessChainElement::Named(name) => {
                         // Snapshot the heap-owned form before the
                         // registry consumes the borrowed event — the
                         // Err arm needs a stable, arena-independent
                         // event for the DLQ context.
                         let backup_owned = current.to_owned();
-                        match ctx.registry.call(name, &evaluated_args, current, ctx.arena) {
+                        match ctx.registry.call(name, current, ctx.arena) {
                             Ok(Some(e)) => {
-                                // `arg_repr` (a `Vec<String>` built via
-                                // `Value::to_string`) is only needed
-                                // for the trace label, so it's built
-                                // inside the closure — skipped
-                                // entirely when `out.trace` is `None`
-                                // (the daemon hot path).
                                 out.push_trace(|| TraceEntry {
                                     stage: "process".into(),
-                                    label: if args.is_empty() {
-                                        name.clone()
-                                    } else {
-                                        let arg_repr: Vec<String> =
-                                            evaluated_args.iter().map(|v| v.to_string()).collect();
-                                        format!("{}({})", name, arg_repr.join(", "))
-                                    },
+                                    label: name.clone(),
                                     detail: "ok".into(),
                                 });
                                 current = e;
