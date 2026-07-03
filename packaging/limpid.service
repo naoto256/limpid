@@ -104,8 +104,8 @@ SystemCallFilter=@system-service
 # hardware.
 UMask=0027
 # The control socket is created with explicit 0o660 permissions in
-# control.rs (see crates/limpid/src/control.rs:135,
-# std::fs::set_permissions after bind), so UMask does not affect it.
+# control.rs (ControlServer::run calls set_permissions right after
+# bind), so UMask does not affect it.
 # `StateDirectory=limpid` and `RuntimeDirectory=limpid` above already
 # mount `/var/lib/limpid` and `/var/run/limpid` writable under
 # ProtectSystem=strict, so listing them here would be redundant. Only

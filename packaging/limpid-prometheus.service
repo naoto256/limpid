@@ -19,7 +19,7 @@ RestartSec=5
 # of running as the shared `syslog` account; SupplementaryGroups=syslog
 # is the one thing still needed from that account, since the control
 # socket at /var/run/limpid is group-owned syslog with mode 0o660
-# (crates/limpid/src/control.rs:135) and this process must read it.
+# (set by ControlServer::run in control.rs) and this process must read it.
 DynamicUser=yes
 SupplementaryGroups=syslog
 
