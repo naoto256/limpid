@@ -2,6 +2,8 @@
 
 #[cfg(feature = "journal")]
 pub mod journal;
+#[cfg(feature = "journal")]
+mod journal_sys;
 pub mod otlp;
 pub mod rate_limit;
 pub mod syslog_tcp;

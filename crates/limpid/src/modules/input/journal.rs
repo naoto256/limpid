@@ -4,8 +4,9 @@
 //! `ingress` is one journald entry serialised as a single-line UTF-8
 //! JSON object, shaped to be journalctl-`-o json`-compatible for the
 //! fields libsystemd exposes. Field values match journalctl, but
-//! `__SEQNUM` / `__SEQNUM_ID` (newer journalctl) are not surfaced
-//! because the libsystemd crate doesn't expose them. Key order is
+//! `__SEQNUM` / `__SEQNUM_ID` (newer journalctl) are not surfaced —
+//! this input's `sd_journal_*` FFI binding (`journal_sys`) doesn't
+//! call `sd_journal_get_seqnum`. Key order is
 //! insertion order from libsystemd and is not guaranteed to match
 //! journalctl's output ordering.
 //!
@@ -35,10 +36,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use super::journal_sys::Journal;
 use anyhow::Result;
 use bytes::Bytes;
 use serde_json::{Map as JsonMap, Value as JsonValue};
-use systemd::journal::{Journal, OpenOptions};
 use tracing::{error, info, warn};
 
 use crate::dsl::props;
@@ -271,8 +272,8 @@ fn drain_cursor_acks(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AckPosition>)
 ///   - `__MONOTONIC_TIMESTAMP` — boot-relative microseconds (string)
 ///
 /// `__SEQNUM` / `__SEQNUM_ID` (newer journalctl) are not surfaced —
-/// the systemd-0.10.x crate exposes no equivalent API. Add when
-/// upstream support lands.
+/// `journal_sys` doesn't bind `sd_journal_get_seqnum`. Add if a caller
+/// needs it.
 ///
 /// Key order is not guaranteed to match journalctl; this is a JSON
 /// object so order is a serialisation detail, not a semantic one.
@@ -363,7 +364,7 @@ fn run_journal_reader(
     tx: tokio::sync::mpsc::Sender<(Vec<u8>, String)>,
     shutdown: Arc<AtomicBool>,
 ) {
-    let mut journal = match OpenOptions::default().open() {
+    let mut journal = match Journal::open() {
         Ok(j) => j,
         Err(e) => {
             error!("journal: failed to open: {}", e);
