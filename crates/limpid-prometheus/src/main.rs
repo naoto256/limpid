@@ -41,6 +41,16 @@ use tokio::sync::Semaphore;
 /// scrape gets a fresh attempt instead of waiting behind the old one.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Hard upper bound on how long a single accepted HTTP connection is
+/// allowed to occupy a permit. This is the slowloris backstop — a peer
+/// that opens a TCP connection but never sends a complete request will
+/// otherwise sit in `serve_connection().await` forever, keeping its
+/// permit. Once every permit is held by such an idle peer, all future
+/// scrapes are refused at accept time and the exporter is effectively
+/// wedged. Capping the whole connection recycles the permit even if
+/// the peer never sends anything or leaves the socket half-open.
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Maximum concurrent HTTP connections served at once. Mirrors the
 /// daemon's own control-socket cap (`MAX_CONTROL_CONNECTIONS` in
 /// limpid's control.rs): a scrape endpoint needs one connection per
@@ -48,7 +58,8 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// cap keeps a misbehaving peer (or a slowloris-style dribble of idle
 /// connections) from accumulating unbounded tasks. Excess connections
 /// are closed immediately; the next scrape gets a fresh slot as soon
-/// as an in-flight one finishes.
+/// as an in-flight one finishes — paired with `CONNECTION_TIMEOUT`,
+/// so an idle-forever peer can't perma-hold its slot.
 const MAX_CONCURRENT_CONNECTIONS: usize = 8;
 
 #[derive(Parser)]
@@ -78,12 +89,14 @@ async fn main() {
     eprintln!("limpid-prometheus listening on http://{}", cli.bind);
     eprintln!("  control socket: {:?}", cli.socket);
 
-    serve(listener, cli.socket).await;
+    serve(listener, cli.socket, CONNECTION_TIMEOUT).await;
 }
 
 /// Accept loop, split from `main` so the connection-cap behaviour is
-/// testable against an ephemeral listener.
-async fn serve(listener: TcpListener, socket: PathBuf) {
+/// testable against an ephemeral listener. `connection_timeout` is a
+/// parameter so tests can shrink it without waiting on the real
+/// 15-second bound; production callers pass `CONNECTION_TIMEOUT`.
+async fn serve(listener: TcpListener, socket: PathBuf, connection_timeout: Duration) {
     let conn_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
     loop {
@@ -96,10 +109,11 @@ async fn serve(listener: TcpListener, socket: PathBuf) {
         };
 
         // At the cap: close the connection immediately (drop = RST/FIN)
-        // rather than queueing it. A stalled scrape already has
-        // QUERY_TIMEOUT bounding it, so slots recycle quickly; anything
-        // that keeps all 8 busy is a misbehaving peer, and the honest
-        // fix for the client is to retry the next scrape interval.
+        // rather than queueing it. A stalled scrape has QUERY_TIMEOUT
+        // bounding the control-socket round trip *and* CONNECTION_TIMEOUT
+        // bounding the whole HTTP conversation, so slots recycle within
+        // a bounded window; the honest fix for a client hitting the cap
+        // is to retry the next scrape interval.
         let permit = match Arc::clone(&conn_sem).try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
@@ -119,10 +133,27 @@ async fn serve(listener: TcpListener, socket: PathBuf) {
                 let socket = socket.clone();
                 async move { handle_request(req, &socket).await }
             });
-            if let Err(e) = http1::Builder::new().serve_connection(io, svc).await
-                && !e.is_incomplete_message()
-            {
-                eprintln!("connection error: {}", e);
+            // Wrap the whole `serve_connection` future in a timeout,
+            // not just the request handler. QUERY_TIMEOUT only bounds
+            // the control-socket round trip inside `handle_request`,
+            // so a peer that opens a TCP connection and then never
+            // sends a request header (classic slowloris) would sit
+            // in `serve_connection().await` indefinitely and never
+            // release its permit. Once every permit is held that way,
+            // scrapes accepted at the cap are dropped and the
+            // exporter is wedged from the outside. `CONNECTION_TIMEOUT`
+            // caps the whole conversation so an idle-forever peer
+            // still frees its slot within a bounded window.
+            let conn = http1::Builder::new().serve_connection(io, svc);
+            match tokio::time::timeout(connection_timeout, conn).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) if e.is_incomplete_message() => {}
+                Ok(Err(e)) => eprintln!("connection error: {}", e),
+                Err(_) => {
+                    // Timeout fired. Dropping `conn` shuts the socket
+                    // down and releases the permit at the end of this
+                    // task, which is the recovery signal for the cap.
+                }
             }
         });
     }
@@ -409,7 +440,11 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         // Control socket path deliberately nonexistent — /health would
         // 503, but the idle connections never send a request at all.
-        let server = tokio::spawn(serve(listener, PathBuf::from("/nonexistent/control.sock")));
+        let server = tokio::spawn(serve(
+            listener,
+            PathBuf::from("/nonexistent/control.sock"),
+            CONNECTION_TIMEOUT,
+        ));
 
         // Fill every slot with idle connections. Connect sequentially:
         // the accept loop acquires the permit synchronously right
@@ -435,6 +470,77 @@ mod tests {
 
         server.abort();
         drop(held);
+    }
+
+    #[tokio::test]
+    async fn idle_connections_release_their_permits_after_connection_timeout() {
+        // Regression: without a whole-connection timeout, a slowloris
+        // peer that opens a TCP connection and never sends a request
+        // header would sit inside `serve_connection().await` forever
+        // and hold its permit. Fill every slot with such peers, wait
+        // past the (short) connection timeout, then require that a new
+        // client can grab a slot and receive a valid HTTP response.
+        // Uses a real (short) connection_timeout so real network I/O
+        // and the timeout live in the same clock.
+        use tokio::io::AsyncWriteExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        // 250 ms is long enough that a normal HTTP round trip isn't
+        // race-timed out, short enough that the test finishes in ~1 s.
+        let short_timeout = Duration::from_millis(250);
+        let server = tokio::spawn(serve(listener, sock, short_timeout));
+
+        // Fill every slot with idle connections. Each parked TCP
+        // connection keeps its `serve_connection` future suspended
+        // pre-fix; the timeout must free the slot on the fix side.
+        let mut idle = Vec::new();
+        for _ in 0..MAX_CONCURRENT_CONNECTIONS {
+            idle.push(TcpStream::connect(addr).await.unwrap());
+        }
+
+        // Sanity check the pre-recycle state: one more connection is
+        // accepted at the TCP layer, then immediately closed because
+        // the cap holds. Give the loop a moment to run the drop.
+        {
+            let mut over = TcpStream::connect(addr).await.unwrap();
+            let mut buf = [0u8; 1];
+            let read = tokio::time::timeout(Duration::from_millis(500), over.read(&mut buf)).await;
+            assert!(
+                matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+                "over-cap connection must be closed while permits are held, got {read:?}"
+            );
+        }
+
+        // Wait past the connection timeout so every `serve_connection`
+        // future times out and its permit drops. A small margin over
+        // the timeout absorbs scheduler jitter.
+        tokio::time::sleep(short_timeout + Duration::from_millis(150)).await;
+
+        // Recovery client: after the timeout window, a fresh
+        // connection must reach `handle_request` and see a real HTTP
+        // reply (503 for /health with no daemon on the other end is
+        // fine — the point is we weren't refused at the cap).
+        let mut recovery = TcpStream::connect(addr).await.unwrap();
+        recovery
+            .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .expect("write recovery request");
+        let mut buf = [0u8; 12];
+        let n = tokio::time::timeout(Duration::from_secs(2), recovery.read(&mut buf))
+            .await
+            .expect("recovery response must not block")
+            .expect("recovery response read must succeed");
+        assert!(n > 0, "recovery client must receive HTTP status bytes");
+        assert!(
+            buf[..n].starts_with(b"HTTP/1."),
+            "recovery response must be HTTP, got: {:?}",
+            &buf[..n]
+        );
+
+        server.abort();
+        drop(idle);
     }
 
     #[tokio::test(start_paused = true)]
