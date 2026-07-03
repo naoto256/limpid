@@ -904,10 +904,11 @@ mod tests {
         write_errored_to_dlq(&err_ctx, &metrics, Some(&writer)).await;
 
         // Errored counter is bumped at the caller (worker.metrics);
-        // the helper itself only writes. Verify the JSONL is on
-        // disk. Use the async reader to share tokio's view of the
-        // file — the synchronous std::fs::read can race the async
-        // close on a busier CI scheduler.
+        // the helper itself only writes. Verify the JSONL is on disk.
+        // `ErrorLogWriter::write` now awaits `shutdown()` on the file
+        // handle before returning, so the record is visible by the
+        // time the helper's future resolves — but keep the async
+        // reader for symmetry with the runtime path.
         let contents = tokio::fs::read_to_string(&log_path).await.unwrap();
         assert!(
             contents.contains("simulated runtime error"),

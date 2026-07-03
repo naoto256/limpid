@@ -226,8 +226,8 @@ pub struct ErrorLogWriter {
     /// Serialises concurrent `write()` calls so that records from
     /// different pipeline workers cannot interleave when a single
     /// JSONL line exceeds `PIPE_BUF`. The lock is held only across
-    /// the open + write_all sequence — not around `to_jsonl()` which
-    /// is pure CPU work.
+    /// the open + write_all + shutdown sequence — not around
+    /// `to_jsonl()` which is pure CPU work.
     write_lock: Mutex<()>,
 }
 
@@ -278,6 +278,17 @@ impl ErrorLogWriter {
     /// Append one JSONL record for `ctx`. Errors here are surfaced to
     /// the caller (runtime layer) which counts them in
     /// `events_errored_unwritable` and falls back to tracing.
+    ///
+    /// The trailing `shutdown().await` closes the underlying handle
+    /// synchronously with this future rather than leaving it to
+    /// `Drop`. `tokio::fs::File`'s `Drop` fires the close on the
+    /// blocking pool and returns immediately, so without an explicit
+    /// shutdown a caller that observes `write()` returning `Ok(())` is
+    /// not guaranteed the record is visible to a subsequent open/read
+    /// on another task — the flake this closes surfaced exactly that
+    /// way in CI, where a subsequent `tokio::fs::read_to_string`
+    /// occasionally saw an empty file. Shutdown-then-drop also nudges
+    /// the file toward on-disk durability, which matters for a DLQ.
     pub async fn write(&self, ctx: &ErroredEventContext) -> Result<()> {
         let mut line = ctx.to_jsonl();
         line.push('\n');
@@ -291,6 +302,9 @@ impl ErrorLogWriter {
         f.write_all(line.as_bytes())
             .await
             .with_context(|| format!("error_log: failed to write to {}", self.path.display()))?;
+        f.shutdown()
+            .await
+            .with_context(|| format!("error_log: failed to close {}", self.path.display()))?;
         Ok(())
     }
 }
