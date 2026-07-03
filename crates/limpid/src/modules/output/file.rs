@@ -1113,71 +1113,39 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn apply_file_metadata_survives_outer_future_cancellation() {
-        // Regression pin: `spawn_blocking` isn't cancel-safe, so if a
-        // caller drops `write_payload`'s future mid-await (shutdown
-        // timeout etc.), the blocking task keeps running while the
-        // source `File` gets closed. Before we duped the fd, that
-        // window let the leftover `fchmod`/`fchown` land on an
-        // unrelated inode when the kernel reused the fd number. Pin
-        // that even under aggressive cancellation the mode still
-        // lands on the file we wrote to — or, if the future was
-        // dropped before `apply_file_metadata_to_fd` even ran, no
-        // stray metadata escapes.
-        use std::os::unix::fs::PermissionsExt;
+    async fn dropping_never_polled_write_payload_leaves_no_side_effects() {
+        // Narrow regression pin: constructing `write_payload`'s future
+        // and dropping it without ever polling must not touch the
+        // filesystem. This is not the same shape as "future was polled,
+        // reached apply_file_metadata_to_fd, then got cancelled" — Rust
+        // async futures are lazy, so a never-polled future runs no
+        // code. Verifying the mid-await cancellation shape would need
+        // a test-only barrier inside `write_payload` to hold the future
+        // at a known suspension point; the fd-lifetime argument for the
+        // cancel-safe path lives in the module-level comment and in
+        // this commit's message. What this test *does* pin is that
+        // wiring the payload alone has no observable side effect, so a
+        // caller that speculatively builds a write and then abandons it
+        // doesn't leak file/state.
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("cancel.log");
+        let path = dir.path().join("never_polled.log");
 
-        let out = std::sync::Arc::new(make_output_with(
+        let out = make_output_with(
             ek(ExprKind::StringLit(path.display().to_string())),
             Some(0o600),
-        ));
-
-        // Kick off write_payload but drop the future immediately.
-        // Whatever happens under the covers, the outcome must be
-        // either "no file exists" or "file has mode 0o600" — never a
-        // different inode carrying our chmod.
-        let out2 = out.clone();
-        let path_str = path.display().to_string();
-        let fut = out2.write_payload(FilePayload {
-            egress: Bytes::from("cancelled"),
-            path: path_str,
+        );
+        let fut = out.write_payload(FilePayload {
+            egress: Bytes::from("never"),
+            path: path.display().to_string(),
             is_dynamic: false,
         });
         drop(fut);
 
-        // Yield a couple of times so any spawned blocking work runs.
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        if let Ok(meta) = std::fs::metadata(&path) {
-            let mode = meta.permissions().mode() & 0o777;
-            assert_eq!(
-                mode, 0o600,
-                "if the file exists after cancellation, its mode must be the one we asked for"
-            );
-        }
-        // If the file doesn't exist yet, we cancelled early enough
-        // that write never landed — also fine.
-
-        // And a follow-up "normal" write must still apply mode as
-        // expected, i.e. the previous cancellation didn't corrupt the
-        // metadata state.
-        let path2 = dir.path().join("normal.log");
-        make_output_with(
-            ek(ExprKind::StringLit(path2.display().to_string())),
-            Some(0o640),
-        )
-        .write_payload(FilePayload {
-            egress: Bytes::from("ok"),
-            path: path2.display().to_string(),
-            is_dynamic: false,
-        })
-        .await
-        .expect("normal follow-up write must succeed");
-        let mode2 = std::fs::metadata(&path2).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode2, 0o640);
+        // Nothing was polled, so no `open` happened. The file must not
+        // exist and no other state must have changed.
+        assert!(
+            !path.exists(),
+            "never-polled write_payload future must not create the target file"
+        );
     }
 }
