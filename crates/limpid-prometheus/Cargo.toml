@@ -44,4 +44,13 @@ assets = [
     ["target/release/limpid-prometheus", "usr/bin/", "755"],
     ["../../packaging/limpid-prometheus.default", "etc/default/limpid-prometheus", "644"],
 ]
-systemd-units = { unit-name = "limpid-prometheus", unit-scripts = "../../packaging" }
+# start = false mirrors limpid.service. Without it, cargo-deb's
+# dh_installsystemd port defaults `start` to true and would start the
+# exporter on install — and since limpid-prometheus.service declares
+# `Requires=limpid.service`, that would pull limpid.service up too,
+# defeating the deliberate `start = false` on the daemon (which exists
+# so a `#DEBHELPER#` start can't collide with rsyslog/syslog-ng still
+# holding the syslog ports on upgrade). enable = true (the default,
+# stated for parity with limpid) leaves the exporter to start with the
+# daemon on the next boot / explicit `systemctl start`.
+systemd-units = { unit-name = "limpid-prometheus", unit-scripts = "../../packaging", enable = true, start = false }
