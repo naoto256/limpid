@@ -430,4 +430,171 @@ mod tests {
                 .unwrap_or_else(|e| panic!("line {} is not valid JSON: {}\nline: {}", i, e, line));
         }
     }
+
+    // -----------------------------------------------------------------
+    // to_jsonl wire-format tests
+    // -----------------------------------------------------------------
+    //
+    // The JSONL shape (schema_version = 2, `Process`/`Output` sum
+    // discriminants, forbidden routing fields on Output, event sub-object
+    // replayable through `Event::from_json`) is `error_log`'s to own —
+    // that contract is what `limpidctl inject --json` and any downstream
+    // DLQ tooling read against. Keep the wire-shape assertions here even
+    // though `ErroredEventContext` and `to_jsonl` are constructed and
+    // called out of `crate::pipeline`.
+
+    fn sample_owned_event() -> crate::event::OwnedEvent {
+        use std::net::SocketAddr;
+        let mut ev = crate::event::OwnedEvent::new(
+            Bytes::from_static(b"hello"),
+            "10.0.0.1:514".parse::<SocketAddr>().unwrap(),
+        );
+        ev.egress = Bytes::from_static(b"goodbye");
+        ev
+    }
+
+    #[test]
+    fn process_variant_jsonl_has_no_egress_no_output_block() {
+        let ctx = ErroredEventContext::Process {
+            timestamp: chrono::DateTime::from_timestamp_nanos(1_700_000_000_000_000_000),
+            pipeline: "p".into(),
+            site: "wrap".into(),
+            reason: "boom".into(),
+            event: crate::pipeline::ProcessEvent::from_owned(&sample_owned_event()),
+        };
+        let line = ctx.to_jsonl();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["schema_version"], 2);
+        assert_eq!(v["kind"], "process");
+        assert_eq!(v["pipeline"], "p");
+        assert_eq!(v["reason"], "boom");
+        assert_eq!(v["process"]["name"], "wrap");
+        assert!(v["output"].is_null(), "Process must not carry output block");
+        assert_eq!(v["event"]["ingress"], "hello");
+        assert!(
+            v["event"]["egress"].is_null(),
+            "Process event must omit egress"
+        );
+        assert!(v["event"]["workspace"].is_null());
+    }
+
+    #[test]
+    fn output_variant_jsonl_carries_egress_and_output_block() {
+        let ctx = ErroredEventContext::Output {
+            timestamp: chrono::DateTime::from_timestamp_nanos(1_700_000_000_000_000_000),
+            pipeline: String::new(),
+            site: "sink enqueue".into(),
+            reason: "queue closed".into(),
+            output_name: "sink".into(),
+            event: crate::pipeline::OutputEvent::from_owned(&sample_owned_event()),
+        };
+        let line = ctx.to_jsonl();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["schema_version"], 2);
+        assert_eq!(v["kind"], "output");
+        assert_eq!(v["pipeline"], "");
+        assert_eq!(v["output"]["name"], "sink");
+        assert!(
+            v["process"].is_null(),
+            "Output must not carry process block"
+        );
+        assert_eq!(v["event"]["ingress"], "hello");
+        assert_eq!(v["event"]["egress"], "goodbye");
+        assert!(v["event"]["workspace"].is_null());
+    }
+
+    #[test]
+    fn output_variant_jsonl_must_not_carry_sink_routing_metadata() {
+        // Pin the DLQ no-address contract: the Output record carries
+        // ONLY `{ name }`. No address, dest, path, key, topic,
+        // partition, endpoint, url, peer, target, or workspace at any
+        // level.
+        let ctx = ErroredEventContext::Output {
+            timestamp: chrono::Utc::now(),
+            pipeline: "p".into(),
+            site: "sink".into(),
+            reason: "retry exhausted".into(),
+            output_name: "sink".into(),
+            event: crate::pipeline::OutputEvent::from_owned(&sample_owned_event()),
+        };
+        let line = ctx.to_jsonl();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let forbidden = [
+            "address",
+            "dest",
+            "path",
+            "key",
+            "topic",
+            "partition",
+            "endpoint",
+            "url",
+            "peer",
+            "target",
+            "workspace",
+        ];
+        for f in forbidden {
+            assert!(
+                v.get(f).is_none(),
+                "top-level must not carry forbidden field {}",
+                f
+            );
+            assert!(
+                v["output"].get(f).is_none(),
+                "output block must not carry forbidden field {}",
+                f
+            );
+            assert!(
+                v["event"].get(f).is_none(),
+                "event block must not carry forbidden field {}",
+                f
+            );
+        }
+        // output block must have *only* `name`.
+        let obj = v["output"].as_object().expect("output is an object");
+        assert_eq!(obj.len(), 1, "output block must carry only `name`");
+        assert!(obj.contains_key("name"));
+    }
+
+    #[test]
+    fn output_variant_round_trip_via_event_from_json() {
+        // The Output event sub-object must be replayable through
+        // `Event::from_json` so `limpidctl inject output --json` can
+        // reconstruct the egress payload end-to-end.
+        let ctx = ErroredEventContext::Output {
+            timestamp: chrono::Utc::now(),
+            pipeline: String::new(),
+            site: "sink enqueue".into(),
+            reason: "queue closed".into(),
+            output_name: "sink".into(),
+            event: crate::pipeline::OutputEvent::from_owned(&sample_owned_event()),
+        };
+        let line = ctx.to_jsonl();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let event_str = serde_json::to_string(&v["event"]).unwrap();
+        let replayed =
+            crate::event::Event::from_json(&event_str).expect("event sub-object must replay");
+        assert_eq!(&replayed.ingress[..], b"hello");
+        assert_eq!(&replayed.egress[..], b"goodbye");
+    }
+
+    #[test]
+    fn process_variant_round_trip_via_event_from_json() {
+        let ctx = ErroredEventContext::Process {
+            timestamp: chrono::Utc::now(),
+            pipeline: "p".into(),
+            site: "wrap".into(),
+            reason: "boom".into(),
+            event: crate::pipeline::ProcessEvent::from_owned(&sample_owned_event()),
+        };
+        let line = ctx.to_jsonl();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let event_str = serde_json::to_string(&v["event"]).unwrap();
+        let replayed =
+            crate::event::Event::from_json(&event_str).expect("event sub-object must replay");
+        // Process events omit egress on the wire — Event::from_json
+        // backfills egress from ingress so replay through `inject input`
+        // sees a self-consistent starting state.
+        assert_eq!(&replayed.ingress[..], b"hello");
+        assert_eq!(&replayed.egress[..], b"hello");
+    }
 }
