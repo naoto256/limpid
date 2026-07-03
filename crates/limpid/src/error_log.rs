@@ -289,13 +289,30 @@ impl ErrorLogWriter {
     /// way in CI, where a subsequent `tokio::fs::read_to_string`
     /// occasionally saw an empty file. Shutdown-then-drop also nudges
     /// the file toward on-disk durability, which matters for a DLQ.
+    ///
+    /// The DLQ record carries the failed event's `ingress` / `egress`
+    /// verbatim (UTF-8 payloads land as plain text, not base64), so a
+    /// line that happened to contain a secret or PII is written through
+    /// unchanged. Create the file `0o600` on Unix so it is not
+    /// world-readable when the daemon runs under a permissive umask —
+    /// the `file` output already exposes a `mode` knob for the same
+    /// reason, and the DLQ (which operators don't opt into per-record)
+    /// should default at least as tight.
     pub async fn write(&self, ctx: &ErroredEventContext) -> Result<()> {
         let mut line = ctx.to_jsonl();
         line.push('\n');
         let _guard = self.write_lock.lock().await;
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Only applied when this open creates the file; an existing
+            // DLQ file keeps whatever mode it already has (operators can
+            // tighten a pre-existing file themselves).
+            opts.mode(0o600);
+        }
+        let mut f = opts
             .open(&self.path)
             .await
             .with_context(|| format!("error_log: failed to open {}", self.path.display()))?;
@@ -363,6 +380,21 @@ mod tests {
             assert!(event.get("egress").is_none());
             assert!(event.get("workspace").is_none());
         }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn dlq_file_is_created_owner_only() {
+        // The DLQ can carry secrets from a failed event's payload, so
+        // a file this writer creates must not be world/group-readable
+        // regardless of the daemon's umask.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("errored.jsonl");
+        let w = ErrorLogWriter::new(path.clone());
+        w.write(&ctx()).await.unwrap();
+        let mode = tokio::fs::metadata(&path).await.unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "DLQ file must be created 0o600, got {mode:o}");
     }
 
     #[tokio::test]
