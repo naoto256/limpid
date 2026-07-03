@@ -56,7 +56,6 @@ bumpalo = { version = "3", features = ["collections"] }
 # typical OCSF / syslog field values (`"INFO"`, `"sshd"`, IPv4
 # strings, …) sit comfortably under the inline budget.
 compact_str = { version = "0.9", features = ["serde"] }
-systemd = { version = "0.10", optional = true }
 rdkafka = { version = "0.36", features = ["cmake-build", "ssl", "sasl"], optional = true }
 
 # OTLP (OpenTelemetry Protocol). Pre-generated message types from the
@@ -76,8 +75,17 @@ axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 
 [features]
-journal = ["dep:systemd"]
+# No `dep:` gate — the journal reader is a hand-written FFI binding
+# inside this crate (src/modules/input/journal_sys.rs), not an
+# optional dependency. `build.rs` links libsystemd via pkg-config only
+# when this feature is enabled.
+journal = []
 kafka = ["dep:rdkafka"]
+
+[build-dependencies]
+# Locates libsystemd (`libsystemd-dev`) via pkg-config when the
+# `journal` feature is enabled. See build.rs.
+pkg-config = "0.3"
 
 [dev-dependencies]
 rcgen = "0.13"
