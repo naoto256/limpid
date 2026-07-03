@@ -65,7 +65,9 @@ ProtectHome=yes
 #     [Service]
 #     PrivateDevices=no
 # (/dev/log is also commonly a symlink on the host, which the
-# unix_socket input refuses to bind over — remove it first if present.)
+# unix_socket input refuses to remove a symlink at its target and
+# fails to start, so bind is never reached — remove the symlink first
+# if present.)
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes

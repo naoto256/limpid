@@ -160,7 +160,7 @@ If you configure a `unix_socket` input at `/dev/log` as a syslog(3) replacement,
 PrivateDevices=no
 ```
 
-(`/dev/log` is also commonly a symlink on the host; the `unix_socket` input refuses to bind over one, so remove it first if present.)
+(`/dev/log` is also commonly a symlink on the host; the `unix_socket` input refuses to remove a symlink at its target and fails to start, so remove the symlink first if present.)
 
 Then reload systemd:
 
