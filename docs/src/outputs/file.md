@@ -81,15 +81,17 @@ Path interpolation goes through three safety passes that together make directory
 >
 > Dots are NOT stripped — interpolations contributing to FQDN-style filenames work as expected (`${source.ip}.log` for `10.0.0.1` produces `10.0.0.1.log`).
 
-**Pass 2 — `..` traversal strip on the fully-rendered path.** After all interpolations resolve and the literal+interpolation parts are joined into a single path string, every `../` sequence is removed (iterated to a fixpoint), a trailing `/..` is stripped, and a result of exactly `..` is emptied. Since Pass 1 already normalises slashes inside each interpolation, no single value can introduce a `..` segment of its own, but cross-literal patterns are still handled:
+**Pass 2 — `..` traversal reject on the fully-rendered path.** After all interpolations resolve and the literal+interpolation parts are joined into a single path string, the result is split on `/` and any exact `..` component fails the write with a loud error. Silently rewriting `..` would quietly redirect writes to a different file, so per Principle 1 (zero hidden behaviour) it is refused rather than stripped. Since Pass 1 already normalises slashes inside each interpolation, no single value can introduce a `..` segment of its own; this pass is the cross-literal catch:
 
 ```
-path "/var/log/../x.log"   // → Pass 2 strips "../" → "/var/log/x.log"
+path "/var/log/../x.log"   // → Pass 2 rejects: `..` traversal component
 ```
 
-**Pass 3 — empty-path reject.** If Pass 2 collapsed the entire rendered path to `""`, error explicitly. Trailing-slash and directory-target cases are left to the OS — `EISDIR` / `ENOTDIR` give the same diagnostic surface either way.
+Unusual but harmless dirnames like `...` or `..foo` pass through — only the exact `..` token in any path position is rejected.
 
-The three passes together guarantee that the final write path stays within the directory tree the operator declared in the template, with a non-empty filename component, regardless of what arrives on the wire.
+**Pass 3 — trailing-slash and empty-result reject.** A rendered path that ends in `/` (directory reference, not a file) or collapses to `""` fails with an explicit error rather than deferring to the OS. Both shapes almost always reflect a misconfigured template — leaving them to surface as `EISDIR` at write time buries the real cause under a low-level syscall error.
+
+The three passes together guarantee that the final write path stays within the directory tree the operator declared in the template, has a non-empty filename component, and never terminates in a directory reference — regardless of what arrives on the wire.
 
 Parent directories are created automatically.
 
