@@ -69,12 +69,20 @@ impl StdoutOutput {
     /// non-UTF-8 payload bytes with U+FFFD (`\xEF\xBF\xBD`) — a
     /// silent corruption on a security telemetry pipeline that can
     /// carry binary payloads.
+    ///
+    /// Payload bytes and the trailing `\n` are concatenated into a
+    /// single buffer and written with one `write_all` call. This
+    /// does NOT make the frame atomic — `write_all` internally loops
+    /// over `write(2)` and can still leave partial bytes if the
+    /// underlying writer errors mid-frame — but it removes the
+    /// second `write_all` boundary that could silently succeed
+    /// on the payload and then fail on the delimiter, leaving an
+    /// unterminated line that a retry would double.
     fn write_event(&self, event: &Event) -> Result<()> {
         use std::io::Write;
+        let buf = super::frame_with_newline(&event.egress);
         let mut out = std::io::stdout().lock();
-        out.write_all(&event.egress)
-            .and_then(|()| out.write_all(b"\n"))
-            .context("stdout write failed")?;
+        out.write_all(&buf).context("stdout write failed")?;
         Ok(())
     }
 }

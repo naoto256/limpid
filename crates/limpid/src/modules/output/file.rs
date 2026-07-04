@@ -524,8 +524,21 @@ impl FileOutput {
         // "one line == the event's egress bytes plus a newline", and
         // silent U+FFFD substitution breaks both replay fidelity and
         // downstream forensic hashing.
-        file.write_all(&payload.egress).await?;
-        file.write_all(b"\n").await?;
+        //
+        // Payload bytes and the trailing `\n` are concatenated into a
+        // single buffer and handed to one `write_all` call rather
+        // than two back-to-back `write_all`s. `write_all` still
+        // loops over `write(2)` internally so this does NOT make the
+        // frame atomic, but the split-call shape had a distinct
+        // failure mode: the payload write could return `Ok(())` and
+        // the delimiter write could then error (I/O error, EAGAIN
+        // budget exhausted, closed pipe), leaving an unterminated
+        // line that the retry / DLQ path would follow with a full
+        // frame — duplication instead of the intended "one line per
+        // event". Fusing to one buffer removes that specific
+        // between-writes error boundary.
+        let buf = super::frame_with_newline(&payload.egress);
+        file.write_all(&buf).await?;
         // Push the buffered bytes through tokio's fs::File to the OS
         // before we return "written". Without this, the data may still
         // sit in tokio's per-file buffer at drop time — Drop closes the
