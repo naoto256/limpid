@@ -552,10 +552,18 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                     // shutdown that fires *during* the sleep would
                     // otherwise be stuck until the sleep elapses
                     // (5s+ in practice, longer than the runtime
-                    // shutdown budget). `shutdown_notify.notify_waiters`
-                    // is called by `shutdown()`, so the sleep arm
-                    // here wakes immediately and the next iteration
-                    // sees `is_shutting_down=true` and breaks.
+                    // shutdown budget).
+                    //
+                    // Use `wait_until_shutdown()` (not a bare
+                    // `shutdown_notify.notified()`) so the lost-wake
+                    // window is closed: `shutdown()` first sets
+                    // `is_shutting_down` and *then* calls
+                    // `notify_waiters`. A raw `notified()` registered
+                    // between those two steps would miss the wake and
+                    // sleep the full backoff; `wait_until_shutdown`
+                    // does the load-notified-recheck dance so either
+                    // ordering wakes it. See `wait_until_shutdown`'s
+                    // docs for the argument.
                     //
                     // NOT `flush_notify`: a threshold-driven flush wake
                     // arriving mid-backoff would otherwise cut the
@@ -566,7 +574,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                     // is allowed to short-circuit it.
                     tokio::select! {
                         _ = tokio::time::sleep(wait) => {}
-                        _ = self.shutdown_notify.notified() => {}
+                        _ = self.wait_until_shutdown() => {}
                     }
                     wait = self.retry.next_wait(wait);
                 }
