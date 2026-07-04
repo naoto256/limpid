@@ -57,17 +57,24 @@ impl HasMetrics for StdoutOutput {
 impl StdoutOutput {
     /// Pure write step — extracted so `consume` can drive the retry
     /// loop without duplicating the print. Goes through
-    /// `io::stdout().lock()` + `writeln!` rather than the `println!`
-    /// macro: `println!` panics on a broken pipe (the canonical case
-    /// is `limpid | head` where `head` exits before draining stdout),
-    /// which would tear down the daemon mid-run. The locked-write
-    /// path surfaces the I/O error here instead so the retry / DLQ
-    /// path in `consume` decides the disposition.
+    /// `io::stdout().lock()` + `write_all` rather than the
+    /// `println!` macro: `println!` panics on a broken pipe (the
+    /// canonical case is `limpid | head` where `head` exits before
+    /// draining stdout), which would tear down the daemon mid-run.
+    /// The locked-write path surfaces the I/O error here instead so
+    /// the retry / DLQ path in `consume` decides the disposition.
+    ///
+    /// The bytes are written verbatim; using `writeln!` on a lossy
+    /// `String::from_utf8_lossy` view would silently replace
+    /// non-UTF-8 payload bytes with U+FFFD (`\xEF\xBF\xBD`) — a
+    /// silent corruption on a security telemetry pipeline that can
+    /// carry binary payloads.
     fn write_event(&self, event: &Event) -> Result<()> {
         use std::io::Write;
-        let msg = String::from_utf8_lossy(&event.egress);
         let mut out = std::io::stdout().lock();
-        writeln!(out, "{}", msg).context("stdout write failed")?;
+        out.write_all(&event.egress)
+            .and_then(|()| out.write_all(b"\n"))
+            .context("stdout write failed")?;
         Ok(())
     }
 }

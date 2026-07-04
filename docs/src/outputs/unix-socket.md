@@ -19,6 +19,7 @@ def output local_forward {
 
 ## Notes
 
+- Each frame is the `egress` bytes verbatim followed by a `\n`. Non-UTF-8 payloads are written unchanged rather than lossily normalised to U+FFFD, so binary payloads round-trip to the peer without silent corruption.
 - Connection is established on first use and reused.
 - Automatically reconnects if the connection breaks.
 - Common queue / retry properties — see [Queue and retry](./README.md#queue-and-retry).

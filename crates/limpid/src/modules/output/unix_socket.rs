@@ -202,8 +202,12 @@ impl PersistentConn for UnixSocketOutput {
     }
 
     async fn write_frame(&self, stream: &mut UnixStream, payload: &Bytes) -> Result<()> {
-        let msg = String::from_utf8_lossy(payload);
-        stream.write_all(msg.as_bytes()).await?;
+        // Write the payload verbatim. `String::from_utf8_lossy`
+        // would silently replace non-UTF-8 bytes with U+FFFD
+        // (`\xEF\xBF\xBD`), which is exactly the wrong default for
+        // a security telemetry pipeline shipping opaque payloads
+        // to a local collector.
+        stream.write_all(payload).await?;
         stream.write_all(b"\n").await?;
         stream.flush().await?;
         Ok(())
