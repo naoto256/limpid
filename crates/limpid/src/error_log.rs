@@ -59,11 +59,16 @@
 //! `SIGHUP`-handled file-handle reset. The open itself is a two-branch
 //! contract: `create_new(true)` (`O_CREAT|O_EXCL`) with `O_NOFOLLOW`
 //! and `mode(0o600)` for the fresh-inode path, falling back to a
-//! non-create `O_NOFOLLOW` open plus an `fstat` mode-verify on the
-//! `AlreadyExists` branch. Symlinks are refused via `O_NOFOLLOW`; an
-//! existing DLQ file whose mode isn't exactly `0o600` is refused
-//! with a loud error rather than silently appending a leak-prone
-//! record. See `ErrorLogWriter::write` for the invariants.
+//! non-create `O_NOFOLLOW | O_NONBLOCK` open plus an `fstat`
+//! `S_ISREG` + mode verify on the `AlreadyExists` branch. Symlinks
+//! are refused via `O_NOFOLLOW`; a FIFO at the DLQ path with no
+//! reader is refused fast via `O_NONBLOCK` returning `ENXIO`, and
+//! any other non-regular shape (FIFO with a reader, socket,
+//! directory, device node) is refused by the `S_ISREG` fstat before
+//! any bytes are written. An existing DLQ file whose mode isn't
+//! exactly `0o600` is refused with a loud error rather than silently
+//! appending a leak-prone record. See `ErrorLogWriter::write` for the
+//! invariants.
 //!
 //! Concurrency note: multiple pipeline workers may call `write()`
 //! concurrently when several pipelines hit a process error in the
@@ -251,18 +256,24 @@ impl ErrorLogWriter {
     /// Checks:
     /// - The parent directory exists and is a directory.
     /// - If the DLQ file already exists on disk (leftover from a
-    ///   prior run, logrotate output, or an operator tool), it is
-    ///   not a symlink and its mode is exactly `0o600`. The runtime
-    ///   `write` path refuses both conditions loudly, so an operator
-    ///   whose fresh deployment inherits a `0o644` file or a symlink
-    ///   would otherwise discover the mismatch only at the first
-    ///   real failure — after the pipeline has already lost the
+    ///   prior run, logrotate output, or an operator tool), it is a
+    ///   regular file (not a symlink, FIFO, socket, directory, or
+    ///   device node) and its mode is exactly `0o600`. The runtime
+    ///   `write` path refuses each of these loudly, so an operator
+    ///   whose fresh deployment inherits a `0o644` file, a symlink,
+    ///   or a mistyped path pointing at some other node type would
+    ///   otherwise discover the mismatch only at the first real
+    ///   failure — after the pipeline has already lost the
     ///   observability on that record. Surface it at startup so the
-    ///   fix (remove or `chmod` the file) happens before any events
-    ///   flow.
+    ///   fix (remove or `chmod` the file, remove the wrong node)
+    ///   happens before any events flow.
     ///
     /// The file itself does not need to exist; the runtime write
     /// path materialises it on the first failure with `mode(0o600)`.
+    /// This function is called only from the daemon startup path
+    /// (`Runtime::start`), not from `--check` — configuration
+    /// validation must not touch the filesystem beyond the read-only
+    /// stat performed here.
     pub async fn validate_at_startup(&self) -> Result<()> {
         let parent = self.path.parent().ok_or_else(|| {
             anyhow::anyhow!(
@@ -288,36 +299,68 @@ impl ErrorLogWriter {
             );
         }
 
-        // If the DLQ file already exists on disk, refuse a symlink
-        // and refuse a mode other than 0o600 at startup so operators
-        // see the same contract failure they would hit at first
-        // write, but *before* any events reach a failure site.
-        // `symlink_metadata` inspects the link itself rather than
-        // following it, so we can distinguish symlink from regular
-        // file.
+        // If the DLQ file already exists on disk, refuse anything that
+        // isn't a regular 0o600 file. The runtime `write` path applies
+        // the same contract (`O_NOFOLLOW`, fstat `S_ISREG`, mode
+        // check), so an operator whose deployment inherited a
+        // symlink, a FIFO, a socket, a directory, or a 0o644 leftover
+        // would otherwise discover the mismatch only at the first
+        // real failure — after the pipeline has already lost the
+        // observability on that record. Surface it at startup so the
+        // fix (remove or `chmod` the file, replace the node) happens
+        // before any events flow. `symlink_metadata` inspects the
+        // link itself rather than following it, so we can name the
+        // symlink case explicitly instead of returning an `ELOOP`
+        // wrapped in a stat error.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
+            use std::os::unix::fs::{FileTypeExt, PermissionsExt};
             match tokio::fs::symlink_metadata(&self.path).await {
                 Ok(meta) => {
-                    if meta.file_type().is_symlink() {
+                    let ft = meta.file_type();
+                    if ft.is_symlink() {
                         anyhow::bail!(
                             "error_log: '{}' is a symlink; the runtime refuses to follow it. \
                              Remove the symlink before starting the daemon.",
                             self.path.display()
                         );
                     }
-                    if meta.is_file() {
-                        let actual = meta.permissions().mode() & 0o7777;
-                        if actual != 0o600 {
-                            anyhow::bail!(
-                                "error_log: existing file '{}' has mode 0o{:o}, but the DLQ \
-                                 writer requires exactly 0o600. `chmod 0600 <path>` or remove \
-                                 the file so the runtime recreates it.",
-                                self.path.display(),
-                                actual
-                            );
-                        }
+                    if !ft.is_file() {
+                        // Any non-regular, non-symlink node: FIFO,
+                        // socket, directory, block or character
+                        // device. The write-path fstat would refuse
+                        // this too, but the startup refusal names the
+                        // offending shape directly.
+                        let shape = if ft.is_dir() {
+                            "directory"
+                        } else if ft.is_fifo() {
+                            "FIFO"
+                        } else if ft.is_socket() {
+                            "socket"
+                        } else if ft.is_block_device() {
+                            "block device"
+                        } else if ft.is_char_device() {
+                            "character device"
+                        } else {
+                            "non-regular file"
+                        };
+                        anyhow::bail!(
+                            "error_log: '{}' is a {} rather than a regular file; the runtime \
+                             refuses to write through it. Remove or move the node before \
+                             starting the daemon.",
+                            self.path.display(),
+                            shape
+                        );
+                    }
+                    let actual = meta.permissions().mode() & 0o7777;
+                    if actual != 0o600 {
+                        anyhow::bail!(
+                            "error_log: existing file '{}' has mode 0o{:o}, but the DLQ \
+                             writer requires exactly 0o600. `chmod 0600 <path>` or remove \
+                             the file so the runtime recreates it.",
+                            self.path.display(),
+                            actual
+                        );
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -400,18 +443,29 @@ impl ErrorLogWriter {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 // Fallback: open the existing inode non-create with
-                // O_NOFOLLOW, then fstat-verify the mode. Any mismatch
-                // — including `0o644` from an umask-created leftover,
-                // or an unexpected setuid bit — refuses the write.
+                // O_NOFOLLOW | O_NONBLOCK, then fstat-verify it is a
+                // regular file with mode `0o600`. O_NONBLOCK stops a
+                // FIFO-with-no-reader at the DLQ path from blocking
+                // the writer indefinitely; on the failure side the
+                // `verify_existing_mode` fstat catches the FIFO / any
+                // non-regular node before we would append anything.
                 let mut existing_opts = OpenOptions::new();
                 existing_opts.write(true).append(true);
                 #[cfg(unix)]
-                existing_opts.custom_flags(libc::O_NOFOLLOW);
+                existing_opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
                 let f = existing_opts.open(&self.path).await.map_err(|e| {
                     #[cfg(unix)]
                     if e.raw_os_error() == Some(libc::ELOOP) {
                         return anyhow::anyhow!(
                             "refusing to follow symlink at error_log path: {}",
+                            self.path.display()
+                        );
+                    }
+                    #[cfg(unix)]
+                    if e.raw_os_error() == Some(libc::ENXIO) {
+                        return anyhow::anyhow!(
+                            "refusing to write to non-regular file at error_log path (looks \
+                             like a FIFO with no reader): {}",
                             self.path.display()
                         );
                     }
@@ -443,11 +497,17 @@ impl ErrorLogWriter {
         Ok(())
     }
 
-    /// Verify that an existing DLQ file's on-disk mode is exactly
-    /// `0o600`. Called only on the `AlreadyExists` branch of the
-    /// write path — we did not create the inode, and the operator or
-    /// logrotate may have left a file whose mode is different from
-    /// what the DLQ is supposed to guarantee.
+    /// Verify that an existing DLQ file is a regular file with on-disk
+    /// mode exactly `0o600`. Called only on the `AlreadyExists` branch
+    /// of the write path — we did not create the inode, and the
+    /// operator or logrotate may have left a file whose type or mode
+    /// is different from what the DLQ is supposed to guarantee.
+    ///
+    /// The `S_ISREG` check is not defensive — an operator typo that
+    /// pointed `error_log` at a FIFO, socket, directory, or device
+    /// node would otherwise let this writer append records into a
+    /// stream the operator didn't intend to be one. The mode check
+    /// alone doesn't catch that shape mismatch (a FIFO can be `0o600`).
     ///
     /// Uses `dup(2)` + `spawn_blocking` so the `fstat` runs against a
     /// fd that stays live for the duration of the syscall even if the
@@ -481,6 +541,15 @@ impl ErrorLogWriter {
             if rc != 0 {
                 let err = std::io::Error::last_os_error();
                 anyhow::bail!("error_log '{}': fstat failed: {}", path.display(), err);
+            }
+            if (stat.st_mode as u32 & libc::S_IFMT as u32) != libc::S_IFREG as u32 {
+                anyhow::bail!(
+                    "error_log '{}': existing path is not a regular file (st_mode & S_IFMT = \
+                     0o{:o}); refusing to write. Remove the node or point `error_log` at a real \
+                     file.",
+                    path.display(),
+                    (stat.st_mode as u32) & libc::S_IFMT as u32
+                );
             }
             let actual = (stat.st_mode as u32) & 0o7777;
             if actual != 0o600 {
@@ -638,6 +707,38 @@ mod tests {
         // A file at the correct mode must pass.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         w.validate_at_startup().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn validate_at_startup_refuses_fifo_at_dlq_path() {
+        // A stale FIFO left at the DLQ path — from a debugging
+        // session, an operator typo, or a leftover from another
+        // daemon — must be refused. The FIFO can be 0o600 and would
+        // pass the mode check alone; only the S_ISREG shape check
+        // catches it.
+        use std::ffi::CString;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("errored.jsonl");
+        let c_path = CString::new(path.as_os_str().to_str().unwrap()).unwrap();
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        let w = ErrorLogWriter::new(path.clone());
+        let err = w.validate_at_startup().await.unwrap_err().to_string();
+        assert!(err.contains("FIFO"), "got: {}", err);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn validate_at_startup_refuses_directory_at_dlq_path() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("errored.jsonl");
+        std::fs::create_dir(&path).unwrap();
+
+        let w = ErrorLogWriter::new(path.clone());
+        let err = w.validate_at_startup().await.unwrap_err().to_string();
+        assert!(err.contains("directory"), "got: {}", err);
     }
 
     #[tokio::test]

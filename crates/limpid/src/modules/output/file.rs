@@ -463,10 +463,20 @@ impl FileOutput {
                 f
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // O_NONBLOCK on the existing-open covers the FIFO case:
+                // a plain `open(2)` write-only on a FIFO blocks until a
+                // reader appears, which would stall the entire consume
+                // path against an operator's typo (`/tmp/mylog` was a
+                // named pipe). With O_NONBLOCK, opening a FIFO write-
+                // only without a reader fails fast with `ENXIO`; with a
+                // reader, the open succeeds and the subsequent
+                // `verify_fd_is_regular_file` refuses on `S_ISFIFO`.
+                // For regular files (the only shape we accept downstream)
+                // O_NONBLOCK is a no-op on write.
                 let mut existing_options = OpenOptions::new();
                 existing_options.write(true).append(true);
                 #[cfg(unix)]
-                existing_options.custom_flags(libc::O_NOFOLLOW);
+                existing_options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
                 let f = existing_options.open(&path).await.map_err(|e| {
                     #[cfg(unix)]
                     if e.raw_os_error() == Some(libc::ELOOP) {
@@ -475,8 +485,23 @@ impl FileOutput {
                             resolved
                         );
                     }
+                    #[cfg(unix)]
+                    if e.raw_os_error() == Some(libc::ENXIO) {
+                        return anyhow::anyhow!(
+                            "refusing to write to non-regular file at output path (looks like a \
+                             FIFO with no reader): {}",
+                            resolved
+                        );
+                    }
                     anyhow::Error::from(e)
                 })?;
+                // S_ISREG contract: we only ever write to regular files.
+                // A FIFO / socket / directory / block or character
+                // device at the output path would silently redirect the
+                // stream elsewhere. Refuse before the first payload
+                // byte.
+                #[cfg(unix)]
+                Self::verify_fd_is_regular_file(&f, &path).await?;
                 if requires_metadata {
                     self.verify_existing_file_metadata(&f, &path).await?;
                 }
@@ -875,6 +900,64 @@ impl FileOutput {
     fn requires_metadata(&self) -> bool {
         self.mode.is_some() || self.owner.is_some() || self.group.is_some()
     }
+
+    /// Refuse to write through anything that isn't a regular file.
+    ///
+    /// Called unconditionally on the `AlreadyExists` branch of
+    /// `write_payload` — the mode/owner contract is optional, but the
+    /// "this output writes to regular files" contract is not. Without
+    /// this, an operator who put a FIFO / socket / directory / device
+    /// node at the output path would silently redirect the log
+    /// stream: for a FIFO the bytes flow to whoever `read(2)`s it, for
+    /// a socket the write returns `ENOTCONN` (or worse, hits an
+    /// accept-loop the operator forgot about), for a directory the
+    /// open itself errors but with an OS-level errno rather than a
+    /// message that names the actual misconfiguration.
+    ///
+    /// `dup(2)` + `spawn_blocking` so the `fstat` runs against a fd
+    /// that stays live for the syscall even if the outer future is
+    /// cancelled. Same pattern as `verify_existing_file_metadata`.
+    #[cfg(unix)]
+    async fn verify_fd_is_regular_file(file: &tokio::fs::File, path: &Path) -> Result<()> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::unix::io::AsRawFd;
+
+        let path = path.to_path_buf();
+        let path_for_join = path.clone();
+
+        let duped: i32 = unsafe { libc::dup(file.as_raw_fd()) };
+        if duped < 0 {
+            let err = std::io::Error::last_os_error();
+            anyhow::bail!("output file '{}': dup failed: {}", path.display(), err);
+        }
+        let owned_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(duped) };
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let fd = owned_fd.as_raw_fd();
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::fstat(fd, &mut stat) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                anyhow::bail!("output file '{}': fstat failed: {}", path.display(), err);
+            }
+            if (stat.st_mode as u32 & libc::S_IFMT as u32) != libc::S_IFREG as u32 {
+                anyhow::bail!(
+                    "output file '{}': existing path is not a regular file (st_mode & S_IFMT = \
+                     0o{:o}); refusing to write. Remove the node or point `path` at a real file.",
+                    path.display(),
+                    (stat.st_mode as u32) & libc::S_IFMT as u32
+                );
+            }
+            Ok(())
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "output file '{}': regular-file verify task failed to join",
+                path_for_join.display()
+            )
+        })?
+    }
 }
 
 // Buffer size for the reentrant getpwnam_r / getgrnam_r calls below.
@@ -1270,6 +1353,41 @@ mod tests {
         );
         // The target file must be untouched.
         assert_eq!(std::fs::read(&target).unwrap(), b"pre-existing");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn write_payload_refuses_fifo_at_output_path() {
+        // A stale FIFO at the output path (operator typo, leftover
+        // from a debugging session, planted by a co-tenant) must be
+        // refused before any bytes are written. Without the S_ISREG
+        // fstat, the write would either block indefinitely (no
+        // reader) or drain events into whatever process happened to
+        // be reading the pipe. With O_NONBLOCK, no reader → open
+        // fails with ENXIO wrapped as a "non-regular file" refusal;
+        // with a reader, the open succeeds and the fstat catches the
+        // FIFO shape.
+        use std::ffi::CString;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("out.log");
+        let c_path = CString::new(path.as_os_str().to_str().unwrap()).unwrap();
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        let out = make_output(ek(ExprKind::StringLit(path.display().to_string())));
+        let err = out
+            .write_payload(FilePayload {
+                egress: Bytes::from("hello"),
+                path: path.display().to_string(),
+                is_dynamic: false,
+            })
+            .await
+            .expect_err("FIFO at output path must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("non-regular file") || msg.contains("not a regular file"),
+            "refusal must name the shape, got: {msg}"
+        );
     }
 
     #[tokio::test]
