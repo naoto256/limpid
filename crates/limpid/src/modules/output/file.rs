@@ -93,8 +93,19 @@ pub struct FileOutput {
     mode: Option<u32>,
     owner: Option<String>,
     group: Option<String>,
-    /// Tracks which paths have been created (for applying mode/owner/group once)
+    /// Paths this output has finished applying mode/owner/group to.
+    /// Membership is only inserted *after* `apply_file_metadata_to_fd`
+    /// returns, so it is authoritative: presence == metadata obligation
+    /// satisfied.
     created_paths: Mutex<HashSet<PathBuf>>,
+    /// Paths where this output has successfully opened the file at
+    /// least once but has not yet promoted them to `created_paths`.
+    /// Used to survive a write_all failure or a cancellation between
+    /// write_all and apply — either case leaves an on-disk file this
+    /// output owes metadata to. Presence here forces the next
+    /// successful write to re-apply mode/owner even though
+    /// `path.exists()` is now true.
+    metadata_obligations: Mutex<HashSet<PathBuf>>,
     funcs: Arc<FunctionRegistry>,
     retry: RetryConfig,
     error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
@@ -153,6 +164,7 @@ impl Module for FileOutput {
             owner,
             group,
             created_paths: Mutex::new(HashSet::new()),
+            metadata_obligations: Mutex::new(HashSet::new()),
             funcs,
             retry,
             error_log,
@@ -349,16 +361,32 @@ impl FileOutput {
             );
         }
 
-        // Sample the "have we ever created this path" flag *before*
-        // opening the file — we can't record the create yet because
-        // `open` and `write_all` may still fail (O_NOFOLLOW → ELOOP,
-        // ENOSPC, permission errors, etc.), and marking it created
-        // pre-open would leave a permanently-broken output whose
-        // mode/owner never gets applied on the next successful write.
-        // The record happens only after the write actually lands.
-        let is_new_path = {
-            let guard = self.created_paths.lock().await;
-            !path.exists() && !guard.contains(&path)
+        // Decide whether this write owes metadata to the target
+        // path, sampled *before* the open. Two orthogonal signals:
+        //
+        //   * `already_applied` — a prior write for this path ran
+        //     apply_file_metadata_to_fd to completion. Nothing more
+        //     to do.
+        //   * `has_prior_obligation` — a prior write got as far as a
+        //     successful `open` for this path but did not finish the
+        //     apply (write_all failed, or the apply await was
+        //     cancelled). We still owe metadata; the on-disk file
+        //     exists but the obligation is outstanding.
+        //
+        // For "path exists but neither flag is set" — a pre-existing
+        // file some other producer created — we deliberately skip
+        // metadata: this output has never touched it, so overriding
+        // its mode/owner would surprise operators. The obligation
+        // path only kicks in once we've opened the file at least once
+        // ourselves.
+        let (path_preexisted, has_prior_obligation, already_applied) = {
+            let created = self.created_paths.lock().await;
+            let obligations = self.metadata_obligations.lock().await;
+            (
+                path.exists(),
+                obligations.contains(&path),
+                created.contains(&path),
+            )
         };
 
         // Fourth safety pass, complementing the three path-rendering
@@ -388,6 +416,19 @@ impl FileOutput {
             anyhow::Error::from(e)
         })?;
 
+        // We now hold an fd for the target. If this write is going to
+        // owe metadata, record the obligation *before* write_all — the
+        // open may have just created a fresh file on disk, and if
+        // write_all fails or is cancelled we must remember to finish
+        // the apply on the next attempt (otherwise `path.exists()`
+        // above would silently drop us into the "pre-existing" arm on
+        // the next call).
+        let should_apply = !already_applied && (has_prior_obligation || !path_preexisted);
+        if should_apply && !has_prior_obligation {
+            let mut obligations = self.metadata_obligations.lock().await;
+            obligations.insert(path.clone());
+        }
+
         let msg = String::from_utf8_lossy(&payload.egress);
         let mut buf = Vec::with_capacity(msg.len() + 1);
         buf.extend_from_slice(msg.as_bytes());
@@ -395,26 +436,7 @@ impl FileOutput {
         file.write_all(&buf).await?;
         self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
 
-        // Only after the write actually succeeded do we (a) mark the
-        // path as created for this output's lifetime and (b) apply
-        // mode/owner. Doing (b) inside the same critical section as
-        // (a) means a concurrent second write for the same path can't
-        // sneak past — the first successful writer wins the
-        // metadata-apply slot, and everyone else sees the path in
-        // `created_paths` and skips it.
-        let first_create = if is_new_path {
-            let mut guard = self.created_paths.lock().await;
-            if guard.insert(path.clone()) {
-                true
-            } else {
-                // Another concurrent writer beat us to it.
-                false
-            }
-        } else {
-            false
-        };
-
-        if first_create {
+        if should_apply {
             // Apply mode/owner through the open fd rather than the path.
             // The path is already guarded by O_NOFOLLOW at open time, but
             // set_permissions()/chown() would re-resolve the path and
@@ -422,7 +444,21 @@ impl FileOutput {
             // metadata call — closing that TOCTOU window means the mode
             // and ownership always land on the same inode we just wrote
             // to, never a different one.
+            //
+            // apply_file_metadata_to_fd is cancel-safe (dup fd +
+            // spawn_blocking): if this await returns at all, the
+            // fchmod/fchown have run. So once we get past it we can
+            // promote the path from "obligation outstanding" to
+            // "obligation satisfied". A concurrent second writer may
+            // have observed should_apply=true and re-applied in
+            // parallel — fchmod/fchown are idempotent so the extra
+            // call is harmless, and the insert below de-duplicates
+            // future callers.
             self.apply_file_metadata_to_fd(&file, &path).await;
+            let mut created = self.created_paths.lock().await;
+            let mut obligations = self.metadata_obligations.lock().await;
+            created.insert(path.clone());
+            obligations.remove(&path);
         }
 
         Ok(())
@@ -798,6 +834,7 @@ mod tests {
             owner: None,
             group: None,
             created_paths: Mutex::new(HashSet::new()),
+            metadata_obligations: Mutex::new(HashSet::new()),
             funcs: funcs(),
             retry: RetryConfig::default(),
             error_log: None,
@@ -1224,6 +1261,103 @@ mod tests {
         assert_eq!(
             mode, 0o640,
             "post-fix: metadata contract must apply on the first successful write, not on the first attempt"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn outstanding_metadata_obligation_reapplies_on_next_write() {
+        // Regression pin for the "write_all failed or the apply await
+        // was cancelled between open and apply_file_metadata_to_fd"
+        // shape (audit round-2, boundary-contract / security). Before
+        // the fix, the metadata obligation was tracked only through
+        // `path.exists()` — once the file existed on disk (which
+        // `open(create=true)` guarantees the moment it returns), any
+        // subsequent call landed in the "not first create" arm and
+        // silently skipped mode/owner. We simulate that shape by
+        // seeding `metadata_obligations` directly: it is what a prior
+        // aborted attempt would have left behind.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("obligation.log");
+
+        // Pretend a previous attempt got as far as `open` (creating
+        // the file) but was cancelled before apply. On disk that
+        // looks like: file exists with umask-default mode; obligation
+        // still registered.
+        std::fs::write(&path, b"partial\n").unwrap();
+        let out = make_output_with(
+            ek(ExprKind::StringLit(path.display().to_string())),
+            Some(0o600),
+        );
+        out.metadata_obligations.lock().await.insert(path.clone());
+
+        // Next successful write must honour the obligation.
+        out.write_payload(FilePayload {
+            egress: Bytes::from("retry"),
+            path: path.display().to_string(),
+            is_dynamic: false,
+        })
+        .await
+        .expect("retry write must succeed");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "outstanding metadata obligation must trigger apply on the next successful write"
+        );
+        assert!(
+            out.metadata_obligations.lock().await.is_empty(),
+            "obligation must be cleared once apply has landed"
+        );
+        assert!(
+            out.created_paths.lock().await.contains(&path),
+            "successful apply must promote the path to created_paths"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn preexisting_file_from_another_producer_keeps_its_mode() {
+        // Semantic pin, complementing the obligation test above: a
+        // file that existed *before* this output ever touched it, and
+        // therefore carries no obligation, must not have its mode
+        // overwritten on our first append. The mode contract is
+        // scoped to files this output creates (or has an outstanding
+        // obligation on); rewriting an unrelated producer's file
+        // would surprise operators.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("foreign.log");
+
+        std::fs::write(&path, b"not ours\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let out = make_output_with(
+            ek(ExprKind::StringLit(path.display().to_string())),
+            Some(0o600),
+        );
+
+        out.write_payload(FilePayload {
+            egress: Bytes::from("append"),
+            path: path.display().to_string(),
+            is_dynamic: false,
+        })
+        .await
+        .expect("append to a preexisting file must succeed");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o644,
+            "pre-existing file with no obligation must keep its mode"
+        );
+        assert!(
+            out.metadata_obligations.lock().await.is_empty(),
+            "no obligation should have been recorded for a preexisting file"
+        );
+        assert!(
+            !out.created_paths.lock().await.contains(&path),
+            "no metadata was applied, so nothing should have promoted to created_paths"
         );
     }
 }
