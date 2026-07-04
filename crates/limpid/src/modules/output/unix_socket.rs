@@ -207,8 +207,17 @@ impl PersistentConn for UnixSocketOutput {
         // (`\xEF\xBF\xBD`), which is exactly the wrong default for
         // a security telemetry pipeline shipping opaque payloads
         // to a local collector.
-        stream.write_all(payload).await?;
-        stream.write_all(b"\n").await?;
+        //
+        // Payload bytes and the trailing `\n` are concatenated into
+        // one buffer and handed to a single `write_all`, so an I/O
+        // error between the payload and the delimiter — which the
+        // previous two-`write_all` shape could produce as
+        // `Ok(payload) → Err(delimiter)` — no longer leaves an
+        // unterminated line for the retry / DLQ path to double.
+        // `write_all` still loops internally, so this is a boundary
+        // narrowing, not an atomicity guarantee.
+        let buf = super::frame_with_newline(payload);
+        stream.write_all(&buf).await?;
         stream.flush().await?;
         Ok(())
     }
