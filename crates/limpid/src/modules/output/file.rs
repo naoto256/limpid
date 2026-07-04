@@ -696,8 +696,8 @@ impl FileOutput {
     /// re-checked rather than re-applied. On mismatch the write is
     /// refused with a loud error so an operator can rotate the file,
     /// fix ownership, or investigate an unexpected pre-existing inode
-    /// (dropped `metadata_obligations` from a crashed prior run,
-    /// logrotate copying instead of moving, etc.).
+    /// (empty file left by a failed prior apply, logrotate copying
+    /// instead of moving, unrelated producer sharing the path, etc.).
     ///
     /// Uses the same `dup(2)` + `spawn_blocking` pattern as
     /// `apply_file_metadata_to_fd`: the fd stays live for the entire
@@ -738,7 +738,13 @@ impl FileOutput {
                 anyhow::bail!("output file '{}': fstat failed: {}", path.display(), err);
             }
             if let Some(configured) = mode {
-                let actual = (stat.st_mode as u32) & 0o777;
+                // Compare the full permission mode including the
+                // setuid / setgid / sticky bits (mask 0o7777). Masking
+                // to 0o777 would let a file with an unexpected
+                // setuid/setgid bit slip through as long as the rwx
+                // triples matched — a trust-relevant gap on log paths
+                // that are supposed to be plain regular files.
+                let actual = (stat.st_mode as u32) & 0o7777;
                 if actual != configured {
                     anyhow::bail!(
                         "output file '{}': existing file mode 0o{:o} does not match configured mode 0o{:o}; refusing to write. Remove or rotate the file to have this output recreate it with the configured mode.",
@@ -1017,10 +1023,9 @@ mod tests {
         // Backslash must be sanitised on every platform, not just
         // Windows — a Windows-style path leaking into the limpid
         // value pool would otherwise let an attacker (or a typo)
-        // smuggle in a path-component break on Linux too. Pre-fix
-        // audits flagged that the existing
-        // render_template_sanitises_every_interpolation case used a
-        // value with neither `/` nor `\` and so didn't actually pin
+        // smuggle in a path-component break on Linux too. The
+        // existing render_template_sanitises_every_interpolation case
+        // used a value with neither `/` nor `\` and so did not pin
         // the backslash branch; pin it here.
         assert_eq!(sanitize_path_component("a\\b\\c"), "a_b_c");
     }
@@ -1423,6 +1428,56 @@ mod tests {
             std::fs::read(&path).unwrap(),
             b"existing\n",
             "payload must not have been appended when the mode check refused"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn existing_file_with_extra_special_mode_bits_is_refused() {
+        // The permission mode comparison must cover the full 0o7777
+        // mask (setuid / setgid / sticky + rwx), not just 0o777. If
+        // an existing file has an unexpected setuid bit on top of
+        // matching rwx bits, the write must still refuse — a
+        // trust-relevant surface for log files that are supposed to
+        // be plain regular files.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("suid.log");
+
+        std::fs::write(&path, b"existing\n").unwrap();
+        // Configured mode will be 0o640; on disk we set 0o4640 (adds
+        // setuid). The low 9 bits match, but the full 12-bit mode
+        // does not — so the write must refuse.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4640)).unwrap();
+
+        let out = make_output_with(
+            ek(ExprKind::StringLit(path.display().to_string())),
+            Some(0o640),
+        );
+
+        let err = out
+            .write_payload(FilePayload {
+                egress: Bytes::from("payload"),
+                path: path.display().to_string(),
+                is_dynamic: false,
+            })
+            .await
+            .expect_err("preexisting file with an unexpected setuid bit must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("existing file mode"), "{msg}");
+        assert!(
+            msg.contains("0o4640"),
+            "diagnostic must show the actual full mode: {msg}"
+        );
+        assert!(
+            msg.contains("0o640"),
+            "diagnostic must show the configured mode: {msg}"
+        );
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"existing\n",
+            "payload must not have been appended"
         );
     }
 
