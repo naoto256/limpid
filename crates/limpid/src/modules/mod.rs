@@ -42,15 +42,56 @@ use crate::metrics::{InputMetrics, OutputMetrics};
 pub struct BuildContext {
     pub funcs: Arc<crate::functions::FunctionRegistry>,
     pub error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+    /// Runtime-level shutdown broadcast. Unbatched sinks clone this
+    /// receiver and race their retry backoff sleep against it — if
+    /// shutdown fires mid-sleep, the sink breaks out of the retry
+    /// loop, routes the pending event to DLQ, and returns Ok(())
+    /// instead of blocking the queue consumer's select! for up to
+    /// `retry.max_wait`. Without this, a steady-state `consume()`
+    /// stuck in exponential backoff (1+2+4+8s = 15s under defaults)
+    /// outlasts the runtime's 10s shutdown budget and the runtime
+    /// task-aborts the consumer, dropping any handles in flight.
+    /// Batched sinks have their own actor-local shutdown notify and
+    /// do not need this receiver.
+    pub shutdown_signal: tokio::sync::watch::Receiver<bool>,
+}
+
+/// Shared retry-backoff helper for unbatched sinks: sleep `wait`, but
+/// abort the sleep if the runtime shutdown signal fires. Returns
+/// `true` if shutdown fired mid-sleep (caller should DLQ-route the
+/// pending event and return), `false` if the sleep completed
+/// normally (caller should continue the retry loop). Also treats a
+/// dropped shutdown sender (RecvError from `wait_for`) as
+/// "shutdown fired" — the sender is only dropped when the runtime
+/// is tearing down.
+pub async fn sleep_or_shutdown(
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    wait: std::time::Duration,
+) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(wait) => false,
+        _ = shutdown.wait_for(|s| *s) => true,
+    }
 }
 
 impl BuildContext {
-    /// Test-only ctor with a no-op funcs registry and no error_log.
+    /// Test-only ctor with a no-op funcs registry, no error_log, and
+    /// a shutdown receiver that never fires. Tests that need to
+    /// script a mid-consume shutdown build their own
+    /// `watch::channel` and populate `shutdown_signal` directly.
     #[cfg(test)]
     pub fn for_testing() -> Self {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        // Leak the sender so the receiver stays open for the whole
+        // test — dropping it would flip the receiver to
+        // `RecvError` on the first `wait_for`, which the sinks
+        // treat as a shutdown fire (correct in production but not
+        // what the ambient test setup wants).
+        Box::leak(Box::new(_tx));
         Self {
             funcs: Arc::new(crate::functions::FunctionRegistry::new()),
             error_log: None,
+            shutdown_signal: rx,
         }
     }
 }

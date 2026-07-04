@@ -23,6 +23,7 @@ pub struct StdoutOutput {
     retry: RetryConfig,
     error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
     metrics: Arc<OutputMetrics>,
+    shutdown_signal: tokio::sync::watch::Receiver<bool>,
 }
 
 impl Module for StdoutOutput {
@@ -41,6 +42,7 @@ impl Module for StdoutOutput {
             retry,
             error_log: ctx.error_log.as_ref().map(Arc::clone),
             metrics: Arc::new(OutputMetrics::default()),
+            shutdown_signal: ctx.shutdown_signal.clone(),
         })
     }
 }
@@ -75,6 +77,7 @@ impl Output for StdoutOutput {
     async fn consume(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
         let mut attempt = 0u32;
         let mut wait = self.retry.initial_wait;
+        let mut shutdown = self.shutdown_signal.clone();
         loop {
             match self.write_event(event) {
                 Ok(()) => {
@@ -107,7 +110,30 @@ impl Output for StdoutOutput {
                         e,
                         wait
                     );
-                    tokio::time::sleep(wait).await;
+                    // Race the backoff sleep against shutdown. If the runtime
+                    // signals shutdown mid-sleep, do NOT keep retrying — the
+                    // retry budget (default 1+2+4+8 = 15 s) can outlast the
+                    // runtime's 10 s shutdown budget, and if we don't return
+                    // the queue consumer's select! never gets back to its
+                    // shutdown arm. Route the pending event to DLQ, resolve
+                    // `Recovered`, and return.
+                    if crate::modules::sleep_or_shutdown(&mut shutdown, wait).await {
+                        let reason = format!(
+                            "output write failed and shutdown observed mid-retry \
+                             after {} attempts: {}",
+                            attempt, e
+                        );
+                        crate::modules::route_event_to_dlq(
+                            self.error_log.as_ref(),
+                            &self.name,
+                            event,
+                            &reason,
+                        )
+                        .await;
+                        self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                        ack.resolve_recovered();
+                        return Ok(());
+                    }
                     wait = self.retry.next_wait(wait);
                 }
             }

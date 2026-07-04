@@ -90,6 +90,7 @@ impl Runtime {
         let build_ctx = crate::modules::BuildContext {
             funcs: Arc::clone(&func_registry),
             error_log: error_log.as_ref().map(Arc::clone),
+            shutdown_signal: shutdown_rx.clone(),
         };
 
         // --- 1. Create outputs (each output owns its own OutputMetrics) ---

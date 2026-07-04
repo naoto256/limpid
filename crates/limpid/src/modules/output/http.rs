@@ -1460,8 +1460,8 @@ def output o {{
             fast_retry_block(),
         ];
         let ctx = crate::modules::BuildContext {
-            funcs: Arc::new(crate::functions::FunctionRegistry::new()),
             error_log: Some(Arc::clone(&writer)),
+            ..crate::modules::BuildContext::for_testing()
         };
         let output = HttpOutput::from_properties("test", &mp(&props), &ctx).unwrap();
 
@@ -1635,8 +1635,8 @@ def output o {{
         let path = dir.path().join("errored.jsonl");
         let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
         let ctx = crate::modules::BuildContext {
-            funcs: Arc::new(crate::functions::FunctionRegistry::new()),
             error_log: Some(Arc::clone(&writer)),
+            ..crate::modules::BuildContext::for_testing()
         };
         let output = HttpOutput::from_properties(
             "myout",
@@ -2064,8 +2064,8 @@ def output o {{
         let path = dir.path().join("errored.jsonl");
         let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
         let ctx = crate::modules::BuildContext {
-            funcs: Arc::new(crate::functions::FunctionRegistry::new()),
             error_log: Some(Arc::clone(&writer)),
+            ..crate::modules::BuildContext::for_testing()
         };
         let retry = Property::Block {
             key: "retry".into(),
@@ -2160,8 +2160,8 @@ def output o {{
         let path = dir.path().join("errored.jsonl");
         let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
         let ctx = crate::modules::BuildContext {
-            funcs: Arc::new(crate::functions::FunctionRegistry::new()),
             error_log: Some(Arc::clone(&writer)),
+            ..crate::modules::BuildContext::for_testing()
         };
         let output = HttpOutput::from_properties(
             "myout",
@@ -2221,8 +2221,8 @@ def output o {{
         let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path));
 
         let ctx = crate::modules::BuildContext {
-            funcs: Arc::new(crate::functions::FunctionRegistry::new()),
             error_log: Some(Arc::clone(&writer)),
+            ..crate::modules::BuildContext::for_testing()
         };
         let output = HttpOutput::from_properties(
             "test",
@@ -2267,8 +2267,8 @@ def output o {{
             dir.path().join("errored.jsonl"),
         ));
         let ctx = crate::modules::BuildContext {
-            funcs: Arc::new(crate::functions::FunctionRegistry::new()),
             error_log: Some(Arc::clone(&writer)),
+            ..crate::modules::BuildContext::for_testing()
         };
         let output = HttpOutput::from_properties(
             "test",
@@ -2330,8 +2330,8 @@ def output o {{
         let path = dir.path().join("errored.jsonl");
         let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
         let ctx = crate::modules::BuildContext {
-            funcs: Arc::new(crate::functions::FunctionRegistry::new()),
             error_log: Some(Arc::clone(&writer)),
+            ..crate::modules::BuildContext::for_testing()
         };
         // Long retry waits so a non-cancelled budget would clearly
         // exceed SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT (3s).
@@ -2468,8 +2468,8 @@ def output o {{
         let path = dir.path().join("errored.jsonl");
         let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
         let ctx = crate::modules::BuildContext {
-            funcs: Arc::new(crate::functions::FunctionRegistry::new()),
             error_log: Some(Arc::clone(&writer)),
+            ..crate::modules::BuildContext::for_testing()
         };
         // Short timer wake + large batch_size so the actor (not
         // consume itself) is the path that calls `send`.
@@ -2561,8 +2561,8 @@ def output o {{
         let path = dir.path().join("errored.jsonl");
         let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
         let ctx = crate::modules::BuildContext {
-            funcs: Arc::new(crate::functions::FunctionRegistry::new()),
             error_log: Some(Arc::clone(&writer)),
+            ..crate::modules::BuildContext::for_testing()
         };
         let output = Arc::new(
             HttpOutput::from_properties(
@@ -2645,8 +2645,8 @@ def output o {{
         let path = dir.path().join("errored.jsonl");
         let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
         let ctx = crate::modules::BuildContext {
-            funcs: Arc::new(crate::functions::FunctionRegistry::new()),
             error_log: Some(Arc::clone(&writer)),
+            ..crate::modules::BuildContext::for_testing()
         };
         let output = Arc::new(
             HttpOutput::from_properties(
