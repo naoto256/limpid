@@ -149,18 +149,55 @@ impl ControlServer {
             ensure_socket_parent_dir(parent);
         }
 
-        // Remove stale socket — only if it's actually a socket (not a symlink)
-        if self.socket_path.exists() {
+        // Remove stale socket — only if it's actually a socket. Any
+        // other node type (regular file, directory, FIFO, device
+        // node) is refused loudly. The previous shape ("non-symlink
+        // → remove") was destructive by design: an operator typo that
+        // set `socket` to a real file path would silently unlink the
+        // target on daemon startup. The comment ("only if it's
+        // actually a socket") is now the actual contract.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
             match std::fs::symlink_metadata(&self.socket_path) {
                 Ok(meta) => {
-                    if meta.file_type().is_symlink() {
+                    let ft = meta.file_type();
+                    if ft.is_symlink() {
                         error!(
                             "control socket: {:?} is a symlink — refusing to remove",
                             self.socket_path
                         );
                         return;
                     }
+                    if !ft.is_socket() {
+                        let shape = if ft.is_dir() {
+                            "directory"
+                        } else if ft.is_file() {
+                            "regular file"
+                        } else if ft.is_fifo() {
+                            "FIFO"
+                        } else if ft.is_block_device() {
+                            "block device"
+                        } else if ft.is_char_device() {
+                            "character device"
+                        } else {
+                            "non-socket node"
+                        };
+                        error!(
+                            "control socket: {:?} is a {} — refusing to remove. \
+                             The stale-cleanup path only unlinks actual socket \
+                             nodes; remove or move the node manually if this path \
+                             is correct.",
+                            self.socket_path, shape
+                        );
+                        return;
+                    }
+                    // Actual stale socket — safe to unlink.
                     let _ = std::fs::remove_file(&self.socket_path);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // No node at the path — `bind(2)` will create it
+                    // fresh.
                 }
                 Err(e) => {
                     warn!("control socket: cannot stat {:?}: {}", self.socket_path, e);
