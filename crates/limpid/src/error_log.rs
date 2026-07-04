@@ -362,10 +362,69 @@ impl ErrorLogWriter {
                             actual
                         );
                     }
+
+                    // Preflight: open the same fd shape the runtime
+                    // write path uses (write + append + `O_NOFOLLOW`
+                    // + `O_NONBLOCK`) and immediately close it. This
+                    // catches parent-directory execute/write denials
+                    // and stale ACLs that a bare `symlink_metadata`
+                    // stat cannot see — the parent may exist and be
+                    // group-readable while `open(2)` for append is
+                    // refused with `EACCES`. Docs promise the DLQ
+                    // path is validated up front; without the probe,
+                    // the failure would only surface at first DLQ
+                    // write, after the pipeline has already lost the
+                    // observability on that record.
+                    let mut probe_opts = OpenOptions::new();
+                    probe_opts.write(true).append(true);
+                    probe_opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+                    match probe_opts.open(&self.path).await {
+                        Ok(f) => {
+                            drop(f);
+                        }
+                        Err(e) => {
+                            return Err(anyhow::Error::from(e).context(format!(
+                                "error_log: existing DLQ file '{}' is not writable by the \
+                                 daemon user",
+                                self.path.display()
+                            )));
+                        }
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // No file yet — the runtime will create it under
-                    // the correct mode on the first failure.
+                    // Absent file — probe the create path so a
+                    // parent-directory permission miss or an SELinux/
+                    // AppArmor denial surfaces at startup rather than
+                    // at first DLQ write. Uses the same
+                    // `create_new` + `O_NOFOLLOW` + `mode(0o600)`
+                    // shape the runtime write path uses, so a success
+                    // here is a real guarantee that the write path
+                    // can create the inode.
+                    //
+                    // A successful preflight leaves an empty 0o600
+                    // file at `self.path`. This is intentional and
+                    // documented — daemon startup is the only caller
+                    // of this function (never `--check`), and an
+                    // empty DLQ file at the configured path matches
+                    // what the runtime would have created on the
+                    // first real failure anyway.
+                    let mut create_opts = OpenOptions::new();
+                    create_opts.write(true).create_new(true).append(true);
+                    create_opts.custom_flags(libc::O_NOFOLLOW);
+                    create_opts.mode(0o600);
+                    match create_opts.open(&self.path).await {
+                        Ok(f) => {
+                            drop(f);
+                        }
+                        Err(e) => {
+                            return Err(anyhow::Error::from(e).context(format!(
+                                "error_log: cannot create DLQ file at '{}'; check parent \
+                                 directory permissions, ownership, and any MAC (SELinux / \
+                                 AppArmor) confinement",
+                                self.path.display()
+                            )));
+                        }
+                    }
                 }
                 Err(e) => {
                     return Err(anyhow::Error::from(e).context(format!(
@@ -746,10 +805,61 @@ mod tests {
     async fn validate_at_startup_accepts_absent_file() {
         // A path whose parent exists but whose file itself does not
         // exist must pass — the runtime creates the file on first
-        // failure with the correct mode.
+        // failure with the correct mode. The preflight creates it
+        // eagerly at 0o600 (see next test for that assertion).
         let dir = TempDir::new().unwrap();
         let w = ErrorLogWriter::new(dir.path().join("errored.jsonl"));
         w.validate_at_startup().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn validate_at_startup_creates_absent_file_at_0o600() {
+        // The absent-path preflight opens with `create_new` +
+        // `mode(0o600)` and leaves the file in place. Pin this so a
+        // future refactor that drops the preflight (or leaves a
+        // wider-mode file behind) trips this test.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("errored.jsonl");
+        let w = ErrorLogWriter::new(path.clone());
+        w.validate_at_startup().await.unwrap();
+
+        let meta = tokio::fs::metadata(&path).await.unwrap();
+        assert!(meta.is_file(), "preflight must have created the file");
+        assert_eq!(meta.len(), 0, "preflight must leave the file empty");
+        let mode = meta.permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o600,
+            "preflight file must be 0o600 (matches the runtime write contract), got 0o{mode:o}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn validate_at_startup_fails_on_readonly_parent_absent_file() {
+        // A parent directory the daemon user cannot write to is only
+        // caught by the create-probe — a stat of the parent still
+        // succeeds (it's readable). The docs promise this preflight
+        // exists; pin it against a regression that reverts to
+        // stat-only validation.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("locked");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let w = ErrorLogWriter::new(sub.join("errored.jsonl"));
+        let result = w.validate_at_startup().await;
+
+        // Restore write bit so TempDir can clean up.
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = result.expect_err("readonly parent must fail preflight").to_string();
+        assert!(
+            err.contains("cannot create DLQ file"),
+            "err must name the preflight failure, got: {err}"
+        );
     }
 
     #[tokio::test]
