@@ -55,13 +55,14 @@ A typical operator setup keeps the live file capped and the rotated archives com
     copytruncate
     notifempty
     missingok
-    create 0640 limpid adm
+    create 0600 limpid limpid
     maxsize 1G
 }
 ```
 
 Key choices:
 
+- `create 0600` — the DLQ writer's runtime contract is *exactly* `0o600` on the on-disk file. If logrotate creates the fresh post-rotation file at any other mode, the next DLQ write is refused with a `existing file mode 0o... does not match configured mode 0o600` error and `events_errored_unwritable` bumps until the operator aligns the file. Match the rotator's `create` mode with the runtime contract to avoid that failure.
 - `copytruncate` — limpid reopens the inode every write, so a normal rotate-and-rename works too, but `copytruncate` is the simplest setup that doesn't require any signal handshake.
 - `maxsize 1G` — caps the live file even when `daily` hasn't fired yet. A pipeline producing failures at 10k events/sec with 1 KiB records would fill 1 GiB in ~100 seconds; tune to your environment.
 - `rotate 14 + compress` — two weeks of rotated history is usually enough to catch and replay everything between an incident and the operator noticing it.
@@ -456,7 +457,7 @@ For operators, the practical implications:
 
 - **Watch `events_failed` at output granularity.** A step increase without a matching increase in `events_errored` or DLQ file size means events are dropping through this path. Cross-check `events_written + events_failed + retries` against upstream input rate to bound the loss.
 - **Watch daemon panics.** A `panicked at` line in the daemon's `tracing` output is the primary observable for the bug path. `RUST_BACKTRACE=1` in the systemd unit is worth the extra bytes.
-- **Shutdown-fallthrough is progressively narrowing.** Recent releases have brought the batched-sink retry loop, the unbatched-sink retry backoff sleep, and the unbatched-sink single send attempt all under a shutdown-race that DLQ-routes on time. The remaining exposure is limited to shapes where the ack channel or a batched-sink buffer still holds a handle at the SIGTERM deadline — rare in a healthy deployment, still a bug-attributed loss when it happens.
+- **Shutdown-fallthrough is progressively narrowing.** Recent releases have brought the batched-sink retry loop, the unbatched-sink retry backoff sleep, and the network unbatched-sinks' single send attempt (`kafka`, `syslog_*`, `unix_socket`) all under a shutdown-race that DLQ-routes on time. The remaining exposure covers the shapes where the runtime task is aborted with a handle still parked mid-flight: the ack channel, a batched-sink buffer at the SIGTERM deadline, or an in-flight `write_payload` on the `file` output (whose write attempt is deliberately *not* raced against shutdown to avoid the partial-append duplicate documented in `crates/limpid/src/modules/output/file.rs`). Rare in a healthy deployment, still a bug-attributed loss when it happens.
 
 ## Schema migration v1 → v2
 
