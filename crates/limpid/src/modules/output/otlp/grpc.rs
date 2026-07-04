@@ -1295,8 +1295,8 @@ mod tests {
         let path = dir.path().join("errored.jsonl");
         let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path.clone()));
         let ctx = crate::modules::BuildContext {
-            funcs: Arc::new(crate::functions::FunctionRegistry::new()),
             error_log: Some(Arc::clone(&writer)),
+            ..crate::modules::BuildContext::for_testing()
         };
         let output = OtlpGrpcOutput::from_properties("myout", &mp(&props), &ctx).unwrap();
         buffer_two(&output).await;
@@ -1406,8 +1406,8 @@ mod tests {
         let writer = Arc::new(crate::error_log::ErrorLogWriter::new(path));
 
         let ctx = crate::modules::BuildContext {
-            funcs: Arc::new(crate::functions::FunctionRegistry::new()),
             error_log: Some(Arc::clone(&writer)),
+            ..crate::modules::BuildContext::for_testing()
         };
         let output = OtlpGrpcOutput::from_properties(
             "test",

@@ -95,6 +95,12 @@ pub struct FileOutput {
     retry: RetryConfig,
     error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
     metrics: Arc<OutputMetrics>,
+    /// Runtime shutdown broadcast. Cloned inside the `consume` retry
+    /// loop so the exponential backoff sleep races against it: a
+    /// shutdown fired mid-sleep terminates the retry and routes the
+    /// pending event to DLQ instead of extending past the runtime's
+    /// shutdown budget and getting the consumer task-aborted.
+    shutdown_signal: tokio::sync::watch::Receiver<bool>,
 }
 
 impl Module for FileOutput {
@@ -171,6 +177,7 @@ impl Module for FileOutput {
             retry,
             error_log,
             metrics: Arc::new(OutputMetrics::default()),
+            shutdown_signal: ctx.shutdown_signal.clone(),
         })
     }
 }
@@ -219,6 +226,7 @@ impl Output for FileOutput {
 
         let mut attempt = 0u32;
         let mut wait = self.retry.initial_wait;
+        let mut shutdown = self.shutdown_signal.clone();
         loop {
             // Clone the payload's path/dynamic flag for each attempt;
             // `egress` is a refcounted `Bytes` so the actual buffer
@@ -258,7 +266,31 @@ impl Output for FileOutput {
                         e,
                         wait
                     );
-                    tokio::time::sleep(wait).await;
+                    // Race the backoff sleep against shutdown. If the
+                    // runtime signals shutdown mid-sleep, do NOT keep
+                    // retrying — the retry budget (default 1+2+4+8 =
+                    // 15 s) can outlast the runtime's 10 s shutdown
+                    // budget, and if we don't return the queue
+                    // consumer's select! never gets back to its
+                    // shutdown arm. Route the pending event to DLQ,
+                    // resolve `Recovered`, and return.
+                    if crate::modules::sleep_or_shutdown(&mut shutdown, wait).await {
+                        let reason = format!(
+                            "output write failed and shutdown observed mid-retry \
+                             after {} attempts: {}",
+                            attempt, e
+                        );
+                        crate::modules::route_event_to_dlq(
+                            self.error_log.as_ref(),
+                            &self.name,
+                            event,
+                            &reason,
+                        )
+                        .await;
+                        self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                        ack.resolve_recovered();
+                        return Ok(());
+                    }
                     wait = self.retry.next_wait(wait);
                 }
             }
@@ -964,6 +996,7 @@ mod tests {
             retry: RetryConfig::default(),
             error_log: None,
             metrics: Arc::new(OutputMetrics::default()),
+            shutdown_signal: crate::modules::BuildContext::for_testing().shutdown_signal,
         }
     }
 
@@ -1731,5 +1764,77 @@ mod tests {
                 "diagnostic must name the constraint: {msg}"
             );
         }
+    }
+
+    /// Regression pin for the unbatched-sink shutdown race. A steady-
+    /// state `consume` that fails and enters its retry backoff must
+    /// not sleep past the runtime's shutdown budget: if the runtime
+    /// signals shutdown mid-sleep, the sink breaks out, routes the
+    /// pending event to DLQ, resolves `Recovered`, and returns
+    /// promptly so the queue consumer's select! can proceed with the
+    /// drain. Without this the retry sleep (default 1+2+4+8 = 15 s)
+    /// held the consumer past the 10 s runtime shutdown budget and
+    /// the task was aborted mid-flight — the exact class of loss
+    /// PR #84 closed for batched sinks.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn consume_short_circuits_retry_backoff_on_shutdown() {
+        use crate::queue::{AckDisposition, BackoffStrategy, QueueAckHandle};
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let dir = tempfile::TempDir::new().unwrap();
+        // Point at a non-existent parent so every write_payload fails
+        // with ENOENT — the retry loop has to actually visit the
+        // backoff sleep for the test to observe the race.
+        let path = dir.path().join("does_not_exist").join("file.log");
+
+        let out = FileOutput {
+            name: "test".into(),
+            path: ek(ExprKind::StringLit(path.display().to_string())),
+            mode: None,
+            owner: None,
+            group: None,
+            funcs: funcs(),
+            // Long backoff floor so an untouched sleep would obviously
+            // hold the consume past the assertion window.
+            retry: crate::queue::RetryConfig {
+                max_attempts: 5,
+                initial_wait: std::time::Duration::from_secs(5),
+                max_wait: std::time::Duration::from_secs(5),
+                backoff: BackoffStrategy::Fixed,
+            },
+            error_log: None,
+            metrics: Arc::new(OutputMetrics::default()),
+            shutdown_signal: shutdown_rx,
+        };
+
+        let (ack, mut ack_rx) = QueueAckHandle::for_test();
+        let event = event_with_workspace();
+        let out = Arc::new(out);
+        let out_clone = Arc::clone(&out);
+        let started = std::time::Instant::now();
+        let consume = tokio::spawn(async move { out_clone.consume(&event, ack).await });
+
+        // Let the first attempt fail and the retry loop reach the sleep.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        shutdown_tx.send(true).unwrap();
+
+        let res = consume.await.unwrap();
+        let elapsed = started.elapsed();
+        res.expect("consume must return Ok after shutdown-driven exit");
+        assert!(
+            elapsed < std::time::Duration::from_millis(1500),
+            "consume must short-circuit the retry sleep — took {elapsed:?} against a 5s floor"
+        );
+
+        // The handle must resolve as `Recovered`, not `Dropped` — the
+        // event was routed to DLQ, not silently lost.
+        let (_pos, disposition) = ack_rx
+            .try_recv()
+            .expect("ack channel must have carried the resolution");
+        assert!(
+            matches!(disposition, AckDisposition::Recovered),
+            "expected Recovered, got {disposition:?}"
+        );
     }
 }
