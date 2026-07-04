@@ -293,28 +293,86 @@ impl ErrorLogWriter {
     /// The DLQ record carries the failed event's `ingress` / `egress`
     /// verbatim (UTF-8 payloads land as plain text, not base64), so a
     /// line that happened to contain a secret or PII is written through
-    /// unchanged. Create the file `0o600` on Unix so it is not
-    /// world-readable when the daemon runs under a permissive umask —
-    /// the `file` output already exposes a `mode` knob for the same
-    /// reason, and the DLQ (which operators don't opt into per-record)
-    /// should default at least as tight.
+    /// unchanged. Two invariants gate every write on Unix:
+    ///
+    /// - `O_NOFOLLOW`: refuse to write through a symlink at the DLQ
+    ///   path. If an attacker (or a mis-configured operator tool)
+    ///   plants a symlink where the DLQ file should be, we surface it
+    ///   as `refusing to follow symlink at error_log path` rather than
+    ///   silently redirecting failure records to whatever the symlink
+    ///   points at. This mirrors the guard already in place on the
+    ///   `file` output.
+    /// - **Full 12-bit mode contract** (`0o600`): when we take the
+    ///   `create_new` branch (fresh inode), the mode is set at
+    ///   `open(2)` time via the `mode` option. When we take the
+    ///   `AlreadyExists` branch (an inode was already there — logrotate,
+    ///   a crash-leftover, or an operator-touched file), we `fstat` the
+    ///   fd and refuse the write if the observed mode is not exactly
+    ///   `0o600` (masking to 0o7777 so setuid/setgid/sticky mismatches
+    ///   don't slip through with matching rwx bits). No silent chmod
+    ///   on a file we didn't create; the operator sees a loud error
+    ///   and either rotates the file or aligns the mode. Same shape as
+    ///   the `file` output's `verify_existing_file_metadata` — a DLQ
+    ///   that leaks its records at 0o644 is exactly as bad as a log
+    ///   sink that does.
     pub async fn write(&self, ctx: &ErroredEventContext) -> Result<()> {
         let mut line = ctx.to_jsonl();
         line.push('\n');
         let _guard = self.write_lock.lock().await;
-        let mut opts = OpenOptions::new();
-        opts.create(true).append(true);
-        // Only applied when this open creates the file; an existing
-        // DLQ file keeps whatever mode it already has (operators can
-        // tighten a pre-existing file themselves). tokio's
-        // `OpenOptions::mode` is inherent (no OpenOptionsExt trait
-        // import needed).
+
+        // Fresh-inode branch: `create_new` (= `O_CREAT|O_EXCL`) plus
+        // `O_NOFOLLOW`. Succeeds only if the path had nothing there,
+        // which is our unambiguous "we own this inode from birth"
+        // signal. The `mode(0o600)` on the OpenOptions lands the
+        // permission at `open(2)` time, before the first payload byte
+        // hits disk.
+        let mut create_opts = OpenOptions::new();
+        create_opts.write(true).create_new(true).append(true);
         #[cfg(unix)]
-        opts.mode(0o600);
-        let mut f = opts
-            .open(&self.path)
-            .await
-            .with_context(|| format!("error_log: failed to open {}", self.path.display()))?;
+        {
+            create_opts.custom_flags(libc::O_NOFOLLOW);
+            create_opts.mode(0o600);
+        }
+        let create_res = create_opts.open(&self.path).await;
+
+        let mut f = match create_res {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Fallback: open the existing inode non-create with
+                // O_NOFOLLOW, then fstat-verify the mode. Any mismatch
+                // — including `0o644` from an umask-created leftover,
+                // or an unexpected setuid bit — refuses the write.
+                let mut existing_opts = OpenOptions::new();
+                existing_opts.write(true).append(true);
+                #[cfg(unix)]
+                existing_opts.custom_flags(libc::O_NOFOLLOW);
+                let f = existing_opts.open(&self.path).await.map_err(|e| {
+                    #[cfg(unix)]
+                    if e.raw_os_error() == Some(libc::ELOOP) {
+                        return anyhow::anyhow!(
+                            "refusing to follow symlink at error_log path: {}",
+                            self.path.display()
+                        );
+                    }
+                    anyhow::Error::from(e)
+                        .context(format!("error_log: failed to open {}", self.path.display()))
+                })?;
+                #[cfg(unix)]
+                self.verify_existing_mode(&f).await?;
+                f
+            }
+            Err(e) => {
+                #[cfg(unix)]
+                if e.raw_os_error() == Some(libc::ELOOP) {
+                    anyhow::bail!(
+                        "refusing to follow symlink at error_log path: {}",
+                        self.path.display()
+                    );
+                }
+                return Err(anyhow::Error::from(e)
+                    .context(format!("error_log: failed to open {}", self.path.display())));
+            }
+        };
         f.write_all(line.as_bytes())
             .await
             .with_context(|| format!("error_log: failed to write to {}", self.path.display()))?;
@@ -322,6 +380,66 @@ impl ErrorLogWriter {
             .await
             .with_context(|| format!("error_log: failed to close {}", self.path.display()))?;
         Ok(())
+    }
+
+    /// Verify that an existing DLQ file's on-disk mode is exactly
+    /// `0o600`. Called only on the `AlreadyExists` branch of the
+    /// write path — we did not create the inode, and the operator or
+    /// logrotate may have left a file whose mode is different from
+    /// what the DLQ is supposed to guarantee.
+    ///
+    /// Uses `dup(2)` + `spawn_blocking` so the `fstat` runs against a
+    /// fd that stays live for the duration of the syscall even if the
+    /// outer future is cancelled — a raw fd number is trivial for
+    /// the kernel to reuse after the source `File` is dropped, and
+    /// letting the syscall race that reuse would land on an unrelated
+    /// inode. Same shape as `apply_file_metadata_to_fd` in the file
+    /// output.
+    #[cfg(unix)]
+    async fn verify_existing_mode(&self, file: &tokio::fs::File) -> Result<()> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::unix::io::AsRawFd;
+
+        let path = self.path.clone();
+        let path_for_join = path.clone();
+
+        let duped: i32 = unsafe { libc::dup(file.as_raw_fd()) };
+        if duped < 0 {
+            let err = std::io::Error::last_os_error();
+            anyhow::bail!("error_log '{}': dup failed: {}", path.display(), err);
+        }
+        // SAFETY: `duped >= 0` was just returned by `libc::dup` and no
+        // other Rust type owns it yet, so we transfer exclusive
+        // ownership to the `OwnedFd`.
+        let owned_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(duped) };
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let fd = owned_fd.as_raw_fd();
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::fstat(fd, &mut stat) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                anyhow::bail!("error_log '{}': fstat failed: {}", path.display(), err);
+            }
+            let actual = (stat.st_mode as u32) & 0o7777;
+            if actual != 0o600 {
+                anyhow::bail!(
+                    "error_log '{}': existing file mode 0o{:o} does not match the required \
+                     0o600 contract; refusing to write. Remove or rotate the file so a fresh \
+                     inode is created with the required mode.",
+                    path.display(),
+                    actual
+                );
+            }
+            Ok(())
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "error_log '{}': mode verify task failed to join",
+                path_for_join.display()
+            )
+        })?
     }
 }
 
@@ -646,5 +764,112 @@ mod tests {
         // sees a self-consistent starting state.
         assert_eq!(&replayed.ingress[..], b"hello");
         assert_eq!(&replayed.egress[..], b"hello");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn fresh_dlq_file_lands_with_0o600_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dlq.jsonl");
+        let writer = ErrorLogWriter::new(path.clone());
+        writer
+            .write(&ctx())
+            .await
+            .expect("first DLQ write must succeed");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o600,
+            "fresh DLQ file must land under 0o600, not umask default"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn preexisting_dlq_file_with_wrong_mode_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dlq.jsonl");
+        // A stray DLQ file left by an operator tool or logrotate at
+        // world-readable mode. The write must refuse rather than
+        // silently appending secrets to a file exposed at 0o644.
+        std::fs::write(&path, b"leftover\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let writer = ErrorLogWriter::new(path.clone());
+        let err = writer
+            .write(&ctx())
+            .await
+            .expect_err("wrong-mode preexisting DLQ file must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("existing file mode"),
+            "diagnostic must name the observed mode: {msg}"
+        );
+        assert!(msg.contains("0o644"), "{msg}");
+        assert!(msg.contains("0o600"), "{msg}");
+
+        // The refusal must land before write_all, so the file
+        // contents are unchanged.
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"leftover\n",
+            "record must not have been appended when verify refused"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn preexisting_dlq_file_with_correct_mode_accepts_writes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dlq.jsonl");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let writer = ErrorLogWriter::new(path.clone());
+        writer
+            .write(&ctx())
+            .await
+            .expect("existing 0o600 DLQ must accept writes");
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.contains("\"kind\":\"process\""),
+            "record must have been appended, got: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn dlq_write_refuses_symlink_at_path() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dlq.jsonl");
+        // A symlink at the DLQ path — the security concern is that
+        // an attacker points it at a file they can otherwise read,
+        // and every DLQ record leaks to that file. `O_NOFOLLOW`
+        // guards both the create_new branch (symlink → EEXIST) and
+        // the fallback existing-open (symlink → ELOOP).
+        let bait = dir.path().join("_would_be_hijacked.jsonl");
+        std::os::unix::fs::symlink(&bait, &path).unwrap();
+
+        let writer = ErrorLogWriter::new(path.clone());
+        let err = writer
+            .write(&ctx())
+            .await
+            .expect_err("symlink at DLQ path must be refused");
+        assert!(
+            err.to_string().contains("refusing to follow symlink"),
+            "diagnostic must name the refusal reason: {}",
+            err
+        );
+
+        // The bait file must never have been created — writing to it
+        // is exactly what the symlink was trying to achieve.
+        assert!(
+            !bait.exists(),
+            "the symlink target must not have been touched"
+        );
     }
 }
