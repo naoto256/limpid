@@ -236,39 +236,21 @@ impl Output for FileOutput {
                 path: payload.path.clone(),
                 is_dynamic: payload.is_dynamic,
             };
-            // Race the single write attempt against shutdown. On
-            // shutdown mid-attempt, abandon the future (drop cancels
-            // it), route the pending event to DLQ, resolve
-            // `Recovered`, and return. Without this the write
-            // attempt itself (open + apply + write + flush on a
-            // slow disk) can hold the queue consumer past the
-            // runtime shutdown budget just as the retry sleep did
-            // before shutdown-race wrapping.
-            let outcome = match crate::modules::attempt_or_shutdown(
-                &mut shutdown,
-                self.write_payload(attempt_payload),
-            )
-            .await
-            {
-                Some(r) => r,
-                None => {
-                    let reason = format!(
-                        "output '{}': write attempt abandoned on shutdown",
-                        self.name
-                    );
-                    crate::modules::route_event_to_dlq(
-                        self.error_log.as_ref(),
-                        &self.name,
-                        event,
-                        &reason,
-                    )
-                    .await;
-                    self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-                    ack.resolve_recovered();
-                    return Ok(());
-                }
-            };
-            match outcome {
+            // Note: unlike the network sinks, the file writer is
+            // *not* wrapped in `attempt_or_shutdown` here. The file
+            // output's contract is one line = one event, and
+            // aborting `write_payload` mid-flight can leave a partial
+            // append on disk (write_all is not atomic across
+            // syscalls; a large payload can be split into several
+            // `write(2)` calls). If we cancelled and DLQ-routed as
+            // Recovered at the same time, replay would re-append the
+            // event, producing a partial-then-full duplicate. Since
+            // the file write is local disk I/O, the individual
+            // attempt is typically <10 ms and finishes well inside
+            // the shutdown budget; the retry backoff sleep
+            // (`sleep_or_shutdown` below) is where the real
+            // shutdown-awareness bound lives.
+            match self.write_payload(attempt_payload).await {
                 Ok(()) => {
                     ack.resolve_delivered();
                     return Ok(());
