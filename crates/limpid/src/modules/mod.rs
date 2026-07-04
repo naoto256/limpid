@@ -74,6 +74,38 @@ pub async fn sleep_or_shutdown(
     }
 }
 
+/// Shared per-attempt helper for unbatched sinks: race a single
+/// send-attempt future against the runtime shutdown signal. Returns
+/// `Some(result)` if the attempt completed (either `Ok` or a
+/// transport `Err`), `None` if shutdown fired first — the caller
+/// should abandon the in-flight attempt, DLQ-route the pending
+/// event, resolve the ack handle as `Recovered`, and return so the
+/// queue consumer's `select!` reaches its drain arm inside the
+/// runtime shutdown budget. Companion to `sleep_or_shutdown`: that
+/// closes the retry backoff window; this closes the single-attempt
+/// I/O window (kafka's 30 s `message.timeout.ms`, syslog_tcp's
+/// per-peer 5+5+10 s per attempt, unix_socket's unbounded connect
+/// and write). A dropped shutdown sender is treated as
+/// "shutdown fired", same as `sleep_or_shutdown`.
+///
+/// Cancelling the attempt future may leave the transport in a
+/// partially-sent state (e.g. a half-written TCP frame). That is an
+/// intentional trade-off: the alternative is holding the queue
+/// consumer past the shutdown deadline and getting task-aborted
+/// mid-flight, which drops the ack handle and loses the event
+/// silently. A partial-line trailer is documented as the cost of
+/// prompt shutdown; downstream syslog / kafka receivers already
+/// tolerate resend-on-reconnect.
+pub async fn attempt_or_shutdown<F: std::future::Future>(
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    attempt: F,
+) -> Option<F::Output> {
+    tokio::select! {
+        r = attempt => Some(r),
+        _ = shutdown.wait_for(|s| *s) => None,
+    }
+}
+
 impl BuildContext {
     /// Test-only ctor with a no-op funcs registry, no error_log, and
     /// a shutdown receiver that never fires. Tests that need to
@@ -772,4 +804,60 @@ where
             })
         },
     );
+}
+
+#[cfg(test)]
+mod attempt_or_shutdown_tests {
+    use super::attempt_or_shutdown;
+    use std::time::Duration;
+
+    /// Happy path: the attempt future completes first, the shutdown
+    /// receiver is untouched, and the outcome is returned intact.
+    #[tokio::test]
+    async fn attempt_completes_before_shutdown_returns_the_outcome() {
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        let outcome = attempt_or_shutdown(&mut rx, async { 42u32 }).await;
+        assert_eq!(outcome, Some(42));
+    }
+
+    /// Shutdown fires while the attempt is still pending: the helper
+    /// returns `None` and the attempt future is dropped. Pin this on
+    /// wall time so a regression that dropped the shutdown arm would
+    /// hang and time out here — the assert bound (200 ms against a
+    /// 5 s sleep) is far under any plausible scheduler jitter.
+    #[tokio::test]
+    async fn shutdown_before_attempt_completes_returns_none() {
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        let helper = async move {
+            attempt_or_shutdown(&mut rx, tokio::time::sleep(Duration::from_secs(5)))
+                .await
+                .map(|_| ())
+        };
+        let handle = tokio::spawn(helper);
+        // Give the helper a chance to enter the select.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tx.send(true).unwrap();
+        let started = std::time::Instant::now();
+        let outcome = handle.await.unwrap();
+        let elapsed = started.elapsed();
+        assert!(outcome.is_none(), "shutdown must produce None");
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "shutdown must preempt the sleep — took {elapsed:?}"
+        );
+    }
+
+    /// A dropped shutdown sender flips `wait_for` into a `RecvError`;
+    /// the helper treats that as "shutdown fired" (the sender is
+    /// only dropped when the runtime is tearing down). Pin the
+    /// contract so a future refactor that changed the RecvError
+    /// mapping would trip the test.
+    #[tokio::test]
+    async fn dropped_shutdown_sender_is_treated_as_fired() {
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        drop(tx);
+        let outcome =
+            attempt_or_shutdown(&mut rx, tokio::time::sleep(Duration::from_secs(5))).await;
+        assert!(outcome.is_none());
+    }
 }

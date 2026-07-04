@@ -81,7 +81,31 @@ impl Output for UnixSocketOutput {
         let mut wait = self.retry.initial_wait;
         let mut shutdown = self.shutdown_signal.clone();
         loop {
-            match write_with_reconnect(self, &self.conn, &self.metrics, &event.egress).await {
+            let outcome = match crate::modules::attempt_or_shutdown(
+                &mut shutdown,
+                write_with_reconnect(self, &self.conn, &self.metrics, &event.egress),
+            )
+            .await
+            {
+                Some(r) => r,
+                None => {
+                    let reason = format!(
+                        "output '{}': write attempt abandoned on shutdown",
+                        self.name
+                    );
+                    crate::modules::route_event_to_dlq(
+                        self.error_log.as_ref(),
+                        &self.name,
+                        event,
+                        &reason,
+                    )
+                    .await;
+                    self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                    ack.resolve_recovered();
+                    return Ok(());
+                }
+            };
+            match outcome {
                 Ok(()) => {
                     ack.resolve_delivered();
                     return Ok(());
