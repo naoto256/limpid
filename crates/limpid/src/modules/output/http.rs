@@ -1972,6 +1972,77 @@ def output o {{
         server.abort();
     }
 
+    /// Regression pin: `shutdown()` fired while a retry backoff sleep
+    /// is in progress must short-circuit that sleep promptly, even
+    /// under the lost-wake window. The previous implementation
+    /// awaited a bare `shutdown_notify.notified()` inside the retry
+    /// `tokio::select!`. If `shutdown()` ran between the pre-sleep
+    /// `is_shutting_down.load()` and the `notified()` registration
+    /// (a real race — those steps aren't atomic), the wake was
+    /// lost and the retry loop slept the full `max_wait`. With
+    /// `max_wait` defaulting to 60 s and the runtime's shutdown
+    /// budget at 10 s, that stranded actor state past the join and
+    /// forced a task abort — the same class of leak that PR #84
+    /// closed for the steady-state path.
+    ///
+    /// This test can't atomically script the "shutdown fires
+    /// between the outer load and the inner notified()" ordering.
+    /// It instead pins the observable outcome: with a long backoff
+    /// (`max_wait=5s`) and shutdown fired ~150 ms into the sleep,
+    /// `shutdown()` must return well under `max_wait`. Pre-fix this
+    /// occasionally slept the full 5 s; post-fix it is always
+    /// prompt because `wait_until_shutdown()`'s load-notified-
+    /// recheck pattern catches either ordering.
+    #[tokio::test]
+    async fn shutdown_short_circuits_the_retry_backoff() {
+        let (addr, _post_count, server) = run_counting_failing_collector().await;
+        let url = format!("http://{}/", addr);
+        // A very long floor makes it unambiguous: any prompt
+        // shutdown return is thanks to the wake, not the sleep
+        // elapsing on its own.
+        let slow_retry = Property::Block {
+            key: "retry".into(),
+            key_span: None,
+            properties: vec![
+                prop_int("max_attempts", 5),
+                prop_str("initial_wait", "5s"),
+                prop_str("max_wait", "5s"),
+                Property::KeyValue {
+                    key: "backoff".into(),
+                    key_span: None,
+                    value: Expr::spanless(ExprKind::Ident(vec!["fixed".into()])),
+                    value_span: None,
+                },
+            ],
+        };
+        let output = HttpOutput::from_properties(
+            "test",
+            &mp(&[peer_block(&url), prop_int("batch_size", 1), slow_retry]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
+
+        output
+            .consume(&event_with("first"), event_ack())
+            .await
+            .unwrap();
+
+        // Let the actor reach the retry sleep.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Fire shutdown. Measure the wall time to return; it must
+        // be far less than the 5 s max_wait floor.
+        let started = std::time::Instant::now();
+        output.shutdown(None).await.unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "shutdown must short-circuit the retry sleep — took {elapsed:?} against a 5s floor"
+        );
+
+        server.abort();
+    }
+
     /// Cheap ack handle that discards its disposition — the sleep-race
     /// regression above doesn't need to inspect it.
     fn event_ack() -> crate::queue::QueueAckHandle {
