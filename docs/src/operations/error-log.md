@@ -440,6 +440,24 @@ Investigate immediately:
 
 Once the underlying issue is fixed, the next errored event lands in the file again and the counter stops increasing; existing records are unaffected.
 
+## Standing limitation: bug/panic/shutdown-fallthrough drops advance the cursor
+
+The DLQ contract described above assumes every event handed to an output either lands (`AckDisposition::Delivered` — cursor advances) or gets routed to `error_log` (`AckDisposition::Recovered` — cursor advances *after* the DLQ record is written). A third disposition exists — `AckDisposition::Dropped` — for the paths that resolve the ack handle without a matching `resolve_delivered()` / `resolve_recovered()` call:
+
+- A bug in an output's `consume` implementation that returns before signalling the handle (the handle's `Drop` then fires `Dropped`).
+- A panic inside `consume` while it holds the handle.
+- Residual shutdown-fallthrough shapes not yet covered by the shutdown-aware paths: the queue consumer's task is aborted mid-flight (SIGTERM budget exhausted) while a handle is still parked in an in-flight `write_payload` future, in a batched sink's buffer, or in the ack channel.
+
+When any of these fires, the handle's `Drop` sends `Dropped` down the ack channel, the queue consumer advances the cursor and bumps the output's `events_failed` counter — but **no DLQ record is written**, so replay tooling has nothing to reprocess.
+
+That "lost but no replay" behaviour is the current contract, marked *out of scope* in a per-line comment in `crates/limpid/src/queue/mod.rs` next to `receiver.ack_to(position)`. Full panic recovery (write the handle's carried event into the DLQ from the `Dropped` path, plus a queue-cursor rewind on a bounded lookahead window) is queued for a separate cycle: it needs `QueueAckHandle` to carry the event bytes long enough for the panic path to route them, plus a queue-cursor contract change so a rewind doesn't reorder events across pipelines.
+
+For operators, the practical implications:
+
+- **Watch `events_failed` at output granularity.** A step increase without a matching increase in `events_errored` or DLQ file size means events are dropping through this path. Cross-check `events_written + events_failed + retries` against upstream input rate to bound the loss.
+- **Watch daemon panics.** A `panicked at` line in the daemon's `tracing` output is the primary observable for the bug path. `RUST_BACKTRACE=1` in the systemd unit is worth the extra bytes.
+- **Shutdown-fallthrough is progressively narrowing.** Recent releases have brought the batched-sink retry loop, the unbatched-sink retry backoff sleep, and the unbatched-sink single send attempt all under a shutdown-race that DLQ-routes on time. The remaining exposure is limited to shapes where the ack channel or a batched-sink buffer still holds a handle at the SIGTERM deadline — rare in a healthy deployment, still a bug-attributed loss when it happens.
+
 ## Schema migration v1 → v2
 
 The 0.7.8 release introduces `schema_version: 2` as a **hard break**. v1 records (no `schema_version`, top-level `process` string field as the discriminator, no `kind`, no per-kind block) are not readable by v2 tooling, and v2 records are not readable by v1 tooling.
