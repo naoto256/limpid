@@ -485,6 +485,15 @@ impl FileOutput {
         buf.extend_from_slice(msg.as_bytes());
         buf.push(b'\n');
         file.write_all(&buf).await?;
+        // Push the buffered bytes through tokio's fs::File to the OS
+        // before we return "written". Without this, the data may still
+        // sit in tokio's per-file buffer at drop time — Drop closes the
+        // fd on a background thread, and if the pipeline advances
+        // (metrics tick, ack, downstream reader) before that close
+        // finishes flushing, the reader can observe a shorter file
+        // than the event count claims. The syscall is cheap and turns
+        // "write returned Ok" into an OS-visible commitment.
+        file.flush().await?;
         self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
