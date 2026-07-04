@@ -18,10 +18,8 @@
 //! interpolated values can't introduce `/`, `\`, or `..` segments
 //! that would escape into sibling directories.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
@@ -93,19 +91,6 @@ pub struct FileOutput {
     mode: Option<u32>,
     owner: Option<String>,
     group: Option<String>,
-    /// Paths this output has finished applying mode/owner/group to.
-    /// Membership is only inserted *after* `apply_file_metadata_to_fd`
-    /// returns, so it is authoritative: presence == metadata obligation
-    /// satisfied.
-    created_paths: Mutex<HashSet<PathBuf>>,
-    /// Paths where this output has successfully opened the file at
-    /// least once but has not yet promoted them to `created_paths`.
-    /// Used to survive a write_all failure or a cancellation between
-    /// write_all and apply — either case leaves an on-disk file this
-    /// output owes metadata to. Presence here forces the next
-    /// successful write to re-apply mode/owner even though
-    /// `path.exists()` is now true.
-    metadata_obligations: Mutex<HashSet<PathBuf>>,
     funcs: Arc<FunctionRegistry>,
     retry: RetryConfig,
     error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
@@ -163,8 +148,6 @@ impl Module for FileOutput {
             mode,
             owner,
             group,
-            created_paths: Mutex::new(HashSet::new()),
-            metadata_obligations: Mutex::new(HashSet::new()),
             funcs,
             retry,
             error_log,
@@ -361,124 +344,91 @@ impl FileOutput {
             );
         }
 
-        // Decide whether this write owes metadata to the target path.
-        // Sample the flags *before* the open, and only run the
-        // bookkeeping at all when the output actually configured
-        // mode/owner/group (`requires_metadata`). Signals:
+        // File-open strategy: distinguish "we just created this file"
+        // from "the file was already there" at the syscall level, so
+        // the metadata contract is enforced against the actual on-disk
+        // inode instead of process-local memory. Two attempts:
         //
-        //   * `already_applied` — a prior write for this path ran
-        //     apply_file_metadata_to_fd to completion.
-        //   * `has_prior_obligation` — a prior write got as far as a
-        //     successful `open` for this path but did not finish the
-        //     apply (open cancelled after the syscall landed, apply
-        //     itself failed and refused to promote). The on-disk file
-        //     exists but the obligation is outstanding.
+        //   1. `create_new(true)` (O_CREAT | O_EXCL). Succeeds only if
+        //      no file exists at the path. That is our unambiguous
+        //      signal for "this output owns the inode from birth" —
+        //      apply mode/owner immediately, before any payload bytes
+        //      reach disk.
+        //   2. On `AlreadyExists` (EEXIST), the path is already
+        //      populated — either by a prior successful run, by a
+        //      logrotate that removed/recreated the file, by an
+        //      operator, or by a pre-planted attacker file/symlink.
+        //      Open non-create with O_NOFOLLOW, then if a metadata
+        //      contract is configured, `fstat` the fd and refuse the
+        //      write if the observed mode/owner/group don't match. We
+        //      never silently chmod a file we didn't create — that
+        //      would be a foreign-inode side effect. The operator gets
+        //      a loud error and can rotate or fix the file.
         //
-        // For "path exists but neither flag is set" — a pre-existing
-        // file some other producer created — we deliberately skip
-        // metadata: this output has never touched it, so overriding
-        // its mode/owner would surprise operators. The obligation
-        // path only kicks in once we've opened the file at least once
-        // ourselves.
+        // Compared with the previous path-keyed in-memory bookkeeping,
+        // this survives daemon restart (state lives on the inode), and
+        // logrotate-driven inode swaps re-run the apply because the
+        // fresh inode is created via O_EXCL again.
+        //
+        // O_NOFOLLOW guards symlink attacks on the final path
+        // component in both branches (create-new refuses symlinks by
+        // its own semantics; the fallback open explicitly asks
+        // O_NOFOLLOW so a symlink at the path is refused with ELOOP).
         let requires_metadata = self.requires_metadata();
-        let should_apply = if requires_metadata {
-            let (path_preexisted, has_prior_obligation, already_applied) = {
-                let created = self.created_paths.lock().unwrap();
-                let obligations = self.metadata_obligations.lock().unwrap();
-                (
-                    path.exists(),
-                    obligations.contains(&path),
-                    created.contains(&path),
-                )
-            };
-            let should_apply = !already_applied && (has_prior_obligation || !path_preexisted);
 
-            // Record the metadata obligation *before* the open await,
-            // and synchronously — `metadata_obligations` is a
-            // `std::sync::Mutex` so the lock scope contains no
-            // cancellation points. If the open await is then cancelled
-            // after the syscall has already created the file on disk,
-            // or if it fails outright (e.g. ELOOP), the obligation is
-            // already recorded and the next successful write picks it
-            // up. Registering after the open would leave a race
-            // window: the on-disk file could exist while the in-memory
-            // obligation was never persisted, and the next call would
-            // treat the path as "some other producer's file" and
-            // silently skip mode/owner.
-            if should_apply && !has_prior_obligation {
-                self.metadata_obligations
-                    .lock()
-                    .unwrap()
-                    .insert(path.clone());
-            }
-            should_apply
-        } else {
-            false
-        };
-
-        // Fourth safety pass, complementing the three path-rendering
-        // passes in `render_path_in` (interpolation sanitising, `..`
-        // reject, trailing-slash reject): refuse to write through a
-        // symlink at the final path component. The rendering passes
-        // stop an event from *composing* an escaping path; O_NOFOLLOW
-        // stops a pre-planted symlink at a legitimately-composed path
-        // from redirecting the append to an arbitrary file (classic
-        // local symlink attack on a writable log directory). Scope is
-        // the final component only — that is the file this output
-        // creates and owns; symlinked *parent directories* are a
-        // deployment topology choice and stay under the operator's
-        // control.
-        let mut options = OpenOptions::new();
-        options.create(true).append(true);
+        let mut create_options = OpenOptions::new();
+        create_options.write(true).create_new(true).append(true);
         #[cfg(unix)]
-        options.custom_flags(libc::O_NOFOLLOW);
-        let mut file = options.open(&path).await.map_err(|e| {
-            // ELOOP is how open(2) reports O_NOFOLLOW hitting a
-            // symlink; surface it as an explicit refusal so the DLQ
-            // reason names the attack instead of a cryptic errno. We
-            // intentionally leave the obligation registered so the
-            // next successful write for this path finishes the apply
-            // (harmless if the operator drops the path, useful if
-            // they clear the symlink and retry).
-            #[cfg(unix)]
-            if e.raw_os_error() == Some(libc::ELOOP) {
-                return anyhow::anyhow!("refusing to follow symlink at output path: {}", resolved);
-            }
-            anyhow::Error::from(e)
-        })?;
+        create_options.custom_flags(libc::O_NOFOLLOW);
+        let create_res = create_options.open(&path).await;
 
-        if should_apply {
-            // Apply mode/owner *before* any payload bytes reach disk.
-            // The alternative — write first, chmod second — leaves a
-            // window where the file exists under the process umask
-            // and default ownership. For an output where the operator
-            // asked for 0600 / a specific owner, that window is
-            // security-relevant: another local reader could snapshot
-            // the file's contents before mode narrows down.
-            //
-            // Failure here is *not* a warn-and-move-on: propagate the
-            // error and leave `metadata_obligations` set. The retry
-            // driver runs the caller again, which re-opens the same
-            // path (obligation still present) and re-tries the apply
-            // from a clean slate. If apply keeps failing, the write
-            // exhausts its retry budget and lands in DLQ with the
-            // real reason attached, instead of silently degrading to
-            // "bytes are on disk under the wrong mode".
-            //
-            // apply_file_metadata_to_fd is cancel-safe (dup fd +
-            // spawn_blocking): if this await returns at all, the
-            // fchmod/fchown have run.
-            self.apply_file_metadata_to_fd(&file, &path).await?;
-            // Promote to "obligation satisfied" only after apply
-            // returned Ok. A concurrent second writer may have
-            // observed should_apply=true and re-applied in parallel —
-            // fchmod/fchown are idempotent so the extra call is
-            // harmless, and the insert de-duplicates future callers.
-            let mut created = self.created_paths.lock().unwrap();
-            let mut obligations = self.metadata_obligations.lock().unwrap();
-            created.insert(path.clone());
-            obligations.remove(&path);
-        }
+        let mut file = match create_res {
+            Ok(f) => {
+                // Fresh inode. Apply mode/owner/group BEFORE payload
+                // bytes reach disk so an intruder co-tenant can't
+                // snapshot the file under process umask/default owner
+                // in the window between write_all and fchmod.
+                //
+                // apply_file_metadata_to_fd is cancel-safe (dup fd +
+                // spawn_blocking): if this await returns Ok, the
+                // fchmod/fchown have run. If it returns Err, the file
+                // stays empty on disk; subsequent writes fall into the
+                // "already exists" branch, fstat it, see the umask
+                // default, and refuse — the failure is surfaced loud
+                // instead of degrading silently.
+                if requires_metadata {
+                    self.apply_file_metadata_to_fd(&f, &path).await?;
+                }
+                f
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let mut existing_options = OpenOptions::new();
+                existing_options.write(true).append(true);
+                #[cfg(unix)]
+                existing_options.custom_flags(libc::O_NOFOLLOW);
+                let f = existing_options.open(&path).await.map_err(|e| {
+                    #[cfg(unix)]
+                    if e.raw_os_error() == Some(libc::ELOOP) {
+                        return anyhow::anyhow!(
+                            "refusing to follow symlink at output path: {}",
+                            resolved
+                        );
+                    }
+                    anyhow::Error::from(e)
+                })?;
+                if requires_metadata {
+                    self.verify_existing_file_metadata(&f, &path).await?;
+                }
+                f
+            }
+            Err(e) => {
+                #[cfg(unix)]
+                if e.raw_os_error() == Some(libc::ELOOP) {
+                    anyhow::bail!("refusing to follow symlink at output path: {}", resolved);
+                }
+                return Err(anyhow::Error::from(e));
+            }
+        };
 
         let msg = String::from_utf8_lossy(&payload.egress);
         let mut buf = Vec::with_capacity(msg.len() + 1);
@@ -739,12 +689,116 @@ impl FileOutput {
         })?
     }
 
+    /// Verify that an existing file's on-disk mode/owner/group match
+    /// the operator-configured values. Called only when this output
+    /// took the "path already existed" branch of the write path — i.e.
+    /// we did not create the inode, and the metadata contract must be
+    /// re-checked rather than re-applied. On mismatch the write is
+    /// refused with a loud error so an operator can rotate the file,
+    /// fix ownership, or investigate an unexpected pre-existing inode
+    /// (dropped `metadata_obligations` from a crashed prior run,
+    /// logrotate copying instead of moving, etc.).
+    ///
+    /// Uses the same `dup(2)` + `spawn_blocking` pattern as
+    /// `apply_file_metadata_to_fd`: the fd stays live for the entire
+    /// blocking call even if the outer future is cancelled, so a
+    /// concurrently-closed source `File` can't cause the fstat to hit
+    /// an unrelated inode via fd reuse.
+    async fn verify_existing_file_metadata(
+        &self,
+        file: &tokio::fs::File,
+        path: &Path,
+    ) -> Result<()> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::unix::io::AsRawFd;
+
+        let mode = self.mode;
+        let owner = self.owner.clone();
+        let group = self.group.clone();
+        debug_assert!(
+            mode.is_some() || owner.is_some() || group.is_some(),
+            "callers must gate this on requires_metadata()"
+        );
+        let path = path.to_path_buf();
+        let path_for_join = path.clone();
+
+        let duped: i32 = unsafe { libc::dup(file.as_raw_fd()) };
+        if duped < 0 {
+            let err = std::io::Error::last_os_error();
+            anyhow::bail!("output file '{}': dup failed: {}", path.display(), err);
+        }
+        let owned_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(duped) };
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let fd = owned_fd.as_raw_fd();
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::fstat(fd, &mut stat) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                anyhow::bail!("output file '{}': fstat failed: {}", path.display(), err);
+            }
+            if let Some(configured) = mode {
+                let actual = (stat.st_mode as u32) & 0o777;
+                if actual != configured {
+                    anyhow::bail!(
+                        "output file '{}': existing file mode 0o{:o} does not match configured mode 0o{:o}; refusing to write. Remove or rotate the file to have this output recreate it with the configured mode.",
+                        path.display(),
+                        actual,
+                        configured
+                    );
+                }
+            }
+            if let Some(name) = owner.as_deref() {
+                let configured_uid = resolve_uid(name).with_context(|| {
+                    format!(
+                        "output file '{}': failed to resolve owner '{}'",
+                        path.display(),
+                        name
+                    )
+                })?;
+                if stat.st_uid != configured_uid {
+                    anyhow::bail!(
+                        "output file '{}': existing file owner uid {} does not match configured owner '{}' (uid {}); refusing to write.",
+                        path.display(),
+                        stat.st_uid,
+                        name,
+                        configured_uid
+                    );
+                }
+            }
+            if let Some(name) = group.as_deref() {
+                let configured_gid = resolve_gid(name).with_context(|| {
+                    format!(
+                        "output file '{}': failed to resolve group '{}'",
+                        path.display(),
+                        name
+                    )
+                })?;
+                if stat.st_gid != configured_gid {
+                    anyhow::bail!(
+                        "output file '{}': existing file group gid {} does not match configured group '{}' (gid {}); refusing to write.",
+                        path.display(),
+                        stat.st_gid,
+                        name,
+                        configured_gid
+                    );
+                }
+            }
+            Ok(())
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "output file '{}': metadata verify task failed to join",
+                path_for_join.display()
+            )
+        })?
+    }
+
     /// Whether this output has a mode/owner/group contract to enforce.
-    /// When false, the writer skips all metadata bookkeeping and the
-    /// on-disk file inherits the process umask / default ownership
-    /// exactly as it would for a caller that never configured any of
-    /// these knobs — no obligation is registered, no apply is run, no
-    /// created_paths entry appears.
+    /// When false, an existing file's metadata is not verified and
+    /// freshly-created files inherit the process umask / default
+    /// ownership.
     fn requires_metadata(&self) -> bool {
         self.mode.is_some() || self.owner.is_some() || self.group.is_some()
     }
@@ -762,9 +816,10 @@ const NSS_RECORD_BUF: usize = 4096;
 /// variant is used in place of `getpwnam` so the call is safe to make
 /// concurrently with other `getpw*` users in the process (the legacy
 /// `getpwnam` returns a pointer into a static buffer shared across
-/// threads). Called only at module construction time today, but the
-/// hard guarantee removes a hazard for any future caller that wires
-/// this onto a hot path.
+/// threads). Called from the write path inside `spawn_blocking`
+/// (`apply_file_metadata_to_fd` on create, `verify_existing_file_metadata`
+/// on subsequent writes), so the thread-safety guarantee is
+/// load-bearing, not defensive.
 fn resolve_uid(name: &str) -> Result<u32> {
     use std::ffi::CString;
     use std::mem::MaybeUninit;
@@ -880,8 +935,6 @@ mod tests {
             mode,
             owner,
             group,
-            created_paths: Mutex::new(HashSet::new()),
-            metadata_obligations: Mutex::new(HashSet::new()),
             funcs: funcs(),
             retry: RetryConfig::default(),
             error_log: None,
@@ -1197,23 +1250,25 @@ mod tests {
             "fchmod must land the configured mode on the created file"
         );
 
-        // A second write must not re-apply the mode — apply_file_metadata
-        // is gated on first_create. Externally tightening the mode
-        // between writes stays sticky, which is the operator-friendly
-        // behaviour.
+        // Second write from an operator who then externally tightened
+        // the mode: the fstat verify refuses, so the write does not
+        // silently override the operator's manual chmod, nor does it
+        // silently proceed under a mode that no longer matches config.
+        // The operator's next step is either to align the file with
+        // config (chmod back) or to update the config to match the
+        // file — both are explicit, neither is silent.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        out.write_payload(FilePayload {
-            egress: Bytes::from("again"),
-            path: path.display().to_string(),
-            is_dynamic: false,
-        })
-        .await
-        .expect("second write must succeed");
+        let err = out
+            .write_payload(FilePayload {
+                egress: Bytes::from("again"),
+                path: path.display().to_string(),
+                is_dynamic: false,
+            })
+            .await
+            .expect_err("mismatched mode must be refused");
+        assert!(err.to_string().contains("existing file mode"));
         let mode2 = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            mode2, 0o600,
-            "second write must not re-apply mode; operator tightening stays sticky"
-        );
+        assert_eq!(mode2, 0o600, "refusal must not chmod the file back");
     }
 
     #[tokio::test]
@@ -1313,73 +1368,37 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn outstanding_metadata_obligation_reapplies_on_next_write() {
-        // Regression pin for the "write_all failed or the apply await
-        // was cancelled between open and apply_file_metadata_to_fd"
-        // shape. An earlier version tracked the metadata obligation
-        // only through `path.exists()` — once the file existed on
-        // disk (which `open(create=true)` guarantees the moment it
-        // returns), any subsequent call landed in the "not first
-        // create" arm and silently skipped mode/owner. We simulate
-        // that shape by seeding `metadata_obligations` directly: it
-        // is what a prior aborted attempt would have left behind.
+    async fn existing_file_with_matching_mode_accepts_subsequent_writes() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("obligation.log");
+        let path = dir.path().join("continuing.log");
 
-        // Pretend a previous attempt got as far as `open` (creating
-        // the file) but was cancelled before apply. On disk that
-        // looks like: file exists with umask-default mode; obligation
-        // still registered.
-        std::fs::write(&path, b"partial\n").unwrap();
         let out = make_output_with(
             ek(ExprKind::StringLit(path.display().to_string())),
             Some(0o600),
         );
-        out.metadata_obligations
-            .lock()
-            .unwrap()
-            .insert(path.clone());
-
-        // Next successful write must honour the obligation.
-        out.write_payload(FilePayload {
-            egress: Bytes::from("retry"),
-            path: path.display().to_string(),
-            is_dynamic: false,
-        })
-        .await
-        .expect("retry write must succeed");
-
+        for payload in ["first", "second", "third"] {
+            out.write_payload(FilePayload {
+                egress: Bytes::from(payload),
+                path: path.display().to_string(),
+                is_dynamic: false,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("{payload} write must succeed: {e:#}"));
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"first\nsecond\nthird\n");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            mode, 0o600,
-            "outstanding metadata obligation must trigger apply on the next successful write"
-        );
-        assert!(
-            out.metadata_obligations.lock().unwrap().is_empty(),
-            "obligation must be cleared once apply has landed"
-        );
-        assert!(
-            out.created_paths.lock().unwrap().contains(&path),
-            "successful apply must promote the path to created_paths"
-        );
+        assert_eq!(mode, 0o600, "mode set on create must persist across writes");
     }
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn preexisting_file_from_another_producer_keeps_its_mode() {
-        // Semantic pin, complementing the obligation test above: a
-        // file that existed *before* this output ever touched it, and
-        // therefore carries no obligation, must not have its mode
-        // overwritten on our first append. The mode contract is
-        // scoped to files this output creates (or has an outstanding
-        // obligation on); rewriting an unrelated producer's file
-        // would surprise operators.
+    async fn existing_file_with_mismatched_mode_is_refused_loudly() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("foreign.log");
+        let path = dir.path().join("mismatched.log");
 
-        std::fs::write(&path, b"not ours\n").unwrap();
+        std::fs::write(&path, b"existing\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         let out = make_output_with(
@@ -1387,119 +1406,142 @@ mod tests {
             Some(0o600),
         );
 
-        out.write_payload(FilePayload {
-            egress: Bytes::from("append"),
-            path: path.display().to_string(),
-            is_dynamic: false,
-        })
-        .await
-        .expect("append to a preexisting file must succeed");
+        let err = out
+            .write_payload(FilePayload {
+                egress: Bytes::from("payload"),
+                path: path.display().to_string(),
+                is_dynamic: false,
+            })
+            .await
+            .expect_err("mismatched-mode preexisting file must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("existing file mode"), "{msg}");
+        assert!(msg.contains("0o644"), "{msg}");
+        assert!(msg.contains("0o600"), "{msg}");
 
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
-            mode, 0o644,
-            "pre-existing file with no obligation must keep its mode"
-        );
-        assert!(
-            out.metadata_obligations.lock().unwrap().is_empty(),
-            "no obligation should have been recorded for a preexisting file"
-        );
-        assert!(
-            !out.created_paths.lock().unwrap().contains(&path),
-            "no metadata was applied, so nothing should have promoted to created_paths"
+            std::fs::read(&path).unwrap(),
+            b"existing\n",
+            "payload must not have been appended when the mode check refused"
         );
     }
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn open_failure_leaves_metadata_obligation_registered_for_the_retry() {
-        // Regression pin for the pre-open obligation-registration
-        // race. An earlier shape recorded the obligation *after*
-        // `open(...).await` returned. That left a window: if
-        // `open(create=true)` created the file on disk and the
-        // future was cancelled before the post-open insert landed,
-        // the on-disk file was orphaned — `path.exists()=true`,
-        // obligation absent — and the next call misread it as a
-        // foreign preexisting file, silently skipping mode/owner.
-        //
-        // Fix: keep the sets behind `std::sync::Mutex` (lock scope
-        // holds no cancellation point) and record the obligation
-        // synchronously, *before* the open await. We can't script an
-        // await-time cancellation from a stable test, but the
-        // observable outcome that guarantees the pre-open shape is
-        // that after any open failure (ELOOP here) the obligation is
-        // already registered. If the insert had been post-open, this
-        // test would find `metadata_obligations` empty.
+    async fn logrotate_style_inode_swap_reapplies_configured_mode() {
+        use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("guarded.log");
-        let symlink_target = dir.path().join("_would_be_hijacked.log");
-        std::os::unix::fs::symlink(&symlink_target, &path).unwrap();
+        let path = dir.path().join("rotated.log");
 
         let out = make_output_with(
             ek(ExprKind::StringLit(path.display().to_string())),
-            Some(0o640),
+            Some(0o600),
         );
 
-        let err = out
+        out.write_payload(FilePayload {
+            egress: Bytes::from("pre-rotate"),
+            path: path.display().to_string(),
+            is_dynamic: false,
+        })
+        .await
+        .expect("first write");
+        let ino_a = std::fs::metadata(&path).unwrap().ino();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        out.write_payload(FilePayload {
+            egress: Bytes::from("post-rotate"),
+            path: path.display().to_string(),
+            is_dynamic: false,
+        })
+        .await
+        .expect("write on freshly-rotated path");
+
+        let ino_b = std::fs::metadata(&path).unwrap().ino();
+        assert_ne!(ino_a, ino_b, "sanity: rotation must produce a new inode");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "post-rotation inode must inherit the configured mode, not umask default"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn empty_file_left_by_failed_apply_blocks_next_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("crashed.log");
+
+        let attempt1 = make_output_with_metadata(
+            ek(ExprKind::StringLit(path.display().to_string())),
+            Some(0o600),
+            Some("bad\0owner".into()),
+            None,
+        );
+        let err1 = attempt1
             .write_payload(FilePayload {
                 egress: Bytes::from("first"),
                 path: path.display().to_string(),
                 is_dynamic: false,
             })
             .await
-            .expect_err("symlink at output path must be refused on first write");
-        assert!(err.to_string().contains("refusing to follow symlink"));
+            .expect_err("apply failure must refuse the first write");
+        assert!(err1.to_string().contains("failed to resolve owner"));
+        assert!(path.exists());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        // Force the leftover file into a mode that will not match the
+        // configured value on the next attempt. On production Linux
+        // (umask 0022) create_new produces 0o644 for free; setting it
+        // explicitly makes the test invariant hold regardless of the
+        // host's umask (macOS test runners can land at 0o600 by
+        // chance, which would otherwise pass verify).
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(attempt1);
 
-        // Direct check of the internal state: pre-open registration
-        // means the obligation survives the open failure, ready for
-        // the next successful write to complete the metadata apply.
-        assert!(
-            out.metadata_obligations.lock().unwrap().contains(&path),
-            "obligation must be recorded before open, so the retry can finish the metadata apply even if open (or its await) never completes"
+        // Simulate daemon restart with a fixed config.
+        let attempt2 = make_output_with(
+            ek(ExprKind::StringLit(path.display().to_string())),
+            Some(0o600),
         );
+        let err2 = attempt2
+            .write_payload(FilePayload {
+                egress: Bytes::from("second"),
+                path: path.display().to_string(),
+                is_dynamic: false,
+            })
+            .await
+            .expect_err("post-restart write must refuse if leftover file mode does not match");
+        assert!(err2.to_string().contains("existing file mode"));
 
-        // End-to-end confirmation: with the symlink cleared, the
-        // retry runs open+write+apply and the configured mode lands.
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+        // Operator remediation: remove the crash-leftover file.
         std::fs::remove_file(&path).unwrap();
-        out.write_payload(FilePayload {
-            egress: Bytes::from("second"),
-            path: path.display().to_string(),
-            is_dynamic: false,
-        })
-        .await
-        .expect("second write must succeed after removing the symlink");
-
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o640, "obligation-driven retry must apply mode");
-        assert!(
-            out.metadata_obligations.lock().unwrap().is_empty(),
-            "obligation must be cleared once apply has landed"
-        );
-        assert!(
-            out.created_paths.lock().unwrap().contains(&path),
-            "successful apply must promote the path to created_paths"
+        attempt2
+            .write_payload(FilePayload {
+                egress: Bytes::from("second"),
+                path: path.display().to_string(),
+                is_dynamic: false,
+            })
+            .await
+            .expect("write must succeed once the leftover file is cleared");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
         );
     }
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn metadata_apply_failure_keeps_obligation_and_does_not_write_bytes() {
-        // Pin the invariant that a `mode`/`owner`/`group` contract is
-        // *enforced*, not best-effort. If the operator asked for a
-        // specific owner that cannot be resolved on this host, the
-        // write must not silently degrade to "bytes on disk under
-        // process defaults with a warning line". Instead: apply
-        // returns an error, no payload bytes are written, and the
-        // obligation stays set so the next attempt (retry driver, or
-        // an operator fix + resend) starts from a clean slate.
+    async fn metadata_apply_failure_leaves_empty_file_and_no_bytes() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("apply_fail.log");
 
-        // A username with a NUL byte makes `resolve_uid` (via
-        // `CString::new`) fail deterministically without depending on
-        // /etc/passwd. Semantically equivalent to any "the configured
-        // owner cannot be resolved" case from the operator's POV.
         let out = make_output_with_metadata(
             ek(ExprKind::StringLit(path.display().to_string())),
             Some(0o600),
@@ -1515,74 +1557,40 @@ mod tests {
             })
             .await
             .expect_err("metadata contract must refuse the write when apply cannot land");
-        assert!(
-            err.to_string().contains("failed to resolve owner"),
-            "error must surface the real reason, not a bytes-on-disk fallback: {err:#}"
-        );
-
-        // `open(create=true)` did run — the file exists on disk. But
-        // apply refused before we wrote, so the file must still be
-        // empty. That is the security-relevant invariant: payload
-        // bytes never landed under the process umask/ownership.
-        assert!(path.exists(), "open(create=true) created the file");
+        assert!(err.to_string().contains("failed to resolve owner"));
+        assert!(path.exists(), "create_new produced the file");
         assert_eq!(
             std::fs::metadata(&path).unwrap().len(),
             0,
             "payload must not have been written when metadata apply failed"
         );
-
-        // Obligation stays set — next attempt retries apply from a
-        // clean slate. Nothing promotes to created_paths.
-        assert!(
-            out.metadata_obligations.lock().unwrap().contains(&path),
-            "obligation must remain until apply actually lands"
-        );
-        assert!(
-            !out.created_paths.lock().unwrap().contains(&path),
-            "apply failure must not promote the path to created_paths"
-        );
     }
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn output_with_no_metadata_contract_skips_all_bookkeeping() {
-        // When no mode/owner/group is configured the output has no
-        // metadata contract to enforce, so it must not register
-        // obligations or created_paths entries — those sets exist to
-        // remember "we still owe this path a mode/owner apply", and
-        // that concept is undefined without a contract. Pin the
-        // no-op shape so a future refactor can't accidentally
-        // start tracking every path a metadata-free output touches.
+    async fn output_with_no_metadata_contract_accepts_existing_file_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("no_contract.log");
+        std::fs::write(&path, b"pre-existing\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         let out = make_output_with(ek(ExprKind::StringLit(path.display().to_string())), None);
         assert!(!out.requires_metadata());
 
         out.write_payload(FilePayload {
-            egress: Bytes::from("hello"),
+            egress: Bytes::from("appended"),
             path: path.display().to_string(),
             is_dynamic: false,
         })
         .await
         .expect("write must succeed with no metadata contract");
 
-        assert!(
-            path.exists(),
-            "payload path must exist after a successful write"
-        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"pre-existing\nappended\n");
         assert_eq!(
-            std::fs::read(&path).unwrap(),
-            b"hello\n",
-            "payload bytes must be on disk"
-        );
-        assert!(
-            out.metadata_obligations.lock().unwrap().is_empty(),
-            "no metadata contract means no obligation to record"
-        );
-        assert!(
-            out.created_paths.lock().unwrap().is_empty(),
-            "no metadata contract means no created_paths entry"
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "no metadata contract means the existing file's mode is untouched"
         );
     }
 }
