@@ -131,5 +131,5 @@ Parent directories are created automatically for dynamic paths (templates with `
 ## Notes
 
 - Each line is the event's `egress` bytes verbatim followed by a `\n`. The writer is byte-preserving: non-UTF-8 payloads (rare vendor formats, base64-decoded blobs) are written unchanged rather than lossily normalised to U+FFFD.
-- For log rotation, use `logrotate` with `copytruncate` or `create` + SIGHUP.
+- For log rotation, the output uses a fresh `open(2)` per write (`create_new` + `fstat` verify on the existing branch), so no `SIGHUP` reload is needed — logrotate's default rename-and-recreate flow works because the next event opens the new inode. `copytruncate` also works. If logrotate's `create` mode is set, its mode / owner / group must match the output's configured `mode` / `owner` / `group`; otherwise the next write is refused with a mismatch diagnostic (see the [Permissions contract](#properties) above). See also the DLQ [error-log rotation guidance](../operations/error-log.md#recommended-logrotate-configuration) for the same shape.
 - Common queue / retry properties — see [Queue and retry](./README.md#queue-and-retry).
