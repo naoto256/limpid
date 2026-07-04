@@ -1,6 +1,6 @@
 # Functions
 
-Functions return values. They appear in conditions, on the right-hand side of assignments, inside `${...}` interpolations, in HashLit values, as `process` arguments, and as bare statements inside a `process` body (where the returned object is merged into `workspace`).
+Functions return values. They appear in conditions, on the right-hand side of assignments, inside `${...}` interpolations, in HashLit values, and as bare statements inside a `process` body (where the returned object is merged into `workspace`).
 
 limpid distinguishes two forms by where the implementation lives, but the call surface is identical for both:
 
