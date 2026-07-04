@@ -52,11 +52,18 @@
 //!     | limpidctl inject output <output-name> --json
 //! ```
 //!
-//! Per-write `OpenOptions::create(true).append(true)` is used by
-//! design — failures are (hopefully) rare so the cost of a fresh open
-//! is negligible, and it keeps the writer compatible with logrotate's
+//! Per-write open (not a persistent handle) is used by design —
+//! failures are (hopefully) rare so the cost of a fresh open is
+//! negligible, and it keeps the writer compatible with logrotate's
 //! `copytruncate` / signal-less rotation flows without needing a
-//! `SIGHUP`-handled file-handle reset.
+//! `SIGHUP`-handled file-handle reset. The open itself is a two-branch
+//! contract: `create_new(true)` (`O_CREAT|O_EXCL`) with `O_NOFOLLOW`
+//! and `mode(0o600)` for the fresh-inode path, falling back to a
+//! non-create `O_NOFOLLOW` open plus an `fstat` mode-verify on the
+//! `AlreadyExists` branch. Symlinks are refused via `O_NOFOLLOW`; an
+//! existing DLQ file whose mode isn't exactly `0o600` is refused
+//! with a loud error rather than silently appending a leak-prone
+//! record. See `ErrorLogWriter::write` for the invariants.
 //!
 //! Concurrency note: multiple pipeline workers may call `write()`
 //! concurrently when several pipelines hit a process error in the
