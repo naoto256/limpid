@@ -151,7 +151,7 @@ Process flavor (4 sites — replay via `inject input`):
 
 1. **`<process_name>`** — an explicit `process` body raised via `error <expr>` or a process-internal failure.
 2. **`(inline)`** — an inline `process { ... }` block raised the same way.
-3. **`(pipeline body)`** — an `if` condition / `switch` discriminant / explicit `error <expr>` argument / `process` function argument failed to evaluate before reaching a process body.
+3. **`(pipeline body)`** — an `if` condition / `switch` discriminant / explicit `error <expr>` argument failed to evaluate before reaching a process body.
 4. **`(pipeline)`** — `error <expr>` at the pipeline (statement) level raised, including the dispatcher pattern where a snippet routes on an unrecognised subtype.
 
 Output flavor (3 sites — replay via `inject output`):

@@ -16,8 +16,8 @@
 //!    via `error <expr>` or a process-internal failure.
 //! 2. **`(inline)`** — an inline `process { ... }` block raised
 //!    similarly.
-//! 3. **`(pipeline body)`** — `if`/`switch`/`error <expr>`/process-args
-//!    eval failed before reaching a process body.
+//! 3. **`(pipeline body)`** — `if`/`switch`/`error <expr>` eval
+//!    failed before reaching a process body.
 //! 4. **`(pipeline)`** — `error <expr>` at the pipeline (statement)
 //!    level raised.
 //!

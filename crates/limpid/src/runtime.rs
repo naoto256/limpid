@@ -670,8 +670,8 @@ async fn process_event(
             Err(e) => {
                 // Pipeline body raised a runtime error that wasn't
                 // caught by `process` (= came out of expression
-                // evaluation in `error <expr>`, process arguments,
-                // switch discriminant/pattern, or `if` condition).
+                // evaluation in `error <expr>`, switch discriminant/
+                // pattern, or `if` condition).
                 // Pre-fix this branch only logged and the event
                 // disappeared without an `events_errored` increment
                 // or a DLQ entry — operators had no replay path,
