@@ -21,12 +21,12 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
 
 use bytes::Bytes;
 
@@ -380,14 +380,36 @@ impl FileOutput {
         // path only kicks in once we've opened the file at least once
         // ourselves.
         let (path_preexisted, has_prior_obligation, already_applied) = {
-            let created = self.created_paths.lock().await;
-            let obligations = self.metadata_obligations.lock().await;
+            let created = self.created_paths.lock().unwrap();
+            let obligations = self.metadata_obligations.lock().unwrap();
             (
                 path.exists(),
                 obligations.contains(&path),
                 created.contains(&path),
             )
         };
+        let should_apply = !already_applied && (has_prior_obligation || !path_preexisted);
+
+        // Record the metadata obligation *before* the open await, and
+        // synchronously — both `created_paths` and
+        // `metadata_obligations` are `std::sync::Mutex`, so the lock
+        // scope contains no cancellation points. If the open await is
+        // then cancelled after the syscall has already created the
+        // file on disk, or if it fails outright (e.g. ELOOP), the
+        // obligation is already recorded and the next successful
+        // write picks it up. Registering after the open would leave a
+        // race window: the on-disk file could exist while the
+        // in-memory obligation was never persisted, and the next call
+        // would treat the path as "some other producer's file" and
+        // silently skip mode/owner. Skipping the insert when
+        // `has_prior_obligation` avoids overwriting a set membership
+        // that already exists.
+        if should_apply && !has_prior_obligation {
+            self.metadata_obligations
+                .lock()
+                .unwrap()
+                .insert(path.clone());
+        }
 
         // Fourth safety pass, complementing the three path-rendering
         // passes in `render_path_in` (interpolation sanitising, `..`
@@ -408,26 +430,17 @@ impl FileOutput {
         let mut file = options.open(&path).await.map_err(|e| {
             // ELOOP is how open(2) reports O_NOFOLLOW hitting a
             // symlink; surface it as an explicit refusal so the DLQ
-            // reason names the attack instead of a cryptic errno.
+            // reason names the attack instead of a cryptic errno. We
+            // intentionally leave the obligation registered so the
+            // next successful write for this path finishes the apply
+            // (harmless if the operator drops the path, useful if
+            // they clear the symlink and retry).
             #[cfg(unix)]
             if e.raw_os_error() == Some(libc::ELOOP) {
                 return anyhow::anyhow!("refusing to follow symlink at output path: {}", resolved);
             }
             anyhow::Error::from(e)
         })?;
-
-        // We now hold an fd for the target. If this write is going to
-        // owe metadata, record the obligation *before* write_all — the
-        // open may have just created a fresh file on disk, and if
-        // write_all fails or is cancelled we must remember to finish
-        // the apply on the next attempt (otherwise `path.exists()`
-        // above would silently drop us into the "pre-existing" arm on
-        // the next call).
-        let should_apply = !already_applied && (has_prior_obligation || !path_preexisted);
-        if should_apply && !has_prior_obligation {
-            let mut obligations = self.metadata_obligations.lock().await;
-            obligations.insert(path.clone());
-        }
 
         let msg = String::from_utf8_lossy(&payload.egress);
         let mut buf = Vec::with_capacity(msg.len() + 1);
@@ -455,8 +468,8 @@ impl FileOutput {
             // call is harmless, and the insert below de-duplicates
             // future callers.
             self.apply_file_metadata_to_fd(&file, &path).await;
-            let mut created = self.created_paths.lock().await;
-            let mut obligations = self.metadata_obligations.lock().await;
+            let mut created = self.created_paths.lock().unwrap();
+            let mut obligations = self.metadata_obligations.lock().unwrap();
             created.insert(path.clone());
             obligations.remove(&path);
         }
@@ -1269,14 +1282,13 @@ mod tests {
     async fn outstanding_metadata_obligation_reapplies_on_next_write() {
         // Regression pin for the "write_all failed or the apply await
         // was cancelled between open and apply_file_metadata_to_fd"
-        // shape (audit round-2, boundary-contract / security). Before
-        // the fix, the metadata obligation was tracked only through
-        // `path.exists()` — once the file existed on disk (which
-        // `open(create=true)` guarantees the moment it returns), any
-        // subsequent call landed in the "not first create" arm and
-        // silently skipped mode/owner. We simulate that shape by
-        // seeding `metadata_obligations` directly: it is what a prior
-        // aborted attempt would have left behind.
+        // shape. An earlier version tracked the metadata obligation
+        // only through `path.exists()` — once the file existed on
+        // disk (which `open(create=true)` guarantees the moment it
+        // returns), any subsequent call landed in the "not first
+        // create" arm and silently skipped mode/owner. We simulate
+        // that shape by seeding `metadata_obligations` directly: it
+        // is what a prior aborted attempt would have left behind.
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("obligation.log");
@@ -1290,7 +1302,10 @@ mod tests {
             ek(ExprKind::StringLit(path.display().to_string())),
             Some(0o600),
         );
-        out.metadata_obligations.lock().await.insert(path.clone());
+        out.metadata_obligations
+            .lock()
+            .unwrap()
+            .insert(path.clone());
 
         // Next successful write must honour the obligation.
         out.write_payload(FilePayload {
@@ -1307,11 +1322,11 @@ mod tests {
             "outstanding metadata obligation must trigger apply on the next successful write"
         );
         assert!(
-            out.metadata_obligations.lock().await.is_empty(),
+            out.metadata_obligations.lock().unwrap().is_empty(),
             "obligation must be cleared once apply has landed"
         );
         assert!(
-            out.created_paths.lock().await.contains(&path),
+            out.created_paths.lock().unwrap().contains(&path),
             "successful apply must promote the path to created_paths"
         );
     }
@@ -1352,12 +1367,84 @@ mod tests {
             "pre-existing file with no obligation must keep its mode"
         );
         assert!(
-            out.metadata_obligations.lock().await.is_empty(),
+            out.metadata_obligations.lock().unwrap().is_empty(),
             "no obligation should have been recorded for a preexisting file"
         );
         assert!(
-            !out.created_paths.lock().await.contains(&path),
+            !out.created_paths.lock().unwrap().contains(&path),
             "no metadata was applied, so nothing should have promoted to created_paths"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn open_failure_leaves_metadata_obligation_registered_for_the_retry() {
+        // Regression pin for the pre-open obligation-registration
+        // race. An earlier shape recorded the obligation *after*
+        // `open(...).await` returned. That left a window: if
+        // `open(create=true)` created the file on disk and the
+        // future was cancelled before the post-open insert landed,
+        // the on-disk file was orphaned — `path.exists()=true`,
+        // obligation absent — and the next call misread it as a
+        // foreign preexisting file, silently skipping mode/owner.
+        //
+        // Fix: keep the sets behind `std::sync::Mutex` (lock scope
+        // holds no cancellation point) and record the obligation
+        // synchronously, *before* the open await. We can't script an
+        // await-time cancellation from a stable test, but the
+        // observable outcome that guarantees the pre-open shape is
+        // that after any open failure (ELOOP here) the obligation is
+        // already registered. If the insert had been post-open, this
+        // test would find `metadata_obligations` empty.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("guarded.log");
+        let symlink_target = dir.path().join("_would_be_hijacked.log");
+        std::os::unix::fs::symlink(&symlink_target, &path).unwrap();
+
+        let out = make_output_with(
+            ek(ExprKind::StringLit(path.display().to_string())),
+            Some(0o640),
+        );
+
+        let err = out
+            .write_payload(FilePayload {
+                egress: Bytes::from("first"),
+                path: path.display().to_string(),
+                is_dynamic: false,
+            })
+            .await
+            .expect_err("symlink at output path must be refused on first write");
+        assert!(err.to_string().contains("refusing to follow symlink"));
+
+        // Direct check of the internal state: pre-open registration
+        // means the obligation survives the open failure, ready for
+        // the next successful write to complete the metadata apply.
+        assert!(
+            out.metadata_obligations.lock().unwrap().contains(&path),
+            "obligation must be recorded before open, so the retry can finish the metadata apply even if open (or its await) never completes"
+        );
+
+        // End-to-end confirmation: with the symlink cleared, the
+        // retry runs open+write+apply and the configured mode lands.
+        std::fs::remove_file(&path).unwrap();
+        out.write_payload(FilePayload {
+            egress: Bytes::from("second"),
+            path: path.display().to_string(),
+            is_dynamic: false,
+        })
+        .await
+        .expect("second write must succeed after removing the symlink");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "obligation-driven retry must apply mode");
+        assert!(
+            out.metadata_obligations.lock().unwrap().is_empty(),
+            "obligation must be cleared once apply has landed"
+        );
+        assert!(
+            out.created_paths.lock().unwrap().contains(&path),
+            "successful apply must promote the path to created_paths"
         );
     }
 }
