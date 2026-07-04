@@ -42,6 +42,8 @@ For any pipeline that uses `retry { ... }` or a batched output (`http`, `otlp_ht
 
 The path must be in a directory the daemon user can write to. limpid validates this at startup (`--check` and daemon start both fail with a clear message if the parent directory is missing or non-writable).
 
+The path itself, if it already exists, must be a regular 0o600 file. Daemon startup and every runtime write refuse a symlink, a FIFO, a socket, a directory, or a device node at the DLQ path with a diagnostic that names the observed shape — an operator typo that pointed `error_log` at `/dev/log`, a stale FIFO from a debugging session, or a socket file left over from another daemon is caught before any records are appended to the wrong endpoint.
+
 ### Recommended `logrotate` configuration
 
 A typical operator setup keeps the live file capped and the rotated archives compressed:

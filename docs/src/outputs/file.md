@@ -23,6 +23,15 @@ def output archive {
 | `owner` | no | process user | File owner (requires `CAP_CHOWN`) |
 | `group` | no | process group | File group |
 
+**Regular-file contract.** The output only ever writes to a regular
+file at `path`. If the path already exists and points at a symlink,
+FIFO, socket, directory, or device node, the write is refused with a
+diagnostic that names the observed shape — the output does not treat
+those as write targets and does not create anything alongside them.
+This holds independently of the `mode` / `owner` / `group` contract
+below: an operator typo that pointed `path` at `/dev/log` or a stale
+FIFO won't silently drain events into whatever is on the other end.
+
 **Permissions contract.** When any of `mode` / `owner` / `group` is
 configured, the output enforces the following on every write:
 
