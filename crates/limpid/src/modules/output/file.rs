@@ -128,14 +128,33 @@ impl Module for FileOutput {
         }
 
         let mode = props::get_string(properties, "mode")
-            .map(|s| {
-                let s = s.trim_start_matches('0');
-                u32::from_str_radix(s, 8).with_context(|| {
+            .map(|raw| {
+                // Parse as octal directly. Do NOT strip leading zeros
+                // first: `"0"` and `"0000"` are both valid Unix modes
+                // and must survive the parse; stripping to `""` used
+                // to turn them into a load-time error.
+                let parsed = u32::from_str_radix(&raw, 8).with_context(|| {
                     format!(
                         "output '{}': invalid mode (expected octal, e.g. \"0640\")",
                         name
                     )
-                })
+                })?;
+                // Enforce the same 12-bit mask the write path checks
+                // via `fstat` (setuid / setgid / sticky + rwx). A
+                // value above 0o7777 could never be honoured — the
+                // `fchmod` on create silently masks the extras, and
+                // the fstat verify on subsequent writes would report
+                // a permanent mismatch. Reject at load time so the
+                // operator sees the mistake in the daemon startup
+                // log rather than at first write.
+                if parsed > 0o7777 {
+                    anyhow::bail!(
+                        "output '{}': mode 0o{:o} exceeds the 12-bit permission range 0o7777",
+                        name,
+                        parsed
+                    );
+                }
+                Ok(parsed)
             })
             .transpose()?;
 
@@ -1655,5 +1674,62 @@ mod tests {
             0o644,
             "no metadata contract means the existing file's mode is untouched"
         );
+    }
+
+    fn mp(props: &[crate::dsl::ast::Property]) -> crate::dsl::module_props::ModuleProperties {
+        crate::dsl::module_props::ModuleProperties::from_parts("file", props.to_vec())
+    }
+
+    fn prop_str(key: &str, val: &str) -> crate::dsl::ast::Property {
+        crate::dsl::ast::Property::KeyValue {
+            key: key.to_string(),
+            key_span: None,
+            value: Expr::spanless(ExprKind::StringLit(val.to_string())),
+            value_span: None,
+        }
+    }
+
+    #[test]
+    fn mode_parser_accepts_all_zero_forms() {
+        // `0o0000` is a legitimate Unix mode (no permission bits set).
+        // The parser used to `trim_start_matches('0')` first, which
+        // turned `"0"` and `"0000"` into an empty string and then a
+        // parse error. Pin both spellings as accepted so future
+        // refactors don't reintroduce the strip.
+        for raw in ["0", "0000"] {
+            let props = mp(&[prop_str("path", "/tmp/nowhere.log"), prop_str("mode", raw)]);
+            let out = FileOutput::from_properties(
+                "t",
+                &props,
+                &crate::modules::BuildContext::for_testing(),
+            )
+            .unwrap_or_else(|e| panic!("mode {raw:?} must parse: {e:#}"));
+            assert_eq!(out.mode, Some(0o0000), "mode {raw:?}");
+        }
+    }
+
+    #[test]
+    fn mode_parser_rejects_values_above_the_permission_mask() {
+        // A value above 0o7777 could never be honoured by the fstat
+        // verify (which masks to 0o7777). Reject at load time so the
+        // mistake surfaces in the startup log, not as a permanent
+        // "mode does not match" refusal on every subsequent write.
+        for raw in ["10000", "17777"] {
+            let props = mp(&[prop_str("path", "/tmp/nowhere.log"), prop_str("mode", raw)]);
+            let res = FileOutput::from_properties(
+                "t",
+                &props,
+                &crate::modules::BuildContext::for_testing(),
+            );
+            let err = match res {
+                Ok(_) => panic!("mode {raw:?} exceeds 0o7777 and must be rejected"),
+                Err(e) => e,
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("exceeds the 12-bit permission range"),
+                "diagnostic must name the constraint: {msg}"
+            );
+        }
     }
 }
