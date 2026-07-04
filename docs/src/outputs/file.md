@@ -121,6 +121,6 @@ Parent directories are created automatically for dynamic paths (templates with `
 
 ## Notes
 
-- Each line is one event's `egress` bytes followed by a newline.
+- Each line is the event's `egress` bytes verbatim followed by a `\n`. The writer is byte-preserving: non-UTF-8 payloads (rare vendor formats, base64-decoded blobs) are written unchanged rather than lossily normalised to U+FFFD.
 - For log rotation, use `logrotate` with `copytruncate` or `create` + SIGHUP.
 - Common queue / retry properties — see [Queue and retry](./README.md#queue-and-retry).

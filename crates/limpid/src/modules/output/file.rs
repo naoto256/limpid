@@ -491,11 +491,16 @@ impl FileOutput {
             }
         };
 
-        let msg = String::from_utf8_lossy(&payload.egress);
-        let mut buf = Vec::with_capacity(msg.len() + 1);
-        buf.extend_from_slice(msg.as_bytes());
-        buf.push(b'\n');
-        file.write_all(&buf).await?;
+        // Preserve the payload bytes verbatim. `String::from_utf8_lossy`
+        // would silently replace non-UTF-8 bytes with U+FFFD (`\xEF\xBF\xBD`),
+        // which is exactly the wrong default for a security telemetry
+        // pipeline that can carry binary payloads (rare vendor
+        // formats, base64-decoded blobs, etc.) — the docs promise
+        // "one line == the event's egress bytes plus a newline", and
+        // silent U+FFFD substitution breaks both replay fidelity and
+        // downstream forensic hashing.
+        file.write_all(&payload.egress).await?;
+        file.write_all(b"\n").await?;
         // Push the buffered bytes through tokio's fs::File to the OS
         // before we return "written". Without this, the data may still
         // sit in tokio's per-file buffer at drop time — Drop closes the
@@ -1265,6 +1270,42 @@ mod tests {
         );
         // The target file must be untouched.
         assert_eq!(std::fs::read(&target).unwrap(), b"pre-existing");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn write_payload_preserves_non_utf8_bytes_verbatim() {
+        // The docs promise the writer emits `egress` bytes verbatim.
+        // Payloads carrying non-UTF-8 sequences (rare vendor formats,
+        // base64-decoded blobs, binary tails on a mis-classified
+        // vendor stream) must land on disk unchanged rather than
+        // lossily rewritten to U+FFFD (`\xEF\xBF\xBD`). Pin the byte-
+        // preserving contract so a future refactor that reintroduces
+        // `String::from_utf8_lossy` on the write path trips this
+        // test.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("bytes.log");
+
+        let raw: &[u8] = &[0xff, 0xfe, b'A', b'B', 0x80, 0x00, 0x0a, b'x'];
+        let out = make_output(ek(ExprKind::StringLit(path.display().to_string())));
+        out.write_payload(FilePayload {
+            egress: Bytes::from(raw.to_vec()),
+            path: path.display().to_string(),
+            is_dynamic: false,
+        })
+        .await
+        .expect("byte payload write must succeed");
+
+        let mut expected = raw.to_vec();
+        expected.push(b'\n');
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(on_disk, expected, "bytes must survive verbatim");
+        // Belt-and-braces: the U+FFFD replacement sequence must NOT
+        // appear at any offset in the on-disk output.
+        assert!(
+            !on_disk.windows(3).any(|w| w == [0xef_u8, 0xbf, 0xbd]),
+            "U+FFFD (\\xEF\\xBF\\xBD) must not appear on disk"
+        );
     }
 
     #[tokio::test]
