@@ -1484,7 +1484,6 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn logrotate_style_inode_swap_reapplies_configured_mode() {
-        use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("rotated.log");
@@ -1501,7 +1500,6 @@ mod tests {
         })
         .await
         .expect("first write");
-        let ino_a = std::fs::metadata(&path).unwrap().ino();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -1516,8 +1514,18 @@ mod tests {
         .await
         .expect("write on freshly-rotated path");
 
-        let ino_b = std::fs::metadata(&path).unwrap().ino();
-        assert_ne!(ino_a, ino_b, "sanity: rotation must produce a new inode");
+        // The freshly-created file must contain only the post-rotate
+        // payload — proving `create_new` was taken (not append-onto-
+        // the-original), which is the branch that runs the apply.
+        // Inode numbers are intentionally NOT compared: some
+        // filesystems reuse inode numbers immediately after unlink,
+        // and doing so is not a violation of what this test cares
+        // about.
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"post-rotate\n",
+            "rotation must have re-created the file (not appended to a leftover)"
+        );
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600,
