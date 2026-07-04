@@ -338,32 +338,28 @@ impl Output for FileOutput {
                 return Ok(());
             }
         };
-        match tokio::time::timeout(
-            crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT,
-            self.write_payload(payload),
-        )
-        .await
-        {
-            Ok(Ok(())) => {
+        // Unlike the network sinks, the file writer is NOT wrapped
+        // in a `tokio::time::timeout(SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT,
+        // ...)`. Cancelling `write_payload` mid-flight would leave a
+        // partial append on disk (`write_all` is not atomic across
+        // syscalls) and *simultaneously* route the event to DLQ as
+        // `Recovered`, so an operator replay would produce a
+        // partial-then-full duplicate. The steady-state `consume`
+        // path already made this trade-off; the shutdown drain
+        // inherits it. Local disk writes are typically <10 ms and
+        // finish well inside the shutdown budget; a truly hung
+        // filesystem here becomes a task-abort → `Dropped` (the
+        // "lost but no replay" contract documented under the
+        // Standing limitation section of
+        // `docs/src/operations/error-log.md`), which is worse than
+        // a partial-then-full duplicate on paper but at least does
+        // not double the operator's cleanup surface at replay time.
+        match self.write_payload(payload).await {
+            Ok(()) => {
                 ack.resolve_delivered();
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 let reason = format!("shutdown write failed: {}", e);
-                crate::modules::route_event_to_dlq(
-                    self.error_log.as_ref(),
-                    &self.name,
-                    event,
-                    &reason,
-                )
-                .await;
-                self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-                ack.resolve_recovered();
-            }
-            Err(_) => {
-                let reason = format!(
-                    "shutdown write timed out after {:?}",
-                    crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT
-                );
                 crate::modules::route_event_to_dlq(
                     self.error_log.as_ref(),
                     &self.name,
@@ -656,10 +652,11 @@ impl FileOutput {
     /// the same inode `write_all` just touched. `path` here is only
     /// used to label warnings.
     ///
-    /// The `spawn_blocking` future is *not* cancel-safe: if the caller
-    /// (say `consume_shutdown` under a `timeout`) drops the awaiting
-    /// future, the blocking task keeps running while the outer `File`
-    /// gets dropped and closes its fd. A raw fd number is trivial for
+    /// The `spawn_blocking` future is *not* cancel-safe: if the outer
+    /// `write_payload` future is dropped mid-flight (a task-abort at
+    /// the runtime shutdown deadline is the concrete scenario),
+    /// the blocking task keeps running while the outer `File` gets
+    /// dropped and closes its fd. A raw fd number is trivial for
     /// the kernel to reuse for an unrelated `open`, and the leftover
     /// `fchmod`/`fchown` would then land on that other inode. Guard
     /// against that by `dup(2)`-ing the fd into an `OwnedFd` that the

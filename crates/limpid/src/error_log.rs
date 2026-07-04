@@ -248,13 +248,21 @@ impl ErrorLogWriter {
 
     /// Validate that the `error_log` path is reachable at startup.
     ///
-    /// Checks the parent directory exists and is writable by the
-    /// daemon user. Surfacing this at startup (rather than at first
-    /// failure) matches Principle 1 — operators see typo'd paths
-    /// before any event hits a process error.
+    /// Checks:
+    /// - The parent directory exists and is a directory.
+    /// - If the DLQ file already exists on disk (leftover from a
+    ///   prior run, logrotate output, or an operator tool), it is
+    ///   not a symlink and its mode is exactly `0o600`. The runtime
+    ///   `write` path refuses both conditions loudly, so an operator
+    ///   whose fresh deployment inherits a `0o644` file or a symlink
+    ///   would otherwise discover the mismatch only at the first
+    ///   real failure — after the pipeline has already lost the
+    ///   observability on that record. Surface it at startup so the
+    ///   fix (remove or `chmod` the file) happens before any events
+    ///   flow.
     ///
-    /// The file itself does not need to exist; `OpenOptions::create`
-    /// will materialise it on the first failure.
+    /// The file itself does not need to exist; the runtime write
+    /// path materialises it on the first failure with `mode(0o600)`.
     pub async fn validate_at_startup(&self) -> Result<()> {
         let parent = self.path.parent().ok_or_else(|| {
             anyhow::anyhow!(
@@ -279,6 +287,52 @@ impl ErrorLogWriter {
                 parent.display()
             );
         }
+
+        // If the DLQ file already exists on disk, refuse a symlink
+        // and refuse a mode other than 0o600 at startup so operators
+        // see the same contract failure they would hit at first
+        // write, but *before* any events reach a failure site.
+        // `symlink_metadata` inspects the link itself rather than
+        // following it, so we can distinguish symlink from regular
+        // file.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            match tokio::fs::symlink_metadata(&self.path).await {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        anyhow::bail!(
+                            "error_log: '{}' is a symlink; the runtime refuses to follow it. \
+                             Remove the symlink before starting the daemon.",
+                            self.path.display()
+                        );
+                    }
+                    if meta.is_file() {
+                        let actual = meta.permissions().mode() & 0o7777;
+                        if actual != 0o600 {
+                            anyhow::bail!(
+                                "error_log: existing file '{}' has mode 0o{:o}, but the DLQ \
+                                 writer requires exactly 0o600. `chmod 0600 <path>` or remove \
+                                 the file so the runtime recreates it.",
+                                self.path.display(),
+                                actual
+                            );
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // No file yet — the runtime will create it under
+                    // the correct mode on the first failure.
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::from(e).context(format!(
+                        "error_log: failed to stat '{}'",
+                        self.path.display()
+                    )));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -548,6 +602,53 @@ mod tests {
         let w = ErrorLogWriter::new(dir.path().join("nope/errored.jsonl"));
         let err = w.validate_at_startup().await.unwrap_err().to_string();
         assert!(err.contains("not accessible"), "got: {}", err);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn validate_at_startup_refuses_symlink_at_dlq_path() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("errored.jsonl");
+        let target = dir.path().join("_hijacked.jsonl");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        let w = ErrorLogWriter::new(path.clone());
+        let err = w.validate_at_startup().await.unwrap_err().to_string();
+        assert!(err.contains("is a symlink"), "got: {}", err);
+        assert!(
+            !target.exists(),
+            "symlink target must not have been touched"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn validate_at_startup_refuses_wrong_mode_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("errored.jsonl");
+        std::fs::write(&path, b"leftover\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let w = ErrorLogWriter::new(path.clone());
+        let err = w.validate_at_startup().await.unwrap_err().to_string();
+        assert!(err.contains("has mode 0o644"), "got: {}", err);
+        assert!(err.contains("0o600"), "got: {}", err);
+
+        // A file at the correct mode must pass.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        w.validate_at_startup().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn validate_at_startup_accepts_absent_file() {
+        // A path whose parent exists but whose file itself does not
+        // exist must pass — the runtime creates the file on first
+        // failure with the correct mode.
+        let dir = TempDir::new().unwrap();
+        let w = ErrorLogWriter::new(dir.path().join("errored.jsonl"));
+        w.validate_at_startup().await.unwrap();
     }
 
     #[tokio::test]
