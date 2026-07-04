@@ -69,18 +69,73 @@ impl Input for UnixSocketInput {
         tx: tokio::sync::mpsc::Sender<Event>,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
-        // Remove stale socket file if it exists (but not if it's a symlink)
-        if std::path::Path::new(&self.path).exists() {
+        // Stale socket cleanup: unlink the previous socket inode so
+        // `bind(2)` can succeed. The removal is narrowed to actual
+        // socket nodes — anything else at the path (regular file,
+        // directory, FIFO, device node) is refused loudly. The
+        // previous shape (`_ => remove_file(...)`) was destructive by
+        // design: an operator typo that pointed `path` at
+        // `/etc/passwd` would silently unlink the target at daemon
+        // startup. This narrowing rejects that shape instead.
+        //
+        // `symlink_metadata` inspects the link itself rather than
+        // following it, so a symlink at the path is caught before we
+        // consider `remove_file`.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
             match std::fs::symlink_metadata(&self.path) {
-                Ok(meta) if meta.file_type().is_symlink() => {
-                    error!(
-                        "unix_socket: {:?} is a symlink — refusing to remove",
-                        self.path
-                    );
-                    anyhow::bail!("unix_socket: {:?} is a symlink", self.path);
-                }
-                _ => {
+                Ok(meta) => {
+                    let ft = meta.file_type();
+                    if ft.is_symlink() {
+                        error!(
+                            "unix_socket: {:?} is a symlink — refusing to remove",
+                            self.path
+                        );
+                        anyhow::bail!("unix_socket: {:?} is a symlink", self.path);
+                    }
+                    if !ft.is_socket() {
+                        let shape = if ft.is_dir() {
+                            "directory"
+                        } else if ft.is_file() {
+                            "regular file"
+                        } else if ft.is_fifo() {
+                            "FIFO"
+                        } else if ft.is_block_device() {
+                            "block device"
+                        } else if ft.is_char_device() {
+                            "character device"
+                        } else {
+                            "non-socket node"
+                        };
+                        error!(
+                            "unix_socket: {:?} is a {} — refusing to remove",
+                            self.path, shape
+                        );
+                        anyhow::bail!(
+                            "unix_socket: {:?} is a {}; refusing to remove. The stale-cleanup \
+                             path is intended for actual socket nodes only. Remove or move the \
+                             node manually if this path is correct.",
+                            self.path,
+                            shape
+                        );
+                    }
+                    // Actual stale socket — safe to unlink.
                     let _ = std::fs::remove_file(&self.path);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // No node at the path — `bind(2)` will create the
+                    // socket fresh.
+                }
+                Err(e) => {
+                    error!(
+                        "unix_socket: failed to stat {:?}: {}",
+                        self.path, e
+                    );
+                    return Err(anyhow::Error::from(e).context(format!(
+                        "unix_socket: failed to stat {:?}",
+                        self.path
+                    )));
                 }
             }
         }
@@ -202,21 +257,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replaces_stale_regular_file_at_path() {
-        // Inverse case: a stale regular file at the configured path
-        // (e.g. left over from a previous run that didn't clean up
-        // gracefully) MUST be removed so the bind can proceed. A
-        // regression that conflated regular-file and symlink would
-        // either leave the daemon stuck on startup OR (worse) let
-        // symlinks through.
+    async fn refuses_regular_file_at_socket_path() {
+        // Contract narrowing (v0.7.9): a regular file at the
+        // configured socket path is NOT treated as a stale-socket
+        // leftover. The previous implementation removed anything
+        // non-symlink; an operator typo that pointed `path` at
+        // `/etc/passwd` (or any real file) would silently unlink the
+        // target at daemon startup. Cleanup is now scoped to actual
+        // socket nodes — anything else is refused.
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("sock");
-        std::fs::write(&socket_path, b"stale").unwrap();
+        std::fs::write(&socket_path, b"important-content").unwrap();
+
+        let (handle, _sd_tx, _rx) = spawn_with_path(&socket_path);
+        let result = handle.await.expect("task join");
+        let err = result.expect_err("regular file at socket path must be refused");
+        assert!(
+            err.to_string().contains("regular file"),
+            "refusal must name the shape, got: {err}"
+        );
+        // The regular file must be untouched — nothing removed.
+        let body = std::fs::read(&socket_path).unwrap();
+        assert_eq!(body, b"important-content");
+    }
+
+    #[tokio::test]
+    async fn refuses_directory_at_socket_path() {
+        // A directory at the configured path is likewise refused.
+        // The old cleanup path would have attempted `remove_file`,
+        // which would fail with EISDIR, but the failure would be
+        // silent (`let _ = ...`) and then bind would fail with an
+        // opaque EADDRINUSE-style error. The narrowed cleanup surfaces
+        // the actual misconfiguration up front.
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("sock");
+        std::fs::create_dir(&socket_path).unwrap();
+
+        let (handle, _sd_tx, _rx) = spawn_with_path(&socket_path);
+        let result = handle.await.expect("task join");
+        let err = result.expect_err("directory at socket path must be refused");
+        assert!(
+            err.to_string().contains("directory"),
+            "refusal must name the shape, got: {err}"
+        );
+        // The directory must still exist.
+        assert!(socket_path.is_dir(), "directory must not be removed");
+    }
+
+    #[tokio::test]
+    async fn replaces_stale_socket_at_path() {
+        // The actual stale-socket case: a leftover socket inode from
+        // a previous run (crash, ungraceful shutdown, forgotten
+        // manual bind) must be cleared so `bind(2)` can proceed. This
+        // is the contract the cleanup path is intended to serve — and
+        // now the only shape it accepts.
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("sock");
+
+        // Pre-bind a socket at the path, then drop it without
+        // unlinking, mirroring a crashed previous run that left the
+        // socket inode behind.
+        {
+            let stale = StdUnixDatagram::bind(&socket_path).unwrap();
+            drop(stale);
+        }
+        // Sanity: the socket inode is still there.
+        assert!(
+            std::fs::symlink_metadata(&socket_path)
+                .unwrap()
+                .file_type()
+                .is_socket(),
+            "test setup: stale socket must be present before daemon starts"
+        );
 
         let (handle, sd_tx, _rx) = spawn_with_path(&socket_path);
         // Give the listener a moment to bind.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        // Path should now be a socket, not a regular file.
+        // Path should be a fresh, live socket bound by the daemon.
         let meta = std::fs::symlink_metadata(&socket_path).unwrap();
         assert!(
             meta.file_type().is_socket(),
