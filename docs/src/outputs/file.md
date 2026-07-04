@@ -23,7 +23,31 @@ def output archive {
 | `owner` | no | process user | File owner (requires `CAP_CHOWN`) |
 | `group` | no | process group | File group |
 
-Permissions are applied only when the file is first created.
+**Permissions contract.** When any of `mode` / `owner` / `group` is
+configured, the output enforces the following on every write:
+
+- **File newly created by this output:** the configured `mode` /
+  `owner` / `group` is applied via `fchmod(2)` / `fchown(2)` on the
+  open fd *before* any payload bytes hit disk. If the apply fails
+  (e.g. an unresolvable owner name, `EPERM` on `fchown`), the write
+  is refused and no payload bytes are written.
+- **File already exists on disk:** the on-disk mode / owner / group
+  is compared via `fstat(2)` against the configured values. On
+  mismatch the write is refused with a diagnostic that names both
+  the observed and the configured values. This output never
+  silently chmods or chowns a file it did not create — an
+  operator-visible refusal is the correct response, whether the
+  mismatch is a stale file left by an earlier failed apply, a
+  logrotate that copied instead of renamed, or an unexpected
+  external change.
+
+Remediation for a refused write is either to align the file with
+config (`chmod` / `chown` to the configured values or simply remove
+the file so the output recreates it) or to update the config to
+match the file. Both are explicit; neither is silent. When none of
+`mode` / `owner` / `group` is configured, the output does not
+verify existing files and freshly-created files inherit the process
+umask and default ownership.
 
 ## Dynamic path templates
 
@@ -93,7 +117,7 @@ Unusual but harmless dirnames like `...` or `..foo` pass through — only the ex
 
 The three passes together guarantee that the final write path stays within the directory tree the operator declared in the template, has a non-empty filename component, and never terminates in a directory reference — regardless of what arrives on the wire.
 
-Parent directories are created automatically.
+Parent directories are created automatically for dynamic paths (templates with `${...}` interpolation), since those may cover cardinalities the operator can't pre-provision. Static paths do *not* auto-create parents — a missing parent surfaces as an `ENOENT` open failure so the deployment mistake is loud instead of quietly extending the writable tree.
 
 ## Notes
 
