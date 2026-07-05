@@ -453,8 +453,7 @@ pub async fn finalize_shutdown_singleton_disposition(
         Err(e) => {
             let reason = format!("shutdown send failed: {}", e);
             let outcome = route_event_to_dlq(error_log, metrics, output_name, event, &reason).await;
-            metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-            resolve_ack_from_dlq_outcome(ack, outcome);
+            resolve_ack_from_dlq_outcome(ack, outcome, metrics);
         }
     }
 }
@@ -463,22 +462,26 @@ pub async fn finalize_shutdown_singleton_disposition(
 /// send attempt failed (transport error or deadline elapsed). Every
 /// `(Event, QueueAckHandle)` entry is:
 ///
-/// 1. Counted in `events_failed`.
-/// 2. Routed to the DLQ when `error_log` is `Some`. A per-record DLQ
+/// 1. Routed to the DLQ when `error_log` is `Some`. A per-record DLQ
 ///    write success resolves the ack as `Recovered`; a per-record DLQ
 ///    write failure bumps `events_errored_unwritable` and hands the
 ///    ack through `resolve_ack_from_dlq_outcome`, which on a disk
 ///    queue resolves as `Dropped` (the disk-queue fail-stop wedge
 ///    holds the cursor for replay on next start) and on a memory
 ///    queue resolves as `Recovered` (memory queues cannot replay).
+/// 2. Counted in `events_failed` — the bump is owned by
+///    `resolve_ack_from_dlq_outcome` so the count is authoritative and
+///    matches the disposition it just committed.
 ///
 /// When `error_log` is `None` we emit one `tracing::error!` per event
 /// with the full JSONL as a structured field (matching the
 /// pipeline-side `write_errored_to_dlq` shape) so the operator has an
-/// out-of-daemon durable copy, and resolve every handle as
-/// `Recovered`. Silently keeping handles parked would be strictly
-/// worse — the ack-handle contract requires an explicit disposition,
-/// and the JSONL-in-log path is at least grep-and-replayable.
+/// out-of-daemon durable copy, and route each ack through the same
+/// helper with an explicit `Recovered` outcome — the failure count and
+/// the resolve go through the same choke point as the DLQ path.
+/// Silently keeping handles parked would be strictly worse: the
+/// ack-handle contract requires an explicit disposition, and the
+/// JSONL-in-log path is at least grep-and-replayable.
 pub async fn route_shutdown_batch_to_dlq(
     error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
     metrics: &OutputMetrics,
@@ -517,8 +520,7 @@ pub async fn route_shutdown_batch_to_dlq(
                     DlqRouteOutcome::Dropped
                 }
             };
-            metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-            resolve_ack_from_dlq_outcome(ack, outcome);
+            resolve_ack_from_dlq_outcome(ack, outcome, metrics);
         }
     } else {
         // No DLQ configured — emit one `tracing::error!` line
@@ -527,7 +529,11 @@ pub async fn route_shutdown_batch_to_dlq(
         // and replay. Matches the shape used elsewhere
         // (pipeline-side `write_errored_to_dlq`, sink-side
         // `route_event_to_dlq`); without the JSONL the payloads
-        // would vanish alongside the shutdown drain.
+        // would vanish alongside the shutdown drain. Route the
+        // ack through `resolve_ack_from_dlq_outcome` with an
+        // explicit `Recovered` outcome so the failure count and
+        // ack disposition go through the same choke point as the
+        // DLQ path.
         let reason = format!("shutdown flush failed: {}", flush_err);
         for (ev, ack) in events {
             let ctx = crate::pipeline::ErroredEventContext::Output {
@@ -544,32 +550,42 @@ pub async fn route_shutdown_batch_to_dlq(
                  `control {{ error_log \"...\" }}` for file-based DLQ",
                 output_name
             );
-            metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-            ack.resolve_recovered();
+            resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Recovered, metrics);
         }
     }
 }
 
-/// Resolve `ack` per the queue backend and the DLQ route outcome
-/// so `route_event_to_dlq`'s `Dropped` arm wedges disk queues
-/// (via `resolve_dropped`) while memory queues stay on the
-/// `resolve_recovered` best-effort path.
+/// Resolve `ack` per the queue backend and the DLQ route outcome,
+/// and count the terminal failure in `events_failed`. This helper
+/// owns the failure count for every DLQ-adjacent path so the metric
+/// is bumped exactly once per event, regardless of which queue backend
+/// resolved it. Callers must NOT bump `events_failed` themselves next
+/// to this call.
 ///
-/// - `Recovered` (any queue): `resolve_recovered`.
-/// - `Dropped` + disk queue: `resolve_dropped` — the disk cursor
-///   holds and the event replays on next start (the disk-queue
-///   fail-stop wedge kicks in on the consumer side).
-/// - `Dropped` + memory queue: `resolve_recovered` — memory
-///   queues cannot replay on restart, so `resolve_dropped`
+/// - `Recovered` (any queue): bump `events_failed`, `resolve_recovered`.
+/// - `Dropped` + memory queue: bump `events_failed`, `resolve_recovered`
+///   — memory queues cannot replay on restart, so `resolve_dropped`
 ///   would only wedge the pipeline without a recovery path;
-///   `events_errored_unwritable` (bumped inside
-///   `route_event_to_dlq` before this call) is the only durable
-///   trace on memory queues, and that is the operator alarm
+///   `events_errored_unwritable` (bumped inside `route_event_to_dlq`
+///   before this call) is the durable trace and the operator alarm
 ///   signal.
-pub fn resolve_ack_from_dlq_outcome(ack: crate::queue::QueueAckHandle, outcome: DlqRouteOutcome) {
+/// - `Dropped` + disk queue: `resolve_dropped` — the disk cursor holds
+///   and the event replays on next start (the disk-queue fail-stop
+///   wedge kicks in on the consumer side). `events_failed` is bumped
+///   on the ack side by `handle_ack_disposition(Dropped)` when the
+///   consumer receives the disposition, so this helper deliberately
+///   does NOT bump here. Bumping here as well would double-count
+///   every disk-backed DLQ-write failure.
+pub fn resolve_ack_from_dlq_outcome(
+    ack: crate::queue::QueueAckHandle,
+    outcome: DlqRouteOutcome,
+    metrics: &OutputMetrics,
+) {
     use crate::queue::AckPosition;
+    use std::sync::atomic::Ordering;
     match (outcome, ack.position()) {
         (DlqRouteOutcome::Recovered, _) | (DlqRouteOutcome::Dropped, AckPosition::Memory) => {
+            metrics.events_failed.fetch_add(1, Ordering::Relaxed);
             ack.resolve_recovered();
         }
         (DlqRouteOutcome::Dropped, AckPosition::Disk { .. }) => {
@@ -1018,19 +1034,25 @@ mod pre_send_or_shutdown_tests {
 #[cfg(test)]
 mod resolve_ack_from_dlq_outcome_tests {
     use super::{DlqRouteOutcome, resolve_ack_from_dlq_outcome};
+    use crate::metrics::OutputMetrics;
     use crate::queue::{AckDisposition, AckPosition, QueueAckHandle};
+    use std::sync::atomic::Ordering;
 
     /// Recovered outcome always maps to `resolve_recovered` on
     /// both memory and disk queues — the DLQ record is durable,
-    /// so cursor advancement is honest.
+    /// so cursor advancement is honest. The helper bumps
+    /// `events_failed` for the recoverable failure so callers do
+    /// not need to (and must not).
     #[tokio::test]
     async fn recovered_outcome_resolves_recovered_on_memory() {
         let (ack, mut rx) = QueueAckHandle::for_test();
-        resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Recovered);
+        let metrics = OutputMetrics::default();
+        resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Recovered, &metrics);
         assert_eq!(
             rx.recv().await,
             Some((AckPosition::Memory, AckDisposition::Recovered))
         );
+        assert_eq!(metrics.events_failed.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -1040,29 +1062,40 @@ mod resolve_ack_from_dlq_outcome_tests {
             offset: 128,
         };
         let (ack, mut rx) = QueueAckHandle::for_test_with_position(position);
-        resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Recovered);
+        let metrics = OutputMetrics::default();
+        resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Recovered, &metrics);
         assert_eq!(rx.recv().await, Some((position, AckDisposition::Recovered)));
+        assert_eq!(metrics.events_failed.load(Ordering::Relaxed), 1);
     }
 
     /// Dropped outcome on a memory queue still resolves as
     /// `Recovered` — memory queues cannot replay, so wedging
     /// would only cause loss without a recovery path.
     /// `events_errored_unwritable` (bumped inside
-    /// `route_event_to_dlq`) is the operator's durable trace.
+    /// `route_event_to_dlq`) is the operator's durable trace, and
+    /// the helper bumps `events_failed` here so the memory-queue
+    /// terminal-failure count matches the disk-queue count (which
+    /// is bumped on the ack side by `handle_ack_disposition`).
     #[tokio::test]
     async fn dropped_outcome_resolves_recovered_on_memory() {
         let (ack, mut rx) = QueueAckHandle::for_test();
-        resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Dropped);
+        let metrics = OutputMetrics::default();
+        resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Dropped, &metrics);
         assert_eq!(
             rx.recv().await,
             Some((AckPosition::Memory, AckDisposition::Recovered))
         );
+        assert_eq!(metrics.events_failed.load(Ordering::Relaxed), 1);
     }
 
-    /// Dropped outcome on a disk queue resolves as
-    /// `Dropped` — the disk queue's consumer wedges on the
-    /// Dropped disposition (the disk-queue fail-stop wedge) and holds the cursor
-    /// at this position for replay on next start.
+    /// Dropped outcome on a disk queue resolves as `Dropped` — the
+    /// disk queue's consumer wedges on the Dropped disposition (the
+    /// disk-queue fail-stop wedge) and holds the cursor at this
+    /// position for replay on next start. The helper deliberately
+    /// does NOT bump `events_failed` on this arm because the ack
+    /// side (`handle_ack_disposition(Dropped)`) already bumps it
+    /// when the consumer receives the disposition — bumping here
+    /// would double-count.
     #[tokio::test]
     async fn dropped_outcome_resolves_dropped_on_disk() {
         let position = AckPosition::Disk {
@@ -1070,7 +1103,9 @@ mod resolve_ack_from_dlq_outcome_tests {
             offset: 4242,
         };
         let (ack, mut rx) = QueueAckHandle::for_test_with_position(position);
-        resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Dropped);
+        let metrics = OutputMetrics::default();
+        resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Dropped, &metrics);
         assert_eq!(rx.recv().await, Some((position, AckDisposition::Dropped)));
+        assert_eq!(metrics.events_failed.load(Ordering::Relaxed), 0);
     }
 }

@@ -420,9 +420,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                 &ev,
                 &reason,
             )
-            .await;
-            self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-            crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome);
+            .await;            crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
         }
         (payloads, shippable)
     }
@@ -448,24 +446,19 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                 .events_written
                 .fetch_add(written, Ordering::Relaxed);
         }
-        if rejected > 0 {
-            self.metrics
-                .events_failed
-                .fetch_add(rejected, Ordering::Relaxed);
-        }
         let split = (count - rejected) as usize;
         let mut iter = shippable.into_iter();
         for (_, ack) in iter.by_ref().take(split) {
             ack.resolve_delivered();
         }
+        // Per-event DLQ routing for the trailing `rejected` entries.
+        // `events_failed` is bumped by `resolve_ack_from_dlq_outcome`
+        // (memory + Recovered-on-disk arms) or by
+        // `handle_ack_disposition(Dropped)` on the ack side
+        // (Dropped-on-disk arm); the aggregate across all rejected
+        // handles equals `rejected`.
         for (ev, ack) in iter {
             let reason = "collector reported partial_success rejection".to_string();
-            // `events_failed` was already bumped by the outer
-            // `rejected > 0` fetch_add above (partial-success
-            // paths report the count once, not per handle), so
-            // this call must NOT re-bump — the DLQ-outcome
-            // refactor's bulk sink update accidentally added a
-            // per-event bump that double-counted here.
             let __dlq_outcome = crate::modules::route_event_to_dlq(
                 self.error_log.as_ref(),
                 &self.metrics,
@@ -474,7 +467,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                 &reason,
             )
             .await;
-            crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome);
+            crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
         }
     }
 
@@ -508,9 +501,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                         &ev,
                         &reason,
                     )
-                    .await;
-                    self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-                    crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome);
+                    .await;                    crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
                 }
                 return;
             }
@@ -616,9 +607,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                 &ev,
                 &reason,
             )
-            .await;
-            self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-            crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome);
+            .await;            crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
         }
     }
 
