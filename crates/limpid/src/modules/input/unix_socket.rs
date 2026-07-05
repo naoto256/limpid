@@ -267,17 +267,30 @@ impl Input for UnixSocketInput {
             }
         };
 
-        // Make socket world-writable so any process can send (like /dev/log)
+        // Make socket world-writable so any process can send
+        // (like `/dev/log`). Failure here is fatal: the input's
+        // operator-facing contract is a `0o666` datagram
+        // socket, and running on with an umask-derived mode
+        // silently changes who can `sendto` the inode — an
+        // operator alarm signal, not a warn-and-continue. The
+        // just-bound socket inode is unlinked before we bail
+        // so the daemon can be restarted cleanly (the parent is
+        // safe by `validate_unix_socket_input_parent` and the
+        // inode is the one we just created, so `remove_file`
+        // cannot touch a foreign node).
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             if let Err(e) =
                 std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o666))
             {
-                warn!(
-                    "unix_socket {}: failed to set permissions: {}",
+                error!(
+                    "unix_socket {}: failed to set permissions to 0o666: {} — refusing to \
+                     listen on a socket whose mode does not match the operator-facing contract",
                     self.path, e
                 );
+                let _ = std::fs::remove_file(&self.path);
+                anyhow::bail!("unix_socket {}: chmod 0o666 failed: {}", self.path, e);
             }
         }
 
