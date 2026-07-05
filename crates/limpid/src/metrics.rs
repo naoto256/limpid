@@ -85,6 +85,19 @@ pub struct OutputMetrics {
     /// See `docs/src/operations/error-log.md` for the manual
     /// intervention runbook.
     pub events_wedged: AtomicU64,
+    /// Sink-side counterpart to `PipelineMetrics::events_errored_unwritable`:
+    /// bumped when an output's own `route_event_to_dlq` call
+    /// failed to write the DLQ record (`error_log` was configured
+    /// but the disk write itself errored — full disk, permission
+    /// drop, rotation race). Distinct from the pipeline-side
+    /// counter because operator alarms need to know which failure
+    /// path is misbehaving. When this bumps on a disk queue the
+    /// consumer routes the event as `Dropped` (Branch B C2 wedge)
+    /// so the cursor holds and a subsequent daemon start replays
+    /// the event through a hopefully-healthy DLQ. On memory
+    /// queues the event is `Recovered` regardless — there is no
+    /// replay path — and this counter is the only durable trace.
+    pub events_errored_unwritable: AtomicU64,
 }
 
 impl Default for OutputMetrics {
@@ -96,6 +109,7 @@ impl Default for OutputMetrics {
             events_failed: AtomicU64::new(0),
             retries: AtomicU64::new(0),
             events_wedged: AtomicU64::new(0),
+            events_errored_unwritable: AtomicU64::new(0),
         }
     }
 }
@@ -208,6 +222,10 @@ impl MetricsRegistry {
             o.insert(
                 "events_wedged".into(),
                 m.events_wedged.load(Ordering::Relaxed).into(),
+            );
+            o.insert(
+                "events_errored_unwritable".into(),
+                m.events_errored_unwritable.load(Ordering::Relaxed).into(),
             );
             outputs.insert(name.clone(), serde_json::Value::Object(o));
         }
