@@ -268,6 +268,14 @@ impl Runtime {
             .global_blocks
             .get("control")
             .and_then(|p| props::get_string(p, "socket"));
+        // Validate the control socket's parent BEFORE the control
+        // task is spawned. `ControlServer::run` returns `()` and is
+        // fire-and-forget from the runtime's perspective, so a
+        // fail-closed check inside the task would just make the
+        // control socket die silently while the daemon runs on.
+        // Bailing here stops the whole startup — the same shape as
+        // `ErrorLogWriter::validate_at_startup`.
+        crate::control::validate_control_socket_parent(control_path.as_deref())?;
         let started_at = std::time::Instant::now();
         let control = ControlServer::new(
             control_path,

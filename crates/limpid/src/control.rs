@@ -68,6 +68,13 @@ pub type InputInjectTarget = (mpsc::Sender<Event>, Arc<crate::metrics::InputMetr
 /// `RuntimeDirectoryMode` in the unit file) and already exists here; a
 /// pre-existing directory's permissions are deliberately left alone
 /// because they may be operator-managed.
+///
+/// Pre-existing parents whose mode fails
+/// [`parent_dir_mode_is_unsafe`] are handled elsewhere — see
+/// [`validate_control_socket_parent`], which is called from
+/// `Runtime::start` before this spawned task runs and bails the
+/// entire daemon rather than proceeding with a compromised bind→chmod
+/// window.
 fn ensure_socket_parent_dir(parent: &std::path::Path) {
     let preexisting = parent.exists();
     let _ = std::fs::create_dir_all(parent);
@@ -76,26 +83,93 @@ fn ensure_socket_parent_dir(parent: &std::path::Path) {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o750));
     }
-    // A pre-existing parent dir (systemd's RuntimeDirectory, or an
-    // operator-managed path) keeps its own mode — the 0o750 tightening
-    // above only applies to dirs this call created. Rather than
-    // silently trust an inherited mode, warn when it is too loose to
-    // uphold the bind->chmod window's assumption that only the daemon's
-    // group can reach the socket inode. See `parent_dir_mode_is_unsafe`
-    // for exactly which bits break that, and why.
+}
+
+/// Startup-time validation for the control socket's parent
+/// directory. Called from `Runtime::start` before the control
+/// task is spawned, so an unsafe pre-existing parent aborts the
+/// whole daemon startup instead of letting a background task
+/// die silently with the daemon still running under a broken
+/// trust boundary.
+///
+/// - Parent absent → OK. The subsequent
+///   `ensure_socket_parent_dir` call from the control task
+///   creates it at 0o750 (bare / non-systemd runs), which
+///   passes the [`parent_dir_mode_is_unsafe`] predicate by
+///   construction.
+/// - Parent exists but is not a directory → bail. Almost
+///   always a config typo (`socket "/var/log/limpid.log"`
+///   instead of `.sock`).
+/// - Parent exists as a directory with an unsafe mode →
+///   bail with the observed mode and a remediation hint.
+///
+/// The custom-deploy contract this closes: an operator whose
+/// `control { socket "..." }` points into a directory they
+/// have not tightened (e.g. `0o755`, `0o770`, or worse) would
+/// previously have seen only a `warn!` line and a live daemon
+/// running on an insecure socket. That warn-only shape is now
+/// a fatal startup error, matching the equivalent shape from
+/// the DLQ preflight in `error_log::validate_at_startup`.
+///
+/// Under packaged systemd units (`RuntimeDirectory=limpid`
+/// with `RuntimeDirectoryMode=0750`) the parent is already
+/// safe and this validation is a no-op.
+pub fn validate_control_socket_parent(socket_path_config: Option<&str>) -> anyhow::Result<()> {
+    let socket_path = PathBuf::from(
+        socket_path_config
+            .map(str::to_string)
+            .unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_string()),
+    );
+    let Some(parent) = socket_path.parent() else {
+        return Ok(());
+    };
+    let parent = if parent.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        parent
+    };
     #[cfg(unix)]
-    if let Ok(meta) = std::fs::metadata(parent) {
+    {
         use std::os::unix::fs::PermissionsExt;
-        let mode = meta.permissions().mode() & 0o777;
-        if parent_dir_mode_is_unsafe(mode) {
-            warn!(
-                "control socket: parent dir {:?} has mode {:o} (group-writable and/or \
-                 world-traversable) — this weakens the bind-time TOCTOU mitigation; \
-                 expected 0o750 or tighter",
-                parent, mode
-            );
+        match std::fs::metadata(parent) {
+            Ok(meta) => {
+                if !meta.is_dir() {
+                    anyhow::bail!(
+                        "control socket: parent {:?} exists but is not a directory; \
+                         check the `control {{ socket \"...\" }}` value",
+                        parent
+                    );
+                }
+                let mode = meta.permissions().mode() & 0o777;
+                if parent_dir_mode_is_unsafe(mode) {
+                    anyhow::bail!(
+                        "control socket: parent dir {:?} has mode 0o{:o} — refusing to bind. \
+                         The control socket is a root-equivalent trust boundary and the \
+                         bind→chmod 0o660 window assumes only the daemon's group can \
+                         traverse to the socket inode. Tighten the parent to 0o750 or \
+                         stricter (`chmod 0750 {:?}`), or point `control {{ socket \"...\" }}` \
+                         at a packaged path (`/var/run/limpid/`, with \
+                         `RuntimeDirectoryMode=0750` under systemd).",
+                        parent,
+                        mode,
+                        parent
+                    );
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Parent will be created at 0o750 by the control
+                // task's `ensure_socket_parent_dir`. No pre-existing
+                // mode to check.
+            }
+            Err(e) => {
+                return Err(anyhow::Error::from(e).context(format!(
+                    "control socket: failed to stat parent {:?}",
+                    parent
+                )));
+            }
         }
     }
+    Ok(())
 }
 
 /// True when the parent dir's mode breaks either TOCTOU-mitigating
@@ -104,6 +178,13 @@ fn ensure_socket_parent_dir(parent: &std::path::Path) {
 /// execute (an outside-the-group user can traverse to and connect the
 /// socket inode during the bind->chmod window). Group execute is not
 /// flagged — group is the socket's own trusted access group.
+///
+/// **Not shared with the unix_socket input predicate**: that sink
+/// binds a world-writable (`0o666`) datagram socket at
+/// `/dev/log`-style paths, where other-execute on the parent is a
+/// requirement rather than a threat. Its own predicate lives in
+/// `crates/limpid/src/modules/input/unix_socket.rs` and flags
+/// group/other write only.
 #[cfg(unix)]
 fn parent_dir_mode_is_unsafe(mode: u32) -> bool {
     mode & 0o023 != 0
@@ -996,13 +1077,16 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn ensure_socket_parent_dir_warns_on_unsafe_preexisting_mode() {
-        // Regression pin for the loud-warn path: a pre-existing,
-        // group-writable parent dir must not be silently trusted.
-        // `tracing_test` isn't a dependency here, so this test only
-        // pins that the function doesn't panic/alter an unsafe mode
-        // (the warn! call itself is covered by the mode-detection unit
-        // test above); the mode-preservation contract still applies.
+    fn ensure_socket_parent_dir_preserves_unsafe_preexisting_mode() {
+        // `ensure_socket_parent_dir` is creation-only under the
+        // Branch C fail-closed contract: `validate_control_socket_parent`
+        // is authoritative for pre-existing parents and runs
+        // ahead of this function on the daemon startup path. If
+        // control still reaches `ensure_socket_parent_dir` with
+        // an unsafe pre-existing parent (a test invoking it in
+        // isolation), the function must not fail-fast or silently
+        // tighten an operator-managed dir — the operator's mode
+        // stays.
         use std::os::unix::fs::PermissionsExt;
         let base = tempfile::TempDir::new().unwrap();
         let parent = base.path().join("unsafe-run");
@@ -1012,7 +1096,88 @@ mod tests {
         let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
         assert_eq!(
             mode, 0o777,
-            "function must not fail-fast or silently tighten an operator-managed dir"
+            "creation-only helper must not silently tighten an operator-managed dir"
+        );
+    }
+
+    /// Fail-closed startup validation: a pre-existing parent
+    /// whose mode fails `parent_dir_mode_is_unsafe` must bail
+    /// with a diagnostic that names the observed mode and the
+    /// remediation. This is the whole daemon's startup guard;
+    /// the previous warn-only shape let the control socket
+    /// die silently while the daemon ran on.
+    #[test]
+    #[cfg(unix)]
+    fn validate_control_socket_parent_bails_on_unsafe_preexisting_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::TempDir::new().unwrap();
+        let parent = base.path().join("bad-run");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let socket = parent.join("control.sock");
+
+        let err = validate_control_socket_parent(Some(socket.to_str().unwrap())).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("0o777"),
+            "diagnostic must name the mode: {msg}"
+        );
+        assert!(
+            msg.contains("refusing to bind"),
+            "diagnostic must state the refusal: {msg}"
+        );
+    }
+
+    /// A pre-existing parent whose mode passes the predicate
+    /// (systemd's `RuntimeDirectory=limpid` with
+    /// `RuntimeDirectoryMode=0750`, or an operator that already
+    /// tightened the path) must not trigger any warning or
+    /// bail — this is the flagship packaged-deploy path and
+    /// must stay a silent no-op.
+    #[test]
+    #[cfg(unix)]
+    fn validate_control_socket_parent_accepts_safe_preexisting_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::TempDir::new().unwrap();
+        let parent = base.path().join("good-run");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let socket = parent.join("control.sock");
+
+        validate_control_socket_parent(Some(socket.to_str().unwrap())).unwrap();
+    }
+
+    /// An absent parent is OK — the subsequent
+    /// `ensure_socket_parent_dir` call in the control task
+    /// will create it at 0o750, which passes the predicate by
+    /// construction. This preserves the bare / non-systemd
+    /// developer workflow of pointing `control { socket "..." }`
+    /// at a path whose parent doesn't exist yet.
+    #[test]
+    fn validate_control_socket_parent_accepts_absent_parent() {
+        let base = tempfile::TempDir::new().unwrap();
+        let socket = base.path().join("missing-subdir").join("control.sock");
+        validate_control_socket_parent(Some(socket.to_str().unwrap())).unwrap();
+    }
+
+    /// A parent path that exists but isn't a directory (a
+    /// stray file left by a misconfigured operator) must bail
+    /// with a diagnostic naming the config value — a bind
+    /// attempt would otherwise fail with an opaque `ENOTDIR`
+    /// on the socket create.
+    #[test]
+    #[cfg(unix)]
+    fn validate_control_socket_parent_bails_when_parent_is_not_a_directory() {
+        let base = tempfile::TempDir::new().unwrap();
+        let file_at_parent = base.path().join("not-a-dir");
+        std::fs::write(&file_at_parent, b"oops").unwrap();
+        let socket = file_at_parent.join("control.sock");
+
+        let err = validate_control_socket_parent(Some(socket.to_str().unwrap())).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a directory"),
+            "diagnostic must name the shape: {msg}"
         );
     }
 }
