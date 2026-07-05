@@ -446,23 +446,32 @@ Investigate immediately:
 
 Once the underlying issue is fixed, the next errored event lands in the file again and the counter stops increasing; existing records are unaffected.
 
-## Standing limitation: bug/panic/shutdown-fallthrough drops advance the cursor
+## Disposition contract and fail-stop wedge on disk queues
 
-The DLQ contract described above assumes every event handed to an output either lands (`AckDisposition::Delivered` — cursor advances) or gets routed to `error_log` (`AckDisposition::Recovered` — cursor advances *after* the DLQ record is written). A third disposition exists — `AckDisposition::Dropped` — for the paths that resolve the ack handle without a matching `resolve_delivered()` / `resolve_recovered()` call:
+Every event handed to an output resolves to one of three `AckDisposition` values:
 
-- A bug in an output's `consume` implementation that returns before signalling the handle (the handle's `Drop` then fires `Dropped`).
+- **`Delivered`** — the output confirmed the send. Cursor advances on both memory and disk queues; `events_written` ticks.
+- **`Recovered`** — the send failed but the failure record was durably written (`error_log` file, or a structured `tracing::error!` line when `error_log` is unset). Cursor advances on both memory and disk queues; `events_failed` ticks.
+- **`Dropped`** — the output could not confirm the send *and* could not durably record the failure. Cursor **holds** on a disk queue and **advances** on a memory queue; `events_failed` ticks.
+
+Three paths reach `Dropped`:
+
+- A bug in an output's `consume` implementation that returns before signalling the handle (the handle's `Drop` then fires `Dropped`, guarded by a `debug_assert!` in test builds).
 - A panic inside `consume` while it holds the handle.
-- Residual shutdown-fallthrough shapes not yet covered by the shutdown-aware paths: the queue consumer's task is aborted mid-flight (SIGTERM budget exhausted) while a handle is still parked in an in-flight `write_payload` future, in a batched sink's buffer, or in the ack channel.
+- An **intentional** `resolve_dropped()` call from a sink whose DLQ write failed — the failure has no durable trace, so cursor advancement would be a silent loss.
 
-When any of these fires, the handle's `Drop` sends `Dropped` down the ack channel, the queue consumer advances the cursor and bumps the output's `events_failed` counter — but **no DLQ record is written**, so replay tooling has nothing to reprocess.
+On a **disk queue**, observing `Dropped` triggers the **fail-stop wedge**: the queue consumer stops accepting new events, holds the on-disk cursor at the offending position, emits a `tracing::error!` line, and bumps `events_wedged`. Existing in-flight events drain (their acks are still processed) but no further work starts. On the next daemon start the disk queue replays from the wedged position, giving the operator a chance to fix the underlying bug / DLQ health / etc. before the same event reaches a healthy output.
 
-That "lost but no replay" behaviour is the current contract, marked *out of scope* in a per-line comment in `crates/limpid/src/queue/mod.rs` next to `receiver.ack_to(position)`. Full panic recovery (write the handle's carried event into the DLQ from the `Dropped` path, plus a queue-cursor rewind on a bounded lookahead window) is queued for a separate cycle: it needs `QueueAckHandle` to carry the event bytes long enough for the panic path to route them, plus a queue-cursor contract change so a rewind doesn't reorder events across pipelines.
+On a **memory queue** the wedge does not fire — memory queues cannot replay on restart, so holding the cursor would only cause loss without a recovery path. The consumer bumps `events_failed` and moves on; `events_errored_unwritable` is the only durable trace when a DLQ write failure was the cause.
 
 For operators, the practical implications:
 
-- **Watch `events_failed` at output granularity.** A step increase without a matching increase in `events_errored` or DLQ file size means events are dropping through this path. Cross-check `events_written + events_failed + retries` against upstream input rate to bound the loss.
-- **Watch daemon panics.** A `panicked at` line in the daemon's `tracing` output is the primary observable for the bug path. `RUST_BACKTRACE=1` in the systemd unit is worth the extra bytes.
-- **Shutdown-fallthrough is progressively narrowing.** Recent releases have brought the batched-sink retry loop, the unbatched-sink retry backoff sleep, and the network unbatched-sinks' single send attempt (`kafka`, `syslog_*`, `unix_socket`) all under a shutdown-race that DLQ-routes on time. The remaining exposure covers the shapes where the runtime task is aborted with a handle still parked mid-flight: the ack channel, a batched-sink buffer at the SIGTERM deadline, or an in-flight `write_payload` on the `file` output (whose write attempt is deliberately *not* raced against shutdown to avoid the partial-append duplicate documented in `crates/limpid/src/modules/output/file.rs`). Rare in a healthy deployment, still a bug-attributed loss when it happens.
+- **`events_wedged` is a fail-stop alarm.** Non-zero means a disk-queue consumer has stopped accepting new events. Investigate the output: check for panics (`panicked at ...` lines with `RUST_BACKTRACE=1`), DLQ health (`events_errored_unwritable`), and disk / permission errors on the DLQ file. **Restart the daemon after fixing the underlying issue** so the disk queue replays from the wedge point.
+- **`events_wedged` is not self-healing.** Poison-message bugs (a specific event that reliably panics one output) will replay the same event on every start and re-wedge. Fix or delete the underlying record before the restart, or operator intervention becomes a loop.
+- **`events_errored_unwritable` on the output pairs with the pipeline-side counter of the same name.** Both surface DLQ-write failure; the output-side counter fires on the sink-side path (`route_event_to_dlq` in `crates/limpid/src/modules/mod.rs`), the pipeline-side counter fires on the pipeline runtime path (`write_errored_to_dlq` in `crates/limpid/src/runtime.rs`). Alarm on both.
+- **`events_failed` remains the aggregate failure counter.** A step increase without a matching increase in `events_errored`, DLQ file size, or `events_wedged` means events are failing at the send stage but recovering successfully — expected under transient network trouble, worth watching under a healthy DLQ.
+
+Shutdown fallthrough — the runtime SIGTERM budget elapsing while a send is still in flight — falls into the same `Dropped` path: the task is aborted, the parked handle drops, and on a disk queue the position holds for replay on next start. Network unbatched sinks (`kafka`, `syslog_tcp`, `syslog_udp`, `unix_socket`) narrow the shutdown race to the pre-send phase (connect / handshake / rotation); the send phase itself runs to completion or times out via its per-write timeout (`PEER_WRITE_TIMEOUT` / `message.timeout.ms`), and only that timeout — or a runtime task abort — can cut a send short. The `file` output remains deliberately shutdown-unaware end-to-end for the same reason: partial-append duplication on retry is worse than a Dropped-then-replayed event.
 
 ## Schema migration v1 → v2
 
