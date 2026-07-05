@@ -569,7 +569,7 @@ impl QueueAckHandle {
     /// Test-only accessor — no production caller needs it today (the
     /// queue consumer reads `position` off the resolved
     /// `(AckPosition, AckDisposition)` tuple instead). Now exposed
-    /// crate-wide for the Branch B C3 DLQ-outcome dispatcher —
+    /// crate-wide for the the DLQ-outcome dispatcher —
     /// `resolve_ack_from_dlq_outcome` (in `crates/limpid/src/modules/mod.rs`)
     /// consults the queue kind to decide between `resolve_recovered`
     /// (memory) and `resolve_dropped` (disk wedge) on a Dropped
@@ -615,8 +615,8 @@ impl QueueAckHandle {
     ///
     /// Currently only exercised by test-side mocks that need to
     /// signal `Dropped` without tripping the debug_assert;
-    /// production callers (DLQ-write-failure path) are wired in
-    /// Branch B C3.
+    /// in-daemon callers (DLQ-write-failure path) reach it
+    /// through the DLQ-outcome dispatcher.
     #[allow(dead_code)]
     pub fn resolve_dropped(mut self) {
         self.resolved = true;
@@ -845,14 +845,27 @@ pub async fn run_queue_consumer(
     // handles are exactly what `writer.shutdown()` resolves, so the
     // wait can never make progress on its own.
     //
-    // Wedge-exit skips the shutdown-drive of the output:
-    // `writer.shutdown` on a wedged output would pump more events
-    // through the buggy path, and the wedge contract says
-    // in-flight events should drain but no *new* work should
-    // start. The batched-handle drain only matters for outputs
-    // that were still Delivering successfully; a wedged consumer
-    // by definition already stopped accepting new events, so no
-    // batched buffer accumulation happened after the wedge.
+    // Wedge-exit skips the `writer.shutdown()` drive: the wedge
+    // contract says "no new work through a bug-path output". For
+    // unbatched sinks this is the whole story because their
+    // `shutdown()` is a no-op — there is no buffer to flush. For
+    // batched sinks (`http`, `otlp_http`, `otlp_grpc`) that were
+    // accepting events before the wedge fired, any handles
+    // parked in their internal buffer at wedge time are
+    // **currently leaked**: skipping `shutdown()` means those
+    // handles never receive an explicit resolve, and if we
+    // reached this point with `in_flight > 0` the drain loop
+    // below waits on ack messages that will never arrive. That
+    // is deliberate — replaying a buffered handle through a
+    // still-buggy sink would risk the same Dropped outcome and
+    // just prolong the wedge — but it is not "safe" in the sense
+    // that batched buffers are automatically empty here.
+    // Batched-sink wedge handling is out of scope for this
+    // release (the fail-stop refactor deliberately covered
+    // unbatched sinks only); a follow-up will extend
+    // `writer.shutdown()` with an explicit wedge-aware resolve
+    // so the parked handles resolve as `Dropped` and the disk
+    // queue's wedged cursor stays where it is.
     if !wedged && let Err(e) = writer.shutdown(error_log.as_ref()).await {
         warn!("output '{}': shutdown flush failed: {}", name, e);
     }
@@ -909,8 +922,32 @@ fn handle_ack_disposition(
             // Same rationale as `Delivered`.
         }
         AckDisposition::Dropped => {
+            // Dropped reaches this arm from two shapes:
+            //
+            // - **Bug path**: an output's `consume` returned
+            //   without an explicit `resolve_*` call, and the
+            //   handle's `Drop` fired `Dropped` through the
+            //   ack channel (guarded in debug builds by the
+            //   `debug_assert!(self.resolved, ...)` in
+            //   `QueueAckHandle::drop`).
+            // - **Intentional path**: `resolve_dropped()` was
+            //   called explicitly — currently the only in-daemon
+            //   caller is `route_event_to_dlq` on a DLQ-write
+            //   failure, dispatched via
+            //   `resolve_ack_from_dlq_outcome` for disk-backed
+            //   queues so the fail-stop wedge holds the cursor
+            //   for replay.
+            //
+            // The two are indistinguishable at this level, so
+            // the log line names both possibilities. Operators
+            // reading this should cross-reference
+            // `events_errored_unwritable` (bumped on the
+            // DLQ-write failure path) and the daemon's
+            // `panicked at` lines (bug path).
             tracing::error!(
-                "output '{}': event dropped without explicit disposition (bug)",
+                "output '{}': event dropped — no explicit disposition (bug) or intentional \
+                 Dropped from a DLQ-write failure (check events_errored_unwritable and daemon \
+                 panic logs)",
                 name
             );
             metrics.events_failed.fetch_add(1, Ordering::Relaxed);
@@ -1367,7 +1404,7 @@ mod consumer_lifecycle_tests {
         receiver.ack_to(AckPosition::Memory);
     }
 
-    // ---- disk queue wedge (Branch B C2) ----
+    // ---- disk queue wedge (the disk-queue fail-stop wedge) ----
     //
     // Fail-stop wedge: a disk-queue consumer that observes
     // `AckDisposition::Dropped` cannot honestly advance the cursor

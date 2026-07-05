@@ -77,7 +77,7 @@ The daemon-wide [`control { error_log "..." }`](../operations/error-log.md) bloc
 
 Each line is one per-event record carrying `event.egress` — the **pipeline-produced payload** at the moment it was handed to the sink (`egress` starts as a clone of `ingress` and is overwritten as the pipeline's process bodies run). Replay via `limpidctl inject output <name> --json` re-injects the event into the named sink's `consume()` path — the pipeline is **bypassed**, but the sink's own transport-level rendering (batched encode, HTTP body framing, OTLP `ResourceLogs` packing, etc.) **does** re-run. See [Error Log → Output flavor](../operations/error-log.md#output-flavor) for the full record shape and producer-site catalog.
 
-When `error_log` is unset, Output-flavor records fall back to a name-only `tracing::warn!` / `error!` line that does **not** serialize the event payload — the data is effectively dropped. `limpid --check` emits a recovery-readiness warning so the operator notices the silent drop path before the first failure.
+When `error_log` is unset, Output-flavor records fall back to a `tracing::error!` line carrying the full JSONL in an `event_record` structured field — the same shape Process-flavor uses — so `journalctl | jq` can extract and replay the record. This is strictly worse than a dedicated DLQ file (log rotation, aggregation delays, tracing filters) but the payload is not lost. `limpid --check` emits a recovery-readiness warning so operators notice the missing configuration before the first failure.
 
 > **Graceful shutdown vs. SIGKILL.** The shutdown-drain path above
 > only fires on **graceful** shutdown — `SIGTERM`, `SIGHUP` reload,

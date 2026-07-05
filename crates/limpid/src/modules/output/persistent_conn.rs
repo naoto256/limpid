@@ -144,7 +144,7 @@ pub(crate) enum WriteReconnectOutcome {
 ///   runtime task is aborted at the shutdown deadline while
 ///   `write_frame` is still in flight, the ack handle drops as
 ///   `Dropped`, and — on a disk queue — that Dropped position
-///   holds the cursor for replay on next start (Branch B C2's
+///   holds the cursor for replay on next start (the disk-queue wedge
 ///   fail-stop contract).
 ///
 /// This restructures the "one failed write triggers one
