@@ -160,6 +160,24 @@ where
 }
 
 /// Write one syslog message with RFC 6587 framing.
+///
+/// Both framing variants build the wire bytes into a single
+/// buffer and hand it to one `write_all` — the header + payload
+/// (OctetCounting) and the payload + `\n` delimiter
+/// (NonTransparent) used to be issued as two separate
+/// `write_all` calls, which opened a between-writes error
+/// boundary: the first call could return `Ok(())` and the second
+/// could then error (I/O error, `EAGAIN` budget exhausted,
+/// timeout drop), leaving an incomplete frame that the retry /
+/// DLQ path would follow with a full frame — silently doubling
+/// or corrupting the record on the wire.
+///
+/// Fusing the two writes into one call removes that specific
+/// error boundary. `write_all` still loops over `write(2)`
+/// internally so this is a boundary narrowing, not an atomicity
+/// guarantee — a timeout-cancelled `write_all` mid-loop can
+/// still leave partial bytes, which the at-least-once retry
+/// contract acknowledges.
 pub async fn write_framed<S>(
     stream: &mut S,
     framing: SyslogFraming,
@@ -168,18 +186,23 @@ pub async fn write_framed<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    match framing {
+    let buf = match framing {
         SyslogFraming::OctetCounting => {
             let header = format!("{} ", payload.len());
-            stream.write_all(header.as_bytes()).await?;
-            stream.write_all(payload).await?;
+            let header_bytes = header.as_bytes();
+            let mut buf = Vec::with_capacity(header_bytes.len() + payload.len());
+            buf.extend_from_slice(header_bytes);
+            buf.extend_from_slice(payload);
+            buf
         }
         SyslogFraming::NonTransparent => {
-            stream.write_all(payload).await?;
-            stream.write_all(b"\n").await?;
+            let mut buf = Vec::with_capacity(payload.len() + 1);
+            buf.extend_from_slice(payload);
+            buf.push(b'\n');
+            buf
         }
-    }
-
+    };
+    stream.write_all(&buf).await?;
     stream.flush().await?;
     Ok(())
 }
@@ -981,5 +1004,50 @@ mod tests {
         let m = &list.peer_metrics()[0];
         assert_eq!(m.events_written.load(Ordering::Relaxed), 1);
         assert_eq!(m.cooldowns_entered.load(Ordering::Relaxed), 0);
+    }
+
+    /// OctetCounting framing must land header + payload as a
+    /// single `write_all` (buffer fusion) — a pre-fix regression
+    /// would issue two calls and the header could reach the
+    /// wire before the payload write failed, leaving an
+    /// unparseable partial frame on the wire.
+    #[tokio::test]
+    async fn octet_counting_writes_header_and_payload_in_one_write_all() {
+        use tokio::io::AsyncReadExt;
+        let payload = Bytes::from_static(b"<134>hello");
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let payload_clone = payload.clone();
+        let write_task = tokio::spawn(async move {
+            write_framed(&mut client, SyslogFraming::OctetCounting, &payload_clone)
+                .await
+                .unwrap();
+        });
+        write_task.await.unwrap();
+        // A single write_all + flush lands the full frame; read
+        // it back and pin the exact shape "<len> <payload>".
+        let mut got = Vec::new();
+        server.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"10 <134>hello");
+    }
+
+    /// NonTransparent framing must land payload + `\n` as a
+    /// single `write_all` (same fusion rationale as
+    /// OctetCounting) so a between-writes failure cannot leave
+    /// an unterminated line for the retry / DLQ path to double.
+    #[tokio::test]
+    async fn non_transparent_writes_payload_and_delimiter_in_one_write_all() {
+        use tokio::io::AsyncReadExt;
+        let payload = Bytes::from_static(b"<134>hello");
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let payload_clone = payload.clone();
+        let write_task = tokio::spawn(async move {
+            write_framed(&mut client, SyslogFraming::NonTransparent, &payload_clone)
+                .await
+                .unwrap();
+        });
+        write_task.await.unwrap();
+        let mut got = Vec::new();
+        server.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"<134>hello\n");
     }
 }
