@@ -569,7 +569,7 @@ impl QueueAckHandle {
     /// Test-only accessor — no production caller needs it today (the
     /// queue consumer reads `position` off the resolved
     /// `(AckPosition, AckDisposition)` tuple instead). Now exposed
-    /// crate-wide for the the DLQ-outcome dispatcher —
+    /// crate-wide for the DLQ-outcome dispatcher —
     /// `resolve_ack_from_dlq_outcome` (in `crates/limpid/src/modules/mod.rs`)
     /// consults the queue kind to decide between `resolve_recovered`
     /// (memory) and `resolve_dropped` (disk wedge) on a Dropped
@@ -758,7 +758,7 @@ pub async fn run_queue_consumer(
                 // recovery contract. Memory queues cannot replay
                 // on restart, so wedging would only cause loss
                 // without a recovery path — they keep the
-                // pre-B-C2 continue-and-count behavior.
+                // pre-fail-stop continue-and-count behavior.
                 let is_disk_position = matches!(position, AckPosition::Disk { .. });
                 let should_wedge = matches!(disposition, AckDisposition::Dropped)
                     && is_disk_position
@@ -1526,7 +1526,7 @@ mod consumer_lifecycle_tests {
     /// A memory-queue consumer does NOT wedge on Dropped: a
     /// memory queue has no persistent cursor to hold and cannot
     /// replay on restart, so wedging would just cause loss with
-    /// no recovery path. The pre-B-C2 continue-and-count
+    /// no recovery path. The pre-fail-stop continue-and-count
     /// behavior is retained on memory queues.
     #[tokio::test]
     async fn memory_queue_does_not_wedge_on_dropped() {
