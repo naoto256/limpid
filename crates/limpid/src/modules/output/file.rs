@@ -344,12 +344,14 @@ impl Output for FileOutput {
         // path already made this trade-off; the shutdown drain
         // inherits it. Local disk writes are typically <10 ms and
         // finish well inside the shutdown budget; a truly hung
-        // filesystem here becomes a task-abort → `Dropped` (the
-        // "lost but no replay" contract documented under the
-        // Standing limitation section of
-        // `docs/src/operations/error-log.md`), which is worse than
-        // a partial-then-full duplicate on paper but at least does
-        // not double the operator's cleanup surface at replay time.
+        // filesystem here becomes a task-abort → `Dropped` — on a
+        // disk queue that engages the fail-stop wedge and the
+        // event replays on next start; on a memory queue there is
+        // no replay path (see the Disposition contract in
+        // `docs/src/operations/error-log.md`). Either shape is
+        // worse than a partial-then-full duplicate on paper but
+        // at least does not double the operator's cleanup surface
+        // at replay time.
         match self.write_payload(payload).await {
             Ok(()) => {
                 ack.resolve_delivered();
