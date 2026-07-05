@@ -74,36 +74,82 @@ pub async fn sleep_or_shutdown(
     }
 }
 
-/// Shared per-attempt helper for unbatched sinks: race a single
-/// send-attempt future against the runtime shutdown signal. Returns
-/// `Some(result)` if the attempt completed (either `Ok` or a
-/// transport `Err`), `None` if shutdown fired first — the caller
-/// should abandon the in-flight attempt, DLQ-route the pending
-/// event, resolve the ack handle as `Recovered`, and return so the
-/// queue consumer's `select!` reaches its drain arm inside the
-/// runtime shutdown budget. Companion to `sleep_or_shutdown`: that
-/// closes the retry backoff window; this closes the single-attempt
-/// I/O window (kafka's 30 s `message.timeout.ms`, syslog_tcp's
-/// per-peer 5+5+10 s per attempt, unix_socket's unbounded connect
-/// and write). A dropped shutdown sender is treated as
-/// "shutdown fired", same as `sleep_or_shutdown`.
+/// Race a **pre-send** operation against the runtime shutdown
+/// signal. Returns `Some(result)` if the operation completed
+/// (either `Ok` or an `Err` from the operation itself), `None` if
+/// shutdown fired first — in the `None` case the caller has done
+/// nothing observable and can safely DLQ-route the event as
+/// `Recovered`.
 ///
-/// Cancelling the attempt future may leave the transport in a
-/// partially-sent state (e.g. a half-written TCP frame). That is an
-/// intentional trade-off: the alternative is holding the queue
-/// consumer past the shutdown deadline and getting task-aborted
-/// mid-flight, which drops the ack handle and loses the event
-/// silently. A partial-line trailer is documented as the cost of
-/// prompt shutdown; downstream syslog / kafka receivers already
-/// tolerate resend-on-reconnect.
+/// # Contract
+///
+/// This helper is **only** safe around code that has no wire-level
+/// side effect: connect, TLS handshake, DNS lookup, credential
+/// refresh, peer rotation, cool-down waits. It is **not** safe
+/// around a `write(2)` / `write_all` / `send_to` / `producer.send`
+/// call: cancelling those mid-flight leaves the transport in a
+/// partially-sent or ambiguous-delivery state, and the DLQ
+/// `Recovered` disposition would be a lie (the receiver may have
+/// observed part or all of the payload).
+///
+/// The correct shape for unbatched sinks is:
+///
+/// ```text
+/// loop attempt:
+///     match pre_send_or_shutdown(&mut shutdown, connect_and_prepare()).await {
+///         Some(Ok(prepared)) => {
+///             // Send phase runs to completion — no shutdown
+///             // wrapper here. Existing I/O timeouts (per-peer
+///             // write timeout, kafka `message.timeout.ms`)
+///             // still bound the wait.
+///             match send_phase(prepared).await { ... }
+///         }
+///         Some(Err(e)) => { /* connect failed; retry */ }
+///         None => { /* shutdown pre-send; DLQ Recovered — honest */ }
+///     }
+/// ```
+///
+/// Shutdown does **not** add a new cancellation point beyond the
+/// pre-send phase. The send phase remains cancellable only by its
+/// existing timeout sources (e.g. `PEER_WRITE_TIMEOUT`); the
+/// resulting partial-write ambiguity is the existing at-least-once
+/// contract (retry may duplicate). If the send phase runs past the
+/// runtime shutdown budget the task is aborted and the ack handle
+/// drops as `Dropped`; on a disk queue that Dropped position holds
+/// the cursor and the event replays on next start (see
+/// `crates/limpid/src/queue/mod.rs` for the queue-side wedge
+/// contract).
+///
+/// A dropped shutdown sender is treated as "shutdown fired",
+/// matching `sleep_or_shutdown`.
+pub async fn pre_send_or_shutdown<F: std::future::Future>(
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    pre_send: F,
+) -> Option<F::Output> {
+    tokio::select! {
+        r = pre_send => Some(r),
+        _ = shutdown.wait_for(|s| *s) => None,
+    }
+}
+
+/// **Deprecated in-place**: prior name for [`pre_send_or_shutdown`].
+///
+/// The old contract wrapped an entire send attempt (connect +
+/// write) in the shutdown race, and on shutdown reported the event
+/// as `Recovered` even when bytes may have already reached the
+/// wire. That was silently at-most-once on retry and could
+/// double-send on reconnect. Existing call sites use this name
+/// while the sink-level refactor lands; each such site is being
+/// re-shaped in Branch B to wrap only the pre-send phase, at which
+/// point references migrate to [`pre_send_or_shutdown`] and this
+/// alias is removed.
+///
+/// Do not add new callers.
 pub async fn attempt_or_shutdown<F: std::future::Future>(
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     attempt: F,
 ) -> Option<F::Output> {
-    tokio::select! {
-        r = attempt => Some(r),
-        _ = shutdown.wait_for(|s| *s) => None,
-    }
+    pre_send_or_shutdown(shutdown, attempt).await
 }
 
 impl BuildContext {
@@ -807,29 +853,30 @@ where
 }
 
 #[cfg(test)]
-mod attempt_or_shutdown_tests {
-    use super::attempt_or_shutdown;
+mod pre_send_or_shutdown_tests {
+    use super::{attempt_or_shutdown, pre_send_or_shutdown};
     use std::time::Duration;
 
-    /// Happy path: the attempt future completes first, the shutdown
+    /// Happy path: the pre-send future completes first, the shutdown
     /// receiver is untouched, and the outcome is returned intact.
     #[tokio::test]
-    async fn attempt_completes_before_shutdown_returns_the_outcome() {
+    async fn pre_send_completes_before_shutdown_returns_the_outcome() {
         let (_tx, mut rx) = tokio::sync::watch::channel(false);
-        let outcome = attempt_or_shutdown(&mut rx, async { 42u32 }).await;
+        let outcome = pre_send_or_shutdown(&mut rx, async { 42u32 }).await;
         assert_eq!(outcome, Some(42));
     }
 
-    /// Shutdown fires while the attempt is still pending: the helper
-    /// returns `None` and the attempt future is dropped. Pin this on
-    /// wall time so a regression that dropped the shutdown arm would
-    /// hang and time out here — the assert bound (200 ms against a
-    /// 5 s sleep) is far under any plausible scheduler jitter.
+    /// Shutdown fires while the pre-send is still pending: the
+    /// helper returns `None` and the pre-send future is dropped.
+    /// Pin this on wall time so a regression that dropped the
+    /// shutdown arm would hang and time out here — the assert bound
+    /// (200 ms against a 5 s sleep) is far under any plausible
+    /// scheduler jitter.
     #[tokio::test]
-    async fn shutdown_before_attempt_completes_returns_none() {
+    async fn shutdown_before_pre_send_completes_returns_none() {
         let (tx, mut rx) = tokio::sync::watch::channel(false);
         let helper = async move {
-            attempt_or_shutdown(&mut rx, tokio::time::sleep(Duration::from_secs(5)))
+            pre_send_or_shutdown(&mut rx, tokio::time::sleep(Duration::from_secs(5)))
                 .await
                 .map(|_| ())
         };
@@ -854,6 +901,24 @@ mod attempt_or_shutdown_tests {
     /// mapping would trip the test.
     #[tokio::test]
     async fn dropped_shutdown_sender_is_treated_as_fired() {
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        drop(tx);
+        let outcome =
+            pre_send_or_shutdown(&mut rx, tokio::time::sleep(Duration::from_secs(5))).await;
+        assert!(outcome.is_none());
+    }
+
+    /// The `attempt_or_shutdown` alias delegates to
+    /// `pre_send_or_shutdown` and stays functionally identical
+    /// during the Branch B refactor migration. Pin this so a
+    /// premature removal or divergent implementation of the alias
+    /// trips the test before the callers migrate.
+    #[tokio::test]
+    async fn attempt_or_shutdown_alias_delegates_unchanged() {
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        let outcome = attempt_or_shutdown(&mut rx, async { 7u32 }).await;
+        assert_eq!(outcome, Some(7));
+
         let (tx, mut rx) = tokio::sync::watch::channel(false);
         drop(tx);
         let outcome =
