@@ -309,10 +309,11 @@ impl<P: BatchSinkPolicy> Drop for BatchedSink<P> {
         // lock here would block the warn under contention; try_lock
         // is the right behaviour for a Drop path. Each leftover
         // handle's own Drop impl fires `Dropped` back at the queue
-        // consumer, which advances the cursor and bumps
-        // `events_failed` but writes no DLQ record — the "lost but
-        // no replay" contract documented in the operator-facing
-        // Standing limitation section of `docs/src/operations/error-log.md`.
+        // consumer, which bumps `events_failed` but writes no DLQ
+        // record — on a disk queue the fail-stop wedge holds the
+        // cursor for replay on next start; on a memory queue the
+        // event is unrecoverable. See the Disposition contract in
+        // `docs/src/operations/error-log.md`.
         if let Ok(buf) = self.inner.batch.try_lock()
             && !buf.is_empty()
         {

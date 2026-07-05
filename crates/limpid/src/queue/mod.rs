@@ -1682,8 +1682,9 @@ mod consumer_lifecycle_tests {
     /// A memory-queue consumer does NOT wedge on Dropped: a
     /// memory queue has no persistent cursor to hold and cannot
     /// replay on restart, so wedging would just cause loss with
-    /// no recovery path. The pre-fail-stop continue-and-count
-    /// behavior is retained on memory queues.
+    /// no recovery path. Memory queues retain a continue-and-count
+    /// behavior on Dropped instead of the fail-stop wedge that
+    /// disk queues use.
     #[tokio::test]
     async fn memory_queue_does_not_wedge_on_dropped() {
         let writer = Arc::new(ScriptedWriter::new(vec![Outcome::Bug, Outcome::Delivered]));
