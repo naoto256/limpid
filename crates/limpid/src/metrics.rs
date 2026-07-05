@@ -92,7 +92,7 @@ pub struct OutputMetrics {
     /// drop, rotation race). Distinct from the pipeline-side
     /// counter because operator alarms need to know which failure
     /// path is misbehaving. When this bumps on a disk queue the
-    /// consumer routes the event as `Dropped` (Branch B C2 wedge)
+    /// consumer routes the event as `Dropped` (disk-queue fail-stop wedge)
     /// so the cursor holds and a subsequent daemon start replays
     /// the event through a hopefully-healthy DLQ. On memory
     /// queues the event is `Recovered` regardless — there is no

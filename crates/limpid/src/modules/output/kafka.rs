@@ -654,7 +654,7 @@ impl KafkaOutput {
     ///
     /// The recheck is best-effort: if shutdown flips between the
     /// borrow and the `producer.send(...)` call the record ships;
-    /// the caller's outer race and the disk-queue wedge (Branch B
+    /// the caller's outer race and the disk-queue wedge (the disk-queue fail-stop contract
     /// C2) cover that case.
     async fn try_send(
         &self,

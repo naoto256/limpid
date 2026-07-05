@@ -372,7 +372,7 @@ impl<C> PeerList<C> {
     /// runtime shutdown budget elapses while the write is still in
     /// flight, the queue-consumer task is aborted and the ack
     /// handle drops as `Dropped` — a disk queue holds the cursor
-    /// and replays on next start (Branch B C2's fail-stop
+    /// and replays on next start (the disk-queue fail-stop
     /// contract).
     pub async fn write_with_rotation_shutdown_aware<F>(
         &self,

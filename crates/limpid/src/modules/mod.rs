@@ -421,8 +421,15 @@ pub const SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Durat
 /// disposition under the shutdown contract (no retry, no backoff).
 ///
 /// - `Ok(())` → `events_written++`, ack `Delivered`.
-/// - `Err(e)` → DLQ via `route_event_to_dlq`, `events_failed++`, ack
-///   `Recovered`. Never `Dropped` — the handle is always resolved.
+/// - `Err(e)` → DLQ via `route_event_to_dlq`, `events_failed++`, and
+///   dispatch the ack through `resolve_ack_from_dlq_outcome`: `Recovered`
+///   when the DLQ write succeeded (or when no `error_log` is configured
+///   — the payload is emitted to the tracing channel instead), and
+///   `Dropped` when a configured DLQ file was present but the write to
+///   it failed. The `Dropped` arm on a disk queue triggers the
+///   disk-queue fail-stop wedge so the cursor holds for a replay on
+///   next start rather than silently advancing past an event with no
+///   durable trace.
 ///
 /// Callers are responsible for wrapping their send in
 /// `tokio::time::timeout(SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT, ...)` when the
@@ -457,15 +464,21 @@ pub async fn finalize_shutdown_singleton_disposition(
 /// `(Event, QueueAckHandle)` entry is:
 ///
 /// 1. Counted in `events_failed`.
-/// 2. Routed to the DLQ when `error_log` is `Some` (per-record write
-///    failure → warn and continue; the cursor must keep advancing).
-/// 3. Resolved as `Recovered` so the queue's ack-handle invariant holds
-///    and the handle's `Drop` does NOT fire `Dropped` (which would be
-///    silent loss attributed to a bug).
+/// 2. Routed to the DLQ when `error_log` is `Some`. A per-record DLQ
+///    write success resolves the ack as `Recovered`; a per-record DLQ
+///    write failure bumps `events_errored_unwritable` and hands the
+///    ack through `resolve_ack_from_dlq_outcome`, which on a disk
+///    queue resolves as `Dropped` (the disk-queue fail-stop wedge
+///    holds the cursor for replay on next start) and on a memory
+///    queue resolves as `Recovered` (memory queues cannot replay).
 ///
-/// When `error_log` is `None` we log loudly and resolve `Recovered`
-/// anyway — keeping the handle parked is strictly worse than an
-/// explicit, logged best-effort recovery.
+/// When `error_log` is `None` we emit one `tracing::error!` per event
+/// with the full JSONL as a structured field (matching the
+/// pipeline-side `write_errored_to_dlq` shape) so the operator has an
+/// out-of-daemon durable copy, and resolve every handle as
+/// `Recovered`. Silently keeping handles parked would be strictly
+/// worse — the ack-handle contract requires an explicit disposition,
+/// and the JSONL-in-log path is at least grep-and-replayable.
 pub async fn route_shutdown_batch_to_dlq(
     error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
     metrics: &OutputMetrics,
@@ -508,13 +521,29 @@ pub async fn route_shutdown_batch_to_dlq(
             resolve_ack_from_dlq_outcome(ack, outcome);
         }
     } else {
-        tracing::warn!(
-            "output '{}': {} events dropped at shutdown (no error_log): {}",
-            output_name,
-            events.len(),
-            flush_err
-        );
-        for (_, ack) in events {
+        // No DLQ configured — emit one `tracing::error!` line
+        // per parked event with the full JSONL as a structured
+        // field so the operator can grep / `journalctl | jq`
+        // and replay. Matches the shape used elsewhere
+        // (pipeline-side `write_errored_to_dlq`, sink-side
+        // `route_event_to_dlq`); without the JSONL the payloads
+        // would vanish alongside the shutdown drain.
+        let reason = format!("shutdown flush failed: {}", flush_err);
+        for (ev, ack) in events {
+            let ctx = crate::pipeline::ErroredEventContext::Output {
+                timestamp: chrono::Utc::now(),
+                pipeline: String::new(),
+                site: format!("{} shutdown", output_name),
+                reason: reason.clone(),
+                output_name: output_name.to_string(),
+                event: crate::pipeline::OutputEvent::from_owned(&ev),
+            };
+            tracing::error!(
+                event_record = %ctx.to_jsonl(),
+                "output '{}': shutdown-drain event dropped (no error_log); configure \
+                 `control {{ error_log \"...\" }}` for file-based DLQ",
+                output_name
+            );
             metrics.events_failed.fetch_add(1, Ordering::Relaxed);
             ack.resolve_recovered();
         }
@@ -528,8 +557,8 @@ pub async fn route_shutdown_batch_to_dlq(
 ///
 /// - `Recovered` (any queue): `resolve_recovered`.
 /// - `Dropped` + disk queue: `resolve_dropped` — the disk cursor
-///   holds and the event replays on next start (Branch B C2
-///   wedge kicks in on the consumer side).
+///   holds and the event replays on next start (the disk-queue
+///   fail-stop wedge kicks in on the consumer side).
 /// - `Dropped` + memory queue: `resolve_recovered` — memory
 ///   queues cannot replay on restart, so `resolve_dropped`
 ///   would only wedge the pipeline without a recovery path;
@@ -560,7 +589,7 @@ pub fn resolve_ack_from_dlq_outcome(ack: crate::queue::QueueAckHandle, outcome: 
 ///   (disk full, permission drop, corrupted DLQ, etc.). Nothing
 ///   durable was written; on a disk queue the caller should
 ///   `resolve_dropped()` so the queue cursor holds and the event
-///   replays on next start (Branch B C2 wedge). On a memory
+///   replays on next start (disk-queue fail-stop wedge). On a memory
 ///   queue the caller still `resolve_recovered()` because there
 ///   is no replay path either way and `events_errored_unwritable`
 ///   has already been bumped as the operator signal.
@@ -603,7 +632,7 @@ pub async fn route_event_to_dlq(
                 // uses, so both sink-side and pipeline-side
                 // DLQ-write failures show up under the same
                 // metric. `Dropped` signals the caller to hold
-                // the cursor on a disk queue (Branch B C2 wedge)
+                // the cursor on a disk queue (disk-queue fail-stop wedge)
                 // rather than advance past an event that has no
                 // durable trail.
                 tracing::warn!(
@@ -620,16 +649,27 @@ pub async fn route_event_to_dlq(
         }
     } else {
         // No DLQ configured — surface the full failure context
-        // to the tracing channel. Operators grep / journalctl
-        // for these lines; the event is technically "lost" from
-        // the daemon's storage perspective, but the record is
-        // preserved on the standard log channel. `Recovered` is
-        // honest here because the operator has an
-        // outside-the-daemon durable copy.
+        // to the tracing channel, matching the pipeline-side
+        // `write_errored_to_dlq` (in runtime.rs) which also
+        // emits the full JSONL via a structured field so the
+        // operator can grep / `journalctl | jq` the record and
+        // replay it via `limpidctl inject output <name> --json`.
+        // Without the JSONL the payload would be gone as soon
+        // as the cursor advances, so `Recovered` would over-
+        // promise recoverability. The `event_record` structured
+        // field is the same shape a DLQ file would receive.
+        let ctx = crate::pipeline::ErroredEventContext::Output {
+            timestamp: chrono::Utc::now(),
+            pipeline: String::new(),
+            site: output_name.to_string(),
+            reason: reason.to_string(),
+            output_name: output_name.to_string(),
+            event: crate::pipeline::OutputEvent::from_owned(event),
+        };
         tracing::error!(
-            "output '{}': dropping event (no error_log): {}",
-            output_name,
-            reason
+            event_record = %ctx.to_jsonl(),
+            "output '{}': dropping event (no error_log); configure `control {{ error_log \"...\" }}` for file-based DLQ",
+            output_name
         );
         DlqRouteOutcome::Recovered
     }
@@ -1021,7 +1061,7 @@ mod resolve_ack_from_dlq_outcome_tests {
 
     /// Dropped outcome on a disk queue resolves as
     /// `Dropped` — the disk queue's consumer wedges on the
-    /// Dropped disposition (Branch B C2) and holds the cursor
+    /// Dropped disposition (the disk-queue fail-stop wedge) and holds the cursor
     /// at this position for replay on next start.
     #[tokio::test]
     async fn dropped_outcome_resolves_dropped_on_disk() {
