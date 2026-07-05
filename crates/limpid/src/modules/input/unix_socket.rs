@@ -128,14 +128,9 @@ impl Input for UnixSocketInput {
                     // socket fresh.
                 }
                 Err(e) => {
-                    error!(
-                        "unix_socket: failed to stat {:?}: {}",
-                        self.path, e
-                    );
-                    return Err(anyhow::Error::from(e).context(format!(
-                        "unix_socket: failed to stat {:?}",
-                        self.path
-                    )));
+                    error!("unix_socket: failed to stat {:?}: {}", self.path, e);
+                    return Err(anyhow::Error::from(e)
+                        .context(format!("unix_socket: failed to stat {:?}", self.path)));
                 }
             }
         }

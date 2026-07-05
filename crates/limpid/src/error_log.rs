@@ -855,7 +855,9 @@ mod tests {
         // Restore write bit so TempDir can clean up.
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let err = result.expect_err("readonly parent must fail preflight").to_string();
+        let err = result
+            .expect_err("readonly parent must fail preflight")
+            .to_string();
         assert!(
             err.contains("cannot create DLQ file"),
             "err must name the preflight failure, got: {err}"
