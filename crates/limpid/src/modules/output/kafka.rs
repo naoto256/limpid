@@ -464,16 +464,37 @@ impl Output for KafkaOutput {
         let mut wait = self.retry.initial_wait;
         let mut shutdown = self.shutdown_signal.clone();
         loop {
+            // Pre-send shutdown check. Kafka's side-effect boundary
+            // is the `producer.send(...)` call itself (see
+            // `try_send`): librdkafka's `FutureProducer::send`
+            // synchronously enqueues the record into the internal
+            // producer queue, and dropping the returned future
+            // waits-side only — the record still ships to the
+            // broker. `try_send` therefore rechecks the shutdown
+            // signal one last time immediately before calling
+            // `send`, and the outer race here is best-effort: if
+            // shutdown flips between this check and the internal
+            // recheck we still return `Recovered` (the shutdown
+            // arm below), but the internal recheck is the
+            // load-bearing guard.
+            // Clone the shutdown receiver for the inner recheck
+            // BEFORE we take the mutable borrow for the outer
+            // race. The inner recheck is where the load-bearing
+            // guard sits (immediately before `producer.send(...)`);
+            // the outer race exists so a shutdown during in-process
+            // prep still returns None promptly rather than waiting
+            // for the recheck.
+            let inner_shutdown = shutdown.clone();
             let outcome = match crate::modules::attempt_or_shutdown(
                 &mut shutdown,
-                self.try_send(event),
+                self.try_send(event, inner_shutdown),
             )
             .await
             {
                 Some(r) => r,
                 None => {
                     let reason = format!(
-                        "output '{}': write attempt abandoned on shutdown",
+                        "output '{}': write attempt abandoned on shutdown (pre-send)",
                         self.name
                     );
                     crate::modules::route_event_to_dlq(
@@ -489,9 +510,25 @@ impl Output for KafkaOutput {
                 }
             };
             match outcome {
-                Ok(()) => {
+                Ok(KafkaTrySendOutcome::Delivered) => {
                     self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
                     ack.resolve_delivered();
+                    return Ok(());
+                }
+                Ok(KafkaTrySendOutcome::PreSendShutdown) => {
+                    let reason = format!(
+                        "output '{}': write attempt abandoned on shutdown (pre-send)",
+                        self.name
+                    );
+                    crate::modules::route_event_to_dlq(
+                        self.error_log.as_ref(),
+                        &self.name,
+                        event,
+                        &reason,
+                    )
+                    .await;
+                    self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                    ack.resolve_recovered();
                     return Ok(());
                 }
                 Err(e) => {
@@ -550,13 +587,33 @@ impl Output for KafkaOutput {
     }
 
     async fn consume_shutdown(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
+        // `consume_shutdown` is called *because* the runtime
+        // shutdown signal has fired — passing the process-wide
+        // shutdown receiver into `try_send` would cause its
+        // pre-send recheck to short-circuit every event as
+        // `PreSendShutdown` and no drain event would ship. Build a
+        // fresh receiver that never observes shutdown so the
+        // recheck is a no-op; the surrounding
+        // `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT` is what bounds the
+        // wait during drain. The `_no_shutdown_tx` binding keeps
+        // the sender alive for the whole call.
+        let (_no_shutdown_tx, no_shutdown_rx) = tokio::sync::watch::channel(false);
         let result = match tokio::time::timeout(
             crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT,
-            self.try_send(event),
+            self.try_send(event, no_shutdown_rx),
         )
         .await
         {
-            Ok(r) => r,
+            Ok(Ok(KafkaTrySendOutcome::Delivered)) => Ok(()),
+            Ok(Ok(KafkaTrySendOutcome::PreSendShutdown)) => {
+                // The receiver we passed can never observe
+                // shutdown — this branch is a defensive
+                // assertion, not a live code path.
+                unreachable!(
+                    "kafka consume_shutdown must not observe PreSendShutdown from a never-fire receiver"
+                )
+            }
+            Ok(Err(e)) => Err(e),
             Err(_) => Err(anyhow::anyhow!(
                 "timed out after {:?}",
                 crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT
@@ -576,7 +633,30 @@ impl Output for KafkaOutput {
 }
 
 impl KafkaOutput {
-    async fn try_send(&self, event: &Event) -> Result<()> {
+    /// Steady-state single-attempt send.
+    ///
+    /// The pre-send phase is everything up to (but not including)
+    /// `producer.send(...)`: key resolution, payload cloning, and
+    /// `FutureRecord` construction — all in-process, no wire-side
+    /// effect. Once `producer.send(...)` is called, librdkafka has
+    /// **synchronously** enqueued the record into its internal
+    /// producer queue and there is no supported way to remove it
+    /// (dropping the returned delivery future cancels the wait
+    /// only; the record still ships to the broker, subject to
+    /// `message.timeout.ms`). This helper therefore takes a
+    /// shutdown receiver and rechecks it once more immediately
+    /// before the `producer.send(...)` call — that recheck is
+    /// where the side-effect boundary sits.
+    ///
+    /// The recheck is best-effort: if shutdown flips between the
+    /// borrow and the `producer.send(...)` call the record ships;
+    /// the caller's outer race and the disk-queue wedge (Branch B
+    /// C2) cover that case.
+    async fn try_send(
+        &self,
+        event: &Event,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<KafkaTrySendOutcome> {
         let key = self.resolve_key(event);
         let egress = event.egress.clone();
 
@@ -585,12 +665,34 @@ impl KafkaOutput {
             record = record.key(k);
         }
 
+        // Load-bearing shutdown recheck: the point of no return is
+        // the `producer.send(...)` call below. Everything above is
+        // in-process prep; everything below waits for the delivery
+        // report of a record that has already been queued to
+        // librdkafka. Return `PreSendShutdown` here rather than
+        // starting a send we cannot cancel.
+        if *shutdown.borrow_and_update() {
+            return Ok(KafkaTrySendOutcome::PreSendShutdown);
+        }
+
+        // Side-effect boundary crossed. Await the delivery future
+        // to completion (bounded by `queue_timeout` /
+        // `message.timeout.ms`). A shutdown flip past this line
+        // does **not** cancel the send: dropping the future would
+        // only stop us from observing the delivery report, not
+        // stop the ship.
         self.producer
             .send(record, self.queue_timeout)
             .await
             .map_err(|(e, _)| anyhow::anyhow!("kafka produce failed: {}", e))?;
-        Ok(())
+        Ok(KafkaTrySendOutcome::Delivered)
     }
+}
+
+/// Outcome of a single kafka `try_send` attempt.
+enum KafkaTrySendOutcome {
+    Delivered,
+    PreSendShutdown,
 }
 
 impl Drop for KafkaOutput {
