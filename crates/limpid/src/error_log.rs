@@ -365,31 +365,34 @@ impl ErrorLogWriter {
 
                     // Preflight: open the same fd shape the runtime
                     // write path uses (write + append + `O_NOFOLLOW`
-                    // + `O_NONBLOCK`) and immediately close it. This
-                    // catches parent-directory execute/write denials
-                    // and stale ACLs that a bare `symlink_metadata`
-                    // stat cannot see — the parent may exist and be
-                    // group-readable while `open(2)` for append is
-                    // refused with `EACCES`. Docs promise the DLQ
-                    // path is validated up front; without the probe,
-                    // the failure would only surface at first DLQ
+                    // + `O_NONBLOCK`) and re-verify shape / mode on
+                    // that fd. The two-syscall shape (stat above,
+                    // open here) leaves a TOCTOU window where the
+                    // path could be swapped between checks;
+                    // fstat-ing the opened fd forces the same-inode
+                    // contract that the runtime write path also
+                    // relies on. This also catches parent-directory
+                    // execute/write denials and stale ACLs that a
+                    // bare `symlink_metadata` stat cannot see — the
+                    // parent may exist and be group-readable while
+                    // `open(2)` for append is refused with
+                    // `EACCES`. Docs promise the DLQ path is
+                    // validated up front; without the probe, the
+                    // failure would only surface at first DLQ
                     // write, after the pipeline has already lost the
                     // observability on that record.
                     let mut probe_opts = OpenOptions::new();
                     probe_opts.write(true).append(true);
                     probe_opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-                    match probe_opts.open(&self.path).await {
-                        Ok(f) => {
-                            drop(f);
-                        }
-                        Err(e) => {
-                            return Err(anyhow::Error::from(e).context(format!(
-                                "error_log: existing DLQ file '{}' is not writable by the \
-                                 daemon user",
-                                self.path.display()
-                            )));
-                        }
-                    }
+                    let probe = probe_opts.open(&self.path).await.map_err(|e| {
+                        anyhow::Error::from(e).context(format!(
+                            "error_log: existing DLQ file '{}' is not writable by the \
+                             daemon user",
+                            self.path.display()
+                        ))
+                    })?;
+                    self.verify_existing_mode(&probe).await?;
+                    drop(probe);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     // Absent file — probe the create path so a
@@ -412,19 +415,28 @@ impl ErrorLogWriter {
                     create_opts.write(true).create_new(true).append(true);
                     create_opts.custom_flags(libc::O_NOFOLLOW);
                     create_opts.mode(0o600);
-                    match create_opts.open(&self.path).await {
-                        Ok(f) => {
-                            drop(f);
-                        }
-                        Err(e) => {
-                            return Err(anyhow::Error::from(e).context(format!(
-                                "error_log: cannot create DLQ file at '{}'; check parent \
-                                 directory permissions, ownership, and any MAC (SELinux / \
-                                 AppArmor) confinement",
-                                self.path.display()
-                            )));
-                        }
-                    }
+                    let probe = create_opts.open(&self.path).await.map_err(|e| {
+                        anyhow::Error::from(e).context(format!(
+                            "error_log: cannot create DLQ file at '{}'; check parent \
+                             directory permissions, ownership, and any MAC (SELinux / \
+                             AppArmor) confinement",
+                            self.path.display()
+                        ))
+                    })?;
+                    // umask defense: `.mode(0o600)` at `open(2)`
+                    // time is masked against the process umask, so
+                    // an unusually restrictive umask (e.g. `0o277`,
+                    // which strips owner write) or an unusually
+                    // permissive one (a paranoid packager wrapper
+                    // that leaves umask as inherited from the
+                    // caller) could land the file at a different
+                    // mode. `fchmod` on the just-opened fd forces
+                    // exactly `0o600`; the subsequent
+                    // `verify_existing_mode` fstats the same fd to
+                    // confirm both S_ISREG and the 0o600 contract
+                    // that the runtime write path checks.
+                    self.fchmod_and_verify_dlq_mode(&probe).await?;
+                    drop(probe);
                 }
                 Err(e) => {
                     return Err(anyhow::Error::from(e).context(format!(
@@ -499,7 +511,16 @@ impl ErrorLogWriter {
         let create_res = create_opts.open(&self.path).await;
 
         let mut f = match create_res {
-            Ok(f) => f,
+            Ok(f) => {
+                // umask defense: `.mode(0o600)` at `open(2)` time
+                // is masked by the process umask, so an unusual
+                // umask can strip owner bits. Force the mode on
+                // the just-created fd via `fchmod` (which is
+                // umask-independent) and re-verify via `fstat`.
+                #[cfg(unix)]
+                self.fchmod_and_verify_dlq_mode(&f).await?;
+                f
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 // Fallback: open the existing inode non-create with
                 // O_NOFOLLOW | O_NONBLOCK, then fstat-verify it is a
@@ -636,6 +657,79 @@ impl ErrorLogWriter {
             )
         })?
     }
+
+    /// Force the DLQ file's mode to exactly `0o600` on the just-
+    /// created fd, then re-verify via `fstat`. Called on the
+    /// fresh-inode branch of the write path and on the absent-file
+    /// branch of `validate_at_startup` — both use
+    /// `OpenOptions::mode(0o600)` at `open(2)` time, but the mode
+    /// argument to `open(2)` is masked by the process umask, so an
+    /// unusually restrictive umask (e.g. `0o277` stripping owner
+    /// write) can land the file at something other than `0o600`.
+    /// `fchmod(2)` on a fd is umask-independent, so this call
+    /// snaps the mode back to the DLQ contract regardless of the
+    /// umask the daemon inherited. The `fstat` afterward is the
+    /// same read-back-what-you-just-wrote pattern the runtime
+    /// write path relies on for the `AlreadyExists` branch.
+    ///
+    /// Uses the same `dup(2)` + `spawn_blocking` cancel-safety
+    /// pattern as `verify_existing_mode`.
+    #[cfg(unix)]
+    async fn fchmod_and_verify_dlq_mode(&self, file: &tokio::fs::File) -> Result<()> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::unix::io::AsRawFd;
+
+        let path = self.path.clone();
+        let path_for_join = path.clone();
+
+        let duped: i32 = unsafe { libc::dup(file.as_raw_fd()) };
+        if duped < 0 {
+            let err = std::io::Error::last_os_error();
+            anyhow::bail!("error_log '{}': dup failed: {}", path.display(), err);
+        }
+        let owned_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(duped) };
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let fd = owned_fd.as_raw_fd();
+            let rc = unsafe { libc::fchmod(fd, 0o600 as libc::mode_t) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                anyhow::bail!("error_log '{}': fchmod failed: {}", path.display(), err);
+            }
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::fstat(fd, &mut stat) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                anyhow::bail!("error_log '{}': fstat failed: {}", path.display(), err);
+            }
+            let ifmt = stat.st_mode & libc::S_IFMT;
+            if ifmt != libc::S_IFREG {
+                anyhow::bail!(
+                    "error_log '{}': freshly created path is not a regular file (st_mode & \
+                     S_IFMT = 0o{:o}); refusing to write.",
+                    path.display(),
+                    ifmt
+                );
+            }
+            let actual = (stat.st_mode as u32) & 0o7777;
+            if actual != 0o600 {
+                anyhow::bail!(
+                    "error_log '{}': freshly created file mode is 0o{:o} after fchmod(0o600); \
+                     the filesystem may not honour the mode contract, refusing to write.",
+                    path.display(),
+                    actual
+                );
+            }
+            Ok(())
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "error_log '{}': fchmod+verify task failed to join",
+                path_for_join.display()
+            )
+        })?
+    }
 }
 
 #[cfg(test)]
@@ -712,6 +806,91 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "DLQ file must be created 0o600, got {mode:o}");
+    }
+
+    // Umask defense — pins both the runtime write path and the
+    // startup preflight against a hostile process umask.
+    //
+    // The `.mode(0o600)` argument to `OpenOptions` is masked by
+    // the process umask at `open(2)` time: a umask of `0o777` (or
+    // any mask that strips owner bits, e.g. `0o600`) yields a
+    // birth mode other than `0o600`. Both paths defend by calling
+    // `fchmod(0o600)` on the just-created fd (umask-independent)
+    // and re-verifying via `fstat`.
+    //
+    // `#[ignore]` because `umask(2)` is a process-global side
+    // effect and this test needs to be run alone. Concurrent
+    // tokio tests (the default `#[tokio::test]` shape) would race
+    // on the flip and corrupt every other test's tempdirs. Run
+    // manually via:
+    //
+    //   cargo test -p limpid --bin limpid \
+    //       error_log::tests::dlq_mode_survives_hostile_umask \
+    //       -- --ignored --test-threads=1
+    //
+    // A `serial_test`-style cross-module serialisation would let
+    // this run in CI, but adding a dev-dep for one test is
+    // heavier than the containment gain. Both paths are also
+    // covered structurally via `fchmod_and_verify_dlq_mode`'s
+    // fstat verify — a code-level regression that drops the
+    // fchmod would surface at the fstat mismatch on the very
+    // first hostile-umask deploy.
+    #[cfg(unix)]
+    struct RestoreUmask(libc::mode_t);
+    #[cfg(unix)]
+    impl Drop for RestoreUmask {
+        fn drop(&mut self) {
+            unsafe {
+                libc::umask(self.0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[ignore = "flips process-global umask; run with --test-threads=1"]
+    async fn dlq_mode_survives_hostile_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Two independent DLQ paths so we can exercise write()
+        // and validate_at_startup() back-to-back inside one test.
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let write_path = dir_a.path().join("errored.jsonl");
+        let preflight_path = dir_b.path().join("errored.jsonl");
+
+        let saved_umask = unsafe { libc::umask(0o777) };
+        let _restore = RestoreUmask(saved_umask);
+
+        // 1. Runtime write path: fresh-inode create → fchmod defense.
+        let w = ErrorLogWriter::new(write_path.clone());
+        w.write(&ctx()).await.unwrap();
+        let mode = tokio::fs::metadata(&write_path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            mode, 0o600,
+            "runtime-created DLQ file must land at 0o600 despite the hostile umask, got \
+             0o{mode:o}"
+        );
+
+        // 2. Startup preflight: absent-file eager create → fchmod defense.
+        let w = ErrorLogWriter::new(preflight_path.clone());
+        w.validate_at_startup().await.unwrap();
+        let mode = tokio::fs::metadata(&preflight_path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            mode, 0o600,
+            "preflight-materialized DLQ file must land at 0o600 despite the hostile umask, got \
+             0o{mode:o}"
+        );
     }
 
     #[tokio::test]
