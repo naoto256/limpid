@@ -594,6 +594,36 @@ impl QueueAckHandle {
         }
     }
 
+    /// Signal an **intentional** `Dropped` disposition: the caller
+    /// has decided the event cannot be delivered *and* cannot be
+    /// routed to the DLQ (e.g. DLQ-write failed with the outer
+    /// route_event_to_dlq contract). On a disk queue this holds
+    /// the cursor at the event's position so a subsequent daemon
+    /// start replays it; on a memory queue it is functionally
+    /// identical to the implicit drop (memory queues have no
+    /// cursor to hold and cannot replay).
+    ///
+    /// Distinct from the `Drop` impl's `Dropped` send: `Drop`
+    /// firing signals a **bug** (the output failed to resolve
+    /// explicitly), guarded by `debug_assert!(self.resolved,
+    /// ...)`. This method is the honest way to arrive at the same
+    /// disposition without tripping the assertion, and the two
+    /// paths are indistinguishable to the queue consumer — the
+    /// wedge contract applies to both because the underlying
+    /// disposition is `Dropped` either way.
+    ///
+    /// Currently only exercised by test-side mocks that need to
+    /// signal `Dropped` without tripping the debug_assert;
+    /// production callers (DLQ-write-failure path) are wired in
+    /// Branch B C3.
+    #[allow(dead_code)]
+    pub fn resolve_dropped(mut self) {
+        self.resolved = true;
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send((self.position, AckDisposition::Dropped));
+        }
+    }
+
     /// Test-only constructor returning the handle and the receiving
     /// half of its ack channel, so tests can assert on the disposition.
     #[cfg(test)]
@@ -657,6 +687,15 @@ pub async fn run_queue_consumer(
         tokio::sync::mpsc::unbounded_channel::<(AckPosition, AckDisposition)>();
     let mut in_flight: usize = 0;
     let mut accepting = true;
+    // `wedged` distinguishes fail-stop wedge from natural queue
+    // closure. Both drive `accepting=false`, but they differ in
+    // exit reason (logged), whether shutdown drain runs (skipped
+    // when wedged — feeding more events into a bug-path output
+    // just piles up doomed handles), and whether the exit message
+    // is `info` (natural) or `error` (wedge — operator action
+    // required). Once wedged, in-flight is drained but new
+    // events stay in the queue for the next run's replay.
+    let mut wedged = false;
 
     loop {
         tokio::select! {
@@ -703,19 +742,57 @@ pub async fn run_queue_consumer(
 
             Some((position, disposition)) = ack_rx.recv() => {
                 handle_ack_disposition(disposition, &name, &metrics);
-                // Dropped disposition advances the cursor the same as Delivered:
-                // panic-mid-handle event loss is the pre-0.7.7 semantic and is
-                // out of scope for this regression fix; full panic recovery is
-                // a separate cycle.
-                receiver.ack_to(position);
+                // Dropped disposition on a *disk* queue is the
+                // fail-stop wedge. `receiver.ack_to` would advance
+                // the cursor past a position we cannot honestly
+                // confirm — silently losing the event on a
+                // durable queue. Instead we hold the cursor (skip
+                // the `ack_to` call so `in_flight_positions`
+                // keeps its unacked front) and stop accepting new
+                // events: further `consume` calls on a bug-path
+                // output would just accumulate more doomed
+                // handles behind the front. Operator intervention
+                // (fix the bug / restart the daemon so the disk
+                // queue replays from the wedge point) is the
+                // recovery contract. Memory queues cannot replay
+                // on restart, so wedging would only cause loss
+                // without a recovery path — they keep the
+                // pre-B-C2 continue-and-count behavior.
+                let is_disk_position = matches!(position, AckPosition::Disk { .. });
+                let should_wedge = matches!(disposition, AckDisposition::Dropped)
+                    && is_disk_position
+                    && !wedged;
+                if should_wedge {
+                    wedged = true;
+                    accepting = false;
+                    metrics.events_wedged.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        "output '{}': disk queue wedged after AckDisposition::Dropped at \
+                         position {:?} — the consumer will drain in-flight events and stop \
+                         accepting new ones. Fix the underlying bug / DLQ-write failure and \
+                         restart the daemon so the disk queue replays from the wedge point. \
+                         See docs/src/operations/error-log.md for the manual intervention \
+                         runbook.",
+                        name,
+                        position,
+                    );
+                    // Deliberately do NOT call `receiver.ack_to`
+                    // for this position — the disk-side
+                    // in-flight bookkeeping keeps the wedged
+                    // position at the front, blocking the cursor
+                    // from advancing past it until replay.
+                } else {
+                    receiver.ack_to(position);
+                }
                 in_flight = in_flight.saturating_sub(1);
-                // Natural queue-closure exit: the receiver returned
-                // None, we stopped accepting, and the last in-flight
-                // handle just resolved. Shutdown does NOT exit here —
-                // it breaks straight out of the select arm above so
-                // the post-loop `writer.shutdown()` can drain batched
-                // buffers (which is the only thing that can resolve
-                // their parked handles).
+                // Natural queue-closure or wedge exit: the
+                // consumer stopped accepting (queue drained or
+                // fail-stop wedged) and the last in-flight
+                // handle just resolved. Shutdown does NOT exit
+                // here — it breaks straight out of the select
+                // arm above so the post-loop `writer.shutdown()`
+                // can drain batched buffers (which is the only
+                // thing that can resolve their parked handles).
                 if !accepting && in_flight == 0 {
                     break;
                 }
@@ -766,13 +843,31 @@ pub async fn run_queue_consumer(
     // in_flight == 0 before calling shutdown) deadlocks: the buffered
     // handles are exactly what `writer.shutdown()` resolves, so the
     // wait can never make progress on its own.
-    if let Err(e) = writer.shutdown(error_log.as_ref()).await {
+    //
+    // Wedge-exit skips the shutdown-drive of the output:
+    // `writer.shutdown` on a wedged output would pump more events
+    // through the buggy path, and the wedge contract says
+    // in-flight events should drain but no *new* work should
+    // start. The batched-handle drain only matters for outputs
+    // that were still Delivering successfully; a wedged consumer
+    // by definition already stopped accepting new events, so no
+    // batched buffer accumulation happened after the wedge.
+    if !wedged && let Err(e) = writer.shutdown(error_log.as_ref()).await {
         warn!("output '{}': shutdown flush failed: {}", name, e);
     }
     drop(ack_tx);
     while let Some((position, disposition)) = ack_rx.recv().await {
         handle_ack_disposition(disposition, &name, &metrics);
-        receiver.ack_to(position);
+        // Wedge held the cursor; subsequent ack drain still
+        // advances via `ack_to` on delivered / recovered
+        // positions, but a `Dropped` on the disk backend keeps
+        // holding. Follow the same distinction as the steady-state
+        // arm above.
+        let is_disk_position = matches!(position, AckPosition::Disk { .. });
+        let is_dropped_on_disk = matches!(disposition, AckDisposition::Dropped) && is_disk_position;
+        if !is_dropped_on_disk {
+            receiver.ack_to(position);
+        }
         in_flight = in_flight.saturating_sub(1);
     }
     if in_flight != 0 {
@@ -783,7 +878,15 @@ pub async fn run_queue_consumer(
         );
     }
 
-    info!("output '{}': queue consumer stopped", name);
+    if wedged {
+        tracing::error!(
+            "output '{}': queue consumer stopped after wedge — cursor held at the Dropped \
+             position for the next daemon start's replay",
+            name
+        );
+    } else {
+        info!("output '{}': queue consumer stopped", name);
+    }
 }
 
 fn handle_ack_disposition(
@@ -834,8 +937,11 @@ mod consumer_lifecycle_tests {
     /// from `script` and resolves the handle accordingly. The script
     /// vocabulary mirrors the per-event ack-lifecycle a real output
     /// reaches: `Delivered` resolves the handle as delivered, and
-    /// `Bug` returns Err WITHOUT resolving the handle (exercise the
-    /// consumer's fallthrough).
+    /// `Bug` returns Err after explicitly resolving as `Dropped`
+    /// (the honest way to signal a bug path; the alternative of
+    /// dropping the handle without any resolve is guarded by
+    /// `debug_assert!(self.resolved, ...)` and would panic in
+    /// test builds).
     #[derive(Clone, Copy)]
     enum Outcome {
         Delivered,
@@ -886,10 +992,16 @@ mod consumer_lifecycle_tests {
                     Ok(())
                 }
                 Outcome::Bug => {
-                    // Drop the handle without resolve — exercises the
-                    // consumer's Dropped-fallthrough path. Returning
-                    // Err signals the bug.
-                    drop(ack);
+                    // Honest Dropped: `resolve_dropped()` marks the
+                    // handle resolved (satisfies the debug_assert
+                    // in `Drop`) and sends `Dropped` on the ack
+                    // channel — same disposition a real output's
+                    // bug path (panic / DLQ-write failure) would
+                    // deliver, but without tripping the assertion
+                    // on the way. Returning Err signals the
+                    // consumer that the caller considered this a
+                    // failure path.
+                    ack.resolve_dropped();
                     Err(anyhow::anyhow!("scripted bug"))
                 }
             }
@@ -1252,6 +1364,270 @@ mod consumer_lifecycle_tests {
         receiver.ack_to(position);
         // A second ack on the same position is still a clean no-op.
         receiver.ack_to(AckPosition::Memory);
+    }
+
+    // ---- disk queue wedge (Branch B C2) ----
+    //
+    // Fail-stop wedge: a disk-queue consumer that observes
+    // `AckDisposition::Dropped` cannot honestly advance the cursor
+    // past that position (bug / panic / DLQ-write failure paths
+    // leave the event un-DLQ'd), so it stops accepting new events
+    // and holds the cursor. The tests below pin the four legs of
+    // that contract: cursor hold, accepting flip, memory-queue
+    // opt-out, and replay-on-reopen.
+
+    /// Build a queue + spawn consumer helper, generic over queue
+    /// type so the disk-wedge tests below can reuse the same
+    /// scaffolding as the memory-queue tests above.
+    async fn spawn_consumer_with_queue(
+        queue_type: QueueType,
+        writer: Arc<dyn Output>,
+        metrics: Arc<crate::metrics::OutputMetrics>,
+    ) -> (
+        QueueSender,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (sender, receiver) = create_queue(
+            "wedge_test".into(),
+            QueueConfig {
+                queue_type,
+                capacity: 16,
+            },
+        )
+        .unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(run_queue_consumer(
+            receiver,
+            writer,
+            None,
+            metrics,
+            None,
+            shutdown_rx,
+        ));
+        (sender, shutdown_tx, handle)
+    }
+
+    async fn wait_for_wedge(metrics: &Arc<crate::metrics::OutputMetrics>) {
+        for _ in 0..500 {
+            if metrics.events_wedged.load(Ordering::Relaxed) >= 1 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        panic!(
+            "wedge did not fire within 1s — events_wedged={}",
+            metrics.events_wedged.load(Ordering::Relaxed),
+        );
+    }
+
+    /// A disk-queue consumer that observes `Dropped` on an event
+    /// stops accepting new events (accepting = false via the
+    /// fail-stop wedge). Pin this so a regression that let the
+    /// consumer keep pulling from the receiver would grow the
+    /// disk in-flight bookkeeping unboundedly behind an
+    /// un-advanceable cursor front.
+    #[tokio::test]
+    async fn disk_queue_wedges_on_dropped_and_stops_accepting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = Arc::new(ScriptedWriter::new(vec![Outcome::Bug]));
+        let metrics = Arc::clone(&writer.metrics);
+        let (sender, _shutdown_tx, handle) = spawn_consumer_with_queue(
+            QueueType::Disk {
+                path: tmp.path().display().to_string(),
+                max_size: 4 * 1024 * 1024,
+            },
+            writer.clone(),
+            metrics.clone(),
+        )
+        .await;
+
+        sender.send(owned_event()).await.unwrap();
+        wait_for_wedge(&metrics).await;
+        assert_eq!(
+            writer.calls(),
+            1,
+            "exactly one consume should have run before the wedge fired; calls={}",
+            writer.calls(),
+        );
+
+        // Subsequent send lands in the queue (producer side keeps
+        // accepting) but the consumer must NOT dequeue it — we
+        // pin this by waiting a beat and observing that
+        // `writer.calls()` did not tick past 1.
+        sender.send(owned_event()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            writer.calls(),
+            1,
+            "consumer must not pull a second event after wedge; calls={}",
+            writer.calls(),
+        );
+        assert_eq!(metrics.events_wedged.load(Ordering::Relaxed), 1);
+        // `events_failed` may be bumped multiple times per bug
+        // event under the pre-existing shape (one from the ack
+        // disposition arm, one from the outer `consume` Err
+        // fallthrough), so pin the lower bound rather than an
+        // exact count — the wedge-adjacent invariant we care
+        // about is "at least one failure recorded", not the
+        // exact bump multiplicity.
+        assert!(
+            metrics.events_failed.load(Ordering::Relaxed) >= 1,
+            "at least one events_failed bump expected",
+        );
+
+        // Dropping the sender closes the producer channel; the
+        // consumer should exit cleanly with in_flight == 0.
+        drop(sender);
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("consumer must exit after wedge + producer drop")
+            .expect("consumer task must not panic");
+    }
+
+    /// A memory-queue consumer does NOT wedge on Dropped: a
+    /// memory queue has no persistent cursor to hold and cannot
+    /// replay on restart, so wedging would just cause loss with
+    /// no recovery path. The pre-B-C2 continue-and-count
+    /// behavior is retained on memory queues.
+    #[tokio::test]
+    async fn memory_queue_does_not_wedge_on_dropped() {
+        let writer = Arc::new(ScriptedWriter::new(vec![Outcome::Bug, Outcome::Delivered]));
+        let metrics = Arc::clone(&writer.metrics);
+        let (sender, _shutdown_tx, handle) =
+            spawn_consumer_with_queue(QueueType::Memory, writer.clone(), metrics.clone()).await;
+
+        sender.send(owned_event()).await.unwrap();
+        sender.send(owned_event()).await.unwrap();
+
+        // Give the consumer time to consume both events.
+        for _ in 0..500 {
+            if writer.calls() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(writer.calls(), 2, "memory queue must not wedge");
+        assert_eq!(
+            metrics.events_wedged.load(Ordering::Relaxed),
+            0,
+            "memory queue must never bump events_wedged",
+        );
+
+        drop(sender);
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("consumer must exit after producer drop")
+            .expect("consumer task must not panic");
+    }
+
+    /// A disk-queue consumer that wedges and then observes
+    /// Delivered acks for subsequent events must still hold the
+    /// disk cursor at the wedged (front) position — the contiguous-
+    /// prefix ack in `DiskQueueReceiver::ack_to` naturally
+    /// enforces this, but here we pin the behaviour end-to-end:
+    /// even if a later Delivered ack somehow reaches
+    /// `ack_to`, it must not advance the persisted cursor past
+    /// the wedged front.
+    ///
+    /// Regression pin: if a future refactor collapsed the disk /
+    /// memory branch above and started calling `ack_to` on the
+    /// Dropped position, this test's disk cursor would advance
+    /// and the reopen would find nothing to replay.
+    #[tokio::test]
+    async fn disk_queue_wedge_reopen_replays_from_wedged_front() {
+        let tmp = tempfile::tempdir().unwrap();
+        let disk = QueueType::Disk {
+            path: tmp.path().display().to_string(),
+            max_size: 4 * 1024 * 1024,
+        };
+
+        // First run: send one event, script drops it → wedge.
+        {
+            let writer = Arc::new(ScriptedWriter::new(vec![Outcome::Bug]));
+            let metrics = Arc::clone(&writer.metrics);
+            let (sender, _shutdown_tx, handle) =
+                spawn_consumer_with_queue(disk.clone(), writer.clone(), metrics.clone()).await;
+            sender.send(owned_event()).await.unwrap();
+            wait_for_wedge(&metrics).await;
+            drop(sender);
+            tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        // Second run: reopen the same disk path. The wedged
+        // event must replay — script says Delivered this time
+        // (bug fixed) and the consumer drains cleanly.
+        {
+            let writer = Arc::new(ScriptedWriter::new(vec![Outcome::Delivered]));
+            let metrics = Arc::clone(&writer.metrics);
+            let (sender, _shutdown_tx, handle) =
+                spawn_consumer_with_queue(disk, writer.clone(), metrics.clone()).await;
+            for _ in 0..500 {
+                if writer.calls() >= 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            assert_eq!(
+                writer.calls(),
+                1,
+                "reopen must replay the wedged event; calls={}",
+                writer.calls(),
+            );
+            assert_eq!(
+                metrics.events_wedged.load(Ordering::Relaxed),
+                0,
+                "clean-second-run must not wedge again",
+            );
+            drop(sender);
+            tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    /// Wedge fires exactly once per consumer lifetime — a second
+    /// Dropped after the first wedge (in-flight tail scenario)
+    /// must not double-count `events_wedged`.
+    #[tokio::test]
+    async fn disk_queue_wedge_fires_at_most_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Two Bug outcomes in a row: only the first should flip
+        // the wedge; the second (if it dequeued somehow) must
+        // not tick the counter again.
+        let writer = Arc::new(ScriptedWriter::new(vec![Outcome::Bug, Outcome::Bug]));
+        let metrics = Arc::clone(&writer.metrics);
+        let (sender, _shutdown_tx, handle) = spawn_consumer_with_queue(
+            QueueType::Disk {
+                path: tmp.path().display().to_string(),
+                max_size: 4 * 1024 * 1024,
+            },
+            writer.clone(),
+            metrics.clone(),
+        )
+        .await;
+
+        sender.send(owned_event()).await.unwrap();
+        wait_for_wedge(&metrics).await;
+        // Additional sends after wedge should NOT be dequeued.
+        sender.send(owned_event()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(
+            metrics.events_wedged.load(Ordering::Relaxed),
+            1,
+            "wedge counter must fire exactly once per consumer lifetime",
+        );
+
+        drop(sender);
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
 
