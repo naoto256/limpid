@@ -5,10 +5,11 @@
 //! Properties:
 //!   path   "/dev/log"   — required
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::Bytes;
 use tokio::net::UnixDatagram;
 use tracing::{error, info, warn};
@@ -21,6 +22,98 @@ use crate::metrics::InputMetrics;
 use crate::modules::{HasMetrics, Input, Module};
 
 const UNIX_SOURCE: &str = "127.0.0.1:0";
+
+/// True when the parent dir's mode lets an outside-the-owner
+/// party plant or swap a node at the socket path.
+///
+/// The unix_socket input binds an intentionally world-writable
+/// (`0o666`) datagram socket at `/dev/log`-style paths — the
+/// standard `/dev` mode is `0o755`, and any local process must
+/// be able to `sendto` the inode, so **other-execute is a
+/// requirement, not a threat**. What we must refuse is a parent
+/// that grants **write** access outside the owner: a
+/// group-writable or world-writable parent lets an attacker
+/// swap the socket path for a symlink between shutdown and
+/// next bind, or between the stale-cleanup stat and the
+/// following `remove_file`.
+///
+/// Distinct predicate from `control.rs::parent_dir_mode_is_unsafe`,
+/// which additionally flags other-execute — the control
+/// socket's `0o660` bind→chmod window relies on non-group
+/// traversal that the input's `0o666` bind by design does not.
+///
+/// **Sticky bit + world-writable (`/tmp` at `0o1777`) is
+/// deliberately rejected**: the sticky bit only protects
+/// against non-owner unlink of files whose owner matches, but
+/// under a swap attack the attacker owns the replacement node,
+/// so sticky offers no protection here. `/tmp/foo.sock` is
+/// unsupported for this input; use `/dev/log` (path in a
+/// non-writable parent) or a packaged runtime directory
+/// instead.
+#[cfg(unix)]
+fn parent_dir_mode_is_unsafe_for_input(mode: u32) -> bool {
+    mode & 0o022 != 0
+}
+
+/// Startup-time validation of the unix_socket input's parent
+/// directory. Called from `UnixSocketInput::from_properties`
+/// so a fail-closed bail aborts daemon startup via
+/// `create_input` — matching the pipeline-side fatal shape of
+/// `control::validate_control_socket_parent` and
+/// `ErrorLogWriter::validate_at_startup`.
+///
+/// - Parent absent → bail. Unlike control, this input does
+///   not create its own parent (`/dev` is expected to exist);
+///   an absent parent almost always means a config typo.
+/// - Parent exists but is not a directory → bail.
+/// - Parent exists as a directory whose mode is group-writable
+///   or world-writable → bail. `/dev` at `0o755` passes.
+///   `/tmp` at `0o1777` does **not** — see the predicate doc
+///   for why sticky is not treated as protective here.
+fn validate_unix_socket_input_parent(path: &str) -> Result<()> {
+    let path = Path::new(path);
+    let Some(parent) = path.parent() else {
+        anyhow::bail!("input unix_socket: path {:?} has no parent directory", path);
+    };
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(parent).with_context(|| {
+            format!(
+                "input unix_socket: parent directory {:?} is not accessible (does it exist?)",
+                parent
+            )
+        })?;
+        if !meta.is_dir() {
+            anyhow::bail!(
+                "input unix_socket: parent {:?} exists but is not a directory; check the `path` value",
+                parent
+            );
+        }
+        let mode = meta.permissions().mode() & 0o7777;
+        if parent_dir_mode_is_unsafe_for_input(mode & 0o777) {
+            anyhow::bail!(
+                "input unix_socket: parent dir {:?} has mode 0o{:o} — refusing to bind. \
+                 The unix_socket input binds a world-writable (0o666) datagram socket, so a \
+                 group- or world-writable parent lets an outside-the-owner process swap the \
+                 socket path between shutdown and next bind (or between the stale-cleanup \
+                 stat and the follow-up unlink). Tighten the parent to 0o755 or stricter, or \
+                 point `path` at `/dev/log` (parent `/dev` is `0o755` on standard POSIX \
+                 systems). `/tmp` (`0o1777`) is **not** supported — sticky protects unlink \
+                 of files the attacker doesn't own, but a swap attack plants an attacker-owned \
+                 node.",
+                parent,
+                mode & 0o777,
+            );
+        }
+    }
+    Ok(())
+}
 
 const UNIX_SOCKET_INPUT_SCHEMA: &[PropertySpec] = &[PropertySpec {
     name: "path",
@@ -48,6 +141,15 @@ impl Module for UnixSocketInput {
         let properties = properties.user_properties();
         let path = props::get_string(properties, "path")
             .ok_or_else(|| anyhow::anyhow!("input '{}': unix_socket requires 'path'", name))?;
+        // Parent safety fail-closed: refuse startup when the
+        // configured path's parent is group-writable or
+        // world-writable. Symmetric with
+        // `control::validate_control_socket_parent`; the two
+        // predicates diverge because this input binds a
+        // world-writable socket where other-execute on the
+        // parent is a use-case requirement, not a threat.
+        validate_unix_socket_input_parent(&path)
+            .with_context(|| format!("input '{}': unix_socket startup validation failed", name))?;
         Ok(Self {
             path,
             metrics: Arc::new(InputMetrics::default()),
@@ -138,6 +240,33 @@ impl Input for UnixSocketInput {
         let socket = UnixDatagram::bind(&self.path)?;
         info!("unix_socket listening on {}", self.path);
 
+        // Record the (dev, ino) of the socket we just bound. Used
+        // at shutdown as a defense-in-depth check so the unlink
+        // path can refuse to remove a node that has been swapped
+        // out from under us since bind. This is best-effort: the
+        // primary trust boundary is
+        // `validate_unix_socket_input_parent`'s fail-closed on
+        // group/other-writable parents. On a safe parent no
+        // outside-the-owner writer exists; on an unsafe parent
+        // startup would have bailed and we would not be here.
+        // If the stat fails we log and continue with the same
+        // path-based unlink as before.
+        #[cfg(unix)]
+        let bound_inode = {
+            use std::os::unix::fs::MetadataExt;
+            match std::fs::symlink_metadata(&self.path) {
+                Ok(meta) => Some((meta.dev(), meta.ino())),
+                Err(e) => {
+                    warn!(
+                        "unix_socket {}: failed to stat bound socket for shutdown \
+                         defense-in-depth: {}",
+                        self.path, e
+                    );
+                    None
+                }
+            }
+        };
+
         // Make socket world-writable so any process can send (like /dev/log)
         #[cfg(unix)]
         {
@@ -162,7 +291,55 @@ impl Input for UnixSocketInput {
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         info!("unix_socket {}: shutting down", self.path);
-                        let _ = std::fs::remove_file(&self.path);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::MetadataExt;
+                            match (bound_inode, std::fs::symlink_metadata(&self.path)) {
+                                (Some((dev, ino)), Ok(meta))
+                                    if meta.dev() == dev && meta.ino() == ino =>
+                                {
+                                    // Same inode we bound at startup —
+                                    // safe to unlink.
+                                    let _ = std::fs::remove_file(&self.path);
+                                }
+                                (Some((dev, ino)), Ok(meta)) => {
+                                    warn!(
+                                        "unix_socket {}: path swapped since bind (bound dev/ino \
+                                         {}/{}, now {}/{}); refusing to unlink foreign inode",
+                                        self.path,
+                                        dev,
+                                        ino,
+                                        meta.dev(),
+                                        meta.ino()
+                                    );
+                                }
+                                (Some(_), Err(e))
+                                    if e.kind() == std::io::ErrorKind::NotFound =>
+                                {
+                                    // Already gone — nothing to unlink.
+                                }
+                                (Some(_), Err(e)) => {
+                                    warn!(
+                                        "unix_socket {}: failed to re-stat before shutdown \
+                                         unlink: {}",
+                                        self.path, e
+                                    );
+                                }
+                                (None, _) => {
+                                    // We never recorded the bound
+                                    // inode (best-effort at startup);
+                                    // fall back to a path-based
+                                    // unlink under the safe-parent
+                                    // assumption enforced by
+                                    // `validate_unix_socket_input_parent`.
+                                    let _ = std::fs::remove_file(&self.path);
+                                }
+                            }
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            let _ = std::fs::remove_file(&self.path);
+                        }
                         break;
                     }
                 }
@@ -392,5 +569,118 @@ mod tests {
         assert_eq!(&event.ingress[..], b"<13>test message");
         let _ = sd_tx.send(true);
         let _ = handle.await;
+    }
+
+    // ---- parent-safety validation ----
+
+    /// Predicate scope: the input predicate treats parent write
+    /// access as unsafe (group/other write flag `0o022`), but
+    /// leaves other-execute alone — `/dev` at `0o755` is the
+    /// flagship `/dev/log` deploy shape and must pass.
+    #[test]
+    #[cfg(unix)]
+    fn parent_dir_mode_is_unsafe_for_input_flags_write_only() {
+        // Safe: no group/other write bit.
+        assert!(!parent_dir_mode_is_unsafe_for_input(0o755)); // `/dev` shape — flagship
+        assert!(!parent_dir_mode_is_unsafe_for_input(0o750));
+        assert!(!parent_dir_mode_is_unsafe_for_input(0o700));
+        assert!(!parent_dir_mode_is_unsafe_for_input(0o711)); // owner + traverse
+        // Unsafe: group or world writable.
+        assert!(parent_dir_mode_is_unsafe_for_input(0o775)); // group write
+        assert!(parent_dir_mode_is_unsafe_for_input(0o757)); // world write
+        assert!(parent_dir_mode_is_unsafe_for_input(0o777)); // both
+        assert!(parent_dir_mode_is_unsafe_for_input(0o770)); // group rwx
+    }
+
+    /// Sticky bit + world-writable (`/tmp` at `0o1777`) is
+    /// **not** an escape hatch. Auditor sign-off: sticky
+    /// prevents non-owner unlink but not attacker-owned
+    /// replacement in a swap. `/tmp/foo.sock` is unsupported.
+    #[test]
+    #[cfg(unix)]
+    fn parent_dir_mode_sticky_world_writable_is_unsafe() {
+        // Callers pass the low 9 permission bits, so `/tmp`'s
+        // 0o1777 arrives as 0o777 through
+        // `validate_unix_socket_input_parent`. Pin the low-bits
+        // shape here so a future caller that forgot to mask
+        // still trips the predicate.
+        assert!(parent_dir_mode_is_unsafe_for_input(0o777));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn from_properties_bails_on_group_writable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("group-writable");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let socket_path = parent.join("sock");
+        let err = validate_unix_socket_input_parent(socket_path.to_str().unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("0o775"),
+            "diagnostic must name the mode: {msg}"
+        );
+        assert!(
+            msg.contains("refusing to bind"),
+            "diagnostic must state the refusal: {msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn from_properties_accepts_dev_shaped_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("dev-shaped");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let socket_path = parent.join("log");
+        validate_unix_socket_input_parent(socket_path.to_str().unwrap()).unwrap();
+    }
+
+    /// End-to-end: the run() shutdown path records the bound
+    /// (dev, ino) at bind time and refuses to unlink the path
+    /// if the on-disk node has been swapped out from under us.
+    /// The test simulates the swap by rebinding a fresh
+    /// standalone datagram socket at the same path before
+    /// triggering shutdown; the swap survives (input refuses
+    /// to unlink it).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn shutdown_refuses_to_unlink_swapped_socket() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("sock");
+
+        let (handle, sd_tx, _rx) = spawn_with_path(&socket_path);
+        // Give the input a moment to bind.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let bound_meta_before = std::fs::symlink_metadata(&socket_path).unwrap();
+
+        // Simulate a swap: unlink and rebind a fresh socket
+        // (different inode) at the same path.
+        std::fs::remove_file(&socket_path).unwrap();
+        let squatter = StdUnixDatagram::bind(&socket_path).unwrap();
+        drop(squatter);
+        let swapped_meta = std::fs::symlink_metadata(&socket_path).unwrap();
+        assert!(
+            swapped_meta.ino() != bound_meta_before.ino(),
+            "test setup: swap must produce a fresh inode",
+        );
+
+        // Trigger shutdown. The input's dev/ino check should
+        // observe the inode mismatch and refuse to unlink.
+        let _ = sd_tx.send(true);
+        let _ = handle.await;
+
+        let post_meta =
+            std::fs::symlink_metadata(&socket_path).expect("swapped socket must survive shutdown");
+        assert_eq!(
+            post_meta.ino(),
+            swapped_meta.ino(),
+            "swapped inode must not have been unlinked by shutdown",
+        );
     }
 }

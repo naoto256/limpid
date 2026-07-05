@@ -297,6 +297,31 @@ impl ControlServer {
             }
         };
 
+        // Record (dev, ino) of the socket we just bound. Used at
+        // shutdown as a defense-in-depth check: refuse to unlink
+        // a node that has been swapped out from under us since
+        // bind. Primary trust boundary is
+        // `validate_control_socket_parent`'s fail-closed on
+        // group/other-writable parents — on a safe parent no
+        // outside-the-group writer can perform the swap. This
+        // check is the extra ring of safety, not the load-bearing
+        // guard.
+        #[cfg(unix)]
+        let bound_inode = {
+            use std::os::unix::fs::MetadataExt;
+            match std::fs::symlink_metadata(&self.socket_path) {
+                Ok(meta) => Some((meta.dev(), meta.ino())),
+                Err(e) => {
+                    warn!(
+                        "control socket: failed to stat bound socket for shutdown \
+                         defense-in-depth: {}",
+                        e
+                    );
+                    None
+                }
+            }
+        };
+
         // Restrict socket permissions to owner + group (0o660).
         //
         // TOCTOU note (security audit Low 3-3): between `bind` above
@@ -316,8 +341,10 @@ impl ControlServer {
         // gates who can reach the socket inode — daemon-created dirs are
         // 0o750 and packaged units pin `RuntimeDirectoryMode=0750`, so
         // an outside-the-group attacker cannot reach it during the
-        // window. `ensure_socket_parent_dir` warns when an inherited
-        // parent is too loose to hold that line.
+        // window. `validate_control_socket_parent` fails startup
+        // when an inherited parent is too loose to hold that
+        // line, so by the time we reach this point the parent
+        // mode has been vetted.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -393,8 +420,53 @@ impl ControlServer {
             }
         }
 
-        // Clean up socket file
-        let _ = std::fs::remove_file(&self.socket_path);
+        // Clean up socket file. Defense-in-depth: only unlink
+        // when the on-disk (dev, ino) still matches the socket
+        // we bound. `validate_control_socket_parent`'s
+        // fail-closed on writable parents is the load-bearing
+        // guard; this check refuses to remove a foreign inode
+        // even in the residual case where the parent contract
+        // was somehow broken after startup validation ran.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            match (bound_inode, std::fs::symlink_metadata(&self.socket_path)) {
+                (Some((dev, ino)), Ok(meta)) if meta.dev() == dev && meta.ino() == ino => {
+                    let _ = std::fs::remove_file(&self.socket_path);
+                }
+                (Some((dev, ino)), Ok(meta)) => {
+                    warn!(
+                        "control socket: path swapped since bind (bound dev/ino {}/{}, now \
+                         {}/{}); refusing to unlink foreign inode",
+                        dev,
+                        ino,
+                        meta.dev(),
+                        meta.ino()
+                    );
+                }
+                (Some(_), Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Already gone — nothing to unlink.
+                }
+                (Some(_), Err(e)) => {
+                    warn!(
+                        "control socket: failed to re-stat before shutdown unlink: {}",
+                        e
+                    );
+                }
+                (None, _) => {
+                    // We never recorded the bound inode (best-
+                    // effort at startup); fall back to a
+                    // path-based unlink under the safe-parent
+                    // assumption enforced by
+                    // `validate_control_socket_parent`.
+                    let _ = std::fs::remove_file(&self.socket_path);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
     }
 }
 
