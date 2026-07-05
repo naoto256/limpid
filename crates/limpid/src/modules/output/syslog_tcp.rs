@@ -18,6 +18,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::{Context as TaskContext, Poll};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tokio::io::AsyncWrite;
@@ -33,7 +34,8 @@ use crate::event::Event;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::syslog_peers::{
     PEER_CONNECT_TIMEOUT, PEER_HANDSHAKE_TIMEOUT, PEER_WRITE_TIMEOUT, Peer, PeerList,
-    SyslogFraming, SyslogPayload, parse_host_port, write_framed,
+    PeerSendError, PreSendShutdownMarker, SyslogFraming, SyslogPayload, parse_host_port,
+    write_framed,
 };
 use crate::modules::{HasMetrics, Module, Output};
 use crate::queue::{QueueAckHandle, RetryConfig};
@@ -355,16 +357,15 @@ impl Output for SyslogTcpOutput {
             let payload = SyslogPayload {
                 egress: event.egress.clone(),
             };
-            let outcome = match crate::modules::attempt_or_shutdown(
-                &mut shutdown,
-                self.write_payload(payload),
-            )
-            .await
+            let write_result = match self
+                .write_payload_shutdown_aware(payload, &mut shutdown)
+                .await
             {
-                Some(r) => r,
-                None => {
+                SyslogTcpWriteOutcome::Delivered => Ok(()),
+                SyslogTcpWriteOutcome::Err(e) => Err(e),
+                SyslogTcpWriteOutcome::PreSendShutdown => {
                     let reason = format!(
-                        "output '{}': write attempt abandoned on shutdown",
+                        "output '{}': write attempt abandoned on shutdown (pre-send)",
                         self.name
                     );
                     crate::modules::route_event_to_dlq(
@@ -379,7 +380,7 @@ impl Output for SyslogTcpOutput {
                     return Ok(());
                 }
             };
-            match outcome {
+            match write_result {
                 Ok(()) => {
                     self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
                     ack.resolve_delivered();
@@ -469,7 +470,145 @@ impl Output for SyslogTcpOutput {
     }
 }
 
+/// Outcome of a single steady-state write attempt through the
+/// shutdown-aware syslog_tcp send path.
+enum SyslogTcpWriteOutcome {
+    Delivered,
+    Err(anyhow::Error),
+    PreSendShutdown,
+}
+
 impl SyslogTcpOutput {
+    /// Shutdown-aware steady-state send. Reuses the same
+    /// per-peer connect/handshake/write flow as [`Self::write_payload`],
+    /// but wraps each peer's connect and TLS handshake in
+    /// `pre_send_or_shutdown` so shutdown fired before the write
+    /// begins returns `PreSendShutdown` honestly. The write phase
+    /// (`write_framed` inside `PEER_WRITE_TIMEOUT`) is deliberately
+    /// **not** wrapped — the existing `PEER_WRITE_TIMEOUT` is the
+    /// only cancellation source once bytes may reach the wire.
+    async fn write_payload_shutdown_aware(
+        &self,
+        payload: SyslogPayload,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> SyslogTcpWriteOutcome {
+        let framing = self.framing;
+        let connectors = self.connectors.clone();
+        let result = self
+            .peers
+            .write_with_rotation_shutdown_aware(
+                Instant::now(),
+                move |idx, peer, state, shutdown| {
+                    let egress = payload.egress.clone();
+                    let address = peer.address();
+                    let server_name = peer.host.clone();
+                    let connector = connectors[idx].clone();
+                    Box::pin(async move {
+                        if state.conn.is_none() {
+                            // Pre-send phase: connect + TLS handshake
+                            // are shutdown-cancellable. Cancelling
+                            // here is honest — no payload bytes have
+                            // reached the wire yet.
+                            let tcp = match crate::modules::pre_send_or_shutdown(
+                                shutdown,
+                                tokio::time::timeout(
+                                    PEER_CONNECT_TIMEOUT,
+                                    TcpStream::connect(&address),
+                                ),
+                            )
+                            .await
+                            {
+                                Some(Ok(Ok(tcp))) => tcp,
+                                Some(Ok(Err(e))) => {
+                                    return Err(anyhow::Error::from(e)
+                                        .context(format!("syslog_tcp connect to {}", address)));
+                                }
+                                Some(Err(_)) => {
+                                    return Err(anyhow::anyhow!(
+                                        "syslog_tcp connect to {} timed out",
+                                        address
+                                    ));
+                                }
+                                None => {
+                                    return Err(anyhow::Error::new(PreSendShutdownMarker));
+                                }
+                            };
+
+                            let conn = match connector {
+                                Some(connector) => {
+                                    let server_name = ServerName::try_from(server_name.as_str())
+                                        .with_context(|| {
+                                            format!(
+                                                "syslog_tcp invalid server name: {}",
+                                                server_name
+                                            )
+                                        })?
+                                        .to_owned();
+                                    let tls = match crate::modules::pre_send_or_shutdown(
+                                        shutdown,
+                                        tokio::time::timeout(
+                                            PEER_HANDSHAKE_TIMEOUT,
+                                            connector.connect(server_name, tcp),
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        Some(Ok(Ok(tls))) => tls,
+                                        Some(Ok(Err(e))) => {
+                                            return Err(anyhow::Error::from(e).context(format!(
+                                                "syslog_tcp TLS handshake to {}",
+                                                address
+                                            )));
+                                        }
+                                        Some(Err(_)) => {
+                                            return Err(anyhow::anyhow!(
+                                                "syslog_tcp TLS handshake to {} timed out",
+                                                address
+                                            ));
+                                        }
+                                        None => {
+                                            return Err(anyhow::Error::new(PreSendShutdownMarker));
+                                        }
+                                    };
+                                    Conn::Tls(Box::new(tls))
+                                }
+                                None => Conn::Plain(tcp),
+                            };
+                            state.conn = Some(conn);
+                        }
+
+                        // Send phase: no shutdown wrap. Only
+                        // `PEER_WRITE_TIMEOUT` bounds the wait, and
+                        // if the runtime shutdown budget elapses
+                        // while this write is still in flight the
+                        // outer task is aborted → Handle::drop →
+                        // Dropped → disk queue holds cursor and
+                        // replays on next start.
+                        let stream = state.conn.as_mut().expect("connection should be present");
+                        let write_result = tokio::time::timeout(
+                            PEER_WRITE_TIMEOUT,
+                            write_framed(stream, framing, &egress),
+                        )
+                        .await
+                        .map_err(|_| anyhow::anyhow!("syslog_tcp write to {} timed out", address))
+                        .and_then(|res| res);
+                        if write_result.is_err() {
+                            state.conn = None;
+                        }
+                        write_result
+                    })
+                },
+                shutdown,
+            )
+            .await;
+
+        match result {
+            Ok(()) => SyslogTcpWriteOutcome::Delivered,
+            Err(PeerSendError::PreSendShutdown) => SyslogTcpWriteOutcome::PreSendShutdown,
+            Err(e) => SyslogTcpWriteOutcome::Err(e.into()),
+        }
+    }
+
     /// Send one syslog frame via the peer-rotation helper. Returns
     /// `Ok(())` on a successful write to the wire and `Err(_)`
     /// otherwise. Disposition metrics are the caller's responsibility:

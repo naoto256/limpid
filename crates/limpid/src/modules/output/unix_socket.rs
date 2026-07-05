@@ -15,7 +15,10 @@ use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
-use crate::modules::output::persistent_conn::{PersistentConn, write_with_reconnect};
+use crate::modules::output::persistent_conn::{
+    PersistentConn, WriteReconnectOutcome, write_with_reconnect,
+    write_with_reconnect_shutdown_aware,
+};
 use crate::modules::{HasMetrics, Module, Output};
 use crate::queue::{QueueAckHandle, RetryConfig};
 
@@ -81,16 +84,26 @@ impl Output for UnixSocketOutput {
         let mut wait = self.retry.initial_wait;
         let mut shutdown = self.shutdown_signal.clone();
         loop {
-            let outcome = match crate::modules::attempt_or_shutdown(
+            // Split the attempt into a pre-send phase (mutex lock +
+            // reconnect + pre-write shutdown check) and a send phase
+            // (`write_frame`). Shutdown only cancels the pre-send
+            // side; a partial write that had already reached the
+            // wire would otherwise be masked as `Recovered` and
+            // double-sent on the next start's retry.
+            let write_result = match write_with_reconnect_shutdown_aware(
+                self,
+                &self.conn,
+                &self.metrics,
+                &event.egress,
                 &mut shutdown,
-                write_with_reconnect(self, &self.conn, &self.metrics, &event.egress),
             )
             .await
             {
-                Some(r) => r,
-                None => {
+                WriteReconnectOutcome::Delivered => Ok(()),
+                WriteReconnectOutcome::Err(e) => Err(e),
+                WriteReconnectOutcome::PreSendShutdown => {
                     let reason = format!(
-                        "output '{}': write attempt abandoned on shutdown",
+                        "output '{}': write attempt abandoned on shutdown (pre-send)",
                         self.name
                     );
                     crate::modules::route_event_to_dlq(
@@ -105,7 +118,7 @@ impl Output for UnixSocketOutput {
                     return Ok(());
                 }
             };
-            match outcome {
+            match write_result {
                 Ok(()) => {
                     ack.resolve_delivered();
                     return Ok(());
