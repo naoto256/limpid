@@ -398,9 +398,19 @@ struct PipelineContext {
     tap: TapRegistry,
     /// Dead-letter queue writer used for: (1) `process` runtime
     /// errors, (2) output retry-exhausted payloads, (3)
-    /// batched-output shutdown-flush leftovers. `None` when
-    /// `control { error_log }` is unset — falls back to a structured
-    /// `tracing::error!` line for each case.
+    /// batched-output shutdown-flush leftovers, (4) runtime-side
+    /// enqueue failures (queue closed, disk write error, unknown
+    /// output). `None` when `control { error_log }` is unset — the
+    /// fallback shape differs by site: the process-side and
+    /// enqueue-failure paths (`write_errored_to_dlq` in this
+    /// module) emit a `tracing::error!` line with the **full
+    /// failure JSONL** in the `event_record` structured field, so
+    /// the payload is recoverable from journald; the sink-side
+    /// retry-exhaustion and shutdown-drain paths (`route_event_to_dlq`
+    /// in `crates/limpid/src/modules/mod.rs`) emit a
+    /// `tracing::error!` line naming the output and the reason
+    /// only, without the payload. Both converge on the same file
+    /// once `error_log` is configured.
     error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
 }
 

@@ -36,7 +36,10 @@ control {
 When unset, the fallback differs by flavor:
 
 - **Process flavor** — the daemon emits a `tracing::error!` line that includes the full failure JSONL inline, so the data is still preserved on the standard log channel. Replay is awkward (you have to `jq` over journald, no `limpidctl inject` shortcut) but the original event is recoverable.
-- **Output flavor** — the daemon emits a `tracing::warn!` / `error!` line that names the output and the reason, but **does not serialize the event payload**. The record is effectively dropped; it is not recoverable from journald. The retry-exhaustion, shutdown-drain, and enqueue-failure paths all behave this way when `error_log` is unset.
+- **Output flavor** — the fallback shape differs by *which* failure site:
+    - **Retry-exhaustion and shutdown-drain** (per-output `consume`/`consume_shutdown` path, `route_event_to_dlq` in `crates/limpid/src/modules/mod.rs`) — the daemon emits a `tracing::error!` line that names the output and the reason but **does not serialize the event payload**. The record is effectively dropped; it is not recoverable from journald.
+    - **Enqueue failure** (the pipeline's runtime layer could not hand the event to the output's queue, `write_errored_to_dlq` in `crates/limpid/src/runtime.rs`) — the daemon emits the same shape the Process flavor uses: a `tracing::error!` line with the **full failure JSONL** in the `event_record` structured field, so the payload is still recoverable via `jq` over journald even without a DLQ file. The Output-flavor enqueue-failure JSONL follows the same `kind: "output"` layout it would have on disk.
+  Once `error_log` is configured, both sink-side paths converge on the same file (the `route_event_to_dlq` warn-on-DLQ-write-failure fallback still trims to the output-and-reason-only line, but that is a nested fallback — the primary write goes through `ErrorLogWriter`).
 
 For any pipeline that uses `retry { ... }` or a batched output (`http`, `otlp_http`, `otlp_grpc`), `limpid --check` raises a recovery-readiness warning when `error_log` is not configured; see [Recovery readiness check](#recovery-readiness-check---check) below.
 
