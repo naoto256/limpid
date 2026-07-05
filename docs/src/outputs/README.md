@@ -43,6 +43,18 @@ def output reliable {
 
 `retry` is accepted by every output type. Retry-exhausted payloads are persisted to `control { error_log "..." }` (see [Recovery (error_log)](#recovery-error_log) below) when configured; otherwise they are dropped with a `tracing::warn!` and an `events_failed` counter increment.
 
+### Disposition contract
+
+Every event handed to an output resolves to one of three dispositions:
+
+| Disposition | Meaning | Disk queue cursor | Memory queue cursor | Metrics |
+|-------------|---------|-------------------|---------------------|---------|
+| `Delivered` | Sink confirmed the send. | advances | advances | `events_written++` |
+| `Recovered` | Send failed, but the failure record was durably written (`error_log` file or a full-payload `tracing::error!` line when `error_log` is unset). | advances | advances | `events_failed++` |
+| `Dropped` | Send failed *and* no durable failure record was written (DLQ-write failure, bug / panic in the sink, runtime task abort past shutdown budget). | **holds — fail-stop wedge; consumer stops accepting new events and replays on next daemon start** | advances (memory queues cannot replay) | `events_failed++`, `events_wedged++` on disk queues |
+
+The **fail-stop wedge** on disk queues is intentional. Holding the cursor guarantees that no event is silently lost on a durable queue; the trade-off is that the affected output's pipeline halts until an operator investigates and restarts the daemon. See [Error Log → Disposition contract and fail-stop wedge on disk queues](../operations/error-log.md#disposition-contract-and-fail-stop-wedge-on-disk-queues) for the operator runbook.
+
 ### Memory queue (default)
 
 Fast, but events are lost on process restart.
