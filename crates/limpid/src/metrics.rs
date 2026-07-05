@@ -71,6 +71,20 @@ pub struct OutputMetrics {
     pub events_written: AtomicU64,
     pub events_failed: AtomicU64,
     pub retries: AtomicU64,
+    /// Disk queue consumers that stopped accepting new events after
+    /// observing an `AckDisposition::Dropped` — `Dropped` cannot
+    /// advance a disk cursor without hiding data loss, and
+    /// continuing to accept would grow the in-flight bookkeeping
+    /// unboundedly. Bumped once per fail-stop event on a disk
+    /// consumer; memory-queue consumers never bump this counter
+    /// (they cannot replay on restart, so continuing is the only
+    /// available policy). A non-zero value here is an
+    /// operator-facing signal to investigate the output for the
+    /// underlying bug / panic / DLQ-write failure and restart the
+    /// daemon so the disk queue can replay from the wedge point.
+    /// See `docs/src/operations/error-log.md` for the manual
+    /// intervention runbook.
+    pub events_wedged: AtomicU64,
 }
 
 impl Default for OutputMetrics {
@@ -81,6 +95,7 @@ impl Default for OutputMetrics {
             events_written: AtomicU64::new(0),
             events_failed: AtomicU64::new(0),
             retries: AtomicU64::new(0),
+            events_wedged: AtomicU64::new(0),
         }
     }
 }
@@ -190,6 +205,10 @@ impl MetricsRegistry {
                 m.events_failed.load(Ordering::Relaxed).into(),
             );
             o.insert("retries".into(), m.retries.load(Ordering::Relaxed).into());
+            o.insert(
+                "events_wedged".into(),
+                m.events_wedged.load(Ordering::Relaxed).into(),
+            );
             outputs.insert(name.clone(), serde_json::Value::Object(o));
         }
         map.insert("outputs".into(), serde_json::Value::Object(outputs));
