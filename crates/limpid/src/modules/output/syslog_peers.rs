@@ -328,6 +328,95 @@ impl<C> PeerList<C> {
 
         Err(PeerSendError::AllPeersUnavailable { n })
     }
+
+    /// Shutdown-aware variant of [`Self::write_with_rotation_now`].
+    ///
+    /// Two shutdown-observation points wrap the rotation pass:
+    ///
+    /// 1. Between peer selections — `*shutdown.borrow()` is
+    ///    checked before locking the next peer's state. If the
+    ///    runtime is tearing down we stop rotating and return
+    ///    `PreSendShutdown` without touching cooldowns.
+    /// 2. Inside the closure — the caller is expected to race its
+    ///    connect / handshake portion against the shared shutdown
+    ///    receiver via [`crate::modules::pre_send_or_shutdown`],
+    ///    and to return `Err(anyhow::Error::new(PreSendShutdownMarker))`
+    ///    on that arm. The rotation helper downcasts the error
+    ///    and exits without cooling the peer.
+    ///
+    /// The closure's write phase (post-connect) is deliberately
+    /// **not** wrapped in a shutdown race by this helper. If the
+    /// runtime shutdown budget elapses while the write is still in
+    /// flight, the queue-consumer task is aborted and the ack
+    /// handle drops as `Dropped` — a disk queue holds the cursor
+    /// and replays on next start (Branch B C2's fail-stop
+    /// contract).
+    pub async fn write_with_rotation_shutdown_aware<F>(
+        &self,
+        now: Instant,
+        mut attempt: F,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), PeerSendError>
+    where
+        F: for<'a> FnMut(
+            usize,
+            &'a Peer,
+            &'a mut PeerState<C>,
+            &'a mut tokio::sync::watch::Receiver<bool>,
+        ) -> PeerAttemptFuture<'a>,
+    {
+        let n = self.peers.len();
+        if n == 0 {
+            return Err(PeerSendError::Empty);
+        }
+
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
+        for offset in 0..n {
+            // Pre-rotation shutdown check: if the runtime is
+            // already tearing down, don't begin a fresh peer
+            // attempt. Rotation continuing here would just
+            // accumulate cooldowns on peers we never intended to
+            // try during shutdown.
+            if *shutdown.borrow() {
+                return Err(PeerSendError::PreSendShutdown);
+            }
+            let idx = (start + offset) % n;
+            let mut state = self.state[idx].lock().await;
+            if state.cooldown_until.is_some_and(|until| until > now) {
+                continue;
+            }
+
+            match attempt(idx, &self.peers[idx], &mut state, shutdown).await {
+                Ok(()) => {
+                    state.cooldown_until = None;
+                    self.metrics[idx]
+                        .events_written
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(e) => {
+                    // Closure-signalled pre-send shutdown gets a
+                    // dedicated exit: no cooldown, no rotation
+                    // continuation. Every other error is treated
+                    // as a genuine peer failure and cools the peer
+                    // down (same shape as the non-shutdown-aware
+                    // helper).
+                    if e.downcast_ref::<PreSendShutdownMarker>().is_some() {
+                        return Err(PeerSendError::PreSendShutdown);
+                    }
+                    state.cooldown_until = Some(Instant::now() + PEER_COOLDOWN);
+                    self.metrics[idx]
+                        .connect_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.metrics[idx]
+                        .cooldowns_entered
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        Err(PeerSendError::AllPeersUnavailable { n })
+    }
 }
 
 /// Cursor-driven single-candidate peer rotation with per-peer failure
@@ -412,7 +501,34 @@ pub enum PeerSendError {
     Empty,
     #[error("all {n} peers are in cooldown or failed this round")]
     AllPeersUnavailable { n: usize },
+    /// Runtime shutdown fired before a peer had accepted the write
+    /// on this rotation pass — no peer's write phase had begun, so
+    /// the caller can DLQ-route as `Recovered` without ambiguity.
+    /// Only emitted by [`PeerList::write_with_rotation_shutdown_aware`].
+    #[error("shutdown fired during pre-send phase")]
+    PreSendShutdown,
 }
+
+/// Sentinel error type an attempt closure returns to signal
+/// "shutdown fired during my pre-send phase — stop rotation, do
+/// not cool this peer down". Recognised by
+/// [`PeerList::write_with_rotation_shutdown_aware`] via
+/// downcasting; any other error type is treated as a peer
+/// failure (cooldown + rotate).
+///
+/// Wrap in `anyhow::Error::new(PreSendShutdownMarker)` at the
+/// closure return site; the rotation helper's downcast will pick
+/// it up.
+#[derive(Debug)]
+pub struct PreSendShutdownMarker;
+
+impl std::fmt::Display for PreSendShutdownMarker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "shutdown fired during pre-send phase")
+    }
+}
+
+impl std::error::Error for PreSendShutdownMarker {}
 
 #[cfg(test)]
 mod tests {
@@ -749,5 +865,121 @@ mod tests {
             cooldown_until,
             expected_floor
         );
+    }
+
+    /// Shutdown already fired before rotation starts: the helper
+    /// must return `PreSendShutdown` immediately without touching
+    /// any peer's cooldown or invoking the closure. Pin this so a
+    /// regression that reordered the pre-rotation shutdown check
+    /// (or dropped it) would trip here — an unnoticed miss would
+    /// silently accumulate cooldowns during shutdown.
+    #[tokio::test]
+    async fn rotation_shutdown_aware_returns_pre_send_shutdown_before_any_attempt() {
+        let list = PeerList::<()>::new(peers(3));
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        tx.send(true).unwrap();
+        let called = Arc::new(AtomicUsize::new(0));
+        let called_for_attempt = Arc::clone(&called);
+
+        let err = list
+            .write_with_rotation_shutdown_aware(
+                Instant::now(),
+                move |_, _, _, _| {
+                    let called = Arc::clone(&called_for_attempt);
+                    called.fetch_add(1, Ordering::Relaxed);
+                    Box::pin(async move { Ok(()) })
+                },
+                &mut rx,
+            )
+            .await
+            .expect_err("shutdown before rotation must return PreSendShutdown");
+
+        assert!(matches!(err, PeerSendError::PreSendShutdown));
+        assert_eq!(
+            called.load(Ordering::Relaxed),
+            0,
+            "closure must not run when shutdown fires before rotation"
+        );
+        for m in list.peer_metrics() {
+            assert_eq!(m.cooldowns_entered.load(Ordering::Relaxed), 0);
+            assert_eq!(m.connect_failures.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    /// Closure signals pre-send shutdown via
+    /// `PreSendShutdownMarker` on its return: the helper must exit
+    /// rotation with `PreSendShutdown` and must **not** cool the
+    /// peer down. Cooling on shutdown would accumulate cooldowns
+    /// on healthy peers over successive shutdown-then-restart
+    /// cycles.
+    #[tokio::test]
+    async fn rotation_shutdown_aware_treats_marker_as_pre_send_shutdown() {
+        let list = PeerList::<()>::new(peers(2));
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+
+        let err = list
+            .write_with_rotation_shutdown_aware(
+                Instant::now(),
+                move |_, _, _, _| {
+                    Box::pin(async move { Err(anyhow::Error::new(PreSendShutdownMarker)) })
+                },
+                &mut rx,
+            )
+            .await
+            .expect_err("marker must map to PreSendShutdown");
+
+        assert!(matches!(err, PeerSendError::PreSendShutdown));
+        for m in list.peer_metrics() {
+            assert_eq!(
+                m.cooldowns_entered.load(Ordering::Relaxed),
+                0,
+                "peer must not be cooled down on PreSendShutdownMarker"
+            );
+        }
+    }
+
+    /// Ordinary attempt errors (non-marker) are still treated as
+    /// per-peer failures — cooldown, rotation, and (with all peers
+    /// down) `AllPeersUnavailable`. Confirms the shutdown-aware
+    /// helper preserves the existing rotation contract for genuine
+    /// transport errors.
+    #[tokio::test]
+    async fn rotation_shutdown_aware_still_cools_on_non_marker_errors() {
+        let list = PeerList::<()>::new(peers(2));
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+
+        let err = list
+            .write_with_rotation_shutdown_aware(
+                Instant::now(),
+                move |_, _, _, _| Box::pin(async move { Err(anyhow::anyhow!("connect refused")) }),
+                &mut rx,
+            )
+            .await
+            .expect_err("all peers failed");
+        assert!(matches!(err, PeerSendError::AllPeersUnavailable { n: 2 }));
+        for m in list.peer_metrics() {
+            assert_eq!(m.cooldowns_entered.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    /// Successful attempt through the shutdown-aware helper
+    /// resets that peer's cooldown and bumps `events_written` —
+    /// same success semantics as the non-shutdown-aware sibling.
+    #[tokio::test]
+    async fn rotation_shutdown_aware_success_matches_the_non_aware_helper() {
+        let list = PeerList::<()>::new(peers(2));
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+
+        list.write_with_rotation_shutdown_aware(
+            Instant::now(),
+            move |_, _, _, _| Box::pin(async move { Ok(()) }),
+            &mut rx,
+        )
+        .await
+        .expect("first peer should succeed");
+
+        let m = &list.peer_metrics()[0];
+        assert_eq!(m.events_written.load(Ordering::Relaxed), 1);
+        assert_eq!(m.cooldowns_entered.load(Ordering::Relaxed), 0);
     }
 }
