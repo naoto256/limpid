@@ -55,17 +55,21 @@ fn parent_dir_mode_is_unsafe_for_input(mode: u32) -> bool {
     mode & 0o022 != 0
 }
 
-/// True when the parent dir's owner is neither root (uid 0) nor the
-/// daemon's own effective uid. Symmetric with the control-socket
-/// helper: an untrusted owner keeps rename/unlink rights inside the
-/// directory regardless of mode bits, and can swap the socket inode
-/// between the stale-cleanup stat and the follow-up unlink or between
-/// shutdown and next bind. `/dev` (root-owned) and packaged runtime
-/// directories owned by the daemon's uid pass; a user-created parent
-/// owned by an unrelated uid fails even at `0o755`.
+/// True when the parent dir's owner is not the daemon's own effective
+/// uid. Symmetric with the control-socket helper: an untrusted owner
+/// keeps rename/unlink rights inside the directory regardless of mode
+/// bits, and can swap the socket inode between the stale-cleanup stat
+/// and the follow-up unlink or between shutdown and next bind. A
+/// root-owned parent is trusted **only when the daemon itself runs as
+/// root** (`self_euid == 0`); at the packaged `0o755` a non-root
+/// daemon has no write permission on a root-owned parent, so bind
+/// would fail post-validation — the very shape this preflight exists
+/// to prevent. For the flagship `/dev/log` case, `syslog` traditionally
+/// runs as root, keeping `/dev` (root-owned) trusted; non-root deploys
+/// should point `path` at a daemon-owned runtime directory.
 #[cfg(unix)]
 fn parent_dir_owner_is_untrusted_for_input(uid: u32, self_euid: u32) -> bool {
-    uid != 0 && uid != self_euid
+    uid != self_euid
 }
 
 /// Startup-time validation of the unix_socket input's parent
@@ -117,13 +121,14 @@ fn validate_unix_socket_input_parent(path: &str) -> Result<()> {
         let self_euid = unsafe { libc::geteuid() };
         if parent_dir_owner_is_untrusted_for_input(uid, self_euid) {
             anyhow::bail!(
-                "input unix_socket: parent dir {:?} is owned by uid {} — refusing to bind. \
-                 The unix_socket input expects its parent directory to be owned by root \
-                 (uid 0) or by the daemon's own effective uid ({}); any other owner can \
-                 rename or replace the socket inode between the stale-cleanup stat and the \
-                 follow-up unlink, or between shutdown and next bind, even when the mode \
-                 looks safe. Point `path` at `/dev/log` (`/dev` is root-owned) or move it \
-                 into a daemon-owned runtime directory.",
+                "input unix_socket: parent dir {:?} is owned by uid {}, but the daemon's \
+                 effective uid is {} — refusing to bind. Directory mode alone does not \
+                 close the trust boundary (an untrusted owner can rename or replace the \
+                 socket inode inside the parent), and a root-owned parent at the packaged \
+                 `0o755` is not writable by a non-root daemon so bind would fail \
+                 post-validation anyway. For the flagship `/dev/log` deploy the daemon \
+                 runs as root and `/dev` (root-owned) is trusted; non-root deploys should \
+                 point `path` at a daemon-owned runtime directory.",
                 parent,
                 uid,
                 self_euid,
@@ -660,16 +665,21 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn parent_dir_owner_untrusted_for_input_flags_non_root_non_self() {
-        // Root-owned (`/dev` shape) is always trusted.
+    fn parent_dir_owner_untrusted_for_input_flags_non_matching_owner() {
+        // Root daemon + `/dev` (root-owned) — the flagship
+        // `/dev/log` deploy — is trusted.
         assert!(!parent_dir_owner_is_untrusted_for_input(0, 0));
-        assert!(!parent_dir_owner_is_untrusted_for_input(0, 1000));
-        // Daemon's own euid is trusted (custom deploys, systemd
-        // `User=` matching the runtime dir owner).
+        // Non-root daemon + daemon-owned parent (custom runtime dir).
         assert!(!parent_dir_owner_is_untrusted_for_input(1000, 1000));
-        // Any other owner is untrusted independent of mode: rename
-        // rights alone let them swap the socket inode.
+        // Non-root daemon + root-owned parent is UNTRUSTED: at 0o755
+        // the daemon has no write permission on the parent so bind
+        // would fail post-validation. Non-root deploys must point
+        // `path` at a daemon-owned runtime dir, not `/dev/log`.
+        assert!(parent_dir_owner_is_untrusted_for_input(0, 1000));
+        // Root daemon + non-root parent is untrusted (attacker-owned
+        // dir even for a root daemon).
         assert!(parent_dir_owner_is_untrusted_for_input(1000, 0));
+        // Any unrelated uid is untrusted.
         assert!(parent_dir_owner_is_untrusted_for_input(1001, 1000));
         assert!(parent_dir_owner_is_untrusted_for_input(65534, 1000));
     }

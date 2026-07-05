@@ -113,7 +113,12 @@ impl Output for StdoutOutput {
                             event,
                             &reason,
                         )
-                        .await;                        crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
+                        .await;
+                        crate::modules::resolve_ack_from_dlq_outcome(
+                            ack,
+                            __dlq_outcome,
+                            &self.metrics,
+                        );
                         return Ok(());
                     }
                     tracing::warn!(
@@ -144,7 +149,12 @@ impl Output for StdoutOutput {
                             event,
                             &reason,
                         )
-                        .await;                        crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
+                        .await;
+                        crate::modules::resolve_ack_from_dlq_outcome(
+                            ack,
+                            __dlq_outcome,
+                            &self.metrics,
+                        );
                         return Ok(());
                     }
                     wait = self.retry.next_wait(wait);
@@ -168,7 +178,8 @@ impl Output for StdoutOutput {
                     event,
                     &reason,
                 )
-                .await;                crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
+                .await;
+                crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
             }
         }
         Ok(())

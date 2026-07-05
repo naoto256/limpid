@@ -888,13 +888,7 @@ pub async fn run_queue_consumer(
         // the operator alarm (`events_wedged` + wedge log line)
         // still fires. `accepting` is not touched — the loop above
         // has already exited its accept phase.
-        record_wedge_transition_if_first(
-            position,
-            disposition,
-            &mut wedged,
-            &name,
-            &metrics,
-        );
+        record_wedge_transition_if_first(position, disposition, &mut wedged, &name, &metrics);
         let is_disk_position = matches!(position, AckPosition::Disk { .. });
         let is_dropped_on_disk = matches!(disposition, AckDisposition::Dropped) && is_disk_position;
         if !is_dropped_on_disk {

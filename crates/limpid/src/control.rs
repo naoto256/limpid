@@ -150,17 +150,19 @@ pub fn validate_control_socket_parent(socket_path_config: Option<&str>) -> anyho
                 let self_euid = unsafe { libc::geteuid() };
                 if parent_dir_owner_is_untrusted(uid, self_euid) {
                     anyhow::bail!(
-                        "control socket: parent dir {:?} is owned by uid {} — refusing to bind. \
-                         The control socket is a root-equivalent trust boundary and expects its \
-                         parent directory to be owned by root (uid 0) or by the daemon's own \
-                         effective uid ({}); any other owner can rename or replace the socket \
-                         inode between bind and chmod even when the directory mode looks safe. \
-                         Move the socket into a daemon-owned or root-owned parent \
-                         (`/var/run/limpid/`, with `RuntimeDirectoryMode=0750` under systemd) or \
-                         `chown` the current parent to a trusted uid.",
+                        "control socket: parent dir {:?} is owned by uid {}, but the daemon's \
+                         effective uid is {} — refusing to bind. Directory mode alone does not \
+                         close the trust boundary (an untrusted owner can rename or replace the \
+                         socket inode inside the parent), and a root-owned parent at the \
+                         packaged mode (`0o750`) is not writable by a non-root daemon so bind \
+                         would fail post-validation anyway. Under systemd, `RuntimeDirectory=limpid` \
+                         combined with `User=limpid` creates a daemon-owned parent at the \
+                         requested mode — that is the intended shape. For custom deploys, \
+                         `chown <daemon-user>:<daemon-group> {:?}` and re-run.",
                         parent,
                         uid,
                         self_euid,
+                        parent,
                     );
                 }
                 let mode = meta.permissions().mode() & 0o777;
@@ -213,18 +215,29 @@ fn parent_dir_mode_is_unsafe(mode: u32) -> bool {
     mode & 0o023 != 0
 }
 
-/// True when the parent dir's owner is neither root (uid 0) nor the
-/// daemon's own effective uid. Directory mode alone does not close the
-/// trust boundary: an untrusted owner retains rename/unlink rights
-/// inside the directory regardless of mode bits, and can therefore
-/// replace the socket inode between the daemon's `bind` and its
-/// follow-up `chmod`. Root-owned parents are always trusted (packaged
-/// deployments own `/var/run/limpid/` at daemon-user, root-owned
-/// `/dev` is also trusted). Kept separate from the mode predicate so
-/// error diagnostics can name the failing property (owner vs mode).
+/// True when the parent dir's owner is not the daemon's own effective
+/// uid. Directory mode alone does not close the trust boundary: an
+/// untrusted owner retains rename/unlink rights inside the directory
+/// regardless of mode bits, and can therefore replace the socket inode
+/// between the daemon's `bind` and its follow-up `chmod`.
+///
+/// A root-owned parent is trusted **only when the daemon itself runs
+/// as root** (`self_euid == 0`). A non-root daemon binding into a
+/// root-owned parent at the packaged mode (`0o750`) has no write
+/// permission on the parent, so `bind` would fail post-validation and
+/// the fire-and-forget control task would die silently — same failure
+/// shape the startup validation was introduced to prevent. Requiring
+/// the parent owner to match the daemon's own euid covers both cases:
+/// a root daemon runs against a root-owned parent, and a non-root
+/// daemon runs against a daemon-owned parent (systemd's
+/// `RuntimeDirectory=limpid` with `User=limpid` produces exactly this
+/// shape).
+///
+/// Kept separate from the mode predicate so error diagnostics can name
+/// the failing property (owner vs mode).
 #[cfg(unix)]
 fn parent_dir_owner_is_untrusted(uid: u32, self_euid: u32) -> bool {
-    uid != 0 && uid != self_euid
+    uid != self_euid
 }
 
 pub struct ControlServer {
@@ -1186,18 +1199,26 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn parent_dir_owner_untrusted_flags_non_root_non_self() {
-        // Root-owned is always trusted, no matter what the daemon
-        // euid is (packaged deploys often ship root-owned parents).
+    fn parent_dir_owner_untrusted_flags_non_matching_owner() {
+        // Root daemon + root-owned parent is trusted (the packaged
+        // shape when limpid runs as root).
         assert!(!parent_dir_owner_is_untrusted(0, 0));
-        assert!(!parent_dir_owner_is_untrusted(0, 1000));
-        // Daemon's own euid is trusted — this is the common case when
-        // the daemon itself created the parent (custom deploys) or
-        // when systemd's `User=` matches the runtime dir owner.
+        // Non-root daemon + daemon-owned parent is trusted (systemd's
+        // `RuntimeDirectory=limpid` + `User=limpid` produces this
+        // shape at 0o750).
         assert!(!parent_dir_owner_is_untrusted(1000, 1000));
-        // Any other owner is untrusted, even when mode looks safe:
-        // the owner retains rename/unlink rights inside the dir.
+        // Non-root daemon + root-owned parent is UNTRUSTED even though
+        // root ownership sounds safer: at the packaged `0o750` mode
+        // the daemon has no write permission on the parent, so `bind`
+        // would fail post-validation and the fire-and-forget control
+        // task would die silently — the exact failure shape this
+        // check exists to prevent.
+        assert!(parent_dir_owner_is_untrusted(0, 1000));
+        // Root daemon + non-root parent is untrusted (someone else
+        // owns the dir; even a root daemon should not bind into an
+        // attacker-controlled directory).
         assert!(parent_dir_owner_is_untrusted(1000, 0));
+        // Any unrelated uid is untrusted.
         assert!(parent_dir_owner_is_untrusted(1001, 1000));
         assert!(parent_dir_owner_is_untrusted(65534, 1000)); // nobody
     }
