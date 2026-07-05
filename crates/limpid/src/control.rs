@@ -100,16 +100,22 @@ fn ensure_socket_parent_dir(parent: &std::path::Path) {
 /// - Parent exists but is not a directory → bail. Almost
 ///   always a config typo (`socket "/var/log/limpid.log"`
 ///   instead of `.sock`).
+/// - Parent exists as a directory owned by an untrusted uid
+///   (neither root nor the daemon's own effective uid) →
+///   bail. Directory mode alone does not close the trust
+///   boundary: the owner can rename or replace the socket
+///   inode inside the parent even when the mode looks safe.
 /// - Parent exists as a directory with an unsafe mode →
 ///   bail with the observed mode and a remediation hint.
 ///
 /// The custom-deploy contract this closes: an operator whose
 /// `control { socket "..." }` points into a directory they
-/// have not tightened (e.g. `0o755`, `0o770`, or worse) would
-/// previously have seen only a `warn!` line and a live daemon
-/// running on an insecure socket. That warn-only shape is now
-/// a fatal startup error, matching the equivalent shape from
-/// the DLQ preflight in `error_log::validate_at_startup`.
+/// have not tightened (e.g. `0o755`, `0o770`, or worse) or
+/// which is owned by another user would previously have seen
+/// only a `warn!` line and a live daemon running on an
+/// insecure socket. That warn-only shape is now a fatal
+/// startup error, matching the equivalent shape from the DLQ
+/// preflight in `error_log::validate_at_startup`.
 ///
 /// Under packaged systemd units (`RuntimeDirectory=limpid`
 /// with `RuntimeDirectoryMode=0750`) the parent is already
@@ -130,7 +136,7 @@ pub fn validate_control_socket_parent(socket_path_config: Option<&str>) -> anyho
     };
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         match std::fs::metadata(parent) {
             Ok(meta) => {
                 if !meta.is_dir() {
@@ -138,6 +144,23 @@ pub fn validate_control_socket_parent(socket_path_config: Option<&str>) -> anyho
                         "control socket: parent {:?} exists but is not a directory; \
                          check the `control {{ socket \"...\" }}` value",
                         parent
+                    );
+                }
+                let uid = meta.uid();
+                let self_euid = unsafe { libc::geteuid() };
+                if parent_dir_owner_is_untrusted(uid, self_euid) {
+                    anyhow::bail!(
+                        "control socket: parent dir {:?} is owned by uid {} — refusing to bind. \
+                         The control socket is a root-equivalent trust boundary and expects its \
+                         parent directory to be owned by root (uid 0) or by the daemon's own \
+                         effective uid ({}); any other owner can rename or replace the socket \
+                         inode between bind and chmod even when the directory mode looks safe. \
+                         Move the socket into a daemon-owned or root-owned parent \
+                         (`/var/run/limpid/`, with `RuntimeDirectoryMode=0750` under systemd) or \
+                         `chown` the current parent to a trusted uid.",
+                        parent,
+                        uid,
+                        self_euid,
                     );
                 }
                 let mode = meta.permissions().mode() & 0o777;
@@ -188,6 +211,20 @@ pub fn validate_control_socket_parent(socket_path_config: Option<&str>) -> anyho
 #[cfg(unix)]
 fn parent_dir_mode_is_unsafe(mode: u32) -> bool {
     mode & 0o023 != 0
+}
+
+/// True when the parent dir's owner is neither root (uid 0) nor the
+/// daemon's own effective uid. Directory mode alone does not close the
+/// trust boundary: an untrusted owner retains rename/unlink rights
+/// inside the directory regardless of mode bits, and can therefore
+/// replace the socket inode between the daemon's `bind` and its
+/// follow-up `chmod`. Root-owned parents are always trusted (packaged
+/// deployments own `/var/run/limpid/` at daemon-user, root-owned
+/// `/dev` is also trusted). Kept separate from the mode predicate so
+/// error diagnostics can name the failing property (owner vs mode).
+#[cfg(unix)]
+fn parent_dir_owner_is_untrusted(uid: u32, self_euid: u32) -> bool {
+    uid != 0 && uid != self_euid
 }
 
 pub struct ControlServer {
@@ -1145,6 +1182,24 @@ mod tests {
         // is expected and not flagged — group is the socket's own
         // trusted access group per the 0o660 chmod.
         assert!(!parent_dir_mode_is_unsafe(0o710));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn parent_dir_owner_untrusted_flags_non_root_non_self() {
+        // Root-owned is always trusted, no matter what the daemon
+        // euid is (packaged deploys often ship root-owned parents).
+        assert!(!parent_dir_owner_is_untrusted(0, 0));
+        assert!(!parent_dir_owner_is_untrusted(0, 1000));
+        // Daemon's own euid is trusted — this is the common case when
+        // the daemon itself created the parent (custom deploys) or
+        // when systemd's `User=` matches the runtime dir owner.
+        assert!(!parent_dir_owner_is_untrusted(1000, 1000));
+        // Any other owner is untrusted, even when mode looks safe:
+        // the owner retains rename/unlink rights inside the dir.
+        assert!(parent_dir_owner_is_untrusted(1000, 0));
+        assert!(parent_dir_owner_is_untrusted(1001, 1000));
+        assert!(parent_dir_owner_is_untrusted(65534, 1000)); // nobody
     }
 
     #[test]

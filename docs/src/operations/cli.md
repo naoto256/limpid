@@ -116,15 +116,21 @@ limpidctl health --json
 
 ### Control socket parent safety
 
-The control socket is a root-equivalent trust boundary, and its `bind → chmod 0o660` window relies on the parent directory keeping non-group traffic out. Daemon startup **refuses to start** when the configured `control { socket "..." }`'s parent already exists on disk and is group-writable, world-writable, or world-traversable (predicate `mode & 0o023 != 0`). Under packaged systemd units (`RuntimeDirectory=limpid` with `RuntimeDirectoryMode=0750` explicitly set in the unit file) the parent is already safe by construction and this check is a no-op.
+The control socket is a root-equivalent trust boundary, and its `bind → chmod 0o660` window relies on the parent directory both being controlled by a trusted owner and keeping non-group traffic out. Daemon startup **refuses to start** when the configured `control { socket "..." }`'s parent already exists on disk and either check fails:
 
-For custom deploys, tighten the parent to `0o750` (or `0o700` for owner-only) before starting the daemon:
+- **Owner** — the parent must be owned by root (uid 0) or by the daemon's own effective uid. An untrusted owner retains rename/unlink rights inside the directory regardless of mode bits and can replace the socket inode between bind and chmod.
+- **Mode** — the parent must not be group-writable, world-writable, or world-traversable (predicate `mode & 0o023 != 0`).
+
+Under packaged systemd units (`RuntimeDirectory=limpid` with `RuntimeDirectoryMode=0750` explicitly set in the unit file) both properties are satisfied by construction — systemd creates the runtime dir at the daemon's uid with the requested mode — and this check is a no-op.
+
+For custom deploys, ensure the parent is owned by a trusted uid and tighten it to `0o750` (or `0o700` for owner-only) before starting the daemon:
 
 ```sh
-chmod 0750 /path/to/parent   # daemon user + group only
+chown root:limpid /path/to/parent   # or the daemon's own uid
+chmod 0750 /path/to/parent          # daemon user + group only
 ```
 
-The failure diagnostic names the observed mode and remediation. If the parent does not exist yet, the control task creates it at `0o750` — no operator action needed.
+The failure diagnostic names whether the owner or the mode failed and gives the observed value plus a remediation hint. If the parent does not exist yet, the control task creates it at `0o750` under the daemon's own uid — no operator action needed.
 
 At shutdown, the control task records the `(dev, ino)` of the socket it bound and refuses to unlink the path if the on-disk inode has been swapped since bind. Under the safe-parent contract above no outside-the-group writer can produce the swap; this is defense-in-depth, not the load-bearing guard.
 

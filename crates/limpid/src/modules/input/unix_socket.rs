@@ -55,6 +55,19 @@ fn parent_dir_mode_is_unsafe_for_input(mode: u32) -> bool {
     mode & 0o022 != 0
 }
 
+/// True when the parent dir's owner is neither root (uid 0) nor the
+/// daemon's own effective uid. Symmetric with the control-socket
+/// helper: an untrusted owner keeps rename/unlink rights inside the
+/// directory regardless of mode bits, and can swap the socket inode
+/// between the stale-cleanup stat and the follow-up unlink or between
+/// shutdown and next bind. `/dev` (root-owned) and packaged runtime
+/// directories owned by the daemon's uid pass; a user-created parent
+/// owned by an unrelated uid fails even at `0o755`.
+#[cfg(unix)]
+fn parent_dir_owner_is_untrusted_for_input(uid: u32, self_euid: u32) -> bool {
+    uid != 0 && uid != self_euid
+}
+
 /// Startup-time validation of the unix_socket input's parent
 /// directory. Called from `UnixSocketInput::from_properties`
 /// so a fail-closed bail aborts daemon startup via
@@ -66,6 +79,11 @@ fn parent_dir_mode_is_unsafe_for_input(mode: u32) -> bool {
 ///   not create its own parent (`/dev` is expected to exist);
 ///   an absent parent almost always means a config typo.
 /// - Parent exists but is not a directory → bail.
+/// - Parent exists as a directory owned by an untrusted uid
+///   (neither root nor the daemon's own effective uid) →
+///   bail. `/dev` (root-owned) and daemon-owned runtime dirs
+///   pass; a user-created dir owned by an unrelated uid fails
+///   independent of mode.
 /// - Parent exists as a directory whose mode is group-writable
 ///   or world-writable → bail. `/dev` at `0o755` passes.
 ///   `/tmp` at `0o1777` does **not** — see the predicate doc
@@ -82,7 +100,7 @@ fn validate_unix_socket_input_parent(path: &str) -> Result<()> {
     };
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let meta = std::fs::metadata(parent).with_context(|| {
             format!(
                 "input unix_socket: parent directory {:?} is not accessible (does it exist?)",
@@ -93,6 +111,22 @@ fn validate_unix_socket_input_parent(path: &str) -> Result<()> {
             anyhow::bail!(
                 "input unix_socket: parent {:?} exists but is not a directory; check the `path` value",
                 parent
+            );
+        }
+        let uid = meta.uid();
+        let self_euid = unsafe { libc::geteuid() };
+        if parent_dir_owner_is_untrusted_for_input(uid, self_euid) {
+            anyhow::bail!(
+                "input unix_socket: parent dir {:?} is owned by uid {} — refusing to bind. \
+                 The unix_socket input expects its parent directory to be owned by root \
+                 (uid 0) or by the daemon's own effective uid ({}); any other owner can \
+                 rename or replace the socket inode between the stale-cleanup stat and the \
+                 follow-up unlink, or between shutdown and next bind, even when the mode \
+                 looks safe. Point `path` at `/dev/log` (`/dev` is root-owned) or move it \
+                 into a daemon-owned runtime directory.",
+                parent,
+                uid,
+                self_euid,
             );
         }
         let mode = meta.permissions().mode() & 0o7777;
@@ -142,12 +176,14 @@ impl Module for UnixSocketInput {
         let path = props::get_string(properties, "path")
             .ok_or_else(|| anyhow::anyhow!("input '{}': unix_socket requires 'path'", name))?;
         // Parent safety fail-closed: refuse startup when the
-        // configured path's parent is group-writable or
-        // world-writable. Symmetric with
-        // `control::validate_control_socket_parent`; the two
-        // predicates diverge because this input binds a
-        // world-writable socket where other-execute on the
-        // parent is a use-case requirement, not a threat.
+        // configured path's parent is owned by an untrusted uid
+        // or is group-/world-writable. Symmetric with
+        // `control::validate_control_socket_parent`; the mode
+        // predicate diverges (this sink binds a world-writable
+        // datagram socket where other-execute on the parent is a
+        // use-case requirement, not a threat), but the owner
+        // predicate is identical: only root or the daemon's own
+        // effective uid may own the parent.
         validate_unix_socket_input_parent(&path)
             .with_context(|| format!("input '{}': unix_socket startup validation failed", name))?;
         Ok(Self {
@@ -620,6 +656,22 @@ mod tests {
         // shape here so a future caller that forgot to mask
         // still trips the predicate.
         assert!(parent_dir_mode_is_unsafe_for_input(0o777));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn parent_dir_owner_untrusted_for_input_flags_non_root_non_self() {
+        // Root-owned (`/dev` shape) is always trusted.
+        assert!(!parent_dir_owner_is_untrusted_for_input(0, 0));
+        assert!(!parent_dir_owner_is_untrusted_for_input(0, 1000));
+        // Daemon's own euid is trusted (custom deploys, systemd
+        // `User=` matching the runtime dir owner).
+        assert!(!parent_dir_owner_is_untrusted_for_input(1000, 1000));
+        // Any other owner is untrusted independent of mode: rename
+        // rights alone let them swap the socket inode.
+        assert!(parent_dir_owner_is_untrusted_for_input(1000, 0));
+        assert!(parent_dir_owner_is_untrusted_for_input(1001, 1000));
+        assert!(parent_dir_owner_is_untrusted_for_input(65534, 1000));
     }
 
     #[test]
