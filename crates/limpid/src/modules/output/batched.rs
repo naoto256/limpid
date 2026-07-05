@@ -413,10 +413,16 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
         }
         for (ev, ack, err) in render_failures {
             let reason = format!("render failed during {}: {}", site, err);
-            crate::modules::route_event_to_dlq(self.error_log.as_ref(), &self.name, &ev, &reason)
-                .await;
+            let __dlq_outcome = crate::modules::route_event_to_dlq(
+                self.error_log.as_ref(),
+                &self.metrics,
+                &self.name,
+                &ev,
+                &reason,
+            )
+            .await;
             self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-            ack.resolve_recovered();
+            crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome);
         }
         (payloads, shippable)
     }
@@ -454,9 +460,21 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
         }
         for (ev, ack) in iter {
             let reason = "collector reported partial_success rejection".to_string();
-            crate::modules::route_event_to_dlq(self.error_log.as_ref(), &self.name, &ev, &reason)
-                .await;
-            ack.resolve_recovered();
+            // `events_failed` was already bumped by the outer
+            // `rejected > 0` fetch_add above (partial-success
+            // paths report the count once, not per handle), so
+            // this call must NOT re-bump — the perl-driven bulk
+            // refactor for B-C3 accidentally added a per-event
+            // bump that double-counted here.
+            let __dlq_outcome = crate::modules::route_event_to_dlq(
+                self.error_log.as_ref(),
+                &self.metrics,
+                &self.name,
+                &ev,
+                &reason,
+            )
+            .await;
+            crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome);
         }
     }
 
@@ -483,15 +501,16 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                 // so skip the retry budget and route straight to DLQ.
                 let reason = format!("flush failed: {}", e);
                 for (ev, ack) in shippable {
-                    crate::modules::route_event_to_dlq(
+                    let __dlq_outcome = crate::modules::route_event_to_dlq(
                         self.error_log.as_ref(),
+                        &self.metrics,
                         &self.name,
                         &ev,
                         &reason,
                     )
                     .await;
                     self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-                    ack.resolve_recovered();
+                    crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome);
                 }
                 return;
             }
@@ -590,10 +609,16 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
         // batch on restart (the ack-handle invariant).
         let reason = format!("flush failed after {} attempts: {}", attempt, final_err);
         for (ev, ack) in shippable {
-            crate::modules::route_event_to_dlq(self.error_log.as_ref(), &self.name, &ev, &reason)
-                .await;
+            let __dlq_outcome = crate::modules::route_event_to_dlq(
+                self.error_log.as_ref(),
+                &self.metrics,
+                &self.name,
+                &ev,
+                &reason,
+            )
+            .await;
             self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-            ack.resolve_recovered();
+            crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome);
         }
     }
 

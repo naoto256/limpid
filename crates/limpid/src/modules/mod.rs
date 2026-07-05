@@ -445,9 +445,9 @@ pub async fn finalize_shutdown_singleton_disposition(
         }
         Err(e) => {
             let reason = format!("shutdown send failed: {}", e);
-            route_event_to_dlq(error_log, output_name, event, &reason).await;
+            let outcome = route_event_to_dlq(error_log, metrics, output_name, event, &reason).await;
             metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-            ack.resolve_recovered();
+            resolve_ack_from_dlq_outcome(ack, outcome);
         }
     }
 }
@@ -489,15 +489,23 @@ pub async fn route_shutdown_batch_to_dlq(
                 output_name: output_name.to_string(),
                 event: crate::pipeline::OutputEvent::from_owned(&ev),
             };
-            if let Err(write_err) = writer.write(&ctx).await {
-                tracing::warn!(
-                    "output '{}': error_log write during shutdown failed: {} — dropping event",
-                    output_name,
-                    write_err
-                );
-            }
+            let outcome = match writer.write(&ctx).await {
+                Ok(()) => DlqRouteOutcome::Recovered,
+                Err(write_err) => {
+                    tracing::warn!(
+                        "output '{}': error_log write during shutdown failed: {} — routing as \
+                         Dropped so the disk queue holds the cursor for replay",
+                        output_name,
+                        write_err
+                    );
+                    metrics
+                        .events_errored_unwritable
+                        .fetch_add(1, Ordering::Relaxed);
+                    DlqRouteOutcome::Dropped
+                }
+            };
             metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-            ack.resolve_recovered();
+            resolve_ack_from_dlq_outcome(ack, outcome);
         }
     } else {
         tracing::warn!(
@@ -513,17 +521,70 @@ pub async fn route_shutdown_batch_to_dlq(
     }
 }
 
+/// Resolve `ack` per the queue backend and the DLQ route outcome
+/// so `route_event_to_dlq`'s `Dropped` arm wedges disk queues
+/// (via `resolve_dropped`) while memory queues stay on the
+/// `resolve_recovered` best-effort path.
+///
+/// - `Recovered` (any queue): `resolve_recovered`.
+/// - `Dropped` + disk queue: `resolve_dropped` — the disk cursor
+///   holds and the event replays on next start (Branch B C2
+///   wedge kicks in on the consumer side).
+/// - `Dropped` + memory queue: `resolve_recovered` — memory
+///   queues cannot replay on restart, so `resolve_dropped`
+///   would only wedge the pipeline without a recovery path;
+///   `events_errored_unwritable` (bumped inside
+///   `route_event_to_dlq` before this call) is the only durable
+///   trace on memory queues, and that is the operator alarm
+///   signal.
+pub fn resolve_ack_from_dlq_outcome(ack: crate::queue::QueueAckHandle, outcome: DlqRouteOutcome) {
+    use crate::queue::AckPosition;
+    match (outcome, ack.position()) {
+        (DlqRouteOutcome::Recovered, _) | (DlqRouteOutcome::Dropped, AckPosition::Memory) => {
+            ack.resolve_recovered();
+        }
+        (DlqRouteOutcome::Dropped, AckPosition::Disk { .. }) => {
+            ack.resolve_dropped();
+        }
+    }
+}
+
+/// Outcome of a single per-event DLQ route.
+///
+/// - `Recovered` — either the record was written to the operator-
+///   configured DLQ file, or `error_log` was unset and the event
+///   was surfaced as a `tracing::error!` line. In both shapes the
+///   caller has a written durable trail (DLQ file / journal),
+///   so `resolve_recovered()` is honest.
+/// - `Dropped` — `error_log` was configured but the write failed
+///   (disk full, permission drop, corrupted DLQ, etc.). Nothing
+///   durable was written; on a disk queue the caller should
+///   `resolve_dropped()` so the queue cursor holds and the event
+///   replays on next start (Branch B C2 wedge). On a memory
+///   queue the caller still `resolve_recovered()` because there
+///   is no replay path either way and `events_errored_unwritable`
+///   has already been bumped as the operator signal.
+#[must_use]
+pub enum DlqRouteOutcome {
+    Recovered,
+    Dropped,
+}
+
 /// Per-event DLQ writer shared by every output's `consume` body. Writes
 /// one `ErroredEventContext` record carrying the original event and a
-/// human-readable reason; warns and continues if the writer itself
-/// fails (no recursion / loops). Does NOT touch the ack handle —
-/// callers resolve as `Recovered` after this returns.
+/// human-readable reason; on `error_log` configured + write failure
+/// bumps `events_errored_unwritable` and returns `Dropped` so the
+/// caller can choose between `resolve_recovered` (memory queue) and
+/// `resolve_dropped` (disk queue wedge). Does NOT touch the ack
+/// handle directly.
 pub async fn route_event_to_dlq(
     error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+    metrics: &OutputMetrics,
     output_name: &str,
     event: &Event,
     reason: &str,
-) {
+) -> DlqRouteOutcome {
+    use std::sync::atomic::Ordering;
     if let Some(writer) = error_log {
         let ctx = crate::pipeline::ErroredEventContext::Output {
             timestamp: chrono::Utc::now(),
@@ -533,19 +594,44 @@ pub async fn route_event_to_dlq(
             output_name: output_name.to_string(),
             event: crate::pipeline::OutputEvent::from_owned(event),
         };
-        if let Err(write_err) = writer.write(&ctx).await {
-            tracing::warn!(
-                "output '{}': error_log write failed: {} — dropping event",
-                output_name,
-                write_err
-            );
+        match writer.write(&ctx).await {
+            Ok(()) => DlqRouteOutcome::Recovered,
+            Err(write_err) => {
+                // The DLQ file itself failed. Bump the operator-
+                // facing counter that the process-side runtime
+                // path (write_errored_to_dlq in runtime.rs) also
+                // uses, so both sink-side and pipeline-side
+                // DLQ-write failures show up under the same
+                // metric. `Dropped` signals the caller to hold
+                // the cursor on a disk queue (Branch B C2 wedge)
+                // rather than advance past an event that has no
+                // durable trail.
+                tracing::warn!(
+                    "output '{}': error_log write failed: {} — routing as Dropped so the disk \
+                     queue holds the cursor for replay",
+                    output_name,
+                    write_err
+                );
+                metrics
+                    .events_errored_unwritable
+                    .fetch_add(1, Ordering::Relaxed);
+                DlqRouteOutcome::Dropped
+            }
         }
     } else {
+        // No DLQ configured — surface the full failure context
+        // to the tracing channel. Operators grep / journalctl
+        // for these lines; the event is technically "lost" from
+        // the daemon's storage perspective, but the record is
+        // preserved on the standard log channel. `Recovered` is
+        // honest here because the operator has an
+        // outside-the-daemon durable copy.
         tracing::error!(
             "output '{}': dropping event (no error_log): {}",
             output_name,
             reason
         );
+        DlqRouteOutcome::Recovered
     }
 }
 
@@ -886,5 +972,65 @@ mod pre_send_or_shutdown_tests {
         let outcome =
             pre_send_or_shutdown(&mut rx, tokio::time::sleep(Duration::from_secs(5))).await;
         assert!(outcome.is_none());
+    }
+}
+
+#[cfg(test)]
+mod resolve_ack_from_dlq_outcome_tests {
+    use super::{DlqRouteOutcome, resolve_ack_from_dlq_outcome};
+    use crate::queue::{AckDisposition, AckPosition, QueueAckHandle};
+
+    /// Recovered outcome always maps to `resolve_recovered` on
+    /// both memory and disk queues — the DLQ record is durable,
+    /// so cursor advancement is honest.
+    #[tokio::test]
+    async fn recovered_outcome_resolves_recovered_on_memory() {
+        let (ack, mut rx) = QueueAckHandle::for_test();
+        resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Recovered);
+        assert_eq!(
+            rx.recv().await,
+            Some((AckPosition::Memory, AckDisposition::Recovered))
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_outcome_resolves_recovered_on_disk() {
+        let position = AckPosition::Disk {
+            seq: 4,
+            offset: 128,
+        };
+        let (ack, mut rx) = QueueAckHandle::for_test_with_position(position);
+        resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Recovered);
+        assert_eq!(rx.recv().await, Some((position, AckDisposition::Recovered)));
+    }
+
+    /// Dropped outcome on a memory queue still resolves as
+    /// `Recovered` — memory queues cannot replay, so wedging
+    /// would only cause loss without a recovery path.
+    /// `events_errored_unwritable` (bumped inside
+    /// `route_event_to_dlq`) is the operator's durable trace.
+    #[tokio::test]
+    async fn dropped_outcome_resolves_recovered_on_memory() {
+        let (ack, mut rx) = QueueAckHandle::for_test();
+        resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Dropped);
+        assert_eq!(
+            rx.recv().await,
+            Some((AckPosition::Memory, AckDisposition::Recovered))
+        );
+    }
+
+    /// Dropped outcome on a disk queue resolves as
+    /// `Dropped` — the disk queue's consumer wedges on the
+    /// Dropped disposition (Branch B C2) and holds the cursor
+    /// at this position for replay on next start.
+    #[tokio::test]
+    async fn dropped_outcome_resolves_dropped_on_disk() {
+        let position = AckPosition::Disk {
+            seq: 7,
+            offset: 4242,
+        };
+        let (ack, mut rx) = QueueAckHandle::for_test_with_position(position);
+        resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Dropped);
+        assert_eq!(rx.recv().await, Some((position, AckDisposition::Dropped)));
     }
 }

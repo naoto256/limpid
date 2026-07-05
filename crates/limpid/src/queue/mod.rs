@@ -568,11 +568,12 @@ impl QueueAckHandle {
     /// The position this handle's event occupies in the source queue.
     /// Test-only accessor — no production caller needs it today (the
     /// queue consumer reads `position` off the resolved
-    /// `(AckPosition, AckDisposition)` tuple instead). Re-add
-    /// `#[allow(dead_code)] pub` if a real caller shows up; until then
-    /// keeping it `#[cfg(test)]` avoids carrying unreachable public
-    /// API surface.
-    #[cfg(test)]
+    /// `(AckPosition, AckDisposition)` tuple instead). Now exposed
+    /// crate-wide for the Branch B C3 DLQ-outcome dispatcher —
+    /// `resolve_ack_from_dlq_outcome` (in `crates/limpid/src/modules/mod.rs`)
+    /// consults the queue kind to decide between `resolve_recovered`
+    /// (memory) and `resolve_dropped` (disk wedge) on a Dropped
+    /// route outcome.
     pub fn position(&self) -> AckPosition {
         self.position
     }

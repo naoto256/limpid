@@ -497,15 +497,16 @@ impl Output for KafkaOutput {
                         "output '{}': write attempt abandoned on shutdown (pre-send)",
                         self.name
                     );
-                    crate::modules::route_event_to_dlq(
+                    let __dlq_outcome = crate::modules::route_event_to_dlq(
                         self.error_log.as_ref(),
+                        &self.metrics,
                         &self.name,
                         event,
                         &reason,
                     )
                     .await;
                     self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-                    ack.resolve_recovered();
+                    crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome);
                     return Ok(());
                 }
             };
@@ -520,15 +521,16 @@ impl Output for KafkaOutput {
                         "output '{}': write attempt abandoned on shutdown (pre-send)",
                         self.name
                     );
-                    crate::modules::route_event_to_dlq(
+                    let __dlq_outcome = crate::modules::route_event_to_dlq(
                         self.error_log.as_ref(),
+                        &self.metrics,
                         &self.name,
                         event,
                         &reason,
                     )
                     .await;
                     self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-                    ack.resolve_recovered();
+                    crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome);
                     return Ok(());
                 }
                 Err(e) => {
@@ -537,15 +539,16 @@ impl Output for KafkaOutput {
                     if attempt >= self.retry.max_attempts {
                         let reason =
                             format!("output write failed after {} attempts: {}", attempt, e);
-                        crate::modules::route_event_to_dlq(
+                        let __dlq_outcome = crate::modules::route_event_to_dlq(
                             self.error_log.as_ref(),
+                            &self.metrics,
                             &self.name,
                             event,
                             &reason,
                         )
                         .await;
                         self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-                        ack.resolve_recovered();
+                        crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome);
                         return Ok(());
                     }
                     tracing::warn!(
@@ -569,15 +572,16 @@ impl Output for KafkaOutput {
                              after {} attempts: {}",
                             attempt, e
                         );
-                        crate::modules::route_event_to_dlq(
+                        let __dlq_outcome = crate::modules::route_event_to_dlq(
                             self.error_log.as_ref(),
+                            &self.metrics,
                             &self.name,
                             event,
                             &reason,
                         )
                         .await;
                         self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-                        ack.resolve_recovered();
+                        crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome);
                         return Ok(());
                     }
                     wait = self.retry.next_wait(wait);
