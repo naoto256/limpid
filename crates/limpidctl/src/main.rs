@@ -524,15 +524,43 @@ fn format_stats(json: &str) {
             println!("\nOutputs:");
             for name in &names {
                 let m = &outputs[*name];
-                println!(
-                    "  {:<24} {:>8} received  {:>8} injected  {:>8} written  {:>8} failed  {:>8} retries",
-                    name,
-                    get(m, "events_received"),
-                    get(m, "events_injected"),
-                    get(m, "events_written"),
-                    get(m, "events_failed"),
-                    get(m, "retries"),
-                );
+                let wedged = get(m, "events_wedged");
+                let unwritable = get(m, "events_errored_unwritable");
+                // Same shape as the pipelines row above: the alarm
+                // columns (`wedged`, `errored_unwritable`) only print
+                // when non-zero. Zero-across-all-outputs would just be
+                // visual noise on a steady-state row.
+                if wedged == 0 && unwritable == 0 {
+                    println!(
+                        "  {:<24} {:>8} received  {:>8} injected  {:>8} written  {:>8} failed  {:>8} retries",
+                        name,
+                        get(m, "events_received"),
+                        get(m, "events_injected"),
+                        get(m, "events_written"),
+                        get(m, "events_failed"),
+                        get(m, "retries"),
+                    );
+                } else {
+                    println!(
+                        "  {:<24} {:>8} received  {:>8} injected  {:>8} written  {:>8} failed  {:>8} retries{}{}",
+                        name,
+                        get(m, "events_received"),
+                        get(m, "events_injected"),
+                        get(m, "events_written"),
+                        get(m, "events_failed"),
+                        get(m, "retries"),
+                        if wedged > 0 {
+                            format!("  {:>8} wedged", wedged)
+                        } else {
+                            String::new()
+                        },
+                        if unwritable > 0 {
+                            format!("  {:>8} errored_unwritable", unwritable)
+                        } else {
+                            String::new()
+                        },
+                    );
+                }
             }
         }
     }
