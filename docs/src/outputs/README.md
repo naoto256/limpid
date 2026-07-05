@@ -41,7 +41,7 @@ def output reliable {
 }
 ```
 
-`retry` is accepted by every output type. Retry-exhausted payloads are persisted to `control { error_log "..." }` (see [Recovery (error_log)](#recovery-error_log) below) when configured; otherwise they are dropped with a `tracing::warn!` and an `events_failed` counter increment.
+`retry` is accepted by every output type. Retry-exhausted payloads are persisted to `control { error_log "..." }` (see [Recovery (error_log)](#recovery-error_log) below) when configured. When `error_log` is unset, the payload is emitted as a `tracing::error!` line carrying the full JSONL in an `event_record` structured field (so `journalctl | jq` can still extract and replay it) and the event resolves as `Recovered` — `events_failed` counts every terminal failure once, disk vs memory queue agnostic, via `resolve_ack_from_dlq_outcome`.
 
 ### Disposition contract
 

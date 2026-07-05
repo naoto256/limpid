@@ -424,15 +424,12 @@ This is useful for confirming the JSONL shape, the `kind` / per-kind name discri
 
 ## When the DLQ write itself fails
 
-`events_errored_unwritable` counts the cases where the daemon raised an error trying to write a **runtime-side** DLQ record to the configured `error_log` file (disk full, permissions, NFS hiccup, rotation race). The runtime-side path covers both Process-flavor records (process body raised / explicit `error <expr>`) and the output-enqueue subset of Output-flavor records — both routed through `runtime::write_errored_to_dlq`. The runtime falls back to `tracing::error!` with the full JSONL record on the standard log channel so the data is still preserved — but this is alarm-level: a non-zero counter means the replay path may be incomplete, and the next failure may not have a corresponding line in the file.
+`events_errored_unwritable` counts the cases where the daemon raised an error trying to write a DLQ record to the configured `error_log` file (disk full, permissions, NFS hiccup, rotation race). The counter is split across two labels that share the metric name; both must be watched:
 
-> **Scope gap.** Sink-side Output-flavor DLQ write failures (retry
-> exhaustion or shutdown drain routed via `route_event_to_dlq` in
-> `modules/mod.rs`) currently emit a `tracing::warn` but do **not**
-> bump `events_errored_unwritable`. Operators monitoring this counter
-> should also alert on `error_log`-write `warn` lines from outputs to
-> catch sink-side DLQ failures. Closing this gap is queued for a later
-> release.
+- **Pipeline-side** (`limpid_pipeline_events_errored_unwritable_total{pipeline=...}`) — the Process-flavor path and the output-enqueue subset of Output-flavor records failed to land in `error_log`. Both routed through `runtime::write_errored_to_dlq`.
+- **Output-side** (`limpid_output_events_errored_unwritable_total{output=...}`) — a sink-side Output-flavor DLQ write (retry exhaustion, shutdown drain, batched render failure, partial-success reject) failed to land in `error_log`. Routed through `modules::route_event_to_dlq`, which bumps the per-output counter and returns `Dropped`; on a disk queue that triggers the [fail-stop wedge](../outputs/README.md#disposition-contract) — the wedge holds the cursor for a replay on next daemon start rather than silently advancing past a DLQ-failed event.
+
+In both cases the daemon falls back to `tracing::error!` with the full JSONL record on the standard log channel so the data is still preserved off the DLQ file — but this is alarm-level: a non-zero counter on either label means the replay path may be incomplete, and the next failure may not have a corresponding line in the file.
 
 Investigate immediately:
 

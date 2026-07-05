@@ -17,7 +17,12 @@ limpid tracks metrics at every level of the pipeline. Each component counts its 
 
 **`events_errored`** is the pipeline-side rollup of every event that ended in a Process flavor DLQ record (process body raised, pipeline-skeleton eval failed, explicit `error <expr>`) plus runtime-side output enqueue failures. Sink-side terminal failures (retry exhausted, shutdown drain, batched render failure, OTLP partial-success rejects) are counted separately under the per-output `events_failed`. The original event is preserved in the [error log](./error-log.md) for replay — `jq -c 'select(.kind == "process") | .event' /var/log/limpid/errored.jsonl | limpidctl inject input <name> --json` for Process records, `jq -c 'select(.kind == "output") | .event' ... | limpidctl inject output <name> --json` for Output records (see [Error Log → Replay](./error-log.md#replay)).
 
-**`events_errored_unwritable`** is alarm-level — non-zero means **runtime-side** DLQ writes (Process-flavor records *and* the output-enqueue subset of Output-flavor records, both routed via `runtime::write_errored_to_dlq`) fell back to the `tracing::error!` channel because the configured `error_log` file couldn't be written (disk full, permissions, rotation race). Note the scope gap: **sink-side** Output-flavor DLQ write failures (retry exhaustion / shutdown drain routed via `modules::route_event_to_dlq`) currently emit a `tracing::warn` but do **not** bump this counter — do not rely on it for sink-side recovery coverage. Investigate the runtime-side cause before assuming replay coverage is complete; see [Error Log → When the DLQ write itself fails](./error-log.md#when-the-dlq-write-itself-fails).
+**`events_errored_unwritable`** is alarm-level — non-zero means a DLQ write to the configured `error_log` file fell back to the `tracing::error!` channel (disk full, permissions, rotation race). The counter is emitted under two labels that share the metric name and both need to be watched:
+
+- **Pipeline-side** (`limpid_pipeline_events_errored_unwritable_total{pipeline=...}`) — Process-flavor records and the output-enqueue subset of Output-flavor records, both routed through `runtime::write_errored_to_dlq`.
+- **Output-side** (`limpid_output_events_errored_unwritable_total{output=...}`) — sink-side Output-flavor DLQ writes (retry exhaustion, shutdown drain, batched render failure, partial-success reject) routed through `modules::route_event_to_dlq`. On a disk queue a sink-side DLQ-write failure also triggers the fail-stop wedge (see `events_wedged` below and the [Outputs disposition contract](../outputs/README.md#disposition-contract)) so the cursor holds for replay on next daemon start.
+
+Investigate the underlying cause before assuming replay coverage is complete; see [Error Log → When the DLQ write itself fails](./error-log.md#when-the-dlq-write-itself-fails).
 
 ## Input metrics
 
@@ -38,6 +43,8 @@ The split between `received` and `injected` keeps "real" traffic distinguishable
 | `written` | Events successfully written to the destination |
 | `failed` | Events whose final state on this output was a terminal failure. Includes retry-budget exhaustion, per-event render failures on batched outputs' `flush()`, shutdown-drain leftovers when the final flush fails, and — for the OTLP outputs (`otlp_grpc` / `otlp_http`) — the receiver's `partial_success.rejected_log_records`, which are events the server *accepted at the transport layer* but refused at the validation layer (dropped per the [`partial_success` policy](../otlp.md#56-retry-transport-level-only)). |
 | `retries` | Total retry attempts across all events |
+| `wedged` | Disk-queue fail-stop wedges observed by this output — alarm-level. Non-zero means the consumer stopped accepting new events on this output and will replay from the wedged cursor on next daemon start (see [Outputs disposition contract](../outputs/README.md#disposition-contract)). Only printed by `limpidctl stats` when non-zero. |
+| `errored_unwritable` | Sink-side counterpart of the pipeline-side `events_errored_unwritable` — alarm-level. Non-zero means a `route_event_to_dlq` write to `error_log` failed for this output; investigate DLQ file health. Only printed by `limpidctl stats` when non-zero. |
 
 `received - injected` = events delivered via pipelines. `received - written - failed` ≈ events pending in the queue (useful for disk queues).
 
@@ -83,6 +90,8 @@ Exposed metrics:
 | `limpid_output_events_written_total` | counter | `output` |
 | `limpid_output_events_failed_total` | counter | `output` |
 | `limpid_output_retries_total` | counter | `output` |
+| `limpid_output_events_wedged_total` | counter | `output` |
+| `limpid_output_events_errored_unwritable_total` | counter | `output` |
 
 limpid itself has no Prometheus dependency — the format conversion is entirely `limpid-prometheus`'s job.
 
