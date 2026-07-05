@@ -268,12 +268,27 @@ impl ErrorLogWriter {
     ///   fix (remove or `chmod` the file, remove the wrong node)
     ///   happens before any events flow.
     ///
-    /// The file itself does not need to exist; the runtime write
-    /// path materialises it on the first failure with `mode(0o600)`.
+    /// The file itself does not need to exist. If it is absent,
+    /// the preflight materialises it eagerly: `create_new` +
+    /// `O_NOFOLLOW` + `mode(0o600)`, followed by `fchmod(0o600)`
+    /// and an `fstat` re-verify on the fresh fd so a hostile
+    /// umask (which would otherwise mask the `open(2)` mode
+    /// argument) can't leave the file at anything but `0o600`.
+    /// The resulting empty 0o600 file matches what the runtime
+    /// would have produced on the first real failure.
+    ///
+    /// If the file already exists, the preflight opens it with
+    /// `O_WRONLY|O_APPEND|O_NOFOLLOW|O_NONBLOCK` and `fstat`s the
+    /// opened fd to re-check the S_ISREG + `0o600` contract —
+    /// closing the TOCTOU gap between the earlier
+    /// `symlink_metadata` and the `open(2)`.
+    ///
     /// This function is called only from the daemon startup path
-    /// (`Runtime::start`), not from `--check` — configuration
-    /// validation must not touch the filesystem beyond the read-only
-    /// stat performed here.
+    /// (`Runtime::start`), never from `--check`. Configuration
+    /// validation must not touch the filesystem beyond a
+    /// read-only stat; the eager create on the absent-file path
+    /// makes this preflight write-side and is deliberately gated
+    /// on daemon startup.
     pub async fn validate_at_startup(&self) -> Result<()> {
         let parent = self.path.parent().ok_or_else(|| {
             anyhow::anyhow!(
