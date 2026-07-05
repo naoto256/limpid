@@ -35,11 +35,21 @@ FIFO won't silently drain events into whatever is on the other end.
 **Permissions contract.** When any of `mode` / `owner` / `group` is
 configured, the output enforces the following on every write:
 
-- **File newly created by this output:** the configured `mode` /
-  `owner` / `group` is applied via `fchmod(2)` / `fchown(2)` on the
-  open fd *before* any payload bytes hit disk. If the apply fails
-  (e.g. an unresolvable owner name, `EPERM` on `fchown`), the write
-  is refused and no payload bytes are written.
+- **File newly created by this output:** the inode is born
+  owner-only (`0o600`) at `open(2)` time whenever an `owner` or
+  `group` is configured, then `fchown(2)` sets the configured
+  owner / group, and finally `fchmod(2)` narrows or widens to the
+  configured `mode`. The order matters: birthing the inode
+  directly at a wider mode (e.g. `0o640` with `group adm`) would
+  leave a window of a few microseconds between `open(2)` and
+  `fchown(2)` where the file is group-readable to the daemon's own
+  primary group — on a shared host that window is a real
+  co-tenant read. Only when `mode` is configured *without* any
+  owner / group change is the file born directly at the target
+  mode (there is no ownership window to protect). If any of the
+  three syscalls fails (e.g. an unresolvable owner name, `EPERM`
+  on `fchown`), the write is refused and no payload bytes are
+  written.
 - **File already exists on disk:** the on-disk mode / owner / group
   is compared via `fstat(2)` against the configured values. On
   mismatch the write is refused with a diagnostic that names both

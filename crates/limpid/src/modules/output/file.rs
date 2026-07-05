@@ -437,10 +437,41 @@ impl FileOutput {
         // O_NOFOLLOW so a symlink at the path is refused with ELOOP).
         let requires_metadata = self.requires_metadata();
 
+        // Birth mode for the fresh-create branch.
+        //
+        // - No metadata contract (`mode`/`owner`/`group` all unset):
+        //   we don't touch the mode at all. The file inherits the
+        //   process umask / default owner; that is the operator's
+        //   opt-out.
+        // - Metadata contract with only `mode` configured (no owner
+        //   / group change): birth directly at the configured mode.
+        //   There is no ownership window to protect and one syscall
+        //   is enough.
+        // - Metadata contract with `owner` and/or `group` set: birth
+        //   at `0o600` (owner-only) regardless of the configured
+        //   mode. `apply_file_metadata_to_fd` then `fchown`s to the
+        //   configured owner / group and, only after ownership is
+        //   correct, `fchmod`s to the configured mode. This closes
+        //   the window a broader initial mode would open: with
+        //   `mode=0o640, group=adm`, birthing at 0o640 makes the
+        //   inode group-readable to the daemon's own primary group
+        //   for the microseconds between `open(2)` and `fchown(2)`,
+        //   which on shared hosts can be a real co-tenant.
+        let birth_mode: Option<u32> = match (self.mode, self.owner.as_ref(), self.group.as_ref()) {
+            (None, None, None) => None,
+            (_, Some(_), _) | (_, _, Some(_)) => Some(0o600),
+            (Some(m), None, None) => Some(m),
+        };
+
         let mut create_options = OpenOptions::new();
         create_options.write(true).create_new(true).append(true);
         #[cfg(unix)]
-        create_options.custom_flags(libc::O_NOFOLLOW);
+        {
+            create_options.custom_flags(libc::O_NOFOLLOW);
+            if let Some(m) = birth_mode {
+                create_options.mode(m);
+            }
+        }
         let create_res = create_options.open(&path).await;
 
         let mut file = match create_res {
@@ -737,14 +768,20 @@ impl FileOutput {
 
         tokio::task::spawn_blocking(move || -> Result<()> {
             let fd = owned_fd.as_raw_fd();
-            if let Some(mode) = mode {
-                let rc = unsafe { libc::fchmod(fd, mode as libc::mode_t) };
-                if rc != 0 {
-                    let err = std::io::Error::last_os_error();
-                    anyhow::bail!("output file '{}': fchmod failed: {}", path.display(), err);
-                }
-            }
-
+            // Order: fchown first, then fchmod. Reversing this leaves
+            // a "mode already loosened but ownership still daemon
+            // user" window: with `mode=0640, group=adm`, an fchmod
+            // that ran before fchown would make the inode
+            // group-readable to the daemon's own group *before* the
+            // group ownership moved to `adm`. On multi-tenant hosts
+            // that window lets an unrelated co-tenant in the daemon
+            // group snapshot bytes the operator never intended them
+            // to see. The initial birth mode (set at `open(2)` time
+            // by the caller) is `0o600` when an owner/group is
+            // configured, so before this closure runs the inode is
+            // owner-only and no co-tenant can see anything; running
+            // fchown first keeps that invariant, and fchmod at the
+            // end narrows / widens only after ownership is correct.
             if owner.is_some() || group.is_some() {
                 let uid = match owner.as_deref() {
                     Some(name) => Some(resolve_uid(name).with_context(|| {
@@ -777,6 +814,14 @@ impl FileOutput {
                 if rc != 0 {
                     let err = std::io::Error::last_os_error();
                     anyhow::bail!("output file '{}': fchown failed: {}", path.display(), err);
+                }
+            }
+
+            if let Some(mode) = mode {
+                let rc = unsafe { libc::fchmod(fd, mode as libc::mode_t) };
+                if rc != 0 {
+                    let err = std::io::Error::last_os_error();
+                    anyhow::bail!("output file '{}': fchmod failed: {}", path.display(), err);
                 }
             }
             // `owned_fd` drops here at end-of-closure, so `close(2)`
@@ -1867,6 +1912,53 @@ mod tests {
             std::fs::metadata(&path).unwrap().len(),
             0,
             "payload must not have been written when metadata apply failed"
+        );
+    }
+
+    /// The output birth-mode contract exists to close a specific
+    /// window: with a metadata contract like `mode 0640, group adm`,
+    /// birthing the inode directly at `0o640` makes it
+    /// group-readable to the daemon's own primary group for the
+    /// microseconds between `open(2)` and `fchown(2)`. On a shared
+    /// host that window is a real co-tenant read. Birth mode must
+    /// be `0o600` (owner-only) whenever an owner or group is
+    /// configured, regardless of the final target mode.
+    ///
+    /// This test drives the failure path so we can observe the
+    /// birth mode without a race: `apply_file_metadata_to_fd` bails
+    /// at owner resolution before any `fchown` / `fchmod` runs, so
+    /// the on-disk file's mode is exactly what `open(2)` produced.
+    /// A regression that birthed at the configured mode instead
+    /// would leave a `0o640` file here.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn fresh_create_births_at_0o600_when_owner_or_group_configured() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("birth_mode.log");
+
+        // Configured `mode = 0o640` with an owner set — the birth
+        // mode must ignore 0o640 and use 0o600.
+        let out = make_output_with_metadata(
+            ek(ExprKind::StringLit(path.display().to_string())),
+            Some(0o640),
+            Some("bad\0owner".into()),
+            None,
+        );
+
+        let _err = out
+            .write_payload(FilePayload {
+                egress: Bytes::from("payload"),
+                path: path.display().to_string(),
+                is_dynamic: false,
+            })
+            .await
+            .expect_err("apply must fail on unresolvable owner");
+
+        let actual = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            actual, 0o600,
+            "birth mode must be 0o600 (owner-only) when owner/group is configured, got 0o{actual:o}",
         );
     }
 
