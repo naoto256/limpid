@@ -680,8 +680,6 @@ pub async fn run_queue_consumer(
     error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    use std::sync::atomic::Ordering;
-
     let name = Arc::clone(&receiver.name);
     info!("output '{}': queue consumer started", name);
     let (ack_tx, mut ack_rx) =
@@ -754,41 +752,40 @@ pub async fn run_queue_consumer(
                 // fail-stop wedge. `receiver.ack_to` would advance
                 // the cursor past a position we cannot honestly
                 // confirm — silently losing the event on a
-                // durable queue. Instead we hold the cursor (skip
-                // the `ack_to` call so `in_flight_positions`
-                // keeps its unacked front) and stop accepting new
-                // events: further `consume` calls on a bug-path
-                // output would just accumulate more doomed
-                // handles behind the front. Operator intervention
-                // (fix the bug / restart the daemon so the disk
-                // queue replays from the wedge point) is the
-                // recovery contract. Memory queues cannot replay
-                // on restart, so wedging would only cause loss
-                // without a recovery path — they keep the
-                // pre-fail-stop continue-and-count behavior.
-                let is_disk_position = matches!(position, AckPosition::Disk { .. });
-                let should_wedge = matches!(disposition, AckDisposition::Dropped)
-                    && is_disk_position
-                    && !wedged;
-                if should_wedge {
-                    wedged = true;
+                // durable queue. On the first Dropped-on-disk we
+                // record the wedge transition (helper: log +
+                // `events_wedged++`, guarded so subsequent Dropped
+                // dispositions after the wedge do not re-emit),
+                // stop accepting new events (further `consume`
+                // calls on a bug-path output would just
+                // accumulate more doomed handles behind the
+                // wedged front), and skip `ack_to` so the
+                // disk-side in-flight bookkeeping keeps the
+                // wedged position at the front, blocking the
+                // cursor from advancing past it until replay.
+                // Subsequent Dropped dispositions after the wedge
+                // are drained through the normal `ack_to` path
+                // for their positions — the wedged front already
+                // holds the cursor.
+                // Operator intervention (fix the bug / restart
+                // the daemon so the disk queue replays from the
+                // wedge point) is the recovery contract. Memory
+                // queues cannot replay on restart, so wedging
+                // would only cause loss without a recovery path
+                // — they keep the continue-and-count behavior.
+                let was_wedged = wedged;
+                record_wedge_transition_if_first(
+                    position,
+                    disposition,
+                    &mut wedged,
+                    &name,
+                    &metrics,
+                );
+                if !was_wedged && wedged {
                     accepting = false;
-                    metrics.events_wedged.fetch_add(1, Ordering::Relaxed);
-                    tracing::error!(
-                        "output '{}': disk queue wedged after AckDisposition::Dropped at \
-                         position {:?} — the consumer will drain in-flight events and stop \
-                         accepting new ones. Fix the underlying bug / DLQ-write failure and \
-                         restart the daemon so the disk queue replays from the wedge point. \
-                         See docs/src/operations/error-log.md for the manual intervention \
-                         runbook.",
-                        name,
-                        position,
-                    );
-                    // Deliberately do NOT call `receiver.ack_to`
-                    // for this position — the disk-side
-                    // in-flight bookkeeping keeps the wedged
-                    // position at the front, blocking the cursor
-                    // from advancing past it until replay.
+                    // Skip ack_to on this position — the wedge
+                    // was just recorded and its position must
+                    // stay at the in-flight front.
                 } else {
                     receiver.ack_to(position);
                 }
@@ -881,11 +878,23 @@ pub async fn run_queue_consumer(
     drop(ack_tx);
     while let Some((position, disposition)) = ack_rx.recv().await {
         handle_ack_disposition(disposition, &name, &metrics);
-        // Wedge held the cursor; subsequent ack drain still
-        // advances via `ack_to` on delivered / recovered
-        // positions, but a `Dropped` on the disk backend keeps
-        // holding. Follow the same distinction as the steady-state
-        // arm above.
+        // Wedge held the cursor when it fired in the steady-state
+        // arm above; subsequent ack drain still advances via
+        // `ack_to` on delivered / recovered positions but keeps
+        // holding on Dropped-on-disk. If the FIRST Dropped-on-disk
+        // arrives here (never happened in steady-state — e.g. the
+        // wedge originates from the post-loop `writer.shutdown()`
+        // drain), the helper records the wedge transition once so
+        // the operator alarm (`events_wedged` + wedge log line)
+        // still fires. `accepting` is not touched — the loop above
+        // has already exited its accept phase.
+        record_wedge_transition_if_first(
+            position,
+            disposition,
+            &mut wedged,
+            &name,
+            &metrics,
+        );
         let is_disk_position = matches!(position, AckPosition::Disk { .. });
         let is_dropped_on_disk = matches!(disposition, AckDisposition::Dropped) && is_disk_position;
         if !is_dropped_on_disk {
@@ -970,6 +979,135 @@ fn handle_ack_disposition(
             );
             metrics.events_failed.fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+/// Record the fail-stop wedge transition on the first Dropped
+/// disposition observed on a disk-backed position. Idempotent: the
+/// `wedged` flag guards against re-recording on subsequent Dropped
+/// dispositions after the wedge already fired. Non-disk positions and
+/// non-Dropped dispositions are no-ops.
+///
+/// The wedge log line and the `events_wedged` counter bump are the
+/// operator-facing signal that a disk queue has stopped accepting
+/// new events and will replay from the wedged cursor on next
+/// daemon start.
+///
+/// Callers are responsible for the cursor decision (whether to skip
+/// `receiver.ack_to`) and, in the steady-state select arm, for
+/// stopping acceptance (`accepting = false`). Those decisions are
+/// outside the wedge-recording contract because their reachability
+/// differs per call site — the post-loop ack drain has no
+/// `accepting` state to mutate and always holds the cursor on
+/// Dropped-on-disk.
+fn record_wedge_transition_if_first(
+    position: AckPosition,
+    disposition: AckDisposition,
+    wedged: &mut bool,
+    name: &str,
+    metrics: &crate::metrics::OutputMetrics,
+) {
+    use std::sync::atomic::Ordering;
+    let is_disk_position = matches!(position, AckPosition::Disk { .. });
+    let is_dropped_on_disk = matches!(disposition, AckDisposition::Dropped) && is_disk_position;
+    if is_dropped_on_disk && !*wedged {
+        *wedged = true;
+        metrics.events_wedged.fetch_add(1, Ordering::Relaxed);
+        tracing::error!(
+            "output '{}': disk queue wedged after AckDisposition::Dropped at position {:?} — \
+             the consumer will drain in-flight events and stop accepting new ones. Fix the \
+             underlying bug / DLQ-write failure and restart the daemon so the disk queue \
+             replays from the wedge point. See docs/src/operations/error-log.md for the \
+             manual intervention runbook.",
+            name,
+            position,
+        );
+    }
+}
+
+#[cfg(test)]
+mod wedge_transition_helper_tests {
+    use super::*;
+    use crate::metrics::OutputMetrics;
+    use std::sync::atomic::Ordering;
+
+    fn disk_pos(seq: u64) -> AckPosition {
+        AckPosition::Disk { seq, offset: 0 }
+    }
+
+    #[test]
+    fn first_dropped_on_disk_sets_wedge_and_bumps() {
+        let mut wedged = false;
+        let metrics = OutputMetrics::default();
+        record_wedge_transition_if_first(
+            disk_pos(1),
+            AckDisposition::Dropped,
+            &mut wedged,
+            "test",
+            &metrics,
+        );
+        assert!(wedged);
+        assert_eq!(metrics.events_wedged.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn subsequent_dropped_on_disk_is_idempotent() {
+        let mut wedged = true;
+        let metrics = OutputMetrics::default();
+        record_wedge_transition_if_first(
+            disk_pos(2),
+            AckDisposition::Dropped,
+            &mut wedged,
+            "test",
+            &metrics,
+        );
+        assert!(wedged);
+        assert_eq!(metrics.events_wedged.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn dropped_on_memory_is_noop() {
+        let mut wedged = false;
+        let metrics = OutputMetrics::default();
+        record_wedge_transition_if_first(
+            AckPosition::Memory,
+            AckDisposition::Dropped,
+            &mut wedged,
+            "test",
+            &metrics,
+        );
+        assert!(!wedged);
+        assert_eq!(metrics.events_wedged.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn recovered_on_disk_is_noop() {
+        let mut wedged = false;
+        let metrics = OutputMetrics::default();
+        record_wedge_transition_if_first(
+            disk_pos(3),
+            AckDisposition::Recovered,
+            &mut wedged,
+            "test",
+            &metrics,
+        );
+        assert!(!wedged);
+        assert_eq!(metrics.events_wedged.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn delivered_on_disk_is_noop() {
+        let mut wedged = false;
+        let metrics = OutputMetrics::default();
+        record_wedge_transition_if_first(
+            disk_pos(4),
+            AckDisposition::Delivered,
+            &mut wedged,
+            "test",
+            &metrics,
+        );
+        assert!(!wedged);
+        assert_eq!(metrics.events_wedged.load(Ordering::Relaxed), 0);
     }
 }
 
