@@ -441,7 +441,7 @@ Investigate immediately:
 
 - Is the parent directory writable by the daemon user?
 - Is the disk full? (`df`)
-- Is a rotation tool deleting the file mid-write? (Switch the rotator to `copytruncate` or `nocreate`.)
+- Did rotation leave an incompatible node or mode/owner at the path? The DLQ writer opens a fresh fd per write (`create_new` + `fstat` verify), so rotation does not need a `SIGHUP` reload — but if the rotator recreated the file at a different mode (`0o644` instead of `0o600`) or owner, the fstat check refuses to append. Use `copytruncate` (which preserves the inode and its mode), or `create 0600 limpid limpid` matching the DLQ's runtime contract exactly. `nocreate` also works but leaves the runtime to materialise the file on the next failure, which pushes the deploy check onto the failure path.
 - Is the file path on a network filesystem with intermittent connectivity?
 
 Once the underlying issue is fixed, the next errored event lands in the file again and the counter stops increasing; existing records are unaffected.
