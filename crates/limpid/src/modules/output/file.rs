@@ -953,12 +953,18 @@ impl FileOutput {
                 let err = std::io::Error::last_os_error();
                 anyhow::bail!("output file '{}': fstat failed: {}", path.display(), err);
             }
-            if (stat.st_mode as u32 & libc::S_IFMT as u32) != libc::S_IFREG as u32 {
+            // `stat.st_mode` and `libc::S_IF*` are both `mode_t` on
+            // every target the crate builds for (u16 on macOS, u32
+            // on Linux). Compare them directly — an explicit cast to
+            // a fixed width is `unnecessary_cast` on the Linux
+            // toolchain and trips `-D warnings` in CI.
+            let ifmt = stat.st_mode & libc::S_IFMT;
+            if ifmt != libc::S_IFREG {
                 anyhow::bail!(
                     "output file '{}': existing path is not a regular file (st_mode & S_IFMT = \
                      0o{:o}); refusing to write. Remove the node or point `path` at a real file.",
                     path.display(),
-                    (stat.st_mode as u32) & libc::S_IFMT as u32
+                    ifmt
                 );
             }
             Ok(())
