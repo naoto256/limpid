@@ -606,9 +606,11 @@ mod tests {
     }
 
     /// Sticky bit + world-writable (`/tmp` at `0o1777`) is
-    /// **not** an escape hatch. Auditor sign-off: sticky
-    /// prevents non-owner unlink but not attacker-owned
-    /// replacement in a swap. `/tmp/foo.sock` is unsupported.
+    /// **not** an escape hatch: sticky prevents non-owner
+    /// unlink of files whose owner does not match, but a swap
+    /// attack plants an attacker-owned replacement node, so
+    /// sticky offers no protection here. `/tmp/foo.sock` is
+    /// unsupported for this input.
     #[test]
     #[cfg(unix)]
     fn parent_dir_mode_sticky_world_writable_is_unsafe() {

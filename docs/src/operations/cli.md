@@ -116,12 +116,12 @@ limpidctl health --json
 
 ### Control socket parent safety
 
-The control socket is a root-equivalent trust boundary, and its `bind → chmod 0o660` window relies on the parent directory keeping non-group traffic out. Daemon startup **refuses to start** when the configured `control { socket "..." }`'s parent already exists on disk and is group-writable, world-writable, or world-traversable (predicate `mode & 0o023 != 0`). Under packaged systemd units (`RuntimeDirectory=limpid` with `RuntimeDirectoryMode=0750`) the parent is already safe by construction and this check is a no-op.
+The control socket is a root-equivalent trust boundary, and its `bind → chmod 0o660` window relies on the parent directory keeping non-group traffic out. Daemon startup **refuses to start** when the configured `control { socket "..." }`'s parent already exists on disk and is group-writable, world-writable, or world-traversable (predicate `mode & 0o023 != 0`). Under packaged systemd units (`RuntimeDirectory=limpid` with `RuntimeDirectoryMode=0750` explicitly set in the unit file) the parent is already safe by construction and this check is a no-op.
 
 For custom deploys, tighten the parent to `0o750` (or `0o700` for owner-only) before starting the daemon:
 
 ```sh
-chmod 0o750 /path/to/parent   # daemon user + group only
+chmod 0750 /path/to/parent   # daemon user + group only
 ```
 
 The failure diagnostic names the observed mode and remediation. If the parent does not exist yet, the control task creates it at `0o750` — no operator action needed.

@@ -1151,7 +1151,7 @@ mod tests {
     #[cfg(unix)]
     fn ensure_socket_parent_dir_preserves_unsafe_preexisting_mode() {
         // `ensure_socket_parent_dir` is creation-only under the
-        // Branch C fail-closed contract: `validate_control_socket_parent`
+        // startup fail-closed contract: `validate_control_socket_parent`
         // is authoritative for pre-existing parents and runs
         // ahead of this function on the daemon startup path. If
         // control still reaches `ensure_socket_parent_dir` with
