@@ -728,13 +728,20 @@ pub async fn run_queue_consumer(
                         // only and let the post-loop `writer.shutdown()`
                         // drain bounded. See `Output::consume_shutdown`.
                         if let Err(e) = writer.consume_shutdown(&event, handle).await {
+                            // Bug path: `consume_shutdown` returned
+                            // Err without taking ownership of the
+                            // handle. The handle's Drop impl fires
+                            // `Dropped` through the ack channel, and
+                            // `handle_ack_disposition(Dropped)` is
+                            // the single site that bumps
+                            // `events_failed` for bug-path drops —
+                            // do NOT bump here as well.
                             tracing::error!(
                                 "output '{}': consume_shutdown returned Err during drain: {} \
                                  (bug — disposition signalled via handle)",
                                 name,
                                 e
                             );
-                            metrics.events_failed.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     break;
@@ -813,15 +820,17 @@ pub async fn run_queue_consumer(
                             // ack-handle contract that signals a bug
                             // (the output failed to take ownership of
                             // the lifecycle). The handle's Drop impl
-                            // fires `Dropped` via the channel; we just
-                            // log so operators can investigate.
+                            // fires `Dropped` via the channel, and
+                            // `handle_ack_disposition(Dropped)` is the
+                            // single site that bumps `events_failed`
+                            // for bug-path drops — do NOT bump here
+                            // as well (double count).
                             tracing::error!(
                                 "output '{}': consume returned Err: {} \
                                  (bug — disposition signalled via handle)",
                                 name,
                                 e
                             );
-                            metrics.events_failed.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     None => {
@@ -917,9 +926,11 @@ fn handle_ack_disposition(
             // when 0.8 lands.
         }
         AckDisposition::Recovered => {
-            // The output bumped `events_failed` on the recovery path
-            // (retry exhausted / render error / shutdown leftover).
-            // Same rationale as `Delivered`.
+            // `events_failed` for the Recovered path is bumped by
+            // `resolve_ack_from_dlq_outcome` when it commits the
+            // recovery disposition. Nothing to do here — kept
+            // explicit so the per-disposition metrics breakdown has
+            // an obvious hook when 0.8 lands.
         }
         AckDisposition::Dropped => {
             // Dropped reaches this arm from two shapes:
@@ -932,17 +943,24 @@ fn handle_ack_disposition(
             //   `QueueAckHandle::drop`).
             // - **Intentional path**: `resolve_dropped()` was
             //   called explicitly — currently the only in-daemon
-            //   caller is `route_event_to_dlq` on a DLQ-write
-            //   failure, dispatched via
-            //   `resolve_ack_from_dlq_outcome` for disk-backed
-            //   queues so the fail-stop wedge holds the cursor
-            //   for replay.
+            //   caller is `resolve_ack_from_dlq_outcome` on a
+            //   disk-backed queue whose DLQ-write failure was
+            //   just observed, so the fail-stop wedge holds the
+            //   cursor for replay.
             //
-            // The two are indistinguishable at this level, so
-            // the log line names both possibilities. Operators
-            // reading this should cross-reference
-            // `events_errored_unwritable` (bumped on the
-            // DLQ-write failure path) and the daemon's
+            // Both shapes count exactly once here: this is the
+            // single site that bumps `events_failed` for a
+            // Dropped disposition. Callers that observe a bug
+            // (`consume` / `consume_shutdown` returning `Err`)
+            // must NOT bump `events_failed` themselves — the
+            // handle's Drop will route through here and the
+            // aggregate would double-count otherwise.
+            // Callers that produce an intentional Dropped via
+            // `resolve_ack_from_dlq_outcome` on a disk queue also
+            // must NOT bump — the helper delegates the count to
+            // this arm on purpose. Operators reading this should
+            // cross-reference `events_errored_unwritable` (bumped
+            // on the DLQ-write failure path) and the daemon's
             // `panicked at` lines (bug path).
             tracing::error!(
                 "output '{}': event dropped — no explicit disposition (bug) or intentional \

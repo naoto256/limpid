@@ -148,9 +148,7 @@ impl Output for SyslogUdpOutput {
                         event,
                         &reason,
                     )
-                    .await;
-                    self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-                    crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome);
+                    .await;                    crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
                     return Ok(());
                 }
             };
@@ -172,9 +170,7 @@ impl Output for SyslogUdpOutput {
                             event,
                             &reason,
                         )
-                        .await;
-                        self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-                        crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome);
+                        .await;                        crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
                         return Ok(());
                     }
                     tracing::warn!(
@@ -205,9 +201,7 @@ impl Output for SyslogUdpOutput {
                             event,
                             &reason,
                         )
-                        .await;
-                        self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-                        crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome);
+                        .await;                        crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
                         return Ok(());
                     }
                     wait = self.retry.next_wait(wait);
@@ -238,9 +232,7 @@ impl Output for SyslogUdpOutput {
                     event,
                     &reason,
                 )
-                .await;
-                self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-                crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome);
+                .await;                crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
             }
             Err(_) => {
                 let reason = format!(
@@ -254,9 +246,7 @@ impl Output for SyslogUdpOutput {
                     event,
                     &reason,
                 )
-                .await;
-                self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
-                crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome);
+                .await;                crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
             }
         }
         Ok(())
