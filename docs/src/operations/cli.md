@@ -114,6 +114,20 @@ limpidctl health --json
 |------|-------------|
 | `--socket <path>` | Control socket path (default: `/var/run/limpid/control.sock`) |
 
+### Control socket parent safety
+
+The control socket is a root-equivalent trust boundary, and its `bind → chmod 0o660` window relies on the parent directory keeping non-group traffic out. Daemon startup **refuses to start** when the configured `control { socket "..." }`'s parent already exists on disk and is group-writable, world-writable, or world-traversable (predicate `mode & 0o023 != 0`). Under packaged systemd units (`RuntimeDirectory=limpid` with `RuntimeDirectoryMode=0750`) the parent is already safe by construction and this check is a no-op.
+
+For custom deploys, tighten the parent to `0o750` (or `0o700` for owner-only) before starting the daemon:
+
+```sh
+chmod 0o750 /path/to/parent   # daemon user + group only
+```
+
+The failure diagnostic names the observed mode and remediation. If the parent does not exist yet, the control task creates it at `0o750` — no operator action needed.
+
+At shutdown, the control task records the `(dev, ino)` of the socket it bound and refuses to unlink the path if the on-disk inode has been swapped since bind. Under the safe-parent contract above no outside-the-group writer can produce the swap; this is defense-in-depth, not the load-bearing guard.
+
 ### Control socket limits
 
 The control socket is a local root-equivalent trust boundary (mode `0o660` in

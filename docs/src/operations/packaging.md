@@ -82,7 +82,7 @@ ReadWritePaths=/var/log/limpid
 
 - `CAP_NET_BIND_SERVICE` allows binding to privileged ports (514) without root
 - `ProtectSystem=strict` makes the filesystem read-only except for explicitly allowed paths
-- `RuntimeDirectory=limpid` ensures `/var/run/limpid/` exists for the control socket
+- `RuntimeDirectory=limpid` ensures `/var/run/limpid/` exists for the control socket. Pair with `RuntimeDirectoryMode=0750` (systemd's default): daemon startup refuses to run when the control socket's parent is group- or world-writable, so a laxer mode would fail-close and break the unit
 - `ExecReload=/bin/kill -HUP $MAINPID` triggers hot reload via SIGHUP
 - `StateDirectory=limpid` and `RuntimeDirectory=limpid` provide `/var/lib/limpid` and `/var/run/limpid` writable; `ReadWritePaths=/var/log/limpid` covers the log directory. Operators using the `file` output to write elsewhere add a drop-in with the extra path.
 - `PrivateDevices=yes` means a `/dev/log` `unix_socket` input needs a `PrivateDevices=no` drop-in (see [systemd](./systemd.md#adding-write-paths))
