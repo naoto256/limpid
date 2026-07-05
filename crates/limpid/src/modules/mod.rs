@@ -132,26 +132,6 @@ pub async fn pre_send_or_shutdown<F: std::future::Future>(
     }
 }
 
-/// **Deprecated in-place**: prior name for [`pre_send_or_shutdown`].
-///
-/// The old contract wrapped an entire send attempt (connect +
-/// write) in the shutdown race, and on shutdown reported the event
-/// as `Recovered` even when bytes may have already reached the
-/// wire. That was silently at-most-once on retry and could
-/// double-send on reconnect. Existing call sites use this name
-/// while the sink-level refactor lands; each such site is being
-/// re-shaped in Branch B to wrap only the pre-send phase, at which
-/// point references migrate to [`pre_send_or_shutdown`] and this
-/// alias is removed.
-///
-/// Do not add new callers.
-pub async fn attempt_or_shutdown<F: std::future::Future>(
-    shutdown: &mut tokio::sync::watch::Receiver<bool>,
-    attempt: F,
-) -> Option<F::Output> {
-    pre_send_or_shutdown(shutdown, attempt).await
-}
-
 impl BuildContext {
     /// Test-only ctor with a no-op funcs registry, no error_log, and
     /// a shutdown receiver that never fires. Tests that need to
@@ -854,7 +834,7 @@ where
 
 #[cfg(test)]
 mod pre_send_or_shutdown_tests {
-    use super::{attempt_or_shutdown, pre_send_or_shutdown};
+    use super::pre_send_or_shutdown;
     use std::time::Duration;
 
     /// Happy path: the pre-send future completes first, the shutdown
@@ -905,24 +885,6 @@ mod pre_send_or_shutdown_tests {
         drop(tx);
         let outcome =
             pre_send_or_shutdown(&mut rx, tokio::time::sleep(Duration::from_secs(5))).await;
-        assert!(outcome.is_none());
-    }
-
-    /// The `attempt_or_shutdown` alias delegates to
-    /// `pre_send_or_shutdown` and stays functionally identical
-    /// during the Branch B refactor migration. Pin this so a
-    /// premature removal or divergent implementation of the alias
-    /// trips the test before the callers migrate.
-    #[tokio::test]
-    async fn attempt_or_shutdown_alias_delegates_unchanged() {
-        let (_tx, mut rx) = tokio::sync::watch::channel(false);
-        let outcome = attempt_or_shutdown(&mut rx, async { 7u32 }).await;
-        assert_eq!(outcome, Some(7));
-
-        let (tx, mut rx) = tokio::sync::watch::channel(false);
-        drop(tx);
-        let outcome =
-            attempt_or_shutdown(&mut rx, tokio::time::sleep(Duration::from_secs(5))).await;
         assert!(outcome.is_none());
     }
 }
