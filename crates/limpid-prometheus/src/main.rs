@@ -323,6 +323,22 @@ fn json_to_prometheus(json: &str) -> Result<String, String> {
             outputs,
             "retries",
         );
+        write_counter(
+            &mut out,
+            "limpid_output_events_wedged_total",
+            "Total disk-queue fail-stop wedges observed by this output; alarm on this — the consumer has stopped accepting new events and will replay from the wedged cursor on next daemon start.",
+            "output",
+            outputs,
+            "events_wedged",
+        );
+        write_counter(
+            &mut out,
+            "limpid_output_events_errored_unwritable_total",
+            "Sink-side counterpart of limpid_pipeline_events_errored_unwritable_total: DLQ (error_log) write failures observed while routing an output-side failure through the DLQ. Alarm on this — the replay path may be incomplete.",
+            "output",
+            outputs,
+            "events_errored_unwritable",
+        );
     }
 
     Ok(out)
@@ -429,6 +445,41 @@ mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
     use tokio::net::{TcpStream, UnixListener};
+
+    /// Alarm counters observable in the stats JSON must be emitted as
+    /// Prometheus samples so operators can build alerts on them. The
+    /// output-side `events_wedged` (disk-queue fail-stop wedge) and
+    /// `events_errored_unwritable` (sink-side DLQ-write failure) are
+    /// documented as alarm signals in
+    /// `docs/src/operations/error-log.md` and must appear in the
+    /// scrape output alongside the pipeline-side alarm counter.
+    #[test]
+    fn output_alarm_counters_are_exported() {
+        let json = r#"{
+            "outputs": {
+                "primary": {
+                    "events_received": 100,
+                    "events_injected": 0,
+                    "events_written": 90,
+                    "events_failed": 10,
+                    "retries": 3,
+                    "events_wedged": 1,
+                    "events_errored_unwritable": 2
+                }
+            }
+        }"#;
+        let out = json_to_prometheus(json).unwrap();
+        assert!(
+            out.contains("limpid_output_events_wedged_total{output=\"primary\"} 1"),
+            "expected events_wedged sample:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "limpid_output_events_errored_unwritable_total{output=\"primary\"} 2"
+            ),
+            "expected sink-side events_errored_unwritable sample:\n{out}"
+        );
+    }
 
     #[tokio::test]
     async fn accept_loop_closes_connections_over_the_cap() {
