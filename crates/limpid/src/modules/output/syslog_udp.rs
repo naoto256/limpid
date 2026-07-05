@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
@@ -11,7 +12,8 @@ use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::syslog_peers::{
-    PEER_CONNECT_TIMEOUT, PEER_WRITE_TIMEOUT, Peer, PeerList, SyslogPayload, parse_host_port,
+    PEER_CONNECT_TIMEOUT, PEER_WRITE_TIMEOUT, Peer, PeerList, PeerSendError, PreSendShutdownMarker,
+    SyslogPayload, parse_host_port,
 };
 use crate::modules::{HasMetrics, Module, Output};
 use crate::queue::{QueueAckHandle, RetryConfig};
@@ -128,16 +130,15 @@ impl Output for SyslogUdpOutput {
             let payload = SyslogPayload {
                 egress: event.egress.clone(),
             };
-            let outcome = match crate::modules::attempt_or_shutdown(
-                &mut shutdown,
-                self.write_payload(payload),
-            )
-            .await
+            let write_result = match self
+                .write_payload_shutdown_aware(payload, &mut shutdown)
+                .await
             {
-                Some(r) => r,
-                None => {
+                SyslogUdpWriteOutcome::Delivered => Ok(()),
+                SyslogUdpWriteOutcome::Err(e) => Err(e),
+                SyslogUdpWriteOutcome::PreSendShutdown => {
                     let reason = format!(
-                        "output '{}': write attempt abandoned on shutdown",
+                        "output '{}': write attempt abandoned on shutdown (pre-send)",
                         self.name
                     );
                     crate::modules::route_event_to_dlq(
@@ -152,7 +153,7 @@ impl Output for SyslogUdpOutput {
                     return Ok(());
                 }
             };
-            match outcome {
+            match write_result {
                 Ok(()) => {
                     ack.resolve_delivered();
                     return Ok(());
@@ -257,7 +258,173 @@ impl Output for SyslogUdpOutput {
     }
 }
 
+/// Outcome of a single steady-state syslog_udp send attempt.
+enum SyslogUdpWriteOutcome {
+    Delivered,
+    Err(anyhow::Error),
+    PreSendShutdown,
+}
+
 impl SyslogUdpOutput {
+    /// Shutdown-aware steady-state send. Same lookup / bind / connect
+    /// / send flow as [`Self::write_payload`], but wraps the DNS
+    /// lookup, socket bind, and UDP `connect` (all in-process or
+    /// wire-preparation with no datagram side effect) in
+    /// `pre_send_or_shutdown`. The `UdpSocket::send` call itself is
+    /// deliberately **not** shutdown-cancellable: UDP writes are
+    /// single-datagram, and a partial write is impossible, but the
+    /// send syscall does have a wire-visible effect (the datagram
+    /// leaves the process). The existing `PEER_WRITE_TIMEOUT`
+    /// bounds the wait.
+    async fn write_payload_shutdown_aware(
+        &self,
+        payload: SyslogPayload,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> SyslogUdpWriteOutcome {
+        let metrics = Arc::clone(&self.metrics);
+        let result = self
+            .peers
+            .write_with_rotation_shutdown_aware(
+                Instant::now(),
+                move |_idx, peer, state, shutdown| {
+                    let egress = payload.egress.clone();
+                    let address = peer.address();
+                    let metrics = Arc::clone(&metrics);
+                    Box::pin(async move {
+                        let _ = &metrics; // silence unused-if-no-write-path lint
+                        if state.conn.is_none() {
+                            // Pre-send phase: DNS lookup, ephemeral
+                            // bind, and UDP `connect` are all
+                            // wire-preparation with no datagram
+                            // side effect — safe to race against
+                            // shutdown.
+                            let resolved: Vec<std::net::SocketAddr> =
+                                match crate::modules::pre_send_or_shutdown(
+                                    shutdown,
+                                    tokio::time::timeout(
+                                        PEER_CONNECT_TIMEOUT,
+                                        tokio::net::lookup_host(address.as_str()),
+                                    ),
+                                )
+                                .await
+                                {
+                                    Some(Ok(Ok(iter))) => iter.collect(),
+                                    Some(Ok(Err(e))) => {
+                                        return Err(anyhow::Error::from(e)
+                                            .context(format!("syslog_udp lookup {}", address)));
+                                    }
+                                    Some(Err(_)) => {
+                                        return Err(anyhow::anyhow!(
+                                            "syslog_udp lookup {} timed out",
+                                            address
+                                        ));
+                                    }
+                                    None => {
+                                        return Err(anyhow::Error::new(PreSendShutdownMarker));
+                                    }
+                                };
+                            if resolved.is_empty() {
+                                anyhow::bail!(
+                                    "syslog_udp: name resolution for {} returned no addresses",
+                                    address
+                                );
+                            }
+                            let mut socket: Option<UdpSocket> = None;
+                            let mut last_err: Option<anyhow::Error> = None;
+                            for addr in &resolved {
+                                let bind_addr = match addr {
+                                    std::net::SocketAddr::V4(_) => "0.0.0.0:0",
+                                    std::net::SocketAddr::V6(_) => "[::]:0",
+                                };
+                                let candidate = match UdpSocket::bind(bind_addr).await {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        last_err = Some(anyhow::Error::from(e).context(format!(
+                                            "syslog_udp output: failed to bind ephemeral \
+                                                 socket ({})",
+                                            bind_addr
+                                        )));
+                                        continue;
+                                    }
+                                };
+                                // Per-address connect is also
+                                // pre-send: `connect(2)` on a UDP
+                                // socket only sets the default
+                                // peer, no packet is sent.
+                                let connect_res = match crate::modules::pre_send_or_shutdown(
+                                    shutdown,
+                                    tokio::time::timeout(
+                                        PEER_CONNECT_TIMEOUT,
+                                        candidate.connect(*addr),
+                                    ),
+                                )
+                                .await
+                                {
+                                    Some(Ok(Ok(()))) => Ok(()),
+                                    Some(Ok(Err(e))) => Err(anyhow::Error::from(e).context(
+                                        format!("syslog_udp connect to {} ({})", address, addr),
+                                    )),
+                                    Some(Err(_)) => Err(anyhow::anyhow!(
+                                        "syslog_udp connect to {} ({}) timed out",
+                                        address,
+                                        addr
+                                    )),
+                                    None => {
+                                        return Err(anyhow::Error::new(PreSendShutdownMarker));
+                                    }
+                                };
+                                match connect_res {
+                                    Ok(()) => {
+                                        socket = Some(candidate);
+                                        break;
+                                    }
+                                    Err(e) => last_err = Some(e),
+                                }
+                            }
+                            let socket = socket.ok_or_else(|| {
+                                last_err.unwrap_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "syslog_udp: no resolved address for {} could be \
+                                         connected",
+                                        address
+                                    )
+                                })
+                            })?;
+                            state.conn = Some(socket);
+                        }
+
+                        // Send phase: single-datagram
+                        // `UdpSocket::send`. No shutdown wrap here;
+                        // partial write is impossible (UDP is
+                        // datagram-oriented), and the existing
+                        // `PEER_WRITE_TIMEOUT` bounds the wait.
+                        let socket = state.conn.as_mut().expect("connection should be present");
+                        let send_result =
+                            tokio::time::timeout(PEER_WRITE_TIMEOUT, socket.send(&egress))
+                                .await
+                                .map_err(|_| {
+                                    anyhow::anyhow!("syslog_udp send to {} timed out", address)
+                                })
+                                .and_then(|res| {
+                                    res.with_context(|| format!("syslog_udp send to {}", address))
+                                });
+                        if send_result.is_err() {
+                            state.conn = None;
+                        }
+                        send_result.map(|_| ())
+                    })
+                },
+                shutdown,
+            )
+            .await;
+
+        match result {
+            Ok(()) => SyslogUdpWriteOutcome::Delivered,
+            Err(PeerSendError::PreSendShutdown) => SyslogUdpWriteOutcome::PreSendShutdown,
+            Err(e) => SyslogUdpWriteOutcome::Err(e.into()),
+        }
+    }
+
     /// Send one rendered datagram via the peer-rotation helper.
     /// Private — used only by [`Output::consume`] and unit tests that
     /// drive the transport directly without constructing an `Event`.

@@ -485,7 +485,7 @@ impl Output for KafkaOutput {
             // prep still returns None promptly rather than waiting
             // for the recheck.
             let inner_shutdown = shutdown.clone();
-            let outcome = match crate::modules::attempt_or_shutdown(
+            let outcome = match crate::modules::pre_send_or_shutdown(
                 &mut shutdown,
                 self.try_send(event, inner_shutdown),
             )
