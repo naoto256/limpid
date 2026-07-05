@@ -118,19 +118,19 @@ limpidctl health --json
 
 The control socket is a root-equivalent trust boundary, and its `bind → chmod 0o660` window relies on the parent directory both being controlled by a trusted owner and keeping non-group traffic out. Daemon startup **refuses to start** when the configured `control { socket "..." }`'s parent already exists on disk and either check fails:
 
-- **Owner** — the parent must be owned by root (uid 0) or by the daemon's own effective uid. An untrusted owner retains rename/unlink rights inside the directory regardless of mode bits and can replace the socket inode between bind and chmod.
+- **Owner** — the parent must be owned by the daemon's own effective uid. An untrusted owner retains rename/unlink rights inside the directory regardless of mode bits and can replace the socket inode between bind and chmod. A root-owned parent is trusted **only when the daemon itself runs as root**; for a non-root daemon a root-owned parent at the packaged `0o750` is not writable anyway, so bind would fail post-validation and the fire-and-forget control task would die silently — the exact failure this preflight prevents.
 - **Mode** — the parent must not be group-writable, world-writable, or world-traversable (predicate `mode & 0o023 != 0`).
 
-Under packaged systemd units (`RuntimeDirectory=limpid` with `RuntimeDirectoryMode=0750` explicitly set in the unit file) both properties are satisfied by construction — systemd creates the runtime dir at the daemon's uid with the requested mode — and this check is a no-op.
+Under packaged systemd units (`RuntimeDirectory=limpid` combined with `User=limpid` and `RuntimeDirectoryMode=0750` explicitly set in the unit file) both properties are satisfied by construction — systemd creates the runtime dir at the daemon's uid with the requested mode — and this check is a no-op.
 
-For custom deploys, ensure the parent is owned by a trusted uid and tighten it to `0o750` (or `0o700` for owner-only) before starting the daemon:
+For custom deploys, ensure the parent is owned by the daemon's own uid (not root) and tightened to `0o750` (or `0o700` for owner-only) before starting the daemon:
 
 ```sh
-chown root:limpid /path/to/parent   # or the daemon's own uid
-chmod 0750 /path/to/parent          # daemon user + group only
+chown limpid:limpid /path/to/parent   # daemon user; if running as root, chown root:root
+chmod 0750 /path/to/parent            # owner + group only
 ```
 
-The failure diagnostic names whether the owner or the mode failed and gives the observed value plus a remediation hint. If the parent does not exist yet, the control task creates it at `0o750` under the daemon's own uid — no operator action needed.
+The failure diagnostic names whether the owner or the mode failed, prints the observed value alongside the daemon's own effective uid, and gives a remediation hint. If the parent does not exist yet, the control task creates it at `0o750` under the daemon's own uid — no operator action needed.
 
 At shutdown, the control task records the `(dev, ino)` of the socket it bound and refuses to unlink the path if the on-disk inode has been swapped since bind. Under the safe-parent contract above no outside-the-group writer can produce the swap; this is defense-in-depth, not the load-bearing guard.
 

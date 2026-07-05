@@ -421,7 +421,8 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                 &ev,
                 &reason,
             )
-            .await;            crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
+            .await;
+            crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
         }
         (payloads, shippable)
     }
@@ -502,7 +503,8 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                         &ev,
                         &reason,
                     )
-                    .await;                    crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
+                    .await;
+                    crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
                 }
                 return;
             }
@@ -608,7 +610,8 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                 &ev,
                 &reason,
             )
-            .await;            crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
+            .await;
+            crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
         }
     }
 

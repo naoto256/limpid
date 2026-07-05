@@ -378,7 +378,7 @@ wc -l /var/log/limpid/errored.jsonl
 
 For rotation, see the [Recommended `logrotate` configuration](#recommended-logrotate-configuration) above. A retention policy on the rotated archives — for example, compress after 1 day, ship to long-term storage at 7 days, delete at 30 — sits on top of that `logrotate` block via a separate cron / archival job; it is intentionally not embedded in `logrotate` itself because retention is environment-specific (compliance hold, cold-storage budget, replay window) and should not be coupled to in-process rotation.
 
-**Alerting on DLQ growth.** Two counters together cover both flavors: pipeline-side failures (Process records + the enqueue-failure subset of Output records) bump `events_errored` on the pipeline, while sink-side failures (retry exhausted, shutdown drain, batched-output per-event render failures) bump `events_failed` on the originating output. `events_errored_unwritable` is the secondary alarm that the DLQ writer itself is failing — see [Metrics](./metrics.md) for the full list. A Prometheus rule:
+**Alerting on DLQ growth.** Two counters together cover both flavors: pipeline-side failures (Process records + the enqueue-failure subset of Output records) bump `events_errored` on the pipeline, while sink-side failures (retry exhausted, shutdown drain, batched-output per-event render failures) bump `events_failed` on the originating output. `events_errored_unwritable` is the secondary alarm that the DLQ writer itself is failing — split across two labels, one for each side — and `events_wedged` (output-side) fires when a disk-queue Dropped disposition has stopped the consumer from accepting new events. See [Metrics](./metrics.md) for the full list. A Prometheus rule:
 
 ```promql
 # Sustained pipeline-side failure (Process flavor + output enqueue):
@@ -389,11 +389,20 @@ rate(limpid_pipeline_events_errored_total[5m]) > 10
 # any single output averaging > 10 failures/sec for 5 minutes.
 rate(limpid_output_events_failed_total[5m]) > 10
 
-# Alarm: the DLQ writer itself can't write — replay is partial.
+# Alarm: pipeline-side DLQ writer can't write — replay is partial.
 increase(limpid_pipeline_events_errored_unwritable_total[5m]) > 0
+
+# Alarm: sink-side DLQ writer can't write on this output — the
+# same recovery gap on the output-flavor path.
+increase(limpid_output_events_errored_unwritable_total[5m]) > 0
+
+# Alarm: disk-queue fail-stop wedge fired on this output — the
+# consumer has stopped accepting new events and will replay from
+# the wedged cursor on next daemon start. Page on this.
+increase(limpid_output_events_wedged_total[5m]) > 0
 ```
 
-(Confirm the exact exported metric names against your `limpid-prometheus` exporter; the in-process counter names are `events_errored`, `events_failed` (per output), and `events_errored_unwritable`.)
+(Confirm the exact exported metric names against your `limpid-prometheus` exporter; the in-process counter names are `events_errored`, `events_failed` (per output), `events_errored_unwritable` (both sides), and `events_wedged` (output-side only).)
 
 **Multi-instance DLQ aggregation.** When several limpid daemons each write their own `error_log` file, central triage means shipping each file to a single host and replaying from there. The simple shape: a `filebeat` / `vector` / `rsyslog` collector tails each daemon's DLQ and forwards the lines into a central archive bucket; replay runs against a `jq` query over the aggregated archive and injects back into the daemon whose `pipeline` (Process flavor) or `output.name` (Output flavor) matches. Detailed multi-instance topology is deferred to a separate runbook.
 

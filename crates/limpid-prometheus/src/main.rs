@@ -474,9 +474,7 @@ mod tests {
             "expected events_wedged sample:\n{out}"
         );
         assert!(
-            out.contains(
-                "limpid_output_events_errored_unwritable_total{output=\"primary\"} 2"
-            ),
+            out.contains("limpid_output_events_errored_unwritable_total{output=\"primary\"} 2"),
             "expected sink-side events_errored_unwritable sample:\n{out}"
         );
     }
