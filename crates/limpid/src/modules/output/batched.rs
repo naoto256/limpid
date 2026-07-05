@@ -463,9 +463,9 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
             // `events_failed` was already bumped by the outer
             // `rejected > 0` fetch_add above (partial-success
             // paths report the count once, not per handle), so
-            // this call must NOT re-bump — the perl-driven bulk
-            // refactor for B-C3 accidentally added a per-event
-            // bump that double-counted here.
+            // this call must NOT re-bump — the DLQ-outcome
+            // refactor's bulk sink update accidentally added a
+            // per-event bump that double-counted here.
             let __dlq_outcome = crate::modules::route_event_to_dlq(
                 self.error_log.as_ref(),
                 &self.metrics,
