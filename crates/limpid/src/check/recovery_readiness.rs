@@ -126,7 +126,7 @@ pub(super) fn analyze_all(config: &CompiledConfig, diags: &mut Vec<Diagnostic>) 
          DLQ (log rotation / filters / aggregation delays and no `limpidctl inject` \
          replay shortcut), so operator recovery is weaker without `error_log`. \
          To enable durable file-based recovery, add:\n    \
-         control {{\n        error_log \"/var/log/limpid/error_log.jsonl\"\n    }}",
+         control {{\n        error_log \"/var/log/limpid/errored.jsonl\"\n    }}",
         summary,
     );
 
@@ -220,7 +220,7 @@ def pipeline p { input i; output o }
     #[test]
     fn no_warning_when_error_log_configured() {
         let src = r#"
-control { error_log "/var/log/limpid/error_log.jsonl" }
+control { error_log "/var/log/limpid/errored.jsonl" }
 def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o {
     type syslog_tcp
