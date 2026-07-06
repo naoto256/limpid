@@ -1045,9 +1045,24 @@ mod tests {
         assert!(err.contains("error_log"), "got: {}", err);
     }
 
+    /// Create a tempdir whose mode is guaranteed to be `0o750` on
+    /// every platform the tests run on. The default `TempDir::new()`
+    /// picks up the process umask — `0o700` on macOS but `0o775` (=
+    /// `mode & 0o022 = 0o020` group-writable) on typical Linux
+    /// runners — which the DLQ parent-trust predicate refuses.
+    /// Tests that are testing something *other* than the parent-mode
+    /// contract should use this so they run identically on both.
+    #[cfg(unix)]
+    fn safe_dlq_tempdir() -> TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+        dir
+    }
+
     #[tokio::test]
     async fn validate_at_startup_passes_for_existing_parent() {
-        let dir = TempDir::new().unwrap();
+        let dir = safe_dlq_tempdir();
         let w = ErrorLogWriter::new(dir.path().join("errored.jsonl"));
         w.validate_at_startup().await.unwrap();
     }
@@ -1211,7 +1226,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn validate_at_startup_refuses_symlink_at_dlq_path() {
-        let dir = TempDir::new().unwrap();
+        let dir = safe_dlq_tempdir();
         let path = dir.path().join("errored.jsonl");
         let target = dir.path().join("_hijacked.jsonl");
         std::os::unix::fs::symlink(&target, &path).unwrap();
@@ -1229,7 +1244,7 @@ mod tests {
     #[cfg(unix)]
     async fn validate_at_startup_refuses_wrong_mode_existing_file() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = TempDir::new().unwrap();
+        let dir = safe_dlq_tempdir();
         let path = dir.path().join("errored.jsonl");
         std::fs::write(&path, b"leftover\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -1253,7 +1268,7 @@ mod tests {
         // pass the mode check alone; only the S_ISREG shape check
         // catches it.
         use std::ffi::CString;
-        let dir = TempDir::new().unwrap();
+        let dir = safe_dlq_tempdir();
         let path = dir.path().join("errored.jsonl");
         let c_path = CString::new(path.as_os_str().to_str().unwrap()).unwrap();
         let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
@@ -1267,7 +1282,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn validate_at_startup_refuses_directory_at_dlq_path() {
-        let dir = TempDir::new().unwrap();
+        let dir = safe_dlq_tempdir();
         let path = dir.path().join("errored.jsonl");
         std::fs::create_dir(&path).unwrap();
 
@@ -1283,7 +1298,7 @@ mod tests {
         // exist must pass — the runtime creates the file on first
         // failure with the correct mode. The preflight creates it
         // eagerly at 0o600 (see next test for that assertion).
-        let dir = TempDir::new().unwrap();
+        let dir = safe_dlq_tempdir();
         let w = ErrorLogWriter::new(dir.path().join("errored.jsonl"));
         w.validate_at_startup().await.unwrap();
     }
@@ -1296,7 +1311,7 @@ mod tests {
         // future refactor that drops the preflight (or leaves a
         // wider-mode file behind) trips this test.
         use std::os::unix::fs::PermissionsExt;
-        let dir = TempDir::new().unwrap();
+        let dir = safe_dlq_tempdir();
         let path = dir.path().join("errored.jsonl");
         let w = ErrorLogWriter::new(path.clone());
         w.validate_at_startup().await.unwrap();
