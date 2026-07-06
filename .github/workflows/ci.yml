@@ -41,3 +41,92 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
+
+  # Kafka feature is documented as a product capability (README, docs,
+  # trust-boundary + shutdown-drain contracts). The default `check`
+  # job does not compile the kafka backend — a regression that broke
+  # the librdkafka path would ship undetected. This job mirrors what
+  # release.yml would use for a kafka-enabled artifact, so a PR that
+  # breaks it fails the gate. Journal is bundled because the packaged
+  # release artifact enables it too; keeping the two features on the
+  # same job means the release-artifact compile succeeds or fails as
+  # one unit rather than emerging as a separate surprise at tag time.
+  check-kafka:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # pin-audit:2026-06-03 de0fac2 | v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # pin-audit:2026-05-21 29eef33 | stable
+        with:
+          components: clippy
+
+      # librdkafka's Rust binding compiles the C library from source.
+      # The system needs a SASL / SSL / build toolchain baseline; the
+      # ubuntu-latest image has cmake / gcc already, so we only add
+      # the dev packages the linker misses at link time. `libsystemd-dev`
+      # is required by the `journal` feature the release artifact also
+      # enables — mirrors the packaging release job's setup.
+      - name: Install kafka + journal build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libsasl2-dev libssl-dev libsystemd-dev pkg-config
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # pin-audit:2026-05-21 e18b497 | v2
+        with:
+          key: kafka-journal
+
+      - name: Build (kafka + journal)
+        run: cargo build --workspace --features kafka,journal
+
+      - name: Test (kafka + journal)
+        run: cargo test --workspace --features kafka,journal
+
+      - name: Clippy (kafka + journal)
+        run: cargo clippy --workspace --features kafka,journal -- -D warnings
+
+  # Supply-chain audit: `cargo deny` gates advisories, bans, sources,
+  # and licenses against `deny.toml`; `cargo audit` cross-checks the
+  # same Cargo.lock against the RustSec advisory database. Runs on
+  # every PR so a new dependency that trips either surfaces before
+  # merge instead of at release time. Pinned tool versions (installed
+  # with `cargo install --locked --version`) so the supply-chain
+  # gate is itself reproducible: floating `latest` versions would
+  # let a tool update silently change the meaning of "pass".
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # pin-audit:2026-06-03 de0fac2 | v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # pin-audit:2026-05-21 29eef33 | stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # pin-audit:2026-05-21 e18b497 | v2
+        with:
+          key: supply-chain
+
+      # 0.18.6 is the minimum that parses CVSS v4.0 advisories in
+      # the RustSec database — 0.16.x errors on entries with the
+      # 4.0 vector syntax RustSec started emitting in 2026.
+      - name: Install cargo-deny
+        run: cargo install --locked --version 0.18.6 cargo-deny
+
+      - name: Install cargo-audit
+        run: cargo install --locked --version 0.21.2 cargo-audit
+
+      - name: cargo deny check
+        run: cargo deny check advisories bans sources licenses
+
+      # `cargo audit` reads `Cargo.lock` from the current directory
+      # and errors if it is missing, then cross-checks every
+      # dependency against the RustSec advisory database fetched
+      # from https://github.com/RustSec/advisory-db on each run.
+      - name: cargo audit
+        run: cargo audit
