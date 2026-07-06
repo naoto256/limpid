@@ -346,6 +346,19 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     ///   `finalize_shutdown_singleton_disposition` bundles the
     ///   Ok/Err arms into a single call for sinks that do not need
     ///   custom branching.
+    /// - Stream / byte-oriented transports whose `Err` cannot be
+    ///   proved to have fired *before* the wire byte-boundary
+    ///   (e.g. TCP with or without TLS, unix stream sockets — any
+    ///   transport where the outer `tokio::time::timeout` or a
+    ///   mid-write disconnect can leave a partial frame at the
+    ///   peer) MUST route through
+    ///   `finalize_shutdown_singleton_disposition_ambiguous`
+    ///   instead of the plain variant. The `_ambiguous` variant
+    ///   force-Dropped-so-wedges the disk queue for next-start
+    ///   replay, avoiding the double-state where the payload
+    ///   partially reached the downstream and the DLQ record is
+    ///   also replayable; memory queues still fall back to
+    ///   `Recovered`.
     /// - `Ok(())` signals the output took lifecycle ownership; actual
     ///   disposition flows through the handle.
     ///
@@ -472,6 +485,66 @@ pub async fn finalize_shutdown_singleton_disposition(
             let reason = format!("shutdown send failed: {}", e);
             let outcome = route_event_to_dlq(error_log, metrics, output_name, event, &reason).await;
             resolve_ack_from_dlq_outcome(ack, outcome, metrics);
+        }
+    }
+}
+
+/// Same shape as [`finalize_shutdown_singleton_disposition`] but for
+/// transports whose `Err` is ambiguous with respect to the
+/// side-effect boundary: the payload may have already been observed
+/// downstream by the time the failure fired (partial wire state,
+/// connection reset mid-frame, `tokio::time::timeout` firing after
+/// the first byte was already on the wire — the reason
+/// `write_frame` in `persistent_conn` explicitly documents that
+/// mid-write cancellation can leave partial wire state).
+///
+/// The steady-state `Recovered` disposition would fabricate an
+/// at-least-once guarantee the transport does not support: the
+/// payload might have reached the downstream AND land in the DLQ
+/// for replay, producing a double delivery. This variant forces
+/// the failure disposition to `Dropped` regardless of the DLQ-write
+/// outcome:
+///
+/// - Disk queue: `Dropped` triggers the fail-stop wedge; the cursor
+///   holds and the event replays on next start after operator
+///   intervention. That is safe: a genuinely-delivered event will
+///   be a duplicate on replay, which the downstream can dedupe or
+///   an operator can reconcile with the DLQ record.
+/// - Memory queue: `Dropped` folds to `Recovered` inside
+///   `resolve_ack_from_dlq_outcome` (memory has no replay path);
+///   the loss is unavoidable but the DLQ record still captured
+///   what would have shipped.
+///
+/// `Ok(())` still counts as `Delivered` with the usual metric bump.
+///
+/// The DLQ record is written for operator visibility (even though
+/// the outcome is forced to `Dropped`), so reconciliation between
+/// the wedged position and the downstream is possible via
+/// `journalctl | jq` or the DLQ file.
+pub async fn finalize_shutdown_singleton_disposition_ambiguous(
+    result: Result<()>,
+    error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+    metrics: &OutputMetrics,
+    output_name: &str,
+    event: &Event,
+    ack: crate::queue::QueueAckHandle,
+) {
+    use std::sync::atomic::Ordering;
+    match result {
+        Ok(()) => {
+            metrics.events_written.fetch_add(1, Ordering::Relaxed);
+            ack.resolve_delivered();
+        }
+        Err(e) => {
+            let reason = format!(
+                "shutdown send failed after side-effect boundary (ambiguous wire state): {}",
+                e
+            );
+            // Write the DLQ record for the operator's audit trail —
+            // even though we're forcing `Dropped`, the record makes
+            // reconciliation possible after next-start replay.
+            let _ = route_event_to_dlq(error_log, metrics, output_name, event, &reason).await;
+            resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Dropped, metrics);
         }
     }
 }

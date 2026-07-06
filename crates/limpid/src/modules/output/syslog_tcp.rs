@@ -450,6 +450,17 @@ impl Output for SyslogTcpOutput {
     }
 
     async fn consume_shutdown(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
+        // `write_payload` on a TCP stream (with or without TLS) can
+        // cross the byte-on-wire boundary before the outer
+        // `tokio::time::timeout` fires or a mid-write disconnect
+        // returns Err — the frame header (or its opening bytes) can
+        // already be at the peer. Route through the `_ambiguous`
+        // finalizer: any failure force-Dropped, disk queue wedges
+        // for next-start replay, memory queue folds to Recovered.
+        // Never fabricate the honest-Recovered guarantee the
+        // stream transport does not support. Same discipline as
+        // `unix_socket::consume_shutdown` and the underlying
+        // `persistent_conn` partial-send documentation.
         let payload = SyslogPayload {
             egress: event.egress.clone(),
         };
@@ -465,7 +476,7 @@ impl Output for SyslogTcpOutput {
                 crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT
             )),
         };
-        crate::modules::finalize_shutdown_singleton_disposition(
+        crate::modules::finalize_shutdown_singleton_disposition_ambiguous(
             result,
             self.error_log.as_ref(),
             &self.metrics,
@@ -703,6 +714,38 @@ mod tests {
     use crate::dsl::ast::{Expr, ExprKind, Property};
     use crate::dsl::schema::SchemaErrorKind;
     use tempfile::TempDir;
+
+    /// Structural pin: `consume_shutdown` routes its result through
+    /// the `_ambiguous` finalizer, not the plain
+    /// `finalize_shutdown_singleton_disposition`. Rationale identical
+    /// to the same-named test in `unix_socket`: a TCP stream can
+    /// have partial bytes on the wire when the outer `timeout` or
+    /// a mid-write disconnect fires, so honest `Recovered` would
+    /// fabricate an at-least-once guarantee the transport does not
+    /// support. Force `Dropped` so the disk queue wedges for
+    /// operator reconciliation on next start.
+    #[test]
+    fn consume_shutdown_uses_ambiguous_finalizer() {
+        let src = include_str!("syslog_tcp.rs");
+        let start = src
+            .find("async fn consume_shutdown(")
+            .expect("consume_shutdown fn must exist");
+        let end_offset = src[start..]
+            .find("\n}\n")
+            .expect("consume_shutdown body must end with a top-level closing brace");
+        let body = &src[start..start + end_offset];
+        assert!(
+            body.contains("finalize_shutdown_singleton_disposition_ambiguous("),
+            "consume_shutdown must route through the _ambiguous finalizer to hold the disk \
+             cursor on partial-wire failures — the plain variant would honest-Recovered and \
+             risk downstream duplicates on next-start replay."
+        );
+        assert!(
+            !body.contains("crate::modules::finalize_shutdown_singleton_disposition("),
+            "consume_shutdown must not fall back to the plain finalizer — the wire state \
+             cannot be proved pre-boundary from outside write_payload."
+        );
+    }
 
     struct PemFiles {
         _dir: TempDir,
