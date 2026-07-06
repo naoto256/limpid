@@ -337,6 +337,57 @@ impl ErrorLogWriter {
             );
         }
 
+        // Parent trust: the DLQ file carries the full failure JSONL
+        // (including `event.ingress` and `event.egress`), which for
+        // most deployments is the most sensitive on-disk artifact
+        // limpid produces. Directory mode alone does not close the
+        // trust boundary — an untrusted owner retains rename/unlink
+        // rights inside the parent regardless of mode bits and can
+        // replace the DLQ inode between two writes even if the file
+        // itself was created via `O_NOFOLLOW` + `create_new`. Owner
+        // must match the daemon's own euid (or root when the daemon
+        // itself runs as root), and the parent must not be group- or
+        // world-writable. This mirrors the control-socket parent
+        // predicate; the two surfaces have the same threat shape
+        // (long-lived process-owned inode inside a directory the
+        // attacker must not be able to rearrange).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let self_euid = unsafe { libc::geteuid() };
+            let parent_uid = link_meta.uid();
+            if parent_dir_owner_is_untrusted(parent_uid, self_euid) {
+                anyhow::bail!(
+                    "error_log: parent dir '{}' is owned by uid {}, but the daemon's effective \
+                     uid is {} — refusing to preflight. The DLQ file carries the full failure \
+                     JSONL (including per-event `ingress` and `egress` bytes); a parent owner \
+                     other than the daemon retains rename/unlink rights inside the directory \
+                     regardless of mode bits and can swap the DLQ inode between writes. Under \
+                     systemd, `User=<daemon-user>` (the packaged unit ships with `User=syslog`) \
+                     combined with a daemon-owned `/var/log/limpid/` is the intended shape. \
+                     For custom deploys, `chown <daemon-user>:<daemon-group> '{}'` and re-run.",
+                    parent.display(),
+                    parent_uid,
+                    self_euid,
+                    parent.display(),
+                );
+            }
+            let parent_mode = link_meta.permissions().mode() & 0o777;
+            if parent_dir_mode_is_unsafe(parent_mode) {
+                anyhow::bail!(
+                    "error_log: parent dir '{}' has mode 0o{:o} — refusing to preflight. A \
+                     group- or world-writable DLQ parent lets a co-tenant plant a symlink or a \
+                     preallocated 0o600 file at the DLQ path between writes; the runtime write \
+                     path would then land failure JSONL on the wrong inode. Tighten the parent \
+                     to 0o750 or stricter (`chmod 0750 '{}'`) or point `control {{ error_log \
+                     \"...\" }}` at a packaged path.",
+                    parent.display(),
+                    parent_mode,
+                    parent.display(),
+                );
+            }
+        }
+
         // If the DLQ file already exists on disk, refuse anything that
         // isn't a regular 0o600 file. The runtime `write` path applies
         // the same contract (`O_NOFOLLOW`, fstat `S_ISREG`, mode
@@ -652,6 +703,7 @@ impl ErrorLogWriter {
         // ownership to the `OwnedFd`.
         let owned_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(duped) };
 
+        let self_euid = unsafe { libc::geteuid() };
         tokio::task::spawn_blocking(move || -> Result<()> {
             let fd = owned_fd.as_raw_fd();
             let mut stat: libc::stat = unsafe { std::mem::zeroed() };
@@ -683,6 +735,32 @@ impl ErrorLogWriter {
                      inode is created with the required mode.",
                     path.display(),
                     actual
+                );
+            }
+            // Owner trust: an attacker who can plant a 0o600 file at
+            // the DLQ path (via a preallocated inode inside an
+            // attacker-writable parent, or via a pre-existing
+            // deployment mistake) would otherwise pass the mode
+            // check and receive every subsequent DLQ record. The
+            // parent-dir owner+mode gate in `validate_at_startup`
+            // narrows the window, but the fstat st_uid check here
+            // is the load-bearing terminal check on the actual
+            // inode the daemon just opened for write — the same
+            // shape as `apply_file_metadata_to_fd` in the file
+            // output. Reject anything the daemon does not own.
+            let file_uid: u32 = stat.st_uid;
+            if file_uid != self_euid {
+                anyhow::bail!(
+                    "error_log '{}': existing file is owned by uid {}, but the daemon's \
+                     effective uid is {}; refusing to write. The DLQ file carries the full \
+                     failure JSONL for every failed event — a mismatched owner would let a \
+                     co-tenant read (or race against) subsequent writes. Remove the file so \
+                     the runtime recreates it with the correct owner, or `chown \
+                     <daemon-user>:<daemon-group> '{}'`.",
+                    path.display(),
+                    file_uid,
+                    self_euid,
+                    path.display(),
                 );
             }
             Ok(())
@@ -768,6 +846,33 @@ impl ErrorLogWriter {
             )
         })?
     }
+}
+
+/// True when the DLQ parent's owner is not the daemon's own effective
+/// uid. Same shape as the control-socket predicate (see
+/// `crates/limpid/src/control.rs`): directory mode alone does not
+/// close the trust boundary — an untrusted owner retains
+/// rename/unlink rights inside the directory regardless of mode
+/// bits, and can therefore swap the DLQ inode between two runtime
+/// writes even if the file itself was created via `O_NOFOLLOW` +
+/// `create_new`. A root-owned parent is trusted only when the
+/// daemon itself runs as root.
+#[cfg(unix)]
+fn parent_dir_owner_is_untrusted(uid: u32, self_euid: u32) -> bool {
+    uid != self_euid
+}
+
+/// True when the DLQ parent's mode allows group- or world-writable
+/// access. Different bits than the control-socket predicate on
+/// purpose: the control socket needs `mode & 0o023 == 0` to protect
+/// the bind→chmod 0o660 window; the DLQ file is created 0o600 and
+/// never widens, so the group-write bit alone would not immediately
+/// leak the file, but a group- or world-writable parent still lets
+/// a co-tenant `unlink` and re-create the DLQ path with an attacker-
+/// owned inode. Reject both `g+w` (0o020) and `o+w` (0o002).
+#[cfg(unix)]
+fn parent_dir_mode_is_unsafe(mode: u32) -> bool {
+    mode & 0o022 != 0
 }
 
 #[cfg(test)]
@@ -968,6 +1073,111 @@ mod tests {
         assert!(
             err.contains("symlink") && err.contains("refusing to preflight"),
             "diagnostic must name the symlink shape: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn validate_at_startup_refuses_group_writable_parent() {
+        // Parent trust: `g+w` on the DLQ parent lets a co-tenant with
+        // group membership `unlink` the DLQ file and replace the path
+        // with an attacker-owned inode. Refuse it at preflight.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let parent = dir.path().join("dlq-parent");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let w = ErrorLogWriter::new(parent.join("errored.jsonl"));
+        let err = w.validate_at_startup().await.unwrap_err().to_string();
+        assert!(
+            err.contains("mode 0o770") && err.contains("refusing to preflight"),
+            "diagnostic must name the mode and the refusal: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn validate_at_startup_refuses_world_writable_parent() {
+        // Same reasoning as the group-writable case, one step wider.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let parent = dir.path().join("dlq-parent");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o707)).unwrap();
+        let w = ErrorLogWriter::new(parent.join("errored.jsonl"));
+        let err = w.validate_at_startup().await.unwrap_err().to_string();
+        assert!(
+            err.contains("mode 0o707") && err.contains("refusing to preflight"),
+            "diagnostic must name the mode and the refusal: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn parent_dir_mode_is_unsafe_covers_g_and_o_write_bits() {
+        // Codifies the predicate: `mode & 0o022 != 0` means either
+        // `g+w` (0o020) or `o+w` (0o002) is set — the two shapes that
+        // let a co-tenant swap the DLQ inode. Also asserts the
+        // packaged-shape modes (`0o700`, `0o750`, `0o755`) pass.
+        assert!(!parent_dir_mode_is_unsafe(0o700));
+        assert!(!parent_dir_mode_is_unsafe(0o750));
+        assert!(!parent_dir_mode_is_unsafe(0o755));
+        assert!(parent_dir_mode_is_unsafe(0o770));
+        assert!(parent_dir_mode_is_unsafe(0o707));
+        assert!(parent_dir_mode_is_unsafe(0o777));
+        assert!(parent_dir_mode_is_unsafe(0o022));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn parent_dir_owner_is_untrusted_matches_euid_semantics() {
+        // Directory owner must equal daemon euid. A root-owned parent
+        // is trusted only when the daemon runs as root; a foreign-uid
+        // parent is untrusted regardless.
+        assert!(!parent_dir_owner_is_untrusted(1000, 1000));
+        assert!(!parent_dir_owner_is_untrusted(0, 0));
+        assert!(parent_dir_owner_is_untrusted(0, 1000));
+        assert!(parent_dir_owner_is_untrusted(1000, 0));
+        assert!(parent_dir_owner_is_untrusted(1001, 1000));
+    }
+
+    /// Structural pin: `validate_at_startup` invokes both the
+    /// `parent_dir_owner_is_untrusted` and `parent_dir_mode_is_unsafe`
+    /// predicates against the final parent's `symlink_metadata`, and
+    /// `verify_existing_mode` checks `stat.st_uid` against the
+    /// daemon's euid. Behavioural coverage for the owner-mismatch
+    /// arms would need to fabricate an inode owned by a different
+    /// uid, which needs root — the structural pin is the honest
+    /// alternative.
+    #[test]
+    fn parent_trust_checks_wired_into_validate_at_startup() {
+        let src = include_str!("error_log.rs");
+        let vas_start = src
+            .find("pub async fn validate_at_startup(")
+            .expect("validate_at_startup fn must exist");
+        let vas_end = src[vas_start..]
+            .find("\n    /// Force the DLQ file's mode")
+            .or_else(|| {
+                src[vas_start..].find("\n    #[cfg(unix)]\n    async fn verify_existing_mode")
+            })
+            .expect("validate_at_startup body must be followed by the next fn");
+        let vas_body = &src[vas_start..vas_start + vas_end];
+        assert!(
+            vas_body.contains("parent_dir_owner_is_untrusted("),
+            "validate_at_startup must call parent_dir_owner_is_untrusted on the parent"
+        );
+        assert!(
+            vas_body.contains("parent_dir_mode_is_unsafe("),
+            "validate_at_startup must call parent_dir_mode_is_unsafe on the parent"
+        );
+
+        let vem_start = src
+            .find("async fn verify_existing_mode(")
+            .expect("verify_existing_mode fn must exist");
+        let vem_body = &src[vem_start..vem_start + 4000];
+        assert!(
+            vem_body.contains("stat.st_uid") && vem_body.contains("self_euid"),
+            "verify_existing_mode must fstat-compare st_uid against the daemon's euid"
         );
     }
 
