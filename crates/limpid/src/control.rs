@@ -1315,11 +1315,17 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn validate_creates_absent_parent_at_0o750_under_daemon_owned_ancestor() {
-        // Absent parent + ancestor owned by the daemon's euid (the
-        // tempdir default) → validate creates the parent at 0o750
-        // and passes.
+        // Absent parent + ancestor owned by the daemon's euid → validate
+        // creates the parent at 0o750 and passes. The tempdir is
+        // explicitly chmod'd to 0o755 so the test runs the same way
+        // regardless of the caller's umask; on Linux systems where the
+        // default umask is 0o002 the raw tempdir would land at 0o775
+        // (group-write set) and fail the `mode & 0o022 == 0` ancestor
+        // trust predicate — the operator-facing behaviour, not a bug
+        // the test wants to reproduce.
         use std::os::unix::fs::PermissionsExt;
         let base = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         let parent = base.path().join("limpid-run");
         assert!(!parent.exists());
         let socket = parent.join("control.sock");
@@ -1517,13 +1523,16 @@ mod tests {
     /// An absent parent is OK — `validate_control_socket_parent`
     /// creates it at 0o750 under the daemon's uid after verifying
     /// the nearest existing ancestor is trusted, then re-verifies
-    /// via `symlink_metadata`. This preserves the bare /
-    /// non-systemd developer workflow of pointing
-    /// `control { socket "..." }` at a path whose parent does not
-    /// exist yet.
+    /// via `symlink_metadata`. Tempdir is chmod'd to 0o755 so the
+    /// ancestor trust check doesn't reject it under a Linux
+    /// 0o002-umask default that would leave the raw tempdir at
+    /// 0o775 (group-write bit set).
     #[test]
+    #[cfg(unix)]
     fn validate_control_socket_parent_accepts_absent_parent() {
+        use std::os::unix::fs::PermissionsExt;
         let base = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         let socket = base.path().join("missing-subdir").join("control.sock");
         validate_control_socket_parent(Some(socket.to_str().unwrap())).unwrap();
     }
@@ -1534,14 +1543,18 @@ mod tests {
     /// where `Path::new("foo").parent()` returns `Some("")` and
     /// `symlink_metadata("")` fails with `ENOENT`, leaving the naive
     /// walk with no candidate. Uses `set_current_dir` inside a
-    /// tempdir so the test does not litter the developer cwd.
+    /// tempdir (chmod 0o755 so the ancestor trust predicate accepts
+    /// it independent of the caller's umask) so the test does not
+    /// litter the developer cwd.
     #[test]
     #[cfg(unix)]
     fn validate_control_socket_parent_handles_relative_absent_parent() {
+        use std::os::unix::fs::PermissionsExt;
         use std::sync::Mutex;
         static CWD_LOCK: Mutex<()> = Mutex::new(());
         let _guard = CWD_LOCK.lock().unwrap();
         let base = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(base.path()).unwrap();
         let result = validate_control_socket_parent(Some("missing-subdir/control.sock"));
