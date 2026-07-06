@@ -980,14 +980,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let real_ancestor = dir.path().join("real-ancestor");
         std::fs::create_dir(&real_ancestor).unwrap();
-        std::fs::set_permissions(&real_ancestor, std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        std::fs::set_permissions(&real_ancestor, std::fs::Permissions::from_mode(0o755)).unwrap();
         let link_ancestor = dir.path().join("link-ancestor");
         std::os::unix::fs::symlink(&real_ancestor, &link_ancestor).unwrap();
         let final_parent = link_ancestor.join("dlq");
         std::fs::create_dir(&final_parent).unwrap();
-        std::fs::set_permissions(&final_parent, std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        std::fs::set_permissions(&final_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
         let w = ErrorLogWriter::new(final_parent.join("errored.jsonl"));
         w.validate_at_startup().await.unwrap();
     }
