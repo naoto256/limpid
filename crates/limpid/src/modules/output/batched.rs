@@ -48,11 +48,49 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
 use crate::queue::{QueueAckHandle, RetryConfig};
+
+/// One parked event in the batched sink's buffer: the event, the ack
+/// handle whose disposition it drives, and an optional bounded-ownership
+/// permit.
+///
+/// The permit is `Some` for events accepted by the steady-state
+/// `consume()` path — it holds one slot on the shared
+/// [`SinkShared::permits`] semaphore and drops (releases the slot)
+/// when the tuple itself drops after the handle resolves. That is
+/// what caps how many events the sink can own at once: without it,
+/// `consume()` returned `Ok` after a `Vec::push` regardless of
+/// flusher state, so a stalled peer let the queue backpressure
+/// dissolve into an unbounded in-memory `Vec` (and, on disk-backed
+/// queues, into a shutdown-window RAM peak that scaled with the
+/// durable backlog).
+///
+/// The permit is `None` for two entries: `consume_shutdown()` (queue
+/// consumer's post-shutdown drain — memory queue capacity + close-
+/// drain already caps peak RAM, and disk queues no longer surface
+/// unread WAL entries during shutdown, so the semaphore is not
+/// load-bearing here) and `consume()` entries whose permit
+/// acquisition raced the runtime shutdown watch and bypassed
+/// (permit-wait must not prevent the actor from observing shutdown
+/// — see `BatchedSink::consume`).
+pub(crate) type ParkedEvent = (Event, QueueAckHandle, Option<OwnedSemaphorePermit>);
+
+/// Drop the semaphore permits out of a `Vec<ParkedEvent>` before
+/// handing it to a helper whose signature does not (and should not)
+/// know about batched-sink internals. Consumes the input to make
+/// the permit release visible in the call site — the DLQ route
+/// resolves handles but does not need to keep permits alive across
+/// the resolve.
+fn strip_permits(events: Vec<ParkedEvent>) -> Vec<(Event, QueueAckHandle)> {
+    events
+        .into_iter()
+        .map(|(ev, ack, _permit)| (ev, ack))
+        .collect()
+}
 
 /// Transport-success outcome from a single export call.
 ///
@@ -131,12 +169,37 @@ pub(crate) struct SinkShared<P: BatchSinkPolicy> {
     /// retry budget for batched outputs lives entirely here.
     pub(crate) retry: RetryConfig,
     /// Buffered events awaiting flush, paired with their queue ack
-    /// handles. Render happens at flush time so per-event render
-    /// failures can be routed to DLQ on their own without dropping
-    /// the rest of the batch; the ack handle resolves when the
-    /// event's disposition is decided (delivered on flush success,
-    /// recovered on DLQ landing).
-    pub(crate) batch: Mutex<Vec<(Event, QueueAckHandle)>>,
+    /// handles and their bounded-ownership permits. Render happens at
+    /// flush time so per-event render failures can be routed to DLQ
+    /// on their own without dropping the rest of the batch; the ack
+    /// handle resolves when the event's disposition is decided
+    /// (delivered on flush success, recovered on DLQ landing). See
+    /// [`ParkedEvent`] for the permit semantics.
+    pub(crate) batch: Mutex<Vec<ParkedEvent>>,
+    /// Bounded-ownership permit pool. Each event accepted by
+    /// steady-state `consume()` holds one permit for its full
+    /// lifetime in the sink (park → flush → handle resolve), then
+    /// releases the slot when the tuple drops. Capacity is
+    /// `batch_size.saturating_mul(2).max(1)` — one batch worth of
+    /// parked events plus one batch worth of in-flight refill room,
+    /// which is the smallest bound that does not starve
+    /// threshold-driven flushes (a bound below `batch_size` would
+    /// block `consume()` before the threshold notify fires, wedging
+    /// the sink).
+    pub(crate) permits: Arc<Semaphore>,
+    /// Runtime shutdown watch, cloned from the `BuildContext` at
+    /// construction. Steady-state `consume()` races the permit
+    /// acquisition against this receiver so a `consume()` blocked on
+    /// a saturated `permits` (peer stalled, retry burning through
+    /// its budget) can still observe shutdown and let the actor
+    /// exit — otherwise `run_queue_consumer` would be trapped
+    /// mid-`consume().await` and never reach its own shutdown drain
+    /// (see queue/mod.rs shutdown arm). RetryConfig only accepts a
+    /// finite `max_attempts`, so the deadlock window is bounded even
+    /// without this race; the plumbing narrows shutdown latency and
+    /// keeps the sink well-behaved if future config exposes an
+    /// unbounded retry mode.
+    pub(crate) shutdown_signal: watch::Receiver<bool>,
     /// `error_log` writer injected at construction time by the
     /// runtime via `BuildContext`. Used by the flush path to route
     /// per-event render failures and shutdown-flush leftovers into
@@ -170,6 +233,7 @@ impl<P: BatchSinkPolicy> BatchedSink<P> {
     /// Build the sink and spawn the flusher actor. Spawn is skipped
     /// when there is no Tokio runtime (= parsing-only unit tests
     /// outside `#[tokio::test]`).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         policy: P,
         name: &str,
@@ -178,13 +242,19 @@ impl<P: BatchSinkPolicy> BatchedSink<P> {
         retry: RetryConfig,
         error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
         metrics: Arc<OutputMetrics>,
+        shutdown_signal: watch::Receiver<bool>,
     ) -> Self {
+        // See `SinkShared::permits` for why the bound is
+        // `batch_size * 2` clamped away from zero.
+        let permit_capacity = batch_size.saturating_mul(2).max(1);
         let inner = Arc::new(SinkShared {
             policy,
             name: name.to_string(),
             batch_timeout,
             retry,
             batch: Mutex::new(Vec::with_capacity(batch_size.max(1))),
+            permits: Arc::new(Semaphore::new(permit_capacity)),
+            shutdown_signal,
             error_log,
             metrics,
             flush_notify: Notify::new(),
@@ -215,9 +285,39 @@ impl<P: BatchSinkPolicy> BatchedSink<P> {
     /// (`batch_size <= 1`) modes — for the latter the actor flushes a
     /// one-element batch on each notify.
     pub(crate) async fn consume(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
+        // Bounded ownership: hold one permit for the event's full
+        // lifetime in the sink. The permit drops (releases its slot)
+        // when the tuple drops after the handle resolves. Race the
+        // permit acquire with the runtime shutdown watch and the
+        // cooperative `is_shutting_down` flag so a saturated
+        // semaphore does not trap this task past the moment shutdown
+        // fires — a `consume().await` stuck here would prevent the
+        // queue consumer from reaching its own drain arm.
+        let permit: Option<OwnedSemaphorePermit> = if self
+            .inner
+            .is_shutting_down
+            .load(Ordering::Acquire)
+            || *self.inner.shutdown_signal.borrow()
+        {
+            None
+        } else {
+            let mut shutdown_rx = self.inner.shutdown_signal.clone();
+            let permits = Arc::clone(&self.inner.permits);
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => None,
+                acquired = permits.acquire_owned() => {
+                    // `acquire_owned` only errors when the
+                    // semaphore is `close()`d; we never close
+                    // this permit pool, so treat the Err as a
+                    // bug rather than silently bypassing.
+                    Some(acquired.expect("batched-sink permit semaphore was closed unexpectedly"))
+                }
+            }
+        };
         let should_flush = {
             let mut buf = self.inner.batch.lock().await;
-            buf.push((event.clone(), ack));
+            buf.push((event.clone(), ack, permit));
             buf.len() >= self.batch_size
         };
         if should_flush {
@@ -228,16 +328,29 @@ impl<P: BatchSinkPolicy> BatchedSink<P> {
         Ok(())
     }
 
-    /// Drain-time per-event entry: park the `(event, ack)` pair in the
-    /// buffer that the post-loop `shutdown()` call will drain bounded.
-    /// Deliberately does NOT trigger a flush from here — that would
-    /// re-enter the steady-state retry path (`flush_events`'
-    /// exponential backoff loop) which the shutdown contract forbids.
-    /// The buffer holds the handle until `shutdown()` resolves it via
-    /// `flush_events_at_shutdown`'s bounded single attempt + DLQ route.
+    /// Drain-time per-event entry: park the `(event, ack, permit)`
+    /// tuple in the buffer that the post-loop `shutdown()` call will
+    /// drain bounded. Deliberately does NOT trigger a flush from
+    /// here — that would re-enter the steady-state retry path
+    /// (`flush_events`' exponential backoff loop) which the shutdown
+    /// contract forbids. The buffer holds the handle until
+    /// `shutdown()` resolves it via `flush_events_at_shutdown`'s
+    /// bounded single attempt + DLQ route.
+    ///
+    /// Permit acquisition is bypassed here (permit = `None`): the
+    /// queue consumer's shutdown drain already bounds peak RAM
+    /// (memory queues are capped by channel capacity + close-drain;
+    /// disk queues no longer surface unread WAL entries during
+    /// shutdown at all — see the queue/mod.rs shutdown arm), so the
+    /// semaphore is not load-bearing on this path and adding it
+    /// would open a subtle deadlock: `consume_shutdown` is called
+    /// from inside the same task that would eventually drop the
+    /// permits when tuples resolve, so a saturated semaphore here
+    /// would block the drain until an in-flight batch happened to
+    /// resolve.
     pub(crate) async fn consume_shutdown(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
         let mut buf = self.inner.batch.lock().await;
-        buf.push((event.clone(), ack));
+        buf.push((event.clone(), ack, None));
         Ok(())
     }
 
@@ -397,19 +510,25 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
     /// shutdown flush wordings in DLQ records.
     async fn render_batch(
         &self,
-        batch: Vec<(Event, QueueAckHandle)>,
+        batch: Vec<ParkedEvent>,
         site: &str,
-    ) -> (Vec<P::Payload>, Vec<(Event, QueueAckHandle)>) {
+    ) -> (Vec<P::Payload>, Vec<ParkedEvent>) {
         let mut payloads: Vec<P::Payload> = Vec::with_capacity(batch.len());
-        let mut shippable: Vec<(Event, QueueAckHandle)> = Vec::with_capacity(batch.len());
+        let mut shippable: Vec<ParkedEvent> = Vec::with_capacity(batch.len());
         let mut render_failures: Vec<(Event, QueueAckHandle, anyhow::Error)> = Vec::new();
-        for (ev, ack) in batch {
+        for (ev, ack, permit) in batch {
             match self.policy.render(&ev) {
                 Ok(p) => {
                     payloads.push(p);
-                    shippable.push((ev, ack));
+                    shippable.push((ev, ack, permit));
                 }
-                Err(e) => render_failures.push((ev, ack, e)),
+                // Drop the permit as the render failure is fanned
+                // out; the DLQ route below owns disposition without
+                // needing the semaphore slot.
+                Err(e) => {
+                    drop(permit);
+                    render_failures.push((ev, ack, e));
+                }
             }
         }
         for (ev, ack, err) in render_failures {
@@ -435,11 +554,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
     /// resolving the rest as Delivered — metric totals are accurate
     /// either way. `rejected: 0` (the plain-HTTP case) resolves the
     /// whole batch as Delivered.
-    async fn resolve_send_success(
-        &self,
-        shippable: Vec<(Event, QueueAckHandle)>,
-        outcome: SendOutcome,
-    ) {
+    async fn resolve_send_success(&self, shippable: Vec<ParkedEvent>, outcome: SendOutcome) {
         let count = shippable.len() as u64;
         let rejected = outcome.rejected.min(count);
         let written = count - rejected;
@@ -450,7 +565,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
         }
         let split = (count - rejected) as usize;
         let mut iter = shippable.into_iter();
-        for (_, ack) in iter.by_ref().take(split) {
+        for (_, ack, _permit) in iter.by_ref().take(split) {
             ack.resolve_delivered();
         }
         // Per-event DLQ routing for the trailing `rejected` entries.
@@ -459,7 +574,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
         // `handle_ack_disposition(Dropped)` on the ack side
         // (Dropped-on-disk arm); the aggregate across all rejected
         // handles equals `rejected`.
-        for (ev, ack) in iter {
+        for (ev, ack, _permit) in iter {
             let reason = "collector reported partial_success rejection".to_string();
             let __dlq_outcome = crate::modules::route_event_to_dlq(
                 self.error_log.as_ref(),
@@ -480,7 +595,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
     /// (resolve_recovered); the rest proceed to the send loop.
     /// Transport failures consume the per-flush retry budget; on
     /// exhaust the whole shippable subset is routed to DLQ.
-    async fn flush_events(&self, batch: Vec<(Event, QueueAckHandle)>) {
+    async fn flush_events(&self, batch: Vec<ParkedEvent>) {
         if batch.is_empty() {
             return;
         }
@@ -495,7 +610,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                 // decode / compress): re-attempting cannot succeed,
                 // so skip the retry budget and route straight to DLQ.
                 let reason = format!("flush failed: {}", e);
-                for (ev, ack) in shippable {
+                for (ev, ack, _permit) in shippable {
                     let __dlq_outcome = crate::modules::route_event_to_dlq(
                         self.error_log.as_ref(),
                         &self.metrics,
@@ -602,7 +717,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
         // every handle resolves, so a daemon crash here replays the
         // batch on restart (the ack-handle invariant).
         let reason = format!("flush failed after {} attempts: {}", attempt, final_err);
-        for (ev, ack) in shippable {
+        for (ev, ack, _permit) in shippable {
             let __dlq_outcome = crate::modules::route_event_to_dlq(
                 self.error_log.as_ref(),
                 &self.metrics,
@@ -625,7 +740,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
     /// an `Elapsed` outcome does NOT drop it — otherwise the inner
     /// handles would fire `QueueAckHandle::Drop` and be counted as
     /// silent loss.
-    async fn flush_events_at_shutdown(&self, batch: Vec<(Event, QueueAckHandle)>) {
+    async fn flush_events_at_shutdown(&self, batch: Vec<ParkedEvent>) {
         if batch.is_empty() {
             return;
         }
@@ -641,7 +756,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                     self.error_log.as_ref(),
                     &self.metrics,
                     &self.name,
-                    shippable,
+                    strip_permits(shippable),
                     &err,
                 )
                 .await;
@@ -663,7 +778,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                     self.error_log.as_ref(),
                     &self.metrics,
                     &self.name,
-                    shippable,
+                    strip_permits(shippable),
                     &err,
                 )
                 .await;
@@ -677,7 +792,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                     self.error_log.as_ref(),
                     &self.metrics,
                     &self.name,
-                    shippable,
+                    strip_permits(shippable),
                     &err,
                 )
                 .await;
