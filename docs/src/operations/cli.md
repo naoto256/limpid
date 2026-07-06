@@ -124,13 +124,13 @@ The control socket is a root-equivalent trust boundary, and its `bind → chmod 
 
 If the parent does not exist yet, the preflight itself creates it at `0o750` under the daemon's own uid, but only after checking that the deepest existing ancestor is trusted. "Trusted" means both properties hold: (a) the ancestor is owned by the daemon's own uid or by root, AND (b) its mode is not group- or world-writable (`mode & 0o022 == 0`). Ownership alone is not enough — an ancestor at `0o777` still lets any process with write permission plant a node under the target name before the daemon's `chmod` runs. Both attacker-writable ancestors (e.g. `/tmp` at `0o1777`) and daemon-owned-but-world-writable ancestors refuse the create. After create, `symlink_metadata` on the created path re-verifies real-directory shape, daemon ownership, and the requested mode.
 
-Under packaged systemd units (`RuntimeDirectory=limpid` combined with `User=limpid` and `RuntimeDirectoryMode=0750` explicitly set in the unit file) every property is satisfied by construction — systemd creates the runtime dir at the daemon's uid with the requested mode — and this check is a no-op.
+Under packaged systemd units (`RuntimeDirectory=limpid` combined with `User=<daemon-user>` — the packaged `limpid.service` ships with `User=syslog` — and `RuntimeDirectoryMode=0750` explicitly set in the unit file) every property is satisfied by construction — systemd creates the runtime dir at the daemon's uid with the requested mode — and this check is a no-op.
 
-For custom deploys, ensure the parent is owned by the daemon's own uid (not root) and tightened to `0o750` (or `0o700` for owner-only) before starting the daemon:
+For custom deploys, ensure the parent is owned by the daemon's own uid (not root) and tightened to `0o750` (or `0o700` for owner-only) before starting the daemon. Substitute your daemon user for `<daemon-user>` (the packaged `limpid.service` uses `syslog`):
 
 ```sh
-chown limpid:limpid /path/to/parent   # daemon user; if running as root, chown root:root
-chmod 0750 /path/to/parent            # owner + group only
+chown <daemon-user>:<daemon-group> /path/to/parent   # e.g. `chown syslog:syslog ...` for the packaged unit
+chmod 0750 /path/to/parent                           # owner + group only
 ```
 
 The failure diagnostic names whether the symlink shape, owner, or mode failed, prints the observed values alongside the daemon's own effective uid, and gives a remediation hint.
