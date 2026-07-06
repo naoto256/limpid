@@ -56,6 +56,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 
 use crate::dsl::ast::Property;
 use crate::dsl::props;
@@ -450,41 +451,58 @@ impl Output for HttpOutput {
 
 #[async_trait::async_trait]
 impl BatchSinkPolicy for HttpSinkPolicy {
-    type Payload = String;
+    type Payload = Bytes;
     type Prepared = Vec<u8>;
 
     fn kind(&self) -> &'static str {
         "http output"
     }
 
-    /// Render a single event into its HTTP body string. Called from
-    /// the flush path on an owned `Event`, so no borrowed-view arena
-    /// setup is required. Kept fallible (the lossy conversion itself
-    /// cannot fail) so per-event DLQ routing stays available if a
-    /// stricter render is ever introduced.
-    fn render(&self, event: &Event) -> Result<String> {
-        Ok(String::from_utf8_lossy(&event.egress).into_owned())
+    /// Render a single event into its per-event HTTP body payload
+    /// bytes. Called from the flush path on an owned `Event`, so no
+    /// borrowed-view arena setup is required. The egress bytes are
+    /// forwarded verbatim — `Bytes` is refcounted, so this is a
+    /// share, not a copy — because HTTP treats the request body as
+    /// an opaque byte stream and the daemon must not silently rewrite
+    /// customer payload content. `render` stays fallible so per-
+    /// event DLQ routing remains available if a stricter render is
+    /// ever introduced.
+    fn render(&self, event: &Event) -> Result<Bytes> {
+        Ok(event.egress.clone())
     }
 
-    /// Join the batch bodies and optionally gzip. Runs once per flush
-    /// (the skeleton prepares before its retry loop), so compression
-    /// is not re-done per attempt — the transformation is
-    /// deterministic, so the wire bytes are identical either way.
-    fn prepare(&self, messages: Vec<String>) -> Result<Vec<u8>> {
-        let body_str = messages.join("\n");
+    /// Join the batch bodies with a single `b'\n'` separator between
+    /// records and optionally gzip. Byte-preserving: no UTF-8
+    /// conversion at any point, so non-UTF-8 egress reaches the
+    /// receiver verbatim (there is no U+FFFD substitution). Runs
+    /// once per flush (the skeleton prepares before its retry loop),
+    /// so compression is not re-done per attempt.
+    fn prepare(&self, messages: Vec<Bytes>) -> Result<Vec<u8>> {
+        // Preallocate: sum of payload lengths + one newline per
+        // separator (there are `n - 1` separators for `n` payloads,
+        // so `saturating_sub(1)` avoids overflow on the empty case).
+        let total_len: usize =
+            messages.iter().map(|m| m.len()).sum::<usize>() + messages.len().saturating_sub(1);
+        let mut body = Vec::with_capacity(total_len);
+        for (i, msg) in messages.iter().enumerate() {
+            if i > 0 {
+                body.push(b'\n');
+            }
+            body.extend_from_slice(msg);
+        }
         if self.compress {
             use flate2::Compression;
             use flate2::write::GzEncoder;
             use std::io::Write;
             let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
             encoder
-                .write_all(body_str.as_bytes())
+                .write_all(&body)
                 .context("http output: gzip compression failed")?;
             encoder
                 .finish()
                 .context("http output: gzip finalization failed")
         } else {
-            Ok(body_str.into_bytes())
+            Ok(body)
         }
     }
 
@@ -1121,7 +1139,7 @@ def output o {{
             .sink
             .inner
             .policy
-            .prepare(vec!["hello".to_string()])
+            .prepare(vec![bytes::Bytes::from_static(b"hello")])
             .unwrap();
         insecure
             .sink
@@ -1150,7 +1168,7 @@ def output o {{
             .sink
             .inner
             .policy
-            .prepare(vec!["hello".to_string()])
+            .prepare(vec![bytes::Bytes::from_static(b"hello")])
             .unwrap();
         let err = strict
             .sink
@@ -1259,7 +1277,9 @@ def output o {{
         // Hit the policy's prepare + send directly so we can still
         // assert on the snippet-cap behaviour at the transport layer.
         let policy = &output.sink.inner.policy;
-        let body = policy.prepare(vec!["hello".to_string()]).unwrap();
+        let body = policy
+            .prepare(vec![bytes::Bytes::from_static(b"hello")])
+            .unwrap();
         let err = policy
             .send(&body)
             .await
@@ -1317,7 +1337,9 @@ def output o {{
         )
         .unwrap();
         let policy = &output.sink.inner.policy;
-        let body = policy.prepare(vec!["hello".to_string()]).unwrap();
+        let body = policy
+            .prepare(vec![bytes::Bytes::from_static(b"hello")])
+            .unwrap();
         let err = policy
             .send(&body)
             .await
@@ -2793,6 +2815,105 @@ def output o {{
         tokio::time::timeout(Duration::from_secs(5), output.shutdown(None))
             .await
             .expect("shutdown must complete inside bounded budget")
+            .unwrap();
+        server.abort();
+    }
+
+    /// Byte-preserving pin: the HTTP output must forward non-UTF-8
+    /// egress bytes to the receiver verbatim, not through a
+    /// `String::from_utf8_lossy` that would substitute U+FFFD for
+    /// every invalid byte sequence. The daemon does not know what
+    /// downstream schema the operator is shipping (protobuf,
+    /// FlatBuffers, raw binary, syslog with 8-bit MSGs), and
+    /// silently rewriting the payload turns HTTP into a lossy
+    /// transport — the exact bug the other sinks were audited free
+    /// of. Encodes an event whose bytes contain `0xff 0x00 0x80`
+    /// (canonical invalid UTF-8 shape: unpaired high byte + NUL +
+    /// unpaired high byte) and asserts the receiver's request body
+    /// matches byte-for-byte.
+    #[tokio::test]
+    async fn http_output_forwards_non_utf8_egress_verbatim() {
+        use axum::{Router, http::StatusCode, response::IntoResponse, routing::post};
+
+        #[derive(Clone)]
+        struct State {
+            received: Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
+        }
+        async fn handle(
+            axum::extract::State(state): axum::extract::State<State>,
+            body: axum::body::Bytes,
+        ) -> impl IntoResponse {
+            state.received.lock().await.push(body.to_vec());
+            (StatusCode::OK, "")
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received: Arc<tokio::sync::Mutex<Vec<Vec<u8>>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let state = State {
+            received: Arc::clone(&received),
+        };
+        let app = Router::new().route("/", post(handle)).with_state(state);
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let url = format!("http://{}/", addr);
+        let output = Arc::new(
+            HttpOutput::from_properties(
+                "test",
+                &mp(&[
+                    peer_block(&url),
+                    prop_int("batch_size", 1),
+                    fast_retry_block(),
+                ]),
+                &crate::modules::BuildContext::for_testing(),
+            )
+            .unwrap(),
+        );
+
+        // Canonical non-UTF-8 payload: unpaired continuation bytes,
+        // a NUL in the middle, and a lone high byte at the tail.
+        let raw: &[u8] = &[0xff, 0x00, 0x80, b'x', 0xc3, 0x28];
+        let ev = Event::new(
+            bytes::Bytes::copy_from_slice(raw),
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        );
+        let (ack, mut rx) = QueueAckHandle::for_test();
+        <HttpOutput as Output>::consume(&output, &ev, ack)
+            .await
+            .unwrap();
+
+        // Give the flusher a moment to ship then poll for delivery.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let body = loop {
+            {
+                let guard = received.lock().await;
+                if let Some(first) = guard.first() {
+                    break first.clone();
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("receiver never observed the request within 3s");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(
+            body, raw,
+            "HTTP output must forward non-UTF-8 egress bytes verbatim; got {:?}, expected {:?}",
+            body, raw
+        );
+        // Sanity: single-event batch resolves as Delivered, no DLQ.
+        let (_, disp) = rx.try_recv().expect("ack must resolve");
+        assert!(
+            matches!(disp, crate::queue::AckDisposition::Delivered),
+            "expected Delivered, got {:?}",
+            disp
+        );
+
+        tokio::time::timeout(Duration::from_secs(3), output.shutdown(None))
+            .await
+            .expect("shutdown must complete")
             .unwrap();
         server.abort();
     }
