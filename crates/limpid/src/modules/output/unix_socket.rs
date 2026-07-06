@@ -193,6 +193,19 @@ impl Output for UnixSocketOutput {
     }
 
     async fn consume_shutdown(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
+        // `write_with_reconnect` may cross the byte-on-wire
+        // boundary: a stream-oriented connection can accept the
+        // first frame bytes into the kernel socket buffer and even
+        // ship them before a mid-write disconnect or the outer
+        // `tokio::time::timeout` fires. Once the outer Elapsed
+        // fires — or any inner Err arrives out of a reconnect
+        // loop — the wire state is ambiguous, so route through the
+        // `_ambiguous` finalizer: force `Dropped` (disk queue
+        // wedges for next-start replay, memory queue falls back to
+        // `Recovered`) and never fabricate the honest-Recovered
+        // guarantee the transport does not support. See
+        // `persistent_conn::PersistentConn::write_frame` for the
+        // partial-send documentation this discipline is enforcing.
         let result = match tokio::time::timeout(
             crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT,
             write_with_reconnect(self, &self.conn, &event.egress),
@@ -205,7 +218,7 @@ impl Output for UnixSocketOutput {
                 crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT
             )),
         };
-        crate::modules::finalize_shutdown_singleton_disposition(
+        crate::modules::finalize_shutdown_singleton_disposition_ambiguous(
             result,
             self.error_log.as_ref(),
             &self.metrics,
@@ -321,6 +334,41 @@ mod tests {
             output.metrics.events_failed.load(Ordering::Relaxed),
             0,
             "successful drain must not bump events_failed"
+        );
+    }
+
+    /// Structural pin: `consume_shutdown` routes its result through
+    /// the `_ambiguous` finalizer, not the plain
+    /// `finalize_shutdown_singleton_disposition`. The plain variant
+    /// resolves shutdown-time send failures as `Recovered` — which
+    /// on a disk queue advances the cursor past a DLQ record even
+    /// though the payload's bytes may already have been written to
+    /// the peer socket (kernel buffer, first frame partially on
+    /// wire, or reconnect-mid-write). That produces a double-state:
+    /// the downstream received part or all of the record AND the
+    /// DLQ record is available for replay. The `_ambiguous`
+    /// variant force-Dropped-so-wedged, holding the cursor for
+    /// operator reconciliation on next start.
+    #[test]
+    fn consume_shutdown_uses_ambiguous_finalizer() {
+        let src = include_str!("unix_socket.rs");
+        let start = src
+            .find("async fn consume_shutdown(")
+            .expect("consume_shutdown fn must exist");
+        let end_offset = src[start..]
+            .find("\n}\n")
+            .expect("consume_shutdown body must end with a top-level closing brace");
+        let body = &src[start..start + end_offset];
+        assert!(
+            body.contains("finalize_shutdown_singleton_disposition_ambiguous("),
+            "consume_shutdown must route through the _ambiguous finalizer to hold the disk \
+             cursor on partial-wire failures — the plain variant would honest-Recovered and \
+             risk downstream duplicates on next-start replay."
+        );
+        assert!(
+            !body.contains("crate::modules::finalize_shutdown_singleton_disposition("),
+            "consume_shutdown must not fall back to the plain finalizer — the wire state \
+             cannot be proved pre-boundary from outside the write helper."
         );
     }
 
