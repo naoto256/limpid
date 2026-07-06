@@ -480,6 +480,28 @@ For operators, the practical implications:
 
 Shutdown fallthrough — the runtime SIGTERM budget elapsing while a send is still in flight — falls into the same `Dropped` path: the task is aborted, the parked handle drops, and on a disk queue the position holds for replay on next start. Network unbatched sinks (`kafka`, `syslog_tcp`, `syslog_udp`, `unix_socket`) narrow the shutdown race to the pre-send phase (connect / handshake / rotation); the send phase itself runs to completion or times out via its per-write timeout (`PEER_WRITE_TIMEOUT` / `message.timeout.ms`), and only that timeout — or a runtime task abort — can cut a send short. The `file` output remains deliberately shutdown-unaware end-to-end for the same reason: partial-append duplication on retry is worse than a Dropped-then-replayed event.
 
+## Graceful shutdown guarantees and known limitations
+
+The runtime's graceful-shutdown sequence (`SIGTERM`, `SIGHUP` reload, `systemctl stop`, or an explicit `shutdown()` API call) is bounded by `runtime::Daemon::SHUTDOWN_TIMEOUT` (10 s) and pipes every in-daemon event through a defined disposition — there is no silent-loss window inside the runtime's own channels.
+
+### What the shutdown drain guarantees
+
+- **Output-queue backend-aware drain.** Memory-backed output queues are closed and drained via `recv().await`-until-`None`, the tokio-documented pattern for consuming every value already sent or being sent by a sender still holding a channel permit. A pipeline worker whose `send()` had reserved a permit but not yet written its value is not silently lost — the send still becomes visible before the drain terminates. Disk-backed output queues do not drain unread WAL entries into the 10 s shutdown window at all; the WAL cursor holds and the unread backlog replays on next start.
+- **Pipeline-worker channel drain.** The pipeline worker's input channel (`event_rx`) uses the same close + recv-until-None pattern, so an input task whose `send()` was mid-flight when shutdown fired lands on the worker. Late input sends that lose the race surface via `journalctl` at `info!` level rather than a silent stop.
+- **Bounded batched-sink ownership.** Batched outputs (`http`, `otlp_http`, `otlp_grpc`) hold at most `batch_size × 2` events in memory via a per-sink permit pool. Queue backpressure survives a stalled downstream: a durable disk backlog cannot dissolve into shutdown-window RAM through an unbounded parked buffer.
+- **No fabricated at-least-once on ambiguous wire state.** Stream-oriented sinks whose drain write may have partially reached the peer (`unix_socket`, `syslog_tcp`) route their drain failure to `Dropped`, not `Recovered`. On a disk queue the fail-stop wedge holds the cursor for next-start replay after operator reconciliation; on a memory queue the disposition folds to `Recovered`. A DLQ record is still written for the operator's audit trail — the disposition change prevents the pattern where a partial-wire success is compounded by a DLQ-driven replay.
+
+### Known limitations
+
+Two boundaries the shutdown drain does not cover. Both are protocol-level and both are called out here so operators know where the guarantees end.
+
+1. **Wire buffer between kernel and daemon.** Bytes that reached the kernel socket buffer for a limpid input (`syslog_udp`, `syslog_tcp`, `unix_socket`) but were not yet read by the daemon at the moment `SIGTERM` fired are outside the shutdown drain's reach. UDP has no protocol-level ack and cannot recover this class in principle; stream syslog cannot recover it without a per-connection application ack from the upstream, which is not part of the protocol. Operators who need the wire buffer to survive limpid restarts must run an ack-aware collector upstream (OTLP with retries, kafka with acks, or a queueing forwarder) rather than rely on plain syslog.
+2. **Delivery-completeness upgrade for the race window.** The current shutdown ordering routes any event that lost the shutdown-vs-send race to the DLQ (`Recovered`) instead of shipping it to the primary sink. This is safe (no loss) but is a downgrade from full "delivery" for the affected event: the operator has to run `limpidctl inject output` to replay, or accept the DLQ record as the terminal disposition. A full phase-split of the shutdown ordering — inputs stop, pipeline workers drain, output senders close, output consumers drain — would upgrade this class to `Delivered`. It is queued for a follow-up release; the current shape is documented, not silent, and the DLQ record is durable.
+
+Both limitations are surfaced deliberately. `events_failed` on the output ticks for the Recovered path; the DLQ record captures the payload. Neither is treated as an excuse for further silent gaps inside the runtime.
+
+**`SIGKILL` (`kill -9`) still bypasses the entire graceful-shutdown path.** Actor tasks are aborted with their handles unresolved, and batched outputs lose whatever was mid-flush. Production deployments must keep systemd's `KillSignal=SIGTERM` default and give the daemon its 10 s budget.
+
 ## Schema migration v1 → v2
 
 The 0.7.8 release introduces `schema_version: 2` as a **hard break**. v1 records (no `schema_version`, top-level `process` string field as the discriminator, no `kind`, no per-kind block) are not readable by v2 tooling, and v2 records are not readable by v1 tooling.
