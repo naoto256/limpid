@@ -409,16 +409,16 @@ struct PipelineContext {
     /// batched-output shutdown-flush leftovers, (4) runtime-side
     /// enqueue failures (queue closed, disk write error, unknown
     /// output). `None` when `control { error_log }` is unset — the
-    /// fallback shape differs by site: the process-side and
-    /// enqueue-failure paths (`write_errored_to_dlq` in this
-    /// module) emit a `tracing::error!` line with the **full
-    /// failure JSONL** in the `event_record` structured field, so
-    /// the payload is recoverable from journald; the sink-side
-    /// retry-exhaustion and shutdown-drain paths (`route_event_to_dlq`
-    /// in `crates/limpid/src/modules/mod.rs`) emit a
-    /// `tracing::error!` line naming the output and the reason
-    /// only, without the payload. Both converge on the same file
-    /// once `error_log` is configured.
+    /// fallback shape is now uniform across sites: both the
+    /// process-side / enqueue-failure paths (`write_errored_to_dlq`
+    /// in this module) and the sink-side retry-exhaustion /
+    /// shutdown-drain paths (`route_event_to_dlq` and
+    /// `route_shutdown_batch_to_dlq` in
+    /// `crates/limpid/src/modules/mod.rs`) emit a
+    /// `tracing::error!` line with the **full failure JSONL** in
+    /// the `event_record` structured field. The payload is
+    /// recoverable from journald in either case, and both converge
+    /// on the same file once `error_log` is configured.
     error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
 }
 

@@ -171,8 +171,9 @@ fn validate_existing_parent(
              boundary (an untrusted owner can rename or replace the socket inode inside the \
              parent), and a root-owned parent at the packaged mode (`0o750`) is not writable \
              by a non-root daemon so bind would fail post-validation anyway. Under systemd, \
-             `RuntimeDirectory=limpid` combined with `User=limpid` creates a daemon-owned \
-             parent at the requested mode — that is the intended shape. For custom deploys, \
+             `RuntimeDirectory=limpid` combined with `User=<daemon-user>` (the packaged \
+             unit ships with `User=syslog`) creates a daemon-owned parent at the requested \
+             mode — that is the intended shape. For custom deploys, \
              `chown <daemon-user>:<daemon-group> {:?}` and re-run.",
             parent,
             uid,
@@ -399,8 +400,8 @@ fn parent_dir_mode_is_unsafe(mode: u32) -> bool {
 /// the parent owner to match the daemon's own euid covers both cases:
 /// a root daemon runs against a root-owned parent, and a non-root
 /// daemon runs against a daemon-owned parent (systemd's
-/// `RuntimeDirectory=limpid` with `User=limpid` produces exactly this
-/// shape).
+/// `RuntimeDirectory=limpid` with `User=<daemon-user>` — the packaged
+/// unit ships with `User=syslog` — produces exactly this shape).
 ///
 /// Kept separate from the mode predicate so error diagnostics can name
 /// the failing property (owner vs mode).
@@ -1371,7 +1372,8 @@ mod tests {
         // shape when limpid runs as root).
         assert!(!parent_dir_owner_is_untrusted(0, 0));
         // Non-root daemon + daemon-owned parent is trusted (systemd's
-        // `RuntimeDirectory=limpid` + `User=limpid` produces this
+        // `RuntimeDirectory=limpid` + `User=<daemon-user>` (the
+        // packaged unit ships with `User=syslog`) produces this
         // shape at 0o750).
         assert!(!parent_dir_owner_is_untrusted(1000, 1000));
         // Non-root daemon + root-owned parent is UNTRUSTED even though

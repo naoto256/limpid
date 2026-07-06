@@ -2,12 +2,19 @@
 //! `error_log` for failure recovery while leaving it unconfigured.
 //!
 //! Several recovery paths added in 0.7.8 (retry-exhausted recovery and
-//! the batched-output shutdown-flush drain) only persist the original payload when
+//! the batched-output shutdown-flush drain) only persist the original
+//! payload to a durable, easily-replayable **file** when
 //! `control { error_log "..." }` is set. With `error_log` missing the
-//! runtime falls back to the 0.7.7 behaviour (log + metric only, no
-//! replay-able record on disk) — so an operator writing a config with
-//! retry / batched outputs and *no* `error_log` silently voids the
-//! safety net those features were added to provide.
+//! runtime falls back to emitting a `tracing::error!` line carrying
+//! the full failure JSONL in the `event_record` structured field: the
+//! payload is not silently dropped and remains recoverable via
+//! `journalctl | jq`, but this fallback is strictly worse than a
+//! dedicated DLQ file (subject to log rotation, filters, and
+//! aggregation delays) and offers no `limpidctl inject` replay
+//! shortcut. An operator writing a config with retry / batched
+//! outputs and no `error_log` therefore weakens the safety net those
+//! features were added to provide, even though the payload is not
+//! outright lost.
 //!
 //! This module raises one [`Level::Warning`] when:
 //!
@@ -111,9 +118,13 @@ pub(super) fn analyze_all(config: &CompiledConfig, diags: &mut Vec<Diagnostic>) 
         "config has outputs that depend on `error_log` for failure recovery, \
          but `control {{ error_log \"...\" }}` is not configured. \
          Affected outputs: {}. \
-         On retry exhaustion or shutdown flush failure, the original payload \
-         will be dropped silently (log + metric only, no replay-able record). \
-         To enable recovery, add:\n    \
+         On retry exhaustion or shutdown flush failure the daemon falls back to \
+         emitting one `tracing::error!` line per event with the full JSONL in an \
+         `event_record` structured field, so the payload is recoverable from \
+         journald via `journalctl | jq`; this is strictly worse than a file-based \
+         DLQ (log rotation / filters / aggregation delays and no `limpidctl inject` \
+         replay shortcut), so operator recovery is weaker without `error_log`. \
+         To enable durable file-based recovery, add:\n    \
          control {{\n        error_log \"/var/log/limpid/error_log.jsonl\"\n    }}",
         summary,
     );
