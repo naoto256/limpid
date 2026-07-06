@@ -931,6 +931,41 @@ impl FileOutput {
                         configured_uid
                     );
                 }
+            } else {
+                // Implicit owner contract: when `owner` is left
+                // unset but the metadata contract is otherwise
+                // active (`mode` or `group` configured), require
+                // the existing file to be owned by the daemon's own
+                // euid. Without this arm a pre-existing 0o600
+                // inode owned by a co-tenant under an
+                // attacker-writable ancestor would clear the mode
+                // check and receive every subsequent log write —
+                // the exact shape the DLQ trust boundary now
+                // covers, and the file output's own contract
+                // requires the same treatment here (an operator
+                // who bothered to write `mode "0600"` did not opt
+                // into leaking to whichever uid happens to own the
+                // path). The unconfigured-metadata case is
+                // unchanged: `requires_metadata` gates entry to
+                // this function, so the callers only reach here
+                // when at least one of mode/owner/group is set.
+                let self_euid = unsafe { libc::geteuid() };
+                if stat.st_uid != self_euid {
+                    anyhow::bail!(
+                        "output file '{}': existing file owner uid {} does not match the \
+                         daemon's effective uid {} — refusing to write. Without an explicit \
+                         `owner \"...\"` the metadata contract implicitly requires the daemon \
+                         to own the inode: an attacker-planted file under a shared parent \
+                         would otherwise receive every subsequent log record. Remove the file \
+                         so this output recreates it under the daemon's uid, `chown \
+                         <daemon-user>:<daemon-group> '{}'`, or configure `owner \"...\"` \
+                         explicitly if the operator really wants a different uid.",
+                        path.display(),
+                        stat.st_uid,
+                        self_euid,
+                        path.display(),
+                    );
+                }
             }
             if let Some(name) = group.as_deref() {
                 let configured_gid = resolve_gid(name).with_context(|| {
@@ -1969,6 +2004,44 @@ mod tests {
         assert_eq!(
             actual, 0o600,
             "birth mode must be 0o600 (owner-only) when owner/group is configured, got 0o{actual:o}",
+        );
+    }
+
+    /// Structural pin: when `owner` is left unset but the metadata
+    /// contract is active (i.e. `verify_existing_file_metadata` is
+    /// called at all), the fstat st_uid check falls back to the
+    /// daemon's own euid via `libc::geteuid`. Fabricating an
+    /// existing inode owned by a different uid needs root, so the
+    /// behavioural coverage of the *refusal* arm is a source-level
+    /// pin. The *acceptance* arm (implicit-euid file, mode-only
+    /// config) is covered by
+    /// `existing_file_with_matching_mode_accepts_subsequent_writes`
+    /// — the tempdir-created inode is euid-owned by construction, so
+    /// the new check passes there naturally.
+    #[test]
+    fn verify_existing_file_metadata_falls_back_to_daemon_euid_when_owner_unset() {
+        let src = include_str!("file.rs");
+        let start = src
+            .find("async fn verify_existing_file_metadata(")
+            .expect("verify_existing_file_metadata fn must exist");
+        // Limit to the fn body: end at the next top-level `async fn`
+        // sibling (or `fn`) so we do not scan unrelated code.
+        let after_body = src[start + 1..]
+            .find("\n    async fn ")
+            .or_else(|| src[start + 1..].find("\n    fn "))
+            .or_else(|| src[start + 1..].find("\n}\n"))
+            .expect("verify_existing_file_metadata body must be delimited");
+        let body = &src[start..start + 1 + after_body];
+        assert!(
+            body.contains("} else {") && body.contains("libc::geteuid"),
+            "verify_existing_file_metadata must fall back to geteuid() when owner is unset — \
+             a mode-only or group-only metadata contract must not silently accept an \
+             attacker-owned existing inode"
+        );
+        assert!(
+            body.contains("daemon's effective uid"),
+            "the else-arm bail must name the daemon-euid contract explicitly so operators \
+             know why the write was refused"
         );
     }
 
