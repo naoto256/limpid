@@ -387,7 +387,7 @@ fn run_journal_reader(
     }
 
     // Seek to saved cursor or end
-    if let Some(cursor) = state_file.as_ref().and_then(|f| load_cursor(f)) {
+    if let Some(cursor) = state_file.as_ref().and_then(load_cursor) {
         if let Err(e) = journal.seek_cursor(&cursor) {
             warn!(
                 "journal: failed to seek to cursor, starting from end: {}",
