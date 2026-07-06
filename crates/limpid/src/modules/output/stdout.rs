@@ -164,24 +164,23 @@ impl Output for StdoutOutput {
     }
 
     async fn consume_shutdown(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
-        match self.write_event(event) {
-            Ok(()) => {
-                self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
-                ack.resolve_delivered();
-            }
-            Err(e) => {
-                let reason = format!("shutdown write failed: {}", e);
-                let __dlq_outcome = crate::modules::route_event_to_dlq(
-                    self.error_log.as_ref(),
-                    &self.metrics,
-                    &self.name,
-                    event,
-                    &reason,
-                )
-                .await;
-                crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
-            }
-        }
+        // `write_event` is a synchronous write with no metric side
+        // effects, so the success + failure paths reduce to the
+        // canonical shape `finalize_shutdown_singleton_disposition`
+        // handles: bump events_written on Ok, route to DLQ on Err.
+        // Delegating removes the inline `route_event_to_dlq` +
+        // `resolve_ack_from_dlq_outcome` pair and lines up with the
+        // sibling sinks (syslog_tcp, syslog_udp, unix_socket, kafka)
+        // that already use the helper.
+        crate::modules::finalize_shutdown_singleton_disposition(
+            self.write_event(event),
+            self.error_log.as_ref(),
+            &self.metrics,
+            &self.name,
+            event,
+            ack,
+        )
+        .await;
         Ok(())
     }
 }
