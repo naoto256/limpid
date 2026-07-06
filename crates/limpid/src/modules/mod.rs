@@ -299,8 +299,24 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     /// (disk queue) or count it lost (memory queue on shutdown).
     ///
     /// - On successful delivery: call `ack.resolve_delivered()`.
-    /// - On DLQ recovery (retry exhausted / render error / shutdown
-    ///   leftover): call `ack.resolve_recovered()`.
+    /// - On failure (retry exhausted / render error / DLQ-adjacent
+    ///   path): route through `route_event_to_dlq` and dispatch the
+    ///   returned `DlqRouteOutcome` through
+    ///   `resolve_ack_from_dlq_outcome`. The dispatcher owns the
+    ///   backend-aware terminal disposition: `Recovered` on any queue
+    ///   when the DLQ record was durably written (or when the JSONL
+    ///   tracing fallback ran because `error_log` was unset),
+    ///   `Dropped` on a disk queue when the configured DLQ file
+    ///   write itself failed (which triggers the fail-stop wedge so
+    ///   the disk cursor holds for next-start replay), and memory
+    ///   queues fold `Dropped` back to `Recovered` internally
+    ///   because they have no replay path. Sinks that resolve the
+    ///   handle themselves must call one of `resolve_delivered` /
+    ///   `resolve_recovered` / `resolve_dropped` directly, but the
+    ///   dispatcher is the standard shape — it keeps
+    ///   `events_failed` bumped exactly once per failure and picks
+    ///   the correct disposition per backend without per-sink
+    ///   duplication.
     ///
     /// `Ok(())` does NOT mean the event was delivered — it means the
     /// output accepted ownership of the lifecycle. Actual disposition
@@ -646,8 +662,10 @@ pub async fn route_shutdown_batch_to_dlq(
             };
             tracing::error!(
                 event_record = %ctx.to_jsonl(),
-                "output '{}': shutdown-drain event dropped (no error_log); configure \
-                 `control {{ error_log \"...\" }}` for file-based DLQ",
+                "output '{}': shutdown-drain event emitted as tracing fallback (no error_log \
+                 configured); disposition is Recovered, payload is grep/journalctl-recoverable \
+                 via the event_record field. Configure `control {{ error_log \"...\" }}` for \
+                 file-based DLQ and `limpidctl inject output` replay",
                 output_name
             );
             resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Recovered, metrics);
@@ -911,7 +929,10 @@ pub async fn route_event_to_dlq(
         };
         tracing::error!(
             event_record = %ctx.to_jsonl(),
-            "output '{}': dropping event (no error_log); configure `control {{ error_log \"...\" }}` for file-based DLQ",
+            "output '{}': event emitted as tracing fallback (no error_log configured); \
+             payload is grep/journalctl-recoverable via the event_record field. Configure \
+             `control {{ error_log \"...\" }}` for file-based DLQ and `limpidctl inject \
+             output` replay",
             output_name
         );
         DlqRouteOutcome::Recovered
