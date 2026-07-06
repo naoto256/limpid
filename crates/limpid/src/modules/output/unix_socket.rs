@@ -30,6 +30,13 @@ const UNIX_SOCKET_OUTPUT_SCHEMA: &[PropertySpec] = &[
         exclusive_group: None,
         kind: PropertyValueKind::String,
     },
+    PropertySpec {
+        name: "expected_peer_uid",
+        required: false,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::String,
+    },
     crate::queue::RETRY_PROPERTY_SPEC,
     crate::queue::QUEUE_PROPERTY_SPEC,
 ];
@@ -42,6 +49,30 @@ pub struct UnixSocketOutput {
     error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
     metrics: Arc<OutputMetrics>,
     shutdown_signal: tokio::sync::watch::Receiver<bool>,
+    /// UIDs that the peer service listening on `path` may report via
+    /// its socket credentials (Linux `SO_PEERCRED` / macOS
+    /// `LOCAL_PEERCRED`) and still be accepted.
+    ///
+    /// - **Unset `expected_peer_uid`**: `{daemon euid, 0}`. Root is
+    ///   trusted because the canonical peer on packaged
+    ///   deployments is `journald` (`/dev/log` → root-listener) and
+    ///   an attacker who can `bind` as root has already crossed a
+    ///   larger trust boundary than this check defends; the check
+    ///   is aimed at non-root co-tenants who `bind` a squatter
+    ///   socket at the path before the real peer restarts. `syslog`
+    ///   (the packaged `User=`) matches the euid arm.
+    /// - **`expected_peer_uid "<name>"`**: the default set is
+    ///   **replaced** (not extended) with the resolved uid alone —
+    ///   root is refused too. This is the operator lock-down mode
+    ///   for deployments with a known dedicated collector uid.
+    ///
+    /// Path-shape trust (parent owner, final-component symlink
+    /// refusal, socket-shape preflight) is intentionally **not**
+    /// applied to this connect-side sink: `/dev/log` is a symlink
+    /// on systemd installs and its parent `/dev` is root-owned, so
+    /// bind-side predicates would refuse the most common
+    /// deployment.
+    allowed_peer_uids: Vec<u32>,
 }
 
 impl Module for UnixSocketOutput {
@@ -58,6 +89,40 @@ impl Module for UnixSocketOutput {
         let properties = properties.user_properties();
         let path = props::get_string(properties, "path")
             .ok_or_else(|| anyhow::anyhow!("output '{}': unix_socket requires 'path'", name))?;
+        let allowed_peer_uids = match props::get_string(properties, "expected_peer_uid") {
+            Some(user) => {
+                // Explicit lock-down: replace the default allow set
+                // with the single resolved uid. Root is refused too.
+                let uid = resolve_uid(&user).with_context(|| {
+                    format!(
+                        "output '{}': failed to resolve expected_peer_uid '{}'",
+                        name, user
+                    )
+                })?;
+                vec![uid]
+            }
+            None => {
+                // Default: allow the daemon's own euid plus root.
+                // `{daemon euid, 0}` covers the two canonical peer
+                // identities on packaged deployments (`syslog` uid
+                // for the daemon-owned collector, `0` for
+                // journald's `/dev/log`) while refusing any other
+                // uid — the co-tenant-squatter defense.
+                #[cfg(unix)]
+                {
+                    let self_euid = unsafe { libc::geteuid() };
+                    if self_euid == 0 {
+                        vec![0]
+                    } else {
+                        vec![self_euid, 0]
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    Vec::new()
+                }
+            }
+        };
         Ok(Self {
             name: name.to_string(),
             path: PathBuf::from(path),
@@ -66,6 +131,7 @@ impl Module for UnixSocketOutput {
             error_log: ctx.error_log.as_ref().map(Arc::clone),
             metrics: Arc::new(OutputMetrics::default()),
             shutdown_signal: ctx.shutdown_signal.clone(),
+            allowed_peer_uids,
         })
     }
 }
@@ -236,9 +302,44 @@ impl PersistentConn for UnixSocketOutput {
     type Stream = UnixStream;
 
     async fn connect(&self) -> Result<UnixStream> {
-        UnixStream::connect(&self.path)
+        let stream = UnixStream::connect(&self.path)
             .await
-            .with_context(|| format!("unix_socket connect to {}", self.path.display()))
+            .with_context(|| format!("unix_socket connect to {}", self.path.display()))?;
+        // Peer-credential trust: the connect-side sink defends
+        // against a co-tenant squatter binding on `self.path`
+        // before the legitimate peer restarts. Every reconnect is
+        // its own credential check — a one-shot startup validation
+        // would miss the exact race window this defends. See the
+        // `allowed_peer_uids` field docs on the struct for the
+        // default-set semantics.
+        #[cfg(unix)]
+        {
+            let cred = stream.peer_cred().with_context(|| {
+                format!(
+                    "unix_socket '{}': failed to read peer credentials on socket at {}",
+                    self.name,
+                    self.path.display()
+                )
+            })?;
+            let peer_uid = cred.uid();
+            if !self.allowed_peer_uids.contains(&peer_uid) {
+                anyhow::bail!(
+                    "unix_socket '{}': peer at {} runs as uid {}, which is not in the allowed \
+                     set {:?} — refusing to ship events. This defends against a co-tenant \
+                     process that bound a squatter socket at the path between the peer \
+                     service's restarts; the daemon must not silently hand the failure \
+                     JSONL for every event to whichever process happens to hold the socket \
+                     inode. If the observed uid is the legitimate collector, set \
+                     `expected_peer_uid \"<user>\"` on the output. If the observed uid is \
+                     unexpected, investigate: kill the squatter or restart the intended peer.",
+                    self.name,
+                    self.path.display(),
+                    peer_uid,
+                    self.allowed_peer_uids,
+                );
+            }
+        }
+        Ok(stream)
     }
 
     async fn write_frame(&self, stream: &mut UnixStream, payload: &Bytes) -> Result<()> {
@@ -261,6 +362,44 @@ impl PersistentConn for UnixSocketOutput {
         stream.flush().await?;
         Ok(())
     }
+}
+
+/// Resolve a username to its uid via `getpwnam_r`. Same reentrant
+/// pattern the file output uses for its `owner` property (see
+/// `crates/limpid/src/modules/output/file.rs::resolve_uid`). Called
+/// once at construction time so runtime `connect()` never blocks
+/// on NSS. Numeric-string uids fall through as invalid names and
+/// surface the diagnostic — deliberate: the config surface is
+/// name-based like the file output's, and mixing numeric and named
+/// forms invites operator confusion about which one wins under
+/// user-database rebuilds.
+#[cfg(unix)]
+fn resolve_uid(name: &str) -> Result<u32> {
+    use std::ffi::CString;
+    use std::mem::MaybeUninit;
+    const NSS_RECORD_BUF: usize = 4096;
+    let c_name = CString::new(name)?;
+    let mut buf = [0u8; NSS_RECORD_BUF];
+    let mut pwd: MaybeUninit<libc::passwd> = MaybeUninit::uninit();
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getpwnam_r(
+            c_name.as_ptr(),
+            pwd.as_mut_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 {
+        anyhow::bail!("getpwnam_r failed for '{}': errno {}", name, rc);
+    }
+    if result.is_null() {
+        anyhow::bail!("user '{}' not found", name);
+    }
+    // SAFETY: `result` is non-null and points into `pwd`; pw_uid is
+    // a plain numeric copy that outlives the borrow.
+    Ok(unsafe { (*result).pw_uid })
 }
 
 #[cfg(test)]
@@ -369,6 +508,183 @@ mod tests {
             !body.contains("crate::modules::finalize_shutdown_singleton_disposition("),
             "consume_shutdown must not fall back to the plain finalizer — the wire state \
              cannot be proved pre-boundary from outside the write helper."
+        );
+    }
+
+    /// Default policy pin: with no `expected_peer_uid` configured
+    /// the allow set is `{daemon euid, 0}`. A non-root daemon
+    /// carries both entries so `journald` (`/dev/log` = root) and
+    /// a daemon-owned collector are both accepted; a root daemon
+    /// collapses to just `[0]`.
+    #[test]
+    fn default_allow_set_is_daemon_euid_plus_root() {
+        use crate::dsl::ast::{Expr, ExprKind, Property};
+        use crate::dsl::module_props::ModuleProperties;
+        let props = ModuleProperties::from_parts(
+            "unix_socket",
+            vec![Property::KeyValue {
+                key: "path".into(),
+                key_span: None,
+                value: Expr::spanless(ExprKind::StringLit("/tmp/never.sock".into())),
+                value_span: None,
+            }],
+        );
+        let out = UnixSocketOutput::from_properties(
+            "u",
+            &props,
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .expect("build");
+        let self_euid = unsafe { libc::geteuid() };
+        if self_euid == 0 {
+            assert_eq!(
+                out.allowed_peer_uids,
+                vec![0],
+                "root daemon: default allow set collapses to [0]"
+            );
+        } else {
+            assert!(
+                out.allowed_peer_uids.contains(&self_euid) && out.allowed_peer_uids.contains(&0),
+                "non-root daemon: default allow set must contain both euid and 0; got {:?}",
+                out.allowed_peer_uids
+            );
+            assert_eq!(
+                out.allowed_peer_uids.len(),
+                2,
+                "default allow set must be exactly {{euid, 0}}"
+            );
+        }
+    }
+
+    /// `expected_peer_uid` **replaces** the default allow set — root
+    /// is refused too. Pin the strict-mode semantics against the
+    /// operator-facing docstring.
+    #[test]
+    fn expected_peer_uid_replaces_default_set() {
+        use crate::dsl::ast::{Expr, ExprKind, Property};
+        use crate::dsl::module_props::ModuleProperties;
+        // Try `nobody` first; fall through to the current user if
+        // the test image doesn't have a `nobody` entry (Docker
+        // scratch, minimal Alpine, some CI runners).
+        let user_name: String = if resolve_uid("nobody").is_ok() {
+            "nobody".into()
+        } else {
+            unsafe {
+                let euid = libc::geteuid();
+                let pwd = libc::getpwuid(euid);
+                if pwd.is_null() {
+                    panic!("cannot resolve current user for test — no `nobody` either");
+                }
+                std::ffi::CStr::from_ptr((*pwd).pw_name)
+                    .to_str()
+                    .expect("username is UTF-8")
+                    .to_string()
+            }
+        };
+        let expected_uid = resolve_uid(&user_name).expect("resolve test user");
+        let props = ModuleProperties::from_parts(
+            "unix_socket",
+            vec![
+                Property::KeyValue {
+                    key: "path".into(),
+                    key_span: None,
+                    value: Expr::spanless(ExprKind::StringLit("/tmp/never.sock".into())),
+                    value_span: None,
+                },
+                Property::KeyValue {
+                    key: "expected_peer_uid".into(),
+                    key_span: None,
+                    value: Expr::spanless(ExprKind::StringLit(user_name.clone())),
+                    value_span: None,
+                },
+            ],
+        );
+        let out = UnixSocketOutput::from_properties(
+            "u",
+            &props,
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .expect("build");
+        assert_eq!(
+            out.allowed_peer_uids,
+            vec![expected_uid],
+            "expected_peer_uid must REPLACE the default set (root not implicitly included)"
+        );
+    }
+
+    /// A misspelt `expected_peer_uid` surfaces at build time, not
+    /// at first connect. Prevents a config typo from turning into a
+    /// silent socket-squatter acceptance later.
+    #[test]
+    fn expected_peer_uid_unknown_user_fails_at_build() {
+        use crate::dsl::ast::{Expr, ExprKind, Property};
+        use crate::dsl::module_props::ModuleProperties;
+        let props = ModuleProperties::from_parts(
+            "unix_socket",
+            vec![
+                Property::KeyValue {
+                    key: "path".into(),
+                    key_span: None,
+                    value: Expr::spanless(ExprKind::StringLit("/tmp/never.sock".into())),
+                    value_span: None,
+                },
+                Property::KeyValue {
+                    key: "expected_peer_uid".into(),
+                    key_span: None,
+                    value: Expr::spanless(ExprKind::StringLit(
+                        "definitely_not_a_real_user_xyzzy".into(),
+                    )),
+                    value_span: None,
+                },
+            ],
+        );
+        let err = match UnixSocketOutput::from_properties(
+            "u",
+            &props,
+            &crate::modules::BuildContext::for_testing(),
+        ) {
+            Ok(_) => panic!("build must fail on unresolvable expected_peer_uid"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expected_peer_uid") && msg.contains("definitely_not_a_real_user_xyzzy"),
+            "diagnostic must name the property and the offending value: {msg}"
+        );
+    }
+
+    /// Structural pin: `PersistentConn::connect` verifies the peer
+    /// credential against `self.allowed_peer_uids` on every call.
+    /// Behavioural coverage for the *reject* arm needs a listener
+    /// running under a different uid, which is root-only; pin the
+    /// shape at the source so a mechanical refactor that strips
+    /// the check fails at test time. The default-set *accept* arm
+    /// is exercised by every existing e2e test in this module,
+    /// which runs its listener under the process euid.
+    #[test]
+    fn connect_verifies_peer_uid_against_allowed_set() {
+        let src = include_str!("unix_socket.rs");
+        // Anchor on the `PersistentConn for UnixSocketOutput` impl
+        // header so the `async fn connect(` we grab is the one on
+        // the trait impl, not any incidental mention elsewhere.
+        let impl_start = src
+            .find("impl PersistentConn for UnixSocketOutput {")
+            .expect("PersistentConn impl must exist");
+        let connect_start = src[impl_start..]
+            .find("async fn connect(")
+            .map(|off| impl_start + off)
+            .expect("connect fn inside the impl block");
+        let body_end = src[connect_start..]
+            .find("async fn write_frame")
+            .expect("connect body ends before write_frame");
+        let body = &src[connect_start..connect_start + body_end];
+        assert!(
+            body.contains("peer_cred()"),
+            "connect must call peer_cred() on the freshly-connected socket"
+        );
+        assert!(
+            body.contains("allowed_peer_uids.contains("),
+            "connect must reject a peer whose uid is not in self.allowed_peer_uids"
         );
     }
 
