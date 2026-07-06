@@ -655,6 +655,118 @@ pub async fn route_shutdown_batch_to_dlq(
     }
 }
 
+/// Same shape as [`route_shutdown_batch_to_dlq`] but for batched-sink
+/// failures whose wire state is ambiguous: `policy.send(...)` may have
+/// committed part or all of the batch to the peer before the
+/// cancellation / timeout fired. Two call sites for this today:
+///
+/// - `BatchedSink::flush_events` steady-state retry loop, `None` arm:
+///   `wait_until_shutdown` wins over an in-flight `policy.send(...)`,
+///   so the send future is dropped mid-flight. HTTP / OTLP transports
+///   have already flushed request bytes into the kernel by the time
+///   the future returns to the runtime.
+/// - `BatchedSink::flush_events_at_shutdown` `Elapsed` arm:
+///   `tokio::time::timeout(SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT, ...)` fires
+///   after the send call has been running for 3 s — the same
+///   partial-wire risk.
+///
+/// The plain [`route_shutdown_batch_to_dlq`] resolves the failure as
+/// `Recovered` on a successful DLQ write, which advances the disk
+/// queue's cursor past the batch. Combined with a partial-wire
+/// success this can double-deliver: the downstream receives some
+/// records, the DLQ record replays via `limpidctl inject output`, and
+/// the operator has no signal that the two paths overlap.
+///
+/// This variant writes the DLQ record for the operator's audit trail
+/// (reconciliation between wedged position and downstream is only
+/// possible when the payload survives durably) but forces the
+/// failure disposition to `Dropped` regardless of the DLQ-write
+/// outcome:
+///
+/// - Disk queue: the fail-stop wedge holds the cursor at the batch's
+///   position on next start, giving the operator a chance to
+///   reconcile the DLQ record against the downstream before the
+///   same batch is retried.
+/// - Memory queue: `Dropped` folds to `Recovered` inside
+///   `resolve_ack_from_dlq_outcome` (no replay path exists so the
+///   loss is unavoidable, but the DLQ record still captures what
+///   would have shipped).
+///
+/// The `no error_log` branch mirrors the plain helper: emit the
+/// `event_record` JSONL as a tracing fallback (that is the only
+/// durable trace available), then resolve the ack. Even without a
+/// file DLQ the disposition is forced to `Dropped` so operators do
+/// not silently lose the ambiguity signal on a disk queue.
+pub async fn route_shutdown_batch_ambiguous_to_dlq(
+    error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+    metrics: &OutputMetrics,
+    output_name: &str,
+    events: Vec<(Event, crate::queue::QueueAckHandle)>,
+    flush_err: &anyhow::Error,
+) {
+    use std::sync::atomic::Ordering;
+
+    if events.is_empty() {
+        return;
+    }
+    let reason = format!(
+        "shutdown flush failed after send-boundary (ambiguous wire state): {}",
+        flush_err
+    );
+    if let Some(writer) = error_log {
+        for (ev, ack) in events {
+            let ctx = crate::pipeline::ErroredEventContext::Output {
+                timestamp: chrono::Utc::now(),
+                pipeline: String::new(),
+                site: format!("{} shutdown", output_name),
+                reason: reason.clone(),
+                output_name: output_name.to_string(),
+                event: crate::pipeline::OutputEvent::from_owned(&ev),
+            };
+            if let Err(write_err) = writer.write(&ctx).await {
+                tracing::error!(
+                    event_record = %ctx.to_jsonl(),
+                    "output '{}': error_log write during ambiguous shutdown drain failed: {} — \
+                     forcing Dropped so the disk queue holds the cursor for reconciliation; \
+                     event_record below is a best-effort tracing fallback (a healthy `error_log` \
+                     file is the load-bearing recovery)",
+                    output_name,
+                    write_err
+                );
+                metrics
+                    .events_errored_unwritable
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            // The DLQ record has been written (or the tracing
+            // fallback fired) for operator visibility, but the
+            // disposition is forced to `Dropped` regardless: the
+            // wire state cannot be proved pre-boundary, so
+            // `Recovered` would fabricate an at-least-once
+            // guarantee the transport does not support.
+            resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Dropped, metrics);
+        }
+    } else {
+        for (ev, ack) in events {
+            let ctx = crate::pipeline::ErroredEventContext::Output {
+                timestamp: chrono::Utc::now(),
+                pipeline: String::new(),
+                site: format!("{} shutdown", output_name),
+                reason: reason.clone(),
+                output_name: output_name.to_string(),
+                event: crate::pipeline::OutputEvent::from_owned(&ev),
+            };
+            tracing::error!(
+                event_record = %ctx.to_jsonl(),
+                "output '{}': ambiguous shutdown-drain event forced Dropped (no error_log); \
+                 configure `control {{ error_log \"...\" }}` for file-based DLQ so \
+                 reconciliation against the downstream is durable",
+                output_name
+            );
+            resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Dropped, metrics);
+        }
+    }
+}
+
 /// Resolve `ack` per the queue backend and the DLQ route outcome,
 /// and count the terminal failure in `events_failed`. This helper
 /// owns the failure count for every DLQ-adjacent path so the metric

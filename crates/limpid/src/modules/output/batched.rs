@@ -626,6 +626,17 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
         };
         let mut attempt = 0u32;
         let mut wait = self.retry.initial_wait;
+        // Distinguishes "retry budget exhausted, transport reported
+        // Err" (safe to route Recovered — no wire commit was
+        // observed, or the transport's own Err semantics rule it
+        // out) from "shutdown cancelled the in-flight send" (the
+        // future was dropped while the request may already have
+        // been serialised into the kernel socket buffer). Only the
+        // latter needs the ambiguous-wire discipline: `Recovered`
+        // in that case would fabricate an at-least-once guarantee
+        // that lets a partial-wire success be replayed and
+        // double-delivered.
+        let mut shutdown_cancelled_send = false;
         let final_err = loop {
             // Race the transport against the shutdown signal. A
             // stalled peer (= TCP accepted but never responds) holds
@@ -635,8 +646,9 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
             // QueueAckHandle unresolved (the unresolved-handle
             // regression). With the race, a `shutdown()` mid-flight
             // cancels the send future (the transport client cancels
-            // the connection on drop) and falls through to the DLQ +
-            // Recovered path below.
+            // the connection on drop). The dropped future's wire
+            // state is ambiguous — the ambiguous DLQ route below
+            // forces Dropped rather than Recovered.
             let send_outcome = tokio::select! {
                 biased;
                 res = self.policy.send(&prepared) => Some(res),
@@ -648,6 +660,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                     return;
                 }
                 None => {
+                    shutdown_cancelled_send = true;
                     break anyhow::anyhow!(
                         "shutdown cancelled in-flight send (collapsed retry budget)"
                     );
@@ -711,22 +724,48 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                 }
             }
         };
-        // Retry exhausted: route every shippable event to DLQ and
-        // resolve Recovered. The batch is gone from the buffer at
-        // this point — the disk-queue cursor will not advance until
-        // every handle resolves, so a daemon crash here replays the
-        // batch on restart (the ack-handle invariant).
-        let reason = format!("flush failed after {} attempts: {}", attempt, final_err);
-        for (ev, ack, _permit) in shippable {
-            let __dlq_outcome = crate::modules::route_event_to_dlq(
+        // Terminal disposition: split by why we left the loop.
+        //
+        // - Shutdown cancelled the in-flight send → the wire state
+        //   is ambiguous (HTTP / OTLP transports flush request bytes
+        //   into the kernel socket buffer well before the send
+        //   future resolves, so a mid-flight drop can happen after
+        //   the peer has already read part or all of the batch).
+        //   `route_shutdown_batch_ambiguous_to_dlq` writes the DLQ
+        //   record for the operator's audit trail but forces
+        //   `Dropped` — on a disk queue the fail-stop wedge holds
+        //   the cursor for next-start reconciliation instead of
+        //   advancing past a batch that may already have shipped.
+        //
+        // - Retry exhausted from transport `Err` → `Recovered` via
+        //   the plain per-event DLQ route. Retry-exhausted `Err` is
+        //   the transport's own signal that no wire commit is
+        //   pending: HTTP returned a status / connection error,
+        //   OTLP returned a gRPC status, the send future is done.
+        //   The disk-queue cursor advances past this batch (the DLQ
+        //   record is now the load-bearing recovery).
+        if shutdown_cancelled_send {
+            crate::modules::route_shutdown_batch_ambiguous_to_dlq(
                 self.error_log.as_ref(),
                 &self.metrics,
                 &self.name,
-                &ev,
-                &reason,
+                strip_permits(shippable),
+                &final_err,
             )
             .await;
-            crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
+        } else {
+            let reason = format!("flush failed after {} attempts: {}", attempt, final_err);
+            for (ev, ack, _permit) in shippable {
+                let __dlq_outcome = crate::modules::route_event_to_dlq(
+                    self.error_log.as_ref(),
+                    &self.metrics,
+                    &self.name,
+                    &ev,
+                    &reason,
+                )
+                .await;
+                crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
+            }
         }
     }
 
@@ -784,11 +823,16 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                 .await;
             }
             Err(_elapsed) => {
+                // The 3 s attempt timeout fired after `policy.send`
+                // was already running — the same partial-wire
+                // ambiguity as the steady-state shutdown-cancel arm.
+                // Use the ambiguous DLQ route so a partially-shipped
+                // batch does not double-deliver on next-start replay.
                 let err = anyhow::anyhow!(
                     "deadline exceeded after {:?} during shutdown flush",
                     crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT
                 );
-                crate::modules::route_shutdown_batch_to_dlq(
+                crate::modules::route_shutdown_batch_ambiguous_to_dlq(
                     self.error_log.as_ref(),
                     &self.metrics,
                     &self.name,
@@ -798,5 +842,75 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                 .await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Structural pin: `flush_events`' shutdown-cancel arm and
+    /// `flush_events_at_shutdown`'s `Elapsed` arm both route through
+    /// `route_shutdown_batch_ambiguous_to_dlq`, not the plain
+    /// `route_shutdown_batch_to_dlq`.
+    ///
+    /// The batched transports (HTTP / OTLP-HTTP / OTLP-gRPC) push
+    /// request bytes into the kernel socket buffer well before
+    /// `policy.send(...)` resolves, so both cancelling the future
+    /// mid-flight (`wait_until_shutdown` wins the select) and
+    /// timing it out after `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT` leave
+    /// the wire state ambiguous. Honest `Recovered` on a disk queue
+    /// would advance the cursor past a batch the downstream may
+    /// have already received; forcing `Dropped` wedges the cursor
+    /// for next-start reconciliation instead. The plain helper is
+    /// still used for retry-exhausted `Err` (retry-exhausted `Err`
+    /// is the transport's own no-commit signal, so `Recovered` is
+    /// honest there) and for the deterministic prepare-failure arm.
+    #[test]
+    fn shutdown_ambiguous_arms_use_ambiguous_dlq_helper() {
+        let src = include_str!("batched.rs");
+
+        // `flush_events` steady-state shutdown arm: check the
+        // terminal-disposition split. The `shutdown_cancelled_send`
+        // branch must call the ambiguous helper; the `else` branch
+        // (retry exhausted) keeps `route_event_to_dlq` per event.
+        let fe_start = src
+            .find("async fn flush_events(&self, batch: Vec<ParkedEvent>)")
+            .expect("flush_events fn must exist");
+        let fe_end = src[fe_start..]
+            .find("async fn flush_events_at_shutdown(")
+            .expect("flush_events must precede flush_events_at_shutdown");
+        let fe_body = &src[fe_start..fe_start + fe_end];
+        assert!(
+            fe_body.contains("if shutdown_cancelled_send {"),
+            "flush_events must split its terminal disposition on shutdown_cancelled_send"
+        );
+        assert!(
+            fe_body.contains("route_shutdown_batch_ambiguous_to_dlq("),
+            "flush_events shutdown-cancel arm must call the ambiguous DLQ helper"
+        );
+
+        // `flush_events_at_shutdown` Elapsed arm: same check. The
+        // Err(_elapsed) branch must call the ambiguous helper.
+        let fs_start = src
+            .find("async fn flush_events_at_shutdown(&self, batch: Vec<ParkedEvent>)")
+            .expect("flush_events_at_shutdown fn must exist");
+        // Take the rest of the file — the fn is the last thing here.
+        let fs_body = &src[fs_start..];
+        // Locate the `Err(_elapsed)` arm and check its body block
+        // reaches the ambiguous helper before the next top-level
+        // `match` arm boundary.
+        let elapsed_arm = fs_body
+            .find("Err(_elapsed) => {")
+            .expect("Elapsed arm must exist");
+        let elapsed_tail = &fs_body[elapsed_arm..];
+        // Take a generous window up to the closing brace of the
+        // whole match — the ambiguous call must appear inside.
+        assert!(
+            elapsed_tail
+                .split("\n            }")
+                .next()
+                .unwrap_or("")
+                .contains("route_shutdown_batch_ambiguous_to_dlq("),
+            "flush_events_at_shutdown Elapsed arm must call the ambiguous DLQ helper"
+        );
     }
 }

@@ -601,10 +601,20 @@ impl Output for KafkaOutput {
         // duplicate delivery + replayable DLQ record. The same
         // reasoning applies here as the steady-state `consume` path:
         // once the side-effect boundary is crossed, an outer
-        // timeout is unsafe. On a disk queue a shutdown-time
-        // producer failure still triggers the fail-stop wedge via
-        // `finalize_shutdown_singleton_disposition` so the cursor
-        // holds for next-start replay.
+        // timeout is unsafe.
+        //
+        // `try_send`'s `Err` is itself ambiguous with respect to
+        // the wire boundary: `queue_timeout` / `message.timeout.ms`
+        // fires *after* `producer.send(...)` has synchronously
+        // enqueued the record into librdkafka's internal queue, and
+        // the record may or may not have been shipped to the broker
+        // by the time the awaited delivery future returns Err.
+        // Route through `finalize_shutdown_singleton_disposition_ambiguous`
+        // so shutdown-time failure is forced to `Dropped`: disk
+        // queues wedge for next-start reconciliation, memory queues
+        // fall back to `Recovered` inside the disposition helper.
+        // Recovered would fabricate an at-least-once guarantee kafka
+        // does not support at this boundary.
         let (_no_shutdown_tx, no_shutdown_rx) = tokio::sync::watch::channel(false);
         let result = match self.try_send(event, no_shutdown_rx).await {
             Ok(KafkaTrySendOutcome::Delivered) => Ok(()),
@@ -618,7 +628,7 @@ impl Output for KafkaOutput {
             }
             Err(e) => Err(e),
         };
-        crate::modules::finalize_shutdown_singleton_disposition(
+        crate::modules::finalize_shutdown_singleton_disposition_ambiguous(
             result,
             self.error_log.as_ref(),
             &self.metrics,
@@ -1109,6 +1119,38 @@ mod tests {
              mid-producer.send shutdown drop the delivery future while librdkafka has \
              already accepted the record, producing duplicate delivery. The load-bearing \
              pre-send guard lives inside try_send at the borrow_and_update recheck."
+        );
+    }
+
+    /// `consume_shutdown` routes its result through
+    /// `finalize_shutdown_singleton_disposition_ambiguous`, not the
+    /// plain variant. Rationale: `try_send`'s `Err` fires after
+    /// `producer.send(...)` has synchronously enqueued the record
+    /// into librdkafka; the delivery future's failure (queue_timeout /
+    /// message.timeout.ms) does not distinguish "queue full, never
+    /// touched broker" from "record was picked up and broker ack
+    /// never came". Routing `Err` as honest `Recovered` on shutdown
+    /// therefore risks a duplicate — force `Dropped` so the disk
+    /// queue wedges for next-start reconciliation instead.
+    #[test]
+    fn consume_shutdown_uses_ambiguous_finalizer() {
+        let src = include_str!("kafka.rs");
+        let start = src
+            .find("async fn consume_shutdown(")
+            .expect("consume_shutdown fn must exist");
+        let end_offset = src[start..]
+            .find("impl KafkaOutput {")
+            .expect("consume_shutdown body must end before next impl block");
+        let body = &src[start..start + end_offset];
+        assert!(
+            body.contains("finalize_shutdown_singleton_disposition_ambiguous("),
+            "kafka consume_shutdown must use the _ambiguous finalizer — try_send Err after \
+             producer.send is ambiguous with respect to the wire boundary, and honest Recovered \
+             would risk a duplicate on next-start replay of the DLQ record."
+        );
+        assert!(
+            !body.contains("crate::modules::finalize_shutdown_singleton_disposition("),
+            "kafka consume_shutdown must not fall back to the plain finalizer."
         );
     }
 
