@@ -79,19 +79,24 @@ fn parent_dir_owner_is_untrusted_for_input(uid: u32, self_euid: u32) -> bool {
 /// `control::validate_control_socket_parent` and
 /// `ErrorLogWriter::validate_at_startup`.
 ///
-/// - Parent absent → bail. Unlike control, this input does
-///   not create its own parent (`/dev` is expected to exist);
-///   an absent parent almost always means a config typo.
+/// The trust boundary is enforced on the FINAL parent component via
+/// `symlink_metadata`. A symlink final parent lets an attacker
+/// redirect the bind target between validation and the daemon's
+/// actual `bind`, so it is rejected up front. Ancestor path
+/// components may still be symlinks (`/var/run` → `/run`); ancestor
+/// path identity is a deployment contract, not a runtime check.
+///
+/// - Parent absent → bail. Unlike control, this input does not create
+///   its own parent (`/dev` is expected to exist); an absent parent
+///   almost always means a config typo.
+/// - Parent is a symlink → bail (parent-swap TOCTOU).
 /// - Parent exists but is not a directory → bail.
-/// - Parent exists as a directory owned by an untrusted uid
-///   (neither root nor the daemon's own effective uid) →
-///   bail. `/dev` (root-owned) and daemon-owned runtime dirs
-///   pass; a user-created dir owned by an unrelated uid fails
-///   independent of mode.
-/// - Parent exists as a directory whose mode is group-writable
-///   or world-writable → bail. `/dev` at `0o755` passes.
-///   `/tmp` at `0o1777` does **not** — see the predicate doc
-///   for why sticky is not treated as protective here.
+/// - Parent exists as a directory owned by an untrusted uid → bail.
+///   `/dev` (root-owned) is trusted only when the daemon runs as
+///   root; a non-root daemon requires a daemon-owned parent.
+/// - Parent exists as a directory whose mode is group-writable or
+///   world-writable → bail. `/dev` at `0o755` passes; `/tmp` at
+///   `0o1777` does not.
 fn validate_unix_socket_input_parent(path: &str) -> Result<()> {
     let path = Path::new(path);
     let Some(parent) = path.parent() else {
@@ -105,19 +110,29 @@ fn validate_unix_socket_input_parent(path: &str) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let meta = std::fs::metadata(parent).with_context(|| {
+        let link_meta = std::fs::symlink_metadata(parent).with_context(|| {
             format!(
                 "input unix_socket: parent directory {:?} is not accessible (does it exist?)",
                 parent
             )
         })?;
-        if !meta.is_dir() {
+        if link_meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "input unix_socket: parent {:?} is a symlink — refusing to bind. The final \
+                 parent component must be a real directory: a symlink lets an attacker redirect \
+                 the bind target between this preflight and the daemon's actual `bind`. Modern \
+                 Linux ships `/var/run` as a symlink to `/run`; point `path` at a `/run/...` \
+                 path or a daemon-owned runtime directory.",
+                parent
+            );
+        }
+        if !link_meta.is_dir() {
             anyhow::bail!(
                 "input unix_socket: parent {:?} exists but is not a directory; check the `path` value",
                 parent
             );
         }
-        let uid = meta.uid();
+        let uid = link_meta.uid();
         let self_euid = unsafe { libc::geteuid() };
         if parent_dir_owner_is_untrusted_for_input(uid, self_euid) {
             anyhow::bail!(
@@ -134,7 +149,7 @@ fn validate_unix_socket_input_parent(path: &str) -> Result<()> {
                 self_euid,
             );
         }
-        let mode = meta.permissions().mode() & 0o7777;
+        let mode = link_meta.permissions().mode() & 0o7777;
         if parent_dir_mode_is_unsafe_for_input(mode & 0o777) {
             anyhow::bail!(
                 "input unix_socket: parent dir {:?} has mode 0o{:o} — refusing to bind. \
@@ -682,6 +697,50 @@ mod tests {
         // Any unrelated uid is untrusted.
         assert!(parent_dir_owner_is_untrusted_for_input(1001, 1000));
         assert!(parent_dir_owner_is_untrusted_for_input(65534, 1000));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_input_bails_when_final_parent_component_is_a_symlink() {
+        // Parent-swap TOCTOU: a symlink final parent lets an attacker
+        // redirect the bind between validation and the daemon's
+        // `bind`. `symlink_metadata` catches the symlink up front.
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("real-parent");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = base.path().join("symlink-parent");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let socket_path = link.join("in.sock");
+        let err = validate_unix_socket_input_parent(socket_path.to_str().unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("symlink") && msg.contains("refusing to bind"),
+            "diagnostic must name the symlink shape: {msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_input_accepts_ancestor_symlink_when_final_parent_is_a_real_dir() {
+        // /dev is real on Linux, but this test proves the more
+        // general shape: ancestor symlink + real final parent must
+        // pass. Mirrors the control-socket ancestor-symlink test.
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let real_ancestor = base.path().join("real-ancestor");
+        std::fs::create_dir(&real_ancestor).unwrap();
+        std::fs::set_permissions(&real_ancestor, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let link_ancestor = base.path().join("link-ancestor");
+        std::os::unix::fs::symlink(&real_ancestor, &link_ancestor).unwrap();
+        let final_parent = link_ancestor.join("in");
+        std::fs::create_dir(&final_parent).unwrap();
+        std::fs::set_permissions(&final_parent, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let socket_path = final_parent.join("in.sock");
+        validate_unix_socket_input_parent(socket_path.to_str().unwrap()).unwrap();
     }
 
     #[test]

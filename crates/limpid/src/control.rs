@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use anyhow::Context;
 use bytes::Bytes;
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -69,57 +70,47 @@ pub type InputInjectTarget = (mpsc::Sender<Event>, Arc<crate::metrics::InputMetr
 /// pre-existing directory's permissions are deliberately left alone
 /// because they may be operator-managed.
 ///
-/// Pre-existing parents whose mode fails
-/// [`parent_dir_mode_is_unsafe`] are handled elsewhere — see
-/// [`validate_control_socket_parent`], which is called from
-/// `Runtime::start` before this spawned task runs and bails the
-/// entire daemon rather than proceeding with a compromised bind→chmod
-/// window.
-fn ensure_socket_parent_dir(parent: &std::path::Path) {
-    let preexisting = parent.exists();
-    let _ = std::fs::create_dir_all(parent);
-    #[cfg(unix)]
-    if !preexisting {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o750));
-    }
-}
-
-/// Startup-time validation for the control socket's parent
-/// directory. Called from `Runtime::start` before the control
-/// task is spawned, so an unsafe pre-existing parent aborts the
-/// whole daemon startup instead of letting a background task
-/// die silently with the daemon still running under a broken
-/// trust boundary.
+/// Startup-time validation and (when absent) creation of the control
+/// socket's parent directory. Called from `Runtime::start` before the
+/// control task is spawned, so an unsafe pre-existing parent — or a
+/// failure to safely create an absent parent — aborts the whole daemon
+/// startup instead of letting a background task die silently with the
+/// daemon still running under a broken trust boundary.
 ///
-/// - Parent absent → OK. The subsequent
-///   `ensure_socket_parent_dir` call from the control task
-///   creates it at 0o750 (bare / non-systemd runs), which
-///   passes the [`parent_dir_mode_is_unsafe`] predicate by
-///   construction.
-/// - Parent exists but is not a directory → bail. Almost
-///   always a config typo (`socket "/var/log/limpid.log"`
-///   instead of `.sock`).
-/// - Parent exists as a directory owned by an untrusted uid
-///   (neither root nor the daemon's own effective uid) →
-///   bail. Directory mode alone does not close the trust
-///   boundary: the owner can rename or replace the socket
-///   inode inside the parent even when the mode looks safe.
-/// - Parent exists as a directory with an unsafe mode →
-///   bail with the observed mode and a remediation hint.
+/// The trust boundary is enforced on the FINAL parent component:
+///
+/// - `symlink_metadata(parent)` inspects the final component itself
+///   without following it. A symlink parent lets an attacker redirect
+///   the bind target between validation and the daemon's actual `bind`
+///   — the classic parent-swap TOCTOU — so a symlink final component
+///   is rejected up front. Ancestor path components may be symlinks
+///   (modern Linux ships `/var/run` → `/run` as a compatibility
+///   symlink); ancestor path identity is a deployment contract.
+/// - Parent exists but is not a directory → bail (config typo).
+/// - Parent exists as a directory owned by an untrusted uid → bail.
+///   Directory mode alone does not close the boundary: the owner
+///   retains rename/unlink rights regardless of mode. A root-owned
+///   parent is trusted only when the daemon runs as root; a non-root
+///   daemon requires a daemon-owned parent.
+/// - Parent exists as a directory with an unsafe mode → bail with the
+///   observed mode and a remediation hint.
+/// - Parent absent → verify the nearest existing ancestor is trusted
+///   (daemon-owned, or root-owned and not other-writable), then create
+///   the parent under our control at 0o750, then `symlink_metadata`
+///   the created path to confirm it is a real directory owned by us at
+///   the requested mode. Any mismatch bails startup.
 ///
 /// The custom-deploy contract this closes: an operator whose
-/// `control { socket "..." }` points into a directory they
-/// have not tightened (e.g. `0o755`, `0o770`, or worse) or
-/// which is owned by another user would previously have seen
-/// only a `warn!` line and a live daemon running on an
-/// insecure socket. That warn-only shape is now a fatal
-/// startup error, matching the equivalent shape from the DLQ
+/// `control { socket "..." }` points into a directory they have not
+/// tightened (or that is owned by someone else, or that is a symlink,
+/// or that lives under an attacker-writable ancestor) would previously
+/// have seen only a `warn!` line or a silent bind failure. That
+/// warn-only shape is now a fatal startup error, matching the DLQ
 /// preflight in `error_log::validate_at_startup`.
 ///
-/// Under packaged systemd units (`RuntimeDirectory=limpid`
-/// with `RuntimeDirectoryMode=0750`) the parent is already
-/// safe and this validation is a no-op.
+/// Under packaged systemd units (`RuntimeDirectory=limpid` with
+/// `RuntimeDirectoryMode=0750`) the parent is already safe and this
+/// validation is a no-op except for the symlink check.
 pub fn validate_control_socket_parent(socket_path_config: Option<&str>) -> anyhow::Result<()> {
     let socket_path = PathBuf::from(
         socket_path_config
@@ -136,55 +127,11 @@ pub fn validate_control_socket_parent(socket_path_config: Option<&str>) -> anyho
     };
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        match std::fs::metadata(parent) {
-            Ok(meta) => {
-                if !meta.is_dir() {
-                    anyhow::bail!(
-                        "control socket: parent {:?} exists but is not a directory; \
-                         check the `control {{ socket \"...\" }}` value",
-                        parent
-                    );
-                }
-                let uid = meta.uid();
-                let self_euid = unsafe { libc::geteuid() };
-                if parent_dir_owner_is_untrusted(uid, self_euid) {
-                    anyhow::bail!(
-                        "control socket: parent dir {:?} is owned by uid {}, but the daemon's \
-                         effective uid is {} — refusing to bind. Directory mode alone does not \
-                         close the trust boundary (an untrusted owner can rename or replace the \
-                         socket inode inside the parent), and a root-owned parent at the \
-                         packaged mode (`0o750`) is not writable by a non-root daemon so bind \
-                         would fail post-validation anyway. Under systemd, `RuntimeDirectory=limpid` \
-                         combined with `User=limpid` creates a daemon-owned parent at the \
-                         requested mode — that is the intended shape. For custom deploys, \
-                         `chown <daemon-user>:<daemon-group> {:?}` and re-run.",
-                        parent,
-                        uid,
-                        self_euid,
-                        parent,
-                    );
-                }
-                let mode = meta.permissions().mode() & 0o777;
-                if parent_dir_mode_is_unsafe(mode) {
-                    anyhow::bail!(
-                        "control socket: parent dir {:?} has mode 0o{:o} — refusing to bind. \
-                         The control socket is a root-equivalent trust boundary and the \
-                         bind→chmod 0o660 window assumes only the daemon's group can \
-                         traverse to the socket inode. Tighten the parent to 0o750 or \
-                         stricter (`chmod 0750 {:?}`), or point `control {{ socket \"...\" }}` \
-                         at a packaged path (`/var/run/limpid/`, with \
-                         `RuntimeDirectoryMode=0750` under systemd).",
-                        parent,
-                        mode,
-                        parent
-                    );
-                }
-            }
+        let self_euid = unsafe { libc::geteuid() };
+        match std::fs::symlink_metadata(parent) {
+            Ok(link_meta) => validate_existing_parent(parent, &link_meta, self_euid)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Parent will be created at 0o750 by the control
-                // task's `ensure_socket_parent_dir`. No pre-existing
-                // mode to check.
+                create_parent_under_trusted_ancestor(parent, self_euid)?;
             }
             Err(e) => {
                 return Err(anyhow::Error::from(e).context(format!(
@@ -195,6 +142,199 @@ pub fn validate_control_socket_parent(socket_path_config: Option<&str>) -> anyho
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn validate_existing_parent(
+    parent: &std::path::Path,
+    link_meta: &std::fs::Metadata,
+    self_euid: u32,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if link_meta.file_type().is_symlink() {
+        anyhow::bail!(
+            "control socket: parent {:?} is a symlink — refusing to bind. The final parent \
+             component must be a real directory: a symlink lets an attacker redirect the bind \
+             target between this preflight and the daemon's actual `bind`. Modern Linux ships \
+             `/var/run` as a symlink to `/run`; point `control {{ socket \"...\" }}` at a \
+             `/run/limpid/...` path, or leave the packaged default alone.",
+            parent
+        );
+    }
+    if !link_meta.is_dir() {
+        anyhow::bail!(
+            "control socket: parent {:?} exists but is not a directory; check the \
+             `control {{ socket \"...\" }}` value",
+            parent
+        );
+    }
+    let uid = link_meta.uid();
+    if parent_dir_owner_is_untrusted(uid, self_euid) {
+        anyhow::bail!(
+            "control socket: parent dir {:?} is owned by uid {}, but the daemon's effective \
+             uid is {} — refusing to bind. Directory mode alone does not close the trust \
+             boundary (an untrusted owner can rename or replace the socket inode inside the \
+             parent), and a root-owned parent at the packaged mode (`0o750`) is not writable \
+             by a non-root daemon so bind would fail post-validation anyway. Under systemd, \
+             `RuntimeDirectory=limpid` combined with `User=limpid` creates a daemon-owned \
+             parent at the requested mode — that is the intended shape. For custom deploys, \
+             `chown <daemon-user>:<daemon-group> {:?}` and re-run.",
+            parent, uid, self_euid, parent,
+        );
+    }
+    let mode = link_meta.permissions().mode() & 0o777;
+    if parent_dir_mode_is_unsafe(mode) {
+        anyhow::bail!(
+            "control socket: parent dir {:?} has mode 0o{:o} — refusing to bind. The control \
+             socket is a root-equivalent trust boundary and the bind→chmod 0o660 window \
+             assumes only the daemon's group can traverse to the socket inode. Tighten the \
+             parent to 0o750 or stricter (`chmod 0750 {:?}`), or point \
+             `control {{ socket \"...\" }}` at a packaged path (`/var/run/limpid/`, with \
+             `RuntimeDirectoryMode=0750` under systemd).",
+            parent, mode, parent,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_parent_under_trusted_ancestor(
+    parent: &std::path::Path,
+    self_euid: u32,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    // Verify the nearest existing ancestor is a trusted owner so we
+    // are not creating a fresh directory (and immediately chmod-ing
+    // it to 0o750) inside an attacker-writable ancestor. Canonicalize
+    // the ancestor so `/var/run` (symlink) → `/run` is checked at its
+    // real identity; the check itself follows the canonical path.
+    let ancestor = nearest_existing_ancestor(parent).with_context(|| {
+        format!(
+            "control socket: no existing ancestor for absent parent {:?}",
+            parent
+        )
+    })?;
+    let canonical = std::fs::canonicalize(&ancestor).with_context(|| {
+        format!(
+            "control socket: cannot canonicalize ancestor {:?} of parent {:?}",
+            ancestor, parent
+        )
+    })?;
+    let ancestor_meta = std::fs::metadata(&canonical).with_context(|| {
+        format!(
+            "control socket: cannot stat ancestor {:?} (canonical {:?})",
+            ancestor, canonical
+        )
+    })?;
+    let ancestor_uid = ancestor_meta.uid();
+    let ancestor_mode = ancestor_meta.permissions().mode() & 0o777;
+    if !ancestor_is_trusted_for_create(ancestor_uid, ancestor_mode, self_euid) {
+        anyhow::bail!(
+            "control socket: refusing to create parent {:?} — nearest existing ancestor \
+             {:?} (canonical {:?}) is owned by uid {} at mode 0o{:o}, which is neither \
+             daemon-owned nor a root-owned non-writable system directory. Creating the \
+             parent here would let an attacker with rename rights on the ancestor \
+             substitute the newly-created directory. Move the socket into a daemon-owned \
+             or root-owned system runtime dir (e.g. `/run/limpid/`).",
+            parent, ancestor, canonical, ancestor_uid, ancestor_mode,
+        );
+    }
+    std::fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "control socket: failed to create parent directory {:?}",
+            parent
+        )
+    })?;
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o750)).with_context(
+        || {
+            format!(
+                "control socket: failed to chmod 0o750 on created parent {:?}",
+                parent
+            )
+        },
+    )?;
+    // Post-create verify: symlink_metadata so we notice if a
+    // concurrent attacker swapped the created path with a symlink
+    // between our create and the check.
+    let created = std::fs::symlink_metadata(parent).with_context(|| {
+        format!(
+            "control socket: failed to stat freshly-created parent {:?}",
+            parent
+        )
+    })?;
+    if created.file_type().is_symlink() {
+        anyhow::bail!(
+            "control socket: parent {:?} is a symlink after create — refusing to bind. A \
+             concurrent process replaced the directory we just created.",
+            parent
+        );
+    }
+    if !created.is_dir() {
+        anyhow::bail!(
+            "control socket: parent {:?} is not a directory after create — refusing to bind",
+            parent
+        );
+    }
+    let created_uid = created.uid();
+    if created_uid != self_euid {
+        anyhow::bail!(
+            "control socket: freshly-created parent {:?} is owned by uid {}, not the daemon's \
+             effective uid {} — refusing to bind",
+            parent, created_uid, self_euid,
+        );
+    }
+    let created_mode = created.permissions().mode() & 0o777;
+    if created_mode != 0o750 {
+        anyhow::bail!(
+            "control socket: freshly-created parent {:?} has mode 0o{:o}, not the requested \
+             0o750 — refusing to bind",
+            parent, created_mode,
+        );
+    }
+    Ok(())
+}
+
+/// True when the deepest existing ancestor of an absent parent is
+/// safe to `create_dir_all` into. Two shapes qualify:
+///
+/// - Daemon-owned (`uid == self_euid`): the daemon controls the
+///   ancestor's contents by definition. Mode is irrelevant here; the
+///   daemon is authoritative regardless.
+/// - Root-owned and not other-writable (`uid == 0 && mode & 0o022 == 0`):
+///   the packaged runtime ancestors (`/run`, `/var/lib/limpid`, etc.).
+///   Root-owned + world-writable (sticky-bit `/tmp` at `0o1777`) is
+///   deliberately excluded — an attacker with rename rights on
+///   `/tmp` could substitute the newly-created directory before we
+///   chmod it, and the sticky bit does not protect against a
+///   rename-in of an attacker-owned node.
+///
+/// Pure function so it can be exercised directly by unit tests
+/// without requiring privilege escalation to construct an ancestor
+/// owned by a different uid.
+#[cfg(unix)]
+fn ancestor_is_trusted_for_create(uid: u32, mode: u32, self_euid: u32) -> bool {
+    uid == self_euid || (uid == 0 && mode & 0o022 == 0)
+}
+
+/// Walk up `path` until a component exists on the filesystem (checked
+/// with `symlink_metadata` so a broken symlink counts as "does not
+/// exist" for the purpose of finding an ancestor we can trust). Used
+/// by [`create_parent_under_trusted_ancestor`] to find the deepest
+/// existing ancestor whose identity we can verify before creating a
+/// new directory below it.
+#[cfg(unix)]
+fn nearest_existing_ancestor(path: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let mut current = path;
+    loop {
+        let Some(parent) = current.parent() else {
+            anyhow::bail!("no existing ancestor for {:?}", path);
+        };
+        if std::fs::symlink_metadata(parent).is_ok() {
+            return Ok(parent.to_path_buf());
+        }
+        current = parent;
+    }
 }
 
 /// True when the parent dir's mode breaks either TOCTOU-mitigating
@@ -274,11 +414,14 @@ impl ControlServer {
     }
 
     pub async fn run(self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
-        // Ensure parent directory exists (see `ensure_socket_parent_dir`
-        // for the 0o750 tightening rationale).
-        if let Some(parent) = self.socket_path.parent() {
-            ensure_socket_parent_dir(parent);
-        }
+        // Parent directory has already been validated and (when absent)
+        // created at 0o750 under a trusted ancestor by
+        // `validate_control_socket_parent`, called from `Runtime::start`
+        // before this task was spawned. No parent-preparation happens
+        // here — moving it out was deliberate: a bail inside this
+        // fire-and-forget task would kill the control server silently
+        // with the daemon still running, so any trust-boundary decision
+        // must be made at startup where its errors abort the daemon.
 
         // Remove stale socket — only if it's actually a socket. Any
         // other node type (regular file, directory, FIFO, device
@@ -1142,33 +1285,22 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn parent_dir_created_by_daemon_is_group_scoped() {
+    fn validate_creates_absent_parent_at_0o750_under_daemon_owned_ancestor() {
+        // Absent parent + ancestor owned by the daemon's euid (the
+        // tempdir default) → validate creates the parent at 0o750
+        // and passes.
         use std::os::unix::fs::PermissionsExt;
         let base = tempfile::TempDir::new().unwrap();
         let parent = base.path().join("limpid-run");
         assert!(!parent.exists());
-        ensure_socket_parent_dir(&parent);
+        let socket = parent.join("control.sock");
+        validate_control_socket_parent(Some(socket.to_str().unwrap())).unwrap();
+        assert!(parent.exists());
         let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
         assert_eq!(
             mode, 0o750,
-            "daemon-created socket dir must not be world-traversable"
+            "validate-created parent must not be world-traversable"
         );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn preexisting_parent_dir_permissions_left_alone() {
-        // systemd's RuntimeDirectory (or an operator) owns the mode of
-        // a directory that already exists — the daemon must not fight
-        // it.
-        use std::os::unix::fs::PermissionsExt;
-        let base = tempfile::TempDir::new().unwrap();
-        let parent = base.path().join("managed-run");
-        std::fs::create_dir_all(&parent).unwrap();
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
-        ensure_socket_parent_dir(&parent);
-        let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o755, "pre-existing dir mode must be preserved");
     }
 
     #[test]
@@ -1225,27 +1357,84 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn ensure_socket_parent_dir_preserves_unsafe_preexisting_mode() {
-        // `ensure_socket_parent_dir` is creation-only under the
-        // startup fail-closed contract: `validate_control_socket_parent`
-        // is authoritative for pre-existing parents and runs
-        // ahead of this function on the daemon startup path. If
-        // control still reaches `ensure_socket_parent_dir` with
-        // an unsafe pre-existing parent (a test invoking it in
-        // isolation), the function must not fail-fast or silently
-        // tighten an operator-managed dir — the operator's mode
-        // stays.
+    fn validate_bails_when_final_parent_component_is_a_symlink() {
+        // A symlink final parent lets an attacker redirect the bind
+        // target between validation and the daemon's `bind`. The
+        // check uses `symlink_metadata` so the symlink itself is
+        // seen (not followed) and the daemon startup bails.
         use std::os::unix::fs::PermissionsExt;
         let base = tempfile::TempDir::new().unwrap();
-        let parent = base.path().join("unsafe-run");
-        std::fs::create_dir_all(&parent).unwrap();
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
-        ensure_socket_parent_dir(&parent);
-        let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            mode, 0o777,
-            "creation-only helper must not silently tighten an operator-managed dir"
+        let real = base.path().join("real-parent");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let link = base.path().join("symlink-parent");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let socket = link.join("control.sock");
+        let err = validate_control_socket_parent(Some(socket.to_str().unwrap())).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("symlink") && msg.contains("refusing to bind"),
+            "diagnostic must name the symlink shape: {msg}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_accepts_ancestor_symlink_when_final_parent_is_a_real_dir() {
+        // Modern Linux ships `/var/run` as a symlink to `/run` — the
+        // default `/var/run/limpid/control.sock` has an ancestor
+        // symlink but a real final parent `limpid`. Ancestor symlinks
+        // must not trip the check.
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::TempDir::new().unwrap();
+        let real_ancestor = base.path().join("real-ancestor");
+        std::fs::create_dir_all(&real_ancestor).unwrap();
+        std::fs::set_permissions(&real_ancestor, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let link_ancestor = base.path().join("link-ancestor");
+        std::os::unix::fs::symlink(&real_ancestor, &link_ancestor).unwrap();
+        let final_parent = link_ancestor.join("limpid");
+        std::fs::create_dir_all(&final_parent).unwrap();
+        std::fs::set_permissions(&final_parent, std::fs::Permissions::from_mode(0o750))
+            .unwrap();
+        let socket = final_parent.join("control.sock");
+        validate_control_socket_parent(Some(socket.to_str().unwrap())).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn nearest_existing_ancestor_walks_up_through_missing_components() {
+        let base = tempfile::TempDir::new().unwrap();
+        let deep = base.path().join("a/b/c/d");
+        let found = super::nearest_existing_ancestor(&deep).unwrap();
+        assert_eq!(found, base.path());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ancestor_trust_predicate_covers_all_shapes() {
+        // Daemon-owned ancestor is trusted regardless of mode — the
+        // daemon controls its own dir.
+        assert!(ancestor_is_trusted_for_create(1000, 0o755, 1000));
+        assert!(ancestor_is_trusted_for_create(1000, 0o777, 1000));
+        assert!(ancestor_is_trusted_for_create(0, 0o700, 0));
+        // Root-owned + mode-safe (not other-writable) is trusted for
+        // both root and non-root daemons — the packaged system
+        // runtime dirs (`/run`, `/var/lib/limpid`, etc.) fit here.
+        assert!(ancestor_is_trusted_for_create(0, 0o755, 1000));
+        assert!(ancestor_is_trusted_for_create(0, 0o750, 1000));
+        assert!(ancestor_is_trusted_for_create(0, 0o700, 1000));
+        // Root-owned + world-writable (`/tmp` at `0o1777`, but mode
+        // truncated to 0o777 for the predicate) is UNTRUSTED — an
+        // attacker with rename rights on the ancestor could
+        // substitute the newly-created directory.
+        assert!(!ancestor_is_trusted_for_create(0, 0o777, 1000));
+        assert!(!ancestor_is_trusted_for_create(0, 0o1777 & 0o777, 1000));
+        // Non-root non-self-owned ancestor is untrusted regardless of
+        // mode.
+        assert!(!ancestor_is_trusted_for_create(1001, 0o755, 1000));
+        assert!(!ancestor_is_trusted_for_create(1001, 0o700, 1000));
+        assert!(!ancestor_is_trusted_for_create(65534, 0o755, 1000));
     }
 
     /// Fail-closed startup validation: a pre-existing parent
