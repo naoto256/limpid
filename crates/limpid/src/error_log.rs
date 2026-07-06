@@ -301,13 +301,36 @@ impl ErrorLogWriter {
         } else {
             parent
         };
-        let meta = tokio::fs::metadata(parent).await.with_context(|| {
+        // Inspect the FINAL parent component with `symlink_metadata`
+        // so a symlink parent can be named explicitly and rejected up
+        // front. Otherwise `metadata` would follow the link and pass
+        // the check against the (safe) target, letting an attacker
+        // who can rename the symlink between here and the runtime
+        // write path redirect DLQ writes into an attacker-controlled
+        // directory. Final file is separately guarded by
+        // `O_NOFOLLOW` + fstat on the fd, but that only covers the
+        // socket path's last component; the parent path's identity
+        // is the ancestor trust boundary. Ancestor components may
+        // still be symlinks (`/var/run` → `/run`); ancestor path
+        // identity is a deployment contract, not a runtime check.
+        let link_meta = tokio::fs::symlink_metadata(parent).await.with_context(|| {
             format!(
                 "error_log: parent directory '{}' is not accessible (does it exist?)",
                 parent.display()
             )
         })?;
-        if !meta.is_dir() {
+        if link_meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "error_log: parent directory '{}' is a symlink — refusing to preflight. The \
+                 final parent component must be a real directory: a symlink lets an attacker \
+                 redirect DLQ writes between this check and the runtime `write` path. Point \
+                 `control {{ error_log \"...\" }}` at a real directory (or leave the packaged \
+                 default alone). Modern Linux ships `/var/run` as a symlink to `/run`; a \
+                 `/run/limpid/...` path avoids the symlink parent shape.",
+                parent.display()
+            );
+        }
+        if !link_meta.is_dir() {
             anyhow::bail!(
                 "error_log: '{}' exists but is not a directory",
                 parent.display()
@@ -921,6 +944,51 @@ mod tests {
     async fn validate_at_startup_passes_for_existing_parent() {
         let dir = TempDir::new().unwrap();
         let w = ErrorLogWriter::new(dir.path().join("errored.jsonl"));
+        w.validate_at_startup().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn validate_at_startup_bails_when_final_parent_is_a_symlink() {
+        // Parent-swap TOCTOU on the DLQ parent path is prevented by
+        // inspecting the final parent component with
+        // `symlink_metadata` and refusing a symlink. Ancestor
+        // components may still be symlinks (`/var/run` → `/run`);
+        // ancestor path identity is a deployment contract, not a
+        // runtime check.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real-parent");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = dir.path().join("symlink-parent");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let w = ErrorLogWriter::new(link.join("errored.jsonl"));
+        let err = w.validate_at_startup().await.unwrap_err().to_string();
+        assert!(
+            err.contains("symlink") && err.contains("refusing to preflight"),
+            "diagnostic must name the symlink shape: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn validate_at_startup_accepts_ancestor_symlink_when_final_parent_is_real() {
+        // /var/run → /run compatibility: an ancestor symlink with a
+        // real final parent must not trip the check.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let real_ancestor = dir.path().join("real-ancestor");
+        std::fs::create_dir(&real_ancestor).unwrap();
+        std::fs::set_permissions(&real_ancestor, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let link_ancestor = dir.path().join("link-ancestor");
+        std::os::unix::fs::symlink(&real_ancestor, &link_ancestor).unwrap();
+        let final_parent = link_ancestor.join("dlq");
+        std::fs::create_dir(&final_parent).unwrap();
+        std::fs::set_permissions(&final_parent, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let w = ErrorLogWriter::new(final_parent.join("errored.jsonl"));
         w.validate_at_startup().await.unwrap();
     }
 
