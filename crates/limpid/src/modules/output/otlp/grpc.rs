@@ -306,6 +306,7 @@ impl Module for OtlpGrpcOutput {
             retry_config,
             error_log,
             Arc::clone(&metrics),
+            ctx.shutdown_signal.clone(),
         );
 
         Ok(Self { sink, metrics })

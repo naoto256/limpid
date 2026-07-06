@@ -408,6 +408,7 @@ impl Module for HttpOutput {
             retry,
             error_log,
             Arc::clone(&metrics),
+            ctx.shutdown_signal.clone(),
         );
 
         Ok(Self { sink, metrics })
@@ -2695,5 +2696,104 @@ def output o {{
             1,
             "the singleton event must land in the DLQ"
         );
+    }
+
+    /// Bounded ownership pin: `batch_size = 1` sets the permit
+    /// capacity to `batch_size * 2 = 2`. That is the smallest bound
+    /// that allows a threshold-driven flush to coexist with an
+    /// in-flight refill without stalling — one permit is held by
+    /// the event the actor moved into `shippable` for its in-flight
+    /// send, one is held by the newly-parked event awaiting the
+    /// next actor iteration. A third concurrent event must block
+    /// on `permits.acquire_owned()` because both slots are taken.
+    ///
+    /// Also pins the shutdown-race bypass: while the third
+    /// `consume()` is blocked, flipping the runtime shutdown watch
+    /// wakes the permit acquire, bypasses the bound (permit =
+    /// `None`), pushes the event, and returns `Ok` — otherwise
+    /// graceful shutdown could not proceed past a saturated sink.
+    #[tokio::test]
+    async fn batched_permit_bound_is_two_for_batch_size_one_and_shutdown_bypasses() {
+        let (addr, server) = run_stalled_listener().await;
+        let url = format!("http://{}/", addr);
+        let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);
+        let ctx = crate::modules::BuildContext {
+            shutdown_signal: sd_rx,
+            ..crate::modules::BuildContext::for_testing()
+        };
+        // Long backoff → the actor stays parked in-flight against
+        // the stalled peer for the duration of the test rather than
+        // churning through the retry budget and freeing the permit.
+        let long_retry = Property::Block {
+            key: "retry".into(),
+            key_span: None,
+            properties: vec![
+                prop_int("max_attempts", 100),
+                prop_str("initial_wait", "5s"),
+                prop_str("max_wait", "5s"),
+                Property::KeyValue {
+                    key: "backoff".into(),
+                    key_span: None,
+                    value: Expr::spanless(ExprKind::Ident(vec!["fixed".into()])),
+                    value_span: None,
+                },
+            ],
+        };
+        let output = Arc::new(
+            HttpOutput::from_properties(
+                "test",
+                &mp(&[peer_block(&url), prop_int("batch_size", 1), long_retry]),
+                &ctx,
+            )
+            .unwrap(),
+        );
+
+        let (ack1, _rx1) = QueueAckHandle::for_test();
+        let (ack2, _rx2) = QueueAckHandle::for_test();
+        let (ack3, _rx3) = QueueAckHandle::for_test();
+
+        // First consume: pushes 1 event, hits threshold (batch_size=1),
+        // fires flush_notify, actor picks up and enters the send.
+        // Permit A now held inside `shippable`.
+        <HttpOutput as Output>::consume(&output, &event_with("a"), ack1)
+            .await
+            .unwrap();
+        // Give the actor time to drain the buffer and enter the
+        // in-flight send against the stalled peer.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Second consume: buffer refill, permit B parked with the
+        // new tuple. Now both permits are held.
+        <HttpOutput as Output>::consume(&output, &event_with("b"), ack2)
+            .await
+            .unwrap();
+
+        // Third consume: no permit available. Must block on
+        // `permits.acquire_owned()`.
+        let output_clone = Arc::clone(&output);
+        let mut consume3 = tokio::spawn(async move {
+            <HttpOutput as Output>::consume(&output_clone, &event_with("c"), ack3).await
+        });
+        tokio::select! {
+            _ = &mut consume3 => panic!("3rd consume() must block awaiting a permit"),
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+
+        // Flip runtime shutdown watch: the blocked permit acquire
+        // wakes via `shutdown_rx.changed()`, bypasses the bound
+        // (permit = None), pushes to buffer, returns Ok.
+        sd_tx.send(true).unwrap();
+        let consume3_result = tokio::time::timeout(Duration::from_secs(2), consume3)
+            .await
+            .expect("3rd consume() must unblock within 2s of shutdown flip")
+            .expect("consume task must not panic");
+        consume3_result.expect("consume must return Ok after shutdown bypass");
+
+        // Clean shutdown so every parked handle resolves.
+        tokio::time::timeout(Duration::from_secs(5), output.shutdown(None))
+            .await
+            .expect("shutdown must complete inside bounded budget")
+            .unwrap();
+        server.abort();
     }
 }
