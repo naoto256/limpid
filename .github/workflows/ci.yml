@@ -104,14 +104,19 @@ jobs:
       - name: Clippy (kafka + journal)
         run: cargo clippy --workspace --features kafka,journal -- -D warnings
 
-  # Supply-chain audit: `cargo deny` gates advisories, bans, sources,
-  # and licenses against `deny.toml`; `cargo audit` cross-checks the
-  # same Cargo.lock against the RustSec advisory database. Runs on
-  # every PR so a new dependency that trips either surfaces before
-  # merge instead of at release time. Pinned tool versions (installed
-  # with `cargo install --locked --version`) so the supply-chain
-  # gate is itself reproducible: floating `latest` versions would
-  # let a tool update silently change the meaning of "pass".
+  # Supply-chain audit: `cargo deny check advisories bans sources
+  # licenses` gates every dimension `deny.toml` covers — RustSec
+  # advisories, banned/duplicate crates, source restrictions, and
+  # license policy — against `Cargo.lock` on every PR. cargo-deny
+  # bundles a stand-alone `rustsec` client, so this single tool
+  # covers the same ground that a separate `cargo audit` step
+  # would (and does so with a parser that already handles CVSS
+  # v4.0 vectors; cargo-audit's parser is still on v3.x and errors
+  # out on the CVSS 4.0 records the RustSec database has been
+  # emitting since 2026). Pinned tool version (installed with
+  # `cargo install --locked --version`) so the supply-chain gate
+  # is itself reproducible: floating `latest` versions would let a
+  # tool update silently change the meaning of "pass".
   supply-chain:
     runs-on: ubuntu-latest
     steps:
@@ -133,15 +138,5 @@ jobs:
       - name: Install cargo-deny
         run: cargo install --locked --version 0.18.6 cargo-deny
 
-      - name: Install cargo-audit
-        run: cargo install --locked --version 0.21.2 cargo-audit
-
       - name: cargo deny check
         run: cargo deny check advisories bans sources licenses
-
-      # `cargo audit` reads `Cargo.lock` from the current directory
-      # and errors if it is missing, then cross-checks every
-      # dependency against the RustSec advisory database fetched
-      # from https://github.com/RustSec/advisory-db on each run.
-      - name: cargo audit
-        run: cargo audit
