@@ -126,9 +126,10 @@ fn main() -> Result<()> {
 /// is a network-listening daemon and an event-processing engine; both
 /// surfaces have meaningful blast radius if compromised, so the
 /// principle is "drop privileges before reading any event". The
-/// canonical operational shape is systemd `User=limpid` plus
+/// canonical operational shape is systemd `User=<daemon-user>` plus
 /// `AmbientCapabilities=CAP_NET_BIND_SERVICE` for listeners on
-/// privileged ports (< 1024). Operators who genuinely need to run as
+/// privileged ports (< 1024) — the packaged `limpid.service` ships
+/// with `User=syslog`. Operators who genuinely need to run as
 /// root (containerised init that hasn't dropped UID yet, debugging on
 /// a workstation, …) can set `LIMPID_ALLOW_ROOT=1` to override.
 ///
