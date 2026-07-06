@@ -735,14 +735,12 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let real_ancestor = base.path().join("real-ancestor");
         std::fs::create_dir(&real_ancestor).unwrap();
-        std::fs::set_permissions(&real_ancestor, std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        std::fs::set_permissions(&real_ancestor, std::fs::Permissions::from_mode(0o755)).unwrap();
         let link_ancestor = base.path().join("link-ancestor");
         std::os::unix::fs::symlink(&real_ancestor, &link_ancestor).unwrap();
         let final_parent = link_ancestor.join("in");
         std::fs::create_dir(&final_parent).unwrap();
-        std::fs::set_permissions(&final_parent, std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        std::fs::set_permissions(&final_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
         let socket_path = final_parent.join("in.sock");
         validate_unix_socket_input_parent(socket_path.to_str().unwrap()).unwrap();
     }

@@ -94,11 +94,16 @@ pub type InputInjectTarget = (mpsc::Sender<Event>, Arc<crate::metrics::InputMetr
 ///   daemon requires a daemon-owned parent.
 /// - Parent exists as a directory with an unsafe mode → bail with the
 ///   observed mode and a remediation hint.
-/// - Parent absent → verify the nearest existing ancestor is trusted
-///   (daemon-owned, or root-owned and not other-writable), then create
-///   the parent under our control at 0o750, then `symlink_metadata`
-///   the created path to confirm it is a real directory owned by us at
-///   the requested mode. Any mismatch bails startup.
+/// - Parent absent → verify the nearest existing ancestor is
+///   trusted: owner must be the daemon's own euid or root, AND the
+///   mode must not be group- or world-writable (`mode & 0o022 == 0`).
+///   Ownership alone is not enough; a daemon-owned `0o777` ancestor
+///   still lets any writer plant a node under the target name and
+///   race the create+chmod, and root-owned `/tmp` at `0o1777` has
+///   the same shape. Then create the parent under our control at
+///   0o750, then `symlink_metadata` the created path to confirm it
+///   is a real directory owned by us at the requested mode. Any
+///   mismatch bails startup.
 ///
 /// The custom-deploy contract this closes: an operator whose
 /// `control { socket "..." }` points into a directory they have not
@@ -179,7 +184,10 @@ fn validate_existing_parent(
              `RuntimeDirectory=limpid` combined with `User=limpid` creates a daemon-owned \
              parent at the requested mode — that is the intended shape. For custom deploys, \
              `chown <daemon-user>:<daemon-group> {:?}` and re-run.",
-            parent, uid, self_euid, parent,
+            parent,
+            uid,
+            self_euid,
+            parent,
         );
     }
     let mode = link_meta.permissions().mode() & 0o777;
@@ -191,7 +199,9 @@ fn validate_existing_parent(
              parent to 0o750 or stricter (`chmod 0750 {:?}`), or point \
              `control {{ socket \"...\" }}` at a packaged path (`/var/run/limpid/`, with \
              `RuntimeDirectoryMode=0750` under systemd).",
-            parent, mode, parent,
+            parent,
+            mode,
+            parent,
         );
     }
     Ok(())
@@ -232,12 +242,18 @@ fn create_parent_under_trusted_ancestor(
     if !ancestor_is_trusted_for_create(ancestor_uid, ancestor_mode, self_euid) {
         anyhow::bail!(
             "control socket: refusing to create parent {:?} — nearest existing ancestor \
-             {:?} (canonical {:?}) is owned by uid {} at mode 0o{:o}, which is neither \
-             daemon-owned nor a root-owned non-writable system directory. Creating the \
-             parent here would let an attacker with rename rights on the ancestor \
-             substitute the newly-created directory. Move the socket into a daemon-owned \
-             or root-owned system runtime dir (e.g. `/run/limpid/`).",
-            parent, ancestor, canonical, ancestor_uid, ancestor_mode,
+             {:?} (canonical {:?}) is owned by uid {} at mode 0o{:o}, which does not satisfy \
+             the create-ancestor trust contract (owner must be the daemon's euid or root, \
+             AND the mode must have `mode & 0o022 == 0`). Owner alone is not enough: any \
+             process with write permission on the ancestor could plant a node under the \
+             target name or race the `create_dir_all` + `chmod` window. Move the socket \
+             into a daemon-owned or root-owned parent that is not group- or world-writable \
+             (e.g. `/run/limpid/`).",
+            parent,
+            ancestor,
+            canonical,
+            ancestor_uid,
+            ancestor_mode,
         );
     }
     std::fs::create_dir_all(parent).with_context(|| {
@@ -281,7 +297,9 @@ fn create_parent_under_trusted_ancestor(
         anyhow::bail!(
             "control socket: freshly-created parent {:?} is owned by uid {}, not the daemon's \
              effective uid {} — refusing to bind",
-            parent, created_uid, self_euid,
+            parent,
+            created_uid,
+            self_euid,
         );
     }
     let created_mode = created.permissions().mode() & 0o777;
@@ -289,32 +307,39 @@ fn create_parent_under_trusted_ancestor(
         anyhow::bail!(
             "control socket: freshly-created parent {:?} has mode 0o{:o}, not the requested \
              0o750 — refusing to bind",
-            parent, created_mode,
+            parent,
+            created_mode,
         );
     }
     Ok(())
 }
 
 /// True when the deepest existing ancestor of an absent parent is
-/// safe to `create_dir_all` into. Two shapes qualify:
+/// safe to `create_dir_all` into.
 ///
-/// - Daemon-owned (`uid == self_euid`): the daemon controls the
-///   ancestor's contents by definition. Mode is irrelevant here; the
-///   daemon is authoritative regardless.
-/// - Root-owned and not other-writable (`uid == 0 && mode & 0o022 == 0`):
-///   the packaged runtime ancestors (`/run`, `/var/lib/limpid`, etc.).
-///   Root-owned + world-writable (sticky-bit `/tmp` at `0o1777`) is
-///   deliberately excluded — an attacker with rename rights on
-///   `/tmp` could substitute the newly-created directory before we
-///   chmod it, and the sticky bit does not protect against a
-///   rename-in of an attacker-owned node.
+/// Two properties must both hold:
+///
+/// - Trusted owner: either the daemon's own effective uid or root.
+///   Anyone else can `rename` or `unlink` inside a directory they
+///   own regardless of its mode bits, so a non-daemon non-root owner
+///   is out of scope for auto-create.
+/// - Not group- or world-writable (`mode & 0o022 == 0`). Ownership
+///   trusts the *owner*, but `create_dir_all` runs on the ancestor
+///   from *any* process with write permission on that ancestor. A
+///   daemon-owned ancestor at `0o777` still lets an outside user
+///   `mkdir` the target name (or plant a node under it) before we
+///   chmod, so the ownership check is not by itself enough. The
+///   most common concrete example is sticky-bit `/tmp` at `0o1777`:
+///   root owns it, but the sticky bit only stops `unlink` of files
+///   the attacker doesn't own — an attacker can still create nodes,
+///   and the daemon must not race with them.
 ///
 /// Pure function so it can be exercised directly by unit tests
 /// without requiring privilege escalation to construct an ancestor
 /// owned by a different uid.
 #[cfg(unix)]
 fn ancestor_is_trusted_for_create(uid: u32, mode: u32, self_euid: u32) -> bool {
-    uid == self_euid || (uid == 0 && mode & 0o022 == 0)
+    (uid == self_euid || uid == 0) && mode & 0o022 == 0
 }
 
 /// Walk up `path` until a component exists on the filesystem (checked
@@ -1389,14 +1414,12 @@ mod tests {
         let base = tempfile::TempDir::new().unwrap();
         let real_ancestor = base.path().join("real-ancestor");
         std::fs::create_dir_all(&real_ancestor).unwrap();
-        std::fs::set_permissions(&real_ancestor, std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        std::fs::set_permissions(&real_ancestor, std::fs::Permissions::from_mode(0o755)).unwrap();
         let link_ancestor = base.path().join("link-ancestor");
         std::os::unix::fs::symlink(&real_ancestor, &link_ancestor).unwrap();
         let final_parent = link_ancestor.join("limpid");
         std::fs::create_dir_all(&final_parent).unwrap();
-        std::fs::set_permissions(&final_parent, std::fs::Permissions::from_mode(0o750))
-            .unwrap();
+        std::fs::set_permissions(&final_parent, std::fs::Permissions::from_mode(0o750)).unwrap();
         let socket = final_parent.join("control.sock");
         validate_control_socket_parent(Some(socket.to_str().unwrap())).unwrap();
     }
@@ -1413,24 +1436,27 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn ancestor_trust_predicate_covers_all_shapes() {
-        // Daemon-owned ancestor is trusted regardless of mode — the
-        // daemon controls its own dir.
+        // Trusted: daemon-owned OR root-owned, AND not group- or
+        // world-writable.
         assert!(ancestor_is_trusted_for_create(1000, 0o755, 1000));
-        assert!(ancestor_is_trusted_for_create(1000, 0o777, 1000));
-        assert!(ancestor_is_trusted_for_create(0, 0o700, 0));
-        // Root-owned + mode-safe (not other-writable) is trusted for
-        // both root and non-root daemons — the packaged system
-        // runtime dirs (`/run`, `/var/lib/limpid`, etc.) fit here.
+        assert!(ancestor_is_trusted_for_create(1000, 0o750, 1000));
+        assert!(ancestor_is_trusted_for_create(1000, 0o700, 1000));
         assert!(ancestor_is_trusted_for_create(0, 0o755, 1000));
         assert!(ancestor_is_trusted_for_create(0, 0o750, 1000));
-        assert!(ancestor_is_trusted_for_create(0, 0o700, 1000));
-        // Root-owned + world-writable (`/tmp` at `0o1777`, but mode
-        // truncated to 0o777 for the predicate) is UNTRUSTED — an
-        // attacker with rename rights on the ancestor could
-        // substitute the newly-created directory.
+        assert!(ancestor_is_trusted_for_create(0, 0o700, 0));
+        // Untrusted: daemon-owned but group- or world-writable. Owner
+        // trust does not override directory write permission — an
+        // outside user with write access to the ancestor can plant a
+        // node under the target name and race the create.
+        assert!(!ancestor_is_trusted_for_create(1000, 0o777, 1000));
+        assert!(!ancestor_is_trusted_for_create(1000, 0o775, 1000));
+        assert!(!ancestor_is_trusted_for_create(1000, 0o757, 1000));
+        // Untrusted: root-owned + world-writable (sticky-bit `/tmp`
+        // shape at `0o1777`, mode masked to `0o777`) — sticky stops
+        // unlink of other users' files but not create-in.
         assert!(!ancestor_is_trusted_for_create(0, 0o777, 1000));
         assert!(!ancestor_is_trusted_for_create(0, 0o1777 & 0o777, 1000));
-        // Non-root non-self-owned ancestor is untrusted regardless of
+        // Untrusted: non-root, non-self-owned ancestor regardless of
         // mode.
         assert!(!ancestor_is_trusted_for_create(1001, 0o755, 1000));
         assert!(!ancestor_is_trusted_for_create(1001, 0o700, 1000));
