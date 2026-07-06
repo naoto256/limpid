@@ -60,16 +60,6 @@ const MAX_INJECT_BYTES: u64 = 16 * 1024 * 1024;
 /// Per-input inject target: event channel + metrics handle (for events_injected).
 pub type InputInjectTarget = (mpsc::Sender<Event>, Arc<crate::metrics::InputMetrics>);
 
-/// Create the control socket's parent directory if absent. When *this
-/// call* created it (bare / non-systemd runs), tighten it to 0o750 so
-/// only the daemon user and its group can reach the socket inode at
-/// all — this directory mode is the layer that covers the bind→chmod
-/// window in [`ControlServer::run`]. Under systemd the directory comes
-/// from `RuntimeDirectory=limpid` (mode pinned via
-/// `RuntimeDirectoryMode` in the unit file) and already exists here; a
-/// pre-existing directory's permissions are deliberately left alone
-/// because they may be operator-managed.
-///
 /// Startup-time validation and (when absent) creation of the control
 /// socket's parent directory. Called from `Runtime::start` before the
 /// control task is spawned, so an unsafe pre-existing parent — or a
@@ -348,6 +338,15 @@ fn ancestor_is_trusted_for_create(uid: u32, mode: u32, self_euid: u32) -> bool {
 /// by [`create_parent_under_trusted_ancestor`] to find the deepest
 /// existing ancestor whose identity we can verify before creating a
 /// new directory below it.
+///
+/// Relative paths anchor to the current working directory. On Unix,
+/// `Path::new("foo").parent()` returns `Some("")`, and
+/// `symlink_metadata` on an empty path fails with `ENOENT`, so the
+/// naive walk would then hit `Path::new("").parent() == None` and
+/// bail. Treating an empty candidate as `.` (the cwd) keeps a
+/// relative config like `control { socket "missing/control.sock" }`
+/// walking up to a real ancestor instead of raising a spurious
+/// "no existing ancestor" at startup.
 #[cfg(unix)]
 fn nearest_existing_ancestor(path: &std::path::Path) -> anyhow::Result<PathBuf> {
     let mut current = path;
@@ -355,8 +354,13 @@ fn nearest_existing_ancestor(path: &std::path::Path) -> anyhow::Result<PathBuf> 
         let Some(parent) = current.parent() else {
             anyhow::bail!("no existing ancestor for {:?}", path);
         };
-        if std::fs::symlink_metadata(parent).is_ok() {
-            return Ok(parent.to_path_buf());
+        let candidate: &std::path::Path = if parent.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            parent
+        };
+        if std::fs::symlink_metadata(candidate).is_ok() {
+            return Ok(candidate.to_path_buf());
         }
         current = parent;
     }
@@ -1510,17 +1514,42 @@ mod tests {
         validate_control_socket_parent(Some(socket.to_str().unwrap())).unwrap();
     }
 
-    /// An absent parent is OK — the subsequent
-    /// `ensure_socket_parent_dir` call in the control task
-    /// will create it at 0o750, which passes the predicate by
-    /// construction. This preserves the bare / non-systemd
-    /// developer workflow of pointing `control { socket "..." }`
-    /// at a path whose parent doesn't exist yet.
+    /// An absent parent is OK — `validate_control_socket_parent`
+    /// creates it at 0o750 under the daemon's uid after verifying
+    /// the nearest existing ancestor is trusted, then re-verifies
+    /// via `symlink_metadata`. This preserves the bare /
+    /// non-systemd developer workflow of pointing
+    /// `control { socket "..." }` at a path whose parent does not
+    /// exist yet.
     #[test]
     fn validate_control_socket_parent_accepts_absent_parent() {
         let base = tempfile::TempDir::new().unwrap();
         let socket = base.path().join("missing-subdir").join("control.sock");
         validate_control_socket_parent(Some(socket.to_str().unwrap())).unwrap();
+    }
+
+    /// A relative socket path with an absent nested parent must not
+    /// bail with "no existing ancestor" — the walk anchors to `.`
+    /// when named ancestors run out. Regression against the shape
+    /// where `Path::new("foo").parent()` returns `Some("")` and
+    /// `symlink_metadata("")` fails with `ENOENT`, leaving the naive
+    /// walk with no candidate. Uses `set_current_dir` inside a
+    /// tempdir so the test does not litter the developer cwd.
+    #[test]
+    #[cfg(unix)]
+    fn validate_control_socket_parent_handles_relative_absent_parent() {
+        use std::sync::Mutex;
+        static CWD_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = CWD_LOCK.lock().unwrap();
+        let base = tempfile::TempDir::new().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(base.path()).unwrap();
+        let result = validate_control_socket_parent(Some("missing-subdir/control.sock"));
+        // Restore cwd before asserting so a panic-on-fail leaves a
+        // recoverable state for later tests running in the same
+        // process.
+        std::env::set_current_dir(&prev).unwrap();
+        result.unwrap();
     }
 
     /// A parent path that exists but isn't a directory (a
