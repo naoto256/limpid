@@ -140,8 +140,10 @@ At shutdown, the control task records the `(dev, ino)` of the socket it bound an
 ### Control socket limits
 
 The control socket is a local root-equivalent trust boundary (mode `0o660` in
-a root-owned directory), but limpid still enforces these limits as defense
-in depth:
+a daemon-owned runtime directory — the packaged unit provisions
+`/var/run/limpid/` at `User=syslog` via `RuntimeDirectory=limpid` +
+`RuntimeDirectoryMode=0750`), but limpid still enforces these limits as
+defense in depth:
 
 | Limit | Value | Behaviour on breach |
 |-------|-------|---------------------|
