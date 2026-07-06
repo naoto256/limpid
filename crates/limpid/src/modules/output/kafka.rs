@@ -587,19 +587,28 @@ impl Output for KafkaOutput {
         // pre-send recheck to short-circuit every event as
         // `PreSendShutdown` and no drain event would ship. Build a
         // fresh receiver that never observes shutdown so the
-        // recheck is a no-op; the surrounding
-        // `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT` is what bounds the
-        // wait during drain. The `_no_shutdown_tx` binding keeps
+        // recheck is a no-op. The `_no_shutdown_tx` binding keeps
         // the sender alive for the whole call.
+        //
+        // No outer `timeout(...)` around `try_send` here — the wait
+        // envelope is librdkafka's own `queue_timeout` /
+        // `message.timeout.ms`. Wrapping the future in an outer
+        // timeout would cancel it after `producer.send(...)` had
+        // already handed the record to librdkafka; the record would
+        // still ship to the broker (drop only cancels observation),
+        // and the shutdown-drain path would then route the same
+        // event through the DLQ as `Recovered`, producing a
+        // duplicate delivery + replayable DLQ record. The same
+        // reasoning applies here as the steady-state `consume` path:
+        // once the side-effect boundary is crossed, an outer
+        // timeout is unsafe. On a disk queue a shutdown-time
+        // producer failure still triggers the fail-stop wedge via
+        // `finalize_shutdown_singleton_disposition` so the cursor
+        // holds for next-start replay.
         let (_no_shutdown_tx, no_shutdown_rx) = tokio::sync::watch::channel(false);
-        let result = match tokio::time::timeout(
-            crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT,
-            self.try_send(event, no_shutdown_rx),
-        )
-        .await
-        {
-            Ok(Ok(KafkaTrySendOutcome::Delivered)) => Ok(()),
-            Ok(Ok(KafkaTrySendOutcome::PreSendShutdown)) => {
+        let result = match self.try_send(event, no_shutdown_rx).await {
+            Ok(KafkaTrySendOutcome::Delivered) => Ok(()),
+            Ok(KafkaTrySendOutcome::PreSendShutdown) => {
                 // The receiver we passed can never observe
                 // shutdown — this branch is a defensive
                 // assertion, not a live code path.
@@ -607,11 +616,7 @@ impl Output for KafkaOutput {
                     "kafka consume_shutdown must not observe PreSendShutdown from a never-fire receiver"
                 )
             }
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(anyhow::anyhow!(
-                "timed out after {:?}",
-                crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT
-            )),
+            Err(e) => Err(e),
         };
         crate::modules::finalize_shutdown_singleton_disposition(
             result,
@@ -1104,6 +1109,41 @@ mod tests {
              mid-producer.send shutdown drop the delivery future while librdkafka has \
              already accepted the record, producing duplicate delivery. The load-bearing \
              pre-send guard lives inside try_send at the borrow_and_update recheck."
+        );
+    }
+
+    /// Same shape pin, on the shutdown-drain path: `consume_shutdown`
+    /// must not wrap `try_send` in an outer `tokio::time::timeout`.
+    /// The steady-state `consume` had this rule from the beginning;
+    /// the shutdown path used to carry a `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT`
+    /// wrapper that reintroduced exactly the same duplicate-delivery
+    /// failure mode: a timeout that fires after `producer.send(...)`
+    /// has already handed the record to librdkafka cancels the
+    /// delivery future but not the ship — the record still goes to
+    /// the broker, and the shutdown-drain path routes the same
+    /// event through the DLQ as `Recovered`. The wait envelope is
+    /// librdkafka's `queue_timeout` / `message.timeout.ms`; a
+    /// disk-queue Dropped on failure triggers the fail-stop wedge
+    /// for next-start replay.
+    #[test]
+    fn consume_shutdown_does_not_wrap_try_send_in_outer_timeout() {
+        let src = include_str!("kafka.rs");
+        let start = src
+            .find("async fn consume_shutdown(")
+            .expect("consume_shutdown fn must exist");
+        // Take the body up to the next top-level `impl` or the end
+        // of the `impl Output for KafkaOutput` block. The next
+        // `impl KafkaOutput` marks the boundary.
+        let end_offset = src[start..]
+            .find("impl KafkaOutput {")
+            .expect("consume_shutdown body must end before next impl block");
+        let body = &src[start..start + end_offset];
+        assert!(
+            !body.contains("tokio::time::timeout("),
+            "consume_shutdown must not wrap try_send in tokio::time::timeout; that lets a \
+             post-producer.send timeout cancel the delivery future while librdkafka has \
+             already accepted the record — same duplicate-delivery gap as the steady-state \
+             consume. Rely on queue_timeout / message.timeout.ms for the wait envelope."
         );
     }
 
