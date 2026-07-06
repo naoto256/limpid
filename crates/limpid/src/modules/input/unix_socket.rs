@@ -432,6 +432,18 @@ impl Input for UnixSocketInput {
 
                             let event = Event::new(Bytes::copy_from_slice(data), source_addr);
                             if tx.send(event).await.is_err() {
+                                // Pipeline event channel closed —
+                                // expected during graceful shutdown
+                                // when the pipeline worker drains
+                                // and closes its receiver; also
+                                // fires if the worker exits early.
+                                // Log once so the transition is
+                                // visible in journald rather than
+                                // showing up as an unexplained input
+                                // stop.
+                                info!(
+                                    "unix_socket: pipeline event channel closed, stopping input task",
+                                );
                                 break;
                             }
                         }

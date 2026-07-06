@@ -249,10 +249,6 @@ impl DiskQueueReceiver {
         }
     }
 
-    pub fn try_recv(&mut self) -> Option<(Event, AckPosition)> {
-        self.try_read_next()
-    }
-
     /// Commit a specific event's position to the in-flight tracker
     /// and, if it completes the contiguous acked prefix from the
     /// front, advance the persisted cursor through that prefix and
