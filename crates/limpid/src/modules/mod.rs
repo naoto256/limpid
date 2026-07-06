@@ -333,9 +333,19 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     ///   bounded. Do NOT trigger a steady-state flush (`flush_events`
     ///   with retry budget) from here — buffer only, defer the
     ///   bounded final flush to `shutdown()`.
-    /// - On successful delivery (unbatched only): `ack.resolve_delivered()`.
+    /// - On successful delivery (unbatched only): `ack.resolve_delivered()`,
+    ///   or delegate the whole disposition to
+    ///   `finalize_shutdown_singleton_disposition`, which owns the
+    ///   success bump and the DLQ route for a single bounded attempt.
     /// - On failure (transport / timeout / render): route to DLQ via
-    ///   `route_event_to_dlq` and `ack.resolve_recovered()`.
+    ///   `route_event_to_dlq` and dispatch the returned
+    ///   `DlqRouteOutcome` through `resolve_ack_from_dlq_outcome`, so
+    ///   disk queues wedge on a configured-DLQ-write failure and
+    ///   memory queues fall back to `Recovered` with the JSONL
+    ///   trace as recovery material. The helper
+    ///   `finalize_shutdown_singleton_disposition` bundles the
+    ///   Ok/Err arms into a single call for sinks that do not need
+    ///   custom branching.
     /// - `Ok(())` signals the output took lifecycle ownership; actual
     ///   disposition flows through the handle.
     ///
@@ -370,14 +380,22 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     /// and route the unsent leftovers to the DLQ via
     /// `route_shutdown_batch_to_dlq`.
     ///
-    /// Per-handle disposition rules mirror the steady-state contract:
-    /// - successful final delivery → `resolve_delivered()`
-    /// - routed to DLQ (`error_log`) after a failed final flush or a
-    ///   per-event render error → `resolve_recovered()`
-    /// - no DLQ configured and the flush failed → log loudly and
-    ///   `resolve_recovered()` anyway; leaking the handle would let
-    ///   `Drop` fire `Dropped` (= silent loss attributed to a bug),
-    ///   which is worse than an explicit, logged best-effort recovery.
+    /// Per-handle disposition rules mirror the steady-state contract
+    /// and are dispatched through `resolve_ack_from_dlq_outcome` so
+    /// disk and memory queues get the correct terminal disposition:
+    /// - successful final delivery → `resolve_delivered()`.
+    /// - routed to DLQ via `route_event_to_dlq` (or the batched
+    ///   variant `route_shutdown_batch_to_dlq`); the returned
+    ///   `DlqRouteOutcome` is handed to `resolve_ack_from_dlq_outcome`,
+    ///   which resolves as `Recovered` on any queue when the DLQ
+    ///   record was durably written (or when the JSONL tracing
+    ///   fallback ran because `error_log` was unset), and as
+    ///   `Dropped` on a disk queue when the configured DLQ file
+    ///   write itself failed (disk-queue fail-stop wedge holds the
+    ///   cursor for replay on next start). Memory queues cannot
+    ///   replay across restarts, so the same DLQ-write-failure
+    ///   shape resolves as `Recovered` there and the JSONL trace
+    ///   in `event_record` is the sole recovery material.
     ///
     /// `Drop` cannot do this work because it is synchronous and the
     /// sink-side I/O is async. The queue consumer calls `shutdown`

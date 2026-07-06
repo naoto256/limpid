@@ -310,7 +310,7 @@ fn json_to_prometheus(json: &str) -> Result<String, String> {
         write_counter(
             &mut out,
             "limpid_output_events_failed_total",
-            "Total events that failed to write after all retries.",
+            "Total events whose final disposition on this output was a terminal failure: retry-budget exhaustion, per-event render or prepare failure, shutdown-drain leftover, OTLP partial_success rejects, or a Dropped disposition (bug path or DLQ-write failure). See docs/src/operations/metrics.md for the producer-site list.",
             "output",
             outputs,
             "events_failed",
