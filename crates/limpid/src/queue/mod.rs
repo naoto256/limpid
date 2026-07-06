@@ -324,6 +324,21 @@ pub enum AckPosition {
     Disk { seq: u64, offset: u64 },
 }
 
+/// Which backend implements a given [`QueueReceiver`].
+///
+/// The shutdown drain in `run_queue_consumer` (and the pipeline
+/// worker's mirror in `runtime.rs`) is the only site that currently
+/// needs this distinction: memory queues must be closed and drained
+/// to `None` so an outstanding-permit send from the pipeline side
+/// still lands on the consumer, whereas disk queues must skip the
+/// drain entirely so unread WAL entries survive to the next-start
+/// replay path rather than being pulled into shutdown-window RAM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueBackendKind {
+    Memory,
+    Disk,
+}
+
 /// Handle for receiving events from a queue.
 pub struct QueueReceiver {
     inner: ReceiverInner,
@@ -336,6 +351,38 @@ enum ReceiverInner {
 }
 
 impl QueueReceiver {
+    /// Which backend is behind this receiver. See [`QueueBackendKind`].
+    pub fn backend_kind(&self) -> QueueBackendKind {
+        match &self.inner {
+            ReceiverInner::Memory(_) => QueueBackendKind::Memory,
+            ReceiverInner::Disk(_) => QueueBackendKind::Disk,
+        }
+    }
+
+    /// Refuse further sends on the underlying channel so any
+    /// outstanding-permit-holding sender wakes up with `Err`, and any
+    /// event whose send had already committed a slot still becomes
+    /// visible to `recv()` before the final `None`.
+    ///
+    /// Load-bearing for shutdown correctness on the memory backend:
+    /// the previous `try_recv()` snapshot drain would race with a
+    /// pipeline-side send that had reserved a permit but not yet
+    /// written the value, silently losing the event once the consumer
+    /// exited. Combining `close()` with `recv().await`-until-`None`
+    /// consumes every value already in the channel plus every value
+    /// still being written by an outstanding permit-holder, then
+    /// terminates deterministically.
+    ///
+    /// No-op on the disk backend — unread WAL entries are handled by
+    /// the shutdown drain skipping them entirely, so they survive to
+    /// the next-start replay cursor.
+    pub fn close(&mut self) {
+        match &mut self.inner {
+            ReceiverInner::Memory(rx) => rx.close(),
+            ReceiverInner::Disk(_) => {}
+        }
+    }
+
     /// Receive the next event, paired with the position that must be
     /// fed back via `ack_to` once the event reaches a terminal
     /// disposition. The position is captured at the moment of read,
@@ -345,13 +392,6 @@ impl QueueReceiver {
         match &mut self.inner {
             ReceiverInner::Memory(rx) => rx.recv().await.map(|e| (e, AckPosition::Memory)),
             ReceiverInner::Disk(rx) => rx.recv().await,
-        }
-    }
-
-    pub fn try_recv(&mut self) -> Option<(Event, AckPosition)> {
-        match &mut self.inner {
-            ReceiverInner::Memory(rx) => rx.try_recv().ok().map(|e| (e, AckPosition::Memory)),
-            ReceiverInner::Disk(rx) => rx.try_recv(),
         }
     }
 
@@ -703,42 +743,66 @@ pub async fn run_queue_consumer(
             _ = shutdown.changed(), if accepting => {
                 if *shutdown.borrow() {
                     info!("output '{}': shutting down, draining queue", name);
-                    // Feed any events already buffered on the receiver
-                    // into the output one last time so they don't
-                    // survive the restart with the queue still pointing
-                    // at them. The output owns the per-event lifecycle
-                    // from here; we exit the select loop and let the
-                    // shutdown phase below resolve every in-flight
-                    // handle by calling `writer.shutdown()` first
-                    // (which drains batched buffers and resolves the
-                    // handles parked inside them) and only then
-                    // draining the ack channel.
-                    while let Some((event, position)) = receiver.try_recv() {
-                        if let Some(tap) = &tap {
-                            tap.emit(&format!("output {}", name), &event).await;
+                    // Backend-aware drain.
+                    //
+                    // Memory backend: close the receiver first, then
+                    // consume with `recv().await` until `None`. Closing
+                    // makes any outstanding-permit sender wake with
+                    // `Err`, while values whose send had already
+                    // committed a slot still become visible before
+                    // `None`. The previous `try_recv()` snapshot loop
+                    // raced with permit-holding sends and could silently
+                    // exit before a mid-flight `send` completed its
+                    // write — dropping that event even though the
+                    // sender saw `Ok`. Bounded because the mpsc capacity
+                    // caps how much can be in flight when we start.
+                    //
+                    // Disk backend: skip the drain entirely. The WAL
+                    // owns unread durable state; pulling it into
+                    // `consume_shutdown` here would pin the whole
+                    // unread backlog into shutdown-window RAM (and
+                    // stretch the flush deadline over WAL read time).
+                    // Unread entries stay on disk and replay on the
+                    // next start; only handles already owned by the
+                    // output resolve via the post-loop `writer.shutdown()`
+                    // and the ack drain that follows.
+                    match receiver.backend_kind() {
+                        QueueBackendKind::Memory => {
+                            receiver.close();
+                            while let Some((event, position)) = receiver.recv().await {
+                                if let Some(tap) = &tap {
+                                    tap.emit(&format!("output {}", name), &event).await;
+                                }
+                                let handle = QueueAckHandle::new(ack_tx.clone(), position);
+                                in_flight += 1;
+                                // `consume_shutdown` (not `consume`) — the
+                                // shutdown contract forbids the steady-state
+                                // retry path. Unbatched outputs ship once
+                                // bounded then DLQ; batched outputs buffer
+                                // only and let the post-loop `writer.shutdown()`
+                                // drain bounded. See `Output::consume_shutdown`.
+                                if let Err(e) = writer.consume_shutdown(&event, handle).await {
+                                    // Bug path: `consume_shutdown` returned
+                                    // Err without taking ownership of the
+                                    // handle. The handle's Drop impl fires
+                                    // `Dropped` through the ack channel, and
+                                    // `handle_ack_disposition(Dropped)` is
+                                    // the single site that bumps
+                                    // `events_failed` for bug-path drops —
+                                    // do NOT bump here as well.
+                                    tracing::error!(
+                                        "output '{}': consume_shutdown returned Err during drain: {} \
+                                         (bug — disposition signalled via handle)",
+                                        name,
+                                        e
+                                    );
+                                }
+                            }
                         }
-                        let handle = QueueAckHandle::new(ack_tx.clone(), position);
-                        in_flight += 1;
-                        // `consume_shutdown` (not `consume`) — the
-                        // shutdown contract forbids the steady-state
-                        // retry path. Unbatched outputs ship once
-                        // bounded then DLQ; batched outputs buffer
-                        // only and let the post-loop `writer.shutdown()`
-                        // drain bounded. See `Output::consume_shutdown`.
-                        if let Err(e) = writer.consume_shutdown(&event, handle).await {
-                            // Bug path: `consume_shutdown` returned
-                            // Err without taking ownership of the
-                            // handle. The handle's Drop impl fires
-                            // `Dropped` through the ack channel, and
-                            // `handle_ack_disposition(Dropped)` is
-                            // the single site that bumps
-                            // `events_failed` for bug-path drops —
-                            // do NOT bump here as well.
-                            tracing::error!(
-                                "output '{}': consume_shutdown returned Err during drain: {} \
-                                 (bug — disposition signalled via handle)",
-                                name,
-                                e
+                        QueueBackendKind::Disk => {
+                            info!(
+                                "output '{}': disk backend — leaving unread backlog for next-start replay",
+                                name
                             );
                         }
                     }
@@ -1817,6 +1881,247 @@ mod consumer_lifecycle_tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    // ---- backend-aware shutdown drain ----
+
+    /// The load-bearing tokio-mpsc guarantee that `close()` +
+    /// `recv-until-None` builds on: a `Receiver::close()` mid-flight
+    /// does NOT cancel an outstanding permit's write — the value
+    /// still becomes visible before `recv()` returns `None`.
+    ///
+    /// This is the exact scenario the previous `try_recv()` snapshot
+    /// drain could not observe: a sender that had reserved a permit
+    /// but not yet written the value would complete after the
+    /// consumer's snapshot loop exited, silently dropping the event.
+    /// The new shutdown drain relies on this tokio behavior; if a
+    /// future tokio update ever broke it, the drain would need to
+    /// change too — this test pins the assumption at the mpsc layer
+    /// so that failure would show up here first, not as a lost event
+    /// in the queue-level test.
+    #[tokio::test]
+    async fn tokio_mpsc_close_then_permit_send_still_visible() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<u32>(1);
+        let permit = tx.reserve().await.expect("reserve must succeed");
+        rx.close();
+        permit.send(42);
+        drop(tx);
+        assert_eq!(rx.recv().await, Some(42));
+        assert_eq!(rx.recv().await, None);
+    }
+
+    /// `QueueReceiver::close()` on a memory backend refuses further
+    /// sends, but events already buffered remain readable until the
+    /// receiver observes `None`. This is what the shutdown drain
+    /// depends on: after `close()`, drain with `recv().await` until
+    /// `None` to catch every value that was in-flight when shutdown
+    /// fired.
+    #[tokio::test]
+    async fn queue_receiver_close_then_recv_drains_buffered_before_none() {
+        let (sender, mut receiver) = create_queue(
+            "close_test".into(),
+            QueueConfig {
+                queue_type: QueueType::Memory,
+                capacity: 4,
+            },
+        )
+        .unwrap();
+        sender.send(owned_event()).await.unwrap();
+        sender.send(owned_event()).await.unwrap();
+        receiver.close();
+
+        // Post-close sends are refused.
+        let err = sender
+            .send(owned_event())
+            .await
+            .expect_err("send after close must fail");
+        assert!(matches!(err, QueueSendError::ChannelClosed));
+
+        // Buffered events are still readable.
+        assert!(receiver.recv().await.is_some(), "first buffered event");
+        assert!(receiver.recv().await.is_some(), "second buffered event");
+        // Drop the sender so `recv` can observe termination.
+        drop(sender);
+        assert!(receiver.recv().await.is_none(), "final None after drain");
+    }
+
+    /// A sender blocked on a full memory channel must wake with
+    /// `ChannelClosed` when `receiver.close()` fires, not hang.
+    /// Otherwise the shutdown drain could deadlock a pipeline worker
+    /// that is mid-`send().await` on a saturated output queue.
+    #[tokio::test]
+    async fn blocked_sender_wakes_with_err_after_receiver_close() {
+        let (sender, mut receiver) = create_queue(
+            "block_test".into(),
+            QueueConfig {
+                queue_type: QueueType::Memory,
+                capacity: 1,
+            },
+        )
+        .unwrap();
+        sender.send(owned_event()).await.unwrap();
+
+        let sender_clone = sender.clone();
+        let blocked = tokio::spawn(async move { sender_clone.send(owned_event()).await });
+        // Give the spawned task time to reach the permit wait.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        receiver.close();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), blocked)
+            .await
+            .expect("blocked send must wake within 1s of receiver.close()")
+            .expect("task must not panic");
+        assert!(
+            matches!(result, Err(QueueSendError::ChannelClosed)),
+            "expected ChannelClosed, got {:?}",
+            result
+        );
+    }
+
+    /// End-to-end shutdown drain on a memory queue: events already
+    /// buffered when shutdown fires reach `consume_shutdown`. The
+    /// close-then-recv-until-None pattern is what guarantees this
+    /// under the older `try_recv()` snapshot semantics; pins the
+    /// visible behavior so a regression that stripped `close()` back
+    /// out would fail here rather than at a customer.
+    #[tokio::test]
+    async fn memory_shutdown_drain_delivers_buffered_events_to_consume_shutdown() {
+        let writer = Arc::new(ScriptedWriter::new(vec![]));
+        let metrics = Arc::clone(&writer.metrics);
+        let (sender, shutdown_tx, handle) =
+            spawn_consumer_with_queue(QueueType::Memory, writer.clone(), metrics.clone()).await;
+
+        // Buffer three events without letting the consumer touch
+        // them by holding the runtime yield until after the sends.
+        sender.send(owned_event()).await.unwrap();
+        sender.send(owned_event()).await.unwrap();
+        sender.send(owned_event()).await.unwrap();
+
+        shutdown_tx.send(true).unwrap();
+        drop(sender);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("consumer must exit within 2s of shutdown")
+            .expect("consumer task must not panic");
+
+        assert_eq!(
+            writer.calls(),
+            3,
+            "memory drain must deliver all buffered events to consume_shutdown",
+        );
+    }
+
+    /// Disk backend: shutdown must NOT drain unread WAL entries
+    /// into `consume_shutdown`. Unread entries stay on disk and are
+    /// available via next-start replay. The previous `try_recv()`
+    /// loop over the WAL would pull the entire durable backlog into
+    /// RAM for the shutdown window and slow the flush deadline.
+    #[tokio::test]
+    async fn disk_shutdown_drain_leaves_unread_backlog_for_replay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let disk = QueueType::Disk {
+            path: tmp.path().display().to_string(),
+            max_size: 4 * 1024 * 1024,
+        };
+        let writer = Arc::new(ScriptedWriter::new(vec![]));
+        let metrics = Arc::clone(&writer.metrics);
+        let (sender, shutdown_tx, handle) =
+            spawn_consumer_with_queue(disk.clone(), writer.clone(), metrics.clone()).await;
+
+        // Signal shutdown before any event lands so the consumer
+        // takes the shutdown branch immediately (before draining).
+        shutdown_tx.send(true).unwrap();
+        // Yield so the consumer observes shutdown.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Now write events to the WAL. The sender writes directly
+        // to disk; the consumer is already in the shutdown-skip
+        // branch and must not read them.
+        sender.send(owned_event()).await.unwrap();
+        sender.send(owned_event()).await.unwrap();
+        sender.send(owned_event()).await.unwrap();
+        drop(sender);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("consumer must exit")
+            .expect("consumer task must not panic");
+
+        assert_eq!(
+            writer.calls(),
+            0,
+            "disk shutdown drain must not read unread WAL entries into consume_shutdown",
+        );
+
+        // Reopen the disk queue at the same path — the three
+        // unconsumed events must replay.
+        let (_reopen_sender, mut reopen_receiver) = create_queue(
+            "wedge_test".into(),
+            QueueConfig {
+                queue_type: disk,
+                capacity: 16,
+            },
+        )
+        .unwrap();
+        let mut replayed = 0;
+        for _ in 0..3 {
+            if reopen_receiver.recv().await.is_some() {
+                replayed += 1;
+            }
+        }
+        assert_eq!(
+            replayed, 3,
+            "disk queue must replay all three unconsumed events on reopen",
+        );
+    }
+
+    /// Structural pin: the shutdown arm in `run_queue_consumer`
+    /// branches on `backend_kind()`, uses `close() + recv().await`
+    /// on the memory backend, and does not fall back to any
+    /// `try_recv()` snapshot. Prevents a mechanical refactor from
+    /// silently reintroducing the C1 permit-holder race.
+    #[test]
+    fn shutdown_drain_arm_is_backend_aware_and_uses_close_recv_pattern() {
+        let src = include_str!("mod.rs");
+        let arm_start = src
+            .find("_ = shutdown.changed(), if accepting =>")
+            .expect("shutdown arm marker must exist");
+        // Isolate the arm body up to the closing brace of the
+        // outer `if *shutdown.borrow()` guard. Walk to the second
+        // `break;` — the exit of the drain — and take everything
+        // between as the arm body.
+        let arm_tail = &src[arm_start..];
+        let body_end = arm_tail
+            .find("break;")
+            .expect("shutdown arm must break out of the select loop");
+        let body = &arm_tail[..body_end];
+
+        assert!(
+            body.contains("receiver.backend_kind()"),
+            "shutdown arm must branch on backend_kind()",
+        );
+        assert!(
+            body.contains("QueueBackendKind::Memory"),
+            "shutdown arm must have a memory branch",
+        );
+        assert!(
+            body.contains("QueueBackendKind::Disk"),
+            "shutdown arm must have a disk branch",
+        );
+        assert!(
+            body.contains("receiver.close()"),
+            "memory branch must close the receiver before draining",
+        );
+        assert!(
+            body.contains("receiver.recv().await"),
+            "memory branch must drain with recv().await, not try_recv()",
+        );
+        assert!(
+            !body.contains("receiver.try_recv()"),
+            "shutdown drain must not use try_recv() — permit-holder race",
+        );
     }
 }
 

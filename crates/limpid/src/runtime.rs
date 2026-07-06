@@ -479,8 +479,23 @@ async fn run_pipeline_workers(
 
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
-                    // Drain remaining events from channel before stopping
-                    while let Ok(event) = event_rx.try_recv() {
+                    // Close the receiver first, then drain with
+                    // `recv().await` until `None`. The previous
+                    // `try_recv()` snapshot loop raced with input
+                    // tasks that had reserved an mpsc permit but not
+                    // yet written the value — the loop could exit
+                    // observing an empty channel while a permit-holder
+                    // was mid-write, silently dropping that event.
+                    // `close()` + `recv-until-None` is the tokio-
+                    // documented contract for reading every value that
+                    // was already sent or is being sent by an
+                    // outstanding permit-holder before terminating.
+                    // Any input-side `send` that races the close and
+                    // has not yet reserved a permit wakes with
+                    // `SendError`, surfaced by the input tasks
+                    // themselves (see `run_input`).
+                    event_rx.close();
+                    while let Some(event) = event_rx.recv().await {
                         process_event(&event, workers, ctx, &input_tap_key, &mut bump).await;
                         bump.reset();
                     }
@@ -1019,5 +1034,41 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["sink_a".to_string(), "sink_b".to_string()]);
+    }
+
+    /// Structural pin: the pipeline worker's shutdown arm closes
+    /// `event_rx` and drains with `recv().await` until `None`, not
+    /// `try_recv()` snapshot. The old snapshot loop had the same
+    /// permit-holder race as the output queue drain: an input task
+    /// that had reserved an mpsc permit but not yet written the
+    /// value would complete after the worker exited, silently
+    /// dropping the event. Mirror-tested at the tokio-mpsc level in
+    /// `queue::tests::tokio_mpsc_close_then_permit_send_still_visible`.
+    #[test]
+    fn pipeline_worker_shutdown_arm_uses_close_recv_pattern() {
+        let src = include_str!("runtime.rs");
+        // Anchor on the specific inner select arm inside
+        // `run_pipeline_workers`, not the outer `let event = tokio::select!`
+        // that races receive vs shutdown.
+        let marker = "// Close the receiver first, then drain with";
+        let start = src
+            .find(marker)
+            .expect("pipeline worker shutdown drain marker must exist");
+        let tail = &src[start..];
+        let body_end = tail.find("break;").expect("shutdown arm must break out");
+        let body = &tail[..body_end];
+
+        assert!(
+            body.contains("event_rx.close()"),
+            "pipeline worker shutdown must close event_rx before draining",
+        );
+        assert!(
+            body.contains("event_rx.recv().await"),
+            "pipeline worker shutdown must drain with recv().await, not try_recv()",
+        );
+        assert!(
+            !body.contains("event_rx.try_recv()"),
+            "pipeline worker shutdown must not use try_recv() — permit-holder race",
+        );
     }
 }

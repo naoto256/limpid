@@ -117,6 +117,19 @@ impl Input for SyslogUdpInput {
                             let raw = Bytes::copy_from_slice(data);
                             let event = Event::new(raw, addr);
                             if tx.send(event).await.is_err() {
+                                // The pipeline event channel closed
+                                // beneath us — during graceful
+                                // shutdown this is expected (the
+                                // pipeline worker closes the channel
+                                // as part of its drain protocol);
+                                // otherwise it signals a downstream
+                                // task exit. Log once so operators
+                                // see the transition rather than a
+                                // silent stop, then exit the input.
+                                info!(
+                                    "syslog_udp [{}]: pipeline event channel closed, stopping input task",
+                                    addr
+                                );
                                 break;
                             }
                         }

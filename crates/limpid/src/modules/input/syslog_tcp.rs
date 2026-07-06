@@ -346,7 +346,27 @@ impl Input for SyslogTcpInput {
                                     TcpFraming::Auto => unreachable!(),
                                 };
 
-                                debug!("syslog_tcp [{}]: connection closed ({})", addr, reason);
+                                // `ChannelClosed` is the only reason
+                                // the pipeline (not the peer) tore
+                                // down the connection — during
+                                // graceful shutdown this fires for
+                                // every open connection as the
+                                // pipeline worker closes its event
+                                // channel. Surface at `info!` so the
+                                // shutdown transition is visible in
+                                // journald; other reasons are per-
+                                // connection peer/framing noise and
+                                // stay at `debug!`.
+                                match reason {
+                                    CloseReason::ChannelClosed => info!(
+                                        "syslog_tcp [{}]: connection closed ({})",
+                                        addr, reason
+                                    ),
+                                    _ => debug!(
+                                        "syslog_tcp [{}]: connection closed ({})",
+                                        addr, reason
+                                    ),
+                                }
                             }));
                         }
                         Err(e) => {
