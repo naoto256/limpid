@@ -29,9 +29,10 @@
 //!
 //! The warning is intentionally [`Level::Warning`] rather than
 //! [`Level::Error`]: an operator may have made an informed choice to
-//! accept silent drops on failure (e.g. low-criticality telemetry on
-//! a host with no spare disk). `--check --ultra-strict` promotion is
-//! handled at the CLI layer per existing convention.
+//! accept the fragile tracing fallback on failure (e.g.
+//! low-criticality telemetry on a host with no spare disk, where
+//! journald-based recovery is acceptable). `--check --ultra-strict`
+//! promotion is handled at the CLI layer per existing convention.
 //!
 //! Detection is config-shape-only — no runtime, no I/O. The set of
 //! "batched output types" is intentionally hardcoded to the three
@@ -167,7 +168,8 @@ mod tests {
     #[test]
     fn warns_when_retry_block_present_without_error_log() {
         // syslog_tcp with an explicit retry block but no
-        // `control { error_log }` — exactly the silent-drop scenario.
+        // `control { error_log }` — exactly the tracing-fallback
+        // scenario the warning targets.
         let src = r#"
 def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o {
