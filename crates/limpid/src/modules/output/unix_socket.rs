@@ -93,7 +93,6 @@ impl Output for UnixSocketOutput {
             let write_result = match write_with_reconnect_shutdown_aware(
                 self,
                 &self.conn,
-                &self.metrics,
                 &event.egress,
                 &mut shutdown,
             )
@@ -120,6 +119,13 @@ impl Output for UnixSocketOutput {
             };
             match write_result {
                 Ok(()) => {
+                    // Metric ownership stays with the caller so
+                    // `finalize_shutdown_singleton_disposition` on the
+                    // shutdown-drain path (which also owns the
+                    // success bump) does not double-count against the
+                    // transport helper. Sibling syslog_udp uses the
+                    // identical shape after the previous fix.
+                    self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
                     ack.resolve_delivered();
                     return Ok(());
                 }
@@ -189,7 +195,7 @@ impl Output for UnixSocketOutput {
     async fn consume_shutdown(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
         let result = match tokio::time::timeout(
             crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT,
-            write_with_reconnect(self, &self.conn, &self.metrics, &event.egress),
+            write_with_reconnect(self, &self.conn, &event.egress),
         )
         .await
         {
@@ -241,5 +247,98 @@ impl PersistentConn for UnixSocketOutput {
         stream.write_all(&buf).await?;
         stream.flush().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::Event;
+    use crate::queue::QueueAckHandle;
+    use bytes::Bytes;
+    use std::os::unix::net::UnixListener as StdUnixListener;
+    use tempfile::TempDir;
+
+    /// Steady-state `consume` success bumps `events_written` exactly
+    /// once. Regression against a metric-ownership drift that would
+    /// double-count with the transport helper or leave it at zero.
+    #[tokio::test]
+    async fn steady_state_consume_success_bumps_events_written_once() {
+        let dir = TempDir::new().unwrap();
+        let socket_path = dir.path().join("out.sock");
+        let listener = StdUnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let _listener = tokio::net::UnixListener::from_std(listener).unwrap();
+
+        let output = build_test_output(&socket_path).await;
+        let event = Event::new(
+            Bytes::from_static(b"payload"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let (ack, _rx) = QueueAckHandle::for_test();
+        output.consume(&event, ack).await.expect("consume");
+
+        assert_eq!(
+            output.metrics.events_written.load(Ordering::Relaxed),
+            1,
+            "steady-state consume success must bump events_written exactly once"
+        );
+        assert_eq!(
+            output.metrics.events_failed.load(Ordering::Relaxed),
+            0,
+            "successful send must not bump events_failed"
+        );
+    }
+
+    /// Shutdown-drain success via `finalize_shutdown_singleton_disposition`
+    /// bumps `events_written` exactly once (previously double: once
+    /// inside `write_with_reconnect` and once in the helper).
+    #[tokio::test]
+    async fn shutdown_consume_success_bumps_events_written_once() {
+        let dir = TempDir::new().unwrap();
+        let socket_path = dir.path().join("out.sock");
+        let listener = StdUnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let _listener = tokio::net::UnixListener::from_std(listener).unwrap();
+
+        let output = build_test_output(&socket_path).await;
+        let event = Event::new(
+            Bytes::from_static(b"payload"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let (ack, _rx) = QueueAckHandle::for_test();
+        output
+            .consume_shutdown(&event, ack)
+            .await
+            .expect("consume_shutdown");
+
+        assert_eq!(
+            output.metrics.events_written.load(Ordering::Relaxed),
+            1,
+            "consume_shutdown success must bump events_written exactly once (via helper)"
+        );
+        assert_eq!(
+            output.metrics.events_failed.load(Ordering::Relaxed),
+            0,
+            "successful drain must not bump events_failed"
+        );
+    }
+
+    async fn build_test_output(socket_path: &std::path::Path) -> UnixSocketOutput {
+        use crate::dsl::ast::{Expr, ExprKind, Property};
+        use crate::dsl::module_props::ModuleProperties;
+        let props = ModuleProperties::from_parts(
+            "unix_socket",
+            vec![Property::KeyValue {
+                key: "path".into(),
+                key_span: None,
+                value: Expr::spanless(ExprKind::StringLit(
+                    socket_path.to_str().unwrap().to_string(),
+                )),
+                value_span: None,
+            }],
+        );
+        UnixSocketOutput::from_properties("u", &props, &crate::modules::BuildContext::for_testing())
+            .expect("build")
     }
 }

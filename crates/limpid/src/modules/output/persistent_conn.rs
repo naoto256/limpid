@@ -17,14 +17,9 @@
 //! Kept `pub(crate)` — internal implementation detail of the output
 //! layer, not part of the module contract.
 
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-
 use anyhow::Result;
 use bytes::Bytes;
 use tokio::sync::Mutex;
-
-use crate::metrics::OutputMetrics;
 
 /// Policy trait implemented by each persistent-connection output. The
 /// concrete stream type and the framed-write routine stay in the
@@ -51,7 +46,11 @@ pub(crate) trait PersistentConn: Sync {
 }
 
 /// Write `payload` through a persistent stream, reconnecting once if
-/// the cached stream is stale. Bumps `events_written` on success.
+/// the cached stream is stale. Transport-only — does NOT mutate
+/// `OutputMetrics`. Disposition ownership (the `events_written` bump
+/// on success, or the DLQ route on failure) lives with the caller;
+/// unifying it there keeps steady-state consume and shutdown-drain
+/// success from double-counting under `finalize_shutdown_singleton_disposition`.
 ///
 /// On the fast path (cached stream, write succeeds) `connect` is never
 /// invoked. A single failed write triggers one reconnect attempt; if
@@ -69,7 +68,6 @@ pub(crate) trait PersistentConn: Sync {
 pub(crate) async fn write_with_reconnect<P>(
     policy: &P,
     conn: &Mutex<Option<P::Stream>>,
-    metrics: &Arc<OutputMetrics>,
     payload: &Bytes,
 ) -> Result<()>
 where
@@ -80,10 +78,7 @@ where
     // Fast path: reuse an existing connection.
     if guard.is_some() {
         match policy.write_frame(guard.as_mut().unwrap(), payload).await {
-            Ok(()) => {
-                metrics.events_written.fetch_add(1, Ordering::Relaxed);
-                return Ok(());
-            }
+            Ok(()) => return Ok(()),
             Err(_) => {
                 // Broken pipe / reset — drop and reconnect below.
                 *guard = None;
@@ -95,7 +90,6 @@ where
     let stream = policy.connect().await?;
     *guard = Some(stream);
     policy.write_frame(guard.as_mut().unwrap(), payload).await?;
-    metrics.events_written.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -109,7 +103,12 @@ where
 /// `Recovered` on shutdown or spin an extra retry attempt after
 /// the runtime has already asked them to stop.
 pub(crate) enum WriteReconnectOutcome {
-    /// Payload was written and `events_written` bumped.
+    /// Payload was written. Metric ownership is the caller's — this
+    /// helper is transport-only, and the caller (steady-state
+    /// `consume` for the shutdown-aware path, or
+    /// `finalize_shutdown_singleton_disposition` for the shutdown
+    /// drain path via `write_with_reconnect`) bumps `events_written`
+    /// exactly once per delivered event.
     Delivered,
     /// A pre-send phase (connect, or a mutex-guard scoped shutdown
     /// check that fires before `write_frame` runs) observed the
@@ -155,7 +154,6 @@ pub(crate) enum WriteReconnectOutcome {
 pub(crate) async fn write_with_reconnect_shutdown_aware<P>(
     policy: &P,
     conn: &Mutex<Option<P::Stream>>,
-    metrics: &Arc<OutputMetrics>,
     payload: &Bytes,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> WriteReconnectOutcome
@@ -176,10 +174,7 @@ where
             return WriteReconnectOutcome::PreSendShutdown;
         }
         match policy.write_frame(guard.as_mut().unwrap(), payload).await {
-            Ok(()) => {
-                metrics.events_written.fetch_add(1, Ordering::Relaxed);
-                return WriteReconnectOutcome::Delivered;
-            }
+            Ok(()) => return WriteReconnectOutcome::Delivered,
             Err(_) => {
                 // Broken pipe / reset — drop the cached stream and
                 // fall through to the reconnect path below. Some
@@ -207,10 +202,7 @@ where
         return WriteReconnectOutcome::PreSendShutdown;
     }
     match policy.write_frame(guard.as_mut().unwrap(), payload).await {
-        Ok(()) => {
-            metrics.events_written.fetch_add(1, Ordering::Relaxed);
-            WriteReconnectOutcome::Delivered
-        }
+        Ok(()) => WriteReconnectOutcome::Delivered,
         Err(e) => {
             *guard = None;
             WriteReconnectOutcome::Err(e)
