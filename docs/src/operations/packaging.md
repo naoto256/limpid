@@ -39,6 +39,7 @@ cargo deb -p limpid -- --features journal,kafka
 | `/usr/bin/limpidctl` | Control and debug CLI |
 | `/usr/share/limpid/limpid.conf.example` | Example configuration |
 | `/usr/share/doc/limpid/README.md` | Documentation |
+| `/usr/share/limpid/snippets/` | Shipped snippet library (`composers/`, `filters/`, `functions/`, `parsers/`) — resolved by absolute-`include` under `SYSTEM_SNIPPET_DIR`. See [Snippet Library](../snippets/README.md). |
 | `/etc/systemd/system/limpid.service` | systemd unit file |
 
 The post-install script (`packaging/postinst`) runs on first install:
@@ -115,10 +116,11 @@ sudo systemctl restart limpid-prometheus
 ├── processes/
 └── pipelines/
 
-/var/lib/limpid/          # Disk queue data
-/var/log/limpid/          # Default file output location
+/usr/share/limpid/snippets/  # Shipped snippet library (composers/, filters/, functions/, parsers/)
+/var/lib/limpid/             # Disk queue data
+/var/log/limpid/             # Default file output location
 /var/run/limpid/
-└── control.sock          # Control socket (created at runtime)
+└── control.sock             # Control socket (created at runtime)
 ```
 
 ## Upgrading

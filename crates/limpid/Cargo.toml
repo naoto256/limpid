@@ -104,10 +104,19 @@ assets = [
     ["target/release/limpidctl", "usr/bin/", "755"],
     ["../../packaging/limpid.conf.example", "usr/share/limpid/limpid.conf.example", "644"],
     ["../../README.md", "usr/share/doc/limpid/README.md", "644"],
-    # The snippet library that lives under packaging/snippets/ ships in
-    # v0.6.0; the config loader already honours absolute includes under
-    # /usr/share/limpid/snippets/ via SYSTEM_SNIPPET_DIR (see config.rs)
-    # so the .deb just needs the directory once snippets exist.
+    # The snippet library under packaging/snippets/ is loaded by the
+    # daemon via SYSTEM_SNIPPET_DIR (`/usr/share/limpid/snippets/`,
+    # see config.rs). Every documented `include "snippets/..."`
+    # relies on this directory being present in the deb — without
+    # it, an operator following the docs verbatim gets an
+    # unresolved-include failure at startup. Ship the whole tree
+    # (README + composers/ filters/ functions/ parsers/) so the
+    # packaged surface matches what the docs promise.
+    ["../../packaging/snippets/README.md", "usr/share/limpid/snippets/README.md", "644"],
+    ["../../packaging/snippets/composers/*.limpid", "usr/share/limpid/snippets/composers/", "644"],
+    ["../../packaging/snippets/filters/*.limpid", "usr/share/limpid/snippets/filters/", "644"],
+    ["../../packaging/snippets/functions/*.limpid", "usr/share/limpid/snippets/functions/", "644"],
+    ["../../packaging/snippets/parsers/*.limpid", "usr/share/limpid/snippets/parsers/", "644"],
 ]
 maintainer-scripts = "../../packaging"
 # start = false preserves the existing "enable but don't start on first
