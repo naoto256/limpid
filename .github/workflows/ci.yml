@@ -64,16 +64,31 @@ jobs:
           components: clippy
 
       # librdkafka's Rust binding compiles the C library from source.
-      # The system needs a SASL / SSL / build toolchain baseline; the
-      # ubuntu-latest image has cmake / gcc already, so we only add
-      # the dev packages the linker misses at link time. `libsystemd-dev`
-      # is required by the `journal` feature the release artifact also
-      # enables — mirrors the packaging release job's setup.
+      # The system needs a SASL / SSL / curl / compression + build
+      # toolchain baseline; the ubuntu-latest image has cmake / gcc
+      # already, so we only add the dev packages the linker misses at
+      # link time. Each package listed below is required by librdkafka
+      # 2.x's CMake build:
+      #
+      #   libsasl2-dev         — SASL authentication (Kerberos / PLAIN)
+      #   libssl-dev           — TLS + broker cert validation
+      #   libcurl4-openssl-dev — required by rdkafka_conf.c's OAUTHBEARER
+      #                          OIDC support (missing this yields
+      #                          `fatal error: curl/curl.h: No such file`)
+      #   zlib1g-dev           — gzip compression codec
+      #   libzstd-dev          — zstd compression codec
+      #   liblz4-dev           — lz4 compression codec
+      #   libsystemd-dev       — the `journal` feature the release
+      #                          artifact also enables; mirrors the
+      #                          packaging release job's setup.
+      #   pkg-config           — link-line discovery for all of the above.
       - name: Install kafka + journal build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libsasl2-dev libssl-dev libsystemd-dev pkg-config
+            libsasl2-dev libssl-dev libcurl4-openssl-dev \
+            zlib1g-dev libzstd-dev liblz4-dev \
+            libsystemd-dev pkg-config
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # pin-audit:2026-05-21 e18b497 | v2
