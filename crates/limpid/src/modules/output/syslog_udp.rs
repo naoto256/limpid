@@ -155,6 +155,15 @@ impl Output for SyslogUdpOutput {
             };
             match write_result {
                 Ok(()) => {
+                    // `write_payload_shutdown_aware` (and its transport-
+                    // only sibling `write_payload`) intentionally do NOT
+                    // bump `events_written`; disposition ownership lives
+                    // with the caller so the steady-state and shutdown
+                    // paths agree on a single "successful event" ==
+                    // "one bump" contract. Sibling `syslog_tcp` uses the
+                    // identical shape (see the comment at the analogous
+                    // `write_payload_shutdown_aware` return site).
+                    self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
                     ack.resolve_delivered();
                     return Ok(());
                 }
@@ -225,43 +234,33 @@ impl Output for SyslogUdpOutput {
         let payload = SyslogPayload {
             egress: event.egress.clone(),
         };
-        let result = tokio::time::timeout(
+        // Delegate disposition (metric bump + ack resolution + DLQ
+        // route) to `finalize_shutdown_singleton_disposition` so the
+        // "successful shutdown-drain event == one `events_written`
+        // bump" contract is owned by the helper, not the sink.
+        // Sibling `syslog_tcp::consume_shutdown` uses the identical
+        // shape.
+        let result = match tokio::time::timeout(
             crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT,
             self.write_payload(payload),
         )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(anyhow::anyhow!(
+                "timed out after {:?}",
+                crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT
+            )),
+        };
+        crate::modules::finalize_shutdown_singleton_disposition(
+            result,
+            self.error_log.as_ref(),
+            &self.metrics,
+            &self.name,
+            event,
+            ack,
+        )
         .await;
-        match result {
-            Ok(Ok(())) => {
-                ack.resolve_delivered();
-            }
-            Ok(Err(e)) => {
-                let reason = format!("shutdown write failed: {}", e);
-                let __dlq_outcome = crate::modules::route_event_to_dlq(
-                    self.error_log.as_ref(),
-                    &self.metrics,
-                    &self.name,
-                    event,
-                    &reason,
-                )
-                .await;
-                crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
-            }
-            Err(_) => {
-                let reason = format!(
-                    "shutdown write timed out after {:?}",
-                    crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT
-                );
-                let __dlq_outcome = crate::modules::route_event_to_dlq(
-                    self.error_log.as_ref(),
-                    &self.metrics,
-                    &self.name,
-                    event,
-                    &reason,
-                )
-                .await;
-                crate::modules::resolve_ack_from_dlq_outcome(ack, __dlq_outcome, &self.metrics);
-            }
-        }
         Ok(())
     }
 }
@@ -434,10 +433,16 @@ impl SyslogUdpOutput {
     }
 
     /// Send one rendered datagram via the peer-rotation helper.
-    /// Private — used only by [`Output::consume`] and unit tests that
-    /// drive the transport directly without constructing an `Event`.
+    /// Transport-only — does NOT mutate `OutputMetrics`. The disposition
+    /// owner ([`Output::consume`]'s Delivered arm for steady-state, or
+    /// [`finalize_shutdown_singleton_disposition`][crate::modules::finalize_shutdown_singleton_disposition]
+    /// for shutdown drain) bumps `events_written` on success. Private —
+    /// called from [`Output::consume_shutdown`] and unit tests that
+    /// drive the transport directly without constructing an `Event`;
+    /// the steady-state `Output::consume` uses
+    /// [`Self::write_payload_shutdown_aware`] so its pre-send DNS /
+    /// bind / connect phase can race the shutdown signal.
     async fn write_payload(&self, payload: SyslogPayload) -> Result<()> {
-        let metrics = Arc::clone(&self.metrics);
         let result = self
             .peers
             .write_with_rotation_now(move |_idx, peer, state| {
@@ -545,13 +550,7 @@ impl SyslogUdpOutput {
             })
             .await;
 
-        match result {
-            Ok(()) => {
-                metrics.events_written.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
-            Err(err) => Err(anyhow::anyhow!("{}", err)),
-        }
+        result.map_err(|err| anyhow::anyhow!("{}", err))
     }
 }
 
@@ -791,6 +790,128 @@ mod tests {
             matches!(src, SocketAddr::V6(_)),
             "peer source must be v6, got {:?}",
             src
+        );
+
+        // The transport helper is metric-free by contract — the
+        // steady-state `consume` and the shutdown-drain helper are the
+        // sole owners of the `events_written` bump. Pin that so a
+        // future refactor that re-adds a bump to `write_payload` is
+        // caught here.
+        assert_eq!(
+            output.metrics.events_written.load(Ordering::Relaxed),
+            0,
+            "write_payload must not mutate events_written; disposition owner bumps"
+        );
+    }
+
+    /// Steady-state success (delivered via `consume`) bumps
+    /// `events_written` exactly once. Regression against the
+    /// under-count where `write_payload_shutdown_aware` returning
+    /// `Delivered` left the counter untouched, so normal traffic
+    /// reported `events_written == 0` while shutdown-drain success
+    /// counted.
+    #[tokio::test]
+    async fn steady_state_consume_success_bumps_events_written_once() {
+        use crate::event::Event;
+        use crate::queue::QueueAckHandle;
+        use bytes::Bytes;
+
+        let listener = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port() as i64;
+
+        let output = SyslogUdpOutput::build(
+            "u",
+            &mp(&[block(
+                "peer",
+                vec![
+                    kv("host", ExprKind::StringLit("127.0.0.1".into())),
+                    kv("port", ExprKind::IntLit(port)),
+                ],
+            )]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .expect("build");
+
+        let event = Event::new(
+            Bytes::from_static(b"<134>hello"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let (ack, _ack_rx) = QueueAckHandle::for_test();
+        output.consume(&event, ack).await.expect("consume");
+
+        // Drain the datagram off the listener so the test doesn't
+        // race the socket's send-buffer flush.
+        let mut buf = [0u8; 64];
+        let _ = tokio::time::timeout(Duration::from_secs(1), listener.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for datagram")
+            .expect("recv_from");
+
+        assert_eq!(
+            output.metrics.events_written.load(Ordering::Relaxed),
+            1,
+            "steady-state consume success must bump events_written exactly once"
+        );
+        assert_eq!(
+            output.metrics.events_failed.load(Ordering::Relaxed),
+            0,
+            "successful send must not bump events_failed"
+        );
+    }
+
+    /// Shutdown-drain success bumps `events_written` exactly once,
+    /// via `finalize_shutdown_singleton_disposition`. Regression to
+    /// pin that the fold to the helper preserves the one-bump-per-
+    /// successful-event contract on the shutdown path.
+    #[tokio::test]
+    async fn shutdown_consume_success_bumps_events_written_once() {
+        use crate::event::Event;
+        use crate::queue::QueueAckHandle;
+        use bytes::Bytes;
+
+        let listener = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port() as i64;
+
+        let output = SyslogUdpOutput::build(
+            "u",
+            &mp(&[block(
+                "peer",
+                vec![
+                    kv("host", ExprKind::StringLit("127.0.0.1".into())),
+                    kv("port", ExprKind::IntLit(port)),
+                ],
+            )]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .expect("build");
+
+        let event = Event::new(
+            Bytes::from_static(b"<134>shutdown"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let (ack, _ack_rx) = QueueAckHandle::for_test();
+        output
+            .consume_shutdown(&event, ack)
+            .await
+            .expect("consume_shutdown");
+
+        let mut buf = [0u8; 64];
+        let _ = tokio::time::timeout(Duration::from_secs(1), listener.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for datagram")
+            .expect("recv_from");
+
+        assert_eq!(
+            output.metrics.events_written.load(Ordering::Relaxed),
+            1,
+            "consume_shutdown success must bump events_written exactly once via helper"
+        );
+        assert_eq!(
+            output.metrics.events_failed.load(Ordering::Relaxed),
+            0,
+            "successful drain must not bump events_failed"
         );
     }
 }
