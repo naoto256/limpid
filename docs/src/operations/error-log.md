@@ -404,7 +404,7 @@ increase(limpid_output_events_errored_unwritable_total[5m]) > 0
 increase(limpid_output_events_wedged_total[5m]) > 0
 ```
 
-(Confirm the exact exported metric names against your `limpid-prometheus` exporter; the in-process counter names are `events_errored`, `events_failed` (per output), `events_errored_unwritable` (both sides), and `events_wedged` (output-side only).)
+The Prometheus metric names above are the authoritative form emitted by `limpid-prometheus`; the equivalents on the JSON stats endpoint are `events_errored`, `events_failed` (per output), `events_errored_unwritable` (both pipeline and output sides), and `events_wedged` (output-side only).
 
 **Multi-instance DLQ aggregation.** When several limpid daemons each write their own `error_log` file, central triage means shipping each file to a single host and replaying from there. The simple shape: a `filebeat` / `vector` / `rsyslog` collector tails each daemon's DLQ and forwards the lines into a central archive bucket; replay runs against a `jq` query over the aggregated archive and injects back into the daemon whose `pipeline` (Process flavor) or `output.name` (Output flavor) matches. Detailed multi-instance topology is deferred to a separate runbook.
 
