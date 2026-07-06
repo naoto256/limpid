@@ -508,9 +508,18 @@ pub async fn route_shutdown_batch_to_dlq(
             let outcome = match writer.write(&ctx).await {
                 Ok(()) => DlqRouteOutcome::Recovered,
                 Err(write_err) => {
-                    tracing::warn!(
+                    // Same shutdown-drain JSONL fallback contract as
+                    // `route_event_to_dlq`: emit the full record via
+                    // `event_record` so the operator has a manual-
+                    // recovery trail alongside the counter bump. The
+                    // configured DLQ file remains the load-bearing
+                    // recovery; this is best-effort.
+                    tracing::error!(
+                        event_record = %ctx.to_jsonl(),
                         "output '{}': error_log write during shutdown failed: {} — routing as \
-                         Dropped so the disk queue holds the cursor for replay",
+                         Dropped so the disk queue holds the cursor for replay; event_record \
+                         below is a best-effort tracing fallback (a healthy `error_log` file \
+                         is the load-bearing recovery)",
                         output_name,
                         write_err
                     );
@@ -651,9 +660,24 @@ pub async fn route_event_to_dlq(
                 // the cursor on a disk queue (disk-queue fail-stop wedge)
                 // rather than advance past an event that has no
                 // durable trail.
-                tracing::warn!(
+                //
+                // Also emit the full JSONL via a structured
+                // `event_record` field on `tracing::error!` so the
+                // operator still has a manual-recovery trail even
+                // when the configured DLQ file is unhealthy. This
+                // is best-effort (subject to log rotation /
+                // filters / aggregation) — a healthy DLQ file
+                // remains the load-bearing recovery contract —
+                // but on a memory queue this fallback is the only
+                // durable trace left, and on a disk queue it
+                // supplements the wedge for out-of-band operator
+                // triage. Matches the pipeline-side
+                // `write_errored_to_dlq` shape in runtime.rs.
+                tracing::error!(
+                    event_record = %ctx.to_jsonl(),
                     "output '{}': error_log write failed: {} — routing as Dropped so the disk \
-                     queue holds the cursor for replay",
+                     queue holds the cursor for replay; event_record below is a best-effort \
+                     tracing fallback (a healthy `error_log` file is the load-bearing recovery)",
                     output_name,
                     write_err
                 );
@@ -1107,5 +1131,83 @@ mod resolve_ack_from_dlq_outcome_tests {
         resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Dropped, &metrics);
         assert_eq!(rx.recv().await, Some((position, AckDisposition::Dropped)));
         assert_eq!(metrics.events_failed.load(Ordering::Relaxed), 0);
+    }
+}
+
+/// Structural pins for the output-side DLQ write-failure JSONL
+/// fallback contract. The pipeline-side `runtime::write_errored_to_dlq`
+/// emits a full `event_record` via `tracing::error!` when the
+/// configured DLQ file write itself fails, so operators still have a
+/// manual-recovery trail out of journald. Historically the output-
+/// side routes (`route_event_to_dlq`, `route_shutdown_batch_to_dlq`)
+/// emitted only a `tracing::warn!` on that path, and the parity
+/// claim in docs was fiction. This module now emits the same
+/// `event_record` field; the tests below prevent that fix from
+/// silently regressing.
+#[cfg(test)]
+mod output_dlq_jsonl_fallback_tests {
+    /// `route_event_to_dlq`'s configured-writer write-failure arm
+    /// must emit `event_record = %ctx.to_jsonl()`. Detection is
+    /// source-level (grep the module for the arm's `event_record`
+    /// field); the alternative — attaching a tracing subscriber and
+    /// asserting on captured fields — requires infrastructure the
+    /// workspace's unit tests do not yet share.
+    #[test]
+    fn route_event_to_dlq_configured_failure_emits_event_record() {
+        let src = include_str!("mod.rs");
+        let fn_start = src
+            .find("pub async fn route_event_to_dlq(")
+            .expect("route_event_to_dlq must exist");
+        // Bound the search at the next top-level `pub async fn` or
+        // `pub fn` to keep the grep scoped to this function's body.
+        let fn_end_candidates = [
+            src[fn_start + 32..].find("\npub async fn "),
+            src[fn_start + 32..].find("\npub fn "),
+        ];
+        let fn_end = fn_end_candidates
+            .into_iter()
+            .flatten()
+            .min()
+            .expect("a following pub fn must exist");
+        let body = &src[fn_start..fn_start + 32 + fn_end];
+        assert!(
+            body.contains("event_record ="),
+            "route_event_to_dlq must emit `event_record = %ctx.to_jsonl()` in its \
+             configured-writer write-failure arm so operators have a journald fallback \
+             when the DLQ file is unhealthy"
+        );
+        assert!(
+            body.contains("events_errored_unwritable"),
+            "route_event_to_dlq must still bump events_errored_unwritable on the same arm"
+        );
+    }
+
+    /// Same structural pin for the shutdown-batch route.
+    #[test]
+    fn route_shutdown_batch_to_dlq_configured_failure_emits_event_record() {
+        let src = include_str!("mod.rs");
+        let fn_start = src
+            .find("pub async fn route_shutdown_batch_to_dlq(")
+            .expect("route_shutdown_batch_to_dlq must exist");
+        let fn_end_candidates = [
+            src[fn_start + 42..].find("\npub async fn "),
+            src[fn_start + 42..].find("\npub fn "),
+        ];
+        let fn_end = fn_end_candidates
+            .into_iter()
+            .flatten()
+            .min()
+            .expect("a following pub fn must exist");
+        let body = &src[fn_start..fn_start + 42 + fn_end];
+        assert!(
+            body.contains("event_record ="),
+            "route_shutdown_batch_to_dlq must emit `event_record = %ctx.to_jsonl()` in \
+             its configured-writer write-failure arm so shutdown-drain failures leave a \
+             journald fallback when the DLQ file is unhealthy"
+        );
+        assert!(
+            body.contains("events_errored_unwritable"),
+            "route_shutdown_batch_to_dlq must still bump events_errored_unwritable"
+        );
     }
 }
