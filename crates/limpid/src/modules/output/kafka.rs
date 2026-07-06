@@ -642,10 +642,19 @@ impl KafkaOutput {
     /// before the `producer.send(...)` call — that recheck is
     /// where the side-effect boundary sits.
     ///
-    /// The recheck is best-effort: if shutdown flips between the
-    /// borrow and the `producer.send(...)` call the record ships;
-    /// the caller's outer race and the disk-queue fail-stop wedge
-    /// cover that case.
+    /// If shutdown flips *between* this recheck and the
+    /// `producer.send(...)` call the record ships. There is no
+    /// outer race in `Output::consume` that could catch this: the
+    /// caller `await`s `try_send` directly, deliberately, to avoid
+    /// letting a `tokio::select!` shutdown arm cancel the
+    /// `producer.send(...)` future mid-flight (that would produce
+    /// duplicate delivery — record on the broker AND in the DLQ).
+    /// The remaining unavoidable gap is covered by two operator-
+    /// visible mechanisms: the delivery future's own
+    /// `queue_timeout` / `message.timeout.ms` bounds the wait, and
+    /// on a disk queue a shutdown-driven Dropped disposition
+    /// triggers the fail-stop wedge so the cursor holds for
+    /// replay on next start.
     async fn try_send(
         &self,
         event: &Event,
