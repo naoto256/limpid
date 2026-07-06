@@ -59,14 +59,14 @@ A typical operator setup keeps the live file capped and the rotated archives com
     copytruncate
     notifempty
     missingok
-    create 0600 limpid limpid
+    create 0600 syslog syslog
     maxsize 1G
 }
 ```
 
 Key choices:
 
-- `create 0600` — the DLQ writer's runtime contract is *exactly* `0o600` on the on-disk file. If logrotate creates the fresh post-rotation file at any other mode, the next DLQ write is refused with a `existing file mode 0o... does not match configured mode 0o600` error and `events_errored_unwritable` bumps until the operator aligns the file. Match the rotator's `create` mode with the runtime contract to avoid that failure.
+- `create 0600 syslog syslog` — the packaged unit runs limpid as `User=syslog` / `Group=syslog`, and the DLQ writer's runtime contract is *exactly* `0o600` on the on-disk file **owned by the daemon's euid** (the fstat re-verify refuses a foreign-uid inode, see [Trust boundaries](./error-log.md#trust-boundaries) if you have configured a different user). For custom deploys running under a different user, substitute `<daemon-user>:<daemon-group>` in both places. If logrotate creates the fresh post-rotation file at any other mode or owner, the next DLQ write is refused with a `existing file mode 0o... does not match configured mode 0o600` or `existing file is owned by uid ...` diagnostic and `events_errored_unwritable` bumps until the operator aligns the file. Match the rotator's `create` mode + owner with the runtime contract to avoid that failure.
 - `copytruncate` — limpid reopens the inode every write, so a normal rotate-and-rename works too, but `copytruncate` is the simplest setup that doesn't require any signal handshake.
 - `maxsize 1G` — caps the live file even when `daily` hasn't fired yet. A pipeline producing failures at 10k events/sec with 1 KiB records would fill 1 GiB in ~100 seconds; tune to your environment.
 - `rotate 14 + compress` — two weeks of rotated history is usually enough to catch and replay everything between an incident and the operator noticing it.
@@ -446,7 +446,7 @@ Investigate immediately:
 
 - Is the parent directory writable by the daemon user?
 - Is the disk full? (`df`)
-- Did rotation leave an incompatible node or mode/owner at the path? The DLQ writer opens a fresh fd per write (`create_new` + `fstat` verify), so rotation does not need a `SIGHUP` reload — but if the rotator recreated the file at a different mode (`0o644` instead of `0o600`) or owner, the fstat check refuses to append. Use `copytruncate` (which preserves the inode and its mode), or `create 0600 limpid limpid` matching the DLQ's runtime contract exactly. `nocreate` also works but leaves the runtime to materialise the file on the next failure, which pushes the deploy check onto the failure path.
+- Did rotation leave an incompatible node or mode/owner at the path? The DLQ writer opens a fresh fd per write (`create_new` + `fstat` verify), so rotation does not need a `SIGHUP` reload — but if the rotator recreated the file at a different mode (`0o644` instead of `0o600`) or a different owner (a foreign uid, or a group other than the daemon's), the fstat check refuses to append. Use `copytruncate` (which preserves the inode and its mode + owner), or `create 0600 syslog syslog` matching the packaged unit's runtime contract exactly (substitute `<daemon-user>:<daemon-group>` for custom deploys). `nocreate` also works but leaves the runtime to materialise the file on the next failure, which pushes the deploy check onto the failure path.
 - Is the file path on a network filesystem with intermittent connectivity?
 
 Once the underlying issue is fixed, the next errored event lands in the file again and the counter stops increasing; existing records are unaffected.

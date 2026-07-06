@@ -60,7 +60,7 @@ include "pipelines/*.limpid"
 
 control {
     socket "/var/run/limpid/control.sock"
-    error_log "/var/log/limpid/error_log.jsonl"
+    error_log "/var/log/limpid/errored.jsonl"
 }
 ```
 
