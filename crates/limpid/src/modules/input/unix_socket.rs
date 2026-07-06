@@ -196,14 +196,18 @@ impl Module for UnixSocketInput {
         let path = props::get_string(properties, "path")
             .ok_or_else(|| anyhow::anyhow!("input '{}': unix_socket requires 'path'", name))?;
         // Parent safety fail-closed: refuse startup when the
-        // configured path's parent is owned by an untrusted uid
-        // or is group-/world-writable. Symmetric with
+        // configured path's parent is a symlink, is owned by an
+        // untrusted uid, or is group-/world-writable. Symmetric with
         // `control::validate_control_socket_parent`; the mode
         // predicate diverges (this sink binds a world-writable
         // datagram socket where other-execute on the parent is a
         // use-case requirement, not a threat), but the owner
-        // predicate is identical: only root or the daemon's own
-        // effective uid may own the parent.
+        // predicate is identical: the parent's uid must match the
+        // daemon's own effective uid. A root-owned parent is trusted
+        // only when the daemon runs as root (self_euid == 0), the
+        // classic `/dev/log` deploy shape; a non-root daemon has no
+        // write permission on a root-owned `0o755` parent so bind
+        // would fail post-validation anyway.
         validate_unix_socket_input_parent(&path)
             .with_context(|| format!("input '{}': unix_socket startup validation failed", name))?;
         Ok(Self {

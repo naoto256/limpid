@@ -116,12 +116,15 @@ limpidctl health --json
 
 ### Control socket parent safety
 
-The control socket is a root-equivalent trust boundary, and its `bind → chmod 0o660` window relies on the parent directory both being controlled by a trusted owner and keeping non-group traffic out. Daemon startup **refuses to start** when the configured `control { socket "..." }`'s parent already exists on disk and either check fails:
+The control socket is a root-equivalent trust boundary, and its `bind → chmod 0o660` window relies on the parent directory being a real, trusted-owner directory that keeps non-group traffic out. Daemon startup **refuses to start** when the configured `control { socket "..." }`'s parent fails any of:
 
+- **Final component symlink** — the final parent component is checked with `symlink_metadata`. A symlink parent lets an attacker redirect the bind target between this preflight and the daemon's actual `bind`, so a symlink final parent is rejected up front. **Ancestor** components may still be symlinks — modern Linux ships `/var/run` as a symlink to `/run`, and the packaged default path (`/var/run/limpid/control.sock` — final parent `limpid` is a real directory) relies on that compat. Ancestor path identity is a **deployment contract**: the daemon does not follow every ancestor to its root and refuse an ancestor-symlink chain, but it does trust that the ancestor chain resolves under a directory the operator controls.
 - **Owner** — the parent must be owned by the daemon's own effective uid. An untrusted owner retains rename/unlink rights inside the directory regardless of mode bits and can replace the socket inode between bind and chmod. A root-owned parent is trusted **only when the daemon itself runs as root**; for a non-root daemon a root-owned parent at the packaged `0o750` is not writable anyway, so bind would fail post-validation and the fire-and-forget control task would die silently — the exact failure this preflight prevents.
 - **Mode** — the parent must not be group-writable, world-writable, or world-traversable (predicate `mode & 0o023 != 0`).
 
-Under packaged systemd units (`RuntimeDirectory=limpid` combined with `User=limpid` and `RuntimeDirectoryMode=0750` explicitly set in the unit file) both properties are satisfied by construction — systemd creates the runtime dir at the daemon's uid with the requested mode — and this check is a no-op.
+If the parent does not exist yet, the preflight itself creates it at `0o750` under the daemon's own uid, but only after checking that the deepest existing ancestor is trusted (owned by the daemon's uid, or owned by root and not other-writable). An attacker-writable ancestor (e.g. `/tmp` at `0o1777`) refuses the create — the sticky bit does not stop an attacker from planting an attacker-owned node with the same name and letting the daemon `chmod` it. After create, `symlink_metadata` on the created path re-verifies real-directory shape, daemon ownership, and the requested mode.
+
+Under packaged systemd units (`RuntimeDirectory=limpid` combined with `User=limpid` and `RuntimeDirectoryMode=0750` explicitly set in the unit file) every property is satisfied by construction — systemd creates the runtime dir at the daemon's uid with the requested mode — and this check is a no-op.
 
 For custom deploys, ensure the parent is owned by the daemon's own uid (not root) and tightened to `0o750` (or `0o700` for owner-only) before starting the daemon:
 
@@ -130,7 +133,7 @@ chown limpid:limpid /path/to/parent   # daemon user; if running as root, chown r
 chmod 0750 /path/to/parent            # owner + group only
 ```
 
-The failure diagnostic names whether the owner or the mode failed, prints the observed value alongside the daemon's own effective uid, and gives a remediation hint. If the parent does not exist yet, the control task creates it at `0o750` under the daemon's own uid — no operator action needed.
+The failure diagnostic names whether the symlink shape, owner, or mode failed, prints the observed values alongside the daemon's own effective uid, and gives a remediation hint.
 
 At shutdown, the control task records the `(dev, ino)` of the socket it bound and refuses to unlink the path if the on-disk inode has been swapped since bind. Under the safe-parent contract above no outside-the-group writer can produce the swap; this is defense-in-depth, not the load-bearing guard.
 
