@@ -772,6 +772,20 @@ fn run_daemon_attempt(config: &std::path::Path) -> std::process::Output {
     // would block the suite indefinitely. The poll interval is short
     // enough that the happy (= reject) path still finishes in tens of
     // ms.
+    //
+    // Concurrent pipe drain (not `wait_with_output` at the end): the
+    // daemon's diagnostic renderer writes several hundred bytes of
+    // analyzer diagnostic to stderr just before exit. On macOS the
+    // default pipe buffer + Rust's stdio buffering interact in a way
+    // that lets `try_wait()` observe `None` even after the child
+    // process has finished writing — the child is really blocked in
+    // `close(2)` cleanup on the parent side, but from `try_wait`'s
+    // POV it looks like the process is still alive. Running
+    // `wait_with_output` *after* the poll loop breaks a
+    // `try_wait`-only observer because the reader never keeps up
+    // with the writer. Draining stdout/stderr concurrently in
+    // separate threads clears the pipe as fast as the child writes
+    // it, so exit is observed as soon as the child actually closes.
     let mut child = Command::new(limpid_bin())
         .arg("--config")
         .arg(config)
@@ -780,14 +794,23 @@ fn run_daemon_attempt(config: &std::path::Path) -> std::process::Output {
         .spawn()
         .expect("failed to spawn limpid");
 
+    let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut stdout_pipe, &mut buf).ok();
+        buf
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut stderr_pipe, &mut buf).ok();
+        buf
+    });
+
     let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => {
-                return child
-                    .wait_with_output()
-                    .expect("failed to capture daemon output");
-            }
+            Ok(Some(s)) => break s,
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
@@ -801,6 +824,18 @@ fn run_daemon_attempt(config: &std::path::Path) -> std::process::Output {
             }
             Err(e) => panic!("try_wait error: {}", e),
         }
+    };
+
+    let stdout = stdout_handle
+        .join()
+        .expect("stdout drain thread must not panic");
+    let stderr = stderr_handle
+        .join()
+        .expect("stderr drain thread must not panic");
+    std::process::Output {
+        status,
+        stdout,
+        stderr,
     }
 }
 
