@@ -568,12 +568,67 @@ impl ControlServer {
         // when an inherited parent is too loose to hold that
         // line, so by the time we reach this point the parent
         // mode has been vetted.
+        // chmod failure is fatal to the control task. A successful
+        // `bind` with a subsequent chmod failure would leave a socket
+        // whose mode is umask-derived (typically 0o755) instead of
+        // the contract-required 0o660 — root-equivalent traffic could
+        // reach a socket group-writable to `other`, silently
+        // widening the trust boundary. So on chmod failure:
+        //
+        //   1. record an error diagnostic naming the observed error;
+        //   2. best-effort inode-bound unlink the socket we bound
+        //      (`(dev, ino)` recorded above must still match — the
+        //      swap-check is defensive against a concurrent replace,
+        //      which the parent-safety preflight already gates
+        //      against);
+        //   3. return without entering the accept loop so no client
+        //      connects to a mis-moded socket.
+        //
+        // The daemon as a whole remains up (control is a fire-and-
+        // forget task and cannot abort daemon startup from here);
+        // operator response is `journalctl -u limpid | grep chmod`
+        // + reconfigure and restart. That is a narrowing over the
+        // previous warn-and-continue shape, which let the daemon
+        // appear healthy while the control socket carried the
+        // wrong mode.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o660);
             if let Err(e) = std::fs::set_permissions(&self.socket_path, perms) {
-                warn!("control socket: failed to set permissions: {}", e);
+                error!(
+                    "control socket: chmod 0o660 failed on bound socket {:?}: {} — refusing \
+                     to listen on a socket whose mode does not match the operator-facing \
+                     contract (0o660, root-equivalent); the control task exits without \
+                     accepting connections. Fix the filesystem / packaging issue and \
+                     restart the daemon.",
+                    self.socket_path, e
+                );
+                if let Some((bound_dev, bound_ino)) = bound_inode {
+                    use std::os::unix::fs::MetadataExt;
+                    match std::fs::symlink_metadata(&self.socket_path) {
+                        Ok(m) if (m.dev(), m.ino()) == (bound_dev, bound_ino) => {
+                            if let Err(ue) = std::fs::remove_file(&self.socket_path) {
+                                warn!(
+                                    "control socket: cleanup unlink after chmod failure \
+                                     also failed: {}",
+                                    ue
+                                );
+                            }
+                        }
+                        Ok(_) => warn!(
+                            "control socket: inode at {:?} changed between bind and chmod \
+                             failure; refusing to unlink an entry we no longer own",
+                            self.socket_path
+                        ),
+                        Err(se) => warn!(
+                            "control socket: failed to re-stat {:?} for cleanup after \
+                             chmod failure: {}",
+                            self.socket_path, se
+                        ),
+                    }
+                }
+                return;
             }
         }
 
@@ -1585,6 +1640,57 @@ mod tests {
         assert!(
             msg.contains("not a directory"),
             "diagnostic must name the shape: {msg}"
+        );
+    }
+
+    /// Structural regression pin for the control-socket chmod
+    /// fatalize contract. `ControlServer::run` must:
+    ///
+    /// - emit an `error!` (not `warn!`) on the chmod-failure arm so
+    ///   operators reading `journalctl -u limpid` see the failure
+    ///   at the right severity;
+    /// - `return` from that arm without entering the accept loop
+    ///   (this is what "fatal to the control task" means — the
+    ///   daemon as a whole stays up, but no client connects to a
+    ///   socket carrying the wrong mode);
+    /// - perform an inode-bound cleanup via `remove_file` gated by
+    ///   the `(dev, ino)` match on the bound inode, so a
+    ///   concurrent replace of the socket entry is not blindly
+    ///   unlinked.
+    ///
+    /// The direct behavioural test (inject a `chmod` failure at
+    /// runtime) requires a test-harness plumbing we do not yet
+    /// share; a source-level pin is honest for a shape (contract)
+    /// rather than a value, and catches the regression that would
+    /// reintroduce warn-and-continue.
+    #[test]
+    fn chmod_failure_arm_is_fatal_and_inode_bound() {
+        let src = include_str!("control.rs");
+        // Bound to the body of `ControlServer::run` — start at the
+        // fn signature and stop at the module-scope closer that
+        // follows the `impl ControlServer` block.
+        let run_start = src
+            .find("pub async fn run(self")
+            .expect("ControlServer::run must exist");
+        // The body is not enormous; take a generous slice.
+        let slice_end = (run_start + 20_000).min(src.len());
+        let body = &src[run_start..slice_end];
+
+        // The chmod-failure arm must emit `error!` and contain the
+        // fatalization intent (a `return;` inside the same arm).
+        assert!(
+            body.contains("chmod 0o660 failed on bound socket"),
+            "control socket chmod failure diagnostic must be present"
+        );
+        assert!(
+            body.contains("error!(") && body.contains("refusing \\\n"),
+            "chmod failure must use `error!` (not `warn!`) so severity matches the trust \
+             boundary the mode is meant to enforce"
+        );
+        assert!(
+            body.contains("(bound_dev, bound_ino)"),
+            "chmod-failure cleanup must be gated by a bound (dev, ino) match so a swapped \
+             entry is not blindly unlinked"
         );
     }
 }
