@@ -292,8 +292,12 @@ impl ErrorLogFallback {
 ///
 /// Built once at runtime startup from the `error_log` property in the
 /// `control { ... }` block. Wrapped in `Option` upstream — when not
-/// configured, the runtime falls back to a structured `tracing::error!`
-/// line so the failure data is never silently lost.
+/// configured, the operator has declared no durable recovery is
+/// required and the runtime emits a payload-free summary via the
+/// `error_log_fallback` ladder helper (`emit_dlq_tracing_fallback`).
+/// The ladder line is a best-effort operator signal, not a load-bearing
+/// recovery target; `error_log_fallback "full"` is the explicit
+/// opt-in for the pre-ladder `event_record` shape.
 pub struct ErrorLogWriter {
     path: PathBuf,
     /// Serialises concurrent `write()` calls so that records from

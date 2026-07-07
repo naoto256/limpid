@@ -772,8 +772,11 @@ async fn process_event(
 }
 
 /// Persist an errored event to the dead-letter queue, or — if no
-/// `error_log` is configured — emit a structured tracing line so the
-/// record never disappears silently.
+/// `error_log` is configured — delegate to the `error_log_fallback`
+/// ladder helper so the failure surfaces as a payload-free operator
+/// signal by default (or as `Meta` / `Full` on explicit opt-in). The
+/// tracing line is best-effort, not a durable recovery trail; the
+/// DLQ file remains the load-bearing recovery target.
 ///
 /// Shared by both runtime-error shapes the orchestrator surfaces:
 /// `PipelineTermination::Errored` (a `process` raised an error mid-

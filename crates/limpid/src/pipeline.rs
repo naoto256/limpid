@@ -411,7 +411,10 @@ pub struct PipelineRunResult {
     /// the runtime layer appends per-failed-output enqueue records
     /// (one per failed output). The runtime drains each record into
     /// the configured `error_log`, or — when none is configured —
-    /// emits one structured `tracing::error!` line per record.
+    /// delegates to the `error_log_fallback` ladder helper to emit a
+    /// payload-free operator signal by default (or `Meta` / `Full`
+    /// on explicit opt-in). The tracing line is best-effort, not
+    /// load-bearing recovery.
     pub errored: Vec<ErroredEventContext>,
 }
 
