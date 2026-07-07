@@ -55,7 +55,13 @@ const JOURNAL_INPUT_SCHEMA: &[PropertySpec] = &[
     PropertySpec {
         name: "match",
         required: false,
-        repeatable: false,
+        // Repeatable so operators can express both AND (across
+        // different fields) and OR (repeat the same field). libsystemd's
+        // `sd_journal_add_match` treats consecutive calls with the same
+        // FIELD name as disjunctive (OR) and calls across different
+        // FIELD names as conjunctive (AND); see `docs/src/inputs/journal.md`
+        // for the operator-facing summary.
+        repeatable: true,
         exclusive_group: None,
         kind: PropertyValueKind::String,
     },
@@ -93,9 +99,41 @@ impl Module for JournalInput {
         _ctx: &crate::modules::BuildContext,
     ) -> Result<Self> {
         let properties = properties.user_properties();
-        let mut matches = Vec::new();
-        if let Some(m) = props::get_string(properties, "match") {
-            matches.push(m);
+        // Repeatable `match` — walk every occurrence so multi-filter
+        // configs (`match "F=a" match "F=b"` for OR, `match "F=a"
+        // match "G=b"` for AND) are all threaded through to
+        // `sd_journal_add_match` at reader start.
+        let matches: Vec<String> = properties
+            .iter()
+            .filter_map(|p| match p {
+                crate::dsl::ast::Property::KeyValue { key, value, .. } if key == "match" => {
+                    match &value.kind {
+                        crate::dsl::ast::ExprKind::StringLit(s) => Some(s.clone()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+
+        // Load-time format validation: each match must be
+        // `FIELD=value`. A malformed entry here becomes a hard config
+        // error at daemon startup / `--check` time so operators do
+        // not discover the typo at runtime as an "reader terminated"
+        // log line. `libsystemd` will still reject any well-formed
+        // string it doesn't like (lowercase field name, empty field,
+        // NUL bytes, etc.) at the runtime `match_add` boundary — that
+        // path is handled below in `run_journal_reader`.
+        for m in &matches {
+            if !m.contains('=') {
+                anyhow::bail!(
+                    "input '{}': journal `match` requires `FIELD=value` shape (got \"{}\") — \
+                     each match string must contain '='; see \
+                     `docs/src/inputs/journal.md` for the filter combining rules",
+                    _name,
+                    m
+                );
+            }
         }
 
         let state_file = props::get_string(properties, "state_file").map(PathBuf::from);
@@ -372,36 +410,73 @@ fn run_journal_reader(
         }
     };
 
-    // Apply match filters (format: "FIELD=value")
+    // Apply match filters. Format was validated at load time
+    // (`from_properties` rejects any string without '='), so
+    // `split_once('=')` here is defensively resolved as `else { … }`
+    // rather than `unwrap()`. libsystemd's `sd_journal_add_match`
+    // rejects field names it doesn't recognise (lowercase, empty,
+    // NUL-containing, etc.) — we collect every rejection so the
+    // operator sees the full list in one pass and terminate the
+    // reader if any filter failed. Semantics: a filter that
+    // libsystemd cannot install matches nothing, so the reader
+    // exiting with zero events *is* the configured behaviour — the
+    // `error!` line is only there so the operator knows which
+    // filter string was refused. Other inputs are unaffected.
+    let mut match_add_failed = false;
     for m in &matches {
-        if let Some((key, val)) = m.split_once('=') {
-            if let Err(e) = journal.match_add(key, val) {
-                warn!("journal: failed to add match '{}': {}", m, e);
-            }
-        } else {
-            warn!(
-                "journal: invalid match format '{}', expected 'FIELD=value'",
+        let Some((key, val)) = m.split_once('=') else {
+            error!(
+                "journal input: match '{}' has no '=' separator — should have been rejected at \
+                 load time; reader terminating",
                 m
             );
+            return;
+        };
+        if let Err(e) = journal.match_add(key, val) {
+            error!(
+                "journal input: match_add rejected filter '{}': {} — this filter cannot be \
+                 satisfied by any journal entry",
+                m, e
+            );
+            match_add_failed = true;
         }
     }
+    if match_add_failed {
+        error!(
+            "journal input: one or more match filters were rejected by libsystemd; reader \
+             terminating (semantics: no journal entry can satisfy the specified configuration, \
+             so zero events is the correct output — fix the offending filter(s) and restart)"
+        );
+        return;
+    }
 
-    // Seek to saved cursor or end
+    // Seek to saved cursor or end.
+    //
+    // First-start (no `state_file` or an empty one) is the case
+    // hardware validation caught previously: with a `match` filter
+    // whose view of the journal is empty at daemon start
+    // (e.g. a brand-new `SYSLOG_IDENTIFIER` that has never been
+    // logged before), `sd_journal_seek_tail` + `sd_journal_previous`
+    // leaves the read pointer in an implementation-defined state and
+    // the poll loop below never advances to new arrivals. Branch on
+    // `previous()`'s return value: on `> 0` we anchored at the last
+    // matching entry (the historical working path); on `0` (empty
+    // match view) fall back to `seek_head` — with no past matching
+    // entries there is no history to replay, and `next()` in the
+    // poll loop cleanly advances to the first newly-arrived entry.
     if let Some(cursor) = state_file.as_ref().and_then(load_cursor) {
         if let Err(e) = journal.seek_cursor(&cursor) {
             warn!(
                 "journal: failed to seek to cursor, starting from end: {}",
                 e
             );
-            let _ = journal.seek_tail();
-            let _ = journal.previous();
+            anchor_at_tail_or_head(&mut journal);
         } else {
-            // Skip the entry at the cursor (already processed)
+            // Skip the entry at the cursor (already processed).
             let _ = journal.next();
         }
     } else {
-        let _ = journal.seek_tail();
-        let _ = journal.previous();
+        anchor_at_tail_or_head(&mut journal);
     }
 
     loop {
@@ -556,6 +631,124 @@ mod tests {
         }
     }
 
+    /// Build a `ModuleProperties` for `type journal` from a raw DSL
+    /// input body — the parser's normal path with the `type` prefix
+    /// stripped by `ModuleProperties`, so `from_properties` sees the
+    /// same shape it does at daemon startup.
+    fn journal_properties_from_body(body: &str) -> crate::dsl::module_props::ModuleProperties {
+        let src = format!(
+            "def input j {{ type journal {} }} def output o {{ type file path \"/tmp/o.log\" }} \
+             def pipeline p {{ input j; output o }}",
+            body
+        );
+        let config = crate::dsl::parser::parse_config(&src).expect("parse should succeed");
+        for def in &config.definitions {
+            if let crate::dsl::ast::Definition::Input(input) = def
+                && input.name == "j"
+            {
+                return input.properties.clone();
+            }
+        }
+        panic!("input 'j' must exist");
+    }
+
+    #[test]
+    fn from_properties_accepts_multiple_match_filters() {
+        // Repeatable `match` — libsystemd combines same-field entries
+        // as OR and different-field entries as AND. The load-time
+        // parser must accept every occurrence so both semantics are
+        // available to operators.
+        let props = journal_properties_from_body(
+            r#"match "SYSLOG_IDENTIFIER=app1" match "SYSLOG_IDENTIFIER=app2" match "_UID=1000""#,
+        );
+        let input = JournalInput::from_properties(
+            "j",
+            &props,
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .expect("valid config should parse");
+        assert_eq!(input.matches.len(), 3);
+        assert_eq!(input.matches[0], "SYSLOG_IDENTIFIER=app1");
+        assert_eq!(input.matches[1], "SYSLOG_IDENTIFIER=app2");
+        assert_eq!(input.matches[2], "_UID=1000");
+    }
+
+    #[test]
+    fn from_properties_rejects_match_without_equals_separator() {
+        // Every `match` string must contain `=` (FIELD=value shape).
+        // A typo like `match "SYSLOG_IDENTIFIER app"` (space instead
+        // of `=`) must fail at load time so operators do not
+        // discover the mistake at runtime as a terminated reader.
+        let props = journal_properties_from_body(r#"match "no_equals_separator""#);
+        let err = match JournalInput::from_properties(
+            "j",
+            &props,
+            &crate::modules::BuildContext::for_testing(),
+        ) {
+            Ok(_) => panic!("malformed match must reject at load time"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no_equals_separator") && msg.contains("FIELD=value"),
+            "reject message must name the offending value and remediation; got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn from_properties_rejects_mixed_valid_and_invalid_match_filters() {
+        // Reject at the first malformed entry even if earlier ones
+        // parse cleanly — an operator with a typo in the second
+        // filter should not have to notice the loud diagnostic buried
+        // between valid ones.
+        let props =
+            journal_properties_from_body(r#"match "SYSLOG_IDENTIFIER=app" match "typo_here""#);
+        let err = match JournalInput::from_properties(
+            "j",
+            &props,
+            &crate::modules::BuildContext::for_testing(),
+        ) {
+            Ok(_) => panic!("malformed match must reject at load time"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("typo_here"));
+    }
+
+    #[test]
+    fn schema_rejects_unknown_property_on_journal_input() {
+        // Regression pin for the `cursor_file` typo (the correct
+        // property name is `state_file`). Schema validation must
+        // reject any property not listed in `JOURNAL_INPUT_SCHEMA`;
+        // the analyzer produces a `Level::Error` diagnostic
+        // that both `--check` and daemon startup surface.
+        use crate::check::analyze;
+        use crate::dsl::span::SourceMap;
+        use crate::pipeline::CompiledConfig;
+
+        let src = r#"
+def input j { type journal cursor_file "/tmp/j.cursor" }
+def output o { type file path "/tmp/o.log" }
+def pipeline p { input j; output o }
+"#;
+        let config = crate::dsl::parser::parse_config(src).expect("parse should succeed");
+        let compiled = CompiledConfig::from_config(config).expect("compile should succeed");
+        let mut sm = SourceMap::new();
+        sm.add_anonymous(src);
+        let diags = analyze(&compiled, &sm);
+        let unknown_cursor_file = diags.iter().any(|d| {
+            d.level == crate::check::Level::Error
+                && d.message.contains("cursor_file")
+                && d.message.contains("unknown property")
+        });
+        assert!(
+            unknown_cursor_file,
+            "--check must reject `cursor_file` (the correct property is `state_file`) with a \
+             Level::Error diagnostic; got: {:?}",
+            diags
+        );
+    }
+
     #[test]
     fn save_cursor_then_load_round_trips() {
         // The cursor watermark must survive a write+read round-trip.
@@ -588,6 +781,74 @@ mod tests {
             "should not over-sleep wildly; took {:?}",
             elapsed
         );
+    }
+}
+
+/// Anchor the journal read pointer at "just after the last matching
+/// entry" — so the poll loop's `next()` advances to the FIRST entry
+/// that arrives after daemon start, and no history is replayed.
+///
+/// The obvious `seek_tail()` + `previous()` sequence works when the
+/// active `match` view has at least one past entry (`previous`
+/// returns `n > 0`), but silently fails when the view is empty
+/// (`previous` returns `0` and the read pointer is
+/// implementation-defined). Branch on `previous()`'s return so the
+/// empty-match-view case falls through to `seek_head()` — with no
+/// history to replay by definition, `seek_head` + poll-loop `next()`
+/// picks up the first future match cleanly.
+///
+/// Errors are logged (`warn!`) but not fatal: `seek_tail` / `previous`
+/// / `seek_head` failing here means the reader will still call
+/// `next()` in the poll loop against whatever cursor state the
+/// journal actually holds, and the operator will see the log line.
+/// Terminating the reader on a seek error would be stricter than
+/// necessary — the caller already made match_add work, and a poll
+/// loop against an inherited cursor is safer than crashing.
+fn anchor_at_tail_or_head(journal: &mut Journal) {
+    if let Err(e) = journal.seek_tail() {
+        warn!(
+            "journal: seek_tail failed, poll loop will start from whatever position the journal \
+             defaulted to: {}",
+            e
+        );
+        return;
+    }
+    match journal.previous() {
+        Ok(n) if n > 0 => {
+            // Anchored at the last matching entry; the poll loop's
+            // `next()` will advance past it into new arrivals.
+        }
+        Ok(_) => {
+            // Empty match view — no past matching entries. `seek_tail`
+            // may have left the read pointer in an implementation-
+            // defined state, so re-anchor at head. Since the match
+            // view is empty by construction there is no history to
+            // replay; the very next `next()` in the poll loop will
+            // wait until a matching entry actually appears.
+            if let Err(e) = journal.seek_head() {
+                warn!(
+                    "journal: seek_head fallback failed after empty-match previous(); poll loop \
+                     may not detect new matching entries reliably: {}",
+                    e
+                );
+            }
+        }
+        Err(e) => {
+            // Journal-level error walking backward. Fall back to head
+            // for the same reason as the empty-view arm.
+            warn!(
+                "journal: previous() after seek_tail failed ({}) — falling back to seek_head so \
+                 new matching entries are picked up by the poll loop",
+                e
+            );
+            if let Err(e) = journal.seek_head() {
+                warn!(
+                    "journal: seek_head fallback also failed: {} — poll loop may not detect new \
+                     matching entries reliably",
+                    e
+                );
+            }
+        }
     }
 }
 

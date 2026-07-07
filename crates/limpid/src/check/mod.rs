@@ -39,6 +39,8 @@ pub mod expr_types;
 mod function;
 mod global_props;
 pub mod graph;
+#[cfg(feature = "journal")]
+mod journal_match_format;
 mod module_props;
 mod outputs;
 mod parser_effects;
@@ -286,6 +288,8 @@ pub fn analyze(config: &CompiledConfig, _source_map: &SourceMap) -> Vec<Diagnost
     function::check_all_functions(config, &registry, &mut diagnostics);
     module_props::analyze_all(config, &module_registry, &mut diagnostics);
     global_props::analyze_all(config, &mut diagnostics);
+    #[cfg(feature = "journal")]
+    journal_match_format::analyze_all(config, &mut diagnostics);
     recovery_readiness::analyze_all(config, &mut diagnostics);
     tls_verify::analyze_all(config, &mut diagnostics);
     for (name, pipeline) in &config.pipelines {
