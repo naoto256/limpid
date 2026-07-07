@@ -5,16 +5,16 @@
 //! the batched-output shutdown-flush drain) only persist the original
 //! payload to a durable, easily-replayable **file** when
 //! `control { error_log "..." }` is set. With `error_log` missing the
-//! runtime falls back to emitting a `tracing::error!` line carrying
-//! the full failure JSONL in the `event_record` structured field: the
-//! payload is not silently dropped and remains recoverable via
-//! `journalctl | jq`, but this fallback is strictly worse than a
-//! dedicated DLQ file (subject to log rotation, filters, and
-//! aggregation delays) and offers no `limpidctl inject` replay
-//! shortcut. An operator writing a config with retry / batched
-//! outputs and no `error_log` therefore weakens the safety net those
-//! features were added to provide, even though the payload is not
-//! outright lost.
+//! runtime emits a one-line `tracing::error!` summary per failure —
+//! the payload is not written anywhere by default. The `Meta` and
+//! `Full` values of [`crate::error_log::ErrorLogFallback`] can attach
+//! structured metadata / the full JSONL to the tracing line, but
+//! that opt-in only takes effect when `error_log` is set (a
+//! separate `--check` warning surfaces the inert
+//! `error_log_fallback`-without-`error_log` combination). Without
+//! either a DLQ file or an explicit fallback opt-in the failure
+//! record is a summary line only — no `limpidctl inject` replay
+//! shortcut, no journald payload extraction.
 //!
 //! This module raises one [`Level::Warning`] when:
 //!
@@ -86,6 +86,39 @@ fn recovery_reason(output: &crate::dsl::ast::OutputDef) -> Option<&'static str> 
 }
 
 pub(super) fn analyze_all(config: &CompiledConfig, diags: &mut Vec<Diagnostic>) {
+    // Independent warning: `error_log_fallback` set without a
+    // corresponding `error_log`. The fallback is a confidentiality
+    // opt-in that only shapes what appears on the tracing side when
+    // `error_log` writes fail; without `error_log` the runtime
+    // ignores the value (row-A ordering guard in
+    // `emit_dlq_tracing_fallback`), so a solo `error_log_fallback`
+    // is inert and almost certainly an operator misconfiguration.
+    // Warn — not error — because the shape harmlessly appears in
+    // shared-template configs where individual environments
+    // deactivate `error_log`.
+    if let Some(fallback_str) = config
+        .global_blocks
+        .get("control")
+        .and_then(|p| props::get_string(p, "error_log_fallback"))
+        && !error_log_configured(config)
+    {
+        diags.push(Diagnostic {
+            level: Level::Warning,
+            kind: DiagKind::Other,
+            message: format!(
+                "control.error_log_fallback = \"{}\" is set but control.error_log \
+                 is unset — the fallback is inert without a durable DLQ target. \
+                 Either set control.error_log to opt into the fallback (payload / \
+                 metadata surface on the tracing side when the DLQ write itself \
+                 fails), or remove control.error_log_fallback to silence this \
+                 warning.",
+                fallback_str
+            ),
+            span: None,
+            help: None,
+        });
+    }
+
     if error_log_configured(config) {
         return;
     }
@@ -119,12 +152,11 @@ pub(super) fn analyze_all(config: &CompiledConfig, diags: &mut Vec<Diagnostic>) 
         "config has outputs that depend on `error_log` for failure recovery, \
          but `control {{ error_log \"...\" }}` is not configured. \
          Affected outputs: {}. \
-         On retry exhaustion or shutdown flush failure the daemon falls back to \
-         emitting one `tracing::error!` line per event with the full JSONL in an \
-         `event_record` structured field, so the payload is recoverable from \
-         journald via `journalctl | jq`; this is strictly worse than a file-based \
-         DLQ (log rotation / filters / aggregation delays and no `limpidctl inject` \
-         replay shortcut), so operator recovery is weaker without `error_log`. \
+         Without `error_log` the daemon emits a one-line `tracing::error!` \
+         summary per failed event but does not persist the payload anywhere \
+         — the metadata / full-JSONL tracing fallback is off by default and \
+         requires an explicit `control {{ error_log_fallback \"meta\" | \"full\" }}` \
+         opt-in, which itself only takes effect when `error_log` is also set. \
          To enable durable file-based recovery, add:\n    \
          control {{\n        error_log \"/var/log/limpid/errored.jsonl\"\n    }}",
         summary,
@@ -254,6 +286,82 @@ def pipeline p { input i; output o }
             recovery_warnings(&diags).is_empty(),
             "plain file output should not raise the warning, got: {:?}",
             diags,
+        );
+    }
+
+    fn fallback_warnings(diags: &[Diagnostic]) -> Vec<&Diagnostic> {
+        diags
+            .iter()
+            .filter(|d| {
+                d.level == Level::Warning && d.message.contains("control.error_log_fallback = \"")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn warns_when_error_log_fallback_set_without_error_log() {
+        // Operator opted into the tracing-side confidentiality
+        // ladder but never gave the runtime a DLQ target. The
+        // fallback is inert here; surface the misconfiguration so
+        // the operator either adds error_log or drops the setting.
+        let src = r#"
+control { error_log_fallback "meta" }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type file path "/tmp/o.log" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        let ws = fallback_warnings(&diags);
+        assert_eq!(
+            ws.len(),
+            1,
+            "expected fallback-without-error_log warning, got: {:?}",
+            diags
+        );
+        assert!(
+            ws[0].message.contains("\"meta\""),
+            "warning must quote the offending value; got: {}",
+            ws[0].message
+        );
+    }
+
+    #[test]
+    fn no_fallback_warning_when_error_log_also_set() {
+        // Both configured together is the healthy shape.
+        let src = r#"
+control {
+    error_log "/var/log/limpid/errored.jsonl"
+    error_log_fallback "full"
+}
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type file path "/tmp/o.log" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            fallback_warnings(&diags).is_empty(),
+            "fallback + error_log together should not warn; got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn no_fallback_warning_when_neither_set() {
+        // The recovery-readiness warning may still fire for
+        // recovery-worthy outputs, but the fallback-specific
+        // warning must not: nothing about the fallback is
+        // misconfigured here.
+        let src = r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type file path "/tmp/o.log" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            fallback_warnings(&diags).is_empty(),
+            "no `error_log_fallback` set should not fire the fallback warning; \
+             got: {:?}",
+            diags
         );
     }
 

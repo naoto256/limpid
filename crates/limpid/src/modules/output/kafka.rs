@@ -319,6 +319,7 @@ pub struct KafkaOutput {
     queue_timeout: Duration,
     retry: RetryConfig,
     error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+    error_log_fallback: crate::error_log::ErrorLogFallback,
     metrics: Arc<OutputMetrics>,
     shutdown_signal: tokio::sync::watch::Receiver<bool>,
 }
@@ -444,6 +445,7 @@ impl Module for KafkaOutput {
             queue_timeout,
             retry,
             error_log,
+            error_log_fallback: ctx.error_log_fallback,
             metrics: Arc::new(OutputMetrics::default()),
             shutdown_signal: ctx.shutdown_signal.clone(),
         })
@@ -508,6 +510,7 @@ impl Output for KafkaOutput {
                     );
                     let __dlq_outcome = crate::modules::route_event_to_dlq(
                         self.error_log.as_ref(),
+                        self.error_log_fallback,
                         &self.metrics,
                         &self.name,
                         event,
@@ -525,6 +528,7 @@ impl Output for KafkaOutput {
                             format!("output write failed after {} attempts: {}", attempt, e);
                         let __dlq_outcome = crate::modules::route_event_to_dlq(
                             self.error_log.as_ref(),
+                            self.error_log_fallback,
                             &self.metrics,
                             &self.name,
                             event,
@@ -561,6 +565,7 @@ impl Output for KafkaOutput {
                         );
                         let __dlq_outcome = crate::modules::route_event_to_dlq(
                             self.error_log.as_ref(),
+                            self.error_log_fallback,
                             &self.metrics,
                             &self.name,
                             event,
@@ -631,6 +636,7 @@ impl Output for KafkaOutput {
         crate::modules::finalize_shutdown_singleton_disposition_ambiguous(
             result,
             self.error_log.as_ref(),
+            self.error_log_fallback,
             &self.metrics,
             &self.name,
             event,
@@ -1220,6 +1226,7 @@ mod tests {
             queue_timeout: Duration::from_secs(1),
             retry: RetryConfig::default(),
             error_log: None,
+            error_log_fallback: crate::error_log::ErrorLogFallback::default(),
             metrics: Arc::new(OutputMetrics::default()),
             shutdown_signal: rx.clone(),
         };

@@ -94,6 +94,7 @@ pub struct FileOutput {
     funcs: Arc<FunctionRegistry>,
     retry: RetryConfig,
     error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+    error_log_fallback: crate::error_log::ErrorLogFallback,
     metrics: Arc<OutputMetrics>,
     /// Runtime shutdown broadcast. Cloned inside the `consume` retry
     /// loop so the exponential backoff sleep races against it: a
@@ -176,6 +177,7 @@ impl Module for FileOutput {
             funcs,
             retry,
             error_log,
+            error_log_fallback: ctx.error_log_fallback,
             metrics: Arc::new(OutputMetrics::default()),
             shutdown_signal: ctx.shutdown_signal.clone(),
         })
@@ -213,6 +215,7 @@ impl Output for FileOutput {
                 let reason = format!("render failed: {}", RenderError::new(e));
                 let __dlq_outcome = crate::modules::route_event_to_dlq(
                     self.error_log.as_ref(),
+                    self.error_log_fallback,
                     &self.metrics,
                     &self.name,
                     event,
@@ -263,6 +266,7 @@ impl Output for FileOutput {
                             format!("output write failed after {} attempts: {}", attempt, e);
                         let __dlq_outcome = crate::modules::route_event_to_dlq(
                             self.error_log.as_ref(),
+                            self.error_log_fallback,
                             &self.metrics,
                             &self.name,
                             event,
@@ -300,6 +304,7 @@ impl Output for FileOutput {
                         );
                         let __dlq_outcome = crate::modules::route_event_to_dlq(
                             self.error_log.as_ref(),
+                            self.error_log_fallback,
                             &self.metrics,
                             &self.name,
                             event,
@@ -336,6 +341,7 @@ impl Output for FileOutput {
                 let reason = format!("render failed: {}", RenderError::new(e));
                 let __dlq_outcome = crate::modules::route_event_to_dlq(
                     self.error_log.as_ref(),
+                    self.error_log_fallback,
                     &self.metrics,
                     &self.name,
                     event,
@@ -372,6 +378,7 @@ impl Output for FileOutput {
                 let reason = format!("shutdown write failed: {}", e);
                 let __dlq_outcome = crate::modules::route_event_to_dlq(
                     self.error_log.as_ref(),
+                    self.error_log_fallback,
                     &self.metrics,
                     &self.name,
                     event,
@@ -1203,6 +1210,7 @@ mod tests {
             funcs: funcs(),
             retry: RetryConfig::default(),
             error_log: None,
+            error_log_fallback: crate::error_log::ErrorLogFallback::default(),
             metrics: Arc::new(OutputMetrics::default()),
             shutdown_signal: crate::modules::BuildContext::for_testing().shutdown_signal,
         }
@@ -2168,6 +2176,7 @@ mod tests {
                 backoff: BackoffStrategy::Fixed,
             },
             error_log: None,
+            error_log_fallback: crate::error_log::ErrorLogFallback::default(),
             metrics: Arc::new(OutputMetrics::default()),
             shutdown_signal: shutdown_rx,
         };

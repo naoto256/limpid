@@ -424,6 +424,7 @@ impl Module for OtlpHttpOutput {
             batch_timeout,
             retry_config,
             error_log,
+            ctx.error_log_fallback,
             Arc::clone(&metrics),
             ctx.shutdown_signal.clone(),
         );

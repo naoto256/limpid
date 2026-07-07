@@ -47,6 +47,7 @@ pub struct UnixSocketOutput {
     conn: Mutex<Option<UnixStream>>,
     retry: RetryConfig,
     error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+    error_log_fallback: crate::error_log::ErrorLogFallback,
     metrics: Arc<OutputMetrics>,
     shutdown_signal: tokio::sync::watch::Receiver<bool>,
     /// UIDs that the peer service listening on `path` may report via
@@ -129,6 +130,7 @@ impl Module for UnixSocketOutput {
             conn: Mutex::new(None),
             retry,
             error_log: ctx.error_log.as_ref().map(Arc::clone),
+            error_log_fallback: ctx.error_log_fallback,
             metrics: Arc::new(OutputMetrics::default()),
             shutdown_signal: ctx.shutdown_signal.clone(),
             allowed_peer_uids,
@@ -173,6 +175,7 @@ impl Output for UnixSocketOutput {
                     );
                     let __dlq_outcome = crate::modules::route_event_to_dlq(
                         self.error_log.as_ref(),
+                        self.error_log_fallback,
                         &self.metrics,
                         &self.name,
                         event,
@@ -203,6 +206,7 @@ impl Output for UnixSocketOutput {
                             format!("output write failed after {} attempts: {}", attempt, e);
                         let __dlq_outcome = crate::modules::route_event_to_dlq(
                             self.error_log.as_ref(),
+                            self.error_log_fallback,
                             &self.metrics,
                             &self.name,
                             event,
@@ -239,6 +243,7 @@ impl Output for UnixSocketOutput {
                         );
                         let __dlq_outcome = crate::modules::route_event_to_dlq(
                             self.error_log.as_ref(),
+                            self.error_log_fallback,
                             &self.metrics,
                             &self.name,
                             event,
@@ -287,6 +292,7 @@ impl Output for UnixSocketOutput {
         crate::modules::finalize_shutdown_singleton_disposition_ambiguous(
             result,
             self.error_log.as_ref(),
+            self.error_log_fallback,
             &self.metrics,
             &self.name,
             event,

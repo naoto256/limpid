@@ -227,6 +227,67 @@ impl ErroredEventContext {
     }
 }
 
+/// Operator-selected confidentiality policy for the tracing
+/// `error!` line emitted when a DLQ write fails (or when `error_log`
+/// is unset). The `error_log` file itself is a 0o600 boundary the
+/// operator has already tightened; the tracing fallback goes to
+/// journald / log aggregation whose access controls are usually
+/// weaker, so what appears there is a separate operator decision.
+///
+/// The ladder is a strict subset relation: `Off ⊂ Meta ⊂ Full` in
+/// terms of what surfaces on the tracing line.
+///
+/// | State  | Tracing line body                                         |
+/// |--------|-----------------------------------------------------------|
+/// | `Off`  | one-line failure summary (reason + output name); no payload, no metadata |
+/// | `Meta` | structured metadata fields (`kind`, `fallback`, `reason`, `output`, `timestamp`, `size`, `position`); no payload bytes, no full event JSONL |
+/// | `Full` | current `event_record = <full JSONL>` shape — includes ingress/egress bytes; operator has explicitly opted into exposing payloads to whatever the tracing subscriber reaches |
+///
+/// Row-A rule (`error_log` unset): the operator has already declared
+/// "no durable recovery needed" by omitting `error_log`. The
+/// emission helpers MUST check `error_log.is_none()` FIRST and emit
+/// the one-line summary regardless of the fallback value — a
+/// paternalistic upgrade to `Meta`/`Full` on the unset path would
+/// contradict the operator's own declaration.
+///
+/// Default is `Off`. Docs / `--check` warn when `error_log_fallback`
+/// is set while `error_log` is unset — the config is inert but
+/// otherwise unsurprising, so the shape is a warning, not an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ErrorLogFallback {
+    #[default]
+    Off,
+    Meta,
+    Full,
+}
+
+impl ErrorLogFallback {
+    /// Config-string form used by the `control { error_log_fallback
+    /// "..." }` property. Case-sensitive by intent — a typo like
+    /// `Off` / `META` is a config error, not a silent normalisation.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "off" => Ok(Self::Off),
+            "meta" => Ok(Self::Meta),
+            "full" => Ok(Self::Full),
+            other => Err(format!(
+                "control.error_log_fallback: unknown value \"{}\"; expected \"off\", \"meta\", or \"full\"",
+                other
+            )),
+        }
+    }
+
+    /// Human-readable label used in tracing structured fields and
+    /// operator-facing log lines. Matches the config string exactly.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Meta => "meta",
+            Self::Full => "full",
+        }
+    }
+}
+
 /// Writer for the configured `error_log` JSONL file.
 ///
 /// Built once at runtime startup from the `error_log` property in the
@@ -883,6 +944,58 @@ mod tests {
     use bytes::Bytes;
     use std::net::SocketAddr;
     use tempfile::TempDir;
+
+    #[test]
+    fn fallback_parse_accepts_off_meta_full_only() {
+        assert_eq!(
+            ErrorLogFallback::parse("off").unwrap(),
+            ErrorLogFallback::Off
+        );
+        assert_eq!(
+            ErrorLogFallback::parse("meta").unwrap(),
+            ErrorLogFallback::Meta
+        );
+        assert_eq!(
+            ErrorLogFallback::parse("full").unwrap(),
+            ErrorLogFallback::Full
+        );
+    }
+
+    #[test]
+    fn fallback_parse_rejects_uppercase_and_typos() {
+        // Case-sensitive by design — a silent normalisation would
+        // hide operator typos.
+        for bad in ["Off", "META", "Full", "off ", "on", "", "meta,", "true"] {
+            let err = ErrorLogFallback::parse(bad).expect_err(&format!(
+                "\"{}\" must be rejected — silent normalisation hides typos",
+                bad
+            ));
+            assert!(
+                err.contains("error_log_fallback"),
+                "reject error must mention the property name; got: {}",
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_default_is_off() {
+        assert_eq!(ErrorLogFallback::default(), ErrorLogFallback::Off);
+    }
+
+    #[test]
+    fn fallback_as_str_matches_config_form() {
+        // Round-trip: parse(as_str(x)) == x for every variant. Keeps
+        // the config-facing string and the enum in lockstep even if
+        // someone renames a variant later.
+        for v in [
+            ErrorLogFallback::Off,
+            ErrorLogFallback::Meta,
+            ErrorLogFallback::Full,
+        ] {
+            assert_eq!(ErrorLogFallback::parse(v.as_str()).unwrap(), v);
+        }
+    }
 
     fn ctx() -> ErroredEventContext {
         let mut event = Event::new(

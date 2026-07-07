@@ -42,6 +42,13 @@ use crate::metrics::{InputMetrics, OutputMetrics};
 pub struct BuildContext {
     pub funcs: Arc<crate::functions::FunctionRegistry>,
     pub error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+    /// Operator-selected confidentiality policy for tracing-side DLQ
+    /// fallback emission (unset `error_log`, or `error_log` write
+    /// failure). See [`crate::error_log::ErrorLogFallback`]. Default
+    /// `Off` — the tracing line is a one-line failure summary and
+    /// no event payload leaves the daemon through log aggregation
+    /// unless the operator opts in.
+    pub error_log_fallback: crate::error_log::ErrorLogFallback,
     /// Runtime-level shutdown broadcast. Unbatched sinks clone this
     /// receiver and race their retry backoff sleep against it — if
     /// shutdown fires mid-sleep, the sink breaks out of the retry
@@ -149,6 +156,7 @@ impl BuildContext {
         Self {
             funcs: Arc::new(crate::functions::FunctionRegistry::new()),
             error_log: None,
+            error_log_fallback: crate::error_log::ErrorLogFallback::default(),
             shutdown_signal: rx,
         }
     }
@@ -537,6 +545,7 @@ pub const SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Durat
 pub async fn finalize_shutdown_singleton_disposition(
     result: Result<()>,
     error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+    error_log_fallback: crate::error_log::ErrorLogFallback,
     metrics: &OutputMetrics,
     output_name: &str,
     event: &Event,
@@ -550,7 +559,15 @@ pub async fn finalize_shutdown_singleton_disposition(
         }
         Err(e) => {
             let reason = format!("shutdown send failed: {}", e);
-            let outcome = route_event_to_dlq(error_log, metrics, output_name, event, &reason).await;
+            let outcome = route_event_to_dlq(
+                error_log,
+                error_log_fallback,
+                metrics,
+                output_name,
+                event,
+                &reason,
+            )
+            .await;
             resolve_ack_from_dlq_outcome(ack, outcome, metrics);
         }
     }
@@ -591,6 +608,7 @@ pub async fn finalize_shutdown_singleton_disposition(
 pub async fn finalize_shutdown_singleton_disposition_ambiguous(
     result: Result<()>,
     error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+    error_log_fallback: crate::error_log::ErrorLogFallback,
     metrics: &OutputMetrics,
     output_name: &str,
     event: &Event,
@@ -610,7 +628,15 @@ pub async fn finalize_shutdown_singleton_disposition_ambiguous(
             // Write the DLQ record for the operator's audit trail —
             // even though we're forcing `Dropped`, the record makes
             // reconciliation possible after next-start replay.
-            let _ = route_event_to_dlq(error_log, metrics, output_name, event, &reason).await;
+            let _ = route_event_to_dlq(
+                error_log,
+                error_log_fallback,
+                metrics,
+                output_name,
+                event,
+                &reason,
+            )
+            .await;
             resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Dropped, metrics);
         }
     }
@@ -642,6 +668,7 @@ pub async fn finalize_shutdown_singleton_disposition_ambiguous(
 /// JSONL-in-log path is at least grep-and-replayable.
 pub async fn route_shutdown_batch_to_dlq(
     error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+    error_log_fallback: crate::error_log::ErrorLogFallback,
     metrics: &OutputMetrics,
     output_name: &str,
     events: Vec<(Event, crate::queue::QueueAckHandle)>,
@@ -652,9 +679,10 @@ pub async fn route_shutdown_batch_to_dlq(
     if events.is_empty() {
         return;
     }
+    let reason = format!("shutdown flush failed: {}", flush_err);
     if let Some(writer) = error_log {
-        let reason = format!("shutdown flush failed: {}", flush_err);
         for (ev, ack) in events {
+            let position = ack.position();
             let ctx = crate::pipeline::ErroredEventContext::Output {
                 timestamp: chrono::Utc::now(),
                 pipeline: String::new(),
@@ -666,20 +694,12 @@ pub async fn route_shutdown_batch_to_dlq(
             let outcome = match writer.write(&ctx).await {
                 Ok(()) => DlqRouteOutcome::Recovered,
                 Err(write_err) => {
-                    // Same shutdown-drain JSONL fallback contract as
-                    // `route_event_to_dlq`: emit the full record via
-                    // `event_record` so the operator has a manual-
-                    // recovery trail alongside the counter bump. The
-                    // configured DLQ file remains the load-bearing
-                    // recovery; this is best-effort.
-                    tracing::error!(
-                        event_record = %ctx.to_jsonl(),
-                        "output '{}': error_log write during shutdown failed: {} — routing as \
-                         Dropped so the disk queue holds the cursor for replay; event_record \
-                         below is a best-effort tracing fallback (a healthy `error_log` file \
-                         is the load-bearing recovery)",
-                        output_name,
-                        write_err
+                    emit_dlq_tracing_fallback(
+                        /* error_log_configured */ true,
+                        error_log_fallback,
+                        &ctx,
+                        Some(position),
+                        Some(&write_err),
                     );
                     metrics
                         .events_errored_unwritable
@@ -690,19 +710,13 @@ pub async fn route_shutdown_batch_to_dlq(
             resolve_ack_from_dlq_outcome(ack, outcome, metrics);
         }
     } else {
-        // No DLQ configured — emit one `tracing::error!` line
-        // per parked event with the full JSONL as a structured
-        // field so the operator can grep / `journalctl | jq`
-        // and replay. Matches the shape used elsewhere
-        // (pipeline-side `write_errored_to_dlq`, sink-side
-        // `route_event_to_dlq`); without the JSONL the payloads
-        // would vanish alongside the shutdown drain. Route the
-        // ack through `resolve_ack_from_dlq_outcome` with an
-        // explicit `Recovered` outcome so the failure count and
-        // ack disposition go through the same choke point as the
-        // DLQ path.
-        let reason = format!("shutdown flush failed: {}", flush_err);
+        // No DLQ configured — payload-free tracing per ladder
+        // row-A. Disposition still folds to `Recovered` so the
+        // ack drain progresses; the operator has no recovery
+        // trail beyond the one-line summary, which is exactly
+        // what the unset config declares.
         for (ev, ack) in events {
+            let position = ack.position();
             let ctx = crate::pipeline::ErroredEventContext::Output {
                 timestamp: chrono::Utc::now(),
                 pipeline: String::new(),
@@ -711,13 +725,12 @@ pub async fn route_shutdown_batch_to_dlq(
                 output_name: output_name.to_string(),
                 event: crate::pipeline::OutputEvent::from_owned(&ev),
             };
-            tracing::error!(
-                event_record = %ctx.to_jsonl(),
-                "output '{}': shutdown-drain event emitted as tracing fallback (no error_log \
-                 configured); disposition is Recovered, payload is grep/journalctl-recoverable \
-                 via the event_record field. Configure `control {{ error_log \"...\" }}` for \
-                 file-based DLQ and `limpidctl inject output` replay",
-                output_name
+            emit_dlq_tracing_fallback(
+                /* error_log_configured */ false,
+                error_log_fallback,
+                &ctx,
+                Some(position),
+                None,
             );
             resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Recovered, metrics);
         }
@@ -768,6 +781,7 @@ pub async fn route_shutdown_batch_to_dlq(
 /// not silently lose the ambiguity signal on a disk queue.
 pub async fn route_shutdown_batch_ambiguous_to_dlq(
     error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+    error_log_fallback: crate::error_log::ErrorLogFallback,
     metrics: &OutputMetrics,
     output_name: &str,
     events: Vec<(Event, crate::queue::QueueAckHandle)>,
@@ -784,6 +798,7 @@ pub async fn route_shutdown_batch_ambiguous_to_dlq(
     );
     if let Some(writer) = error_log {
         for (ev, ack) in events {
+            let position = ack.position();
             let ctx = crate::pipeline::ErroredEventContext::Output {
                 timestamp: chrono::Utc::now(),
                 pipeline: String::new(),
@@ -793,29 +808,28 @@ pub async fn route_shutdown_batch_ambiguous_to_dlq(
                 event: crate::pipeline::OutputEvent::from_owned(&ev),
             };
             if let Err(write_err) = writer.write(&ctx).await {
-                tracing::error!(
-                    event_record = %ctx.to_jsonl(),
-                    "output '{}': error_log write during ambiguous shutdown drain failed: {} — \
-                     forcing Dropped so the disk queue holds the cursor for reconciliation; \
-                     event_record below is a best-effort tracing fallback (a healthy `error_log` \
-                     file is the load-bearing recovery)",
-                    output_name,
-                    write_err
+                emit_dlq_tracing_fallback(
+                    /* error_log_configured */ true,
+                    error_log_fallback,
+                    &ctx,
+                    Some(position),
+                    Some(&write_err),
                 );
                 metrics
                     .events_errored_unwritable
                     .fetch_add(1, Ordering::Relaxed);
             }
             // The DLQ record has been written (or the tracing
-            // fallback fired) for operator visibility, but the
-            // disposition is forced to `Dropped` regardless: the
-            // wire state cannot be proved pre-boundary, so
+            // fallback fired per ladder) for operator visibility,
+            // but the disposition is forced to `Dropped` regardless:
+            // the wire state cannot be proved pre-boundary, so
             // `Recovered` would fabricate an at-least-once
             // guarantee the transport does not support.
             resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Dropped, metrics);
         }
     } else {
         for (ev, ack) in events {
+            let position = ack.position();
             let ctx = crate::pipeline::ErroredEventContext::Output {
                 timestamp: chrono::Utc::now(),
                 pipeline: String::new(),
@@ -824,14 +838,167 @@ pub async fn route_shutdown_batch_ambiguous_to_dlq(
                 output_name: output_name.to_string(),
                 event: crate::pipeline::OutputEvent::from_owned(&ev),
             };
-            tracing::error!(
-                event_record = %ctx.to_jsonl(),
-                "output '{}': ambiguous shutdown-drain event forced Dropped (no error_log); \
-                 configure `control {{ error_log \"...\" }}` for file-based DLQ so \
-                 reconciliation against the downstream is durable",
-                output_name
+            emit_dlq_tracing_fallback(
+                /* error_log_configured */ false,
+                error_log_fallback,
+                &ctx,
+                Some(position),
+                None,
             );
             resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Dropped, metrics);
+        }
+    }
+}
+
+/// Emit the DLQ tracing fallback line per operator ladder.
+///
+/// Central emission for all four DLQ paths (steady-state per-event,
+/// batched shutdown-drain, ambiguous shutdown-drain, and the
+/// pipeline-side runtime error path in `runtime.rs`). Only the
+/// tracing line is written here — every caller keeps ownership of
+/// its own ack disposition so this helper can never accidentally
+/// change queue cursor semantics.
+///
+/// # Ladder
+///
+/// | State                                    | Line body                                                                 |
+/// |------------------------------------------|---------------------------------------------------------------------------|
+/// | `error_log` unset                        | payload-free summary; `fallback` value ignored                            |
+/// | `error_log` set, fallback `Off`          | payload-free summary; write-fail context noted                            |
+/// | `error_log` set, fallback `Meta`         | structured metadata (`kind`, `fallback`, `reason`, `timestamp`, `size`, `position`); no payload bytes |
+/// | `error_log` set, fallback `Full`         | `event_record = <full JSONL>`; opt-in to payload exposure                 |
+///
+/// # Row-A ordering guard
+///
+/// The unset check is *before* the fallback match by design: an
+/// operator who omits `error_log` has already declared "no durable
+/// recovery needed", and honouring a stray `error_log_fallback
+/// "full"` on that operator's config would contradict the declaration
+/// (a `--check` warning surfaces the inert combination separately).
+///
+/// # Structured fields
+///
+/// - `kind`: `"output"` or `"process"` — matches the DLQ record shape.
+/// - `name`: the output name (Output flavor) or pipeline name (Process flavor).
+/// - `site`: failure site (`<name>`, `<name> shutdown`, `(pipeline body)`, …).
+/// - `reason`: the failure reason captured on `ctx`.
+/// - `fallback`: the resolved ladder state, present only when
+///   `error_log` was configured (row-A skips the fallback fields
+///   because the value is being ignored anyway).
+/// - `timestamp`: RFC3339 wall-clock from `ctx` (Meta only).
+/// - `size`: bytes of the recoverable payload — egress for Output,
+///   ingress for Process (Meta only).
+/// - `position`: `AckPosition` debug form; queue kind + numeric
+///   offset/seq only, no filesystem path (Meta only, Output-flavor
+///   sites where a queue handle exists; `(none)` on the pipeline side).
+///
+/// # Excluded fields
+///
+/// The `Meta` shape deliberately never carries: `event_record`,
+/// rendered body / egress bytes, ingress bytes, HTTP headers, or
+/// any operator/customer-populated labels. If a future extension
+/// wants any of those, gate them behind a `Full` opt-in — this
+/// keeps the confidentiality boundary that separates `Meta` from
+/// `Full` bright-line.
+pub(crate) fn emit_dlq_tracing_fallback(
+    error_log_configured: bool,
+    fallback: crate::error_log::ErrorLogFallback,
+    ctx: &crate::pipeline::ErroredEventContext,
+    position: Option<crate::queue::AckPosition>,
+    write_err: Option<&anyhow::Error>,
+) {
+    use crate::error_log::ErrorLogFallback;
+
+    let (kind, name) = match ctx {
+        crate::pipeline::ErroredEventContext::Output { output_name, .. } => {
+            ("output", output_name.as_str())
+        }
+        crate::pipeline::ErroredEventContext::Process { pipeline, .. } => {
+            ("process", pipeline.as_str())
+        }
+    };
+    let site = ctx.site();
+    let reason = ctx.reason();
+
+    // Row-A guard: unset error_log always emits payload-free line
+    // regardless of the fallback value.
+    if !error_log_configured {
+        tracing::error!(
+            kind = kind,
+            name = name,
+            site = site,
+            reason = reason,
+            "{} '{}' (site '{}'): DLQ record not written (no error_log configured); \
+             payload omitted from tracing fallback to preserve confidentiality. \
+             Configure `control {{ error_log \"...\" }}` and set \
+             `control {{ error_log_fallback \"meta\" | \"full\" }}` to opt into a \
+             tracing-side recovery trail.",
+            kind,
+            name,
+            site,
+        );
+        return;
+    }
+
+    let write_err_str = write_err
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "<unknown>".to_string());
+
+    match fallback {
+        ErrorLogFallback::Off => {
+            tracing::error!(
+                kind = kind,
+                name = name,
+                site = site,
+                fallback = "off",
+                reason = reason,
+                "{} '{}' (site '{}'): error_log write failed: {} — payload omitted \
+                 from tracing fallback (error_log_fallback = off; set \"meta\" or \
+                 \"full\" to expose)",
+                kind,
+                name,
+                site,
+                write_err_str,
+            );
+        }
+        ErrorLogFallback::Meta => {
+            let position_str = position
+                .map(|p| format!("{:?}", p))
+                .unwrap_or_else(|| "(none)".to_string());
+            tracing::error!(
+                kind = kind,
+                name = name,
+                site = site,
+                fallback = "meta",
+                reason = reason,
+                timestamp = %ctx.timestamp().to_rfc3339(),
+                size = ctx.payload_size_hint(),
+                position = position_str,
+                "{} '{}' (site '{}'): error_log write failed: {} — metadata emitted, \
+                 payload bytes omitted (error_log_fallback = meta)",
+                kind,
+                name,
+                site,
+                write_err_str,
+            );
+        }
+        ErrorLogFallback::Full => {
+            tracing::error!(
+                kind = kind,
+                name = name,
+                site = site,
+                fallback = "full",
+                event_record = %ctx.to_jsonl(),
+                reason = reason,
+                "{} '{}' (site '{}'): error_log write failed: {} — routing as Dropped \
+                 so the disk queue holds the cursor for replay; event_record below \
+                 carries the full JSONL (error_log_fallback = full — payload may \
+                 reach journald / log aggregation)",
+                kind,
+                name,
+                site,
+                write_err_str,
+            );
         }
     }
 }
@@ -905,6 +1072,7 @@ pub enum DlqRouteOutcome {
 /// handle directly.
 pub async fn route_event_to_dlq(
     error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+    error_log_fallback: crate::error_log::ErrorLogFallback,
     metrics: &OutputMetrics,
     output_name: &str,
     event: &Event,
@@ -923,35 +1091,28 @@ pub async fn route_event_to_dlq(
         match writer.write(&ctx).await {
             Ok(()) => DlqRouteOutcome::Recovered,
             Err(write_err) => {
-                // The DLQ file itself failed. Bump the operator-
-                // facing counter that the process-side runtime
-                // path (write_errored_to_dlq in runtime.rs) also
-                // uses, so both sink-side and pipeline-side
-                // DLQ-write failures show up under the same
-                // metric. `Dropped` signals the caller to hold
-                // the cursor on a disk queue (disk-queue fail-stop wedge)
-                // rather than advance past an event that has no
-                // durable trail.
+                // DLQ file itself failed. Bump the operator-facing
+                // counter that pipeline-side `write_errored_to_dlq`
+                // (in runtime.rs) also uses so both sink-side and
+                // pipeline-side DLQ-write failures show up under
+                // the same metric. `Dropped` signals the caller
+                // to hold the cursor on a disk queue rather than
+                // advance past an event with no durable trail.
                 //
-                // Also emit the full JSONL via a structured
-                // `event_record` field on `tracing::error!` so the
-                // operator still has a manual-recovery trail even
-                // when the configured DLQ file is unhealthy. This
-                // is best-effort (subject to log rotation /
-                // filters / aggregation) — a healthy DLQ file
-                // remains the load-bearing recovery contract —
-                // but on a memory queue this fallback is the only
-                // durable trace left, and on a disk queue it
-                // supplements the wedge for out-of-band operator
-                // triage. Matches the pipeline-side
-                // `write_errored_to_dlq` shape in runtime.rs.
-                tracing::error!(
-                    event_record = %ctx.to_jsonl(),
-                    "output '{}': error_log write failed: {} — routing as Dropped so the disk \
-                     queue holds the cursor for replay; event_record below is a best-effort \
-                     tracing fallback (a healthy `error_log` file is the load-bearing recovery)",
-                    output_name,
-                    write_err
+                // Tracing fallback is dispatched through the
+                // ladder helper: whether any payload / metadata /
+                // JSONL appears on the tracing side is the
+                // operator's `control { error_log_fallback "..." }`
+                // choice, not this call site's. `Off` (default)
+                // keeps the line payload-free; `Meta` adds
+                // structured metadata; `Full` emits `event_record`
+                // as before.
+                emit_dlq_tracing_fallback(
+                    /* error_log_configured */ true,
+                    error_log_fallback,
+                    &ctx,
+                    None,
+                    Some(&write_err),
                 );
                 metrics
                     .events_errored_unwritable
@@ -960,16 +1121,13 @@ pub async fn route_event_to_dlq(
             }
         }
     } else {
-        // No DLQ configured — surface the full failure context
-        // to the tracing channel, matching the pipeline-side
-        // `write_errored_to_dlq` (in runtime.rs) which also
-        // emits the full JSONL via a structured field so the
-        // operator can grep / `journalctl | jq` the record and
-        // replay it via `limpidctl inject output <name> --json`.
-        // Without the JSONL the payload would be gone as soon
-        // as the cursor advances, so `Recovered` would over-
-        // promise recoverability. The `event_record` structured
-        // field is the same shape a DLQ file would receive.
+        // No DLQ configured — the operator has declared no
+        // durable recovery is required. The ladder helper emits a
+        // payload-free summary line regardless of the fallback
+        // value (row-A guard); the disposition still folds to
+        // `Recovered` on any queue because there is no path
+        // forward for this event and holding the cursor without
+        // a recovery target would only wedge the pipeline.
         let ctx = crate::pipeline::ErroredEventContext::Output {
             timestamp: chrono::Utc::now(),
             pipeline: String::new(),
@@ -978,13 +1136,12 @@ pub async fn route_event_to_dlq(
             output_name: output_name.to_string(),
             event: crate::pipeline::OutputEvent::from_owned(event),
         };
-        tracing::error!(
-            event_record = %ctx.to_jsonl(),
-            "output '{}': event emitted as tracing fallback (no error_log configured); \
-             payload is grep/journalctl-recoverable via the event_record field. Configure \
-             `control {{ error_log \"...\" }}` for file-based DLQ and `limpidctl inject \
-             output` replay",
-            output_name
+        emit_dlq_tracing_fallback(
+            /* error_log_configured */ false,
+            error_log_fallback,
+            &ctx,
+            None,
+            None,
         );
         DlqRouteOutcome::Recovered
     }
@@ -1409,80 +1566,194 @@ mod resolve_ack_from_dlq_outcome_tests {
     }
 }
 
-/// Structural pins for the output-side DLQ write-failure JSONL
-/// fallback contract. The pipeline-side `runtime::write_errored_to_dlq`
-/// emits a full `event_record` via `tracing::error!` when the
-/// configured DLQ file write itself fails, so operators still have a
-/// manual-recovery trail out of journald. Historically the output-
-/// side routes (`route_event_to_dlq`, `route_shutdown_batch_to_dlq`)
-/// emitted only a `tracing::warn!` on that path, and the parity
-/// claim in docs was fiction. This module now emits the same
-/// `event_record` field; the tests below prevent that fix from
-/// silently regressing.
 #[cfg(test)]
-mod output_dlq_jsonl_fallback_tests {
-    /// `route_event_to_dlq`'s configured-writer write-failure arm
-    /// must emit `event_record = %ctx.to_jsonl()`. Detection is
-    /// source-level (grep the module for the arm's `event_record`
-    /// field); the alternative — attaching a tracing subscriber and
-    /// asserting on captured fields — requires infrastructure the
-    /// workspace's unit tests do not yet share.
-    #[test]
-    fn route_event_to_dlq_configured_failure_emits_event_record() {
+mod output_dlq_tracing_fallback_ladder_tests {
+    //! Structural pins for the DLQ tracing fallback ladder.
+    //!
+    //! The ladder policy — enforced by `emit_dlq_tracing_fallback`
+    //! and delegated to from every DLQ emission site — is:
+    //!
+    //! - `error_log` unset: payload-free line, fallback value
+    //!   ignored (row-A ordering guard).
+    //! - `error_log` set, fallback `Off` (default): payload-free
+    //!   line, no `event_record`, no meta fields.
+    //! - `error_log` set, fallback `Meta`: structured metadata
+    //!   (`kind`, `fallback = "meta"`, `size`, `timestamp`,
+    //!   `position`), no payload bytes.
+    //! - `error_log` set, fallback `Full`: `event_record =
+    //!   %ctx.to_jsonl()` — the pre-ladder shape, kept behind an
+    //!   explicit opt-in.
+    //!
+    //! Testing via a tracing subscriber layer would give runtime
+    //! observation of every combination but requires infra the
+    //! workspace does not yet share. Instead, pin the shape at
+    //! source level: the helper is the single site the ladder
+    //! lives in, so grep pins there catch drift at every emission
+    //! site simultaneously.
+
+    fn helper_body() -> &'static str {
         let src = include_str!("mod.rs");
         let fn_start = src
-            .find("pub async fn route_event_to_dlq(")
-            .expect("route_event_to_dlq must exist");
-        // Bound the search at the next top-level `pub async fn` or
-        // `pub fn` to keep the grep scoped to this function's body.
-        let fn_end_candidates = [
-            src[fn_start + 32..].find("\npub async fn "),
-            src[fn_start + 32..].find("\npub fn "),
-        ];
-        let fn_end = fn_end_candidates
-            .into_iter()
-            .flatten()
-            .min()
-            .expect("a following pub fn must exist");
-        let body = &src[fn_start..fn_start + 32 + fn_end];
+            .find("pub(crate) fn emit_dlq_tracing_fallback(")
+            .expect("emit_dlq_tracing_fallback must exist");
+        // Bound the body at the function's own closing brace, not
+        // at the next top-level `pub fn` — the doc comment of the
+        // following function is above its `pub fn` line and would
+        // otherwise be pulled into the extracted body, muddying
+        // grep pins with unrelated `resolve_*` references from
+        // that neighbour's docs.
+        let fn_end_rel = src[fn_start..]
+            .find("\n}\n")
+            .expect("emit_dlq_tracing_fallback must have a closing brace at column 0");
+        let end = fn_start + fn_end_rel + "\n}\n".len();
+        let bytes = &src.as_bytes()[fn_start..end];
+        std::str::from_utf8(bytes).expect("mod.rs must be utf-8")
+    }
+
+    /// `Off` arm (default): no `event_record`, no payload-carrying
+    /// tracing fields. This is the confidentiality baseline — an
+    /// operator who did not opt in must never see event bytes on
+    /// the tracing side.
+    #[test]
+    fn ladder_off_arm_has_no_event_record() {
+        let body = helper_body();
+        let off_marker = body
+            .find("ErrorLogFallback::Off =>")
+            .expect("Off arm must exist");
+        let next_arm = body[off_marker..]
+            .find("ErrorLogFallback::Meta =>")
+            .expect("Meta arm must follow Off");
+        let off_block = &body[off_marker..off_marker + next_arm];
         assert!(
-            body.contains("event_record ="),
-            "route_event_to_dlq must emit `event_record = %ctx.to_jsonl()` in its \
-             configured-writer write-failure arm so operators have a journald fallback \
-             when the DLQ file is unhealthy"
+            !off_block.contains("event_record"),
+            "Off arm must not emit event_record — payload leak on a \
+             fallback the operator explicitly disabled"
         );
         assert!(
-            body.contains("events_errored_unwritable"),
-            "route_event_to_dlq must still bump events_errored_unwritable on the same arm"
+            off_block.contains("fallback = \"off\""),
+            "Off arm must tag the tracing line with `fallback = \"off\"` \
+             so operators can filter"
         );
     }
 
-    /// Same structural pin for the shutdown-batch route.
+    /// `Meta` arm: structured metadata only. The confidentiality
+    /// boundary between `Meta` and `Full` is the whole point of the
+    /// ladder — a stray `event_record` here would silently upgrade
+    /// every operator on `Meta` to `Full` semantics.
     #[test]
-    fn route_shutdown_batch_to_dlq_configured_failure_emits_event_record() {
-        let src = include_str!("mod.rs");
-        let fn_start = src
-            .find("pub async fn route_shutdown_batch_to_dlq(")
-            .expect("route_shutdown_batch_to_dlq must exist");
-        let fn_end_candidates = [
-            src[fn_start + 42..].find("\npub async fn "),
-            src[fn_start + 42..].find("\npub fn "),
-        ];
-        let fn_end = fn_end_candidates
-            .into_iter()
-            .flatten()
-            .min()
-            .expect("a following pub fn must exist");
-        let body = &src[fn_start..fn_start + 42 + fn_end];
+    fn ladder_meta_arm_has_structured_fields_but_no_event_record() {
+        let body = helper_body();
+        let meta_marker = body
+            .find("ErrorLogFallback::Meta =>")
+            .expect("Meta arm must exist");
+        let next_arm = body[meta_marker..]
+            .find("ErrorLogFallback::Full =>")
+            .expect("Full arm must follow Meta");
+        let meta_block = &body[meta_marker..meta_marker + next_arm];
         assert!(
-            body.contains("event_record ="),
-            "route_shutdown_batch_to_dlq must emit `event_record = %ctx.to_jsonl()` in \
-             its configured-writer write-failure arm so shutdown-drain failures leave a \
-             journald fallback when the DLQ file is unhealthy"
+            !meta_block.contains("event_record"),
+            "Meta arm must not emit event_record — that upgrade belongs \
+             to the Full opt-in"
         );
         assert!(
-            body.contains("events_errored_unwritable"),
-            "route_shutdown_batch_to_dlq must still bump events_errored_unwritable"
+            meta_block.contains("fallback = \"meta\""),
+            "Meta arm must tag `fallback = \"meta\"` for filter parity"
+        );
+        for field in ["size", "timestamp", "position"] {
+            assert!(
+                meta_block.contains(field),
+                "Meta arm must emit `{field}` structured field so \
+                 operators can correlate the record with metrics / \
+                 replay tooling"
+            );
+        }
+    }
+
+    /// `Full` arm: kept for operators who explicitly opted into
+    /// payload exposure on the tracing side. This preserves the
+    /// pre-ladder `event_record = %ctx.to_jsonl()` shape so a
+    /// `journalctl | jq` extraction path documented against
+    /// earlier releases still works when opted in.
+    #[test]
+    fn ladder_full_arm_emits_event_record_jsonl() {
+        let body = helper_body();
+        let full_marker = body
+            .find("ErrorLogFallback::Full =>")
+            .expect("Full arm must exist");
+        let block_end = body[full_marker..]
+            .find("        }\n    }")
+            .expect("Full arm must have a closing brace pair");
+        let full_block = &body[full_marker..full_marker + block_end];
+        assert!(
+            full_block.contains("event_record = %ctx.to_jsonl()"),
+            "Full arm must emit `event_record = %ctx.to_jsonl()` — this \
+             is the payload-exposure opt-in the operator selected"
+        );
+        assert!(
+            full_block.contains("fallback = \"full\""),
+            "Full arm must tag `fallback = \"full\"` for filter parity"
+        );
+    }
+
+    /// Row-A ordering guard: the unset-error_log branch checks
+    /// `error_log_configured` BEFORE reading the fallback value,
+    /// and its own tracing line has no `event_record` regardless
+    /// of the fallback the operator inadvertently set. Without
+    /// this ordering, an operator who set
+    /// `error_log_fallback "full"` without setting `error_log`
+    /// would leak payloads on every DLQ path — contradicting
+    /// their own "no durable recovery needed" declaration.
+    #[test]
+    fn ladder_no_error_log_arm_ignores_fallback_and_has_no_event_record() {
+        let body = helper_body();
+        let guard_marker = body
+            .find("if !error_log_configured {")
+            .expect("row-A guard must exist");
+        let after_guard = body[guard_marker..]
+            .find("return;")
+            .expect("row-A guard must return before fallback match");
+        let guard_block = &body[guard_marker..guard_marker + after_guard];
+        assert!(
+            !guard_block.contains("event_record"),
+            "row-A (unset error_log) branch must not emit event_record"
+        );
+        assert!(
+            !guard_block.contains("ErrorLogFallback::"),
+            "row-A branch must not switch on the fallback value — that \
+             would let a stray `error_log_fallback \"full\"` upgrade the \
+             confidentiality-declined path"
+        );
+        // Also verify the guard appears before the `match fallback`
+        // block, not after — order matters for the invariant.
+        let match_marker = body
+            .find("match fallback {")
+            .expect("fallback match must exist");
+        assert!(
+            guard_marker < match_marker,
+            "row-A guard must run BEFORE the fallback match, otherwise \
+             the ordering invariant collapses"
+        );
+    }
+
+    /// Disposition ownership: the ladder must change the tracing
+    /// emission only, never the ack disposition. `route_*` helpers
+    /// still own the `resolve_ack_from_dlq_outcome` call for every
+    /// path; the ladder helper itself has no `resolve_*` inside it.
+    #[test]
+    fn ladder_helper_does_not_touch_ack_disposition() {
+        let body = helper_body();
+        assert!(
+            !body.contains("resolve_ack_from_dlq_outcome"),
+            "emit_dlq_tracing_fallback must not resolve ack disposition — \
+             that ownership stays with the route_* callers so the ladder \
+             cannot silently change disk-queue wedge / memory-queue fold \
+             semantics"
+        );
+        assert!(
+            !body.contains("resolve_delivered")
+                && !body.contains("resolve_recovered")
+                && !body.contains("resolve_dropped"),
+            "emit_dlq_tracing_fallback must not touch any ack resolve method"
         );
     }
 }
