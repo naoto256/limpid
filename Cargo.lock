@@ -1121,7 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "limpid"
-version = "0.7.8"
+version = "0.7.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1169,7 +1169,7 @@ dependencies = [
 
 [[package]]
 name = "limpid-prometheus"
-version = "0.7.8"
+version = "0.7.9"
 dependencies = [
  "clap",
  "http-body-util",
@@ -1182,7 +1182,7 @@ dependencies = [
 
 [[package]]
 name = "limpidctl"
-version = "0.7.8"
+version = "0.7.9"
 dependencies = [
  "chrono",
  "clap",
