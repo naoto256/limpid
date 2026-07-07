@@ -453,6 +453,57 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// Wedge-exit lifecycle hook: resolve internally parked ack
+    /// handles WITHOUT any new delivery attempt.
+    ///
+    /// Called by the queue consumer instead of [`Output::shutdown`]
+    /// when the output is exiting through the fail-stop wedge path —
+    /// i.e. a `Dropped-on-disk` disposition has been observed, meaning
+    /// the sink hit a bug boundary (typically DLQ write itself failed
+    /// on a disk-backed queue) and the operator contract is that no
+    /// further work goes through this codepath in this daemon
+    /// generation. The wedge is a hard trust boundary; replaying
+    /// buffered handles through a still-buggy sink would risk the
+    /// same Dropped outcome and prolong the wedge.
+    ///
+    /// Contract:
+    ///
+    /// - **No new delivery attempt.** Implementations MUST NOT enter
+    ///   `policy.send` / `flush_events` / any transport call. This is
+    ///   the lifecycle distinction from [`Output::shutdown`], whose
+    ///   contract explicitly allows one bounded flush.
+    /// - **Resolve internally parked handles only.** Any
+    ///   `QueueAckHandle` still held inside the sink's own buffer
+    ///   must be resolved before this method returns, otherwise the
+    ///   consumer's ack drain hangs on messages that will never
+    ///   arrive and the runtime falls back to its 10s wall-clock
+    ///   shutdown timeout.
+    /// - **Ambiguous outcome.** Buffered events go through
+    ///   [`route_shutdown_batch_ambiguous_to_dlq`] — the wedge is
+    ///   itself a failure boundary and the wire state is undefined,
+    ///   so per-batch disposition forces `Dropped` regardless of
+    ///   the DLQ write result. On a disk queue that keeps the
+    ///   cursor at the wedged batch's position for replay; on a
+    ///   memory queue the fold to `Recovered` inside
+    ///   `resolve_ack_from_dlq_outcome` prevents the ack drain
+    ///   deadlock at the cost of losing the buffered events (no
+    ///   replay path exists across restarts anyway).
+    ///
+    /// Unbatched sinks hold no buffer, so the default no-op impl is
+    /// correct for them — every handle they took has already been
+    /// resolved on the steady-state path by the time the wedge
+    /// signal reaches the consumer.
+    ///
+    /// `error_log` is the operator-configured DLQ writer used by the
+    /// wedge-exit DLQ route. `None` falls back to the ambiguous
+    /// helper's tracing branch (see [`route_shutdown_batch_ambiguous_to_dlq`]).
+    async fn shutdown_wedged(
+        &self,
+        _error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Per-attempt deadline for the single shutdown flush a batched output

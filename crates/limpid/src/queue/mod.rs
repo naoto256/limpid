@@ -740,8 +740,23 @@ pub async fn run_queue_consumer(
         tokio::select! {
             biased;
 
-            _ = shutdown.changed(), if accepting => {
+            _ = shutdown.changed(), if accepting || wedged => {
                 if *shutdown.borrow() {
+                    // Wedged path: skip the drain and break immediately.
+                    // The consumer is not accepting new events (that is
+                    // the wedge contract), and any handles still parked
+                    // inside a batched sink's buffer at this point can
+                    // only be resolved by the post-loop
+                    // `writer.shutdown_wedged()` — waiting for
+                    // `in_flight == 0` here would deadlock exactly the
+                    // case the wedge-aware resolve was added to fix.
+                    if wedged {
+                        info!(
+                            "output '{}': shutting down while wedged; parked buffers resolve via shutdown_wedged",
+                            name
+                        );
+                        break;
+                    }
                     info!("output '{}': shutting down, draining queue", name);
                     // Backend-aware drain.
                     //
@@ -915,28 +930,24 @@ pub async fn run_queue_consumer(
     // handles are exactly what `writer.shutdown()` resolves, so the
     // wait can never make progress on its own.
     //
-    // Wedge-exit skips the `writer.shutdown()` drive: the wedge
-    // contract says "no new work through a bug-path output". For
-    // unbatched sinks this is the whole story because their
-    // `shutdown()` is a no-op — there is no buffer to flush. For
-    // batched sinks (`http`, `otlp_http`, `otlp_grpc`) that were
-    // accepting events before the wedge fired, any handles
-    // parked in their internal buffer at wedge time are
-    // **currently leaked**: skipping `shutdown()` means those
-    // handles never receive an explicit resolve, and if we
-    // reached this point with `in_flight > 0` the drain loop
-    // below waits on ack messages that will never arrive. That
-    // is deliberate — replaying a buffered handle through a
-    // still-buggy sink would risk the same Dropped outcome and
-    // just prolong the wedge — but it is not "safe" in the sense
-    // that batched buffers are automatically empty here.
-    // Batched-sink wedge handling is out of scope for this
-    // release (the fail-stop refactor deliberately covered
-    // unbatched sinks only); a follow-up will extend
-    // `writer.shutdown()` with an explicit wedge-aware resolve
-    // so the parked handles resolve as `Dropped` and the disk
-    // queue's wedged cursor stays where it is.
-    if !wedged && let Err(e) = writer.shutdown(error_log.as_ref()).await {
+    // Wedge-exit takes the separate `shutdown_wedged()` path
+    // instead of `shutdown()`: the wedge contract says "no new
+    // work through a bug-path output", so this variant resolves
+    // internally parked handles without entering any transport
+    // send. Buffered events go through
+    // `route_shutdown_batch_ambiguous_to_dlq` — on a disk queue
+    // the wedged cursor stays put for replay, on a memory queue
+    // the ambiguous helper folds to `Recovered` so the ack drain
+    // below does not hang on messages that will never arrive.
+    // Unbatched sinks hold no buffer, so their default no-op
+    // impl is correct — every handle they took has already been
+    // resolved on the steady-state path by the time the wedge
+    // signal reaches this arm.
+    if wedged {
+        if let Err(e) = writer.shutdown_wedged(error_log.as_ref()).await {
+            warn!("output '{}': wedge shutdown resolve failed: {}", name, e);
+        }
+    } else if let Err(e) = writer.shutdown(error_log.as_ref()).await {
         warn!("output '{}': shutdown flush failed: {}", name, e);
     }
     drop(ack_tx);
@@ -1843,6 +1854,187 @@ mod consumer_lifecycle_tests {
         }
     }
 
+    /// Batched-sink wedge exit calls `shutdown_wedged`, not
+    /// `shutdown`. The wedge contract is "no new work through a
+    /// bug-path output" — the queue consumer must NOT enter the
+    /// normal shutdown path (which does one more bounded send)
+    /// when a Dropped-on-disk disposition fired the wedge. This
+    /// mirror pin catches a regression where a refactor collapsed
+    /// the `wedged` / else arms.
+    #[test]
+    fn queue_consumer_wedge_arm_calls_shutdown_wedged_not_shutdown() {
+        let src = include_str!("mod.rs");
+        let consumer_body = src
+            .find("pub(crate) async fn run_queue_consumer")
+            .expect("run_queue_consumer must exist");
+        // Look inside the consumer body for the two branches.
+        let window = &src[consumer_body..consumer_body + 20_000];
+        assert!(
+            window.contains("if wedged {")
+                && window.contains("writer.shutdown_wedged(error_log.as_ref()).await"),
+            "run_queue_consumer must drive `writer.shutdown_wedged()` on the wedged branch"
+        );
+        assert!(
+            window.contains("} else if let Err(e) = writer.shutdown(error_log.as_ref()).await"),
+            "the non-wedged branch must still drive `writer.shutdown()`"
+        );
+    }
+
+    /// Batched wedge scenario end-to-end: the flusher actor's
+    /// analogue (a background task inside the mock) fires a
+    /// Dropped ack for one already-consumed event, which trips
+    /// the disk-queue wedge while other handles are still parked
+    /// in the mock's buffer. The queue consumer must take the
+    /// wedge-exit `shutdown_wedged` path — resolving the parked
+    /// handles WITHOUT attempting a further send — so the ack
+    /// drain does not hang on messages that will never arrive.
+    ///
+    /// Regression pin: the previous shape skipped both `shutdown`
+    /// and `shutdown_wedged` on wedge exit, leaving parked
+    /// handles unresolved and forcing the runtime's 10 s wall-
+    /// clock timeout to unblock the drain.
+    #[tokio::test]
+    async fn batched_wedge_resolves_parked_buffer_without_send() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::AtomicUsize;
+
+        struct WedgeMockWriter {
+            buffer: tokio::sync::Mutex<Vec<QueueAckHandle>>,
+            consume_calls: AtomicUsize,
+            send_calls: AtomicUsize,
+            shutdown_called: AtomicBool,
+            shutdown_wedged_called: AtomicBool,
+            metrics: Arc<crate::metrics::OutputMetrics>,
+        }
+
+        impl HasMetrics for WedgeMockWriter {
+            type Stats = crate::metrics::OutputMetrics;
+            fn metrics(&self) -> Arc<crate::metrics::OutputMetrics> {
+                Arc::clone(&self.metrics)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Output for WedgeMockWriter {
+            async fn consume(&self, _event: &Event, ack: QueueAckHandle) -> anyhow::Result<()> {
+                self.consume_calls.fetch_add(1, Ordering::Relaxed);
+                self.buffer.lock().await.push(ack);
+                Ok(())
+            }
+
+            async fn consume_shutdown(
+                &self,
+                _event: &Event,
+                ack: QueueAckHandle,
+            ) -> anyhow::Result<()> {
+                self.buffer.lock().await.push(ack);
+                Ok(())
+            }
+
+            async fn shutdown(
+                &self,
+                _error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+            ) -> anyhow::Result<()> {
+                self.shutdown_called.store(true, Ordering::Relaxed);
+                // Normal shutdown pretends to do one bounded send.
+                // The wedge path must NEVER reach here.
+                self.send_calls.fetch_add(1, Ordering::Relaxed);
+                let leftover = std::mem::take(&mut *self.buffer.lock().await);
+                for ack in leftover {
+                    ack.resolve_recovered();
+                }
+                Ok(())
+            }
+
+            async fn shutdown_wedged(
+                &self,
+                _error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+            ) -> anyhow::Result<()> {
+                self.shutdown_wedged_called.store(true, Ordering::Relaxed);
+                // Wedge contract: no send. Resolve every parked
+                // handle as Recovered (mirrors
+                // `route_shutdown_batch_ambiguous_to_dlq` folding
+                // on the ack channel — on a real disk queue this
+                // path forces Dropped; the memory-queue fold happens
+                // inside `resolve_ack_from_dlq_outcome`, but here we
+                // just need every handle resolved so the drain
+                // exits).
+                let leftover = std::mem::take(&mut *self.buffer.lock().await);
+                for ack in leftover {
+                    ack.resolve_recovered();
+                }
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = Arc::new(WedgeMockWriter {
+            buffer: tokio::sync::Mutex::new(Vec::new()),
+            consume_calls: AtomicUsize::new(0),
+            send_calls: AtomicUsize::new(0),
+            shutdown_called: AtomicBool::new(false),
+            shutdown_wedged_called: AtomicBool::new(false),
+            metrics: Arc::new(crate::metrics::OutputMetrics::default()),
+        });
+        let metrics = Arc::clone(&writer.metrics);
+        let (sender, shutdown_tx, handle) = spawn_consumer_with_queue(
+            QueueType::Disk {
+                path: tmp.path().display().to_string(),
+                max_size: 4 * 1024 * 1024,
+            },
+            writer.clone(),
+            metrics.clone(),
+        )
+        .await;
+
+        // Dispatch 4 events into the batched buffer.
+        for _ in 0..4 {
+            sender.send(owned_event()).await.unwrap();
+        }
+        for _ in 0..500 {
+            if writer.consume_calls.load(Ordering::Relaxed) >= 4 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(writer.consume_calls.load(Ordering::Relaxed), 4);
+
+        // Simulate the flusher actor firing a Dropped ack for the
+        // first parked handle — the disposition that trips the
+        // fail-stop wedge on a disk queue. The remaining 3 handles
+        // stay parked in the buffer.
+        {
+            let mut buf = writer.buffer.lock().await;
+            let first = buf.remove(0);
+            first.resolve_dropped();
+        }
+        wait_for_wedge(&metrics).await;
+
+        // Trigger graceful shutdown. The consumer must take the
+        // wedge-exit path — `shutdown_wedged` on the mock — and
+        // exit within the timeout without hanging on the 3
+        // still-parked handles.
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("consumer must exit within 2s on wedge shutdown")
+            .expect("consumer task must not panic");
+
+        assert!(
+            writer.shutdown_wedged_called.load(Ordering::Relaxed),
+            "wedge exit must drive shutdown_wedged()"
+        );
+        assert!(
+            !writer.shutdown_called.load(Ordering::Relaxed),
+            "wedge exit must NOT drive shutdown() (that would attempt a further send)"
+        );
+        assert_eq!(
+            writer.send_calls.load(Ordering::Relaxed),
+            0,
+            "wedge contract: no send attempted on the wedge-exit path"
+        );
+    }
+
     /// Wedge fires exactly once per consumer lifetime — a second
     /// Dropped after the first wedge (in-flight tail scenario)
     /// must not double-count `events_wedged`.
@@ -2086,17 +2278,28 @@ mod consumer_lifecycle_tests {
     fn shutdown_drain_arm_is_backend_aware_and_uses_close_recv_pattern() {
         let src = include_str!("mod.rs");
         let arm_start = src
-            .find("_ = shutdown.changed(), if accepting =>")
+            .find("_ = shutdown.changed(), if accepting || wedged =>")
             .expect("shutdown arm marker must exist");
-        // Isolate the arm body up to the closing brace of the
-        // outer `if *shutdown.borrow()` guard. Walk to the second
-        // `break;` — the exit of the drain — and take everything
-        // between as the arm body.
+        // Isolate the arm body from the wedge-shutdown early-break
+        // to the next `break;` — the exit of the memory drain — and
+        // take everything between as the arm body. The wedge branch
+        // (`if wedged { … break; }`) sits before the backend split,
+        // so start the search past its break to reach the drain
+        // scaffolding the pins below cover.
         let arm_tail = &src[arm_start..];
-        let body_end = arm_tail
+        let wedge_break = arm_tail
+            .find("if wedged {")
+            .expect("shutdown arm must handle wedged early-break");
+        let after_wedge_break = wedge_break
+            + arm_tail[wedge_break..]
+                .find("break;")
+                .expect("wedge branch must break out")
+            + "break;".len();
+        let drain_tail = &arm_tail[after_wedge_break..];
+        let body_end = drain_tail
             .find("break;")
-            .expect("shutdown arm must break out of the select loop");
-        let body = &arm_tail[..body_end];
+            .expect("shutdown arm must break out of the select loop after the drain");
+        let body = &drain_tail[..body_end];
 
         assert!(
             body.contains("receiver.backend_kind()"),
