@@ -114,6 +114,7 @@ impl Output for StdoutOutput {
                             &self.metrics,
                             &self.name,
                             event,
+                            ack.position(),
                             &reason,
                         )
                         .await;
@@ -151,6 +152,7 @@ impl Output for StdoutOutput {
                             &self.metrics,
                             &self.name,
                             event,
+                            ack.position(),
                             &reason,
                         )
                         .await;

@@ -593,6 +593,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                 &self.metrics,
                 &self.name,
                 &ev,
+                ack.position(),
                 &reason,
             )
             .await;
@@ -637,6 +638,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                 &self.metrics,
                 &self.name,
                 &ev,
+                ack.position(),
                 &reason,
             )
             .await;
@@ -673,6 +675,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                         &self.metrics,
                         &self.name,
                         &ev,
+                        ack.position(),
                         &reason,
                     )
                     .await;
@@ -820,6 +823,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                     &self.metrics,
                     &self.name,
                     &ev,
+                    ack.position(),
                     &reason,
                 )
                 .await;

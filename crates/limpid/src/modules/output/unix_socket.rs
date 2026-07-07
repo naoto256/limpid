@@ -179,6 +179,7 @@ impl Output for UnixSocketOutput {
                         &self.metrics,
                         &self.name,
                         event,
+                        ack.position(),
                         &reason,
                     )
                     .await;
@@ -210,6 +211,7 @@ impl Output for UnixSocketOutput {
                             &self.metrics,
                             &self.name,
                             event,
+                            ack.position(),
                             &reason,
                         )
                         .await;
@@ -247,6 +249,7 @@ impl Output for UnixSocketOutput {
                             &self.metrics,
                             &self.name,
                             event,
+                            ack.position(),
                             &reason,
                         )
                         .await;
