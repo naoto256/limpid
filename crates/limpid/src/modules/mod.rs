@@ -574,12 +574,14 @@ pub async fn finalize_shutdown_singleton_disposition(
         }
         Err(e) => {
             let reason = format!("shutdown send failed: {}", e);
+            let position = ack.position();
             let outcome = route_event_to_dlq(
                 error_log,
                 error_log_fallback,
                 metrics,
                 output_name,
                 event,
+                position,
                 &reason,
             )
             .await;
@@ -648,12 +650,14 @@ pub async fn finalize_shutdown_singleton_disposition_ambiguous(
             // Write the DLQ record for the operator's audit trail —
             // even though we're forcing `Dropped`, the record makes
             // reconciliation possible after next-start replay.
+            let position = ack.position();
             let _ = route_event_to_dlq(
                 error_log,
                 error_log_fallback,
                 metrics,
                 output_name,
                 event,
+                position,
                 &reason,
             )
             .await;
@@ -913,8 +917,14 @@ pub async fn route_shutdown_batch_ambiguous_to_dlq(
 /// - `size`: bytes of the recoverable payload — egress for Output,
 ///   ingress for Process (Meta only).
 /// - `position`: `AckPosition` debug form; queue kind + numeric
-///   offset/seq only, no filesystem path (Meta only, Output-flavor
-///   sites where a queue handle exists; `(none)` on the pipeline side).
+///   offset/seq only, no filesystem path (Meta only). Always
+///   present on sink-side callers — `route_event_to_dlq` /
+///   `finalize_shutdown_singleton_disposition{,_ambiguous}` /
+///   `route_shutdown_batch_to_dlq` / `route_shutdown_batch_ambiguous_to_dlq`
+///   all require a live `AckPosition` at the type level and pass
+///   `Some(position)` here. `(none)` only appears on the pipeline
+///   side (`runtime::write_errored_to_dlq`) where the event
+///   never entered an output queue and no `AckPosition` exists.
 ///
 /// # Excluded fields
 ///
@@ -1100,12 +1110,26 @@ pub enum DlqRouteOutcome {
 /// caller can choose between `resolve_recovered` (memory queue) and
 /// `resolve_dropped` (disk queue wedge). Does NOT touch the ack
 /// handle directly.
+///
+/// `position` is the queue-side `AckPosition` snapshot taken from the
+/// caller's `QueueAckHandle` *before* the ack is resolved. It is
+/// required — not `Option` — because this helper is the sink-side
+/// entry point and every sink call site holds an in-scope
+/// `QueueAckHandle` at the moment of dispatch (the immediate next
+/// statement resolves it via `resolve_ack_from_dlq_outcome`). The
+/// pipeline-side runtime path (`runtime::write_errored_to_dlq`)
+/// legitimately has no such handle and does not route through this
+/// helper — it delegates to `emit_dlq_tracing_fallback` directly
+/// with `position = None`. Requiring the argument here at the type
+/// level locks the sink-side plumbing so a future refactor cannot
+/// silently drop the `Meta`-arm `position` field back to `(none)`.
 pub async fn route_event_to_dlq(
     error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
     error_log_fallback: crate::error_log::ErrorLogFallback,
     metrics: &OutputMetrics,
     output_name: &str,
     event: &Event,
+    position: crate::queue::AckPosition,
     reason: &str,
 ) -> DlqRouteOutcome {
     use std::sync::atomic::Ordering;
@@ -1141,7 +1165,7 @@ pub async fn route_event_to_dlq(
                     /* error_log_configured */ true,
                     error_log_fallback,
                     &ctx,
-                    None,
+                    Some(position),
                     Some(&write_err),
                 );
                 metrics
@@ -1170,7 +1194,7 @@ pub async fn route_event_to_dlq(
             /* error_log_configured */ false,
             error_log_fallback,
             &ctx,
-            None,
+            Some(position),
             None,
         );
         DlqRouteOutcome::Recovered
@@ -1696,6 +1720,78 @@ mod output_dlq_tracing_fallback_ladder_tests {
                 "Meta arm must emit `{field}` structured field so \
                  operators can correlate the record with metrics / \
                  replay tooling"
+            );
+        }
+    }
+
+    /// Sink-side helpers require a live `AckPosition` at the type
+    /// level. Every route the ladder's `Meta` arm reaches from a
+    /// sink caller therefore has a real queue position to emit,
+    /// not `(none)`. This pin ensures a future refactor cannot
+    /// silently regress `route_event_to_dlq` /
+    /// `finalize_shutdown_singleton_disposition{,_ambiguous}` to
+    /// `Option<AckPosition>` (or drop the parameter) without
+    /// updating every call site — which is exactly what let the
+    /// previous sink-side plumbing drop `position` back to `(none)` on the
+    /// steady-state retry-exhausted path (the most common DLQ
+    /// route) despite the ladder docs promising it.
+    ///
+    /// Detection is source-level: grep the four public helper
+    /// signatures for `position: crate::queue::AckPosition,`
+    /// (required, not `Option`). If a future variant needs to
+    /// stay position-agnostic, add a separate helper — do not
+    /// weaken these four.
+    #[test]
+    fn sink_side_dlq_helpers_require_ack_position() {
+        let src = include_str!("mod.rs");
+
+        // `route_event_to_dlq` is the shared shape every sink's
+        // `consume` call reaches; the type-level requirement is
+        // the load-bearing part of the fix, so its signature must
+        // continue to require `AckPosition` directly (not `Option`).
+        let start = src
+            .find("pub async fn route_event_to_dlq(")
+            .expect("route_event_to_dlq must exist");
+        let sig_end = src[start..]
+            .find(") ->")
+            .expect("route_event_to_dlq must have a return arrow");
+        let sig = &src[start..start + sig_end];
+        assert!(
+            sig.contains("position: crate::queue::AckPosition,"),
+            "route_event_to_dlq must require an `AckPosition` (not \
+             `Option<...>`) so sink-side callers cannot silently drop \
+             the ladder's `Meta`-arm `position` field back to `(none)` \
+             — see the doc comment on `route_event_to_dlq`",
+        );
+        assert!(
+            !sig.contains("position: Option<crate::queue::AckPosition>"),
+            "route_event_to_dlq takes `AckPosition` directly; wrapping \
+             it in `Option` here defeats the type-level guarantee",
+        );
+
+        // `finalize_shutdown_singleton_disposition{,_ambiguous}` take
+        // the whole `QueueAckHandle` (they own the resolve) and extract
+        // position internally via `ack.position()` before handing it
+        // to `route_event_to_dlq`. Pin the extraction so a future edit
+        // cannot skip it and re-introduce the `(none)` regression.
+        for finalize_helper in [
+            "pub async fn finalize_shutdown_singleton_disposition(",
+            "pub async fn finalize_shutdown_singleton_disposition_ambiguous(",
+        ] {
+            let start = src
+                .find(finalize_helper)
+                .unwrap_or_else(|| panic!("{} must exist", finalize_helper));
+            // Find the closing brace at column 0 for the fn body.
+            let body_end = src[start..]
+                .find("\n}\n")
+                .unwrap_or_else(|| panic!("{} must have a closing brace", finalize_helper));
+            let body = &src[start..start + body_end];
+            assert!(
+                body.contains("let position = ack.position();"),
+                "{finalize_helper} must extract `let position = ack.position();` \
+                 before delegating to `route_event_to_dlq` so the `Meta`-arm \
+                 `position` field carries the real queue position rather than \
+                 `(none)`",
             );
         }
     }

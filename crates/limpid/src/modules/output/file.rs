@@ -219,6 +219,7 @@ impl Output for FileOutput {
                     &self.metrics,
                     &self.name,
                     event,
+                    ack.position(),
                     &reason,
                 )
                 .await;
@@ -270,6 +271,7 @@ impl Output for FileOutput {
                             &self.metrics,
                             &self.name,
                             event,
+                            ack.position(),
                             &reason,
                         )
                         .await;
@@ -308,6 +310,7 @@ impl Output for FileOutput {
                             &self.metrics,
                             &self.name,
                             event,
+                            ack.position(),
                             &reason,
                         )
                         .await;
@@ -345,6 +348,7 @@ impl Output for FileOutput {
                     &self.metrics,
                     &self.name,
                     event,
+                    ack.position(),
                     &reason,
                 )
                 .await;
@@ -382,6 +386,7 @@ impl Output for FileOutput {
                     &self.metrics,
                     &self.name,
                     event,
+                    ack.position(),
                     &reason,
                 )
                 .await;

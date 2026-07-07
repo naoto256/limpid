@@ -149,6 +149,7 @@ impl Output for SyslogUdpOutput {
                         &self.metrics,
                         &self.name,
                         event,
+                        ack.position(),
                         &reason,
                     )
                     .await;
@@ -182,6 +183,7 @@ impl Output for SyslogUdpOutput {
                             &self.metrics,
                             &self.name,
                             event,
+                            ack.position(),
                             &reason,
                         )
                         .await;
@@ -219,6 +221,7 @@ impl Output for SyslogUdpOutput {
                             &self.metrics,
                             &self.name,
                             event,
+                            ack.position(),
                             &reason,
                         )
                         .await;

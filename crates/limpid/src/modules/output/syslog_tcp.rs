@@ -376,6 +376,7 @@ impl Output for SyslogTcpOutput {
                         &self.metrics,
                         &self.name,
                         event,
+                        ack.position(),
                         &reason,
                     )
                     .await;
@@ -401,6 +402,7 @@ impl Output for SyslogTcpOutput {
                             &self.metrics,
                             &self.name,
                             event,
+                            ack.position(),
                             &reason,
                         )
                         .await;
@@ -438,6 +440,7 @@ impl Output for SyslogTcpOutput {
                             &self.metrics,
                             &self.name,
                             event,
+                            ack.position(),
                             &reason,
                         )
                         .await;
