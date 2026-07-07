@@ -96,7 +96,11 @@ omit both for one-way TLS.
 
 The `password_file` is read once at daemon start; rotate it and restart
 the daemon to refresh credentials. `chmod 600` it and ensure the file
-is owned by the limpid user. A trailing newline is stripped (`\r\n`,
+is owned by (or at least readable by) the daemon's service user — under
+the packaged systemd unit that is `syslog` (`User=syslog Group=syslog`
+in `limpid.service`), so a `password_file` at `/etc/limpid/kafka.pw`
+should be `syslog:syslog 0600`. Custom deploys should substitute
+whichever user the daemon runs as. A trailing newline is stripped (`\r\n`,
 bare `\n`, and bare `\r` are all handled), so `echo "secret" >
 /etc/limpid/kafka.pw` works as expected and a CRLF-terminated file from
 a Windows host authenticates correctly. An empty file is rejected —
@@ -167,7 +171,7 @@ Routing decisions stay in the pipeline body; the output configs stay static and 
 ## Notes
 
 - rdkafka handles batching and compression internally — no manual batch configuration needed (unlike [http](./http.md)).
-- On shutdown, the producer flushes pending messages (up to 5 seconds).
+- On graceful shutdown (`SIGTERM`, `SIGHUP` reload, `systemctl stop`), the producer hands each pending message to librdkafka via `try_send`; the pending-envelope wait is bounded by librdkafka's own `queue_timeout` and `message.timeout.ms` (there is no additional outer 5-second wrapper — a previous version had one and it was removed because it cut librdkafka's delivery attempt short at the wire boundary, producing ambiguous outcomes). A message whose `try_send` cannot complete before shutdown routes through the ambiguous DLQ path — `Dropped` on a disk queue so the fail-stop wedge holds the cursor for next-start reconciliation, folded to `Recovered` on a memory queue for lack of a replay path. A DLQ record is written for reconciliation in either case.
 - The internal delivery timeout (`message.timeout.ms`) is 30 seconds. If a message can't be delivered within that time, it's returned as an error and the output's `retry { ... }` budget (driven inside `consume()`) handles re-delivery. On retry exhaustion the payload routes to `control { error_log "..." }` as an Output-flavor DLQ record; see [Outputs → Recovery (error_log)](./README.md#recovery-error_log).
 
 ## Example

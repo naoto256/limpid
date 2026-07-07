@@ -25,6 +25,7 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 RuntimeDirectory=limpid
+RuntimeDirectoryMode=0750
 StateDirectory=limpid
 ConfigurationDirectory=limpid
 
@@ -54,10 +55,14 @@ WantedBy=multi-user.target
 
 The full unit (`packaging/limpid.service`) carries a comment above each
 directive explaining why it's safe for limpid's inputs/outputs; this
-page shows the trimmed shape. Notably `PrivateDevices=yes` gives the
-unit a private `/dev` without the host's `/dev/log` — see [Adding write
-paths](#adding-write-paths) below for the `/dev/log` and extra
-`ReadWritePaths` drop-ins.
+page shows the trimmed shape but keeps the trust-boundary-relevant
+directives. `RuntimeDirectoryMode=0750` is one of those: the daemon's
+control-socket parent-directory preflight refuses to bind under a
+group- or world-writable parent, so the trimmed unit must set the mode
+explicitly rather than rely on systemd's `0755` default. Notably
+`PrivateDevices=yes` gives the unit a private `/dev` without the
+host's `/dev/log` — see [Adding write paths](#adding-write-paths)
+below for the `/dev/log` and extra `ReadWritePaths` drop-ins.
 
 ## Key features
 
