@@ -86,6 +86,31 @@ fn recovery_reason(output: &crate::dsl::ast::OutputDef) -> Option<&'static str> 
 }
 
 pub(super) fn analyze_all(config: &CompiledConfig, diags: &mut Vec<Diagnostic>) {
+    let fallback_str = config
+        .global_blocks
+        .get("control")
+        .and_then(|p| props::get_string(p, "error_log_fallback"));
+
+    // Value-level validation. The schema layer only checks that
+    // `error_log_fallback` is a String; the enum membership check
+    // has to run here so a typo like `"Off"` or `"metadata"`
+    // surfaces at `--check` time rather than falling through to the
+    // daemon-startup `ErrorLogFallback::parse` failure. Level::Error
+    // matches the daemon startup behaviour (invalid value refuses
+    // startup) — this is a hard bug in the config, not a shape-
+    // aware warning.
+    if let Some(ref s) = fallback_str
+        && let Err(parse_err) = crate::error_log::ErrorLogFallback::parse(s)
+    {
+        diags.push(Diagnostic {
+            level: Level::Error,
+            kind: DiagKind::Other,
+            message: parse_err,
+            span: None,
+            help: None,
+        });
+    }
+
     // Independent warning: `error_log_fallback` set without a
     // corresponding `error_log`. The fallback is a confidentiality
     // opt-in that only shapes what appears on the tracing side when
@@ -96,10 +121,7 @@ pub(super) fn analyze_all(config: &CompiledConfig, diags: &mut Vec<Diagnostic>) 
     // Warn — not error — because the shape harmlessly appears in
     // shared-template configs where individual environments
     // deactivate `error_log`.
-    if let Some(fallback_str) = config
-        .global_blocks
-        .get("control")
-        .and_then(|p| props::get_string(p, "error_log_fallback"))
+    if let Some(ref fallback_str) = fallback_str
         && !error_log_configured(config)
     {
         diags.push(Diagnostic {
@@ -296,6 +318,76 @@ def pipeline p { input i; output o }
                 d.level == Level::Warning && d.message.contains("control.error_log_fallback = \"")
             })
             .collect()
+    }
+
+    fn fallback_parse_errors(diags: &[Diagnostic]) -> Vec<&Diagnostic> {
+        diags
+            .iter()
+            .filter(|d| {
+                d.level == Level::Error
+                    && d.message.contains("error_log_fallback")
+                    && d.message.contains("unknown value")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rejects_invalid_error_log_fallback_value_at_check_time() {
+        // Value-level validation gap: the schema layer only checks
+        // that error_log_fallback is a String; the enum-membership
+        // check has to run here so a typo like "Off" surfaces
+        // at --check rather than deferring to daemon startup.
+        let src = r#"
+control {
+    error_log "/tmp/dlq.jsonl"
+    error_log_fallback "bogus"
+}
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type file path "/tmp/o.log" }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        let errs = fallback_parse_errors(&diags);
+        assert_eq!(
+            errs.len(),
+            1,
+            "expected exactly one parse-error diagnostic; got: {:?}",
+            diags
+        );
+        assert!(
+            errs[0].message.contains("\"bogus\""),
+            "error must name the offending value; got: {}",
+            errs[0].message
+        );
+    }
+
+    #[test]
+    fn accepts_all_valid_error_log_fallback_values() {
+        // Round-trip guard: every string ErrorLogFallback::parse
+        // accepts must also survive --check without a parse-error
+        // diagnostic. Catches a config-layer / runtime-layer drift
+        // where one accepts values the other doesn't.
+        for v in ["off", "meta", "full"] {
+            let src = format!(
+                r#"
+control {{
+    error_log "/tmp/dlq.jsonl"
+    error_log_fallback "{}"
+}}
+def input i {{ type syslog_tcp bind "0.0.0.0:514" }}
+def output o {{ type file path "/tmp/o.log" }}
+def pipeline p {{ input i; output o }}
+"#,
+                v
+            );
+            let diags = analyze_str(&src);
+            assert!(
+                fallback_parse_errors(&diags).is_empty(),
+                "valid value \"{}\" was rejected by --check: {:?}",
+                v,
+                diags
+            );
+        }
     }
 
     #[test]
