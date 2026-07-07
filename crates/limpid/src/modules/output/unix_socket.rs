@@ -406,9 +406,17 @@ fn resolve_uid(name: &str) -> Result<u32> {
     if result.is_null() {
         anyhow::bail!("user '{}' not found", name);
     }
-    // SAFETY: `result` is non-null and points into `pwd`; pw_uid is
-    // a plain numeric copy that outlives the borrow.
-    Ok(unsafe { (*result).pw_uid })
+    // SAFETY: `getpwnam_r` returned success (`rc == 0`) and `result`
+    // is non-null, which by the contract of `getpwnam_r(3)`
+    // guarantees `pwd` has been fully written with a valid
+    // `libc::passwd` — `result` and `pwd.as_ptr()` point to the same
+    // memory. Reading through the initialised `MaybeUninit` (rather
+    // than dereferencing the raw `*result`) promotes the
+    // "libc initialised this" guarantee to the type system so static
+    // analysis (CodeQL, miri, etc.) can see the initialisation
+    // without having to reason about the FFI contract.
+    let pwd = unsafe { pwd.assume_init() };
+    Ok(pwd.pw_uid)
 }
 
 #[cfg(test)]
