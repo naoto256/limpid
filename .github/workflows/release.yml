@@ -23,7 +23,19 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # pin-audit:2026-05-21 29eef33 | stable
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsystemd-dev
+        # `libsystemd-dev` is required by the `journal` feature; the
+        # remaining packages are `rdkafka-sys` (`libsasl2-dev`,
+        # `libssl-dev`, `libcurl4-openssl-dev`) plus the compression
+        # codecs librdkafka's cmake picks up by default on Debian-family
+        # images (`zlib1g-dev`, `libzstd-dev`, `liblz4-dev`). Matches the
+        # apt list the `check-kafka` job in `ci.yml` installs so the two
+        # jobs stay in lockstep.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libsasl2-dev libssl-dev libcurl4-openssl-dev \
+            zlib1g-dev libzstd-dev liblz4-dev \
+            libsystemd-dev pkg-config
 
       - name: Install cargo-deb
         # Pinned + --locked so packaging tooling is reproducible; bump the
@@ -32,7 +44,14 @@ jobs:
         run: cargo install cargo-deb --version 3.7.0 --locked
 
       - name: Build release
-        run: cargo build --release -p limpid -p limpidctl -p limpid-prometheus --features journal
+        # `journal,kafka` ships both feature-gated inputs / outputs in
+        # the packaged binary. The `check-kafka` CI job builds the same
+        # combination on every PR so a regression on either surface
+        # surfaces at PR time rather than at tag time. Hardware
+        # validation confirmed that `cargo deb -p limpid --features
+        # journal,kafka` produces a working package on aarch64 Ubuntu
+        # (`journal → kafka SASL+TLS` end-to-end PASS in the aarch64 packaging validation report).
+        run: cargo build --release -p limpid -p limpidctl -p limpid-prometheus --features journal,kafka
 
       - name: Build .deb packages
         run: |
