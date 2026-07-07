@@ -111,7 +111,7 @@ def pipeline main {
 
 In every case the event is *not* forwarded downstream — at the failure point the runtime has no way to produce a correct egress, and the pre-0.5 behaviour of forwarding the original `ingress` silently turned wrap / enrichment bugs into data-shape regressions at the receiving SIEM. Instead, the event is routed to the [error log](../operations/error-log.md) so operators can inspect, fix the offending config, and replay.
 
-`events_errored_unwritable` is the subset where the DLQ write itself failed (disk full, permissions, rotation race). The runtime falls back to a structured `tracing::error!` line, but operators should alarm on this counter — a non-zero value means the replay path may be incomplete.
+`events_errored_unwritable` is the subset where the DLQ write itself failed (disk full, permissions, rotation race). The tracing line the runtime emits on that path is shaped by the operator's `error_log_fallback` [ladder](../operations/error-log.md#tracing-fallback-ladder-error_log_fallback) — payload-free summary by default, `Meta` / `Full` only on explicit opt-in — so the counter is the operator alarm signal for the loss rather than a durable trace of the payload, and a non-zero value means the replay path may be incomplete regardless of the ladder state.
 
 ## Example: filtering + routing
 

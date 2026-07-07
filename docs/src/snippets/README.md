@@ -184,9 +184,12 @@ DLQ on day one and decides whether to extend the snippet or update
 the upstream allow-list.
 
 The DLQ entries are JSONL via `control { error_log "..." }`; without
-that, errors fall back to a structured `tracing::error!` line.
-Configure the error log path explicitly so unsupported-vocabulary
-events don't silently scroll off journald.
+that, errors fall back to a payload-free `tracing::error!` summary
+line (the [`error_log_fallback`
+ladder](../operations/error-log.md#tracing-fallback-ladder-error_log_fallback)'s
+default). Set `error_log` explicitly so unsupported-vocabulary events
+land in a replayable file rather than a summary-only signal on
+journald.
 
 ## Per-parser status
 
