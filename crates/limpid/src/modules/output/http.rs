@@ -447,6 +447,13 @@ impl Output for HttpOutput {
     ) -> Result<()> {
         self.sink.shutdown().await
     }
+
+    async fn shutdown_wedged(
+        &self,
+        _error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+    ) -> Result<()> {
+        self.sink.shutdown_wedged().await
+    }
 }
 
 #[async_trait::async_trait]

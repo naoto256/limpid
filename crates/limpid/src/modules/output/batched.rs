@@ -399,6 +399,50 @@ impl<P: BatchSinkPolicy> BatchedSink<P> {
         self.inner.flush_events_at_shutdown(leftover).await;
         Ok(())
     }
+
+    /// Wedge-exit resolve. Same signal + join preamble as
+    /// [`BatchedSink::shutdown`], but the final drain routes every
+    /// parked handle through [`crate::modules::route_shutdown_batch_ambiguous_to_dlq`]
+    /// with a synthesized wedge error rather than through
+    /// `flush_events_at_shutdown` — no `policy.send` call is ever
+    /// entered. See the [`crate::modules::Output::shutdown_wedged`]
+    /// trait doc for the full lifecycle contract.
+    ///
+    /// The signal + join preamble is still needed so the long-lived
+    /// flusher actor exits cleanly: signalling `is_shutting_down`
+    /// makes the actor's own in-flight `flush_events` observe the
+    /// shutdown notify and resolve its stack-local batch via the
+    /// steady-state ambiguous-DLQ path. Skipping the signal would
+    /// let the actor keep running past this method's return, leaving
+    /// its parked handles unresolved.
+    pub(crate) async fn shutdown_wedged(&self) -> Result<()> {
+        self.inner.is_shutting_down.store(true, Ordering::Release);
+        self.inner.flush_notify.notify_waiters();
+        self.inner.shutdown_notify.notify_waiters();
+
+        let handle_opt = self.actor_handle.lock().await.take();
+        if let Some(h) = handle_opt {
+            let _ = tokio::time::timeout(crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT, h).await;
+        }
+
+        let leftover = std::mem::take(&mut *self.inner.batch.lock().await);
+        if !leftover.is_empty() {
+            let wedge_err = anyhow::anyhow!(
+                "output '{}' wedged: skipping shutdown flush; parked buffer resolved via ambiguous DLQ (no send attempted)",
+                self.inner.name
+            );
+            let events = strip_permits(leftover);
+            crate::modules::route_shutdown_batch_ambiguous_to_dlq(
+                self.inner.error_log.as_ref(),
+                &self.inner.metrics,
+                &self.inner.name,
+                events,
+                &wedge_err,
+            )
+            .await;
+        }
+        Ok(())
+    }
 }
 
 impl<P: BatchSinkPolicy> Drop for BatchedSink<P> {
