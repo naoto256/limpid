@@ -365,8 +365,12 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     ///   `route_event_to_dlq` and dispatch the returned
     ///   `DlqRouteOutcome` through `resolve_ack_from_dlq_outcome`, so
     ///   disk queues wedge on a configured-DLQ-write failure and
-    ///   memory queues fall back to `Recovered` with the JSONL
-    ///   trace as recovery material. The helper
+    ///   memory queues fall back to `Recovered`. The tracing-side
+    ///   fallback line is shaped by the operator's `error_log_fallback`
+    ///   ladder (`Off` = 1-line summary, `Meta` = structured
+    ///   metadata, `Full` = full JSONL via `event_record`) and is
+    ///   not treated as durable recovery material — the DLQ file
+    ///   is the load-bearing recovery target. The helper
     ///   `finalize_shutdown_singleton_disposition` bundles the
     ///   Ok/Err arms into a single call for sinks that do not need
     ///   custom branching.
@@ -425,14 +429,18 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     ///   variant `route_shutdown_batch_to_dlq`); the returned
     ///   `DlqRouteOutcome` is handed to `resolve_ack_from_dlq_outcome`,
     ///   which resolves as `Recovered` on any queue when the DLQ
-    ///   record was durably written (or when the JSONL tracing
-    ///   fallback ran because `error_log` was unset), and as
-    ///   `Dropped` on a disk queue when the configured DLQ file
-    ///   write itself failed (disk-queue fail-stop wedge holds the
-    ///   cursor for replay on next start). Memory queues cannot
-    ///   replay across restarts, so the same DLQ-write-failure
-    ///   shape resolves as `Recovered` there and the JSONL trace
-    ///   in `event_record` is the sole recovery material.
+    ///   record was durably written or when `error_log` was unset
+    ///   (the operator has declared no durable recovery is required
+    ///   and the tracing fallback runs per the `error_log_fallback`
+    ///   ladder — payload-free by default, `Meta` / `Full` only on
+    ///   explicit opt-in), and as `Dropped` on a disk queue when
+    ///   the configured DLQ file write itself failed (disk-queue
+    ///   fail-stop wedge holds the cursor for replay on next
+    ///   start). Memory queues cannot replay across restarts, so
+    ///   the same DLQ-write-failure shape resolves as `Recovered`
+    ///   there and the operator relies on `events_errored_unwritable`
+    ///   as the alarm signal (the tracing fallback line, whatever
+    ///   its ladder-selected shape, is best-effort, not load-bearing).
     ///
     /// `Drop` cannot do this work because it is synchronous and the
     /// sink-side I/O is async. The queue consumer calls `shutdown`
@@ -529,9 +537,12 @@ pub const SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Durat
 /// - `Ok(())` → `events_written++`, ack `Delivered`.
 /// - `Err(e)` → DLQ via `route_event_to_dlq`, `events_failed++`, and
 ///   dispatch the ack through `resolve_ack_from_dlq_outcome`: `Recovered`
-///   when the DLQ write succeeded (or when no `error_log` is configured
-///   — the payload is emitted to the tracing channel instead), and
-///   `Dropped` when a configured DLQ file was present but the write to
+///   when the DLQ write succeeded, or when no `error_log` is configured
+///   and the operator has declared no durable recovery is required —
+///   the tracing fallback runs per the `error_log_fallback` ladder
+///   (`Off` = payload-free summary by default, `Meta` / `Full` on
+///   explicit opt-in), not as a guaranteed recovery path. `Dropped`
+///   fires when a configured DLQ file was present but the write to
 ///   it failed. The `Dropped` arm on a disk queue triggers the
 ///   disk-queue fail-stop wedge so the cursor holds for a replay on
 ///   next start rather than silently advancing past an event with no
@@ -603,8 +614,13 @@ pub async fn finalize_shutdown_singleton_disposition(
 ///
 /// The DLQ record is written for operator visibility (even though
 /// the outcome is forced to `Dropped`), so reconciliation between
-/// the wedged position and the downstream is possible via
-/// `journalctl | jq` or the DLQ file.
+/// the wedged position and the downstream is possible from the
+/// DLQ file when configured. The tracing-side fallback line is
+/// shaped by the operator's `error_log_fallback` ladder — a
+/// `journalctl | jq` reconciliation path only exists on the
+/// explicit `Full` opt-in; `Off` (default) and `Meta` do not
+/// carry the payload bytes reconciliation would need. The DLQ
+/// file remains the load-bearing reconciliation source.
 pub async fn finalize_shutdown_singleton_disposition_ambiguous(
     result: Result<()>,
     error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
