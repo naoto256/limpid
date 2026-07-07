@@ -50,8 +50,8 @@ Every event handed to an output resolves to one of three dispositions:
 | Disposition | Meaning | Disk queue cursor | Memory queue cursor | Metrics |
 |-------------|---------|-------------------|---------------------|---------|
 | `Delivered` | Sink confirmed the send. | advances | advances | `events_written++` |
-| `Recovered` | Send failed, but the failure record was durably written (`error_log` file or a full-payload `tracing::error!` line when `error_log` is unset). | advances | advances | `events_failed++` |
-| `Dropped` | Send failed *and* no durable failure record was written (DLQ-write failure, bug / panic in the sink, runtime task abort past shutdown budget). | **holds — fail-stop wedge; consumer stops accepting new events and replays on next daemon start** | advances (memory queues cannot replay) | `events_failed++`, `events_wedged++` on disk queues |
+| `Recovered` | Send failed, and either the failure record was durably written to `error_log`, or `error_log` is unset so the operator has declared no durable recovery is required (the tracing fallback runs per the `error_log_fallback` ladder and is best-effort, not load-bearing). | advances | advances | `events_failed++` |
+| `Dropped` | Send failed *and* no durable failure record was written (configured DLQ-file write failure, bug / panic in the sink, runtime task abort past shutdown budget, or an ambiguous shutdown-drain failure where the wire state cannot be proved and a `Recovered` disposition would fabricate at-least-once). | **holds — fail-stop wedge; consumer stops accepting new events and replays on next daemon start** | advances (memory queues cannot replay) | `events_failed++`, `events_wedged++` on disk queues |
 
 The **fail-stop wedge** on disk queues is intentional. Holding the cursor guarantees that no event is silently lost on a durable queue; the trade-off is that the affected output's pipeline halts until an operator investigates and restarts the daemon. Both **unbatched sinks** (`file`, `stdout`, `unix_socket`, `syslog_tcp`, `syslog_udp`, `kafka`) and **batched sinks** (`http`, `otlp_http`, `otlp_grpc`) exit the wedge cleanly — unbatched sinks resolve each ack synchronously inside `consume`, so `in-flight == 0` at wedge time; batched sinks take a separate wedge-exit path that resolves parked buffer entries as ambiguous DLQ records without attempting any further send. See [Error Log → Disposition contract and fail-stop wedge on disk queues](../operations/error-log.md#disposition-contract-and-fail-stop-wedge-on-disk-queues) for the operator runbook.
 
@@ -95,11 +95,20 @@ The `"full"` value restores the pre-0.7.9 shape (full JSONL on the tracing line)
 > `systemctl stop`, or an explicit `shutdown()` call. The bounded
 > final drain runs one attempt per parked payload with a 3-second
 > `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT` (plus the per-actor in-flight
-> cancel); drain failures land in the error log as Output-flavor
-> `Recovered` records. **`SIGKILL` (`kill -9`) cannot run this
-> path** — actor tasks are aborted and their stack-local buffers go
-> with them. Operators should not send `SIGKILL` directly to the
-> daemon; keep systemd's `KillSignal=SIGTERM` default in place.
+> cancel). Drain failures whose wire state can be proved
+> pre-boundary (e.g. render failure, permission drop before any
+> byte hit the transport) land in the error log as Output-flavor
+> `Recovered` records; drain failures where the wire state is
+> ambiguous (batched send cancelled mid-flight by shutdown, or
+> the 3-second attempt timeout firing after the first request
+> byte already left the kernel) route through the ambiguous DLQ
+> path and force `Dropped` on a disk queue so the fail-stop wedge
+> reconciles against the DLQ record on next start, while memory
+> queues fold to `Recovered` for lack of a replay path. **`SIGKILL`
+> (`kill -9`) cannot run either path** — actor tasks are aborted
+> and their stack-local buffers go with them. Operators should
+> not send `SIGKILL` directly to the daemon; keep systemd's
+> `KillSignal=SIGTERM` default in place.
 
 ## Usage in pipelines
 

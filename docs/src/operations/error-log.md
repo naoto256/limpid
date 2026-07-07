@@ -469,7 +469,7 @@ Once the underlying issue is fixed, the next errored event lands in the file aga
 Every event handed to an output resolves to one of three `AckDisposition` values:
 
 - **`Delivered`** — the output confirmed the send. Cursor advances on both memory and disk queues; `events_written` ticks.
-- **`Recovered`** — the send failed but the failure record was durably written (`error_log` file, or a structured `tracing::error!` line when `error_log` is unset). Cursor advances on both memory and disk queues; `events_failed` ticks.
+- **`Recovered`** — the send failed and either the failure record was durably written to `error_log`, or `error_log` is unset so the operator has declared no durable recovery is required. The tracing-side fallback line runs per the `error_log_fallback` [ladder](#tracing-fallback-ladder-error_log_fallback) — payload-free summary by default, structured metadata on `"meta"`, full JSONL on `"full"` — and is best-effort, not load-bearing. Cursor advances on both memory and disk queues; `events_failed` ticks.
 - **`Dropped`** — the output could not confirm the send *and* could not durably record the failure. Cursor **holds** on a disk queue and **advances** on a memory queue; `events_failed` ticks.
 
 Three paths reach `Dropped`:

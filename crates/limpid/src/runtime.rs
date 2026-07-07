@@ -56,13 +56,16 @@ impl Runtime {
         // Optional dead-letter queue for events that fail in `process`
         // or that an output drops after exhausting retries
         // (retry-exhausted recovery). `control { error_log "..." }`
-        // opts in to file-based recovery; when unset, the runtime
-        // falls back to a structured `tracing::warn!` / `error!` line
-        // (pipeline path emits the full JSONL on the tracing line; the
-        // output path emits the failure summary without the full
-        // payload). The path is validated at startup (parent dir
-        // reachable) so operator typos surface before the first
-        // failure event.
+        // opts in to file-based recovery; when unset, every emission
+        // site delegates to `emit_dlq_tracing_fallback`, which
+        // enforces the operator's `error_log_fallback` ladder —
+        // payload-free summary by default (`Off`), structured
+        // metadata on `Meta`, or full JSONL via `event_record`
+        // on `Full`. Pipeline-side and sink-side paths share the
+        // same helper, so the ladder shape is identical across
+        // both surfaces. The path is validated at startup (parent
+        // dir reachable) so operator typos surface before the
+        // first failure event.
         //
         // Built *before* outputs are constructed so each batched output
         // (`http`, `otlp_http`, `otlp_grpc`) receives the handle via
