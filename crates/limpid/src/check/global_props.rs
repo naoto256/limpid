@@ -29,6 +29,13 @@ const CONTROL_SCHEMA: &[PropertySpec] = &[
         exclusive_group: None,
         kind: PropertyValueKind::String,
     },
+    PropertySpec {
+        name: "error_log_fallback",
+        required: false,
+        repeatable: false,
+        exclusive_group: None,
+        kind: PropertyValueKind::String,
+    },
 ];
 
 const GEOIP_SCHEMA: &[PropertySpec] = &[PropertySpec {

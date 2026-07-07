@@ -207,6 +207,13 @@ pub(crate) struct SinkShared<P: BatchSinkPolicy> {
     /// `control { error_log "..." }` — the flush path then falls
     /// back to a `tracing` log line.
     pub(crate) error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+    /// Operator-selected confidentiality policy for the tracing-side
+    /// fallback line — see [`crate::error_log::ErrorLogFallback`].
+    /// Passed through to `route_event_to_dlq` /
+    /// `route_shutdown_batch_to_dlq` /
+    /// `route_shutdown_batch_ambiguous_to_dlq` from every emission
+    /// site so all three ladder states surface consistently.
+    pub(crate) error_log_fallback: crate::error_log::ErrorLogFallback,
     metrics: Arc<OutputMetrics>,
     /// Threshold-driven flush trigger. `consume()` calls
     /// `notify_one()` when the buffer crosses `batch_size`; the
@@ -241,6 +248,7 @@ impl<P: BatchSinkPolicy> BatchedSink<P> {
         batch_timeout: Duration,
         retry: RetryConfig,
         error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+        error_log_fallback: crate::error_log::ErrorLogFallback,
         metrics: Arc<OutputMetrics>,
         shutdown_signal: watch::Receiver<bool>,
     ) -> Self {
@@ -256,6 +264,7 @@ impl<P: BatchSinkPolicy> BatchedSink<P> {
             permits: Arc::new(Semaphore::new(permit_capacity)),
             shutdown_signal,
             error_log,
+            error_log_fallback,
             metrics,
             flush_notify: Notify::new(),
             shutdown_notify: Notify::new(),
@@ -434,6 +443,7 @@ impl<P: BatchSinkPolicy> BatchedSink<P> {
             let events = strip_permits(leftover);
             crate::modules::route_shutdown_batch_ambiguous_to_dlq(
                 self.inner.error_log.as_ref(),
+                self.inner.error_log_fallback,
                 &self.inner.metrics,
                 &self.inner.name,
                 events,
@@ -579,6 +589,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
             let reason = format!("render failed during {}: {}", site, err);
             let __dlq_outcome = crate::modules::route_event_to_dlq(
                 self.error_log.as_ref(),
+                self.error_log_fallback,
                 &self.metrics,
                 &self.name,
                 &ev,
@@ -622,6 +633,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
             let reason = "collector reported partial_success rejection".to_string();
             let __dlq_outcome = crate::modules::route_event_to_dlq(
                 self.error_log.as_ref(),
+                self.error_log_fallback,
                 &self.metrics,
                 &self.name,
                 &ev,
@@ -657,6 +669,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                 for (ev, ack, _permit) in shippable {
                     let __dlq_outcome = crate::modules::route_event_to_dlq(
                         self.error_log.as_ref(),
+                        self.error_log_fallback,
                         &self.metrics,
                         &self.name,
                         &ev,
@@ -791,6 +804,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
         if shutdown_cancelled_send {
             crate::modules::route_shutdown_batch_ambiguous_to_dlq(
                 self.error_log.as_ref(),
+                self.error_log_fallback,
                 &self.metrics,
                 &self.name,
                 strip_permits(shippable),
@@ -802,6 +816,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
             for (ev, ack, _permit) in shippable {
                 let __dlq_outcome = crate::modules::route_event_to_dlq(
                     self.error_log.as_ref(),
+                    self.error_log_fallback,
                     &self.metrics,
                     &self.name,
                     &ev,
@@ -837,6 +852,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                 let err = anyhow::anyhow!("transport error: {}", e);
                 crate::modules::route_shutdown_batch_to_dlq(
                     self.error_log.as_ref(),
+                    self.error_log_fallback,
                     &self.metrics,
                     &self.name,
                     strip_permits(shippable),
@@ -859,6 +875,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                 let err = anyhow::anyhow!("transport error: {}", send_err);
                 crate::modules::route_shutdown_batch_to_dlq(
                     self.error_log.as_ref(),
+                    self.error_log_fallback,
                     &self.metrics,
                     &self.name,
                     strip_permits(shippable),
@@ -878,6 +895,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                 );
                 crate::modules::route_shutdown_batch_ambiguous_to_dlq(
                     self.error_log.as_ref(),
+                    self.error_log_fallback,
                     &self.metrics,
                     &self.name,
                     strip_permits(shippable),

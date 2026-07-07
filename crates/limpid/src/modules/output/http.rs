@@ -408,6 +408,7 @@ impl Module for HttpOutput {
             batch_timeout,
             retry,
             error_log,
+            ctx.error_log_fallback,
             Arc::clone(&metrics),
             ctx.shutdown_signal.clone(),
         );

@@ -41,7 +41,7 @@ def output reliable {
 }
 ```
 
-`retry` is accepted by every output type. Retry-exhausted payloads are persisted to `control { error_log "..." }` (see [Recovery (error_log)](#recovery-error_log) below) when configured. When `error_log` is unset, the payload is emitted as a `tracing::error!` line carrying the full JSONL in an `event_record` structured field (so `journalctl | jq` can still extract and replay it) and the event resolves as `Recovered` — `events_failed` counts every terminal failure once, disk vs memory queue agnostic, via `resolve_ack_from_dlq_outcome`.
+`retry` is accepted by every output type. Retry-exhausted payloads are persisted to `control { error_log "..." }` (see [Recovery (error_log)](#recovery-error_log) below) when configured. When `error_log` is unset, the runtime emits a one-line `tracing::error!` summary per failure with no payload (a confidentiality-preserving default) and the event resolves as `Recovered` — `events_failed` counts every terminal failure once, disk vs memory queue agnostic, via `resolve_ack_from_dlq_outcome`. An operator who wants payload metadata or the full JSONL on the tracing side opts in explicitly via `control { error_log_fallback "meta" | "full" }`; that setting only takes effect when `error_log` is also configured (see [Recovery (error_log)](#recovery-error_log) for the ladder).
 
 ### Disposition contract
 
@@ -77,7 +77,18 @@ The daemon-wide [`control { error_log "..." }`](../operations/error-log.md) bloc
 
 Each line is one per-event record carrying `event.egress` — the **pipeline-produced payload** at the moment it was handed to the sink (`egress` starts as a clone of `ingress` and is overwritten as the pipeline's process bodies run). Replay via `limpidctl inject output <name> --json` re-injects the event into the named sink's `consume()` path — the pipeline is **bypassed**, but the sink's own transport-level rendering (batched encode, HTTP body framing, OTLP `ResourceLogs` packing, etc.) **does** re-run. See [Error Log → Output flavor](../operations/error-log.md#output-flavor) for the full record shape and producer-site catalog.
 
-When `error_log` is unset, Output-flavor records fall back to a `tracing::error!` line carrying the full JSONL in an `event_record` structured field — the same shape Process-flavor uses — so `journalctl | jq` can extract and replay the record. This is strictly worse than a dedicated DLQ file (log rotation, aggregation delays, tracing filters) but the payload is not lost. `limpid --check` emits a recovery-readiness warning so operators notice the missing configuration before the first failure.
+When `error_log` is unset, Output-flavor records fall back to a one-line `tracing::error!` summary (site + reason, no payload) and the event resolves as `Recovered`. The payload is not persisted anywhere by default — operators who want the metadata or the full JSONL on the tracing side must explicitly opt in with `control { error_log_fallback "meta" | "full" }`, and that opt-in only takes effect when `error_log` is also configured (see the ladder table below). `limpid --check` emits a recovery-readiness warning so operators notice the missing configuration before the first failure, plus a separate warning when `error_log_fallback` is set while `error_log` is unset (the fallback is inert in that combination).
+
+**`error_log_fallback` ladder.** The tracing fallback line carries different fields depending on the operator's confidentiality choice. All rows preserve the same ack disposition — only the tracing emission differs.
+
+| `error_log` | `error_log_fallback` | tracing line body                                                                              |
+|-------------|----------------------|------------------------------------------------------------------------------------------------|
+| unset       | (any — value ignored)| one-line summary (site + reason), no payload, no metadata                                      |
+| set         | unset / `"off"`      | one-line summary; `error_log` write-failure noted                                              |
+| set         | `"meta"`             | structured metadata (`kind`, `fallback`, `reason`, `timestamp`, `size`, `position`); no payload |
+| set         | `"full"`             | `event_record = <full JSONL>` — payload may reach journald / log aggregation                    |
+
+The `"full"` value restores the pre-0.7.9 shape (full JSONL on the tracing line) for operators who want a journald-based recovery trail; it exposes the pipeline egress bytes to the tracing subscriber, so treat it as an opt-in for environments where the journald boundary is trusted.
 
 > **Graceful shutdown vs. SIGKILL.** The shutdown-drain path above
 > only fires on **graceful** shutdown — `SIGTERM`, `SIGHUP` reload,

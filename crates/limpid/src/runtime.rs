@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::sync::{mpsc, watch};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::control::ControlServer;
 use crate::dsl::ast::*;
@@ -84,12 +84,37 @@ impl Runtime {
             None => None,
         };
 
+        // Fallback policy for the tracing line when `error_log` write
+        // fails or is unset. Parsed here so invalid values fail
+        // daemon startup (matching `--check`'s config-time refusal).
+        let error_log_fallback = match config
+            .global_blocks
+            .get("control")
+            .and_then(|p| props::get_string(p, "error_log_fallback"))
+        {
+            Some(s) => crate::error_log::ErrorLogFallback::parse(&s)
+                .map_err(|e| anyhow::anyhow!("{}", e))?,
+            None => crate::error_log::ErrorLogFallback::default(),
+        };
+        if error_log.is_none()
+            && error_log_fallback != crate::error_log::ErrorLogFallback::default()
+        {
+            warn!(
+                "control.error_log_fallback = \"{}\" is set but control.error_log is unset — \
+                 tracing fallback stays payload-free because no durable DLQ was requested; \
+                 either set control.error_log to opt into the fallback, or remove \
+                 control.error_log_fallback to silence this warning",
+                error_log_fallback.as_str(),
+            );
+        }
+
         // Single bundle threaded into every Input/Output factory. Future
         // build-time dependencies (transport-key registry, metrics hooks)
         // land as new fields on this struct rather than as new parameters.
         let build_ctx = crate::modules::BuildContext {
             funcs: Arc::clone(&func_registry),
             error_log: error_log.as_ref().map(Arc::clone),
+            error_log_fallback,
             shutdown_signal: shutdown_rx.clone(),
         };
 
@@ -221,6 +246,7 @@ impl Runtime {
                 funcs: Arc::clone(&func_registry),
                 tap: tap.clone(),
                 error_log: error_log.as_ref().map(Arc::clone),
+                error_log_fallback,
             };
             let iname = input_name.clone();
             let shutdown_for_worker = shutdown_rx.clone();
@@ -420,6 +446,11 @@ struct PipelineContext {
     /// recoverable from journald in either case, and both converge
     /// on the same file once `error_log` is configured.
     error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+    /// Operator-selected confidentiality policy for the tracing-side
+    /// fallback line. Threaded through `write_errored_to_dlq` so the
+    /// pipeline-side runtime error surface obeys the same ladder as
+    /// the sink-side DLQ paths.
+    error_log_fallback: crate::error_log::ErrorLogFallback,
 }
 
 // ---------------------------------------------------------------------------
@@ -681,6 +712,7 @@ async fn process_event(
                                     err_ctx,
                                     &worker.metrics,
                                     ctx.error_log.as_ref(),
+                                    ctx.error_log_fallback,
                                 )
                                 .await;
                             }
@@ -726,7 +758,13 @@ async fn process_event(
                     reason: e.to_string(),
                     event: crate::pipeline::ProcessEvent::from_owned(&owned),
                 };
-                write_errored_to_dlq(&err_ctx, &worker.metrics, ctx.error_log.as_ref()).await;
+                write_errored_to_dlq(
+                    &err_ctx,
+                    &worker.metrics,
+                    ctx.error_log.as_ref(),
+                    ctx.error_log_fallback,
+                )
+                .await;
             }
         }
     }
@@ -749,6 +787,7 @@ async fn write_errored_to_dlq(
     err_ctx: &crate::pipeline::ErroredEventContext,
     worker_metrics: &PipelineMetrics,
     error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
+    error_log_fallback: crate::error_log::ErrorLogFallback,
 ) {
     match error_log {
         Some(writer) => {
@@ -756,22 +795,25 @@ async fn write_errored_to_dlq(
                 worker_metrics
                     .events_errored_unwritable
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                error!(
-                    event_record = %err_ctx.to_jsonl(),
-                    "error_log: write failed: {} — record below for manual recovery",
-                    e
+                crate::modules::emit_dlq_tracing_fallback(
+                    /* error_log_configured */ true,
+                    error_log_fallback,
+                    err_ctx,
+                    None,
+                    Some(&e),
                 );
             }
         }
         None => {
-            // No DLQ configured — surface the record as a structured
-            // tracing line so the failure data is never silently
-            // lost. Operators can grep / `journalctl | jq` it.
-            error!(
-                event_record = %err_ctx.to_jsonl(),
-                "pipeline '{}': site '{}' errored; configure `control {{ error_log \"...\" }}` for file-based DLQ",
-                err_ctx.pipeline(),
-                err_ctx.site()
+            // No DLQ configured — payload-free tracing per ladder
+            // row-A. Operator declared no durable recovery is
+            // required; the summary line is all that surfaces.
+            crate::modules::emit_dlq_tracing_fallback(
+                /* error_log_configured */ false,
+                error_log_fallback,
+                err_ctx,
+                None,
+                None,
             );
         }
     }
@@ -865,6 +907,7 @@ mod tests {
             funcs: Arc::new(FunctionRegistry::new()),
             tap: tap.clone(),
             error_log: None,
+            error_log_fallback: crate::error_log::ErrorLogFallback::default(),
         };
         let ctx_b = PipelineContext {
             output_senders: Arc::clone(&ctx_a.output_senders),
@@ -872,6 +915,7 @@ mod tests {
             funcs: Arc::clone(&ctx_a.funcs),
             tap: tap.clone(),
             error_log: None,
+            error_log_fallback: crate::error_log::ErrorLogFallback::default(),
         };
 
         let workers_a = Arc::clone(&workers);
@@ -935,7 +979,13 @@ mod tests {
         let metrics = PipelineMetrics::default();
         let err_ctx = make_err_ctx("simulated runtime error");
 
-        write_errored_to_dlq(&err_ctx, &metrics, Some(&writer)).await;
+        write_errored_to_dlq(
+            &err_ctx,
+            &metrics,
+            Some(&writer),
+            crate::error_log::ErrorLogFallback::default(),
+        )
+        .await;
 
         // Errored counter is bumped at the caller (worker.metrics);
         // the helper itself only writes. Verify the JSONL is on disk.
@@ -969,7 +1019,13 @@ mod tests {
         let metrics = PipelineMetrics::default();
         let err_ctx = make_err_ctx("no DLQ configured");
 
-        write_errored_to_dlq(&err_ctx, &metrics, None).await;
+        write_errored_to_dlq(
+            &err_ctx,
+            &metrics,
+            None,
+            crate::error_log::ErrorLogFallback::default(),
+        )
+        .await;
 
         // Sanity: no metric is touched on this branch (the caller
         // already bumped events_errored before calling us).
@@ -1000,6 +1056,7 @@ mod tests {
             funcs: Arc::new(FunctionRegistry::new()),
             tap: TapRegistry::new(),
             error_log: None,
+            error_log_fallback: crate::error_log::ErrorLogFallback::default(),
         };
 
         let addr = SocketAddr::from_str("127.0.0.1:0").unwrap();

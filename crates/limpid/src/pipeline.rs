@@ -353,17 +353,37 @@ impl OutputEvent {
 }
 
 impl ErroredEventContext {
-    /// Pipeline name accessor (empty string for runtime-side Output records).
-    pub fn pipeline(&self) -> &str {
-        match self {
-            Self::Process { pipeline, .. } | Self::Output { pipeline, .. } => pipeline,
-        }
-    }
-
     /// Failure-site accessor.
     pub fn site(&self) -> &str {
         match self {
             Self::Process { site, .. } | Self::Output { site, .. } => site,
+        }
+    }
+
+    /// Reason string accessor.
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Process { reason, .. } | Self::Output { reason, .. } => reason,
+        }
+    }
+
+    /// Wall-clock timestamp accessor.
+    pub fn timestamp(&self) -> chrono::DateTime<chrono::Utc> {
+        match self {
+            Self::Process { timestamp, .. } | Self::Output { timestamp, .. } => *timestamp,
+        }
+    }
+
+    /// Byte-length hint of the recoverable payload — `egress` on
+    /// Output flavor (that is what a replay would ship), `ingress`
+    /// on Process flavor (that is what a replay would re-enter). Used
+    /// by the `Meta` tracing fallback so operators can correlate
+    /// journald records with their pipeline / output metrics
+    /// without the payload bytes themselves leaving the daemon.
+    pub fn payload_size_hint(&self) -> usize {
+        match self {
+            Self::Process { event, .. } => event.ingress.len(),
+            Self::Output { event, .. } => event.egress.len(),
         }
     }
 }

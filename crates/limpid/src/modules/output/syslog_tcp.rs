@@ -176,6 +176,7 @@ pub struct SyslogTcpOutput {
     connectors: Vec<Option<TlsConnector>>,
     retry: RetryConfig,
     error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
+    error_log_fallback: crate::error_log::ErrorLogFallback,
     metrics: Arc<OutputMetrics>,
     shutdown_signal: tokio::sync::watch::Receiver<bool>,
 }
@@ -220,6 +221,7 @@ impl Module for SyslogTcpOutput {
             connectors,
             retry,
             error_log,
+            error_log_fallback: ctx.error_log_fallback,
             metrics: Arc::new(OutputMetrics::default()),
             shutdown_signal: ctx.shutdown_signal.clone(),
         })
@@ -370,6 +372,7 @@ impl Output for SyslogTcpOutput {
                     );
                     let __dlq_outcome = crate::modules::route_event_to_dlq(
                         self.error_log.as_ref(),
+                        self.error_log_fallback,
                         &self.metrics,
                         &self.name,
                         event,
@@ -394,6 +397,7 @@ impl Output for SyslogTcpOutput {
                             format!("output write failed after {} attempts: {}", attempt, e);
                         let __dlq_outcome = crate::modules::route_event_to_dlq(
                             self.error_log.as_ref(),
+                            self.error_log_fallback,
                             &self.metrics,
                             &self.name,
                             event,
@@ -430,6 +434,7 @@ impl Output for SyslogTcpOutput {
                         );
                         let __dlq_outcome = crate::modules::route_event_to_dlq(
                             self.error_log.as_ref(),
+                            self.error_log_fallback,
                             &self.metrics,
                             &self.name,
                             event,
@@ -479,6 +484,7 @@ impl Output for SyslogTcpOutput {
         crate::modules::finalize_shutdown_singleton_disposition_ambiguous(
             result,
             self.error_log.as_ref(),
+            self.error_log_fallback,
             &self.metrics,
             &self.name,
             event,

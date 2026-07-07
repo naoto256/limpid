@@ -33,12 +33,23 @@ control {
 }
 ```
 
-When unset, the fallback differs by flavor:
+When `error_log` is unset, the daemon emits a one-line `tracing::error!` summary per failure — site + reason, no payload. Both flavors (Process and Output) behave the same on the unset path: the operator has declared no durable recovery is required, and the tracing side stays payload-free by default. To attach metadata or the full JSONL to the tracing line, opt in via `control { error_log_fallback "meta" | "full" }` — the ladder is documented in [Tracing fallback ladder](#tracing-fallback-ladder-error_log_fallback) below.
 
-- **Process flavor** — the daemon emits a `tracing::error!` line that includes the full failure JSONL inline, so the data is still preserved on the standard log channel. Replay is awkward (you have to `jq` over journald, no `limpidctl inject` shortcut) but the original event is recoverable.
-- **Output flavor** — every failure site (retry exhaustion, sink-side shutdown drain, enqueue failure) emits a `tracing::error!` line with the full failure JSONL in an `event_record` structured field, matching the Process-flavor shape. Operators can `jq` the record out of journald and replay it via `limpidctl inject output <name> --json`. Once `error_log` is configured, all three sites converge on the same DLQ file.
+For any pipeline that uses `retry { ... }` or a batched output (`http`, `otlp_http`, `otlp_grpc`), `limpid --check` raises a recovery-readiness warning when `error_log` is not configured; see [Recovery readiness check](#recovery-readiness-check---check) below. A separate `--check` warning fires when `error_log_fallback` is set but `error_log` is unset (the fallback is inert in that combination).
 
-For any pipeline that uses `retry { ... }` or a batched output (`http`, `otlp_http`, `otlp_grpc`), `limpid --check` raises a recovery-readiness warning when `error_log` is not configured; see [Recovery readiness check](#recovery-readiness-check---check) below.
+### Tracing fallback ladder (`error_log_fallback`)
+
+The `error_log` file is a 0o600 confidentiality boundary the operator has already tightened. The tracing fallback lands in journald / whatever log aggregation is attached, whose access controls are usually weaker, so what appears there is a separate operator decision. `control { error_log_fallback "..." }` picks one of three states:
+
+| Value    | Line body                                                                                                  |
+|----------|------------------------------------------------------------------------------------------------------------|
+| `"off"`  | (default) one-line failure summary — `kind`, `output` / `pipeline` name, `site`, `reason`. No payload, no metadata. |
+| `"meta"` | structured metadata — adds `fallback = "meta"`, `timestamp`, `size` (bytes of the recoverable payload), and `position` (queue kind + numeric offset/seq only, no filesystem path). Still no payload bytes, no full JSONL, no headers, no operator-populated labels. |
+| `"full"` | pre-0.7.9 shape — adds `event_record` carrying the full JSONL (ingress / egress bytes included). This exposes the pipeline egress bytes to the tracing subscriber; use only in environments where the journald boundary is trusted. |
+
+**Row-A rule.** When `error_log` is unset the fallback value is ignored — the operator has declared "no durable recovery needed" by omitting `error_log`, and honouring a stray `error_log_fallback "full"` on that path would contradict the declaration. Runtime, startup, and `--check` all enforce this ordering; startup and `--check` emit a warning surfacing the inert combination.
+
+**Disposition invariance.** The ladder shapes the *tracing emission* only. The ack disposition (Delivered / Recovered / Dropped), the disk-queue fail-stop wedge, and the memory-queue fold to Recovered are unchanged by the fallback value — an operator can move up or down the ladder without altering queue cursor semantics.
 
 The path must be in a directory the daemon user can write to, and the **parent directory itself** must not be a symlink — the daemon inspects the final parent component with `symlink_metadata` and refuses a symlink parent because it would let an attacker redirect DLQ writes between the preflight and the runtime write path. Ancestor components may still be symlinks (e.g. `/var/run` → `/run` on modern Linux); ancestor path identity is a **deployment contract**, and pointing `error_log` at a `/run/limpid/...` path avoids the symlink final-parent shape.
 
@@ -183,7 +194,9 @@ The trade-off: an operator who needs to know *which peer failed* for an `<output
 
 ### Recovery readiness check (`--check`)
 
-Since 0.7.8, `limpid --check` emits a recovery-readiness warning when any output declares `retry` or is a batched OTLP/HTTP output and `control { error_log }` is unset. Without `error_log`, every Output-flavor recovery path (retry exhausted, shutdown drain, enqueue failure) still emits the full JSONL on a `tracing::error!` line via an `event_record` structured field — the same shape Process-flavor uses — so `journalctl | jq` can extract and replay the record, but the workflow is much more fragile than a dedicated DLQ file (log rotation, aggregation delays, tracing filters). The warning catches the missing configuration before the first failure.
+Since 0.7.8, `limpid --check` emits a recovery-readiness warning when any output declares `retry` or is a batched OTLP/HTTP output and `control { error_log }` is unset. Without `error_log`, every Output-flavor recovery path (retry exhausted, shutdown drain, enqueue failure) emits only a one-line `tracing::error!` summary — the payload is not persisted anywhere unless `error_log` is set and `error_log_fallback` is opted up the [ladder](#tracing-fallback-ladder-error_log_fallback). The warning catches the missing configuration before the first failure.
+
+A separate `--check` warning fires when `control { error_log_fallback "..." }` is set while `control { error_log "..." }` is unset — the fallback is a confidentiality opt-in for the tracing side of a *configured* DLQ path, and has no effect on its own. Either add `error_log` to activate the fallback, or drop `error_log_fallback` to silence the warning.
 
 Since 0.7.8, the cursor a `tail` / `journal` input persists to its `state_file` advances on **pipeline-worker completion**, not on channel hand-off. A crash mid-processing now leaves the on-disk cursor pointing to the last *processed* line, so the next start re-reads any events that were in flight — closing the previous at-most-once gap and moving recovery toward at-least-once.
 
