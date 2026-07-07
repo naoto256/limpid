@@ -120,7 +120,11 @@ impl ModuleProperties {
                     value_span,
                     ..
                 } => {
-                    let Some(first) = parts.first() else {
+                    // Single-segment idents only. `type kafka.output` is
+                    // rejected as `NonIdent` — otherwise the multi-segment
+                    // `ident_path` from the grammar would silently truncate
+                    // to the first segment and resolve as `kafka`.
+                    let [first] = parts.as_slice() else {
                         return Err(ModulePropertyError::NonIdent { span: *value_span });
                     };
                     if type_name.is_some() {
@@ -244,6 +248,28 @@ mod tests {
     fn parse_rejects_non_ident_type_block() {
         // `type { ... }` — block instead of value
         let raw = vec![block("type")];
+        let err = ModuleProperties::parse(raw).expect_err("should fail");
+        assert!(matches!(err, ModulePropertyError::NonIdent { .. }));
+    }
+
+    #[test]
+    fn parse_rejects_multi_segment_type_ident() {
+        // `type kafka.output` — the parser produces
+        // `ExprKind::Ident(vec!["kafka", "output"])` via the `ident_path`
+        // rule. `parse` must reject this rather than silently truncating
+        // to the first segment.
+        let raw = vec![kv(
+            "type",
+            ExprKind::Ident(vec!["kafka".into(), "output".into()]),
+        )];
+        let err = ModuleProperties::parse(raw).expect_err("should fail");
+        assert!(matches!(err, ModulePropertyError::NonIdent { .. }));
+    }
+
+    #[test]
+    fn parse_rejects_empty_ident_path() {
+        // Defensive: `Ident(vec![])` should also fail as `NonIdent`.
+        let raw = vec![kv("type", ExprKind::Ident(vec![]))];
         let err = ModuleProperties::parse(raw).expect_err("should fail");
         assert!(matches!(err, ModulePropertyError::NonIdent { .. }));
     }
