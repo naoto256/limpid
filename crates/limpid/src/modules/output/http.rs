@@ -211,8 +211,21 @@ fn parse_peer(name: &str, peer_props: &[Property], verify: bool) -> Result<HttpP
     let has_tls_block = tls_block.is_some();
 
     if !is_https && has_tls_block {
-        tracing::warn!(
-            "output '{}': 'tls' block on peer '{}' has no effect on non-HTTPS URL",
+        // A `tls { ... }` block on a plaintext (`http://` or
+        // scheme-less) URL is almost always an operator error:
+        // reqwest only engages the TLS layer when the URL scheme
+        // is https, so the configured CA / client identity is
+        // silently dropped and the daemon ships requests in clear
+        // text. The earlier shape emitted a `tracing::warn!` at
+        // build time and continued, which meant an operator who
+        // added a `tls { ca ... }` line to lock down egress could
+        // still be shipping plaintext bytes to the peer while
+        // trusting the config had done what it said. Refuse at
+        // parse time so the misconfiguration is visible instead of
+        // hidden in the startup log. Mirrors the matching guard in
+        // `output otlp_http` and `output otlp_grpc`.
+        anyhow::bail!(
+            "output '{}': http peer url '{}' uses a plaintext scheme but a tls {{ ... }} block was supplied — switch the url to https:// or drop the tls block",
             name,
             url
         );
@@ -721,6 +734,67 @@ mod tests {
         .unwrap();
         assert_eq!(output.sink.inner.policy.peers.len(), 3);
         assert_eq!(output.sink.inner.policy.peers[2].url, "http://c:8080/");
+    }
+
+    #[test]
+    fn rejects_tls_block_on_plaintext_url() {
+        // `tls { ... }` on a plaintext (`http://` or scheme-less)
+        // URL is almost always an operator error — reqwest only
+        // engages the TLS layer when the scheme is https, so the
+        // configured CA / client identity is silently dropped
+        // and the daemon ships plaintext. Fail fast at parse
+        // time. Mirrors the matching guard in `output otlp_http`
+        // and `output otlp_grpc`.
+        let props = vec![Property::Block {
+            key: "peer".into(),
+            key_span: None,
+            properties: vec![
+                prop_str("url", "http://x:8080/"),
+                Property::Block {
+                    key: "tls".into(),
+                    key_span: None,
+                    properties: vec![prop_str("ca", "/etc/ca.pem")],
+                },
+            ],
+        }];
+        let err = HttpOutput::from_properties(
+            "o",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .err()
+        .unwrap();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("plaintext") && msg.contains("https://"),
+            "expected the error to name the mismatch and the fix; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn accepts_tls_block_on_https_url() {
+        // Regression guard for the plaintext-rejection check:
+        // `https://` URLs must still accept an (empty) tls block
+        // so no on-disk file is required for the round-trip.
+        let props = vec![Property::Block {
+            key: "peer".into(),
+            key_span: None,
+            properties: vec![
+                prop_str("url", "https://x:8443/"),
+                Property::Block {
+                    key: "tls".into(),
+                    key_span: None,
+                    properties: vec![],
+                },
+            ],
+        }];
+        let output = HttpOutput::from_properties(
+            "o",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
+        assert_eq!(output.sink.inner.policy.peers.len(), 1);
     }
 
     #[test]

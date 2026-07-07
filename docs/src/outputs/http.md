@@ -110,6 +110,7 @@ Per peer:
 | `https://` URL, no `tls` block | Validate server cert against system CA store |
 | `https://` URL, `tls { ca "..." }` | Add custom CA for private PKI |
 | `https://` URL, `tls { ca cert key }` | mTLS — present `cert`/`key` as client identity |
+| `http://` URL, `tls { ... }` block | **Rejected at load time.** reqwest only engages TLS for `https://`, so the tls settings would be silently dropped and the daemon would ship plaintext. Switch the url to `https://` or drop the tls block. |
 | `verify false` (top-level) | Skip all certificate validation for every peer |
 
 > **Warning**: `verify false` disables TLS certificate validation entirely — the
