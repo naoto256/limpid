@@ -11,6 +11,11 @@ on:
 # `Swatinem/rust-cache` works in read-only fallback without an explicit
 # `actions: write` grant — fine for a solo-dev workflow where the
 # cache hit rate is acceptable. No GitHub API writes from this job.
+#
+# Cache saves are gated on non-PR events (see `save-if:` on each
+# `Swatinem/rust-cache` step below). PR runs can still restore an
+# existing cache but cannot write one back, so a hostile PR cannot
+# poison the cache that a subsequent trusted `push` run would restore.
 permissions:
   contents: read
 
@@ -32,6 +37,8 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # pin-audit:2026-05-21 e18b497 | v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Build
         run: cargo build --workspace
@@ -94,6 +101,7 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # pin-audit:2026-05-21 e18b497 | v2
         with:
           key: kafka-journal
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Build (kafka + journal)
         run: cargo build --workspace --features kafka,journal
@@ -131,6 +139,7 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # pin-audit:2026-05-21 e18b497 | v2
         with:
           key: supply-chain
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       # 0.18.6 is the minimum that parses CVSS v4.0 advisories in
       # the RustSec database — 0.16.x errors on entries with the

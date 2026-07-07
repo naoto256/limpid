@@ -121,7 +121,7 @@ pub(super) fn analyze_all(config: &CompiledConfig, diags: &mut Vec<Diagnostic>) 
     // Warn — not error — because the shape harmlessly appears in
     // shared-template configs where individual environments
     // deactivate `error_log`.
-    if let Some(ref fallback_str) = fallback_str
+    if let Some(ref fallback_val) = fallback_str
         && !error_log_configured(config)
     {
         diags.push(Diagnostic {
@@ -134,7 +134,7 @@ pub(super) fn analyze_all(config: &CompiledConfig, diags: &mut Vec<Diagnostic>) 
                  metadata surface on the tracing side when the DLQ write itself \
                  fails), or remove control.error_log_fallback to silence this \
                  warning.",
-                fallback_str
+                fallback_val
             ),
             span: None,
             help: None,
