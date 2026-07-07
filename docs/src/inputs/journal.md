@@ -24,9 +24,21 @@ def input system {
 
 | Property | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `match` | no | none | Journal match filter (e.g., `SYSLOG_FACILITY=10`) |
+| `match` | no | none | Journal match filter (`FIELD=value`, e.g. `SYSLOG_FACILITY=10`). Repeatable — see [match combining rules](#match-combining-rules) for AND / OR semantics. |
 | `state_file` | no | none | Path to persist journal cursor (survives restarts) |
 | `poll_interval` | no | `1s` | How often to poll for new entries |
+
+### `match` combining rules
+
+`match` is repeatable. libsystemd's `sd_journal_add_match` combines
+consecutive filters by the field name:
+
+- **Same field name → OR.** `match "SYSLOG_IDENTIFIER=app1" match "SYSLOG_IDENTIFIER=app2"` matches entries whose `SYSLOG_IDENTIFIER` is either `app1` or `app2`.
+- **Different field names → AND.** `match "SYSLOG_IDENTIFIER=app" match "_UID=1000"` matches only entries whose `SYSLOG_IDENTIFIER` is `app` **and** whose `_UID` is `1000`.
+
+Field names are the ones journald uses internally (`SYSLOG_IDENTIFIER`, `_UID`, `_SYSTEMD_UNIT`, `PRIORITY`, `MESSAGE`, …) — see `systemd.journal-fields(7)`. `journalctl -o json` shows the full field set for any entry you want to filter on.
+
+Format is validated at daemon startup / `--check` time — every match string must contain `=`, and each token before / after the separator is treated as an opaque byte sequence handed to libsystemd. libsystemd rejects field names it doesn't accept (lowercase, empty, non-printable, NUL-containing, etc.) at the runtime `sd_journal_add_match` boundary; the journal input **logs the rejected filter and terminates the reader** rather than continuing without the filter (a filter that libsystemd cannot install matches nothing, so zero events is the semantically correct output — fix the filter and restart the daemon).
 
 ## Wire format
 

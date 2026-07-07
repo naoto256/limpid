@@ -38,6 +38,7 @@ unsafe extern "C" {
     fn sd_journal_previous(j: *mut SdJournal) -> c_int;
     fn sd_journal_add_match(j: *mut SdJournal, data: *const c_void, size: usize) -> c_int;
     fn sd_journal_seek_tail(j: *mut SdJournal) -> c_int;
+    fn sd_journal_seek_head(j: *mut SdJournal) -> c_int;
     fn sd_journal_seek_cursor(j: *mut SdJournal, cursor: *const c_char) -> c_int;
     fn sd_journal_get_cursor(j: *mut SdJournal, cursor: *mut *mut c_char) -> c_int;
     fn sd_journal_get_realtime_usec(j: *mut SdJournal, ret: *mut u64) -> c_int;
@@ -121,6 +122,19 @@ impl Journal {
         let rc = unsafe { sd_journal_seek_tail(self.ptr) };
         if rc < 0 {
             bail!("sd_journal_seek_tail failed: {}", errno_msg(rc));
+        }
+        Ok(())
+    }
+
+    /// Position the read pointer before the first (matching) journal
+    /// entry. Used by the first-start anchoring fallback when the
+    /// active `match` view has no past entries — see
+    /// `run_journal_reader::anchor_at_tail_or_head` for the seek
+    /// semantics rationale.
+    pub fn seek_head(&mut self) -> Result<()> {
+        let rc = unsafe { sd_journal_seek_head(self.ptr) };
+        if rc < 0 {
+            bail!("sd_journal_seek_head failed: {}", errno_msg(rc));
         }
         Ok(())
     }
