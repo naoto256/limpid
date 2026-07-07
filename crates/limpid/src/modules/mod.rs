@@ -312,12 +312,16 @@ pub trait Output: HasMetrics<Stats = OutputMetrics> + Send + Sync + 'static {
     ///   returned `DlqRouteOutcome` through
     ///   `resolve_ack_from_dlq_outcome`. The dispatcher owns the
     ///   backend-aware terminal disposition: `Recovered` on any queue
-    ///   when the DLQ record was durably written (or when the JSONL
-    ///   tracing fallback ran because `error_log` was unset),
-    ///   `Dropped` on a disk queue when the configured DLQ file
-    ///   write itself failed (which triggers the fail-stop wedge so
-    ///   the disk cursor holds for next-start replay), and memory
-    ///   queues fold `Dropped` back to `Recovered` internally
+    ///   when the DLQ record was durably written, or when `error_log`
+    ///   is unset — the operator has declared no durable recovery
+    ///   is required and the tracing fallback runs per the
+    ///   `error_log_fallback` ladder (payload-free summary by
+    ///   default, `Meta` / `Full` only on explicit opt-in) as a
+    ///   best-effort operator signal, not a load-bearing recovery
+    ///   target. `Dropped` on a disk queue when the configured DLQ
+    ///   file write itself failed (which triggers the fail-stop
+    ///   wedge so the disk cursor holds for next-start replay), and
+    ///   memory queues fold `Dropped` back to `Recovered` internally
     ///   because they have no replay path. Sinks that resolve the
     ///   handle themselves must call one of `resolve_delivered` /
     ///   `resolve_recovered` / `resolve_dropped` directly, but the
@@ -545,8 +549,8 @@ pub const SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Durat
 ///   fires when a configured DLQ file was present but the write to
 ///   it failed. The `Dropped` arm on a disk queue triggers the
 ///   disk-queue fail-stop wedge so the cursor holds for a replay on
-///   next start rather than silently advancing past an event with no
-///   durable trace.
+///   next start rather than silently advancing past an event whose
+///   DLQ record was never durably written.
 ///
 /// Callers are responsible for wrapping their send in
 /// `tokio::time::timeout(SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT, ...)` when the
@@ -673,15 +677,16 @@ pub async fn finalize_shutdown_singleton_disposition_ambiguous(
 ///    `resolve_ack_from_dlq_outcome` so the count is authoritative and
 ///    matches the disposition it just committed.
 ///
-/// When `error_log` is `None` we emit one `tracing::error!` per event
-/// with the full JSONL as a structured field (matching the
-/// pipeline-side `write_errored_to_dlq` shape) so the operator has an
-/// out-of-daemon durable copy, and route each ack through the same
-/// helper with an explicit `Recovered` outcome — the failure count and
-/// the resolve go through the same choke point as the DLQ path.
-/// Silently keeping handles parked would be strictly worse: the
-/// ack-handle contract requires an explicit disposition, and the
-/// JSONL-in-log path is at least grep-and-replayable.
+/// When `error_log` is `None` the operator has declared no durable
+/// recovery is required. The emission goes through
+/// `emit_dlq_tracing_fallback` which enforces the operator's
+/// `error_log_fallback` ladder — payload-free summary by default,
+/// structured metadata on `Meta`, or full JSONL via `event_record`
+/// on the explicit `Full` opt-in. Each ack still resolves through
+/// the same helper with an explicit `Recovered` outcome so the
+/// failure count and the resolve go through the same choke point
+/// as the DLQ path; the tracing line is a best-effort operator
+/// signal, not a load-bearing recovery target.
 pub async fn route_shutdown_batch_to_dlq(
     error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
     error_log_fallback: crate::error_log::ErrorLogFallback,
@@ -790,11 +795,14 @@ pub async fn route_shutdown_batch_to_dlq(
 ///   loss is unavoidable, but the DLQ record still captures what
 ///   would have shipped).
 ///
-/// The `no error_log` branch mirrors the plain helper: emit the
-/// `event_record` JSONL as a tracing fallback (that is the only
-/// durable trace available), then resolve the ack. Even without a
-/// file DLQ the disposition is forced to `Dropped` so operators do
-/// not silently lose the ambiguity signal on a disk queue.
+/// The `no error_log` branch mirrors the plain helper: dispatch
+/// through `emit_dlq_tracing_fallback` (payload-free summary by
+/// default under the operator's declared no-recovery contract;
+/// `Meta` / `Full` shape only on explicit opt-in), then resolve
+/// the ack. Even without a file DLQ the disposition is forced to
+/// `Dropped` so operators do not silently lose the ambiguity
+/// signal on a disk queue — the tracing line is a best-effort
+/// operator signal, not a load-bearing recovery target.
 pub async fn route_shutdown_batch_ambiguous_to_dlq(
     error_log: Option<&Arc<crate::error_log::ErrorLogWriter>>,
     error_log_fallback: crate::error_log::ErrorLogFallback,
@@ -1029,10 +1037,11 @@ pub(crate) fn emit_dlq_tracing_fallback(
 /// - `Recovered` (any queue): bump `events_failed`, `resolve_recovered`.
 /// - `Dropped` + memory queue: bump `events_failed`, `resolve_recovered`
 ///   — memory queues cannot replay on restart, so `resolve_dropped`
-///   would only wedge the pipeline without a recovery path;
-///   `events_errored_unwritable` (bumped inside `route_event_to_dlq`
-///   before this call) is the durable trace and the operator alarm
-///   signal.
+///   would only wedge the pipeline without a recovery path; the
+///   event is actually lost. `events_errored_unwritable` (bumped
+///   inside `route_event_to_dlq` before this call) is the
+///   operator alarm signal for that loss, not a durable trace of
+///   the event itself.
 /// - `Dropped` + disk queue: `resolve_dropped` — the disk cursor holds
 ///   and the event replays on next start (the disk-queue fail-stop
 ///   wedge kicks in on the consumer side). `events_failed` is bumped
@@ -1061,10 +1070,15 @@ pub fn resolve_ack_from_dlq_outcome(
 /// Outcome of a single per-event DLQ route.
 ///
 /// - `Recovered` — either the record was written to the operator-
-///   configured DLQ file, or `error_log` was unset and the event
-///   was surfaced as a `tracing::error!` line. In both shapes the
-///   caller has a written durable trail (DLQ file / journal),
-///   so `resolve_recovered()` is honest.
+///   configured DLQ file, or `error_log` was unset and the operator
+///   has declared no durable recovery is required. In the first
+///   shape the DLQ file is a load-bearing recovery target; in the
+///   second the `tracing::error!` line runs per the operator's
+///   `error_log_fallback` ladder (payload-free by default, `Meta`
+///   / `Full` on explicit opt-in) as a best-effort operator signal.
+///   `resolve_recovered()` is honest in both shapes because the
+///   operator either has a written DLQ record or has explicitly
+///   opted out of one.
 /// - `Dropped` — `error_log` was configured but the write failed
 ///   (disk full, permission drop, corrupted DLQ, etc.). Nothing
 ///   durable was written; on a disk queue the caller should
@@ -1544,10 +1558,11 @@ mod resolve_ack_from_dlq_outcome_tests {
     /// `Recovered` — memory queues cannot replay, so wedging
     /// would only cause loss without a recovery path.
     /// `events_errored_unwritable` (bumped inside
-    /// `route_event_to_dlq`) is the operator's durable trace, and
-    /// the helper bumps `events_failed` here so the memory-queue
-    /// terminal-failure count matches the disk-queue count (which
-    /// is bumped on the ack side by `handle_ack_disposition`).
+    /// `route_event_to_dlq`) is the operator's alarm signal for
+    /// the loss, not a durable trace of the event, and the helper
+    /// bumps `events_failed` here so the memory-queue terminal-
+    /// failure count matches the disk-queue count (which is bumped
+    /// on the ack side by `handle_ack_disposition`).
     #[tokio::test]
     async fn dropped_outcome_resolves_recovered_on_memory() {
         let (ack, mut rx) = QueueAckHandle::for_test();
