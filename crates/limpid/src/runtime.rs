@@ -434,17 +434,15 @@ struct PipelineContext {
     /// errors, (2) output retry-exhausted payloads, (3)
     /// batched-output shutdown-flush leftovers, (4) runtime-side
     /// enqueue failures (queue closed, disk write error, unknown
-    /// output). `None` when `control { error_log }` is unset — the
-    /// fallback shape is now uniform across sites: both the
-    /// process-side / enqueue-failure paths (`write_errored_to_dlq`
-    /// in this module) and the sink-side retry-exhaustion /
-    /// shutdown-drain paths (`route_event_to_dlq` and
-    /// `route_shutdown_batch_to_dlq` in
-    /// `crates/limpid/src/modules/mod.rs`) emit a
-    /// `tracing::error!` line with the **full failure JSONL** in
-    /// the `event_record` structured field. The payload is
-    /// recoverable from journald in either case, and both converge
-    /// on the same file once `error_log` is configured.
+    /// output). `None` when `control { error_log }` is unset — on
+    /// that path every emission site delegates to
+    /// [`crate::modules::emit_dlq_tracing_fallback`], which enforces
+    /// the operator's `error_log_fallback` ladder policy: payload-
+    /// free summary by default (`Off`), structured metadata on
+    /// opt-in (`Meta`), or the pre-ladder full-JSONL shape on
+    /// explicit `Full` opt-in. See the ladder documentation in
+    /// `docs/src/operations/error-log.md` for the confidentiality
+    /// rationale.
     error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
     /// Operator-selected confidentiality policy for the tracing-side
     /// fallback line. Threaded through `write_errored_to_dlq` so the

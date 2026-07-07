@@ -453,7 +453,7 @@ This is useful for confirming the JSONL shape, the `kind` / per-kind name discri
 - **Pipeline-side** (`limpid_pipeline_events_errored_unwritable_total{pipeline=...}`) — the Process-flavor path and the output-enqueue subset of Output-flavor records failed to land in `error_log`. Both routed through `runtime::write_errored_to_dlq`.
 - **Output-side** (`limpid_output_events_errored_unwritable_total{output=...}`) — a sink-side Output-flavor DLQ write (retry exhaustion, shutdown drain, batched render failure, partial-success reject) failed to land in `error_log`. Routed through `modules::route_event_to_dlq`, which bumps the per-output counter and returns `Dropped`; on a disk queue that triggers the [fail-stop wedge](../outputs/README.md#disposition-contract) — the wedge holds the cursor for a replay on next daemon start rather than silently advancing past a DLQ-failed event.
 
-In both cases the daemon falls back to `tracing::error!` with the full JSONL record on the standard log channel so the data is still preserved off the DLQ file — but this is alarm-level: a non-zero counter on either label means the replay path may be incomplete, and the next failure may not have a corresponding line in the file.
+In both cases the daemon emits a `tracing::error!` line whose body is shaped by the operator's `error_log_fallback` [ladder](#tracing-fallback-ladder-error_log_fallback) — payload-free summary by default, structured metadata on `"meta"`, or the full JSONL on `"full"`. This is alarm-level regardless of the ladder state: a non-zero counter on either label means the replay path may be incomplete, and the next failure may not have a corresponding line in the file.
 
 Investigate immediately:
 
