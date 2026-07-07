@@ -96,7 +96,9 @@ pub struct OutputMetrics {
     /// so the cursor holds and a subsequent daemon start replays
     /// the event through a hopefully-healthy DLQ. On memory
     /// queues the event is `Recovered` regardless — there is no
-    /// replay path — and this counter is the only durable trace.
+    /// replay path so the event is actually lost, and this counter
+    /// is the operator alarm signal for that loss rather than a
+    /// durable trace of it.
     pub events_errored_unwritable: AtomicU64,
 }
 
