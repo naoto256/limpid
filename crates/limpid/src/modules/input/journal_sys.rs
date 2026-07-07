@@ -55,13 +55,25 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// `sd_id128_t` — a 16-byte boot/machine identifier. Only its size and
-/// alignment matter here: `Journal::monotonic_timestamp` discards the
-/// value, matching how the sole caller already ignores it.
-#[repr(C)]
+/// `sd_id128_t` — a 16-byte boot/machine identifier. libsystemd
+/// defines it as `union { uint8_t bytes[16]; uint64_t qwords[2]; }`
+/// which picks up 8-byte alignment from the `uint64_t` arm. We mirror
+/// that alignment so out-parameters passed to functions like
+/// `sd_journal_get_monotonic_usec` observe the same ABI shape the C
+/// library expects — a plain `[u8; 16]` under `#[repr(C)]` is
+/// 1-byte-aligned and would be UB on strict-alignment targets when
+/// libc writes through it as a `uint64_t[2]`. Only size and alignment
+/// matter here: `Journal::monotonic_timestamp` discards the value,
+/// matching how the sole caller already ignores it.
+#[repr(C, align(8))]
 struct Id128 {
     _bytes: [u8; 16],
 }
+
+const _: () = {
+    assert!(std::mem::size_of::<Id128>() == 16);
+    assert!(std::mem::align_of::<Id128>() == 8);
+};
 
 /// One field ("NAME=value") from the current journal entry.
 pub struct JournalField<'a> {

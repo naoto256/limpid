@@ -793,9 +793,17 @@ def pipeline p { input j; output o }
 /// returns `n > 0`), but silently fails when the view is empty
 /// (`previous` returns `0` and the read pointer is
 /// implementation-defined). Branch on `previous()`'s return so the
-/// empty-match-view case falls through to `seek_head()` — with no
-/// history to replay by definition, `seek_head` + poll-loop `next()`
-/// picks up the first future match cleanly.
+/// empty-match-view case (`Ok(0)`) falls through to `seek_head()` —
+/// with no history to replay by definition, `seek_head` + poll-loop
+/// `next()` picks up the first future match cleanly.
+///
+/// A `previous()` **error** is deliberately NOT treated the same way:
+/// `Err` does not imply an empty view — a non-empty view can also
+/// error here — and `seek_head` on a non-empty view would replay
+/// every past matching entry. On `Err` we keep the tail-anchored
+/// position established by the preceding `seek_tail()` and let the
+/// poll loop's `next()` advance from there; the operator sees the
+/// warn line.
 ///
 /// Errors are logged (`warn!`) but not fatal: `seek_tail` / `previous`
 /// / `seek_head` failing here means the reader will still call
@@ -834,20 +842,17 @@ fn anchor_at_tail_or_head(journal: &mut Journal) {
             }
         }
         Err(e) => {
-            // Journal-level error walking backward. Fall back to head
-            // for the same reason as the empty-view arm.
+            // Journal-level error walking backward. Do NOT fall back
+            // to `seek_head`: the view may be non-empty, and re-
+            // seeking to head would replay historical matching
+            // entries. Keep the tail-anchored position from
+            // `seek_tail()` and let the poll loop's `next()` advance
+            // from there.
             warn!(
-                "journal: previous() after seek_tail failed ({}) — falling back to seek_head so \
-                 new matching entries are picked up by the poll loop",
+                "journal: previous() after seek_tail failed ({}) — keeping the tail-anchored \
+                 position from seek_tail; poll loop will advance from there",
                 e
             );
-            if let Err(e) = journal.seek_head() {
-                warn!(
-                    "journal: seek_head fallback also failed: {} — poll loop may not detect new \
-                     matching entries reliably",
-                    e
-                );
-            }
         }
     }
 }
