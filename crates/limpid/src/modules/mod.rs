@@ -1024,10 +1024,11 @@ pub(crate) fn emit_dlq_tracing_fallback(
                 fallback = "full",
                 event_record = %ctx.to_jsonl(),
                 reason = reason,
-                "{} '{}' (site '{}'): error_log write failed: {} — routing as Dropped \
-                 so the disk queue holds the cursor for replay; event_record below \
-                 carries the full JSONL (error_log_fallback = full — payload may \
-                 reach journald / log aggregation)",
+                "{} '{}' (site '{}'): error_log write failed: {} — routing as Dropped; \
+                 the final disposition (queue-cursor hold for replay vs. terminal \
+                 loss) depends on the queue backend and is applied on the ack side. \
+                 event_record below carries the full JSONL (error_log_fallback = \
+                 full — payload may reach journald / log aggregation)",
                 kind,
                 name,
                 site,

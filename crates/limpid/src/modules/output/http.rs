@@ -175,10 +175,12 @@ struct HttpPeer {
 }
 
 /// Transport policy plugged into the shared [`BatchedSink`] skeleton:
-/// render = lossy UTF-8 of `event.egress`, prepare = newline join +
-/// optional gzip, send = one attempt against the next rotation
-/// candidate. Buffering, retry, and the shutdown lifecycle live in
-/// `crate::modules::output::batched`.
+/// render = verbatim (byte-preserving) `event.egress` bytes,
+/// prepare = newline join + optional gzip, send = one attempt against
+/// the next rotation candidate. Buffering, retry, and the shutdown
+/// lifecycle live in `crate::modules::output::batched`. Binary payload
+/// fidelity is pinned by `http_output_forwards_non_utf8_egress_verbatim` —
+/// do NOT re-introduce a `from_utf8_lossy` here.
 struct HttpSinkPolicy {
     peers: Vec<HttpPeer>,
     /// Round-robin cursor + per-peer failure cooldown; one candidate
