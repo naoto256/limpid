@@ -30,7 +30,7 @@ read that and explains the OTLP-specific reading on top.
 | Transports | HTTP/JSON, HTTP/protobuf, gRPC (all three; output side split into `output otlp_http` / `output otlp_grpc` introduced in 0.7.6; in 0.7.8 plaintext `http://` with `tls { ... }` is now rejected at parse time — see CHANGELOG 0.7.8) |
 | Direction | input *and* output (so collector-to-collector relay works) |
 | TLS | server-side TLS / mTLS on every input (`otlp_http`, `otlp_grpc`); client-side TLS / mTLS on every output (per-peer `tls { ca cert key }` on both `output otlp_http` and `output otlp_grpc`; introduced in 0.7.6, with 0.7.8 adding fail-fast rejection of plaintext `http://` URLs that pair a `tls { ... }` block) |
-| Versioning | OTLP 1.4 wire (the proto3 schema as of opentelemetry-proto 0.27) |
+| Versioning | OTLP 1.10 wire (the proto3 schema as of opentelemetry-proto 0.32) |
 
 Traces and metrics share the same wire envelope shape but use different
 proto messages, so the input / output skeleton from logs is reusable.

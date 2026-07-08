@@ -276,11 +276,14 @@ fn hashlit_to_anyvalue(v: &Value<'_>) -> Result<AnyValue> {
     // ProfilesDictionary.string_table). Round-tripped through the DSL so a
     // Profiles-aware caller can construct it; not resolved to a string here
     // because the string table is a Profiles-level structure the primitive
-    // does not carry.
-    if let Some(n) = lookup(entries, "string_value_strindex").and_then(|v| v.as_i64()) {
+    // does not carry. `i32_field` range-checks the DSL value so an
+    // out-of-`i32`-range integer becomes a load-time error rather than a
+    // silent wrap — same treatment as the sibling `key_strindex` on
+    // `KeyValue`.
+    if let Some(n) = i32_field(entries, "string_value_strindex") {
         set_variant(
             "string_value_strindex",
-            any_value::Value::StringValueStrindex(n as i32),
+            any_value::Value::StringValueStrindex(n),
         )?;
     }
 
@@ -696,5 +699,39 @@ mod tests {
             flag_before,
             "subsequent uncoercible values must not re-flip the flag"
         );
+    }
+
+    #[test]
+    fn key_strindex_out_of_i32_range_rejected() {
+        // A DSL-side integer that overflows `i32` must not silently wrap
+        // to a garbage strindex; `i32_field` filters it to `None` and the
+        // KeyValue reaches the wire with `key_strindex = 0`.
+        let entries: &[(&str, Value<'_>)] = &[
+            ("key", Value::String("k")),
+            ("key_strindex", Value::Int(i64::MAX)),
+        ];
+        let kv = hashlit_to_keyvalue(&Value::Object(entries)).unwrap();
+        assert_eq!(kv.key_strindex, 0);
+    }
+
+    #[test]
+    fn string_value_strindex_out_of_i32_range_rejected() {
+        // The `AnyValue::StringValueStrindex` oneof arm must apply the
+        // same range check as `KeyValue::key_strindex`; otherwise a DSL
+        // value above `i32::MAX` would silently wrap on the wire.
+        let entries: &[(&str, Value<'_>)] = &[("string_value_strindex", Value::Int(i64::MAX))];
+        let av = hashlit_to_anyvalue(&Value::Object(entries)).unwrap();
+        // Out-of-range → variant not set, `AnyValue.value` stays `None`.
+        assert!(av.value.is_none());
+    }
+
+    #[test]
+    fn string_value_strindex_in_range_round_trips() {
+        let entries: &[(&str, Value<'_>)] = &[("string_value_strindex", Value::Int(42))];
+        let av = hashlit_to_anyvalue(&Value::Object(entries)).unwrap();
+        match av.value {
+            Some(any_value::Value::StringValueStrindex(n)) => assert_eq!(n, 42),
+            other => panic!("expected StringValueStrindex(42), got {:?}", other),
+        }
     }
 }
