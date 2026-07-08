@@ -12,8 +12,8 @@ use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::metrics::OutputMetrics;
 use crate::modules::output::syslog_peers::{
-    PEER_CONNECT_TIMEOUT, PEER_WRITE_TIMEOUT, Peer, PeerList, PeerSendError, PreSendShutdownMarker,
-    SyslogPayload, parse_host_port,
+    PEER_CONNECT_TIMEOUT, Peer, PeerList, PeerSendError, PreSendShutdownMarker, SyslogPayload,
+    parse_host_port,
 };
 use crate::modules::{HasMetrics, Module, Output};
 use crate::queue::{QueueAckHandle, RetryConfig};
@@ -283,11 +283,13 @@ impl SyslogUdpOutput {
     /// lookup, socket bind, and UDP `connect` (all in-process or
     /// wire-preparation with no datagram side effect) in
     /// `pre_send_or_shutdown`. The `UdpSocket::send` call itself is
-    /// deliberately **not** shutdown-cancellable: UDP writes are
-    /// single-datagram, and a partial write is impossible, but the
-    /// send syscall does have a wire-visible effect (the datagram
-    /// leaves the process). The existing `PEER_WRITE_TIMEOUT`
-    /// bounds the wait.
+    /// deliberately **not** shutdown-cancellable and **not** wrapped
+    /// in a wall-clock timeout: UDP writes are single-datagram (no
+    /// partial-write state), the send syscall has a wire-visible
+    /// effect (the datagram leaves the process), and there is no
+    /// remote-peer wait for the sender to hang on — see the
+    /// per-site comment on the send call for the full asymmetry
+    /// rationale.
     async fn write_payload_shutdown_aware(
         &self,
         payload: SyslogPayload,
@@ -405,21 +407,53 @@ impl SyslogUdpOutput {
                             state.conn = Some(socket);
                         }
 
-                        // Send phase: single-datagram
-                        // `UdpSocket::send`. No shutdown wrap here;
-                        // partial write is impossible (UDP is
-                        // datagram-oriented), and the existing
-                        // `PEER_WRITE_TIMEOUT` bounds the wait.
+                        // Send phase: single-datagram `UdpSocket::send`.
+                        //
+                        // No timeout wrapper here (asymmetric with
+                        // `syslog_tcp`, which does wrap `write_all` in
+                        // `PEER_WRITE_TIMEOUT` — see the rationale on
+                        // that call site). A connected UDP send has
+                        // three terminal states: it succeeds
+                        // immediately (datagram enters the kernel
+                        // send buffer, the common case), it fails
+                        // immediately (ECONNREFUSED / ENETDOWN /
+                        // async ICMP surfaced synchronously by the
+                        // kernel), or it briefly Pends on writable
+                        // when the local send buffer / qdisc is full
+                        // and drains within microseconds-to-
+                        // milliseconds. There is no "remote peer
+                        // stopped reading" state for UDP: unlike TCP,
+                        // the sender doesn't wait on the peer at all.
+                        // A 10-second wall-clock cap over this
+                        // pattern only fires under kernel pathology
+                        // (send buffer full and the tokio waker
+                        // wedged), and in exchange for that
+                        // vanishingly rare protection the wrapper
+                        // adds per-event `Sleep` construction and
+                        // its scheduler-wake fallout to every
+                        // successful send. Profiling the passthrough
+                        // workload showed the timer / wake pattern
+                        // dominating this hot path.
+                        //
+                        // Removing the wrapper turns "send buffer
+                        // full" into ordinary async backpressure that
+                        // flows back through the queue to the input,
+                        // which is the correct log-pipeline
+                        // behaviour anyway: today a burst that fills
+                        // the kernel buffer would time out per event
+                        // for 10 s and route DLQ-shaped "Delivered"
+                        // failures for events the kernel is about to
+                        // drain, which is worse than pausing the
+                        // pipeline. Shutdown safety is unaffected
+                        // (the queue-consumer task is abort-ed by
+                        // the runtime shutdown budget; the ack
+                        // handle drops as `Dropped` and a disk
+                        // queue holds the cursor).
                         let socket = state.conn.as_mut().expect("connection should be present");
-                        let send_result =
-                            tokio::time::timeout(PEER_WRITE_TIMEOUT, socket.send(&egress))
-                                .await
-                                .map_err(|_| {
-                                    anyhow::anyhow!("syslog_udp send to {} timed out", address)
-                                })
-                                .and_then(|res| {
-                                    res.with_context(|| format!("syslog_udp send to {}", address))
-                                });
+                        let send_result = socket
+                            .send(&egress)
+                            .await
+                            .with_context(|| format!("syslog_udp send to {}", address));
                         if send_result.is_err() {
                             state.conn = None;
                         }
@@ -537,16 +571,13 @@ impl SyslogUdpOutput {
                         state.conn = Some(socket);
                     }
 
+                    // No timeout wrapper on UDP send — see the
+                    // rationale on the sibling shutdown-aware path.
                     let socket = state.conn.as_mut().expect("connection should be present");
-                    let send_result =
-                        tokio::time::timeout(PEER_WRITE_TIMEOUT, socket.send(&egress))
-                            .await
-                            .map_err(|_| {
-                                anyhow::anyhow!("syslog_udp send to {} timed out", address)
-                            })
-                            .and_then(|res| {
-                                res.with_context(|| format!("syslog_udp send to {}", address))
-                            });
+                    let send_result = socket
+                        .send(&egress)
+                        .await
+                        .with_context(|| format!("syslog_udp send to {}", address));
                     if send_result.is_err() {
                         state.conn = None;
                     }
