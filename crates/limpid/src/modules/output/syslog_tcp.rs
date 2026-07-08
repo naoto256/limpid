@@ -290,7 +290,7 @@ fn parse_peer(
     let default_port = if tls.is_some() { 6514 } else { 514 };
     let host_port_label = format!("output '{}': {}", name, label);
     let (host, port) = parse_host_port(properties, default_port, &host_port_label)?;
-    Ok(Peer { host, port, tls })
+    Ok(Peer::new(host, port, tls))
 }
 
 fn parse_peer_tls(

@@ -108,11 +108,7 @@ fn parse_peers(name: &str, properties: &[Property]) -> Result<Vec<Peer>> {
 fn parse_peer(name: &str, label: &str, properties: &[Property]) -> Result<Peer> {
     let label = format!("output '{}': {}", name, label);
     let (host, port) = parse_host_port(properties, 514, &label)?;
-    Ok(Peer {
-        host,
-        port,
-        tls: None,
-    })
+    Ok(Peer::new(host, port, None))
 }
 
 impl HasMetrics for SyslogUdpOutput {
@@ -319,7 +315,7 @@ impl SyslogUdpOutput {
                                     shutdown,
                                     tokio::time::timeout(
                                         PEER_CONNECT_TIMEOUT,
-                                        tokio::net::lookup_host(address.as_str()),
+                                        tokio::net::lookup_host(address),
                                     ),
                                 )
                                 .await
@@ -476,7 +472,7 @@ impl SyslogUdpOutput {
                         // `TcpStream::connect` walking semantics.
                         let resolved: Vec<std::net::SocketAddr> = tokio::time::timeout(
                             PEER_CONNECT_TIMEOUT,
-                            tokio::net::lookup_host(address.as_str()),
+                            tokio::net::lookup_host(address),
                         )
                         .await
                         .with_context(|| format!("syslog_udp lookup {} timed out", address))?
