@@ -510,6 +510,7 @@ impl DslProcessRegistry<'_> {
 /// formatting work runs when nothing will read it. The collected
 /// entries live in the caller's `Vec`; `PipelineRunResult` does not
 /// carry them.
+#[allow(clippy::too_many_arguments)]
 pub fn run_pipeline(
     pipeline: &PipelineDef,
     event: &OwnedEvent,
@@ -517,6 +518,7 @@ pub fn run_pipeline(
     funcs: &FunctionRegistry,
     tap: Option<&TapRegistry>,
     trace: Option<&mut Vec<TraceEntry>>,
+    output_capture: OutputCapturePolicy<'_>,
     bump: &mut bumpalo::Bump,
 ) -> Result<PipelineRunResult> {
     let registry = DslProcessRegistry::new(&config.processes, funcs, tap);
@@ -556,6 +558,7 @@ pub fn run_pipeline(
         registry: &registry,
         funcs,
         arena: &arena,
+        output_capture,
     };
     let mut exec_out = PipelineExecOut {
         trace,
@@ -573,6 +576,61 @@ pub fn run_pipeline(
     })
 }
 
+/// Whether each per-output `OwnedEvent` snapshot pushed at
+/// `output` statements carries the pipeline's per-event `workspace`
+/// or drops it on the floor.
+///
+/// The snapshot is what the downstream queue transports. A memory
+/// queue's consumer only reads `egress` (with `file` also reading
+/// `source` / `received_at` and `kafka` optionally `source.ip`),
+/// and every DLQ record projection stores only `OutputEvent`'s four
+/// fields, so the workspace deep-clone was pure overhead on the
+/// hot path — the largest contributor to the D-shape throughput
+/// regression the `b7625bb` refactor introduced (see the release
+/// notes for 0.7.10). Two consumers of the snapshot do still need
+/// the workspace, and this policy names them explicitly rather
+/// than inferring from ambient state:
+///
+/// - **Disk-backed queues** serialise the full `Event` JSON to the
+///   WAL and rehydrate the workspace on replay. Skipping the
+///   capture there would silently change on-disk semantics on the
+///   next restart.
+/// - **`--test-pipeline`** shows the resulting `OwnedEvent`
+///   (workspace included) in its CLI output so operators can see
+///   what a pipeline produced at each sink boundary.
+///
+/// The `tap output --json` path is *not* a workspace consumer under
+/// 0.7.10's tap contract: the tap projection strips `workspace`
+/// unconditionally on the emit side, so both memory and disk
+/// queues expose the same tap-JSON shape regardless of what the
+/// snapshot carries.
+#[derive(Debug, Clone, Copy)]
+pub enum OutputCapturePolicy<'a> {
+    /// Strip the workspace from every output snapshot. Used by
+    /// unit tests that don't care about workspace round-trip.
+    #[allow(dead_code)]
+    StripAll,
+    /// Capture the workspace on every output snapshot. Used by
+    /// `--test-pipeline` so the CLI display shows what the
+    /// pipeline actually built.
+    CaptureAll,
+    /// Capture the workspace only on the named outputs (those whose
+    /// queue is disk-backed). The daemon hot path builds this set
+    /// once at startup from the compiled config's queue kinds and
+    /// hands it in per event.
+    DiskOnly(&'a std::collections::HashSet<String>),
+}
+
+impl<'a> OutputCapturePolicy<'a> {
+    fn should_capture_workspace(&self, output_name: &str) -> bool {
+        match self {
+            Self::StripAll => false,
+            Self::CaptureAll => true,
+            Self::DiskOnly(disk) => disk.contains(output_name),
+        }
+    }
+}
+
 /// Immutable shared context threaded through the pipeline executor.
 ///
 /// `pipeline_name` is here purely so a process-runtime error can
@@ -582,11 +640,16 @@ pub fn run_pipeline(
 /// `run_pipeline` opened on the stack. The reference itself is held at
 /// `'bump` so closures and primitive impls allocating into it can
 /// produce values that live for the rest of the pipeline body.
+///
+/// `output_capture` decides per output whether the snapshot pushed
+/// to `PipelineExecOut::outputs` carries the workspace — see
+/// [`OutputCapturePolicy`].
 struct PipelineExecCtx<'a, 'bump: 'a> {
     pipeline_name: &'a str,
     registry: &'a DslProcessRegistry<'a>,
     funcs: &'a FunctionRegistry,
     arena: &'bump EventArena<'bump>,
+    output_capture: OutputCapturePolicy<'a>,
 }
 
 /// Mutable accumulators threaded through the pipeline executor:
@@ -782,12 +845,36 @@ fn exec_pipeline_stmt<'bump>(
                 label: format!("→ {}", name),
                 detail: String::new(),
             });
-            // Every output statement enqueues a plain `OwnedEvent`.
-            // The queue no longer distinguishes between a rendered
-            // payload and an owned event — both memory and disk queues
-            // carry `Event` end-to-end, and render runs consumer-side
-            // inside each sink's `Output::consume`.
-            out.outputs.push((name.clone(), event.to_owned()));
+            // The queue transports a plain `OwnedEvent`; both memory
+            // and disk queues carry `Event` end-to-end and render
+            // runs consumer-side inside each sink's `Output::consume`.
+            // What the snapshot pushed here contains is decided by
+            // `OutputCapturePolicy`:
+            //
+            // - Memory queue + non-test-pipeline: the snapshot drops
+            //   the `workspace` (via `to_owned_without_workspace`).
+            //   The downstream sink reads `egress` (and, for `file`
+            //   and `kafka`, `source` / `received_at` / `source.ip`),
+            //   the DLQ path projects to `OutputEvent`'s four fields,
+            //   and the output-flavor `tap` strips `workspace` on the
+            //   emit side too — so nobody observes the missing
+            //   workspace.
+            // - Disk queue (or `--test-pipeline`): the snapshot keeps
+            //   the `workspace` (via `to_owned`). Disk queues need it
+            //   because the WAL persists the full `Event` JSON and
+            //   replay rehydrates it; `--test-pipeline` needs it
+            //   because its CLI display shows the snapshot verbatim.
+            //
+            // The live `event` is unchanged either way — any
+            // subsequent `if workspace.x == ...` gate at pipeline
+            // scope still sees the populated workspace on the
+            // borrowed view.
+            let snapshot = if ctx.output_capture.should_capture_workspace(name) {
+                event.to_owned()
+            } else {
+                event.to_owned_without_workspace()
+            };
+            out.outputs.push((name.clone(), snapshot));
             cont(event)
         }
 
@@ -938,6 +1025,7 @@ def pipeline p {
             &funcs,
             None,
             None,
+            OutputCapturePolicy::CaptureAll,
             &mut bumpalo::Bump::new(),
         )
         .unwrap();
@@ -1015,6 +1103,7 @@ def pipeline p {
             &funcs,
             None,
             None,
+            OutputCapturePolicy::CaptureAll,
             &mut bumpalo::Bump::new(),
         )
         .unwrap();
@@ -1072,6 +1161,7 @@ def pipeline p {
             &funcs,
             None,
             None,
+            OutputCapturePolicy::CaptureAll,
             &mut bumpalo::Bump::new(),
         )
         .unwrap();
@@ -1155,6 +1245,7 @@ def pipeline p { input i; process wrap; output o }
             &funcs,
             None,
             None,
+            OutputCapturePolicy::CaptureAll,
             &mut bumpalo::Bump::new(),
         )
         .unwrap();
@@ -1197,6 +1288,7 @@ def pipeline p {
             &funcs,
             None,
             None,
+            OutputCapturePolicy::CaptureAll,
             &mut bumpalo::Bump::new(),
         )
         .unwrap();
@@ -1205,5 +1297,138 @@ def pipeline p {
             &result.errored[0],
             ErroredEventContext::Process { site, .. } if site == "(inline)"
         ));
+    }
+
+    #[test]
+    fn output_capture_strip_all_leaves_live_event_workspace_intact_for_downstream_if() {
+        // Contract pin for the output-snapshot workspace strip: dropping workspace from the
+        // per-output *snapshot* (the value pushed onto
+        // `PipelineExecOut::outputs`) must not affect the *live event*
+        // that the executor threads to subsequent pipeline statements.
+        // Concretely: a process sets `workspace.route = "keep"`, an
+        // `output` statement runs under `StripAll` policy, and the
+        // following pipeline-level `if workspace.route == "keep"`
+        // still sees the populated workspace and takes its true arm.
+        //
+        // If this test breaks it means the `Output` arm accidentally
+        // consumed / mutated the live event when preparing its
+        // workspace-less snapshot.
+        use crate::event::OwnedEvent;
+        use crate::functions::{FunctionRegistry, register_builtins, table::TableStore};
+        use bytes::Bytes;
+        use std::net::SocketAddr;
+
+        let src = r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output a { type stdout }
+def output b { type stdout }
+def process tag {
+    workspace.route = "keep"
+}
+def pipeline p {
+    input i
+    process tag
+    output a
+    if workspace.route == "keep" {
+        output b
+    }
+    finish
+}
+"#;
+        let cfg = compile(src).unwrap();
+        let pipeline = cfg.pipelines.get("p").unwrap();
+        let mut funcs = FunctionRegistry::new();
+        let store = TableStore::from_configs(vec![]).unwrap();
+        register_builtins(&mut funcs, store);
+        let event = OwnedEvent::new(
+            Bytes::from_static(b"payload"),
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        );
+        let result = run_pipeline(
+            pipeline,
+            &event,
+            &cfg,
+            &funcs,
+            None,
+            None,
+            OutputCapturePolicy::StripAll,
+            &mut bumpalo::Bump::new(),
+        )
+        .unwrap();
+        assert_eq!(result.termination, PipelineTermination::Finished);
+        // Both outputs pushed → the pipeline-level `if` correctly read
+        // `workspace.route` from the live event after the `output a`
+        // statement executed against the strip-all policy.
+        let names: Vec<&str> = result.outputs.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+        // Both snapshots have empty workspace (strip policy took effect).
+        assert!(
+            result.outputs[0].1.workspace.is_empty(),
+            "output 'a' snapshot must have empty workspace under StripAll"
+        );
+        assert!(
+            result.outputs[1].1.workspace.is_empty(),
+            "output 'b' snapshot must have empty workspace under StripAll"
+        );
+    }
+
+    #[test]
+    fn output_capture_disk_only_captures_workspace_selectively() {
+        // Contract pin: given the DiskOnly policy with `a` marked
+        // disk-backed and `b` memory-backed, only `a`'s snapshot
+        // carries the workspace. This is the shape the daemon path
+        // uses per event.
+        use crate::event::OwnedEvent;
+        use crate::functions::{FunctionRegistry, register_builtins, table::TableStore};
+        use bytes::Bytes;
+        use std::collections::HashSet;
+        use std::net::SocketAddr;
+
+        let src = r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output a { type stdout }
+def output b { type stdout }
+def process tag {
+    workspace.route = "keep"
+}
+def pipeline p {
+    input i
+    process tag
+    output a
+    output b
+}
+"#;
+        let cfg = compile(src).unwrap();
+        let pipeline = cfg.pipelines.get("p").unwrap();
+        let mut funcs = FunctionRegistry::new();
+        let store = TableStore::from_configs(vec![]).unwrap();
+        register_builtins(&mut funcs, store);
+        let event = OwnedEvent::new(
+            Bytes::from_static(b"payload"),
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        );
+        let disk: HashSet<String> = ["a".to_string()].into_iter().collect();
+        let result = run_pipeline(
+            pipeline,
+            &event,
+            &cfg,
+            &funcs,
+            None,
+            None,
+            OutputCapturePolicy::DiskOnly(&disk),
+            &mut bumpalo::Bump::new(),
+        )
+        .unwrap();
+        let a_snapshot = &result.outputs.iter().find(|(n, _)| n == "a").unwrap().1;
+        let b_snapshot = &result.outputs.iter().find(|(n, _)| n == "b").unwrap().1;
+        assert_eq!(
+            a_snapshot.workspace.get("route"),
+            Some(&crate::dsl::value::OwnedValue::String("keep".into())),
+            "disk-backed output 'a' must carry workspace"
+        );
+        assert!(
+            b_snapshot.workspace.is_empty(),
+            "memory-backed output 'b' must have empty workspace"
+        );
     }
 }

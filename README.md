@@ -67,10 +67,10 @@ A few we have already covered:
 
 And here is the half that should make you grin — daily operations the alternatives simply cannot match, the kind of thing that changes how you live with a log pipeline:
 
-- **You can watch the pipeline work, live.** `limpidctl tap output security_lake --json` and events stream out as they leave for the destination — body, attributes, source IP, the whole Event. No pause, no traffic duplication, no second tool. Every pipeline is its own debugger.
+- **You can watch the pipeline work, live.** `limpidctl tap output security_lake --json` streams events as they leave for the destination (source, ingress, egress bytes). `limpidctl tap process compose_ocsf --json` shows the workspace state at that pipeline hop. No pause, no traffic duplication, no second tool. Every pipeline is its own debugger.
 
   ```text
-  $ limpidctl tap output security_lake --json | jq -c '{src: .source, sev: .workspace.cef.severity_level, class: .workspace.ocsf.class_uid}'
+  $ limpidctl tap process compose_ocsf --json | jq -c '{src: .source, sev: .workspace.cef.severity_level, class: .workspace.ocsf.class_uid}'
   {"src":{"ip":"10.0.0.21","port":51234},"sev":3,"class":200401}
   {"src":{"ip":"10.0.0.21","port":51234},"sev":7,"class":200401}
   {"src":{"ip":"10.0.0.22","port":42100},"sev":2,"class":200401}

@@ -4,7 +4,7 @@
 //! Runtime does NOT count metrics — each component counts its own.
 //! Runtime only collects metrics handles into MetricsRegistry for stats.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -124,10 +124,18 @@ impl Runtime {
         // --- 1. Create outputs (each output owns its own OutputMetrics) ---
         let mut output_senders: HashMap<String, QueueSender> = HashMap::new();
         let mut output_receivers = Vec::new();
+        // Populated in the loop below alongside the queue creation so
+        // the same `QueueConfig` decides which set of outputs need a
+        // workspace-carrying snapshot at `output` statement time. See
+        // `PipelineContext::disk_outputs` for the runtime contract.
+        let mut disk_outputs: HashSet<String> = HashSet::new();
 
         for (name, output_def) in &config.outputs {
             let queue_config =
                 QueueConfig::from_output_properties(name, output_def.properties.user_properties())?;
+            if matches!(queue_config.queue_type, queue::QueueType::Disk { .. }) {
+                disk_outputs.insert(name.clone());
+            }
             // Retry config is parsed by each output's `from_properties`
             // (outputs own retry + DLQ). The runtime no longer needs a
             // copy here.
@@ -187,6 +195,7 @@ impl Runtime {
         }
 
         let output_senders = Arc::new(output_senders);
+        let disk_outputs = Arc::new(disk_outputs);
 
         // --- 2. Group pipelines by input ---
         //
@@ -245,6 +254,7 @@ impl Runtime {
             let workers: Arc<Vec<Arc<PipelineWorker>>> = Arc::new(pipelines);
             let ctx = PipelineContext {
                 output_senders: Arc::clone(&output_senders),
+                disk_outputs: Arc::clone(&disk_outputs),
                 config: Arc::clone(&config),
                 funcs: Arc::clone(&func_registry),
                 tap: tap.clone(),
@@ -430,6 +440,17 @@ pub(crate) fn init_tables(config: &CompiledConfig) -> Result<crate::functions::t
 
 struct PipelineContext {
     output_senders: Arc<HashMap<String, QueueSender>>,
+    /// Names of outputs whose queue backend is disk-based. Precomputed
+    /// at startup from each output's parsed `QueueConfig` and handed
+    /// to `run_pipeline` per event via
+    /// [`crate::pipeline::OutputCapturePolicy::DiskOnly`], which uses
+    /// it to decide per-output whether to keep the workspace on the
+    /// snapshot pushed to the queue. Disk-backed queues need the
+    /// workspace because the WAL persists the full `Event` JSON and
+    /// replay rehydrates it; memory queues drop it because no
+    /// downstream reader (sink, DLQ record, output tap) touches
+    /// workspace on that path.
+    disk_outputs: Arc<HashSet<String>>,
     config: Arc<CompiledConfig>,
     funcs: Arc<FunctionRegistry>,
     tap: TapRegistry,
@@ -567,6 +588,7 @@ async fn run_pipeline_with_outputs(
         &ctx.funcs,
         Some(&ctx.tap),
         None,
+        crate::pipeline::OutputCapturePolicy::DiskOnly(&ctx.disk_outputs),
         bump,
     )?;
 
@@ -905,8 +927,10 @@ mod tests {
         // one suffices because the pipeline body is `drop` (no output lookup,
         // no process lookup).
         let cfg = CompiledConfig::from_config(parse_config("").unwrap()).unwrap();
+        let disk_outputs = Arc::new(HashSet::new());
         let ctx_a = PipelineContext {
             output_senders: Arc::new(HashMap::new()),
+            disk_outputs: Arc::clone(&disk_outputs),
             config: Arc::new(cfg.clone()),
             funcs: Arc::new(FunctionRegistry::new()),
             tap: tap.clone(),
@@ -915,6 +939,7 @@ mod tests {
         };
         let ctx_b = PipelineContext {
             output_senders: Arc::clone(&ctx_a.output_senders),
+            disk_outputs: Arc::clone(&disk_outputs),
             config: Arc::clone(&ctx_a.config),
             funcs: Arc::clone(&ctx_a.funcs),
             tap: tap.clone(),
@@ -1056,6 +1081,7 @@ mod tests {
             // failed enqueue. This is exactly the codepath the runtime
             // is meant to split per-output.
             output_senders: Arc::new(HashMap::new()),
+            disk_outputs: Arc::new(HashSet::new()),
             config: Arc::new(cfg),
             funcs: Arc::new(FunctionRegistry::new()),
             tap: TapRegistry::new(),

@@ -18,14 +18,18 @@ sudo limpidctl tap process enrich_fortigate
 sudo limpidctl list
 ```
 
-By default, tap emits each event's `egress` bytes as a line of text. Add `--json` to emit the full Event as one JSON object per line. Top-level keys are `received_at`, `source`, `ingress`, and `egress`; `workspace` is included only when non-empty, so jq expressions should defensively use `.workspace // {}` if a pipeline may emit events without workspace fields:
+By default, tap emits each event's `egress` bytes as a line of text. Add `--json` to emit the Event as one JSON object per line. Top-level keys are always `received_at`, `source`, `ingress`, and `egress`. `workspace` inclusion depends on the tap point:
+
+- **`tap process <name> --json`** — `workspace` is included when non-empty. This is the tap point that shows workspace state, because process bodies are the only DSL construct that mutates it.
+- **`tap input <name> --json`** — `workspace` is always absent (input events start with an empty workspace).
+- **`tap output <name> --json`** — `workspace` is always absent, regardless of what earlier processes wrote. Debugging workspace state at output boundaries is a `tap process` job: use `tap process <last_process_in_chain> --json` on the process immediately before `output` and you will see the same workspace the output would have received. Only-inline (unnamed) process chains have no tap point, so add a `def process` name to any workspace-mutating block you want to observe.
 
 ```bash
-# Full Event JSON, one per line — pipe to jq for inspection
-sudo limpidctl tap output ama --json | jq .
+# Egress bytes leaving the sink (source + destination-shape summary)
+sudo limpidctl tap output ama --json | jq -r '[.source.ip, .egress] | @tsv'
 
-# Extract just source + egress
-sudo limpidctl tap input splunk_udp --json | jq -r '[.source, .egress] | @tsv'
+# Workspace state after a named process
+sudo limpidctl tap process enrich_fortigate --json | jq '.workspace'
 ```
 
 ## How it works
@@ -45,9 +49,10 @@ sudo limpidctl tap output ama | grep Fortinet
 # Only high-severity (PRI-prefixed text)
 sudo limpidctl tap input syslog | grep -E '<[0-3]>'
 
-# Structured filter via full-Event JSON (severity lives inside the egress bytes;
-# decode the leading <PRI> here, or rely on a workspace field set in your pipeline)
-sudo limpidctl tap output siem --json | jq 'select(.workspace.cef.severity != null and (.workspace.cef.severity | tonumber) <= 3)'
+# Structured filter via full-Event JSON — output tap exposes egress and
+# provenance only, so inspect workspace state one hop earlier via the
+# named process that set it.
+sudo limpidctl tap process parse_cef --json | jq 'select(.workspace.cef.severity != null and (.workspace.cef.severity | tonumber) <= 3)'
 ```
 
 ## Inject

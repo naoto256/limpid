@@ -461,6 +461,9 @@ fn run_test(config_path: &str, pipeline_name: &str, input_json: Option<&str>) ->
         &func_registry,
         None,
         Some(&mut trace),
+        // `--test-pipeline` shows the workspace in its CLI output, so
+        // force full capture on every output regardless of queue kind.
+        crate::pipeline::OutputCapturePolicy::CaptureAll,
         &mut bump,
     )?;
 

@@ -190,11 +190,14 @@ sudo limpidctl tap output to_relay
 # On the relay — verify bytes arrived correctly
 sudo limpidctl tap input tcp514
 
-# On the relay — verify PRI rewrite and parse results
-sudo limpidctl tap output ama --json | jq '.egress, .workspace'
+# On the relay — verify PRI rewrite (egress bytes leaving the sink)
+sudo limpidctl tap output ama --json | jq '.egress'
+
+# On the relay — verify parse results (workspace state after the parser)
+sudo limpidctl tap process parse_journal --json | jq '.workspace'
 ```
 
-A common bug shape: `app_drop_debug` was supposed to drop DEBUG events but wasn't — the `level` field was nested inside the parsed JSON and the snippet referenced `workspace.level` instead of the correct path. The four-point tap finds this in under a minute: the event is present at `input tcp514`, still present at `output ama`, and `workspace.level` is undefined. No guessing, no restart, no log-digging. This is Principle 5 (safety and operational transparency) paying rent.
+A common bug shape: `app_drop_debug` was supposed to drop DEBUG events but wasn't — the `level` field was nested inside the parsed JSON and the snippet referenced `workspace.level` instead of the correct path. The five-point tap finds this in under a minute: the event is present at `input tcp514`, still present at `output ama`, and `workspace.level` is undefined at `tap process parse_journal`. No guessing, no restart, no log-digging. This is Principle 5 (safety and operational transparency) paying rent.
 
 ## End-to-end testing without real traffic
 
