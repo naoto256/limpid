@@ -464,6 +464,48 @@ impl<'bump> BorrowedEvent<'bump> {
         }
     }
 
+    /// Take an arena-local shallow snapshot of this borrowed view.
+    ///
+    /// Every field is a shallow copy: `source` and `received_at` are
+    /// `Copy` scalars; `ingress` and `egress` bump their `Bytes`
+    /// refcounts; the workspace vec is copied into a fresh
+    /// `bumpalo::Vec` of `(&'bump str, Value<'bump>)` pairs. The key
+    /// slices and the arena-side `Value` referents are shared with
+    /// the original view — they live in `arena` and are
+    /// `Copy`-flavored (see `dsl::value::Value`). The workspace
+    /// `Value`s themselves do not carry interior mutability, so the
+    /// two views observe the same immutable data even if the source
+    /// view later `workspace_set`s new entries or replaces existing
+    /// slots (both operations mutate this view's `bumpalo::Vec` of
+    /// index entries, not the arena-side value tree they point to).
+    ///
+    /// Cost model: one bump alloc (the new workspace `Vec`'s slice) +
+    /// a memcpy of the `(ptr, len, value)` triples + two `Bytes`
+    /// refcount bumps. No `HashMap` allocation, no `String` key
+    /// allocations, no `Value` tree materialization — the deep-clone
+    /// path that `to_owned` walks is not entered.
+    ///
+    /// Called by the `ProcessChain` executor to hold a stable
+    /// pre-process view for the Err arm's DLQ context without paying
+    /// `to_owned`'s heap materialization on every success. The Err
+    /// arm still calls `.to_owned()` on the snapshot at DLQ-record
+    /// build time to cross the arena boundary once — only the failure
+    /// path pays that cost, not every successful process call.
+    pub fn snapshot_in(&self, arena: &EventArena<'bump>) -> BorrowedEvent<'bump> {
+        let mut workspace =
+            bumpalo::collections::Vec::with_capacity_in(self.workspace.len(), arena.bump());
+        for entry in self.workspace.iter() {
+            workspace.push(*entry);
+        }
+        BorrowedEvent {
+            received_at: self.received_at,
+            source: self.source,
+            ingress: self.ingress.clone(),
+            egress: self.egress.clone(),
+            workspace,
+        }
+    }
+
     /// Return the workspace value bound to `key`, if any. Linear scan
     /// in insertion order.
     pub fn workspace_get(&self, key: &str) -> Option<Value<'bump>> {
@@ -648,6 +690,108 @@ mod boundary_tests {
         assert_eq!(light.source, original.source);
         assert_eq!(light.ingress, original.ingress);
         assert_eq!(light.egress, original.egress);
+    }
+
+    // ---- snapshot_in invariant pins ----
+    //
+    // `BorrowedEvent::snapshot_in` produces an arena-local shallow
+    // view used by `ProcessChain` to hold a stable pre-call event for
+    // the Err arm's DLQ context. The design relies on three invariants
+    // that a future refactor could silently break — pin them here so
+    // any accidental introduction of interior mutability or index
+    // aliasing surfaces at test time rather than as a hard-to-catch
+    // production drift.
+
+    #[test]
+    fn snapshot_in_is_stable_when_source_view_adds_a_new_workspace_key() {
+        // Invariant (a): after taking the snapshot, mutating the
+        // source view by adding a new workspace key must not appear
+        // in the snapshot. This locks the shallow-copy semantics —
+        // the snapshot's workspace vec is its own storage, not an
+        // alias into the source's.
+        let mut original = OwnedEvent::new(
+            Bytes::from_static(b"ingress"),
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        );
+        original
+            .workspace
+            .insert("pre".into(), OwnedValue::String("initial".into()));
+        let bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let mut view = original.view_in(&arena);
+        let snapshot = view.snapshot_in(&arena);
+
+        // Mutate the source view after snapshotting.
+        view.workspace_set_str(&arena, "added_after_snapshot", Value::Int(42));
+
+        // The snapshot must not observe the new key.
+        assert!(snapshot.workspace_get("added_after_snapshot").is_none());
+        // The pre-existing key must still be visible on the snapshot,
+        // proving the shallow copy captured it.
+        assert!(matches!(
+            snapshot.workspace_get("pre"),
+            Some(Value::String("initial"))
+        ));
+    }
+
+    #[test]
+    fn snapshot_in_retains_old_value_when_source_view_replaces_slot() {
+        // Invariant (b): if the source view replaces an existing
+        // workspace slot's value after the snapshot, the snapshot's
+        // matching entry must retain the pre-call value. This locks
+        // that `workspace_set` mutates the source view's index vec,
+        // not the arena-side referent — the snapshot's own index vec
+        // continues to point at the pre-mutation `Value`.
+        let mut original = OwnedEvent::new(
+            Bytes::from_static(b"ingress"),
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        );
+        original
+            .workspace
+            .insert("route".into(), OwnedValue::String("original".into()));
+        let bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let mut view = original.view_in(&arena);
+        let snapshot = view.snapshot_in(&arena);
+
+        // Replace the slot on the source view.
+        let replaced = Value::String(arena.alloc_str("replaced"));
+        view.workspace_set_str(&arena, "route", replaced);
+
+        // Snapshot still shows the original value.
+        assert!(matches!(
+            snapshot.workspace_get("route"),
+            Some(Value::String("original"))
+        ));
+        // Source view now shows the replacement.
+        assert!(matches!(
+            view.workspace_get("route"),
+            Some(Value::String("replaced"))
+        ));
+    }
+
+    #[test]
+    fn snapshot_in_retains_original_egress_when_source_view_rewrites_it() {
+        // Invariant (c): `egress` is `Bytes`, i.e. a refcounted
+        // handle. If the source view assigns a fresh `Bytes` to
+        // `egress` after the snapshot, the snapshot's `egress` must
+        // still point at the original bytes — refcounts, not shared
+        // storage.
+        let mut original = OwnedEvent::new(
+            Bytes::from_static(b"ingress"),
+            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+        );
+        original.egress = Bytes::from_static(b"pre-call egress");
+        let bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let mut view = original.view_in(&arena);
+        let snapshot = view.snapshot_in(&arena);
+
+        // Rewrite egress on the source view.
+        view.egress = Bytes::from_static(b"post-call egress");
+
+        assert_eq!(&snapshot.egress[..], b"pre-call egress");
+        assert_eq!(&view.egress[..], b"post-call egress");
     }
 
     #[test]
