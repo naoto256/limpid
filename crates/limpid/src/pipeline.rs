@@ -752,11 +752,25 @@ fn exec_pipeline_stmt<'bump>(
             for element in chain {
                 match element {
                     ProcessChainElement::Named(name) => {
-                        // Snapshot the heap-owned form before the
-                        // registry consumes the borrowed event — the
-                        // Err arm needs a stable, arena-independent
-                        // event for the DLQ context.
-                        let backup_owned = current.to_owned();
+                        // Snapshot the pre-call view before the registry
+                        // consumes the borrowed event — the Err arm
+                        // needs a stable, DLQ-ready event. Use an
+                        // arena-local shallow snapshot rather than
+                        // `to_owned`: the success path (dominant on the
+                        // hot path) only needs the snapshot to survive
+                        // until the `match` returns `Ok(...)`, and
+                        // paying the heap materialization of the
+                        // workspace `HashMap` + `Value` tree on every
+                        // successful process call was a significant
+                        // fraction of the runtime for multi-process
+                        // pipelines where `parse | enrich | route`-shaped
+                        // chains re-entered process #2+ with a populated
+                        // workspace. `snapshot_in` bumps `Bytes`
+                        // refcounts and copies the workspace index vec;
+                        // the deep `to_owned` clone happens only in the
+                        // Err arm below, where the DLQ record's owned
+                        // event has to cross the arena boundary anyway.
+                        let backup_view = current.snapshot_in(ctx.arena);
                         match ctx.registry.call(name, current, ctx.arena) {
                             Ok(Some(e)) => {
                                 out.push_trace(|| TraceEntry {
@@ -790,14 +804,21 @@ fn exec_pipeline_stmt<'bump>(
                                     pipeline: ctx.pipeline_name.to_string(),
                                     site: name.clone(),
                                     reason: e.to_string(),
-                                    event: ProcessEvent::from_owned(&backup_owned),
+                                    // Cross the arena boundary here on
+                                    // the (rare) failure path only: the
+                                    // owned DLQ record outlives the
+                                    // per-event arena.
+                                    event: ProcessEvent::from_owned(&backup_view.to_owned()),
                                 });
                                 return Ok((None, PipelineTermination::Errored));
                             }
                         }
                     }
                     ProcessChainElement::Inline(body) => {
-                        let backup_owned = current.to_owned();
+                        // Same rationale as the Named arm: arena-local
+                        // shallow snapshot for the DLQ Err path; the
+                        // heap materialization happens only on failure.
+                        let backup_view = current.snapshot_in(ctx.arena);
                         match exec_process_body(body, current, ctx.registry, ctx.funcs, ctx.arena) {
                             Ok(ExecResult::Continue(e)) => {
                                 out.push_trace(|| TraceEntry {
@@ -827,7 +848,7 @@ fn exec_pipeline_stmt<'bump>(
                                     pipeline: ctx.pipeline_name.to_string(),
                                     site: "(inline)".to_string(),
                                     reason: e.to_string(),
-                                    event: ProcessEvent::from_owned(&backup_owned),
+                                    event: ProcessEvent::from_owned(&backup_view.to_owned()),
                                 });
                                 return Ok((None, PipelineTermination::Errored));
                             }
