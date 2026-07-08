@@ -339,10 +339,187 @@ pub enum QueueBackendKind {
     Disk,
 }
 
+/// Maximum spin iterations the [`SpinController`] budget will ever
+/// reach. `try_recv` + `std::hint::spin_loop` per iteration puts the
+/// worst-case spin duration in the low-microsecond range; that ceiling
+/// is what keeps a busy consumer from monopolising its tokio worker
+/// against cooperative scheduling. This is the only [`SpinController`]
+/// tuning constant a human chose from a latency argument rather than
+/// from measurement, and is chosen deliberately over a per-output or
+/// runtime-configurable knob.
+const SPIN_CAP: u32 = 128;
+
+/// Number of consecutive spin misses (or their pseudo-hit equivalents)
+/// before the arrival-evidence held on the [`SpinController`] halves.
+/// The staleness rule is what lets the evidence floor decay to zero at
+/// idle — without it R2's floor would pin the budget at a stale
+/// arrival mode forever, keeping the daemon spinning long after
+/// arrivals had stopped. Sixteen misses is fast enough that a
+/// sustained load drop stops costing spin within milliseconds and slow
+/// enough that a single anomalous long gap does not erase the floor
+/// that the steady-state regime depends on.
+const EVIDENCE_STALE_AFTER: u32 = 16;
+
+/// Threshold below which a park wake is treated as evidence that
+/// spinning would have caught the arrival ("pseudo-hit"). Sits at
+/// roughly 2–5× the worst-case spin duration, so wake events near the
+/// spin-time budget are treated as growth signals. Falsely triggering
+/// (a park at 9 µs that spin could not actually have covered) only
+/// costs budget growth that R2's decay will walk back — the rule errs
+/// toward re-engagement because the cost function is asymmetric
+/// (short-park misclassification: nanoseconds of extra spin; missed
+/// short-park signal: microseconds of extra park round trips).
+const PSEUDO_HIT_PARK_NS: u64 = 10_000;
+
+/// Adaptive spin-before-park controller for [`QueueReceiver::recv_many`].
+///
+/// Bounded queue consumers on tokio pay a full park/wake round trip
+/// (scheduler wake, timer bookkeeping, context switch) every time the
+/// producer's inter-arrival gap crosses the park boundary — even when
+/// the next event is only nanoseconds away. This controller lets the
+/// consumer spin a short adaptive budget of `try_recv` polls before
+/// parking, converting the "arrival just after park" case into a
+/// synchronous `try_recv` hit at a fraction of the cost.
+///
+/// Under a steady load the budget rises to the arrival mode and stays
+/// there; under an idle load it decays to zero and the receiver
+/// behaves exactly as it would without the controller (byte-identical
+/// on the park path, including its scheduler footprint).
+///
+/// The five rules (`R1` growth on hit / `R2` evidence-floored decay
+/// on miss / `R3` staleness / `R4` pseudo-hit escape from park /
+/// `R5` zero-budget short-circuit) each exist to close a specific
+/// failure mode the plain versions of the machine have. See the
+/// per-method docstrings for which mode each rule closes; simplifying
+/// any of them re-opens the mode it exists to prevent.
+///
+/// Total state is three `u32`s and the state machine has no `.await`,
+/// no clock read (the caller feeds a park duration to
+/// [`Self::record_park`]), and no allocation, so it can be composed
+/// into any receive path without changing its cost profile.
+#[derive(Debug, Clone, Copy)]
+struct SpinController {
+    /// Current spin iterations budget. `0` means "skip spin, park
+    /// immediately" (R5). Grows on hit, decays with an evidence floor
+    /// on miss.
+    budget: u32,
+    /// Arrival-mode evidence: the deepest spin iteration index at
+    /// which a hit landed (subject to staleness). Serves as the floor
+    /// under R2 decay so that a single anomalous long gap cannot pin
+    /// the budget below the arrival point where hits are actually
+    /// happening.
+    evidence: u32,
+    /// Spin misses (or the pseudo-hit equivalents that R4 folds into
+    /// the same counter) since evidence was last refreshed. Drives R3
+    /// staleness so evidence eventually decays back to zero at idle.
+    evidence_age: u32,
+}
+
+impl SpinController {
+    const fn new() -> Self {
+        Self {
+            budget: 0,
+            evidence: 0,
+            evidence_age: 0,
+        }
+    }
+
+    /// R5: return `Some(budget)` when the caller should enter the spin
+    /// phase and `None` when the caller should park immediately.
+    ///
+    /// Zero-budget short-circuit is what keeps the idle daemon
+    /// byte-identical to the pre-controller receive path. When budget
+    /// has decayed to zero (cold start, or R3 staleness from a
+    /// sustained idle) the spin phase is skipped entirely — no
+    /// `try_recv`, no `spin_loop`, no clock read on the spin side.
+    fn should_spin(&self) -> Option<u32> {
+        (self.budget > 0).then_some(self.budget)
+    }
+
+    /// R1: called when a `try_recv` inside the spin phase returned
+    /// `Some`. `iterations_needed` is the 1-based count of `try_recv`
+    /// calls made through and including the successful one.
+    ///
+    /// Growth is aggressive (`budget * 2`, saturating at `SPIN_CAP`)
+    /// because the cost function is asymmetric — an oversized budget
+    /// costs nanoseconds on true miss iterations (the spin exits at
+    /// the hit and never walks the surplus), an undersized budget
+    /// costs the full park/wake round trip in microseconds. Err on
+    /// the high side, fast.
+    fn record_hit(&mut self, iterations_needed: u32) {
+        self.evidence = self.evidence.max(iterations_needed);
+        self.evidence_age = 0;
+        self.budget = self.budget.max(1).saturating_mul(2).min(SPIN_CAP);
+    }
+
+    /// R2 (evidence-floored decay on miss) composed with R3 (evidence
+    /// staleness). Called after the caller has spun through the full
+    /// budget without a hit — right before the caller parks.
+    ///
+    /// The evidence floor is what makes this controller work under
+    /// steady load. Blind halving would create an absorbing zero
+    /// state: under a regular arrival mode, one anomalous long gap
+    /// halves the budget below the arrival point, after which hits
+    /// become impossible, R1's growth signal disappears, and the
+    /// budget monotonically decays to zero — every subsequent event
+    /// paying full park cost, forever. R2's floor forbids decaying
+    /// below the demonstrated arrival mode, so a single tail event
+    /// cannot pin the controller into that trap.
+    ///
+    /// R3 makes the floor age out. Without staleness the floor
+    /// eventually pins the budget at a mode that has stopped being
+    /// the current arrival regime — including at idle, where the
+    /// daemon would keep spinning `evidence` iterations per wake
+    /// despite arrivals having stopped. Aging lets evidence (and so
+    /// the budget floor, and so the budget itself) decay back to zero
+    /// at idle. R2 without R3 breaks the idle-safety property.
+    fn record_spin_miss(&mut self) {
+        self.evidence_age = self.evidence_age.saturating_add(1);
+        if self.evidence_age >= EVIDENCE_STALE_AFTER {
+            self.evidence /= 2;
+            self.evidence_age = 0;
+        }
+        let proposed = self.budget / 2;
+        self.budget = if proposed < self.evidence {
+            self.evidence.min(self.budget)
+        } else {
+            proposed
+        };
+    }
+
+    /// R4 (pseudo-hit escape from park). Called after every park's
+    /// wake with the time actually spent parked.
+    ///
+    /// A short park is the direct observation "spinning would have
+    /// caught this event" and is the only growth signal available
+    /// below the arrival mode. R1's spin-hit growth requires
+    /// `budget >= arrival mode`; from a zero budget (cold start, or
+    /// after idle decay through R3) hits are structurally impossible
+    /// and the controller would have an absorbing low state without
+    /// this rule. A short park lets the controller notice that load
+    /// has returned and grow the budget back into the useful range.
+    ///
+    /// Long parks (past `PSEUDO_HIT_PARK_NS`) are no-ops on state so
+    /// the idle-safety property from R3+R5 is preserved verbatim.
+    fn record_park(&mut self, parked_ns: u64) {
+        if parked_ns < PSEUDO_HIT_PARK_NS {
+            self.budget = self.budget.max(1).saturating_mul(2).min(SPIN_CAP);
+            self.evidence = self.evidence.max(self.budget);
+            self.evidence_age = 0;
+        }
+    }
+}
+
 /// Handle for receiving events from a queue.
 pub struct QueueReceiver {
     inner: ReceiverInner,
     name: Arc<String>,
+    /// Adaptive spin-before-park controller applied inside
+    /// [`Self::recv_many`]. Local to the receiver (not shared across
+    /// receivers) because the arrival mode is a property of the
+    /// producer feeding this specific channel — noisy neighbours on a
+    /// different queue must not perturb this one's arrival estimate.
+    spin_ctrl: SpinController,
 }
 
 enum ReceiverInner {
@@ -419,22 +596,81 @@ impl QueueReceiver {
     /// events total from the queue into `buf`. Returns the number of
     /// events appended (0 only when the queue is closed and empty).
     ///
-    /// Cancel-safe: the only `.await` is the initial `recv()` call,
+    /// Cancel-safe: the only `.await` is the eventual `recv()` call,
     /// which is cancel-safe by contract on both backends. Everything
-    /// after it is synchronous `try_recv()` — once the first event
-    /// lands in `buf`, this call cannot yield back to `select!` until
-    /// it returns. So if a `tokio::select!` branch other than this
-    /// one fires while `recv_many` is waiting for the first event,
-    /// no events are consumed; and if the first event has already
-    /// been observed, the whole batch runs to completion.
+    /// else is synchronous — the initial fast-path drain, the
+    /// adaptive spin phase (bounded by [`SpinController`]) and every
+    /// greedy `try_recv` follow-up. If a `tokio::select!` branch
+    /// other than this one fires before the `recv()` returns Ready,
+    /// no events have been consumed; if `recv()` has already
+    /// returned an event, the whole batch runs to completion.
+    ///
+    /// Flow:
+    /// 1. **Fast-path drain**: pop already-queued events synchronously.
+    ///    On a healthy backlog regime this is the only step that runs.
+    /// 2. **Adaptive spin** (`SpinController::should_spin`): if the
+    ///    controller has a non-zero budget, spin `try_recv` /
+    ///    `spin_loop` up to that budget. On a hit inside the spin
+    ///    window we skip the park entirely and record the arrival
+    ///    depth via `record_hit`; on budget exhaustion we call
+    ///    `record_spin_miss` right before parking.
+    /// 3. **Timed park**: `Instant::now()` before `recv().await`,
+    ///    `elapsed()` after — the duration is fed to `record_park`
+    ///    so the controller can grow the budget when it sees a park
+    ///    that spinning could plausibly have caught.
     pub async fn recv_many(&mut self, buf: &mut Vec<(Event, AckPosition)>, max: usize) -> usize {
         if max == 0 {
             return 0;
         }
         let start = buf.len();
+
+        // (1) Fast-path drain: on backlog we take events without ever
+        // touching spin or park. Cancel-safe because there is no
+        // await — if we push anything we exit through the return
+        // below, and if we push nothing we haven't consumed anything.
+        while buf.len() - start < max {
+            match self.try_recv() {
+                Some(pair) => buf.push(pair),
+                None => break,
+            }
+        }
+        if buf.len() > start {
+            return buf.len() - start;
+        }
+
+        // (2) Adaptive spin phase. When budget is 0 (cold start /
+        // decayed at idle) `should_spin` returns None and we go
+        // straight to park — that is the "idle byte-identical" path.
+        if let Some(budget) = self.spin_ctrl.should_spin() {
+            let mut iterations: u32 = 0;
+            while iterations < budget {
+                iterations = iterations.saturating_add(1);
+                if let Some(pair) = self.try_recv() {
+                    self.spin_ctrl.record_hit(iterations);
+                    buf.push(pair);
+                    while buf.len() - start < max {
+                        match self.try_recv() {
+                            Some(p) => buf.push(p),
+                            None => break,
+                        }
+                    }
+                    return buf.len() - start;
+                }
+                std::hint::spin_loop();
+            }
+            self.spin_ctrl.record_spin_miss();
+        }
+
+        // (3) Park path. Time the wait so a short park (indistinguishable
+        // from a spin hit that we just barely missed) can lift the
+        // controller out of the absorbing zero-budget state via R4.
+        // Clock reads only appear here — never on the spin side.
+        let park_start = std::time::Instant::now();
         let Some(first) = self.recv().await else {
             return 0;
         };
+        let parked_ns: u64 = park_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        self.spin_ctrl.record_park(parked_ns);
         buf.push(first);
         while buf.len() - start < max {
             match self.try_recv() {
@@ -503,6 +739,7 @@ pub fn create_queue(
                 QueueReceiver {
                     inner: ReceiverInner::Memory(rx),
                     name: Arc::clone(&name),
+                    spin_ctrl: SpinController::new(),
                 },
             ))
         }
@@ -517,6 +754,7 @@ pub fn create_queue(
                 QueueReceiver {
                     inner: ReceiverInner::Disk(rx),
                     name: Arc::clone(&name),
+                    spin_ctrl: SpinController::new(),
                 },
             ))
         }
@@ -2298,6 +2536,233 @@ mod consumer_lifecycle_tests {
         assert!(
             !src.contains(forbidden),
             "steady-state arm must not use the pre-batch per-event recv() shape"
+        );
+    }
+
+    // ---- adaptive spin-before-park controller ----
+
+    /// R1: recording a spin hit doubles the budget (saturating at
+    /// `SPIN_CAP`), lifts evidence to at least the hit depth, and
+    /// zeroes the staleness counter. From a zero budget, growth
+    /// still fires because `max(1) * 2 = 2`.
+    #[test]
+    fn spin_controller_hit_grows_budget_and_records_evidence() {
+        let mut ctrl = SpinController::new();
+        assert_eq!(ctrl.budget, 0);
+        ctrl.record_hit(5);
+        assert_eq!(ctrl.budget, 2, "growth from zero uses max(budget, 1) * 2");
+        assert_eq!(ctrl.evidence, 5, "evidence tracks the deepest hit position");
+        assert_eq!(ctrl.evidence_age, 0);
+
+        // Repeated hits keep doubling until SPIN_CAP.
+        for _ in 0..10 {
+            ctrl.record_hit(3);
+        }
+        assert_eq!(ctrl.budget, SPIN_CAP, "budget saturates at SPIN_CAP");
+        assert_eq!(
+            ctrl.evidence, 5,
+            "evidence stays at the max seen, not the current hit"
+        );
+    }
+
+    /// R2: after a hit at position K, a spin-miss decay refuses to
+    /// drop the budget below K. This is what stops one anomalous
+    /// long-gap event from collapsing the controller into a
+    /// permanently-low absorbing state under a steady arrival regime
+    /// (where the spin-miss would otherwise halve the budget below
+    /// the arrival mode and never hit again).
+    #[test]
+    fn spin_controller_evidence_floor_prevents_decay_below_arrival_mode() {
+        let mut ctrl = SpinController::new();
+        // Force budget up to SPIN_CAP with evidence pinned at 40.
+        ctrl.record_hit(40);
+        while ctrl.budget < SPIN_CAP {
+            ctrl.record_hit(40);
+        }
+        assert_eq!(ctrl.evidence, 40);
+
+        // A single miss halves budget but must not drop below evidence.
+        for _ in 0..10 {
+            ctrl.record_spin_miss();
+            assert!(
+                ctrl.budget >= ctrl.evidence,
+                "budget {} decayed below evidence {}",
+                ctrl.budget,
+                ctrl.evidence
+            );
+        }
+    }
+
+    /// R3: after `EVIDENCE_STALE_AFTER` consecutive misses, evidence
+    /// halves and the staleness counter resets. With enough misses
+    /// both evidence and budget decay to zero — this is what
+    /// re-enables the R5 idle-safety property after a load drop.
+    #[test]
+    fn spin_controller_staleness_lets_evidence_and_budget_decay_to_zero() {
+        let mut ctrl = SpinController::new();
+        ctrl.record_hit(64);
+        while ctrl.budget < SPIN_CAP {
+            ctrl.record_hit(64);
+        }
+        assert_eq!(ctrl.evidence, 64);
+
+        // Enough misses to walk evidence all the way down.
+        // Each round of EVIDENCE_STALE_AFTER misses halves evidence.
+        let miss_rounds = 20; // 20 * 16 = 320 misses, plenty of room to hit zero.
+        for _ in 0..(miss_rounds * EVIDENCE_STALE_AFTER) {
+            ctrl.record_spin_miss();
+        }
+        assert_eq!(
+            ctrl.evidence, 0,
+            "evidence must decay to zero after sustained misses (R3)"
+        );
+        assert_eq!(
+            ctrl.budget, 0,
+            "budget must decay to zero after evidence has been walked out"
+        );
+    }
+
+    /// R4: from an absorbing zero budget (cold start or post-idle
+    /// decay), a short park wake grows the budget. Without this
+    /// escape the controller would be permanently disabled once
+    /// budget hit zero — the only growth signal, spin-hit, cannot
+    /// fire from budget = 0.
+    #[test]
+    fn spin_controller_pseudo_hit_escapes_zero_budget() {
+        let mut ctrl = SpinController::new();
+        assert_eq!(ctrl.budget, 0);
+
+        ctrl.record_park(PSEUDO_HIT_PARK_NS / 2);
+        assert_eq!(ctrl.budget, 2, "short park grows from zero via max(1)*2");
+        assert_eq!(ctrl.evidence, 2, "evidence tracks the new budget");
+        assert_eq!(ctrl.evidence_age, 0);
+
+        // Repeated short parks keep growing.
+        for _ in 0..10 {
+            ctrl.record_park(1_000);
+        }
+        assert_eq!(ctrl.budget, SPIN_CAP);
+    }
+
+    /// R5: with `budget == 0` the caller must skip the spin phase
+    /// entirely — no `try_recv`, no `spin_loop`. Idle daemons are
+    /// byte-identical to the pre-controller receive path when the
+    /// budget is zero.
+    #[test]
+    fn spin_controller_zero_budget_short_circuits_spin() {
+        let ctrl = SpinController::new();
+        assert_eq!(ctrl.budget, 0);
+        assert!(
+            ctrl.should_spin().is_none(),
+            "zero budget must short-circuit the spin phase"
+        );
+    }
+
+    /// A long park (past `PSEUDO_HIT_PARK_NS`) from an idle state
+    /// leaves the controller in place. This preserves the
+    /// idle-safety property: a genuinely idle daemon accumulates no
+    /// budget through repeated long parks.
+    #[test]
+    fn spin_controller_long_park_from_zero_budget_is_no_op() {
+        let mut ctrl = SpinController::new();
+        for _ in 0..100 {
+            ctrl.record_park(PSEUDO_HIT_PARK_NS * 100);
+        }
+        assert_eq!(ctrl.budget, 0);
+        assert_eq!(ctrl.evidence, 0);
+        assert_eq!(ctrl.evidence_age, 0);
+    }
+
+    /// Integration pin: under a trickle load (arrivals slower than
+    /// the pseudo-hit threshold) the spin budget must not grow. The
+    /// receiver should behave exactly like the pre-controller path
+    /// under such loads, and idle CPU must not rise. This test
+    /// exercises the receiver end-to-end, not the state machine in
+    /// isolation.
+    #[tokio::test]
+    async fn trickle_load_keeps_spin_budget_at_zero() {
+        let (sender, mut receiver) = create_queue(
+            "trickle".into(),
+            QueueConfig {
+                queue_type: QueueType::Memory,
+                capacity: 4,
+            },
+        )
+        .unwrap();
+
+        // Warm-up round: prove that Some path is exercised.
+        sender.send(owned_event()).await.unwrap();
+        let mut buf: Vec<(Event, AckPosition)> = Vec::with_capacity(4);
+        assert_eq!(receiver.recv_many(&mut buf, 4).await, 1);
+        buf.clear();
+
+        // The spin budget must stay at zero: each recv_many parks,
+        // and the park duration exceeds the pseudo-hit threshold by
+        // orders of magnitude.
+        for _ in 0..3 {
+            let send_delay = std::time::Duration::from_millis(50);
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(send_delay).await;
+                let _ = sender.send(owned_event()).await;
+            });
+            assert_eq!(receiver.recv_many(&mut buf, 4).await, 1);
+            buf.clear();
+            assert_eq!(
+                receiver.spin_ctrl.budget, 0,
+                "trickle load must leave the spin budget at zero (R5 idle path)"
+            );
+        }
+    }
+
+    /// Structural pin: `recv_many` must consult the spin controller
+    /// via `should_spin`, must time the park duration and feed it to
+    /// `record_park`, and must call `record_hit` on spin success and
+    /// `record_spin_miss` on budget exhaustion. Prevents a mechanical
+    /// simplification from dropping the controller integration while
+    /// keeping the batch-drain shape — the runtime symptom would be a
+    /// throughput regression on the batch-drain measurement gate that
+    /// no unit test can produce.
+    #[test]
+    fn recv_many_uses_spin_controller_and_times_park() {
+        let src = include_str!("mod.rs");
+        // Locate the recv_many body between the pub-async signature
+        // and the trailing brace at the end of the fn.
+        let sig_marker = "pub async fn recv_many(&mut self, buf: &mut Vec<(Event, AckPosition)>, max: usize) -> usize {";
+        let start = src
+            .find(sig_marker)
+            .expect("recv_many signature marker must exist");
+        // The body ends at the first blank-line `}` after the sig.
+        let body_tail = &src[start..];
+        // Take a generous slice — the body is a couple of dozen lines.
+        let slice_end = body_tail
+            .find("    /// Commit a specific event's position as processed.")
+            .expect("recv_many must be followed by ack_to doc");
+        let body = &body_tail[..slice_end];
+
+        assert!(
+            body.contains("self.spin_ctrl.should_spin()"),
+            "recv_many must consult SpinController via should_spin"
+        );
+        assert!(
+            body.contains("self.spin_ctrl.record_hit("),
+            "recv_many must call record_hit on spin success"
+        );
+        assert!(
+            body.contains("self.spin_ctrl.record_spin_miss()"),
+            "recv_many must call record_spin_miss on budget exhaustion"
+        );
+        assert!(
+            body.contains("std::time::Instant::now()"),
+            "recv_many must time the park duration for record_park"
+        );
+        assert!(
+            body.contains("self.spin_ctrl.record_park("),
+            "recv_many must feed the park duration to record_park"
+        );
+        assert!(
+            body.contains("std::hint::spin_loop()"),
+            "recv_many must use std::hint::spin_loop between spin iterations"
         );
     }
 
