@@ -74,26 +74,29 @@ When a new downstream appears with a schema nobody has seen before, the integrat
 
 ## Recipes
 
-All recipes assume `limpidctl tap output <name> --json` is producing the pipeline's final serialized output — the same Event JSON described in [Debug Tap](./tap.md). Each event is one line, with `received_at`, `source`, `ingress`, and `egress` top-level keys; `workspace` is included only when the pipeline populated it (use `.workspace // {}` in jq when in doubt). Structured output fields, when present, live under `workspace`.
+All recipes assume `limpidctl tap <kind> <name> --json` is producing the pipeline's final serialized output — the same Event JSON described in [Debug Tap](./tap.md). Each event is one line, with `received_at`, `source`, `ingress`, and `egress` top-level keys. Which tap point exposes the structured payload depends on where the check lives:
+
+- **Wire-level validation** (schema over the bytes the sink will actually ship) uses `tap output <name> --json` and reads `.egress`. This is the shape a receiver sees.
+- **Pre-serialization / composed-object validation** (schema over the tree the pipeline built before rendering) uses `tap process <compose_process> --json` and reads `.workspace.<schema>` — the process tap is where workspace state is observable. `tap output --json` does not expose `workspace`; picking the named `compose` process one hop back keeps the recipe reading the same fields it always has, just from the pipeline point that actually holds them.
 
 ### OCSF (JSON Schema)
 
 Use any JSON Schema validator. `ajv-cli` is convenient because it streams:
 
 ```bash
-limpidctl tap output ocsf_sink --json \
+limpidctl tap process compose_ocsf --json \
   | jq -c '.workspace.ocsf' \
   | ajv validate -s ocsf-schemas/network_activity.json --all-errors -
 ```
 
-`jq -c '.workspace.ocsf'` extracts the structured payload the pipeline built under a workspace key; adjust the path to match your DSL.
+`jq -c '.workspace.ocsf'` extracts the structured payload the pipeline built under a workspace key; substitute your own compose process name and the workspace path it writes to.
 
 ### ECS (Elastic)
 
 ECS ships YAML; convert to JSON Schema once with Elastic's generator and feed it to the same validator:
 
 ```bash
-limpidctl tap output elastic --json \
+limpidctl tap process compose_ecs --json \
   | jq -c '.workspace.ecs' \
   | jsonschema -i /dev/stdin ecs.schema.json
 ```
@@ -136,7 +139,7 @@ The building block is `inject` on one side, `tap` on the other. `--replay-timing
 # ci/validate-ocsf.sh
 set -euo pipefail
 
-sudo limpidctl tap output ocsf_sink --json > tap.jsonl &
+sudo limpidctl tap process compose_ocsf --json > tap.jsonl &
 TAP_PID=$!
 
 sudo limpidctl inject input edge_syslog --json < tests/fixtures/edge.jsonl
@@ -158,7 +161,8 @@ Run the validator alongside the daemon as a separate service. The systemd patter
 ```ini
 # /etc/systemd/system/limpid-ocsf-monitor.service
 [Service]
-ExecStart=/bin/sh -c 'limpidctl tap output ocsf_sink --json \
+ExecStart=/bin/sh -c 'limpidctl tap process compose_ocsf --json \
+  | jq -c ".workspace.ocsf" \
   | ajv validate -s /etc/limpid/schemas/ocsf_network_activity.json - \
   | logger -t limpid-ocsf-monitor'
 Restart=always
@@ -177,7 +181,7 @@ Anything that reads JSONL from stdin and exits non-zero on failure works. The co
 - **One event per line.** Each line is a complete [Event JSON](./tap.md#usage) object.
 - **Exit code 0 = all good, non-zero = reject.** For streaming validators, prefer printing per-event diagnostics to stderr and keeping the process alive; let a supervising process aggregate.
 - **No assumptions about key order.** `tap --json` does not guarantee key order across versions; schema validators don't care, but ad-hoc `grep` pipelines might.
-- **Workspace keys.** Structured fields built by the pipeline live under `workspace.<key>`. Use the key names your DSL actually assigns; inspect a live sample with `limpidctl tap output <name> --json | jq '.workspace | keys'` to confirm the actual key set.
+- **Workspace keys.** Structured fields built by the pipeline live under `workspace.<key>`. Use the key names your DSL actually assigns; inspect a live sample with `limpidctl tap process <compose_process> --json | jq '.workspace | keys'` to confirm the actual key set. `tap output` does not expose `workspace` — tap the named process that populates it instead.
 - **Non-JSON wire formats.** If the final wire format is protobuf, Avro, or similar, serialize with your existing producer and validate the bytes (e.g. `.egress` piped through `protoc --decode`).
 
 ## Related design decisions
