@@ -40,7 +40,9 @@ use anyhow::{Result, anyhow, bail};
 use prost::Message;
 
 use opentelemetry_proto::tonic::{
-    common::v1::{AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList, any_value},
+    common::v1::{
+        AnyValue, ArrayValue, EntityRef, InstrumentationScope, KeyValue, KeyValueList, any_value,
+    },
     logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
     resource::v1::Resource,
 };
@@ -133,6 +135,28 @@ fn hashlit_to_resource(v: &Value<'_>) -> Result<Resource> {
     Ok(Resource {
         attributes: array_field(entries, "attributes", hashlit_to_keyvalue)?,
         dropped_attributes_count: u32_field(entries, "dropped_attributes_count").unwrap_or(0),
+        // OTLP 0.32: Resource can carry a list of EntityRef pointers into the
+        // Resource's own attributes. Non-Entity workflows leave this empty; we
+        // still accept it so a round-trip through the DSL primitive preserves
+        // an inbound EntityRef list a caller might one day emit.
+        entity_refs: array_field(entries, "entity_refs", hashlit_to_entity_ref)?,
+    })
+}
+
+fn hashlit_to_entity_ref(v: &Value<'_>) -> Result<EntityRef> {
+    let entries = expect_object(v, "EntityRef")?;
+    let string_list = |key: &str| -> Result<Vec<String>> {
+        array_field(entries, key, |v| {
+            v.as_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| anyhow!("EntityRef.{}: expected string element", key))
+        })
+    };
+    Ok(EntityRef {
+        schema_url: string_field(entries, "schema_url").unwrap_or_default(),
+        r#type: string_field(entries, "type").unwrap_or_default(),
+        id_keys: string_list("id_keys")?,
+        description_keys: string_list("description_keys")?,
     })
 }
 
@@ -172,6 +196,9 @@ fn hashlit_to_log_record(v: &Value<'_>) -> Result<LogRecord> {
         flags: u32_field(entries, "flags").unwrap_or(0),
         trace_id: bytes_field(entries, "trace_id").unwrap_or_default(),
         span_id: bytes_field(entries, "span_id").unwrap_or_default(),
+        // OTLP 0.32: promoted from an `event.name` attribute to a first-class
+        // field on LogRecord.
+        event_name: string_field(entries, "event_name").unwrap_or_default(),
     })
 }
 
@@ -180,7 +207,15 @@ fn hashlit_to_keyvalue(v: &Value<'_>) -> Result<KeyValue> {
     let key =
         string_field(entries, "key").ok_or_else(|| anyhow!("KeyValue: missing string `key`"))?;
     let value = opt_field(entries, "value", hashlit_to_anyvalue)?;
-    Ok(KeyValue { key, value })
+    Ok(KeyValue {
+        key,
+        value,
+        // OTLP 0.32: Profiles-only field (index into
+        // ProfilesDictionary.string_table). Non-Profiles signals such as
+        // Logs / Traces / Metrics leave it at 0; we accept it from the DSL so
+        // a Profiles-aware caller can round-trip through the primitive.
+        key_strindex: i32_field(entries, "key_strindex").unwrap_or(0),
+    })
 }
 
 /// Convert the tagged HashLit form into the proto3 `oneof` AnyValue.
@@ -236,6 +271,17 @@ fn hashlit_to_anyvalue(v: &Value<'_>) -> Result<AnyValue> {
             ),
         };
         set_variant("bytes_value", any_value::Value::BytesValue(bytes))?;
+    }
+    // OTLP 0.32: Profiles-only variant (index into
+    // ProfilesDictionary.string_table). Round-tripped through the DSL so a
+    // Profiles-aware caller can construct it; not resolved to a string here
+    // because the string table is a Profiles-level structure the primitive
+    // does not carry.
+    if let Some(n) = lookup(entries, "string_value_strindex").and_then(|v| v.as_i64()) {
+        set_variant(
+            "string_value_strindex",
+            any_value::Value::StringValueStrindex(n as i32),
+        )?;
     }
 
     Ok(AnyValue { value: found })
@@ -380,6 +426,37 @@ fn resource_to_hashlit<'bump>(arena: &EventArena<'bump>, r: &Resource) -> Value<
             Value::Int(r.dropped_attributes_count as i64),
         );
     }
+    if !r.entity_refs.is_empty() {
+        let mut refs =
+            bumpalo::collections::Vec::with_capacity_in(r.entity_refs.len(), arena.bump());
+        for er in &r.entity_refs {
+            refs.push(entity_ref_to_hashlit(arena, er));
+        }
+        b.push("entity_refs", Value::Array(refs.into_bump_slice()));
+    }
+    b.finish()
+}
+
+fn entity_ref_to_hashlit<'bump>(arena: &EventArena<'bump>, er: &EntityRef) -> Value<'bump> {
+    let mut b = ObjectBuilder::new(arena);
+    if !er.schema_url.is_empty() {
+        b.push("schema_url", Value::String(arena.alloc_str(&er.schema_url)));
+    }
+    if !er.r#type.is_empty() {
+        b.push("type", Value::String(arena.alloc_str(&er.r#type)));
+    }
+    let push_strings = |b: &mut ObjectBuilder<'bump>, key: &'static str, xs: &[String]| {
+        if xs.is_empty() {
+            return;
+        }
+        let mut arr = bumpalo::collections::Vec::with_capacity_in(xs.len(), arena.bump());
+        for s in xs {
+            arr.push(Value::String(arena.alloc_str(s)));
+        }
+        b.push(key, Value::Array(arr.into_bump_slice()));
+    };
+    push_strings(&mut b, "id_keys", &er.id_keys);
+    push_strings(&mut b, "description_keys", &er.description_keys);
     b.finish()
 }
 
@@ -470,6 +547,9 @@ fn log_record_to_hashlit<'bump>(arena: &EventArena<'bump>, lr: &LogRecord) -> Va
     if !lr.span_id.is_empty() {
         b.push("span_id", Value::Bytes(arena.alloc_bytes(&lr.span_id)));
     }
+    if !lr.event_name.is_empty() {
+        b.push("event_name", Value::String(arena.alloc_str(&lr.event_name)));
+    }
     b.finish()
 }
 
@@ -478,6 +558,9 @@ fn keyvalue_to_hashlit<'bump>(arena: &EventArena<'bump>, kv: &KeyValue) -> Value
     b.push("key", Value::String(arena.alloc_str(&kv.key)));
     if let Some(v) = &kv.value {
         b.push("value", anyvalue_to_hashlit(arena, v));
+    }
+    if kv.key_strindex != 0 {
+        b.push("key_strindex", Value::Int(kv.key_strindex as i64));
     }
     b.finish()
 }
@@ -520,6 +603,9 @@ fn anyvalue_to_hashlit<'bump>(arena: &EventArena<'bump>, av: &AnyValue) -> Value
         }
         Some(any_value::Value::BytesValue(bytes)) => {
             b.push("bytes_value", Value::Bytes(arena.alloc_bytes(bytes)));
+        }
+        Some(any_value::Value::StringValueStrindex(idx)) => {
+            b.push("string_value_strindex", Value::Int(*idx as i64));
         }
     }
     b.finish()

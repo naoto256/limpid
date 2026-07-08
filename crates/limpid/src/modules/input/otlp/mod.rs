@@ -136,6 +136,7 @@ mod tests {
         let resource = Some(Resource {
             attributes: vec![],
             dropped_attributes_count: 0,
+            ..Default::default()
         });
         let scope = Some(InstrumentationScope {
             name: "test".into(),

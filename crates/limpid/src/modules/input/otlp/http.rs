@@ -727,8 +727,10 @@ mod tests {
                         value: Some(AnyValue {
                             value: Some(any_value::Value::StringValue("body-limit-test".into())),
                         }),
+                        ..Default::default()
                     }],
                     dropped_attributes_count: 0,
+                    ..Default::default()
                 }),
                 scope_logs: vec![ScopeLogs {
                     scope: Some(InstrumentationScope {
@@ -895,8 +897,10 @@ mod tests {
                         value: Some(AnyValue {
                             value: Some(any_value::Value::StringValue("rate-test".into())),
                         }),
+                        ..Default::default()
                     }],
                     dropped_attributes_count: 0,
+                    ..Default::default()
                 }),
                 scope_logs: vec![ScopeLogs {
                     scope: Some(InstrumentationScope {
