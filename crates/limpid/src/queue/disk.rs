@@ -249,6 +249,14 @@ impl DiskQueueReceiver {
         }
     }
 
+    /// Non-blocking read of the next available event. Returns `None`
+    /// on empty (regardless of whether the queue has been closed) —
+    /// closure observation is left to a subsequent `recv().await`.
+    /// Used as the greedy-drain step inside `QueueReceiver::recv_many`.
+    pub fn try_recv(&mut self) -> Option<(Event, AckPosition)> {
+        self.try_read_next()
+    }
+
     /// Commit a specific event's position to the in-flight tracker
     /// and, if it completes the contiguous acked prefix from the
     /// front, advance the persisted cursor through that prefix and
