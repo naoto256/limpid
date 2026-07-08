@@ -47,27 +47,67 @@ pub enum SyslogFraming {
 
 /// A configured destination. `tls` is `Some(...)` only for outputs
 /// that negotiate client-side TLS; plaintext outputs leave it `None`.
+///
+/// `display_address` is the `host:port` string every syslog output
+/// hands to `TcpStream::connect` / `tokio::net::lookup_host` /
+/// `format!()` in error contexts. It is computed once at construction
+/// time so the hot path can borrow `&str` from the peer instead of
+/// running `format!()` per event just to build a string that only
+/// error-context messages ever consume.
 #[derive(Debug, Clone)]
 pub struct Peer {
     pub host: String,
+    // The parsed port is also embedded in `display_address`, so
+    // nothing on the send-path reads this field directly today. Kept
+    // as-is so a future observability change (per-peer metric label,
+    // tap output shape, etc.) doesn't have to re-parse it out of the
+    // pre-formatted string.
+    #[allow(dead_code)]
     pub port: u16,
     pub tls: Option<crate::tls::ClientTlsConfig>,
+    display_address: String,
 }
 
 impl Peer {
-    /// Formatted `host:port` suitable for `TcpStream::connect` /
-    /// `UdpSocket::connect`. Bare IPv6 literals (e.g. `::1`) must be
-    /// bracketed so the port parses correctly — `format!("{}:{}", "::1", 514)`
-    /// yields `::1:514` which Rust's `SocketAddr` parser rejects (it
-    /// reads the trailing `:514` as part of the address). Hostnames
-    /// and IPv4 literals don't need brackets; an already-bracketed
-    /// literal (`[::1]`) is left untouched.
-    pub fn address(&self) -> String {
-        if self.host.contains(':') && !self.host.starts_with('[') && !self.host.ends_with(']') {
-            format!("[{}]:{}", self.host, self.port)
-        } else {
-            format!("{}:{}", self.host, self.port)
+    /// Build a `Peer`, computing its display address once. Call this
+    /// rather than a struct literal so any `Peer` in the process has a
+    /// populated `display_address`.
+    pub fn new(host: String, port: u16, tls: Option<crate::tls::ClientTlsConfig>) -> Self {
+        let display_address = format_display_address(&host, port);
+        Self {
+            host,
+            port,
+            tls,
+            display_address,
         }
+    }
+
+    /// `host:port` string suitable for `TcpStream::connect` /
+    /// `tokio::net::lookup_host` and for interpolating into
+    /// error-context messages. Bare IPv6 literals (e.g. `::1`) are
+    /// bracketed so the port parses correctly — `format!("{}:{}",
+    /// "::1", 514)` yields `::1:514` which Rust's `SocketAddr` parser
+    /// rejects (it reads the trailing `:514` as part of the address).
+    /// Hostnames and IPv4 literals aren't bracketed; an
+    /// already-bracketed literal (`[::1]`) is left untouched.
+    ///
+    /// Returns a borrow rather than an allocation — the string is
+    /// held on the `Peer` for as long as the peer lives, so every
+    /// call is a bare pointer/length copy. The pre-0.7.10 signature
+    /// returned `String` and re-ran the `format!()` on every send,
+    /// which showed up as a per-event allocation on the syslog_udp /
+    /// syslog_tcp hot path even though only the (near-zero-frequency)
+    /// error-context path actually consumed the value.
+    pub fn address(&self) -> &str {
+        &self.display_address
+    }
+}
+
+fn format_display_address(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') && !host.ends_with(']') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
     }
 }
 
@@ -560,11 +600,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     fn peer(host: &str, port: u16) -> Peer {
-        Peer {
-            host: host.to_string(),
-            port,
-            tls: None,
-        }
+        Peer::new(host.to_string(), port, None)
     }
 
     fn peers(n: usize) -> Vec<Peer> {
