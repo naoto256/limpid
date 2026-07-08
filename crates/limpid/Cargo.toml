@@ -63,9 +63,9 @@ rdkafka = { version = "0.36", features = ["cmake-build", "ssl", "sasl"], optiona
 # generated gRPC client/server stubs; `with-serde` derives Serialize /
 # Deserialize so the same message types serialize as both protobuf
 # (binary, gRPC and HTTP/protobuf) and JSON (HTTP/JSON).
-opentelemetry-proto = { version = "0.27", features = ["logs", "gen-tonic", "with-serde"] }
-tonic = { version = "0.12", features = ["tls", "tls-roots"] }
-prost = "0.13"
+opentelemetry-proto = { version = "0.32", features = ["logs", "gen-tonic", "with-serde"] }
+tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
+prost = "0.14"
 axum = "0.7"
 # axum-server with rustls support for the otlp_http TLS / mTLS path.
 # axum 0.7's bundled `axum::serve` is hardcoded to `TcpListener`; switching

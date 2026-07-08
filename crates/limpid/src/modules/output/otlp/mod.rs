@@ -182,6 +182,13 @@ fn resources_eq(a: &Option<Resource>, b: &Option<Resource>) -> bool {
         (Some(x), Some(y)) => {
             x.dropped_attributes_count == y.dropped_attributes_count
                 && attrs_eq(&x.attributes, &y.attributes)
+                // `entity_refs` (OTLP 0.32) participate in identity: two
+                // Resources with different EntityRef lists are semantically
+                // distinct resources, and folding them under one merge slot
+                // would drop the losing side's entity metadata. EntityRef
+                // itself derives `PartialEq + Eq`, so pointwise comparison
+                // suffices for the current EntityRef shape.
+                && x.entity_refs == y.entity_refs
         }
         _ => false,
     }
@@ -215,7 +222,12 @@ fn attrs_eq(a: &[KeyValue], b: &[KeyValue]) -> bool {
     a_sorted
         .iter()
         .zip(b_sorted.iter())
-        .all(|(x, y)| x.key == y.key && x.value == y.value)
+        // `key_strindex` (OTLP 0.32) is Profiles-only, but if a KeyValue
+        // does carry a strindex reference it identifies the key just as
+        // much as `key` does; skipping it would let two Profiles-encoded
+        // attributes with different strindex references collapse into one
+        // merge slot.
+        .all(|(x, y)| x.key == y.key && x.value == y.value && x.key_strindex == y.key_strindex)
 }
 
 #[cfg(test)]
@@ -233,8 +245,9 @@ mod tests {
                         ),
                     ),
                 }),
+                ..Default::default()
             }],
-            dropped_attributes_count: 0,
+            ..Default::default()
         })
     }
 
@@ -439,20 +452,24 @@ mod tests {
             KeyValue {
                 key: "k1".into(),
                 value: None,
+                ..Default::default()
             },
             KeyValue {
                 key: "k2".into(),
                 value: None,
+                ..Default::default()
             },
         ];
         let b = vec![
             KeyValue {
                 key: "k2".into(),
                 value: None,
+                ..Default::default()
             },
             KeyValue {
                 key: "k1".into(),
                 value: None,
+                ..Default::default()
             },
         ];
         assert!(attrs_eq(&a, &b));

@@ -416,6 +416,7 @@ mod tests {
                 resource: Some(Resource {
                     attributes: vec![],
                     dropped_attributes_count: 0,
+                    ..Default::default()
                 }),
                 scope_logs: vec![ScopeLogs {
                     scope: Some(InstrumentationScope {
