@@ -395,6 +395,56 @@ impl QueueReceiver {
         }
     }
 
+    /// Non-blocking peek at the next event. Returns `None` on empty
+    /// (regardless of closure state); a subsequent `recv().await` is
+    /// what observes queue closure.
+    ///
+    /// Safe here as the greedy-drain step of [`Self::recv_many`]
+    /// because the outer consumer loop always re-enters through
+    /// `recv().await` after each batch — so a permit-holding sender
+    /// whose write races the `try_recv()` will still be picked up on
+    /// the next iteration. This differs from the shutdown drain,
+    /// which exits the loop after one snapshot and therefore MUST
+    /// use `close() + recv().await`-until-`None` to avoid dropping
+    /// mid-write permit-holder sends. Do not lift `try_recv()` into
+    /// any exit path.
+    pub fn try_recv(&mut self) -> Option<(Event, AckPosition)> {
+        match &mut self.inner {
+            ReceiverInner::Memory(rx) => rx.try_recv().ok().map(|e| (e, AckPosition::Memory)),
+            ReceiverInner::Disk(rx) => rx.try_recv(),
+        }
+    }
+
+    /// Wait for at least one event, then greedily drain up to `max`
+    /// events total from the queue into `buf`. Returns the number of
+    /// events appended (0 only when the queue is closed and empty).
+    ///
+    /// Cancel-safe: the only `.await` is the initial `recv()` call,
+    /// which is cancel-safe by contract on both backends. Everything
+    /// after it is synchronous `try_recv()` — once the first event
+    /// lands in `buf`, this call cannot yield back to `select!` until
+    /// it returns. So if a `tokio::select!` branch other than this
+    /// one fires while `recv_many` is waiting for the first event,
+    /// no events are consumed; and if the first event has already
+    /// been observed, the whole batch runs to completion.
+    pub async fn recv_many(&mut self, buf: &mut Vec<(Event, AckPosition)>, max: usize) -> usize {
+        if max == 0 {
+            return 0;
+        }
+        let start = buf.len();
+        let Some(first) = self.recv().await else {
+            return 0;
+        };
+        buf.push(first);
+        while buf.len() - start < max {
+            match self.try_recv() {
+                Some(pair) => buf.push(pair),
+                None => break,
+            }
+        }
+        buf.len() - start
+    }
+
     /// Commit a specific event's position as processed. For the disk
     /// backend this records the ack against the in-flight position
     /// queue and, when the position is the front of the queue (or
@@ -702,6 +752,17 @@ impl Drop for QueueAckHandle {
     }
 }
 
+/// Maximum number of events drained per [`QueueReceiver::recv_many`]
+/// call inside the consumer loop. Bounds the number of events
+/// processed between two select-loop re-entries, which sets the
+/// worst-case latency for observing shutdown and ack arrivals — at
+/// this size (64 × sub-microsecond per-event `consume` calls in
+/// steady state) the blackout stays sub-millisecond, well inside the
+/// shutdown budget. Amortization of per-wake scheduler cost is a
+/// 1/k curve, so raising this further has diminishing returns while
+/// the blackout grows linearly; 64 sits past the knee of the curve.
+const RECV_BATCH_MAX: usize = 64;
+
 /// Run a queue consumer that drains events and writes them to an output.
 ///
 /// The consumer does not own retry / DLQ logic — each `Output` runs
@@ -735,6 +796,14 @@ pub async fn run_queue_consumer(
     // required). Once wedged, in-flight is drained but new
     // events stay in the queue for the next run's replay.
     let mut wedged = false;
+    // Reused batch buffer for `recv_many`. Allocated once with the
+    // batch cap so the steady-state hot path never reallocates. Owned
+    // by the loop (not the arm) so its lifetime is independent of any
+    // single `select!` future's cancellation — since our `recv_many`
+    // is cancel-safe up to its first pushed event, and the drain that
+    // follows the first push is synchronous, the only state that can
+    // survive across select re-entries is an empty buffer.
+    let mut batch: Vec<(Event, AckPosition)> = Vec::with_capacity(RECV_BATCH_MAX);
 
     loop {
         tokio::select! {
@@ -882,9 +951,18 @@ pub async fn run_queue_consumer(
                 }
             }
 
-            input = receiver.recv(), if accepting => {
-                match input {
-                    Some((event, position)) => {
+            n = receiver.recv_many(&mut batch, RECV_BATCH_MAX), if accepting => {
+                if n == 0 {
+                    // `recv_many` returned 0 ⇔ `recv().await` observed
+                    // `None` ⇔ queue closed and empty. Same semantics as
+                    // the pre-batch single-event `input = None` arm.
+                    info!("output '{}': queue closed", name);
+                    accepting = false;
+                    if in_flight == 0 {
+                        break;
+                    }
+                } else {
+                    for (event, position) in batch.drain(..) {
                         if let Some(tap) = &tap {
                             tap.emit(&format!("output {}", name), &event).await;
                         }
@@ -907,13 +985,6 @@ pub async fn run_queue_consumer(
                                 name,
                                 e
                             );
-                        }
-                    }
-                    None => {
-                        info!("output '{}': queue closed", name);
-                        accepting = false;
-                        if in_flight == 0 {
-                            break;
                         }
                     }
                 }
@@ -2073,6 +2144,161 @@ mod consumer_lifecycle_tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    // ---- recv_many batch drain ----
+
+    /// Batch drain preserves in-order delivery: N events pushed in
+    /// sender order arrive at the output in the same order. The disk
+    /// cursor's contiguous-prefix ack advances rely on this — a
+    /// mechanical refactor that pulled events out of `recv_many` in a
+    /// reordered way would silently break at-least-once.
+    #[tokio::test]
+    async fn recv_many_preserves_order_across_batch() {
+        let (sender, mut receiver) = create_queue(
+            "batch_order".into(),
+            QueueConfig {
+                queue_type: QueueType::Memory,
+                capacity: 16,
+            },
+        )
+        .unwrap();
+        for i in 0..8u32 {
+            let e = Event::new(
+                Bytes::copy_from_slice(&i.to_le_bytes()),
+                "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            );
+            sender.send(e).await.unwrap();
+        }
+        // Give the sends time to land so recv_many drains the whole
+        // backlog in one call (deterministic single-batch scenario).
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let mut buf: Vec<(Event, AckPosition)> = Vec::with_capacity(16);
+        let n = receiver.recv_many(&mut buf, 16).await;
+        assert_eq!(n, 8, "single-batch drain must collect all 8 events");
+        for (i, (event, _)) in buf.iter().enumerate() {
+            let mut expected = [0u8; 4];
+            expected.copy_from_slice(event.ingress.as_ref());
+            assert_eq!(
+                u32::from_le_bytes(expected),
+                i as u32,
+                "recv_many must preserve sender order at index {}",
+                i
+            );
+        }
+    }
+
+    /// Every event in a batch gets its own `QueueAckHandle` and its own
+    /// position feedback — batching must not coalesce acks. The
+    /// consumer path constructs one handle per drained event; this
+    /// test verifies at the receiver level that positions are distinct
+    /// across a batch.
+    #[tokio::test]
+    async fn recv_many_produces_distinct_positions_on_disk_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sender, mut receiver) = create_queue(
+            "batch_positions".into(),
+            QueueConfig {
+                queue_type: QueueType::Disk {
+                    path: tmp.path().display().to_string(),
+                    max_size: 4 * 1024 * 1024,
+                },
+                capacity: 16,
+            },
+        )
+        .unwrap();
+        for _ in 0..5 {
+            sender.send(owned_event()).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let mut buf: Vec<(Event, AckPosition)> = Vec::with_capacity(8);
+        let n = receiver.recv_many(&mut buf, 8).await;
+        assert_eq!(n, 5);
+        let mut seen: std::collections::HashSet<AckPosition> = std::collections::HashSet::new();
+        for (_, pos) in &buf {
+            assert!(
+                matches!(pos, AckPosition::Disk { .. }),
+                "disk backend must produce Disk positions"
+            );
+            assert!(
+                seen.insert(*pos),
+                "each event in a batch must carry a unique position; duplicate = {:?}",
+                pos
+            );
+        }
+    }
+
+    /// Natural close mid-drain: the sender is dropped while the
+    /// receiver still holds buffered events. `recv_many` must deliver
+    /// the remaining events on the batch that observes them, and the
+    /// next call must return 0 (queue closed). The consumer loop's
+    /// `n == 0` branch depends on this equivalence with the old
+    /// `recv() -> None`.
+    #[tokio::test]
+    async fn recv_many_returns_remainder_then_zero_after_sender_drop() {
+        let (sender, mut receiver) = create_queue(
+            "close_batch".into(),
+            QueueConfig {
+                queue_type: QueueType::Memory,
+                capacity: 8,
+            },
+        )
+        .unwrap();
+        sender.send(owned_event()).await.unwrap();
+        sender.send(owned_event()).await.unwrap();
+        sender.send(owned_event()).await.unwrap();
+        drop(sender);
+
+        let mut buf: Vec<(Event, AckPosition)> = Vec::with_capacity(8);
+        let n = receiver.recv_many(&mut buf, 8).await;
+        assert_eq!(n, 3, "closing after 3 sends must still yield those 3");
+        buf.clear();
+        let n2 = receiver.recv_many(&mut buf, 8).await;
+        assert_eq!(n2, 0, "subsequent call on closed empty queue must return 0");
+    }
+
+    /// Structural pin: the steady-state arm of `run_queue_consumer`
+    /// uses `recv_many` against the reused batch buffer, and returns
+    /// through the queue-closed branch when `n == 0`. Prevents a
+    /// refactor from silently reverting to per-event `recv()` (which
+    /// would restore the wake amplification that this phase exists to
+    /// mitigate) or from moving the batch buffer inside the select
+    /// arm (where cancellation could strand pushed events).
+    #[test]
+    fn steady_state_arm_uses_recv_many_with_reused_buffer() {
+        let src = include_str!("mod.rs");
+        // The batch buffer must be declared before the outer `loop`,
+        // not inside the select arm — otherwise its lifetime would
+        // not span cancellations. We only assert the declaration
+        // shape; a rename of `batch` would only fail this pin (not
+        // the correctness of the code) and force a deliberate update.
+        assert!(
+            src.contains(
+                "let mut batch: Vec<(Event, AckPosition)> = Vec::with_capacity(RECV_BATCH_MAX);"
+            ),
+            "batch buffer must be declared once outside the select loop"
+        );
+        // The steady-state arm must dispatch through `recv_many` and
+        // handle both `n == 0` (close) and drain-and-process paths.
+        assert!(
+            src.contains("receiver.recv_many(&mut batch, RECV_BATCH_MAX)"),
+            "steady-state arm must call recv_many with the reused batch buffer"
+        );
+        assert!(
+            src.contains("if n == 0 {"),
+            "steady-state arm must observe queue closure through n == 0"
+        );
+        // Guardrail: the old per-event single-recv shape must not survive
+        // alongside the batch shape. Assemble the forbidden literal at
+        // runtime so this test file itself does not contain it (the
+        // pattern-match would otherwise fail on the pin itself).
+        let forbidden = concat!("input = receiver.", "recv(), if accepting =>");
+        assert!(
+            !src.contains(forbidden),
+            "steady-state arm must not use the pre-batch per-event recv() shape"
+        );
     }
 
     // ---- backend-aware shutdown drain ----
