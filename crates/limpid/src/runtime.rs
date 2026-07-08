@@ -580,19 +580,28 @@ async fn run_pipeline_with_outputs(
     // `events_finished` / `events_discarded` decision still observes
     // the original semantics (Finished AND emitted ≥1 output → finished).
     let outputs = std::mem::take(&mut result.outputs);
-    // Each failed enqueue carries the per-output `OwnedEvent`
-    // snapshot so the DLQ record reflects the value the pipeline
-    // produced for that sink. The input event the function received
-    // is not equivalent: the pipeline may have produced a different
-    // egress for the output, and `inject output` replay must
-    // preserve the bytes the sink would have shipped.
-    let mut failed_outputs: Vec<(String, crate::event::OwnedEvent)> = Vec::new();
+    // Each failed enqueue carries a per-output snapshot of just the
+    // fields the DLQ record actually stores (`OutputEvent`:
+    // `source`, `received_at`, `ingress`, `egress` — the same shape
+    // `inject output` replay needs). Snapshotting `OutputEvent` here
+    // rather than the whole `OwnedEvent` avoids the workspace
+    // `HashMap<String, OwnedValue>` deep clone on every success:
+    // pre-fix this ran unconditionally before `sender.send(event)`
+    // because the send consumed `event`, and populated workspaces
+    // dominated the runtime hot path (see the `634cbd0` perf
+    // regression thread). The input event the function received is
+    // not equivalent to a per-output snapshot: the pipeline may have
+    // produced a different `egress` per output, and replay must
+    // preserve the bytes the sink would have shipped — which is why
+    // the snapshot is per-`(output_name, event)`, not one shared
+    // capture at function entry.
+    let mut failed_outputs: Vec<(String, crate::pipeline::OutputEvent)> = Vec::new();
     for (output_name, event) in outputs {
         if let Some(sender) = ctx.output_senders.get(&output_name) {
-            // Clone before send: the sender consumes `event`. `OwnedEvent`
-            // clone is cheap (Bytes are refcounted; workspace cost
-            // scales with the per-event populated keys).
-            let snapshot = event.clone();
+            // Snapshot the DLQ-relevant fields before the send
+            // consumes `event`. Cheap: four Copy scalars + two
+            // `Bytes` refcount bumps; workspace is not touched.
+            let snapshot = crate::pipeline::OutputEvent::from_owned(&event);
             if let Err(e) = sender.send(event).await {
                 // QueueSender::send already bumped per-output
                 // `events_failed` on the Err branch — that gives the
@@ -614,7 +623,10 @@ async fn run_pipeline_with_outputs(
                 "pipeline '{}': output '{}' not found",
                 pipeline.name, output_name
             );
-            failed_outputs.push((output_name, event));
+            failed_outputs.push((
+                output_name,
+                crate::pipeline::OutputEvent::from_owned(&event),
+            ));
         }
     }
 
@@ -645,7 +657,7 @@ async fn run_pipeline_with_outputs(
                     site: format!("{} enqueue", output_name),
                     reason: reason.clone(),
                     output_name: output_name.clone(),
-                    event: crate::pipeline::OutputEvent::from_owned(&snapshot),
+                    event: snapshot,
                 });
         }
     }
