@@ -78,7 +78,10 @@ limpidctl tap input fw_syslog
 # Stream events after a process
 limpidctl tap process enrich_fortigate
 
-# Stream full Event JSON (one per line) — useful for piping to jq
+# Stream Event JSON (one per line) — useful for piping to jq. Output-flavor
+# tap includes `received_at`, `source`, `ingress`, `egress`; use
+# `tap process <name> --json` to observe `workspace` state, which
+# `tap output` intentionally omits (see docs/src/operations/tap.md).
 limpidctl tap output ama --json
 
 # Inject raw lines into an input (each stdin line becomes one event)

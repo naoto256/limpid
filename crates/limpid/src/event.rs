@@ -246,8 +246,25 @@ impl OwnedEvent {
     /// boundary rules in `dsl::value_json`. Non-UTF-8 `ingress` /
     /// `egress` content surfaces as `OwnedValue::Bytes` and is encoded
     /// with the `$bytes_b64` marker; UTF-8-clean content stays a plain
-    /// JSON string. Workspace values flow through the same boundary.
+    /// JSON string. Workspace values flow through the same boundary
+    /// (present iff non-empty).
     pub fn to_json_value(&self) -> JsonValue {
+        self.to_json_value_with(true)
+    }
+
+    /// As [`Self::to_json_value`], but always omits the `workspace`
+    /// key regardless of population. Used by the output-flavor `tap`
+    /// projection so the tap JSON shape stays queue-kind independent:
+    /// disk-backed queues preserve the full workspace on their WAL
+    /// snapshot (see `to_owned` at the pipeline's output statement),
+    /// but the operator-facing tap output must not expose that
+    /// disk/memory-queue difference — see docs/src/operations/tap.md
+    /// for the contract.
+    pub fn to_json_value_without_workspace(&self) -> JsonValue {
+        self.to_json_value_with(false)
+    }
+
+    fn to_json_value_with(&self, include_workspace: bool) -> JsonValue {
         let mut map = serde_json::Map::new();
         // Wire form is unix nanoseconds (i64) — matches OTLP
         // `time_unix_nano` and is lossless against RFC3339. Receivers
@@ -268,7 +285,7 @@ impl OwnedEvent {
         map.insert("source".into(), JsonValue::Object(source_obj));
         map.insert("ingress".into(), bytes_to_json(&self.ingress));
         map.insert("egress".into(), bytes_to_json(&self.egress));
-        if !self.workspace.is_empty() {
+        if include_workspace && !self.workspace.is_empty() {
             let ws: Map = self
                 .workspace
                 .iter()
@@ -405,6 +422,44 @@ impl<'bump> BorrowedEvent<'bump> {
             // in `process_event`) still owns the Arc and fires the ack on
             // its own scope exit, which is exactly the "pipeline-worker
             // completion" semantics we want.
+            ack: None,
+        }
+    }
+
+    /// Heap-allocate a fresh [`OwnedEvent`] from this borrowed view,
+    /// dropping the `workspace` on the floor.
+    ///
+    /// Used at the pipeline `output` boundary for memory-backed queues,
+    /// where no downstream consumer reads `workspace`: every sink's
+    /// `consume` reads `egress` (with `file`'s dynamic path evaluator
+    /// reading `source` / `received_at` and `kafka`'s optional key
+    /// reading `source.ip`), the DLQ record projection stores only
+    /// `OutputEvent`'s four fields, and the analyzer rejects
+    /// `workspace` on the output config side at load time. Skipping
+    /// the workspace deep-clone here avoids the per-event `HashMap<
+    /// String, OwnedValue>` allocation + string-key allocations +
+    /// `Value` tree materialisation that dominated the hot path once
+    /// [`ProcessChain`] populated a non-trivial workspace — the
+    /// dominant contributor to the D-shape throughput regression that
+    /// landed with `b7625bb`.
+    ///
+    /// Not used on disk-backed queues (their WAL persists the full
+    /// `Event` JSON including `workspace`) or in `--test-pipeline`
+    /// mode (whose CLI display shows the populated workspace). The
+    /// caller (`PipelineStatement::Output` in
+    /// [`exec_pipeline_stmt`]) decides via its capture policy which
+    /// of `to_owned` / `to_owned_without_workspace` to invoke.
+    pub fn to_owned_without_workspace(&self) -> OwnedEvent {
+        OwnedEvent {
+            received_at: self.received_at,
+            source: self.source,
+            ingress: self.ingress.clone(),
+            egress: self.egress.clone(),
+            // `HashMap::new()` here does not allocate a backing table
+            // — that only happens on the first `insert`. So this is a
+            // zero-heap-touch construction; the four Bytes/scalar
+            // copies dominate.
+            workspace: HashMap::new(),
             ack: None,
         }
     }
@@ -546,6 +601,53 @@ mod boundary_tests {
             Some(OwnedValue::Bytes(b)) => assert_eq!(&b[..], &[0xff, 0x00, 0xab]),
             other => panic!("k_bytes round-tripped as wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn to_json_value_without_workspace_strips_populated_workspace() {
+        // Contract pin for the 0.7.10 tap-output-JSON change: the
+        // workspace-less projection must drop the `workspace` key
+        // even when the source event carries populated workspace
+        // entries. The output-flavor `tap` uses this projection to
+        // make its JSON shape independent of the queue backend
+        // (disk-backed queues preserve workspace on the snapshot; the
+        // tap must strip it uniformly). If a future change puts the
+        // key back, this test fires before docs / snippets drift.
+        let ev = sample_event();
+        assert!(
+            !ev.workspace.is_empty(),
+            "test fixture must populate workspace"
+        );
+        let stripped = ev.to_json_value_without_workspace();
+        let obj = stripped.as_object().expect("must produce object");
+        assert!(!obj.contains_key("workspace"), "workspace must be absent");
+        // The remaining shape stays byte-identical to `to_json_value` sans workspace,
+        // so downstream jq expressions that already project egress / source / etc.
+        // keep working verbatim.
+        assert!(obj.contains_key("received_at"));
+        assert!(obj.contains_key("source"));
+        assert!(obj.contains_key("ingress"));
+        assert!(obj.contains_key("egress"));
+    }
+
+    #[test]
+    fn to_owned_without_workspace_produces_empty_workspace() {
+        // Pin the counterpart at the pipeline output boundary: the
+        // memory-queue snapshot must not carry workspace even when the
+        // borrowed event's workspace has entries. `to_owned` still
+        // carries them for the disk-queue / `--test-pipeline` paths.
+        let original = sample_event();
+        let bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let borrowed = original.view_in(&arena);
+        let light = borrowed.to_owned_without_workspace();
+        assert!(light.workspace.is_empty(), "workspace must be empty");
+        // Every other DLQ / sink-relevant field must survive verbatim,
+        // matching the same round-trip guarantees as `to_owned`.
+        assert_eq!(light.received_at, original.received_at);
+        assert_eq!(light.source, original.source);
+        assert_eq!(light.ingress, original.ingress);
+        assert_eq!(light.egress, original.egress);
     }
 
     #[test]

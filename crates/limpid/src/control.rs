@@ -842,7 +842,25 @@ async fn handle_connection(
         };
         match tap.subscribe(&tap_target).await {
             Some(subscription) => {
-                handle_tap(&tap_target, subscription, &mut writer, json_mode).await;
+                // Output-flavor tap projects `workspace` out of its JSON
+                // shape unconditionally (0.7.10 contract): the pipeline's
+                // `output` statement drops workspace from the memory-
+                // queue snapshot but not the disk-queue one, and
+                // projecting here as well is what makes the operator-
+                // facing tap output shape independent of the queue kind
+                // the operator happened to configure. `process` and
+                // `input` taps keep workspace — process tap is exactly
+                // where operators debug workspace state, and input tap
+                // fires before any process has populated it.
+                let strip_workspace_json = tap_target.starts_with("output ");
+                handle_tap(
+                    &tap_target,
+                    subscription,
+                    &mut writer,
+                    json_mode,
+                    strip_workspace_json,
+                )
+                .await;
             }
             None => {
                 let _ = writer
@@ -1132,6 +1150,7 @@ async fn handle_tap(
     mut subscription: crate::tap::TapSubscription,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     json_mode: bool,
+    strip_workspace_json: bool,
 ) {
     // Skip the human-readable header in JSON mode so output is pure NDJSON
     // (safe to pipe to `jq` or `limpidctl inject --json`).
@@ -1145,7 +1164,12 @@ async fn handle_tap(
         match subscription.recv().await {
             Ok(event) => {
                 let line = if json_mode {
-                    event.to_json_string()
+                    if strip_workspace_json {
+                        serde_json::to_string(&event.to_json_value_without_workspace())
+                            .unwrap_or_default()
+                    } else {
+                        event.to_json_string()
+                    }
                 } else {
                     String::from_utf8_lossy(&event.egress).into_owned()
                 };
