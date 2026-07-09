@@ -51,7 +51,7 @@ def process compose_ocsf_detection_finding {
 
 Each `def process` is one small responsibility — parse one vendor, shape one schema, drop one class of events. A pipeline is a chain of them, separated by `|`, written in the same DSL whether you authored the piece yourself or pulled it from the library.
 
-The day you need to ship Cisco ASA logs to the same destination, you write `parse_cisco_asa` and reuse `compose_ocsf_finding` unchanged. The day you want to drop debug-level events before they leave, you slot in a `drop_debug` ahead of the chain. The day a vendor adds a field, you edit the parser snippet and `SIGHUP`. Each change is a swap, an insertion, or an edit on one named piece — never a rewrite of the whole pipeline.
+The day you need to ship Cisco ASA logs to the same destination, you write `parse_asa` and reuse `compose_ocsf` unchanged. The day you want to drop debug-level events before they leave, you slot in a `drop_debug` ahead of the chain. The day a vendor adds a field, you edit the parser snippet and `SIGHUP`. Each change is a swap, an insertion, or an edit on one named piece — never a rewrite of the whole pipeline.
 
 ## Why this is different
 
@@ -70,7 +70,7 @@ And here is the half that should make you grin — daily operations the alternat
 - **You can watch the pipeline work, live.** `limpidctl tap output security_lake --json` streams events as they leave for the destination (source, ingress, egress bytes). `limpidctl tap process compose_ocsf --json` shows the workspace state at that pipeline hop. No pause, no traffic duplication, no second tool. Every pipeline is its own debugger.
 
   ```text
-  $ limpidctl tap process compose_ocsf --json | jq -c '{src: .source, sev: .workspace.cef.severity_level, class: .workspace.ocsf.class_uid}'
+  $ limpidctl tap process compose_ocsf --json | jq -c '{src: .source, sev: .workspace.limpid.severity_id, class: .workspace.limpid.class_uid}'
   {"src":{"ip":"10.0.0.21","port":51234},"sev":3,"class":200401}
   {"src":{"ip":"10.0.0.21","port":51234},"sev":7,"class":200401}
   {"src":{"ip":"10.0.0.22","port":42100},"sev":2,"class":200401}
@@ -79,21 +79,19 @@ And here is the half that should make you grin — daily operations the alternat
 
 - **Edit. Save. Reload. Mistake? It rolls back.** `SIGHUP` validates the new config first. A typo, an unknown identifier, a missing include — the daemon refuses the new config, prints a diagnostic, keeps the existing runtime intact. A *valid* reload tears down the old runtime and rebinds — brief downtime for *new* connections; the old runtime drains established TCP/HTTP/gRPC connections and disk queues persist across the cycle (memory queues and in-flight events are best-effort drained). Iterating on production pipelines stops being scary.
 
-- **Yesterday's traffic, today's config.** Capture an hour of real events with `tap --json`; edit the pipeline; replay through `inject --json`. Pipeline changes get validated against actual production shapes — not synthetic fixtures, not staging that drifted six months ago.
+- **Yesterday's traffic, today's config.** Capture an hour of real events with `limpidctl tap output <name> --json`; edit the pipeline; replay through `limpidctl inject input <name> --json`. Pipeline changes get validated against actual production shapes — not synthetic fixtures, not staging that drifted six months ago.
 
-- **Mistyped a workspace field?** `limpid --check` catches it before the daemon starts: rustc-style diagnostic, line and column, *"did you mean `workspace.severity`?"*. No "deploy and find out". No 3am page from a config typo that compiled fine and silently dropped half the events.
+- **Mistyped a function name?** `limpid --check --ultra-strict` catches it before the daemon starts: rustc-style diagnostic, line and column, *"did you mean `parse_json`?"*. No "deploy and find out". No 3am page from a config typo that compiled fine and silently dropped half the events.
 
   ```text
-  $ limpid --check --config /etc/limpid/limpid.conf
-  error: unknown identifier `workspace.severty`
-    --> /etc/limpid/limpid.conf:34:26
+  $ limpid --check --ultra-strict --config /etc/limpid/limpid.conf
+  error[dataflow]: [pipeline main] call to unknown function `parse_jsn`
+    --> /etc/limpid/limpid.conf:11:24
      |
-  34 |     if workspace.severty == "high" {
-     |        ^^^^^^^^^^^^^^^^^^ help: did you mean `workspace.severity`?
-     |
-     = note: defined in process `parse_fortigate` at line 12
-
-  error: aborting due to 1 previous error
+  11 |     workspace.parsed = parse_jsn(ingress)
+     |                        ^^^^^^^^^^^^^^^^^^
+     = help: did you mean `parse_json`?
+  error: /etc/limpid/limpid.conf: 1 error(s) found
   ```
 
 These come from [five design principles](docs/src/design-principles.md) — *zero hidden behavior*, *I/O is dumb transport*, *only `egress` crosses hops*, *atomic events through the pipeline*, and *safety and operational transparency* — that are stated, defended, and held in place by the analyzer.
@@ -105,6 +103,14 @@ cargo build --release -p limpid -p limpidctl -p limpid-prometheus
 
 limpid --check --config /etc/limpid/limpid.conf     # static analysis
 limpid --config /etc/limpid/limpid.conf             # run the daemon
+```
+
+Optional feature-gated modules (require system libs):
+
+```bash
+cargo build --release -p limpid --features journal    # systemd journal input; needs libsystemd-dev
+cargo build --release -p limpid --features kafka      # kafka output; needs libsasl2-dev / librdkafka build deps
+cargo build --release -p limpid --features journal,kafka
 ```
 
 Other useful flags during config development:
@@ -120,11 +126,13 @@ See the [Getting Started guide](docs/src/getting-started.md) for installation, .
 
 ### Inputs
 
-`syslog_udp` · `syslog_tcp` (with optional TLS / mTLS) · `tail` · `journal` · `unix_socket` · `otlp_http` · `otlp_grpc`
+`syslog_udp` · `syslog_tcp` (with optional TLS / mTLS) · `tail` · `journal`&nbsp;\* · `unix_socket` · `otlp_http` · `otlp_grpc`
 
 ### Outputs
 
-`syslog_udp` · `syslog_tcp` (with optional per-peer TLS / mTLS) · `file` · `http` (with per-peer TLS / mTLS, round-robin across peers) · `kafka` (with optional TLS / mTLS / SASL) · `unix_socket` · `stdout` · `otlp_http` / `otlp_grpc` (with per-peer TLS / mTLS, round-robin across peers)
+`syslog_udp` · `syslog_tcp` (with optional per-peer TLS / mTLS) · `file` · `http` (with per-peer TLS / mTLS, round-robin across peers) · `kafka`&nbsp;\* (with optional TLS / mTLS / SASL) · `unix_socket` · `stdout` · `otlp_http` / `otlp_grpc` (with per-peer TLS / mTLS, round-robin across peers)
+
+\* `journal` and `kafka` are feature-gated — build with `--features journal` / `--features kafka` (see [Quick start](#quick-start)).
 
 ### Upgrading from earlier versions
 
@@ -176,18 +184,18 @@ Full reference: [Built-in Functions](docs/src/functions/expression-functions.md)
 
 ## Performance
 
-A single core handles **~221k events/sec** on the heaviest realistic DSL workload — full OCSF Authentication compose with `to_json` serialization, single-pipeline single-input, channel-direct injection. Lighter shapes scale up from there:
+A single core handles **~221k events/sec** on the heaviest realistic schema-shaping DSL workload — full OCSF Authentication compose with `to_json` serialization, single-pipeline single-input, channel-direct injection. Lighter shapes scale up from there:
 
 | Pipeline shape | events/sec/core |
 | --- | ---: |
 | passthrough | 378k |
 | `syslog.parse(ingress)` | 380k |
-| parse + 2× regex + if/else | 146k |
-| **OCSF compose + to_json (heaviest)** | **221k** |
+| OCSF compose + to_json (heaviest realistic schema-shaping) | 221k |
+| **parse + 2× regex + if/else (heaviest per event)** | **146k** |
 
-Multi-pipeline configurations scale across cores via Tokio's multi-thread runtime: 4 independent pipelines (each its own input, process chain, and output) reach ~459k events/sec aggregate on the OCSF compose workload — 2.7× the single-pipeline number on a 16-core host with no application-level work-stealing or pinning.
+Multi-pipeline configurations scale across cores via Tokio's multi-thread runtime: 4 independent pipelines (each its own input, process chain, and output) reach ~459k events/sec aggregate on the OCSF compose workload on a 16-core host, with no application-level work-stealing or pinning. That aggregate figure is a v0.6.x measurement window that predates the v0.7.10 wake-mitigation work; the same experiment on v0.7.10 has not yet been re-run, and the aggregate is likely higher today.
 
-The numbers come from the v0.6.0 perf milestone (per-event bump arena, direct `serde::Serialize` for the runtime `Value` tree, static-literal hash-key interning, and a boundary refactor that eliminated the hot-path `BorrowedEvent::to_owned()` at every output sink), the v0.6.1 follow-up (per-worker bump-arena recycling, lifting the macOS `xzm` zone-lock contention that capped multi-pipeline scaling), and the v0.7.10 queue-consumer wake mitigation (batch-drain via `recv_many` plus an adaptive spin-before-park controller) that closed a wake-amplification tail on populated-workspace workloads. Real I/O (`__sendto`) and tokio scheduling are now the dominant categories on the flame graph; allocation collapsed from 43% at v0.5.7 to 15% on the single-pipeline path. See the [CHANGELOG](CHANGELOG.md) for the cumulative breakdown.
+The single-core numbers above are v0.7.10 measurements. The path to today's numbers ran through the v0.6.0 perf milestone (per-event bump arena, direct `serde::Serialize` for the runtime `Value` tree, static-literal hash-key interning, and a boundary refactor that eliminated the hot-path `BorrowedEvent::to_owned()` at every output sink), the v0.6.1 follow-up (per-worker bump-arena recycling, lifting the macOS `xzm` zone-lock contention that capped multi-pipeline scaling), and the v0.7.10 queue-consumer wake mitigation (batch-drain via `recv_many` plus an adaptive spin-before-park controller) that closed a wake-amplification tail on populated-workspace workloads. Real I/O (`__sendto`) and tokio scheduling are now the dominant categories on the flame graph; allocation collapsed from 43% at v0.5.7 to 15% on the single-pipeline path. See the [CHANGELOG](CHANGELOG.md) for the cumulative breakdown.
 
 ## Compared to rsyslog / fluentd / Vector
 
@@ -195,9 +203,9 @@ A capability snapshot versus the established log forwarders. Where a cell says "
 
 | Capability | rsyslog | fluentd | Vector | **limpid** |
 | --- | --- | --- | --- | --- |
-| **Pre-deploy config check** | — | — | `vector validate` | rustc-style type checker |
+| **Pre-deploy config check** | `rsyslogd -N1` (syntax) | `fluentd --dry-run` (config parse) | `vector validate` | rustc-style type + dataflow checker |
 | **Live event tap (any hop)** | — | — | `vector tap` | `limpidctl tap` |
-| **Replay captured traffic** | — | — | — | `inject --json` |
+| **Replay captured traffic** | — | — | — | `limpidctl inject` |
 | **Hot reload safety** | SIGHUP, no rollback | SIGHUP, fragile | SIGHUP, validates first | SIGHUP atomic, rollback on failure |
 | **Vendor parsers** | C modules | Ruby plugins | DSL transforms (VRL) | DSL snippets (`include`-able) |
 | **OTLP first-class** | — | plugin | yes | yes (input + output, 3 transports) |
@@ -213,7 +221,7 @@ The point is not that the alternatives are bad — they have decades of hardened
 - [Process Design Guide](docs/src/processing/design-guide.md) · [User-defined Processes](docs/src/processing/user-defined.md)
 - [Functions](docs/src/functions/README.md) · [Built-in Functions](docs/src/functions/expression-functions.md) · [User-defined Functions](docs/src/functions/user-defined.md)
 - [Pipelines](docs/src/pipelines/README.md) · [Routing](docs/src/pipelines/routing.md) · [`drop`, `finish`, and `error`](docs/src/pipelines/drop-finish-error.md) · [Examples](docs/src/pipelines/examples.md) · [Multi-host Pipeline Example](docs/src/pipelines/multi-host.md)
-- [CLI](docs/src/operations/cli.md) · [Debug Tap](docs/src/operations/tap.md) · [Schema Validation](docs/src/operations/schema-validation.md) · [Metrics](docs/src/operations/metrics.md) · [Packaging](docs/src/operations/packaging.md) · [systemd](docs/src/operations/systemd.md)
+- [CLI](docs/src/operations/cli.md) · [Debug Tap](docs/src/operations/tap.md) · [Error Log (DLQ)](docs/src/operations/error-log.md) · [Schema Validation](docs/src/operations/schema-validation.md) · [Metrics](docs/src/operations/metrics.md) · [Packaging](docs/src/operations/packaging.md) · [systemd](docs/src/operations/systemd.md)
 - [OTLP — design rationale](docs/src/otlp.md)
 - [Migrating from rsyslog](docs/src/operations/migration.md)
 
