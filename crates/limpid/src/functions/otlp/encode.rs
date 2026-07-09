@@ -734,4 +734,84 @@ mod tests {
             other => panic!("expected StringValueStrindex(42), got {:?}", other),
         }
     }
+
+    /// OTLP 0.32 promoted `Resource.entity_refs` (`EntityRef`) to a
+    /// first-class wire surface. The DSL primitive must preserve
+    /// every named field on that surface across a decode/encode
+    /// cycle — schema_url, type, id_keys, description_keys — or a
+    /// caller that constructs an EntityRef through the DSL will
+    /// silently lose the field on the wire.
+    #[test]
+    fn entity_ref_round_trips_all_fields_through_hashlit_form() {
+        // Construct a full-shape EntityRef DSL object.
+        let id_keys: &[Value<'_>] = &[Value::String("host.id"), Value::String("host.name")];
+        let description_keys: &[Value<'_>] = &[Value::String("host.type")];
+        let entity_entries: &[(&str, Value<'_>)] = &[
+            (
+                "schema_url",
+                Value::String("https://opentelemetry.io/schemas/1.32.0"),
+            ),
+            ("type", Value::String("host")),
+            ("id_keys", Value::Array(id_keys)),
+            ("description_keys", Value::Array(description_keys)),
+        ];
+
+        // DSL → proto: every named field must land on the wire.
+        let er = hashlit_to_entity_ref(&Value::Object(entity_entries)).unwrap();
+        assert_eq!(er.schema_url, "https://opentelemetry.io/schemas/1.32.0");
+        assert_eq!(er.r#type, "host");
+        assert_eq!(
+            er.id_keys,
+            vec!["host.id".to_string(), "host.name".to_string()]
+        );
+        assert_eq!(er.description_keys, vec!["host.type".to_string()]);
+
+        // proto → DSL: the same fields must come back through the
+        // arena-side encoder in the object shape the DSL side reads.
+        let bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let out = entity_ref_to_hashlit(&arena, &er);
+        let out_entries = match out {
+            Value::Object(entries) => entries,
+            other => panic!("entity_ref_to_hashlit must return Object, got {:?}", other),
+        };
+        let get = |k: &str| -> Value<'_> {
+            out_entries
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| *v)
+                .unwrap_or_else(|| panic!("EntityRef roundtrip: missing field `{}`", k))
+        };
+        assert!(matches!(
+            get("schema_url"),
+            Value::String("https://opentelemetry.io/schemas/1.32.0")
+        ));
+        assert!(matches!(get("type"), Value::String("host")));
+        match get("id_keys") {
+            Value::Array(xs) => {
+                let strs: Vec<&str> = xs
+                    .iter()
+                    .map(|v| match v {
+                        Value::String(s) => *s,
+                        other => panic!("id_keys element must be String, got {:?}", other),
+                    })
+                    .collect();
+                assert_eq!(strs, vec!["host.id", "host.name"]);
+            }
+            other => panic!("id_keys must be Array, got {:?}", other),
+        }
+        match get("description_keys") {
+            Value::Array(xs) => {
+                let strs: Vec<&str> = xs
+                    .iter()
+                    .map(|v| match v {
+                        Value::String(s) => *s,
+                        other => panic!("description_keys element must be String, got {:?}", other),
+                    })
+                    .collect();
+                assert_eq!(strs, vec!["host.type"]);
+            }
+            other => panic!("description_keys must be Array, got {:?}", other),
+        }
+    }
 }
