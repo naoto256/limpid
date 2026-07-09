@@ -592,6 +592,27 @@ impl QueueReceiver {
         }
     }
 
+    /// Return the current spin budget only when the spin phase is
+    /// worth running on this receiver's backend.
+    ///
+    /// The `SpinController` state machine is per-receiver and applies
+    /// uniformly, but the *cost model* of the spin phase's `try_recv`
+    /// calls does not: memory `try_recv` is nanoseconds (one atomic
+    /// mpsc peek), disk `try_recv` opens a segment file and seeks per
+    /// call (multiple microseconds). The spin phase is meant to
+    /// convert a park/wake round trip (a few microseconds) into a
+    /// handful of quick `try_recv` calls, and only earns its keep on
+    /// the memory backend where each poll is cheap. On the disk
+    /// backend the same 128-iteration budget would cost more than
+    /// the park it is meant to skip. Gating the phase here is the
+    /// smallest change that respects both sides of the balance.
+    fn spin_budget_for_backend(&self) -> Option<u32> {
+        match &self.inner {
+            ReceiverInner::Memory(_) => self.spin_ctrl.should_spin(),
+            ReceiverInner::Disk(_) => None,
+        }
+    }
+
     /// Wait for at least one event, then greedily drain up to `max`
     /// events total from the queue into `buf`. Returns the number of
     /// events appended (0 only when the queue is closed and empty).
@@ -608,12 +629,14 @@ impl QueueReceiver {
     /// Flow:
     /// 1. **Fast-path drain**: pop already-queued events synchronously.
     ///    On a healthy backlog regime this is the only step that runs.
-    /// 2. **Adaptive spin** (`SpinController::should_spin`): if the
-    ///    controller has a non-zero budget, spin `try_recv` /
-    ///    `spin_loop` up to that budget. On a hit inside the spin
-    ///    window we skip the park entirely and record the arrival
-    ///    depth via `record_hit`; on budget exhaustion we call
-    ///    `record_spin_miss` right before parking.
+    /// 2. **Adaptive spin** (`SpinController::should_spin`, gated to
+    ///    the memory backend via [`Self::spin_budget_for_backend`]): if
+    ///    the controller has a non-zero budget and the receiver's
+    ///    backend is memory, spin `try_recv` / `spin_loop` up to that
+    ///    budget. On a hit inside the spin window we skip the park
+    ///    entirely and record the arrival depth via `record_hit`; on
+    ///    budget exhaustion we call `record_spin_miss` right before
+    ///    parking.
     /// 3. **Timed park**: `Instant::now()` before `recv().await`,
     ///    `elapsed()` after — the duration is fed to `record_park`
     ///    so the controller can grow the budget when it sees a park
@@ -638,10 +661,21 @@ impl QueueReceiver {
             return buf.len() - start;
         }
 
-        // (2) Adaptive spin phase. When budget is 0 (cold start /
-        // decayed at idle) `should_spin` returns None and we go
-        // straight to park — that is the "idle byte-identical" path.
-        if let Some(budget) = self.spin_ctrl.should_spin() {
+        // (2) Adaptive spin phase. Gated to the memory backend: on
+        // the disk backend every `try_recv` performs a fresh segment
+        // file open + seek (multi-microseconds), so a spin budget of
+        // up to `SPIN_CAP = 128` iterations against an empty
+        // disk-backed queue would cost hundreds of microseconds per
+        // idle poll — comparable to or worse than the single park
+        // round trip the spin phase is meant to save. The controller
+        // still records park durations on the disk backend below
+        // (the state is cheap and preserves R4's pseudo-hit escape
+        // shape) but the spin phase itself is a memory-only path.
+        // When the budget is 0 (cold start / decayed at idle) or
+        // the backend is disk, `spin_budget_for_backend` returns
+        // `None` and we go straight to park — that is the
+        // "idle byte-identical" path.
+        if let Some(budget) = self.spin_budget_for_backend() {
             let mut iterations: u32 = 0;
             while iterations < budget {
                 iterations = iterations.saturating_add(1);
@@ -2741,8 +2775,9 @@ mod consumer_lifecycle_tests {
         let body = &body_tail[..slice_end];
 
         assert!(
-            body.contains("self.spin_ctrl.should_spin()"),
-            "recv_many must consult SpinController via should_spin"
+            body.contains("self.spin_budget_for_backend()"),
+            "recv_many must gate the spin phase through spin_budget_for_backend \
+             (which composes SpinController::should_spin with the backend check)"
         );
         assert!(
             body.contains("self.spin_ctrl.record_hit("),
@@ -2763,6 +2798,69 @@ mod consumer_lifecycle_tests {
         assert!(
             body.contains("std::hint::spin_loop()"),
             "recv_many must use std::hint::spin_loop between spin iterations"
+        );
+    }
+
+    /// Backend-aware spin gating: on the memory backend the helper
+    /// forwards the controller's current budget (nanosecond-scale
+    /// `try_recv` per iteration is worth spinning); on the disk
+    /// backend the helper returns `None` regardless of controller
+    /// state (multi-microsecond `try_recv` per iteration would cost
+    /// more than the park round trip the spin phase is meant to
+    /// skip). Prevents a mechanical simplification from lifting the
+    /// spin phase back onto the disk backend, which no unit test
+    /// timing check would catch on its own.
+    #[tokio::test]
+    async fn spin_budget_for_backend_returns_none_on_disk_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_sender, mut receiver) = create_queue(
+            "spin_budget_disk".into(),
+            QueueConfig {
+                queue_type: QueueType::Disk {
+                    path: tmp.path().display().to_string(),
+                    max_size: 4 * 1024 * 1024,
+                },
+                capacity: 16,
+            },
+        )
+        .unwrap();
+
+        // Warm the receiver's own controller — a copy would only pin
+        // the SpinController state machine, not the backend gate the
+        // helper on the receiver is supposed to apply on top of it.
+        receiver.spin_ctrl.record_hit(SPIN_CAP);
+        assert!(
+            receiver.spin_ctrl.should_spin().is_some(),
+            "sanity: receiver's controller is warm — the assertion below is checking the gate, not the controller"
+        );
+
+        // With the receiver's own controller genuinely warm, the
+        // helper must still return None because the backend is disk.
+        assert!(
+            receiver.spin_budget_for_backend().is_none(),
+            "disk backend must never enter the spin phase, even when the receiver's controller is warm"
+        );
+    }
+
+    #[tokio::test]
+    async fn spin_budget_for_backend_forwards_controller_on_memory_backend() {
+        let (_sender, mut receiver) = create_queue(
+            "spin_budget_memory".into(),
+            QueueConfig {
+                queue_type: QueueType::Memory,
+                capacity: 16,
+            },
+        )
+        .unwrap();
+
+        // Cold controller: helper returns None (matches R5).
+        assert!(receiver.spin_budget_for_backend().is_none());
+
+        // Warm the controller and confirm the helper now forwards it.
+        receiver.spin_ctrl.record_hit(4);
+        assert!(
+            receiver.spin_budget_for_backend().is_some(),
+            "memory backend with a warm controller must return Some(budget)"
         );
     }
 

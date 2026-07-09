@@ -74,10 +74,10 @@ When a new downstream appears with a schema nobody has seen before, the integrat
 
 ## Recipes
 
-All recipes assume `limpidctl tap <kind> <name> --json` is producing the pipeline's final serialized output — the same Event JSON described in [Debug Tap](./tap.md). Each event is one line, with `received_at`, `source`, `ingress`, and `egress` top-level keys. Which tap point exposes the structured payload depends on where the check lives:
+All recipes stream a JSONL Event via `limpidctl tap <kind> <name> --json` — the same Event JSON described in [Debug Tap](./tap.md), one event per line, with `received_at`, `source`, `ingress`, and `egress` top-level keys always present. Which tap point you pick — and whether the payload the schema lives on is `.egress` or `.workspace.<schema>` — depends on where the check lives:
 
-- **Wire-level validation** (schema over the bytes the sink will actually ship) uses `tap output <name> --json` and reads `.egress`. This is the shape a receiver sees.
-- **Pre-serialization / composed-object validation** (schema over the tree the pipeline built before rendering) uses `tap process <compose_process> --json` and reads `.workspace.<schema>` — the process tap is where workspace state is observable. `tap output --json` does not expose `workspace`; picking the named `compose` process one hop back keeps the recipe reading the same fields it always has, just from the pipeline point that actually holds them.
+- **Wire-level validation** (schema over the bytes the sink will actually ship) uses `tap output <name> --json` and reads `.egress`. This is the shape a receiver sees. `tap output --json` never carries `workspace` — the projection is unconditional in v0.7.10 regardless of queue backend.
+- **Pre-serialization / composed-object validation** (schema over the tree the pipeline built before rendering) uses `tap process <compose_process> --json` and reads `.workspace.<schema>` — the process tap emits at process exit with the full workspace state visible, which is where the composed structured payload lives before the sink renders it into `egress`. Picking the named `compose` process one hop back keeps the recipe reading the same fields it always has, just from the pipeline point that actually holds them.
 
 ### OCSF (JSON Schema)
 
