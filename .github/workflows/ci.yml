@@ -46,6 +46,29 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # Snippet-pack gates. Both are cheap after the workspace build
+      # above (xtask is already compiled), and they fail on distinct
+      # conditions worth surfacing independently in the CI log.
+      #
+      #   lint-snippet-headers      — every packaging/snippets/**/*.limpid
+      #                                header conforms to the per-kind
+      #                                schema (see packaging/snippets/README.md
+      #                                § Authoring conventions). Enforces the
+      #                                seven guardrails documented there and
+      #                                fails on unknown / mis-ordered / typo'd
+      #                                keys.
+      #   gen-snippet-inventory     — the four inventory tables in
+      #        --check                packaging/snippets/README.md match
+      #                                what regeneration would produce from
+      #                                the current headers. Fails on drift so
+      #                                that a header change without an
+      #                                inventory refresh does not merge.
+      - name: Lint snippet headers
+        run: cargo xtask lint-snippet-headers
+
+      - name: Verify snippet inventory in sync
+        run: cargo xtask gen-snippet-inventory --check
+
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
 

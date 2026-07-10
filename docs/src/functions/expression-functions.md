@@ -581,8 +581,10 @@ egress = to_json(null_omit(workspace.payload))
 | `null` | `null` |
 | `42` | `42` (scalar pass-through) |
 
-Designed for the OCSF-shape composer pattern (build a HashLit from
-parser-populated workspace fields, then `to_json` for `egress`).
+Designed for the schema-composer pattern (build a HashLit from
+parser-populated `workspace.lsis.*` fields, then `to_json` into the
+LSIS slot `workspace.lsis.<schema>`; the companion
+`<schema>_to_egress` process moves the slot to `egress`).
 Without `null_omit`, every absent field renders as `"key": null` in
 the output — not strictly invalid, but consumers that strictly
 validate against OCSF schema (Microsoft Sentinel, Splunk DM) often

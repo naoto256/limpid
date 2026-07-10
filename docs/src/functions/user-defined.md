@@ -194,7 +194,7 @@ Rule of thumb: **if the result is a single value the caller wants to embed somew
 
 ## Example: vendor parser glue
 
-A typical vendor parser uses several small functions to canonicalise vendor-specific values into OCSF-shape:
+A typical vendor parser uses several small functions to canonicalise vendor-specific values into canonical LSIS shape:
 
 ```
 // functions/normalize_severity.limpid

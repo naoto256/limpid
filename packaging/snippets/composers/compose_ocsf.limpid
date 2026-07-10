@@ -15,8 +15,8 @@
 // Test corpus: spec-only (OCSF 1.3.0 schema; per-class leaf shapes
 //              cross-checked against schema.ocsf.io class definitions)
 //
-// Contract — workspace.lsis is the parser ↔ composer canonical intermediate:
-//   * parsers populate `workspace.lsis.*` only with OCSF-canonical
+// Contract — workspace.lsis is the parser ↔ composer canonical intermediate (LSIS):
+//   * parsers populate `workspace.lsis.*` only with LSIS-vocabulary
 //     fields. Vendor intermediates (`workspace.cef`, `workspace.syslog`)
 //     are NOT read by the composer.
 //   * composer reads `workspace.lsis.*` only.
