@@ -1,10 +1,18 @@
-// Replayable-event composer
+// Summary:     Serialises the event into the minimal replay-record
+//              shape `{ received_at, source, ingress }` — the same
+//              three fields the error_log (DLQ) preserves and
+//              `inject --json` consumes.
+// Reads:       ingress (passed through verbatim) — plus the ambient
+//              event metadata `received_at` / `source`, which every
+//              process can read unconditionally.
+// Writes:      workspace.lsis.replayable — replay record JSONL line
+//              (String). Pipe `| replayable_to_egress` (foot of
+//              file) to emit it as the capture stream.
+// Test corpus: spec-only (mirrors the error_log DLQ record shape;
+//              round-trips through `limpidctl inject --json`)
 //
-// Serialises the event into the minimal "replay record" shape —
-// `{ received_at, source, ingress }` — the same three fields the
-// error_log (DLQ) preserves and `inject --json` consumes. Pair with
-// `output file` to capture a JSONL stream that can be replayed later
-// through any pipeline:
+// Pair with `output file` to capture a JSONL stream that can be
+// replayed later through any pipeline:
 //
 //   def output capture {
 //       type file

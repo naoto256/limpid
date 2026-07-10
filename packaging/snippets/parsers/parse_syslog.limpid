@@ -1,12 +1,16 @@
-// Vendor:   RFC 3164 / RFC 5424 syslog (transport)
-// Wire:     `<PRI>...` syslog header + message body, single line per
-//           record (auto-detects RFC 3164 BSD vs RFC 5424 versioned)
-// Upstream: none — `parse_syslog` is a transport-layer parser, run
-//           directly off `ingress` (typically the first process in a
-//           pipeline whose `input` is `syslog_tcp` (optionally TLS-
-//           terminated) or `syslog_udp`)
-// Output:   workspace.syslog.{pri, facility, severity, timestamp,
-//           hostname, appname, procid, msgid, msg}
+// Summary:     RFC 3164 / RFC 5424 syslog wire → workspace.syslog.*
+//              transport fields (transport-layer parser; bridging the body
+//              into a vocabulary intake is the caller's job).
+// Reads:       ingress (raw wire) — <PRI>-prefixed syslog line, RFC 3164
+//              BSD vs RFC 5424 auto-detected
+// Writes:      workspace.syslog.{pri, facility, severity, timestamp,
+//              hostname, appname, procid, msgid, msg} — the transport
+//              namespace, not LSIS.
+// Category:    Transport
+// Test corpus: synthetic (RFC 3164 / RFC 5424 sample wires in this header)
+//
+// Typically the first process in a pipeline whose `input` is `syslog_tcp`
+// (optionally TLS-terminated) or `syslog_udp`.
 //
 // Thin wrapper around the `syslog.parse()` primitive. Exists so a
 // pipeline can express transport stacking explicitly:

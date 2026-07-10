@@ -1,5 +1,20 @@
 // Zeek full-scope parser (vocabulary)
 //
+// Summary:     Zeek full-scope extension — remaining protocol streams, drop
+//              arms for low-signal streams, and a catch-all that wraps
+//              unknown _paths into 4001/unmapped, on top of parse_zeek_soc.
+// Reads:       workspace.zeek.* (bridge — see Bridges in parse_zeek_default.limpid)
+//   .body (required, Object) — parsed Zeek event (caller does `parse_json(ingress)`)
+//   .hostname (optional, String) — collector override
+//   .time (optional, Int) — epoch ns override
+// Writes:      workspace.lsis.* — 14 protocol streams → 4001 (generic);
+//              stats / capture_loss / known_* / software dropped; catch-all
+//              wraps any other _path into 4001 with the raw body under
+//              unmapped.
+// Category:    OSS NDR
+// Test corpus: spec-only (Zeek script reference; catch-all and drop arms are
+//              shape-level, not corpus-verified)
+//
 // Extends `parse_zeek_soc.limpid` with:
 //   - Specialised handlers for the rest of the Zeek default protocol
 //     scripts (signature / intel / traceroute / tunnel / mysql /
@@ -15,7 +30,7 @@
 //     can post-process by inspecting `unmapped.zeek_path` to recover
 //     the original log type.
 //
-// Composition: transitively includes parse_zeek_soc → parse_zeek_default.
+// Composition — transitively includes parse_zeek_soc → parse_zeek_default.
 // Operators picking the full scope only write one include + reference
 // `parse_zeek_full` in the pipeline.
 //

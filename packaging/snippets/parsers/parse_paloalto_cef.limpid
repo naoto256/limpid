@@ -1,9 +1,15 @@
-// Palo Alto Networks PAN-OS CEF parser
+// Summary:     Palo Alto Networks PAN-OS CEF → LSIS, dispatched by CEF
+//              name (TRAFFIC / THREAT / URL / …).
+// Reads:       ingress (raw wire) — syslog-wrapped CEF (CEF:0|Palo Alto Networks|PAN-OS|...)
+// Writes:      workspace.lsis.* — TRAFFIC → 4001, THREAT / WILDFIRE → 2004,
+//              URL → 6004, GLOBALPROTECT / AUTHENTICATION → 3002; see the
+//              subtype leaves below.
+// Category:    Network firewall / IPS
+// Test corpus: synthetic (documentation-derived sample wires in this header)
 //
-// Vendor:  Palo Alto Networks
-// Product: PAN-OS (Next-Generation Firewalls — PA-series, VM-series)
-// Wire:    syslog-wrapped CEF — `<priority>timestamp host CEF:0|Palo Alto Networks|PAN-OS|...`
-// Schema:  ArcSight CEF (header) + PAN-OS-specific extension keys
+// Wire —    syslog-wrapped CEF — `<priority>timestamp host CEF:0|Palo Alto Networks|PAN-OS|...`
+//          ArcSight CEF header + PAN-OS-specific extension keys
+//          (Next-Generation Firewalls — PA-series, VM-series).
 //
 // PAN-OS encodes the log type in the CEF `name` field:
 //   "TRAFFIC"        — connection start/end (OCSF Network Activity 4001)

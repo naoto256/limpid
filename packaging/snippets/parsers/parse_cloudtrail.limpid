@@ -1,14 +1,16 @@
-// AWS CloudTrail JSON parser
+// Summary:     AWS CloudTrail JSON events → LSIS API Activity.
+// Reads:       ingress (raw wire) — one CloudTrail event JSON object per
+//              ingress (unwrap {"Records":[...]} at the transport layer)
+// Writes:      workspace.lsis.* — 6003 (API Activity).
+// Category:    Cloud audit (API control plane)
+// Test corpus: public (FLAWS CloudTrail dataset, 1M events)
 //
-// Vendor:  Amazon Web Services
-// Product: CloudTrail
-// Wire:    JSON — one CloudTrail event per `ingress`. CloudTrail's S3
+// Wire —    JSON — one CloudTrail event per `ingress`. CloudTrail's S3
 //          delivery wraps events as `{"Records": [...]}` arrays, but
 //          downstream transports (CloudWatch Logs subscription filters,
 //          EventBridge, Kinesis Firehose, the AWS CLI) all unwrap into
 //          a single-event-per-message form. Handle the array-of-records
 //          unwrap at the transport layer, not here.
-// Output:  OCSF API Activity (class_uid 6003) on `workspace.lsis`.
 //
 // Sample input (Management event, IAMUser, single event JSON):
 //   {"eventVersion":"1.08","userIdentity":{"type":"IAMUser","userName":"alice","arn":"arn:aws:iam::123:user/alice","accountId":"123","accessKeyId":"AKIA..."},"eventTime":"2026-04-29T10:00:00Z","eventSource":"s3.amazonaws.com","eventName":"GetObject","awsRegion":"us-east-1","sourceIPAddress":"203.0.113.10","userAgent":"aws-cli/2.x","readOnly":true,"eventID":"...","eventType":"AwsApiCall","managementEvent":true,"recipientAccountId":"123","eventCategory":"Management"}
@@ -26,7 +28,7 @@
 //   Cancel* / Reject* / Revoke* / Deregister* / Release*  → 4 Delete
 //   anything else                                         → 99 Other
 //
-// Status: presence of `errorCode` → Failure (2), absence → Success (1).
+// status_id mapping: presence of `errorCode` → Failure (2), absence → Success (1).
 //
 // userIdentity → actor.user mapping:
 //   userName / sessionContext.sessionIssuer.userName / principalId,
@@ -35,7 +37,7 @@
 //   prefer that over the raw assumed-role principalId so the actor
 //   name is human-readable.
 //
-// Direct call: this snippet is single-format (JSON), single-class
+// Direct call — this snippet is single-format (JSON), single-class
 // (6003); no dispatcher. Call as `process parse_cloudtrail` directly.
 
 // ---------------------------------------------------------------------------

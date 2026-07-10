@@ -1,0 +1,390 @@
+// AWS GuardDuty finding JSON parser
+//
+// Summary:     AWS GuardDuty findings JSON → LSIS Detection Finding.
+// Reads:       ingress (raw wire) — one GuardDuty finding object per ingress
+//              (identical across EventBridge / SNS / S3 delivery)
+// Writes:      workspace.lsis.* — 2004 (Detection Finding), one finding → one
+//              record; unknown ThreatPurpose values route to error_log.
+// Category:    Cloud security findings
+// Test corpus: spec-only (AWS documentation per-finding-type sample bodies;
+//              cross-referenced against the CreateSampleFindings API shape —
+//              verify against live findings before production rollout)
+//
+// Vendor notes — Amazon Web Services GuardDuty — the AWS-native threat
+//           detection service. Findings synthesise signals from
+//           CloudTrail, VPC Flow Logs, DNS query logs, EKS audit
+//           logs, S3 data events, malware-protection scans and the
+//           managed threat-intel feed; each finding is a single
+//           detection event keyed by `id` within an `accountId` /
+//           `region` / `detectorId` scope.
+// Wire —     JSON — one GuardDuty finding object per `ingress`.
+//           Top-level fields — `schemaVersion`, `accountId`, `region`,
+//           `partition`, `id`, `arn`, `type`, `severity` (Float
+//           1.0–10.0), `title`, `description`, `createdAt`,
+//           `updatedAt`, plus the nested `resource.*` and
+//           `service.*` payloads. The wire is identical across the
+//           three common delivery paths (EventBridge default bus,
+//           SNS topic from the GuardDuty console, direct findings
+//           export to S3 / EventBridge); transports either pass the
+//           bare finding or wrap it under a `detail` envelope which
+//           the upstream bridge unwraps before invoking this parser.
+//           Reference —
+//           https://docs.aws.amazon.com/guardduty/latest/ug/guardduty_findings.html
+//
+// Sample input (Recon:EC2/Portscan, anonymised to RFC 5737):
+//   {"schemaVersion":"2.0","accountId":"123456789012","region":"us-east-1","partition":"aws","id":"abcd1234efgh5678ijkl","arn":"arn:aws:guardduty:us-east-1:123456789012:detector/12abc34d567e8fa901bc2d34e56789f0/finding/abcd1234efgh5678ijkl","type":"Recon:EC2/Portscan","resource":{"resourceType":"Instance","instanceDetails":{"instanceId":"i-99999999","instanceType":"t2.micro","availabilityZone":"us-east-1a"}},"service":{"action":{"actionType":"PORT_PROBE","portProbeAction":{"portProbeDetails":[{"localPortDetails":{"port":22,"portName":"SSH"},"remoteIpDetails":{"ipAddressV4":"198.51.100.10","country":{"countryName":"United States"}}}]}},"archived":false,"count":3,"detectorId":"12abc34d567e8fa901bc2d34e56789f0","eventFirstSeen":"2026-05-20T03:14:15Z","eventLastSeen":"2026-05-20T04:00:00Z"},"severity":2.0,"title":"Unprotected port on EC2 instance i-99999999 is being probed.","description":"EC2 instance has an unprotected port which is being probed by a known malicious host.","createdAt":"2026-05-20T03:14:16Z","updatedAt":"2026-05-20T04:00:01Z"}
+//
+// Severity mapping (`severity` is a Float; ranges per AWS docs
+// "Severity levels for GuardDuty findings"):
+//   1.0 – 3.9   → 2 Low
+//   4.0 – 6.9   → 3 Medium
+//   7.0 – 8.9   → 4 High
+//   9.0 – 10.0  → 5 Critical
+//
+// `finding_info.types[]` derivation: GuardDuty's `type` field
+// follows the closed shape `<ThreatPurpose>:<ResourceType>/<ThreatName>`
+// (sometimes with a `.<Variant>` suffix on ThreatName, e.g.
+// `UnauthorizedAccess:IAMUser/ConsoleLoginSuccess.B`). We
+// regex-split into three OCSF type tokens; the variant suffix
+// stays inside the threat-name token to preserve sub-detector
+// distinction.
+//
+// Direct call — this snippet handles a single OCSF class (2004); the
+// dispatch is purely for validating the category vocabulary. Call
+// as `process parse_aws_guardduty` directly.
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Float severity → OCSF severity_id. AWS documents four buckets;
+// out-of-range values (which the AWS API does not emit, but a
+// malformed upstream could) fall through to 1 Informational so
+// the operator sees the anomaly downstream without dropping the
+// finding.
+def function aws_guardduty_severity_id(severity) {
+    switch true {
+        severity == null             { 1 }
+        severity >= 1.0 and severity < 4.0  { 2 }
+        severity >= 4.0 and severity < 7.0  { 3 }
+        severity >= 7.0 and severity < 9.0  { 4 }
+        severity >= 9.0 and severity <= 10.0 { 5 }
+        default                      { 1 }
+    }
+}
+
+// Split GuardDuty `type` into its three OCSF type tokens.
+//   "Recon:EC2/Portscan" →
+//     { category: "Recon", resource_type: "EC2", threat_name: "Portscan" }
+// Returns null when the wire does not match the closed shape — the
+// caller routes that to error_log.
+def function aws_guardduty_split_type(type_str) {
+    regex_parse(
+        type_str,
+        "^(?P<category>[A-Za-z]+):(?P<resource_type>[A-Za-z0-9]+)/(?P<threat_name>[A-Za-z0-9._-]+)$"
+    )
+}
+
+// Build the OCSF `resources[]` entry from `resource.*`. Each
+// GuardDuty `resourceType` selects a different sibling object on
+// the wire (`instanceDetails` for Instance, `accessKeyDetails` for
+// AccessKey, `s3BucketDetails` for S3Bucket, etc.); we surface the
+// raw vendor block under `unmapped` so the composer can still emit
+// it without the parser having to teach the composer every AWS
+// resource shape. The minimal OCSF Resource fields (`type`, `uid`,
+// `name`) are populated from the most-distinctive identifier
+// available per resourceType.
+def function aws_guardduty_resource(resource) {
+    switch true {
+        resource == null { null }
+        resource.resourceType == "Instance" {
+            {
+                type: "Instance",
+                uid:  resource.instanceDetails.instanceId,
+                name: resource.instanceDetails.instanceId,
+                cloud_partition: null,
+                region:          resource.instanceDetails.availabilityZone,
+                unmapped:        resource.instanceDetails
+            }
+        }
+        resource.resourceType == "AccessKey" {
+            {
+                type: "AccessKey",
+                uid:  resource.accessKeyDetails.accessKeyId,
+                name: resource.accessKeyDetails.userName,
+                unmapped: resource.accessKeyDetails
+            }
+        }
+        resource.resourceType == "S3Bucket" {
+            {
+                type: "S3Bucket",
+                uid:  resource.s3BucketDetails.arn,
+                name: resource.s3BucketDetails.name,
+                unmapped: resource.s3BucketDetails
+            }
+        }
+        resource.resourceType == "EKSCluster" {
+            {
+                type: "EKSCluster",
+                uid:  resource.eksClusterDetails.arn,
+                name: resource.eksClusterDetails.name,
+                unmapped: resource.eksClusterDetails
+            }
+        }
+        resource.resourceType == "KubernetesCluster" {
+            {
+                type: "KubernetesCluster",
+                uid:  null,
+                name: null,
+                unmapped: resource.kubernetesDetails
+            }
+        }
+        resource.resourceType == "ECSCluster" {
+            {
+                type: "ECSCluster",
+                uid:  resource.ecsClusterDetails.arn,
+                name: resource.ecsClusterDetails.name,
+                unmapped: resource.ecsClusterDetails
+            }
+        }
+        resource.resourceType == "Container" {
+            {
+                type: "Container",
+                uid:  resource.containerDetails.id,
+                name: resource.containerDetails.name,
+                unmapped: resource.containerDetails
+            }
+        }
+        resource.resourceType == "RDSDBInstance" {
+            {
+                type: "RDSDBInstance",
+                uid:  resource.rdsDbInstanceDetails.dbInstanceArn,
+                name: resource.rdsDbInstanceDetails.dbInstanceIdentifier,
+                unmapped: resource.rdsDbInstanceDetails
+            }
+        }
+        resource.resourceType == "Lambda" {
+            {
+                type: "Lambda",
+                uid:  resource.lambdaDetails.functionArn,
+                name: resource.lambdaDetails.functionName,
+                unmapped: resource.lambdaDetails
+            }
+        }
+        default {
+            // Unknown resourceType: emit a stub with the raw type
+            // string so OCSF consumers see *something* and the
+            // operator sees the new resourceType surface in their
+            // SIEM. We deliberately do NOT route to error_log here:
+            // the finding's classification (the `type` field) is
+            // still meaningful even when the resource shape is one
+            // we haven't taught the parser. New AWS resourceTypes
+            // get added several times a year; failing the whole
+            // finding on a resource we can't fully unpack would
+            // discard real detections.
+            {
+                type: resource.resourceType,
+                uid:  null,
+                name: null,
+                unmapped: resource
+            }
+        }
+    }
+}
+
+// service.evidence.threatIntelligenceDetails[] surface. GuardDuty
+// wraps each TI hit as `{threatListName, threatNames[]}`, which
+// does not align with OCSF's Evidence Artifacts object shape
+// (OCSF expects a sparse object keyed by artifact type — process,
+// file, http_request, etc.). Rather than synthesise a fake shape
+// we pass the raw vendor array through under `unmapped.evidence`
+// so a consumer that knows GuardDuty can correlate by feed name
+// without us mis-mapping the schema.
+def function aws_guardduty_threat_intel(service) {
+    switch true {
+        service == null                                          { null }
+        service.evidence == null                                 { null }
+        default {
+            service.evidence.threatIntelligenceDetails
+        }
+    }
+}
+
+// Build the Detection Finding (2004) record. The dispatcher has
+// already validated `type_parts.category` against the closed
+// GuardDuty taxonomy by the time we get here, so the per-branch
+// processes can share one body without re-checking the category.
+def function aws_guardduty_finding_record(body, type_parts, attack_tactic) {
+    {
+        class_uid:    2004,
+        category_uid: 2,
+        activity_id:  1,                                          // Create (a new finding)
+        type_uid:     2004 * 100 + 1,
+        severity_id:  aws_guardduty_severity_id(body.severity),
+        status_id:    99,                                         // Other (GuardDuty doesn't carry a remediation status on the finding itself)
+        time:         to_int(parse_datetime_rfc3339(body.service.eventLastSeen)),
+        start_time:   to_int(parse_datetime_rfc3339(body.service.eventFirstSeen)),
+        finding_info: {
+            uid:   body.id,
+            title: body.title,
+            desc:  body.description,
+            types: [type_parts.category, type_parts.resource_type, type_parts.threat_name],
+            src_url: null
+        },
+        attacks: [{
+            // GuardDuty's ThreatPurpose categories align with MITRE
+            // ATT&CK tactic names for the Recon / Discovery /
+            // Persistence / PrivilegeEscalation / DefenseEvasion /
+            // Execution / Exfiltration / Impact / InitialAccess
+            // values; the AWS-specific buckets (UnauthorizedAccess,
+            // Backdoor, Trojan, CryptoCurrency, Stealth, PenTest,
+            // Policy) don't map cleanly so we pass the raw value
+            // through and let the consumer's correlation layer
+            // bucket them. The dispatcher above sets `attack_tactic`
+            // to the AWS taxonomy name verbatim.
+            tactic:    { name: attack_tactic },
+            technique: { name: type_parts.threat_name }
+        }],
+        resources: [aws_guardduty_resource(body.resource)],
+        cloud: {
+            provider:  "AWS",
+            region:    body.region,
+            account:   { uid: body.accountId },
+            zone:      null
+        },
+        count:    body.service.count,
+        message:  body.description,
+        unmapped: {
+            arn:           body.arn,
+            partition:     body.partition,
+            schemaVersion: body.schemaVersion,
+            detectorId:    body.service.detectorId,
+            archived:      body.service.archived,
+            createdAt:     body.createdAt,
+            updatedAt:     body.updatedAt,
+            service_action: body.service.action,
+            additionalInfo: body.service.additionalInfo,
+            resourceRole:   body.service.resourceRole,
+            evidence:       aws_guardduty_threat_intel(body.service)
+        },
+        metadata: {
+            product: {
+                vendor_name: "Amazon Web Services",
+                name:        "GuardDuty"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main parser
+// ---------------------------------------------------------------------------
+//
+// Parse the JSON, split the `type` field, validate the leading
+// ThreatPurpose category against the closed GuardDuty taxonomy,
+// then dispatch to a per-category leaf. Every leaf builds the
+// same 2004 record — the dispatch exists to enforce the closed
+// vocabulary (loud-fail-fast on a category AWS hasn't published
+// yet) and to populate the MITRE-aligned `attacks[].tactic.name`.
+
+def process parse_aws_guardduty {
+    workspace.gd = parse_json(ingress)
+    workspace.gd_type = aws_guardduty_split_type(workspace.gd.type)
+    switch true {
+        workspace.gd_type == null {
+            error "parse_aws_guardduty: `type` field does not match GuardDuty `<Category>:<ResourceType>/<ThreatName>` shape: ${workspace.gd.type}"
+        }
+        default {
+            process parse_aws_guardduty_dispatch
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Category dispatcher
+// ---------------------------------------------------------------------------
+//
+// Each branch is a one-liner that calls aws_guardduty_finding_record
+// with the MITRE-ATT&CK tactic name appropriate for the GuardDuty
+// ThreatPurpose. The mapping is documented in
+// https://docs.aws.amazon.com/guardduty/latest/ug/guardduty_finding-types-active.html
+// (the per-finding-type pages enumerate the ThreatPurpose taxonomy).
+
+def process parse_aws_guardduty_dispatch {
+    switch workspace.gd_type.category {
+        "Recon" {
+            workspace.lsis = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Reconnaissance")
+        }
+        "Discovery" {
+            workspace.lsis = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Discovery")
+        }
+        "InitialAccess" {
+            workspace.lsis = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Initial Access")
+        }
+        "Execution" {
+            workspace.lsis = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Execution")
+        }
+        "Persistence" {
+            workspace.lsis = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Persistence")
+        }
+        "PrivilegeEscalation" {
+            workspace.lsis = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Privilege Escalation")
+        }
+        "DefenseEvasion" {
+            workspace.lsis = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Defense Evasion")
+        }
+        "Stealth" {
+            // AWS-specific bucket: covers log-tampering / audit-
+            // disable findings (CloudTrail logging disabled, S3
+            // public-access-block disabled, etc.). Closest ATT&CK
+            // tactic is Defense Evasion; pass the AWS label through
+            // verbatim so the consumer can disambiguate.
+            workspace.lsis = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Stealth")
+        }
+        "Exfiltration" {
+            workspace.lsis = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Exfiltration")
+        }
+        "Impact" {
+            workspace.lsis = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Impact")
+        }
+        "UnauthorizedAccess" {
+            // AWS-specific: anomalous auth / API-call patterns
+            // (ConsoleLoginSuccess.B, MaliciousIPCaller.Custom,
+            // TorIPCaller, etc.). Spans ATT&CK Initial Access and
+            // Credential Access; pass the AWS label through.
+            workspace.lsis = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "UnauthorizedAccess")
+        }
+        "Backdoor" {
+            // AWS-specific: EC2 instance behaving as part of a C2
+            // channel (DNS C2, persistent outbound to known C2 IP).
+            workspace.lsis = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Backdoor")
+        }
+        "Trojan" {
+            // AWS-specific: EC2 instance exhibiting trojan-family
+            // network behaviour (DGA domain queries, dropper
+            // beacons).
+            workspace.lsis = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Trojan")
+        }
+        "CryptoCurrency" {
+            // AWS-specific: connections to known mining pools /
+            // crypto-jacking activity on EC2 / EKS / ECS.
+            workspace.lsis = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "CryptoCurrency")
+        }
+        "Policy" {
+            // AWS-specific: account / org hygiene posture findings
+            // (root user activity, password policy weak, S3 block-
+            // public-access disabled). Operational, not adversary-
+            // driven — pass the AWS label through.
+            workspace.lsis = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Policy")
+        }
+        "PenTest" {
+            // AWS-specific: known pen-test tooling user-agents
+            // (Kali, ParrotLinux, Pentoo) hitting the API.
+            workspace.lsis = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "PenTest")
+        }
+        default {
+            error "parse_aws_guardduty: unknown ThreatPurpose category `${workspace.gd_type.category}` (full type `${workspace.gd.type}`); GuardDuty closed taxonomy was extended — extend the dispatcher"
+        }
+    }
+}

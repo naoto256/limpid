@@ -1,4 +1,12 @@
-// Strip non-sshd noise from a journal-sourced sshd stream.
+// Summary:     Strip PAM-stack noise from a journal-sourced sshd
+//              stream ahead of parse_openssh.
+// Reads:       workspace.journald.* (from parse_journald)
+//                .MESSAGE (required, String) — sshd body candidate
+// Effect:      drop lines matching `^pam_unix(sshd:<module>):`
+//              (PAM lifecycle noise riding sshd's syslogtag); pass
+//              everything else through unchanged.
+// Test corpus: synthetic (pam_unix / sshd sample bodies referenced
+//              in this header's drop/pass tables)
 //
 // systemd-journald groups log lines by `_SYSTEMD_UNIT`, so subscribing
 // to `_SYSTEMD_UNIT=ssh.service` collects every line emitted by the
@@ -7,15 +15,10 @@
 // vocabulary; feeding them straight into [`parse_openssh`](../parsers/parse_openssh.limpid)
 // would land them in its error route on every login.
 //
-// This filter drops journal-source noise that travels under sshd's
-// syslogtag but is not produced by sshd itself. Run it ahead of
-// `parse_openssh` only when the upstream input is journald (or
-// anything else that aggregates by Unix process / cgroup); for native
-// syslog feeds (where each daemon has its own syslogtag) this filter
-// is a no-op and can be omitted.
-//
-// Intake:   workspace.journald.MESSAGE  (required, String) — set by
-//           `parse_journald` upstream.
+// Run this ahead of `parse_openssh` only when the upstream input is
+// journald (or anything else that aggregates by Unix process /
+// cgroup); for native syslog feeds (where each daemon has its own
+// syslogtag) this filter is a no-op and can be omitted.
 //
 // Usage (filter sits between parse_journald and the openssh bridge):
 //
@@ -42,7 +45,7 @@
 //     authentication outcome with richer fields, so the PAM lines are
 //     redundant for OCSF Authentication purposes.
 //
-// What is NOT filtered: anything starting with sshd's own vocabulary
+// What is NOT filtered — anything starting with sshd's own vocabulary
 // (`Accepted`, `Failed`, `Invalid user`, `Disconnected`, `Connection
 // closed by`, `Connection reset by`, `Did not receive identification
 // string`, …). Those flow through unchanged for `parse_openssh` to
