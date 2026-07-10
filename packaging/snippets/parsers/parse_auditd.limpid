@@ -28,7 +28,7 @@
 //
 //           - file tail (most common — `audisp-syslog` writes
 //             `/var/log/audit/audit.log` and limpid tails it):
-//                 { workspace.auditd = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_auditd | compose_ocsf
+//                 { workspace.auditd = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_auditd | compose_ocsf | ocsf_to_egress
 //
 //           - syslog transport (audispd-syslog plugin):
 //                 process parse_syslog | {
@@ -37,7 +37,7 @@
 //                         hostname: workspace.syslog.hostname,
 //                         time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
 //                     }
-//                 } | parse_auditd | compose_ocsf
+//                 } | parse_auditd | compose_ocsf | ocsf_to_egress
 //
 //           - journald transport:
 //                 process parse_journald | {
@@ -46,7 +46,7 @@
 //                         hostname: workspace.journald._HOSTNAME,
 //                         time:     to_int(workspace.journald.__REALTIME_TIMESTAMP) * 1000
 //                     }
-//                 } | parse_auditd | compose_ocsf
+//                 } | parse_auditd | compose_ocsf | ocsf_to_egress
 //
 // Output:   OCSF records on `workspace.lsis`. The class depends
 //           on the auditd record type:

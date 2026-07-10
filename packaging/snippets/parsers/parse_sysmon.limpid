@@ -33,10 +33,10 @@
 //                         hostname: workspace.syslog.hostname,
 //                         time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
 //                     }
-//                 } | parse_sysmon | compose_ocsf
+//                 } | parse_sysmon | compose_ocsf | ocsf_to_egress
 //
 //           - Direct JSON-line tail (when the forwarder writes a JSONL file):
-//                 process { workspace.sysmon = { body: parse_json(ingress), hostname: hostname(), time: to_int(received_at) } } | parse_sysmon | compose_ocsf
+//                 process { workspace.sysmon = { body: parse_json(ingress), hostname: hostname(), time: to_int(received_at) } } | parse_sysmon | compose_ocsf | ocsf_to_egress
 //
 // Output:   OCSF records on `workspace.lsis` for the Sysmon event
 //           types this parser knows. Unknown EventIDs route to

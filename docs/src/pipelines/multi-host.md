@@ -87,7 +87,7 @@ def output to_relay {
 
 def pipeline app_to_relay {
     input app_journal
-    process parse_journald | compose_rfc5424
+    process parse_journald | compose_rfc5424 | rfc5424_to_egress
     output to_relay
 }
 ```

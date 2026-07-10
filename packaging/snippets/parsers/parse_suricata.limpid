@@ -21,7 +21,7 @@
 //           (`/var/log/suricata/eve.json`) or ships it over syslog.
 //
 //           - Direct JSONL tail:
-//                 process { workspace.suricata = { body: parse_json(ingress), hostname: hostname(), time: to_int(received_at) } } | parse_suricata | compose_ocsf
+//                 process { workspace.suricata = { body: parse_json(ingress), hostname: hostname(), time: to_int(received_at) } } | parse_suricata | compose_ocsf | ocsf_to_egress
 //
 //           - Via syslog:
 //                 process parse_syslog | {
@@ -30,7 +30,7 @@
 //                         hostname: workspace.syslog.hostname,
 //                         time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
 //                     }
-//                 } | parse_suricata | compose_ocsf
+//                 } | parse_suricata | compose_ocsf | ocsf_to_egress
 //
 // Output:   OCSF records on `workspace.lsis`. Dispatch by
 //           `event_type`:

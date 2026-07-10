@@ -27,7 +27,7 @@
 //           bridges:
 //
 //           - file tail (most common — limpid runs on the DNS server):
-//                 { workspace.bind = { body: ingress, pid: null, hostname: hostname(), time: to_int(received_at) } } | parse_bind | compose_ocsf
+//                 { workspace.bind = { body: ingress, pid: null, hostname: hostname(), time: to_int(received_at) } } | parse_bind | compose_ocsf | ocsf_to_egress
 //
 //           - syslog transport (named logs via syslog instead of file):
 //                 process parse_syslog | {
@@ -37,7 +37,7 @@
 //                         hostname: workspace.syslog.hostname,
 //                         time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
 //                     }
-//                 } | parse_bind | compose_ocsf
+//                 } | parse_bind | compose_ocsf | ocsf_to_egress
 //
 //           - journald transport (named running under systemd):
 //                 process parse_journald | {
@@ -47,7 +47,7 @@
 //                         hostname: workspace.journald._HOSTNAME,
 //                         time:     to_int(workspace.journald.__REALTIME_TIMESTAMP) * 1000
 //                     }
-//                 } | parse_bind | compose_ocsf
+//                 } | parse_bind | compose_ocsf | ocsf_to_egress
 //
 // Output:   OCSF DNS Activity (class_uid 4003) records on
 //           `workspace.lsis`.

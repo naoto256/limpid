@@ -233,7 +233,7 @@ egress
 
 - **Format primitives** (`syslog.parse`, `cef.parse`, `parse_kv`, `parse_json`, `csv_parse`) capture raw bytes into a format-specific namespace (`workspace.syslog`, `workspace.cef`, …). They know nothing about vendors or downstream schemas.
 - **Vendor parsers** (`parse_fortigate_cef`, `parse_paloalto_cef`, `parse_cloudtrail`, `parse_ocsf`, …) read the format namespace and write canonical fields under `workspace.lsis.*`. This is the only layer that knows both the vendor's quirks and the canonical shape. (The shipped set grows on the 0.7.x cadence — see [Snippet Library](../snippets/README.md) for the current inventory.)
-- **Composers** (`compose_ocsf_network_activity`, `compose_ocsf_detection_finding`, `compose_ecs_network`, …) read `workspace.lsis.*` and serialise to `egress` in their target wire schema. They are vendor-unaware on purpose: they pluck `workspace.lsis.src_endpoint.ip` regardless of whether it came from a FortiGate or a Palo Alto event.
+- **Composers** (`compose_ocsf_network_activity`, `compose_ocsf_detection_finding`, `compose_ecs_network`, …) read `workspace.lsis.*` and serialise to the LSIS slot named after the target wire schema (`workspace.lsis.ocsf`, `workspace.lsis.rfc5424`, …). A companion one-line process, `<schema>_to_egress`, moves the slot to `egress` when the pipeline emits that schema as its wire form; envelope composers (e.g. `compose_otlp`) read the schema slot directly instead. Composers are vendor-unaware on purpose: they pluck `workspace.lsis.src_endpoint.ip` regardless of whether it came from a FortiGate or a Palo Alto event.
 
 The payoffs:
 

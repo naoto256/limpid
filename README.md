@@ -21,7 +21,7 @@ Suppose you want to ship FortiGate firewall logs to a security data lake in OCSF
 ```limpid
 def pipeline fortigate_to_security_lake {
     input   fortigate_syslog
-    process parse_fortigate_cef | compose_ocsf
+    process parse_fortigate_cef | compose_ocsf | ocsf_to_egress
     output  security_lake
 }
 ```
@@ -159,7 +159,7 @@ Curated parser / composer / filter library, installed under `/usr/share/limpid/s
 - **Composers (3)** — `compose_ocsf` (OCSF 1.3.0 priority set, 27 classes, dispatched by `workspace.lsis.class_uid`) · `compose_rfc5424` (journald → RFC 5424 wire, v0.7.1) · `compose_replayable` (replay-shape capture).
 - **Filters (1)** — `filter_openssh_journal` (drops PAM session double-count noise from journald sshd streams).
 
-Each parser writes to the canonical `workspace.lsis.*` intermediate; `compose_ocsf` reads from it and emits OCSF JSON to `egress`. Two `include` lines + a two-stage pipeline gets vendor logs into a SIEM / data lake in OCSF form. Full reference: [Snippet Library](docs/src/snippets/README.md).
+Each parser writes to the canonical `workspace.lsis.*` intermediate; `compose_ocsf` reads from it and emits OCSF JSON to `workspace.lsis.ocsf`, and the companion `ocsf_to_egress` hands the slot off to `egress`. Two `include` lines + a two-stage pipeline gets vendor logs into a SIEM / data lake in OCSF form. Full reference: [Snippet Library](docs/src/snippets/README.md).
 
 ### Functions
 

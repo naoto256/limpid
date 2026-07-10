@@ -95,15 +95,17 @@ def output relay {
 
 def pipeline ssh_to_relay {
     input ssh_journal
-    process parse_journald | compose_rfc5424
+    process parse_journald | compose_rfc5424 | rfc5424_to_egress
     output relay
 }
 ```
 
 `parse_journald` populates `workspace.journald.*` with everything in the
 ingress JSON. `compose_rfc5424` reads those fields and writes a single-line
-RFC 5424 record to `egress`. Swap `compose_rfc5424` for `parse_openssh |
-compose_ocsf` to ship OCSF Authentication events instead.
+RFC 5424 record to `workspace.lsis.rfc5424`; the companion `rfc5424_to_egress`
+step at the end of the pipeline hands that slot to `egress`. Swap
+`compose_rfc5424 | rfc5424_to_egress` for `parse_openssh | compose_ocsf |
+ocsf_to_egress` to ship OCSF Authentication events instead.
 
 ## Notes
 

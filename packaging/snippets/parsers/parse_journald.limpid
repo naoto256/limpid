@@ -38,8 +38,8 @@
 //    "MESSAGE":"Accepted publickey for alice from 192.0.2.10 port 51234 ssh2"}
 //
 // Typical pipeline:
-//   process parse_journald | compose_rfc5424
-//   process parse_journald | parse_openssh | compose_ocsf
+//   process parse_journald | compose_rfc5424 | rfc5424_to_egress
+//   process parse_journald | parse_openssh | compose_ocsf | ocsf_to_egress
 
 def process parse_journald {
     workspace.journald = parse_json(ingress)
