@@ -86,7 +86,10 @@ pub fn run(check: bool) -> Result<(), Box<dyn Error>> {
         Ok(())
     } else {
         fs::write(&readme, updated).map_err(|e| format!("write {}: {e}", readme.display()))?;
-        println!("gen-snippet-inventory: updated {} ({counts})", readme.display());
+        println!(
+            "gen-snippet-inventory: updated {} ({counts})",
+            readme.display()
+        );
         Ok(())
     }
 }

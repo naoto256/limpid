@@ -416,9 +416,7 @@ pub fn lint(header: &SnippetHeader) -> Vec<Finding> {
             findings.push(Finding {
                 file: header.file.clone(),
                 severity: Severity::Warning,
-                message: format!(
-                    "unknown key `{key}:` (tolerated; will not appear in inventory)"
-                ),
+                message: format!("unknown key `{key}:` (tolerated; will not appear in inventory)"),
             });
         }
     }
@@ -737,7 +735,12 @@ mod tests {
     use super::*;
 
     fn parser(s: &str) -> SnippetHeader {
-        parse_str(Path::new("packaging/snippets/parsers/x.limpid"), SnippetKind::Parser, s).unwrap()
+        parse_str(
+            Path::new("packaging/snippets/parsers/x.limpid"),
+            SnippetKind::Parser,
+            s,
+        )
+        .unwrap()
     }
     fn composer(s: &str) -> SnippetHeader {
         parse_str(
@@ -748,7 +751,12 @@ mod tests {
         .unwrap()
     }
     fn filter(s: &str) -> SnippetHeader {
-        parse_str(Path::new("packaging/snippets/filters/x.limpid"), SnippetKind::Filter, s).unwrap()
+        parse_str(
+            Path::new("packaging/snippets/filters/x.limpid"),
+            SnippetKind::Filter,
+            s,
+        )
+        .unwrap()
     }
     fn function(s: &str) -> SnippetHeader {
         parse_str(
@@ -809,7 +817,11 @@ def process foo {}
 // Test corpus: real (x)
 ",
         );
-        assert!(lint(&h).iter().any(|f| f.message.contains("missing required key `Summary:`")));
+        assert!(
+            lint(&h)
+                .iter()
+                .any(|f| f.message.contains("missing required key `Summary:`"))
+        );
     }
 
     #[test]
@@ -841,7 +853,9 @@ def process foo {}
         );
         let findings = lint(&h);
         assert!(
-            findings.iter().any(|f| f.message.contains("`Category:` is not permitted on composer")),
+            findings.iter().any(|f| f
+                .message
+                .contains("`Category:` is not permitted on composer")),
             "findings: {findings:?}"
         );
     }
@@ -857,7 +871,11 @@ def process foo {}
 // Test corpus: real (x)
 ",
         );
-        assert!(lint(&h).iter().any(|f| f.message.contains("not in the allowed set")));
+        assert!(
+            lint(&h)
+                .iter()
+                .any(|f| f.message.contains("not in the allowed set"))
+        );
     }
 
     // --- Rule 3: Test corpus prefix ---
@@ -872,7 +890,11 @@ def process foo {}
 def function proto_num(name) {}
 ",
         );
-        assert!(lint(&h).iter().any(|f| f.message.contains("must start with")));
+        assert!(
+            lint(&h)
+                .iter()
+                .any(|f| f.message.contains("must start with"))
+        );
     }
 
     #[test]
@@ -886,7 +908,11 @@ def function proto_num(name) {}
 // Test corpus: unit (some source)
 ",
         );
-        assert!(lint(&h).iter().any(|f| f.message.contains("must start with")));
+        assert!(
+            lint(&h)
+                .iter()
+                .any(|f| f.message.contains("must start with"))
+        );
     }
 
     // --- Rule 4: Reads dot-line grammar (universal) ---
@@ -901,7 +927,11 @@ def function proto_num(name) {}
 // Test corpus: real (x)
 ",
         );
-        assert!(lint(&h).iter().any(|f| f.message.contains("at least one dot-line")));
+        assert!(
+            lint(&h)
+                .iter()
+                .any(|f| f.message.contains("at least one dot-line"))
+        );
     }
 
     #[test]
@@ -916,7 +946,11 @@ def function proto_num(name) {}
 // Test corpus: real (x)
 ",
         );
-        assert!(lint(&h).iter().any(|f| f.message.contains("dot-line intake rows are forbidden")));
+        assert!(
+            lint(&h)
+                .iter()
+                .any(|f| f.message.contains("dot-line intake rows are forbidden"))
+        );
     }
 
     #[test]
@@ -930,7 +964,11 @@ def function proto_num(name) {}
 // Test corpus: real (x)
 ",
         );
-        assert!(lint(&h).iter().any(|f| f.message.contains("at least one dot-line")));
+        assert!(
+            lint(&h)
+                .iter()
+                .any(|f| f.message.contains("at least one dot-line"))
+        );
     }
 
     #[test]
@@ -984,7 +1022,11 @@ def function proto_num(name) {}
 // Test corpus: real (x)
 ",
         );
-        assert!(lint(&h).iter().any(|f| f.message.contains("first token must be")));
+        assert!(
+            lint(&h)
+                .iter()
+                .any(|f| f.message.contains("first token must be"))
+        );
     }
 
     // --- Rule 5: Signature cross-check ---
@@ -1018,7 +1060,11 @@ def function proto_num(name) {
 def function protonum(name) {}
 ",
         );
-        assert!(lint(&h).iter().any(|f| f.message.contains("no `def function proto_num")));
+        assert!(
+            lint(&h)
+                .iter()
+                .any(|f| f.message.contains("no `def function proto_num"))
+        );
     }
 
     #[test]
@@ -1032,7 +1078,11 @@ def function protonum(name) {}
 def function foo(a, b, c) {}
 ",
         );
-        assert!(lint(&h).iter().any(|f| f.message.contains("parameter list")));
+        assert!(
+            lint(&h)
+                .iter()
+                .any(|f| f.message.contains("parameter list"))
+        );
     }
 
     // --- Rule 7: unknown key → warning ---
@@ -1050,7 +1100,10 @@ def function foo(a, b, c) {}
         );
         let f = lint(&h);
         let errors: Vec<_> = f.iter().filter(|x| x.severity == Severity::Error).collect();
-        let warnings: Vec<_> = f.iter().filter(|x| x.severity == Severity::Warning).collect();
+        let warnings: Vec<_> = f
+            .iter()
+            .filter(|x| x.severity == Severity::Warning)
+            .collect();
         assert!(errors.is_empty(), "errors: {errors:?}");
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].message.contains("FortiGate CEF dialect quirks"));

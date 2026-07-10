@@ -14,11 +14,9 @@ use crate::paths::list_all_files;
 pub fn run() -> Result<(), Box<dyn Error>> {
     let files = list_all_files()?;
     if files.is_empty() {
-        return Err(
-            "no `.limpid` files found under \
+        return Err("no `.limpid` files found under \
              packaging/snippets/{parsers,composers,filters,functions}/"
-                .into(),
-        );
+            .into());
     }
 
     let mut all: Vec<Finding> = Vec::new();

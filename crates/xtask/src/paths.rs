@@ -32,7 +32,9 @@ pub fn workspace_root() -> PathBuf {
 /// Directory holding snippets of a given kind:
 /// `packaging/snippets/{parsers,composers,filters,functions}/`.
 pub fn kind_dir(kind: SnippetKind) -> PathBuf {
-    workspace_root().join("packaging/snippets").join(kind.dir_name())
+    workspace_root()
+        .join("packaging/snippets")
+        .join(kind.dir_name())
 }
 
 pub fn readme_path() -> PathBuf {

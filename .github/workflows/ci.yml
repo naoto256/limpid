@@ -33,12 +33,18 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # pin-audit:2026-05-21 29eef33 | stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # pin-audit:2026-05-21 e18b497 | v2
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
+
+      # Format is enforced across the whole workspace so drift cannot
+      # accumulate under a new sub-crate. Rustfmt is deterministic, so
+      # a fmt-clean tree is a cheap invariant to keep on green.
+      - name: Rustfmt
+        run: cargo fmt --all -- --check
 
       - name: Build
         run: cargo build --workspace
