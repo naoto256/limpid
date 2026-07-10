@@ -32,7 +32,7 @@
 //           does not expose the SD block.
 //
 //           - syslog (UDP/TCP):
-//                 { workspace.checkpoint_syslog = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_checkpoint_syslog | compose_ocsf
+//                 { workspace.checkpoint_syslog = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_checkpoint_syslog | compose_ocsf | ocsf_to_egress
 //
 // Output:   OCSF records on `workspace.lsis`. The class depends on
 //           the action / product combination:

@@ -13,7 +13,7 @@
 //
 //   def pipeline mirror {
 //       input wire
-//       process compose_replayable
+//       process compose_replayable | replayable_to_egress
 //       output capture
 //   }
 //
@@ -39,9 +39,20 @@ def process compose_replayable {
     // `{ip, port}` object — same shape `inject --json` expects — so
     // the composer can pass it straight through with no string
     // assembly and no port-placeholder fidelity loss.
-    egress = to_json({
+    workspace.lsis.replayable = to_json({
         received_at: received_at,
         source:      source,
         ingress:     ingress
     })
+}
+
+// ---------------------------------------------------------------------------
+// Egress terminator
+// ---------------------------------------------------------------------------
+//
+// Moves the replay record from `workspace.lsis.replayable` to
+// `egress`. Pipelines that emit the capture stream as the wire form
+// pipe `compose_replayable | replayable_to_egress`.
+def process replayable_to_egress {
+    egress = workspace.lsis.replayable
 }

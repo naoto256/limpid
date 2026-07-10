@@ -1,0 +1,86 @@
+// OTLP envelope composer
+//
+// Wraps an already-serialised payload string in a minimal
+// OTLP-1.0.0 `ResourceLogs` proto and writes the encoded bytes to
+// the LSIS slot `workspace.lsis.otlp`. Pipelines that emit OTLP as
+// the wire form pipe `compose_otlp | otlp_to_egress` (defined
+// below) to hand the bytes off to `egress`.
+//
+// Two-layer contract:
+//   schema composer (compose_ocsf, compose_rfc5424, …) — reads
+//     `workspace.lsis.*`, writes `workspace.lsis.<schema>` slot with
+//     the schema-shape wire form (String).
+//   envelope composer (compose_otlp) — reads the declared per-envelope
+//     input slot `workspace.lsis.otlp_body` (the payload to wrap),
+//     writes `workspace.lsis.otlp` with the encoded envelope bytes.
+//
+// Because each slot has a single writer, feeding a schema composer's
+// output into the envelope composer's input is done in the pipeline
+// with an inline block:
+//
+//   process parse_x
+//         | compose_ocsf
+//         | { workspace.lsis.otlp_body = workspace.lsis.ocsf }
+//         | compose_otlp
+//         | otlp_to_egress
+//
+// The same pattern works for any other schema slot (RFC 5424 record,
+// replayable JSONL line, etc.) — the envelope is agnostic to what the
+// body string encodes.
+//
+// Reads:
+//   .otlp_body (required, String)  — payload wrapped as
+//                                    body.string_value on the log
+//                                    record
+//
+// Output:
+//   workspace.lsis.otlp = ResourceLogs proto bytes (Bytes)
+//   egress              = workspace.lsis.otlp  (via `otlp_to_egress`;
+//                                              opt in per pipeline)
+//
+// Envelope neutrality: this composer deliberately does NOT read LSIS
+// fields other than the declared `otlp_body`. Resource attributes are
+// minimal (`host.name` only) and the scope carries a fixed
+// `{ name: "limpid" }` marker; richer attributes are the caller's
+// concern — override with a downstream process, or write a
+// project-specific `compose_otlp_<flavour>` that reads more of LSIS.
+//
+// Time: `received_at` is used as `time_unix_nano`. Callers that
+// carry a source-claimed timestamp (parsed off the wire) can
+// override in an inline block before compose_otlp:
+//   `{ workspace.event_time_ns = coalesce(workspace.lsis.time, received_at) }`
+// then swap the log-record timestamp read in a wrapper composer.
+// See `docs/src/outputs/otlp_http.md` for the full-fidelity
+// timestamp pattern.
+//
+// Test corpus: spec-only (OTLP/1.0.0 proto shape;
+// otlp.encode_resourcelog_protobuf reference in
+// docs/src/functions/expression-functions.md).
+
+def process compose_otlp {
+    workspace.lsis.otlp = otlp.encode_resourcelog_protobuf({
+        resource: {
+            attributes: [
+                { key: "host.name", value: { string_value: hostname() } }
+            ]
+        },
+        scope_logs: [{
+            scope: { name: "limpid" },
+            log_records: [{
+                time_unix_nano: received_at,
+                body: { string_value: workspace.lsis.otlp_body }
+            }]
+        }]
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Egress terminator
+// ---------------------------------------------------------------------------
+//
+// Moves the OTLP ResourceLogs proto bytes from `workspace.lsis.otlp`
+// to `egress`. Pipelines that emit OTLP as the wire form pipe
+// `compose_otlp | otlp_to_egress`.
+def process otlp_to_egress {
+    egress = workspace.lsis.otlp
+}

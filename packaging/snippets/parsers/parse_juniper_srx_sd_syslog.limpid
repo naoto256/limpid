@@ -22,10 +22,10 @@
 //           lives entirely in SD. Two typical bridges:
 //
 //           - syslog (UDP/TCP):
-//                 { workspace.juniper_srx_sd_syslog = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_juniper_srx_sd_syslog | compose_ocsf
+//                 { workspace.juniper_srx_sd_syslog = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_juniper_srx_sd_syslog | compose_ocsf | ocsf_to_egress
 //
 //           - tail of a forwarded text file:
-//                 { workspace.juniper_srx_sd_syslog = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_juniper_srx_sd_syslog | compose_ocsf
+//                 { workspace.juniper_srx_sd_syslog = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_juniper_srx_sd_syslog | compose_ocsf | ocsf_to_egress
 //
 // Output:   OCSF records on `workspace.lsis`. The class depends
 //           on the daemon / MSGID:

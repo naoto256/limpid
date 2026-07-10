@@ -23,7 +23,7 @@
 // Direct call (skip syslog wrapper, supply raw CEF in `ingress`):
 //   def pipeline x {
 //     input bare_cef
-//     process { workspace.cef = cef.parse(ingress) } | parse_paloalto_cef_traffic | compose_ocsf
+//     process { workspace.cef = cef.parse(ingress) } | parse_paloalto_cef_traffic | compose_ocsf | ocsf_to_egress
 //     output ...
 //   }
 

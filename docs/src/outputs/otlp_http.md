@@ -99,7 +99,7 @@ def process compose_otlp_from_ocsf {
                 time_unix_nano: workspace.event_time_ns,
                 severity_number: 9,
                 severity_text: "INFO",
-                body: { string_value: to_json(workspace.ocsf) }
+                body: { string_value: workspace.lsis.ocsf }
             }]
         }]
     }

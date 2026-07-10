@@ -37,10 +37,10 @@
 //                         hostname: workspace.syslog.hostname,
 //                         time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
 //                     }
-//                 } | parse_nsp | compose_ocsf
+//                 } | parse_nsp | compose_ocsf | ocsf_to_egress
 //
 //           - raw forwarder (sensor → text-only forwarder → limpid tail):
-//                 { workspace.nsp = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_nsp | compose_ocsf
+//                 { workspace.nsp = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_nsp | compose_ocsf | ocsf_to_egress
 //
 // Output:   OCSF Detection Finding (class_uid 2004) records on
 //           `workspace.lsis`.
