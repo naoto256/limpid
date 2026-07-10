@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/limpid", "crates/limpidctl", "crates/limpid-prometheus"]
+members = ["crates/limpid", "crates/limpidctl", "crates/limpid-prometheus", "crates/xtask"]
 resolver = "3"
 
 # Shared package metadata. Each member crate inherits via
