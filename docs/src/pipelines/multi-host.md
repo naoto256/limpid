@@ -95,7 +95,7 @@ def pipeline app_to_relay {
 Three design points worth calling out:
 
 - **PRI carries through the journald entry's own labels.** `app.service`'s `PRIORITY` / `SYSLOG_FACILITY` (set by libsystemd according to how the program writes — direct `sd_journal_send`, `printf` to stderr, syslog API) survive into the RFC 5424 frame. When the entry has neither, `compose_rfc5424` defaults to `<14>` (user.info) so the frame is always valid. Either way the edge does not invent routing; the relay still picks the final facility based on its own criteria.
-- **Parsing is mechanical, not vendor-specific.** `parse_journald` is `parse_json(ingress)` plus a docstring — the edge does not extract individual fields, it just hands the structured form to the composer. If the relay needs more (e.g. `parse_openssh | compose_ocsf`), it runs there, where the cycles can be amortised across many edge hosts. The edge's per-event work stays tiny.
+- **Parsing is mechanical, not vendor-specific.** `parse_journald` is `parse_json(ingress)` plus a docstring — the edge does not extract individual fields, it just hands the structured form to the composer. If the relay needs more (e.g. `parse_openssh | compose_ocsf | ocsf_to_egress`), it runs there, where the cycles can be amortised across many edge hosts. The edge's per-event work stays tiny.
 - **Disk queue on the edge.** Network to the relay can blip; we do not want the composer blocking the journal cursor. The queue lets the output layer absorb the blip without pushing backpressure into the pipeline.
 
 ## Central host: relay

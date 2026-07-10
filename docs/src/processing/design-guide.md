@@ -73,16 +73,24 @@ def process compose_ocsf_authentication {
     // @requires: workspace.lsis.severity_id          (required)
     // @requires: workspace.lsis.src_endpoint.ip      (recommended)
     // @requires: workspace.lsis.actor.user.name      (recommended)
-    // @produces: egress  (OCSF Authentication Activity, JSON, one event per line)
+    // @produces: workspace.lsis.ocsf  (OCSF Authentication Activity, JSON string)
     //
     // Expects: the calling pipeline has run a vendor parser that
-    // already mapped its raw fields into `workspace.lsis.*`
-    // canonical form. This composer is vendor-unaware — it does not
-    // read `workspace.cef.*` / `workspace.syslog.*` directly.
+    // already mapped its raw fields into `workspace.lsis.*` canonical
+    // LSIS form. This composer is vendor-unaware — it does not read
+    // `workspace.cef.*` / `workspace.syslog.*` directly.
+    //
+    // Contract note: schema composers write to their LSIS slot
+    // (`workspace.lsis.ocsf` here) — never to `egress` directly. A
+    // companion one-line process `ocsf_to_egress` (defined next to
+    // the composer in the same file) moves the slot to `egress`
+    // when the pipeline emits OCSF as its wire form. This is the
+    // egress single-writer invariant — see
+    // [Slot registry](../../../packaging/snippets/README.md#slot-registry).
 
     workspace.lsis.class_uid   = 3002
     workspace.lsis.activity_id = 1
-    egress = to_json(workspace.lsis)
+    workspace.lsis.ocsf        = to_json(workspace.lsis)
 }
 ```
 
@@ -199,7 +207,7 @@ Do not pack multiple unrelated schemas into a single file.
 
 ### Use `workspace.lsis` as the canonical intermediate
 
-Pick one canonical intermediate shape and have every parser write into it; have every composer read from it. limpid's library uses the namespace `workspace.lsis` for this — OCSF-inspired in field shape, but explicitly *limpid's* canonical, not a strict OCSF spec binding. The chain has three responsibility layers:
+Pick one canonical intermediate shape and have every parser write into it; have every composer read from it. limpid's library uses the namespace `workspace.lsis` for this — the Limpid Snippet Intermediate Schema (LSIS), whose vocabulary is borrowed from OCSF 1.3.0 but which is not itself an OCSF conformance claim; see [LSIS](../../../packaging/snippets/README.md#lsis--the-parser--composer-intermediate) for the canonical definition and slot registry. The chain has three responsibility layers:
 
 ```
 ingress
@@ -215,20 +223,26 @@ ingress
    ▼
 ┌──────────────────────┐
 │  vendor parsers      │
-│  parse_fortigate_cef,│ ─► workspace.lsis.*    — canonical intermediate
-│  parse_paloalto_cef, │                            (OCSF-shaped, not strict)
-│  parse_cloudtrail, … │
+│  parse_fortigate_cef,│ ─► workspace.lsis.*    — canonical LSIS shape
+│  parse_paloalto_cef, │                            (OCSF-vocabulary, not
+│  parse_cloudtrail, … │                             OCSF-bound)
 └──────────────────────┘
    │
    ▼
-┌──────────────────────────────┐
-│  composers                   │
-│  compose_ocsf_network_activity, │ ─► egress (JSON in target wire schema)
-│  compose_ecs_network, …      │
-└──────────────────────────────┘
+┌────────────────────────────────┐
+│  schema composers              │
+│  compose_ocsf,                 │ ─► workspace.lsis.<slot>
+│  compose_rfc5424,              │       (target wire form: OCSF JSON,
+│  compose_replayable, …         │        RFC 5424 record, JSONL, …)
+└────────────────────────────────┘
    │
    ▼
-egress
+┌────────────────────────────────┐
+│  egress terminator             │
+│  <slot>_to_egress companion,   │ ─► egress
+│  or an envelope composer       │       (single-writer per pipeline)
+│  (compose_otlp) downstream     │
+└────────────────────────────────┘
 ```
 
 - **Format primitives** (`syslog.parse`, `cef.parse`, `parse_kv`, `parse_json`, `csv_parse`) capture raw bytes into a format-specific namespace (`workspace.syslog`, `workspace.cef`, …). They know nothing about vendors or downstream schemas.
@@ -246,8 +260,8 @@ The payoffs:
 
 The two-sided rule of thumb for `workspace.lsis.*`:
 
-- **Parsers fill `workspace.lsis` as close to OCSF shape as possible — but they are not bound by OCSF.** Whenever a vendor field has a clean OCSF home, use the OCSF field name (`src_endpoint.ip`, `actor.user.name`). When it doesn't, carry it on `workspace.lsis` under a vendor-meaningful name; do not throw the data away just because OCSF has no slot.
-- **Composers may assume `workspace.lsis` is OCSF-shaped — but they must not assume strict OCSF compliance.** A composer reads the fields it needs and tolerates extras / absences. An OCSF composer maps `workspace.lsis.*` directly into OCSF JSON; an ECS composer translates the same `workspace.lsis.*` into ECS JSON, taking advantage of the OCSF-likeness without depending on it.
+- **Parsers fill `workspace.lsis` in canonical LSIS shape — OCSF-vocabulary, not OCSF-bound.** Whenever a vendor field has a clean OCSF home, use the OCSF field name (`src_endpoint.ip`, `actor.user.name`). When it doesn't, carry it on `workspace.lsis` under a vendor-meaningful name; do not throw the data away just because OCSF has no slot.
+- **Composers may assume `workspace.lsis` follows canonical LSIS shape — but they must not assume strict OCSF compliance.** A composer reads the fields it needs and tolerates extras / absences. An OCSF composer renders `workspace.lsis.*` to OCSF JSON in the `workspace.lsis.ocsf` slot; an ECS composer would translate the same `workspace.lsis.*` into an ECS JSON slot, taking advantage of the OCSF-vocabulary overlap without depending on it.
 
 A parser must not write vendor-specific format names that bleed into the composer (`workspace.cef.src`, `workspace.fgt_session_id` left at top level); a composer must not read vendor-specific format names directly (`workspace.cef.src`). The contract between them is `workspace.lsis.*`, full stop. Each rename or pass-through layer beyond that is a drift risk.
 

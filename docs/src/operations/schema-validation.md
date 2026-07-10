@@ -77,7 +77,7 @@ When a new downstream appears with a schema nobody has seen before, the integrat
 All recipes stream a JSONL Event via `limpidctl tap <kind> <name> --json` — the same Event JSON described in [Debug Tap](./tap.md), one event per line, with `received_at`, `source`, `ingress`, and `egress` top-level keys always present. Which tap point you pick — and whether the payload the schema lives on is `.egress` or `.workspace.<schema>` — depends on where the check lives:
 
 - **Wire-level validation** (schema over the bytes the sink will actually ship) uses `tap output <name> --json` and reads `.egress`. This is the shape a receiver sees. `tap output --json` never carries `workspace` — the projection is unconditional in v0.7.10 regardless of queue backend.
-- **Pre-serialization / composed-object validation** (schema over the tree the pipeline built before rendering) uses `tap process <compose_process> --json` and reads `.workspace.<schema>` — the process tap emits at process exit with the full workspace state visible, which is where the composed structured payload lives before the sink renders it into `egress`. Picking the named `compose` process one hop back keeps the recipe reading the same fields it always has, just from the pipeline point that actually holds them.
+- **Pre-serialization / composed-object validation** (schema over the tree the pipeline built before rendering) uses `tap process <compose_process> --json` and reads `.workspace.lsis.<schema>` — the process tap emits at process exit with the full workspace state visible, which is where the composed structured payload lives before the sink renders it into `egress`. Picking the named `compose` process one hop back keeps the recipe reading the same LSIS slot the schema composer wrote, just from the pipeline point that actually holds it (see [LSIS slot registry](../../../packaging/snippets/README.md#slot-registry) for the full list).
 
 ### OCSF (JSON Schema)
 
@@ -85,11 +85,11 @@ Use any JSON Schema validator. `ajv-cli` is convenient because it streams:
 
 ```bash
 limpidctl tap process compose_ocsf --json \
-  | jq -c '.workspace.ocsf' \
+  | jq -c '.workspace.lsis.ocsf' \
   | ajv validate -s ocsf-schemas/network_activity.json --all-errors -
 ```
 
-`jq -c '.workspace.ocsf'` extracts the structured payload the pipeline built under a workspace key; substitute your own compose process name and the workspace path it writes to.
+`jq -c '.workspace.lsis.ocsf'` extracts the structured payload the pipeline built under a workspace key; substitute your own compose process name and the workspace path it writes to.
 
 ### ECS (Elastic)
 
@@ -97,7 +97,7 @@ ECS ships YAML; convert to JSON Schema once with Elastic's generator and feed it
 
 ```bash
 limpidctl tap process compose_ecs --json \
-  | jq -c '.workspace.ecs' \
+  | jq -c '.workspace.lsis.ecs' \
   | jsonschema -i /dev/stdin ecs.schema.json
 ```
 
@@ -146,7 +146,7 @@ sudo limpidctl inject input edge_syslog --json < tests/fixtures/edge.jsonl
 sleep 1   # drain
 kill $TAP_PID
 
-jq -c '.workspace.ocsf' tap.jsonl \
+jq -c '.workspace.lsis.ocsf' tap.jsonl \
   | ajv validate -s schemas/ocsf/network_activity.json --all-errors -
 ```
 
@@ -162,7 +162,7 @@ Run the validator alongside the daemon as a separate service. The systemd patter
 # /etc/systemd/system/limpid-ocsf-monitor.service
 [Service]
 ExecStart=/bin/sh -c 'limpidctl tap process compose_ocsf --json \
-  | jq -c ".workspace.ocsf" \
+  | jq -c ".workspace.lsis.ocsf" \
   | ajv validate -s /etc/limpid/schemas/ocsf_network_activity.json - \
   | logger -t limpid-ocsf-monitor'
 Restart=always

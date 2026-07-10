@@ -63,7 +63,10 @@ SIGHUP).
   1.3.0 priority set (27 classes spanning System Activity / Findings
   / Identity & Access Management / Network Activity / Application
   Activity). Each leaf strips `null` keys via `null_omit` and writes
-  OCSF JSON to `egress`.
+  OCSF JSON to the LSIS slot `workspace.lsis.ocsf`; the companion
+  `ocsf_to_egress` process moves the slot to `egress` (the egress
+  single-writer invariant — see
+  [Slot registry](../../../packaging/snippets/README.md#slot-registry)).
 - `composers/compose_rfc5424.limpid` — `workspace.journald.*` →
   RFC 5424 syslog wire. Used at edge boxes to re-frame journald
   entries for syslog relay (e.g. edge → relay → AMA).
@@ -129,7 +132,7 @@ def pipeline fw_to_security_lake {
 ```
 
 `parse_fortigate_cef` writes the parsed event to `workspace.lsis.*`
-in canonical OCSF shape; `compose_ocsf` reads from there and writes
+in canonical LSIS shape; `compose_ocsf` reads from there and writes
 the OCSF JSON record to the LSIS slot `workspace.lsis.ocsf`; the
 one-line `ocsf_to_egress` companion at the tail of the pipeline
 moves the slot to `egress`. Swap the parser for any of the others;
@@ -161,17 +164,24 @@ unsupported vocabulary.
 
 ### `workspace.lsis` is the canonical intermediate
 
-Parsers populate `workspace.lsis.*` only with OCSF-canonical
-fields. Vendor intermediates (`workspace.cef`, `workspace.syslog`,
-`workspace.pf`, `workspace.ct`, `workspace.winevent`, etc.) are
-parser-private scratch — the composer never reads them. This keeps
-the composer schema-aware (it knows OCSF) without making it
-vendor-aware (it never sees CEF quirks, FortiGate dialect, or PAN-OS
-positional CSV columns).
+`workspace.lsis.*` is the **LSIS** — the Limpid Snippet Intermediate
+Schema. LSIS's vocabulary is borrowed from OCSF 1.3.0 (so
+`compose_ocsf` renders LSIS to conformant OCSF JSON without
+translation) but LSIS is not itself an OCSF conformance claim —
+canonical definition and slot registry at
+[packaging/snippets/README.md § LSIS](../../../packaging/snippets/README.md#lsis--the-parser--composer-intermediate).
 
-The contract is documented in [Process Design Guide → Use
-`workspace.lsis` as the canonical
-intermediate](../processing/design-guide.md#use-workspacelimpid-as-the-canonical-intermediate). New
+Parsers populate `workspace.lsis.*` only with LSIS-vocabulary
+fields. Vendor / transport intermediates (`workspace.cef`,
+`workspace.syslog`, `workspace.pf`, `workspace.ct`,
+`workspace.winevent`, etc.) are parser-private scratch — no composer
+reads them. This keeps schema composers LSIS-aware without their
+being vendor-aware (they never see CEF quirks, FortiGate dialect,
+or PAN-OS positional CSV columns).
+
+The parser / composer chain is documented in [Process Design Guide →
+Use `workspace.lsis` as the canonical
+intermediate](../processing/design-guide.md#use-workspacelsis-as-the-canonical-intermediate). New
 parsers follow it; out-of-tree vendor parsers should follow it too
 so they compose cleanly with `compose_ocsf`.
 
