@@ -1596,7 +1596,7 @@ def pipeline p {
     input i
     process {
         workspace.proto = 6
-        workspace.limpid = {
+        workspace.lsis = {
             class_uid: 4001,
             connection_info: { protocol_name: normalize_proto(workspace.proto) }
         }

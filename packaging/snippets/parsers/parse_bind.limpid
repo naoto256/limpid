@@ -50,7 +50,7 @@
 //                 } | parse_bind | compose_ocsf
 //
 // Output:   OCSF DNS Activity (class_uid 4003) records on
-//           `workspace.limpid`.
+//           `workspace.lsis`.
 //
 // Sample BIND querylog lines (what `workspace.bind.body` carries):
 //
@@ -142,7 +142,7 @@ def process parse_bind {
 }
 
 def process parse_bind_query_record {
-    workspace.limpid = bind_dns_record(
+    workspace.lsis = bind_dns_record(
         workspace.bind_query.client_ip,
         workspace.bind_query.client_port,
         workspace.bind_query.qname,

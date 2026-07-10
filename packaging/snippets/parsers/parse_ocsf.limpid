@@ -6,7 +6,7 @@
 //          export, or test fixture).
 // Wire:    OCSF JSON — one object per event, top-level is an OCSF
 //          class instance (`class_uid` at the root).
-// Output:  populates `workspace.limpid` with the same OCSF object,
+// Output:  populates `workspace.lsis` with the same OCSF object,
 //          ready for `compose_ocsf` (or any downstream OCSF-aware
 //          process) to dispatch by `class_uid`.
 //
@@ -28,13 +28,13 @@
 //     re-parses it for further processing (enrichment, filtering,
 //     class-specific routing) without re-implementing 27 class shapes.
 //
-// Contract (per the workspace.limpid canonical intermediate):
-//   * top-level JSON object becomes `workspace.limpid` directly
+// Contract (per the workspace.lsis canonical intermediate):
+//   * top-level JSON object becomes `workspace.lsis` directly
 //   * unknown / missing `class_uid` is left to downstream
 //     (compose_ocsf already routes unknown class_uid to error_log)
 //   * non-object JSON or malformed JSON fails inside parse_json
 //     (process error → DLQ per pipeline error policy)
 
 def process parse_ocsf {
-    workspace.limpid = parse_json(ingress)
+    workspace.lsis = parse_json(ingress)
 }

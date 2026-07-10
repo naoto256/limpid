@@ -417,7 +417,7 @@ def process x {}
 // Test corpus: real (y)
 
 def process y {
-    workspace.limpid.proto = proto_num(workspace.raw.proto)
+    workspace.lsis.proto = proto_num(workspace.raw.proto)
 }
 ",
         );
@@ -435,7 +435,7 @@ def process y {
 
 def process z {
     // proto_num(x) would work here but we compute inline instead
-    workspace.limpid.proto = 6
+    workspace.lsis.proto = 6
 }
 ",
         );

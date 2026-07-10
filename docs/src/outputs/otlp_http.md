@@ -91,7 +91,7 @@ def process compose_otlp_from_ocsf {
 
     workspace.otlp = {
         resource: { attributes: [
-            { key: "service.name", value: { string_value: workspace.limpid.metadata.product.name } }
+            { key: "service.name", value: { string_value: workspace.lsis.metadata.product.name } }
         ]},
         scope_logs: [{
             scope: { name: "limpid", version: "0.5.0" },
