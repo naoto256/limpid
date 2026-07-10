@@ -157,7 +157,10 @@ pub fn render_filters_table(headers: &[SnippetHeader]) -> String {
 pub fn render_functions_table(all_headers: &[SnippetHeader]) -> String {
     let mut out = generated_notice();
     out.push_str("| File | Signature | Used by |\n|---|---|---|\n");
-    for h in all_headers.iter().filter(|h| h.kind == SnippetKind::Function) {
+    for h in all_headers
+        .iter()
+        .filter(|h| h.kind == SnippetKind::Function)
+    {
         let sig = h.get("Signature").unwrap_or("").trim();
         let name = parse_signature(sig).map(|(n, _)| n).unwrap_or_default();
         let callers = derive_used_by(&name, &h.file, all_headers);
@@ -255,15 +258,14 @@ fn contains_call(line: &str, func_name: &str) -> bool {
     let mut start = 0;
     while let Some(pos) = line[start..].find(&needle) {
         let abs = start + pos;
-        let prev_ok = abs == 0
-            || {
-                let before = &line[..abs];
-                !before
-                    .chars()
-                    .next_back()
-                    .map(|c| c.is_ascii_alphanumeric() || c == '_')
-                    .unwrap_or(false)
-            };
+        let prev_ok = abs == 0 || {
+            let before = &line[..abs];
+            !before
+                .chars()
+                .next_back()
+                .map(|c| c.is_ascii_alphanumeric() || c == '_')
+                .unwrap_or(false)
+        };
         if prev_ok {
             return true;
         }
@@ -292,7 +294,11 @@ fn summary_of(h: &SnippetHeader) -> String {
 fn writes_first_token(h: &SnippetHeader) -> String {
     let writes = h.get("Writes").unwrap_or("");
     let first_line = writes.split('\n').next().unwrap_or("");
-    first_line.split_whitespace().next().unwrap_or("").to_string()
+    first_line
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Escape characters that would break markdown table cells. Pipe is
@@ -440,7 +446,12 @@ def process z {
 ",
         );
 
-        let all = vec![def_header.clone(), caller_header_only, caller_body.clone(), caller_comment];
+        let all = vec![
+            def_header.clone(),
+            caller_header_only,
+            caller_body.clone(),
+            caller_comment,
+        ];
         let callers = derive_used_by("proto_num", &def_header.file, &all);
         assert_eq!(callers, vec![caller_body.file.clone()]);
     }
