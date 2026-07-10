@@ -32,12 +32,12 @@ In limpid, anything you want to do to a log on its way from input to output is a
 
 ## So what is a `process`?
 
-A reusable chunk of pipeline logic — small, named, drop-in. You write them yourself, or you include them from the snippet library (a curated collection introduced in **v0.7.0** and expanded across the 0.7.x line: 24 vendor parsers (SIEM + OSS NDR), 2 transport parsers, the OCSF 1.3.0 27-class composer, and shared helper functions; full list in [Snippet Library](docs/src/snippets/README.md)). Here is what an OCSF Detection Finding composer leaf looks like under the hood:
+A reusable chunk of pipeline logic — small, named, drop-in. You write them yourself, or you include them from the snippet library (a curated collection introduced in **v0.7.0** and expanded across the 0.7.x line: 29 vendor parsers (SIEM / OSS NDR / cloud), 2 transport parsers, the OCSF 1.3.0 27-class composer, an OTLP envelope composer, and shared helper functions; full list — machine-generated from snippet headers — in [Snippet Library](packaging/snippets/README.md)). Here is what an OCSF Detection Finding composer leaf looks like under the hood:
 
 ```limpid
 def process compose_ocsf_detection_finding {
     let activity = workspace.lsis.activity_id
-    egress = to_json(null_omit({
+    workspace.lsis.ocsf = to_json(null_omit({
         class_uid:    2004,                     // Detection Finding
         category_uid: 2,                        // Findings
         activity_id:  activity,
@@ -47,6 +47,9 @@ def process compose_ocsf_detection_finding {
         // ...
     }))
 }
+// Companion one-line process `ocsf_to_egress` (in the same file)
+// moves the LSIS slot to `egress` — the egress single-writer
+// invariant. See packaging/snippets/README.md § Slot registry.
 ```
 
 Each `def process` is one small responsibility — parse one vendor, shape one schema, drop one class of events. A pipeline is a chain of them, separated by `|`, written in the same DSL whether you authored the piece yourself or pulled it from the library.
@@ -155,11 +158,11 @@ The single `output otlp { protocol grpc | http_* }` module is split in 0.7.6 int
 Curated parser / composer / filter library, installed under `/usr/share/limpid/snippets/` and `include`-able by absolute path. Introduced in **v0.7.0**, with the transport layer split out as its own snippet category in **v0.7.1** and the vendor lineup expanded across the 0.7.x line:
 
 - **Transport parsers (2, v0.7.1)** — `parse_syslog` (RFC 3164 / 5424 syslog wire) · `parse_journald` (systemd journald JSON). These populate `workspace.<transport>.*` and feed any vocabulary parser downstream via an inline bridge.
-- **Vendor parsers (24)** — security devices / cloud audit: `parse_fortigate_cef` · `parse_fortigate_syslog` · `parse_paloalto_cef` · `parse_paloalto_syslog` · `parse_asa` · `parse_cloudtrail` · `parse_juniper_srx_sd_syslog` (Junos structured-data) · `parse_juniper_srx_syslog` (Junos unstructured RT_IDP) · `parse_checkpoint_leef` (LEEF 2.0 / QRadar) · `parse_checkpoint_syslog` (Check Point Syslog Exporter, real-corpus verified) · `parse_nsp` (Trellix Network Security Platform, real-traffic verified). OSS NDR: `parse_suricata` (EVE JSON) · `parse_zeek_default` / `parse_zeek_soc` / `parse_zeek_full` (Zeek 8 / 20 / 43 protocol scripts, nested-superset scopes, with `_native` / `_flat` convenience variants for raw Zeek vs Filebeat-flat upstream). Server / host vocabulary: `parse_openssh` · `parse_sudo` · `parse_combined_log` (Apache / Nginx) · `parse_postfix` · `parse_winevent_json` · `parse_sysmon` · `parse_bind` · `parse_auditd` (7 OCSF classes, real-corpus verified). Vendor-neutral: `parse_ocsf`.
-- **Composers (3)** — `compose_ocsf` (OCSF 1.3.0 priority set, 27 classes, dispatched by `workspace.lsis.class_uid`) · `compose_rfc5424` (journald → RFC 5424 wire, v0.7.1) · `compose_replayable` (replay-shape capture).
+- **Vendor parsers (29)** — security devices / cloud audit: `parse_fortigate_cef` · `parse_fortigate_syslog` · `parse_paloalto_cef` · `parse_paloalto_syslog` · `parse_asa` · `parse_cloudtrail` · `parse_juniper_srx_sd_syslog` (Junos structured-data) · `parse_juniper_srx_syslog` (Junos unstructured RT_IDP) · `parse_checkpoint_leef` (LEEF 2.0 / QRadar) · `parse_checkpoint_syslog` (Check Point Syslog Exporter, real-corpus verified) · `parse_nsp` (Trellix Network Security Platform, real-traffic verified). OSS NDR: `parse_suricata` (EVE JSON) · `parse_zeek_default` / `parse_zeek_soc` / `parse_zeek_full` (Zeek 8 / 20 / 43 protocol scripts, nested-superset scopes, with `_native` / `_flat` convenience variants for raw Zeek vs Filebeat-flat upstream). Cloud (audit / data-plane / findings / identity / orchestration): `parse_aws_guardduty` · `parse_aws_vpc_flow` · `parse_azure_activity` · `parse_k8s_audit` · `parse_okta_system`. Server / host vocabulary: `parse_openssh` · `parse_sudo` · `parse_combined_log` (Apache / Nginx) · `parse_postfix` · `parse_winevent_json` · `parse_sysmon` · `parse_bind` · `parse_auditd` (7 LSIS classes, real-corpus verified). Vendor-neutral: `parse_ocsf`.
+- **Composers (4)** — `compose_ocsf` (OCSF 1.3.0 priority set, 27 classes, dispatched by `workspace.lsis.class_uid`) · `compose_rfc5424` (journald → RFC 5424 wire, v0.7.1) · `compose_replayable` (replay-shape capture) · `compose_otlp` (envelope composer wrapping a schema slot into OTLP 1.0.0 ResourceLogs bytes). Schema composers write to `workspace.lsis.<schema>` slots; a companion `<schema>_to_egress` one-line process (shipped alongside each composer) moves the slot to `egress` under the egress single-writer invariant.
 - **Filters (1)** — `filter_openssh_journal` (drops PAM session double-count noise from journald sshd streams).
 
-Each parser writes to the canonical `workspace.lsis.*` intermediate; `compose_ocsf` reads from it and emits OCSF JSON to `workspace.lsis.ocsf`, and the companion `ocsf_to_egress` hands the slot off to `egress`. Two `include` lines + a two-stage pipeline gets vendor logs into a SIEM / data lake in OCSF form. Full reference: [Snippet Library](docs/src/snippets/README.md).
+Each parser writes to the canonical `workspace.lsis.*` intermediate (the Limpid Snippet Intermediate Schema — see [LSIS](packaging/snippets/README.md#lsis--the-parser--composer-intermediate)); `compose_ocsf` reads from it and emits OCSF JSON to the LSIS slot `workspace.lsis.ocsf`, and the companion `ocsf_to_egress` hands the slot off to `egress`. Two `include` lines + a two-stage pipeline gets vendor logs into a SIEM / data lake in OCSF form. Full reference: [Snippet Library](packaging/snippets/README.md).
 
 ### Functions
 
