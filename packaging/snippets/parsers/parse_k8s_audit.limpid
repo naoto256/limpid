@@ -176,13 +176,18 @@ def process parse_k8s_audit_api {
     let groups = k8s_audit_build_groups(workspace.k8s.user.groups)
     let src_ip = k8s_audit_pick_src_ip(workspace.k8s.sourceIPs)
 
-    // Resource path for OCSF api.resource — apiGroup/apiVersion/resource
+    // Resource path for LSIS api.resource — apiGroup/apiVersion/resource
     // joined with `/`, stripping the leading slash for core (apiGroup
-    // is empty string for the legacy "" group, e.g. pods/services).
+    // is empty string for the legacy "" group, e.g. v1/pods).
+    // apiVersion is the RESOURCE's version (e.g. "v1", "apps/v1"'s
+    // version part), NOT the audit envelope's `workspace.k8s.apiVersion`
+    // (which is the audit schema version — `audit.k8s.io/v1` — and
+    // constant across virtually all events).
     let api_group = coalesce(workspace.k8s.objectRef.apiGroup, "")
+    let api_version = workspace.k8s.objectRef.apiVersion
     let resource_path = switch true {
-        api_group == "" { workspace.k8s.objectRef.resource }
-        default         { "${api_group}/${workspace.k8s.objectRef.resource}" }
+        api_group == "" { "${api_version}/${workspace.k8s.objectRef.resource}" }
+        default         { "${api_group}/${api_version}/${workspace.k8s.objectRef.resource}" }
     }
 
     workspace.lsis = {
@@ -195,7 +200,7 @@ def process parse_k8s_audit_api {
         time:         to_int(parse_datetime_rfc3339(workspace.k8s.stageTimestamp)),
         api: {
             operation: workspace.k8s.verb,
-            version:   workspace.k8s.apiVersion,
+            version:   api_version,
             service:   { name: "kube-apiserver" },
             request:   { uid: workspace.k8s.auditID },
             response:  { code: workspace.k8s.responseStatus.code },
