@@ -10,13 +10,14 @@ Description=limpid log pipeline daemon
 Documentation=https://github.com/naoto256/limpid
 After=network.target
 Conflicts=rsyslog.service syslog-ng.service syslog.socket
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/limpid --config /etc/limpid/limpid.conf
 ExecReload=/bin/kill -HUP $MAINPID
 TimeoutStopSec=15
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 User=syslog
