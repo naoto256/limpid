@@ -81,18 +81,36 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
-    // Restore the default SIGPIPE disposition for the CLI-style modes
-    // (`--check`, `--test-pipeline`) which write to stdout and may be
-    // piped through `head`/`less`. Daemon mode doesn't write structured
-    // stdout, so this is a no-op there. Without this, the Rust default
-    // (`SIG_IGN`) turns a closed downstream pipe into an `EPIPE` that
-    // the println! infrastructure escalates into a panic.
-    #[cfg(unix)]
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
-
     let cli = Cli::parse();
+
+    // Restore the default SIGPIPE disposition (`SIG_DFL`) ONLY for
+    // CLI-style modes (`--check`, `--graph`, `--test-pipeline`) that
+    // write structured stdout and may be piped through `head` / `less`.
+    // In those modes a downstream pipe close should cleanly terminate
+    // limpid; without `SIG_DFL` the Rust default (`SIG_IGN`) turns the
+    // closed pipe into an `EPIPE` that `println!` escalates into a panic.
+    //
+    // Daemon mode keeps the Rust default (`SIG_IGN`) so a broken pipe
+    // on the stderr side (systemd-journald backing off under a retry-
+    // loop tracing burst, or the journald being restarted) surfaces as
+    // an ordinary `EPIPE` write error the tracing subscriber can drop,
+    // rather than killing the whole daemon. The earlier unconditional
+    // `SIG_DFL` at main entry allowed a saturated stderr / journald
+    // pipe under a tracing burst to raise SIGPIPE on the next write and
+    // take the daemon down; systemd can classify a SIGPIPE exit as
+    // clean (`Deactivated successfully. … signal=PIPE`), so daemon
+    // mode must not restore `SIG_DFL`.
+    let is_cli_mode = cli.check
+        || cli.strict_warnings
+        || cli.ultra_strict
+        || cli.graph.is_some()
+        || cli.test_pipeline.is_some();
+    #[cfg(unix)]
+    if is_cli_mode {
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
 
     // Initialize tracing
     if cli.debug {
