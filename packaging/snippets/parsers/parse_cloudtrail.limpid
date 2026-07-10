@@ -8,7 +8,7 @@
 //          EventBridge, Kinesis Firehose, the AWS CLI) all unwrap into
 //          a single-event-per-message form. Handle the array-of-records
 //          unwrap at the transport layer, not here.
-// Output:  OCSF API Activity (class_uid 6003) on `workspace.limpid`.
+// Output:  OCSF API Activity (class_uid 6003) on `workspace.lsis`.
 //
 // Sample input (Management event, IAMUser, single event JSON):
 //   {"eventVersion":"1.08","userIdentity":{"type":"IAMUser","userName":"alice","arn":"arn:aws:iam::123:user/alice","accountId":"123","accessKeyId":"AKIA..."},"eventTime":"2026-04-29T10:00:00Z","eventSource":"s3.amazonaws.com","eventName":"GetObject","awsRegion":"us-east-1","sourceIPAddress":"203.0.113.10","userAgent":"aws-cli/2.x","readOnly":true,"eventID":"...","eventType":"AwsApiCall","managementEvent":true,"recipientAccountId":"123","eventCategory":"Management"}
@@ -128,7 +128,7 @@ def function cloudtrail_activity_id(name) {
 // ---------------------------------------------------------------------------
 //
 // One process: parse the JSON, then translate top-level CloudTrail
-// fields into OCSF API Activity (6003) on workspace.limpid.
+// fields into OCSF API Activity (6003) on workspace.lsis.
 
 def process parse_cloudtrail {
     workspace.ct = parse_json(ingress)
@@ -139,7 +139,7 @@ def process parse_cloudtrail {
         default                        { 1 }
     }
 
-    workspace.limpid = {
+    workspace.lsis = {
         class_uid:    6003,
         category_uid: 6,
         activity_id:  activity,

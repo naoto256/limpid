@@ -34,7 +34,7 @@
 //           - syslog (UDP/TCP):
 //                 { workspace.checkpoint_syslog = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_checkpoint_syslog | compose_ocsf
 //
-// Output:   OCSF records on `workspace.limpid`. The class depends on
+// Output:   OCSF records on `workspace.lsis`. The class depends on
 //           the action / product combination:
 //             firewall actions (Accept / Drop / Reject / Decrypt)        → 4001 Network Activity
 //             threat actions (Detect / Inline / Block + threat context)  → 2004 Detection Finding
@@ -383,7 +383,7 @@ def process parse_checkpoint_syslog_dispatch {
 
 def process parse_checkpoint_syslog_network_record_proc {
     let sd = workspace.cp_syslog_class.sd
-    workspace.limpid = checkpoint_syslog_network_record(
+    workspace.lsis = checkpoint_syslog_network_record(
         sd,
         parse_checkpoint_syslog_kv(sd, "action"),
         parse_checkpoint_syslog_kv(sd, "src"),
@@ -402,7 +402,7 @@ def process parse_checkpoint_syslog_network_record_proc {
 
 def process parse_checkpoint_syslog_finding_record_proc {
     let sd = workspace.cp_syslog_class.sd
-    workspace.limpid = checkpoint_syslog_finding_record(
+    workspace.lsis = checkpoint_syslog_finding_record(
         sd,
         parse_checkpoint_syslog_kv(sd, "action"),
         parse_checkpoint_syslog_kv(sd, "src"),
@@ -417,7 +417,7 @@ def process parse_checkpoint_syslog_finding_record_proc {
 
 def process parse_checkpoint_syslog_auth_record {
     let sd = workspace.cp_syslog_class.sd
-    workspace.limpid = checkpoint_syslog_auth_record(
+    workspace.lsis = checkpoint_syslog_auth_record(
         sd,
         parse_checkpoint_syslog_kv(sd, "action"),
         coalesce(workspace.cp_syslog_class.host, workspace.checkpoint_syslog.hostname),

@@ -520,10 +520,10 @@ throughout composers and parsers.
 
 ```limpid
 // Composer: prefer parsed event time, fall back to received_at
-let event_time = coalesce(workspace.limpid.time, received_at)
+let event_time = coalesce(workspace.lsis.time, received_at)
 
 // Parser: pick first source IP that is populated
-workspace.limpid.src_endpoint.ip = coalesce(
+workspace.lsis.src_endpoint.ip = coalesce(
     workspace.cef.src,
     workspace.cef.sourceTranslatedAddress,
     workspace.syslog.hostname
@@ -677,7 +677,7 @@ Text-only primitives (`upper`, `regex_*`, `format`, `to_int`,
 Coerces a value to a 64-bit signed integer. Returns `null` on unparseable input, matching the partial-data policy of `regex_extract` and `table_lookup`.
 
 ```limpid
-workspace.limpid.src_endpoint.port = to_int(workspace.cef.spt)  // CEF ext: "54321" → 54321
+workspace.lsis.src_endpoint.port = to_int(workspace.cef.spt)  // CEF ext: "54321" → 54321
 ```
 
 | Input | Result |
@@ -815,7 +815,7 @@ let leaf = path(workspace.geo, dynamic_key, "name")
 Return a new array with `value` added at the back (`append`) or the front (`prepend`). The input array is not mutated — callers re-bind:
 
 ```limpid
-workspace.limpid.observables = append(workspace.limpid.observables, new_obs)
+workspace.lsis.observables = append(workspace.lsis.observables, new_obs)
 workspace.high_prio_tags = prepend(workspace.high_prio_tags, "urgent")
 ```
 
@@ -842,7 +842,7 @@ Cardinality primitive — works for every container-like type:
 | Scalars (`Int` / `Float` / `Bool`) | `Null` |
 
 ```limpid
-workspace.n_observables = len(workspace.limpid.observables)
+workspace.n_observables = len(workspace.lsis.observables)
 workspace.msg_len = len(workspace.syslog.msg)
 ```
 

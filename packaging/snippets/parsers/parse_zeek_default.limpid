@@ -40,7 +40,7 @@
 //           - Per-log JSONL tail:
 //                 process { workspace.zeek = { body: parse_json(ingress), hostname: hostname(), time: to_int(received_at) } } | parse_zeek_default | compose_ocsf
 //
-// Output:   OCSF records on `workspace.limpid`. Dispatch by `_path`:
+// Output:   OCSF records on `workspace.lsis`. Dispatch by `_path`:
 //             conn   → 4001 Network Activity (conn_state → activity_id)
 //             dns    → 4003 DNS Activity
 //             http   → 4002 HTTP Activity (method → activity_id)
@@ -534,7 +534,7 @@ def process parse_zeek_default {
 }
 
 def process parse_zeek_default_conn {
-    workspace.limpid = zeek_conn_record(
+    workspace.lsis = zeek_conn_record(
         workspace.zeek.body,
         workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time)
@@ -542,7 +542,7 @@ def process parse_zeek_default_conn {
 }
 
 def process parse_zeek_default_dns {
-    workspace.limpid = zeek_dns_record(
+    workspace.lsis = zeek_dns_record(
         workspace.zeek.body,
         workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time)
@@ -550,7 +550,7 @@ def process parse_zeek_default_dns {
 }
 
 def process parse_zeek_default_http {
-    workspace.limpid = zeek_http_record(
+    workspace.lsis = zeek_http_record(
         workspace.zeek.body,
         workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time)
@@ -558,7 +558,7 @@ def process parse_zeek_default_http {
 }
 
 def process parse_zeek_default_ssl {
-    workspace.limpid = zeek_ssl_record(
+    workspace.lsis = zeek_ssl_record(
         workspace.zeek.body,
         workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time)
@@ -566,7 +566,7 @@ def process parse_zeek_default_ssl {
 }
 
 def process parse_zeek_default_files {
-    workspace.limpid = zeek_files_record(
+    workspace.lsis = zeek_files_record(
         workspace.zeek.body,
         workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time)
@@ -574,7 +574,7 @@ def process parse_zeek_default_files {
 }
 
 def process parse_zeek_default_x509 {
-    workspace.limpid = zeek_x509_record(
+    workspace.lsis = zeek_x509_record(
         workspace.zeek.body,
         workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time)
@@ -582,7 +582,7 @@ def process parse_zeek_default_x509 {
 }
 
 def process parse_zeek_default_weird {
-    workspace.limpid = zeek_weird_record(
+    workspace.lsis = zeek_weird_record(
         workspace.zeek.body,
         workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time)
@@ -590,7 +590,7 @@ def process parse_zeek_default_weird {
 }
 
 def process parse_zeek_default_notice {
-    workspace.limpid = zeek_notice_record(
+    workspace.lsis = zeek_notice_record(
         workspace.zeek.body,
         workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time)

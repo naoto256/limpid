@@ -59,7 +59,7 @@ SIGHUP).
 ### Composers
 
 - `composers/compose_ocsf.limpid` — dispatches by
-  `workspace.limpid.class_uid` to per-class leaves. Covers the OCSF
+  `workspace.lsis.class_uid` to per-class leaves. Covers the OCSF
   1.3.0 priority set (27 classes spanning System Activity / Findings
   / Identity & Access Management / Network Activity / Application
   Activity). Each leaf strips `null` keys via `null_omit` and writes
@@ -128,7 +128,7 @@ def pipeline fw_to_security_lake {
 }
 ```
 
-`parse_fortigate_cef` writes the parsed event to `workspace.limpid.*`
+`parse_fortigate_cef` writes the parsed event to `workspace.lsis.*`
 in canonical OCSF shape; `compose_ocsf` reads from there and writes
 the OCSF JSON record to `egress`. Swap the parser for any of the
 others; swap the composer for `compose_replayable` to capture
@@ -156,9 +156,9 @@ Two contracts run through the library — the parser ↔ composer
 canonical intermediate, and the loud-fail-fast policy on
 unsupported vocabulary.
 
-### `workspace.limpid` is the canonical intermediate
+### `workspace.lsis` is the canonical intermediate
 
-Parsers populate `workspace.limpid.*` only with OCSF-canonical
+Parsers populate `workspace.lsis.*` only with OCSF-canonical
 fields. Vendor intermediates (`workspace.cef`, `workspace.syslog`,
 `workspace.pf`, `workspace.ct`, `workspace.winevent`, etc.) are
 parser-private scratch — the composer never reads them. This keeps
@@ -167,7 +167,7 @@ vendor-aware (it never sees CEF quirks, FortiGate dialect, or PAN-OS
 positional CSV columns).
 
 The contract is documented in [Process Design Guide → Use
-`workspace.limpid` as the canonical
+`workspace.lsis` as the canonical
 intermediate](../processing/design-guide.md#use-workspacelimpid-as-the-canonical-intermediate). New
 parsers follow it; out-of-tree vendor parsers should follow it too
 so they compose cleanly with `compose_ocsf`.
@@ -260,7 +260,7 @@ conventions are:
   strips the wrapper and routes by header field (`switch
   workspace.<vendor>.<key>`); per-leaf `def process` re-parses the
   body against its subtype-specific shape and writes the OCSF
-  record to `workspace.limpid.*`.
+  record to `workspace.lsis.*`.
 - **Loud-fail-fast** on unsupported vocabulary via `default { error
   "<operator-readable msg>" }`.
 - **Helpers** (`def function ...`) carry per-vendor mapping tables

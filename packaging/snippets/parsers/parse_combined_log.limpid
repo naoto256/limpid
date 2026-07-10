@@ -42,7 +42,7 @@
 //                 } | parse_combined_log | compose_ocsf
 //
 // Output:   OCSF HTTP Activity (class_uid 4002) records on
-//           `workspace.limpid`.
+//           `workspace.lsis`.
 //
 // Sample inputs (`workspace.combined_log.body` carries the CLF line):
 //
@@ -127,7 +127,7 @@ def process parse_combined_log_record {
         default { workspace.web.referer }
     }
 
-    workspace.limpid = {
+    workspace.lsis = {
         class_uid:    4002,
         category_uid: 4,
         activity_id:  activity,

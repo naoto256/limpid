@@ -133,7 +133,7 @@ def process parse_paloalto_cef {
 //   workspace.cef populated by `parse_paloalto_cef` dispatcher or an
 //   inline `cef.parse(...)` upstream of this process.
 def process parse_paloalto_cef_traffic {
-    workspace.limpid = {
+    workspace.lsis = {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  paloalto_cef_traffic_action_to_activity_id(workspace.cef.act),
@@ -192,7 +192,7 @@ def process parse_paloalto_cef_traffic {
 //   suser            — source user
 //   app              — application
 def process parse_paloalto_cef_threat {
-    workspace.limpid = {
+    workspace.lsis = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
@@ -256,7 +256,7 @@ def process parse_paloalto_cef_url {
         "override"  { 1 }
         default     { 0 }
     }
-    workspace.limpid = {
+    workspace.lsis = {
         class_uid:    6004,
         category_uid: 6,
         activity_id:  activity,
@@ -317,7 +317,7 @@ def process parse_paloalto_cef_wildfire {
         "benign"    { 1 }
         default     { 0 }
     }
-    workspace.limpid = {
+    workspace.lsis = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
@@ -379,7 +379,7 @@ def process parse_paloalto_cef_globalprotect {
         "failed" { 2 }
         default  { 1 }
     }
-    workspace.limpid = {
+    workspace.lsis = {
         class_uid:    3002,
         category_uid: 3,
         activity_id:  activity,
@@ -416,7 +416,7 @@ def process parse_paloalto_cef_authentication {
         "failure" { 2 }
         default   { 0 }
     }
-    workspace.limpid = {
+    workspace.lsis = {
         class_uid:    3002,
         category_uid: 3,
         activity_id:  1,

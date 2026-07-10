@@ -11,10 +11,10 @@ prefix.
 ```
 /usr/share/limpid/snippets/
 ├─ parsers/      per-vendor / per-format parsers writing to
-│                workspace.limpid.* (the parser ↔ composer
+│                workspace.lsis.* (the parser ↔ composer
 │                canonical intermediate)
 ├─ composers/    target-schema composers reading from
-│                workspace.limpid.* (currently OCSF 1.3.0;
+│                workspace.lsis.* (currently OCSF 1.3.0;
 │                also the replay-shape composer for parser
 │                regression capture)
 ├─ filters/      pre-parser noise filters (drop / pass-through
@@ -75,7 +75,7 @@ Each parser's docstring records:
 ### Composers (3)
 
 - `composers/compose_ocsf.limpid` — dispatches by
-  `workspace.limpid.class_uid` to per-class leaves, covering the
+  `workspace.lsis.class_uid` to per-class leaves, covering the
   OCSF 1.3.0 priority set (27 classes). Each leaf strips `null`
   keys via `null_omit` and writes OCSF JSON to `egress`.
 - `composers/compose_rfc5424.limpid` — `workspace.journald.*` →
@@ -164,8 +164,8 @@ def pipeline fw_to_ocsf {
 }
 ```
 
-That's it. The parser writes to `workspace.limpid.*` (canonical
-OCSF-shape intermediate); the composer reads from `workspace.limpid.*`
+That's it. The parser writes to `workspace.lsis.*` (canonical
+OCSF-shape intermediate); the composer reads from `workspace.lsis.*`
 and writes OCSF JSON to `egress`. Add `output` to your SIEM /
 data-lake destination (Sentinel, Splunk, Security Lake, OTLP, …)
 and you're shipping OCSF.
@@ -175,8 +175,8 @@ and you're shipping OCSF.
 The library follows two contracts, documented at length in
 `docs/src/processing/user-defined.md`:
 
-1. **`workspace.limpid` is the parser ↔ composer canonical
-   intermediate.** Parsers populate `workspace.limpid.*` only with
+1. **`workspace.lsis` is the parser ↔ composer canonical
+   intermediate.** Parsers populate `workspace.lsis.*` only with
    OCSF-canonical fields. Vendor intermediates (`workspace.cef`,
    `workspace.syslog`, `workspace.pf`, `workspace.ct`, etc.) are
    parser-private and the composer never reads them. This keeps the
@@ -193,7 +193,7 @@ The library follows two contracts, documented at length in
 ## Pipeline shape
 
 Parsers expect to receive raw events on `ingress` and produce
-canonical OCSF-shape on `workspace.limpid.*`. The typical pipeline
+canonical OCSF-shape on `workspace.lsis.*`. The typical pipeline
 is two stages:
 
 ```

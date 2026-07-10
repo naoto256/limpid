@@ -28,7 +28,7 @@
 //                 { workspace.checkpoint_leef = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_checkpoint_leef | compose_ocsf
 //
 // Output:   OCSF Network Activity (class_uid 4001) records on
-//           `workspace.limpid` for traffic events (Accept / Drop /
+//           `workspace.lsis` for traffic events (Accept / Drop /
 //           Reject / Block). Non-traffic LEEF events (Authentication,
 //           VPN tunnel state, etc.) route to error_log per the
 //           loud-fail-fast policy and would need their own subtypes.
@@ -122,7 +122,7 @@ def process parse_checkpoint_leef_record {
             let proto = parse_checkpoint_leef_kv(ext, "proto")
             let src_port = parse_checkpoint_leef_kv(ext, "srcPort")
             let dst_port = parse_checkpoint_leef_kv(ext, "dstPort")
-            workspace.limpid = {
+            workspace.lsis = {
                 class_uid:    4001,
                 category_uid: 4,
                 activity_id:  activity,

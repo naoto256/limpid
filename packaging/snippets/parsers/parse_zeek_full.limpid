@@ -296,97 +296,97 @@ def process parse_zeek_full {
 }
 
 def process parse_zeek_full_signature {
-    workspace.limpid = zeek_signature_record(
+    workspace.lsis = zeek_signature_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
 }
 
 def process parse_zeek_full_intel {
-    workspace.limpid = zeek_intel_record(
+    workspace.lsis = zeek_intel_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
 }
 
 def process parse_zeek_full_traceroute {
-    workspace.limpid = zeek_traceroute_record(
+    workspace.lsis = zeek_traceroute_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
 }
 
 def process parse_zeek_full_rfb {
-    workspace.limpid = zeek_rfb_record(
+    workspace.lsis = zeek_rfb_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
 }
 
 def process parse_zeek_full_tunnel {
-    workspace.limpid = zeek_generic_4001_record(
+    workspace.lsis = zeek_generic_4001_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "tunnel")
 }
 
 def process parse_zeek_full_mysql {
-    workspace.limpid = zeek_generic_4001_record(
+    workspace.lsis = zeek_generic_4001_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "mysql")
 }
 
 def process parse_zeek_full_irc {
-    workspace.limpid = zeek_generic_4001_record(
+    workspace.lsis = zeek_generic_4001_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "irc")
 }
 
 def process parse_zeek_full_sip {
-    workspace.limpid = zeek_generic_4001_record(
+    workspace.lsis = zeek_generic_4001_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "sip")
 }
 
 def process parse_zeek_full_dnp3 {
-    workspace.limpid = zeek_generic_4001_record(
+    workspace.lsis = zeek_generic_4001_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "dnp3")
 }
 
 def process parse_zeek_full_modbus {
-    workspace.limpid = zeek_generic_4001_record(
+    workspace.lsis = zeek_generic_4001_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "modbus")
 }
 
 def process parse_zeek_full_socks {
-    workspace.limpid = zeek_generic_4001_record(
+    workspace.lsis = zeek_generic_4001_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "socks")
 }
 
 def process parse_zeek_full_syslog_over_wire {
-    workspace.limpid = zeek_generic_4001_record(
+    workspace.lsis = zeek_generic_4001_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "syslog")
 }
 
 def process parse_zeek_full_ntp {
-    workspace.limpid = zeek_generic_4001_record(
+    workspace.lsis = zeek_generic_4001_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "ntp")
 }
 
 def process parse_zeek_full_ocsp {
-    workspace.limpid = zeek_generic_4001_record(
+    workspace.lsis = zeek_generic_4001_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "ocsp")
 }
 
 def process parse_zeek_full_pe {
-    workspace.limpid = zeek_generic_4001_record(
+    workspace.lsis = zeek_generic_4001_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "pe")
 }
 
 def process parse_zeek_full_dpd {
-    workspace.limpid = zeek_generic_4001_record(
+    workspace.lsis = zeek_generic_4001_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time), "dpd")
 }
@@ -394,7 +394,7 @@ def process parse_zeek_full_dpd {
 // Catch-all: any _path that even parse_zeek_soc rejects. Wraps the
 // entire body into a 4001 Network Activity record's `unmapped`.
 def process parse_zeek_full_catchall {
-    workspace.limpid = zeek_generic_4001_record(
+    workspace.lsis = zeek_generic_4001_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time),
         coalesce(workspace.zeek.body._path, "unknown"))
