@@ -6,6 +6,73 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime shape converge. After 1.0, changes will follow semver strictly.
 
+## [0.7.11] - 2026-07-11
+
+0.7.11 formalises the snippet library's contracts. The library has grown from a handful of parsers into 39 files across four kinds (parsers / composers / filters / functions), and the ad-hoc header conventions and namespace naming had started to obscure rather than help — vendor documentation blocks and shared-intermediate blurbs were repeating themselves out of sync, the intermediate namespace's `workspace.limpid` name conflated the schema shape with the daemon crate, and the composer contract left it up to each snippet to write `egress` directly with no invariant an operator could rely on. 0.7.11 renames the intermediate to LSIS (Limpid Snippet Intermediate Schema, `workspace.lsis.*`), extracts the header schema into an xtask-enforced per-kind contract with an auto-generated inventory in the packaging README, splits composers into a schema layer that writes an LSIS slot and an envelope layer that wraps a payload, and introduces a `compose_otlp` envelope composer alongside a single-writer invariant on `egress`. Five cloud parsers (AWS GuardDuty, VPC Flow, Azure Activity, Kubernetes audit, Okta System Log) join the tracked set. The daemon runtime is unchanged in shape and throughput — the behaviour differences are confined to what shipped snippets produce, and the two user-visible breaking changes for out-of-tree configs are the namespace rename and the composer-contract split (both described in their own sections below).
+
+### Added — LSIS (Limpid Snippet Intermediate Schema)
+
+The parser ↔ composer canonical intermediate now has a name and a definition of its own. LSIS's vocabulary — field names, numeric class IDs (`class_uid 3002`, `4001`, …), activity / status enumerations — is borrowed from OCSF 1.3.0 so `compose_ocsf` renders LSIS to conformant OCSF JSON without translation, but LSIS is not itself an OCSF conformance claim: fields outside a class's OCSF definition are permitted (they land in `unmapped` when rendered), and future LSIS revisions can diverge from OCSF where wire realities demand it. The canonical definition and a slot registry (`workspace.lsis.ocsf` / `.rfc5424` / `.replayable` / `.otlp` / `.otlp_body`) live at the top of `packaging/snippets/README.md`; the docs pages that referenced the intermediate now link to that section rather than paraphrasing it in place.
+
+### Changed — namespace rename `workspace.limpid.*` → `workspace.lsis.*`
+
+Every snippet body, every doc example, and three Rust references (analyzer test DSL, `coalesce` doc comment, xtask test fixture) migrate to the new namespace. Pipelines that previously wrote or read `workspace.limpid.<field>` must rename to `workspace.lsis.<field>` — this is a breaking change for out-of-tree configs that touched the intermediate directly. CHANGELOG entries for prior releases are unchanged; they describe what shipped under the old namespace.
+
+### Changed — schema composers write LSIS slots; `egress` is single-writer per pipeline
+
+`compose_ocsf`, `compose_rfc5424`, and `compose_replayable` no longer write `egress` directly. Each writes its wire-form artifact to a dedicated LSIS slot (`workspace.lsis.ocsf` / `.rfc5424` / `.replayable`) and ships a companion one-line process `<slot>_to_egress` in the same file that moves the slot to `egress` when the pipeline emits that shape as its wire form. This makes `egress` single-writer per pipeline — `grep 'egress = ' packaging/snippets/` names the writer for every terminal, which is the invariant that makes envelope composition (below) possible without every schema and every envelope needing a separate bridging snippet.
+
+Existing pipelines that used `... | compose_ocsf` at the terminal must add `| ocsf_to_egress` (or the equivalent for `rfc5424` / `replayable`) or the pipeline will no longer write `egress`. Every shipped doc and snippet example is updated; the docs sweep in this release adds the terminator explicitly to every pipeline shape that mentions a composer.
+
+### Added — `compose_otlp` envelope composer
+
+Introduces the envelope-composer role — a second composer layer that wraps an already-serialised payload string in a minimal OTLP-1.0.0 `ResourceLogs` proto and writes the encoded bytes to the LSIS slot `workspace.lsis.otlp`, with a companion `otlp_to_egress` for the pipeline terminal. The envelope reads a declared per-envelope input slot (`workspace.lsis.otlp_body`) and is agnostic to what the body string encodes — feeding a schema slot into the envelope is an explicit inline block in the pipeline:
+
+```
+process parse_x
+      | compose_ocsf
+      | { workspace.lsis.otlp_body = workspace.lsis.ocsf }
+      | compose_otlp
+      | otlp_to_egress
+```
+
+The same pattern works for any other schema slot (RFC 5424 record, replayable line, …), so schemas × envelopes stops producing per-pair bridging snippets and instead composes at the pipeline level. `compose_otlp` is deliberately envelope-neutral — it reads only its declared `otlp_body` slot, populates `host.name` from `hostname()`, and uses `received_at` for `time_unix_nano`; richer resource attributes and source-claimed timestamps are the caller's concern (override in a downstream process or write a `compose_otlp_<flavour>` variant that pulls more of LSIS).
+
+### Added — five cloud parsers join the tracked set
+
+Five cloud parsers become tracked snippets:
+
+- `parse_aws_guardduty` — AWS GuardDuty findings JSON → LSIS Detection Finding (`2004`)
+- `parse_aws_vpc_flow` — AWS VPC Flow Logs text records (v2 default + v5 custom formats) → LSIS Network Activity (`4001`)
+- `parse_azure_activity` — Azure Activity Log events JSON → LSIS API Activity (`6003`)
+- `parse_k8s_audit` — Kubernetes audit Event JSON (`audit.k8s.io/v1`) → LSIS API Activity (`6003`) + Authentication (`3002`)
+- `parse_okta_system` — Okta System Log events JSON (System Log API v1) → LSIS Authentication / Account Change / User Management / Group Management (`3002` / `3001` / `3005` / `3006`)
+
+The tracked vendor / cloud coverage now spans 29 vendor parsers (up from 24) plus the two transport parsers.
+
+### Changed — every snippet header follows a per-kind schema; xtask enforces it
+
+Header keys used to vary per snippet — some carried `Vendor:` / `Wire:` / `Category:` / `Upstream:` / `Intake:` / `Output:` / `Coverage scope:` / `Test corpus:` in various combinations. 0.7.11 introduces a strict per-kind key set (the file's parent directory selects the kind):
+
+  parser   (5 keys): `Summary` / `Reads` / `Writes` / `Category` / `Test corpus`
+  composer (4 keys): `Summary` / `Reads` / `Writes` / `Test corpus`
+  filter   (4 keys): `Summary` / `Reads` / `Effect` / `Test corpus`
+  function (3 keys): `Summary` / `Signature` / `Test corpus`
+
+`Reads:` carries the stream contract as a small grammar: `ingress (raw wire) — …` for raw-wire parsers, or `workspace.<ns>.* (bridge — …)` plus one dot-line per intake field (`^\.<IDENT>\s+\((required|optional), <String|Int|Float|Bool|Object|Array|Timestamp>\)`) for bridge parsers, composers, and filters. Every free-form authored block (wire shapes, dispatch tables, sample inputs, security notes, per-leaf bridge examples) is preserved below the canonical keys as plain comment prose — the only key-shaped lines in every header are the canonical ones, so the lint's unknown-key warning stays meaningful.
+
+`cargo xtask lint-snippet-headers` enforces seven guardrails at build time: canonical key presence and order, `Category:` value in a 17-entry whitelist (parser-only), `Test corpus:` first-token prefix (`real` / `public` / `synthetic` / `spec-only` for stream kinds; `unit` for functions), the `Reads:` dot-line grammar above, function `Signature:` ↔ `def function <name>(params)` cross-check in the same file, `Summary:` required across all kinds, and unknown keys as warnings. `cargo xtask gen-snippet-inventory` regenerates four BEGIN/END inventory tables in `packaging/snippets/README.md` from the headers; `--check` mode fails on drift so a header edit without an inventory refresh cannot merge silently.
+
+Both commands are wired into CI's `check` job alongside `cargo fmt --all -- --check`, so the invariants stay green as a matter of course.
+
+### Changed — snippet library README rewritten around LSIS
+
+`packaging/snippets/README.md` gets a full rewrite: an LSIS definition and slot registry replace the earlier prose introduction, the hand-maintained per-kind tables become the four xtask-generated inventory blocks, *Design principles* grows from two to four contracts (adding the `egress` single-writer invariant and the two-layer composer contract), and *Authoring conventions* is rewritten around the per-kind header schema. The docs pages that used to define the intermediate in their own words (`docs/src/tutorial.md`, `docs/src/processing/design-guide.md`, `docs/src/snippets/README.md`) now link to the packaging README's LSIS section rather than paraphrasing it, so terminology cannot drift from a single source. `docs/src/operations/schema-validation.md`'s tap-process recipes are updated to read `.workspace.lsis.<schema>` (the slot the composer writes) instead of `.workspace.<schema>`.
+
+### Fixed — `parse_k8s_audit` records the target resource's apiVersion, not the audit envelope's
+
+The `parse_k8s_audit` record builder was populating `api.version` from `workspace.k8s.apiVersion`, which is the audit `Event` envelope's schema version (`"audit.k8s.io/v1"`, constant across virtually every event). The actually-useful `workspace.k8s.objectRef.apiVersion` (`"v1"`, the version part of `"apps/v1"`, …) was never read. The same field was missing from the `api.resource` path — despite the surrounding comment stating the intended shape was `apiGroup/apiVersion/resource`. Both spots now read `objectRef.apiVersion`, so an LSIS `6003` record from Kubernetes carries the API version the request actually targeted.
+
 ## [0.7.10] - 2026-07-09
 
 0.7.10 is a focused pipeline hot-path performance recovery release. The single-core throughput on populated-workspace workloads had quietly regressed between v0.6.x and v0.7.9 as a chain of correctness-first refactors (the `refactor(queue,output): carry Event end-to-end` change in v0.7.7–v0.7.8, and the runtime-side `634cbd0` fix that followed) traded per-event heap allocation and scheduler-wake bookkeeping for structural safety. 0.7.10 keeps every correctness invariant intact and unwinds the allocation cost at the two boundaries it accumulated on (the pipeline output snapshot and the `ProcessChain` DLQ backup) plus the scheduler-wake tail on the queue consumer, and clears two per-event allocations from the `syslog_udp` write path that had a similar profile rank once the wake tail flattened. The OpenTelemetry proto stack is also lifted to the current upstream release so the DSL mapper and the batch-merge identity see the new wire fields. A single core now handles ~378k events/sec on passthrough (up from 313k at v0.7.9) and ~221k events/sec on the heaviest realistic DSL workload (OCSF Authentication compose + `to_json`, up from 62k at v0.7.9); the four-row Performance table in the README is refreshed alongside.
@@ -1842,6 +1909,7 @@ See `docs/src/operations/upgrade-0.3.md` for end-to-end migration recipes includ
 Initial public release. Rust + tokio log pipeline daemon replacing rsyslog / syslog-ng / fluentd with a single readable DSL (`def input`, `def process`, `def output`, `def pipeline`). Includes syslog (UDP/TCP/ TLS) / tail / journal / unix socket inputs; file / HTTP / Kafka / TCP / UDP / unix socket / stdout outputs; in-DSL expression language with parsers (JSON / KV / CEF / syslog), regex, string templates, tables with TTL, GeoIP; control socket (`limpidctl tap`, `stats`, `health`); hot reload via `SIGHUP` with automatic rollback; per-output disk-backed queues.
 
 [Unreleased]: https://github.com/naoto256/limpid/compare/v0.7.9...HEAD
+[0.7.11]: https://github.com/naoto256/limpid/compare/v0.7.10...v0.7.11
 [0.7.9]: https://github.com/naoto256/limpid/compare/v0.7.8...v0.7.9
 [0.7.8]: https://github.com/naoto256/limpid/compare/v0.7.7...v0.7.8
 [0.7.7]: https://github.com/naoto256/limpid/compare/v0.7.6...v0.7.7
