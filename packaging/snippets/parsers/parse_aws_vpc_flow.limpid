@@ -1,0 +1,362 @@
+// AWS VPC Flow Logs parser
+//
+// Summary:     AWS VPC Flow Logs text records (v2 default + v5 custom
+//              formats) → LSIS Network Activity.
+// Reads:       ingress (raw wire) — one space-separated flow-log record per
+//              line; dispatch by the leading version token
+// Writes:      workspace.lsis.* — 4001 (Network Activity); unknown version
+//              tokens route to error_log.
+// Category:    Cloud network (data plane)
+// Test corpus: spec-only (AWS VPC Flow Logs documentation column layouts;
+//              synthesised sample lines below cover ACCEPT / REJECT / NODATA /
+//              SKIPDATA and IPv4 + IPv6 — verify the v5 leaf against live
+//              delivery before production)
+//
+// Vendor notes — Amazon Web Services VPC Flow Logs — flow-level network
+//              telemetry emitted per ENI / subnet / VPC. Both v2 (the
+//              default flow-log format) and v5 (custom format with the
+//              extended field set) are supported.
+// Wire —        VPC Flow Logs TEXT format — space-separated positional
+//              tokens, one record per line. Missing values are encoded
+//              as `-` (literal dash) per AWS documentation; they are
+//              mapped to `null` here and dropped on egress by the
+//              composer's `null_omit`. The Parquet flow-log delivery
+//              format is out of LPL scope — only the text wire is
+//              parsed.
+//
+//              v2 (default, 14 columns):
+//                version account-id interface-id srcaddr dstaddr
+//                srcport dstport protocol packets bytes start end
+//                action log-status
+//
+//              v5 (29 columns, **standard column order assumed**):
+//                <v2 columns 1-14> vpc-id subnet-id instance-id
+//                tcp-flags type pkt-srcaddr pkt-dstaddr region az-id
+//                sublocation-type sublocation-id pkt-src-aws-service
+//                pkt-dst-aws-service flow-direction traffic-path
+//
+//              v5 flow logs are emitted in whatever column order the
+//              operator specified at log-format-string definition
+//              time; AWS does not pin a canonical v5 layout the way
+//              v2 is pinned. This parser assumes the documented
+//              superset-of-v2 order above. Deployments using a
+//              different v5 column order need their own parser or
+//              must re-configure the flow-log delivery to match.
+//
+// Sample inputs (one flow record per line; missing values are `-`):
+//
+//   v2 ACCEPT (IPv4 TCP, OK):
+//   2 123456789012 eni-0a1b2c3d4e5f6a7b8 192.0.2.10 198.51.100.5 54321 443 6 10 4000 1714000000 1714000060 ACCEPT OK
+//
+//   v2 REJECT (IPv4 UDP, OK):
+//   2 123456789012 eni-0a1b2c3d4e5f6a7b8 192.0.2.10 198.51.100.5 53124 53 17 1 76 1714000100 1714000160 REJECT OK
+//
+//   v2 NODATA (no traffic captured during aggregation interval —
+//   numeric fields are `-`):
+//   2 123456789012 eni-0a1b2c3d4e5f6a7b8 - - - - - - - 1714000200 1714000260 - NODATA
+//
+//   v2 SKIPDATA (records skipped due to capacity / error):
+//   2 123456789012 eni-0a1b2c3d4e5f6a7b8 - - - - - - - 1714000300 1714000360 - SKIPDATA
+//
+//   v5 ACCEPT (IPv4 TCP, full standard column set):
+//   5 123456789012 eni-0a1b2c3d4e5f6a7b8 192.0.2.10 198.51.100.5 54321 443 6 10 4000 1714000000 1714000060 ACCEPT OK vpc-0aaa1111 subnet-0bbb2222 i-0ccc3333 19 IPv4 192.0.2.10 198.51.100.5 ap-northeast-1 apne1-az1 - - - - egress -
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// VPC Flow `action` → OCSF 4001 activity_id.
+//   ACCEPT → 6 (Traffic)
+//   REJECT → 5 (Refuse)
+//   `-`    → 99 (Other) — only seen on NODATA / SKIPDATA records
+//                         where there is no traffic to classify.
+// OCSF 4001 also defines 1 Open / 2 Close / 3 Reset / 4 Fail, but
+// VPC Flow logs are session-aggregated and do not surface connection-
+// lifecycle stage — only the security-group / NACL decision.
+def function aws_vpc_flow_activity_id(action) {
+    switch action {
+        "ACCEPT" { 6 }
+        "REJECT" { 5 }
+        default  { 99 }
+    }
+}
+
+// VPC Flow `action` → OCSF status_id.
+//   ACCEPT → 1 (Success — traffic was permitted)
+//   REJECT → 2 (Failure — traffic was blocked)
+//   `-`    → 99 (Other — NODATA / SKIPDATA)
+def function aws_vpc_flow_status_id(action) {
+    switch action {
+        "ACCEPT" { 1 }
+        "REJECT" { 2 }
+        default  { 99 }
+    }
+}
+
+// VPC Flow `action` → OCSF severity_id.
+//   ACCEPT → 1 (Informational — normal allowed traffic, volume-
+//            dominant; rely on downstream rules for anomaly scoring)
+//   REJECT → 2 (Low — security-group / NACL denies are signal but
+//            individual REJECTs are also a routine scanning artefact)
+//   default → 1 (treat NODATA / SKIPDATA as Informational housekeeping)
+def function aws_vpc_flow_severity_id(action) {
+    switch action {
+        "ACCEPT" { 1 }
+        "REJECT" { 2 }
+        default  { 1 }
+    }
+}
+
+// IANA protocol number → OCSF connection_info.protocol_name (lower-
+// case, OCSF dictionary form). Only the protocols actually seen on
+// flow logs are spelt out; everything else falls back to `null`
+// (`null_omit` drops it on egress, which is preferable to a wrong
+// guess at the name). The numeric `protocol_num` is always present
+// when the wire carries a non-`-` protocol column.
+def function aws_vpc_flow_proto_name(num) {
+    switch num {
+        1   { "icmp" }
+        6   { "tcp" }
+        17  { "udp" }
+        47  { "gre" }
+        50  { "esp" }
+        51  { "ah" }
+        58  { "icmpv6" }
+        132 { "sctp" }
+        default { null }
+    }
+}
+
+// `-` (dash) is VPC Flow's literal `null` marker on every column —
+// it appears on NODATA / SKIPDATA records (all variable columns) and
+// on individual columns inside otherwise-populated v5 records
+// (sublocation-id, instance-id when traffic transits a non-EC2 ENI,
+// etc). One small helper threads dash → null so the per-column
+// destructuring stays readable.
+def function aws_vpc_flow_dash_to_null(s) {
+    switch s {
+        "-"     { null }
+        null    { null }
+        default { s }
+    }
+}
+
+// `-` → null; otherwise `to_int`. Used for every numeric column the
+// wire can elide (packets / bytes / ports / start / end / protocol).
+// to_int already returns null on unparseable input, but the explicit
+// dash check keeps the intent visible at call sites and saves the
+// regex try-fall-through path.
+def function aws_vpc_flow_int_or_null(s) {
+    switch s {
+        "-"     { null }
+        null    { null }
+        default { to_int(s) }
+    }
+}
+
+// VPC Flow `start` / `end` are epoch SECONDS on the wire, but
+// limpid OCSF `time` / `start_time` / `end_time` are nanoseconds
+// since epoch (matches `to_int(parse_datetime_rfc3339(...))` and
+// `journald.__REALTIME_TIMESTAMP * 1000` conventions used by every
+// other parser in the pack). Scale seconds → nanos here so the
+// emitted record is on the same time scale as the rest of the OCSF
+// surface.
+def function aws_vpc_flow_epoch_seconds_to_nanos(s) {
+    switch s {
+        "-"     { null }
+        null    { null }
+        default { to_int(s) * 1000000000 }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Top-level dispatcher
+// ---------------------------------------------------------------------------
+//
+// The leading token is the format version. Branch on it; each leaf
+// re-parses the line against its own column count and writes a 4001
+// record. Unknown versions → error.
+
+def process parse_aws_vpc_flow {
+    let version = regex_parse(ingress, "^(?P<v>\\S+)")
+    switch true {
+        version == null    { error "parse_aws_vpc_flow: empty or unreadable flow record: ${ingress}" }
+        version.v == "2"   { process parse_aws_vpc_flow_v2 }
+        version.v == "5"   { process parse_aws_vpc_flow_v5 }
+        default            { error "parse_aws_vpc_flow: unsupported VPC Flow Logs version ${version.v}: ${ingress}" }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: v2 (14 columns, fixed order)
+// → 4001 Network Activity
+// ---------------------------------------------------------------------------
+
+def process parse_aws_vpc_flow_v2 {
+    let f = regex_parse(
+        ingress,
+        "^(?P<version>\\S+) (?P<account_id>\\S+) (?P<interface_id>\\S+) (?P<srcaddr>\\S+) (?P<dstaddr>\\S+) (?P<srcport>\\S+) (?P<dstport>\\S+) (?P<protocol>\\S+) (?P<packets>\\S+) (?P<bytes>\\S+) (?P<start>\\S+) (?P<end>\\S+) (?P<action>\\S+) (?P<log_status>\\S+)$"
+    )
+    switch true {
+        f == null { error "parse_aws_vpc_flow: malformed v2 record (expected 14 space-separated columns): ${ingress}" }
+        default   { process parse_aws_vpc_flow_v2_record }
+    }
+}
+
+def process parse_aws_vpc_flow_v2_record {
+    let f = regex_parse(
+        ingress,
+        "^(?P<version>\\S+) (?P<account_id>\\S+) (?P<interface_id>\\S+) (?P<srcaddr>\\S+) (?P<dstaddr>\\S+) (?P<srcport>\\S+) (?P<dstport>\\S+) (?P<protocol>\\S+) (?P<packets>\\S+) (?P<bytes>\\S+) (?P<start>\\S+) (?P<end>\\S+) (?P<action>\\S+) (?P<log_status>\\S+)$"
+    )
+    let proto_num = aws_vpc_flow_int_or_null(f.protocol)
+    let action    = f.action
+    let activity  = aws_vpc_flow_activity_id(action)
+    workspace.lsis = {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  activity,
+        type_uid:     4001 * 100 + activity,
+        severity_id:  aws_vpc_flow_severity_id(action),
+        status_id:    aws_vpc_flow_status_id(action),
+        start_time:   aws_vpc_flow_epoch_seconds_to_nanos(f.start),
+        end_time:     aws_vpc_flow_epoch_seconds_to_nanos(f.end),
+        src_endpoint: {
+            ip:           aws_vpc_flow_dash_to_null(f.srcaddr),
+            port:         aws_vpc_flow_int_or_null(f.srcport),
+            interface_uid: f.interface_id
+        },
+        dst_endpoint: {
+            ip:   aws_vpc_flow_dash_to_null(f.dstaddr),
+            port: aws_vpc_flow_int_or_null(f.dstport)
+        },
+        connection_info: {
+            protocol_num:  proto_num,
+            protocol_name: aws_vpc_flow_proto_name(proto_num)
+        },
+        traffic: {
+            packets: aws_vpc_flow_int_or_null(f.packets),
+            bytes:   aws_vpc_flow_int_or_null(f.bytes)
+        },
+        cloud: {
+            provider:   "AWS",
+            account: {
+                uid: f.account_id
+            }
+        },
+        status_detail: aws_vpc_flow_dash_to_null(f.log_status),
+        metadata: {
+            product: {
+                vendor_name: "Amazon Web Services",
+                name:        "VPC Flow Logs",
+                version:     "2"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Leaf: v5 (29 columns, **assumed standard column order**)
+// → 4001 Network Activity
+//
+// Reminder (wire-format caveat — already covered in the file
+// header `Wire:` block): v5 flow logs use a customisable column
+// order specified by the operator at log-format-string definition
+// time. This leaf
+// assumes the documented superset-of-v2 ordering listed in the file
+// header. Deployments emitting v5 in a different column order will
+// not match this regex and will land in error_log — that's the
+// correct loud-fail behaviour; rewrite the regex (and capture-group
+// names) to match the deployment's actual column order.
+// ---------------------------------------------------------------------------
+
+def process parse_aws_vpc_flow_v5 {
+    let f = regex_parse(
+        ingress,
+        "^(?P<version>\\S+) (?P<account_id>\\S+) (?P<interface_id>\\S+) (?P<srcaddr>\\S+) (?P<dstaddr>\\S+) (?P<srcport>\\S+) (?P<dstport>\\S+) (?P<protocol>\\S+) (?P<packets>\\S+) (?P<bytes>\\S+) (?P<start>\\S+) (?P<end>\\S+) (?P<action>\\S+) (?P<log_status>\\S+) (?P<vpc_id>\\S+) (?P<subnet_id>\\S+) (?P<instance_id>\\S+) (?P<tcp_flags>\\S+) (?P<type>\\S+) (?P<pkt_srcaddr>\\S+) (?P<pkt_dstaddr>\\S+) (?P<region>\\S+) (?P<az_id>\\S+) (?P<sublocation_type>\\S+) (?P<sublocation_id>\\S+) (?P<pkt_src_aws_service>\\S+) (?P<pkt_dst_aws_service>\\S+) (?P<flow_direction>\\S+) (?P<traffic_path>\\S+)$"
+    )
+    switch true {
+        f == null { error "parse_aws_vpc_flow: malformed v5 record (expected 29 space-separated columns in the assumed standard order; see header): ${ingress}" }
+        default   { process parse_aws_vpc_flow_v5_record }
+    }
+}
+
+def process parse_aws_vpc_flow_v5_record {
+    let f = regex_parse(
+        ingress,
+        "^(?P<version>\\S+) (?P<account_id>\\S+) (?P<interface_id>\\S+) (?P<srcaddr>\\S+) (?P<dstaddr>\\S+) (?P<srcport>\\S+) (?P<dstport>\\S+) (?P<protocol>\\S+) (?P<packets>\\S+) (?P<bytes>\\S+) (?P<start>\\S+) (?P<end>\\S+) (?P<action>\\S+) (?P<log_status>\\S+) (?P<vpc_id>\\S+) (?P<subnet_id>\\S+) (?P<instance_id>\\S+) (?P<tcp_flags>\\S+) (?P<type>\\S+) (?P<pkt_srcaddr>\\S+) (?P<pkt_dstaddr>\\S+) (?P<region>\\S+) (?P<az_id>\\S+) (?P<sublocation_type>\\S+) (?P<sublocation_id>\\S+) (?P<pkt_src_aws_service>\\S+) (?P<pkt_dst_aws_service>\\S+) (?P<flow_direction>\\S+) (?P<traffic_path>\\S+)$"
+    )
+    let proto_num = aws_vpc_flow_int_or_null(f.protocol)
+    let action    = f.action
+    let activity  = aws_vpc_flow_activity_id(action)
+    workspace.lsis = {
+        class_uid:    4001,
+        category_uid: 4,
+        activity_id:  activity,
+        type_uid:     4001 * 100 + activity,
+        severity_id:  aws_vpc_flow_severity_id(action),
+        status_id:    aws_vpc_flow_status_id(action),
+        start_time:   aws_vpc_flow_epoch_seconds_to_nanos(f.start),
+        end_time:     aws_vpc_flow_epoch_seconds_to_nanos(f.end),
+        src_endpoint: {
+            ip:            aws_vpc_flow_dash_to_null(f.srcaddr),
+            port:          aws_vpc_flow_int_or_null(f.srcport),
+            interface_uid: f.interface_id,
+            instance_uid:  aws_vpc_flow_dash_to_null(f.instance_id),
+            subnet_uid:    aws_vpc_flow_dash_to_null(f.subnet_id),
+            vpc_uid:       aws_vpc_flow_dash_to_null(f.vpc_id),
+            svc_name:      aws_vpc_flow_dash_to_null(f.pkt_src_aws_service)
+        },
+        dst_endpoint: {
+            ip:       aws_vpc_flow_dash_to_null(f.dstaddr),
+            port:     aws_vpc_flow_int_or_null(f.dstport),
+            svc_name: aws_vpc_flow_dash_to_null(f.pkt_dst_aws_service)
+        },
+        connection_info: {
+            protocol_num:    proto_num,
+            protocol_name:   aws_vpc_flow_proto_name(proto_num),
+            tcp_flags:       aws_vpc_flow_int_or_null(f.tcp_flags),
+            // VPC Flow `flow-direction` is `ingress` or `egress`
+            // from the ENI's perspective. OCSF connection_info.
+            // direction maps cleanly: `ingress` → "Inbound",
+            // `egress` → "Outbound". `-` is preserved as null.
+            direction:       switch f.flow_direction {
+                "ingress" { "Inbound" }
+                "egress"  { "Outbound" }
+                default   { null }
+            }
+        },
+        traffic: {
+            packets: aws_vpc_flow_int_or_null(f.packets),
+            bytes:   aws_vpc_flow_int_or_null(f.bytes)
+        },
+        cloud: {
+            provider: "AWS",
+            account:  { uid: f.account_id },
+            region:   aws_vpc_flow_dash_to_null(f.region),
+            zone:     aws_vpc_flow_dash_to_null(f.az_id)
+        },
+        // VPC Flow `type` is the IP family (`IPv4` / `IPv6` /
+        // `EFA`); kept on the OCSF record's `network_endpoints`
+        // is overkill, so we surface it via `unmapped` for the
+        // operationally-curious without committing it to a
+        // structured OCSF slot.
+        unmapped: {
+            type:                f.type,
+            pkt_srcaddr:         aws_vpc_flow_dash_to_null(f.pkt_srcaddr),
+            pkt_dstaddr:         aws_vpc_flow_dash_to_null(f.pkt_dstaddr),
+            sublocation_type:    aws_vpc_flow_dash_to_null(f.sublocation_type),
+            sublocation_id:      aws_vpc_flow_dash_to_null(f.sublocation_id),
+            traffic_path:        aws_vpc_flow_dash_to_null(f.traffic_path)
+        },
+        status_detail: aws_vpc_flow_dash_to_null(f.log_status),
+        metadata: {
+            product: {
+                vendor_name: "Amazon Web Services",
+                name:        "VPC Flow Logs",
+                version:     "5"
+            },
+            version: "1.3.0"
+        }
+    }
+}

@@ -1,17 +1,19 @@
-// FortiGate native syslog parser (KV format)
+// Summary:     Fortinet FortiGate native key=value syslog (FortiOS
+//              "default" format) → same LSIS shape as parse_fortigate_cef.
+// Reads:       ingress (raw wire) — syslog priority + KV body
+//              (date=... time=... type=...)
+// Writes:      workspace.lsis.* — same classes as parse_fortigate_cef
+//              (the LSIS contract is format-agnostic).
+// Category:    Network firewall / IPS
+// Test corpus: synthetic (FortiOS "default"-format sample wires in this header)
 //
-// Vendor:  Fortinet
-// Product: FortiGate (FortiOS 6.x / 7.x — native syslog output, not CEF)
-// Wire:    syslog priority + KV body — `<priority>date=... time=... type=... ...`
-// Schema:  FortiGate FortiOS native log "default" format (key=value pairs)
+// Wire —    syslog priority + KV body — `<priority>date=... time=... type=... ...`
+//          FortiOS 6.x / 7.x native log "default" format (key=value
+//          pairs), not CEF.
 //
 // Sample input (FortiOS "default" format — no RFC 3164 header between
 // the <PRI> and the KV body; date/time/devname live inside the body):
 //   <134>date=2026-04-27 time=10:00:00 devname="fw01" type="traffic" subtype="forward" srcip=192.0.2.10 srcport=54321 dstip=198.51.100.5 dstport=443 proto=6 action="accept" sentbyte=1024 rcvdbyte=512
-//
-// Output: same `workspace.lsis` shape as `parse_fortigate_cef.limpid`
-// (the canonical OCSF-shape contract is format-agnostic — both
-// FortiGate CEF and native syslog land at the same OCSF class).
 //
 // Direct call (skip syslog wrapper, supply raw KV in `ingress`):
 //   process { workspace.kv = parse_kv(ingress) } | parse_fortigate_syslog_traffic

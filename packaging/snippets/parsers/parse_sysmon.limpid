@@ -1,6 +1,19 @@
 // Microsoft Sysmon parser (vocabulary)
 //
-// Vendor:   Microsoft Sysinternals Sysmon (System Monitor) — the
+// Summary:     Microsoft Sysmon Windows-event JSON (forwarder-shipped) → LSIS,
+//              dispatched by EventID.
+// Reads:       workspace.sysmon.* (bridge — see Bridges below)
+//   .body (required, Object) — parsed Sysmon event (caller does `parse_json(ingress)`)
+//   .hostname (optional, String) — collector override
+//   .time (optional, Int) — epoch ns override
+// Writes:      workspace.lsis.* — EventID 1 (ProcessCreate) → 1007,
+//              3 (NetworkConnect) → 4001, 11 (FileCreate) → 1001;
+//              unknown EventIDs route to error_log.
+// Category:    EDR
+// Test corpus: spec-only (Sysmon event schema reference; EventIDs 1 / 3 / 11
+//              only — the bulk of EDR/SOC consumption)
+//
+// Vendor notes — Microsoft Sysinternals Sysmon (System Monitor) — the
 //           Windows kernel telemetry agent that produces detailed
 //           process / network / file / registry / DNS events via the
 //           `Microsoft-Windows-Sysmon/Operational` Windows Event Log
@@ -8,9 +21,9 @@
 //           event channel (handled by `parse_winevent_json`); Sysmon
 //           is opt-in (deploy + config XML) but produces strictly
 //           richer telemetry for EDR / SIEM correlation.
-// Wire:     Sysmon events arrive as Windows Event Log records, which
+// Wire —     Sysmon events arrive as Windows Event Log records, which
 //           a forwarder (NXLog / Vector / Winlogbeat) ships as JSON.
-//           The relevant fields are:
+//           The relevant fields are —
 //             EventID        — Sysmon-specific (1=ProcessCreate,
 //                              3=NetworkConnect, 11=FileCreate, …)
 //             Channel        — "Microsoft-Windows-Sysmon/Operational"
@@ -18,13 +31,7 @@
 //             Computer       — Windows machine name
 //             EventData      — Object with event-type-specific keys
 //                              (Image, CommandLine, ProcessId, etc.)
-// Intake:   workspace.sysmon.body      (required, Object) — parsed Sysmon
-//                                       event Object (already JSON-decoded;
-//                                       caller does `parse_json(ingress)`
-//                                       and passes the Object as `body`)
-//           workspace.sysmon.hostname  (optional, String) — collector override
-//           workspace.sysmon.time      (optional, Int)    — epoch nanos override
-// Upstream: Sysmon JSON typically arrives via:
+// Bridges —  Sysmon JSON typically arrives via:
 //
 //           - NXLog / Vector / Winlogbeat over TCP/syslog (most common):
 //                 process parse_syslog | {
@@ -37,10 +44,6 @@
 //
 //           - Direct JSON-line tail (when the forwarder writes a JSONL file):
 //                 process { workspace.sysmon = { body: parse_json(ingress), hostname: hostname(), time: to_int(received_at) } } | parse_sysmon | compose_ocsf | ocsf_to_egress
-//
-// Output:   OCSF records on `workspace.lsis` for the Sysmon event
-//           types this parser knows. Unknown EventIDs route to
-//           error_log per the loud-fail-fast policy.
 //
 // Coverage scope (v0.7.1):
 //

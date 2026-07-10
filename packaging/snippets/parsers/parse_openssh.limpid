@@ -1,17 +1,23 @@
-// OpenSSH sshd parser (vocabulary)
+// Summary:     OpenSSH sshd application bodies (post-transport-unwrap) → LSIS
+//              Authentication.
+// Reads:       workspace.openssh.* (bridge — see Bridges below)
+//                .body (required, String) — sshd body
+//                .pid (optional, String) — process id as string
+//                .hostname (optional, String) — SSH server hostname
+//                .time (optional, Int) — epoch nanoseconds of the event
+// Writes:      workspace.lsis.* — 3002 (Authentication).
+// Category:    Endpoint / host audit (Unix)
+// Test corpus: synthetic (sample sshd bodies in this header)
 //
-// Vendor:   OpenSSH (the OpenBSD project's reference implementation of SSH —
+// Vendor notes — OpenSSH (the OpenBSD project's reference implementation of SSH —
 //           most Linux / BSD distros use this; not Tectia, not Dropbear,
 //           not Bitvise, each of which emits different message strings
 //           and would land in their own `parse_<vendor>.limpid` file).
-// Wire:     sshd application body, post-transport-unwrap — the
+//
+// Wire —     sshd application body, post-transport-unwrap — the
 //           `Accepted publickey for alice from 192.0.2.10 port 54321 ssh2`
 //           style text without any syslog / journald wrapper.
-// Intake:   workspace.openssh.body       (required, String) — sshd body
-//           workspace.openssh.pid        (optional, String) — process id as string
-//           workspace.openssh.hostname   (optional, String) — SSH server hostname
-//           workspace.openssh.time       (optional, Int)    — epoch nanoseconds of the event
-// Upstream: transport-agnostic. The pipeline writer is responsible for
+// Bridges —  transport-agnostic. The pipeline writer is responsible for
 //           bridging the upstream transport into the intake schema above.
 //           Two typical bridges (use the trusted source where the
 //           transport provides one — e.g. journald's `_PID` and
@@ -53,7 +59,6 @@
 //           are the caller's responsibility — write your own bridge.
 //           See [Workspace is event-scoped, not message-passed](../../../docs/src/design-principles.md)
 //           for the rationale.
-// Output:   OCSF Authentication (class_uid 3002) records on `workspace.lsis`
 //
 // Sample sshd bodies (i.e. what `workspace.openssh.body` carries):
 //   Accepted publickey for alice from 192.0.2.10 port 54321 ssh2: RSA SHA256:abcd
@@ -67,7 +72,7 @@
 // (3002) record. Login attempts (success / failure) → activity_id=1;
 // session teardown → activity_id=2.
 //
-// Upstream filtering: when sshd events are sourced from systemd
+// Upstream filtering — when sshd events are sourced from systemd
 // journald (`_SYSTEMD_UNIT=ssh.service`), the stream also contains
 // non-sshd lines that ride sshd's syslogtag because PAM and other
 // stacks are invoked from inside the sshd process (e.g.

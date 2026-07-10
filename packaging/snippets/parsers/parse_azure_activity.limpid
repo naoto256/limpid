@@ -1,0 +1,278 @@
+// Azure Activity Log JSON parser
+//
+// Summary:     Azure Activity Log events JSON → LSIS API Activity.
+// Reads:       ingress (raw wire) — one Activity Log event per ingress (flat
+//              per-record form; unwrap Event Hub batches upstream)
+// Writes:      workspace.lsis.* — 6003 (API Activity), dispatched over the
+//              8 documented categories; unknown categories route to
+//              error_log.
+// Category:    Cloud audit (API control plane)
+// Test corpus: spec-only (Microsoft Learn Azure Activity Log schema reference
+//              + documentation samples for the 8 categories; no live capture)
+//
+// Wire —        JSON — one Activity Log event per `ingress`. Azure emits
+//              Activity Log records in two delivery shapes (event hub
+//              vs. log analytics export):
+//
+//                - Event Hub diagnostic settings ("Send to event hub") —
+//                  events arrive wrapped as `{"records":[{...}, ...]}`
+//                  batches. The Event Hub / Kafka / Functions consumer
+//                  upstream of limpid is expected to unwrap the array
+//                  into one record per ingress (the standard pattern
+//                  documented by Microsoft Learn "Stream Azure
+//                  monitoring data to an event hub"). Handle the
+//                  array-of-records unwrap at the transport layer,
+//                  not here.
+//                - Log Analytics export ("Send to Log Analytics" →
+//                  AzureActivity table export, or the legacy
+//                  Insights/Activity REST API) — events arrive as a
+//                  flat top-level JSON object per record, no wrapping.
+//
+//              Both shapes carry the same per-record schema (top-level
+//              `category`, `operationName`, `resultType`, `resourceId`,
+//              `caller`, `time`, plus nested `identity.claims.*` and
+//              `properties.*`). This parser reads the flat per-record
+//              form and is agnostic to which of the two delivery
+//              shapes produced it.
+//
+// Sample input (Administrative, user caller, write verb):
+//   {"time":"2026-04-29T10:00:00.1234567Z","resourceId":"/SUBSCRIPTIONS/00000000-0000-0000-0000-000000000000/RESOURCEGROUPS/RG1/PROVIDERS/MICROSOFT.COMPUTE/VIRTUALMACHINES/VM1","operationName":"MICROSOFT.COMPUTE/VIRTUALMACHINES/WRITE","category":"Administrative","resultType":"Success","resultSignature":"Succeeded.","durationMs":1234,"callerIpAddress":"203.0.113.10","correlationId":"...","identity":{"authorization":{"scope":"...","action":"Microsoft.Compute/virtualMachines/write"},"claims":{"aud":"https://management.core.windows.net/","iss":"https://sts.windows.net/.../","upn":"alice@example.com","name":"Alice Example","appid":"...","ipaddr":"203.0.113.10"}},"caller":"alice@example.com","properties":{"statusCode":"Created","serviceRequestId":"..."}}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Last `/`-delimited segment of `operationName`. The Activity Log
+// operationName is always `Microsoft.<RP>/<resource-type>[/<sub>]*/<verb>`
+// (e.g. `MICROSOFT.COMPUTE/VIRTUALMACHINES/WRITE`,
+// `MICROSOFT.AUTHORIZATION/POLICYASSIGNMENTS/DELETE`,
+// `MICROSOFT.RESOURCES/DEPLOYMENTS/VALIDATE/ACTION`) — the verb is
+// the trailing token. Verb tokens are case-insensitive on the wire
+// (some RPs emit uppercase, some lowercase) so the regex matches
+// case-insensitively. LPL arrays are ordered but index-hidden (no
+// `arr[-1]`), so we use regex anchored to the end-of-string to grab
+// the tail; an alternative is `last(split(operation, "/"))` once
+// `split` lands as a primitive.
+def function azure_operation_verb(operation) {
+    let m = regex_parse(operation, "(?i)/(?P<verb>[A-Za-z]+)$")
+    switch true {
+        m == null { null }
+        default   { lower(m.verb) }
+    }
+}
+
+// Azure Activity Log verb → OCSF API Activity activity_id.
+//   1 Create / 2 Read / 3 Update / 4 Delete / 99 Other.
+//
+// The Azure ARM verb vocabulary is intentionally small: read / write /
+// delete are the CRUD trio, `action` is the catch-all for operational
+// verbs (start / stop / restart / capture / runCommand / generateKey /
+// listKeys etc., which are surfaced as `<rp>/<type>/<verb>/action`),
+// `list` and `get` show up on data-plane subresources. Anything else
+// falls through to 99 so a new verb shape surfaces loudly without
+// breaking pipelines.
+def function azure_activity_id(verb) {
+    switch verb {
+        "read"     { 2 }
+        "list"     { 2 }
+        "get"      { 2 }
+        "write"    { 1 }
+        "create"   { 1 }
+        "delete"   { 4 }
+        "action"   { 3 }
+        "start"    { 3 }
+        "stop"     { 3 }
+        "restart"  { 3 }
+        default    { 99 }
+    }
+}
+
+// resultType → OCSF status_id. Azure surfaces a small fixed
+// vocabulary on the Activity Log wire: Success / Started / Accepted /
+// Failure / Failed / In Progress. We map the unambiguous success and
+// failure tokens directly and route everything else (including in-
+// flight states) to 99 Other so operators can still distinguish them
+// from a definitive Success/Failure outcome.
+def function azure_status_id(result) {
+    switch result {
+        "Success" { 1 }
+        "Started" { 1 }
+        "Failure" { 2 }
+        "Failed"  { 2 }
+        default   { 99 }
+    }
+}
+
+// Extract the resource provider namespace (e.g. "Microsoft.Compute")
+// from a full ARM resourceId. ARM ids are shaped as
+// `/subscriptions/<sub>/resourceGroups/<rg>/providers/<RP>/<type>/<name>[/...]`
+// (or `/providers/<RP>/...` for subscription-scoped events). We
+// regex out the segment immediately after the literal `/providers/`.
+// If the id is malformed or pre-provider, null is returned and the
+// composer leaves the field empty.
+def function azure_resource_provider(resource_id) {
+    let m = regex_parse(resource_id, "(?i)/providers/(?P<rp>[^/]+)")
+    switch true {
+        m == null { null }
+        default   { m.rp }
+    }
+}
+
+// Extract the resource type ("virtualMachines", "storageAccounts",
+// "policyAssignments", …) from an ARM resourceId. One segment past
+// the resource provider.
+def function azure_resource_type(resource_id) {
+    let m = regex_parse(resource_id, "(?i)/providers/[^/]+/(?P<rtype>[^/]+)")
+    switch true {
+        m == null { null }
+        default   { m.rtype }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-category leaf — single-class (6003) record build
+// ---------------------------------------------------------------------------
+//
+// The eight well-known Activity Log categories all map to OCSF 6003
+// API Activity with the same field shape; the dispatcher exists so
+// that an unknown category (a new Azure RP, or a malformed record)
+// routes to `error` rather than zero-mapping. We factor the record
+// build into one helper-style def process so each leaf is one line.
+
+def process parse_azure_activity_record {
+    let verb     = azure_operation_verb(workspace.az.operationName)
+    let activity = azure_activity_id(verb)
+    let status   = azure_status_id(workspace.az.resultType)
+    let rp       = azure_resource_provider(workspace.az.resourceId)
+    let rtype    = azure_resource_type(workspace.az.resourceId)
+
+    workspace.lsis = {
+        class_uid:    6003,
+        category_uid: 6,
+        activity_id:  activity,
+        type_uid:     6003 * 100 + activity,
+        severity_id:  1,
+        status_id:    status,
+        // The Activity Log `time` field is ISO 8601 with TZ and
+        // sub-second precision (e.g. "2026-04-29T10:00:00.1234567Z").
+        // parse_datetime_rfc3339 handles the fractional seconds and
+        // TZ-aware parse natively.
+        time:         to_int(parse_datetime_rfc3339(workspace.az.time)),
+        api: {
+            operation: workspace.az.operationName,
+            service:   { name: rp },
+            request:   { uid: workspace.az.correlationId }
+        },
+        actor: {
+            user: {
+                // caller is a UPN for user callers, an SP object id
+                // for service principals, and null for platform /
+                // system events (ServiceHealth, ResourceHealth).
+                // identity.claims.upn / .appid / .name fall through
+                // in that order so the actor name is the most
+                // human-readable identifier the wire carries.
+                name: coalesce(
+                    workspace.az.caller,
+                    workspace.az.identity.claims.upn,
+                    workspace.az.identity.claims.appid,
+                    workspace.az.identity.claims.name
+                ),
+                uid: coalesce(
+                    workspace.az.identity.claims.oid,
+                    workspace.az.identity.claims.appid
+                )
+            }
+        },
+        src_endpoint: {
+            ip: coalesce(
+                workspace.az.callerIpAddress,
+                workspace.az.identity.claims.ipaddr
+            )
+        },
+        cloud: {
+            provider: "Azure"
+        },
+        resources: [
+            {
+                uid:  workspace.az.resourceId,
+                type: rtype
+                // resource_provider lives under unmapped (below) — OCSF
+                // `cloud_partition` is the AWS partition concept
+                // (aws / aws-cn / aws-us-gov), not the right home for
+                // Azure RP namespaces like "Microsoft.Compute".
+            }
+        ],
+        message: workspace.az.resultSignature,
+        unmapped: {
+            category:          workspace.az.category,
+            resultType:        workspace.az.resultType,
+            resultSignature:   workspace.az.resultSignature,
+            resource_provider: rp,
+            durationMs:        workspace.az.durationMs,
+            properties:        workspace.az.properties,
+            // identity.claims is a JWT-derived blob with per-tenant
+            // custom claim keys; we surface the whole sub-object
+            // rather than enumerate, so operators can extend without
+            // touching the parser.
+            claims:          workspace.az.identity.claims,
+            tenantId:        workspace.az.tenantId,
+            subscriptionId:  workspace.az.subscriptionId
+        },
+        metadata: {
+            product: {
+                vendor_name: "Microsoft",
+                name:        "Azure Activity Log"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dispatcher
+// ---------------------------------------------------------------------------
+//
+// Parse JSON, then route on the top-level `category` field. All
+// eight well-known categories share the same OCSF 6003 mapping and
+// fall through to the same leaf; an unrecognised category routes to
+// `error` so a future Azure RP addition surfaces in the DLQ on day
+// one rather than silently zero-mapping.
+
+def process parse_azure_activity {
+    workspace.az = parse_json(ingress)
+
+    // Loud-fail on missing required fields. An Activity Log event
+    // without category / operationName / resourceId / time is
+    // structurally not an Activity Log record; emitting a 6003 with
+    // those fields null would convey no actionable content and
+    // violates the loud-fail-fast contract (silent zero-mapping).
+    switch true {
+        workspace.az.category == null {
+            error "parse_azure_activity: missing category: ${ingress}"
+        }
+        workspace.az.operationName == null {
+            error "parse_azure_activity: missing operationName: ${ingress}"
+        }
+        workspace.az.resourceId == null {
+            error "parse_azure_activity: missing resourceId: ${ingress}"
+        }
+        workspace.az.time == null {
+            error "parse_azure_activity: missing time: ${ingress}"
+        }
+        default {
+            switch workspace.az.category {
+                "Administrative"  { process parse_azure_activity_record }
+                "ServiceHealth"   { process parse_azure_activity_record }
+                "Alert"           { process parse_azure_activity_record }
+                "Autoscale"       { process parse_azure_activity_record }
+                "Security"        { process parse_azure_activity_record }
+                "Recommendation"  { process parse_azure_activity_record }
+                "Policy"          { process parse_azure_activity_record }
+                "ResourceHealth"  { process parse_azure_activity_record }
+                default {
+                    error "parse_azure_activity: unsupported category ${workspace.az.category}"
+                }
+            }
+        }
+    }
+}

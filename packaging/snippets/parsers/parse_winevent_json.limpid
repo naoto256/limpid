@@ -1,11 +1,22 @@
-// Windows Security Event Log (JSON-shipped) parser
+// Summary:     Windows Event Log JSON (NXLog field-naming shape;
+//              Security channel) → LSIS, dispatched by EventID.
+// Reads:       ingress (raw wire) — one Windows event record JSON object
+//              per ingress
+// Writes:      workspace.lsis.* — 3002 (logon/logoff), 1007 (process),
+//              3001 (account change), 3006 (group management), dispatched
+//              by EventID; unmapped IDs route to error_log. Per-ID table
+//              below.
+// Category:    Endpoint / host audit (Windows)
+// Test corpus: public (OTRF / Mordor dataset)
 //
-// Vendor:  Microsoft Corporation (Windows Event Log channels —
-//          Security, System, Application, plus operational-channel
-//          siblings like Sysmon's Microsoft-Windows-Sysmon/Operational
-//          which this snippet does NOT cover; Sysmon has its own
-//          parser file.)
-// Wire:    JSON — one event record per `ingress`. The de facto
+// Scope — Microsoft Windows Event Log channels (Security, System,
+// Application). Operational-channel siblings like Sysmon's
+// Microsoft-Windows-Sysmon/Operational are NOT covered; Sysmon has its
+// own parser file. Snare Enterprise Agent's tab-separated `MSWinEventLog`
+// format is the legacy syslog-only path — that has its own parser file
+// (`parse_winevent_snare.limpid`, future) so this one stays JSON-only.
+//
+// Wire —    JSON — one event record per `ingress`. The de facto
 //          shipping path on modern deployments is one of:
 //            - NXLog `im_msvistalog` → `om_*` JSON
 //            - Winlogbeat → ECS-shaped JSON
@@ -16,23 +27,19 @@
 //          which is closest to ETW raw names: `EventID`, `Channel`,
 //          `TargetUserName`, `SubjectUserName`, `LogonType`,
 //          `IpAddress`, `IpPort`, etc.
-//          Snare Enterprise Agent's tab-separated `MSWinEventLog`
-//          format is the legacy syslog-only path — that has its own
-//          parser file (`parse_winevent_snare.limpid`, future) so
-//          this one stays JSON-only.
-// Output:  OCSF records on `workspace.lsis`. The class depends on
-//          the EventID:
-//            - 4624 / 4625 (Logon success / failure)  → 3002 Authentication
-//            - 4634 / 4647 (Logoff)                   → 3002 (Logoff)
-//            - 4688 / 4689 (Process create / exit)    → 1007 Process Activity
-//            - 4720 (User account created)            → 3001 Account Change (Create)
-//            - 4722 (Account enabled)                 → 3001 (Enable)
-//            - 4725 (Account disabled)                → 3001 (Disable)
-//            - 4724 (Password reset by admin)         → 3001 (Modify)
-//            - 4726 (User account deleted)            → 3001 (Delete)
-//            - 4732 / 4756 (Group member add)         → 3006 Group Management
-//            - 4733 / 4757 (Group member remove)      → 3006
-//            - everything else → error_log via the default arm
+//
+// Per-EventID class mapping —
+//   - 4624 / 4625 (Logon success / failure)  → 3002 Authentication
+//   - 4634 / 4647 (Logoff)                   → 3002 (Logoff)
+//   - 4688 / 4689 (Process create / exit)    → 1007 Process Activity
+//   - 4720 (User account created)            → 3001 Account Change (Create)
+//   - 4722 (Account enabled)                 → 3001 (Enable)
+//   - 4725 (Account disabled)                → 3001 (Disable)
+//   - 4724 (Password reset by admin)         → 3001 (Modify)
+//   - 4726 (User account deleted)            → 3001 (Delete)
+//   - 4732 / 4756 (Group member add)         → 3006 Group Management
+//   - 4733 / 4757 (Group member remove)      → 3006
+//   - everything else → error_log via the default arm
 //
 // Sample input (4624 logon success, abridged):
 //   {"EventID":4624,"Channel":"Security",

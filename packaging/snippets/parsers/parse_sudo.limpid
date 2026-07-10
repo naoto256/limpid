@@ -1,16 +1,22 @@
-// sudo parser (vocabulary)
+// Summary:     sudo / sudoedit application bodies (post-transport-unwrap) →
+//              LSIS Authorize Session.
+// Reads:       workspace.sudo.* (bridge — see Bridges below)
+//                .body (required, String) — the sudo body
+//                .pid (optional, String) — process id as string
+//                .hostname (optional, String) — host where sudo ran
+//                .time (optional, Int) — epoch nanoseconds
+// Writes:      workspace.lsis.* — 3003 (Authorize Session).
+// Category:    Endpoint / host audit (Unix)
+// Test corpus: synthetic (sample sudo bodies in this header)
 //
-// Vendor:   sudo (the Sudo Project — sudo/sudoedit; not pfexec, not
+// Vendor notes — sudo (the Sudo Project — sudo/sudoedit; not pfexec, not
 //           doas, not /bin/su; each of those would land in their own
 //           parser file).
-// Wire:     sudo application body, post-transport-unwrap — the
+//
+// Wire —     sudo application body, post-transport-unwrap — the
 //           `alice : TTY=pts/0 ; PWD=... ; USER=root ; COMMAND=...`
 //           style text without any syslog / journald wrapper.
-// Intake:   workspace.sudo.body       (required, String) — the sudo body
-//           workspace.sudo.pid        (optional, String) — process id as string
-//           workspace.sudo.hostname   (optional, String) — host where sudo ran
-//           workspace.sudo.time       (optional, Int)    — epoch nanoseconds
-// Upstream: transport-agnostic. Two typical bridges:
+// Bridges —  transport-agnostic. Two typical bridges:
 //
 //           - syslog transport:
 //                 process parse_syslog | {
@@ -32,9 +38,6 @@
 //                         time:     to_int(workspace.journald.__REALTIME_TIMESTAMP) * 1000
 //                     }
 //                 } | parse_sudo | compose_ocsf | ocsf_to_egress
-//
-// Output:   OCSF Authorize Session (class_uid 3003) records on
-//           `workspace.lsis`.
 //
 // Sample sudo bodies (what `workspace.sudo.body` carries):
 //
@@ -68,7 +71,7 @@
 // mark the moment the elevated session starts/ends, which OCSF
 // "Activate" is the closest fit for among the 3003 enum values.
 //
-// Upstream filtering: PAM-pam_unix events from sudo are NOT noise the
+// Upstream filtering — PAM-pam_unix events from sudo are NOT noise the
 // way `pam_unix(sshd:session): ...` lines are for OpenSSH (the OpenSSH
 // parser uses `filter_openssh_journal` to drop those because sshd
 // already emits its own `Accepted` / `Disconnected` lines that cover

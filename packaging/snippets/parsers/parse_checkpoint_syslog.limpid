@@ -1,17 +1,29 @@
-// Check Point Syslog Exporter parser (vocabulary)
+// Summary:     Check Point Syslog-Exporter records (RFC 5424 + Junos-style SD)
+//              → LSIS by action/product.
+// Reads:       workspace.checkpoint_syslog.* (bridge — see Bridges below)
+//                .body (required, String) — the full RFC 5424 wire
+//                .hostname (optional, String) — collector-side hostname override
+//                .time (optional, Int) — epoch nanoseconds
+// Writes:      workspace.lsis.* — firewall actions → 4001, threat actions →
+//              2004, auth actions → 3002; unknown actions land in 4001 with
+//              the action preserved in unmapped.
+// Category:    Network firewall / IPS
+// Test corpus: public (elastic/integrations checkpoint corpus — ~80 events
+//              across 8 product types)
 //
-// Vendor:   Check Point Software Technologies — VPN-1 / FireWall-1 /
+// Vendor notes — Check Point Software Technologies — VPN-1 / FireWall-1 /
 //           Quantum Security Gateway / SmartConsole / Endpoint /
 //           Connectra / and the rest of the CheckPoint product family.
 //           Wire format below is the "Syslog Exporter" output that
 //           ships to generic syslog SIEMs (Splunk / Elastic / etc.).
 //           NOT the LEEF 2.0 form that targets IBM QRadar — for that,
 //           see `parse_checkpoint_leef.limpid`.
-// Wire:     RFC 5424 + Junos-style structured data, with `:` (not `=`)
+//
+// Wire —     RFC 5424 + Junos-style structured data, with `:` (not `=`)
 //           between key and quoted value and `; ` (semicolon-space)
 //           between pairs:
 //             <PRI>1 <ts> <host> CheckPoint <procid> - [key:"value"; key:"value"; ...]
-//           A few quirks:
+//           A few quirks —
 //             - `sys_message::"text"` uses double-colon (CheckPoint
 //               convention for a free-form message field).
 //             - `__policy_id_tag:"product=...;db_tag={...};..."`
@@ -23,10 +35,7 @@
 //           Anti-Bot / Threat Emulation / Log Update / etc.); the
 //           parser captures the common firewall / threat / auth /
 //           audit fields and surfaces the rest under `unmapped`.
-// Intake:   workspace.checkpoint_syslog.body      (required, String) — the full RFC 5424 wire
-//           workspace.checkpoint_syslog.hostname  (optional, String) — collector-side hostname override
-//           workspace.checkpoint_syslog.time      (optional, Int)    — epoch nanoseconds
-// Upstream: CheckPoint gateways / management servers emit via syslog
+// Bridges —  CheckPoint gateways / management servers emit via syslog
 //           (UDP/514 or TCP/514). The bridge passes the raw wire —
 //           parse_syslog is not used because limpid's syslog.parse
 //           does not expose the SD block.
@@ -34,17 +43,15 @@
 //           - syslog (UDP/TCP):
 //                 { workspace.checkpoint_syslog = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_checkpoint_syslog | compose_ocsf | ocsf_to_egress
 //
-// Output:   OCSF records on `workspace.lsis`. The class depends on
-//           the action / product combination:
+// Per-action dispatch (LSIS class depends on the action / product combination):
 //             firewall actions (Accept / Drop / Reject / Decrypt)        → 4001 Network Activity
 //             threat actions (Detect / Inline / Block + threat context)  → 2004 Detection Finding
 //             auth actions   (Log In / Failed Log In / Forgot Passcode)  → 3002 Authentication
 //             other / unknown action                                     → 4001 (with action in unmapped)
 //
-// Coverage scope: verified against the elastic/integrations
-// checkpoint corpus (~80 events across 8 product types — System
-// Monitor / VPN-1 & FireWall-1 / SmartConsole / Connectra / WEB_API /
-// Log Update / etc.).
+// Coverage notes — verified product types include System Monitor /
+// VPN-1 & FireWall-1 / SmartConsole / Connectra / WEB_API /
+// Log Update / etc.
 
 // ---------------------------------------------------------------------------
 // Shared helpers

@@ -1,0 +1,614 @@
+// Okta System Log parser
+//
+// Summary:     Okta System Log events JSON (System Log API v1) → LSIS
+//              identity classes, dispatched by eventType.
+// Reads:       ingress (raw wire) — one LogEvent object per ingress (unwrap
+//              Event Hooks data.events[] upstream)
+// Writes:      workspace.lsis.* — user.session/user.authentication → 3002,
+//              user.lifecycle → 3001, user.account → 3005, group.* → 3006;
+//              other eventTypes route to error_log.
+// Category:    Identity / IdP
+// Test corpus: synthetic (synthesised from the Okta System Log API reference
+//              — eventType taxonomy and LogEvent schema; live-corpus
+//              parse-rate not yet measured, NOTE-flagged subtypes below
+//              unverified)
+//
+// Vendor notes — Okta Workforce Identity Cloud (Okta, Inc.) — System
+//              Log is the authoritative audit-event stream emitted
+//              by every Okta tenant. The stream covers identity
+//              authentication, lifecycle events on users / groups /
+//              applications, MFA factor management, and admin
+//              configuration actions. This parser targets the
+//              **System Log API v1** event shape
+//              (`/api/v1/logs`); the same JSON shape also lands on
+//              the Event Hooks webhook payload (one record per
+//              `data.events[]` element — unwrap upstream).
+// Wire —        JSON — one Okta System Log event per `ingress`. The
+//              shape on the wire is the documented LogEvent object:
+//              `eventType` (dotted taxonomy, e.g. `user.session.start`),
+//              `outcome.result` (SUCCESS / FAILURE / ALLOW / DENY /
+//              CHALLENGE), `actor.{id,type,displayName,alternateId}`,
+//              `target[]` (zero or more `{type,id,displayName,alternateId}`
+//              with `type` ∈ {User, UserGroup, AppInstance, ...}),
+//              `client.{ipAddress,userAgent,geographicalContext}`,
+//              `request.ipChain[]`, `debugContext.debugData`,
+//              `authenticationContext`, `published` (RFC 3339).
+//
+//              Event Hooks deliver `{eventType:"com.okta.event_hook",
+//              data:{events:[<LogEvent>, ...]}}`; unwrap each element
+//              into its own `ingress` upstream of this parser. The
+//              parser itself assumes a single LogEvent per event.
+//
+// NOTE-flagged subtypes (mapping inferred from docs, not yet
+// observed against real-corpus):
+//   - user.account.update_profile             → 3005 / 3 Update
+//   - user.account.reset_password             → 3005 / 8 Reset Credential
+//   - group.user_membership.add               → 3006 / 3 Add User
+//   - group.user_membership.remove            → 3006 / 4 Remove User
+//   - group.lifecycle.create / .delete        → 3006 / 6 Create / 5 Delete
+//
+// Sample input (user.session.start, SUCCESS, abridged):
+//   {"eventType":"user.session.start","published":"2026-04-29T10:00:00.000Z",
+//    "outcome":{"result":"SUCCESS"},
+//    "actor":{"id":"00u123","type":"User","alternateId":"alice@example.com",
+//             "displayName":"Alice Example"},
+//    "client":{"ipAddress":"192.0.2.10","userAgent":{"rawUserAgent":"Mozilla/5.0..."}},
+//    "target":[{"type":"User","id":"00u123","alternateId":"alice@example.com",
+//               "displayName":"Alice Example"}],
+//    "debugContext":{"debugData":{"requestUri":"/login/do-login"}}}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Map Okta `outcome.result` to OCSF status_id.
+//   1 Success / 2 Failure / 99 Other.
+// Okta values: SUCCESS / FAILURE / ALLOW / DENY / CHALLENGE / SKIPPED /
+//              UNKNOWN. ALLOW / DENY appear on policy-evaluation events
+//              (allow-listed below); CHALLENGE / SKIPPED are
+//              authentication-flow intermediate states — neither
+//              terminal success nor terminal failure, so they map to
+//              99 Other so dashboards do not double-count them as
+//              successes.
+def function okta_status_id(result) {
+    switch result {
+        "SUCCESS"   { 1 }
+        "ALLOW"     { 1 }
+        "FAILURE"   { 2 }
+        "DENY"      { 2 }
+        "CHALLENGE" { 99 }
+        "SKIPPED"   { 99 }
+        null        { null }
+        default     { 99 }
+    }
+}
+
+// Map Okta `outcome.result` to OCSF severity_id. Failures escalate;
+// terminal allow/deny stays Informational since Okta itself does not
+// emit a severity field per event.
+def function okta_severity_id(result) {
+    switch result {
+        "FAILURE" { 3 }
+        "DENY"    { 3 }
+        null      { 1 }
+        default   { 1 }
+    }
+}
+
+// Extract the first target whose `type` matches `wanted`. Okta's
+// `target` is an array of zero-or-more references with no documented
+// order guarantee; the caller wants the first User (for the subject of a 3002 / 3001 /
+// 3005 record), the first UserGroup (for 3006), or the first
+// AppInstance (for application events). Returns null if none match.
+def function okta_first_target(targets, wanted) {
+    find(targets) { |t| t.type == wanted }
+}
+
+// Okta `published` is RFC 3339 with millisecond precision and a
+// trailing `Z`. The built-in primitive handles that directly.
+def function okta_time(s) {
+    switch true {
+        s == null { null }
+        default   { to_int(parse_datetime_rfc3339(s)) }
+    }
+}
+
+// Build a user identity from an Okta actor/target object. Okta's
+// `alternateId` is the human-readable login (email-shaped on most
+// tenants); `displayName` is the rendered name; `id` is the stable
+// internal identifier (`00u...` for users, `00g...` for groups,
+// `0oa...` for app instances). Prefer `alternateId` as `name`
+// (matches what an operator searches for) and surface `id` as
+// `uid`.
+// Map Okta `actor.type` / `target.type` to OCSF `actor.user.type`.
+// Okta vocabulary is {"User", "SystemPrincipal", "PublicClientApp",
+// ...}; OCSF user.type expects {"User", "Admin", "System",
+// "Service"}. Only Okta "User" aligns directly; others either go to
+// null (no clean OCSF mapping) or to a coarse-grained value with
+// the raw Okta type preserved in unmapped by the caller.
+def function okta_user_type(okta_type) {
+    switch okta_type {
+        "User"            { "User" }
+        "SystemPrincipal" { "System" }
+        default           { null }
+    }
+}
+
+def function okta_user(obj) {
+    switch true {
+        obj == null { null }
+        default     {
+            {
+                name:          obj.alternateId,
+                full_name:     obj.displayName,
+                uid:           obj.id,
+                type:          okta_user_type(obj.type)
+            }
+        }
+    }
+}
+
+def function okta_group(obj) {
+    switch true {
+        obj == null { null }
+        default     {
+            {
+                name: obj.displayName,
+                uid:  obj.id
+            }
+        }
+    }
+}
+
+// Common Okta product metadata for the OCSF `metadata.product` block.
+def function okta_product_metadata() {
+    {
+        product: {
+            vendor_name: "Okta",
+            name:        "Okta Workforce Identity Cloud",
+            feature: {
+                name: "System Log"
+            }
+        },
+        version: "1.3.0"
+    }
+}
+
+// Best-effort source endpoint from Okta `client.ipAddress`. Okta
+// does not log source port (the SAML / OIDC endpoint is HTTPS-
+// terminated upstream of Okta's audit), so port stays null.
+def function okta_src_endpoint(client) {
+    switch true {
+        client == null { null }
+        default        {
+            {
+                ip: client.ipAddress
+            }
+        }
+    }
+}
+
+// `client.userAgent.rawUserAgent` is canonical OCSF
+// `http_request.user_agent` (a String). The Okta wire wraps the UA
+// in an Object (`{rawUserAgent, os, browser}`); OCSF 1.3.0 expects
+// the bare string. Extract the rawUserAgent field; return null when
+// client / userAgent / rawUserAgent is absent so the field can be
+// omitted by `null_omit` at compose time.
+def function okta_http_request(client) {
+    switch true {
+        client == null                          { null }
+        client.userAgent == null                { null }
+        client.userAgent.rawUserAgent == null   { null }
+        default                                 {
+            { user_agent: client.userAgent.rawUserAgent }
+        }
+    }
+}
+
+// TODO: the following Okta wire fields are not yet surfaced and
+// would need new helper + record-builder signatures to land cleanly:
+//   - request.ipChain[]  (proxy chain → src_endpoint.proxy_endpoint or unmapped)
+//   - debugContext.debugData (arbitrary KV → unmapped)
+//   - authenticationContext  (MFA / SSO context → unmapped)
+//   - client.geographicalContext (geo → src_endpoint.location)
+// Keep these in the parser backlog for a future completeness pass.
+
+// ---------------------------------------------------------------------------
+// Top-level dispatcher
+// ---------------------------------------------------------------------------
+
+def process parse_okta_system {
+    // parse_json on malformed JSON bails to the DLQ via the standard
+    // error-log policy, so no explicit null-check arm is needed here.
+    workspace.okta = parse_json(ingress)
+    let et = workspace.okta.eventType
+
+    // Dispatch on the first segment of `eventType` (the noun). The
+    // per-noun leaf re-inspects the full eventType for the fine
+    // dispatch onto a specific OCSF class + activity_id.
+    //
+    // Pre-validate `target` shape: the leaves rely on `find()` over
+    // `ev.target` to disambiguate User / UserGroup / AppInstance
+    // subjects. A non-null non-array `target` would surface a generic
+    // `find() expects an array` runtime error instead of a parser-
+    // authored loud-fail, so we guard up-front.
+    switch true {
+        et == null                                  { error "parse_okta_system: missing eventType" }
+        workspace.okta.target != null and not is_array(workspace.okta.target) {
+            error "parse_okta_system: target field is not an array (got ${workspace.okta.target}): ${ingress}"
+        }
+        starts_with(et, "user.session.")            { process parse_okta_user_authentication }
+        starts_with(et, "user.authentication.")     { process parse_okta_user_authentication }
+        starts_with(et, "user.lifecycle.")          { process parse_okta_user_lifecycle }
+        starts_with(et, "user.account.")            { process parse_okta_user_account }
+        starts_with(et, "group.user_membership.")   { process parse_okta_group_membership }
+        starts_with(et, "group.lifecycle.")         { process parse_okta_group_lifecycle }
+        starts_with(et, "group.privilege.")         { process parse_okta_group_privilege }
+        default                                     { error "parse_okta_system: unsupported eventType ${et}" }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3002 Authentication — user.session.* / user.authentication.*
+// ---------------------------------------------------------------------------
+//
+// Okta event taxonomy mapping (eventType → activity_id):
+//   user.session.start                 → 1 Logon
+//   user.session.end                   → 2 Logoff
+//   user.session.access_admin_app      → 1 Logon (admin-app entry)
+//   user.authentication.sso            → 1 Logon (SP-initiated SSO)
+//   user.authentication.auth_via_*     → 1 Logon
+//   user.authentication.verify         → 99 Other (MFA step)
+//   anything else under user.session./user.authentication. → 99 Other
+
+def function okta_authentication_record(activity_id, status_id, severity_id, time, user, actor_user, src_endpoint, http_request, message, event_type) {
+    {
+        class_uid:    3002,
+        category_uid: 3,
+        activity_id:  activity_id,
+        type_uid:     3002 * 100 + activity_id,
+        severity_id:  severity_id,
+        status_id:    status_id,
+        time:         time,
+        user:         user,
+        actor:        { user: actor_user },
+        src_endpoint: src_endpoint,
+        http_request: http_request,
+        auth_protocol_id: 99,
+        message:      message,
+        metadata:     okta_product_metadata(),
+        raw_data:     event_type
+    }
+}
+
+def process parse_okta_user_authentication {
+    let ev = workspace.okta
+    let et = ev.eventType
+    let activity_id = switch true {
+        et == "user.session.start"            { 1 }
+        et == "user.session.end"              { 2 }
+        et == "user.session.access_admin_app" { 1 }
+        starts_with(et, "user.authentication.auth_via_") { 1 }
+        et == "user.authentication.sso"       { 1 }
+        et == "user.authentication.verify"    { 99 }
+        default                                { 99 }
+    }
+    // Subject: the first target of type User, else fall back to the
+    // actor (self-authentication is the common case where actor == subject).
+    let subject_target = okta_first_target(ev.target, "User")
+    let subject_user = switch true {
+        subject_target != null { okta_user(subject_target) }
+        default                { okta_user(ev.actor) }
+    }
+    workspace.lsis = okta_authentication_record(
+        activity_id,
+        okta_status_id(ev.outcome.result),
+        okta_severity_id(ev.outcome.result),
+        okta_time(ev.published),
+        subject_user,
+        okta_user(ev.actor),
+        okta_src_endpoint(ev.client),
+                okta_http_request(ev.client),
+        "Okta ${et} (${ev.outcome.result})",
+        et
+    )
+}
+
+// ---------------------------------------------------------------------------
+// 3001 Account Change — user.lifecycle.*
+// ---------------------------------------------------------------------------
+//
+// activity_id mapping (OCSF 1.3.0 Account Change):
+//   1 Create / 2 Enable / 3 Password Change / 4 Password Reset /
+//   5 Disable / 6 Delete / 7 Attach Policy / 8 Detach Policy / 9 Lock /
+//   10 Unlock / 11 MFA Factor Enable / 12 MFA Factor Disable / 99 Other.
+//
+//   user.lifecycle.create                 → 1 Create
+//   user.lifecycle.activate               → 2 Enable
+//   user.lifecycle.deactivate             → 5 Disable
+//   user.lifecycle.suspend                → 5 Disable
+//   user.lifecycle.unsuspend              → 2 Enable
+//   user.lifecycle.delete.initiated /
+//   user.lifecycle.delete.completed       → 6 Delete
+//   user.lifecycle.reactivate             → 2 Enable
+//   user.lifecycle.unlock                 → 10 Unlock
+//   user.lifecycle.lock                   → 9 Lock
+//   anything else under user.lifecycle.   → 99 Other
+
+def function okta_account_change_record(activity_id, status_id, severity_id, time, user, actor_user, src_endpoint, http_request, message, event_type) {
+    {
+        class_uid:    3001,
+        category_uid: 3,
+        activity_id:  activity_id,
+        type_uid:     3001 * 100 + activity_id,
+        severity_id:  severity_id,
+        status_id:    status_id,
+        time:         time,
+        user:         user,
+        actor:        { user: actor_user },
+        src_endpoint: src_endpoint,
+        http_request: http_request,
+        message:      message,
+        metadata:     okta_product_metadata(),
+        raw_data:     event_type
+    }
+}
+
+def process parse_okta_user_lifecycle {
+    let ev = workspace.okta
+    let et = ev.eventType
+    let activity_id = switch true {
+        et == "user.lifecycle.create"              { 1 }
+        et == "user.lifecycle.activate"            { 2 }
+        et == "user.lifecycle.reactivate"          { 2 }
+        et == "user.lifecycle.unsuspend"           { 2 }
+        et == "user.lifecycle.deactivate"          { 5 }
+        et == "user.lifecycle.suspend"             { 5 }
+        et == "user.lifecycle.delete.initiated"    { 6 }
+        et == "user.lifecycle.delete.completed"    { 6 }
+        et == "user.lifecycle.lock"                { 9 }
+        et == "user.lifecycle.unlock"              { 10 }
+        default                                    { 99 }
+    }
+    let subject_target = okta_first_target(ev.target, "User")
+    workspace.lsis = okta_account_change_record(
+        activity_id,
+        okta_status_id(ev.outcome.result),
+        okta_severity_id(ev.outcome.result),
+        okta_time(ev.published),
+        okta_user(subject_target),
+        okta_user(ev.actor),
+        okta_src_endpoint(ev.client),
+                okta_http_request(ev.client),
+        "Okta ${et} (${ev.outcome.result})",
+        et
+    )
+}
+
+// ---------------------------------------------------------------------------
+// 3005 User Management — user.account.*
+// ---------------------------------------------------------------------------
+//
+// activity_id mapping (OCSF 1.3.0 User Management):
+//   1 Create User / 2 Disable User / 3 Enable User / 4 Lock User /
+//   5 Unlock User / 6 Delete User / 7 Change Credential /
+//   8 Reset Credential / 99 Other.
+//
+//   user.account.update_profile             → 99 Other (profile attribute change;
+//                                              no User Management spec activity
+//                                              fits update; surface raw_data for
+//                                              detail)
+//   user.account.reset_password             → 8 Reset Credential
+//   user.account.update_password            → 7 Change Credential
+//   user.account.unlock                     → 5 Unlock User
+//   user.account.lock                       → 4 Lock User
+//   user.account.privilege.grant            → 99 Other (covered separately by
+//                                              group.user_membership.add when
+//                                              role assignment goes through a
+//                                              group; standalone privilege
+//                                              grants stay Other until a
+//                                              dedicated OCSF activity exists)
+//   user.account.privilege.revoke           → 99 Other
+//   anything else under user.account.       → 99 Other
+//
+// Subject vs actor: `actor` is the admin / automated process that
+// performed the change; `user` (subject) is the User target — the
+// account whose state changed. Okta sometimes self-emits (an end
+// user resetting their own password): the target list still
+// contains the same User and the mapping survives.
+
+def function okta_user_management_record(activity_id, status_id, severity_id, time, user, actor_user, src_endpoint, http_request, message, event_type) {
+    {
+        class_uid:    3005,
+        category_uid: 3,
+        activity_id:  activity_id,
+        type_uid:     3005 * 100 + activity_id,
+        severity_id:  severity_id,
+        status_id:    status_id,
+        time:         time,
+        user:         user,
+        actor:        { user: actor_user },
+        src_endpoint: src_endpoint,
+        http_request: http_request,
+        message:      message,
+        metadata:     okta_product_metadata(),
+        raw_data:     event_type
+    }
+}
+
+def process parse_okta_user_account {
+    let ev = workspace.okta
+    let et = ev.eventType
+    let activity_id = switch true {
+        et == "user.account.reset_password"   { 8 }
+        et == "user.account.update_password"  { 7 }
+        et == "user.account.unlock"           { 5 }
+        et == "user.account.lock"             { 4 }
+        default                                { 99 }
+    }
+    let subject_target = okta_first_target(ev.target, "User")
+    // 3005 requires a User subject. If the target list lacks a User
+    // entry the event is malformed for this class — route to DLQ so
+    // the operator can decide whether the upstream eventType filter
+    // needs adjusting.
+    switch true {
+        subject_target == null {
+            error "parse_okta_system: ${et} carries no User target (expected for 3005 User Management)"
+        }
+        default {
+            workspace.lsis = okta_user_management_record(
+                activity_id,
+                okta_status_id(ev.outcome.result),
+                okta_severity_id(ev.outcome.result),
+                okta_time(ev.published),
+                okta_user(subject_target),
+                okta_user(ev.actor),
+                okta_src_endpoint(ev.client),
+                okta_http_request(ev.client),
+                "Okta ${et} (${ev.outcome.result})",
+                et
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3006 Group Management — group.user_membership.* / group.lifecycle.*
+// ---------------------------------------------------------------------------
+//
+// activity_id mapping (OCSF 1.3.0 Group Management):
+//   1 Assign Privileges / 2 Revoke Privileges / 3 Add User /
+//   4 Remove User / 5 Delete (Group) / 6 Create (Group) / 99 Other.
+//
+//   group.user_membership.add             → 3 Add User
+//   group.user_membership.remove          → 4 Remove User
+//   group.lifecycle.create                → 6 Create
+//   group.lifecycle.delete                → 5 Delete
+//   group.lifecycle.update                → 99 Other
+//   group.privilege.grant                 → 1 Assign Privileges
+//   group.privilege.revoke                → 2 Revoke Privileges
+//   anything else                         → 99 Other
+//
+// Subject construction: a membership event has both a UserGroup
+// target (the group) and a User target (the member). A lifecycle
+// event has only a UserGroup target. `okta_first_target` returns
+// null when the requested type is absent, which is the documented
+// shape for the lifecycle case.
+
+def function okta_group_management_record(activity_id, status_id, severity_id, time, group, member_user, actor_user, src_endpoint, http_request, message, event_type) {
+    {
+        class_uid:    3006,
+        category_uid: 3,
+        activity_id:  activity_id,
+        type_uid:     3006 * 100 + activity_id,
+        severity_id:  severity_id,
+        status_id:    status_id,
+        time:         time,
+        group:        group,
+        user:         member_user,
+        actor:        { user: actor_user },
+        src_endpoint: src_endpoint,
+        http_request: http_request,
+        message:      message,
+        metadata:     okta_product_metadata(),
+        raw_data:     event_type
+    }
+}
+
+def process parse_okta_group_membership {
+    let ev = workspace.okta
+    let et = ev.eventType
+    let activity_id = switch true {
+        et == "group.user_membership.add"    { 3 }
+        et == "group.user_membership.remove" { 4 }
+        default                               { 99 }
+    }
+    let group_target  = okta_first_target(ev.target, "UserGroup")
+    let member_target = okta_first_target(ev.target, "User")
+    // 3006 membership requires a UserGroup target. Missing → DLQ.
+    switch true {
+        group_target == null {
+            error "parse_okta_system: ${et} carries no UserGroup target (expected for 3006 Group Management)"
+        }
+        default {
+            workspace.lsis = okta_group_management_record(
+                activity_id,
+                okta_status_id(ev.outcome.result),
+                okta_severity_id(ev.outcome.result),
+                okta_time(ev.published),
+                okta_group(group_target),
+                okta_user(member_target),
+                okta_user(ev.actor),
+                okta_src_endpoint(ev.client),
+                okta_http_request(ev.client),
+                "Okta ${et} (${ev.outcome.result})",
+                et
+            )
+        }
+    }
+}
+
+def process parse_okta_group_lifecycle {
+    let ev = workspace.okta
+    let et = ev.eventType
+    let activity_id = switch true {
+        et == "group.lifecycle.create" { 6 }
+        et == "group.lifecycle.delete" { 5 }
+        default                         { 99 }
+    }
+    let group_target = okta_first_target(ev.target, "UserGroup")
+    switch true {
+        group_target == null {
+            error "parse_okta_system: ${et} carries no UserGroup target (expected for 3006 Group Management)"
+        }
+        default {
+            workspace.lsis = okta_group_management_record(
+                activity_id,
+                okta_status_id(ev.outcome.result),
+                okta_severity_id(ev.outcome.result),
+                okta_time(ev.published),
+                okta_group(group_target),
+                null,
+                okta_user(ev.actor),
+                okta_src_endpoint(ev.client),
+                okta_http_request(ev.client),
+                "Okta ${et} (${ev.outcome.result})",
+                et
+            )
+        }
+    }
+}
+
+// Okta `group.privilege.*` events emit OCSF 3006 with the
+// privilege Assign/Revoke activity_ids. The acting principal is in
+// `ev.actor`; the affected group is the UserGroup target.
+def process parse_okta_group_privilege {
+    let ev = workspace.okta
+    let et = ev.eventType
+    let activity_id = switch true {
+        et == "group.privilege.grant"  { 1 }    // 1 Assign Privileges
+        et == "group.privilege.revoke" { 2 }    // 2 Revoke Privileges
+        default                         { 99 }
+    }
+    let group_target = okta_first_target(ev.target, "UserGroup")
+    switch true {
+        group_target == null {
+            error "parse_okta_system: ${et} carries no UserGroup target (expected for 3006 Group Management)"
+        }
+        default {
+            workspace.lsis = okta_group_management_record(
+                activity_id,
+                okta_status_id(ev.outcome.result),
+                okta_severity_id(ev.outcome.result),
+                okta_time(ev.published),
+                okta_group(group_target),
+                null,
+                okta_user(ev.actor),
+                okta_src_endpoint(ev.client),
+                okta_http_request(ev.client),
+                "Okta ${et} (${ev.outcome.result})",
+                et
+            )
+        }
+    }
+}

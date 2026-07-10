@@ -1,12 +1,19 @@
-// OCSF composer
-//
-// Reads `workspace.lsis` (the canonical OCSF-shape produced by parsers)
-// and writes the corresponding OCSF JSON to the LSIS slot
-// `workspace.lsis.ocsf`. Pipelines that emit OCSF as the wire form
-// pipe `compose_ocsf | ocsf_to_egress` (defined below); envelope
-// composers (e.g. `compose_otlp`) read the slot directly. Class-
-// specific shaping lives in `compose_ocsf_<class>` leaves; the
-// top-level `compose_ocsf` dispatches on `workspace.lsis.class_uid`.
+// Summary:     Renders the LSIS intermediate to OCSF 1.3.0 JSON
+//              (27-class priority set), dispatched by class_uid.
+// Reads:       workspace.lsis.* (the canonical intermediate produced
+//              by vocabulary parsers)
+//                .class_uid (required, Int) — dispatch discriminator;
+//                            unknown values route to error_log
+//              Remaining fields are read per class by the
+//              `compose_ocsf_<class>` leaves (see class coverage
+//              below); `time` falls back to `received_at`.
+// Writes:      workspace.lsis.ocsf — OCSF 1.3.0 JSON, one object per
+//              event (String). Pipe `| ocsf_to_egress` (defined at
+//              the foot of this file) to emit it as the wire form;
+//              envelope composers (e.g. compose_otlp) read the slot
+//              directly instead.
+// Test corpus: spec-only (OCSF 1.3.0 schema; per-class leaf shapes
+//              cross-checked against schema.ocsf.io class definitions)
 //
 // Contract — workspace.lsis is the parser ↔ composer canonical intermediate:
 //   * parsers populate `workspace.lsis.*` only with OCSF-canonical
@@ -18,7 +25,7 @@
 //     null egress, which silently disappears into the output stage's
 //     "no payload" branch — the wrong default.
 //
-// OCSF version: targeting **1.3.0**. The composer emits
+// OCSF version — targeting **1.3.0**. The composer emits
 // `metadata.version = "1.3.0"` so receivers can dispatch by schema
 // version. Parsers populate `workspace.lsis.metadata` with at least
 // `{ product: { vendor_name, name, version }, version: "1.3.0" }`.
@@ -75,10 +82,6 @@
 //   ingress hit limpid) otherwise. This is what makes
 //   `parse_ocsf | compose_ocsf` round-trip preserve `time`, while
 //   parsers that don't populate `time` still emit a sane value.
-//
-// Output:
-//   workspace.lsis.ocsf = OCSF JSON (one object per event, string)
-//   egress = workspace.lsis.ocsf  (via `ocsf_to_egress`; opt in per pipeline)
 
 // ---------------------------------------------------------------------------
 // Top-level dispatcher

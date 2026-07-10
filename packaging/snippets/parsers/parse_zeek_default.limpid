@@ -1,6 +1,19 @@
 // Zeek (formerly Bro) JSON parser — default-enabled scripts (vocabulary)
 //
-// Vendor:   Zeek Project — open-source network monitoring framework
+// Summary:     Zeek default-enabled JSON streams (conn / dns / http / ssl /
+//              files / x509 / weird / notice) → LSIS, dispatched by _path.
+// Reads:       workspace.zeek.* (bridge — see Bridges below)
+//   .body (required, Object) — parsed Zeek event (caller does `parse_json(ingress)`)
+//   .hostname (optional, String) — collector override
+//   .time (optional, Int) — epoch ns override
+// Writes:      workspace.lsis.* — conn / ssl / files / x509 → 4001,
+//              dns → 4003, http → 4002, weird / notice → 2004; other
+//              _paths route to error_log.
+// Category:    OSS NDR
+// Test corpus: public (elastic/integrations zeek corpus — 61 events across
+//              the 8 default streams, pre-unflattened to native nested form)
+//
+// Vendor notes — Zeek Project — open-source network monitoring framework
 //           that passively observes traffic and emits per-protocol
 //           structured logs. The de-facto OSS NDR pair with Suricata:
 //           Suricata raises alerts via signatures, Zeek records
@@ -13,7 +26,7 @@
 //           `parse_zeek_soc.limpid`; for full coverage with a
 //           zero-data-loss catch-all, include `parse_zeek_full.limpid`.
 //
-// Wire:     **Native Zeek JSON output** (`redef LogAscii::use_json = T`).
+// Wire —     **Native Zeek JSON output** (`redef LogAscii::use_json = T`).
 //           Each line is one JSON object with `_path` set to the log
 //           name (`conn`, `dns`, …) and the 5-tuple nested under `id`:
 //
@@ -21,36 +34,19 @@
 //              "id": {"orig_h":"...", "orig_p":80, "resp_h":"...", "resp_p":443},
 //              "proto":"tcp", "service":"http", ...}
 //
-//           NOT supported: the dotted-flat form (`"id.orig_h": "..."`)
+//           NOT supported — the dotted-flat form (`"id.orig_h": "..."`)
 //           that Filebeat / Logstash zeek modules emit for ES indexing.
 //           That shape exists only because of downstream pipeline
 //           conventions; operators shipping Zeek directly to limpid
 //           should leave the native nested form alone.
 //
-// Intake:   workspace.zeek.body      (required, Object) — parsed Zeek event
-//                                     (caller does `parse_json(ingress)`)
-//           workspace.zeek.hostname  (optional, String) — collector override
-//           workspace.zeek.time      (optional, Int)    — epoch ns override
-//
-// Upstream: Zeek typically writes JSONL to per-protocol files (e.g.
+// Bridges —  Zeek typically writes JSONL to per-protocol files (e.g.
 //           `/usr/local/zeek/logs/current/conn.log`). Operators tail
 //           those individually, or use a unified shipper that merges
 //           all log streams to a single endpoint.
 //
 //           - Per-log JSONL tail:
 //                 process { workspace.zeek = { body: parse_json(ingress), hostname: hostname(), time: to_int(received_at) } } | parse_zeek_default | compose_ocsf | ocsf_to_egress
-//
-// Output:   OCSF records on `workspace.lsis`. Dispatch by `_path`:
-//             conn   → 4001 Network Activity (conn_state → activity_id)
-//             dns    → 4003 DNS Activity
-//             http   → 4002 HTTP Activity (method → activity_id)
-//             ssl    → 4001 Network Activity (TLS handshake under unmapped)
-//             files  → 4001 Network Activity (file evidence under unmapped)
-//             x509   → 4001 Network Activity (cert under unmapped)
-//             weird  → 2004 Detection Finding (protocol anomaly)
-//             notice → 2004 Detection Finding (Zeek-script finding)
-//             other  → error_log (loud-fail-fast; use parse_zeek_full
-//                      for a catch-all that absorbs unknown _paths)
 //
 // Coverage scope (v0.7.1): verified against the elastic/integrations
 // zeek corpus (61 events across the 8 default streams), with the
