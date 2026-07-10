@@ -9,8 +9,17 @@ Type=simple
 ExecStart=/usr/bin/limpid --config /etc/limpid/limpid.conf
 ExecReload=/bin/kill -HUP $MAINPID
 TimeoutStopSec=15
-Restart=on-failure
+# `Restart=always` (not `on-failure`) catches signal-killed exits that
+# systemd otherwise treats as clean — notably SIGPIPE from a saturated
+# stderr / journald pipe under a tracing burst. `systemctl stop` still
+# stops the unit cleanly because systemd remembers the operator-initiated
+# transition and does not restart. `StartLimitIntervalSec=0` disables
+# the start-rate ceiling so a sustained-crash regression cannot wedge
+# the unit into `failed` state; each attempt is still paced by
+# `RestartSec=5`.
+Restart=always
 RestartSec=5
+StartLimitIntervalSec=0
 
 # Run as dedicated user
 User=syslog
