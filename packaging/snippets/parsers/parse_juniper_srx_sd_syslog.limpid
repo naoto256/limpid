@@ -27,7 +27,7 @@
 //           - tail of a forwarded text file:
 //                 { workspace.juniper_srx_sd_syslog = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_juniper_srx_sd_syslog | compose_ocsf
 //
-// Output:   OCSF records on `workspace.limpid`. The class depends
+// Output:   OCSF records on `workspace.lsis`. The class depends
 //           on the daemon / MSGID:
 //             RT_FLOW (incl. APPTRACK_*)                                            → 4001 Network Activity
 //             RT_IDP (IDP_ATTACK_LOG_EVENT, IDP_APPDDOS_*)                          → 2004 Detection Finding
@@ -386,7 +386,7 @@ def function parse_juniper_srx_sd_syslog_flow_fields(sd) {
 
 def process parse_juniper_srx_sd_syslog_flow_create {
     workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
-    workspace.limpid = juniper_srx_sd_syslog_network_record(
+    workspace.lsis = juniper_srx_sd_syslog_network_record(
         1, 1, 1,
         workspace.srx_sd_fields.src, workspace.srx_sd_fields.src_port,
         workspace.srx_sd_fields.dst, workspace.srx_sd_fields.dst_port,
@@ -404,7 +404,7 @@ def process parse_juniper_srx_sd_syslog_flow_create {
 
 def process parse_juniper_srx_sd_syslog_flow_close {
     workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
-    workspace.limpid = juniper_srx_sd_syslog_network_record(
+    workspace.lsis = juniper_srx_sd_syslog_network_record(
         2, 1, 1,
         workspace.srx_sd_fields.src, workspace.srx_sd_fields.src_port,
         workspace.srx_sd_fields.dst, workspace.srx_sd_fields.dst_port,
@@ -423,7 +423,7 @@ def process parse_juniper_srx_sd_syslog_flow_close {
 
 def process parse_juniper_srx_sd_syslog_flow_deny {
     workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
-    workspace.limpid = juniper_srx_sd_syslog_network_record(
+    workspace.lsis = juniper_srx_sd_syslog_network_record(
         6, 2, 3,
         workspace.srx_sd_fields.src, workspace.srx_sd_fields.src_port,
         workspace.srx_sd_fields.dst, workspace.srx_sd_fields.dst_port,
@@ -441,7 +441,7 @@ def process parse_juniper_srx_sd_syslog_flow_deny {
 
 def process parse_juniper_srx_sd_syslog_apptrack_create {
     workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
-    workspace.limpid = juniper_srx_sd_syslog_network_record(
+    workspace.lsis = juniper_srx_sd_syslog_network_record(
         1, 1, 1,
         workspace.srx_sd_fields.src, workspace.srx_sd_fields.src_port,
         workspace.srx_sd_fields.dst, workspace.srx_sd_fields.dst_port,
@@ -459,7 +459,7 @@ def process parse_juniper_srx_sd_syslog_apptrack_create {
 
 def process parse_juniper_srx_sd_syslog_apptrack_close {
     workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
-    workspace.limpid = juniper_srx_sd_syslog_network_record(
+    workspace.lsis = juniper_srx_sd_syslog_network_record(
         2, 1, 1,
         workspace.srx_sd_fields.src, workspace.srx_sd_fields.src_port,
         workspace.srx_sd_fields.dst, workspace.srx_sd_fields.dst_port,
@@ -478,7 +478,7 @@ def process parse_juniper_srx_sd_syslog_apptrack_close {
 
 def process parse_juniper_srx_sd_syslog_apptrack_volume {
     workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
-    workspace.limpid = juniper_srx_sd_syslog_network_record(
+    workspace.lsis = juniper_srx_sd_syslog_network_record(
         99, 1, 1,
         workspace.srx_sd_fields.src, workspace.srx_sd_fields.src_port,
         workspace.srx_sd_fields.dst, workspace.srx_sd_fields.dst_port,
@@ -514,7 +514,7 @@ def process parse_juniper_srx_sd_syslog_idp_dispatch {
 def process parse_juniper_srx_sd_syslog_idp_attack {
     let sd = workspace.srx_sd_class.sd
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
-    workspace.limpid = juniper_srx_sd_syslog_finding_record(
+    workspace.lsis = juniper_srx_sd_syslog_finding_record(
         juniper_srx_sd_syslog_severity_id(parse_juniper_srx_sd_syslog_kv(sd, "threat-severity")),
         juniper_srx_sd_syslog_status_id(action),
         parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
@@ -546,7 +546,7 @@ def process parse_juniper_srx_sd_syslog_idp_appddos {
     let sd = workspace.srx_sd_class.sd
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
     let title = coalesce(parse_juniper_srx_sd_syslog_kv(sd, "application-name"), "IDP AppDDoS")
-    workspace.limpid = juniper_srx_sd_syslog_finding_record(
+    workspace.lsis = juniper_srx_sd_syslog_finding_record(
         4,
         juniper_srx_sd_syslog_status_id(action),
         parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
@@ -577,7 +577,7 @@ def process parse_juniper_srx_sd_syslog_screen_record {
     let sd = workspace.srx_sd_class.sd
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
     let attack = parse_juniper_srx_sd_syslog_kv(sd, "attack-name")
-    workspace.limpid = juniper_srx_sd_syslog_finding_record(
+    workspace.lsis = juniper_srx_sd_syslog_finding_record(
         3,
         juniper_srx_sd_syslog_status_id(action),
         parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
@@ -625,7 +625,7 @@ def process parse_juniper_srx_sd_syslog_utm_dispatch {
 def process parse_juniper_srx_sd_syslog_utm_webfilter {
     let sd = workspace.srx_sd_class.sd
     let permitted = workspace.srx_sd_class.msgid == "WEBFILTER_URL_PERMITTED"
-    workspace.limpid = juniper_srx_sd_syslog_http_record(
+    workspace.lsis = juniper_srx_sd_syslog_http_record(
         switch true { permitted { 1 } default { 2 } },
         switch true { permitted { 1 } default { 3 } },
         parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
@@ -647,7 +647,7 @@ def process parse_juniper_srx_sd_syslog_utm_antivirus {
     let sd = workspace.srx_sd_class.sd
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
     let virus = coalesce(parse_juniper_srx_sd_syslog_kv(sd, "virus-name"), workspace.srx_sd_class.msgid)
-    workspace.limpid = juniper_srx_sd_syslog_finding_record(
+    workspace.lsis = juniper_srx_sd_syslog_finding_record(
         4,
         juniper_srx_sd_syslog_status_id(action),
         parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
@@ -675,7 +675,7 @@ def process parse_juniper_srx_sd_syslog_utm_antivirus {
 def process parse_juniper_srx_sd_syslog_utm_antispam {
     let sd = workspace.srx_sd_class.sd
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
-    workspace.limpid = juniper_srx_sd_syslog_finding_record(
+    workspace.lsis = juniper_srx_sd_syslog_finding_record(
         3,
         juniper_srx_sd_syslog_status_id(action),
         parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
@@ -703,7 +703,7 @@ def process parse_juniper_srx_sd_syslog_utm_antispam {
 def process parse_juniper_srx_sd_syslog_utm_content {
     let sd = workspace.srx_sd_class.sd
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
-    workspace.limpid = juniper_srx_sd_syslog_finding_record(
+    workspace.lsis = juniper_srx_sd_syslog_finding_record(
         3,
         juniper_srx_sd_syslog_status_id(action),
         parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
@@ -749,7 +749,7 @@ def process parse_juniper_srx_sd_syslog_aamw_action {
     let sd = workspace.srx_sd_class.sd
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
     let mal = coalesce(parse_juniper_srx_sd_syslog_kv_or_null(sd, "malware-info"), "AAMW action")
-    workspace.limpid = juniper_srx_sd_syslog_finding_record(
+    workspace.lsis = juniper_srx_sd_syslog_finding_record(
         4,
         juniper_srx_sd_syslog_status_id(action),
         parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
@@ -782,7 +782,7 @@ def process parse_juniper_srx_sd_syslog_aamw_action {
 def process parse_juniper_srx_sd_syslog_aamw_malware {
     let sd = workspace.srx_sd_class.sd
     let mal = coalesce(parse_juniper_srx_sd_syslog_kv_or_null(sd, "malware-info"), "AAMW malware")
-    workspace.limpid = juniper_srx_sd_syslog_finding_record(
+    workspace.lsis = juniper_srx_sd_syslog_finding_record(
         4,
         2,
         parse_juniper_srx_sd_syslog_kv(sd, "client-ip"),
@@ -807,7 +807,7 @@ def process parse_juniper_srx_sd_syslog_aamw_malware {
 
 def process parse_juniper_srx_sd_syslog_aamw_host {
     let sd = workspace.srx_sd_class.sd
-    workspace.limpid = juniper_srx_sd_syslog_finding_record(
+    workspace.lsis = juniper_srx_sd_syslog_finding_record(
         5,
         2,
         parse_juniper_srx_sd_syslog_kv(sd, "client-ip"),
@@ -844,7 +844,7 @@ def process parse_juniper_srx_sd_syslog_secintel_record {
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
     let sev_str = parse_juniper_srx_sd_syslog_kv(sd, "threat-severity")
     let title = coalesce(parse_juniper_srx_sd_syslog_kv_or_null(sd, "feed-name"), "SecIntel")
-    workspace.limpid = juniper_srx_sd_syslog_finding_record(
+    workspace.lsis = juniper_srx_sd_syslog_finding_record(
         switch true {
             sev_str == "0"  { 1 }
             sev_str == null { 1 }

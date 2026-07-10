@@ -38,7 +38,7 @@
 //           - Direct JSON-line tail (when the forwarder writes a JSONL file):
 //                 process { workspace.sysmon = { body: parse_json(ingress), hostname: hostname(), time: to_int(received_at) } } | parse_sysmon | compose_ocsf
 //
-// Output:   OCSF records on `workspace.limpid` for the Sysmon event
+// Output:   OCSF records on `workspace.lsis` for the Sysmon event
 //           types this parser knows. Unknown EventIDs route to
 //           error_log per the loud-fail-fast policy.
 //
@@ -96,7 +96,7 @@ def process parse_sysmon {
 
 def process parse_sysmon_process_create {
     let ed = workspace.sysmon.body.EventData
-    workspace.limpid = {
+    workspace.lsis = {
         class_uid:    1007,
         category_uid: 1,
         activity_id:  1,                                // Launch
@@ -166,7 +166,7 @@ def process parse_sysmon_process_create {
 
 def process parse_sysmon_network_connect {
     let ed = workspace.sysmon.body.EventData
-    workspace.limpid = {
+    workspace.lsis = {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  1,                                // Open
@@ -227,7 +227,7 @@ def process parse_sysmon_network_connect {
 
 def process parse_sysmon_file_create {
     let ed = workspace.sysmon.body.EventData
-    workspace.limpid = {
+    workspace.lsis = {
         class_uid:    1001,
         category_uid: 1,
         activity_id:  1,                                // Create

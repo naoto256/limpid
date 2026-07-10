@@ -26,7 +26,7 @@ def pipeline fortigate_to_security_lake {
 }
 ```
 
-The flow is right there in the config. Bytes arrive on `fortigate_syslog`; `parse_fortigate_cef` extracts structured fields into the canonical `workspace.limpid.*` intermediate; `compose_ocsf` dispatches on `workspace.limpid.class_uid` and emits the matching OCSF JSON; the result leaves through `security_lake`. No hidden behavior. No plugin to install. No separate "transform" config.
+The flow is right there in the config. Bytes arrive on `fortigate_syslog`; `parse_fortigate_cef` extracts structured fields into the canonical `workspace.lsis.*` intermediate; `compose_ocsf` dispatches on `workspace.lsis.class_uid` and emits the matching OCSF JSON; the result leaves through `security_lake`. No hidden behavior. No plugin to install. No separate "transform" config.
 
 In limpid, anything you want to do to a log on its way from input to output is achieved by freely combining `process`es.
 
@@ -36,14 +36,14 @@ A reusable chunk of pipeline logic — small, named, drop-in. You write them you
 
 ```limpid
 def process compose_ocsf_detection_finding {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:    2004,                     // Detection Finding
         category_uid: 2,                        // Findings
         activity_id:  activity,
         type_uid:     2004 * 100 + activity,
-        time:         coalesce(workspace.limpid.time, received_at),
-        severity_id:  workspace.limpid.severity_id,
+        time:         coalesce(workspace.lsis.time, received_at),
+        severity_id:  workspace.lsis.severity_id,
         // ...
     }))
 }
@@ -70,7 +70,7 @@ And here is the half that should make you grin — daily operations the alternat
 - **You can watch the pipeline work, live.** `limpidctl tap output security_lake --json` streams events as they leave for the destination (source, ingress, egress bytes). `limpidctl tap process compose_ocsf --json` shows the workspace state at that pipeline hop. No pause, no traffic duplication, no second tool. Every pipeline is its own debugger.
 
   ```text
-  $ limpidctl tap process compose_ocsf --json | jq -c '{src: .source, sev: .workspace.limpid.severity_id, class: .workspace.limpid.class_uid}'
+  $ limpidctl tap process compose_ocsf --json | jq -c '{src: .source, sev: .workspace.lsis.severity_id, class: .workspace.lsis.class_uid}'
   {"src":{"ip":"10.0.0.21","port":51234},"sev":3,"class":200401}
   {"src":{"ip":"10.0.0.21","port":51234},"sev":7,"class":200401}
   {"src":{"ip":"10.0.0.22","port":42100},"sev":2,"class":200401}
@@ -156,10 +156,10 @@ Curated parser / composer / filter library, installed under `/usr/share/limpid/s
 
 - **Transport parsers (2, v0.7.1)** — `parse_syslog` (RFC 3164 / 5424 syslog wire) · `parse_journald` (systemd journald JSON). These populate `workspace.<transport>.*` and feed any vocabulary parser downstream via an inline bridge.
 - **Vendor parsers (24)** — security devices / cloud audit: `parse_fortigate_cef` · `parse_fortigate_syslog` · `parse_paloalto_cef` · `parse_paloalto_syslog` · `parse_asa` · `parse_cloudtrail` · `parse_juniper_srx_sd_syslog` (Junos structured-data) · `parse_juniper_srx_syslog` (Junos unstructured RT_IDP) · `parse_checkpoint_leef` (LEEF 2.0 / QRadar) · `parse_checkpoint_syslog` (Check Point Syslog Exporter, real-corpus verified) · `parse_nsp` (Trellix Network Security Platform, real-traffic verified). OSS NDR: `parse_suricata` (EVE JSON) · `parse_zeek_default` / `parse_zeek_soc` / `parse_zeek_full` (Zeek 8 / 20 / 43 protocol scripts, nested-superset scopes, with `_native` / `_flat` convenience variants for raw Zeek vs Filebeat-flat upstream). Server / host vocabulary: `parse_openssh` · `parse_sudo` · `parse_combined_log` (Apache / Nginx) · `parse_postfix` · `parse_winevent_json` · `parse_sysmon` · `parse_bind` · `parse_auditd` (7 OCSF classes, real-corpus verified). Vendor-neutral: `parse_ocsf`.
-- **Composers (3)** — `compose_ocsf` (OCSF 1.3.0 priority set, 27 classes, dispatched by `workspace.limpid.class_uid`) · `compose_rfc5424` (journald → RFC 5424 wire, v0.7.1) · `compose_replayable` (replay-shape capture).
+- **Composers (3)** — `compose_ocsf` (OCSF 1.3.0 priority set, 27 classes, dispatched by `workspace.lsis.class_uid`) · `compose_rfc5424` (journald → RFC 5424 wire, v0.7.1) · `compose_replayable` (replay-shape capture).
 - **Filters (1)** — `filter_openssh_journal` (drops PAM session double-count noise from journald sshd streams).
 
-Each parser writes to the canonical `workspace.limpid.*` intermediate; `compose_ocsf` reads from it and emits OCSF JSON to `egress`. Two `include` lines + a two-stage pipeline gets vendor logs into a SIEM / data lake in OCSF form. Full reference: [Snippet Library](docs/src/snippets/README.md).
+Each parser writes to the canonical `workspace.lsis.*` intermediate; `compose_ocsf` reads from it and emits OCSF JSON to `egress`. Two `include` lines + a two-stage pipeline gets vendor logs into a SIEM / data lake in OCSF form. Full reference: [Snippet Library](docs/src/snippets/README.md).
 
 ### Functions
 

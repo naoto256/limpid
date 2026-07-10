@@ -30,7 +30,7 @@
 //           - tail of a forwarded text file:
 //                 { workspace.juniper_srx_syslog = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_juniper_srx_syslog | compose_ocsf
 //
-// Output:   OCSF records on `workspace.limpid`, class depends on
+// Output:   OCSF records on `workspace.lsis`, class depends on
 //           DAEMON / MSGID:
 //             RT_IDP IDP_ATTACK_LOG_EVENT       → 2004 Detection Finding
 //             (other RT_IDP / RT_UTM subtypes)  → routed to error_log per
@@ -222,7 +222,7 @@ def process parse_juniper_srx_syslog_idp_attack_record {
             error "parse_juniper_srx_syslog_idp_attack_record: body did not match expected shape: ${workspace.juniper_srx_syslog.body}"
         }
         default {
-            workspace.limpid = juniper_srx_syslog_idp_finding_record(
+            workspace.lsis = juniper_srx_syslog_idp_finding_record(
                 workspace.srx_idp_fields.src,
                 workspace.srx_idp_fields.src_port,
                 workspace.srx_idp_fields.dst,

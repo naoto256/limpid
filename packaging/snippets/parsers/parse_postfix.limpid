@@ -42,7 +42,7 @@
 //                 } | parse_postfix | compose_ocsf
 //
 // Output:   OCSF Email Activity (class_uid 4009) records on
-//           `workspace.limpid` for the operational mail events
+//           `workspace.lsis` for the operational mail events
 //           (delivery attempts, queue events, bounces, SMTP
 //           connections). Daemon-control noise (master / pickup /
 //           trivial-rewrite startup / shutdown / warning lines) is
@@ -177,7 +177,7 @@ def process parse_postfix_smtp {
 }
 
 def process parse_postfix_smtp_record {
-    workspace.limpid = {
+    workspace.lsis = {
         class_uid:    4009,
         category_uid: 4,
         activity_id:  1,
@@ -228,7 +228,7 @@ def process parse_postfix_smtpd {
 }
 
 def process parse_postfix_smtpd_connect_record {
-    workspace.limpid = {
+    workspace.lsis = {
         class_uid:    4009,
         category_uid: 4,
         activity_id:  2,
@@ -257,7 +257,7 @@ def process parse_postfix_smtpd_connect_record {
 }
 
 def process parse_postfix_smtpd_reject_record {
-    workspace.limpid = {
+    workspace.lsis = {
         class_uid:    4009,
         category_uid: 4,
         activity_id:  2,
@@ -306,7 +306,7 @@ def process parse_postfix_qmgr {
 }
 
 def process parse_postfix_qmgr_record {
-    workspace.limpid = {
+    workspace.lsis = {
         class_uid:    4009,
         category_uid: 4,
         activity_id:  1,
@@ -352,7 +352,7 @@ def process parse_postfix_bounce {
 }
 
 def process parse_postfix_bounce_record {
-    workspace.limpid = {
+    workspace.lsis = {
         class_uid:    4009,
         category_uid: 4,
         activity_id:  1,

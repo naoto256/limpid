@@ -32,7 +32,7 @@
 //                     }
 //                 } | parse_suricata | compose_ocsf
 //
-// Output:   OCSF records on `workspace.limpid`. Dispatch by
+// Output:   OCSF records on `workspace.lsis`. Dispatch by
 //           `event_type`:
 //             alert    → 2004 Detection Finding
 //             dns      → 4003 DNS Activity
@@ -419,7 +419,7 @@ def process parse_suricata {
 }
 
 def process parse_suricata_alert {
-    workspace.limpid = suricata_alert_record(
+    workspace.lsis = suricata_alert_record(
         workspace.suricata.body,
         workspace.suricata.hostname,
         suricata_time_ns(workspace.suricata.body, workspace.suricata.time)
@@ -427,7 +427,7 @@ def process parse_suricata_alert {
 }
 
 def process parse_suricata_dns {
-    workspace.limpid = suricata_dns_record(
+    workspace.lsis = suricata_dns_record(
         workspace.suricata.body,
         workspace.suricata.hostname,
         suricata_time_ns(workspace.suricata.body, workspace.suricata.time)
@@ -435,7 +435,7 @@ def process parse_suricata_dns {
 }
 
 def process parse_suricata_http {
-    workspace.limpid = suricata_http_record(
+    workspace.lsis = suricata_http_record(
         workspace.suricata.body,
         workspace.suricata.hostname,
         suricata_time_ns(workspace.suricata.body, workspace.suricata.time)
@@ -443,7 +443,7 @@ def process parse_suricata_http {
 }
 
 def process parse_suricata_flow {
-    workspace.limpid = suricata_flow_record(
+    workspace.lsis = suricata_flow_record(
         workspace.suricata.body,
         workspace.suricata.hostname,
         suricata_time_ns(workspace.suricata.body, workspace.suricata.time)
@@ -451,7 +451,7 @@ def process parse_suricata_flow {
 }
 
 def process parse_suricata_tls {
-    workspace.limpid = suricata_tls_record(
+    workspace.lsis = suricata_tls_record(
         workspace.suricata.body,
         workspace.suricata.hostname,
         suricata_time_ns(workspace.suricata.body, workspace.suricata.time)
@@ -459,7 +459,7 @@ def process parse_suricata_tls {
 }
 
 def process parse_suricata_fileinfo {
-    workspace.limpid = suricata_fileinfo_record(
+    workspace.lsis = suricata_fileinfo_record(
         workspace.suricata.body,
         workspace.suricata.hostname,
         suricata_time_ns(workspace.suricata.body, workspace.suricata.time)

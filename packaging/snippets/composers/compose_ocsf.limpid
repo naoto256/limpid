@@ -1,22 +1,22 @@
 // OCSF composer
 //
-// Reads `workspace.limpid` (the canonical OCSF-shape produced by parsers)
+// Reads `workspace.lsis` (the canonical OCSF-shape produced by parsers)
 // and writes the corresponding OCSF JSON to `egress`. Class-specific
 // shaping lives in `compose_ocsf_<class>` leaves; the top-level
-// `compose_ocsf` dispatches on `workspace.limpid.class_uid`.
+// `compose_ocsf` dispatches on `workspace.lsis.class_uid`.
 //
-// Contract — workspace.limpid is the parser ↔ composer canonical intermediate:
-//   * parsers populate `workspace.limpid.*` only with OCSF-canonical
+// Contract — workspace.lsis is the parser ↔ composer canonical intermediate:
+//   * parsers populate `workspace.lsis.*` only with OCSF-canonical
 //     fields. Vendor intermediates (`workspace.cef`, `workspace.syslog`)
 //     are NOT read by the composer.
-//   * composer reads `workspace.limpid.*` only.
+//   * composer reads `workspace.lsis.*` only.
 //   * unknown `class_uid` is routed to the error_log via `error` —
 //     leaving an event with no egress would silently disappear into the
 //     output stage's "no payload" branch, which is the wrong default.
 //
 // OCSF version: targeting **1.3.0**. The composer emits
 // `metadata.version = "1.3.0"` so receivers can dispatch by schema
-// version. Parsers populate `workspace.limpid.metadata` with at least
+// version. Parsers populate `workspace.lsis.metadata` with at least
 // `{ product: { vendor_name, name, version }, version: "1.3.0" }`.
 //
 // Class coverage (OCSF 1.3.0 priority classes):
@@ -60,13 +60,13 @@
 //
 // Each leaf assumes the dispatcher has already verified `class_uid` and
 // reads only the fields its OCSF class defines, plucking from
-// `workspace.limpid.*`. Common envelope fields (`class_uid`,
+// `workspace.lsis.*`. Common envelope fields (`class_uid`,
 // `category_uid`, `activity_id`, `type_uid`, `severity_id`, `time`,
 // `metadata`) are emitted uniformly.
 //
 // `time` policy:
-//   `coalesce(workspace.limpid.time, received_at)` — prefer the parser's
-//   `workspace.limpid.time` (the actual event timestamp parsed off the
+//   `coalesce(workspace.lsis.time, received_at)` — prefer the parser's
+//   `workspace.lsis.time` (the actual event timestamp parsed off the
 //   wire) when populated, fall back to `received_at` (the moment the
 //   ingress hit limpid) otherwise. This is what makes
 //   `parse_ocsf | compose_ocsf` round-trip preserve `time`, while
@@ -80,7 +80,7 @@
 // ---------------------------------------------------------------------------
 
 def process compose_ocsf {
-    switch workspace.limpid.class_uid {
+    switch workspace.lsis.class_uid {
         // System Activity (category 1)
         1001 { process compose_ocsf_file_system_activity }
         1007 { process compose_ocsf_process_activity }
@@ -113,7 +113,7 @@ def process compose_ocsf {
         6004 { process compose_ocsf_web_resource_access }
         6005 { process compose_ocsf_datastore_activity }
         6007 { process compose_ocsf_scan_activity }
-        default { error "compose_ocsf: unsupported class_uid ${workspace.limpid.class_uid}" }
+        default { error "compose_ocsf: unsupported class_uid ${workspace.lsis.class_uid}" }
     }
 }
 
@@ -128,26 +128,26 @@ def process compose_ocsf {
 // File create / read / update / delete / rename / etc. — typically from
 // EDR / file-integrity-monitoring sources (Sysmon FileCreate, Falco fs
 // rules, Defender ATP, Windows Security 4663). Parsers populate
-// `workspace.limpid.file` (the affected file), `workspace.limpid.actor`
-// (the process that performed the action), and `workspace.limpid.user`
+// `workspace.lsis.file` (the affected file), `workspace.lsis.actor`
+// (the process that performed the action), and `workspace.lsis.user`
 // for the executing user.
 def process compose_ocsf_file_system_activity {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:    1001,
         category_uid: 1,
         activity_id:  activity,
         type_uid:     1001 * 100 + activity,
-        severity_id:  workspace.limpid.severity_id,
-        status_id:    workspace.limpid.status_id,
-        time:         coalesce(workspace.limpid.time, received_at),
-        file:         workspace.limpid.file,
-        actor:        workspace.limpid.actor,
-        device:       workspace.limpid.device,
-        user:         workspace.limpid.user,
-        message:      workspace.limpid.message,
-        unmapped:     workspace.limpid.unmapped,
-        metadata:     workspace.limpid.metadata
+        severity_id:  workspace.lsis.severity_id,
+        status_id:    workspace.lsis.status_id,
+        time:         coalesce(workspace.lsis.time, received_at),
+        file:         workspace.lsis.file,
+        actor:        workspace.lsis.actor,
+        device:       workspace.lsis.device,
+        user:         workspace.lsis.user,
+        message:      workspace.lsis.message,
+        unmapped:     workspace.lsis.unmapped,
+        metadata:     workspace.lsis.metadata
     }))
 }
 
@@ -157,25 +157,25 @@ def process compose_ocsf_file_system_activity {
 //
 // Process launch / terminate / inject / set-uid — Sysmon ProcessCreate
 // (event id 1), Linux audit execve, EDR process events. Parsers populate
-// `workspace.limpid.process` (the process being acted on),
-// `workspace.limpid.actor.process` (the parent / initiator), and
-// `workspace.limpid.actor.user`.
+// `workspace.lsis.process` (the process being acted on),
+// `workspace.lsis.actor.process` (the parent / initiator), and
+// `workspace.lsis.actor.user`.
 def process compose_ocsf_process_activity {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:    1007,
         category_uid: 1,
         activity_id:  activity,
         type_uid:     1007 * 100 + activity,
-        severity_id:  workspace.limpid.severity_id,
-        status_id:    workspace.limpid.status_id,
-        time:         coalesce(workspace.limpid.time, received_at),
-        process:      workspace.limpid.process,
-        actor:        workspace.limpid.actor,
-        device:       workspace.limpid.device,
-        message:      workspace.limpid.message,
-        unmapped:     workspace.limpid.unmapped,
-        metadata:     workspace.limpid.metadata
+        severity_id:  workspace.lsis.severity_id,
+        status_id:    workspace.lsis.status_id,
+        time:         coalesce(workspace.lsis.time, received_at),
+        process:      workspace.lsis.process,
+        actor:        workspace.lsis.actor,
+        device:       workspace.lsis.device,
+        message:      workspace.lsis.message,
+        unmapped:     workspace.lsis.unmapped,
+        metadata:     workspace.lsis.metadata
     }))
 }
 
@@ -184,22 +184,22 @@ def process compose_ocsf_process_activity {
 // ---------------------------------------------------------------------------
 //
 // Windows registry key create / delete / rename. Parsers populate
-// `workspace.limpid.reg_key` (path) and `workspace.limpid.actor.process`
+// `workspace.lsis.reg_key` (path) and `workspace.lsis.actor.process`
 // (the process that touched it).
 def process compose_ocsf_registry_key_activity {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:    1008,
         category_uid: 1,
         activity_id:  activity,
         type_uid:     1008 * 100 + activity,
-        severity_id:  workspace.limpid.severity_id,
-        time:         coalesce(workspace.limpid.time, received_at),
-        reg_key:      workspace.limpid.reg_key,
-        actor:        workspace.limpid.actor,
-        device:       workspace.limpid.device,
-        message:      workspace.limpid.message,
-        metadata:     workspace.limpid.metadata
+        severity_id:  workspace.lsis.severity_id,
+        time:         coalesce(workspace.lsis.time, received_at),
+        reg_key:      workspace.lsis.reg_key,
+        actor:        workspace.lsis.actor,
+        device:       workspace.lsis.device,
+        message:      workspace.lsis.message,
+        metadata:     workspace.lsis.metadata
     }))
 }
 
@@ -208,22 +208,22 @@ def process compose_ocsf_registry_key_activity {
 // ---------------------------------------------------------------------------
 //
 // Windows registry value set / delete / modify. Parsers populate
-// `workspace.limpid.reg_value` (path + data) and
-// `workspace.limpid.actor.process`.
+// `workspace.lsis.reg_value` (path + data) and
+// `workspace.lsis.actor.process`.
 def process compose_ocsf_registry_value_activity {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:    1009,
         category_uid: 1,
         activity_id:  activity,
         type_uid:     1009 * 100 + activity,
-        severity_id:  workspace.limpid.severity_id,
-        time:         coalesce(workspace.limpid.time, received_at),
-        reg_value:    workspace.limpid.reg_value,
-        actor:        workspace.limpid.actor,
-        device:       workspace.limpid.device,
-        message:      workspace.limpid.message,
-        metadata:     workspace.limpid.metadata
+        severity_id:  workspace.lsis.severity_id,
+        time:         coalesce(workspace.lsis.time, received_at),
+        reg_value:    workspace.lsis.reg_value,
+        actor:        workspace.lsis.actor,
+        device:       workspace.lsis.device,
+        message:      workspace.lsis.message,
+        metadata:     workspace.lsis.metadata
     }))
 }
 
@@ -236,24 +236,24 @@ def process compose_ocsf_registry_value_activity {
 // ---------------------------------------------------------------------------
 //
 // Vulnerability scanner output (Tenable, Qualys, OpenVAS). Parsers
-// populate `workspace.limpid.finding_info`,
-// `workspace.limpid.vulnerabilities` (array of CVE / CVSS / etc.),
-// `workspace.limpid.affected_packages`, and `workspace.limpid.resources`.
+// populate `workspace.lsis.finding_info`,
+// `workspace.lsis.vulnerabilities` (array of CVE / CVSS / etc.),
+// `workspace.lsis.affected_packages`, and `workspace.lsis.resources`.
 def process compose_ocsf_vulnerability_finding {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:         2002,
         category_uid:      2,
         activity_id:       activity,
         type_uid:          2002 * 100 + activity,
-        severity_id:       workspace.limpid.severity_id,
-        time:              coalesce(workspace.limpid.time, received_at),
-        finding_info:      workspace.limpid.finding_info,
-        vulnerabilities:   workspace.limpid.vulnerabilities,
-        affected_packages: workspace.limpid.affected_packages,
-        resources:         workspace.limpid.resources,
-        message:           workspace.limpid.message,
-        metadata:          workspace.limpid.metadata
+        severity_id:       workspace.lsis.severity_id,
+        time:              coalesce(workspace.lsis.time, received_at),
+        finding_info:      workspace.lsis.finding_info,
+        vulnerabilities:   workspace.lsis.vulnerabilities,
+        affected_packages: workspace.lsis.affected_packages,
+        resources:         workspace.lsis.resources,
+        message:           workspace.lsis.message,
+        metadata:          workspace.lsis.metadata
     }))
 }
 
@@ -262,23 +262,23 @@ def process compose_ocsf_vulnerability_finding {
 // ---------------------------------------------------------------------------
 //
 // Configuration / posture compliance violation (CIS, AWS Config rules,
-// SOC 2 control failures). Parsers populate `workspace.limpid.compliance`
-// (control / standards) and `workspace.limpid.resource`.
+// SOC 2 control failures). Parsers populate `workspace.lsis.compliance`
+// (control / standards) and `workspace.lsis.resource`.
 def process compose_ocsf_compliance_finding {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:    2003,
         category_uid: 2,
         activity_id:  activity,
         type_uid:     2003 * 100 + activity,
-        severity_id:  workspace.limpid.severity_id,
-        time:         coalesce(workspace.limpid.time, received_at),
-        finding_info: workspace.limpid.finding_info,
-        compliance:   workspace.limpid.compliance,
-        resource:     workspace.limpid.resource,
-        remediation:  workspace.limpid.remediation,
-        message:      workspace.limpid.message,
-        metadata:     workspace.limpid.metadata
+        severity_id:  workspace.lsis.severity_id,
+        time:         coalesce(workspace.lsis.time, received_at),
+        finding_info: workspace.lsis.finding_info,
+        compliance:   workspace.lsis.compliance,
+        resource:     workspace.lsis.resource,
+        remediation:  workspace.lsis.remediation,
+        message:      workspace.lsis.message,
+        metadata:     workspace.lsis.metadata
     }))
 }
 
@@ -287,34 +287,34 @@ def process compose_ocsf_compliance_finding {
 // ---------------------------------------------------------------------------
 //
 // Used by IDS/IPS, antivirus, web filter, DLP, and other detection-type
-// events. Parsers populate `workspace.limpid.finding_info` (title /
-// types / uid), `workspace.limpid.disposition_id` (Allowed / Blocked /
+// events. Parsers populate `workspace.lsis.finding_info` (title /
+// types / uid), `workspace.lsis.disposition_id` (Allowed / Blocked /
 // Detected / Quarantined / etc.), and optionally `attack` / `malware` /
 // `evidences` objects with engine-specific detail.
 def process compose_ocsf_detection_finding {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:       2004,
         category_uid:    2,
         activity_id:     activity,
         type_uid:        2004 * 100 + activity,
-        severity_id:     workspace.limpid.severity_id,
-        status_id:       workspace.limpid.status_id,
-        time:            coalesce(workspace.limpid.time, received_at),
-        finding_info:    workspace.limpid.finding_info,
-        disposition_id:  workspace.limpid.disposition_id,
-        src_endpoint:    workspace.limpid.src_endpoint,
-        dst_endpoint:    workspace.limpid.dst_endpoint,
-        connection_info: workspace.limpid.connection_info,
-        device:          workspace.limpid.device,
-        actor:           workspace.limpid.actor,
-        attacks:         workspace.limpid.attacks,
-        attack:          workspace.limpid.attack,
-        malware:         workspace.limpid.malware,
-        evidences:       workspace.limpid.evidences,
-        message:         workspace.limpid.message,
-        unmapped:        workspace.limpid.unmapped,
-        metadata:        workspace.limpid.metadata
+        severity_id:     workspace.lsis.severity_id,
+        status_id:       workspace.lsis.status_id,
+        time:            coalesce(workspace.lsis.time, received_at),
+        finding_info:    workspace.lsis.finding_info,
+        disposition_id:  workspace.lsis.disposition_id,
+        src_endpoint:    workspace.lsis.src_endpoint,
+        dst_endpoint:    workspace.lsis.dst_endpoint,
+        connection_info: workspace.lsis.connection_info,
+        device:          workspace.lsis.device,
+        actor:           workspace.lsis.actor,
+        attacks:         workspace.lsis.attacks,
+        attack:          workspace.lsis.attack,
+        malware:         workspace.lsis.malware,
+        evidences:       workspace.lsis.evidences,
+        message:         workspace.lsis.message,
+        unmapped:        workspace.lsis.unmapped,
+        metadata:        workspace.lsis.metadata
     }))
 }
 
@@ -326,21 +326,21 @@ def process compose_ocsf_detection_finding {
 // engines. Carries finding metadata plus assignment / status_id and
 // optional links to underlying findings.
 def process compose_ocsf_incident_finding {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:    2005,
         category_uid: 2,
         activity_id:  activity,
         type_uid:     2005 * 100 + activity,
-        severity_id:  workspace.limpid.severity_id,
-        status_id:    workspace.limpid.status_id,
-        time:         coalesce(workspace.limpid.time, received_at),
-        finding_info: workspace.limpid.finding_info,
-        assignee:     workspace.limpid.assignee,
-        priority:     workspace.limpid.priority,
-        impact_id:    workspace.limpid.impact_id,
-        message:      workspace.limpid.message,
-        metadata:     workspace.limpid.metadata
+        severity_id:  workspace.lsis.severity_id,
+        status_id:    workspace.lsis.status_id,
+        time:         coalesce(workspace.lsis.time, received_at),
+        finding_info: workspace.lsis.finding_info,
+        assignee:     workspace.lsis.assignee,
+        priority:     workspace.lsis.priority,
+        impact_id:    workspace.lsis.impact_id,
+        message:      workspace.lsis.message,
+        metadata:     workspace.lsis.metadata
     }))
 }
 
@@ -353,22 +353,22 @@ def process compose_ocsf_incident_finding {
 // ---------------------------------------------------------------------------
 //
 // Account create / delete / disable / enable / password-change. Parsers
-// populate `workspace.limpid.user` (the account being changed) and
-// `workspace.limpid.actor.user` (the actor performing the change).
+// populate `workspace.lsis.user` (the account being changed) and
+// `workspace.lsis.actor.user` (the actor performing the change).
 def process compose_ocsf_account_change {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:    3001,
         category_uid: 3,
         activity_id:  activity,
         type_uid:     3001 * 100 + activity,
-        severity_id:  workspace.limpid.severity_id,
-        time:         coalesce(workspace.limpid.time, received_at),
-        user:         workspace.limpid.user,
-        actor:        workspace.limpid.actor,
-        src_endpoint: workspace.limpid.src_endpoint,
-        message:      workspace.limpid.message,
-        metadata:     workspace.limpid.metadata
+        severity_id:  workspace.lsis.severity_id,
+        time:         coalesce(workspace.lsis.time, received_at),
+        user:         workspace.lsis.user,
+        actor:        workspace.lsis.actor,
+        src_endpoint: workspace.lsis.src_endpoint,
+        message:      workspace.lsis.message,
+        metadata:     workspace.lsis.metadata
     }))
 }
 
@@ -377,30 +377,30 @@ def process compose_ocsf_account_change {
 // ---------------------------------------------------------------------------
 //
 // Login / logout / failed-auth events. Parsers populate
-// `workspace.limpid.user`, `workspace.limpid.src_endpoint`, and
-// `workspace.limpid.status_id` (1 Success / 2 Failure).
+// `workspace.lsis.user`, `workspace.lsis.src_endpoint`, and
+// `workspace.lsis.status_id` (1 Success / 2 Failure).
 def process compose_ocsf_authentication {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:    3002,
         category_uid: 3,
         activity_id:  activity,
         type_uid:     3002 * 100 + activity,
-        severity_id:  workspace.limpid.severity_id,
-        status_id:    workspace.limpid.status_id,
-        time:         coalesce(workspace.limpid.time, received_at),
-        user:         workspace.limpid.user,
-        actor:        workspace.limpid.actor,
-        src_endpoint: workspace.limpid.src_endpoint,
-        dst_endpoint: workspace.limpid.dst_endpoint,
-        device:       workspace.limpid.device,
-        auth_protocol:    workspace.limpid.auth_protocol,
-        auth_protocol_id: workspace.limpid.auth_protocol_id,
-        service:      workspace.limpid.service,
-        session:      workspace.limpid.session,
-        logon_type_id: workspace.limpid.logon_type_id,
-        message:      workspace.limpid.message,
-        metadata:     workspace.limpid.metadata
+        severity_id:  workspace.lsis.severity_id,
+        status_id:    workspace.lsis.status_id,
+        time:         coalesce(workspace.lsis.time, received_at),
+        user:         workspace.lsis.user,
+        actor:        workspace.lsis.actor,
+        src_endpoint: workspace.lsis.src_endpoint,
+        dst_endpoint: workspace.lsis.dst_endpoint,
+        device:       workspace.lsis.device,
+        auth_protocol:    workspace.lsis.auth_protocol,
+        auth_protocol_id: workspace.lsis.auth_protocol_id,
+        service:      workspace.lsis.service,
+        session:      workspace.lsis.session,
+        logon_type_id: workspace.lsis.logon_type_id,
+        message:      workspace.lsis.message,
+        metadata:     workspace.lsis.metadata
     }))
 }
 
@@ -409,26 +409,26 @@ def process compose_ocsf_authentication {
 // ---------------------------------------------------------------------------
 //
 // Session authorization (sudo, su, RBAC role-elevation). Parsers populate
-// `workspace.limpid.user`, `workspace.limpid.session`, and
-// `workspace.limpid.privileges`.
+// `workspace.lsis.user`, `workspace.lsis.session`, and
+// `workspace.lsis.privileges`.
 def process compose_ocsf_authorize_session {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:    3003,
         category_uid: 3,
         activity_id:  activity,
         type_uid:     3003 * 100 + activity,
-        severity_id:  workspace.limpid.severity_id,
-        status_id:    workspace.limpid.status_id,
-        time:         coalesce(workspace.limpid.time, received_at),
-        user:         workspace.limpid.user,
-        actor:        workspace.limpid.actor,
-        session:      workspace.limpid.session,
-        src_endpoint: workspace.limpid.src_endpoint,
-        device:       workspace.limpid.device,
-        privileges:   workspace.limpid.privileges,
-        message:      workspace.limpid.message,
-        metadata:     workspace.limpid.metadata
+        severity_id:  workspace.lsis.severity_id,
+        status_id:    workspace.lsis.status_id,
+        time:         coalesce(workspace.lsis.time, received_at),
+        user:         workspace.lsis.user,
+        actor:        workspace.lsis.actor,
+        session:      workspace.lsis.session,
+        src_endpoint: workspace.lsis.src_endpoint,
+        device:       workspace.lsis.device,
+        privileges:   workspace.lsis.privileges,
+        message:      workspace.lsis.message,
+        metadata:     workspace.lsis.metadata
     }))
 }
 
@@ -438,20 +438,20 @@ def process compose_ocsf_authorize_session {
 //
 // Privilege grant / revoke / role-assignment operations.
 def process compose_ocsf_user_access_management {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:    3005,
         category_uid: 3,
         activity_id:  activity,
         type_uid:     3005 * 100 + activity,
-        severity_id:  workspace.limpid.severity_id,
-        time:         coalesce(workspace.limpid.time, received_at),
-        user:         workspace.limpid.user,
-        actor:        workspace.limpid.actor,
-        privileges:   workspace.limpid.privileges,
-        resource:     workspace.limpid.resource,
-        message:      workspace.limpid.message,
-        metadata:     workspace.limpid.metadata
+        severity_id:  workspace.lsis.severity_id,
+        time:         coalesce(workspace.lsis.time, received_at),
+        user:         workspace.lsis.user,
+        actor:        workspace.lsis.actor,
+        privileges:   workspace.lsis.privileges,
+        resource:     workspace.lsis.resource,
+        message:      workspace.lsis.message,
+        metadata:     workspace.lsis.metadata
     }))
 }
 
@@ -461,19 +461,19 @@ def process compose_ocsf_user_access_management {
 //
 // Group create / delete / membership change.
 def process compose_ocsf_group_management {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:    3006,
         category_uid: 3,
         activity_id:  activity,
         type_uid:     3006 * 100 + activity,
-        severity_id:  workspace.limpid.severity_id,
-        time:         coalesce(workspace.limpid.time, received_at),
-        group:        workspace.limpid.group,
-        user:         workspace.limpid.user,
-        actor:        workspace.limpid.actor,
-        message:      workspace.limpid.message,
-        metadata:     workspace.limpid.metadata
+        severity_id:  workspace.lsis.severity_id,
+        time:         coalesce(workspace.lsis.time, received_at),
+        group:        workspace.lsis.group,
+        user:         workspace.lsis.user,
+        actor:        workspace.lsis.actor,
+        message:      workspace.lsis.message,
+        metadata:     workspace.lsis.metadata
     }))
 }
 
@@ -486,29 +486,29 @@ def process compose_ocsf_group_management {
 // ---------------------------------------------------------------------------
 //
 // Generic network connection (firewall traffic logs, NetFlow, packet
-// captures). Parsers populate `workspace.limpid.src_endpoint`,
-// `workspace.limpid.dst_endpoint`, `workspace.limpid.connection_info`,
-// and optionally `workspace.limpid.traffic` (bytes_in/out).
+// captures). Parsers populate `workspace.lsis.src_endpoint`,
+// `workspace.lsis.dst_endpoint`, `workspace.lsis.connection_info`,
+// and optionally `workspace.lsis.traffic` (bytes_in/out).
 def process compose_ocsf_network_activity {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:       4001,
         category_uid:    4,
         activity_id:     activity,
         type_uid:        4001 * 100 + activity,
-        severity_id:     workspace.limpid.severity_id,
-        status_id:       workspace.limpid.status_id,
-        time:            coalesce(workspace.limpid.time, received_at),
-        src_endpoint:    workspace.limpid.src_endpoint,
-        dst_endpoint:    workspace.limpid.dst_endpoint,
-        connection_info: workspace.limpid.connection_info,
-        traffic:         workspace.limpid.traffic,
-        app_name:        workspace.limpid.app_name,
-        device:          workspace.limpid.device,
-        actor:           workspace.limpid.actor,
-        message:         workspace.limpid.message,
-        unmapped:        workspace.limpid.unmapped,
-        metadata:        workspace.limpid.metadata
+        severity_id:     workspace.lsis.severity_id,
+        status_id:       workspace.lsis.status_id,
+        time:            coalesce(workspace.lsis.time, received_at),
+        src_endpoint:    workspace.lsis.src_endpoint,
+        dst_endpoint:    workspace.lsis.dst_endpoint,
+        connection_info: workspace.lsis.connection_info,
+        traffic:         workspace.lsis.traffic,
+        app_name:        workspace.lsis.app_name,
+        device:          workspace.lsis.device,
+        actor:           workspace.lsis.actor,
+        message:         workspace.lsis.message,
+        unmapped:        workspace.lsis.unmapped,
+        metadata:        workspace.lsis.metadata
     }))
 }
 
@@ -517,28 +517,28 @@ def process compose_ocsf_network_activity {
 // ---------------------------------------------------------------------------
 //
 // HTTP request/response cycle (web servers, reverse proxies, WAFs).
-// Parsers populate `workspace.limpid.http_request` (method / url /
-// headers / body_length) and `workspace.limpid.http_response` (status /
+// Parsers populate `workspace.lsis.http_request` (method / url /
+// headers / body_length) and `workspace.lsis.http_response` (status /
 // headers / body_length).
 def process compose_ocsf_http_activity {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:     4002,
         category_uid:  4,
         activity_id:   activity,
         type_uid:      4002 * 100 + activity,
-        severity_id:   workspace.limpid.severity_id,
-        status_id:     workspace.limpid.status_id,
-        time:          coalesce(workspace.limpid.time, received_at),
-        src_endpoint:  workspace.limpid.src_endpoint,
-        dst_endpoint:  workspace.limpid.dst_endpoint,
-        device:        workspace.limpid.device,
-        actor:         workspace.limpid.actor,
-        http_request:  workspace.limpid.http_request,
-        http_response: workspace.limpid.http_response,
-        traffic:       workspace.limpid.traffic,
-        message:       workspace.limpid.message,
-        metadata:      workspace.limpid.metadata
+        severity_id:   workspace.lsis.severity_id,
+        status_id:     workspace.lsis.status_id,
+        time:          coalesce(workspace.lsis.time, received_at),
+        src_endpoint:  workspace.lsis.src_endpoint,
+        dst_endpoint:  workspace.lsis.dst_endpoint,
+        device:        workspace.lsis.device,
+        actor:         workspace.lsis.actor,
+        http_request:  workspace.lsis.http_request,
+        http_response: workspace.lsis.http_response,
+        traffic:       workspace.lsis.traffic,
+        message:       workspace.lsis.message,
+        metadata:      workspace.lsis.metadata
     }))
 }
 
@@ -547,26 +547,26 @@ def process compose_ocsf_http_activity {
 // ---------------------------------------------------------------------------
 //
 // DNS query / response (BIND, Unbound, Windows DNS, passive DNS taps).
-// Parsers populate `workspace.limpid.query` (question name + type) and
-// `workspace.limpid.answers` (resolved records).
+// Parsers populate `workspace.lsis.query` (question name + type) and
+// `workspace.lsis.answers` (resolved records).
 def process compose_ocsf_dns_activity {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:    4003,
         category_uid: 4,
         activity_id:  activity,
         type_uid:     4003 * 100 + activity,
-        severity_id:  workspace.limpid.severity_id,
-        rcode_id:     workspace.limpid.rcode_id,
-        time:         coalesce(workspace.limpid.time, received_at),
-        src_endpoint: workspace.limpid.src_endpoint,
-        dst_endpoint: workspace.limpid.dst_endpoint,
-        device:       workspace.limpid.device,
-        actor:        workspace.limpid.actor,
-        query:        workspace.limpid.query,
-        answers:      workspace.limpid.answers,
-        message:      workspace.limpid.message,
-        metadata:     workspace.limpid.metadata
+        severity_id:  workspace.lsis.severity_id,
+        rcode_id:     workspace.lsis.rcode_id,
+        time:         coalesce(workspace.lsis.time, received_at),
+        src_endpoint: workspace.lsis.src_endpoint,
+        dst_endpoint: workspace.lsis.dst_endpoint,
+        device:       workspace.lsis.device,
+        actor:        workspace.lsis.actor,
+        query:        workspace.lsis.query,
+        answers:      workspace.lsis.answers,
+        message:      workspace.lsis.message,
+        metadata:     workspace.lsis.metadata
     }))
 }
 
@@ -576,20 +576,20 @@ def process compose_ocsf_dns_activity {
 //
 // DHCP lease lifecycle (discover / offer / request / ack / release).
 def process compose_ocsf_dhcp_activity {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:    4004,
         category_uid: 4,
         activity_id:  activity,
         type_uid:     4004 * 100 + activity,
-        severity_id:  workspace.limpid.severity_id,
-        time:         coalesce(workspace.limpid.time, received_at),
-        src_endpoint: workspace.limpid.src_endpoint,
-        dst_endpoint: workspace.limpid.dst_endpoint,
-        is_renewal:   workspace.limpid.is_renewal,
-        lease_dur:    workspace.limpid.lease_dur,
-        message:      workspace.limpid.message,
-        metadata:     workspace.limpid.metadata
+        severity_id:  workspace.lsis.severity_id,
+        time:         coalesce(workspace.lsis.time, received_at),
+        src_endpoint: workspace.lsis.src_endpoint,
+        dst_endpoint: workspace.lsis.dst_endpoint,
+        is_renewal:   workspace.lsis.is_renewal,
+        lease_dur:    workspace.lsis.lease_dur,
+        message:      workspace.lsis.message,
+        metadata:     workspace.lsis.metadata
     }))
 }
 
@@ -597,22 +597,22 @@ def process compose_ocsf_dhcp_activity {
 // RDP Activity (class_uid 4005)
 // ---------------------------------------------------------------------------
 def process compose_ocsf_rdp_activity {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:    4005,
         category_uid: 4,
         activity_id:  activity,
         type_uid:     4005 * 100 + activity,
-        severity_id:  workspace.limpid.severity_id,
-        time:         coalesce(workspace.limpid.time, received_at),
-        src_endpoint: workspace.limpid.src_endpoint,
-        dst_endpoint: workspace.limpid.dst_endpoint,
-        protocol_ver: workspace.limpid.protocol_ver,
-        capabilities: workspace.limpid.capabilities,
-        device:       workspace.limpid.device,
-        user:         workspace.limpid.user,
-        message:      workspace.limpid.message,
-        metadata:     workspace.limpid.metadata
+        severity_id:  workspace.lsis.severity_id,
+        time:         coalesce(workspace.lsis.time, received_at),
+        src_endpoint: workspace.lsis.src_endpoint,
+        dst_endpoint: workspace.lsis.dst_endpoint,
+        protocol_ver: workspace.lsis.protocol_ver,
+        capabilities: workspace.lsis.capabilities,
+        device:       workspace.lsis.device,
+        user:         workspace.lsis.user,
+        message:      workspace.lsis.message,
+        metadata:     workspace.lsis.metadata
     }))
 }
 
@@ -620,22 +620,22 @@ def process compose_ocsf_rdp_activity {
 // SMB Activity (class_uid 4006)
 // ---------------------------------------------------------------------------
 def process compose_ocsf_smb_activity {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:    4006,
         category_uid: 4,
         activity_id:  activity,
         type_uid:     4006 * 100 + activity,
-        severity_id:  workspace.limpid.severity_id,
-        time:         coalesce(workspace.limpid.time, received_at),
-        src_endpoint: workspace.limpid.src_endpoint,
-        dst_endpoint: workspace.limpid.dst_endpoint,
-        share:        workspace.limpid.share,
-        share_type_id: workspace.limpid.share_type_id,
-        file:         workspace.limpid.file,
-        command:      workspace.limpid.command,
-        message:      workspace.limpid.message,
-        metadata:     workspace.limpid.metadata
+        severity_id:  workspace.lsis.severity_id,
+        time:         coalesce(workspace.lsis.time, received_at),
+        src_endpoint: workspace.lsis.src_endpoint,
+        dst_endpoint: workspace.lsis.dst_endpoint,
+        share:        workspace.lsis.share,
+        share_type_id: workspace.lsis.share_type_id,
+        file:         workspace.lsis.file,
+        command:      workspace.lsis.command,
+        message:      workspace.lsis.message,
+        metadata:     workspace.lsis.metadata
     }))
 }
 
@@ -643,23 +643,23 @@ def process compose_ocsf_smb_activity {
 // SSH Activity (class_uid 4007)
 // ---------------------------------------------------------------------------
 def process compose_ocsf_ssh_activity {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:    4007,
         category_uid: 4,
         activity_id:  activity,
         type_uid:     4007 * 100 + activity,
-        severity_id:  workspace.limpid.severity_id,
-        time:         coalesce(workspace.limpid.time, received_at),
-        src_endpoint: workspace.limpid.src_endpoint,
-        dst_endpoint: workspace.limpid.dst_endpoint,
-        protocol_ver: workspace.limpid.protocol_ver,
-        client_hassh: workspace.limpid.client_hassh,
-        server_hassh: workspace.limpid.server_hassh,
-        auth_type:    workspace.limpid.auth_type,
-        user:         workspace.limpid.user,
-        message:      workspace.limpid.message,
-        metadata:     workspace.limpid.metadata
+        severity_id:  workspace.lsis.severity_id,
+        time:         coalesce(workspace.lsis.time, received_at),
+        src_endpoint: workspace.lsis.src_endpoint,
+        dst_endpoint: workspace.lsis.dst_endpoint,
+        protocol_ver: workspace.lsis.protocol_ver,
+        client_hassh: workspace.lsis.client_hassh,
+        server_hassh: workspace.lsis.server_hassh,
+        auth_type:    workspace.lsis.auth_type,
+        user:         workspace.lsis.user,
+        message:      workspace.lsis.message,
+        metadata:     workspace.lsis.metadata
     }))
 }
 
@@ -667,22 +667,22 @@ def process compose_ocsf_ssh_activity {
 // FTP Activity (class_uid 4008)
 // ---------------------------------------------------------------------------
 def process compose_ocsf_ftp_activity {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:    4008,
         category_uid: 4,
         activity_id:  activity,
         type_uid:     4008 * 100 + activity,
-        severity_id:  workspace.limpid.severity_id,
-        time:         coalesce(workspace.limpid.time, received_at),
-        src_endpoint: workspace.limpid.src_endpoint,
-        dst_endpoint: workspace.limpid.dst_endpoint,
-        command:      workspace.limpid.command,
-        codes:        workspace.limpid.codes,
-        port:         workspace.limpid.port,
-        file:         workspace.limpid.file,
-        message:      workspace.limpid.message,
-        metadata:     workspace.limpid.metadata
+        severity_id:  workspace.lsis.severity_id,
+        time:         coalesce(workspace.lsis.time, received_at),
+        src_endpoint: workspace.lsis.src_endpoint,
+        dst_endpoint: workspace.lsis.dst_endpoint,
+        command:      workspace.lsis.command,
+        codes:        workspace.lsis.codes,
+        port:         workspace.lsis.port,
+        file:         workspace.lsis.file,
+        message:      workspace.lsis.message,
+        metadata:     workspace.lsis.metadata
     }))
 }
 
@@ -690,23 +690,23 @@ def process compose_ocsf_ftp_activity {
 // Email Activity (class_uid 4009)
 // ---------------------------------------------------------------------------
 def process compose_ocsf_email_activity {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:    4009,
         category_uid: 4,
         activity_id:  activity,
         type_uid:     4009 * 100 + activity,
-        severity_id:  workspace.limpid.severity_id,
-        direction_id: workspace.limpid.direction_id,
-        time:         coalesce(workspace.limpid.time, received_at),
-        src_endpoint: workspace.limpid.src_endpoint,
-        dst_endpoint: workspace.limpid.dst_endpoint,
-        device:       workspace.limpid.device,
-        actor:        workspace.limpid.actor,
-        email:        workspace.limpid.email,
-        smtp_hello:   workspace.limpid.smtp_hello,
-        message:      workspace.limpid.message,
-        metadata:     workspace.limpid.metadata
+        severity_id:  workspace.lsis.severity_id,
+        direction_id: workspace.lsis.direction_id,
+        time:         coalesce(workspace.lsis.time, received_at),
+        src_endpoint: workspace.lsis.src_endpoint,
+        dst_endpoint: workspace.lsis.dst_endpoint,
+        device:       workspace.lsis.device,
+        actor:        workspace.lsis.actor,
+        email:        workspace.lsis.email,
+        smtp_hello:   workspace.lsis.smtp_hello,
+        message:      workspace.lsis.message,
+        metadata:     workspace.lsis.metadata
     }))
 }
 
@@ -716,21 +716,21 @@ def process compose_ocsf_email_activity {
 //
 // Cross-host file access over network protocols (NFS, SMB-as-FS, etc.).
 def process compose_ocsf_network_file_activity {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:    4010,
         category_uid: 4,
         activity_id:  activity,
         type_uid:     4010 * 100 + activity,
-        severity_id:  workspace.limpid.severity_id,
-        time:         coalesce(workspace.limpid.time, received_at),
-        src_endpoint: workspace.limpid.src_endpoint,
-        dst_endpoint: workspace.limpid.dst_endpoint,
-        file:         workspace.limpid.file,
-        share:        workspace.limpid.share,
-        actor:        workspace.limpid.actor,
-        message:      workspace.limpid.message,
-        metadata:     workspace.limpid.metadata
+        severity_id:  workspace.lsis.severity_id,
+        time:         coalesce(workspace.lsis.time, received_at),
+        src_endpoint: workspace.lsis.src_endpoint,
+        dst_endpoint: workspace.lsis.dst_endpoint,
+        file:         workspace.lsis.file,
+        share:        workspace.lsis.share,
+        actor:        workspace.lsis.actor,
+        message:      workspace.lsis.message,
+        metadata:     workspace.lsis.metadata
     }))
 }
 
@@ -743,28 +743,28 @@ def process compose_ocsf_network_file_activity {
 // ---------------------------------------------------------------------------
 //
 // API call records (CloudTrail, k8s audit log, internal API gateway).
-// Parsers populate `workspace.limpid.api` (operation / version / service)
-// and `workspace.limpid.actor` (the calling principal).
+// Parsers populate `workspace.lsis.api` (operation / version / service)
+// and `workspace.lsis.actor` (the calling principal).
 def process compose_ocsf_api_activity {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:    6003,
         category_uid: 6,
         activity_id:  activity,
         type_uid:     6003 * 100 + activity,
-        severity_id:  workspace.limpid.severity_id,
-        status_id:    workspace.limpid.status_id,
-        time:         coalesce(workspace.limpid.time, received_at),
-        api:          workspace.limpid.api,
-        actor:        workspace.limpid.actor,
-        src_endpoint: workspace.limpid.src_endpoint,
-        dst_endpoint: workspace.limpid.dst_endpoint,
-        http_request: workspace.limpid.http_request,
-        cloud:        workspace.limpid.cloud,
-        resources:    workspace.limpid.resources,
-        message:      workspace.limpid.message,
-        unmapped:     workspace.limpid.unmapped,
-        metadata:     workspace.limpid.metadata
+        severity_id:  workspace.lsis.severity_id,
+        status_id:    workspace.lsis.status_id,
+        time:         coalesce(workspace.lsis.time, received_at),
+        api:          workspace.lsis.api,
+        actor:        workspace.lsis.actor,
+        src_endpoint: workspace.lsis.src_endpoint,
+        dst_endpoint: workspace.lsis.dst_endpoint,
+        http_request: workspace.lsis.http_request,
+        cloud:        workspace.lsis.cloud,
+        resources:    workspace.lsis.resources,
+        message:      workspace.lsis.message,
+        unmapped:     workspace.lsis.unmapped,
+        metadata:     workspace.lsis.metadata
     }))
 }
 
@@ -773,26 +773,26 @@ def process compose_ocsf_api_activity {
 // ---------------------------------------------------------------------------
 //
 // Used by web-filter and similar URL-allow/deny events. Parsers
-// populate `workspace.limpid.http_request` (url + method),
-// `workspace.limpid.web_resources` (categorisation), and
-// `workspace.limpid.actor.user` for the requesting user.
+// populate `workspace.lsis.http_request` (url + method),
+// `workspace.lsis.web_resources` (categorisation), and
+// `workspace.lsis.actor.user` for the requesting user.
 def process compose_ocsf_web_resource_access {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:     6004,
         category_uid:  6,
         activity_id:   activity,
         type_uid:      6004 * 100 + activity,
-        severity_id:   workspace.limpid.severity_id,
-        time:          coalesce(workspace.limpid.time, received_at),
-        src_endpoint:  workspace.limpid.src_endpoint,
-        dst_endpoint:  workspace.limpid.dst_endpoint,
-        http_request:  workspace.limpid.http_request,
-        http_response: workspace.limpid.http_response,
-        web_resources: workspace.limpid.web_resources,
-        actor:         workspace.limpid.actor,
-        message:       workspace.limpid.message,
-        metadata:      workspace.limpid.metadata
+        severity_id:   workspace.lsis.severity_id,
+        time:          coalesce(workspace.lsis.time, received_at),
+        src_endpoint:  workspace.lsis.src_endpoint,
+        dst_endpoint:  workspace.lsis.dst_endpoint,
+        http_request:  workspace.lsis.http_request,
+        http_response: workspace.lsis.http_response,
+        web_resources: workspace.lsis.web_resources,
+        actor:         workspace.lsis.actor,
+        message:       workspace.lsis.message,
+        metadata:      workspace.lsis.metadata
     }))
 }
 
@@ -802,22 +802,22 @@ def process compose_ocsf_web_resource_access {
 //
 // Database / S3 / object-store access events.
 def process compose_ocsf_datastore_activity {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:    6005,
         category_uid: 6,
         activity_id:  activity,
         type_uid:     6005 * 100 + activity,
-        severity_id:  workspace.limpid.severity_id,
-        time:         coalesce(workspace.limpid.time, received_at),
-        actor:        workspace.limpid.actor,
-        src_endpoint: workspace.limpid.src_endpoint,
-        database:     workspace.limpid.database,
-        databucket:   workspace.limpid.databucket,
-        table:        workspace.limpid.table,
-        query_info:   workspace.limpid.query_info,
-        message:      workspace.limpid.message,
-        metadata:     workspace.limpid.metadata
+        severity_id:  workspace.lsis.severity_id,
+        time:         coalesce(workspace.lsis.time, received_at),
+        actor:        workspace.lsis.actor,
+        src_endpoint: workspace.lsis.src_endpoint,
+        database:     workspace.lsis.database,
+        databucket:   workspace.lsis.databucket,
+        table:        workspace.lsis.table,
+        query_info:   workspace.lsis.query_info,
+        message:      workspace.lsis.message,
+        metadata:     workspace.lsis.metadata
     }))
 }
 
@@ -828,19 +828,19 @@ def process compose_ocsf_datastore_activity {
 // Vulnerability / asset / config scan job records (the orchestration
 // layer; individual findings are class 2002 / 2003).
 def process compose_ocsf_scan_activity {
-    let activity = workspace.limpid.activity_id
+    let activity = workspace.lsis.activity_id
     egress = to_json(null_omit({
         class_uid:    6007,
         category_uid: 6,
         activity_id:  activity,
         type_uid:     6007 * 100 + activity,
-        severity_id:  workspace.limpid.severity_id,
-        time:         coalesce(workspace.limpid.time, received_at),
-        scan:         workspace.limpid.scan,
-        actor:        workspace.limpid.actor,
-        devices:      workspace.limpid.devices,
-        policy:       workspace.limpid.policy,
-        message:      workspace.limpid.message,
-        metadata:     workspace.limpid.metadata
+        severity_id:  workspace.lsis.severity_id,
+        time:         coalesce(workspace.lsis.time, received_at),
+        scan:         workspace.lsis.scan,
+        actor:        workspace.lsis.actor,
+        devices:      workspace.lsis.devices,
+        policy:       workspace.lsis.policy,
+        message:      workspace.lsis.message,
+        metadata:     workspace.lsis.metadata
     }))
 }

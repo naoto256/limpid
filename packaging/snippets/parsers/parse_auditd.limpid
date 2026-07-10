@@ -48,7 +48,7 @@
 //                     }
 //                 } | parse_auditd | compose_ocsf
 //
-// Output:   OCSF records on `workspace.limpid`. The class depends
+// Output:   OCSF records on `workspace.lsis`. The class depends
 //           on the auditd record type:
 //             3002 Authentication             USER_LOGIN / USER_LOGOUT / USER_AUTH /
 //                                              USER_ACCT / CRED_ACQ / CRED_DISP /
@@ -466,7 +466,7 @@ def process parse_auditd_auth_dispatch {
         2       { 3 }          // Medium for auth failure
         default { 1 }
     }
-    workspace.limpid = auditd_auth_record(
+    workspace.lsis = auditd_auth_record(
         activity, status, severity,
         user, addr, terminal, pid, exe,
         workspace.auditd.hostname,
@@ -506,7 +506,7 @@ def process parse_auditd_account_dispatch {
         "role_change" { 2 }
         default       { 99 }
     }
-    workspace.limpid = auditd_account_change_record(
+    workspace.lsis = auditd_account_change_record(
         activity,
         auditd_status_id(res),
         switch true { is_group { null } default { target_user } },
@@ -545,7 +545,7 @@ def process parse_auditd_process_dispatch {
         "no"   { 2 }
         default { 99 }
     }
-    workspace.limpid = auditd_process_record(
+    workspace.lsis = auditd_process_record(
         activity, status,
         comm, exe, pid, ppid, uid,
         workspace.auditd.hostname,
@@ -571,7 +571,7 @@ def process parse_auditd_file_dispatch {
     let body = workspace.auditd.body
     let path_name = parse_auditd_outer_kv_quoted(body, "name")
     let cwd = parse_auditd_outer_kv_quoted(body, "cwd")
-    workspace.limpid = auditd_file_record(
+    workspace.lsis = auditd_file_record(
         99,                          // Other (open / access / etc. unknown without SYSCALL pair)
         1,
         coalesce(path_name, cwd),
@@ -655,7 +655,7 @@ def process parse_auditd_lifecycle_dispatch {
         "SOFTWARE_UPDATE" { 2 }     // Update
         default           { 99 }    // Other
     }
-    workspace.limpid = auditd_lifecycle_record(
+    workspace.lsis = auditd_lifecycle_record(
         activity, auditd_status_id(res),
         comm, exe, pid,
         workspace.auditd.hostname,
@@ -706,7 +706,7 @@ def process parse_auditd_network_dispatch {
     let src = parse_auditd_outer_kv(body, "src")
     let dst = parse_auditd_outer_kv(body, "dst")
     let res = parse_auditd_outer_kv(body, "res")
-    workspace.limpid = auditd_network_event_record(
+    workspace.lsis = auditd_network_event_record(
         99,                                     // Other (kernel netfilter / IPsec event)
         auditd_status_id(res),
         src, dst,
@@ -795,7 +795,7 @@ def process parse_auditd_config_dispatch {
         "CONFIG_CHANGE" { 2 }
         default         { 1 }
     }
-    workspace.limpid = auditd_config_record(
+    workspace.lsis = auditd_config_record(
         title, severity,
         comm, exe, pid,
         workspace.auditd.hostname,
@@ -826,7 +826,7 @@ def process parse_auditd_finding_dispatch {
         "anom_abend" { 3 }
         default      { 2 }
     }
-    workspace.limpid = auditd_finding_record(
+    workspace.lsis = auditd_finding_record(
         severity, title, 99,
         workspace.auditd.hostname,
         workspace.auditd.time,

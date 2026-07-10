@@ -4,11 +4,11 @@
 //! `Value::Null`. If every argument is null, returns `Null`.
 //!
 //! Designed for the OCSF / replay-shape composers, where a populated
-//! field on `workspace.limpid` should win over an environmental
+//! field on `workspace.lsis` should win over an environmental
 //! fallback (`received_at`, `hostname()`, an explicit literal). The
 //! pre-coalesce idiom was a per-leaf `switch true { x != null { x }
 //! default { y } }`, which is correct but verbose at 27 OCSF leaves.
-//! `coalesce(workspace.limpid.time, received_at)` is the same
+//! `coalesce(workspace.lsis.time, received_at)` is the same
 //! semantically, ten characters wide, and reads top-to-bottom.
 //!
 //! Semantics:

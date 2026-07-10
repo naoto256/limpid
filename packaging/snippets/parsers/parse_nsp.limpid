@@ -43,7 +43,7 @@
 //                 { workspace.nsp = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_nsp | compose_ocsf
 //
 // Output:   OCSF Detection Finding (class_uid 2004) records on
-//           `workspace.limpid`.
+//           `workspace.lsis`.
 //
 // Sample bodies (synthetic, anonymised to RFC 5737):
 //
@@ -296,7 +296,7 @@ def process parse_nsp {
             error "parse_nsp: not a Trellix NSP standard-template body: ${workspace.nsp.body}"
         }
         default {
-            workspace.limpid = nsp_finding_record(
+            workspace.lsis = nsp_finding_record(
                 workspace.nsp_kv,
                 workspace.nsp.hostname,
                 workspace.nsp.time
