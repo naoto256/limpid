@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime shape converge. After 1.0, changes will follow semver strictly.
 
+## [0.7.12] - 2026-07-11
+
+0.7.12 is a hotfix for a daemon-fatal SIGPIPE path: a saturated stderr / systemd-journald pipe under a tracing burst (typically a downed OTLP output driving its retry loop's WARN spam) would take the whole daemon with it, and systemd would not restart it because the exit looked clean. The daemon now keeps Rust's `SIG_IGN` default for `SIGPIPE`, and the shipped `limpid.service` unit restarts on any exit reason as defence-in-depth against future variants.
+
+### Fixed — daemon no longer dies on a broken tracing pipe
+
+`crates/limpid/src/main.rs` previously restored `SIGPIPE = SIG_DFL` at process entry unconditionally, before CLI parsing. The intent was to make CLI-style modes (`--check`, `--test-pipeline`, `--graph`) terminate cleanly when their stdout was piped through `head` / `less`; the effect was to also arm the daemon to die on any broken pipe. Under a downed OTLP endpoint, the retry loop's per-attempt `tracing::warn!` messages saturated the stderr-to-journald forwarding pipe; when the pipe closed, the next write raised `SIGPIPE` and the process exited (systemd log: `Deactivated successfully. … signal=PIPE`). Restart was suppressed because the exit was clean from systemd's perspective.
+
+The fix moves the `SIG_DFL` install after `Cli::parse()` and gates it on the CLI-mode flags. Daemon mode now keeps Rust's `SIG_IGN` default, so a broken pipe on the stderr side surfaces as an ordinary `EPIPE` write error the tracing subscriber drops rather than a fatal signal. The CLI-mode behaviour is unchanged: `--check | head` still terminates cleanly on downstream close.
+
+### Changed — packaged systemd unit uses `Restart=always` and disables `StartLimitIntervalSec`
+
+`packaging/limpid.service` moves from `Restart=on-failure` to `Restart=always` so a signal-killed exit that systemd classifies as clean (SIGPIPE being the load-bearing case) still triggers a restart. `systemctl stop` continues to stop the unit cleanly because systemd remembers operator-initiated transitions and does not restart across them. `StartLimitIntervalSec=0` disables the start-rate ceiling so a sustained-crash regression cannot wedge the unit into `failed` state; `RestartSec=5` still paces individual restart attempts. Together the two settings turn systemd into a real defence-in-depth layer around whatever the daemon itself missed to catch.
+
 ## [0.7.11] - 2026-07-11
 
 0.7.11 formalises the snippet library's contracts. The library has grown from a handful of parsers into 39 files across four kinds (parsers / composers / filters / functions), and the ad-hoc header conventions and namespace naming had started to obscure rather than help — vendor documentation blocks and shared-intermediate blurbs were repeating themselves out of sync, the intermediate namespace's `workspace.limpid` name conflated the schema shape with the daemon crate, and the composer contract left it up to each snippet to write `egress` directly with no invariant an operator could rely on. 0.7.11 renames the intermediate to LSIS (Limpid Snippet Intermediate Schema, `workspace.lsis.*`), extracts the header schema into an xtask-enforced per-kind contract with an auto-generated inventory in the packaging README, splits composers into a schema layer that writes an LSIS slot and an envelope layer that wraps a payload, and introduces a `compose_otlp` envelope composer alongside a single-writer invariant on `egress`. Five cloud parsers (AWS GuardDuty, VPC Flow, Azure Activity, Kubernetes audit, Okta System Log) join the tracked set. The daemon runtime is unchanged in shape and throughput — the behaviour differences are confined to what shipped snippets produce, and the two user-visible breaking changes for out-of-tree configs are the namespace rename and the composer-contract split (both described in their own sections below).
@@ -1909,6 +1923,7 @@ See `docs/src/operations/upgrade-0.3.md` for end-to-end migration recipes includ
 Initial public release. Rust + tokio log pipeline daemon replacing rsyslog / syslog-ng / fluentd with a single readable DSL (`def input`, `def process`, `def output`, `def pipeline`). Includes syslog (UDP/TCP/ TLS) / tail / journal / unix socket inputs; file / HTTP / Kafka / TCP / UDP / unix socket / stdout outputs; in-DSL expression language with parsers (JSON / KV / CEF / syslog), regex, string templates, tables with TTL, GeoIP; control socket (`limpidctl tap`, `stats`, `health`); hot reload via `SIGHUP` with automatic rollback; per-output disk-backed queues.
 
 [Unreleased]: https://github.com/naoto256/limpid/compare/v0.7.9...HEAD
+[0.7.12]: https://github.com/naoto256/limpid/compare/v0.7.11...v0.7.12
 [0.7.11]: https://github.com/naoto256/limpid/compare/v0.7.10...v0.7.11
 [0.7.9]: https://github.com/naoto256/limpid/compare/v0.7.8...v0.7.9
 [0.7.8]: https://github.com/naoto256/limpid/compare/v0.7.7...v0.7.8

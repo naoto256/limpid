@@ -1008,7 +1008,7 @@ Useful for tagging events with the forwarder's identity (e.g. when several limpi
 
 ### version()
 
-Returns the limpid daemon's version string, baked in at compile time (e.g. `"0.7.11"`).
+Returns the limpid daemon's version string, baked in at compile time (e.g. `"0.7.12"`).
 
 ```limpid
 workspace.processed_by_version = version()
