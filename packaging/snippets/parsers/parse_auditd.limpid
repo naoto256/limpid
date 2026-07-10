@@ -1,10 +1,18 @@
-// Linux auditd parser (vocabulary)
+// Summary:     Linux kernel audit records (auditd / audispd / auditbeat wire
+//              text) → LSIS, dispatched by record type.
+// Reads:       workspace.auditd.* (bridge — see Bridges below)
+//                .body (required, String) — the auditd record
+//                .hostname (optional, String) — host where audit ran
+//                .time (optional, Int) — epoch nanoseconds
+// Writes:      workspace.lsis.* — 3002 (Authentication), 3001 (Account Change),
+//              1007 (Process Activity), 1001 (File System Activity), 2004
+//              (Detection Finding), dispatched by record type; unmapped types
+//              route to error_log. Per-type table below.
+// Category:    Endpoint / host audit (Unix)
+// Test corpus: public (elastic/integrations auditd corpus — 69 records across
+//              ~45 record types)
 //
-// Vendor:   Linux kernel audit subsystem (auditd / audispd / auditbeat).
-//           Wire format defined by the kernel audit framework (RFC-less,
-//           but stable since Linux 2.6.6+). Not Solaris BSM, not
-//           Windows auditpol; each has its own format.
-// Wire:     auditd line-per-record text:
+// Wire —     auditd line-per-record text:
 //             type=<TYPE> msg=audit(<seconds>.<millis>:<serial>):
 //                 <key>=<value> ... [msg='<inner-key>=<inner-value> ...']
 //           Outer keys are space-separated KV (unquoted), with an
@@ -16,15 +24,16 @@
 //           parser treats each line as an independent event — no
 //           multi-record assembly. Each line carries enough fields
 //           to emit a useful OCSF record.
-// Intake:   workspace.auditd.body      (required, String) — the auditd record
-//           workspace.auditd.hostname  (optional, String) — host where audit ran
-//           workspace.auditd.time      (optional, Int)    — epoch nanoseconds
+//
+// Vendor notes — wire format defined by the kernel audit framework
+//           (RFC-less, but stable since Linux 2.6.6+). Not Solaris BSM,
+//           not Windows auditpol; each has its own format.
 //
 //           pid is not an intake field — auditd records carry their
 //           own `pid=` inside the body, and it's the audited process's
 //           pid (which is the meaningful one for OCSF), not the
 //           auditd daemon's. Extracted from the body.
-// Upstream: transport-agnostic. Three typical bridges:
+// Bridges —  transport-agnostic. Three typical bridges:
 //
 //           - file tail (most common — `audisp-syslog` writes
 //             `/var/log/audit/audit.log` and limpid tails it):
@@ -48,8 +57,7 @@
 //                     }
 //                 } | parse_auditd | compose_ocsf | ocsf_to_egress
 //
-// Output:   OCSF records on `workspace.lsis`. The class depends
-//           on the auditd record type:
+// Per-type dispatch (LSIS class depends on the auditd record type):
 //             3002 Authentication             USER_LOGIN / USER_LOGOUT / USER_AUTH /
 //                                              USER_ACCT / CRED_ACQ / CRED_DISP /
 //                                              USER_START / USER_END / LOGIN
@@ -62,9 +70,6 @@
 //             2004 Detection Finding          ANOM_ABEND / AVC / USER_AVC (SELinux denial)
 //             unmapped (routed to error_log)  System / config / network record types
 //                                              not yet in scope
-//
-// Coverage scope: verified against the elastic/integrations auditd
-// corpus (69 records across ~45 record types).
 
 // ---------------------------------------------------------------------------
 // Helpers

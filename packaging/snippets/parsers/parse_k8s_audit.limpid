@@ -1,0 +1,315 @@
+// Kubernetes audit event JSON parser
+//
+// Summary:     Kubernetes audit Event JSON (audit.k8s.io/v1) → LSIS API
+//              Activity + Authentication.
+// Reads:       ingress (raw wire) — one audit Event object per ingress
+//              (no {"items":[...]} envelope)
+// Writes:      workspace.lsis.* — 6003 (API Activity) for resource requests,
+//              3002 (Authentication) for authentication.k8s.io objectRefs;
+//              unknown kinds route to error_log.
+// Category:    Container / orchestration
+// Test corpus: spec-only (Kubernetes audit policy reference, kube-apiserver
+//              v1.29 audit.k8s.io/v1 schema; verb → activity_id per the OCSF
+//              6003 spec — verify against your apiserver's audit-policy
+//              output before production)
+//
+// Wire —        Kubernetes audit Event JSON — one event per `ingress`.
+//              kube-apiserver emits one JSON object per event (line-
+//              delimited when streamed via the `audit-webhook` backend
+//              or written to the audit log file). Top-level shape:
+//                {"kind":"Event","apiVersion":"audit.k8s.io/v1",
+//                 "level":"Metadata|Request|RequestResponse",
+//                 "auditID":"...","stage":"RequestReceived|ResponseStarted|ResponseComplete|Panic",
+//                 "requestURI":"...","verb":"get|list|watch|create|update|patch|delete|deletecollection|connect|...",
+//                 "user":{"username":"...","groups":["..."],"uid":"...","extra":{...}},
+//                 "impersonatedUser":{...},
+//                 "sourceIPs":["..."],"userAgent":"...",
+//                 "objectRef":{"resource":"pods","namespace":"default","name":"...","apiGroup":"","apiVersion":"v1","subresource":"..."},
+//                 "responseStatus":{"code":200,"status":"Success"},
+//                 "requestObject":{...},"responseObject":{...},
+//                 "requestReceivedTimestamp":"2026-04-29T10:00:00.000000Z",
+//                 "stageTimestamp":"2026-04-29T10:00:00.123456Z",
+//                 "annotations":{"authorization.k8s.io/decision":"allow", ...}}
+//              The S3 / file delivery is one event per line; do not
+//              expect a `{"items":[...]}` envelope here — handle any
+//              such envelope at the transport layer.
+//
+// Sample input (Metadata-level RequestResponse on a Pod create):
+//   {"kind":"Event","apiVersion":"audit.k8s.io/v1","level":"RequestResponse","auditID":"7c5cf7fa-1f1e-4a40-9e1c-1234567890ab","stage":"ResponseComplete","requestURI":"/api/v1/namespaces/default/pods","verb":"create","user":{"username":"system:serviceaccount:default:deployer","uid":"abc-123","groups":["system:serviceaccounts","system:serviceaccounts:default","system:authenticated"]},"sourceIPs":["192.0.2.10"],"userAgent":"kubectl/v1.29.0","objectRef":{"resource":"pods","namespace":"default","apiGroup":"","apiVersion":"v1"},"responseStatus":{"code":201},"requestReceivedTimestamp":"2026-04-29T10:00:00.000000Z","stageTimestamp":"2026-04-29T10:00:00.123456Z","annotations":{"authorization.k8s.io/decision":"allow","authorization.k8s.io/reason":""}}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// k8s verb → OCSF 6003 activity_id.
+//   1 Create / 2 Read / 3 Update / 4 Delete / 99 Other.
+//
+// `connect` (exec / portforward / attach / proxy subresources), the
+// rarely-seen `impersonate`, and any future verb fall through to
+// Other so a vendor addition surfaces as Other rather than being
+// silently misclassified.
+def function k8s_audit_activity_id(verb) {
+    switch verb {
+        "get"               { 2 }
+        "list"              { 2 }
+        "watch"             { 2 }
+        "create"            { 1 }
+        "update"            { 3 }
+        "patch"             { 3 }
+        "delete"            { 4 }
+        "deletecollection"  { 4 }
+        default             { 99 }
+    }
+}
+
+// HTTP response code → OCSF status_id. 2xx → Success, anything else
+// → Failure. Null (no responseStatus yet, e.g. stage=RequestReceived)
+// → Unknown (99). The 2xx test is integer division: 200..=299.
+def function k8s_audit_status_id(code) {
+    switch true {
+        code == null { 99 }
+        code < 200   { 2 }
+        code < 300   { 1 }
+        default      { 2 }
+    }
+}
+
+// Classify a parsed audit event by objectRef + verb. Returns
+// `{class_uid, activity_id}` or null when the wire is not a
+// recognised audit Event.
+//
+// authentication.k8s.io API group → 3002 Authentication
+// (TokenReview / SelfSubjectReview / TokenRequest are login-like
+// — the apiserver is being asked "is this credential valid?"
+// rather than "do X to a resource"). Everything else → 6003 API
+// Activity, which is the default since kube audit is itself an
+// API audit log.
+def function k8s_audit_classify(event) {
+    switch true {
+        event.kind != "Event" { null }
+        event.objectRef.apiGroup == "authentication.k8s.io" {
+            { class_uid: 3002, activity_id: 1 }
+        }
+        default {
+            { class_uid: 6003, activity_id: k8s_audit_activity_id(event.verb) }
+        }
+    }
+}
+
+// k8s user.username → OCSF actor.user.type. ServiceAccount usernames
+// have the well-known `system:serviceaccount:<ns>:<name>` shape;
+// other identities (real users, groups, anonymous) we leave null and
+// let downstream enrichment disambiguate.
+def function k8s_user_type(username) {
+    switch true {
+        username == null                                       { null }
+        starts_with(username, "system:serviceaccount:")        { "ServiceAccount" }
+        default                                                { null }
+    }
+}
+
+// Build the OCSF actor.user.groups array from a k8s `user.groups`
+// string array. OCSF wants `[{name: g}, ...]`; the wire ships bare
+// strings. Pure expression form using `map`.
+def function k8s_audit_build_groups(groups) {
+    switch true {
+        groups == null { null }
+        default        { map(groups) { |g| { name: g } } }
+    }
+}
+
+// Pick the first sourceIPs entry (proxy chain). OCSF src_endpoint.ip
+// is a single value; the full chain is preserved under
+// unmapped.source_ips at the call site.
+def function k8s_audit_pick_src_ip(source_ips) {
+    first(source_ips)
+}
+
+// ---------------------------------------------------------------------------
+// Main parser
+// ---------------------------------------------------------------------------
+
+def process parse_k8s_audit {
+    workspace.k8s = parse_json(ingress)
+    workspace.k8s_class = k8s_audit_classify(workspace.k8s)
+
+    switch true {
+        workspace.k8s_class == null {
+            error "parse_k8s_audit: not a kube audit Event (kind=${workspace.k8s.kind}): ${ingress}"
+        }
+        // objectRef is structurally required for both 6003 (api.resource
+        // comes from it) and 3002 (authentication.k8s.io reviews carry
+        // it too). Missing → loud-fail rather than emit a null-padded
+        // record. The rare apiserver paths that emit no objectRef
+        // (non-resource paths like /healthz, /metrics) should not be
+        // audited as resource access in the first place; if they leak
+        // into the audit stream, the operator-side filter should drop
+        // them upstream.
+        workspace.k8s.objectRef == null {
+            error "parse_k8s_audit: missing objectRef (non-resource path or malformed event): ${ingress}"
+        }
+        // user.groups is fed to `map(groups) { |g| { name: g } }` to
+        // build OCSF actor.user.groups. Pre-validate type so a non-array
+        // surfaces as a parser-authored loud-fail rather than a generic
+        // `map() expects an array` DSL primitive error.
+        workspace.k8s.user.groups != null and not is_array(workspace.k8s.user.groups) {
+            error "parse_k8s_audit: user.groups is not an array (got ${workspace.k8s.user.groups}): ${ingress}"
+        }
+        workspace.k8s.sourceIPs != null and not is_array(workspace.k8s.sourceIPs) {
+            error "parse_k8s_audit: sourceIPs is not an array (got ${workspace.k8s.sourceIPs}): ${ingress}"
+        }
+        workspace.k8s_class.class_uid == 3002 { process parse_k8s_audit_authn }
+        workspace.k8s_class.class_uid == 6003 { process parse_k8s_audit_api }
+        default {
+            error "parse_k8s_audit: unsupported class_uid ${workspace.k8s_class.class_uid}: ${ingress}"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 6003 API Activity — default branch (kube audit is an API audit log)
+// ---------------------------------------------------------------------------
+
+def process parse_k8s_audit_api {
+    let activity = workspace.k8s_class.activity_id
+    let status = k8s_audit_status_id(workspace.k8s.responseStatus.code)
+    let groups = k8s_audit_build_groups(workspace.k8s.user.groups)
+    let src_ip = k8s_audit_pick_src_ip(workspace.k8s.sourceIPs)
+
+    // Resource path for OCSF api.resource — apiGroup/apiVersion/resource
+    // joined with `/`, stripping the leading slash for core (apiGroup
+    // is empty string for the legacy "" group, e.g. pods/services).
+    let api_group = coalesce(workspace.k8s.objectRef.apiGroup, "")
+    let resource_path = switch true {
+        api_group == "" { workspace.k8s.objectRef.resource }
+        default         { "${api_group}/${workspace.k8s.objectRef.resource}" }
+    }
+
+    workspace.lsis = {
+        class_uid:    6003,
+        category_uid: 6,
+        activity_id:  activity,
+        type_uid:     6003 * 100 + activity,
+        severity_id:  1,
+        status_id:    status,
+        time:         to_int(parse_datetime_rfc3339(workspace.k8s.stageTimestamp)),
+        api: {
+            operation: workspace.k8s.verb,
+            version:   workspace.k8s.apiVersion,
+            service:   { name: "kube-apiserver" },
+            request:   { uid: workspace.k8s.auditID },
+            response:  { code: workspace.k8s.responseStatus.code },
+            resource: {
+                name:      workspace.k8s.objectRef.name,
+                namespace: workspace.k8s.objectRef.namespace,
+                type:      resource_path,
+                uid:       workspace.k8s.objectRef.uid
+            }
+        },
+        actor: {
+            user: {
+                name:   workspace.k8s.user.username,
+                uid:    workspace.k8s.user.uid,
+                type:   k8s_user_type(workspace.k8s.user.username),
+                groups: groups
+            }
+        },
+        src_endpoint: { ip: src_ip },
+        http_request: {
+            user_agent: workspace.k8s.userAgent,
+            url:        { path: workspace.k8s.requestURI }
+        },
+        message: workspace.k8s.responseStatus.message,
+        unmapped: {
+            level:                 workspace.k8s.level,
+            stage:                 workspace.k8s.stage,
+            audit_id:              workspace.k8s.auditID,
+            source_ips:            workspace.k8s.sourceIPs,
+            subresource:           workspace.k8s.objectRef.subresource,
+            response_status:       workspace.k8s.responseStatus,
+            request_received_time: workspace.k8s.requestReceivedTimestamp,
+            stage_time:            workspace.k8s.stageTimestamp,
+            annotations:           workspace.k8s.annotations,
+            impersonated_user:     workspace.k8s.impersonatedUser,
+            request_object:        workspace.k8s.requestObject,
+            response_object:       workspace.k8s.responseObject
+        },
+        metadata: {
+            product: {
+                vendor_name: "Kubernetes",
+                name:        "kube-apiserver audit"
+            },
+            version: "1.3.0"
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3002 Authentication — TokenReview / SelfSubjectReview / TokenRequest
+// (authentication.k8s.io API group)
+// ---------------------------------------------------------------------------
+
+def process parse_k8s_audit_authn {
+    let status = k8s_audit_status_id(workspace.k8s.responseStatus.code)
+    let groups = k8s_audit_build_groups(workspace.k8s.user.groups)
+    let src_ip = k8s_audit_pick_src_ip(workspace.k8s.sourceIPs)
+
+    workspace.lsis = {
+        class_uid:    3002,
+        category_uid: 3,
+        activity_id:  1,            // Logon — TokenReview/TokenRequest validates a credential
+        type_uid:     3002 * 100 + 1,
+        severity_id:  1,
+        status_id:    status,
+        time:         to_int(parse_datetime_rfc3339(workspace.k8s.stageTimestamp)),
+        auth_protocol: "Kubernetes",
+        auth_protocol_id: 99,
+        actor: {
+            user: {
+                name:   workspace.k8s.user.username,
+                uid:    workspace.k8s.user.uid,
+                type:   k8s_user_type(workspace.k8s.user.username),
+                groups: groups
+            }
+        },
+        // For TokenReview-style flows the "user being authenticated" is
+        // the actor; OCSF's top-level `user` is the same identity here.
+        // Leave it set so 3002 consumers expecting `user` populated do
+        // not have to dig into `actor`.
+        user: {
+            name:   workspace.k8s.user.username,
+            uid:    workspace.k8s.user.uid,
+            type:   k8s_user_type(workspace.k8s.user.username),
+            groups: groups
+        },
+        src_endpoint: { ip: src_ip },
+        http_request: {
+            user_agent: workspace.k8s.userAgent,
+            url:        { path: workspace.k8s.requestURI }
+        },
+        message: workspace.k8s.responseStatus.message,
+        unmapped: {
+            level:                 workspace.k8s.level,
+            stage:                 workspace.k8s.stage,
+            audit_id:              workspace.k8s.auditID,
+            source_ips:            workspace.k8s.sourceIPs,
+            verb:                  workspace.k8s.verb,
+            resource:              workspace.k8s.objectRef.resource,
+            api_group:             workspace.k8s.objectRef.apiGroup,
+            response_status:       workspace.k8s.responseStatus,
+            request_received_time: workspace.k8s.requestReceivedTimestamp,
+            stage_time:            workspace.k8s.stageTimestamp,
+            annotations:           workspace.k8s.annotations,
+            impersonated_user:     workspace.k8s.impersonatedUser,
+            request_object:        workspace.k8s.requestObject,
+            response_object:       workspace.k8s.responseObject
+        },
+        metadata: {
+            product: {
+                vendor_name: "Kubernetes",
+                name:        "kube-apiserver audit"
+            },
+            version: "1.3.0"
+        }
+    }
+}

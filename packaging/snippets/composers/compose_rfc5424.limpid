@@ -1,23 +1,33 @@
-// Wire:     RFC 5424 syslog (https://datatracker.ietf.org/doc/html/rfc5424)
-// Upstream: parse_journald | compose_rfc5424
-//             reads workspace.journald.{PRIORITY, SYSLOG_FACILITY,
-//                   SYSLOG_IDENTIFIER, _COMM, _PID, SYSLOG_PID, MESSAGE}
-//           Other upstreams (e.g. workspace.syslog.* or workspace.cef.*)
-//           are out of scope — write your own composer if you need to
-//           re-wrap from a different intermediate.
-// Output:   workspace.lsis.rfc5424 — single-line RFC 5424 record (String)
-//           egress = workspace.lsis.rfc5424 via `rfc5424_to_egress`
-//                    (opt in per pipeline; see foot of file)
+// Summary:     journald entry → single-line RFC 5424 syslog record
+//              (https://datatracker.ietf.org/doc/html/rfc5424).
+// Reads:       workspace.journald.* (from parse_journald)
+//                .PRIORITY           (optional, String) — severity 0-7
+//                .SYSLOG_FACILITY    (optional, String) — facility number
+//                .SYSLOG_IDENTIFIER  (optional, String) — APP-NAME source
+//                ._COMM              (optional, String) — APP-NAME fallback
+//                ._PID               (optional, String) — PROCID source
+//                .SYSLOG_PID         (optional, String) — PROCID fallback
+//                ._HOSTNAME          (optional, String) — originating host
+//                .MESSAGE            (optional, String) — MSG (verbatim)
+//              Other upstreams (e.g. workspace.syslog.* or
+//              workspace.cef.*) are out of scope — write your own
+//              composer if you need to re-wrap from a different
+//              intermediate.
+// Writes:      workspace.lsis.rfc5424 — single-line RFC 5424 record
+//              (String). Pipe `| rfc5424_to_egress` (foot of file)
+//              to emit it as the wire form.
+// Test corpus: spec-only (RFC 5424 frame shape; field decisions
+//              documented below)
 //
 // Generic journald → RFC 5424 wire composer. Replaces the hand-rolled
 // `wrap_<program>` patterns that used to live per-host (one per
 // service: sshd / sudo / etc.) and that re-extracted PID and identifier
 // from a synthesised string.
 //
-// Wire shape:
+// Wire shape —
 //   <PRI>1 TIMESTAMP HOSTNAME APP-NAME PROCID MSGID STRUCTURED-DATA MSG
 //
-// Field decisions:
+// Field decisions —
 //   PRI             coalesce(SYSLOG_FACILITY, "1")*8 + coalesce(PRIORITY, "6")
 //                   Default 14 (user.info) when journald did not record one.
 //                   Edge does NOT preserve __REALTIME_TIMESTAMP-derived PRI;
@@ -26,7 +36,7 @@
 //   TIMESTAMP       received_at, not __REALTIME_TIMESTAMP. Edge stays
 //                   neutral — downstream relay decides whether to
 //                   substitute the original wall-clock for replay.
-//                   Format: RFC 3339 with microsecond precision, UTC.
+//                   Format — RFC 3339 with microsecond precision, UTC.
 //   HOSTNAME        Original `_HOSTNAME` from the journald entry,
 //                   falling back to `hostname()` (this host) if the
 //                   field is absent. This preserves the originating

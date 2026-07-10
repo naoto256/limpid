@@ -1,7 +1,8 @@
-// Function: parse_datetime_rfc3164(text) → Timestamp
-//
-// Wire:     RFC 3164 BSD syslog timestamp — `Apr 30 01:23:45`
-// Output:   Value::Timestamp (UTC-normalised)
+// Summary:     RFC 3164 BSD syslog timestamp (`Apr 30 01:23:45`) →
+//              UTC-normalised Timestamp, with year-rollover clamp.
+// Signature:   parse_datetime_rfc3164(text) → Timestamp
+// Test corpus: unit (RFC 3164 timestamp shapes; year-end rollover
+//              clamp cases)
 //
 // Counterpart to the built-in `parse_datetime_rfc3339` primitive,
 // shipped as LPL rather than Rust because RFC 3164 timestamps

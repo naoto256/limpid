@@ -1,11 +1,18 @@
-// Palo Alto Networks PAN-OS syslog (CSV) parser
+// Summary:     Palo Alto Networks PAN-OS native CSV syslog → LSIS,
+//              dispatched by the positional Type field.
+// Reads:       ingress (raw wire) — syslog-wrapped positional CSV
+//              (FUTURE_USE,RecvTime,Serial,Type,Subtype,...)
+// Writes:      workspace.lsis.* — TRAFFIC → 4001, THREAT → 2004
+//              (url → 6004, wildfire → 2004), GLOBALPROTECT /
+//              AUTHENTICATION → 3002; see the subtype leaves below.
+// Category:    Network firewall / IPS
+// Test corpus: synthetic (documentation-derived sample wires in this header)
 //
-// Vendor:  Palo Alto Networks
-// Product: PAN-OS (Next-Generation Firewalls — PA-series, VM-series)
-// Wire:    syslog-wrapped CSV — `<priority>timestamp host FUTURE_USE,RecvTime,Serial,Type,Subtype,...`
-// Schema:  PAN-OS native CSV log format (positional, ~60-117 fields per Type)
+// Wire —    syslog-wrapped CSV — `<priority>timestamp host FUTURE_USE,RecvTime,Serial,Type,Subtype,...`
+//          PAN-OS native CSV log format (positional, ~60-117 fields per
+//          Type; Next-Generation Firewalls — PA-series, VM-series).
 //
-// PAN-OS encodes the log Type at position 4 in the CSV row:
+// PAN-OS encodes the log Type at position 4 in the CSV row —
 //   "TRAFFIC"        — connection start/end (OCSF Network Activity 4001)
 //   "THREAT"         — IPS / vulnerability / spyware / virus
 //                      (OCSF Detection Finding 2004; also URL via
@@ -18,7 +25,7 @@
 //   "USERID"         — user-ID mapping
 //   "HIPMATCH"       — Host Information Profile match
 //
-// Two-pass parse:
+// Two-pass parse —
 //   1. Lightweight csv_parse with a header-only schema to extract
 //      `Type` (and `Subtype` for THREAT routing) — keeps the dispatcher
 //      cheap, single-row parse skips most of the field array.

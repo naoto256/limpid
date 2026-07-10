@@ -1,26 +1,33 @@
-// Apache "combined" access log parser (vocabulary)
+// Summary:     Apache / Nginx combined log format → LSIS HTTP Activity.
+// Reads:       workspace.combined_log.* (bridge — see Bridges below)
+//                .body (required, String) — the CLF line
+//                .hostname (optional, String) — web server hostname
+// Writes:      workspace.lsis.* — 4002 (HTTP Activity).
+// Category:    Web / proxy access
+// Test corpus: synthetic (sample CLF lines in this header)
 //
-// Vendor:   Apache Software Foundation (Apache HTTP Server) — Nginx
+// Vendor notes — Apache Software Foundation (Apache HTTP Server) — Nginx
 //           adopted the same format byte-for-byte as its default
 //           `combined` log format, so this single snippet covers both.
 //           Caddy / lighttpd / OpenLiteSpeed / IIS-with-W3C-extended /
 //           HAProxy each have their own default formats and would land
 //           in their own parser files.
-// Wire:     Apache combined log format —
+//
+// Wire —     Apache combined log format —
 //           `<remote_addr> <ident> <remote_user> [<time>] "<request>" <status> <bytes> "<referer>" "<user_agent>"`
 //           where `<ident>` and `<remote_user>` are `-` when absent
 //           and `<request>` is `<method> <uri> <protocol>`. The format
 //           is defined by the Apache `LogFormat` directive
 //           `"%h %l %u %t \"%r\" %>s %O \"%{Referer}i\" \"%{User-Agent}i\""`
 //           which is also Nginx's `log_format combined` default.
-// Intake:   workspace.combined_log.body      (required, String) — the CLF line
-//           workspace.combined_log.hostname  (optional, String) — web server hostname
 //
 //           The CLF format carries its own time and client IP, so
-//           transport `time` is unused (CLF time is more authoritative
-//           for HTTP activity than the collector receive time). The
-//           transport hostname is the only field worth forwarding.
-// Upstream: transport-agnostic. Three typical bridges:
+//           transport `time` is not an intake field (CLF time is more
+//           authoritative for HTTP activity than the collector receive
+//           time). The transport hostname is the only field worth
+//           forwarding.
+//
+// Bridges —  transport-agnostic. Three typical bridges:
 //
 //           - file tail (most common — limpid runs on the web server):
 //                 { workspace.combined_log = { body: ingress, hostname: hostname() } } | parse_combined_log | compose_ocsf | ocsf_to_egress
@@ -40,9 +47,6 @@
 //                         hostname: workspace.journald._HOSTNAME
 //                     }
 //                 } | parse_combined_log | compose_ocsf | ocsf_to_egress
-//
-// Output:   OCSF HTTP Activity (class_uid 4002) records on
-//           `workspace.lsis`.
 //
 // Sample inputs (`workspace.combined_log.body` carries the CLF line):
 //

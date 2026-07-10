@@ -1,9 +1,15 @@
-// FortiGate CEF parser
+// Summary:     Fortinet FortiGate CEF (FortiOS set format cef) → LSIS,
+//              dispatched by CEF cat subtype.
+// Reads:       ingress (raw wire) — syslog-wrapped CEF (CEF:0|Fortinet|Fortigate|...)
+// Writes:      workspace.lsis.* — class per subtype (traffic → 4001,
+//              IPS / virus → 2004, …); see the subtype leaves below.
+// Category:    Network firewall / IPS
+// Test corpus: real (anonymised FortiGate captures — the dialect-quirks
+//              block below was verified against them)
 //
-// Vendor:  Fortinet
-// Product: FortiGate (FortiOS 6.x / 7.x with `set format cef`)
-// Wire:    syslog-wrapped CEF — `<PRI>Mmm DD HH:MM:SS host CEF:0|Fortinet|Fortigate|...`
-// Schema:  ArcSight CEF (header) + FortiGate-specific extension keys
+// Wire —    syslog-wrapped CEF — `<PRI>Mmm DD HH:MM:SS host CEF:0|Fortinet|Fortigate|...`
+//          ArcSight CEF header + FortiGate-specific extension keys
+//          (FortiOS 6.x / 7.x with `set format cef`).
 //
 // FortiGate CEF dialect quirks (verified against real captures):
 //
@@ -22,9 +28,6 @@
 //
 // Sample input (anonymised IPS detection):
 //   <129>Apr 27 10:00:00 fw01 CEF:0|Fortinet|Fortigate|v7.4.11|16384|utm:ips signature|7|deviceExternalId=FG-EXAMPLE cat=utm:ips FTNTFGTsubtype=ips FTNTFGTseverity=high src=192.0.2.10 spt=36208 dst=198.51.100.5 dpt=9100 proto=6 act=detected FTNTFGTattack=<sig> FTNTFGTattackid=<id> msg=<text>
-//
-// Output: workspace.lsis populated to OCSF-shape; compose_ocsf takes
-// it from there.
 
 // ---------------------------------------------------------------------------
 // Vendor-specific mapping helpers (FortiGate CEF dialect)

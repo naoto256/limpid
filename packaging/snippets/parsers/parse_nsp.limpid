@@ -1,13 +1,24 @@
-// Trellix / McAfee Network Security Platform (NSP) parser (vocabulary)
+// Summary:     Trellix (McAfee) Network Security Platform standard-template KV
+//              alerts → LSIS Detection Finding.
+// Reads:       workspace.nsp.* (bridge — see Bridges below)
+//                .body (required, String) — the KV body
+//                .hostname (optional, String) — collector-side hostname
+//                .time (optional, Int) — epoch nanoseconds
+// Writes:      workspace.lsis.* — 2004 (Detection Finding).
+// Category:    Network firewall / IPS
+// Test corpus: real (Trellix NSP Manager capture — 56/56 alerts across HTTP /
+//              SSH / SSL / NETBIOS-SS / TELNET / NTP / BACKDOOR signature
+//              categories)
 //
-// Vendor:   Trellix (formerly McAfee) Network Security Platform — the
+// Vendor notes — Trellix (formerly McAfee) Network Security Platform — the
 //           inline IPS appliance product. Wire format below is the
 //           **vendor-recommended standard template** for the syslog
 //           forwarder ("Custom Syslog" notification with the standard
 //           field list). Operators with custom templates would need to
 //           fork this parser; the canonical template covers the
 //           ~95% case.
-// Wire:     Space-separated `key=value` pairs (quoted-string values
+//
+// Wire —     Space-separated `key=value` pairs (quoted-string values
 //           when the value contains spaces). The full standard
 //           template field set:
 //             admin_domain alert_id alert_type app_protocol
@@ -22,10 +33,7 @@
 //           malware-confidence second under the same key name. The
 //           parser regex-extracts each by position so neither is lost
 //           to last-wins KV parsing.
-// Intake:   workspace.nsp.body      (required, String) — the KV body
-//           workspace.nsp.hostname  (optional, String) — collector-side hostname
-//           workspace.nsp.time      (optional, Int)    — epoch nanoseconds
-// Upstream: NSP sensors forward via syslog (typically UDP/514). The
+// Bridges —  NSP sensors forward via syslog (typically UDP/514). The
 //           bridge passes the raw KV body (post-syslog-strip if the
 //           sensor wraps in syslog framing, or `ingress` directly
 //           if not). Two typical bridges:
@@ -42,9 +50,6 @@
 //           - raw forwarder (sensor → text-only forwarder → limpid tail):
 //                 { workspace.nsp = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_nsp | compose_ocsf | ocsf_to_egress
 //
-// Output:   OCSF Detection Finding (class_uid 2004) records on
-//           `workspace.lsis`.
-//
 // Sample bodies (synthetic, anonymised to RFC 5737):
 //
 //   Attack alert (no malware fields populated):
@@ -56,10 +61,7 @@
 //   Reconnaissance / alert-only (no action taken):
 //   admin_domain=Default alert_id=12347 alert_type=Reconnaissance app_protocol=ICMP confidence=Tentative attack_count=5 attack_id=0x30000789 attack_name="ICMP: Network Sweep" severity=Low alert_signature="ICMP:SWEEP:001" attack_time="2026-05-16 10:02:00" category=Reconnaissance dest_ip=192.0.2.30 dest_name= dest_port= device_name=nsp-sensor-01 direction=Inbound confidence= file_name= file_hash= file_type= virus_name= action_status= error_status= protocol=ICMP result=Alert src_ip=198.51.100.7 src_name= src_port=
 //
-// Coverage scope: real-traffic verified against a Trellix NSP
-// Manager — 56/56 alerts emit cleanly, covering Signature alerts
-// across HTTP / SSH / SSL / NETBIOS-SS / TELNET / NTP / BACKDOOR
-// categories. The wire format observed on the real Manager omits
+// Coverage notes — the wire format observed on the real Manager omits
 // the quotes the documented template suggests
 // (e.g. `attack_name=NETBIOS-SS: Windows SMB Remote Code Execution
 // Vulnerability` is unquoted with embedded spaces); the boundary-aware

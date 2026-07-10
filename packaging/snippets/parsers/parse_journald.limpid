@@ -1,9 +1,13 @@
-// Vendor:   systemd journald (Linux)
-// Wire:     one line of `journalctl -o json` (UTF-8 JSON object)
-// Upstream: none — `parse_journald` is a transport-layer parser, run
-//           directly off `ingress` (typically the first process in a
-//           pipeline whose `input` is `type journal`)
-// Output:   workspace.journald.* — all fields as journald exposes them
+// Summary:     journalctl -o json lines → workspace.journald.* transport
+//              fields (transport-layer parser).
+// Reads:       ingress (raw wire) — one journalctl -o json line (UTF-8
+//              JSON object) per ingress
+// Writes:      workspace.journald.* — all fields as journald exposes them;
+//              the transport namespace, not LSIS.
+// Category:    Transport
+// Test corpus: synthetic (journalctl -o json sample wire in this header)
+//
+// Typically the first process in a pipeline whose `input` is `type journal`.
 //
 // `parse_journald` is a thin LOTL wrapper: limpid's `input journal`
 // emits ingress as `journalctl -o json`-byte-identical JSON, and this
@@ -12,7 +16,7 @@
 // composers (e.g. `compose_rfc5424`) can read them by their original
 // name.
 //
-// Field naming notes:
+// Field naming notes —
 //   PRIORITY               — syslog severity (0-7), JSON string ("6")
 //   SYSLOG_FACILITY        — syslog facility (0-23), JSON string ("4")
 //   SYSLOG_IDENTIFIER      — program name (e.g. "sshd")
@@ -31,13 +35,13 @@
 // integers, not strings. Treat with care if your downstream is
 // text-only.
 //
-// Sample wire:
+// Sample wire —
 //   {"__CURSOR":"s=...","__REALTIME_TIMESTAMP":"1714400000000000",
 //    "PRIORITY":"6","SYSLOG_FACILITY":"4","SYSLOG_IDENTIFIER":"sshd",
 //    "_PID":"12345","_HOSTNAME":"edge01","_SYSTEMD_UNIT":"ssh.service",
 //    "MESSAGE":"Accepted publickey for alice from 192.0.2.10 port 51234 ssh2"}
 //
-// Typical pipeline:
+// Typical pipeline —
 //   process parse_journald | compose_rfc5424 | rfc5424_to_egress
 //   process parse_journald | parse_openssh | compose_ocsf | ocsf_to_egress
 
