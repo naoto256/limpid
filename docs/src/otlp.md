@@ -457,11 +457,12 @@ kvlist. limpid's snippet author chooses, per pipeline:
 - **kvlist** for structured composition where the receiver natively
   understands the OTLP attribute model (the OTel-native path)
 
-A common pattern for cloud-bound pipelines is to compose an OCSF
-record in `workspace.ocsf` and ship it as
-`body: { string_value: to_json(workspace.ocsf) }`. This matches what
-most cloud backends expect, lets the OCSF schema do the structuring
-work, and avoids fighting the OTLP attribute namespace.
+A common pattern for cloud-bound pipelines is to run `compose_ocsf`
+so the OCSF JSON lands in the LSIS slot `workspace.lsis.ocsf`, then
+ship it as `body: { string_value: workspace.lsis.ocsf }` (the slot
+holds the already-serialised string, so no per-event `to_json`). This
+matches what most cloud backends expect, lets the OCSF schema do the
+structuring work, and avoids fighting the OTLP attribute namespace.
 
 ---
 
