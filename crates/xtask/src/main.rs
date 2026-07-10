@@ -34,9 +34,10 @@ enum Cmd {
         check: bool,
     },
 
-    /// Lint parser-header schema across
-    /// `packaging/snippets/parsers/*.limpid`. Exits 1 if any errors
-    /// are reported (warnings are printed but do not fail).
+    /// Lint snippet-header schemas across
+    /// `packaging/snippets/{parsers,composers,filters,functions}/*.limpid`.
+    /// Exits 1 if any errors are reported (warnings are printed but
+    /// do not fail).
     LintSnippetHeaders,
 }
 
