@@ -38,7 +38,7 @@
 //           all log streams to a single endpoint.
 //
 //           - Per-log JSONL tail:
-//                 process { workspace.zeek = { body: parse_json(ingress), hostname: hostname(), time: to_int(received_at) } } | parse_zeek_default | compose_ocsf
+//                 process { workspace.zeek = { body: parse_json(ingress), hostname: hostname(), time: to_int(received_at) } } | parse_zeek_default | compose_ocsf | ocsf_to_egress
 //
 // Output:   OCSF records on `workspace.lsis`. Dispatch by `_path`:
 //             conn   → 4001 Network Activity (conn_state → activity_id)

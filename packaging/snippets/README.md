@@ -136,7 +136,7 @@ process {
         hostname: hostname(),
         time:     to_int(received_at)
     }
-} | parse_foo | compose_ocsf
+} | parse_foo | compose_ocsf | ocsf_to_egress
 ```
 
 ## Quick start
@@ -159,16 +159,18 @@ def output ama {
 
 def pipeline fw_to_ocsf {
     input fw_syslog
-    process parse_fortigate_cef | compose_ocsf
+    process parse_fortigate_cef | compose_ocsf | ocsf_to_egress
     output ama
 }
 ```
 
 That's it. The parser writes to `workspace.lsis.*` (canonical
 OCSF-shape intermediate); the composer reads from `workspace.lsis.*`
-and writes OCSF JSON to `egress`. Add `output` to your SIEM /
-data-lake destination (Sentinel, Splunk, Security Lake, OTLP, …)
-and you're shipping OCSF.
+and writes OCSF JSON to the LSIS slot `workspace.lsis.ocsf`; the
+one-line `ocsf_to_egress` step at the tail of the pipeline hands
+that slot off to `egress`. Add `output` to your SIEM / data-lake
+destination (Sentinel, Splunk, Security Lake, OTLP, …) and you're
+shipping OCSF.
 
 ## Design principles
 
@@ -197,7 +199,7 @@ canonical OCSF-shape on `workspace.lsis.*`. The typical pipeline
 is two stages:
 
 ```
-process <vendor_parser> | compose_ocsf
+process <vendor_parser> | compose_ocsf | ocsf_to_egress
 ```
 
 For mixed-vendor / mixed-format inputs, dispatch upstream of the

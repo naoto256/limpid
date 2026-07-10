@@ -23,7 +23,7 @@
 // Upstream: transport-agnostic. Three typical bridges:
 //
 //           - file tail (most common — limpid runs on the web server):
-//                 { workspace.combined_log = { body: ingress, hostname: hostname() } } | parse_combined_log | compose_ocsf
+//                 { workspace.combined_log = { body: ingress, hostname: hostname() } } | parse_combined_log | compose_ocsf | ocsf_to_egress
 //
 //           - syslog transport (rsyslog forwarding access logs):
 //                 process parse_syslog | {
@@ -31,7 +31,7 @@
 //                         body:     workspace.syslog.msg,
 //                         hostname: workspace.syslog.hostname
 //                     }
-//                 } | parse_combined_log | compose_ocsf
+//                 } | parse_combined_log | compose_ocsf | ocsf_to_egress
 //
 //           - journald transport (rare for access logs, but possible):
 //                 process parse_journald | {
@@ -39,7 +39,7 @@
 //                         body:     workspace.journald.MESSAGE,
 //                         hostname: workspace.journald._HOSTNAME
 //                     }
-//                 } | parse_combined_log | compose_ocsf
+//                 } | parse_combined_log | compose_ocsf | ocsf_to_egress
 //
 // Output:   OCSF HTTP Activity (class_uid 4002) records on
 //           `workspace.lsis`.

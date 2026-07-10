@@ -25,7 +25,7 @@
 //           splits its own header.
 //
 //           - syslog (UDP/TCP):
-//                 { workspace.checkpoint_leef = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_checkpoint_leef | compose_ocsf
+//                 { workspace.checkpoint_leef = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_checkpoint_leef | compose_ocsf | ocsf_to_egress
 //
 // Output:   OCSF Network Activity (class_uid 4001) records on
 //           `workspace.lsis` for traffic events (Accept / Drop /

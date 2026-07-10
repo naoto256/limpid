@@ -5,7 +5,9 @@
 //           Other upstreams (e.g. workspace.syslog.* or workspace.cef.*)
 //           are out of scope — write your own composer if you need to
 //           re-wrap from a different intermediate.
-// Output:   egress — single-line RFC 5424 record
+// Output:   workspace.lsis.rfc5424 — single-line RFC 5424 record (String)
+//           egress = workspace.lsis.rfc5424 via `rfc5424_to_egress`
+//                    (opt in per pipeline; see foot of file)
 //
 // Generic journald → RFC 5424 wire composer. Replaces the hand-rolled
 // `wrap_<program>` patterns that used to live per-host (one per
@@ -43,7 +45,7 @@
 // Typical pipeline (edge box forwarding journald to a syslog relay):
 //   def pipeline ssh_to_relay {
 //       input ssh_journal
-//       process parse_journald | compose_rfc5424
+//       process parse_journald | compose_rfc5424 | rfc5424_to_egress
 //       output relay
 //   }
 
@@ -77,5 +79,16 @@ def process compose_rfc5424 {
     let procid   = rfc5424_procid()
     let msg      = coalesce(workspace.journald.MESSAGE, "")
 
-    egress = "<${pri}>1 ${ts} ${host} ${app} ${procid} - - ${msg}"
+    workspace.lsis.rfc5424 = "<${pri}>1 ${ts} ${host} ${app} ${procid} - - ${msg}"
+}
+
+// ---------------------------------------------------------------------------
+// Egress terminator
+// ---------------------------------------------------------------------------
+//
+// Moves the RFC 5424 record from `workspace.lsis.rfc5424` to
+// `egress`. Pipelines that emit RFC 5424 as the wire form pipe
+// `compose_rfc5424 | rfc5424_to_egress`.
+def process rfc5424_to_egress {
+    egress = workspace.lsis.rfc5424
 }

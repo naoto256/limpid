@@ -32,7 +32,7 @@
 //                         hostname: workspace.syslog.hostname,
 //                         time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
 //                     }
-//                 } | parse_openssh | compose_ocsf
+//                 } | parse_openssh | compose_ocsf | ocsf_to_egress
 //
 //           - journald transport. Prefer `_PID` over `SYSLOG_PID` (the
 //             former is kernel-verified; the latter is application-set
@@ -47,7 +47,7 @@
 //                         hostname: workspace.journald._HOSTNAME,
 //                         time:     to_int(workspace.journald.__REALTIME_TIMESTAMP) * 1000
 //                     }
-//                 } | parse_openssh | compose_ocsf
+//                 } | parse_openssh | compose_ocsf | ocsf_to_egress
 //
 //           Other stacks (CEF-wrapped, file tail with raw bodies, etc.)
 //           are the caller's responsibility — write your own bridge.

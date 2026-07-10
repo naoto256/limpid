@@ -123,16 +123,19 @@ def output security_lake {
 
 def pipeline fw_to_security_lake {
     input fw_syslog
-    process parse_fortigate_cef | compose_ocsf
+    process parse_fortigate_cef | compose_ocsf | ocsf_to_egress
     output security_lake
 }
 ```
 
 `parse_fortigate_cef` writes the parsed event to `workspace.lsis.*`
 in canonical OCSF shape; `compose_ocsf` reads from there and writes
-the OCSF JSON record to `egress`. Swap the parser for any of the
-others; swap the composer for `compose_replayable` to capture
-replay-shape; chain a filter ahead of the parser to drop noise.
+the OCSF JSON record to the LSIS slot `workspace.lsis.ocsf`; the
+one-line `ocsf_to_egress` companion at the tail of the pipeline
+moves the slot to `egress`. Swap the parser for any of the others;
+swap `compose_ocsf | ocsf_to_egress` for
+`compose_replayable | replayable_to_egress` to capture replay-shape;
+chain a filter ahead of the parser to drop noise.
 
 For mixed-vendor inputs, dispatch upstream of the parser:
 
@@ -140,11 +143,11 @@ For mixed-vendor inputs, dispatch upstream of the parser:
 def pipeline mixed_in {
     input multi_vendor_syslog
     if contains(ingress, "CEF:0|Palo Alto Networks") {
-        process parse_paloalto_cef | compose_ocsf
+        process parse_paloalto_cef | compose_ocsf | ocsf_to_egress
     } else if contains(ingress, "CEF:0|Fortinet") {
-        process parse_fortigate_cef | compose_ocsf
+        process parse_fortigate_cef | compose_ocsf | ocsf_to_egress
     } else {
-        process parse_paloalto_syslog | compose_ocsf
+        process parse_paloalto_syslog | compose_ocsf | ocsf_to_egress
     }
     output security_lake
 }
