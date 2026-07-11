@@ -91,7 +91,7 @@ def process compose_otlp_from_ocsf {
 
     workspace.otlp = {
         resource: { attributes: [
-            { key: "service.name", value: { string_value: workspace.lsis.metadata.product.name } }
+            { key: "service.name", value: { string_value: workspace.lsis.parsed.metadata.product.name } }
         ]},
         scope_logs: [{
             scope: { name: "limpid", version: "0.5.0" },
@@ -99,7 +99,7 @@ def process compose_otlp_from_ocsf {
                 time_unix_nano: workspace.event_time_ns,
                 severity_number: 9,
                 severity_text: "INFO",
-                body: { string_value: workspace.lsis.ocsf }
+                body: { string_value: workspace.lsis.composed.ocsf }
             }]
         }]
     }

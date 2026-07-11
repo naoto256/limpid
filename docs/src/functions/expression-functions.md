@@ -520,10 +520,10 @@ throughout composers and parsers.
 
 ```limpid
 // Composer: prefer parsed event time, fall back to received_at
-let event_time = coalesce(workspace.lsis.time, received_at)
+let event_time = coalesce(workspace.lsis.parsed.time, received_at)
 
 // Parser: pick first source IP that is populated
-workspace.lsis.src_endpoint.ip = coalesce(
+workspace.lsis.parsed.src_endpoint.ip = coalesce(
     workspace.cef.src,
     workspace.cef.sourceTranslatedAddress,
     workspace.syslog.hostname
@@ -582,9 +582,9 @@ egress = to_json(null_omit(workspace.payload))
 | `42` | `42` (scalar pass-through) |
 
 Designed for the schema-composer pattern (build a HashLit from
-parser-populated `workspace.lsis.*` fields, then `to_json` into the
-LSIS slot `workspace.lsis.<schema>`; the companion
-`<schema>_to_egress` process moves the slot to `egress`).
+`workspace.lsis.parsed.*` fields, then `to_json` into the composed
+slot `workspace.lsis.composed.<slot>`; the companion
+`<slot>_to_egress` process moves it to `egress`).
 Without `null_omit`, every absent field renders as `"key": null` in
 the output — not strictly invalid, but consumers that strictly
 validate against OCSF schema (Microsoft Sentinel, Splunk DM) often
@@ -679,7 +679,7 @@ Text-only primitives (`upper`, `regex_*`, `format`, `to_int`,
 Coerces a value to a 64-bit signed integer. Returns `null` on unparseable input, matching the partial-data policy of `regex_extract` and `table_lookup`.
 
 ```limpid
-workspace.lsis.src_endpoint.port = to_int(workspace.cef.spt)  // CEF ext: "54321" → 54321
+workspace.lsis.parsed.src_endpoint.port = to_int(workspace.cef.spt)  // CEF ext: "54321" → 54321
 ```
 
 | Input | Result |
@@ -817,7 +817,7 @@ let leaf = path(workspace.geo, dynamic_key, "name")
 Return a new array with `value` added at the back (`append`) or the front (`prepend`). The input array is not mutated — callers re-bind:
 
 ```limpid
-workspace.lsis.observables = append(workspace.lsis.observables, new_obs)
+workspace.lsis.parsed.observables = append(workspace.lsis.parsed.observables, new_obs)
 workspace.high_prio_tags = prepend(workspace.high_prio_tags, "urgent")
 ```
 
@@ -844,7 +844,7 @@ Cardinality primitive — works for every container-like type:
 | Scalars (`Int` / `Float` / `Bool`) | `Null` |
 
 ```limpid
-workspace.n_observables = len(workspace.lsis.observables)
+workspace.n_observables = len(workspace.lsis.parsed.observables)
 workspace.msg_len = len(workspace.syslog.msg)
 ```
 
