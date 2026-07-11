@@ -10,15 +10,14 @@ prefix.
 
 ```
 /usr/share/limpid/snippets/
-├─ parsers/      per-vendor / per-format parsers writing to
-│                workspace.lsis.* (the parser ↔ composer
-│                canonical intermediate — see LSIS below)
-├─ composers/    two-layer target rendering:
-│                • schema composers (compose_ocsf, compose_rfc5424,
-│                  compose_replayable) read workspace.lsis.* and
-│                  write workspace.lsis.<schema>
-│                • envelope composers (compose_otlp) read a declared
-│                  per-envelope input slot and write encoded bytes
+├─ parsers/      per-vendor / per-format parsers, populating
+│                workspace.lsis.parsed.* (the LSIS facts layer —
+│                see LSIS below)
+├─ composers/    target-shape rendering. Each composer reads
+│                workspace.lsis.parsed.* (facts) and/or
+│                workspace.lsis.shed.<consumer>.* (caller-supplied
+│                hand-off slots) and writes its finished wire form
+│                to workspace.lsis.composed.<slot>
 ├─ filters/      pre-parser noise filters (drop / pass-through by
 │                content predicate)
 └─ functions/    shared pure functions (RFC 3164 timestamp parsing,
@@ -30,38 +29,105 @@ The directory name is the snippet kind. `cargo xtask
 lint-snippet-headers` dispatches header validation on it — the file
 layout is the schema.
 
-## LSIS — the parser ↔ composer intermediate
+## LSIS — the Limpid Snippet Intermediate Schema
 
-**LSIS** (Limpid Snippet Intermediate Schema) is the canonical data
-shape parsers write and schema composers read. It lives in the
-`workspace.lsis.*` scratch namespace on every event.
+LSIS is the gentleman's agreement that lets independent snippets
+compose: a reserved workspace namespace (`workspace.lsis.*`) whose
+names carry meaning by convention. It binds the snippets in this
+pack — and nothing else. Your own config may read and write whatever
+it likes; the daemon neither knows nor enforces LSIS. Keep your own
+state outside `workspace.lsis.*` and the two worlds never collide.
+The only enforcement anywhere is this pack's own CI keeping the pack
+internally consistent.
 
-LSIS's vocabulary — field names, numeric class IDs (`class_uid
-3002`, `4001`, …), activity / status enumerations — is borrowed
-from OCSF 1.3.0 so that `compose_ocsf` can render LSIS to conformant
-OCSF JSON without translation. LSIS is **not** an OCSF conformance
-claim: fields outside a class's OCSF definition are permitted (they
-land in `unmapped` when rendered), and future LSIS revisions can
-diverge from OCSF where wire realities demand it.
+The namespace is stratified into three layers, and the layers differ
+not in strictness but in the *kind* of contract each one makes.
 
-### Slot registry
+### `workspace.lsis.parsed.*` — facts (a vocabulary contract)
 
-Schema and envelope composers write their rendered output to a
-dedicated LSIS slot. Each slot has a single writer (see the "egress
-single-writer invariant" below).
+What parsers established about the event: `parsed.severity_id`,
+`parsed.time`, `parsed.device.hostname`, and friends. The contract is
+a dictionary: *if* a field is present under this name, it means this
+— nothing more. The vocabulary leans OCSF but is an open set
+(syslog, CEF, OCSF-shaped, but not limited to), and every field is
+optional; readers handle absence gracefully. Do not look for a schema
+with required fields here. There isn't one, by design. Writers:
+parsers. Readers: everyone.
+
+### `workspace.lsis.shed.*` — plumbing (a hand-off contract)
+
+Tentative values written by glue blocks for the *next* stage: a
+payload to wrap, target-specific attributes to attach. This layer has
+no vocabulary of its own. Names borrow the consumer's vocabulary
+(`shed.otlp.log_record.body` mirrors the OTLP proto), and each
+consuming snippet's header defines the slots it eats. Meaning comes
+from *who writes for whom*, not from the name globally. Values are
+scoped to one hand-off; nothing under `shed.` is a fact about the
+event.
+
+### `workspace.lsis.composed.*` — products (a registry contract)
+
+Finished wire forms, one slot per composer: `composed.ocsf`,
+`composed.otlp`, `composed.rfc5424`. The slot name announces what got
+produced, and the producing composer is its only writer. Egress
+terminators read from here — `egress = workspace.lsis.composed.otlp`
+is the whole story of shipping an event.
+
+### Why three layers
+
+A flat namespace forced facts, plumbing, and products to wear the
+same face, and every reader had to guess which was which — that
+guessing is where the old "OCSF-shaped" confusion came from. The
+strata make the data's role part of its name. If you catch yourself
+asking "where are the required fields?", you are in `parsed.*`
+expecting a schema — it is a dictionary. If you are asking "what does
+this `shed.` slot mean?", ask instead "which composer consumes it?"
+— that composer's header is the contract.
+
+### `parsed.*` vocabulary — OCSF alignment note
+
+The `parsed.*` field names, numeric class IDs (`class_uid 3002`,
+`4001`, …), and activity / status enumerations are borrowed from OCSF
+1.3.0 so that `compose_ocsf` can render `parsed` to conformant OCSF
+JSON without translation. This is not an OCSF conformance claim: fields
+outside a class's OCSF definition are permitted (they land in
+`unmapped` when rendered), and future LSIS revisions can diverge from
+OCSF where wire realities demand it.
+
+### Slot registry — composed layer
+
+Each composer owns exactly one `composed.<slot>` output. This is the
+single-writer invariant that keeps `<slot>_to_egress` terminators
+unambiguous.
 
 | Slot | Type | Writer | Purpose |
 |---|---|---|---|
-| `workspace.lsis.*` | Object | vocabulary parsers | canonical intermediate (parser ↔ schema composer contract) |
-| `workspace.lsis.ocsf` | String | `compose_ocsf` | OCSF 1.3.0 JSON, one object per event |
-| `workspace.lsis.rfc5424` | String | `compose_rfc5424` | single-line RFC 5424 syslog record |
-| `workspace.lsis.replayable` | String | `compose_replayable` | replay-shape JSONL (`{received_at, source, ingress}`) |
-| `workspace.lsis.otlp_body` | String | (caller assigns) | envelope input — payload the envelope composer wraps |
-| `workspace.lsis.otlp` | Bytes | `compose_otlp` | OTLP-1.0.0 `ResourceLogs` proto bytes |
+| `workspace.lsis.composed.ocsf` | String | `compose_ocsf` | OCSF 1.3.0 JSON, one object per event |
+| `workspace.lsis.composed.rfc5424` | String | `compose_rfc5424` | single-line RFC 5424 syslog record |
+| `workspace.lsis.composed.replayable` | String | `compose_replayable` | replay-shape JSONL (`{received_at, source, ingress}`) |
+| `workspace.lsis.composed.otlp` | Bytes | `compose_otlp` | OTLP-1.0.0 `ResourceLogs` proto bytes |
 
-Companion one-line processes `<schema>_to_egress` (defined in the
-same file as each schema/envelope composer) move the slot to
-`egress` when the pipeline emits that shape as its wire form.
+Companion one-line processes `<slot>_to_egress` (defined in the same
+file as each composer) move the slot to `egress` when the pipeline
+emits that shape as its wire form.
+
+### Shed slots — declared per consumer
+
+The `shed.*` layer has no globally reserved sub-namespace. Each
+consuming composer's header enumerates the slots it eats and the
+default that applies when the caller omits the slot. Current
+consumers:
+
+| Consumer | Shed sub-tree | See header |
+|---|---|---|
+| `compose_otlp` | `workspace.lsis.shed.otlp.*` (resource / scope / log_record attributes + body) | `composers/compose_otlp.limpid` |
+| `compose_rfc5424` | `workspace.lsis.shed.rfc5424.*` (pri / timestamp / hostname / app_name / procid / msgid / sd / msg) | `composers/compose_rfc5424.limpid` |
+
+`compose_ocsf` and `compose_replayable` do not read shed slots; they
+read `parsed.*` directly. A composer adds a shed sub-tree when its
+target has structural room the LSIS facts layer cannot express (OTLP
+target-specific attributes, RFC 5424 fields that the pack cannot
+synthesise on the caller's behalf).
 
 ## What's included
 
@@ -217,26 +283,26 @@ def pipeline fw_to_ocsf {
 }
 ```
 
-That's it. The parser writes to `workspace.lsis.*` (the LSIS
-canonical intermediate); `compose_ocsf` reads from `workspace.lsis.*`
-and writes OCSF JSON to `workspace.lsis.ocsf`; the one-line
-`ocsf_to_egress` step at the tail of the pipeline hands that slot
-off to `egress`. Add `output` to your SIEM / data-lake destination
-(Sentinel, Splunk, Security Lake, OTLP, …) and you're shipping
-OCSF.
+That's it. The parser writes facts to `workspace.lsis.parsed.*`;
+`compose_ocsf` reads `workspace.lsis.parsed.*` and writes OCSF JSON
+to `workspace.lsis.composed.ocsf`; the one-line `ocsf_to_egress`
+step at the tail of the pipeline hands that slot off to `egress`.
+Add `output` to your SIEM / data-lake destination (Sentinel, Splunk,
+Security Lake, OTLP, …) and you're shipping OCSF.
 
 ## Design principles
 
-The library follows four contracts, documented at length in
-`docs/src/processing/user-defined.md`:
+The library follows four contracts:
 
-1. **`workspace.lsis` is the parser ↔ schema-composer canonical
-   intermediate (LSIS).** Parsers populate `workspace.lsis.*` only
-   with LSIS-vocabulary fields. Vendor / transport intermediates
-   (`workspace.cef`, `workspace.syslog`, `workspace.pf`,
-   `workspace.journald`, …) are parser-private and no composer
-   reads them. This keeps the schema composer LSIS-aware without
-   its being vendor-aware.
+1. **LSIS strata (`parsed` / `shed` / `composed`).** Parsers populate
+   `workspace.lsis.parsed.*` with facts about the event; composers
+   read `parsed.*` (facts) and optionally `shed.*` (caller-supplied
+   hand-off slots) and write finished wire forms to
+   `workspace.lsis.composed.<slot>`. See the LSIS section above for
+   the layer contracts and the shed / composed slot registries.
+   Transport-namespace intermediates (`workspace.cef`,
+   `workspace.syslog`, `workspace.journald`, …) live outside LSIS
+   by design; pack composers do not read them directly.
 
 2. **Loud-fail-fast on unsupported vocabulary.** Each parser's
    dispatcher routes events with shapes / subtypes / message IDs
@@ -247,21 +313,20 @@ The library follows four contracts, documented at length in
    extend the snippet or update the upstream allow-list.
 
 3. **egress single-writer invariant.** A composer never assigns
-   `egress` directly. Schema composers write `workspace.lsis.<slot>`;
-   the companion `<slot>_to_egress` one-line process (or an
-   envelope composer downstream) is the sole writer of `egress`
-   per pipeline. `grep 'egress = ' packaging/snippets/` names the
-   writer for every terminal.
+   `egress` directly. Composers write to `workspace.lsis.composed.
+   <slot>`; the companion `<slot>_to_egress` one-line process is the
+   sole writer of `egress` per pipeline. `grep 'egress = '
+   packaging/snippets/` names the writer for every terminal.
 
-4. **Two-layer composer contract.** A schema composer takes LSIS
-   to a wire schema slot (e.g. `compose_ocsf` → `workspace.lsis.ocsf`).
-   An envelope composer takes a declared per-envelope input slot
-   to encoded envelope bytes (e.g. `compose_otlp` reads
-   `workspace.lsis.otlp_body`, writes `workspace.lsis.otlp`).
-   Feeding a schema slot into an envelope's input is an explicit
-   inline block in the pipeline (`{ workspace.lsis.otlp_body =
-   workspace.lsis.ocsf }`) — not a proliferation of `<schema>_to_<envelope_body>`
-   bridging snippets.
+4. **Bridges belong to the consumer.** When a composer reads
+   something other than its plain shed vocabulary — a transport
+   namespace, another composer's `composed` product, an ad-hoc
+   caller value — the reader that decided to reach outside pays the
+   cost. Named bridges (e.g. `journald_to_rfc5424`) live in the
+   consuming composer's file, not in a shared bridges/ directory;
+   ad-hoc glue blocks in the pipeline (`{ workspace.lsis.shed.otlp.
+   log_record.body = workspace.lsis.composed.ocsf }`) do the same
+   job when the mapping is one line.
 
 ## Pipeline shapes
 
@@ -271,20 +336,28 @@ Schema wire form:
 process <vendor_parser> | compose_ocsf | ocsf_to_egress
 ```
 
-Envelope-wrapped schema:
+Envelope-wrapped schema (OTLP wrapping the OCSF JSON as the log
+body):
 
 ```
 process <vendor_parser>
       | compose_ocsf
-      | { workspace.lsis.otlp_body = workspace.lsis.ocsf }
+      | {
+          workspace.lsis.shed.otlp.log_record.body =
+              workspace.lsis.composed.ocsf
+        }
       | compose_otlp
       | otlp_to_egress
 ```
 
+Target-specific attributes (e.g. Azure Monitor Pipeline's
+CommonSecurityLog columns) go in the same glue block via
+`workspace.lsis.shed.otlp.log_record.attributes = [ ... ]`; see the
+`compose_otlp` header for the full example.
+
 For mixed-vendor / mixed-format inputs, dispatch upstream of the
 parser with a `switch contains(ingress, "...")` block, calling the
-appropriate parser per branch. (See the test scaffolding under
-`_check_*.limpid` in the repo root for working examples.)
+appropriate parser per branch.
 
 ## Authoring conventions
 
