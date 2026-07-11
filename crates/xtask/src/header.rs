@@ -554,10 +554,16 @@ fn classify_reads_first_line(first_line: &str) -> ReadsShape {
     if first_token == "ingress" {
         return ReadsShape::Ingress;
     }
-    // workspace.<ident>.*
+    // workspace.<ident>[.<ident>]*.*  — a dot-separated path of ascii
+    // idents ending in `.*`. Multi-segment paths surface the LSIS
+    // strata (`workspace.lsis.parsed.*`, `workspace.lsis.shed.otlp.*`)
+    // and any future nested transport namespace; single-segment paths
+    // (`workspace.journald.*`, `workspace.cef.*`) still classify the
+    // same way.
     if let Some(after_workspace) = first_token.strip_prefix("workspace.")
-        && let Some(dot_star) = after_workspace.strip_suffix(".*")
-        && is_ascii_ident(dot_star)
+        && let Some(path) = after_workspace.strip_suffix(".*")
+        && !path.is_empty()
+        && path.split('.').all(is_ascii_ident)
     {
         return ReadsShape::WorkspaceNamespace;
     }
@@ -568,19 +574,23 @@ fn classify_reads_first_line(first_line: &str) -> ReadsShape {
 /// [`DotLineDecl`]. Returns None if the line doesn't match. Trailing
 /// prose (e.g. `— sshd application body`) is permitted after the
 /// closing paren.
+///
+/// `<name>` may be a single ident (`.body`) or a dot-separated path
+/// (`.log_record.attributes`) that mirrors the structure of the
+/// intake slot. Every segment must be an ascii ident.
 fn parse_dot_line(line: &str) -> Option<DotLineDecl> {
     let s = line.strip_prefix('.')?;
-    // Consume identifier.
+    // Consume dot-separated identifier path: `<ident>(.<ident>)*`.
     let ident_end = s
         .char_indices()
-        .find(|(_, c)| !c.is_ascii_alphanumeric() && *c != '_')
+        .find(|(_, c)| !c.is_ascii_alphanumeric() && *c != '_' && *c != '.')
         .map(|(i, _)| i)
         .unwrap_or(s.len());
     if ident_end == 0 {
         return None;
     }
     let name = &s[..ident_end];
-    if !is_ascii_ident(name) {
+    if !name.split('.').all(is_ascii_ident) {
         return None;
     }
     // Consume required whitespace.
@@ -1009,6 +1019,24 @@ def function proto_num(name) {}
         let d = parse_dot_line(".body (required, String)  — sshd body").unwrap();
         assert_eq!(d.name, "body");
         assert!(d.required);
+    }
+
+    #[test]
+    fn reads_multi_segment_workspace_namespace_accepted() {
+        // LSIS strata surface as multi-segment paths:
+        // workspace.lsis.parsed.*, workspace.lsis.shed.otlp.*, etc.
+        // Also dot-line intake names may be dotted (log_record.body).
+        let h = composer(
+            "\
+// Summary:     Composer reading a multi-segment shed sub-tree
+// Reads:       workspace.lsis.shed.otlp.* — per-slot intake
+//                .log_record.body       (required, String) — body
+//                .log_record.attributes (optional, Array)  — attrs
+// Writes:      workspace.lsis.composed.otlp — proto bytes
+// Test corpus: spec-only (OTLP proto shape)
+",
+        );
+        assert!(lint(&h).is_empty(), "unexpected findings: {:?}", lint(&h));
     }
 
     #[test]

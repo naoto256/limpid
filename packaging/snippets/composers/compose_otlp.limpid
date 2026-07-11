@@ -4,15 +4,15 @@
 //              protobuf bytes for both otlp_http and otlp_grpc.
 // Reads:       workspace.lsis.shed.otlp.* — per-slot intake
 //              (OTLP proto vocabulary):
-//                .resource.attributes    (optional, Array of KeyValue) —
-//                             default: [{ key: "host.name", value:
+//                .resource.attributes    (optional, Array) — of KeyValue.
+//                             default — [{ key: "host.name", value:
 //                             { string_value: hostname() } }]. Specifying
 //                             this slot REPLACES the default (no merge):
 //                             callers who still want host.name in their
 //                             resource attributes must include it in the
 //                             array they pass.
-//                .scope.attributes       (optional, Array of KeyValue) —
-//                             default: empty. `scope.name` is fixed at
+//                .scope.attributes       (optional, Array) — of KeyValue.
+//                             default — empty. `scope.name` is fixed at
 //                             "limpid".
 //                .log_record.body        (required, String) — placed on
 //                             the LogRecord as `body.string_value`. Absent
@@ -20,8 +20,8 @@
 //                             deliberate wrapper (schema composer output,
 //                             raw ingress, etc.) is the caller's job to
 //                             assign in a glue block.
-//                .log_record.attributes  (optional, Array of KeyValue) —
-//                             default: empty. Replacement semantics as
+//                .log_record.attributes  (optional, Array) — of KeyValue.
+//                             default — empty. Replacement semantics as
 //                             above.
 //              workspace.lsis.parsed.* — graceful reads from the fact
 //              layer, no shed intake for these:
