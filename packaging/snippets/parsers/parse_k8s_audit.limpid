@@ -4,7 +4,7 @@
 //              Activity + Authentication.
 // Reads:       ingress (raw wire) — one audit Event object per ingress
 //              (no {"items":[...]} envelope)
-// Writes:      workspace.lsis.* — 6003 (API Activity) for resource requests,
+// Writes:      workspace.lsis.parsed.* — 6003 (API Activity) for resource requests,
 //              3002 (Authentication) for authentication.k8s.io objectRefs;
 //              unknown kinds route to error_log.
 // Category:    Container / orchestration
@@ -190,7 +190,7 @@ def process parse_k8s_audit_api {
         default         { "${api_group}/${api_version}/${workspace.k8s.objectRef.resource}" }
     }
 
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    6003,
         category_uid: 6,
         activity_id:  activity,
@@ -259,7 +259,7 @@ def process parse_k8s_audit_authn {
     let groups = k8s_audit_build_groups(workspace.k8s.user.groups)
     let src_ip = k8s_audit_pick_src_ip(workspace.k8s.sourceIPs)
 
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    3002,
         category_uid: 3,
         activity_id:  1,            // Logon — TokenReview/TokenRequest validates a credential

@@ -4,7 +4,7 @@
 //                .body (required, String) — the syslog wire
 //                .hostname (optional, String) — collector-side hostname
 //                .time (optional, Int) — epoch nanoseconds
-// Writes:      workspace.lsis.* — RT_IDP IDP_ATTACK_LOG_EVENT → 2004 (Detection
+// Writes:      workspace.lsis.parsed.* — RT_IDP IDP_ATTACK_LOG_EVENT → 2004 (Detection
 //              Finding); other daemons / subtypes route to error_log until
 //              their shapes are added.
 // Category:    Network firewall / IPS
@@ -224,7 +224,7 @@ def process parse_juniper_srx_syslog_idp_attack_record {
             error "parse_juniper_srx_syslog_idp_attack_record: body did not match expected shape: ${workspace.juniper_srx_syslog.body}"
         }
         default {
-            workspace.lsis = juniper_srx_syslog_idp_finding_record(
+            workspace.lsis.parsed = juniper_srx_syslog_idp_finding_record(
                 workspace.srx_idp_fields.src,
                 workspace.srx_idp_fields.src_port,
                 workspace.srx_idp_fields.dst,

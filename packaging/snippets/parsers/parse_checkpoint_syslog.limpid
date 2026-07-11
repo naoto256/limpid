@@ -4,7 +4,7 @@
 //                .body (required, String) — the full RFC 5424 wire
 //                .hostname (optional, String) — collector-side hostname override
 //                .time (optional, Int) — epoch nanoseconds
-// Writes:      workspace.lsis.* — firewall actions → 4001, threat actions →
+// Writes:      workspace.lsis.parsed.* — firewall actions → 4001, threat actions →
 //              2004, auth actions → 3002; unknown actions land in 4001 with
 //              the action preserved in unmapped.
 // Category:    Network firewall / IPS
@@ -390,7 +390,7 @@ def process parse_checkpoint_syslog_dispatch {
 
 def process parse_checkpoint_syslog_network_record_proc {
     let sd = workspace.cp_syslog_class.sd
-    workspace.lsis = checkpoint_syslog_network_record(
+    workspace.lsis.parsed = checkpoint_syslog_network_record(
         sd,
         parse_checkpoint_syslog_kv(sd, "action"),
         parse_checkpoint_syslog_kv(sd, "src"),
@@ -409,7 +409,7 @@ def process parse_checkpoint_syslog_network_record_proc {
 
 def process parse_checkpoint_syslog_finding_record_proc {
     let sd = workspace.cp_syslog_class.sd
-    workspace.lsis = checkpoint_syslog_finding_record(
+    workspace.lsis.parsed = checkpoint_syslog_finding_record(
         sd,
         parse_checkpoint_syslog_kv(sd, "action"),
         parse_checkpoint_syslog_kv(sd, "src"),
@@ -424,7 +424,7 @@ def process parse_checkpoint_syslog_finding_record_proc {
 
 def process parse_checkpoint_syslog_auth_record {
     let sd = workspace.cp_syslog_class.sd
-    workspace.lsis = checkpoint_syslog_auth_record(
+    workspace.lsis.parsed = checkpoint_syslog_auth_record(
         sd,
         parse_checkpoint_syslog_kv(sd, "action"),
         coalesce(workspace.cp_syslog_class.host, workspace.checkpoint_syslog.hostname),

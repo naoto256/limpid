@@ -4,7 +4,7 @@
 //              formats) → LSIS Network Activity.
 // Reads:       ingress (raw wire) — one space-separated flow-log record per
 //              line; dispatch by the leading version token
-// Writes:      workspace.lsis.* — 4001 (Network Activity); unknown version
+// Writes:      workspace.lsis.parsed.* — 4001 (Network Activity); unknown version
 //              tokens route to error_log.
 // Category:    Cloud network (data plane)
 // Test corpus: spec-only (AWS VPC Flow Logs documentation column layouts;
@@ -211,7 +211,7 @@ def process parse_aws_vpc_flow_v2_record {
     let proto_num = aws_vpc_flow_int_or_null(f.protocol)
     let action    = f.action
     let activity  = aws_vpc_flow_activity_id(action)
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  activity,
@@ -289,7 +289,7 @@ def process parse_aws_vpc_flow_v5_record {
     let proto_num = aws_vpc_flow_int_or_null(f.protocol)
     let action    = f.action
     let activity  = aws_vpc_flow_activity_id(action)
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  activity,

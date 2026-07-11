@@ -7,7 +7,7 @@
 //   .body (required, Object) — parsed Zeek event (caller does `parse_json(ingress)`)
 //   .hostname (optional, String) — collector override
 //   .time (optional, Int) — epoch ns override
-// Writes:      workspace.lsis.* — ssh → 4007, smtp → 4009, ftp → 4008,
+// Writes:      workspace.lsis.parsed.* — ssh → 4007, smtp → 4009, ftp → 4008,
 //              dhcp → 4004, kerberos / ntlm / radius → 3002,
 //              smb_mapping / smb_cmd / smb_files → 4006,
 //              dce_rpc / snmp → 4001, rdp → 4005; stock streams fall
@@ -572,79 +572,79 @@ def process parse_zeek_soc {
 }
 
 def process parse_zeek_soc_ssh {
-    workspace.lsis = zeek_ssh_record(
+    workspace.lsis.parsed = zeek_ssh_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
 }
 
 def process parse_zeek_soc_smtp {
-    workspace.lsis = zeek_smtp_record(
+    workspace.lsis.parsed = zeek_smtp_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
 }
 
 def process parse_zeek_soc_ftp {
-    workspace.lsis = zeek_ftp_record(
+    workspace.lsis.parsed = zeek_ftp_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
 }
 
 def process parse_zeek_soc_dhcp {
-    workspace.lsis = zeek_dhcp_record(
+    workspace.lsis.parsed = zeek_dhcp_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
 }
 
 def process parse_zeek_soc_kerberos {
-    workspace.lsis = zeek_kerberos_record(
+    workspace.lsis.parsed = zeek_kerberos_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
 }
 
 def process parse_zeek_soc_ntlm {
-    workspace.lsis = zeek_ntlm_record(
+    workspace.lsis.parsed = zeek_ntlm_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
 }
 
 def process parse_zeek_soc_radius {
-    workspace.lsis = zeek_radius_record(
+    workspace.lsis.parsed = zeek_radius_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
 }
 
 def process parse_zeek_soc_smb_mapping {
-    workspace.lsis = zeek_smb_mapping_record(
+    workspace.lsis.parsed = zeek_smb_mapping_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
 }
 
 def process parse_zeek_soc_smb_cmd {
-    workspace.lsis = zeek_smb_cmd_record(
+    workspace.lsis.parsed = zeek_smb_cmd_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
 }
 
 def process parse_zeek_soc_smb_files {
-    workspace.lsis = zeek_smb_files_record(
+    workspace.lsis.parsed = zeek_smb_files_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
 }
 
 def process parse_zeek_soc_dce_rpc {
-    workspace.lsis = zeek_dce_rpc_record(
+    workspace.lsis.parsed = zeek_dce_rpc_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
 }
 
 def process parse_zeek_soc_snmp {
-    workspace.lsis = zeek_snmp_record(
+    workspace.lsis.parsed = zeek_snmp_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
 }
 
 def process parse_zeek_soc_rdp {
-    workspace.lsis = zeek_rdp_record(
+    workspace.lsis.parsed = zeek_rdp_record(
         workspace.zeek.body, workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time))
 }

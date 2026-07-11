@@ -2,7 +2,7 @@
 //              "default" format) → same LSIS shape as parse_fortigate_cef.
 // Reads:       ingress (raw wire) — syslog priority + KV body
 //              (date=... time=... type=...)
-// Writes:      workspace.lsis.* — same classes as parse_fortigate_cef
+// Writes:      workspace.lsis.parsed.* — same classes as parse_fortigate_cef
 //              (the LSIS contract is format-agnostic).
 // Category:    Network firewall / IPS
 // Test corpus: synthetic (FortiOS "default"-format sample wires in this header)
@@ -177,7 +177,7 @@ def function fortigate_syslog_metadata(version_hint) {
 //   inline `parse_kv(...)` upstream of this process.
 def process parse_fortigate_syslog_traffic {
     let proto_num = to_int(workspace.kv.proto)
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  fortigate_syslog_action_to_activity_id(workspace.kv.action),
@@ -214,7 +214,7 @@ def process parse_fortigate_syslog_traffic {
 //   severity    — severity label (informational/low/medium/high/critical)
 //   msg         — human-readable
 def process parse_fortigate_syslog_utm_ips {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
@@ -254,7 +254,7 @@ def process parse_fortigate_syslog_utm_webfilter {
         "monitor"     { 1 }
         default       { 0 }
     }
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    6004,
         category_uid: 6,
         activity_id:  activity,
@@ -296,7 +296,7 @@ def process parse_fortigate_syslog_utm_webfilter {
 //   virus    — malware family / signature
 //   virusid  — numeric signature id
 def process parse_fortigate_syslog_utm_antivirus {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
@@ -344,7 +344,7 @@ def process parse_fortigate_syslog_utm_antivirus {
 // Subtype leaf: utm:dlp → OCSF Detection Finding (2004)
 // ---------------------------------------------------------------------------
 def process parse_fortigate_syslog_utm_dlp {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
@@ -383,7 +383,7 @@ def process parse_fortigate_syslog_utm_dlp {
 // Subtype leaf: utm:app-ctrl → OCSF Detection Finding (2004)
 // ---------------------------------------------------------------------------
 def process parse_fortigate_syslog_utm_appctrl {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
@@ -432,7 +432,7 @@ def process parse_fortigate_syslog_utm_dns {
         "REFUSED"  { 5 }
         default    { 0 }
     }
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    4003,
         category_uid: 4,
         activity_id:  activity,
@@ -459,7 +459,7 @@ def process parse_fortigate_syslog_utm_emailfilter {
         "passthrough" { 6 }
         default       { 0 }
     }
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    4009,
         category_uid: 4,
         activity_id:  activity,
@@ -482,7 +482,7 @@ def process parse_fortigate_syslog_utm_emailfilter {
 // Subtype leaf: utm:waf → OCSF Detection Finding (2004)
 // ---------------------------------------------------------------------------
 def process parse_fortigate_syslog_utm_waf {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
@@ -534,7 +534,7 @@ def process parse_fortigate_syslog_utm_waf {
 //   hostname      — server hostname (CN or expected SNI)
 //   action        — engine verdict (`info` / `block`)
 def process parse_fortigate_syslog_utm_ssl {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
@@ -584,7 +584,7 @@ def process parse_fortigate_syslog_utm_voip {
         default  { 6 }
     }
     let proto_num = to_int(workspace.kv.proto)
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  activity,
@@ -629,7 +629,7 @@ def process parse_fortigate_syslog_event_user {
         "login-failed"    { 2 }
         default           { 1 }
     }
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    3002,
         category_uid: 3,
         activity_id:  activity,
@@ -658,7 +658,7 @@ def process parse_fortigate_syslog_event_vpn {
         "ssl-login-fail"  { 2 }
         default           { 1 }
     }
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    3002,
         category_uid: 3,
         activity_id:  activity,
@@ -675,7 +675,7 @@ def process parse_fortigate_syslog_event_vpn {
 // Subtype leaf: event:system → OCSF Compliance Finding (2003)
 // ---------------------------------------------------------------------------
 def process parse_fortigate_syslog_event_system {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    2003,
         category_uid: 2,
         activity_id:  1,
@@ -704,7 +704,7 @@ def process parse_fortigate_syslog_event_wireless {
         "client-roam"       { 6 }
         default             { 0 }
     }
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  activity,
@@ -737,7 +737,7 @@ def process parse_fortigate_syslog_event_wireless {
 //   auditreporttype  — "CoverageReport" / "OptimizationReport" / ...
 //   criticalcount, highcount, mediumcount, lowcount, passedcount
 def process parse_fortigate_syslog_event_security_rating {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    2003,
         category_uid: 2,
         activity_id:  1,
