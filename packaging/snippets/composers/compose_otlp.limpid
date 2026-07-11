@@ -37,11 +37,13 @@
 //                             `"INFO"`/`"WARN"`/`"ERROR"`.
 //                .log_record.observed_time_unix_nano (optional, Int) —
 //                             time the current process observed the event
-//                             (LogRecord field 11). default — omitted from
-//                             the wire (proto3 default). Set when the
-//                             caller wants both event time (parsed) and
-//                             observed time (usually `to_int(received_at)`)
-//                             on the wire.
+//                             (LogRecord field 11). default —
+//                             `to_int(received_at)`: the logs.proto
+//                             comment says this field MUST be set once
+//                             the event is observed, so the receive time
+//                             always goes on the wire. Set the slot to
+//                             carry an earlier observation point (e.g. a
+//                             timestamp stamped by an upstream collector).
 //              workspace.lsis.parsed.* — graceful reads from the fact
 //              layer, no shed intake for these:
 //                .time         (optional, Int) — used as `time_unix_nano`
@@ -167,7 +169,10 @@ def process compose_otlp {
             },
             log_records: [{
                 time_unix_nano:          coalesce(workspace.lsis.parsed.time, received_at),
-                observed_time_unix_nano: workspace.lsis.shed.otlp.log_record.observed_time_unix_nano,
+                observed_time_unix_nano: coalesce(
+                    workspace.lsis.shed.otlp.log_record.observed_time_unix_nano,
+                    to_int(received_at)
+                ),
                 severity_number:         otlp_severity_number(workspace.lsis.parsed.severity_id),
                 severity_text:           workspace.lsis.shed.otlp.log_record.severity_text,
                 body: { string_value: coalesce(

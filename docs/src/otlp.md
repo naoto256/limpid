@@ -213,8 +213,12 @@ limpid's snippet convention is:
   received_at)` defensively: an absent key encodes as `timeUnixNano: 0`
   on the wire (proto3 default), and the encoder does not warn on
   absent keys — only on present-but-uncoercible values.
-- `observed_time_unix_nano = received_at` only when the snippet
-  explicitly chooses to populate it; not auto-set
+- `observed_time_unix_nano = received_at` by default — the logs.proto
+  comment requires the field to be set once the event is observed, so
+  the packaged `compose_otlp` snippet coalesces its shed slot with
+  `to_int(received_at)`. A snippet overrides the slot only to carry an
+  earlier observation point (e.g. a timestamp stamped by an upstream
+  collector).
 
 The spec is comfortable with this split; the practice in the wild is
 not consistent.
