@@ -1,66 +1,108 @@
-// Summary:     Wraps an already-serialised payload string in a
-//              minimal OTLP-1.0.0 ResourceLogs proto envelope
-//              (envelope composer — agnostic to what the payload
-//              encodes).
-// Reads:       workspace.lsis.parsed.* (per-envelope declared input)
-//                .otlp_body (required, String) — payload wrapped as
-//                            body.string_value on the log record
+// Summary:     Assembles an OTLP-1.0.0 ResourceLogs proto envelope
+//              from per-field shed slots + parsed-layer graceful reads.
+//              Emits a single LogRecord per event, encoded as
+//              protobuf bytes for both otlp_http and otlp_grpc.
+// Reads:       workspace.lsis.shed.otlp.* — per-slot intake
+//              (OTLP proto vocabulary):
+//                .resource.attributes    (optional, Array of KeyValue) —
+//                             default: [{ key: "host.name", value:
+//                             { string_value: hostname() } }]. Specifying
+//                             this slot REPLACES the default (no merge):
+//                             callers who still want host.name in their
+//                             resource attributes must include it in the
+//                             array they pass.
+//                .scope.attributes       (optional, Array of KeyValue) —
+//                             default: empty. `scope.name` is fixed at
+//                             "limpid".
+//                .log_record.body        (required, String) — placed on
+//                             the LogRecord as `body.string_value`. Absent
+//                             body yields an empty body string; a
+//                             deliberate wrapper (schema composer output,
+//                             raw ingress, etc.) is the caller's job to
+//                             assign in a glue block.
+//                .log_record.attributes  (optional, Array of KeyValue) —
+//                             default: empty. Replacement semantics as
+//                             above.
+//              workspace.lsis.parsed.* — graceful reads from the fact
+//              layer, no shed intake for these:
+//                .time         (optional, Int) — used as `time_unix_nano`
+//                             when populated; falls back to `received_at`
+//                             otherwise. Time is a fact about the event,
+//                             so it lives in `parsed`, not `shed`.
+//                .severity_id  (optional, Int) — used as `severity_number`
+//                             when populated. Absent (or 0 = OCSF Unknown)
+//                             means the field is omitted from the wire.
 // Writes:      workspace.lsis.composed.otlp — ResourceLogs proto bytes
-//              (Bytes). Pipe `| otlp_to_egress` (foot of file) to
-//              emit for `output otlp_http` / `otlp_grpc`.
+//              (Bytes). Pipe `| otlp_to_egress` (foot of file) to emit
+//              for `output otlp_http` / `output otlp_grpc`.
 // Test corpus: spec-only (OTLP/1.0.0 proto shape;
 //              otlp.encode_resourcelog_protobuf reference in
 //              docs/src/functions/expression-functions.md)
 //
-// Two-layer contract —
-//   schema composer (compose_ocsf, compose_rfc5424, …) — reads
-//     `workspace.lsis.parsed.*`, writes `workspace.lsis.parsed.<schema>` slot with
-//     the schema-shape wire form (String).
-//   envelope composer (compose_otlp) — reads the declared per-envelope
-//     input slot `workspace.lsis.shed.otlp.log_record.body` (the payload to wrap),
-//     writes `workspace.lsis.composed.otlp` with the encoded envelope bytes.
+// Sourcing the shed slots — a glue block in the pipeline hands the
+// upstream composer's product (or ad-hoc caller-supplied values) into
+// this composer's intake. Two common shapes:
 //
-// Because each slot has a single writer, feeding a schema composer's
-// output into the envelope composer's input is done in the pipeline
-// with an inline block:
+//   1. Wrap an OCSF JSON produced by compose_ocsf as the log body:
 //
-//   process parse_x
-//         | compose_ocsf
-//         | { workspace.lsis.shed.otlp.log_record.body = workspace.lsis.composed.ocsf }
-//         | compose_otlp
-//         | otlp_to_egress
+//        process parse_x
+//              | compose_ocsf
+//              | { workspace.lsis.shed.otlp.log_record.body =
+//                    workspace.lsis.composed.ocsf }
+//              | compose_otlp
+//              | otlp_to_egress
 //
-// The same pattern works for any other schema slot (RFC 5424 record,
-// replayable JSONL line, etc.) — the envelope is agnostic to what the
-// body string encodes.
+//   2. Ship a target-specific attribute vocabulary (e.g. Azure Monitor
+//      Pipeline's CommonSecurityLog columns) via log_record.attributes,
+//      alongside a body of the caller's choosing:
 //
-// Envelope neutrality — this composer deliberately does NOT read LSIS
-// fields other than the declared `otlp_body`. Resource attributes are
-// minimal (`host.name` only) and the scope carries a fixed
-// `{ name: "limpid" }` marker; richer attributes are the caller's
-// concern — override with a downstream process, or write a
-// project-specific `compose_otlp_<flavour>` that reads more of LSIS.
+//        process parse_fortigate_cef
+//              | {
+//                  workspace.lsis.shed.otlp.log_record.body =
+//                      workspace.syslog.msg
+//                  workspace.lsis.shed.otlp.log_record.attributes = [
+//                      { key: "DeviceVendor",  value: { string_value:
+//                          workspace.cef.device_vendor } },
+//                      { key: "DeviceProduct", value: { string_value:
+//                          workspace.cef.device_product } },
+//                      { key: "SourceIP",      value: { string_value:
+//                          workspace.cef.src } }
+//                  ]
+//                }
+//              | compose_otlp
+//              | otlp_to_egress
 //
-// Time — `received_at` is used as `time_unix_nano`. Callers that
-// carry a source-claimed timestamp (parsed off the wire) can
-// override in an inline block before compose_otlp:
-//   `{ workspace.event_time_ns = coalesce(workspace.lsis.parsed.time, received_at) }`
-// then swap the log-record timestamp read in a wrapper composer.
-// See `docs/src/outputs/otlp_http.md` for the full-fidelity
-// timestamp pattern.
+// Bridges live *with the composer that consumes them* (this file is
+// their home). A named `<upstream>_to_otlp` bridge is worth introducing
+// when the caller's mapping is non-trivial and reusable across
+// pipelines; ad-hoc glue blocks like the two above are the norm.
 
 def process compose_otlp {
     workspace.lsis.composed.otlp = otlp.encode_resourcelog_protobuf({
         resource: {
-            attributes: [
-                { key: "host.name", value: { string_value: hostname() } }
-            ]
+            attributes: coalesce(
+                workspace.lsis.shed.otlp.resource.attributes,
+                [ { key: "host.name", value: { string_value: hostname() } } ]
+            )
         },
         scope_logs: [{
-            scope: { name: "limpid" },
+            scope: {
+                name: "limpid",
+                attributes: coalesce(
+                    workspace.lsis.shed.otlp.scope.attributes,
+                    []
+                )
+            },
             log_records: [{
-                time_unix_nano: received_at,
-                body: { string_value: workspace.lsis.shed.otlp.log_record.body }
+                time_unix_nano:  coalesce(workspace.lsis.parsed.time, received_at),
+                severity_number: workspace.lsis.parsed.severity_id,
+                body: { string_value: coalesce(
+                    workspace.lsis.shed.otlp.log_record.body, ""
+                ) },
+                attributes: coalesce(
+                    workspace.lsis.shed.otlp.log_record.attributes,
+                    []
+                )
             }]
         }]
     })
