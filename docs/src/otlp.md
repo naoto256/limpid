@@ -458,11 +458,24 @@ kvlist. limpid's snippet author chooses, per pipeline:
   understands the OTLP attribute model (the OTel-native path)
 
 A common pattern for cloud-bound pipelines is to run `compose_ocsf`
-so the OCSF JSON lands in the LSIS slot `workspace.lsis.ocsf`, then
-ship it as `body: { string_value: workspace.lsis.ocsf }` (the slot
-holds the already-serialised string, so no per-event `to_json`). This
-matches what most cloud backends expect, lets the OCSF schema do the
-structuring work, and avoids fighting the OTLP attribute namespace.
+so the OCSF JSON lands in `workspace.lsis.composed.ocsf`, then hand
+it into `compose_otlp` via the shed slot in a glue block:
+
+```
+process parse_x
+      | compose_ocsf
+      | {
+          workspace.lsis.shed.otlp.log_record.body =
+              workspace.lsis.composed.ocsf
+        }
+      | compose_otlp
+      | otlp_to_egress
+```
+
+The composed slot holds the already-serialised string, so no
+per-event `to_json`. This matches what most cloud backends expect,
+lets the OCSF schema do the structuring work, and avoids fighting the
+OTLP attribute namespace.
 
 ---
 
