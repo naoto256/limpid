@@ -13,10 +13,13 @@
 //                .procid     (optional, String) — default "-"
 //                .msgid      (optional, String) — default "-"
 //                .sd         (optional, String) — default "-"
-//                .msg        (String)           — treated as required. If
-//                             the slot is absent the record still assembles
-//                             with an empty MSG, which is spec-compliant
-//                             (RFC 5424 § 6 grammar makes MSG optional).
+//                .msg        (required, String) — the log body. If the slot
+//                             is absent the record still assembles with an
+//                             empty MSG, which is spec-compliant (RFC 5424
+//                             § 6 grammar makes MSG optional); required is
+//                             the intended contract from the composer's
+//                             point of view, and absence is a caller bug
+//                             to flag.
 // Writes:      workspace.lsis.composed.rfc5424 — single-line RFC 5424
 //              record (String). Pipe `| rfc5424_to_egress` (foot of file)
 //              to emit it as the wire form.
