@@ -1,7 +1,7 @@
 // Summary:     Palo Alto Networks PAN-OS CEF → LSIS, dispatched by CEF
 //              name (TRAFFIC / THREAT / URL / …).
 // Reads:       ingress (raw wire) — syslog-wrapped CEF (CEF:0|Palo Alto Networks|PAN-OS|...)
-// Writes:      workspace.lsis.* — TRAFFIC → 4001, THREAT / WILDFIRE → 2004,
+// Writes:      workspace.lsis.parsed.* — TRAFFIC → 4001, THREAT / WILDFIRE → 2004,
 //              URL → 6004, GLOBALPROTECT / AUTHENTICATION → 3002; see the
 //              subtype leaves below.
 // Category:    Network firewall / IPS
@@ -139,7 +139,7 @@ def process parse_paloalto_cef {
 //   workspace.cef populated by `parse_paloalto_cef` dispatcher or an
 //   inline `cef.parse(...)` upstream of this process.
 def process parse_paloalto_cef_traffic {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  paloalto_cef_traffic_action_to_activity_id(workspace.cef.act),
@@ -198,7 +198,7 @@ def process parse_paloalto_cef_traffic {
 //   suser            — source user
 //   app              — application
 def process parse_paloalto_cef_threat {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
@@ -262,7 +262,7 @@ def process parse_paloalto_cef_url {
         "override"  { 1 }
         default     { 0 }
     }
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    6004,
         category_uid: 6,
         activity_id:  activity,
@@ -323,7 +323,7 @@ def process parse_paloalto_cef_wildfire {
         "benign"    { 1 }
         default     { 0 }
     }
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
@@ -385,7 +385,7 @@ def process parse_paloalto_cef_globalprotect {
         "failed" { 2 }
         default  { 1 }
     }
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    3002,
         category_uid: 3,
         activity_id:  activity,
@@ -422,7 +422,7 @@ def process parse_paloalto_cef_authentication {
         "failure" { 2 }
         default   { 0 }
     }
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    3002,
         category_uid: 3,
         activity_id:  1,

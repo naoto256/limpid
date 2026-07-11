@@ -5,7 +5,7 @@
 // Reads:       ingress (passed through verbatim) — plus the ambient
 //              event metadata `received_at` / `source`, which every
 //              process can read unconditionally.
-// Writes:      workspace.lsis.replayable — replay record JSONL line
+// Writes:      workspace.lsis.composed.replayable — replay record JSONL line
 //              (String). Pipe `| replayable_to_egress` (foot of
 //              file) to emit it as the capture stream.
 // Test corpus: spec-only (mirrors the error_log DLQ record shape;
@@ -47,7 +47,7 @@ def process compose_replayable {
     // `{ip, port}` object — same shape `inject --json` expects — so
     // the composer can pass it straight through with no string
     // assembly and no port-placeholder fidelity loss.
-    workspace.lsis.replayable = to_json({
+    workspace.lsis.composed.replayable = to_json({
         received_at: received_at,
         source:      source,
         ingress:     ingress
@@ -58,9 +58,9 @@ def process compose_replayable {
 // Egress terminator
 // ---------------------------------------------------------------------------
 //
-// Moves the replay record from `workspace.lsis.replayable` to
+// Moves the replay record from `workspace.lsis.composed.replayable` to
 // `egress`. Pipelines that emit the capture stream as the wire form
 // pipe `compose_replayable | replayable_to_egress`.
 def process replayable_to_egress {
-    egress = workspace.lsis.replayable
+    egress = workspace.lsis.composed.replayable
 }

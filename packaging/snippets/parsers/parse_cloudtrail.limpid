@@ -1,7 +1,7 @@
 // Summary:     AWS CloudTrail JSON events → LSIS API Activity.
 // Reads:       ingress (raw wire) — one CloudTrail event JSON object per
 //              ingress (unwrap {"Records":[...]} at the transport layer)
-// Writes:      workspace.lsis.* — 6003 (API Activity).
+// Writes:      workspace.lsis.parsed.* — 6003 (API Activity).
 // Category:    Cloud audit (API control plane)
 // Test corpus: public (FLAWS CloudTrail dataset, 1M events)
 //
@@ -130,7 +130,7 @@ def function cloudtrail_activity_id(name) {
 // ---------------------------------------------------------------------------
 //
 // One process: parse the JSON, then translate top-level CloudTrail
-// fields into OCSF API Activity (6003) on workspace.lsis.
+// fields into OCSF API Activity (6003) on workspace.lsis.parsed.
 
 def process parse_cloudtrail {
     workspace.ct = parse_json(ingress)
@@ -141,7 +141,7 @@ def process parse_cloudtrail {
         default                        { 1 }
     }
 
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    6003,
         category_uid: 6,
         activity_id:  activity,

@@ -2,7 +2,7 @@
 // Reads:       workspace.combined_log.* (bridge — see Bridges below)
 //                .body (required, String) — the CLF line
 //                .hostname (optional, String) — web server hostname
-// Writes:      workspace.lsis.* — 4002 (HTTP Activity).
+// Writes:      workspace.lsis.parsed.* — 4002 (HTTP Activity).
 // Category:    Web / proxy access
 // Test corpus: synthetic (sample CLF lines in this header)
 //
@@ -131,7 +131,7 @@ def process parse_combined_log_record {
         default { workspace.web.referer }
     }
 
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    4002,
         category_uid: 4,
         activity_id:  activity,

@@ -6,7 +6,7 @@
 //   .body (required, Object) — parsed Sysmon event (caller does `parse_json(ingress)`)
 //   .hostname (optional, String) — collector override
 //   .time (optional, Int) — epoch ns override
-// Writes:      workspace.lsis.* — EventID 1 (ProcessCreate) → 1007,
+// Writes:      workspace.lsis.parsed.* — EventID 1 (ProcessCreate) → 1007,
 //              3 (NetworkConnect) → 4001, 11 (FileCreate) → 1001;
 //              unknown EventIDs route to error_log.
 // Category:    EDR
@@ -99,7 +99,7 @@ def process parse_sysmon {
 
 def process parse_sysmon_process_create {
     let ed = workspace.sysmon.body.EventData
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    1007,
         category_uid: 1,
         activity_id:  1,                                // Launch
@@ -169,7 +169,7 @@ def process parse_sysmon_process_create {
 
 def process parse_sysmon_network_connect {
     let ed = workspace.sysmon.body.EventData
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  1,                                // Open
@@ -230,7 +230,7 @@ def process parse_sysmon_network_connect {
 
 def process parse_sysmon_file_create {
     let ed = workspace.sysmon.body.EventData
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    1001,
         category_uid: 1,
         activity_id:  1,                                // Create

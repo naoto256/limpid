@@ -4,7 +4,7 @@
 //                .pid (optional, String) — named pid
 //                .hostname (optional, String) — DNS server hostname
 //                .time (optional, Int) — epoch nanoseconds of arrival
-// Writes:      workspace.lsis.* — 4003 (DNS Activity). Only the queries
+// Writes:      workspace.lsis.parsed.* — 4003 (DNS Activity). Only the queries
 //              channel; other BIND log categories route to error_log.
 // Category:    DNS server
 // Test corpus: synthetic (sample querylog lines in this header)
@@ -145,7 +145,7 @@ def process parse_bind {
 }
 
 def process parse_bind_query_record {
-    workspace.lsis = bind_dns_record(
+    workspace.lsis.parsed = bind_dns_record(
         workspace.bind_query.client_ip,
         workspace.bind_query.client_port,
         workspace.bind_query.qname,

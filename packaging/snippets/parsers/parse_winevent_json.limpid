@@ -2,7 +2,7 @@
 //              Security channel) → LSIS, dispatched by EventID.
 // Reads:       ingress (raw wire) — one Windows event record JSON object
 //              per ingress
-// Writes:      workspace.lsis.* — 3002 (logon/logoff), 1007 (process),
+// Writes:      workspace.lsis.parsed.* — 3002 (logon/logoff), 1007 (process),
 //              3001 (account change), 3006 (group management), dispatched
 //              by EventID; unmapped IDs route to error_log. Per-ID table
 //              below.
@@ -251,7 +251,7 @@ def function winevent_group_management_record(activity_id, severity_id, time, gr
 
 def process parse_winevent_4624_logon_success {
     let we = workspace.winevent
-    workspace.lsis = winevent_authentication_record(
+    workspace.lsis.parsed = winevent_authentication_record(
         1, 1, 1,
         winevent_time(we.EventTime),
         winevent_actor_user(we.TargetUserName, we.TargetDomainName),
@@ -266,7 +266,7 @@ def process parse_winevent_4624_logon_success {
 
 def process parse_winevent_4625_logon_failure {
     let we = workspace.winevent
-    workspace.lsis = winevent_authentication_record(
+    workspace.lsis.parsed = winevent_authentication_record(
         1, 2, 3,
         winevent_time(we.EventTime),
         winevent_actor_user(we.TargetUserName, we.TargetDomainName),
@@ -281,7 +281,7 @@ def process parse_winevent_4625_logon_failure {
 
 def process parse_winevent_4634_logoff {
     let we = workspace.winevent
-    workspace.lsis = winevent_authentication_record(
+    workspace.lsis.parsed = winevent_authentication_record(
         2, 1, 1,
         winevent_time(we.EventTime),
         winevent_actor_user(we.TargetUserName, we.TargetDomainName),
@@ -300,7 +300,7 @@ def process parse_winevent_4634_logoff {
 
 def process parse_winevent_4688_process_create {
     let we = workspace.winevent
-    workspace.lsis = winevent_process_activity_record(
+    workspace.lsis.parsed = winevent_process_activity_record(
         1, 1,
         winevent_time(we.EventTime),
         we.NewProcessName,
@@ -314,7 +314,7 @@ def process parse_winevent_4688_process_create {
 
 def process parse_winevent_4689_process_terminate {
     let we = workspace.winevent
-    workspace.lsis = winevent_process_activity_record(
+    workspace.lsis.parsed = winevent_process_activity_record(
         4, 1,
         winevent_time(we.EventTime),
         we.ProcessName,
@@ -332,7 +332,7 @@ def process parse_winevent_4689_process_terminate {
 
 def process parse_winevent_4720_account_create {
     let we = workspace.winevent
-    workspace.lsis = winevent_account_change_record(
+    workspace.lsis.parsed = winevent_account_change_record(
         1, 2,
         winevent_time(we.EventTime),
         winevent_actor_user(we.TargetUserName, we.TargetDomainName),
@@ -344,7 +344,7 @@ def process parse_winevent_4720_account_create {
 
 def process parse_winevent_account_enable {
     let we = workspace.winevent
-    workspace.lsis = winevent_account_change_record(
+    workspace.lsis.parsed = winevent_account_change_record(
         2, 2,
         winevent_time(we.EventTime),
         winevent_actor_user(we.TargetUserName, we.TargetDomainName),
@@ -356,7 +356,7 @@ def process parse_winevent_account_enable {
 
 def process parse_winevent_account_disable {
     let we = workspace.winevent
-    workspace.lsis = winevent_account_change_record(
+    workspace.lsis.parsed = winevent_account_change_record(
         3, 2,
         winevent_time(we.EventTime),
         winevent_actor_user(we.TargetUserName, we.TargetDomainName),
@@ -368,7 +368,7 @@ def process parse_winevent_account_disable {
 
 def process parse_winevent_account_modify {
     let we = workspace.winevent
-    workspace.lsis = winevent_account_change_record(
+    workspace.lsis.parsed = winevent_account_change_record(
         99, 2,
         winevent_time(we.EventTime),
         winevent_actor_user(we.TargetUserName, we.TargetDomainName),
@@ -380,7 +380,7 @@ def process parse_winevent_account_modify {
 
 def process parse_winevent_account_delete {
     let we = workspace.winevent
-    workspace.lsis = winevent_account_change_record(
+    workspace.lsis.parsed = winevent_account_change_record(
         4, 2,
         winevent_time(we.EventTime),
         winevent_actor_user(we.TargetUserName, we.TargetDomainName),
@@ -396,7 +396,7 @@ def process parse_winevent_account_delete {
 
 def process parse_winevent_group_member_add {
     let we = workspace.winevent
-    workspace.lsis = winevent_group_management_record(
+    workspace.lsis.parsed = winevent_group_management_record(
         1, 2,
         winevent_time(we.EventTime),
         we.TargetUserName,
@@ -409,7 +409,7 @@ def process parse_winevent_group_member_add {
 
 def process parse_winevent_group_member_remove {
     let we = workspace.winevent
-    workspace.lsis = winevent_group_management_record(
+    workspace.lsis.parsed = winevent_group_management_record(
         2, 2,
         winevent_time(we.EventTime),
         we.TargetUserName,

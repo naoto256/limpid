@@ -3,7 +3,7 @@
 // Summary:     Azure Activity Log events JSON → LSIS API Activity.
 // Reads:       ingress (raw wire) — one Activity Log event per ingress (flat
 //              per-record form; unwrap Event Hub batches upstream)
-// Writes:      workspace.lsis.* — 6003 (API Activity), dispatched over the
+// Writes:      workspace.lsis.parsed.* — 6003 (API Activity), dispatched over the
 //              8 documented categories; unknown categories route to
 //              error_log.
 // Category:    Cloud audit (API control plane)
@@ -146,7 +146,7 @@ def process parse_azure_activity_record {
     let rp       = azure_resource_provider(workspace.az.resourceId)
     let rtype    = azure_resource_type(workspace.az.resourceId)
 
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    6003,
         category_uid: 6,
         activity_id:  activity,
