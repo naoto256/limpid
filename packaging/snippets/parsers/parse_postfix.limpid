@@ -4,7 +4,7 @@
 //                .body (required, String) — the postfix-tagged body
 //                .hostname (optional, String) — host where the MTA ran
 //                .time (optional, Int) — epoch nanoseconds
-// Writes:      workspace.lsis.* — 4009 (Email Activity) for mail-flow programs
+// Writes:      workspace.lsis.parsed.* — 4009 (Email Activity) for mail-flow programs
 //              (smtp / smtpd / qmgr / bounce); daemon-control noise routes to
 //              error_log.
 // Category:    Mail (MTA)
@@ -181,7 +181,7 @@ def process parse_postfix_smtp {
 }
 
 def process parse_postfix_smtp_record {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    4009,
         category_uid: 4,
         activity_id:  1,
@@ -232,7 +232,7 @@ def process parse_postfix_smtpd {
 }
 
 def process parse_postfix_smtpd_connect_record {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    4009,
         category_uid: 4,
         activity_id:  2,
@@ -261,7 +261,7 @@ def process parse_postfix_smtpd_connect_record {
 }
 
 def process parse_postfix_smtpd_reject_record {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    4009,
         category_uid: 4,
         activity_id:  2,
@@ -310,7 +310,7 @@ def process parse_postfix_qmgr {
 }
 
 def process parse_postfix_qmgr_record {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    4009,
         category_uid: 4,
         activity_id:  1,
@@ -356,7 +356,7 @@ def process parse_postfix_bounce {
 }
 
 def process parse_postfix_bounce_record {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    4009,
         category_uid: 4,
         activity_id:  1,

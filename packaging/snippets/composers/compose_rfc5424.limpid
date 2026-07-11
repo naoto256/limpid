@@ -13,7 +13,7 @@
 //              workspace.cef.*) are out of scope — write your own
 //              composer if you need to re-wrap from a different
 //              intermediate.
-// Writes:      workspace.lsis.rfc5424 — single-line RFC 5424 record
+// Writes:      workspace.lsis.composed.rfc5424 — single-line RFC 5424 record
 //              (String). Pipe `| rfc5424_to_egress` (foot of file)
 //              to emit it as the wire form.
 // Test corpus: spec-only (RFC 5424 frame shape; field decisions
@@ -89,16 +89,16 @@ def process compose_rfc5424 {
     let procid   = rfc5424_procid()
     let msg      = coalesce(workspace.journald.MESSAGE, "")
 
-    workspace.lsis.rfc5424 = "<${pri}>1 ${ts} ${host} ${app} ${procid} - - ${msg}"
+    workspace.lsis.composed.rfc5424 = "<${pri}>1 ${ts} ${host} ${app} ${procid} - - ${msg}"
 }
 
 // ---------------------------------------------------------------------------
 // Egress terminator
 // ---------------------------------------------------------------------------
 //
-// Moves the RFC 5424 record from `workspace.lsis.rfc5424` to
+// Moves the RFC 5424 record from `workspace.lsis.composed.rfc5424` to
 // `egress`. Pipelines that emit RFC 5424 as the wire form pipe
 // `compose_rfc5424 | rfc5424_to_egress`.
 def process rfc5424_to_egress {
-    egress = workspace.lsis.rfc5424
+    egress = workspace.lsis.composed.rfc5424
 }

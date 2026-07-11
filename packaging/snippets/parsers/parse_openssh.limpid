@@ -5,7 +5,7 @@
 //                .pid (optional, String) — process id as string
 //                .hostname (optional, String) — SSH server hostname
 //                .time (optional, Int) — epoch nanoseconds of the event
-// Writes:      workspace.lsis.* — 3002 (Authentication).
+// Writes:      workspace.lsis.parsed.* — 3002 (Authentication).
 // Category:    Endpoint / host audit (Unix)
 // Test corpus: synthetic (sample sshd bodies in this header)
 //
@@ -68,7 +68,7 @@
 //   Disconnected from authenticating user alice 192.0.2.10 port 54321 [preauth]
 //   Connection closed by 192.0.2.10 port 54321 [preauth]
 //
-// Each pattern populates workspace.lsis as an OCSF Authentication
+// Each pattern populates workspace.lsis.parsed as an OCSF Authentication
 // (3002) record. Login attempts (success / failure) → activity_id=1;
 // session teardown → activity_id=2.
 //
@@ -340,7 +340,7 @@ def function parse_openssh_message(msg) {
 // ---------------------------------------------------------------------------
 
 def process parse_openssh_accepted {
-    workspace.lsis = openssh_auth_record(
+    workspace.lsis.parsed = openssh_auth_record(
         1,                              // activity_id: Logon
         1,                              // status_id:   Success
         1,                              // severity_id: Informational
@@ -370,7 +370,7 @@ def process parse_openssh_failed {
         invalid != null { 3 }   // Medium — invalid-user attempt
         default         { 2 }   // Low — failed auth on a known account
     }
-    workspace.lsis = openssh_auth_record(
+    workspace.lsis.parsed = openssh_auth_record(
         1,                              // activity_id: Logon
         2,                              // status_id:   Failure
         severity,
@@ -389,7 +389,7 @@ def process parse_openssh_failed {
 // ---------------------------------------------------------------------------
 
 def process parse_openssh_invalid_user {
-    workspace.lsis = openssh_auth_record(
+    workspace.lsis.parsed = openssh_auth_record(
         1,                              // activity_id: Logon
         2,                              // status_id:   Failure
         3,                              // severity_id: Medium (probe)
@@ -415,7 +415,7 @@ def process parse_openssh_invalid_user {
 // ---------------------------------------------------------------------------
 
 def process parse_openssh_disconnected {
-    workspace.lsis = openssh_auth_record(
+    workspace.lsis.parsed = openssh_auth_record(
         2,                              // activity_id: Logoff
         1,                              // status_id:   Success
         1,                              // severity_id: Informational
@@ -437,7 +437,7 @@ def process parse_openssh_disconnected {
 // ---------------------------------------------------------------------------
 
 def process parse_openssh_no_ident {
-    workspace.lsis = openssh_auth_record(
+    workspace.lsis.parsed = openssh_auth_record(
         99,                             // activity_id: Other
         2,                              // status_id:   Failure
         2,                              // severity_id: Low

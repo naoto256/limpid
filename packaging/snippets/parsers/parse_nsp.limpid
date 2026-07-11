@@ -4,7 +4,7 @@
 //                .body (required, String) — the KV body
 //                .hostname (optional, String) — collector-side hostname
 //                .time (optional, Int) — epoch nanoseconds
-// Writes:      workspace.lsis.* — 2004 (Detection Finding).
+// Writes:      workspace.lsis.parsed.* — 2004 (Detection Finding).
 // Category:    Network firewall / IPS
 // Test corpus: real (Trellix NSP Manager capture — 56/56 alerts across HTTP /
 //              SSH / SSL / NETBIOS-SS / TELNET / NTP / BACKDOOR signature
@@ -298,7 +298,7 @@ def process parse_nsp {
             error "parse_nsp: not a Trellix NSP standard-template body: ${workspace.nsp.body}"
         }
         default {
-            workspace.lsis = nsp_finding_record(
+            workspace.lsis.parsed = nsp_finding_record(
                 workspace.nsp_kv,
                 workspace.nsp.hostname,
                 workspace.nsp.time

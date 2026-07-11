@@ -4,7 +4,7 @@
 //              identity classes, dispatched by eventType.
 // Reads:       ingress (raw wire) — one LogEvent object per ingress (unwrap
 //              Event Hooks data.events[] upstream)
-// Writes:      workspace.lsis.* — user.session/user.authentication → 3002,
+// Writes:      workspace.lsis.parsed.* — user.session/user.authentication → 3002,
 //              user.lifecycle → 3001, user.account → 3005, group.* → 3006;
 //              other eventTypes route to error_log.
 // Category:    Identity / IdP
@@ -300,7 +300,7 @@ def process parse_okta_user_authentication {
         subject_target != null { okta_user(subject_target) }
         default                { okta_user(ev.actor) }
     }
-    workspace.lsis = okta_authentication_record(
+    workspace.lsis.parsed = okta_authentication_record(
         activity_id,
         okta_status_id(ev.outcome.result),
         okta_severity_id(ev.outcome.result),
@@ -371,7 +371,7 @@ def process parse_okta_user_lifecycle {
         default                                    { 99 }
     }
     let subject_target = okta_first_target(ev.target, "User")
-    workspace.lsis = okta_account_change_record(
+    workspace.lsis.parsed = okta_account_change_record(
         activity_id,
         okta_status_id(ev.outcome.result),
         okta_severity_id(ev.outcome.result),
@@ -456,7 +456,7 @@ def process parse_okta_user_account {
             error "parse_okta_system: ${et} carries no User target (expected for 3005 User Management)"
         }
         default {
-            workspace.lsis = okta_user_management_record(
+            workspace.lsis.parsed = okta_user_management_record(
                 activity_id,
                 okta_status_id(ev.outcome.result),
                 okta_severity_id(ev.outcome.result),
@@ -531,7 +531,7 @@ def process parse_okta_group_membership {
             error "parse_okta_system: ${et} carries no UserGroup target (expected for 3006 Group Management)"
         }
         default {
-            workspace.lsis = okta_group_management_record(
+            workspace.lsis.parsed = okta_group_management_record(
                 activity_id,
                 okta_status_id(ev.outcome.result),
                 okta_severity_id(ev.outcome.result),
@@ -562,7 +562,7 @@ def process parse_okta_group_lifecycle {
             error "parse_okta_system: ${et} carries no UserGroup target (expected for 3006 Group Management)"
         }
         default {
-            workspace.lsis = okta_group_management_record(
+            workspace.lsis.parsed = okta_group_management_record(
                 activity_id,
                 okta_status_id(ev.outcome.result),
                 okta_severity_id(ev.outcome.result),
@@ -596,7 +596,7 @@ def process parse_okta_group_privilege {
             error "parse_okta_system: ${et} carries no UserGroup target (expected for 3006 Group Management)"
         }
         default {
-            workspace.lsis = okta_group_management_record(
+            workspace.lsis.parsed = okta_group_management_record(
                 activity_id,
                 okta_status_id(ev.outcome.result),
                 okta_severity_id(ev.outcome.result),

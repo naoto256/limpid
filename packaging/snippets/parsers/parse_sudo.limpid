@@ -5,7 +5,7 @@
 //                .pid (optional, String) — process id as string
 //                .hostname (optional, String) — host where sudo ran
 //                .time (optional, Int) — epoch nanoseconds
-// Writes:      workspace.lsis.* — 3003 (Authorize Session).
+// Writes:      workspace.lsis.parsed.* — 3003 (Authorize Session).
 // Category:    Endpoint / host audit (Unix)
 // Test corpus: synthetic (sample sudo bodies in this header)
 //
@@ -63,7 +63,7 @@
 //   PAM session closed (privilege deactivation marker):
 //   pam_unix(sudo:session): session closed for user root
 //
-// Each pattern populates `workspace.lsis` as an OCSF Authorize
+// Each pattern populates `workspace.lsis.parsed` as an OCSF Authorize
 // Session (3003) record. Invocation lines map to activity_id=1
 // "Assign Privileges" (status=Success on a clean invocation,
 // status=Failure on auth or authorization denial). PAM session
@@ -280,7 +280,7 @@ def process parse_sudo {
 // ---------------------------------------------------------------------------
 
 def process parse_sudo_invocation {
-    workspace.lsis = sudo_authorize_session_record(
+    workspace.lsis.parsed = sudo_authorize_session_record(
         1,  // activity_id: Assign Privileges
         1,  // status_id:   Success
         1,  // severity_id: Informational
@@ -300,7 +300,7 @@ def process parse_sudo_invocation {
 // ---------------------------------------------------------------------------
 
 def process parse_sudo_auth_failed {
-    workspace.lsis = sudo_authorize_session_record(
+    workspace.lsis.parsed = sudo_authorize_session_record(
         1,  // activity_id: Assign Privileges (denied)
         2,  // status_id:   Failure
         3,  // severity_id: Medium
@@ -320,7 +320,7 @@ def process parse_sudo_auth_failed {
 // ---------------------------------------------------------------------------
 
 def process parse_sudo_denied_sudoers {
-    workspace.lsis = sudo_authorize_session_record(
+    workspace.lsis.parsed = sudo_authorize_session_record(
         1,  // activity_id: Assign Privileges (denied)
         2,  // status_id:   Failure
         3,  // severity_id: Medium — non-sudoer attempting privilege
@@ -341,7 +341,7 @@ def process parse_sudo_denied_sudoers {
 // ---------------------------------------------------------------------------
 
 def process parse_sudo_denied_command {
-    workspace.lsis = sudo_authorize_session_record(
+    workspace.lsis.parsed = sudo_authorize_session_record(
         1,  // activity_id: Assign Privileges (denied)
         2,  // status_id:   Failure
         2,  // severity_id: Low
@@ -371,7 +371,7 @@ def process parse_sudo_denied_command {
 // ---------------------------------------------------------------------------
 
 def process parse_sudo_password_required {
-    workspace.lsis = sudo_authorize_session_record(
+    workspace.lsis.parsed = sudo_authorize_session_record(
         1,  // activity_id: Assign Privileges (denied)
         2,  // status_id:   Failure
         3,  // severity_id: Medium
@@ -385,7 +385,7 @@ def process parse_sudo_password_required {
 }
 
 def process parse_sudo_pam_session_open {
-    workspace.lsis = sudo_authorize_session_record(
+    workspace.lsis.parsed = sudo_authorize_session_record(
         2,  // activity_id: Activate Privileges
         1,  // status_id:   Success
         1,  // severity_id: Informational
@@ -407,7 +407,7 @@ def process parse_sudo_pam_session_open {
 // ---------------------------------------------------------------------------
 
 def process parse_sudo_pam_session_close {
-    workspace.lsis = sudo_authorize_session_record(
+    workspace.lsis.parsed = sudo_authorize_session_record(
         2,  // activity_id: Activate Privileges (closing edge)
         1,  // status_id:   Success
         1,  // severity_id: Informational
@@ -436,7 +436,7 @@ def process parse_sudo_pam_session_close {
 // ---------------------------------------------------------------------------
 
 def process parse_sudo_pam_auth_failure_classic {
-    workspace.lsis = sudo_authorize_session_record(
+    workspace.lsis.parsed = sudo_authorize_session_record(
         1,    // activity_id: Assign Privileges (denied)
         2,    // status_id:   Failure
         3,    // severity_id: Medium
@@ -459,7 +459,7 @@ def process parse_sudo_pam_auth_failure_classic {
 // ---------------------------------------------------------------------------
 
 def process parse_sudo_pam_auth_lookup_failed {
-    workspace.lsis = sudo_authorize_session_record(
+    workspace.lsis.parsed = sudo_authorize_session_record(
         1,    // activity_id: Assign Privileges (denied)
         2,    // status_id:   Failure
         3,    // severity_id: Medium
@@ -483,7 +483,7 @@ def process parse_sudo_pam_auth_lookup_failed {
 // ---------------------------------------------------------------------------
 
 def process parse_sudo_pam_auth_conversation_failed {
-    workspace.lsis = sudo_authorize_session_record(
+    workspace.lsis.parsed = sudo_authorize_session_record(
         1,    // activity_id: Assign Privileges (denied)
         2,    // status_id:   Failure
         2,    // severity_id: Low — usually benign abort

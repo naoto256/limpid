@@ -1,7 +1,7 @@
 // Summary:     Fortinet FortiGate CEF (FortiOS set format cef) → LSIS,
 //              dispatched by CEF cat subtype.
 // Reads:       ingress (raw wire) — syslog-wrapped CEF (CEF:0|Fortinet|Fortigate|...)
-// Writes:      workspace.lsis.* — class per subtype (traffic → 4001,
+// Writes:      workspace.lsis.parsed.* — class per subtype (traffic → 4001,
 //              IPS / virus → 2004, …); see the subtype leaves below.
 // Category:    Network firewall / IPS
 // Test corpus: real (anonymised FortiGate captures — the dialect-quirks
@@ -169,7 +169,7 @@ def process parse_fortigate_cef {
 //   src / spt / dst / dpt / proto / act / app / in / out / msg
 def process parse_fortigate_cef_traffic {
     let proto_num = to_int(workspace.cef.proto)
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  fortigate_cef_action_to_activity_id(workspace.cef.act),
@@ -209,7 +209,7 @@ def process parse_fortigate_cef_traffic {
 //   FTNTFGTref       — reference URL (vendor ext)
 //   src / spt / dst / dpt / proto / act / msg — standard CEF
 def process parse_fortigate_cef_utm_ips {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
@@ -262,7 +262,7 @@ def process parse_fortigate_cef_utm_webfilter {
         "monitor"     { 1 }
         default       { 0 }
     }
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    6004,
         category_uid: 6,
         activity_id:  activity,
@@ -307,7 +307,7 @@ def process parse_fortigate_cef_utm_webfilter {
 //   FTNTFGTfilename — infected filename
 //   FTNTFGTfilehash — file hash
 def process parse_fortigate_cef_utm_antivirus {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
@@ -359,7 +359,7 @@ def process parse_fortigate_cef_utm_antivirus {
 // Subtype leaf: utm:dlp → OCSF Detection Finding (2004)
 // ---------------------------------------------------------------------------
 def process parse_fortigate_cef_utm_dlp {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
@@ -404,7 +404,7 @@ def process parse_fortigate_cef_utm_dlp {
 //
 // Application control: app name + risk level + user.
 def process parse_fortigate_cef_utm_appctrl {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
@@ -459,7 +459,7 @@ def process parse_fortigate_cef_utm_dns {
         "REFUSED"  { 5 }
         default    { 0 }
     }
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    4003,
         category_uid: 4,
         activity_id:  activity,
@@ -492,7 +492,7 @@ def process parse_fortigate_cef_utm_emailfilter {
         "passthrough" { 6 }
         default       { 0 }
     }
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    4009,
         category_uid: 4,
         activity_id:  activity,
@@ -521,7 +521,7 @@ def process parse_fortigate_cef_utm_emailfilter {
 //
 // FortiGate Web Application Firewall — signature + matched URL.
 def process parse_fortigate_cef_utm_waf {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
@@ -580,7 +580,7 @@ def process parse_fortigate_cef_utm_waf {
 //   src / spt / dst / dpt / proto / msg — standard CEF
 //   act                  — engine verdict (`info` / `block`)
 def process parse_fortigate_cef_utm_ssl {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
@@ -638,7 +638,7 @@ def process parse_fortigate_cef_utm_voip {
         "end"    { 2 }
         default  { 6 }
     }
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  activity,
@@ -687,7 +687,7 @@ def process parse_fortigate_cef_event_user {
         "login-failed"    { 2 }
         default           { 1 }
     }
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    3002,
         category_uid: 3,
         activity_id:  activity,
@@ -724,7 +724,7 @@ def process parse_fortigate_cef_event_vpn {
         "ssl-login-fail"  { 2 }
         default           { 1 }
     }
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    3002,
         category_uid: 3,
         activity_id:  activity,
@@ -754,7 +754,7 @@ def process parse_fortigate_cef_event_vpn {
 // because they're posture / configuration signals, with `act` carrying
 // the specific event name and `FTNTFGTlogdesc` the human description.
 def process parse_fortigate_cef_event_system {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    2003,
         category_uid: 2,
         activity_id:  1,
@@ -787,7 +787,7 @@ def process parse_fortigate_cef_event_wireless {
         "client-roam"       { 6 }
         default             { 0 }
     }
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  activity,
@@ -828,7 +828,7 @@ def process parse_fortigate_cef_event_wireless {
 //   FTNTFGTlowcount       — number of low findings
 //   FTNTFGTpassedcount    — number of passed checks
 def process parse_fortigate_cef_event_security_rating {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    2003,
         category_uid: 2,
         activity_id:  1,

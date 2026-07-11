@@ -2,7 +2,7 @@
 //              dispatched by the positional Type field.
 // Reads:       ingress (raw wire) — syslog-wrapped positional CSV
 //              (FUTURE_USE,RecvTime,Serial,Type,Subtype,...)
-// Writes:      workspace.lsis.* — TRAFFIC → 4001, THREAT → 2004
+// Writes:      workspace.lsis.parsed.* — TRAFFIC → 4001, THREAT → 2004
 //              (url → 6004, wildfire → 2004), GLOBALPROTECT /
 //              AUTHENTICATION → 3002; see the subtype leaves below.
 // Category:    Network firewall / IPS
@@ -30,7 +30,7 @@
 //      `Type` (and `Subtype` for THREAT routing) — keeps the dispatcher
 //      cheap, single-row parse skips most of the field array.
 //   2. The matched leaf re-runs csv_parse with the type-specific full
-//      schema and maps to canonical workspace.lsis.
+//      schema and maps to canonical workspace.lsis.parsed.
 //
 // Sample input (RFC 3164 syslog wrapper around CSV, TRAFFIC):
 //   <134>Apr 27 10:00:00 fw-pan01 1,2026-04-27 10:00:00,012345678,TRAFFIC,end,2049,2026-04-27 10:00:00,192.0.2.10,198.51.100.5,...
@@ -180,7 +180,7 @@ def process parse_paloalto_syslog_traffic {
         "VirtualSystemName", // 52
         "DeviceName"         // 53
     ])
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  paloalto_syslog_traffic_action_to_activity_id(workspace.pan.Action),
@@ -337,7 +337,7 @@ def process parse_paloalto_syslog_threat_url {
         "override"     { 1 }
         default        { 0 }
     }
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    6004,
         category_uid: 6,
         activity_id:  activity,
@@ -378,7 +378,7 @@ def process parse_paloalto_syslog_threat_url {
 // Subtype leaf: THREAT/wildfire → OCSF Detection Finding (2004) Malware
 // ---------------------------------------------------------------------------
 def process parse_paloalto_syslog_threat_wildfire {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
@@ -426,7 +426,7 @@ def process parse_paloalto_syslog_threat_wildfire {
 // Subtype leaf: THREAT/virus → OCSF Detection Finding (2004) Malware
 // ---------------------------------------------------------------------------
 def process parse_paloalto_syslog_threat_virus {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
@@ -474,7 +474,7 @@ def process parse_paloalto_syslog_threat_virus {
 //             → OCSF Detection Finding (2004) generic
 // ---------------------------------------------------------------------------
 def process parse_paloalto_syslog_threat_generic {
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
@@ -558,7 +558,7 @@ def process parse_paloalto_syslog_globalprotect {
         "tunnel-establish-failed"  { 2 }
         default                    { 1 }
     }
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    3002,
         category_uid: 3,
         activity_id:  activity,
@@ -632,7 +632,7 @@ def process parse_paloalto_syslog_authentication {
         "failure" { 2 }
         default   { 0 }
     }
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         class_uid:    3002,
         category_uid: 3,
         activity_id:  1,

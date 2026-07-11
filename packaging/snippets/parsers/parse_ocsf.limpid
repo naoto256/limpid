@@ -2,7 +2,7 @@
 //              unchanged, ready for compose_ocsf round-trip.
 // Reads:       ingress (raw wire) — one OCSF class instance JSON object
 //              per ingress (class_uid at the root)
-// Writes:      workspace.lsis.* — same class as the input (passthrough).
+// Writes:      workspace.lsis.parsed.* — same class as the input (passthrough).
 // Category:    Vendor-neutral
 // Test corpus: spec-only (OCSF 1.3.0 class instances; round-trips with
 //              compose_ocsf)
@@ -30,13 +30,13 @@
 //     re-parses it for further processing (enrichment, filtering,
 //     class-specific routing) without re-implementing 27 class shapes.
 //
-// Contract (per the workspace.lsis canonical intermediate):
-//   * top-level JSON object becomes `workspace.lsis` directly
+// Contract (per the workspace.lsis.parsed canonical intermediate):
+//   * top-level JSON object becomes `workspace.lsis.parsed` directly
 //   * unknown / missing `class_uid` is left to downstream
 //     (compose_ocsf already routes unknown class_uid to error_log)
 //   * non-object JSON or malformed JSON fails inside parse_json
 //     (process error → DLQ per pipeline error policy)
 
 def process parse_ocsf {
-    workspace.lsis = parse_json(ingress)
+    workspace.lsis.parsed = parse_json(ingress)
 }

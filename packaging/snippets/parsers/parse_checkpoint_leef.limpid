@@ -4,7 +4,7 @@
 //                .body (required, String) — full syslog wire
 //                .hostname (optional, String) — collector-side hostname override
 //                .time (optional, Int) — epoch nanoseconds of arrival
-// Writes:      workspace.lsis.* — 4001 (Network Activity) for traffic EventIDs
+// Writes:      workspace.lsis.parsed.* — 4001 (Network Activity) for traffic EventIDs
 //              (Accept / Drop / Reject / Block); other LEEF events route to
 //              error_log.
 // Category:    Network firewall / IPS
@@ -124,7 +124,7 @@ def process parse_checkpoint_leef_record {
             let proto = parse_checkpoint_leef_kv(ext, "proto")
             let src_port = parse_checkpoint_leef_kv(ext, "srcPort")
             let dst_port = parse_checkpoint_leef_kv(ext, "dstPort")
-            workspace.lsis = {
+            workspace.lsis.parsed = {
                 class_uid:    4001,
                 category_uid: 4,
                 activity_id:  activity,

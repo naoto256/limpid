@@ -5,7 +5,7 @@
 //   .body (required, Object) — parsed EVE event (caller does `parse_json(ingress)`)
 //   .hostname (optional, String) — collector override
 //   .time (optional, Int) — epoch ns override
-// Writes:      workspace.lsis.* — alert → 2004, dns → 4003, http → 4002,
+// Writes:      workspace.lsis.parsed.* — alert → 2004, dns → 4003, http → 4002,
 //              tls / flow / fileinfo → 4001; stats dropped; other
 //              event_types route to error_log.
 // Category:    OSS NDR
@@ -413,7 +413,7 @@ def process parse_suricata {
 }
 
 def process parse_suricata_alert {
-    workspace.lsis = suricata_alert_record(
+    workspace.lsis.parsed = suricata_alert_record(
         workspace.suricata.body,
         workspace.suricata.hostname,
         suricata_time_ns(workspace.suricata.body, workspace.suricata.time)
@@ -421,7 +421,7 @@ def process parse_suricata_alert {
 }
 
 def process parse_suricata_dns {
-    workspace.lsis = suricata_dns_record(
+    workspace.lsis.parsed = suricata_dns_record(
         workspace.suricata.body,
         workspace.suricata.hostname,
         suricata_time_ns(workspace.suricata.body, workspace.suricata.time)
@@ -429,7 +429,7 @@ def process parse_suricata_dns {
 }
 
 def process parse_suricata_http {
-    workspace.lsis = suricata_http_record(
+    workspace.lsis.parsed = suricata_http_record(
         workspace.suricata.body,
         workspace.suricata.hostname,
         suricata_time_ns(workspace.suricata.body, workspace.suricata.time)
@@ -437,7 +437,7 @@ def process parse_suricata_http {
 }
 
 def process parse_suricata_flow {
-    workspace.lsis = suricata_flow_record(
+    workspace.lsis.parsed = suricata_flow_record(
         workspace.suricata.body,
         workspace.suricata.hostname,
         suricata_time_ns(workspace.suricata.body, workspace.suricata.time)
@@ -445,7 +445,7 @@ def process parse_suricata_flow {
 }
 
 def process parse_suricata_tls {
-    workspace.lsis = suricata_tls_record(
+    workspace.lsis.parsed = suricata_tls_record(
         workspace.suricata.body,
         workspace.suricata.hostname,
         suricata_time_ns(workspace.suricata.body, workspace.suricata.time)
@@ -453,7 +453,7 @@ def process parse_suricata_tls {
 }
 
 def process parse_suricata_fileinfo {
-    workspace.lsis = suricata_fileinfo_record(
+    workspace.lsis.parsed = suricata_fileinfo_record(
         workspace.suricata.body,
         workspace.suricata.hostname,
         suricata_time_ns(workspace.suricata.body, workspace.suricata.time)
