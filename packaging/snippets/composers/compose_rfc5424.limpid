@@ -1,95 +1,175 @@
-// Summary:     journald entry → single-line RFC 5424 syslog record
+// Summary:     Assembles a single-line RFC 5424 syslog record from
+//              per-field shed slots
 //              (https://datatracker.ietf.org/doc/html/rfc5424).
-// Reads:       workspace.journald.* (from parse_journald)
-//                .PRIORITY           (optional, String) — severity 0-7
-//                .SYSLOG_FACILITY    (optional, String) — facility number
-//                .SYSLOG_IDENTIFIER  (optional, String) — APP-NAME source
-//                ._COMM              (optional, String) — APP-NAME fallback
-//                ._PID               (optional, String) — PROCID source
-//                .SYSLOG_PID         (optional, String) — PROCID fallback
-//                ._HOSTNAME          (optional, String) — originating host
-//                .MESSAGE            (optional, String) — MSG (verbatim)
-//              Other upstreams (e.g. workspace.syslog.* or
-//              workspace.cef.*) are out of scope — write your own
-//              composer if you need to re-wrap from a different
-//              intermediate.
-// Writes:      workspace.lsis.composed.rfc5424 — single-line RFC 5424 record
-//              (String). Pipe `| rfc5424_to_egress` (foot of file)
+// Reads:       workspace.lsis.shed.rfc5424.* — per-field intake
+//              (RFC 5424 ABNF vocabulary):
+//                .pri        (optional, Int)    — default 14 (user.info)
+//                .timestamp  (optional, String) — default is `received_at`
+//                             formatted as RFC 3339 with microsecond UTC
+//                             precision. Callers supplying their own value
+//                             MUST also supply the RFC 5424 wire form.
+//                .hostname   (optional, String) — default hostname()
+//                .app_name   (optional, String) — default "-"
+//                .procid     (optional, String) — default "-"
+//                .msgid      (optional, String) — default "-"
+//                .sd         (optional, String) — default "-"
+//                .msg        (String)           — treated as required. If
+//                             the slot is absent the record still assembles
+//                             with an empty MSG, which is spec-compliant
+//                             (RFC 5424 § 6 grammar makes MSG optional).
+// Writes:      workspace.lsis.composed.rfc5424 — single-line RFC 5424
+//              record (String). Pipe `| rfc5424_to_egress` (foot of file)
 //              to emit it as the wire form.
-// Test corpus: spec-only (RFC 5424 frame shape; field decisions
+// Test corpus: spec-only (RFC 5424 § 6 frame shape; field decisions
 //              documented below)
-//
-// Generic journald → RFC 5424 wire composer. Replaces the hand-rolled
-// `wrap_<program>` patterns that used to live per-host (one per
-// service: sshd / sudo / etc.) and that re-extracted PID and identifier
-// from a synthesised string.
 //
 // Wire shape —
 //   <PRI>1 TIMESTAMP HOSTNAME APP-NAME PROCID MSGID STRUCTURED-DATA MSG
 //
-// Field decisions —
-//   PRI             coalesce(SYSLOG_FACILITY, "1")*8 + coalesce(PRIORITY, "6")
-//                   Default 14 (user.info) when journald did not record one.
-//                   Edge does NOT preserve __REALTIME_TIMESTAMP-derived PRI;
-//                   PRIORITY+SYSLOG_FACILITY in the entry are what we use.
+// Contract — this composer is generic. It knows only the RFC 5424 wire
+// format; it does not read any transport / vocabulary namespace directly.
+// Callers feed it through `workspace.lsis.shed.rfc5424.*` (per-slot,
+// replacement semantics: `coalesce(shed value, default)` — no merge).
+//
+// Sourcing the shed slots — two supported shapes:
+//
+//   1. Named bridge (see `journald_to_rfc5424` below) for well-known
+//      upstreams that ship with this pack:
+//
+//        process parse_journald
+//              | journald_to_rfc5424
+//              | compose_rfc5424
+//              | rfc5424_to_egress
+//
+//   2. Anonymous glue block in the pipeline, when the caller is
+//      wrapping an ad-hoc payload (e.g. an OCSF JSON produced by
+//      compose_ocsf, or a message the caller already has in hand):
+//
+//        process parse_x
+//              | compose_ocsf
+//              | { workspace.lsis.shed.rfc5424.msg =
+//                    workspace.lsis.composed.ocsf }
+//              | compose_rfc5424
+//              | rfc5424_to_egress
+//
+// Bridges live *with the composer that consumes them* (one file =
+// one composer's full consumption story: helpers / bridge / body /
+// egress terminator). Additional bridges belong here, not in a
+// separate directory — the bridge is the consumer's cost of eating
+// something other than the plain shed vocabulary, and belongs to the
+// composer.
+//
+// Field decisions (defaults applied when the corresponding shed slot
+// is absent) —
+//   PRI             14 (facility=1 user, severity=6 informational)
 //   VERSION         1 (literal)
-//   TIMESTAMP       received_at, not __REALTIME_TIMESTAMP. Edge stays
-//                   neutral — downstream relay decides whether to
-//                   substitute the original wall-clock for replay.
-//                   Format — RFC 3339 with microsecond precision, UTC.
-//   HOSTNAME        Original `_HOSTNAME` from the journald entry,
-//                   falling back to `hostname()` (this host) if the
-//                   field is absent. This preserves the originating
-//                   host across a relay hop — the relay is forwarding
-//                   someone else's record, not generating its own, so
-//                   stamping the relay's hostname here would erase
-//                   "where did the sshd event actually happen" from
-//                   the RFC 5424 frame.
-//   APP-NAME        SYSLOG_IDENTIFIER, falling back to _COMM, then "-"
-//   PROCID          _PID, falling back to SYSLOG_PID, then "-"
-//   MSGID           "-" (journald has no equivalent concept at this layer)
-//   STRUCTURED-DATA "-" (not synthesised at the edge; downstream
-//                   composers can wrap if they need SD-ELEMENT)
-//   MSG             MESSAGE (verbatim, including any embedded newlines)
+//   TIMESTAMP       `received_at` formatted RFC 3339 with microsecond
+//                   precision, UTC. Callers holding a source-claimed
+//                   timestamp can pre-format and place it in
+//                   `shed.rfc5424.timestamp`.
+//   HOSTNAME        `hostname()` (this box) when the slot is absent.
+//                   Bridges preserving the originating host across a
+//                   relay hop supply the slot themselves — see
+//                   `journald_to_rfc5424` below.
+//   APP-NAME        "-"
+//   PROCID          "-"
+//   MSGID           "-"
+//   STRUCTURED-DATA "-"
+//   MSG             "" when absent (a valid but empty RFC 5424 MSG).
+
+// ---------------------------------------------------------------------------
+// Helper: PRI arithmetic (facility * 8 + severity). Bridges pass in the
+// two byte-string fields from their upstream; the function is pure. Both
+// arguments may be null — the coalesce fallbacks apply per RFC 5424 § 6.2.1
+// convention (unknown facility → 1 user, unknown severity → 6 informational).
+// ---------------------------------------------------------------------------
+
+def function rfc5424_pri_from(facility_str, severity_str) {
+    let facility = to_int(coalesce(facility_str, "1"))
+    let severity = to_int(coalesce(severity_str, "6"))
+    facility * 8 + severity
+}
+
+// ---------------------------------------------------------------------------
+// Generic RFC 5424 body composer — reads shed.rfc5424.*, writes composed.
+// ---------------------------------------------------------------------------
+
+def process compose_rfc5424 {
+    let pri       = coalesce(workspace.lsis.shed.rfc5424.pri, 14)
+    let ts        = coalesce(
+                      workspace.lsis.shed.rfc5424.timestamp,
+                      strftime(received_at, "%Y-%m-%dT%H:%M:%S%.6fZ", "UTC")
+                    )
+    let host      = coalesce(workspace.lsis.shed.rfc5424.hostname, hostname())
+    let app       = coalesce(workspace.lsis.shed.rfc5424.app_name, "-")
+    let procid    = coalesce(workspace.lsis.shed.rfc5424.procid, "-")
+    let msgid     = coalesce(workspace.lsis.shed.rfc5424.msgid, "-")
+    let sd        = coalesce(workspace.lsis.shed.rfc5424.sd, "-")
+    let msg       = coalesce(workspace.lsis.shed.rfc5424.msg, "")
+
+    workspace.lsis.composed.rfc5424 = "<${pri}>1 ${ts} ${host} ${app} ${procid} ${msgid} ${sd} ${msg}"
+}
+
+// ---------------------------------------------------------------------------
+// Bridge: journald entry → shed.rfc5424.*
+// ---------------------------------------------------------------------------
+//
+// Reads workspace.journald.* (produced by `parse_journald`) and populates
+// the RFC 5424 shed slots. Replaces the hand-rolled `wrap_<program>`
+// patterns that used to live per-host (one per service: sshd / sudo / etc.)
+// and that re-extracted PID and identifier from a synthesised string.
+//
+// Field decisions specific to journald sourcing —
+//   PRI       SYSLOG_FACILITY * 8 + PRIORITY (both are strings on the
+//             journalctl -o json wire; parsed via `to_int`). Missing
+//             SYSLOG_FACILITY defaults to facility=1 (user), missing
+//             PRIORITY to severity=6 (informational). Edge does NOT
+//             preserve __REALTIME_TIMESTAMP-derived PRI; the fields in
+//             the entry are what we use.
+//   TIMESTAMP not populated by the bridge — `compose_rfc5424` falls back
+//             to `received_at`. Edge stays neutral; downstream relay
+//             decides whether to substitute the original wall-clock for
+//             replay.
+//   HOSTNAME  `_HOSTNAME` from the journald entry, only when present.
+//             When absent, `compose_rfc5424` falls back to `hostname()`.
+//             This preserves the originating host across a relay hop —
+//             the relay is forwarding someone else's record, not
+//             generating its own, so stamping the relay's hostname
+//             here would erase "where did the sshd event actually
+//             happen" from the RFC 5424 frame.
+//   APP-NAME  SYSLOG_IDENTIFIER, falling back to _COMM.
+//   PROCID    _PID, falling back to SYSLOG_PID.
+//   MSGID     not populated (journald has no equivalent concept at
+//             this layer).
+//   SD        not populated (not synthesised at the edge; downstream
+//             composers can wrap if they need SD-ELEMENT).
+//   MSG       MESSAGE (verbatim, including any embedded newlines).
 //
 // Typical pipeline (edge box forwarding journald to a syslog relay):
 //   def pipeline ssh_to_relay {
 //       input ssh_journal
-//       process parse_journald | compose_rfc5424 | rfc5424_to_egress
+//       process parse_journald
+//             | journald_to_rfc5424
+//             | compose_rfc5424
+//             | rfc5424_to_egress
 //       output relay
 //   }
 
-def function rfc5424_pri {
-    let facility = to_int(coalesce(workspace.journald.SYSLOG_FACILITY, "1"))
-    let severity = to_int(coalesce(workspace.journald.PRIORITY, "6"))
-    facility * 8 + severity
-}
-
-def function rfc5424_appname {
-    coalesce(
-        workspace.journald.SYSLOG_IDENTIFIER,
-        workspace.journald._COMM,
-        "-"
-    )
-}
-
-def function rfc5424_procid {
-    coalesce(
-        workspace.journald._PID,
-        workspace.journald.SYSLOG_PID,
-        "-"
-    )
-}
-
-def process compose_rfc5424 {
-    let pri      = rfc5424_pri()
-    let ts       = strftime(received_at, "%Y-%m-%dT%H:%M:%S%.6fZ", "UTC")
-    let host     = coalesce(workspace.journald._HOSTNAME, hostname())
-    let app      = rfc5424_appname()
-    let procid   = rfc5424_procid()
-    let msg      = coalesce(workspace.journald.MESSAGE, "")
-
-    workspace.lsis.composed.rfc5424 = "<${pri}>1 ${ts} ${host} ${app} ${procid} - - ${msg}"
+def process journald_to_rfc5424 {
+    workspace.lsis.shed.rfc5424.pri      = rfc5424_pri_from(
+                                              workspace.journald.SYSLOG_FACILITY,
+                                              workspace.journald.PRIORITY
+                                            )
+    workspace.lsis.shed.rfc5424.hostname = workspace.journald._HOSTNAME
+    workspace.lsis.shed.rfc5424.app_name = coalesce(
+                                              workspace.journald.SYSLOG_IDENTIFIER,
+                                              workspace.journald._COMM
+                                            )
+    workspace.lsis.shed.rfc5424.procid   = coalesce(
+                                              workspace.journald._PID,
+                                              workspace.journald.SYSLOG_PID
+                                            )
+    workspace.lsis.shed.rfc5424.msg      = workspace.journald.MESSAGE
 }
 
 // ---------------------------------------------------------------------------
@@ -98,7 +178,8 @@ def process compose_rfc5424 {
 //
 // Moves the RFC 5424 record from `workspace.lsis.composed.rfc5424` to
 // `egress`. Pipelines that emit RFC 5424 as the wire form pipe
-// `compose_rfc5424 | rfc5424_to_egress`.
+// `compose_rfc5424 | rfc5424_to_egress` (usually preceded by a bridge
+// or glue block that populates the shed slots).
 def process rfc5424_to_egress {
     egress = workspace.lsis.composed.rfc5424
 }
