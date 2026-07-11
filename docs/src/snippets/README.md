@@ -59,23 +59,36 @@ SIGHUP).
 ### Composers
 
 - `composers/compose_ocsf.limpid` — dispatches by
-  `workspace.lsis.class_uid` to per-class leaves. Covers the OCSF
-  1.3.0 priority set (27 classes spanning System Activity / Findings
-  / Identity & Access Management / Network Activity / Application
-  Activity). Each leaf strips `null` keys via `null_omit` and writes
-  OCSF JSON to the LSIS slot `workspace.lsis.ocsf`; the companion
-  `ocsf_to_egress` process moves the slot to `egress` (the egress
-  single-writer invariant — see
-  [Slot registry](../../../packaging/snippets/README.md#slot-registry)).
-- `composers/compose_rfc5424.limpid` — `workspace.journald.*` →
-  RFC 5424 syslog wire. Used at edge boxes to re-frame journald
-  entries for syslog relay (e.g. edge → relay → AMA).
+  `workspace.lsis.parsed.class_uid` to per-class leaves. Covers the
+  OCSF 1.3.0 priority set (27 classes spanning System Activity /
+  Findings / Identity & Access Management / Network Activity /
+  Application Activity). Each leaf strips `null` keys via
+  `null_omit` and writes OCSF JSON to
+  `workspace.lsis.composed.ocsf`; the companion `ocsf_to_egress`
+  process moves the slot to `egress`.
+- `composers/compose_otlp.limpid` — assembles an OTLP-1.0.0
+  `ResourceLogs` proto envelope. The log body, target-specific
+  attributes, resource attributes, and scope attributes come from
+  `workspace.lsis.shed.otlp.*` slots that the caller sets in a glue
+  block. Common wrapping shape:
+  `{ workspace.lsis.shed.otlp.log_record.body =
+  workspace.lsis.composed.ocsf } | compose_otlp | otlp_to_egress`.
+- `composers/compose_rfc5424.limpid` — generic RFC 5424 wire
+  composer reading `workspace.lsis.shed.rfc5424.*` (pri / timestamp
+  / hostname / app_name / procid / msgid / sd / msg). A named
+  `journald_to_rfc5424` bridge lives in the same file for the
+  common journald → syslog-relay path (edge → relay → AMA).
 - `composers/compose_replayable.limpid` — minimal `{received_at,
   source, ingress}` JSON shape that round-trips through `inject
   --json` for parser regression / replay capture. Use it on a
   fan-out branch to record the raw wire while a parallel branch
   parses, so a parser bug discovered later can be fixed and the
   saved JSONL replayed offline.
+
+See the [pack
+README](../../../packaging/snippets/README.md#slot-registry--composed-layer)
+for the full composed / shed slot registries and the LSIS layer
+contracts.
 
 ### Filters
 
@@ -131,12 +144,12 @@ def pipeline fw_to_security_lake {
 }
 ```
 
-`parse_fortigate_cef` writes the parsed event to `workspace.lsis.*`
-in canonical LSIS shape; `compose_ocsf` reads from there and writes
-the OCSF JSON record to the LSIS slot `workspace.lsis.ocsf`; the
-one-line `ocsf_to_egress` companion at the tail of the pipeline
-moves the slot to `egress`. Swap the parser for any of the others;
-swap `compose_ocsf | ocsf_to_egress` for
+`parse_fortigate_cef` writes facts to `workspace.lsis.parsed.*`;
+`compose_ocsf` reads from there and writes the OCSF JSON record to
+`workspace.lsis.composed.ocsf`; the one-line `ocsf_to_egress`
+companion at the tail of the pipeline moves the slot to `egress`.
+Swap the parser for any of the others; swap
+`compose_ocsf | ocsf_to_egress` for
 `compose_replayable | replayable_to_egress` to capture replay-shape;
 chain a filter ahead of the parser to drop noise.
 
@@ -158,32 +171,14 @@ def pipeline mixed_in {
 
 ## Design contracts
 
-Two contracts run through the library — the parser ↔ composer
-canonical intermediate, and the loud-fail-fast policy on
-unsupported vocabulary.
+The LSIS namespace convention (three layers: parsed / shed /
+composed) that ties parsers and composers together is documented in
+the [pack
+README](../../../packaging/snippets/README.md#lsis--the-limpid-snippet-intermediate-schema).
+Snippets and pipelines below follow the same three-layer contract.
 
-### `workspace.lsis` is the canonical intermediate
-
-`workspace.lsis.*` is the **LSIS** — the Limpid Snippet Intermediate
-Schema. LSIS's vocabulary is borrowed from OCSF 1.3.0 (so
-`compose_ocsf` renders LSIS to conformant OCSF JSON without
-translation) but LSIS is not itself an OCSF conformance claim —
-canonical definition and slot registry at
-[packaging/snippets/README.md § LSIS](../../../packaging/snippets/README.md#lsis--the-parser--composer-intermediate).
-
-Parsers populate `workspace.lsis.*` only with LSIS-vocabulary
-fields. Vendor / transport intermediates (`workspace.cef`,
-`workspace.syslog`, `workspace.pf`, `workspace.ct`,
-`workspace.winevent`, etc.) are parser-private scratch — no composer
-reads them. This keeps schema composers LSIS-aware without their
-being vendor-aware (they never see CEF quirks, FortiGate dialect,
-or PAN-OS positional CSV columns).
-
-The parser / composer chain is documented in [Process Design Guide →
-Use `workspace.lsis` as the canonical
-intermediate](../processing/design-guide.md#use-workspacelsis-as-the-canonical-intermediate). New
-parsers follow it; out-of-tree vendor parsers should follow it too
-so they compose cleanly with `compose_ocsf`.
+The other contract worth calling out here is the loud-fail-fast
+policy on unsupported vocabulary.
 
 ### Loud-fail-fast on unsupported vocabulary
 
@@ -272,8 +267,8 @@ conventions are:
 - **Two-tier dispatch**: the top-level `def process parse_<vendor>`
   strips the wrapper and routes by header field (`switch
   workspace.<vendor>.<key>`); per-leaf `def process` re-parses the
-  body against its subtype-specific shape and writes the OCSF
-  record to `workspace.lsis.*`.
+  body against its subtype-specific shape and writes the parsed
+  fact record to `workspace.lsis.parsed.*`.
 - **Loud-fail-fast** on unsupported vocabulary via `default { error
   "<operator-readable msg>" }`.
 - **Helpers** (`def function ...`) carry per-vendor mapping tables

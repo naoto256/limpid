@@ -35,7 +35,7 @@ A `let` binding can hold any value type — scalar, Object, or Array. When the b
 ```limpid
 def process parse_xxx {
     let f = regex_parse(workspace.body, "(?P<user>\\S+) (?P<host>\\S+)")
-    workspace.lsis = {
+    workspace.lsis.parsed = {
         user: f.user,                    // read from the let-bound Object
         host: f.host
     }
