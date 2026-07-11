@@ -11,9 +11,16 @@
 //                             callers who still want host.name in their
 //                             resource attributes must include it in the
 //                             array they pass.
+//                .scope.name             (optional, String) — instrumentation
+//                             scope name. default — "limpid". Callers
+//                             segmenting by pipeline family override this
+//                             (e.g. "limpid.amp.cef", "limpid.amp.syslog").
+//                .scope.version          (optional, String) — instrumentation
+//                             scope version. default — omitted from the
+//                             wire (proto3 default). Set when the caller
+//                             is versioning the shape it emits.
 //                .scope.attributes       (optional, Array) — of KeyValue.
-//                             default — empty. `scope.name` is fixed at
-//                             "limpid".
+//                             default — empty.
 //                .log_record.body        (required, String) — placed on
 //                             the LogRecord as `body.string_value`. Absent
 //                             body yields an empty body string; a
@@ -23,6 +30,18 @@
 //                .log_record.attributes  (optional, Array) — of KeyValue.
 //                             default — empty. Replacement semantics as
 //                             above.
+//                .log_record.severity_text          (optional, String) —
+//                             free-form severity label. default — omitted
+//                             from the wire (proto3 default). Common
+//                             pairing with a caller-classified severity is
+//                             `"INFO"`/`"WARN"`/`"ERROR"`.
+//                .log_record.observed_time_unix_nano (optional, Int) —
+//                             time the current process observed the event
+//                             (LogRecord field 11). default — omitted from
+//                             the wire (proto3 default). Set when the
+//                             caller wants both event time (parsed) and
+//                             observed time (usually `to_int(received_at)`)
+//                             on the wire.
 //              workspace.lsis.parsed.* — graceful reads from the fact
 //              layer, no shed intake for these:
 //                .time         (optional, Int) — used as `time_unix_nano`
@@ -32,6 +51,13 @@
 //                .severity_id  (optional, Int) — used as `severity_number`
 //                             when populated. Absent (or 0 = OCSF Unknown)
 //                             means the field is omitted from the wire.
+//
+// Slots deliberately NOT exposed today — `log_record.trace_id`,
+// `log_record.span_id`, `log_record.event_name`, and the
+// `dropped_attributes_count` / `flags` housekeeping fields. These have
+// no implementation-driving caller in the pack today; they are added
+// on the same coalesce-with-default pattern above when a real caller
+// needs them.
 // Writes:      workspace.lsis.composed.otlp — ResourceLogs proto bytes
 //              (Bytes). Pipe `| otlp_to_egress` (foot of file) to emit
 //              for `output otlp_http` / `output otlp_grpc`.
@@ -87,15 +113,18 @@ def process compose_otlp {
         },
         scope_logs: [{
             scope: {
-                name: "limpid",
+                name:       coalesce(workspace.lsis.shed.otlp.scope.name, "limpid"),
+                version:    workspace.lsis.shed.otlp.scope.version,
                 attributes: coalesce(
                     workspace.lsis.shed.otlp.scope.attributes,
                     []
                 )
             },
             log_records: [{
-                time_unix_nano:  coalesce(workspace.lsis.parsed.time, received_at),
-                severity_number: workspace.lsis.parsed.severity_id,
+                time_unix_nano:          coalesce(workspace.lsis.parsed.time, received_at),
+                observed_time_unix_nano: workspace.lsis.shed.otlp.log_record.observed_time_unix_nano,
+                severity_number:         workspace.lsis.parsed.severity_id,
+                severity_text:           workspace.lsis.shed.otlp.log_record.severity_text,
                 body: { string_value: coalesce(
                     workspace.lsis.shed.otlp.log_record.body, ""
                 ) },
