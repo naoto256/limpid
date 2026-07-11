@@ -6,6 +6,84 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime shape converge. After 1.0, changes will follow semver strictly.
 
+## [0.7.13] - 2026-07-11
+
+0.7.13 splits the `workspace.lsis.*` LSIS namespace into three explicit layers and reshapes the two envelope composers around the new contract. The trigger was AMP (Azure Monitor Pipeline) integration surfacing that `compose_otlp` had no way to accept caller-supplied target-vocabulary attributes (CommonSecurityLog columns) without every downstream reimplementing the OTLP encoding locally. Rather than expose a shed slot per attribute as an ad-hoc extension hatch, the LSIS namespace itself now has three sub-layers with distinct kinds of contract — a facts layer parsers write, a plumbing layer glue blocks write for the next composer, and a products layer composers write. The runtime is unchanged in behaviour; the surface differences are confined to snippet pack contents, docs prose, and the header lint that keeps the pack self-consistent. All out-of-tree configs that touched `workspace.lsis.*` will need to move to the layered names — the mapping is mechanical and the CHANGELOG's `Changed` section below lists it explicitly.
+
+### Added — LSIS namespace stratified into `parsed` / `shed` / `composed`
+
+The flat `workspace.lsis.*` namespace forced facts, hand-off plumbing, and finished wire-form products to share the same face, and that flatness is what produced the recurring "OCSF-shaped" confusion in the field (readers looking for a schema with required fields on `workspace.lsis.*` and not finding one, because there wasn't one — it was a dictionary, and the values were graceful-absence).
+
+Three layers, each with a distinct kind of contract, now live under the same reserved root:
+
+- **`workspace.lsis.parsed.*`** — facts a parser established about the event. A vocabulary contract, dictionary semantics, every field optional; the vocabulary leans OCSF but is an open set. Writers: parsers. Readers: everyone.
+- **`workspace.lsis.shed.*`** — hand-off values a glue block wrote for the next composer. A per-consumer plumbing contract, no globally reserved vocabulary — names borrow the consumer's own vocabulary (`shed.otlp.log_record.body`, `shed.rfc5424.msg`), and each consuming composer's header enumerates the slots it eats and the defaults it applies. Values are scoped to one hand-off; nothing under `shed.` is a fact about the event.
+- **`workspace.lsis.composed.*`** — finished wire forms, one slot per composer (`composed.ocsf`, `composed.otlp`, `composed.rfc5424`, `composed.replayable`). A registry contract, single-writer invariant. Egress terminators read from here (`egress = workspace.lsis.composed.otlp` is the whole story of shipping an event).
+
+The pack README's LSIS section carries the canonical explanation of the three layers and the slot registries; docs/src references now link there rather than paraphrasing in place.
+
+### Changed — `compose_otlp` reads shed slots + parsed graceful reads (instead of the old `otlp_body` per-envelope slot)
+
+The 0.7.11 envelope composer's "envelope neutrality" doctrine — read only a declared `otlp_body` and produce a minimal envelope — is retired. Real OTLP targets need a way to feed target-specific attributes (AMP CommonSecurityLog columns, `service.name` for a specific backend, etc.) that the pack cannot know about, and forcing every downstream to reimplement compose_otlp locally is not a shape the pack should ship.
+
+`compose_otlp` now reads four `shed` slots plus two `parsed` graceful reads, with a uniform `coalesce(shed value, default)` replacement semantics for every shed slot (no merge):
+
+```
+workspace.lsis.shed.otlp.resource.attributes    (optional Array of KeyValue)
+workspace.lsis.shed.otlp.scope.attributes       (optional Array of KeyValue)
+workspace.lsis.shed.otlp.log_record.body        (required String)
+workspace.lsis.shed.otlp.log_record.attributes  (optional Array of KeyValue)
+
+workspace.lsis.parsed.time         → time_unix_nano  (falls back to received_at)
+workspace.lsis.parsed.severity_id  → severity_number (omitted when 0/absent —
+                                                       OCSF Unknown = 0)
+```
+
+Callers that supply `resource.attributes` REPLACE the default `[host.name]` array (if they still want host.name they include it in the array they pass); callers that supply nothing get the pre-0.7.13 behaviour byte-for-byte modulo the time / severity graceful reads that were previously hard-coded to `received_at` / omitted. The AMP attribute case is demonstrated in the composer's header.
+
+Pipelines that used the 0.7.11 shape (`{ workspace.lsis.otlp_body = workspace.lsis.ocsf } | compose_otlp | otlp_to_egress`) migrate mechanically to `{ workspace.lsis.shed.otlp.log_record.body = workspace.lsis.composed.ocsf } | compose_otlp | otlp_to_egress`.
+
+### Changed — `compose_rfc5424` split into a generic composer + `journald_to_rfc5424` bridge
+
+The 0.7.11 `compose_rfc5424` read `workspace.journald.*` directly, which was the same shape as the CEF-direct-read carve-out that the 0.7.11 design pass explicitly rejected for pack composers. It also had two latent DSL bugs (three zero-arg `def function`s without `()`, and function bodies reading `workspace.journald.*` in violation of the analyzer's purity contract) — neither the pack's CI nor any downstream test happened to exercise the file end-to-end, so both had been shipping quietly. 0.7.13 fixes the contract violation and the shipping bugs together.
+
+`compose_rfc5424.limpid` now contains three cooperating processes plus one pure helper:
+
+- **`def process compose_rfc5424`** (generic body composer) — reads eight `shed.rfc5424.*` slots (`pri` / `timestamp` / `hostname` / `app_name` / `procid` / `msgid` / `sd` / `msg`, with `msg` the only intended-required slot) and writes `workspace.lsis.composed.rfc5424`. Same `coalesce(shed value, default)` replacement semantics as compose_otlp.
+- **`def process journald_to_rfc5424`** (bridge) — reads `workspace.journald.*` (produced by `parse_journald`) and populates the `shed.rfc5424.*` slots. Unset slots fall back to compose_rfc5424's defaults, so the wire output is byte-identical to the old direct-read composer.
+- **`def function rfc5424_pri_from(facility_str, severity_str)`** — the PRI arithmetic (facility × 8 + severity) as a pure helper the bridge calls with journald's byte-string fields.
+- **`def process rfc5424_to_egress`** — unchanged.
+
+Pipelines that used `parse_journald | compose_rfc5424 | rfc5424_to_egress` migrate to `parse_journald | journald_to_rfc5424 | compose_rfc5424 | rfc5424_to_egress` (one extra pipe stage). Non-journald upstreams that want to emit RFC 5424 records now set `shed.rfc5424.*` from an anonymous glue block or a bespoke bridge — see the composer's header for the two supported shapes.
+
+### Changed — namespace rename `workspace.lsis.<field>` → `workspace.lsis.<layer>.<field>` (mechanical)
+
+Every snippet body and every docs example is updated. The mechanical mapping for out-of-tree configs that touched `workspace.lsis.*` directly:
+
+| Old flat name | New layered name |
+|---|---|
+| `workspace.lsis.<any fact field>` (e.g. `.severity_id`, `.time`, `.src_endpoint.ip`) | `workspace.lsis.parsed.<same field>` |
+| `workspace.lsis.otlp_body` | `workspace.lsis.shed.otlp.log_record.body` |
+| `workspace.lsis.ocsf` | `workspace.lsis.composed.ocsf` |
+| `workspace.lsis.rfc5424` | `workspace.lsis.composed.rfc5424` |
+| `workspace.lsis.replayable` | `workspace.lsis.composed.replayable` |
+| `workspace.lsis.otlp` | `workspace.lsis.composed.otlp` |
+| bare `workspace.lsis = { … }` (whole-hash assign in a parser) | `workspace.lsis.parsed = { … }` |
+
+Transport-namespace parsers (`parse_syslog` → `workspace.syslog.*`, `parse_journald` → `workspace.journald.*`) are unaffected — those namespaces live outside LSIS by design, and the pack composers no longer read them directly (bridges now do that job on the consumer side).
+
+### Changed — xtask header lint accepts multi-segment paths
+
+`cargo xtask lint-snippet-headers` teaches its `Reads:` grammar to accept dot-separated ascii-ident paths — both in the workspace namespace at the first line (`workspace.lsis.shed.otlp.*` is a valid intake declaration) and in the intake dot-line's `<name>` field (`.log_record.attributes (optional, Array)` describes an intake slot with a structured name). The 7-element `INTAKE_TYPES` whitelist is unchanged; type refinements like "of KeyValue" go in trailing prose after the closing `)` rather than in the type marker. A new unit test locks in the relaxed grammar so it does not silently drift back.
+
+### Fixed — pack composer inventory table renders new slot names
+
+`cargo xtask gen-snippet-inventory` refreshes the composer table in `packaging/snippets/README.md`. The Writes column now points at the new `workspace.lsis.composed.<slot>` outputs, and the Summary column reflects the rewritten compose_otlp / compose_rfc5424 headers.
+
+### Changed — docs/src collapses LSIS mechanics to a single pointer
+
+Every docs page under `docs/src/` that previously carried its own paraphrase of the LSIS contract now links into `packaging/snippets/README.md`'s LSIS section — the canonical description lives there and only there. Docs prose stays snippet-pack-facing; the language reference does not gain LSIS material. Pipeline examples that showed old slot names are updated to the layered names.
+
 ## [0.7.12] - 2026-07-11
 
 0.7.12 is a hotfix for a daemon-fatal SIGPIPE path: a saturated stderr / systemd-journald pipe under a tracing burst (typically a downed OTLP output driving its retry loop's WARN spam) would take the whole daemon with it, and systemd would not restart it because the exit looked clean. The daemon now keeps Rust's `SIG_IGN` default for `SIGPIPE`, and the shipped `limpid.service` unit restarts on any exit reason as defence-in-depth against future variants.
