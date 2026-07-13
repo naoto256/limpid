@@ -1188,6 +1188,47 @@ def pipeline p {
             .find(|w| w.message.contains("unknown function"))
             .expect("expected unknown function warning");
         assert_eq!(w.kind, DiagKind::UnknownIdent);
+        assert_eq!(w.help.as_deref(), Some("did you mean `upper`?"));
+    }
+
+    #[test]
+    fn unknown_function_without_near_match_is_reported() {
+        let src = r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p {
+    input i
+    process { workspace.x = totally_missing_helper(1) }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        let w = warnings(&diags)
+            .into_iter()
+            .find(|w| w.message.contains("totally_missing_helper"))
+            .expect("expected unknown function warning without a near match");
+        assert_eq!(w.kind, DiagKind::UnknownIdent);
+        assert_eq!(w.help, None);
+    }
+
+    #[test]
+    fn unknown_namespaced_function_uses_qualified_name() {
+        let src = r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p {
+    input i
+    process { workspace.x = missing.helper(1) }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        let w = warnings(&diags)
+            .into_iter()
+            .find(|w| w.message.contains("missing.helper"))
+            .expect("expected qualified unknown function warning");
+        assert_eq!(w.kind, DiagKind::UnknownIdent);
+        assert_eq!(w.help, None);
     }
 
     #[test]
@@ -1577,6 +1618,27 @@ def pipeline p {
                 .iter()
                 .any(|w| w.message.contains("unknown function")),
             "user function should resolve at the call site, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn namespaced_builtin_call_site_resolves() {
+        let src = r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p {
+    input i
+    process { workspace.pri = syslog.extract_pri("<34>hello") }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            !warnings(&diags)
+                .iter()
+                .any(|w| w.message.contains("unknown function")),
+            "registered namespaced built-in should resolve, got: {:?}",
             diags
         );
     }
