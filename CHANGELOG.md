@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime shape converge. After 1.0, changes will follow semver strictly.
 
+## [Unreleased]
+
+### Breaking — `Int` arithmetic stays exact across the full i64 range
+
+When both operands are `Int`, the `+`, `-`, `*`, `/`, and `%` operators now use checked i64 arithmetic instead of converting through `f64`. This prevents epoch-nanosecond values and other integers above 2^53 from silently losing precision. Integer division truncates toward zero (`5 / 2 == 2`, `-5 / 2 == -2`), remainder follows the dividend's sign, and integer division or remainder by zero continues to return `Int(0)`.
+
+This changes `Int / Int` from fractional floating-point division to truncating integer division. Use a `Float` operand (`value / 2.0`) when fractional output is intended. Any i64 overflow, including `i64::MIN / -1` and `i64::MIN % -1`, is now an evaluation error rather than an approximate floating-point fallback. Mixed `Int` / `Float` expressions continue to use the existing floating-point path.
+
 ## [0.7.13] - 2026-07-11
 
 0.7.13 splits the `workspace.lsis.*` LSIS namespace into three explicit layers and reshapes the two envelope composers around the new contract. The trigger was AMP (Azure Monitor Pipeline) integration surfacing that `compose_otlp` had no way to accept caller-supplied target-vocabulary attributes (CommonSecurityLog columns) without every downstream reimplementing the OTLP encoding locally. Rather than expose a shed slot per attribute as an ad-hoc extension hatch, the LSIS namespace itself now has three sub-layers with distinct kinds of contract — a facts layer parsers write, a plumbing layer glue blocks write for the next composer, and a products layer composers write. The runtime is unchanged in behaviour; the surface differences are confined to snippet pack contents, docs prose, and the header lint that keeps the pack self-consistent. All out-of-tree configs that touched `workspace.lsis.*` will need to move to the layered names — the mapping is mechanical and the CHANGELOG's `Changed` section below lists it explicitly.
