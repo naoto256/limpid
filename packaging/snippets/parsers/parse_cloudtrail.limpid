@@ -146,7 +146,6 @@ def process parse_cloudtrail {
         category_uid: 6,
         activity_id:  activity,
         type_uid:     6003 * 100 + activity,
-        severity_id:  1,
         status_id:    status,
         time:         to_int(strptime(workspace.ct.eventTime, "%Y-%m-%dT%H:%M:%SZ", "UTC")),
         api: {
