@@ -329,8 +329,8 @@ fn run_with_flags(config: &std::path::Path, flags: &[&str]) -> std::process::Out
 
 #[test]
 fn ultra_strict_promotes_unknown_function_to_error() {
-    // Unknown function → warning by default. With --ultra-strict it
-    // becomes an error and exit code is 1.
+    // A registry miss without a near match is still a warning by default.
+    // With --ultra-strict it becomes an error and exit code is 1.
     let dir = TempDir::new().unwrap();
     let conf = dir.path().join("us_fn.conf");
     fs::write(
@@ -340,7 +340,7 @@ def input i { type syslog_tcp bind "0.0.0.0:514" }
 def output o { type stdout }
 def pipeline p {
     input i
-    process { workspace.x = upperr(ingress) }
+    process { workspace.x = totally_missing_helper(1) }
     output o
 }
 "#,
@@ -354,6 +354,12 @@ def pipeline p {
         "baseline should succeed: stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("warning"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("totally_missing_helper"),
+        "stderr: {stderr}"
+    );
 
     // --ultra-strict: promoted to error, exit 1.
     let out = run_with_flags(&conf, &["--ultra-strict"]);
@@ -362,6 +368,44 @@ def pipeline p {
         Some(1),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn check_resolves_user_function_from_include_closure() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("helper.limpid"),
+        "def function included_helper(value) { value }\n",
+    )
+    .unwrap();
+
+    let conf = dir.path().join("included_fn.conf");
+    fs::write(
+        &conf,
+        r#"
+include "helper.limpid"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p {
+    input i
+    process { workspace.x = included_helper(1) }
+    output o
+}
+"#,
+    )
+    .unwrap();
+
+    let out = run_with_flags(&conf, &[]);
+    assert!(
+        out.status.success(),
+        "included user function should resolve: stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("unknown function"),
+        "included user function was falsely rejected: {stderr}"
     );
 }
 
