@@ -29,18 +29,39 @@
 //                  flat top-level JSON object per record, no wrapping.
 //
 //              Both shapes carry the same per-record schema (top-level
-//              `category`, `operationName`, `resultType`, `resourceId`,
+//              `category`, `operationName`, `level`, `resultType`, `resourceId`,
 //              `caller`, `time`, plus nested `identity.claims.*` and
 //              `properties.*`). This parser reads the flat per-record
 //              form and is agnostic to which of the two delivery
 //              shapes produced it.
 //
 // Sample input (Administrative, user caller, write verb):
-//   {"time":"2026-04-29T10:00:00.1234567Z","resourceId":"/SUBSCRIPTIONS/00000000-0000-0000-0000-000000000000/RESOURCEGROUPS/RG1/PROVIDERS/MICROSOFT.COMPUTE/VIRTUALMACHINES/VM1","operationName":"MICROSOFT.COMPUTE/VIRTUALMACHINES/WRITE","category":"Administrative","resultType":"Success","resultSignature":"Succeeded.","durationMs":1234,"callerIpAddress":"203.0.113.10","correlationId":"...","identity":{"authorization":{"scope":"...","action":"Microsoft.Compute/virtualMachines/write"},"claims":{"aud":"https://management.core.windows.net/","iss":"https://sts.windows.net/.../","upn":"alice@example.com","name":"Alice Example","appid":"...","ipaddr":"203.0.113.10"}},"caller":"alice@example.com","properties":{"statusCode":"Created","serviceRequestId":"..."}}
+//   {"time":"2026-04-29T10:00:00.1234567Z","resourceId":"/SUBSCRIPTIONS/00000000-0000-0000-0000-000000000000/RESOURCEGROUPS/RG1/PROVIDERS/MICROSOFT.COMPUTE/VIRTUALMACHINES/VM1","operationName":"MICROSOFT.COMPUTE/VIRTUALMACHINES/WRITE","category":"Administrative","level":"Informational","resultType":"Success","resultSignature":"Succeeded.","durationMs":1234,"callerIpAddress":"203.0.113.10","correlationId":"...","identity":{"authorization":{"scope":"...","action":"Microsoft.Compute/virtualMachines/write"},"claims":{"aud":"https://management.core.windows.net/","iss":"https://sts.windows.net/.../","upn":"alice@example.com","name":"Alice Example","appid":"...","ipaddr":"203.0.113.10"}},"caller":"alice@example.com","properties":{"statusCode":"Created","serviceRequestId":"..."}}
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// Azure Activity Log `level` → OTel SeverityNumber. Microsoft documents
+// both Information and Informational spellings; retain the source spelling
+// separately while normalizing both to the same OTel INFO value.
+def function azure_activity_severity_number(level) {
+    switch level {
+        "Verbose"       { 5 }
+        "Information"   { 9 }
+        "Informational" { 9 }
+        "Warning"       { 13 }
+        "Error"         { 17 }
+        "Critical"      { 21 }
+        default         { null }
+    }
+}
+
+def process validate_azure_activity_severity_number {
+    switch workspace.az.level != null and workspace.az.severity_number == null {
+        true { error "parse_azure_activity: invalid Azure Activity Log level ${workspace.az.level}" }
+    }
+}
 
 // Last `/`-delimited segment of `operationName`. The Activity Log
 // operationName is always `Microsoft.<RP>/<resource-type>[/<sub>]*/<verb>`
@@ -151,7 +172,8 @@ def process parse_azure_activity_record {
         category_uid: 6,
         activity_id:  activity,
         type_uid:     6003 * 100 + activity,
-        severity_id:  1,
+        severity_number: workspace.az.severity_number,
+        severity:        workspace.az.level,
         status_id:    status,
         // The Activity Log `time` field is ISO 8601 with TZ and
         // sub-second precision (e.g. "2026-04-29T10:00:00.1234567Z").
@@ -240,6 +262,7 @@ def process parse_azure_activity_record {
 
 def process parse_azure_activity {
     workspace.az = parse_json(ingress)
+    workspace.az.severity_number = azure_activity_severity_number(workspace.az.level)
 
     // Loud-fail on missing required fields. An Activity Log event
     // without category / operationName / resourceId / time is
@@ -260,6 +283,7 @@ def process parse_azure_activity {
             error "parse_azure_activity: missing time: ${ingress}"
         }
         default {
+            process validate_azure_activity_severity_number
             switch workspace.az.category {
                 "Administrative"  { process parse_azure_activity_record }
                 "ServiceHealth"   { process parse_azure_activity_record }
