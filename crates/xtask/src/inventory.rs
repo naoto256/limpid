@@ -28,7 +28,7 @@
 
 use std::path::Path;
 
-use crate::header::{SnippetHeader, SnippetKind, parse_signature};
+use crate::header::{SnippetHeader, SnippetKind, parse_signature, signature_entries};
 
 /// Ordered, authoritative list of allowed parser categories.
 ///
@@ -150,6 +150,9 @@ pub fn render_filters_table(headers: &[SnippetHeader]) -> String {
 
 /// Functions block: flat, columns `File | Signature | Used by`.
 ///
+/// Function-family files produce one row per authored signature, with
+/// Used-by derived independently for each function name.
+///
 /// The Used-by column is derived by lexically scanning every snippet
 /// file's body for calls to the function (see [`derive_used_by`]).
 /// The result is a comma-separated list of caller stems, or `—` if
@@ -161,24 +164,25 @@ pub fn render_functions_table(all_headers: &[SnippetHeader]) -> String {
         .iter()
         .filter(|h| h.kind == SnippetKind::Function)
     {
-        let sig = h.get("Signature").unwrap_or("").trim();
-        let name = parse_signature(sig).map(|(n, _)| n).unwrap_or_default();
-        let callers = derive_used_by(&name, &h.file, all_headers);
-        let callers_cell = if callers.is_empty() {
-            "—".to_string()
-        } else {
-            callers
-                .iter()
-                .map(|p| format!("`{}`", file_stem(p).unwrap_or_default()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        out.push_str(&format!(
-            "| `{}` | `{}` | {} |\n",
-            relative_display_path(&h.file),
-            cell(sig.to_string()),
-            callers_cell,
-        ));
+        for sig in signature_entries(h.get("Signature").unwrap_or("")) {
+            let name = parse_signature(sig).map(|(n, _)| n).unwrap_or_default();
+            let callers = derive_used_by(&name, &h.file, all_headers);
+            let callers_cell = if callers.is_empty() {
+                "—".to_string()
+            } else {
+                callers
+                    .iter()
+                    .map(|p| format!("`{}`", file_stem(p).unwrap_or_default()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            out.push_str(&format!(
+                "| `{}` | `{}` | {} |\n",
+                relative_display_path(&h.file),
+                cell(sig.to_string()),
+                callers_cell,
+            ));
+        }
     }
     out
 }
@@ -477,8 +481,65 @@ def function selfy(x) {
         // The declaration line `def function selfy(` is skipped; the
         // recursion in the body still counts. So Used-by lists the
         // defining file itself.
-        let callers = derive_used_by("selfy", &def.file, &[def.clone()]);
+        let callers = derive_used_by("selfy", &def.file, std::slice::from_ref(&def));
         assert_eq!(callers, vec![def.file.clone()]);
+    }
+
+    #[test]
+    fn functions_table_renders_each_family_signature_with_its_own_callers() {
+        let family = mk(
+            SnippetKind::Function,
+            "/repo/packaging/snippets/functions/timestamp_converter.limpid",
+            "\
+// Summary:     Timestamp unit conversions
+// Signature:   timestamp_ms_to_ns(value) → Int
+//              timestamp_ns_to_ms(value) → Int
+// Test corpus: unit (timestamp boundaries)
+
+def function timestamp_ms_to_ns(value) {}
+def function timestamp_ns_to_ms(value) {}
+",
+        );
+        let ms_caller = mk(
+            SnippetKind::Parser,
+            "/repo/packaging/snippets/parsers/parse_ms.limpid",
+            "\
+// Summary:     Millisecond source
+// Reads:       ingress (raw wire) — JSON
+// Writes:      workspace.lsis.*
+// Category:    Vendor-neutral
+// Test corpus: synthetic (unit)
+
+def process parse_ms {
+    workspace.lsis.time = timestamp_ms_to_ns(workspace.raw.time)
+}
+",
+        );
+        let ns_caller = mk(
+            SnippetKind::Composer,
+            "/repo/packaging/snippets/composers/compose_ms.limpid",
+            "\
+// Summary:     Millisecond output
+// Reads:       workspace.lsis.*
+//              .time (required, Int)
+// Writes:      workspace.lsis.output
+// Test corpus: synthetic (unit)
+
+def process compose_ms {
+    workspace.lsis.output = timestamp_ns_to_ms(workspace.lsis.time)
+}
+",
+        );
+
+        let out = render_functions_table(&[family, ms_caller, ns_caller]);
+        assert_eq!(out.matches("timestamp_ms_to_ns(value)").count(), 1);
+        assert_eq!(out.matches("timestamp_ns_to_ms(value)").count(), 1);
+        assert!(out.contains(
+            "| `functions/timestamp_converter.limpid` | `timestamp_ms_to_ns(value) → Int` | `parse_ms` |"
+        ));
+        assert!(out.contains(
+            "| `functions/timestamp_converter.limpid` | `timestamp_ns_to_ms(value) → Int` | `compose_ms` |"
+        ));
     }
 
     #[test]
