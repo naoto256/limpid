@@ -78,19 +78,6 @@ def function combined_log_status_id(code) {
     }
 }
 
-// HTTP status code → OCSF severity_id heuristic.
-//   2xx-3xx → Informational
-//   4xx     → Low (client-side errors are noise but not threats)
-//   5xx     → Medium (server-side errors are operational signal)
-def function combined_log_severity_id(code) {
-    switch true {
-        code >= 200 and code < 400 { 1 }
-        code >= 400 and code < 500 { 2 }
-        code >= 500 and code < 600 { 3 }
-        default                    { 1 }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Main parser
 // ---------------------------------------------------------------------------
@@ -136,7 +123,6 @@ def process parse_combined_log_record {
         category_uid: 4,
         activity_id:  activity,
         type_uid:     4002 * 100 + activity,
-        severity_id:  combined_log_severity_id(status),
         status_id:    combined_log_status_id(status),
         time:         event_time,
         src_endpoint: {
