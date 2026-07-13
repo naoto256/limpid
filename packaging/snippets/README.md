@@ -45,14 +45,22 @@ not in strictness but in the *kind* of contract each one makes.
 
 ### `workspace.lsis.parsed.*` — facts (a vocabulary contract)
 
-What parsers established about the event: `parsed.severity_id`,
-`parsed.time`, `parsed.device.hostname`, and friends. The contract is
+What parsers established about the event: canonical OTel
+`parsed.severity_number`, `parsed.time`, `parsed.device.hostname`, and
+friends. The contract is
 a dictionary: *if* a field is present under this name, it means this
 — nothing more. The vocabulary leans OCSF but is an open set
 (syslog, CEF, OCSF-shaped, but not limited to), and every field is
 optional; readers handle absence gracefully. Do not look for a schema
 with required fields here. There isn't one, by design. Writers:
 parsers. Readers: everyone.
+
+Bundled semantic parsers are migrating from the legacy OCSF
+`parsed.severity_id` slot. During that transition `compose_ocsf` prefers
+canonical `severity_number`, accepts `severity_id` only as a lower-priority
+compatibility input, and supplies OCSF's required Unknown (0) only at the
+output boundary when neither a number nor source-specific severity text is
+available.
 
 ### `workspace.lsis.shed.*` — plumbing (a hand-off contract)
 
@@ -189,7 +197,7 @@ regions.
 | **Endpoint / host audit (Windows)** | |
 | `parsers/parse_winevent_json.limpid` | Windows Event Log JSON (NXLog field-naming shape; Security channel) → LSIS, dispatched by EventID. |
 | **Vendor-neutral** | |
-| `parsers/parse_ocsf.limpid` | Parses OCSF JSON into LSIS and normalizes the root event time from OCSF epoch milliseconds to LSIS epoch nanoseconds. |
+| `parsers/parse_ocsf.limpid` | Parses OCSF JSON into LSIS, normalizing root time to epoch nanoseconds and severity_id to OTel SeverityNumber. |
 <!-- END: inventory:parsers -->
 
 ### Composers
@@ -231,6 +239,8 @@ regions.
 | `functions/http_method_activity_id.limpid` | `http_method_activity_id(method) → Int` | `parse_combined_log`, `parse_suricata`, `parse_zeek_default` |
 | `functions/parse_datetime_rfc3164.limpid` | `parse_datetime_rfc3164(text) → Timestamp` | — |
 | `functions/proto_num.limpid` | `proto_num(name) → Int \| null` | `parse_checkpoint_leef`, `parse_checkpoint_syslog`, `parse_juniper_srx_sd_syslog`, `parse_juniper_srx_syslog`, `parse_paloalto_cef`, `parse_paloalto_syslog`, `parse_suricata`, `parse_sysmon`, `parse_zeek_default`, `parse_zeek_full` |
+| `functions/severity_converter.limpid` | `ocsf_severity_id_to_otel_severity_number(severity_id) → Int \| null` | `parse_ocsf` |
+| `functions/severity_converter.limpid` | `otel_severity_number_to_ocsf_severity_id(severity_number) → Int \| null` | `compose_ocsf` |
 | `functions/timestamp_converter.limpid` | `timestamp_ns_to_ms(value) → Int \| null` | `compose_ocsf` |
 | `functions/timestamp_converter.limpid` | `timestamp_ms_to_ns(value) → Int \| null` | `parse_ocsf` |
 <!-- END: inventory:functions -->
@@ -492,7 +502,7 @@ this mode to fail on drift.
   dispatch, per-leaf record build); the dispatcher handles
   unsupported vocabulary with `error "<operator-readable msg>"`.
 - Helpers (`def function ...`) carry their per-vendor mapping tables
-  (severity → LSIS `severity_id`, action → `activity_id`, etc.).
+  (severity → LSIS `severity_number`, action → `activity_id`, etc.).
 - Files are one per (vendor, format). FortiGate has two files
   (`parse_fortigate_cef` + `parse_fortigate_syslog`) because CEF and
   native KV are different wire shapes; OpenSSH is one file because

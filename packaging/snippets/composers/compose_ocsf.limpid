@@ -74,7 +74,9 @@
 // reads only the fields its OCSF class defines, plucking from
 // `workspace.lsis.parsed.*`. Common envelope fields (`class_uid`,
 // `category_uid`, `activity_id`, `type_uid`, `severity_id`, `time`,
-// `metadata`) are emitted uniformly.
+// `metadata`) are emitted uniformly. Canonical OTel `severity_number` is
+// converted at this boundary. Until bundled parsers migrate, legacy
+// `severity_id` remains an explicit lower-priority compatibility input.
 //
 // Root `time` policy:
 //   LSIS record-level timestamps are Unix epoch nanoseconds; OCSF
@@ -85,6 +87,23 @@
 //   sub-millisecond truncation solely to the OCSF output boundary.
 
 include "../functions/timestamp_converter.limpid"
+include "../functions/severity_converter.limpid"
+
+def process validate_ocsf_severity_number {
+    let severity_id = otel_severity_number_to_ocsf_severity_id(workspace.lsis.parsed.severity_number)
+    switch workspace.lsis.parsed.severity_number != null and severity_id == null {
+        true { error "compose_ocsf: invalid OTel severity_number ${workspace.lsis.parsed.severity_number}" }
+    }
+}
+
+def function compose_ocsf_severity_id(severity_number, legacy_severity_id, severity) {
+    switch true {
+        severity_number != null { otel_severity_number_to_ocsf_severity_id(severity_number) }
+        legacy_severity_id != null { legacy_severity_id }
+        severity != null { 99 }
+        default { 0 }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Top-level dispatcher
@@ -143,13 +162,15 @@ def process compose_ocsf {
 // (the process that performed the action), and `workspace.lsis.parsed.user`
 // for the executing user.
 def process compose_ocsf_file_system_activity {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:    1001,
         category_uid: 1,
         activity_id:  activity,
         type_uid:     1001 * 100 + activity,
-        severity_id:  workspace.lsis.parsed.severity_id,
+        severity_id:  compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         status_id:    workspace.lsis.parsed.status_id,
         time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         file:         workspace.lsis.parsed.file,
@@ -172,13 +193,15 @@ def process compose_ocsf_file_system_activity {
 // `workspace.lsis.parsed.actor.process` (the parent / initiator), and
 // `workspace.lsis.parsed.actor.user`.
 def process compose_ocsf_process_activity {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:    1007,
         category_uid: 1,
         activity_id:  activity,
         type_uid:     1007 * 100 + activity,
-        severity_id:  workspace.lsis.parsed.severity_id,
+        severity_id:  compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         status_id:    workspace.lsis.parsed.status_id,
         time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         process:      workspace.lsis.parsed.process,
@@ -198,13 +221,15 @@ def process compose_ocsf_process_activity {
 // `workspace.lsis.parsed.reg_key` (path) and `workspace.lsis.parsed.actor.process`
 // (the process that touched it).
 def process compose_ocsf_registry_key_activity {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:    1008,
         category_uid: 1,
         activity_id:  activity,
         type_uid:     1008 * 100 + activity,
-        severity_id:  workspace.lsis.parsed.severity_id,
+        severity_id:  compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         reg_key:      workspace.lsis.parsed.reg_key,
         actor:        workspace.lsis.parsed.actor,
@@ -222,13 +247,15 @@ def process compose_ocsf_registry_key_activity {
 // `workspace.lsis.parsed.reg_value` (path + data) and
 // `workspace.lsis.parsed.actor.process`.
 def process compose_ocsf_registry_value_activity {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:    1009,
         category_uid: 1,
         activity_id:  activity,
         type_uid:     1009 * 100 + activity,
-        severity_id:  workspace.lsis.parsed.severity_id,
+        severity_id:  compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         reg_value:    workspace.lsis.parsed.reg_value,
         actor:        workspace.lsis.parsed.actor,
@@ -251,13 +278,15 @@ def process compose_ocsf_registry_value_activity {
 // `workspace.lsis.parsed.vulnerabilities` (array of CVE / CVSS / etc.),
 // `workspace.lsis.parsed.affected_packages`, and `workspace.lsis.parsed.resources`.
 def process compose_ocsf_vulnerability_finding {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:         2002,
         category_uid:      2,
         activity_id:       activity,
         type_uid:          2002 * 100 + activity,
-        severity_id:       workspace.lsis.parsed.severity_id,
+        severity_id:       compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         time:              timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         finding_info:      workspace.lsis.parsed.finding_info,
         vulnerabilities:   workspace.lsis.parsed.vulnerabilities,
@@ -276,13 +305,15 @@ def process compose_ocsf_vulnerability_finding {
 // SOC 2 control failures). Parsers populate `workspace.lsis.parsed.compliance`
 // (control / standards) and `workspace.lsis.parsed.resource`.
 def process compose_ocsf_compliance_finding {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:    2003,
         category_uid: 2,
         activity_id:  activity,
         type_uid:     2003 * 100 + activity,
-        severity_id:  workspace.lsis.parsed.severity_id,
+        severity_id:  compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         finding_info: workspace.lsis.parsed.finding_info,
         compliance:   workspace.lsis.parsed.compliance,
@@ -303,13 +334,15 @@ def process compose_ocsf_compliance_finding {
 // Detected / Quarantined / etc.), and optionally `attack` / `malware` /
 // `evidences` objects with engine-specific detail.
 def process compose_ocsf_detection_finding {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:       2004,
         category_uid:    2,
         activity_id:     activity,
         type_uid:        2004 * 100 + activity,
-        severity_id:     workspace.lsis.parsed.severity_id,
+        severity_id:     compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         status_id:       workspace.lsis.parsed.status_id,
         time:            timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         finding_info:    workspace.lsis.parsed.finding_info,
@@ -337,13 +370,15 @@ def process compose_ocsf_detection_finding {
 // engines. Carries finding metadata plus assignment / status_id and
 // optional links to underlying findings.
 def process compose_ocsf_incident_finding {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:    2005,
         category_uid: 2,
         activity_id:  activity,
         type_uid:     2005 * 100 + activity,
-        severity_id:  workspace.lsis.parsed.severity_id,
+        severity_id:  compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         status_id:    workspace.lsis.parsed.status_id,
         time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         finding_info: workspace.lsis.parsed.finding_info,
@@ -367,13 +402,15 @@ def process compose_ocsf_incident_finding {
 // populate `workspace.lsis.parsed.user` (the account being changed) and
 // `workspace.lsis.parsed.actor.user` (the actor performing the change).
 def process compose_ocsf_account_change {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:    3001,
         category_uid: 3,
         activity_id:  activity,
         type_uid:     3001 * 100 + activity,
-        severity_id:  workspace.lsis.parsed.severity_id,
+        severity_id:  compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         user:         workspace.lsis.parsed.user,
         actor:        workspace.lsis.parsed.actor,
@@ -391,13 +428,15 @@ def process compose_ocsf_account_change {
 // `workspace.lsis.parsed.user`, `workspace.lsis.parsed.src_endpoint`, and
 // `workspace.lsis.parsed.status_id` (1 Success / 2 Failure).
 def process compose_ocsf_authentication {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:    3002,
         category_uid: 3,
         activity_id:  activity,
         type_uid:     3002 * 100 + activity,
-        severity_id:  workspace.lsis.parsed.severity_id,
+        severity_id:  compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         status_id:    workspace.lsis.parsed.status_id,
         time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         user:         workspace.lsis.parsed.user,
@@ -423,13 +462,15 @@ def process compose_ocsf_authentication {
 // `workspace.lsis.parsed.user`, `workspace.lsis.parsed.session`, and
 // `workspace.lsis.parsed.privileges`.
 def process compose_ocsf_authorize_session {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:    3003,
         category_uid: 3,
         activity_id:  activity,
         type_uid:     3003 * 100 + activity,
-        severity_id:  workspace.lsis.parsed.severity_id,
+        severity_id:  compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         status_id:    workspace.lsis.parsed.status_id,
         time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         user:         workspace.lsis.parsed.user,
@@ -449,13 +490,15 @@ def process compose_ocsf_authorize_session {
 //
 // Privilege grant / revoke / role-assignment operations.
 def process compose_ocsf_user_access_management {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:    3005,
         category_uid: 3,
         activity_id:  activity,
         type_uid:     3005 * 100 + activity,
-        severity_id:  workspace.lsis.parsed.severity_id,
+        severity_id:  compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         user:         workspace.lsis.parsed.user,
         actor:        workspace.lsis.parsed.actor,
@@ -472,13 +515,15 @@ def process compose_ocsf_user_access_management {
 //
 // Group create / delete / membership change.
 def process compose_ocsf_group_management {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:    3006,
         category_uid: 3,
         activity_id:  activity,
         type_uid:     3006 * 100 + activity,
-        severity_id:  workspace.lsis.parsed.severity_id,
+        severity_id:  compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         group:        workspace.lsis.parsed.group,
         user:         workspace.lsis.parsed.user,
@@ -501,13 +546,15 @@ def process compose_ocsf_group_management {
 // `workspace.lsis.parsed.dst_endpoint`, `workspace.lsis.parsed.connection_info`,
 // and optionally `workspace.lsis.parsed.traffic` (bytes_in/out).
 def process compose_ocsf_network_activity {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:       4001,
         category_uid:    4,
         activity_id:     activity,
         type_uid:        4001 * 100 + activity,
-        severity_id:     workspace.lsis.parsed.severity_id,
+        severity_id:     compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         status_id:       workspace.lsis.parsed.status_id,
         time:            timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         src_endpoint:    workspace.lsis.parsed.src_endpoint,
@@ -532,13 +579,15 @@ def process compose_ocsf_network_activity {
 // headers / body_length) and `workspace.lsis.parsed.http_response` (status /
 // headers / body_length).
 def process compose_ocsf_http_activity {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:     4002,
         category_uid:  4,
         activity_id:   activity,
         type_uid:      4002 * 100 + activity,
-        severity_id:   workspace.lsis.parsed.severity_id,
+        severity_id:   compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         status_id:     workspace.lsis.parsed.status_id,
         time:          timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         src_endpoint:  workspace.lsis.parsed.src_endpoint,
@@ -561,13 +610,15 @@ def process compose_ocsf_http_activity {
 // Parsers populate `workspace.lsis.parsed.query` (question name + type) and
 // `workspace.lsis.parsed.answers` (resolved records).
 def process compose_ocsf_dns_activity {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:    4003,
         category_uid: 4,
         activity_id:  activity,
         type_uid:     4003 * 100 + activity,
-        severity_id:  workspace.lsis.parsed.severity_id,
+        severity_id:  compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         rcode_id:     workspace.lsis.parsed.rcode_id,
         time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         src_endpoint: workspace.lsis.parsed.src_endpoint,
@@ -587,13 +638,15 @@ def process compose_ocsf_dns_activity {
 //
 // DHCP lease lifecycle (discover / offer / request / ack / release).
 def process compose_ocsf_dhcp_activity {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:    4004,
         category_uid: 4,
         activity_id:  activity,
         type_uid:     4004 * 100 + activity,
-        severity_id:  workspace.lsis.parsed.severity_id,
+        severity_id:  compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         src_endpoint: workspace.lsis.parsed.src_endpoint,
         dst_endpoint: workspace.lsis.parsed.dst_endpoint,
@@ -608,13 +661,15 @@ def process compose_ocsf_dhcp_activity {
 // RDP Activity (class_uid 4005)
 // ---------------------------------------------------------------------------
 def process compose_ocsf_rdp_activity {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:    4005,
         category_uid: 4,
         activity_id:  activity,
         type_uid:     4005 * 100 + activity,
-        severity_id:  workspace.lsis.parsed.severity_id,
+        severity_id:  compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         src_endpoint: workspace.lsis.parsed.src_endpoint,
         dst_endpoint: workspace.lsis.parsed.dst_endpoint,
@@ -631,13 +686,15 @@ def process compose_ocsf_rdp_activity {
 // SMB Activity (class_uid 4006)
 // ---------------------------------------------------------------------------
 def process compose_ocsf_smb_activity {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:    4006,
         category_uid: 4,
         activity_id:  activity,
         type_uid:     4006 * 100 + activity,
-        severity_id:  workspace.lsis.parsed.severity_id,
+        severity_id:  compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         src_endpoint: workspace.lsis.parsed.src_endpoint,
         dst_endpoint: workspace.lsis.parsed.dst_endpoint,
@@ -654,13 +711,15 @@ def process compose_ocsf_smb_activity {
 // SSH Activity (class_uid 4007)
 // ---------------------------------------------------------------------------
 def process compose_ocsf_ssh_activity {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:    4007,
         category_uid: 4,
         activity_id:  activity,
         type_uid:     4007 * 100 + activity,
-        severity_id:  workspace.lsis.parsed.severity_id,
+        severity_id:  compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         src_endpoint: workspace.lsis.parsed.src_endpoint,
         dst_endpoint: workspace.lsis.parsed.dst_endpoint,
@@ -678,13 +737,15 @@ def process compose_ocsf_ssh_activity {
 // FTP Activity (class_uid 4008)
 // ---------------------------------------------------------------------------
 def process compose_ocsf_ftp_activity {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:    4008,
         category_uid: 4,
         activity_id:  activity,
         type_uid:     4008 * 100 + activity,
-        severity_id:  workspace.lsis.parsed.severity_id,
+        severity_id:  compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         src_endpoint: workspace.lsis.parsed.src_endpoint,
         dst_endpoint: workspace.lsis.parsed.dst_endpoint,
@@ -701,13 +762,15 @@ def process compose_ocsf_ftp_activity {
 // Email Activity (class_uid 4009)
 // ---------------------------------------------------------------------------
 def process compose_ocsf_email_activity {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:    4009,
         category_uid: 4,
         activity_id:  activity,
         type_uid:     4009 * 100 + activity,
-        severity_id:  workspace.lsis.parsed.severity_id,
+        severity_id:  compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         direction_id: workspace.lsis.parsed.direction_id,
         time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         src_endpoint: workspace.lsis.parsed.src_endpoint,
@@ -727,13 +790,15 @@ def process compose_ocsf_email_activity {
 //
 // Cross-host file access over network protocols (NFS, SMB-as-FS, etc.).
 def process compose_ocsf_network_file_activity {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:    4010,
         category_uid: 4,
         activity_id:  activity,
         type_uid:     4010 * 100 + activity,
-        severity_id:  workspace.lsis.parsed.severity_id,
+        severity_id:  compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         src_endpoint: workspace.lsis.parsed.src_endpoint,
         dst_endpoint: workspace.lsis.parsed.dst_endpoint,
@@ -757,13 +822,15 @@ def process compose_ocsf_network_file_activity {
 // Parsers populate `workspace.lsis.parsed.api` (operation / version / service)
 // and `workspace.lsis.parsed.actor` (the calling principal).
 def process compose_ocsf_api_activity {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:    6003,
         category_uid: 6,
         activity_id:  activity,
         type_uid:     6003 * 100 + activity,
-        severity_id:  workspace.lsis.parsed.severity_id,
+        severity_id:  compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         status_id:    workspace.lsis.parsed.status_id,
         time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         api:          workspace.lsis.parsed.api,
@@ -788,13 +855,15 @@ def process compose_ocsf_api_activity {
 // `workspace.lsis.parsed.web_resources` (categorisation), and
 // `workspace.lsis.parsed.actor.user` for the requesting user.
 def process compose_ocsf_web_resource_access {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:     6004,
         category_uid:  6,
         activity_id:   activity,
         type_uid:      6004 * 100 + activity,
-        severity_id:   workspace.lsis.parsed.severity_id,
+        severity_id:   compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         time:          timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         src_endpoint:  workspace.lsis.parsed.src_endpoint,
         dst_endpoint:  workspace.lsis.parsed.dst_endpoint,
@@ -813,13 +882,15 @@ def process compose_ocsf_web_resource_access {
 //
 // Database / S3 / object-store access events.
 def process compose_ocsf_datastore_activity {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:    6005,
         category_uid: 6,
         activity_id:  activity,
         type_uid:     6005 * 100 + activity,
-        severity_id:  workspace.lsis.parsed.severity_id,
+        severity_id:  compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         actor:        workspace.lsis.parsed.actor,
         src_endpoint: workspace.lsis.parsed.src_endpoint,
@@ -839,13 +910,15 @@ def process compose_ocsf_datastore_activity {
 // Vulnerability / asset / config scan job records (the orchestration
 // layer; individual findings are class 2002 / 2003).
 def process compose_ocsf_scan_activity {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:    6007,
         category_uid: 6,
         activity_id:  activity,
         type_uid:     6007 * 100 + activity,
-        severity_id:  workspace.lsis.parsed.severity_id,
+        severity_id:  compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
+        severity:     workspace.lsis.parsed.severity,
         time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         scan:         workspace.lsis.parsed.scan,
         actor:        workspace.lsis.parsed.actor,
