@@ -497,23 +497,25 @@ fn check_fn_call(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let Some(sig) = registry.signature(namespace, name) else {
-        // Unknown function — emit a hint with a near-match if any
-        // registered name is close. Skipped for namespaced calls because
-        // user-defined namespaces aren't enumerable here yet.
+        // Every registry miss is an unknown function. A near-match only
+        // enriches the diagnostic; it must not decide whether a missing
+        // function is reported, or include-closure omissions can pass
+        // static checking and fail only at runtime.
+        let mut diag = Diagnostic::warning_kind(
+            DiagKind::UnknownIdent,
+            format!(
+                "[pipeline {}] call to unknown function `{}`",
+                pipeline_name,
+                qualified_name(namespace, name)
+            ),
+        )
+        .with_span(span);
         if namespace.is_none()
             && let Some(near) = suggestions::near_function_name(name, registry)
         {
-            let mut diag = Diagnostic::warning_kind(
-                DiagKind::UnknownIdent,
-                format!(
-                    "[pipeline {}] call to unknown function `{}`",
-                    pipeline_name, name
-                ),
-            )
-            .with_span(span);
             diag = diag.with_help(format!("did you mean `{}`?", near));
-            diagnostics.push(diag);
         }
+        diagnostics.push(diag);
         return;
     };
     if !arity_in_range(sig, args.len()) {
