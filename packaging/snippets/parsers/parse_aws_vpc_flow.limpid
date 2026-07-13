@@ -93,20 +93,6 @@ def function aws_vpc_flow_status_id(action) {
     }
 }
 
-// VPC Flow `action` → OCSF severity_id.
-//   ACCEPT → 1 (Informational — normal allowed traffic, volume-
-//            dominant; rely on downstream rules for anomaly scoring)
-//   REJECT → 2 (Low — security-group / NACL denies are signal but
-//            individual REJECTs are also a routine scanning artefact)
-//   default → 1 (treat NODATA / SKIPDATA as Informational housekeeping)
-def function aws_vpc_flow_severity_id(action) {
-    switch action {
-        "ACCEPT" { 1 }
-        "REJECT" { 2 }
-        default  { 1 }
-    }
-}
-
 // IANA protocol number → OCSF connection_info.protocol_name (lower-
 // case, OCSF dictionary form). Only the protocols actually seen on
 // flow logs are spelt out; everything else falls back to `null`
@@ -216,7 +202,6 @@ def process parse_aws_vpc_flow_v2_record {
         category_uid: 4,
         activity_id:  activity,
         type_uid:     4001 * 100 + activity,
-        severity_id:  aws_vpc_flow_severity_id(action),
         status_id:    aws_vpc_flow_status_id(action),
         start_time:   aws_vpc_flow_epoch_seconds_to_nanos(f.start),
         end_time:     aws_vpc_flow_epoch_seconds_to_nanos(f.end),
@@ -294,7 +279,6 @@ def process parse_aws_vpc_flow_v5_record {
         category_uid: 4,
         activity_id:  activity,
         type_uid:     4001 * 100 + activity,
-        severity_id:  aws_vpc_flow_severity_id(action),
         status_id:    aws_vpc_flow_status_id(action),
         start_time:   aws_vpc_flow_epoch_seconds_to_nanos(f.start),
         end_time:     aws_vpc_flow_epoch_seconds_to_nanos(f.end),
