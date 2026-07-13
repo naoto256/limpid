@@ -609,16 +609,16 @@ fn eval_bin_op<'bump>(
         BinOp::And => Ok(Value::Bool(left.is_truthy() && right.is_truthy())),
         BinOp::Or => Ok(Value::Bool(left.is_truthy() || right.is_truthy())),
         BinOp::Add => add_values(left, right, arena),
-        BinOp::Sub => numeric_op("subtract", left, right, |a, b| a - b),
-        BinOp::Mul => numeric_op("multiply", left, right, |a, b| a * b),
+        BinOp::Sub => numeric_op(BinOp::Sub, left, right, |a, b| a - b),
+        BinOp::Mul => numeric_op(BinOp::Mul, left, right, |a, b| a * b),
         BinOp::Div => numeric_op(
-            "divide",
+            BinOp::Div,
             left,
             right,
             |a, b| if b != 0.0 { a / b } else { 0.0 },
         ),
         BinOp::Mod => numeric_op(
-            "modulo",
+            BinOp::Mod,
             left,
             right,
             |a, b| if b != 0.0 { a % b } else { 0.0 },
@@ -821,17 +821,56 @@ fn add_values<'bump>(
         s.push_str(&value_to_string(right));
         return Ok(Value::String(arena.alloc_str(&s)));
     }
-    numeric_op("add", left, right, |a, b| a + b)
+    numeric_op(BinOp::Add, left, right, |a, b| a + b)
 }
 
+fn arithmetic_labels(op: BinOp) -> (&'static str, &'static str) {
+    match op {
+        BinOp::Add => ("add", "+"),
+        BinOp::Sub => ("subtract", "-"),
+        BinOp::Mul => ("multiply", "*"),
+        BinOp::Div => ("divide", "/"),
+        BinOp::Mod => ("modulo", "%"),
+        _ => unreachable!("numeric_op only accepts arithmetic operators"),
+    }
+}
+
+fn exact_int_op(op: BinOp, left: i64, right: i64) -> Result<i64> {
+    let result = match op {
+        BinOp::Add => left.checked_add(right),
+        BinOp::Sub => left.checked_sub(right),
+        BinOp::Mul => left.checked_mul(right),
+        BinOp::Div if right == 0 => Some(0),
+        BinOp::Div => left.checked_div(right),
+        BinOp::Mod if right == 0 => Some(0),
+        BinOp::Mod => left.checked_rem(right),
+        _ => unreachable!("exact_int_op only accepts arithmetic operators"),
+    };
+    let (_, symbol) = arithmetic_labels(op);
+    result.ok_or_else(|| {
+        anyhow::anyhow!(
+            "integer overflow for operator `{symbol}`: {left} {symbol} {right} exceeds i64"
+        )
+    })
+}
+
+/// Shared arithmetic kernel for `+ - * / %`.
+///
+/// Two `Int` operands stay on checked i64 arithmetic. Any overflow is
+/// an evaluation error; exact integer input never falls back to f64.
+/// Other numeric/coercible combinations retain the historical f64 path.
 fn numeric_op<'bump>(
-    op: &str,
+    op: BinOp,
     left: &Value<'bump>,
     right: &Value<'bump>,
     f: impl Fn(f64, f64) -> f64,
 ) -> Result<Value<'bump>> {
+    let (action, _) = arithmetic_labels(op);
     if matches!(left, Value::Bytes(_)) || matches!(right, Value::Bytes(_)) {
-        bail!("cannot {} a bytes value", op);
+        bail!("cannot {} a bytes value", action);
+    }
+    if let (Value::Int(a), Value::Int(b)) = (left, right) {
+        return exact_int_op(op, *a, *b).map(Value::Int);
     }
     let a = value_to_f64(left);
     let b = value_to_f64(right);
@@ -844,7 +883,9 @@ fn numeric_op<'bump>(
 /// onto f64 internally for math, but the type that surfaces should
 /// match user expectations.
 fn numeric_value_from_f64<'bump>(n: f64) -> Value<'bump> {
-    if n.is_finite() && n.fract() == 0.0 && (i64::MIN as f64..=i64::MAX as f64).contains(&n) {
+    let i64_min = i64::MIN as f64;
+    let i64_max_exclusive = -i64_min;
+    if n.is_finite() && n.fract() == 0.0 && n >= i64_min && n < i64_max_exclusive {
         Value::Int(n as i64)
     } else if n.is_finite() {
         Value::Float(n)
@@ -1035,9 +1076,7 @@ mod tests {
             Value::String("42 ms")
         );
 
-        // Int + Int stays numeric (no regression). numeric_op widens to
-        // f64 internally; an integer-valued finite result coerces back
-        // to Value::Int, so `as_f64()` returns the same f64 either way.
+        // Int + Int stays numeric and exact.
         let expr = e(ExprKind::BinOp(
             Box::new(e(ExprKind::IntLit(3))),
             BinOp::Add,
@@ -1059,6 +1098,140 @@ mod tests {
         assert_eq!(
             eval_expr(&expr, &bev, &f, &arena).unwrap(),
             Value::String("abc")
+        );
+    }
+
+    #[test]
+    fn test_eval_binop_exact_int_arithmetic() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&_bump);
+        let ev = make_event();
+        let bev = ev.view_in(&arena);
+        let f = make_funcs();
+        let eval = |left, op, right| {
+            let expr = e(ExprKind::BinOp(
+                Box::new(e(ExprKind::IntLit(left))),
+                op,
+                Box::new(e(ExprKind::IntLit(right))),
+            ));
+            eval_expr(&expr, &bev, &f, &arena)
+        };
+
+        assert_eq!(
+            eval(1_750_000_000_123_456_789, BinOp::Div, 1_000_000).unwrap(),
+            Value::Int(1_750_000_000_123)
+        );
+        assert_eq!(eval(5, BinOp::Div, 2).unwrap(), Value::Int(2));
+        assert_eq!(eval(-5, BinOp::Div, 2).unwrap(), Value::Int(-2));
+        assert_eq!(eval(7, BinOp::Mod, 3).unwrap(), Value::Int(1));
+        assert_eq!(eval(-7, BinOp::Mod, 3).unwrap(), Value::Int(-1));
+        assert_eq!(eval(7, BinOp::Div, 0).unwrap(), Value::Int(0));
+        assert_eq!(eval(7, BinOp::Mod, 0).unwrap(), Value::Int(0));
+
+        assert_eq!(
+            eval(9_007_199_254_740_992, BinOp::Add, 1).unwrap(),
+            Value::Int(9_007_199_254_740_993)
+        );
+        assert_eq!(
+            eval(9_007_199_254_740_993, BinOp::Sub, 1).unwrap(),
+            Value::Int(9_007_199_254_740_992)
+        );
+        assert_eq!(
+            eval(1_750_000_000_123, BinOp::Mul, 1_000_000).unwrap(),
+            Value::Int(1_750_000_000_123_000_000)
+        );
+
+        let mixed = e(ExprKind::BinOp(
+            Box::new(e(ExprKind::IntLit(5))),
+            BinOp::Div,
+            Box::new(e(ExprKind::FloatLit(2.0))),
+        ));
+        assert_eq!(
+            eval_expr(&mixed, &bev, &f, &arena).unwrap(),
+            Value::Float(2.5)
+        );
+    }
+
+    #[test]
+    fn test_eval_binop_int_overflow_errors() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&_bump);
+        let ev = make_event();
+        let bev = ev.view_in(&arena);
+        let f = make_funcs();
+
+        for (left, op, right, symbol) in [
+            (i64::MAX, BinOp::Add, 1, "+"),
+            (i64::MIN, BinOp::Sub, 1, "-"),
+            (i64::MAX, BinOp::Mul, 2, "*"),
+            (i64::MIN, BinOp::Div, -1, "/"),
+            (i64::MIN, BinOp::Mod, -1, "%"),
+        ] {
+            let expr = e(ExprKind::BinOp(
+                Box::new(e(ExprKind::IntLit(left))),
+                op,
+                Box::new(e(ExprKind::IntLit(right))),
+            ));
+            let message = eval_expr(&expr, &bev, &f, &arena).unwrap_err().to_string();
+            assert!(message.contains("integer overflow"), "{message}");
+            assert!(
+                message.contains(&format!("operator `{symbol}`")),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_numeric_value_from_f64_excludes_positive_i64_limit() {
+        let positive_limit = -(i64::MIN as f64);
+        assert_eq!(
+            numeric_value_from_f64(i64::MIN as f64),
+            Value::Int(i64::MIN)
+        );
+        assert_eq!(
+            numeric_value_from_f64(positive_limit),
+            Value::Float(positive_limit)
+        );
+    }
+
+    #[test]
+    fn test_eval_text_exact_int_arithmetic_above_f64_limit() {
+        use crate::dsl::parser::parse_config;
+        let src = r#"
+def pipeline p {
+    input a
+    process inline | {
+        workspace.event_time_ms = 1750000000123456789 / 1000000
+    }
+    drop
+}
+"#;
+        let config = parse_config(src).unwrap();
+        let pipeline = match &config.definitions[0] {
+            Definition::Pipeline(def) => def,
+            _ => panic!("expected Pipeline"),
+        };
+        let chain = match &pipeline.body[1] {
+            PipelineStatement::ProcessChain(chain) => chain,
+            _ => panic!("expected ProcessChain"),
+        };
+        let stmts = match &chain[1] {
+            ProcessChainElement::Inline(stmts) => stmts,
+            _ => panic!("expected Inline"),
+        };
+        let expr = match &stmts[0] {
+            ProcessStatement::Assign(_, expr) => expr,
+            _ => panic!("expected Assign"),
+        };
+
+        let _bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&_bump);
+        let ev = make_event();
+        let bev = ev.view_in(&arena);
+        let f = make_funcs();
+        assert_eq!(
+            eval_expr(expr, &bev, &f, &arena).unwrap(),
+            Value::Int(1_750_000_000_123)
         );
     }
 
