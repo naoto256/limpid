@@ -425,6 +425,14 @@ Used as a bare statement, the returned object merges into `workspace` like other
 
 Timestamps are a first-class DSL value type (`Value::Timestamp`). `received_at`, `timestamp()`, and `strptime` all return one; `strftime` accepts one. String coercion (e.g. `${received_at}`) renders RFC3339; `to_int(timestamp)` returns unix nanoseconds (matching OTLP `time_unix_nano`); `tap --json` serialises timestamps as integer unix nanoseconds.
 
+Because `to_int(timestamp)` returns an `Int`, integer unit conversion remains exact beyond f64's 2^53 exact-integer limit:
+
+```limpid
+workspace.event_time_ms = to_int(workspace.event_time) / 1000000
+```
+
+The division truncates toward zero. Use a Float divisor only when a fractional result is intended.
+
 Timestamps and strings are distinct types. `contains(received_at, "2026")` is a type error — to inspect the wire form, format it explicitly: `contains(strftime(received_at, "%Y", "UTC"), "2026")`.
 
 ### strftime(timestamp, format[, timezone])
@@ -1028,6 +1036,24 @@ Expressions support the following operators:
 | `not` | Logical negation |
 | `+` | Arithmetic addition **or** string concatenation (see below) |
 | `-`, `*`, `/`, `%` | Arithmetic (numeric) |
+
+### Arithmetic types
+
+When both operands are `Int`, `+`, `-`, `*`, `/`, and `%` use checked i64 arithmetic and return an `Int`. Integer division truncates toward zero, and remainder has the dividend's sign:
+
+```limpid
+workspace.half = 5 / 2          // Int(2)
+workspace.negative = -5 / 2    // Int(-2)
+workspace.remainder = -7 % 3   // Int(-1)
+```
+
+Integer division and remainder by zero return `Int(0)` for compatibility. Overflow is an evaluation error; it never falls back to an approximate Float. This includes the signed edge cases `i64::MIN / -1` and `i64::MIN % -1`.
+
+If either operand is a `Float`, or an operand uses an existing non-Int numeric coercion, evaluation follows the existing f64 path. Write a Float literal when fractional division is intended:
+
+```limpid
+workspace.ratio = 5 / 2.0      // Float(2.5)
+```
 
 ### `+` overloading
 
