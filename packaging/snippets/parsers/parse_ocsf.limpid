@@ -1,8 +1,9 @@
-// Summary:     OCSF JSON passthrough — an already-OCSF event lands on LSIS
-//              unchanged, ready for compose_ocsf round-trip.
+// Summary:     Parses OCSF JSON into LSIS and normalizes the root event time
+//              from OCSF epoch milliseconds to LSIS epoch nanoseconds.
 // Reads:       ingress (raw wire) — one OCSF class instance JSON object
 //              per ingress (class_uid at the root)
-// Writes:      workspace.lsis.parsed.* — same class as the input (passthrough).
+// Writes:      workspace.lsis.parsed.* — same class and fields as the input;
+//              non-null root `.time` is normalized from ms to ns.
 // Category:    Vendor-neutral
 // Test corpus: spec-only (OCSF 1.3.0 class instances; round-trips with
 //              compose_ocsf)
@@ -14,7 +15,7 @@
 //
 // Sample input (OCSF Network Activity 4001, abbreviated):
 //   {"class_uid":4001,"category_uid":4,"activity_id":6,"type_uid":400106,
-//    "severity_id":1,"time":1777445710669898000,
+//    "severity_id":1,"time":1777445710669,
 //    "src_endpoint":{"ip":"203.0.113.10","port":54321},
 //    "dst_endpoint":{"ip":"198.51.100.5","port":443},
 //    "metadata":{"product":{"vendor_name":"Acme","name":"Acme NGFW"},
@@ -22,8 +23,8 @@
 //
 // Use cases —
 //   * Symmetric correctness: feed compose_ocsf output through parse_ocsf
-//     into compose_ocsf again and diff — round-trip must be lossless
-//     across all 27 priority classes.
+//     into compose_ocsf again and diff — root `time` crosses the OCSF-ms /
+//     LSIS-ns boundary explicitly while the wire value round-trips.
 //   * OCSF replay / fan-out: ingest an existing OCSF JSONL archive and
 //     re-emit (typically into OTLP, Kafka, or a different SIEM).
 //   * Multi-stage pipelines: an upstream limpid emits OCSF, this stage
@@ -37,6 +38,13 @@
 //   * non-object JSON or malformed JSON fails inside parse_json
 //     (process error → DLQ per pipeline error policy)
 
+include "../functions/timestamp_converter.limpid"
+
 def process parse_ocsf {
     workspace.lsis.parsed = parse_json(ingress)
+    switch workspace.lsis.parsed.time != null {
+        true {
+            workspace.lsis.parsed.time = timestamp_ms_to_ns(workspace.lsis.parsed.time)
+        }
+    }
 }

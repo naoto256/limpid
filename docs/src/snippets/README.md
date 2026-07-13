@@ -54,7 +54,7 @@ SIGHUP).
 | `parsers/parse_bind.limpid` | ISC BIND 9 querylog | 4003 DNS Activity |
 | `parsers/parse_auditd.limpid` | Linux auditd, ~45 type codes across 7 OCSF classes (auth / account change / process / file / network / vulnerability / detection), real-corpus verified | 3002 / 3001 / 1007 / 1001 / 4001 / 2002 / 2004 |
 | **Vendor-neutral** | | |
-| `parsers/parse_ocsf.limpid` | OCSF JSON inbound (any vendor's prior compose_ocsf output) | passthrough (any class) |
+| `parsers/parse_ocsf.limpid` | OCSF JSON inbound (any vendor's prior compose_ocsf output); normalizes root `time` from OCSF ms to LSIS ns | any class |
 
 ### Composers
 
