@@ -189,7 +189,7 @@ regions.
 | **Endpoint / host audit (Windows)** | |
 | `parsers/parse_winevent_json.limpid` | Windows Event Log JSON (NXLog field-naming shape; Security channel) → LSIS, dispatched by EventID. |
 | **Vendor-neutral** | |
-| `parsers/parse_ocsf.limpid` | OCSF JSON passthrough — an already-OCSF event lands on LSIS unchanged, ready for compose_ocsf round-trip. |
+| `parsers/parse_ocsf.limpid` | Parses OCSF JSON into LSIS and normalizes the root event time from OCSF epoch milliseconds to LSIS epoch nanoseconds. |
 <!-- END: inventory:parsers -->
 
 ### Composers
@@ -231,6 +231,8 @@ regions.
 | `functions/http_method_activity_id.limpid` | `http_method_activity_id(method) → Int` | `parse_combined_log`, `parse_suricata`, `parse_zeek_default` |
 | `functions/parse_datetime_rfc3164.limpid` | `parse_datetime_rfc3164(text) → Timestamp` | — |
 | `functions/proto_num.limpid` | `proto_num(name) → Int \| null` | `parse_checkpoint_leef`, `parse_checkpoint_syslog`, `parse_juniper_srx_sd_syslog`, `parse_juniper_srx_syslog`, `parse_paloalto_cef`, `parse_paloalto_syslog`, `parse_suricata`, `parse_sysmon`, `parse_zeek_default`, `parse_zeek_full` |
+| `functions/timestamp_converter.limpid` | `timestamp_ns_to_ms(value) → Int \| null` | `compose_ocsf` |
+| `functions/timestamp_converter.limpid` | `timestamp_ms_to_ns(value) → Int \| null` | `parse_ocsf` |
 <!-- END: inventory:functions -->
 
 ### Filebeat-flat JSON: `nest_dotted_keys` primitive

@@ -6,7 +6,8 @@
 //                            unknown values route to error_log
 //              Remaining fields are read per class by the
 //              `compose_ocsf_<class>` leaves (see class coverage
-//              below); `time` falls back to `received_at`.
+//              below); root `time` is emitted in OCSF epoch milliseconds
+//              and falls back to `received_at` when LSIS has no event time.
 // Writes:      workspace.lsis.composed.ocsf — OCSF 1.3.0 JSON, one object per
 //              event (String). Pipe `| ocsf_to_egress` (defined at
 //              the foot of this file) to emit it as the wire form;
@@ -75,13 +76,15 @@
 // `category_uid`, `activity_id`, `type_uid`, `severity_id`, `time`,
 // `metadata`) are emitted uniformly.
 //
-// `time` policy:
-//   `coalesce(workspace.lsis.parsed.time, received_at)` — prefer the parser's
-//   `workspace.lsis.parsed.time` (the actual event timestamp parsed off the
-//   wire) when populated, fall back to `received_at` (the moment the
-//   ingress hit limpid) otherwise. This is what makes
-//   `parse_ocsf | compose_ocsf` round-trip preserve `time`, while
-//   parsers that don't populate `time` still emit a sane value.
+// Root `time` policy:
+//   LSIS record-level timestamps are Unix epoch nanoseconds; OCSF
+//   `timestamp_t` is Unix epoch milliseconds. The composer first chooses
+//   `coalesce(workspace.lsis.parsed.time, received_at)` on the LSIS ns scale,
+//   then applies `timestamp_ns_to_ms`. This preserves a parsed event time when
+//   available, otherwise uses the ingress observation time, and attributes
+//   sub-millisecond truncation solely to the OCSF output boundary.
+
+include "../functions/timestamp_converter.limpid"
 
 // ---------------------------------------------------------------------------
 // Top-level dispatcher
@@ -148,7 +151,7 @@ def process compose_ocsf_file_system_activity {
         type_uid:     1001 * 100 + activity,
         severity_id:  workspace.lsis.parsed.severity_id,
         status_id:    workspace.lsis.parsed.status_id,
-        time:         coalesce(workspace.lsis.parsed.time, received_at),
+        time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         file:         workspace.lsis.parsed.file,
         actor:        workspace.lsis.parsed.actor,
         device:       workspace.lsis.parsed.device,
@@ -177,7 +180,7 @@ def process compose_ocsf_process_activity {
         type_uid:     1007 * 100 + activity,
         severity_id:  workspace.lsis.parsed.severity_id,
         status_id:    workspace.lsis.parsed.status_id,
-        time:         coalesce(workspace.lsis.parsed.time, received_at),
+        time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         process:      workspace.lsis.parsed.process,
         actor:        workspace.lsis.parsed.actor,
         device:       workspace.lsis.parsed.device,
@@ -202,7 +205,7 @@ def process compose_ocsf_registry_key_activity {
         activity_id:  activity,
         type_uid:     1008 * 100 + activity,
         severity_id:  workspace.lsis.parsed.severity_id,
-        time:         coalesce(workspace.lsis.parsed.time, received_at),
+        time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         reg_key:      workspace.lsis.parsed.reg_key,
         actor:        workspace.lsis.parsed.actor,
         device:       workspace.lsis.parsed.device,
@@ -226,7 +229,7 @@ def process compose_ocsf_registry_value_activity {
         activity_id:  activity,
         type_uid:     1009 * 100 + activity,
         severity_id:  workspace.lsis.parsed.severity_id,
-        time:         coalesce(workspace.lsis.parsed.time, received_at),
+        time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         reg_value:    workspace.lsis.parsed.reg_value,
         actor:        workspace.lsis.parsed.actor,
         device:       workspace.lsis.parsed.device,
@@ -255,7 +258,7 @@ def process compose_ocsf_vulnerability_finding {
         activity_id:       activity,
         type_uid:          2002 * 100 + activity,
         severity_id:       workspace.lsis.parsed.severity_id,
-        time:              coalesce(workspace.lsis.parsed.time, received_at),
+        time:              timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         finding_info:      workspace.lsis.parsed.finding_info,
         vulnerabilities:   workspace.lsis.parsed.vulnerabilities,
         affected_packages: workspace.lsis.parsed.affected_packages,
@@ -280,7 +283,7 @@ def process compose_ocsf_compliance_finding {
         activity_id:  activity,
         type_uid:     2003 * 100 + activity,
         severity_id:  workspace.lsis.parsed.severity_id,
-        time:         coalesce(workspace.lsis.parsed.time, received_at),
+        time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         finding_info: workspace.lsis.parsed.finding_info,
         compliance:   workspace.lsis.parsed.compliance,
         resource:     workspace.lsis.parsed.resource,
@@ -308,7 +311,7 @@ def process compose_ocsf_detection_finding {
         type_uid:        2004 * 100 + activity,
         severity_id:     workspace.lsis.parsed.severity_id,
         status_id:       workspace.lsis.parsed.status_id,
-        time:            coalesce(workspace.lsis.parsed.time, received_at),
+        time:            timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         finding_info:    workspace.lsis.parsed.finding_info,
         disposition_id:  workspace.lsis.parsed.disposition_id,
         src_endpoint:    workspace.lsis.parsed.src_endpoint,
@@ -342,7 +345,7 @@ def process compose_ocsf_incident_finding {
         type_uid:     2005 * 100 + activity,
         severity_id:  workspace.lsis.parsed.severity_id,
         status_id:    workspace.lsis.parsed.status_id,
-        time:         coalesce(workspace.lsis.parsed.time, received_at),
+        time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         finding_info: workspace.lsis.parsed.finding_info,
         assignee:     workspace.lsis.parsed.assignee,
         priority:     workspace.lsis.parsed.priority,
@@ -371,7 +374,7 @@ def process compose_ocsf_account_change {
         activity_id:  activity,
         type_uid:     3001 * 100 + activity,
         severity_id:  workspace.lsis.parsed.severity_id,
-        time:         coalesce(workspace.lsis.parsed.time, received_at),
+        time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         user:         workspace.lsis.parsed.user,
         actor:        workspace.lsis.parsed.actor,
         src_endpoint: workspace.lsis.parsed.src_endpoint,
@@ -396,7 +399,7 @@ def process compose_ocsf_authentication {
         type_uid:     3002 * 100 + activity,
         severity_id:  workspace.lsis.parsed.severity_id,
         status_id:    workspace.lsis.parsed.status_id,
-        time:         coalesce(workspace.lsis.parsed.time, received_at),
+        time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         user:         workspace.lsis.parsed.user,
         actor:        workspace.lsis.parsed.actor,
         src_endpoint: workspace.lsis.parsed.src_endpoint,
@@ -428,7 +431,7 @@ def process compose_ocsf_authorize_session {
         type_uid:     3003 * 100 + activity,
         severity_id:  workspace.lsis.parsed.severity_id,
         status_id:    workspace.lsis.parsed.status_id,
-        time:         coalesce(workspace.lsis.parsed.time, received_at),
+        time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         user:         workspace.lsis.parsed.user,
         actor:        workspace.lsis.parsed.actor,
         session:      workspace.lsis.parsed.session,
@@ -453,7 +456,7 @@ def process compose_ocsf_user_access_management {
         activity_id:  activity,
         type_uid:     3005 * 100 + activity,
         severity_id:  workspace.lsis.parsed.severity_id,
-        time:         coalesce(workspace.lsis.parsed.time, received_at),
+        time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         user:         workspace.lsis.parsed.user,
         actor:        workspace.lsis.parsed.actor,
         privileges:   workspace.lsis.parsed.privileges,
@@ -476,7 +479,7 @@ def process compose_ocsf_group_management {
         activity_id:  activity,
         type_uid:     3006 * 100 + activity,
         severity_id:  workspace.lsis.parsed.severity_id,
-        time:         coalesce(workspace.lsis.parsed.time, received_at),
+        time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         group:        workspace.lsis.parsed.group,
         user:         workspace.lsis.parsed.user,
         actor:        workspace.lsis.parsed.actor,
@@ -506,7 +509,7 @@ def process compose_ocsf_network_activity {
         type_uid:        4001 * 100 + activity,
         severity_id:     workspace.lsis.parsed.severity_id,
         status_id:       workspace.lsis.parsed.status_id,
-        time:            coalesce(workspace.lsis.parsed.time, received_at),
+        time:            timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         src_endpoint:    workspace.lsis.parsed.src_endpoint,
         dst_endpoint:    workspace.lsis.parsed.dst_endpoint,
         connection_info: workspace.lsis.parsed.connection_info,
@@ -537,7 +540,7 @@ def process compose_ocsf_http_activity {
         type_uid:      4002 * 100 + activity,
         severity_id:   workspace.lsis.parsed.severity_id,
         status_id:     workspace.lsis.parsed.status_id,
-        time:          coalesce(workspace.lsis.parsed.time, received_at),
+        time:          timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         src_endpoint:  workspace.lsis.parsed.src_endpoint,
         dst_endpoint:  workspace.lsis.parsed.dst_endpoint,
         device:        workspace.lsis.parsed.device,
@@ -566,7 +569,7 @@ def process compose_ocsf_dns_activity {
         type_uid:     4003 * 100 + activity,
         severity_id:  workspace.lsis.parsed.severity_id,
         rcode_id:     workspace.lsis.parsed.rcode_id,
-        time:         coalesce(workspace.lsis.parsed.time, received_at),
+        time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         src_endpoint: workspace.lsis.parsed.src_endpoint,
         dst_endpoint: workspace.lsis.parsed.dst_endpoint,
         device:       workspace.lsis.parsed.device,
@@ -591,7 +594,7 @@ def process compose_ocsf_dhcp_activity {
         activity_id:  activity,
         type_uid:     4004 * 100 + activity,
         severity_id:  workspace.lsis.parsed.severity_id,
-        time:         coalesce(workspace.lsis.parsed.time, received_at),
+        time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         src_endpoint: workspace.lsis.parsed.src_endpoint,
         dst_endpoint: workspace.lsis.parsed.dst_endpoint,
         is_renewal:   workspace.lsis.parsed.is_renewal,
@@ -612,7 +615,7 @@ def process compose_ocsf_rdp_activity {
         activity_id:  activity,
         type_uid:     4005 * 100 + activity,
         severity_id:  workspace.lsis.parsed.severity_id,
-        time:         coalesce(workspace.lsis.parsed.time, received_at),
+        time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         src_endpoint: workspace.lsis.parsed.src_endpoint,
         dst_endpoint: workspace.lsis.parsed.dst_endpoint,
         protocol_ver: workspace.lsis.parsed.protocol_ver,
@@ -635,7 +638,7 @@ def process compose_ocsf_smb_activity {
         activity_id:  activity,
         type_uid:     4006 * 100 + activity,
         severity_id:  workspace.lsis.parsed.severity_id,
-        time:         coalesce(workspace.lsis.parsed.time, received_at),
+        time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         src_endpoint: workspace.lsis.parsed.src_endpoint,
         dst_endpoint: workspace.lsis.parsed.dst_endpoint,
         share:        workspace.lsis.parsed.share,
@@ -658,7 +661,7 @@ def process compose_ocsf_ssh_activity {
         activity_id:  activity,
         type_uid:     4007 * 100 + activity,
         severity_id:  workspace.lsis.parsed.severity_id,
-        time:         coalesce(workspace.lsis.parsed.time, received_at),
+        time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         src_endpoint: workspace.lsis.parsed.src_endpoint,
         dst_endpoint: workspace.lsis.parsed.dst_endpoint,
         protocol_ver: workspace.lsis.parsed.protocol_ver,
@@ -682,7 +685,7 @@ def process compose_ocsf_ftp_activity {
         activity_id:  activity,
         type_uid:     4008 * 100 + activity,
         severity_id:  workspace.lsis.parsed.severity_id,
-        time:         coalesce(workspace.lsis.parsed.time, received_at),
+        time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         src_endpoint: workspace.lsis.parsed.src_endpoint,
         dst_endpoint: workspace.lsis.parsed.dst_endpoint,
         command:      workspace.lsis.parsed.command,
@@ -706,7 +709,7 @@ def process compose_ocsf_email_activity {
         type_uid:     4009 * 100 + activity,
         severity_id:  workspace.lsis.parsed.severity_id,
         direction_id: workspace.lsis.parsed.direction_id,
-        time:         coalesce(workspace.lsis.parsed.time, received_at),
+        time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         src_endpoint: workspace.lsis.parsed.src_endpoint,
         dst_endpoint: workspace.lsis.parsed.dst_endpoint,
         device:       workspace.lsis.parsed.device,
@@ -731,7 +734,7 @@ def process compose_ocsf_network_file_activity {
         activity_id:  activity,
         type_uid:     4010 * 100 + activity,
         severity_id:  workspace.lsis.parsed.severity_id,
-        time:         coalesce(workspace.lsis.parsed.time, received_at),
+        time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         src_endpoint: workspace.lsis.parsed.src_endpoint,
         dst_endpoint: workspace.lsis.parsed.dst_endpoint,
         file:         workspace.lsis.parsed.file,
@@ -762,7 +765,7 @@ def process compose_ocsf_api_activity {
         type_uid:     6003 * 100 + activity,
         severity_id:  workspace.lsis.parsed.severity_id,
         status_id:    workspace.lsis.parsed.status_id,
-        time:         coalesce(workspace.lsis.parsed.time, received_at),
+        time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         api:          workspace.lsis.parsed.api,
         actor:        workspace.lsis.parsed.actor,
         src_endpoint: workspace.lsis.parsed.src_endpoint,
@@ -792,7 +795,7 @@ def process compose_ocsf_web_resource_access {
         activity_id:   activity,
         type_uid:      6004 * 100 + activity,
         severity_id:   workspace.lsis.parsed.severity_id,
-        time:          coalesce(workspace.lsis.parsed.time, received_at),
+        time:          timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         src_endpoint:  workspace.lsis.parsed.src_endpoint,
         dst_endpoint:  workspace.lsis.parsed.dst_endpoint,
         http_request:  workspace.lsis.parsed.http_request,
@@ -817,7 +820,7 @@ def process compose_ocsf_datastore_activity {
         activity_id:  activity,
         type_uid:     6005 * 100 + activity,
         severity_id:  workspace.lsis.parsed.severity_id,
-        time:         coalesce(workspace.lsis.parsed.time, received_at),
+        time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         actor:        workspace.lsis.parsed.actor,
         src_endpoint: workspace.lsis.parsed.src_endpoint,
         database:     workspace.lsis.parsed.database,
@@ -843,7 +846,7 @@ def process compose_ocsf_scan_activity {
         activity_id:  activity,
         type_uid:     6007 * 100 + activity,
         severity_id:  workspace.lsis.parsed.severity_id,
-        time:         coalesce(workspace.lsis.parsed.time, received_at),
+        time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         scan:         workspace.lsis.parsed.scan,
         actor:        workspace.lsis.parsed.actor,
         devices:      workspace.lsis.parsed.devices,
