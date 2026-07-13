@@ -87,7 +87,6 @@ def function bind_dns_record(client_ip, client_port_str, qname, qclass, qtype, s
         class_uid:    4003,
         category_uid: 4,
         activity_id:  1,
-        severity_id:  1,
         time:         time_ns,
         src_endpoint: {
             ip:   client_ip,
