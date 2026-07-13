@@ -1,9 +1,10 @@
-// Summary:     Parses OCSF JSON into LSIS and normalizes the root event time
-//              from OCSF epoch milliseconds to LSIS epoch nanoseconds.
+// Summary:     Parses OCSF JSON into LSIS, normalizing root time to epoch
+//              nanoseconds and severity_id to OTel SeverityNumber.
 // Reads:       ingress (raw wire) — one OCSF class instance JSON object
 //              per ingress (class_uid at the root)
-// Writes:      workspace.lsis.parsed.* — same class and fields as the input;
-//              non-null root `.time` is normalized from ms to ns.
+// Writes:      workspace.lsis.parsed.* — same class and fields as the input,
+//              except root `.time` is normalized from ms to ns and
+//              `.severity_id` becomes canonical `.severity_number`.
 // Category:    Vendor-neutral
 // Test corpus: spec-only (OCSF 1.3.0 class instances; round-trips with
 //              compose_ocsf)
@@ -24,7 +25,8 @@
 // Use cases —
 //   * Symmetric correctness: feed compose_ocsf output through parse_ocsf
 //     into compose_ocsf again and diff — root `time` crosses the OCSF-ms /
-//     LSIS-ns boundary explicitly while the wire value round-trips.
+//     LSIS-ns boundary explicitly while OCSF severity is converted at the
+//     protocol boundary and the wire values round-trip.
 //   * OCSF replay / fan-out: ingest an existing OCSF JSONL archive and
 //     re-emit (typically into OTLP, Kafka, or a different SIEM).
 //   * Multi-stage pipelines: an upstream limpid emits OCSF, this stage
@@ -39,9 +41,19 @@
 //     (process error → DLQ per pipeline error policy)
 
 include "../functions/timestamp_converter.limpid"
+include "../functions/severity_converter.limpid"
 
 def process parse_ocsf {
     workspace.lsis.parsed = parse_json(ingress)
+
+    let source_severity_id = workspace.lsis.parsed.severity_id
+    let severity_number = ocsf_severity_id_to_otel_severity_number(source_severity_id)
+    switch source_severity_id != null and source_severity_id != 99 and severity_number == null {
+        true { error "parse_ocsf: invalid OCSF severity_id ${source_severity_id}" }
+    }
+    workspace.lsis.parsed.severity_id = null
+    workspace.lsis.parsed.severity_number = severity_number
+
     switch workspace.lsis.parsed.time != null {
         true {
             workspace.lsis.parsed.time = timestamp_ms_to_ns(workspace.lsis.parsed.time)

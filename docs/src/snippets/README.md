@@ -54,7 +54,7 @@ SIGHUP).
 | `parsers/parse_bind.limpid` | ISC BIND 9 querylog | 4003 DNS Activity |
 | `parsers/parse_auditd.limpid` | Linux auditd, ~45 type codes across 7 OCSF classes (auth / account change / process / file / network / vulnerability / detection), real-corpus verified | 3002 / 3001 / 1007 / 1001 / 4001 / 2002 / 2004 |
 | **Vendor-neutral** | | |
-| `parsers/parse_ocsf.limpid` | OCSF JSON inbound (any vendor's prior compose_ocsf output); normalizes root `time` from OCSF ms to LSIS ns | any class |
+| `parsers/parse_ocsf.limpid` | OCSF JSON inbound (any vendor's prior compose_ocsf output); normalizes root `time` from OCSF ms to LSIS ns and `severity_id` to OTel `SeverityNumber` | any class |
 
 ### Composers
 
@@ -100,6 +100,13 @@ contracts.
   would double-count.
 
 ### Functions
+
+- `functions/severity_converter.limpid` — explicit OCSF 1.3.0
+  `severity_id` ↔ OTel `SeverityNumber` boundary conversion. The functions
+  are partial and return `null` outside their standard domains;
+  `parse_ocsf` and `compose_ocsf` turn invalid non-null protocol values into
+  explicit errors. OCSF Other (99) remains represented by its sibling
+  `severity` text rather than an invented OTel number.
 
 - `functions/parse_datetime_rfc3164.limpid` —
   `parse_datetime_rfc3164(text) → Timestamp`. LPL counterpart to the
@@ -272,7 +279,7 @@ conventions are:
 - **Loud-fail-fast** on unsupported vocabulary via `default { error
   "<operator-readable msg>" }`.
 - **Helpers** (`def function ...`) carry per-vendor mapping tables
-  (severity → OCSF severity_id, action → activity_id, etc.) — keep
+  (severity → OTel SeverityNumber, action → activity_id, etc.) — keep
   them in the same file as the parser so the parser is
   self-contained.
 

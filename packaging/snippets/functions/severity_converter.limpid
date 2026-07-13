@@ -1,0 +1,57 @@
+// Summary:     Converts severity values between OCSF 1.3.0 severity_id and
+//              OpenTelemetry SeverityNumber without guessing unknown values.
+// Signature:   ocsf_severity_id_to_otel_severity_number(severity_id) → Int | null
+//              otel_severity_number_to_ocsf_severity_id(severity_number) → Int | null
+// Test corpus: unit (OCSF 1.3.0 and OTel severity boundary tables)
+
+// These partial functions encode only the published standard-to-standard
+// boundary. Null stays null. OCSF Other (99) also maps to null because its
+// meaning lives in the sibling `severity` text, not in an OTel numeric band.
+// Values outside either standard's domain return null; protocol-boundary
+// processes compare the source and result and raise an operator-readable
+// error for invalid non-null input.
+
+def function ocsf_severity_id_to_otel_severity_number(severity_id) {
+    switch severity_id {
+        0       { 0 }
+        1       { 9 }
+        2       { 13 }
+        3       { 17 }
+        4       { 19 }
+        5       { 21 }
+        6       { 24 }
+        99      { null }
+        default { null }
+    }
+}
+
+def function otel_severity_number_to_ocsf_severity_id(severity_number) {
+    switch severity_number {
+        0       { 0 }
+        1       { 1 }
+        2       { 1 }
+        3       { 1 }
+        4       { 1 }
+        5       { 1 }
+        6       { 1 }
+        7       { 1 }
+        8       { 1 }
+        9       { 1 }
+        10      { 1 }
+        11      { 1 }
+        12      { 1 }
+        13      { 2 }
+        14      { 2 }
+        15      { 2 }
+        16      { 2 }
+        17      { 3 }
+        18      { 3 }
+        19      { 4 }
+        20      { 4 }
+        21      { 5 }
+        22      { 5 }
+        23      { 5 }
+        24      { 6 }
+        default { null }
+    }
+}
