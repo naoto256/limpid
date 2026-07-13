@@ -639,49 +639,121 @@ fn is_ascii_ident(s: &str) -> bool {
 // Rule 5: Signature cross-check.
 // ---------------------------------------------------------------------------
 
-/// Cross-check that the authored `Signature:` name + parameter list
-/// matches a `def function <name>(<params>) { ... }` declaration in
-/// the same file. The return contract stays authored (the DSL has no
+/// Cross-check the authored `Signature:` entries against every
+/// `def function <name>(<params>) { ... }` declaration in the same
+/// file. The return contract stays authored (the DSL has no
 /// return-type declaration to derive from), so we do not check it.
 fn lint_signature(header: &SnippetHeader, sig_value: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
-
-    let Some((sig_name, sig_params)) = parse_signature(sig_value) else {
+    let entries: Vec<&str> = signature_entries(sig_value).collect();
+    if entries.is_empty() {
         findings.push(Finding {
             file: header.file.clone(),
             severity: Severity::Error,
-            message: format!(
-                "`Signature:` value must have shape `name(param1, param2, ...) → ReturnType`; \
-                 could not parse: {sig_value:?}"
-            ),
+            message: "`Signature:` must contain at least one non-blank entry".to_string(),
         });
         return findings;
-    };
+    }
 
-    match find_def_function_params(&header.content, &sig_name) {
-        None => findings.push(Finding {
-            file: header.file.clone(),
-            severity: Severity::Error,
-            message: format!(
-                "`Signature:` names `{sig_name}` but no `def function {sig_name}(...)` \
-                 declaration was found in the same file"
-            ),
-        }),
-        Some(decl_params) => {
-            if decl_params != sig_params {
-                findings.push(Finding {
-                    file: header.file.clone(),
-                    severity: Severity::Error,
-                    message: format!(
-                        "`Signature:` parameter list {sig_params:?} does not match the \
-                         `def function {sig_name}` declaration's parameters {decl_params:?}"
-                    ),
-                });
-            }
+    let declarations = find_def_functions(&header.content);
+    let mut listed = Vec::new();
+    let mut listed_counts: BTreeMap<String, usize> = BTreeMap::new();
+
+    for entry in entries {
+        let Some((name, params)) = parse_signature(entry) else {
+            findings.push(Finding {
+                file: header.file.clone(),
+                severity: Severity::Error,
+                message: format!(
+                    "`Signature:` entry must have shape `name(param1, param2, ...) → ReturnType`; \
+                     could not parse: {entry:?}"
+                ),
+            });
+            continue;
+        };
+        *listed_counts.entry(name.clone()).or_default() += 1;
+        listed.push((name, params));
+    }
+
+    for (name, count) in &listed_counts {
+        if *count > 1 {
+            findings.push(Finding {
+                file: header.file.clone(),
+                severity: Severity::Error,
+                message: format!(
+                    "duplicate `Signature:` entry for `{name}`; each function must be listed exactly once"
+                ),
+            });
+        }
+    }
+
+    let mut declaration_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for declaration in &declarations {
+        *declaration_counts
+            .entry(declaration.name.clone())
+            .or_default() += 1;
+    }
+    for (name, count) in &declaration_counts {
+        if *count > 1 {
+            findings.push(Finding {
+                file: header.file.clone(),
+                severity: Severity::Error,
+                message: format!(
+                    "duplicate `def function {name}(...)` declaration; the `Signature:` contract requires one declaration per name"
+                ),
+            });
+        }
+    }
+
+    for (name, params) in &listed {
+        if listed_counts[name] != 1 {
+            continue;
+        }
+        let matching: Vec<&FunctionDecl> = declarations
+            .iter()
+            .filter(|declaration| declaration.name == *name)
+            .collect();
+        match matching.as_slice() {
+            [] => findings.push(Finding {
+                file: header.file.clone(),
+                severity: Severity::Error,
+                message: format!(
+                    "`Signature:` names `{name}` but no `def function {name}(...)` \
+                     declaration was found in the same file"
+                ),
+            }),
+            [declaration] if declaration.params != *params => findings.push(Finding {
+                file: header.file.clone(),
+                severity: Severity::Error,
+                message: format!(
+                    "`Signature:` parameter list {params:?} does not match the \
+                     `def function {name}` declaration's parameters {:?}",
+                    declaration.params
+                ),
+            }),
+            _ => {}
+        }
+    }
+
+    for name in declaration_counts.keys() {
+        if !listed_counts.contains_key(name) {
+            findings.push(Finding {
+                file: header.file.clone(),
+                severity: Severity::Error,
+                message: format!(
+                    "`def function {name}(...)` is declared in this file but missing from \
+                     the `Signature:` field; list every function the file defines"
+                ),
+            });
         }
     }
 
     findings
+}
+
+/// Split a `Signature:` value into one authored entry per line.
+pub(crate) fn signature_entries(value: &str) -> impl Iterator<Item = &str> {
+    value.lines().map(str::trim).filter(|line| !line.is_empty())
 }
 
 /// Parse the header value of a `Signature:` key into (name, params).
@@ -691,9 +763,11 @@ fn lint_signature(header: &SnippetHeader, sig_value: &str) -> Vec<Finding> {
 /// tolerated. The return part (everything from `→` on) is discarded.
 pub fn parse_signature(value: &str) -> Option<(String, Vec<String>)> {
     let value = value.trim();
-    // Split off the return part first (if any) — everything up to
-    // (but not including) the `→` arrow. We only need the head.
-    let head = value.split('→').next().unwrap_or(value).trim();
+    let (head, return_type) = value.split_once('→')?;
+    if return_type.trim().is_empty() || return_type.contains('→') {
+        return None;
+    }
+    let head = head.trim();
     let paren_open = head.find('(')?;
     let name = head[..paren_open].trim().to_string();
     if !is_ascii_ident(&name) {
@@ -701,39 +775,64 @@ pub fn parse_signature(value: &str) -> Option<(String, Vec<String>)> {
     }
     let after = &head[paren_open + 1..];
     let paren_close = after.rfind(')')?;
-    let params_str = &after[..paren_close];
-    let params: Vec<String> = params_str
-        .split(',')
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty())
-        .collect();
+    if !after[paren_close + 1..].trim().is_empty() {
+        return None;
+    }
+    let params = parse_params(&after[..paren_close])?;
     Some((name, params))
 }
 
-/// Find `def function <name>(<params>)` in the file body and return
-/// the parameter list. Skips lines that are pure header/body comments
-/// (leading `//`) — the declaration lives in code, not comments.
-fn find_def_function_params(content: &str, name: &str) -> Option<Vec<String>> {
-    let needle = format!("def function {name}(");
+#[derive(Debug, PartialEq, Eq)]
+struct FunctionDecl {
+    name: String,
+    params: Vec<String>,
+}
+
+/// Scan all `def function <name>(<params>)` declarations once.
+/// Pure comment lines are excluded; this intentionally remains a
+/// lexical check rather than adding the DSL parser as an xtask dependency.
+fn find_def_functions(content: &str) -> Vec<FunctionDecl> {
+    let mut declarations = Vec::new();
     for line in content.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with("//") {
             continue;
         }
-        let Some(start) = trimmed.find(&needle) else {
+        let Some(start) = trimmed.find("def function ") else {
             continue;
         };
-        let after = &trimmed[start + needle.len()..];
-        let close = after.find(')')?;
-        let params_str = &after[..close];
-        let params: Vec<String> = params_str
-            .split(',')
-            .map(|p| p.trim().to_string())
-            .filter(|p| !p.is_empty())
-            .collect();
-        return Some(params);
+        let declaration = &trimmed[start + "def function ".len()..];
+        let Some(paren_open) = declaration.find('(') else {
+            continue;
+        };
+        let name = declaration[..paren_open].trim();
+        if !is_ascii_ident(name) {
+            continue;
+        }
+        let after = &declaration[paren_open + 1..];
+        let Some(paren_close) = after.find(')') else {
+            continue;
+        };
+        let Some(params) = parse_params(&after[..paren_close]) else {
+            continue;
+        };
+        declarations.push(FunctionDecl {
+            name: name.to_string(),
+            params,
+        });
     }
-    None
+    declarations
+}
+
+fn parse_params(value: &str) -> Option<Vec<String>> {
+    if value.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    value
+        .split(',')
+        .map(str::trim)
+        .map(|param| is_ascii_ident(param).then(|| param.to_string()))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1113,6 +1212,130 @@ def function foo(a, b, c) {}
         );
     }
 
+    #[test]
+    fn function_family_signatures_match_all_declarations() {
+        let h = function(
+            "\
+// Summary:     Timestamp conversions
+// Signature:   timestamp_ms_to_ns(value) → Int
+//              timestamp_ns_to_ms(value) → Int
+// Test corpus: unit (timestamp boundaries)
+
+def function timestamp_ms_to_ns(value) {}
+def function timestamp_ns_to_ms(value) {}
+",
+        );
+        assert!(lint(&h).is_empty(), "unexpected findings: {:?}", lint(&h));
+    }
+
+    #[test]
+    fn function_declaration_missing_from_signature_is_error() {
+        let h = function(
+            "\
+// Summary:     Timestamp conversions
+// Signature:   timestamp_ms_to_ns(value) → Int
+// Test corpus: unit (timestamp boundaries)
+
+def function timestamp_ms_to_ns(value) {}
+def function timestamp_ns_to_ms(value) {}
+",
+        );
+        assert!(
+            lint(&h)
+                .iter()
+                .any(|f| f.message.contains("timestamp_ns_to_ms") && f.message.contains("missing"))
+        );
+    }
+
+    #[test]
+    fn function_family_second_param_mismatch_is_error() {
+        let h = function(
+            "\
+// Summary:     Timestamp conversions
+// Signature:   timestamp_ms_to_ns(value) → Int
+//              timestamp_ns_to_ms(value, divisor) → Int
+// Test corpus: unit (timestamp boundaries)
+
+def function timestamp_ms_to_ns(value) {}
+def function timestamp_ns_to_ms(value) {}
+",
+        );
+        let findings = lint(&h);
+        assert!(findings.iter().any(|f| {
+            f.message.contains("timestamp_ns_to_ms") && f.message.contains("parameter list")
+        }));
+    }
+
+    #[test]
+    fn malformed_signature_entry_is_error() {
+        let h = function(
+            "\
+// Summary:     Timestamp conversions
+// Signature:   timestamp_ms_to_ns(value) → Int
+//              not a signature
+// Test corpus: unit (timestamp boundaries)
+
+def function timestamp_ms_to_ns(value) {}
+",
+        );
+        assert!(lint(&h).iter().any(
+            |f| f.message.contains("could not parse") && f.message.contains("not a signature")
+        ));
+    }
+
+    #[test]
+    fn blank_signature_is_error() {
+        let h = function(
+            "\
+// Summary:     Empty family
+// Signature:
+// Test corpus: unit (header lint)
+",
+        );
+        assert!(
+            lint(&h)
+                .iter()
+                .any(|f| f.message.contains("at least one non-blank entry"))
+        );
+    }
+
+    #[test]
+    fn duplicate_signature_name_is_error() {
+        let h = function(
+            "\
+// Summary:     Duplicate surface
+// Signature:   convert(value) → Int
+//              convert(other) → Int
+// Test corpus: unit (header lint)
+
+def function convert(value) {}
+",
+        );
+        assert!(lint(&h).iter().any(|f| {
+            f.message
+                .contains("duplicate `Signature:` entry for `convert`")
+        }));
+    }
+
+    #[test]
+    fn duplicate_function_declaration_is_error() {
+        let h = function(
+            "\
+// Summary:     Duplicate declaration
+// Signature:   convert(value) → Int
+// Test corpus: unit (header lint)
+
+def function convert(value) {}
+def function convert(value) {}
+",
+        );
+        assert!(
+            lint(&h)
+                .iter()
+                .any(|f| f.message.contains("duplicate `def function convert"))
+        );
+    }
+
     // --- Rule 7: unknown key → warning ---
     #[test]
     fn unknown_key_is_warning_not_error() {
@@ -1156,5 +1379,7 @@ def function foo(a, b, c) {}
             Some(("nullary".to_string(), vec![]))
         );
         assert_eq!(parse_signature("no parens"), None);
+        assert_eq!(parse_signature("no_return(value)"), None);
+        assert_eq!(parse_signature("empty_return(value) →"), None);
     }
 }
