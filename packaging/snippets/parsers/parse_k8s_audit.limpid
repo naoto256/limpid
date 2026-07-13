@@ -195,7 +195,6 @@ def process parse_k8s_audit_api {
         category_uid: 6,
         activity_id:  activity,
         type_uid:     6003 * 100 + activity,
-        severity_id:  1,
         status_id:    status,
         time:         to_int(parse_datetime_rfc3339(workspace.k8s.stageTimestamp)),
         api: {
@@ -264,7 +263,6 @@ def process parse_k8s_audit_authn {
         category_uid: 3,
         activity_id:  1,            // Logon — TokenReview/TokenRequest validates a credential
         type_uid:     3002 * 100 + 1,
-        severity_id:  1,
         status_id:    status,
         time:         to_int(parse_datetime_rfc3339(workspace.k8s.stageTimestamp)),
         auth_protocol: "Kubernetes",
