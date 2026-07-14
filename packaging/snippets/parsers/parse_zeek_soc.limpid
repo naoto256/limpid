@@ -41,7 +41,6 @@ def function zeek_ssh_record(body, host, time_ns) {
         class_uid:    4007,
         category_uid: 4,
         activity_id:  1,                                  // Open
-        severity_id:  1,
         status_id:    switch true {
             body.auth_success == true  { 1 }
             body.auth_success == false { 2 }
@@ -83,7 +82,6 @@ def function zeek_smtp_record(body, host, time_ns) {
         class_uid:    4009,
         category_uid: 4,
         activity_id:  1,                                  // Send
-        severity_id:  1,
         status_id:    1,
         time:         time_ns,
         src_endpoint: zeek_endpoint(body.id, "src"),
@@ -138,7 +136,6 @@ def function zeek_ftp_record(body, host, time_ns) {
         class_uid:    4008,
         category_uid: 4,
         activity_id:  zeek_ftp_activity_id(body.command),
-        severity_id:  1,
         status_id:    switch true {
             body.reply_code != null and body.reply_code >= 200 and body.reply_code < 400 { 1 }
             body.reply_code != null and body.reply_code >= 400 { 2 }
@@ -180,7 +177,6 @@ def function zeek_dhcp_record(body, host, time_ns) {
         class_uid:    4004,
         category_uid: 4,
         activity_id:  6,                                  // Traffic (multi-msg session)
-        severity_id:  1,
         time:         time_ns,
         src_endpoint: switch true {
             body.client_addr != null { { ip: body.client_addr, mac: body.mac, hostname: body.host_name } }
@@ -218,7 +214,6 @@ def function zeek_kerberos_record(body, host, time_ns) {
             "TGS" { 99 }
             default { 99 }
         },
-        severity_id:  1,
         status_id:    switch true {
             body.success == true  { 1 }
             body.success == false { 2 }
@@ -253,7 +248,6 @@ def function zeek_ntlm_record(body, host, time_ns) {
         class_uid:    3002,
         category_uid: 3,
         activity_id:  1,                                  // Logon
-        severity_id:  1,
         status_id:    switch true {
             body.success == true  { 1 }
             body.success == false { 2 }
@@ -285,7 +279,6 @@ def function zeek_radius_record(body, host, time_ns) {
         class_uid:    3002,
         category_uid: 3,
         activity_id:  1,                                  // Logon
-        severity_id:  1,
         status_id:    switch body.result {
             "success" { 1 }
             "failed"  { 2 }
@@ -319,7 +312,6 @@ def function zeek_smb_mapping_record(body, host, time_ns) {
         class_uid:    4006,
         category_uid: 4,
         activity_id:  6,                                  // Traffic (tree connect)
-        severity_id:  1,
         status_id:    1,
         time:         time_ns,
         src_endpoint: zeek_endpoint(body.id, "src"),
@@ -346,7 +338,6 @@ def function zeek_smb_cmd_record(body, host, time_ns) {
         class_uid:    4006,
         category_uid: 4,
         activity_id:  6,                                  // Traffic
-        severity_id:  1,
         status_id:    switch body.status {
             "SUCCESS" { 1 }
             default   { 99 }
@@ -393,7 +384,6 @@ def function zeek_smb_files_record(body, host, time_ns) {
         class_uid:    4006,
         category_uid: 4,
         activity_id:  zeek_smb_files_activity_id(body.action),
-        severity_id:  1,
         status_id:    1,
         time:         time_ns,
         src_endpoint: zeek_endpoint(body.id, "src"),
@@ -425,7 +415,6 @@ def function zeek_dce_rpc_record(body, host, time_ns) {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  6,                                  // Traffic
-        severity_id:  1,
         status_id:    1,
         time:         time_ns,
         src_endpoint: zeek_endpoint(body.id, "src"),
@@ -453,7 +442,6 @@ def function zeek_snmp_record(body, host, time_ns) {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  6,                                  // Traffic
-        severity_id:  1,
         status_id:    1,
         time:         time_ns,
         src_endpoint: zeek_endpoint(body.id, "src"),
@@ -486,7 +474,6 @@ def function zeek_rdp_record(body, host, time_ns) {
         class_uid:    4005,
         category_uid: 4,
         activity_id:  1,                                  // Open (initial handshake)
-        severity_id:  1,
         status_id:    switch body.result {
             "encrypted" { 1 }
             "success"   { 1 }
