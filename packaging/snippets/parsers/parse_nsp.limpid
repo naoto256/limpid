@@ -73,16 +73,16 @@
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Map NSP severity ("Informational" / "Low" / "Medium" / "High" /
-// "Critical") to OCSF severity_id.
-def function nsp_severity_id(s) {
+// Map the source NSP severity to OTel SeverityNumber.
+def function nsp_severity_number(s) {
     switch s {
-        "Informational" { 1 }
-        "Low"           { 2 }
-        "Medium"        { 3 }
-        "High"          { 4 }
-        "Critical"      { 5 }
-        default         { 1 }
+        "Informational" { 9 }
+        "Low"           { 13 }
+        "Medium"        { 17 }
+        "High"          { 19 }
+        "Critical"      { 21 }
+        null             { null }
+        default          { null }
     }
 }
 
@@ -173,14 +173,15 @@ def function parse_nsp_extract(body) {
 // Build the OCSF Detection Finding (2004) record. `nsp` is the
 // parse_kv result; `confs` is the per-confidence object from
 // `parse_nsp_confidence`.
-def function nsp_finding_record(nsp, host, time_ns) {
+def function nsp_finding_record(nsp, host, time_ns, severity_number, severity) {
     {
-        class_uid:    2004,
-        category_uid: 2,
-        activity_id:  1,                                // Create (new finding)
-        severity_id:  nsp_severity_id(nsp.severity),
-        status_id:    nsp_status_id(nsp.result),
-        time:         time_ns,
+        class_uid:       2004,
+        category_uid:    2,
+        activity_id:     1,                             // Create (new finding)
+        severity_number: severity_number,
+        severity:        severity,
+        status_id:       nsp_status_id(nsp.result),
+        time:            time_ns,
         finding_info: {
             uid:                nsp.alert_id,
             title:              nsp.attack_name,
@@ -281,6 +282,26 @@ def function nsp_finding_record(nsp, host, time_ns) {
 // Main parser
 // ---------------------------------------------------------------------------
 
+def process parse_nsp_normalize_severity {
+    let severity = switch workspace.nsp_kv.severity {
+        ""      { null }
+        "N/A"   { null }
+        default { workspace.nsp_kv.severity }
+    }
+    let severity_number = nsp_severity_number(severity)
+    switch true {
+        severity != null and severity_number == null {
+            error "parse_nsp: invalid Trellix NSP severity ${severity}"
+        }
+        default {
+            workspace.nsp_severity = {
+                number: severity_number,
+                text:   severity
+            }
+        }
+    }
+}
+
 def process parse_nsp {
     // @requires: workspace.nsp.body      (required, String)
     // @requires: workspace.nsp.hostname  (optional, String)
@@ -298,10 +319,13 @@ def process parse_nsp {
             error "parse_nsp: not a Trellix NSP standard-template body: ${workspace.nsp.body}"
         }
         default {
+            process parse_nsp_normalize_severity
             workspace.lsis.parsed = nsp_finding_record(
                 workspace.nsp_kv,
                 workspace.nsp.hostname,
-                workspace.nsp.time
+                workspace.nsp.time,
+                workspace.nsp_severity.number,
+                workspace.nsp_severity.text
             )
         }
     }
