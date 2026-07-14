@@ -57,20 +57,18 @@
 // IANA proto name → number for connection_info.protocol_num.
 include "../functions/proto_num.limpid"
 
-// Map Junos threat-severity to OCSF severity_id.
-//   INFO     → 1 Informational
-//   LOW      → 2 Low
-//   MEDIUM   → 3 Medium
-//   HIGH     → 4 High
-//   CRITICAL → 5 Critical
-def function juniper_srx_syslog_severity_id(s) {
+// Map Junos IDP threat-severity to OTel SeverityNumber. UNDEFINED is a
+// source-defined unset value; unknown non-null labels are rejected by the
+// record process below.
+def function juniper_srx_syslog_severity_number(s) {
     switch s {
-        "INFO"     { 1 }
-        "LOW"      { 2 }
-        "MEDIUM"   { 3 }
-        "HIGH"     { 4 }
-        "CRITICAL" { 5 }
-        default    { 1 }
+        "INFO"     { 9 }
+        "LOW"      { 13 }
+        "MEDIUM"   { 17 }
+        "HIGH"     { 19 }
+        "CRITICAL" { 21 }
+        "UNDEFINED" { null }
+        default    { null }
     }
 }
 
@@ -129,14 +127,15 @@ def function parse_juniper_srx_syslog_idp_attack_fields(body) {
 }
 
 // Build the OCSF Detection Finding (2004) record for an IDP attack.
-def function juniper_srx_syslog_idp_finding_record(src_ip, src_port_str, dst_ip, dst_port_str, proto_name, sig_id, sig_name, action, severity_str, rule, rulebase, policy, host, time_ns) {
+def function juniper_srx_syslog_idp_finding_record(src_ip, src_port_str, dst_ip, dst_port_str, proto_name, sig_id, sig_name, action, severity_number, severity, rule, rulebase, policy, host, time_ns) {
     {
-        class_uid:    2004,
-        category_uid: 2,
-        activity_id:  1,                                     // Create (a new finding)
-        severity_id:  juniper_srx_syslog_severity_id(severity_str),
-        status_id:    juniper_srx_syslog_action_status_id(action),
-        time:         time_ns,
+        class_uid:       2004,
+        category_uid:    2,
+        activity_id:     1,                                  // Create (a new finding)
+        severity_number: severity_number,
+        severity:        severity,
+        status_id:       juniper_srx_syslog_action_status_id(action),
+        time:            time_ns,
         finding_info: {
             uid:   sig_id,
             title: sig_name,
@@ -224,22 +223,31 @@ def process parse_juniper_srx_syslog_idp_attack_record {
             error "parse_juniper_srx_syslog_idp_attack_record: body did not match expected shape: ${workspace.juniper_srx_syslog.body}"
         }
         default {
-            workspace.lsis.parsed = juniper_srx_syslog_idp_finding_record(
-                workspace.srx_idp_fields.src,
-                workspace.srx_idp_fields.src_port,
-                workspace.srx_idp_fields.dst,
-                workspace.srx_idp_fields.dst_port,
-                workspace.srx_idp_fields.proto,
-                workspace.srx_idp_fields.sig_id,
-                workspace.srx_idp_fields.sig_name,
-                workspace.srx_idp_fields.action,
-                workspace.srx_idp_fields.severity,
-                workspace.srx_idp_fields.rule,
-                workspace.srx_idp_fields.rulebase,
-                workspace.srx_idp_fields.policy,
-                coalesce(workspace.srx_syslog_class.host, workspace.juniper_srx_syslog.hostname),
-                workspace.juniper_srx_syslog.time
-            )
+            workspace.srx_idp_severity_number = juniper_srx_syslog_severity_number(workspace.srx_idp_fields.severity)
+            switch true {
+                workspace.srx_idp_fields.severity != null and workspace.srx_idp_fields.severity != "UNDEFINED" and workspace.srx_idp_severity_number == null {
+                    error "parse_juniper_srx_syslog: invalid Junos IDP threat-severity ${workspace.srx_idp_fields.severity}"
+                }
+                default {
+                    workspace.lsis.parsed = juniper_srx_syslog_idp_finding_record(
+                        workspace.srx_idp_fields.src,
+                        workspace.srx_idp_fields.src_port,
+                        workspace.srx_idp_fields.dst,
+                        workspace.srx_idp_fields.dst_port,
+                        workspace.srx_idp_fields.proto,
+                        workspace.srx_idp_fields.sig_id,
+                        workspace.srx_idp_fields.sig_name,
+                        workspace.srx_idp_fields.action,
+                        workspace.srx_idp_severity_number,
+                        workspace.srx_idp_fields.severity,
+                        workspace.srx_idp_fields.rule,
+                        workspace.srx_idp_fields.rulebase,
+                        workspace.srx_idp_fields.policy,
+                        coalesce(workspace.srx_syslog_class.host, workspace.juniper_srx_syslog.hostname),
+                        workspace.juniper_srx_syslog.time
+                    )
+                }
+            }
         }
     }
 }
