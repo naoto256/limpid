@@ -771,6 +771,7 @@ def process compose_ocsf_email_activity {
         type_uid:     4009 * 100 + activity,
         severity_id:  compose_ocsf_severity_id(workspace.lsis.parsed.severity_number, workspace.lsis.parsed.severity_id, workspace.lsis.parsed.severity),
         severity:     workspace.lsis.parsed.severity,
+        status_id:    workspace.lsis.parsed.status_id,
         direction_id: workspace.lsis.parsed.direction_id,
         time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
         src_endpoint: workspace.lsis.parsed.src_endpoint,
