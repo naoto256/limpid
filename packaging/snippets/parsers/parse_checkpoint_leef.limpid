@@ -73,16 +73,6 @@ def function checkpoint_leef_status_id(event_id) {
     }
 }
 
-def function checkpoint_leef_severity_id(event_id) {
-    switch event_id {
-        "Accept" { 1 }                  // Informational
-        "Drop"   { 2 }                  // Low (volume-dominant; not all blocks are threats)
-        "Reject" { 3 }                  // Medium (active rejection signals scanning)
-        "Block"  { 3 }                  // Medium
-        default  { 1 }
-    }
-}
-
 // Extract one LEEF 2.0 KV from the tab-delimited extension block.
 def function parse_checkpoint_leef_kv(ext, name) {
     let m = regex_parse(ext, "(?:^|\\t)${name}=(?P<v>[^\\t]*)")
@@ -128,7 +118,6 @@ def process parse_checkpoint_leef_record {
                 class_uid:    4001,
                 category_uid: 4,
                 activity_id:  activity,
-                severity_id:  checkpoint_leef_severity_id(event_id),
                 status_id:    checkpoint_leef_status_id(event_id),
                 time:         workspace.checkpoint_leef.time,
                 src_endpoint: {
