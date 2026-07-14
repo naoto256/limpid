@@ -13,7 +13,7 @@
 //
 // Sample input (FortiOS "default" format — no RFC 3164 header between
 // the <PRI> and the KV body; date/time/devname live inside the body):
-//   <134>date=2026-04-27 time=10:00:00 devname="fw01" type="traffic" subtype="forward" srcip=192.0.2.10 srcport=54321 dstip=198.51.100.5 dstport=443 proto=6 action="accept" sentbyte=1024 rcvdbyte=512
+//   <134>date=2026-04-27 time=10:00:00 devname="fw01" level="notice" type="traffic" subtype="forward" srcip=192.0.2.10 srcport=54321 dstip=198.51.100.5 dstport=443 proto=6 action="accept" sentbyte=1024 rcvdbyte=512
 //
 // Direct call (skip syslog wrapper, supply raw KV in `ingress`):
 //   process { workspace.kv = parse_kv(ingress) } | parse_fortigate_syslog_traffic
@@ -35,20 +35,30 @@
 // Vendor-specific mapping helpers (FortiGate native syslog dialect)
 // ---------------------------------------------------------------------------
 
-// FortiGate native syslog `level` field is one of:
+// FortiGate native syslog body `level` field is one of:
 //   emergency / alert / critical / error / warning / notice / information / debug
-// Map to OCSF severity_id (1-6 + 99 Other + 0 Unknown).
-def function fortigate_syslog_severity_id(level) {
+// Map it to OTel SeverityNumber. The outer syslog PRI is transport metadata
+// and is not consulted.
+def function fortigate_syslog_severity_number(level) {
     switch level {
-        "emergency"   { 6 }
-        "alert"       { 5 }
-        "critical"    { 5 }
-        "error"       { 4 }
-        "warning"     { 3 }
-        "notice"      { 2 }
-        "information" { 1 }
-        "debug"       { 1 }
-        default       { 0 }
+        "emergency"   { 21 }
+        "alert"       { 19 }
+        "critical"    { 18 }
+        "error"       { 17 }
+        "warning"     { 13 }
+        "notice"      { 10 }
+        "information" { 9 }
+        "debug"       { 5 }
+        default       { null }
+    }
+}
+
+// Normalize and validate body severity at every public leaf boundary so
+// direct leaf calls and dispatcher calls have the same contract.
+def process normalize_fortigate_syslog_severity_number {
+    workspace.fortigate_syslog.severity_number = fortigate_syslog_severity_number(workspace.kv.level)
+    switch workspace.kv.level != null and workspace.fortigate_syslog.severity_number == null {
+        true { error "parse_fortigate_syslog: invalid FortiOS native log level ${workspace.kv.level}" }
     }
 }
 
@@ -176,12 +186,14 @@ def function fortigate_syslog_metadata(version_hint) {
 //   workspace.kv populated by `parse_fortigate_syslog` dispatcher or an
 //   inline `parse_kv(...)` upstream of this process.
 def process parse_fortigate_syslog_traffic {
+    process normalize_fortigate_syslog_severity_number
     let proto_num = to_int(workspace.kv.proto)
     workspace.lsis.parsed = {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  fortigate_syslog_action_to_activity_id(workspace.kv.action),
-        severity_id:  fortigate_syslog_severity_id(workspace.kv.level),
+        severity_number: workspace.fortigate_syslog.severity_number,
+        severity:        workspace.kv.level,
         src_endpoint: {
             ip:   workspace.kv.srcip,
             port: to_int(workspace.kv.srcport)
@@ -214,11 +226,13 @@ def process parse_fortigate_syslog_traffic {
 //   severity    — severity label (informational/low/medium/high/critical)
 //   msg         — human-readable
 def process parse_fortigate_syslog_utm_ips {
+    process normalize_fortigate_syslog_severity_number
     workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
-        severity_id:    fortigate_syslog_severity_id(workspace.kv.level),
+        severity_number: workspace.fortigate_syslog.severity_number,
+        severity:        workspace.kv.level,
         disposition_id: fortigate_syslog_utm_disposition_id(workspace.kv.action),
         finding_info: {
             title: workspace.kv.attack,
@@ -245,6 +259,7 @@ def process parse_fortigate_syslog_utm_ips {
 // Subtype leaf: utm:webfilter → OCSF Web Resource Access (6004)
 // ---------------------------------------------------------------------------
 def process parse_fortigate_syslog_utm_webfilter {
+    process normalize_fortigate_syslog_severity_number
     let activity = switch workspace.kv.action {
         "blocked"     { 2 }
         "block"       { 2 }
@@ -258,7 +273,8 @@ def process parse_fortigate_syslog_utm_webfilter {
         class_uid:    6004,
         category_uid: 6,
         activity_id:  activity,
-        severity_id:  fortigate_syslog_severity_id(workspace.kv.level),
+        severity_number: workspace.fortigate_syslog.severity_number,
+        severity:        workspace.kv.level,
         src_endpoint: {
             ip:   workspace.kv.srcip,
             port: to_int(workspace.kv.srcport)
@@ -296,11 +312,13 @@ def process parse_fortigate_syslog_utm_webfilter {
 //   virus    — malware family / signature
 //   virusid  — numeric signature id
 def process parse_fortigate_syslog_utm_antivirus {
+    process normalize_fortigate_syslog_severity_number
     workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
-        severity_id:    fortigate_syslog_severity_id(workspace.kv.level),
+        severity_number: workspace.fortigate_syslog.severity_number,
+        severity:        workspace.kv.level,
         disposition_id: fortigate_syslog_utm_disposition_id(workspace.kv.action),
         finding_info: {
             title:   workspace.kv.virus,
@@ -344,11 +362,13 @@ def process parse_fortigate_syslog_utm_antivirus {
 // Subtype leaf: utm:dlp → OCSF Detection Finding (2004)
 // ---------------------------------------------------------------------------
 def process parse_fortigate_syslog_utm_dlp {
+    process normalize_fortigate_syslog_severity_number
     workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
-        severity_id:    fortigate_syslog_severity_id(workspace.kv.level),
+        severity_number: workspace.fortigate_syslog.severity_number,
+        severity:        workspace.kv.level,
         disposition_id: fortigate_syslog_utm_disposition_id(workspace.kv.action),
         finding_info: {
             title: workspace.kv.filtername,
@@ -383,11 +403,13 @@ def process parse_fortigate_syslog_utm_dlp {
 // Subtype leaf: utm:app-ctrl → OCSF Detection Finding (2004)
 // ---------------------------------------------------------------------------
 def process parse_fortigate_syslog_utm_appctrl {
+    process normalize_fortigate_syslog_severity_number
     workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
-        severity_id:    fortigate_syslog_severity_id(workspace.kv.level),
+        severity_number: workspace.fortigate_syslog.severity_number,
+        severity:        workspace.kv.level,
         disposition_id: fortigate_syslog_utm_disposition_id(workspace.kv.action),
         finding_info: {
             title: workspace.kv.app,
@@ -417,6 +439,7 @@ def process parse_fortigate_syslog_utm_appctrl {
 // Subtype leaf: utm:dns → OCSF DNS Activity (4003)
 // ---------------------------------------------------------------------------
 def process parse_fortigate_syslog_utm_dns {
+    process normalize_fortigate_syslog_severity_number
     let activity = switch workspace.kv.action {
         "blocked"     { 1 }
         "redirected"  { 1 }
@@ -436,7 +459,8 @@ def process parse_fortigate_syslog_utm_dns {
         class_uid:    4003,
         category_uid: 4,
         activity_id:  activity,
-        severity_id:  fortigate_syslog_severity_id(workspace.kv.level),
+        severity_number: workspace.fortigate_syslog.severity_number,
+        severity:        workspace.kv.level,
         rcode_id:     rcode,
         src_endpoint: { ip: workspace.kv.srcip },
         dst_endpoint: { ip: workspace.kv.dstip },
@@ -453,6 +477,7 @@ def process parse_fortigate_syslog_utm_dns {
 // Subtype leaf: utm:emailfilter → OCSF Email Activity (4009)
 // ---------------------------------------------------------------------------
 def process parse_fortigate_syslog_utm_emailfilter {
+    process normalize_fortigate_syslog_severity_number
     let activity = switch workspace.kv.action {
         "blocked"     { 6 }
         "quarantined" { 6 }
@@ -463,7 +488,8 @@ def process parse_fortigate_syslog_utm_emailfilter {
         class_uid:    4009,
         category_uid: 4,
         activity_id:  activity,
-        severity_id:  fortigate_syslog_severity_id(workspace.kv.level),
+        severity_number: workspace.fortigate_syslog.severity_number,
+        severity:        workspace.kv.level,
         direction_id: 0,
         src_endpoint: { ip: workspace.kv.srcip },
         dst_endpoint: { ip: workspace.kv.dstip },
@@ -482,11 +508,13 @@ def process parse_fortigate_syslog_utm_emailfilter {
 // Subtype leaf: utm:waf → OCSF Detection Finding (2004)
 // ---------------------------------------------------------------------------
 def process parse_fortigate_syslog_utm_waf {
+    process normalize_fortigate_syslog_severity_number
     workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
-        severity_id:    fortigate_syslog_severity_id(workspace.kv.level),
+        severity_number: workspace.fortigate_syslog.severity_number,
+        severity:        workspace.kv.level,
         disposition_id: fortigate_syslog_utm_disposition_id(workspace.kv.action),
         finding_info: {
             title: workspace.kv.signature,
@@ -534,11 +562,13 @@ def process parse_fortigate_syslog_utm_waf {
 //   hostname      — server hostname (CN or expected SNI)
 //   action        — engine verdict (`info` / `block`)
 def process parse_fortigate_syslog_utm_ssl {
+    process normalize_fortigate_syslog_severity_number
     workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
-        severity_id:    fortigate_syslog_severity_id(workspace.kv.level),
+        severity_number: workspace.fortigate_syslog.severity_number,
+        severity:        workspace.kv.level,
         disposition_id: fortigate_syslog_utm_disposition_id(workspace.kv.action),
         finding_info: {
             title: workspace.kv.eventsubtype,
@@ -578,6 +608,7 @@ def process parse_fortigate_syslog_utm_ssl {
 //   srcip / src_port / dstip / dst_port — endpoints (5060 typical)
 //   proto                               — IP proto (17 UDP / 6 TCP)
 def process parse_fortigate_syslog_utm_voip {
+    process normalize_fortigate_syslog_severity_number
     let activity = switch workspace.kv.status {
         "start"  { 1 }
         "end"    { 2 }
@@ -588,7 +619,8 @@ def process parse_fortigate_syslog_utm_voip {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  activity,
-        severity_id:  fortigate_syslog_severity_id(workspace.kv.level),
+        severity_number: workspace.fortigate_syslog.severity_number,
+        severity:        workspace.kv.level,
         src_endpoint: {
             ip:   workspace.kv.srcip,
             port: to_int(workspace.kv.src_port)
@@ -611,6 +643,7 @@ def process parse_fortigate_syslog_utm_voip {
 // Subtype leaf: event:user → OCSF Authentication (3002)
 // ---------------------------------------------------------------------------
 def process parse_fortigate_syslog_event_user {
+    process normalize_fortigate_syslog_severity_number
     let activity = switch workspace.kv.action {
         "login"           { 1 }
         "logon"           { 1 }
@@ -633,7 +666,8 @@ def process parse_fortigate_syslog_event_user {
         class_uid:    3002,
         category_uid: 3,
         activity_id:  activity,
-        severity_id:  fortigate_syslog_severity_id(workspace.kv.level),
+        severity_number: workspace.fortigate_syslog.severity_number,
+        severity:        workspace.kv.level,
         status_id:    status,
         user: { name: workspace.kv.user },
         src_endpoint: { ip: workspace.kv.srcip },
@@ -646,6 +680,7 @@ def process parse_fortigate_syslog_event_user {
 // Subtype leaf: event:vpn → OCSF Authentication (3002)
 // ---------------------------------------------------------------------------
 def process parse_fortigate_syslog_event_vpn {
+    process normalize_fortigate_syslog_severity_number
     let activity = switch workspace.kv.action {
         "tunnel-up"       { 1 }
         "ssl-login-fail"  { 1 }
@@ -662,7 +697,8 @@ def process parse_fortigate_syslog_event_vpn {
         class_uid:    3002,
         category_uid: 3,
         activity_id:  activity,
-        severity_id:  fortigate_syslog_severity_id(workspace.kv.level),
+        severity_number: workspace.fortigate_syslog.severity_number,
+        severity:        workspace.kv.level,
         status_id:    status,
         user: { name: workspace.kv.user },
         src_endpoint: { ip: workspace.kv.srcip },
@@ -675,11 +711,13 @@ def process parse_fortigate_syslog_event_vpn {
 // Subtype leaf: event:system → OCSF Compliance Finding (2003)
 // ---------------------------------------------------------------------------
 def process parse_fortigate_syslog_event_system {
+    process normalize_fortigate_syslog_severity_number
     workspace.lsis.parsed = {
         class_uid:    2003,
         category_uid: 2,
         activity_id:  1,
-        severity_id:  fortigate_syslog_severity_id(workspace.kv.level),
+        severity_number: workspace.fortigate_syslog.severity_number,
+        severity:        workspace.kv.level,
         finding_info: {
             title: workspace.kv.action,
             desc:  workspace.kv.logdesc,
@@ -697,6 +735,7 @@ def process parse_fortigate_syslog_event_system {
 // Subtype leaf: event:wireless → OCSF Network Activity (4001)
 // ---------------------------------------------------------------------------
 def process parse_fortigate_syslog_event_wireless {
+    process normalize_fortigate_syslog_severity_number
     let activity = switch workspace.kv.action {
         "client-connect"    { 1 }
         "client-associate"  { 1 }
@@ -708,7 +747,8 @@ def process parse_fortigate_syslog_event_wireless {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  activity,
-        severity_id:  fortigate_syslog_severity_id(workspace.kv.level),
+        severity_number: workspace.fortigate_syslog.severity_number,
+        severity:        workspace.kv.level,
         src_endpoint: {
             ip:  workspace.kv.srcip,
             mac: workspace.kv.srcmac
@@ -737,11 +777,13 @@ def process parse_fortigate_syslog_event_wireless {
 //   auditreporttype  — "CoverageReport" / "OptimizationReport" / ...
 //   criticalcount, highcount, mediumcount, lowcount, passedcount
 def process parse_fortigate_syslog_event_security_rating {
+    process normalize_fortigate_syslog_severity_number
     workspace.lsis.parsed = {
         class_uid:    2003,
         category_uid: 2,
         activity_id:  1,
-        severity_id:  fortigate_syslog_severity_id(workspace.kv.level),
+        severity_number: workspace.fortigate_syslog.severity_number,
+        severity:        workspace.kv.level,
         finding_info: {
             title: "Security Rating " + workspace.kv.auditreporttype,
             uid:   workspace.kv.auditid,
