@@ -103,7 +103,6 @@ def process parse_sysmon_process_create {
         class_uid:    1007,
         category_uid: 1,
         activity_id:  1,                                // Launch
-        severity_id:  1,                                // Informational
         status_id:    1,                                // Success
         time:         workspace.sysmon.time,
         process: {
@@ -173,7 +172,6 @@ def process parse_sysmon_network_connect {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  1,                                // Open
-        severity_id:  1,                                // Informational
         status_id:    1,
         time:         workspace.sysmon.time,
         src_endpoint: {
@@ -234,7 +232,6 @@ def process parse_sysmon_file_create {
         class_uid:    1001,
         category_uid: 1,
         activity_id:  1,                                // Create
-        severity_id:  1,
         status_id:    1,
         time:         workspace.sysmon.time,
         file: {
