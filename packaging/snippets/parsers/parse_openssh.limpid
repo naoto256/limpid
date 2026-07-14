@@ -88,7 +88,7 @@
 
 // Common Authentication record skeleton — used by every sshd event so
 // the leaves only carry their pattern-specific deviations (status_id,
-// activity_id, severity_id). `port_str` is the port as captured by
+// activity_id). `port_str` is the port as captured by
 // regex_parse (always a String); `to_int` is applied here so leaves
 // don't repeat the conversion.
 //
@@ -96,12 +96,11 @@
 // (via the inline bridge — see the header). Any of them may be null
 // if the bridge left them out or the wire didn't carry them; the
 // caller (compose_<target>) is expected to strip nulls.
-def function openssh_auth_record(activity_id, status_id, severity_id, user, ip, port_str, pid_str, host, time_ns) {
+def function openssh_auth_record(activity_id, status_id, user, ip, port_str, pid_str, host, time_ns) {
     {
         class_uid:        3002,
         category_uid:     3,
         activity_id:      activity_id,
-        severity_id:      severity_id,
         status_id:        status_id,
         time:             time_ns,
         // OCSF auth_protocol_id enum has no SSH slot; 99 = Other.
@@ -343,7 +342,6 @@ def process parse_openssh_accepted {
     workspace.lsis.parsed = openssh_auth_record(
         1,                              // activity_id: Logon
         1,                              // status_id:   Success
-        1,                              // severity_id: Informational
         workspace.ssh.fields.user,
         workspace.ssh.fields.ip,
         workspace.ssh.fields.port,
@@ -359,21 +357,15 @@ def process parse_openssh_accepted {
 //
 // `Failed password for invalid user mallory ...` is captured into
 // `user_invalid`; `Failed password for alice ...` into `user`. The leaf
-// coalesces them and bumps the severity for the invalid-user variant
-// because that's the brute-force-probe signal operators usually act on.
+// coalesces them into the source-backed user fact.
 // ---------------------------------------------------------------------------
 
 def process parse_openssh_failed {
     let invalid = workspace.ssh.fields.user_invalid
     let user = coalesce(invalid, workspace.ssh.fields.user)
-    let severity = switch true {
-        invalid != null { 3 }   // Medium — invalid-user attempt
-        default         { 2 }   // Low — failed auth on a known account
-    }
     workspace.lsis.parsed = openssh_auth_record(
         1,                              // activity_id: Logon
         2,                              // status_id:   Failure
-        severity,
         user,
         workspace.ssh.fields.ip,
         workspace.ssh.fields.port,
@@ -392,7 +384,6 @@ def process parse_openssh_invalid_user {
     workspace.lsis.parsed = openssh_auth_record(
         1,                              // activity_id: Logon
         2,                              // status_id:   Failure
-        3,                              // severity_id: Medium (probe)
         workspace.ssh.fields.user,
         workspace.ssh.fields.ip,
         workspace.ssh.fields.port,
@@ -418,7 +409,6 @@ def process parse_openssh_disconnected {
     workspace.lsis.parsed = openssh_auth_record(
         2,                              // activity_id: Logoff
         1,                              // status_id:   Success
-        1,                              // severity_id: Informational
         workspace.ssh.fields.user,      // may be null when no user was authenticated
         workspace.ssh.fields.ip,
         workspace.ssh.fields.port,
@@ -432,15 +422,14 @@ def process parse_openssh_disconnected {
 // Leaf: "Did not receive identification string from <ip> port <port>"
 // → OCSF Authentication 3002 / activity=Other / status=Failure
 //
-// Connection arrived but the client never sent the SSH version banner.
-// Almost always a TCP scan / nmap probe. No user, low confidence.
+// Connection arrived but the client never sent the SSH version banner;
+// no user identity is present in this message shape.
 // ---------------------------------------------------------------------------
 
 def process parse_openssh_no_ident {
     workspace.lsis.parsed = openssh_auth_record(
         99,                             // activity_id: Other
         2,                              // status_id:   Failure
-        2,                              // severity_id: Low
         null,                           // no user
         workspace.ssh.fields.ip,
         workspace.ssh.fields.port,
