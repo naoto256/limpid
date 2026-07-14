@@ -48,15 +48,30 @@ include "../functions/http_method_activity_id.limpid"
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-// Map Suricata alert severity (1=highest / 4=lowest, Snort
-// convention) to OCSF severity_id (1=Info..6=Fatal).
-def function suricata_severity_id(s) {
+// Map Suricata alert priority (1 highest, 255 lowest) to OTel
+// SeverityNumber. The equality guard admits exact integral numeric values
+// while rejecting numeric strings and fractional values.
+def function suricata_severity_number(s) {
     switch s {
-        1       { 5 }   // Critical
-        2       { 4 }   // High
-        3       { 3 }   // Medium
-        4       { 2 }   // Low
-        default { 1 }   // Informational
+        1 { 21 }
+        2 { 19 }
+        3 { 17 }
+        4 { 13 }
+        default {
+            switch true {
+                s != null and s == to_int(s) and s >= 5 and s <= 255 { 9 }
+                default { null }
+            }
+        }
+    }
+}
+
+// Normalize and validate alert priority at the public leaf boundary so
+// direct calls and dispatcher calls have the same contract.
+def process normalize_suricata_alert_severity_number {
+    workspace.suricata.severity_number = suricata_severity_number(workspace.suricata.body.alert.severity)
+    switch workspace.suricata.body.alert.severity != null and workspace.suricata.severity_number == null {
+        true { error "parse_suricata: invalid alert severity ${workspace.suricata.body.alert.severity}" }
     }
 }
 
@@ -150,13 +165,13 @@ def function suricata_traffic(body) {
 // ---------------------------------------------------------------------------
 
 // `alert` → 2004 Detection Finding
-def function suricata_alert_record(body, host, time_ns) {
+def function suricata_alert_record(body, host, time_ns, severity_number) {
     let a = body.alert
     {
         class_uid:    2004,
         category_uid: 2,
         activity_id:  1,                                  // Create
-        severity_id:  suricata_severity_id(a.severity),
+        severity_number: severity_number,
         status_id:    suricata_status_id(a.action),
         time:         time_ns,
         finding_info: {
@@ -180,14 +195,15 @@ def function suricata_alert_record(body, host, time_ns) {
         connection_info: suricata_connection_info(body),
         device:          { hostname: host },
         unmapped: {
-            event_type:   body.event_type,
-            flow_id:      body.flow_id,
-            in_iface:     body.in_iface,
-            app_proto:    body.app_proto,
-            category:     a.category,
-            gid:          a.gid,
-            rev:          a.rev,
-            action:       a.action,
+            event_type:     body.event_type,
+            flow_id:        body.flow_id,
+            in_iface:       body.in_iface,
+            app_proto:      body.app_proto,
+            category:       a.category,
+            gid:            a.gid,
+            rev:            a.rev,
+            action:         a.action,
+            alert_severity: a.severity,
             alert_metadata: a.metadata,
             community_id: body.community_id,
             http:         body.http,
@@ -220,7 +236,6 @@ def function suricata_dns_record(body, host, time_ns) {
         class_uid:    4003,
         category_uid: 4,
         activity_id:  activity,
-        severity_id:  1,
         rcode_id:     suricata_dns_rcode_id(d.rcode),
         time:         time_ns,
         query: {
@@ -249,7 +264,6 @@ def function suricata_http_record(body, host, time_ns) {
         class_uid:    4002,
         category_uid: 4,
         activity_id:  http_method_activity_id(h.http_method),
-        severity_id:  1,
         status_id:    switch true {
             h.status != null and h.status >= 400 { 2 }
             h.status != null { 1 }
@@ -293,7 +307,6 @@ def function suricata_flow_record(body, host, time_ns) {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  activity,
-        severity_id:  1,
         status_id:    1,
         time:         time_ns,
         src_endpoint:    suricata_endpoint(body.src_ip, body.src_port),
@@ -330,7 +343,6 @@ def function suricata_tls_record(body, host, time_ns) {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  6,                                  // Traffic
-        severity_id:  1,
         status_id:    1,
         time:         time_ns,
         src_endpoint:    suricata_endpoint(body.src_ip, body.src_port),
@@ -364,7 +376,6 @@ def function suricata_fileinfo_record(body, host, time_ns) {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  6,                                  // Traffic
-        severity_id:  1,
         status_id:    1,
         time:         time_ns,
         src_endpoint:    suricata_endpoint(body.src_ip, body.src_port),
@@ -413,10 +424,12 @@ def process parse_suricata {
 }
 
 def process parse_suricata_alert {
+    process normalize_suricata_alert_severity_number
     workspace.lsis.parsed = suricata_alert_record(
         workspace.suricata.body,
         workspace.suricata.hostname,
-        suricata_time_ns(workspace.suricata.body, workspace.suricata.time)
+        suricata_time_ns(workspace.suricata.body, workspace.suricata.time),
+        workspace.suricata.severity_number
     )
 }
 
