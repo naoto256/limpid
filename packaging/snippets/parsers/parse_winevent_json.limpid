@@ -25,6 +25,7 @@
 //          The field naming convention this snippet targets is the
 //          NXLog form (also used by the OTRF / Mordor public dataset),
 //          which is closest to ETW raw names: `EventID`, `Channel`,
+//          `EventType`, `Severity`,
 //          `TargetUserName`, `SubjectUserName`, `LogonType`,
 //          `IpAddress`, `IpPort`, etc.
 //
@@ -43,6 +44,7 @@
 //
 // Sample input (4624 logon success, abridged):
 //   {"EventID":4624,"Channel":"Security",
+//    "EventType":"INFO","Severity":"INFO",
 //    "SourceName":"Microsoft-Windows-Security-Auditing",
 //    "Hostname":"WORKSTATION1","EventTime":"2026-04-29 10:00:00",
 //    "TargetUserName":"alice","TargetDomainName":"CORP",
@@ -84,6 +86,22 @@ def function winevent_logon_type_id(t) {
     }
 }
 
+// Map NXLog's resolved Windows Event severity to OTel SeverityNumber.
+def function winevent_severity_number(severity) {
+    switch severity {
+        "VERBOSE"       { 5 }
+        "DEBUG"         { 5 }
+        "INFO"          { 9 }
+        "AUDIT_SUCCESS" { 9 }
+        "WARNING"       { 13 }
+        "ERROR"         { 17 }
+        "AUDIT_FAILURE" { 17 }
+        "CRITICAL"      { 21 }
+        null            { null }
+        default         { null }
+    }
+}
+
 // Build the actor identity from SubjectUserName + SubjectDomainName
 // (the principal that performed the action — for logon events this is
 // the system context account; for account-management events it is the
@@ -121,7 +139,12 @@ def process parse_winevent_json {
     // so no explicit null-check arm is needed here.
     workspace.winevent = parse_json(ingress)
     let eid = workspace.winevent.EventID
+    workspace.winevent.source_severity = coalesce(workspace.winevent.EventType, workspace.winevent.Severity)
+    workspace.winevent.severity_number = winevent_severity_number(workspace.winevent.source_severity)
     switch true {
+        workspace.winevent.source_severity != null and workspace.winevent.severity_number == null {
+            error "parse_winevent_json: invalid NXLog Windows Event severity ${workspace.winevent.source_severity}"
+        }
         // Authentication (3002)
         eid == 4624 { process parse_winevent_4624_logon_success }
         eid == 4625 { process parse_winevent_4625_logon_failure }
@@ -149,13 +172,14 @@ def process parse_winevent_json {
 // Helpers used by the per-EventID leaves
 // ---------------------------------------------------------------------------
 
-def function winevent_authentication_record(activity_id, status_id, severity_id, time, target_user, actor_user, src_ip, src_port, logon_type, message, hostname) {
+def function winevent_authentication_record(activity_id, status_id, severity_number, severity, time, target_user, actor_user, src_ip, src_port, logon_type, message, hostname) {
     {
         class_uid:    3002,
         category_uid: 3,
         activity_id:  activity_id,
         type_uid:     3002 * 100 + activity_id,
-        severity_id:  severity_id,
+        severity_number: severity_number,
+        severity:        severity,
         status_id:    status_id,
         time:         time,
         user:         { name: target_user },
@@ -174,13 +198,14 @@ def function winevent_authentication_record(activity_id, status_id, severity_id,
     }
 }
 
-def function winevent_process_activity_record(activity_id, severity_id, time, process_name, command_line, parent_name, actor_user, hostname, message) {
+def function winevent_process_activity_record(activity_id, severity_number, severity, time, process_name, command_line, parent_name, actor_user, hostname, message) {
     {
         class_uid:    1007,
         category_uid: 1,
         activity_id:  activity_id,
         type_uid:     1007 * 100 + activity_id,
-        severity_id:  severity_id,
+        severity_number: severity_number,
+        severity:        severity,
         time:         time,
         process: {
             name:         process_name,
@@ -200,13 +225,14 @@ def function winevent_process_activity_record(activity_id, severity_id, time, pr
     }
 }
 
-def function winevent_account_change_record(activity_id, severity_id, time, target_user, actor_user, hostname, message) {
+def function winevent_account_change_record(activity_id, severity_number, severity, time, target_user, actor_user, hostname, message) {
     {
         class_uid:    3001,
         category_uid: 3,
         activity_id:  activity_id,
         type_uid:     3001 * 100 + activity_id,
-        severity_id:  severity_id,
+        severity_number: severity_number,
+        severity:        severity,
         time:         time,
         user:   { name: target_user },
         actor:  { user: { name: actor_user } },
@@ -222,13 +248,14 @@ def function winevent_account_change_record(activity_id, severity_id, time, targ
     }
 }
 
-def function winevent_group_management_record(activity_id, severity_id, time, group_name, member, actor_user, hostname, message) {
+def function winevent_group_management_record(activity_id, severity_number, severity, time, group_name, member, actor_user, hostname, message) {
     {
         class_uid:    3006,
         category_uid: 3,
         activity_id:  activity_id,
         type_uid:     3006 * 100 + activity_id,
-        severity_id:  severity_id,
+        severity_number: severity_number,
+        severity:        severity,
         time:         time,
         group:  { name: group_name },
         user:   { name: member },
@@ -252,7 +279,7 @@ def function winevent_group_management_record(activity_id, severity_id, time, gr
 def process parse_winevent_4624_logon_success {
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_authentication_record(
-        1, 1, 1,
+        1, 1, we.severity_number, we.source_severity,
         winevent_time(we.EventTime),
         winevent_actor_user(we.TargetUserName, we.TargetDomainName),
         winevent_actor_user(we.SubjectUserName, we.SubjectDomainName),
@@ -267,7 +294,7 @@ def process parse_winevent_4624_logon_success {
 def process parse_winevent_4625_logon_failure {
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_authentication_record(
-        1, 2, 3,
+        1, 2, we.severity_number, we.source_severity,
         winevent_time(we.EventTime),
         winevent_actor_user(we.TargetUserName, we.TargetDomainName),
         winevent_actor_user(we.SubjectUserName, we.SubjectDomainName),
@@ -282,7 +309,7 @@ def process parse_winevent_4625_logon_failure {
 def process parse_winevent_4634_logoff {
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_authentication_record(
-        2, 1, 1,
+        2, 1, we.severity_number, we.source_severity,
         winevent_time(we.EventTime),
         winevent_actor_user(we.TargetUserName, we.TargetDomainName),
         null,
@@ -301,7 +328,7 @@ def process parse_winevent_4634_logoff {
 def process parse_winevent_4688_process_create {
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_process_activity_record(
-        1, 1,
+        1, we.severity_number, we.source_severity,
         winevent_time(we.EventTime),
         we.NewProcessName,
         we.CommandLine,
@@ -315,7 +342,7 @@ def process parse_winevent_4688_process_create {
 def process parse_winevent_4689_process_terminate {
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_process_activity_record(
-        4, 1,
+        4, we.severity_number, we.source_severity,
         winevent_time(we.EventTime),
         we.ProcessName,
         null,
@@ -333,7 +360,7 @@ def process parse_winevent_4689_process_terminate {
 def process parse_winevent_4720_account_create {
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_account_change_record(
-        1, 2,
+        1, we.severity_number, we.source_severity,
         winevent_time(we.EventTime),
         winevent_actor_user(we.TargetUserName, we.TargetDomainName),
         winevent_actor_user(we.SubjectUserName, we.SubjectDomainName),
@@ -345,7 +372,7 @@ def process parse_winevent_4720_account_create {
 def process parse_winevent_account_enable {
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_account_change_record(
-        2, 2,
+        2, we.severity_number, we.source_severity,
         winevent_time(we.EventTime),
         winevent_actor_user(we.TargetUserName, we.TargetDomainName),
         winevent_actor_user(we.SubjectUserName, we.SubjectDomainName),
@@ -357,7 +384,7 @@ def process parse_winevent_account_enable {
 def process parse_winevent_account_disable {
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_account_change_record(
-        3, 2,
+        3, we.severity_number, we.source_severity,
         winevent_time(we.EventTime),
         winevent_actor_user(we.TargetUserName, we.TargetDomainName),
         winevent_actor_user(we.SubjectUserName, we.SubjectDomainName),
@@ -369,7 +396,7 @@ def process parse_winevent_account_disable {
 def process parse_winevent_account_modify {
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_account_change_record(
-        99, 2,
+        99, we.severity_number, we.source_severity,
         winevent_time(we.EventTime),
         winevent_actor_user(we.TargetUserName, we.TargetDomainName),
         winevent_actor_user(we.SubjectUserName, we.SubjectDomainName),
@@ -381,7 +408,7 @@ def process parse_winevent_account_modify {
 def process parse_winevent_account_delete {
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_account_change_record(
-        4, 2,
+        4, we.severity_number, we.source_severity,
         winevent_time(we.EventTime),
         winevent_actor_user(we.TargetUserName, we.TargetDomainName),
         winevent_actor_user(we.SubjectUserName, we.SubjectDomainName),
@@ -397,7 +424,7 @@ def process parse_winevent_account_delete {
 def process parse_winevent_group_member_add {
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_group_management_record(
-        1, 2,
+        1, we.severity_number, we.source_severity,
         winevent_time(we.EventTime),
         we.TargetUserName,
         we.MemberName,
@@ -410,7 +437,7 @@ def process parse_winevent_group_member_add {
 def process parse_winevent_group_member_remove {
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_group_management_record(
-        2, 2,
+        2, we.severity_number, we.source_severity,
         winevent_time(we.EventTime),
         we.TargetUserName,
         we.MemberName,
