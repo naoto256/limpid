@@ -230,12 +230,11 @@ def function auditd_int_opt(s) {
 // ---------------------------------------------------------------------------
 
 // 3002 Authentication.
-def function auditd_auth_record(activity_id, status_id, severity_id, user, src_ip, terminal, pid_str, exe, host, time_ns, type) {
+def function auditd_auth_record(activity_id, status_id, user, src_ip, terminal, pid_str, exe, host, time_ns, type) {
     {
         class_uid:    3002,
         category_uid: 3,
         activity_id:  activity_id,
-        severity_id:  severity_id,
         status_id:    status_id,
         time:         time_ns,
         user: { name: user },
@@ -274,7 +273,6 @@ def function auditd_account_change_record(activity_id, status_id, target_user, t
         class_uid:    3001,
         category_uid: 3,
         activity_id:  activity_id,
-        severity_id:  1,
         status_id:    status_id,
         time:         time_ns,
         user: {
@@ -312,7 +310,6 @@ def function auditd_process_record(activity_id, status_id, comm, exe, pid_str, p
         class_uid:    1007,
         category_uid: 1,
         activity_id:  activity_id,
-        severity_id:  1,
         status_id:    status_id,
         time:         time_ns,
         process: {
@@ -350,7 +347,6 @@ def function auditd_file_record(activity_id, status_id, file_name, host, time_ns
         class_uid:    1001,
         category_uid: 1,
         activity_id:  activity_id,
-        severity_id:  1,
         status_id:    status_id,
         time:         time_ns,
         file: {
@@ -372,12 +368,11 @@ def function auditd_file_record(activity_id, status_id, file_name, host, time_ns
 }
 
 // 2004 Detection Finding (AVC / ANOM_ABEND).
-def function auditd_finding_record(severity_id, title, status_id, host, time_ns, type, extra_unmapped) {
+def function auditd_finding_record(title, status_id, host, time_ns, type, extra_unmapped) {
     {
         class_uid:    2004,
         category_uid: 2,
         activity_id:  1,
-        severity_id:  severity_id,
         status_id:    status_id,
         time:         time_ns,
         finding_info: {
@@ -467,12 +462,8 @@ def process parse_auditd_auth_dispatch {
         "user_end"    { 2 }
         default       { 1 }    // Logon
     }
-    let severity = switch status {
-        2       { 3 }          // Medium for auth failure
-        default { 1 }
-    }
     workspace.lsis.parsed = auditd_auth_record(
-        activity, status, severity,
+        activity, status,
         user, addr, terminal, pid, exe,
         workspace.auditd.hostname,
         workspace.auditd.time,
@@ -610,7 +601,6 @@ def function auditd_lifecycle_record(activity_id, status_id, comm, exe, pid_str,
         class_uid:    1007,
         category_uid: 1,
         activity_id:  activity_id,
-        severity_id:  1,
         status_id:    status_id,
         time:         time_ns,
         app_name:     coalesce(comm, exe, type),
@@ -686,7 +676,6 @@ def function auditd_network_event_record(activity_id, status_id, src_ip, dst_ip,
         class_uid:    4001,
         category_uid: 4,
         activity_id:  activity_id,
-        severity_id:  1,
         status_id:    status_id,
         time:         time_ns,
         src_endpoint: { ip: src_ip },
@@ -740,12 +729,11 @@ def process parse_auditd_network_dispatch {
 // closest OCSF class for "thing of audit interest, no clear actor /
 // attack technique"; the audit type lands in unmapped.
 
-def function auditd_config_record(title, severity_id, comm, exe, pid_str, host, time_ns, type, extra_unmapped) {
+def function auditd_config_record(title, comm, exe, pid_str, host, time_ns, type, extra_unmapped) {
     {
         class_uid:    2002,
         category_uid: 2,
         activity_id:  1,
-        severity_id:  severity_id,
         status_id:    99,
         time:         time_ns,
         finding_info: {
@@ -795,13 +783,8 @@ def process parse_auditd_config_dispatch {
         "VIRT_MACHINE_ID" { "Virtualisation machine identification" }
         default           { workspace.auditd_class.type }
     }
-    let severity = switch workspace.auditd_class.type {
-        "KERN_MODULE"   { 3 }
-        "CONFIG_CHANGE" { 2 }
-        default         { 1 }
-    }
     workspace.lsis.parsed = auditd_config_record(
-        title, severity,
+        title,
         comm, exe, pid,
         workspace.auditd.hostname,
         workspace.auditd.time,
@@ -827,12 +810,8 @@ def process parse_auditd_finding_dispatch {
         "anom_abend" { "Process abnormal end (crash)" }
         default      { workspace.auditd_class.type }
     }
-    let severity = switch workspace.auditd_class.kind {
-        "anom_abend" { 3 }
-        default      { 2 }
-    }
     workspace.lsis.parsed = auditd_finding_record(
-        severity, title, 99,
+        title, 99,
         workspace.auditd.hostname,
         workspace.auditd.time,
         workspace.auditd_class.type,
