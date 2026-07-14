@@ -171,10 +171,7 @@ def function parse_sudo_message(msg) {
     // versions:
     //   modern:  `for user X(uid=N) by Y(uid=M)`         — both uids
     //   older:   `for user X by Y(uid=N)`                — only the
-    //                                                      trailing uid
-    //                                                      (which carries
-    //                                                      the TARGET uid,
-    //                                                      not the actor's)
+    //                                                      actor uid
     //   no-tty:  `for user X by (uid=N)`                 — actor name
     //                                                      omitted (sudo
     //                                                      invoked from a
@@ -182,10 +179,11 @@ def function parse_sudo_message(msg) {
     //                                                      context: cron,
     //                                                      systemd unit,
     //                                                      user= directive)
-    // Make uid groups optional and allow the actor to be empty.
+    // Make the target uid optional and allow the actor name to be empty;
+    // the trailing actor uid remains required.
     let pam_session_open = regex_parse(
         msg,
-        "^pam_unix\\(sudo:session\\): session opened for user (?P<target>\\S+)(?:\\(uid=(?P<target_uid>\\d+)\\))? by (?P<actor>\\S*)\\(uid=(?P<by_uid>\\d+)\\)$"
+        "^pam_unix\\(sudo:session\\): session opened for user (?P<target>[^\\s(]+)(?:\\(uid=(?P<target_uid>\\d+)\\))? by (?P<actor>[^\\s(]*)\\(uid=(?P<by_uid>\\d+)\\)$"
     )
     let pam_session_close = regex_parse(
         msg,
@@ -386,6 +384,8 @@ def process parse_sudo_pam_session_open {
         workspace.sudo.hostname,
         workspace.sudo.time
     )
+    workspace.lsis.parsed.user.uid = workspace.sudo_class.fields.target_uid
+    workspace.lsis.parsed.actor.user.uid = workspace.sudo_class.fields.by_uid
 }
 
 // ---------------------------------------------------------------------------
