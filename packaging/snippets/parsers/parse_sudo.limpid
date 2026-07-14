@@ -85,13 +85,12 @@
 // repeating the 3003 envelope per pattern.
 // ---------------------------------------------------------------------------
 
-def function sudo_authorize_session_record(activity_id, status_id, severity_id, target_user, actor_user, message, pid_str, host, time_ns) {
+def function sudo_authorize_session_record(activity_id, status_id, target_user, actor_user, message, pid_str, host, time_ns) {
     {
         class_uid:    3003,
         category_uid: 3,
         activity_id:  activity_id,
         type_uid:     3003 * 100 + activity_id,
-        severity_id:  severity_id,
         status_id:    status_id,
         time:         time_ns,
         // OCSF 3003 Authorize Session models the privilege grant.
@@ -283,7 +282,6 @@ def process parse_sudo_invocation {
     workspace.lsis.parsed = sudo_authorize_session_record(
         1,  // activity_id: Assign Privileges
         1,  // status_id:   Success
-        1,  // severity_id: Informational
         workspace.sudo_class.fields.target,
         workspace.sudo_class.fields.actor,
         workspace.sudo_class.fields.command,
@@ -295,15 +293,13 @@ def process parse_sudo_invocation {
 
 // ---------------------------------------------------------------------------
 // Leaf: auth failure (3 incorrect password attempts)
-// → 3003 / Assign Privileges / Failure (Medium severity — interactive
-//   brute-force probe signal)
+// → 3003 / Assign Privileges / Failure
 // ---------------------------------------------------------------------------
 
 def process parse_sudo_auth_failed {
     workspace.lsis.parsed = sudo_authorize_session_record(
         1,  // activity_id: Assign Privileges (denied)
         2,  // status_id:   Failure
-        3,  // severity_id: Medium
         workspace.sudo_class.fields.target,
         workspace.sudo_class.fields.actor,
         "${workspace.sudo_class.fields.attempts} incorrect password attempts; command was ${workspace.sudo_class.fields.command}",
@@ -314,16 +310,14 @@ def process parse_sudo_auth_failed {
 }
 
 // ---------------------------------------------------------------------------
-// Leaf: invoker not in sudoers (authorization denial — escalation
-//       attempt by an unprivileged user)
-// → 3003 / Assign Privileges / Failure (Medium severity)
+// Leaf: invoker not in sudoers (authorization denial)
+// → 3003 / Assign Privileges / Failure
 // ---------------------------------------------------------------------------
 
 def process parse_sudo_denied_sudoers {
     workspace.lsis.parsed = sudo_authorize_session_record(
         1,  // activity_id: Assign Privileges (denied)
         2,  // status_id:   Failure
-        3,  // severity_id: Medium — non-sudoer attempting privilege
         workspace.sudo_class.fields.target,
         workspace.sudo_class.fields.actor,
         "user NOT in sudoers; command was ${workspace.sudo_class.fields.command}",
@@ -336,15 +330,13 @@ def process parse_sudo_denied_sudoers {
 // ---------------------------------------------------------------------------
 // Leaf: command not in the user's allowed list (authorization denial
 //       within sudoers — user has SOME privileges but not THIS one)
-// → 3003 / Assign Privileges / Failure (Low severity — authorised
-//   user hitting a guard rail; expected operational noise)
+// → 3003 / Assign Privileges / Failure
 // ---------------------------------------------------------------------------
 
 def process parse_sudo_denied_command {
     workspace.lsis.parsed = sudo_authorize_session_record(
         1,  // activity_id: Assign Privileges (denied)
         2,  // status_id:   Failure
-        2,  // severity_id: Low
         workspace.sudo_class.fields.target,
         workspace.sudo_class.fields.actor,
         "command not allowed; command was ${workspace.sudo_class.fields.command}",
@@ -361,7 +353,7 @@ def process parse_sudo_denied_command {
 
 // ---------------------------------------------------------------------------
 // Leaf: password is required (sudo could not prompt or no auth provided)
-// → 3003 / Assign Privileges / Failure (Medium severity)
+// → 3003 / Assign Privileges / Failure
 //
 // Modern sudo emits this when sudoers requires a password for the
 // user/command but the invocation didn't authenticate (script /
@@ -374,7 +366,6 @@ def process parse_sudo_password_required {
     workspace.lsis.parsed = sudo_authorize_session_record(
         1,  // activity_id: Assign Privileges (denied)
         2,  // status_id:   Failure
-        3,  // severity_id: Medium
         workspace.sudo_class.fields.target,
         workspace.sudo_class.fields.actor,
         "a password is required; command was ${workspace.sudo_class.fields.command}",
@@ -388,7 +379,6 @@ def process parse_sudo_pam_session_open {
     workspace.lsis.parsed = sudo_authorize_session_record(
         2,  // activity_id: Activate Privileges
         1,  // status_id:   Success
-        1,  // severity_id: Informational
         workspace.sudo_class.fields.target,
         workspace.sudo_class.fields.actor,
         "pam:session opened",
@@ -410,7 +400,6 @@ def process parse_sudo_pam_session_close {
     workspace.lsis.parsed = sudo_authorize_session_record(
         2,  // activity_id: Activate Privileges (closing edge)
         1,  // status_id:   Success
-        1,  // severity_id: Informational
         workspace.sudo_class.fields.target,
         // pam:session close lines do NOT carry the actor — sudo
         // emits only `for user X`, no `by Y`. Use null for the actor
@@ -425,7 +414,7 @@ def process parse_sudo_pam_session_close {
 
 // ---------------------------------------------------------------------------
 // Leaf: classic pam_unix(sudo:auth): authentication failure
-// → 3003 / Assign Privileges / Failure (Medium severity)
+// → 3003 / Assign Privileges / Failure
 //
 // Older sudo + pam_unix emit a verbose KV-style line on each failed
 // password attempt:
@@ -439,7 +428,6 @@ def process parse_sudo_pam_auth_failure_classic {
     workspace.lsis.parsed = sudo_authorize_session_record(
         1,    // activity_id: Assign Privileges (denied)
         2,    // status_id:   Failure
-        3,    // severity_id: Medium
         null, // target unknown at this PAM line; correlate by pid
         workspace.sudo_class.fields.user,
         "pam:auth authentication failure (uid=${workspace.sudo_class.fields.uid}, tty=${workspace.sudo_class.fields.tty})",
@@ -451,7 +439,7 @@ def process parse_sudo_pam_auth_failure_classic {
 
 // ---------------------------------------------------------------------------
 // Leaf: pam_unix(sudo:auth): auth could not identify password for [user]
-// → 3003 / Assign Privileges / Failure (Medium severity)
+// → 3003 / Assign Privileges / Failure
 //
 // Emitted when the PAM module cannot match the supplied password
 // against the user's hash. Often paired with the classic
@@ -462,7 +450,6 @@ def process parse_sudo_pam_auth_lookup_failed {
     workspace.lsis.parsed = sudo_authorize_session_record(
         1,    // activity_id: Assign Privileges (denied)
         2,    // status_id:   Failure
-        3,    // severity_id: Medium
         null,
         workspace.sudo_class.fields.user,
         "pam:auth could not identify password",
@@ -474,7 +461,7 @@ def process parse_sudo_pam_auth_lookup_failed {
 
 // ---------------------------------------------------------------------------
 // Leaf: pam_unix(sudo:auth): conversation failed
-// → 3003 / Assign Privileges / Failure (Low severity)
+// → 3003 / Assign Privileges / Failure
 //
 // PAM conversation between sudo and the user broke (Ctrl-C at the
 // password prompt, terminal closed, EOF on stdin). No actor / target
@@ -486,7 +473,6 @@ def process parse_sudo_pam_auth_conversation_failed {
     workspace.lsis.parsed = sudo_authorize_session_record(
         1,    // activity_id: Assign Privileges (denied)
         2,    // status_id:   Failure
-        2,    // severity_id: Low — usually benign abort
         null,
         null,
         "pam:auth conversation failed",
