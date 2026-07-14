@@ -137,15 +137,16 @@ def function checkpoint_syslog_4001_activity_id(action) {
     }
 }
 
-// Map CheckPoint action to OCSF severity_id.
-def function checkpoint_syslog_severity_id(action, product) {
-    switch true {
-        action == "Communication with C&C site" { 5 }   // Critical
-        action == "Detect"                      { 3 }   // Medium (threat alert)
-        action == "Inline"                      { 3 }
-        action == "Block" and product != null and (regex_match(product, "(?i)(threat|anti|ips|emulation)")) { 4 }
-        action == "Failed Log In"               { 3 }
-        default                                 { 1 }   // Informational
+// Map the source event severity to OTel SeverityNumber.
+def function checkpoint_syslog_severity_number(severity) {
+    switch severity {
+        "Informational" { 9 }
+        "Low"           { 13 }
+        "Medium"        { 17 }
+        "High"          { 19 }
+        "Critical"      { 21 }
+        null            { null }
+        default         { null }
     }
 }
 
@@ -170,12 +171,13 @@ def function checkpoint_syslog_class_uid(action, product) {
 // Record builders
 // ---------------------------------------------------------------------------
 
-def function checkpoint_syslog_network_record(sd, action, src, src_port, dst, dst_port, proto, policy, rule_name, rule_uid, layer_name, host, time_ns) {
+def function checkpoint_syslog_network_record(sd, action, src, src_port, dst, dst_port, proto, policy, rule_name, rule_uid, layer_name, host, time_ns, severity_number, severity) {
     {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  checkpoint_syslog_4001_activity_id(action),
-        severity_id:  checkpoint_syslog_severity_id(action, parse_checkpoint_syslog_kv(sd, "product")),
+        severity_number: severity_number,
+        severity:        severity,
         status_id:    checkpoint_syslog_status_id(action),
         time:         time_ns,
         src_endpoint: {
@@ -222,14 +224,15 @@ def function checkpoint_syslog_network_record(sd, action, src, src_port, dst, ds
     }
 }
 
-def function checkpoint_syslog_finding_record(sd, action, src, src_port, dst, dst_port, proto, host, time_ns) {
+def function checkpoint_syslog_finding_record(sd, action, src, src_port, dst, dst_port, proto, host, time_ns, severity_number, severity) {
     let product = parse_checkpoint_syslog_kv(sd, "product")
     let attack = coalesce(parse_checkpoint_syslog_kv(sd, "attack"), parse_checkpoint_syslog_kv(sd, "attack_info"), action)
     {
         class_uid:    2004,
         category_uid: 2,
         activity_id:  1,                                     // Create
-        severity_id:  checkpoint_syslog_severity_id(action, product),
+        severity_number: severity_number,
+        severity:        severity,
         status_id:    checkpoint_syslog_status_id(action),
         time:         time_ns,
         finding_info: {
@@ -285,7 +288,7 @@ def function checkpoint_syslog_finding_record(sd, action, src, src_port, dst, ds
     }
 }
 
-def function checkpoint_syslog_auth_record(sd, action, host, time_ns) {
+def function checkpoint_syslog_auth_record(sd, action, host, time_ns, severity_number, severity) {
     let user = coalesce(
         parse_checkpoint_syslog_kv_or_null(sd, "administrator"),
         parse_checkpoint_syslog_kv_or_null(sd, "src_user_name"),
@@ -306,7 +309,8 @@ def function checkpoint_syslog_auth_record(sd, action, host, time_ns) {
         class_uid:    3002,
         category_uid: 3,
         activity_id:  activity,
-        severity_id:  switch status { 2 { 3 } default { 1 } },
+        severity_number: severity_number,
+        severity:        severity,
         status_id:    status,
         time:         time_ns,
         user: { name: user },
@@ -388,7 +392,24 @@ def process parse_checkpoint_syslog_dispatch {
     }
 }
 
+def process parse_checkpoint_syslog_normalize_severity {
+    let severity = parse_checkpoint_syslog_kv_or_null(workspace.cp_syslog_class.sd, "severity")
+    let severity_number = checkpoint_syslog_severity_number(severity)
+    switch true {
+        severity != null and severity_number == null {
+            error "parse_checkpoint_syslog: invalid Check Point severity ${severity}"
+        }
+        default {
+            workspace.checkpoint_syslog_severity = {
+                number: severity_number,
+                text:   severity
+            }
+        }
+    }
+}
+
 def process parse_checkpoint_syslog_network_record_proc {
+    process parse_checkpoint_syslog_normalize_severity
     let sd = workspace.cp_syslog_class.sd
     workspace.lsis.parsed = checkpoint_syslog_network_record(
         sd,
@@ -403,11 +424,14 @@ def process parse_checkpoint_syslog_network_record_proc {
         parse_checkpoint_syslog_kv(sd, "rule_uid"),
         parse_checkpoint_syslog_kv(sd, "layer_name"),
         coalesce(workspace.cp_syslog_class.host, workspace.checkpoint_syslog.hostname),
-        workspace.checkpoint_syslog.time
+        workspace.checkpoint_syslog.time,
+        workspace.checkpoint_syslog_severity.number,
+        workspace.checkpoint_syslog_severity.text
     )
 }
 
 def process parse_checkpoint_syslog_finding_record_proc {
+    process parse_checkpoint_syslog_normalize_severity
     let sd = workspace.cp_syslog_class.sd
     workspace.lsis.parsed = checkpoint_syslog_finding_record(
         sd,
@@ -418,16 +442,21 @@ def process parse_checkpoint_syslog_finding_record_proc {
         parse_checkpoint_syslog_kv(sd, "service"),
         parse_checkpoint_syslog_kv(sd, "proto"),
         coalesce(workspace.cp_syslog_class.host, workspace.checkpoint_syslog.hostname),
-        workspace.checkpoint_syslog.time
+        workspace.checkpoint_syslog.time,
+        workspace.checkpoint_syslog_severity.number,
+        workspace.checkpoint_syslog_severity.text
     )
 }
 
 def process parse_checkpoint_syslog_auth_record {
+    process parse_checkpoint_syslog_normalize_severity
     let sd = workspace.cp_syslog_class.sd
     workspace.lsis.parsed = checkpoint_syslog_auth_record(
         sd,
         parse_checkpoint_syslog_kv(sd, "action"),
         coalesce(workspace.cp_syslog_class.host, workspace.checkpoint_syslog.hostname),
-        workspace.checkpoint_syslog.time
+        workspace.checkpoint_syslog.time,
+        workspace.checkpoint_syslog_severity.number,
+        workspace.checkpoint_syslog_severity.text
     )
 }
