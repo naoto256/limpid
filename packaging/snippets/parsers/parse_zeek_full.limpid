@@ -104,7 +104,6 @@ def function zeek_generic_4001_record(body, host, time_ns, app_proto) {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  6,                                  // Traffic
-        severity_id:  1,
         status_id:    1,
         time:         time_ns,
         src_endpoint: zeek_endpoint(body.id, "src"),
@@ -134,7 +133,6 @@ def function zeek_signature_record(body, host, time_ns) {
         class_uid:    2004,
         category_uid: 2,
         activity_id:  1,                                  // Create
-        severity_id:  3,
         status_id:    99,
         time:         time_ns,
         finding_info: {
@@ -173,7 +171,6 @@ def function zeek_intel_record(body, host, time_ns) {
         class_uid:    2004,
         category_uid: 2,
         activity_id:  1,                                  // Create
-        severity_id:  3,
         status_id:    99,
         time:         time_ns,
         finding_info: {
@@ -208,7 +205,6 @@ def function zeek_traceroute_record(body, host, time_ns) {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  6,
-        severity_id:  1,
         status_id:    1,
         time:         time_ns,
         src_endpoint: { ip: body.src },
@@ -232,7 +228,6 @@ def function zeek_rfb_record(body, host, time_ns) {
         class_uid:    4005,
         category_uid: 4,
         activity_id:  1,
-        severity_id:  1,
         status_id:    switch true {
             body.auth == true  { 1 }
             body.auth == false { 2 }
