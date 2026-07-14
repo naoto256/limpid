@@ -107,15 +107,6 @@ def function postfix_status_id(s) {
     }
 }
 
-def function postfix_severity_for_status(s) {
-    switch s {
-        "sent"     { 1 }
-        "deferred" { 2 }
-        "bounced"  { 3 }
-        default    { 1 }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Top-level dispatcher
 // ---------------------------------------------------------------------------
@@ -186,7 +177,6 @@ def process parse_postfix_smtp_record {
         category_uid: 4,
         activity_id:  1,
         type_uid:     400901,
-        severity_id:  postfix_severity_for_status(workspace.pf_smtp.status),
         status_id:    postfix_status_id(workspace.pf_smtp.status),
         time:         workspace.postfix.time,
         device: {
@@ -237,7 +227,6 @@ def process parse_postfix_smtpd_connect_record {
         category_uid: 4,
         activity_id:  2,
         type_uid:     400902,
-        severity_id:  1,
         status_id:    1,
         time:         workspace.postfix.time,
         device: {
@@ -266,7 +255,6 @@ def process parse_postfix_smtpd_reject_record {
         category_uid: 4,
         activity_id:  2,
         type_uid:     400902,
-        severity_id:  3,
         status_id:    2,
         time:         workspace.postfix.time,
         device: {
@@ -315,7 +303,6 @@ def process parse_postfix_qmgr_record {
         category_uid: 4,
         activity_id:  1,
         type_uid:     400901,
-        severity_id:  1,
         status_id:    1,
         time:         workspace.postfix.time,
         device: {
@@ -361,7 +348,6 @@ def process parse_postfix_bounce_record {
         category_uid: 4,
         activity_id:  1,
         type_uid:     400901,
-        severity_id:  3,
         status_id:    2,
         time:         workspace.postfix.time,
         device: {
