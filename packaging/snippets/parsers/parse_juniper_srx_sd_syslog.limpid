@@ -78,15 +78,36 @@ def function juniper_srx_sd_syslog_proto_name(p) {
 // instead of protocol-id (RT_IDP).
 include "../functions/proto_num.limpid"
 
-// Map Junos threat-severity to OCSF severity_id (1-5).
-def function juniper_srx_sd_syslog_severity_id(s) {
+// Map the textual Junos IDP threat-severity to OTel SeverityNumber.
+def function juniper_srx_sd_syslog_severity_number(s) {
     switch s {
-        "INFO"     { 1 }
-        "LOW"      { 2 }
-        "MEDIUM"   { 3 }
-        "HIGH"     { 4 }
-        "CRITICAL" { 5 }
-        default    { 1 }
+        "INFO"      { 9 }
+        "LOW"       { 13 }
+        "MEDIUM"    { 17 }
+        "HIGH"      { 19 }
+        "CRITICAL"  { 21 }
+        "UNDEFINED" { null }
+        null        { null }
+        default     { null }
+    }
+}
+
+// Map the exact RT_SECINTEL numeric severity lexeme to OTel SeverityNumber.
+def function juniper_srx_sd_syslog_secintel_severity_number(s) {
+    switch s {
+        "0"  { null }
+        "1"  { 13 }
+        "2"  { 13 }
+        "3"  { 13 }
+        "4"  { 17 }
+        "5"  { 17 }
+        "6"  { 17 }
+        "7"  { 19 }
+        "8"  { 19 }
+        "9"  { 19 }
+        "10" { 21 }
+        null    { null }
+        default { null }
     }
 }
 
@@ -149,12 +170,11 @@ def function juniper_srx_sd_syslog_int_opt(s) {
 // ---------------------------------------------------------------------------
 
 // 4001 Network Activity (RT_FLOW / APPTRACK).
-def function juniper_srx_sd_syslog_network_record(activity_id, status_id, severity_id, src_ip, src_port_str, dst_ip, dst_port_str, proto_str, policy, src_zone, dst_zone, session_id, app, bytes_in_str, bytes_out_str, packets_in_str, packets_out_str, reason, msgid, host, time_ns) {
+def function juniper_srx_sd_syslog_network_record(activity_id, status_id, src_ip, src_port_str, dst_ip, dst_port_str, proto_str, policy, src_zone, dst_zone, session_id, app, bytes_in_str, bytes_out_str, packets_in_str, packets_out_str, reason, msgid, host, time_ns) {
     {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  activity_id,
-        severity_id:  severity_id,
         status_id:    status_id,
         time:         time_ns,
         src_endpoint: {
@@ -201,14 +221,15 @@ def function juniper_srx_sd_syslog_network_record(activity_id, status_id, severi
 
 // 2004 Detection Finding (RT_IDP / RT_IDS / RT_UTM AV/Spam/Content /
 // RT_AAMW / RT_SECINTEL). Common skeleton.
-def function juniper_srx_sd_syslog_finding_record(severity_id, status_id, src_ip, src_port_str, dst_ip, dst_port_str, proto_name, sig_id, sig_name, technique_name, finding_types, action, policy, rule, rulebase, src_zone, dst_zone, msgid, host, time_ns, extra_unmapped) {
+def function juniper_srx_sd_syslog_finding_record(severity_number, severity, status_id, src_ip, src_port_str, dst_ip, dst_port_str, proto_name, sig_id, sig_name, technique_name, finding_types, action, policy, rule, rulebase, src_zone, dst_zone, msgid, host, time_ns, extra_unmapped) {
     {
-        class_uid:    2004,
-        category_uid: 2,
-        activity_id:  1,
-        severity_id:  severity_id,
-        status_id:    status_id,
-        time:         time_ns,
+        class_uid:       2004,
+        category_uid:    2,
+        activity_id:     1,
+        severity_number: severity_number,
+        severity:        severity,
+        status_id:       status_id,
+        time:            time_ns,
         finding_info: {
             uid:   sig_id,
             title: sig_name,
@@ -260,12 +281,11 @@ def function juniper_srx_sd_syslog_finding_record(severity_id, status_id, src_ip
 }
 
 // 4002 HTTP Activity (RT_UTM WEBFILTER_URL_BLOCKED / _PERMITTED).
-def function juniper_srx_sd_syslog_http_record(status_id, severity_id, src_ip, src_port_str, dst_ip, dst_port_str, url, category, reason, profile, username, msgid, host, time_ns) {
+def function juniper_srx_sd_syslog_http_record(status_id, src_ip, src_port_str, dst_ip, dst_port_str, url, category, reason, profile, username, msgid, host, time_ns) {
     {
         class_uid:    4002,
         category_uid: 4,
         activity_id:  3,
-        severity_id:  severity_id,
         status_id:    status_id,
         time:         time_ns,
         src_endpoint: {
@@ -393,7 +413,7 @@ def function parse_juniper_srx_sd_syslog_flow_fields(sd) {
 def process parse_juniper_srx_sd_syslog_flow_create {
     workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
     workspace.lsis.parsed = juniper_srx_sd_syslog_network_record(
-        1, 1, 1,
+        1, 1,
         workspace.srx_sd_fields.src, workspace.srx_sd_fields.src_port,
         workspace.srx_sd_fields.dst, workspace.srx_sd_fields.dst_port,
         workspace.srx_sd_fields.proto,
@@ -411,7 +431,7 @@ def process parse_juniper_srx_sd_syslog_flow_create {
 def process parse_juniper_srx_sd_syslog_flow_close {
     workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
     workspace.lsis.parsed = juniper_srx_sd_syslog_network_record(
-        2, 1, 1,
+        2, 1,
         workspace.srx_sd_fields.src, workspace.srx_sd_fields.src_port,
         workspace.srx_sd_fields.dst, workspace.srx_sd_fields.dst_port,
         workspace.srx_sd_fields.proto,
@@ -430,7 +450,7 @@ def process parse_juniper_srx_sd_syslog_flow_close {
 def process parse_juniper_srx_sd_syslog_flow_deny {
     workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
     workspace.lsis.parsed = juniper_srx_sd_syslog_network_record(
-        6, 2, 3,
+        6, 2,
         workspace.srx_sd_fields.src, workspace.srx_sd_fields.src_port,
         workspace.srx_sd_fields.dst, workspace.srx_sd_fields.dst_port,
         workspace.srx_sd_fields.proto,
@@ -448,7 +468,7 @@ def process parse_juniper_srx_sd_syslog_flow_deny {
 def process parse_juniper_srx_sd_syslog_apptrack_create {
     workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
     workspace.lsis.parsed = juniper_srx_sd_syslog_network_record(
-        1, 1, 1,
+        1, 1,
         workspace.srx_sd_fields.src, workspace.srx_sd_fields.src_port,
         workspace.srx_sd_fields.dst, workspace.srx_sd_fields.dst_port,
         workspace.srx_sd_fields.proto,
@@ -466,7 +486,7 @@ def process parse_juniper_srx_sd_syslog_apptrack_create {
 def process parse_juniper_srx_sd_syslog_apptrack_close {
     workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
     workspace.lsis.parsed = juniper_srx_sd_syslog_network_record(
-        2, 1, 1,
+        2, 1,
         workspace.srx_sd_fields.src, workspace.srx_sd_fields.src_port,
         workspace.srx_sd_fields.dst, workspace.srx_sd_fields.dst_port,
         workspace.srx_sd_fields.proto,
@@ -485,7 +505,7 @@ def process parse_juniper_srx_sd_syslog_apptrack_close {
 def process parse_juniper_srx_sd_syslog_apptrack_volume {
     workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
     workspace.lsis.parsed = juniper_srx_sd_syslog_network_record(
-        99, 1, 1,
+        99, 1,
         workspace.srx_sd_fields.src, workspace.srx_sd_fields.src_port,
         workspace.srx_sd_fields.dst, workspace.srx_sd_fields.dst_port,
         workspace.srx_sd_fields.proto,
@@ -517,11 +537,29 @@ def process parse_juniper_srx_sd_syslog_idp_dispatch {
     }
 }
 
+def process parse_juniper_srx_sd_syslog_normalize_idp_severity {
+    let severity = parse_juniper_srx_sd_syslog_kv_or_null(workspace.srx_sd_class.sd, "threat-severity")
+    let severity_number = juniper_srx_sd_syslog_severity_number(severity)
+    switch true {
+        severity != null and severity != "UNDEFINED" and severity_number == null {
+            error "parse_juniper_srx_sd_syslog: invalid IDP threat severity ${severity}"
+        }
+        default {
+            workspace.srx_sd_severity = {
+                number: severity_number,
+                text:   severity
+            }
+        }
+    }
+}
+
 def process parse_juniper_srx_sd_syslog_idp_attack {
+    process parse_juniper_srx_sd_syslog_normalize_idp_severity
     let sd = workspace.srx_sd_class.sd
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
     workspace.lsis.parsed = juniper_srx_sd_syslog_finding_record(
-        juniper_srx_sd_syslog_severity_id(parse_juniper_srx_sd_syslog_kv(sd, "threat-severity")),
+        workspace.srx_sd_severity.number,
+        workspace.srx_sd_severity.text,
         juniper_srx_sd_syslog_status_id(action),
         parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
         parse_juniper_srx_sd_syslog_kv(sd, "source-port"),
@@ -549,11 +587,13 @@ def process parse_juniper_srx_sd_syslog_idp_attack {
 }
 
 def process parse_juniper_srx_sd_syslog_idp_appddos {
+    process parse_juniper_srx_sd_syslog_normalize_idp_severity
     let sd = workspace.srx_sd_class.sd
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
     let title = coalesce(parse_juniper_srx_sd_syslog_kv(sd, "application-name"), "IDP AppDDoS")
     workspace.lsis.parsed = juniper_srx_sd_syslog_finding_record(
-        4,
+        workspace.srx_sd_severity.number,
+        workspace.srx_sd_severity.text,
         juniper_srx_sd_syslog_status_id(action),
         parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
         parse_juniper_srx_sd_syslog_kv(sd, "source-port"),
@@ -584,7 +624,7 @@ def process parse_juniper_srx_sd_syslog_screen_record {
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
     let attack = parse_juniper_srx_sd_syslog_kv(sd, "attack-name")
     workspace.lsis.parsed = juniper_srx_sd_syslog_finding_record(
-        3,
+        null, null,
         juniper_srx_sd_syslog_status_id(action),
         parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
         parse_juniper_srx_sd_syslog_kv(sd, "source-port"),
@@ -633,7 +673,6 @@ def process parse_juniper_srx_sd_syslog_utm_webfilter {
     let permitted = workspace.srx_sd_class.msgid == "WEBFILTER_URL_PERMITTED"
     workspace.lsis.parsed = juniper_srx_sd_syslog_http_record(
         switch true { permitted { 1 } default { 2 } },
-        switch true { permitted { 1 } default { 3 } },
         parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
         parse_juniper_srx_sd_syslog_kv(sd, "source-port"),
         parse_juniper_srx_sd_syslog_kv(sd, "destination-address"),
@@ -654,7 +693,7 @@ def process parse_juniper_srx_sd_syslog_utm_antivirus {
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
     let virus = coalesce(parse_juniper_srx_sd_syslog_kv(sd, "virus-name"), workspace.srx_sd_class.msgid)
     workspace.lsis.parsed = juniper_srx_sd_syslog_finding_record(
-        4,
+        null, null,
         juniper_srx_sd_syslog_status_id(action),
         parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
         parse_juniper_srx_sd_syslog_kv(sd, "source-port"),
@@ -682,7 +721,7 @@ def process parse_juniper_srx_sd_syslog_utm_antispam {
     let sd = workspace.srx_sd_class.sd
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
     workspace.lsis.parsed = juniper_srx_sd_syslog_finding_record(
-        3,
+        null, null,
         juniper_srx_sd_syslog_status_id(action),
         parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
         null, null, null,
@@ -710,7 +749,7 @@ def process parse_juniper_srx_sd_syslog_utm_content {
     let sd = workspace.srx_sd_class.sd
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
     workspace.lsis.parsed = juniper_srx_sd_syslog_finding_record(
-        3,
+        null, null,
         juniper_srx_sd_syslog_status_id(action),
         parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
         parse_juniper_srx_sd_syslog_kv(sd, "source-port"),
@@ -756,7 +795,7 @@ def process parse_juniper_srx_sd_syslog_aamw_action {
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
     let mal = coalesce(parse_juniper_srx_sd_syslog_kv_or_null(sd, "malware-info"), "AAMW action")
     workspace.lsis.parsed = juniper_srx_sd_syslog_finding_record(
-        4,
+        null, null,
         juniper_srx_sd_syslog_status_id(action),
         parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
         parse_juniper_srx_sd_syslog_kv(sd, "source-port"),
@@ -789,7 +828,7 @@ def process parse_juniper_srx_sd_syslog_aamw_malware {
     let sd = workspace.srx_sd_class.sd
     let mal = coalesce(parse_juniper_srx_sd_syslog_kv_or_null(sd, "malware-info"), "AAMW malware")
     workspace.lsis.parsed = juniper_srx_sd_syslog_finding_record(
-        4,
+        null, null,
         2,
         parse_juniper_srx_sd_syslog_kv(sd, "client-ip"),
         null, null, null,
@@ -814,7 +853,7 @@ def process parse_juniper_srx_sd_syslog_aamw_malware {
 def process parse_juniper_srx_sd_syslog_aamw_host {
     let sd = workspace.srx_sd_class.sd
     workspace.lsis.parsed = juniper_srx_sd_syslog_finding_record(
-        5,
+        null, null,
         2,
         parse_juniper_srx_sd_syslog_kv(sd, "client-ip"),
         null, null, null,
@@ -845,17 +884,30 @@ def process parse_juniper_srx_sd_syslog_aamw_host {
 // RT_SECINTEL (threat-feed action)
 // ---------------------------------------------------------------------------
 
+def process parse_juniper_srx_sd_syslog_normalize_secintel_severity {
+    let severity = parse_juniper_srx_sd_syslog_kv_or_null(workspace.srx_sd_class.sd, "threat-severity")
+    let severity_number = juniper_srx_sd_syslog_secintel_severity_number(severity)
+    switch true {
+        severity != null and severity != "0" and severity_number == null {
+            error "parse_juniper_srx_sd_syslog: invalid SecIntel threat severity ${severity}"
+        }
+        default {
+            workspace.srx_sd_secintel_severity = {
+                number: severity_number,
+                raw:    severity
+            }
+        }
+    }
+}
+
 def process parse_juniper_srx_sd_syslog_secintel_record {
+    process parse_juniper_srx_sd_syslog_normalize_secintel_severity
     let sd = workspace.srx_sd_class.sd
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
-    let sev_str = parse_juniper_srx_sd_syslog_kv(sd, "threat-severity")
     let title = coalesce(parse_juniper_srx_sd_syslog_kv_or_null(sd, "feed-name"), "SecIntel")
     workspace.lsis.parsed = juniper_srx_sd_syslog_finding_record(
-        switch true {
-            sev_str == "0"  { 1 }
-            sev_str == null { 1 }
-            default         { juniper_srx_sd_syslog_int_opt(sev_str) }
-        },
+        workspace.srx_sd_secintel_severity.number,
+        null,
         juniper_srx_sd_syslog_status_id(action),
         parse_juniper_srx_sd_syslog_kv(sd, "source-address"),
         parse_juniper_srx_sd_syslog_kv(sd, "source-port"),
@@ -874,12 +926,13 @@ def process parse_juniper_srx_sd_syslog_secintel_record {
         coalesce(workspace.srx_sd_class.host, workspace.juniper_srx_sd_syslog.hostname),
         workspace.juniper_srx_sd_syslog.time,
         {
-            category:      parse_juniper_srx_sd_syslog_kv(sd, "category"),
-            sub_category:  parse_juniper_srx_sd_syslog_kv(sd, "sub-category"),
-            action_detail: parse_juniper_srx_sd_syslog_kv(sd, "action-detail"),
-            http_host:     parse_juniper_srx_sd_syslog_kv(sd, "http-host"),
-            session_id:    parse_juniper_srx_sd_syslog_kv(sd, "session-id-32"),
-            username:      parse_juniper_srx_sd_syslog_kv_or_null(sd, "username")
+            category:        parse_juniper_srx_sd_syslog_kv(sd, "category"),
+            sub_category:    parse_juniper_srx_sd_syslog_kv(sd, "sub-category"),
+            action_detail:   parse_juniper_srx_sd_syslog_kv(sd, "action-detail"),
+            http_host:       parse_juniper_srx_sd_syslog_kv(sd, "http-host"),
+            session_id:      parse_juniper_srx_sd_syslog_kv(sd, "session-id-32"),
+            username:        parse_juniper_srx_sd_syslog_kv_or_null(sd, "username"),
+            threat_severity: workspace.srx_sd_secintel_severity.raw
         }
     )
 }
