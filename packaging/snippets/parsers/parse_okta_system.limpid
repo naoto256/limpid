@@ -26,6 +26,7 @@
 // Wire —        JSON — one Okta System Log event per `ingress`. The
 //              shape on the wire is the documented LogEvent object:
 //              `eventType` (dotted taxonomy, e.g. `user.session.start`),
+//              `severity` (DEBUG / INFO / WARN / ERROR),
 //              `outcome.result` (SUCCESS / FAILURE / ALLOW / DENY /
 //              CHALLENGE), `actor.{id,type,displayName,alternateId}`,
 //              `target[]` (zero or more `{type,id,displayName,alternateId}`
@@ -49,6 +50,7 @@
 //
 // Sample input (user.session.start, SUCCESS, abridged):
 //   {"eventType":"user.session.start","published":"2026-04-29T10:00:00.000Z",
+//    "severity":"INFO",
 //    "outcome":{"result":"SUCCESS"},
 //    "actor":{"id":"00u123","type":"User","alternateId":"alice@example.com",
 //             "displayName":"Alice Example"},
@@ -83,15 +85,15 @@ def function okta_status_id(result) {
     }
 }
 
-// Map Okta `outcome.result` to OCSF severity_id. Failures escalate;
-// terminal allow/deny stays Informational since Okta itself does not
-// emit a severity field per event.
-def function okta_severity_id(result) {
-    switch result {
-        "FAILURE" { 3 }
-        "DENY"    { 3 }
-        null      { 1 }
-        default   { 1 }
+// Map Okta System Log `severity` to OTel SeverityNumber.
+def function okta_severity_number(severity) {
+    switch severity {
+        "DEBUG" { 5 }
+        "INFO"  { 9 }
+        "WARN"  { 13 }
+        "ERROR" { 17 }
+        null    { null }
+        default { null }
     }
 }
 
@@ -237,14 +239,22 @@ def process parse_okta_system {
         workspace.okta.target != null and not is_array(workspace.okta.target) {
             error "parse_okta_system: target field is not an array (got ${workspace.okta.target}): ${ingress}"
         }
-        starts_with(et, "user.session.")            { process parse_okta_user_authentication }
-        starts_with(et, "user.authentication.")     { process parse_okta_user_authentication }
-        starts_with(et, "user.lifecycle.")          { process parse_okta_user_lifecycle }
-        starts_with(et, "user.account.")            { process parse_okta_user_account }
-        starts_with(et, "group.user_membership.")   { process parse_okta_group_membership }
-        starts_with(et, "group.lifecycle.")         { process parse_okta_group_lifecycle }
-        starts_with(et, "group.privilege.")         { process parse_okta_group_privilege }
-        default                                     { error "parse_okta_system: unsupported eventType ${et}" }
+        default {
+            workspace.okta.severity_number = okta_severity_number(workspace.okta.severity)
+            switch true {
+                workspace.okta.severity != null and workspace.okta.severity_number == null {
+                    error "parse_okta_system: invalid Okta System Log severity ${workspace.okta.severity}"
+                }
+                starts_with(et, "user.session.")          { process parse_okta_user_authentication }
+                starts_with(et, "user.authentication.")   { process parse_okta_user_authentication }
+                starts_with(et, "user.lifecycle.")        { process parse_okta_user_lifecycle }
+                starts_with(et, "user.account.")          { process parse_okta_user_account }
+                starts_with(et, "group.user_membership.") { process parse_okta_group_membership }
+                starts_with(et, "group.lifecycle.")       { process parse_okta_group_lifecycle }
+                starts_with(et, "group.privilege.")       { process parse_okta_group_privilege }
+                default                                   { error "parse_okta_system: unsupported eventType ${et}" }
+            }
+        }
     }
 }
 
@@ -261,13 +271,14 @@ def process parse_okta_system {
 //   user.authentication.verify         → 99 Other (MFA step)
 //   anything else under user.session./user.authentication. → 99 Other
 
-def function okta_authentication_record(activity_id, status_id, severity_id, time, user, actor_user, src_endpoint, http_request, message, event_type) {
+def function okta_authentication_record(activity_id, status_id, severity_number, severity, time, user, actor_user, src_endpoint, http_request, message, event_type) {
     {
         class_uid:    3002,
         category_uid: 3,
         activity_id:  activity_id,
         type_uid:     3002 * 100 + activity_id,
-        severity_id:  severity_id,
+        severity_number: severity_number,
+        severity:        severity,
         status_id:    status_id,
         time:         time,
         user:         user,
@@ -303,7 +314,8 @@ def process parse_okta_user_authentication {
     workspace.lsis.parsed = okta_authentication_record(
         activity_id,
         okta_status_id(ev.outcome.result),
-        okta_severity_id(ev.outcome.result),
+        ev.severity_number,
+        ev.severity,
         okta_time(ev.published),
         subject_user,
         okta_user(ev.actor),
@@ -335,13 +347,14 @@ def process parse_okta_user_authentication {
 //   user.lifecycle.lock                   → 9 Lock
 //   anything else under user.lifecycle.   → 99 Other
 
-def function okta_account_change_record(activity_id, status_id, severity_id, time, user, actor_user, src_endpoint, http_request, message, event_type) {
+def function okta_account_change_record(activity_id, status_id, severity_number, severity, time, user, actor_user, src_endpoint, http_request, message, event_type) {
     {
         class_uid:    3001,
         category_uid: 3,
         activity_id:  activity_id,
         type_uid:     3001 * 100 + activity_id,
-        severity_id:  severity_id,
+        severity_number: severity_number,
+        severity:        severity,
         status_id:    status_id,
         time:         time,
         user:         user,
@@ -374,7 +387,8 @@ def process parse_okta_user_lifecycle {
     workspace.lsis.parsed = okta_account_change_record(
         activity_id,
         okta_status_id(ev.outcome.result),
-        okta_severity_id(ev.outcome.result),
+        ev.severity_number,
+        ev.severity,
         okta_time(ev.published),
         okta_user(subject_target),
         okta_user(ev.actor),
@@ -417,13 +431,14 @@ def process parse_okta_user_lifecycle {
 // user resetting their own password): the target list still
 // contains the same User and the mapping survives.
 
-def function okta_user_management_record(activity_id, status_id, severity_id, time, user, actor_user, src_endpoint, http_request, message, event_type) {
+def function okta_user_management_record(activity_id, status_id, severity_number, severity, time, user, actor_user, src_endpoint, http_request, message, event_type) {
     {
         class_uid:    3005,
         category_uid: 3,
         activity_id:  activity_id,
         type_uid:     3005 * 100 + activity_id,
-        severity_id:  severity_id,
+        severity_number: severity_number,
+        severity:        severity,
         status_id:    status_id,
         time:         time,
         user:         user,
@@ -459,7 +474,8 @@ def process parse_okta_user_account {
             workspace.lsis.parsed = okta_user_management_record(
                 activity_id,
                 okta_status_id(ev.outcome.result),
-                okta_severity_id(ev.outcome.result),
+                ev.severity_number,
+                ev.severity,
                 okta_time(ev.published),
                 okta_user(subject_target),
                 okta_user(ev.actor),
@@ -495,13 +511,14 @@ def process parse_okta_user_account {
 // null when the requested type is absent, which is the documented
 // shape for the lifecycle case.
 
-def function okta_group_management_record(activity_id, status_id, severity_id, time, group, member_user, actor_user, src_endpoint, http_request, message, event_type) {
+def function okta_group_management_record(activity_id, status_id, severity_number, severity, time, group, member_user, actor_user, src_endpoint, http_request, message, event_type) {
     {
         class_uid:    3006,
         category_uid: 3,
         activity_id:  activity_id,
         type_uid:     3006 * 100 + activity_id,
-        severity_id:  severity_id,
+        severity_number: severity_number,
+        severity:        severity,
         status_id:    status_id,
         time:         time,
         group:        group,
@@ -534,7 +551,8 @@ def process parse_okta_group_membership {
             workspace.lsis.parsed = okta_group_management_record(
                 activity_id,
                 okta_status_id(ev.outcome.result),
-                okta_severity_id(ev.outcome.result),
+                ev.severity_number,
+                ev.severity,
                 okta_time(ev.published),
                 okta_group(group_target),
                 okta_user(member_target),
@@ -565,7 +583,8 @@ def process parse_okta_group_lifecycle {
             workspace.lsis.parsed = okta_group_management_record(
                 activity_id,
                 okta_status_id(ev.outcome.result),
-                okta_severity_id(ev.outcome.result),
+                ev.severity_number,
+                ev.severity,
                 okta_time(ev.published),
                 okta_group(group_target),
                 null,
@@ -599,7 +618,8 @@ def process parse_okta_group_privilege {
             workspace.lsis.parsed = okta_group_management_record(
                 activity_id,
                 okta_status_id(ev.outcome.result),
-                okta_severity_id(ev.outcome.result),
+                ev.severity_number,
+                ev.severity,
                 okta_time(ev.published),
                 okta_group(group_target),
                 null,
