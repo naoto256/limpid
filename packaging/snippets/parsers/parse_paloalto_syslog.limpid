@@ -11,6 +11,9 @@
 // Wire —    syslog-wrapped CSV — `<priority>timestamp host FUTURE_USE,RecvTime,Serial,Type,Subtype,...`
 //          PAN-OS native CSV log format (positional, ~60-117 fields per
 //          Type; Next-Generation Firewalls — PA-series, VM-series).
+//          The outer syslog priority is transport metadata. Of the
+//          supported standard-format bodies, only THREAT carries the
+//          independent source `Severity` field (position 35).
 //
 // PAN-OS encodes the log Type at position 4 in the CSV row —
 //   "TRAFFIC"        — connection start/end (OCSF Network Activity 4001)
@@ -39,16 +42,36 @@
 // Vendor-specific mapping helpers (PAN-OS dialect)
 // ---------------------------------------------------------------------------
 
-// PAN-OS Severity is an enum string in the syslog format (informational
-// / low / medium / high / critical). Map to OCSF severity_id (1-6).
-def function paloalto_syslog_severity_id(sev) {
-    switch lower(sev) {
-        "informational" { 1 }
-        "low"           { 2 }
-        "medium"        { 3 }
-        "high"          { 4 }
-        "critical"      { 5 }
-        default         { 0 }
+// PAN-OS standard THREAT CSV `Severity` → OTel SeverityNumber. The
+// documented wire domain is lowercase and is matched exactly.
+def function paloalto_syslog_severity_number(sev) {
+    switch sev {
+        "informational" { 9 }
+        "low"           { 13 }
+        "medium"        { 17 }
+        "high"          { 19 }
+        "critical"      { 21 }
+        null             { null }
+        default          { null }
+    }
+}
+
+def process parse_paloalto_syslog_normalize_threat_severity {
+    let severity = switch workspace.pan.Severity {
+        ""      { null }
+        default { workspace.pan.Severity }
+    }
+    let severity_number = paloalto_syslog_severity_number(severity)
+    switch true {
+        severity != null and severity_number == null {
+            error "parse_paloalto_syslog: invalid PAN-OS THREAT severity ${severity}"
+        }
+        default {
+            workspace.paloalto_syslog_severity = {
+                number: severity_number,
+                text:   severity
+            }
+        }
     }
 }
 
@@ -184,7 +207,6 @@ def process parse_paloalto_syslog_traffic {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  paloalto_syslog_traffic_action_to_activity_id(workspace.pan.Action),
-        severity_id:  1,
         src_endpoint: {
             ip:       workspace.pan.SourceAddress,
             port:     to_int(workspace.pan.SourcePort),
@@ -323,6 +345,7 @@ def process parse_paloalto_syslog_threat {
 // Subtype leaf: THREAT/url → OCSF Web Resource Access (6004)
 // ---------------------------------------------------------------------------
 def process parse_paloalto_syslog_threat_url {
+    process parse_paloalto_syslog_normalize_threat_severity
     let activity = switch workspace.pan.Action {
         "block-url"    { 2 }
         "block"        { 2 }
@@ -338,10 +361,11 @@ def process parse_paloalto_syslog_threat_url {
         default        { 0 }
     }
     workspace.lsis.parsed = {
-        class_uid:    6004,
-        category_uid: 6,
-        activity_id:  activity,
-        severity_id:  paloalto_syslog_severity_id(workspace.pan.Severity),
+        class_uid:       6004,
+        category_uid:    6,
+        activity_id:     activity,
+        severity_number: workspace.paloalto_syslog_severity.number,
+        severity:        workspace.paloalto_syslog_severity.text,
         src_endpoint: {
             ip:   workspace.pan.SourceAddress,
             port: to_int(workspace.pan.SourcePort)
@@ -378,11 +402,13 @@ def process parse_paloalto_syslog_threat_url {
 // Subtype leaf: THREAT/wildfire → OCSF Detection Finding (2004) Malware
 // ---------------------------------------------------------------------------
 def process parse_paloalto_syslog_threat_wildfire {
+    process parse_paloalto_syslog_normalize_threat_severity
     workspace.lsis.parsed = {
-        class_uid:    2004,
-        category_uid: 2,
-        activity_id:    1,
-        severity_id:    paloalto_syslog_severity_id(workspace.pan.Severity),
+        class_uid:       2004,
+        category_uid:    2,
+        activity_id:     1,
+        severity_number: workspace.paloalto_syslog_severity.number,
+        severity:        workspace.paloalto_syslog_severity.text,
         disposition_id: paloalto_syslog_threat_disposition_id(workspace.pan.Action),
         finding_info: {
             title: workspace.pan.ThreatName,
@@ -426,11 +452,13 @@ def process parse_paloalto_syslog_threat_wildfire {
 // Subtype leaf: THREAT/virus → OCSF Detection Finding (2004) Malware
 // ---------------------------------------------------------------------------
 def process parse_paloalto_syslog_threat_virus {
+    process parse_paloalto_syslog_normalize_threat_severity
     workspace.lsis.parsed = {
-        class_uid:    2004,
-        category_uid: 2,
-        activity_id:    1,
-        severity_id:    paloalto_syslog_severity_id(workspace.pan.Severity),
+        class_uid:       2004,
+        category_uid:    2,
+        activity_id:     1,
+        severity_number: workspace.paloalto_syslog_severity.number,
+        severity:        workspace.paloalto_syslog_severity.text,
         disposition_id: paloalto_syslog_threat_disposition_id(workspace.pan.Action),
         finding_info: {
             title: workspace.pan.ThreatName,
@@ -474,11 +502,13 @@ def process parse_paloalto_syslog_threat_virus {
 //             → OCSF Detection Finding (2004) generic
 // ---------------------------------------------------------------------------
 def process parse_paloalto_syslog_threat_generic {
+    process parse_paloalto_syslog_normalize_threat_severity
     workspace.lsis.parsed = {
-        class_uid:    2004,
-        category_uid: 2,
-        activity_id:    1,
-        severity_id:    paloalto_syslog_severity_id(workspace.pan.Severity),
+        class_uid:       2004,
+        category_uid:    2,
+        activity_id:     1,
+        severity_number: workspace.paloalto_syslog_severity.number,
+        severity:        workspace.paloalto_syslog_severity.text,
         disposition_id: paloalto_syslog_threat_disposition_id(workspace.pan.Action),
         finding_info: {
             title: workspace.pan.ThreatName,
@@ -562,7 +592,6 @@ def process parse_paloalto_syslog_globalprotect {
         class_uid:    3002,
         category_uid: 3,
         activity_id:  activity,
-        severity_id:  1,
         status_id:    status,
         user: {
             name: workspace.pan.SourceUser
@@ -636,7 +665,6 @@ def process parse_paloalto_syslog_authentication {
         class_uid:    3002,
         category_uid: 3,
         activity_id:  1,
-        severity_id:  1,
         status_id:    status,
         user: {
             name: workspace.pan.SourceUser
