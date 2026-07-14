@@ -37,23 +37,35 @@
 // Vendor-specific mapping helpers (PAN-OS CEF dialect)
 // ---------------------------------------------------------------------------
 
-// PAN-OS CEF emits severity on a 1-5 scale (NOT the ArcSight CEF
-// 0-10 spec — verified against `$number-of-severity` template token in
-// the device's CEF format string and live samples). Direct passthrough
-// to OCSF severity_id (which uses the same 1-5 enum):
-//   1 Informational → 1
-//   2 Low           → 2
-//   3 Medium        → 3
-//   4 High          → 4
-//   5 Critical      → 5
-def function paloalto_cef_severity_id(sev) {
+// PAN-OS 10 CEF templates emit header severity on an exact numeric 1-5
+// scale, separate from the outer syslog PRI. Map that source scale to
+// OTel SeverityNumber:
+//   1 → INFO  (9)
+//   2 → WARN  (13)
+//   3 → ERROR (17)
+//   4 → ERROR3 (19)
+//   5 → FATAL (21)
+def function paloalto_cef_severity_number(sev) {
     switch sev {
-        1       { 1 }
-        2       { 2 }
-        3       { 3 }
-        4       { 4 }
-        5       { 5 }
-        default { 0 }
+        1       { 9 }
+        2       { 13 }
+        3       { 17 }
+        4       { 19 }
+        5       { 21 }
+        null    { null }
+        default { null }
+    }
+}
+
+def process parse_paloalto_cef_normalize_severity {
+    let severity_number = paloalto_cef_severity_number(workspace.cef.severity)
+    switch true {
+        workspace.cef.severity != null and severity_number == null {
+            error "parse_paloalto_cef: invalid PAN-OS CEF severity ${workspace.cef.severity}"
+        }
+        default {
+            workspace.paloalto_cef.severity_number = severity_number
+        }
     }
 }
 
@@ -139,11 +151,12 @@ def process parse_paloalto_cef {
 //   workspace.cef populated by `parse_paloalto_cef` dispatcher or an
 //   inline `cef.parse(...)` upstream of this process.
 def process parse_paloalto_cef_traffic {
+    process parse_paloalto_cef_normalize_severity
     workspace.lsis.parsed = {
-        class_uid:    4001,
-        category_uid: 4,
-        activity_id:  paloalto_cef_traffic_action_to_activity_id(workspace.cef.act),
-        severity_id:  paloalto_cef_severity_id(workspace.cef.severity),
+        class_uid:       4001,
+        category_uid:    4,
+        activity_id:     paloalto_cef_traffic_action_to_activity_id(workspace.cef.act),
+        severity_number: workspace.paloalto_cef.severity_number,
         src_endpoint: {
             ip:   workspace.cef.src,
             port: to_int(workspace.cef.spt)
@@ -163,6 +176,9 @@ def process parse_paloalto_cef_traffic {
         app_name: workspace.cef.app,
         actor: {
             user: { name: workspace.cef.suser }
+        },
+        unmapped: {
+            cef_severity: workspace.cef.severity
         },
         metadata: {
             product: {
@@ -198,11 +214,12 @@ def process parse_paloalto_cef_traffic {
 //   suser            — source user
 //   app              — application
 def process parse_paloalto_cef_threat {
+    process parse_paloalto_cef_normalize_severity
     workspace.lsis.parsed = {
-        class_uid:    2004,
-        category_uid: 2,
-        activity_id:    1,
-        severity_id:    paloalto_cef_severity_id(workspace.cef.severity),
+        class_uid:       2004,
+        category_uid:    2,
+        activity_id:     1,
+        severity_number: workspace.paloalto_cef.severity_number,
         disposition_id: paloalto_cef_threat_disposition_id(workspace.cef.act),
         finding_info: {
             title: workspace.cef.signature_id,
@@ -222,6 +239,9 @@ def process parse_paloalto_cef_threat {
         actor: {
             user: { name: workspace.cef.suser }
         },
+        unmapped: {
+            cef_severity: workspace.cef.severity
+        },
         metadata: {
             product: {
                 vendor_name: workspace.cef.device_vendor,
@@ -237,8 +257,8 @@ def process parse_paloalto_cef_threat {
 // Subtype leaf: URL → OCSF Web Resource Access (6004)
 // ---------------------------------------------------------------------------
 //
-// PAN-OS URL filtering log fields (CEF ext, verified against this
-// deployment's CEF format string at /config/shared/log-settings):
+// PAN-OS URL filtering log fields (CEF ext, verified against the
+// PAN-OS CEF format string structure):
 //   CEF header signature_id — URL category ($threatid template token
 //                              for URL logs renders as the matched
 //                              URL category, e.g. "social-networking")
@@ -251,6 +271,7 @@ def process parse_paloalto_cef_threat {
 //   suser                   — source user
 //   app                     — application context
 def process parse_paloalto_cef_url {
+    process parse_paloalto_cef_normalize_severity
     let activity = switch workspace.cef.act {
         "block-url" { 2 }
         "block"     { 2 }
@@ -263,10 +284,10 @@ def process parse_paloalto_cef_url {
         default     { 0 }
     }
     workspace.lsis.parsed = {
-        class_uid:    6004,
-        category_uid: 6,
-        activity_id:  activity,
-        severity_id:  paloalto_cef_severity_id(workspace.cef.severity),
+        class_uid:       6004,
+        category_uid:    6,
+        activity_id:     activity,
+        severity_number: workspace.paloalto_cef.severity_number,
         src_endpoint: {
             ip:   workspace.cef.src,
             port: to_int(workspace.cef.spt)
@@ -287,6 +308,9 @@ def process parse_paloalto_cef_url {
         ],
         actor: {
             user: { name: workspace.cef.suser }
+        },
+        unmapped: {
+            cef_severity: workspace.cef.severity
         },
         metadata: {
             product: {
@@ -316,6 +340,7 @@ def process parse_paloalto_cef_url {
 //   externalId             — sample id
 //   request                — fetch URL when HTTP-delivered
 def process parse_paloalto_cef_wildfire {
+    process parse_paloalto_cef_normalize_severity
     let disposition = switch workspace.cef.cs1 {
         "malicious" { 2 }
         "phishing"  { 2 }
@@ -324,10 +349,10 @@ def process parse_paloalto_cef_wildfire {
         default     { 0 }
     }
     workspace.lsis.parsed = {
-        class_uid:    2004,
-        category_uid: 2,
-        activity_id:    1,
-        severity_id:    paloalto_cef_severity_id(workspace.cef.severity),
+        class_uid:       2004,
+        category_uid:    2,
+        activity_id:     1,
+        severity_number: workspace.paloalto_cef.severity_number,
         disposition_id: disposition,
         finding_info: {
             title: workspace.cef.cs1,
@@ -350,6 +375,9 @@ def process parse_paloalto_cef_wildfire {
         ],
         src_endpoint: { ip: workspace.cef.src },
         dst_endpoint: { ip: workspace.cef.dst },
+        unmapped: {
+            cef_severity: workspace.cef.severity
+        },
         metadata: {
             product: {
                 vendor_name: workspace.cef.device_vendor,
@@ -373,6 +401,7 @@ def process parse_paloalto_cef_wildfire {
 //   cs1Label="GatewayName"
 //   reason           — failure reason (when applicable)
 def process parse_paloalto_cef_globalprotect {
+    process parse_paloalto_cef_normalize_severity
     let activity = switch workspace.cef.act {
         "login"        { 1 }
         "connected"    { 1 }
@@ -386,15 +415,18 @@ def process parse_paloalto_cef_globalprotect {
         default  { 1 }
     }
     workspace.lsis.parsed = {
-        class_uid:    3002,
-        category_uid: 3,
-        activity_id:  activity,
-        severity_id:  paloalto_cef_severity_id(workspace.cef.severity),
-        status_id:    status,
-        time:         received_at,
+        class_uid:       3002,
+        category_uid:    3,
+        activity_id:     activity,
+        severity_number: workspace.paloalto_cef.severity_number,
+        status_id:       status,
+        time:            received_at,
         user: { name: workspace.cef.suser },
         src_endpoint: { ip: workspace.cef.src },
         message:      workspace.cef.reason,
+        unmapped: {
+            cef_severity: workspace.cef.severity
+        },
         metadata: {
             product: {
                 vendor_name: workspace.cef.device_vendor,
@@ -417,20 +449,24 @@ def process parse_paloalto_cef_globalprotect {
 //   src     — source IP
 //   reason  — failure reason
 def process parse_paloalto_cef_authentication {
+    process parse_paloalto_cef_normalize_severity
     let status = switch workspace.cef.act {
         "success" { 1 }
         "failure" { 2 }
         default   { 0 }
     }
     workspace.lsis.parsed = {
-        class_uid:    3002,
-        category_uid: 3,
-        activity_id:  1,
-        severity_id:  paloalto_cef_severity_id(workspace.cef.severity),
-        status_id:    status,
+        class_uid:       3002,
+        category_uid:    3,
+        activity_id:     1,
+        severity_number: workspace.paloalto_cef.severity_number,
+        status_id:       status,
         user:         { name: workspace.cef.suser },
         src_endpoint: { ip: workspace.cef.src },
         message:      workspace.cef.reason,
+        unmapped: {
+            cef_severity: workspace.cef.severity
+        },
         metadata: {
             product: {
                 vendor_name: workspace.cef.device_vendor,
