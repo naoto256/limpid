@@ -55,12 +55,11 @@ optional; readers handle absence gracefully. Do not look for a schema
 with required fields here. There isn't one, by design. Writers:
 parsers. Readers: everyone.
 
-Bundled semantic parsers are migrating from the legacy OCSF
-`parsed.severity_id` slot. During that transition `compose_ocsf` prefers
-canonical `severity_number`, accepts `severity_id` only as a lower-priority
-compatibility input, and supplies OCSF's required Unknown (0) only at the
-output boundary when neither a number nor source-specific severity text is
-available.
+Bundled semantic parsers write canonical `severity_number` and, when the source
+provides one, exact source text in `severity`. `compose_ocsf` retains
+`severity_id` only as a lower-priority compatibility input for legacy or
+out-of-tree callers, and supplies OCSF's required Unknown (0) only at the output
+boundary when neither a number nor source-specific severity text is available.
 
 ### `workspace.lsis.shed.*` — plumbing (a hand-off contract)
 
@@ -131,11 +130,11 @@ consumers:
 | `compose_otlp` | `workspace.lsis.shed.otlp.*` (resource attributes; scope name/version/attributes; log_record body/attributes/severity_text/observed-time overrides) + parsed time/severity graceful reads; observed time defaults to `received_at` | `composers/compose_otlp.limpid` |
 | `compose_rfc5424` | `workspace.lsis.shed.rfc5424.*` (pri / timestamp / hostname / app_name / procid / msgid / sd / msg) | `composers/compose_rfc5424.limpid` |
 
-`compose_ocsf` and `compose_replayable` do not read shed slots; they
-read `parsed.*` directly. A composer adds a shed sub-tree when its
-target has structural room the LSIS facts layer cannot express (OTLP
-target-specific attributes, RFC 5424 fields that the pack cannot
-synthesise on the caller's behalf).
+`compose_ocsf` reads `parsed.*` directly. `compose_replayable` reads the ambient
+event metadata and raw input (`received_at`, `source`, and `ingress`). Neither
+uses shed slots. A composer adds a shed sub-tree when its target has structural
+room the LSIS facts layer cannot express (OTLP target-specific attributes,
+RFC 5424 fields that the pack cannot synthesise on the caller's behalf).
 
 ## What's included
 
@@ -283,15 +282,14 @@ def input fw_syslog {
     bind "0.0.0.0:514"
 }
 
-def output ama {
-    type tcp
-    address "127.0.0.1:28330"
+def output ocsf_stdout {
+    type stdout
 }
 
 def pipeline fw_to_ocsf {
     input fw_syslog
     process parse_fortigate_cef | compose_ocsf | ocsf_to_egress
-    output ama
+    output ocsf_stdout
 }
 ```
 
@@ -299,8 +297,10 @@ That's it. The parser writes facts to `workspace.lsis.parsed.*`;
 `compose_ocsf` reads `workspace.lsis.parsed.*` and writes OCSF JSON
 to `workspace.lsis.composed.ocsf`; the one-line `ocsf_to_egress`
 step at the tail of the pipeline hands that slot off to `egress`.
-Add `output` to your SIEM / data-lake destination (Sentinel, Splunk,
-Security Lake, OTLP, …) and you're shipping OCSF.
+Replace `ocsf_stdout` with an output that accepts OCSF JSON and you're shipping
+to your SIEM or data lake. An OTLP output requires the envelope-wrapped pipeline
+shown below; OCSF JSON cannot be connected to `otlp_http` or `otlp_grpc`
+directly.
 
 ## Design principles
 
