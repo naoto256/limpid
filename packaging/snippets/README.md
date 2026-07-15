@@ -46,8 +46,8 @@ not in strictness but in the *kind* of contract each one makes.
 ### `workspace.lsis.parsed.*` — facts (a vocabulary contract)
 
 What parsers established about the event: canonical OTel
-`parsed.severity_number`, `parsed.time`, `parsed.device.hostname`, and
-friends. The contract is
+`parsed.severity_number`, exact source spelling `parsed.severity`,
+`parsed.time`, `parsed.device.hostname`, and friends. The contract is
 a dictionary: *if* a field is present under this name, it means this
 — nothing more. The vocabulary leans OCSF but is an open set
 (syslog, CEF, OCSF-shaped, but not limited to), and every field is
@@ -128,7 +128,7 @@ consumers:
 
 | Consumer | Shed sub-tree | See header |
 |---|---|---|
-| `compose_otlp` | `workspace.lsis.shed.otlp.*` (resource attributes; scope name/version/attributes; log_record body/attributes/severity_text/observed_time_unix_nano) | `composers/compose_otlp.limpid` |
+| `compose_otlp` | `workspace.lsis.shed.otlp.*` (resource attributes; scope name/version/attributes; log_record body/attributes/severity_text override/observed_time_unix_nano) + parsed time/severity graceful reads | `composers/compose_otlp.limpid` |
 | `compose_rfc5424` | `workspace.lsis.shed.rfc5424.*` (pri / timestamp / hostname / app_name / procid / msgid / sd / msg) | `composers/compose_rfc5424.limpid` |
 
 `compose_ocsf` and `compose_replayable` do not read shed slots; they

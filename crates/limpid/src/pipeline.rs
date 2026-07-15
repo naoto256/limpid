@@ -1452,4 +1452,219 @@ def pipeline p {
             "memory-backed output 'b' must have empty workspace"
         );
     }
+
+    fn compile_packaged_otlp_composers() -> Result<CompiledConfig> {
+        use std::fs;
+        use std::path::Path;
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut src = String::new();
+        for relative in [
+            "packaging/snippets/functions/timestamp_converter.limpid",
+            "packaging/snippets/functions/severity_converter.limpid",
+            "packaging/snippets/composers/compose_ocsf.limpid",
+            "packaging/snippets/composers/compose_otlp.limpid",
+        ] {
+            src.push_str(&fs::read_to_string(root.join(relative))?);
+            src.push('\n');
+        }
+        src.push_str(
+            r#"
+def input i { type syslog_tcp bind "127.0.0.1:5514" }
+def output o { type stdout }
+
+def pipeline direct_otlp {
+    input i
+    process compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline ocsf_in_otlp {
+    input i
+    process compose_ocsf
+          | {
+              workspace.lsis.shed.otlp.log_record.body =
+                  workspace.lsis.composed.ocsf
+            }
+          | compose_otlp
+          | otlp_to_egress
+    output o
+}
+"#,
+        );
+        compile(&src)
+    }
+
+    fn run_packaged_otlp_composer(
+        cfg: &CompiledConfig,
+        funcs: &FunctionRegistry,
+        pipeline_name: &str,
+        workspace: serde_json::Value,
+    ) -> opentelemetry_proto::tonic::logs::v1::LogRecord {
+        use crate::dsl::value::OwnedValue;
+        use crate::dsl::value_json::json_to_value;
+        use crate::event::OwnedEvent;
+        use bytes::Bytes;
+        use opentelemetry_proto::tonic::logs::v1::ResourceLogs;
+        use prost::Message;
+
+        let mut event = OwnedEvent::new(
+            Bytes::new(),
+            "127.0.0.1:0".parse().expect("valid test source"),
+        );
+        let OwnedValue::Object(workspace) =
+            json_to_value(&workspace).expect("workspace JSON must convert")
+        else {
+            panic!("workspace fixture must be an object");
+        };
+        event.workspace = workspace.into_iter().collect();
+
+        let pipeline = cfg
+            .pipelines
+            .get(pipeline_name)
+            .expect("test pipeline must exist");
+        let result = run_pipeline(
+            pipeline,
+            &event,
+            cfg,
+            funcs,
+            None,
+            None,
+            OutputCapturePolicy::CaptureAll,
+            &mut bumpalo::Bump::new(),
+        )
+        .expect("composer pipeline must run");
+        assert_eq!(result.termination, PipelineTermination::Finished);
+        assert_eq!(result.outputs.len(), 1);
+
+        let resource_logs = ResourceLogs::decode(result.outputs[0].1.egress.as_ref())
+            .expect("composer output must decode as ResourceLogs");
+        resource_logs.scope_logs[0].log_records[0].clone()
+    }
+
+    #[test]
+    fn packaged_compose_otlp_projects_canonical_severity() {
+        use crate::functions::{FunctionRegistry, register_builtins, register_user_functions};
+        use opentelemetry_proto::tonic::common::v1::any_value;
+        use serde_json::json;
+
+        let cfg = compile_packaged_otlp_composers().unwrap();
+        let mut funcs = FunctionRegistry::new();
+        register_builtins(&mut funcs, crate::runtime::init_tables(&cfg).unwrap());
+        register_user_functions(&mut funcs, &cfg);
+
+        for (number, text) in [
+            (9, "INFO"),
+            (13, "WARNING"),
+            (19, "ALERT"),
+            (21, "CRITICAL"),
+        ] {
+            let record = run_packaged_otlp_composer(
+                &cfg,
+                &funcs,
+                "direct_otlp",
+                json!({
+                    "lsis": {
+                        "parsed": {
+                            "time": 1,
+                            "severity_number": number,
+                            "severity": text
+                        }
+                    }
+                }),
+            );
+            assert_eq!(record.severity_number, number);
+            assert_eq!(record.severity_text, text);
+        }
+
+        let overridden = run_packaged_otlp_composer(
+            &cfg,
+            &funcs,
+            "direct_otlp",
+            json!({
+                "lsis": {
+                    "parsed": { "time": 1, "severity_number": 9, "severity": "INFO" },
+                    "shed": { "otlp": { "log_record": { "severity_text": "NOTICE" } } }
+                }
+            }),
+        );
+        assert_eq!(overridden.severity_number, 9);
+        assert_eq!(overridden.severity_text, "NOTICE");
+
+        let missing = run_packaged_otlp_composer(
+            &cfg,
+            &funcs,
+            "direct_otlp",
+            json!({ "lsis": { "parsed": { "time": 1 } } }),
+        );
+        assert_eq!(missing.severity_number, 0);
+        assert_eq!(missing.severity_text, "");
+
+        let text_only = run_packaged_otlp_composer(
+            &cfg,
+            &funcs,
+            "direct_otlp",
+            json!({ "lsis": { "parsed": { "time": 1, "severity": "UNDEFINED" } } }),
+        );
+        assert_eq!(text_only.severity_number, 0);
+        assert_eq!(text_only.severity_text, "UNDEFINED");
+        assert!(matches!(
+            text_only.body.and_then(|body| body.value),
+            Some(any_value::Value::StringValue(body)) if body.is_empty()
+        ));
+    }
+
+    #[test]
+    fn packaged_ocsf_in_otlp_preserves_parsed_severity() {
+        use crate::functions::{FunctionRegistry, register_builtins, register_user_functions};
+        use opentelemetry_proto::tonic::common::v1::any_value;
+        use serde_json::json;
+
+        let cfg = compile_packaged_otlp_composers().unwrap();
+        let mut funcs = FunctionRegistry::new();
+        register_builtins(&mut funcs, crate::runtime::init_tables(&cfg).unwrap());
+        register_user_functions(&mut funcs, &cfg);
+
+        let source_backed = run_packaged_otlp_composer(
+            &cfg,
+            &funcs,
+            "ocsf_in_otlp",
+            json!({
+                "lsis": {
+                    "parsed": {
+                        "class_uid": 3002,
+                        "activity_id": 1,
+                        "time": 1,
+                        "severity_number": 19,
+                        "severity": "HIGH"
+                    }
+                }
+            }),
+        );
+        assert_eq!(source_backed.severity_number, 19);
+        assert_eq!(source_backed.severity_text, "HIGH");
+        let source_backed_body = match source_backed.body.and_then(|body| body.value) {
+            Some(any_value::Value::StringValue(body)) => body,
+            other => panic!("expected OCSF string body, got {other:?}"),
+        };
+        assert!(source_backed_body.contains("\"severity_id\":4"));
+
+        let source_less = run_packaged_otlp_composer(
+            &cfg,
+            &funcs,
+            "ocsf_in_otlp",
+            json!({
+                "lsis": {
+                    "parsed": { "class_uid": 3002, "activity_id": 1, "time": 1 }
+                }
+            }),
+        );
+        assert_eq!(source_less.severity_number, 0);
+        assert_eq!(source_less.severity_text, "");
+        let source_less_body = match source_less.body.and_then(|body| body.value) {
+            Some(any_value::Value::StringValue(body)) => body,
+            other => panic!("expected OCSF string body, got {other:?}"),
+        };
+        assert!(source_less_body.contains("\"severity_id\":0"));
+    }
 }

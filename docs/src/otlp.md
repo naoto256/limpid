@@ -419,6 +419,15 @@ across the 0.7.x line) ships opinionated mappings for common vendors — see
 [Snippet Library](./snippets/README.md). Authors of new snippets
 follow the table conventions documented there.
 
+`compose_otlp` projects the parser's canonical
+`workspace.lsis.parsed.severity_number` directly into
+`SeverityNumber`. When the parser also preserved an exact source token
+in `workspace.lsis.parsed.severity`, the composer uses it as
+`SeverityText`. A caller may replace that text for a specific target by
+setting `workspace.lsis.shed.otlp.log_record.severity_text`; the explicit
+shed value takes precedence. If neither canonical severity field is
+known, OTLP's zero/empty defaults are left on the wire.
+
 ### 5.6 Retry: transport-level only
 
 The output module retries the *whole* `ExportLogsServiceRequest` on
