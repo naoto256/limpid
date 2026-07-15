@@ -14,6 +14,6 @@ Both forms register into the same [`FunctionRegistry`](./expression-functions.md
 Where they differ:
 
 - **Built-in primitives** can be stateful or schema-aware (`syslog.parse`, `cef.parse`, `geoip`, `table_lookup`, `hostname`). Adding a new one means a Rust commit and a daemon rebuild.
-- **User-defined functions** are pure — no Event reads, no side effects, no recursion — and live in the DSL. Adding one is a config edit, no daemon rebuild. They're the right place for vendor-agnostic mappings (protocol number → name, severity string → OCSF `severity_id`, action string → activity_id).
+- **User-defined functions** are pure — no Event reads, no side effects, no recursion — and live in the DSL. Adding one is a config edit, no daemon rebuild. They're the right place for mappings with explicit input domains (protocol number → name, a documented source severity vocabulary → OTel `SeverityNumber`, action string → activity_id).
 
 The functions vs processes choice — when to write `def function` vs `def process` — is documented under [Process Design Guide → Functions vs. processes](../processing/design-guide.md#functions-vs-processes).
