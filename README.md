@@ -60,7 +60,7 @@ def process compose_ocsf_detection_finding {
 
 Each `def process` is one small responsibility — parse one vendor, shape one schema, drop one class of events. A pipeline is a chain of them, separated by `|`, written in the same DSL whether you authored the piece yourself or pulled it from the library.
 
-The day you need to ship Cisco ASA logs to the same destination, you write `parse_asa` and reuse `compose_ocsf` unchanged. The day you want to drop debug-level events before they leave, you slot in a `drop_debug` ahead of the chain. The day a vendor adds a field, you edit the parser snippet and `SIGHUP`. Each change is a swap, an insertion, or an edit on one named piece — never a rewrite of the whole pipeline.
+The day you need to ship Cisco ASA logs to the same destination, you include the bundled `parse_asa` and reuse `compose_ocsf` unchanged. The day you want to drop debug-level events before they leave, you slot in a `drop_debug` ahead of the chain. The day a vendor adds a field, you edit the parser snippet and `SIGHUP`. Each change is a swap, an insertion, or an edit on one named piece — never a rewrite of the whole pipeline.
 
 ## Why this is different
 
@@ -143,28 +143,12 @@ See the [Getting Started guide](docs/src/getting-started.md) for installation, .
 
 \* `journal` and `kafka` are feature-gated — build with `--features journal` / `--features kafka` (see [Quick start](#quick-start)).
 
-### Upgrading from earlier versions
-
-The `output tcp` and `output udp` modules have been renamed to `output syslog_tcp` and `output syslog_udp` to match the input-side naming. Configs using the old type names are rejected at startup; no alias is retained.
-
-The DSL surface for these outputs also changed: the top-level `address` property carrying a `host:port` string (and `host` + `port`) is removed in favour of `peer { host port }` (single destination) or `peers { peer { ... } ... }` (round-robin across multiple destinations). See `CHANGELOG.md` for the full diff and `docs/src/outputs/syslog-tcp.md` (and `-udp.md`) for the new shape.
-
-`output syslog_tcp` accepts a per-peer `tls` block (inline or named-profile reference) so plaintext and TLS destinations can share one peer list. Default port flips per peer: 6514 (RFC 5425) when `tls` is set on that peer, 514 (RFC 6587) otherwise. Optional client mTLS via the same block (`cert` / `key` / `ca`). The standalone `output syslog_tls` module that shipped briefly in 0.7.4 is removed in 0.7.6 — see `CHANGELOG.md` for migration.
-
-`input syslog_tcp` accepts the same optional `tls { cert key ca }` block for TLS termination on the listener side (`ca` enables mTLS client-cert verification). Default port flips with the block: 6514 when TLS is configured, 514 otherwise. The standalone `input syslog_tls` module is removed in 0.7.6 — see `CHANGELOG.md` for migration. (`input otlp_http` gains the same `tls { ... }` block in the same release; `input otlp_grpc` already had it.)
-
-`output kafka` gains optional `tls { ca cert key }` and `sasl { mechanism username password_file }` blocks. With both configured the producer talks SASL/SCRAM (or PLAIN) over TLS — the standard production combination. `cert + key` in `tls` enables mTLS; `password_file` (not inline `password`) is the only supported way to pass SASL credentials, matching the on-disk-with-chmod-600 pattern already used for TLS private keys. No per-peer rotation: librdkafka's `brokers` bootstrap list already handles broker discovery and leader failover internally. Building with `--features kafka` now requires `libssl-dev` and `libsasl2-dev` on Debian/Ubuntu (the cmake-built librdkafka links against them at compile time).
-
-The single `output otlp { protocol grpc | http_* }` module is split in 0.7.6 into two transport-specific modules: `output otlp_http` (keeps the `protocol http_protobuf|http_json` selector) and `output otlp_grpc` (no `protocol`, gRPC is one wire format). The single top-level `endpoint` property is replaced by a `peers { peer { endpoint tls{...} } ... }` block on both modules — flushes round-robin through the peers with per-peer cooldown on failure, the standard production shape. Per-peer `tls { ca cert key }` enables mTLS for either transport. See `CHANGELOG.md` for the migration table.
-
-`output http` gets the same treatment in 0.7.6 — the top-level `url` property is replaced by `peer { url tls{...} }` (single destination shorthand) or `peers { peer { url tls{...} } ... }` (round-robin across multiple endpoints). Per-peer `tls { ca cert key }` enables mTLS to the target. The `verify`, `method`, `content_type`, `compress`, `headers`, `batch_size`, `batch_timeout` properties stay top-level — they apply across all peers. See `CHANGELOG.md` for the migration table.
-
 ### Snippets
 
 Curated parser / composer / filter library, installed under `/usr/share/limpid/snippets/` and `include`-able by absolute path. Introduced in **v0.7.0**, with the transport layer split out as its own snippet category in **v0.7.1** and the vendor lineup expanded across the 0.7.x line:
 
 - **Transport parsers (2, v0.7.1)** — `parse_syslog` (RFC 3164 / 5424 syslog wire) · `parse_journald` (systemd journald JSON). These populate `workspace.<transport>.*` and feed any vocabulary parser downstream via an inline bridge.
-- **Vendor parsers (29)** — security devices / cloud audit: `parse_fortigate_cef` · `parse_fortigate_syslog` · `parse_paloalto_cef` · `parse_paloalto_syslog` · `parse_asa` · `parse_cloudtrail` · `parse_juniper_srx_sd_syslog` (Junos structured-data) · `parse_juniper_srx_syslog` (Junos unstructured RT_IDP) · `parse_checkpoint_leef` (LEEF 2.0 / QRadar) · `parse_checkpoint_syslog` (Check Point Syslog Exporter, real-corpus verified) · `parse_nsp` (Trellix Network Security Platform, real-traffic verified). OSS NDR: `parse_suricata` (EVE JSON) · `parse_zeek_default` / `parse_zeek_soc` / `parse_zeek_full` (Zeek 8 / 20 / 43 protocol scripts, nested-superset scopes, with `_native` / `_flat` convenience variants for raw Zeek vs Filebeat-flat upstream). Cloud (audit / data-plane / findings / identity / orchestration): `parse_aws_guardduty` · `parse_aws_vpc_flow` · `parse_azure_activity` · `parse_k8s_audit` · `parse_okta_system`. Server / host vocabulary: `parse_openssh` · `parse_sudo` · `parse_combined_log` (Apache / Nginx) · `parse_postfix` · `parse_winevent_json` · `parse_sysmon` · `parse_bind` · `parse_auditd` (7 LSIS classes, real-corpus verified). Vendor-neutral: `parse_ocsf`.
+- **Vendor parsers (29)** — security devices / cloud audit: `parse_fortigate_cef` · `parse_fortigate_syslog` · `parse_paloalto_cef` · `parse_paloalto_syslog` · `parse_asa` · `parse_cloudtrail` · `parse_juniper_srx_sd_syslog` (Junos structured-data) · `parse_juniper_srx_syslog` (Junos unstructured RT_IDP) · `parse_checkpoint_leef` (LEEF 2.0 / QRadar) · `parse_checkpoint_syslog` (Check Point Syslog Exporter) · `parse_nsp` (Trellix Network Security Platform). OSS NDR: `parse_suricata` (EVE JSON) · `parse_zeek_default` / `parse_zeek_soc` / `parse_zeek_full` (Zeek 8 / 20 / 43 protocol scripts, nested-superset scopes, with `_native` / `_flat` convenience variants for raw Zeek vs Filebeat-flat upstream). Cloud (audit / data-plane / findings / identity / orchestration): `parse_aws_guardduty` · `parse_aws_vpc_flow` · `parse_azure_activity` · `parse_k8s_audit` · `parse_okta_system`. Server / host vocabulary: `parse_openssh` · `parse_sudo` · `parse_combined_log` (Apache / Nginx) · `parse_postfix` · `parse_winevent_json` · `parse_sysmon` · `parse_bind` · `parse_auditd` (7 LSIS classes). Vendor-neutral: `parse_ocsf`.
 - **Composers (4)** — `compose_ocsf` (OCSF 1.3.0 priority set, 27 classes, dispatched by `workspace.lsis.parsed.class_uid`) · `compose_rfc5424` (generic RFC 5424 record composer with a `journald_to_rfc5424` bridge for edge → syslog-relay use, v0.7.1) · `compose_replayable` (replay-shape capture) · `compose_otlp` (assembles OTLP 1.0.0 `ResourceLogs` proto bytes from per-field shed slots + parsed-layer graceful reads). Composers write to `workspace.lsis.composed.<slot>`; a companion `<slot>_to_egress` one-line process (shipped alongside each composer) moves the slot to `egress` under the egress single-writer invariant.
 - **Filters (1)** — `filter_openssh_journal` (drops PAM session double-count noise from journald sshd streams).
 
@@ -221,6 +205,12 @@ A capability snapshot versus the established log forwarders. Where a cell says "
 | **Runtime** | C | Ruby + C | Rust | Rust |
 
 The point is not that the alternatives are bad — they have decades of hardened, large-scale deployment behind them. The point is that limpid is built for a different default: pipelines that are *legible*, *verifiable*, and *operable* without a second tool.
+
+## Upgrading
+
+Before upgrading, review the target version in [`CHANGELOG.md`](CHANGELOG.md);
+pre-1.0 releases may change DSL and snippet contracts. For package installation
+and service reload procedures, see [Packaging](docs/src/operations/packaging.md#upgrading).
 
 ## Documentation
 

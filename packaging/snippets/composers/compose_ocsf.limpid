@@ -75,8 +75,9 @@
 // `workspace.lsis.parsed.*`. Common envelope fields (`class_uid`,
 // `category_uid`, `activity_id`, `type_uid`, `severity_id`, `time`,
 // `metadata`) are emitted uniformly. Canonical OTel `severity_number` is
-// converted at this boundary. Until bundled parsers migrate, legacy
-// `severity_id` remains an explicit lower-priority compatibility input.
+// converted at this boundary. Bundled parsers use that canonical field;
+// legacy `severity_id` remains an explicit lower-priority compatibility input
+// for out-of-tree callers.
 //
 // Root `time` policy:
 //   LSIS record-level timestamps are Unix epoch nanoseconds; OCSF
