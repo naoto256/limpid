@@ -29,13 +29,13 @@ def process parse_fortigate_cef_traffic {
 
 A call to `normalize_proto(x)` looks like any other function call — there's no marker at the call site that says "this is user-defined." The analyzer arity-checks it the same as a built-in, and a typo in the name surfaces the same way (`unknown function`, near-match suggestion).
 
-The name must be a bare identifier. `def function normalize_proto() { ... }` is allowed; `def function foo.bar() { ... }` is **not** — the dot namespace is reserved for schema-bound built-ins (`syslog.parse`, `cef.parse`, `otlp.encode_resourcelog_protobuf`, …) where the prefix names a specific schema specification (RFC 5424, ArcSight CEF, OCSF, …). User-defined functions are vendor-agnostic by design, so they always live in the flat namespace. See the [*Schema-specific functions live under a schema namespace*](../design-principles.md#schema-specific-functions-live-under-a-schema-namespace) operating rule for the rationale.
+The name must be a bare identifier. `def function normalize_proto() { ... }` is allowed; `def function foo.bar() { ... }` is **not** — the dot namespace is reserved for schema-bound built-ins (`syslog.parse`, `cef.parse`, `otlp.encode_resourcelog_protobuf`, …) where the prefix names a specific schema specification (RFC 5424, ArcSight CEF, OCSF, …). User-defined functions always live in the flat namespace; their names may still identify a vendor-specific mapping whose input domain is documented by that vendor. See the [*Schema-specific functions live under a schema namespace*](../design-principles.md#schema-specific-functions-live-under-a-schema-namespace) operating rule for the rationale.
 
 ## Where they can be called from
 
 Anywhere an expression is evaluated — there's no callsite restriction on the function dispatch itself:
 
-- **Process bodies**: `workspace.lsis.parsed.severity_number = normalize_severity(workspace.cef.severity)`.
+- **Process bodies**: `workspace.lsis.parsed.severity_number = severity_number_from_label(workspace.vendor.severity)`.
 - **Pipeline-level conditions**: `if is_critical(workspace.lsis.parsed.severity_number) { output urgent }`.
 - **`output` templates over event-intrinsic args**: `path "/var/log/limpid/${normalize_proto(source.port)}/events.log"` — the function call itself is fine; what *its arguments* may reference is restricted by the surrounding surface (output config rejects `workspace`, `egress`, `error`; see [DSL Syntax → String interpolation](../dsl-syntax.md#string-interpolation)). To route on a pipeline-mutable value, branch in the pipeline body and select between outputs whose own templates only reference event-intrinsic fields:
   ```limpid
@@ -50,7 +50,7 @@ Anywhere an expression is evaluated — there's no callsite restriction on the f
       }
   }
   ```
-- **HashLit values**: `workspace.lsis.parsed = { severity_id: normalize_severity(...), ... }`.
+- **HashLit values**: `workspace.lsis.parsed = { severity_number: severity_number_from_label(...), ... }`.
 - **Function arguments**: `lower(normalize_proto(workspace.cef.proto))`.
 - **Binary operands**: `if double_score(s) > threshold { ... }`.
 
@@ -60,7 +60,7 @@ The mental model is the same as built-in primitives: `lower()` and `regex_match(
 
 ## When to reach for it
 
-`def function` is the right tool when you have a small, vendor-agnostic mapping or computation that:
+`def function` is the right tool when you have a small mapping or computation with an explicit input domain that:
 
 - takes a few arguments,
 - returns one value,
@@ -72,7 +72,7 @@ Typical use cases:
 | Need | Sketch |
 |------|--------|
 | Protocol number → name | `def function normalize_proto(num) { switch num { ... } }` |
-| Severity string → OCSF `severity_id` | `def function normalize_severity(s) { switch lower(s) { ... } }` |
+| Source severity string → OTel `SeverityNumber` | `def function severity_number_from_label(s) { switch s { ... } }` |
 | Vendor action → OCSF `activity_id` | `def function fortigate_action_to_activity_id(a) { switch a { ... } }` |
 | Numeric clamp / range check | `def function clamp(x, lo, hi) { switch true { x < lo { lo } x > hi { hi } default { x } } }` |
 | String formatting helper | `def function host_label(h, p) { "${h}:${p}" }` |
@@ -84,14 +84,14 @@ For anything with side effects (writing to `workspace.*`, mutating `egress`, cal
 The body is **zero or more `let` bindings followed by a required trailing expression** that becomes the return value:
 
 ```
-def function severity_id_from_label(s) {
-    switch lower(s) {
-        "critical" { 5 }
-        "high"     { 4 }
-        "medium"   { 3 }
-        "low"      { 2 }
-        "info"     { 1 }
-        default    { 1 }
+def function severity_number_from_label(s) {
+    switch s {
+        "Critical"      { 21 }
+        "High"          { 19 }
+        "Medium"        { 17 }
+        "Low"           { 13 }
+        "Informational" { 9 }
+        default         { null }
     }
 }
 ```
@@ -170,8 +170,8 @@ All five are hard errors at `--check` time — the config fails to load and the 
 Functions can call other functions (and any built-in primitive):
 
 ```
-def function fortigate_severity_to_id(label) {
-    severity_id_from_label(label)
+def function vendor_severity_number(label) {
+    severity_number_from_label(label)
 }
 ```
 
@@ -197,14 +197,15 @@ Rule of thumb: **if the result is a single value the caller wants to embed somew
 A typical vendor parser uses several small functions to canonicalise vendor-specific values into canonical LSIS shape:
 
 ```
-// functions/normalize_severity.limpid
-def function normalize_severity(s) {
-    switch lower(s) {
-        "critical" { 5 }
-        "high"     { 4 }
-        "medium"   { 3 }
-        "low"      { 2 }
-        default    { 1 }
+// functions/severity_number_from_label.limpid
+def function severity_number_from_label(s) {
+    switch s {
+        "Critical"      { 21 }
+        "High"          { 19 }
+        "Medium"        { 17 }
+        "Low"           { 13 }
+        "Informational" { 9 }
+        default         { null }
     }
 }
 
@@ -218,19 +219,30 @@ def function normalize_proto(num) {
     }
 }
 
-// parsers/parse_fortigate_cef.limpid
-def process parse_fortigate_cef_traffic {
+// parsers/parse_vendor_event.limpid
+def process parse_vendor_event {
+    let source_severity = workspace.vendor.severity
+    let severity_number = severity_number_from_label(source_severity)
+    if source_severity != null && severity_number == null {
+        error "parse_vendor_event: invalid severity ${source_severity}"
+    }
     workspace.lsis.parsed = {
         class_uid: 4001,
-        severity_id: normalize_severity(workspace.cef.severity),
+        severity_number: severity_number,
+        severity: source_severity,
         connection_info: {
-            protocol_num:  workspace.cef.proto,
-            protocol_name: normalize_proto(workspace.cef.proto)
+            protocol_num:  workspace.vendor.proto,
+            protocol_name: normalize_proto(workspace.vendor.proto)
         },
-        src_endpoint: { ip: workspace.cef.src, port: workspace.cef.spt },
-        dst_endpoint: { ip: workspace.cef.dst, port: workspace.cef.dpt }
+        src_endpoint: { ip: workspace.vendor.src, port: workspace.vendor.spt },
+        dst_endpoint: { ip: workspace.vendor.dst, port: workspace.vendor.dpt }
     }
 }
 ```
 
-Same `normalize_severity` and `normalize_proto` get reused by every other vendor's parser — no duplication, no Event coupling, no need for separate workspace scratch keys.
+The mapper returns `null` for values outside its documented source domain; the
+process boundary distinguishes that invalid non-null input from a genuinely
+missing severity and fails loudly. The exact source spelling is preserved in
+`parsed.severity`, while `parsed.severity_number` carries the normalized OTel
+value. OCSF `severity_id` is derived later by the OCSF composer.
+Reuse a severity mapper only for sources that define the same exact vocabulary.
