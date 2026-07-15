@@ -223,7 +223,7 @@ def function normalize_proto(num) {
 def process parse_vendor_event {
     let source_severity = workspace.vendor.severity
     let severity_number = severity_number_from_label(source_severity)
-    if source_severity != null && severity_number == null {
+    if source_severity != null and severity_number == null {
         error "parse_vendor_event: invalid severity ${source_severity}"
     }
     workspace.lsis.parsed = {
