@@ -31,65 +31,36 @@
 //                             default — empty. Replacement semantics as
 //                             above.
 //                .log_record.severity_text          (optional, String) —
-//                             free-form severity label. default — omitted
-//                             from the wire (proto3 default). Common
-//                             pairing with a caller-classified severity is
-//                             `"INFO"`/`"WARN"`/`"ERROR"`.
+//                             free-form severity label. Overrides the
+//                             source spelling in `parsed.severity`; when
+//                             neither is populated the wire field is
+//                             omitted (proto3 default).
 //                .log_record.observed_time_unix_nano (optional, Int) —
 //                             time the current process observed the event
-//                             (LogRecord field 11). default —
-//                             `to_int(received_at)`: the logs.proto
-//                             comment says this field MUST be set once
-//                             the event is observed, so the receive time
-//                             always goes on the wire. Set the slot to
-//                             carry an earlier observation point (e.g. a
-//                             timestamp stamped by an upstream collector).
+//                             (LogRecord field 11). default — omitted from
+//                             the wire (proto3 default). Set when the
+//                             caller wants both event time (parsed) and
+//                             observed time (usually `to_int(received_at)`)
+//                             on the wire.
 //              workspace.lsis.parsed.* — graceful reads from the fact
 //              layer, no shed intake for these:
 //                .time         (optional, Int) — used as `time_unix_nano`
 //                             when populated; falls back to `received_at`
 //                             otherwise. Time is a fact about the event,
 //                             so it lives in `parsed`, not `shed`.
-//                .severity_id  (optional, Int) — translated to
-//                             `severity_number` via the OCSF-to-OTel
-//                             severity scale mapping below. Absent (or
-//                             0 = OCSF Unknown, 99 = OCSF Other) means
-//                             the field is omitted from the wire.
+//                .severity_number (optional, Int) — normalized OTel
+//                             SeverityNumber. Absent means the field is
+//                             omitted from the wire.
+//                .severity    (optional, String) — exact source severity
+//                             spelling. Used as `severity_text` unless the
+//                             shed override above is populated.
 //
-//              OCSF `severity_id` (LSIS parsed scale, 0-6 + 99) and OTLP
-//              `severity_number` (1-24, with 9=INFO / 13=WARN / 17=ERROR
-//              / 21=FATAL and finer-grained sub-levels between) are NOT
-//              the same scale — passing the OCSF value straight to the
-//              wire silently misclassifies severity (OCSF 4 = High would
-//              land in the OTel DEBUG band). This composer bridges them:
-//
-//                LSIS severity_id → OTLP severity_number
-//                  0  Unknown       → omitted
-//                  1  Informational → 9   INFO
-//                  2  Low           → 10  INFO2
-//                  3  Medium        → 13  WARN
-//                  4  High          → 17  ERROR
-//                  5  Critical      → 20  ERROR4
-//                  6  Fatal         → 21  FATAL
-//                  99 Other         → omitted (no numeric semantics;
-//                                     supply a label via .severity_text)
-//                  other            → omitted (unknown values are not
-//                                     invented on the wire)
-//
-//              The table is a judgement call — no spec pins it — but the
-//              rung positions preserve ordering, keep INFO/WARN/ERROR
-//              aligned with syslog-derived parsers (see parse_asa
-//              helper), and reserve OTel FATAL for OCSF Fatal (which
-//              matches OTel's "unrecoverable" definition). Callers who
-//              disagree layer the target-specific value themselves via
-//              `.severity_text` or a bespoke composer.
-//
-// Slots deliberately NOT exposed today — `log_record.severity_number`
-// override, `log_record.trace_id`, `log_record.span_id`,
-// `log_record.event_name`, and the `dropped_attributes_count` / `flags`
-// housekeeping fields. These have no implementation-driving caller in
-// the pack today; they are added on the same coalesce-with-default
-// pattern above when a real caller needs them.
+// Slots deliberately NOT exposed today — `log_record.trace_id`,
+// `log_record.span_id`, `log_record.event_name`, and the
+// `dropped_attributes_count` / `flags` housekeeping fields. These have
+// no implementation-driving caller in the pack today; they are added
+// on the same coalesce-with-default pattern above when a real caller
+// needs them.
 // Writes:      workspace.lsis.composed.otlp — ResourceLogs proto bytes
 //              (Bytes). Pipe `| otlp_to_egress` (foot of file) to emit
 //              for `output otlp_http` / `output otlp_grpc`.
@@ -135,21 +106,6 @@
 // when the caller's mapping is non-trivial and reusable across
 // pipelines; ad-hoc glue blocks like the two above are the norm.
 
-// OCSF severity_id (LSIS parsed scale) → OTLP severity_number. The
-// mapping table and its rationale live in the header above. Unknown /
-// Other / unmapped values return null so the encoder omits the field.
-def function otlp_severity_number(severity_id) {
-    switch severity_id {
-        1       { 9 }
-        2       { 10 }
-        3       { 13 }
-        4       { 17 }
-        5       { 20 }
-        6       { 21 }
-        default { null }
-    }
-}
-
 def process compose_otlp {
     workspace.lsis.composed.otlp = otlp.encode_resourcelog_protobuf({
         resource: {
@@ -169,12 +125,12 @@ def process compose_otlp {
             },
             log_records: [{
                 time_unix_nano:          coalesce(workspace.lsis.parsed.time, received_at),
-                observed_time_unix_nano: coalesce(
-                    workspace.lsis.shed.otlp.log_record.observed_time_unix_nano,
-                    to_int(received_at)
+                observed_time_unix_nano: workspace.lsis.shed.otlp.log_record.observed_time_unix_nano,
+                severity_number:         workspace.lsis.parsed.severity_number,
+                severity_text:           coalesce(
+                    workspace.lsis.shed.otlp.log_record.severity_text,
+                    workspace.lsis.parsed.severity
                 ),
-                severity_number:         otlp_severity_number(workspace.lsis.parsed.severity_id),
-                severity_text:           workspace.lsis.shed.otlp.log_record.severity_text,
                 body: { string_value: coalesce(
                     workspace.lsis.shed.otlp.log_record.body, ""
                 ) },
