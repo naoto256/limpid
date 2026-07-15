@@ -8,6 +8,46 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+### Changed — snippet severity is canonical OpenTelemetry severity
+
+Bundled semantic parsers now write normalized OTel `SeverityNumber` values to
+`workspace.lsis.parsed.severity_number` and, when the source carries a textual
+severity, preserve its exact spelling in `workspace.lsis.parsed.severity`.
+Source-backed parsers validate their documented input domains and fail with an
+operator-readable error on unknown non-null values. Parsers for sources without
+a severity concept do not infer one from status, action, event kind, syslog PRI,
+or journald `PRIORITY`.
+
+`compose_ocsf` derives its required `severity_id` at the output boundary:
+canonical numeric severity wins, text-only source severity renders as Other
+(99), and a record with neither renders as Unknown (0). Its legacy
+`parsed.severity_id` read remains only as a lower-priority compatibility path
+for out-of-tree callers. Custom parsers should migrate their canonical writer
+to `parsed.severity_number` and optionally preserve exact source text in
+`parsed.severity`; `compose_otlp` does not read the legacy compatibility slot.
+
+### Fixed — OCSF timestamps use the schema's millisecond unit
+
+`compose_ocsf` now converts LSIS epoch nanoseconds to OCSF epoch milliseconds
+for every public class leaf, rather than emitting the nanosecond value directly.
+The inbound `parse_ocsf` path performs the inverse conversion so OCSF
+round-trips retain the canonical LSIS nanosecond scale.
+
+### Fixed — OCSF output retains parsed status and identity facts
+
+The OCSF composer now preserves `status_id` for Email Activity, Account Change,
+Vulnerability Finding, RDP, SMB, SSH, FTP, User Access Management, and Group
+Management records. The sudo parser also retains PAM session user identifiers
+instead of losing them while shaping the LSIS actor and user facts.
+
+### Added — shared snippet converters and stricter authoring checks
+
+The snippet library adds partial, exact-domain helpers for OCSF ↔ OTel severity
+and epoch nanosecond ↔ millisecond conversion. Header lint and generated
+inventory now support multiple function signatures in one function-family file.
+`limpid --check` now reports unknown function calls even when no near-match
+suggestion exists, including namespaced calls.
+
 ### Fixed — OTLP observed time defaults to the Event receive timestamp
 
 `compose_otlp` now populates `observed_time_unix_nano` from `received_at`
