@@ -35,8 +35,8 @@ The name must be a bare identifier. `def function normalize_proto() { ... }` is 
 
 Anywhere an expression is evaluated — there's no callsite restriction on the function dispatch itself:
 
-- **Process bodies**: `workspace.lsis.parsed.severity_id = normalize_severity(workspace.cef.severity)`.
-- **Pipeline-level conditions**: `if is_critical(workspace.lsis.parsed.severity_id) { output urgent }`.
+- **Process bodies**: `workspace.lsis.parsed.severity_number = normalize_severity(workspace.cef.severity)`.
+- **Pipeline-level conditions**: `if is_critical(workspace.lsis.parsed.severity_number) { output urgent }`.
 - **`output` templates over event-intrinsic args**: `path "/var/log/limpid/${normalize_proto(source.port)}/events.log"` — the function call itself is fine; what *its arguments* may reference is restricted by the surrounding surface (output config rejects `workspace`, `egress`, `error`; see [DSL Syntax → String interpolation](../dsl-syntax.md#string-interpolation)). To route on a pipeline-mutable value, branch in the pipeline body and select between outputs whose own templates only reference event-intrinsic fields:
   ```limpid
   def output proto_tcp { type file path "/var/log/limpid/tcp/events.log" }

@@ -36,14 +36,20 @@ A reusable chunk of pipeline logic — small, named, drop-in. You write them you
 
 ```limpid
 def process compose_ocsf_detection_finding {
+    process validate_ocsf_severity_number
     let activity = workspace.lsis.parsed.activity_id
     workspace.lsis.composed.ocsf = to_json(null_omit({
         class_uid:    2004,                     // Detection Finding
         category_uid: 2,                        // Findings
         activity_id:  activity,
         type_uid:     2004 * 100 + activity,
-        time:         coalesce(workspace.lsis.parsed.time, received_at),
-        severity_id:  workspace.lsis.parsed.severity_id,
+        time:         timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
+        severity_id:  compose_ocsf_severity_id(
+            workspace.lsis.parsed.severity_number,
+            null,                               // legacy compatibility slot
+            workspace.lsis.parsed.severity
+        ),
+        severity:     workspace.lsis.parsed.severity,
         // ...
     }))
 }
@@ -73,10 +79,10 @@ And here is the half that should make you grin — daily operations the alternat
 - **You can watch the pipeline work, live.** `limpidctl tap output security_lake --json` streams events as they leave for the destination (source, ingress, egress bytes). `limpidctl tap process compose_ocsf --json` shows the workspace state at that pipeline hop. No pause, no traffic duplication, no second tool. Every pipeline is its own debugger.
 
   ```text
-  $ limpidctl tap process compose_ocsf --json | jq -c '{src: .source, sev: .workspace.lsis.parsed.severity_id, class: .workspace.lsis.parsed.class_uid}'
-  {"src":{"ip":"10.0.0.21","port":51234},"sev":3,"class":200401}
-  {"src":{"ip":"10.0.0.21","port":51234},"sev":7,"class":200401}
-  {"src":{"ip":"10.0.0.22","port":42100},"sev":2,"class":200401}
+  $ limpidctl tap process compose_ocsf --json | jq -c '{src: .source, sev: .workspace.lsis.parsed.severity_number, class: .workspace.lsis.parsed.class_uid}'
+  {"src":{"ip":"10.0.0.21","port":51234},"sev":17,"class":2004}
+  {"src":{"ip":"10.0.0.21","port":51234},"sev":21,"class":2004}
+  {"src":{"ip":"10.0.0.22","port":42100},"sev":13,"class":2004}
   ...
   ```
 
