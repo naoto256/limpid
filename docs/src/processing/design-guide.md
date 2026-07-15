@@ -70,7 +70,8 @@ Put tags in the first block of comments inside the process body. One tag per lin
 
 ```
 def process compose_ocsf_authentication {
-    // @requires: workspace.lsis.parsed.severity_id          (required)
+    // @requires: workspace.lsis.parsed.severity_number      (optional; normalized OTel SeverityNumber)
+    // @requires: workspace.lsis.parsed.severity             (optional; exact source severity text)
     // @requires: workspace.lsis.parsed.src_endpoint.ip      (recommended)
     // @requires: workspace.lsis.parsed.actor.user.name      (recommended)
     // @produces: workspace.lsis.composed.ocsf  (OCSF Authentication Activity, JSON string)
