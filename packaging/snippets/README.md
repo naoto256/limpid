@@ -128,7 +128,7 @@ consumers:
 
 | Consumer | Shed sub-tree | See header |
 |---|---|---|
-| `compose_otlp` | `workspace.lsis.shed.otlp.*` (resource attributes; scope name/version/attributes; log_record body/attributes/severity_text override/observed_time_unix_nano) + parsed time/severity graceful reads | `composers/compose_otlp.limpid` |
+| `compose_otlp` | `workspace.lsis.shed.otlp.*` (resource attributes; scope name/version/attributes; log_record body/attributes/severity_text/observed-time overrides) + parsed time/severity graceful reads; observed time defaults to `received_at` | `composers/compose_otlp.limpid` |
 | `compose_rfc5424` | `workspace.lsis.shed.rfc5424.*` (pri / timestamp / hostname / app_name / procid / msgid / sd / msg) | `composers/compose_rfc5424.limpid` |
 
 `compose_ocsf` and `compose_replayable` do not read shed slots; they

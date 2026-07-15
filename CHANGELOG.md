@@ -8,6 +8,15 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+### Fixed — OTLP observed time defaults to the Event receive timestamp
+
+`compose_otlp` now populates `observed_time_unix_nano` from `received_at`
+when the caller does not provide an explicit
+`shed.otlp.log_record.observed_time_unix_nano` override. The Event timestamp
+is passed to the OTLP encoder without an intermediate floating-point
+conversion, preserving nanosecond values above 2^53 exactly. Explicit
+overrides continue to take precedence.
+
 ### Fixed — OTLP severity follows canonical parsed facts
 
 `compose_otlp` now reads normalized severity from
