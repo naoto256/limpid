@@ -8,6 +8,17 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+### Fixed — OTLP severity follows canonical parsed facts
+
+`compose_otlp` now reads normalized severity from
+`workspace.lsis.parsed.severity_number` instead of the retired
+`parsed.severity_id` compatibility slot. Source-backed records therefore
+retain their OTel `SeverityNumber` on the OTLP wire. When a parser also
+preserves the exact source spelling in `parsed.severity`, the composer uses
+it as `SeverityText`; an explicit
+`shed.otlp.log_record.severity_text` value still takes precedence.
+Source-less records continue to use OTLP's zero/empty defaults.
+
 ### Breaking — `Int` arithmetic stays exact across the full i64 range
 
 When both operands are `Int`, the `+`, `-`, `*`, `/`, and `%` operators now use checked i64 arithmetic instead of converting through `f64`. This prevents epoch-nanosecond values and other integers above 2^53 from silently losing precision. Integer division truncates toward zero (`5 / 2 == 2`, `-5 / 2 == -2`), remainder follows the dividend's sign, and integer division or remainder by zero continues to return `Int(0)`.
