@@ -8,6 +8,8 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+## [0.7.14] - 2026-07-16
+
 ### Changed — snippet severity is canonical OpenTelemetry severity
 
 Bundled semantic parsers now write normalized OTel `SeverityNumber` values to
@@ -2068,9 +2070,12 @@ See `docs/src/operations/upgrade-0.3.md` for end-to-end migration recipes includ
 
 Initial public release. Rust + tokio log pipeline daemon replacing rsyslog / syslog-ng / fluentd with a single readable DSL (`def input`, `def process`, `def output`, `def pipeline`). Includes syslog (UDP/TCP/ TLS) / tail / journal / unix socket inputs; file / HTTP / Kafka / TCP / UDP / unix socket / stdout outputs; in-DSL expression language with parsers (JSON / KV / CEF / syslog), regex, string templates, tables with TTL, GeoIP; control socket (`limpidctl tap`, `stats`, `health`); hot reload via `SIGHUP` with automatic rollback; per-output disk-backed queues.
 
-[Unreleased]: https://github.com/naoto256/limpid/compare/v0.7.9...HEAD
+[Unreleased]: https://github.com/naoto256/limpid/compare/v0.7.14...HEAD
+[0.7.14]: https://github.com/naoto256/limpid/compare/v0.7.13...v0.7.14
+[0.7.13]: https://github.com/naoto256/limpid/compare/v0.7.12...v0.7.13
 [0.7.12]: https://github.com/naoto256/limpid/compare/v0.7.11...v0.7.12
 [0.7.11]: https://github.com/naoto256/limpid/compare/v0.7.10...v0.7.11
+[0.7.10]: https://github.com/naoto256/limpid/compare/v0.7.9...v0.7.10
 [0.7.9]: https://github.com/naoto256/limpid/compare/v0.7.8...v0.7.9
 [0.7.8]: https://github.com/naoto256/limpid/compare/v0.7.7...v0.7.8
 [0.7.7]: https://github.com/naoto256/limpid/compare/v0.7.6...v0.7.7
