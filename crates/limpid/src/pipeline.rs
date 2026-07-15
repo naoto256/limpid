@@ -1501,6 +1501,16 @@ def pipeline ocsf_in_otlp {
         pipeline_name: &str,
         workspace: serde_json::Value,
     ) -> opentelemetry_proto::tonic::logs::v1::LogRecord {
+        run_packaged_otlp_composer_at(cfg, funcs, pipeline_name, workspace, chrono::Utc::now())
+    }
+
+    fn run_packaged_otlp_composer_at(
+        cfg: &CompiledConfig,
+        funcs: &FunctionRegistry,
+        pipeline_name: &str,
+        workspace: serde_json::Value,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) -> opentelemetry_proto::tonic::logs::v1::LogRecord {
         use crate::dsl::value::OwnedValue;
         use crate::dsl::value_json::json_to_value;
         use crate::event::OwnedEvent;
@@ -1512,6 +1522,7 @@ def pipeline ocsf_in_otlp {
             Bytes::new(),
             "127.0.0.1:0".parse().expect("valid test source"),
         );
+        event.received_at = received_at;
         let OwnedValue::Object(workspace) =
             json_to_value(&workspace).expect("workspace JSON must convert")
         else {
@@ -1666,5 +1677,75 @@ def pipeline ocsf_in_otlp {
             other => panic!("expected OCSF string body, got {other:?}"),
         };
         assert!(source_less_body.contains("\"severity_id\":0"));
+    }
+
+    #[test]
+    fn packaged_compose_otlp_defaults_and_overrides_observed_time() {
+        use crate::functions::{FunctionRegistry, register_builtins, register_user_functions};
+        use serde_json::json;
+
+        let cfg = compile_packaged_otlp_composers().unwrap();
+        let mut funcs = FunctionRegistry::new();
+        register_builtins(&mut funcs, crate::runtime::init_tables(&cfg).unwrap());
+        register_user_functions(&mut funcs, &cfg);
+
+        let received_at = chrono::DateTime::from_timestamp(1_784_073_600, 123_456_789)
+            .expect("valid receive timestamp");
+        let received_ns = 1_784_073_600_123_456_789;
+        let event_ns = 1_710_000_000_123_456_789;
+        let override_ns = 1_700_000_000_987_654_321;
+
+        let source_backed = run_packaged_otlp_composer_at(
+            &cfg,
+            &funcs,
+            "direct_otlp",
+            json!({
+                "lsis": {
+                    "parsed": {
+                        "time": event_ns,
+                        "severity_number": 19,
+                        "severity": "HIGH"
+                    }
+                }
+            }),
+            received_at,
+        );
+        assert_eq!(source_backed.time_unix_nano, event_ns);
+        assert_eq!(source_backed.observed_time_unix_nano, received_ns);
+
+        let overridden = run_packaged_otlp_composer_at(
+            &cfg,
+            &funcs,
+            "direct_otlp",
+            json!({
+                "lsis": {
+                    "parsed": { "time": event_ns },
+                    "shed": {
+                        "otlp": {
+                            "log_record": {
+                                "observed_time_unix_nano": override_ns
+                            }
+                        }
+                    }
+                }
+            }),
+            received_at,
+        );
+        assert_eq!(overridden.time_unix_nano, event_ns);
+        assert_eq!(overridden.observed_time_unix_nano, override_ns);
+
+        let source_less = run_packaged_otlp_composer_at(
+            &cfg,
+            &funcs,
+            "ocsf_in_otlp",
+            json!({
+                "lsis": {
+                    "parsed": { "class_uid": 3002, "activity_id": 1 }
+                }
+            }),
+            received_at,
+        );
+        assert_eq!(source_less.time_unix_nano, received_ns);
+        assert_eq!(source_less.observed_time_unix_nano, received_ns);
     }
 }
