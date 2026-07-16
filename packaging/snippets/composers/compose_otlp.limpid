@@ -1,58 +1,35 @@
-// Summary:     Assembles an OTLP-1.0.0 ResourceLogs proto envelope
-//              from per-field shed slots + parsed-layer graceful reads.
-//              Emits a single LogRecord per event, encoded as
-//              protobuf bytes for both otlp_http and otlp_grpc.
-// Reads:       workspace.lsis.shed.otlp.* — per-slot intake
-//              (OTLP proto vocabulary):
-//                .resource.attributes    (optional, Array) — of KeyValue.
-//                             default — [{ key: "host.name", value:
-//                             { string_value: hostname() } }]. Specifying
-//                             this slot REPLACES the default (no merge):
-//                             callers who still want host.name in their
-//                             resource attributes must include it in the
-//                             array they pass.
-//                .scope.name             (optional, String) — instrumentation
-//                             scope name. default — "limpid". Callers
-//                             segmenting by pipeline family override this
-//                             (e.g. "limpid.amp.cef", "limpid.amp.syslog").
-//                .scope.version          (optional, String) — instrumentation
-//                             scope version. default — omitted from the
-//                             wire (proto3 default). Set when the caller
-//                             is versioning the shape it emits.
-//                .scope.attributes       (optional, Array) — of KeyValue.
-//                             default — empty.
-//                .log_record.body        (required, String) — placed on
-//                             the LogRecord as `body.string_value`. Absent
-//                             body yields an empty body string; a
-//                             deliberate wrapper (schema composer output,
-//                             raw ingress, etc.) is the caller's job to
-//                             assign in a glue block.
-//                .log_record.attributes  (optional, Array) — of KeyValue.
-//                             default — empty. Replacement semantics as
-//                             above.
-//                .log_record.severity_text          (optional, String) —
-//                             free-form severity label. Overrides the
-//                             source spelling in `parsed.severity`; when
-//                             neither is populated the wire field is
-//                             omitted (proto3 default).
-//                .log_record.observed_time_unix_nano (optional, Int) —
-//                             time the current process observed the event
-//                             (LogRecord field 11). default — `received_at`,
-//                             preserving the Event's receive timestamp at
-//                             nanosecond precision. Set this slot to carry
-//                             an explicit earlier observation point.
-//              workspace.lsis.parsed.* — graceful reads from the fact
-//              layer, no shed intake for these:
-//                .time         (optional, Int) — used as `time_unix_nano`
-//                             when populated; falls back to `received_at`
-//                             otherwise. Time is a fact about the event,
-//                             so it lives in `parsed`, not `shed`.
-//                .severity_number (optional, Int) — normalized OTel
-//                             SeverityNumber. Absent means the field is
-//                             omitted from the wire.
-//                .severity    (optional, String) — exact source severity
-//                             spelling. Used as `severity_text` unless the
-//                             shed override above is populated.
+// Summary:     Assembles one OTLP-1.0.0 ResourceLogs envelope from canonical
+//              LSIS scalars and source-adapter shed slots. Emits protobuf
+//              bytes for both otlp_http and otlp_grpc.
+// Reads:       workspace.lsis.parsed.* — canonical scalar facts:
+//                .time             (optional, Int) — event time in
+//                                  epoch nanoseconds.
+//                .severity_number  (optional, Int) — OTel SeverityNumber.
+//                .severity         (optional, String) — exact source text.
+//              workspace.lsis.shed.otlp.* — source-adapter output in OTLP
+//              vocabulary. Each slot is optional and replaces, rather than
+//              merges with, any lower-priority value:
+//                .resource.attributes (optional, Array) — OTLP KeyValue list.
+//                .scope.name (optional, String) — instrumentation scope name.
+//                .scope.version (optional, String) — instrumentation scope version.
+//                .scope.attributes (optional, Array) — OTLP KeyValue list.
+//                .log_record.time_unix_nano (optional, Int) — event-time override.
+//                .log_record.observed_time_unix_nano (optional, Int) — observation-time override.
+//                .log_record.severity_number (optional, Int) — severity override.
+//                .log_record.severity_text (optional, String) — severity-text override.
+//                .log_record.body (optional, Object) — tagged OTLP AnyValue.
+//                .log_record.attributes (optional, Array) — OTLP KeyValue list.
+//              `resource.attributes`, all scope slots, `body`, and LogRecord
+//              attributes are adapter-owned because their construction or
+//              placement is source-specific. Body is an OTLP AnyValue object;
+//              the adapter chooses its variant. Missing slots are omitted.
+//              Canonical scalar fallback chains are
+//                time             = coalesce(shed override, parsed.time)
+//                severity_number  = coalesce(shed override,
+//                                            parsed.severity_number)
+//                severity_text    = coalesce(shed override, parsed.severity)
+//                observed_time    = coalesce(shed override, received_at)
+//              Event time never falls back to `received_at`.
 //
 // Slots deliberately NOT exposed today — `log_record.trace_id`,
 // `log_record.span_id`, `log_record.event_name`, and the
@@ -67,82 +44,61 @@
 //              otlp.encode_resourcelog_protobuf reference in
 //              docs/src/functions/expression-functions.md)
 //
-// Sourcing the shed slots — a glue block in the pipeline hands the
-// upstream composer's product (or ad-hoc caller-supplied values) into
-// this composer's intake. Two common shapes:
+// Canonical pipeline shape
 //
-//   1. Wrap an OCSF JSON produced by compose_ocsf as the log body:
+//   process parse_fortigate_syslog
+//         | fortigate_syslog_to_otlp
+//         | compose_otlp
+//         | otlp_to_egress
 //
-//        process parse_x
-//              | compose_ocsf
-//              | { workspace.lsis.shed.otlp.log_record.body =
-//                    workspace.lsis.composed.ocsf }
-//              | compose_otlp
-//              | otlp_to_egress
-//
-//   2. Ship a target-specific attribute vocabulary (e.g. Azure Monitor
-//      Pipeline's CommonSecurityLog columns) via log_record.attributes,
-//      alongside a body of the caller's choosing:
-//
-//        process parse_fortigate_cef
-//              | {
-//                  workspace.lsis.shed.otlp.log_record.body =
-//                      workspace.syslog.msg
-//                  workspace.lsis.shed.otlp.log_record.attributes = [
-//                      { key: "DeviceVendor",  value: { string_value:
-//                          workspace.cef.device_vendor } },
-//                      { key: "DeviceProduct", value: { string_value:
-//                          workspace.cef.device_product } },
-//                      { key: "SourceIP",      value: { string_value:
-//                          workspace.cef.src } }
-//                  ]
-//                }
-//              | compose_otlp
-//              | otlp_to_egress
-//
-// Bridges live *with the composer that consumes them* (this file is
-// their home). A named `<upstream>_to_otlp` bridge is worth introducing
-// when the caller's mapping is non-trivial and reusable across
-// pipelines; ad-hoc glue blocks like the two above are the norm.
+// A `<source>_to_otlp` adapter lives with its parser and owns only the
+// source-specific Body/Resource/Scope/attribute construction and exceptional
+// canonical-scalar overrides. `compose_otlp` performs no source placement,
+// hostname synthesis, fixed scope naming, or Body coercion.
 
 def process compose_otlp {
-    workspace.lsis.composed.otlp = otlp.encode_resourcelog_protobuf({
-        resource: {
-            attributes: coalesce(
-                workspace.lsis.shed.otlp.resource.attributes,
-                [ { key: "host.name", value: { string_value: hostname() } } ]
-            )
+    workspace.lsis.composed.otlp = otlp.encode_resourcelog_protobuf(null_omit({
+        resource: switch len(coalesce(workspace.lsis.shed.otlp.resource.attributes, [])) > 0 {
+            true {
+                { attributes: workspace.lsis.shed.otlp.resource.attributes }
+            }
+            default { null }
         },
         scope_logs: [{
-            scope: {
-                name:       coalesce(workspace.lsis.shed.otlp.scope.name, "limpid"),
-                version:    workspace.lsis.shed.otlp.scope.version,
-                attributes: coalesce(
-                    workspace.lsis.shed.otlp.scope.attributes,
-                    []
-                )
+            scope: switch workspace.lsis.shed.otlp.scope.name != null
+                       or workspace.lsis.shed.otlp.scope.version != null
+                       or workspace.lsis.shed.otlp.scope.attributes != null {
+                true {
+                    {
+                        name:       workspace.lsis.shed.otlp.scope.name,
+                        version:    workspace.lsis.shed.otlp.scope.version,
+                        attributes: workspace.lsis.shed.otlp.scope.attributes
+                    }
+                }
+                default { null }
             },
-            log_records: [{
-                time_unix_nano:          coalesce(workspace.lsis.parsed.time, received_at),
+            log_records: [null_omit({
+                time_unix_nano: coalesce(
+                    workspace.lsis.shed.otlp.log_record.time_unix_nano,
+                    workspace.lsis.parsed.time
+                ),
                 observed_time_unix_nano: coalesce(
                     workspace.lsis.shed.otlp.log_record.observed_time_unix_nano,
                     received_at
                 ),
-                severity_number:         workspace.lsis.parsed.severity_number,
-                severity_text:           coalesce(
+                severity_number: coalesce(
+                    workspace.lsis.shed.otlp.log_record.severity_number,
+                    workspace.lsis.parsed.severity_number
+                ),
+                severity_text: coalesce(
                     workspace.lsis.shed.otlp.log_record.severity_text,
                     workspace.lsis.parsed.severity
                 ),
-                body: { string_value: coalesce(
-                    workspace.lsis.shed.otlp.log_record.body, ""
-                ) },
-                attributes: coalesce(
-                    workspace.lsis.shed.otlp.log_record.attributes,
-                    []
-                )
-            }]
+                body:       workspace.lsis.shed.otlp.log_record.body,
+                attributes: workspace.lsis.shed.otlp.log_record.attributes
+            })]
         }]
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
