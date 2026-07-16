@@ -4,7 +4,7 @@ Forwards events to one or more OpenTelemetry collectors / OTLP-compatible SaaS b
 
 Each Event's `egress` is expected to be the singleton ResourceLogs protobuf bytes produced by [`otlp.encode_resourcelog_protobuf`](../functions/expression-functions.md#otlpencode_resourcelog_protobufhashlit--bytes). The output buffers these per-Event ResourceLogs, flushes on `batch_size` or `batch_timeout`, wraps the batch in an `ExportLogsServiceRequest`, and ships it.
 
-> Why limpid's OTLP behaves the way it does — Resource attributes are user-authored not auto-detected, `partial_success` is not retried selectively, `batch_level` is wire-only and semantically null — is documented in [OTLP — design rationale](../otlp.md). The reference table below covers *how* to configure; the design page covers *why* the defaults are what they are.
+> Why limpid's OTLP behaves the way it does — Resource attributes are source-adapter-owned rather than auto-detected, `partial_success` is not retried selectively, `batch_level` is wire-only and semantically null — is documented in [OTLP — design rationale](../otlp.md). The reference table below covers *how* to configure; the design page covers *why* the defaults are what they are.
 
 ## Configuration
 
@@ -80,39 +80,36 @@ Every HTTP export is bounded by a 30s timeout (connect, TLS handshake, request s
 The output expects `egress` to already be valid singleton ResourceLogs proto bytes. It does **not** re-encode — that's the process layer's job. Typical wiring:
 
 ```
-def process compose_otlp_from_ocsf {
-    // Source-claimed time is expected to be populated upstream (here by
-    // parse_fortigate) into workspace.event_time_ns — see
-    // [§ 4.3](../otlp.md#43-whether-the-originating-timestamp-is-in-time_unix_nano-or-observed_time_unix_nano).
-    // Fall back to received_at when the wire had no parseable timestamp;
-    // without this guard a missing key encodes as timeUnixNano: 0 on the
-    // wire and silently drops the event's time at the receiver.
-    workspace.event_time_ns = coalesce(workspace.event_time_ns, received_at)
-
-    workspace.otlp = {
-        resource: { attributes: [
-            { key: "service.name", value: { string_value: workspace.lsis.parsed.metadata.product.name } }
-        ]},
-        scope_logs: [{
-            scope: { name: "limpid", version: "0.5.0" },
-            log_records: [{
-                time_unix_nano: workspace.event_time_ns,
-                severity_number: 9,
-                severity_text: "INFO",
-                body: { string_value: workspace.lsis.composed.ocsf }
-            }]
-        }]
-    }
-    egress = otlp.encode_resourcelog_protobuf(workspace.otlp)
-}
-
 def pipeline syslog_to_otlp {
     input syslog_udp
-    process parse_fortigate
-          | compose_ocsf_detection_finding
-          | compose_otlp_from_ocsf
+    process parse_fortigate_syslog
+          | fortigate_syslog_to_otlp
+          | compose_otlp
+          | otlp_to_egress
     output otlp_out
 }
+```
+
+The parser establishes canonical event time and severity facts. The
+per-source adapter chooses Resource, Scope, Body, and attribute placement;
+`compose_otlp` then applies explicit shed overrides before canonical scalar
+facts. Missing event time remains absent, while observed time defaults to
+`received_at`.
+
+When a deployment intentionally wraps composed OCSF JSON as the OTLP Body,
+make that target-specific adjustment **after** the source adapter:
+
+```
+process parse_fortigate_syslog
+      | fortigate_syslog_to_otlp
+      | compose_ocsf
+      | {
+          workspace.lsis.shed.otlp.log_record.body = {
+              string_value: workspace.lsis.composed.ocsf
+          }
+        }
+      | compose_otlp
+      | otlp_to_egress
 ```
 
 If `egress` is not a valid ResourceLogs proto, flush errors with `pipeline egress is not a valid ResourceLogs proto (wire it through 'otlp.encode_resourcelog_protobuf')`.

@@ -231,6 +231,13 @@ ingress
    │
    ▼
 ┌────────────────────────────────┐
+│  per-source target adapters    │
+│  fortigate_cef_to_otlp, ...    │ ─► workspace.lsis.shed.<target>.*
+│  (OTLP path; OCSF bypasses)    │       (placement / Body construction)
+└────────────────────────────────┘
+   │
+   ▼
+┌────────────────────────────────┐
 │  schema composers              │
 │  compose_ocsf,                 │ ─► workspace.lsis.composed.<slot>
 │  compose_rfc5424,              │       (target wire form: OCSF JSON,
@@ -248,11 +255,12 @@ ingress
 
 - **Format primitives** (`syslog.parse`, `cef.parse`, `parse_kv`, `parse_json`, `csv_parse`) capture raw bytes into a format-specific namespace (`workspace.syslog`, `workspace.cef`, …). They know nothing about vendors or downstream schemas.
 - **Vendor parsers** (`parse_fortigate_cef`, `parse_paloalto_cef`, `parse_cloudtrail`, `parse_ocsf`, …) read the format namespace and write facts under `workspace.lsis.parsed.*`. This is the only layer that knows both the vendor's quirks and the canonical shape. (The shipped set grows on the 0.7.x cadence — see [Snippet Library](../snippets/README.md) for the current inventory.)
-- **Composers** read `workspace.lsis.parsed.*` (facts) and, when their target has structural room the facts layer cannot express, optionally `workspace.lsis.shed.<consumer>.*` (caller-supplied hand-off values). They serialise to `workspace.lsis.composed.<slot>` (OCSF JSON, RFC 5424 record, OTLP proto bytes, …). A companion one-line process, `<slot>_to_egress`, moves the slot to `egress` when the pipeline emits that shape as its wire form. Composers are vendor-unaware on purpose: they pluck `workspace.lsis.parsed.src_endpoint.ip` regardless of whether it came from a FortiGate or a Palo Alto event.
+- **Per-source target adapters** live in the same parser file. They own non-obvious target placement and construction, such as OTLP Resource/Scope/LogRecord attributes and the Body AnyValue variant. They write `workspace.lsis.shed.<target>.*`; deployment-specific adjustments may replace those slots only after the adapter.
+- **Composers** read canonical facts for source-independent scalar mappings and target shed slots for adapter-owned structure. They serialise to `workspace.lsis.composed.<slot>` (OCSF JSON, RFC 5424 record, OTLP proto bytes, …). A companion one-line process, `<slot>_to_egress`, moves the slot to `egress` when the pipeline emits that shape as its wire form. Composers are vendor-unaware on purpose: they never decide whether a FortiGate or Palo Alto fact belongs in OTLP Resource, Scope, Body, or LogRecord attributes.
 
 The payoffs:
 
-- **Adding a new vendor** is a new parser; no composer change.
+- **Adding a new vendor** is a new parser plus its target adapters; no composer change.
 - **Bumping a target wire schema** (OCSF v3 → v4, ECS minor bump) is a composer change; no parser change.
 - **Multiple vendors → one target** falls out for free — every parser drops its output into the same facts layer.
 - **Multiple targets from the same facts** (one OCSF composer + one ECS composer reading the same `workspace.lsis.parsed.*`) is what makes the matrix manageable. The N-vendor × M-target multiplication never happens at the parser level.

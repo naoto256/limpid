@@ -9,7 +9,7 @@ a vendor adds a field (the snippet is plain DSL: edit the file and
 SIGHUP).
 
 > **Status:** the snippet library was introduced in v0.7.0 and has
-> expanded across the 0.7.x line. It currently ships 26 parser files
+> expanded across the 0.7.x line. It currently ships 31 parser files
 > (vendor parsers — FortiGate / ASA / Checkpoint / Palo Alto / Sysmon /
 > CloudTrail / Zeek / Suricata / OCSF / Juniper SRX / ... — plus the
 > transport parsers `parse_syslog` and `parse_journald`), the OCSF
@@ -67,12 +67,14 @@ SIGHUP).
   `workspace.lsis.composed.ocsf`; the companion `ocsf_to_egress`
   process moves the slot to `egress`.
 - `composers/compose_otlp.limpid` — assembles an OTLP-1.0.0
-  `ResourceLogs` proto envelope. The log body, target-specific
-  attributes, resource attributes, and scope attributes come from
-  `workspace.lsis.shed.otlp.*` slots that the caller sets in a glue
-  block. Common wrapping shape:
-  `{ workspace.lsis.shed.otlp.log_record.body =
-  workspace.lsis.composed.ocsf } | compose_otlp | otlp_to_egress`.
+  `ResourceLogs` proto envelope. Each OTLP-capable raw-source parser file
+  carries a sibling `<source>_to_otlp` adapter; it
+  owns source-specific Resource, Scope, Body, and LogRecord attribute
+  placement. The canonical shape is
+  `parse_<source> | <source>_to_otlp | compose_otlp | otlp_to_egress`.
+  Deployment-specific target adjustments may replace shed slots after the
+  adapter; they do not replace the adapter itself. The inbound `parse_ocsf`
+  compatibility parser is the sole parser without an OTLP adapter.
 - `composers/compose_rfc5424.limpid` — generic RFC 5424 wire
   composer reading `workspace.lsis.shed.rfc5424.*` (pri / timestamp
   / hostname / app_name / procid / msgid / sd / msg). A named
@@ -109,11 +111,13 @@ contracts.
   `severity` text rather than an invented OTel number.
 
 - `functions/parse_datetime_rfc3164.limpid` —
-  `parse_datetime_rfc3164(text) → Timestamp`. LPL counterpart to the
-  built-in `parse_datetime_rfc3339` primitive. RFC 3164 wire carries
-  neither year nor timezone, so the parser encodes the standard
-  policy (current-year + future-clamp + UTC assumption) in DSL so
-  operators on non-UTC senders can fork the snippet and substitute.
+  `parse_datetime_rfc3164(text, timezone) → Timestamp | null`. LPL
+  counterpart to the built-in `parse_datetime_rfc3339` primitive.
+  RFC 3164 wire carries neither year nor timezone, so the helper
+  applies the current-year + future-clamp policy after the calling
+  parser resolves its vendor-specific timezone default or explicit
+  override. `local` means the limpid host's system timezone; `UTC`,
+  IANA names, and fixed offsets are also accepted.
   For RFC 5424 / OTLP / OCSF input use the built-in
   `parse_datetime_rfc3339` primitive directly.
 - `functions/http_method_activity_id.limpid` —
