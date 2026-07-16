@@ -294,17 +294,7 @@ def process parse_aws_guardduty {
         workspace.gd_type == null {
             error "parse_aws_guardduty: `type` field does not match GuardDuty `<Category>:<ResourceType>/<ThreatName>` shape: ${workspace.gd.type}"
         }
-        default {
-            workspace.gd_severity_number = aws_guardduty_severity_number(workspace.gd.severity)
-            switch workspace.gd.severity != null and workspace.gd_severity_number == null {
-                true {
-                    error "parse_aws_guardduty: invalid GuardDuty severity ${workspace.gd.severity}"
-                }
-                default {
-                    process parse_aws_guardduty_dispatch
-                }
-            }
-        }
+        default { process parse_aws_guardduty_dispatch }
     }
 }
 
@@ -318,28 +308,48 @@ def process parse_aws_guardduty {
 // https://docs.aws.amazon.com/guardduty/latest/ug/guardduty_finding-types-active.html
 // (the per-finding-type pages enumerate the ThreatPurpose taxonomy).
 
+def process parse_aws_guardduty_finding {
+    workspace.gd_severity_number = aws_guardduty_severity_number(workspace.gd.severity)
+    switch workspace.gd.severity != null and workspace.gd_severity_number == null {
+        true { error "parse_aws_guardduty: invalid GuardDuty severity ${workspace.gd.severity}" }
+    }
+    workspace.lsis.parsed = aws_guardduty_finding_record(
+        workspace.gd,
+        workspace.gd_type,
+        workspace.gd_tactic,
+        workspace.gd_severity_number
+    )
+}
+
 def process parse_aws_guardduty_dispatch {
     switch workspace.gd_type.category {
         "Recon" {
-            workspace.lsis.parsed = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Reconnaissance", workspace.gd_severity_number)
+            workspace.gd_tactic = "Reconnaissance"
+            process parse_aws_guardduty_finding
         }
         "Discovery" {
-            workspace.lsis.parsed = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Discovery", workspace.gd_severity_number)
+            workspace.gd_tactic = "Discovery"
+            process parse_aws_guardduty_finding
         }
         "InitialAccess" {
-            workspace.lsis.parsed = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Initial Access", workspace.gd_severity_number)
+            workspace.gd_tactic = "Initial Access"
+            process parse_aws_guardduty_finding
         }
         "Execution" {
-            workspace.lsis.parsed = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Execution", workspace.gd_severity_number)
+            workspace.gd_tactic = "Execution"
+            process parse_aws_guardduty_finding
         }
         "Persistence" {
-            workspace.lsis.parsed = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Persistence", workspace.gd_severity_number)
+            workspace.gd_tactic = "Persistence"
+            process parse_aws_guardduty_finding
         }
         "PrivilegeEscalation" {
-            workspace.lsis.parsed = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Privilege Escalation", workspace.gd_severity_number)
+            workspace.gd_tactic = "Privilege Escalation"
+            process parse_aws_guardduty_finding
         }
         "DefenseEvasion" {
-            workspace.lsis.parsed = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Defense Evasion", workspace.gd_severity_number)
+            workspace.gd_tactic = "Defense Evasion"
+            process parse_aws_guardduty_finding
         }
         "Stealth" {
             // AWS-specific bucket: covers log-tampering / audit-
@@ -347,48 +357,57 @@ def process parse_aws_guardduty_dispatch {
             // public-access-block disabled, etc.). Closest ATT&CK
             // tactic is Defense Evasion; pass the AWS label through
             // verbatim so the consumer can disambiguate.
-            workspace.lsis.parsed = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Stealth", workspace.gd_severity_number)
+            workspace.gd_tactic = "Stealth"
+            process parse_aws_guardduty_finding
         }
         "Exfiltration" {
-            workspace.lsis.parsed = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Exfiltration", workspace.gd_severity_number)
+            workspace.gd_tactic = "Exfiltration"
+            process parse_aws_guardduty_finding
         }
         "Impact" {
-            workspace.lsis.parsed = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Impact", workspace.gd_severity_number)
+            workspace.gd_tactic = "Impact"
+            process parse_aws_guardduty_finding
         }
         "UnauthorizedAccess" {
             // AWS-specific: anomalous auth / API-call patterns
             // (ConsoleLoginSuccess.B, MaliciousIPCaller.Custom,
             // TorIPCaller, etc.). Spans ATT&CK Initial Access and
             // Credential Access; pass the AWS label through.
-            workspace.lsis.parsed = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "UnauthorizedAccess", workspace.gd_severity_number)
+            workspace.gd_tactic = "UnauthorizedAccess"
+            process parse_aws_guardduty_finding
         }
         "Backdoor" {
             // AWS-specific: EC2 instance behaving as part of a C2
             // channel (DNS C2, persistent outbound to known C2 IP).
-            workspace.lsis.parsed = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Backdoor", workspace.gd_severity_number)
+            workspace.gd_tactic = "Backdoor"
+            process parse_aws_guardduty_finding
         }
         "Trojan" {
             // AWS-specific: EC2 instance exhibiting trojan-family
             // network behaviour (DGA domain queries, dropper
             // beacons).
-            workspace.lsis.parsed = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Trojan", workspace.gd_severity_number)
+            workspace.gd_tactic = "Trojan"
+            process parse_aws_guardduty_finding
         }
         "CryptoCurrency" {
             // AWS-specific: connections to known mining pools /
             // crypto-jacking activity on EC2 / EKS / ECS.
-            workspace.lsis.parsed = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "CryptoCurrency", workspace.gd_severity_number)
+            workspace.gd_tactic = "CryptoCurrency"
+            process parse_aws_guardduty_finding
         }
         "Policy" {
             // AWS-specific: account / org hygiene posture findings
             // (root user activity, password policy weak, S3 block-
             // public-access disabled). Operational, not adversary-
             // driven — pass the AWS label through.
-            workspace.lsis.parsed = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "Policy", workspace.gd_severity_number)
+            workspace.gd_tactic = "Policy"
+            process parse_aws_guardduty_finding
         }
         "PenTest" {
             // AWS-specific: known pen-test tooling user-agents
             // (Kali, ParrotLinux, Pentoo) hitting the API.
-            workspace.lsis.parsed = aws_guardduty_finding_record(workspace.gd, workspace.gd_type, "PenTest", workspace.gd_severity_number)
+            workspace.gd_tactic = "PenTest"
+            process parse_aws_guardduty_finding
         }
         default {
             error "parse_aws_guardduty: unknown ThreatPurpose category `${workspace.gd_type.category}` (full type `${workspace.gd.type}`); GuardDuty closed taxonomy was extended — extend the dispatcher"

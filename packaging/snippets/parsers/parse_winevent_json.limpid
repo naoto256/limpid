@@ -131,6 +131,16 @@ def function winevent_actor_user(name, domain) {
 // Top-level dispatcher
 // ---------------------------------------------------------------------------
 
+def process parse_winevent_json_normalize_severity {
+    workspace.winevent.source_severity = coalesce(workspace.winevent.EventType, workspace.winevent.Severity)
+    workspace.winevent.severity_number = winevent_severity_number(workspace.winevent.source_severity)
+    switch true {
+        workspace.winevent.source_severity != null and workspace.winevent.severity_number == null {
+            error "parse_winevent_json: invalid NXLog Windows Event severity ${workspace.winevent.source_severity}"
+        }
+    }
+}
+
 def process parse_winevent_json {
     // parse_json always returns a `Value::Object` (non-object JSON
     // is wrapped under a `_json` key per the primitive's contract);
@@ -139,12 +149,7 @@ def process parse_winevent_json {
     // so no explicit null-check arm is needed here.
     workspace.winevent = parse_json(ingress)
     let eid = workspace.winevent.EventID
-    workspace.winevent.source_severity = coalesce(workspace.winevent.EventType, workspace.winevent.Severity)
-    workspace.winevent.severity_number = winevent_severity_number(workspace.winevent.source_severity)
     switch true {
-        workspace.winevent.source_severity != null and workspace.winevent.severity_number == null {
-            error "parse_winevent_json: invalid NXLog Windows Event severity ${workspace.winevent.source_severity}"
-        }
         // Authentication (3002)
         eid == 4624 { process parse_winevent_4624_logon_success }
         eid == 4625 { process parse_winevent_4625_logon_failure }
@@ -277,6 +282,7 @@ def function winevent_group_management_record(activity_id, severity_number, seve
 // ---------------------------------------------------------------------------
 
 def process parse_winevent_4624_logon_success {
+    process parse_winevent_json_normalize_severity
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_authentication_record(
         1, 1, we.severity_number, we.source_severity,
@@ -292,6 +298,7 @@ def process parse_winevent_4624_logon_success {
 }
 
 def process parse_winevent_4625_logon_failure {
+    process parse_winevent_json_normalize_severity
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_authentication_record(
         1, 2, we.severity_number, we.source_severity,
@@ -307,6 +314,7 @@ def process parse_winevent_4625_logon_failure {
 }
 
 def process parse_winevent_4634_logoff {
+    process parse_winevent_json_normalize_severity
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_authentication_record(
         2, 1, we.severity_number, we.source_severity,
@@ -326,6 +334,7 @@ def process parse_winevent_4634_logoff {
 // ---------------------------------------------------------------------------
 
 def process parse_winevent_4688_process_create {
+    process parse_winevent_json_normalize_severity
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_process_activity_record(
         1, we.severity_number, we.source_severity,
@@ -340,6 +349,7 @@ def process parse_winevent_4688_process_create {
 }
 
 def process parse_winevent_4689_process_terminate {
+    process parse_winevent_json_normalize_severity
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_process_activity_record(
         4, we.severity_number, we.source_severity,
@@ -358,6 +368,7 @@ def process parse_winevent_4689_process_terminate {
 // ---------------------------------------------------------------------------
 
 def process parse_winevent_4720_account_create {
+    process parse_winevent_json_normalize_severity
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_account_change_record(
         1, we.severity_number, we.source_severity,
@@ -370,6 +381,7 @@ def process parse_winevent_4720_account_create {
 }
 
 def process parse_winevent_account_enable {
+    process parse_winevent_json_normalize_severity
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_account_change_record(
         2, we.severity_number, we.source_severity,
@@ -382,6 +394,7 @@ def process parse_winevent_account_enable {
 }
 
 def process parse_winevent_account_disable {
+    process parse_winevent_json_normalize_severity
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_account_change_record(
         3, we.severity_number, we.source_severity,
@@ -394,6 +407,7 @@ def process parse_winevent_account_disable {
 }
 
 def process parse_winevent_account_modify {
+    process parse_winevent_json_normalize_severity
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_account_change_record(
         99, we.severity_number, we.source_severity,
@@ -406,6 +420,7 @@ def process parse_winevent_account_modify {
 }
 
 def process parse_winevent_account_delete {
+    process parse_winevent_json_normalize_severity
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_account_change_record(
         4, we.severity_number, we.source_severity,
@@ -422,6 +437,7 @@ def process parse_winevent_account_delete {
 // ---------------------------------------------------------------------------
 
 def process parse_winevent_group_member_add {
+    process parse_winevent_json_normalize_severity
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_group_management_record(
         1, we.severity_number, we.source_severity,
@@ -435,6 +451,7 @@ def process parse_winevent_group_member_add {
 }
 
 def process parse_winevent_group_member_remove {
+    process parse_winevent_json_normalize_severity
     let we = workspace.winevent
     workspace.lsis.parsed = winevent_group_management_record(
         2, we.severity_number, we.source_severity,

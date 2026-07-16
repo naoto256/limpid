@@ -3,7 +3,13 @@
 // Reads:       workspace.nsp.* (bridge — see Bridges below)
 //                .body (required, String) — the KV body
 //                .hostname (optional, String) — collector-side hostname
-//                .time (optional, Int) — epoch nanoseconds
+//                .timezone (optional, String) — source timezone override as an
+//                  IANA name or fixed offset for attack_time values without
+//                  ` UTC`; defaults to UTC when absent
+//                  (the standard-template timestamp zone is not specified in
+//                  the available vendor documentation; explicit ` UTC` is
+//                  interpreted as UTC. UTC is the intentional pack default;
+//                  override it or use a custom parser when the source differs)
 // Writes:      workspace.lsis.parsed.* — 2004 (Detection Finding).
 // Category:    Network firewall / IPS
 // Test corpus: real (Trellix NSP Manager capture — 56/56 alerts across HTTP /
@@ -43,12 +49,12 @@
 //                     workspace.nsp = {
 //                         body:     workspace.syslog.msg,
 //                         hostname: workspace.syslog.hostname,
-//                         time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
+//                         timezone: "+00:00"
 //                     }
 //                 } | parse_nsp | compose_ocsf | ocsf_to_egress
 //
 //           - raw forwarder (sensor → text-only forwarder → limpid tail):
-//                 { workspace.nsp = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_nsp | compose_ocsf | ocsf_to_egress
+//                 { workspace.nsp = { body: ingress, hostname: hostname(), timezone: "+00:00" } } | parse_nsp | compose_ocsf | ocsf_to_egress
 //
 // Sample bodies (synthetic, anonymised to RFC 5737):
 //
@@ -302,10 +308,36 @@ def process parse_nsp_normalize_severity {
     }
 }
 
+def process parse_nsp_normalize_time {
+    switch workspace.nsp.timezone {
+        "local" { error "parse_nsp: source timezone must be an IANA name or fixed offset, not local" }
+    }
+    let source_timezone = coalesce(workspace.nsp.timezone, "UTC")
+    workspace.nsp.timezone_probe = strptime(
+        "2000-01-15 12:00:00",
+        "%Y-%m-%d %H:%M:%S",
+        source_timezone
+    )
+    let quoted = regex_parse(workspace.nsp_kv.attack_time, "^\"(?P<value>.*)\"$")
+    let source_time = coalesce(quoted.value, workspace.nsp_kv.attack_time)
+    let explicit_utc = regex_parse(source_time, "^(?P<value>.*) UTC$")
+    workspace.nsp.time = switch true {
+        source_time == null { null }
+        source_time == ""   { null }
+        source_time == "N/A" { null }
+        explicit_utc != null {
+            to_int(strptime(explicit_utc.value, "%Y-%m-%d %H:%M:%S", "UTC"))
+        }
+        default {
+            to_int(strptime(source_time, "%Y-%m-%d %H:%M:%S", source_timezone))
+        }
+    }
+}
+
 def process parse_nsp {
     // @requires: workspace.nsp.body      (required, String)
     // @requires: workspace.nsp.hostname  (optional, String)
-    // @requires: workspace.nsp.time      (optional, Int — epoch ns)
+    // @requires: workspace.nsp.timezone  (optional, String — IANA name or fixed offset)
     //
     // We do NOT use parse_kv here — see parse_nsp_extract() doc above
     // for why: real Trellix NSP Manager emits unquoted multi-word
@@ -320,6 +352,7 @@ def process parse_nsp {
         }
         default {
             process parse_nsp_normalize_severity
+            process parse_nsp_normalize_time
             workspace.lsis.parsed = nsp_finding_record(
                 workspace.nsp_kv,
                 workspace.nsp.hostname,

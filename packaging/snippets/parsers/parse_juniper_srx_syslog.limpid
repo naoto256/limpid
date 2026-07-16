@@ -3,7 +3,14 @@
 // Reads:       workspace.juniper_srx_syslog.* (bridge — see Bridges below)
 //                .body (required, String) — the syslog wire
 //                .hostname (optional, String) — collector-side hostname
-//                .time (optional, Int) — epoch nanoseconds
+//                .timezone (optional, String) — source device timezone override
+//                  as an IANA name or fixed offset; defaults to the limpid
+//                  host's system timezone for RFC 3164 time
+//                  (Junos security logs may use the configured local zone)
+//                  https://www.juniper.net/documentation/us/en/software/junos/cli-reference/topics/ref/command/show-security-log.html
+//                  The default assumes Junos and limpid have the same correct
+//                  system timezone. Correct either environment, override this
+//                  slot, or use a custom parser when that assumption is false.
 // Writes:      workspace.lsis.parsed.* — RT_IDP IDP_ATTACK_LOG_EVENT → 2004 (Detection
 //              Finding); other daemons / subtypes route to error_log until
 //              their shapes are added.
@@ -34,10 +41,10 @@
 //           on. Two typical bridges:
 //
 //           - syslog (UDP/TCP):
-//                 { workspace.juniper_srx_syslog = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_juniper_srx_syslog | compose_ocsf | ocsf_to_egress
+//                 { workspace.juniper_srx_syslog = { body: ingress, hostname: source.ip } } | parse_juniper_srx_syslog | compose_ocsf | ocsf_to_egress
 //
 //           - tail of a forwarded text file:
-//                 { workspace.juniper_srx_syslog = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_juniper_srx_syslog | compose_ocsf | ocsf_to_egress
+//                 { workspace.juniper_srx_syslog = { body: ingress, hostname: hostname() } } | parse_juniper_srx_syslog | compose_ocsf | ocsf_to_egress
 //
 // Sample wire (anonymised to RFC 5737):
 //
@@ -53,6 +60,8 @@
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+include "../functions/parse_datetime_rfc3164.limpid"
 
 // IANA proto name → number for connection_info.protocol_num.
 include "../functions/proto_num.limpid"
@@ -98,13 +107,14 @@ def function juniper_srx_syslog_action_status_id(action) {
 def function parse_juniper_srx_syslog_classify(text) {
     let m = regex_parse(
         text,
-        "^<\\d+>\\S+ \\S+ \\S+ (?P<host>\\S+) RT_(?P<daemon>[A-Z]+): (?P<msgid>[A-Z][A-Z0-9_]+): (?P<body>.*)$"
+        "^<\\d+>(?P<timestamp>\\S+ \\S+ \\S+) (?P<host>\\S+) RT_(?P<daemon>[A-Z]+): (?P<msgid>[A-Z][A-Z0-9_]+): (?P<body>.*)$"
     )
     switch true {
         m == null { null }
         default {
             {
                 host:   m.host,
+                timestamp: m.timestamp,
                 daemon: m.daemon,
                 msgid:  m.msgid,
                 body:   m.body
@@ -181,16 +191,30 @@ def function juniper_srx_syslog_idp_finding_record(src_ip, src_port_str, dst_ip,
 // Main parser
 // ---------------------------------------------------------------------------
 
+def process parse_juniper_srx_syslog_normalize_time {
+    switch workspace.juniper_srx_syslog.timezone {
+        "local" { error "parse_juniper_srx_syslog: source timezone must be an IANA name or fixed offset, not local" }
+    }
+    let source_timezone = coalesce(workspace.juniper_srx_syslog.timezone, "local")
+    workspace.juniper_srx_syslog.time = to_int(parse_datetime_rfc3164(
+        workspace.srx_syslog_class.timestamp,
+        source_timezone
+    ))
+}
+
 def process parse_juniper_srx_syslog {
     // @requires: workspace.juniper_srx_syslog.body      (required, String)
     // @requires: workspace.juniper_srx_syslog.hostname  (optional, String)
-    // @requires: workspace.juniper_srx_syslog.time      (optional, Int — epoch ns)
+    // @requires: workspace.juniper_srx_syslog.timezone  (optional, String)
+    // The RFC 3164 timestamp uses an explicit source override when supplied;
+    // otherwise it uses the limpid host's system timezone.
     workspace.srx_syslog_class = parse_juniper_srx_syslog_classify(workspace.juniper_srx_syslog.body)
     switch true {
         workspace.srx_syslog_class == null {
             error "parse_juniper_srx_syslog: not a Junos RT_<daemon> line: ${workspace.juniper_srx_syslog.body}"
         }
         workspace.srx_syslog_class.daemon == "IDP" {
+            process parse_juniper_srx_syslog_normalize_time
             process parse_juniper_srx_syslog_idp_dispatch
         }
         default {

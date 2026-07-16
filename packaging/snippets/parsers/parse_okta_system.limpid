@@ -219,6 +219,15 @@ def function okta_http_request(client) {
 // Top-level dispatcher
 // ---------------------------------------------------------------------------
 
+def process parse_okta_system_normalize_severity {
+    workspace.okta.severity_number = okta_severity_number(workspace.okta.severity)
+    switch true {
+        workspace.okta.severity != null and workspace.okta.severity_number == null {
+            error "parse_okta_system: invalid Okta System Log severity ${workspace.okta.severity}"
+        }
+    }
+}
+
 def process parse_okta_system {
     // parse_json on malformed JSON bails to the DLQ via the standard
     // error-log policy, so no explicit null-check arm is needed here.
@@ -240,11 +249,7 @@ def process parse_okta_system {
             error "parse_okta_system: target field is not an array (got ${workspace.okta.target}): ${ingress}"
         }
         default {
-            workspace.okta.severity_number = okta_severity_number(workspace.okta.severity)
             switch true {
-                workspace.okta.severity != null and workspace.okta.severity_number == null {
-                    error "parse_okta_system: invalid Okta System Log severity ${workspace.okta.severity}"
-                }
                 starts_with(et, "user.session.")          { process parse_okta_user_authentication }
                 starts_with(et, "user.authentication.")   { process parse_okta_user_authentication }
                 starts_with(et, "user.lifecycle.")        { process parse_okta_user_lifecycle }
@@ -293,6 +298,7 @@ def function okta_authentication_record(activity_id, status_id, severity_number,
 }
 
 def process parse_okta_user_authentication {
+    process parse_okta_system_normalize_severity
     let ev = workspace.okta
     let et = ev.eventType
     let activity_id = switch true {
@@ -368,6 +374,7 @@ def function okta_account_change_record(activity_id, status_id, severity_number,
 }
 
 def process parse_okta_user_lifecycle {
+    process parse_okta_system_normalize_severity
     let ev = workspace.okta
     let et = ev.eventType
     let activity_id = switch true {
@@ -452,6 +459,7 @@ def function okta_user_management_record(activity_id, status_id, severity_number
 }
 
 def process parse_okta_user_account {
+    process parse_okta_system_normalize_severity
     let ev = workspace.okta
     let et = ev.eventType
     let activity_id = switch true {
@@ -533,6 +541,7 @@ def function okta_group_management_record(activity_id, status_id, severity_numbe
 }
 
 def process parse_okta_group_membership {
+    process parse_okta_system_normalize_severity
     let ev = workspace.okta
     let et = ev.eventType
     let activity_id = switch true {
@@ -567,6 +576,7 @@ def process parse_okta_group_membership {
 }
 
 def process parse_okta_group_lifecycle {
+    process parse_okta_system_normalize_severity
     let ev = workspace.okta
     let et = ev.eventType
     let activity_id = switch true {
@@ -602,6 +612,7 @@ def process parse_okta_group_lifecycle {
 // privilege Assign/Revoke activity_ids. The acting principal is in
 // `ev.actor`; the affected group is the UserGroup target.
 def process parse_okta_group_privilege {
+    process parse_okta_system_normalize_severity
     let ev = workspace.okta
     let et = ev.eventType
     let activity_id = switch true {

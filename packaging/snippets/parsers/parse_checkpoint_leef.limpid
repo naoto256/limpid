@@ -3,7 +3,6 @@
 // Reads:       workspace.checkpoint_leef.* (bridge — see Bridges below)
 //                .body (required, String) — full syslog wire
 //                .hostname (optional, String) — collector-side hostname override
-//                .time (optional, Int) — epoch nanoseconds of arrival
 // Writes:      workspace.lsis.parsed.* — 4001 (Network Activity) for traffic EventIDs
 //              (Accept / Drop / Reject / Block); other LEEF events route to
 //              error_log.
@@ -32,7 +31,7 @@
 //           splits its own header.
 //
 //           - syslog (UDP/TCP):
-//                 { workspace.checkpoint_leef = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_checkpoint_leef | compose_ocsf | ocsf_to_egress
+//                 { workspace.checkpoint_leef = { body: ingress, hostname: source.ip } } | parse_checkpoint_leef | compose_ocsf | ocsf_to_egress
 //
 // Coverage notes — non-traffic LEEF events (Authentication, VPN tunnel
 //           state, etc.) route to error_log per the loud-fail-fast
@@ -89,10 +88,10 @@ def function parse_checkpoint_leef_kv(ext, name) {
 def process parse_checkpoint_leef {
     // @requires: workspace.checkpoint_leef.body      (required, String)
     // @requires: workspace.checkpoint_leef.hostname  (optional, String)
-    // @requires: workspace.checkpoint_leef.time      (optional, Int — epoch ns)
+    // The RFC 5424 TIMESTAMP in `.body` is the event time.
     workspace.cp_header = regex_parse(
         workspace.checkpoint_leef.body,
-        "LEEF:2\\.0\\|Check Point\\|(?P<product>[^|]+)\\|(?P<version>[^|]+)\\|(?P<event_id>[^|]+)\\|(?P<ext>.*)$"
+        "^<\\d+>1 (?P<timestamp>\\S+) \\S+ \\S+ \\S+ \\S+ LEEF:2\\.0\\|Check Point\\|(?P<product>[^|]+)\\|(?P<version>[^|]+)\\|(?P<event_id>[^|]+)\\|(?P<ext>.*)$"
     )
     switch true {
         workspace.cp_header == null {
@@ -119,7 +118,11 @@ def process parse_checkpoint_leef_record {
                 category_uid: 4,
                 activity_id:  activity,
                 status_id:    checkpoint_leef_status_id(event_id),
-                time:         workspace.checkpoint_leef.time,
+                time:         switch workspace.cp_header.timestamp {
+                    null    { null }
+                    "-"     { null }
+                    default { to_int(parse_datetime_rfc3339(workspace.cp_header.timestamp)) }
+                },
                 src_endpoint: {
                     ip:   parse_checkpoint_leef_kv(ext, "src"),
                     port: switch true {

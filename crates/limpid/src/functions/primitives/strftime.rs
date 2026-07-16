@@ -3,9 +3,10 @@
 //! First argument must be a `Value::Timestamp` (returned by
 //! `received_at`, `timestamp()`, `strptime`). `Value::Timestamp` is
 //! UTC-normalised internally; without an explicit `timezone` argument
-//! the result is rendered in UTC. Pass `"local"`, `"UTC"`, or a
-//! literal offset (`+09:00` / `-0530`) to convert before rendering.
-//! An unknown timezone is a loud error.
+//! the result is rendered in UTC. Pass `"local"`, `"UTC"`, an IANA
+//! timezone name (`Asia/Tokyo`), or a literal offset (`+09:00` /
+//! `-0530`) to convert before rendering. An unknown timezone is a
+//! loud error.
 
 use anyhow::bail;
 
@@ -29,6 +30,7 @@ pub fn register(reg: &mut FunctionRegistry) {
             // strftime(ts, fmt, "local")  — convert to local time, then format
             // strftime(ts, fmt, "UTC")    — explicit UTC (same as no tz arg)
             // strftime(ts, fmt, "+09:00") — convert to fixed offset, then format
+            // strftime(ts, fmt, "Asia/Tokyo") — convert to an IANA timezone
             let dt = match &args[0] {
                 Value::Timestamp(dt) => *dt,
                 other => bail!(
@@ -49,14 +51,18 @@ pub fn register(reg: &mut FunctionRegistry) {
                 Some("UTC") | Some("utc") => {
                     dt.with_timezone(&chrono::Utc).format(&fmt).to_string()
                 }
-                Some(offset) => {
-                    let fixed = parse_fixed_offset(offset).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "strftime(): invalid timezone '{}' (expected 'local', 'UTC', or ±HH:MM)",
-                        offset
-                    )
-                })?;
-                    dt.with_timezone(&fixed).format(&fmt).to_string()
+                Some(timezone) => {
+                    if let Some(fixed) = parse_fixed_offset(timezone) {
+                        dt.with_timezone(&fixed).format(&fmt).to_string()
+                    } else {
+                        let zone = timezone.parse::<chrono_tz::Tz>().map_err(|_| {
+                            anyhow::anyhow!(
+                                "strftime(): invalid timezone '{}' (expected 'local', 'UTC', an IANA name, or ±HH:MM)",
+                                timezone
+                            )
+                        })?;
+                        dt.with_timezone(&zone).format(&fmt).to_string()
+                    }
                 }
             };
 
