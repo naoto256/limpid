@@ -8,7 +8,8 @@
 //   .time (optional, Int) — epoch ns override
 // Writes:      workspace.lsis.parsed.* — conn / ssl / files / x509 → 4001,
 //              dns → 4003, http → 4002, weird / notice → 2004; other
-//              _paths route to error_log.
+//              _paths route to error_log. zeek_default_to_otlp writes
+//              source-owned OTLP Resource, Scope, Body, and attributes.
 // Category:    OSS NDR
 // Test corpus: public (elastic/integrations zeek corpus — 61 events across
 //              the 8 default streams, pre-unflattened to native nested form)
@@ -582,5 +583,38 @@ def process parse_zeek_default_notice {
         workspace.zeek.body,
         workspace.zeek.hostname,
         zeek_time_ns(workspace.zeek.body, workspace.zeek.time)
+    )
+}
+
+def function zeek_default_otlp_event_kind(class_uid) { switch class_uid { 2004 { "alert" } default { "event" } } }
+def function zeek_default_otlp_event_category(class_uid) { switch class_uid { 2004 { "intrusion_detection" } 4002 { "web" } default { "network" } } }
+def function zeek_default_otlp_event_outcome(status_id) { switch status_id { 1 { "success" } 2 { "failure" } default { null } } }
+
+def process zeek_default_to_otlp {
+    workspace.lsis.shed.otlp.resource.attributes = concat(
+        [{ key: "observer.vendor", value: { string_value: "Zeek Project" } }],
+        [{ key: "observer.product", value: { string_value: "Zeek" } }],
+        [{ key: "observer.type", value: { string_value: "network" } }],
+        switch workspace.zeek.hostname != null { true { [{ key: "host.name", value: { string_value: workspace.zeek.hostname } }] } default { [] } },
+        [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
+        [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
+    )
+    workspace.lsis.shed.otlp.scope.name = workspace.zeek.body._path
+    workspace.lsis.shed.otlp.log_record.body = { string_value: ingress }
+    workspace.lsis.shed.otlp.log_record.attributes = concat(
+        [{ key: "event.kind", value: { string_value: zeek_default_otlp_event_kind(workspace.lsis.parsed.class_uid) } }],
+        [{ key: "event.category", value: { array_value: { values: [{ string_value: zeek_default_otlp_event_category(workspace.lsis.parsed.class_uid) }] } } }],
+        [{ key: "event.type", value: { array_value: { values: [{ string_value: "protocol" }] } } }],
+        switch workspace.zeek.body._path != null { true { [{ key: "event.code", value: { string_value: workspace.zeek.body._path } }] } default { [] } },
+        switch zeek_default_otlp_event_outcome(workspace.lsis.parsed.status_id) != null { true { [{ key: "event.outcome", value: { string_value: zeek_default_otlp_event_outcome(workspace.lsis.parsed.status_id) } }] } default { [] } },
+        switch workspace.lsis.parsed.src_endpoint.ip != null { true { [{ key: "source.ip", value: { string_value: workspace.lsis.parsed.src_endpoint.ip } }] } default { [] } },
+        switch workspace.lsis.parsed.src_endpoint.port != null { true { [{ key: "source.port", value: { int_value: workspace.lsis.parsed.src_endpoint.port } }] } default { [] } },
+        switch workspace.lsis.parsed.dst_endpoint.ip != null { true { [{ key: "destination.ip", value: { string_value: workspace.lsis.parsed.dst_endpoint.ip } }] } default { [] } },
+        switch workspace.lsis.parsed.dst_endpoint.port != null { true { [{ key: "destination.port", value: { int_value: workspace.lsis.parsed.dst_endpoint.port } }] } default { [] } },
+        switch workspace.lsis.parsed.connection_info.protocol_name != null { true { [{ key: "network.transport", value: { string_value: workspace.lsis.parsed.connection_info.protocol_name } }] } default { [] } },
+        switch workspace.lsis.parsed.dns_query.hostname != null { true { [{ key: "dns.question.name", value: { string_value: workspace.lsis.parsed.dns_query.hostname } }] } default { [] } },
+        switch workspace.lsis.parsed.http_request.url.url_string != null { true { [{ key: "url.original", value: { string_value: workspace.lsis.parsed.http_request.url.url_string } }] } default { [] } },
+        switch workspace.lsis.parsed.http_response.code != null { true { [{ key: "http.response.status_code", value: { int_value: workspace.lsis.parsed.http_response.code } }] } default { [] } },
+        switch workspace.lsis.parsed.finding_info.title != null { true { [{ key: "rule.name", value: { string_value: workspace.lsis.parsed.finding_info.title } }] } default { [] } }
     )
 }

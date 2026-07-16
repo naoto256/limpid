@@ -5,6 +5,8 @@
 // Reads:       ingress (raw wire) — one space-separated flow-log record per
 //              line; dispatch by the leading version token
 // Writes:      workspace.lsis.parsed.* — 4001 (Network Activity); unknown version
+//              aws_vpc_flow_to_otlp additionally writes source-specific
+//              workspace.lsis.shed.otlp Resource, Body, and LogRecord attributes.
 //              tokens route to error_log.
 // Category:    Cloud network (data plane)
 // Test corpus: spec-only (AWS VPC Flow Logs documentation column layouts;
@@ -23,6 +25,10 @@
 //              composer's `null_omit`. The Parquet flow-log delivery
 //              format is out of LPL scope — only the text wire is
 //              parsed.
+//              The OTLP adapter emits ECS `event.start` / `event.end` as
+//              epoch-nanosecond Int AnyValues. ECS models these as date
+//              fields; the integer representation preserves LSIS precision
+//              for OTLP consumers without string conversion.
 //
 //              v2 (default, 14 columns):
 //                version account-id interface-id srcaddr dstaddr
@@ -345,4 +351,116 @@ def process parse_aws_vpc_flow_v5_record {
             version: "1.3.0"
         }
     }
+}
+
+def function aws_vpc_flow_otlp_event_outcome(status_id) {
+    switch status_id {
+        1       { "success" }
+        2       { "failure" }
+        default { null }
+    }
+}
+
+def function aws_vpc_flow_otlp_event_types(status_id) {
+    switch status_id {
+        1       { [{ string_value: "connection" }, { string_value: "allowed" }] }
+        2       { [{ string_value: "connection" }, { string_value: "denied" }] }
+        default  { [{ string_value: "connection" }] }
+    }
+}
+
+def process aws_vpc_flow_to_otlp {
+    workspace.lsis.shed.otlp.resource.attributes = concat(
+        [{ key: "cloud.provider", value: { string_value: "aws" } }],
+        switch workspace.lsis.parsed.cloud.account.uid != null {
+            true { [{ key: "cloud.account.id", value: { string_value: workspace.lsis.parsed.cloud.account.uid } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.cloud.region != null {
+            true { [{ key: "cloud.region", value: { string_value: workspace.lsis.parsed.cloud.region } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.cloud.zone != null {
+            true { [{ key: "cloud.availability_zone", value: { string_value: workspace.lsis.parsed.cloud.zone } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.src_endpoint.instance_uid != null {
+            true { [{ key: "host.id", value: { string_value: workspace.lsis.parsed.src_endpoint.instance_uid } }] }
+            default { [] }
+        },
+        [{ key: "service.name", value: { string_value: "AWS VPC Flow Logs" } }],
+        [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
+        [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
+    )
+
+    workspace.lsis.shed.otlp.log_record.body = { string_value: ingress }
+    workspace.lsis.shed.otlp.log_record.attributes = concat(
+        [{ key: "event.kind", value: { string_value: "event" } }],
+        [{ key: "event.category", value: { array_value: { values: [{ string_value: "network" }] } } }],
+        [{ key: "event.type", value: { array_value: { values: aws_vpc_flow_otlp_event_types(workspace.lsis.parsed.status_id) } } }],
+        switch aws_vpc_flow_otlp_event_outcome(workspace.lsis.parsed.status_id) != null {
+            true { [{ key: "event.outcome", value: { string_value: aws_vpc_flow_otlp_event_outcome(workspace.lsis.parsed.status_id) } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.src_endpoint.ip != null {
+            true { [{ key: "source.ip", value: { string_value: workspace.lsis.parsed.src_endpoint.ip } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.src_endpoint.port != null {
+            true { [{ key: "source.port", value: { int_value: workspace.lsis.parsed.src_endpoint.port } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.dst_endpoint.ip != null {
+            true { [{ key: "destination.ip", value: { string_value: workspace.lsis.parsed.dst_endpoint.ip } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.dst_endpoint.port != null {
+            true { [{ key: "destination.port", value: { int_value: workspace.lsis.parsed.dst_endpoint.port } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.connection_info.protocol_name != null {
+            true { [{ key: "network.transport", value: { string_value: workspace.lsis.parsed.connection_info.protocol_name } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.connection_info.protocol_num != null {
+            true { [{ key: "network.iana_number", value: { int_value: workspace.lsis.parsed.connection_info.protocol_num } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.connection_info.direction != null {
+            true { [{ key: "network.direction", value: { string_value: workspace.lsis.parsed.connection_info.direction } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.start_time != null {
+            true { [{ key: "event.start", value: { int_value: workspace.lsis.parsed.start_time } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.end_time != null {
+            true { [{ key: "event.end", value: { int_value: workspace.lsis.parsed.end_time } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.traffic.packets != null {
+            true { [{ key: "aws.vpc_flow.packets", value: { int_value: workspace.lsis.parsed.traffic.packets } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.traffic.bytes != null {
+            true { [{ key: "aws.vpc_flow.bytes", value: { int_value: workspace.lsis.parsed.traffic.bytes } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.src_endpoint.interface_uid != null {
+            true { [{ key: "aws.vpc_flow.interface.id", value: { string_value: workspace.lsis.parsed.src_endpoint.interface_uid } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.src_endpoint.vpc_uid != null {
+            true { [{ key: "aws.vpc_flow.vpc.id", value: { string_value: workspace.lsis.parsed.src_endpoint.vpc_uid } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.src_endpoint.subnet_uid != null {
+            true { [{ key: "aws.vpc_flow.subnet.id", value: { string_value: workspace.lsis.parsed.src_endpoint.subnet_uid } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.status_detail != null {
+            true { [{ key: "aws.vpc_flow.log_status", value: { string_value: workspace.lsis.parsed.status_detail } }] }
+            default { [] }
+        }
+    )
 }

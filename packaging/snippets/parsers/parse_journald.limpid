@@ -3,7 +3,9 @@
 // Reads:       ingress (raw wire) — one journalctl -o json line (UTF-8
 //              JSON object) per ingress
 // Writes:      workspace.journald.* — all fields as journald exposes them;
-//              the transport namespace, not LSIS.
+//              the transport namespace, not LSIS. journald_to_otlp writes
+//              source-owned OTLP Resource, Scope, Body, and attributes
+//              without promoting PRIORITY to canonical severity.
 // Category:    Transport
 // Test corpus: synthetic (journalctl -o json sample wire in this header)
 //
@@ -28,6 +30,12 @@
 //   __MONOTONIC_TIMESTAMP  — boot-relative microseconds, string
 //   MESSAGE                — log line text
 //
+// The journal records host-local service and process activity, and trusted
+// journal field `_HOSTNAME` identifies the originating host. The adapter
+// therefore retains host event.category/event.type classification and maps
+// `_HOSTNAME` to Resource `host.name`.
+// https://www.freedesktop.org/software/systemd/man/latest/systemd.journal-fields.html
+//
 // Numeric-looking fields stay JSON strings (journalctl convention);
 // convert with `to_int(...)` if you need arithmetic (e.g. PRI).
 //
@@ -47,4 +55,30 @@
 
 def process parse_journald {
     workspace.journald = parse_json(ingress)
+}
+
+def process journald_to_otlp {
+    workspace.lsis.shed.otlp.resource.attributes = concat(
+        switch workspace.journald._HOSTNAME != null { true { [{ key: "host.name", value: { string_value: workspace.journald._HOSTNAME } }] } default { [] } },
+        [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
+        [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
+    )
+    workspace.lsis.shed.otlp.scope.name = coalesce(workspace.journald.SYSLOG_IDENTIFIER, workspace.journald._SYSTEMD_UNIT)
+    workspace.lsis.shed.otlp.scope.attributes = concat(
+        switch workspace.journald._SYSTEMD_UNIT != null { true { [{ key: "systemd.unit", value: { string_value: workspace.journald._SYSTEMD_UNIT } }] } default { [] } },
+        switch workspace.journald._TRANSPORT != null { true { [{ key: "systemd.transport", value: { string_value: workspace.journald._TRANSPORT } }] } default { [] } }
+    )
+    workspace.lsis.shed.otlp.log_record.body = switch workspace.journald.MESSAGE != null {
+        true    { { string_value: workspace.journald.MESSAGE } }
+        default { null }
+    }
+    workspace.lsis.shed.otlp.log_record.attributes = concat(
+        [{ key: "event.kind", value: { string_value: "event" } }],
+        [{ key: "event.category", value: { array_value: { values: [{ string_value: "host" }] } } }],
+        [{ key: "event.type", value: { array_value: { values: [{ string_value: "info" }] } } }],
+        switch workspace.journald.PRIORITY != null { true { [{ key: "log.syslog.severity.code", value: { int_value: to_int(workspace.journald.PRIORITY) } }] } default { [] } },
+        switch workspace.journald.SYSLOG_FACILITY != null { true { [{ key: "log.syslog.facility.code", value: { int_value: to_int(workspace.journald.SYSLOG_FACILITY) } }] } default { [] } },
+        switch coalesce(workspace.journald._PID, workspace.journald.SYSLOG_PID) != null { true { [{ key: "process.pid", value: { int_value: to_int(coalesce(workspace.journald._PID, workspace.journald.SYSLOG_PID)) } }] } default { [] } },
+        switch workspace.journald._UID != null { true { [{ key: "user.id", value: { string_value: workspace.journald._UID } }] } default { [] } }
+    )
 }

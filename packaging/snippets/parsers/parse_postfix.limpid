@@ -6,7 +6,8 @@
 //                .time (optional, Int) — epoch nanoseconds
 // Writes:      workspace.lsis.parsed.* — 4009 (Email Activity) for mail-flow programs
 //              (smtp / smtpd / qmgr / bounce); daemon-control noise routes to
-//              error_log.
+//              error_log. postfix_to_otlp writes source-owned OTLP Resource,
+//              Scope, Body, and LogRecord attributes.
 // Category:    Mail (MTA)
 // Test corpus: synthetic (sample postfix lines in this header)
 //
@@ -367,4 +368,34 @@ def process parse_postfix_bounce_record {
             version: "1.3.0"
         }
     }
+}
+
+def function postfix_otlp_event_outcome(status_id) {
+    switch status_id { 1 { "success" } 2 { "failure" } default { null } }
+}
+
+def process postfix_to_otlp {
+    workspace.lsis.shed.otlp.resource.attributes = concat(
+        [{ key: "service.name", value: { string_value: "postfix" } }],
+        switch workspace.postfix.hostname != null { true { [{ key: "host.name", value: { string_value: workspace.postfix.hostname } }] } default { [] } },
+        [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
+        [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
+    )
+    workspace.lsis.shed.otlp.scope.name = switch workspace.pf.program != null { true { "postfix/${workspace.pf.program}" } default { "postfix" } }
+    workspace.lsis.shed.otlp.log_record.body = { string_value: workspace.postfix.body }
+    workspace.lsis.shed.otlp.log_record.attributes = concat(
+        [{ key: "event.kind", value: { string_value: "event" } }],
+        [{ key: "event.category", value: { array_value: { values: [{ string_value: "email" }] } } }],
+        [{ key: "event.type", value: { array_value: { values: [{ string_value: "info" }] } } }],
+        switch workspace.pf.program != null { true { [{ key: "event.action", value: { string_value: workspace.pf.program } }] } default { [] } },
+        switch postfix_otlp_event_outcome(workspace.lsis.parsed.status_id) != null { true { [{ key: "event.outcome", value: { string_value: postfix_otlp_event_outcome(workspace.lsis.parsed.status_id) } }] } default { [] } },
+        switch workspace.lsis.parsed.message != null { true { [{ key: "message", value: { string_value: workspace.lsis.parsed.message } }] } default { [] } },
+        switch workspace.lsis.parsed.actor.process.pid != null { true { [{ key: "process.pid", value: { int_value: workspace.lsis.parsed.actor.process.pid } }] } default { [] } },
+        switch workspace.lsis.parsed.email.message_uid != null { true { [{ key: "email.message_id", value: { string_value: workspace.lsis.parsed.email.message_uid } }] } default { [] } },
+        switch workspace.lsis.parsed.email.from != null { true { [{ key: "email.from.address", value: { string_value: workspace.lsis.parsed.email.from } }] } default { [] } },
+        switch workspace.lsis.parsed.email.size != null { true { [{ key: "email.message.size", value: { int_value: workspace.lsis.parsed.email.size } }] } default { [] } },
+        switch workspace.lsis.parsed.src_endpoint.ip != null { true { [{ key: "source.ip", value: { string_value: workspace.lsis.parsed.src_endpoint.ip } }] } default { [] } },
+        switch workspace.lsis.parsed.src_endpoint.hostname != null { true { [{ key: "source.domain", value: { string_value: workspace.lsis.parsed.src_endpoint.hostname } }] } default { [] } },
+        switch workspace.lsis.parsed.dst_endpoint.ip != null { true { [{ key: "destination.ip", value: { string_value: workspace.lsis.parsed.dst_endpoint.ip } }] } default { [] } }
+    )
 }

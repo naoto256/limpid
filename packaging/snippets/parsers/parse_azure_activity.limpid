@@ -4,6 +4,8 @@
 // Reads:       ingress (raw wire) — one Activity Log event per ingress (flat
 //              per-record form; unwrap Event Hub batches upstream)
 // Writes:      workspace.lsis.parsed.* — 6003 (API Activity), dispatched over the
+//              azure_activity_to_otlp additionally writes source-specific
+//              workspace.lsis.shed.otlp Resource, Body, and LogRecord attributes.
 //              8 documented categories; unknown categories route to
 //              error_log.
 // Category:    Cloud audit (API control plane)
@@ -299,4 +301,90 @@ def process parse_azure_activity {
             }
         }
     }
+}
+
+def function azure_activity_otlp_event_category(category) {
+    switch category {
+        "Security"       { "intrusion_detection" }
+        "Alert"          { "intrusion_detection" }
+        "ServiceHealth"  { "availability" }
+        "ResourceHealth" { "availability" }
+        default          { "configuration" }
+    }
+}
+
+def function azure_activity_otlp_event_outcome(status_id) {
+    switch status_id {
+        1       { "success" }
+        2       { "failure" }
+        default { null }
+    }
+}
+
+def process azure_activity_to_otlp {
+    workspace.lsis.shed.otlp.resource.attributes = concat(
+        [{ key: "cloud.provider", value: { string_value: "azure" } }],
+        switch workspace.az.subscriptionId != null {
+            true { [{ key: "cloud.account.id", value: { string_value: workspace.az.subscriptionId } }] }
+            default { [] }
+        },
+        switch workspace.az.resourceId != null {
+            true { [{ key: "cloud.resource_id", value: { string_value: workspace.az.resourceId } }] }
+            default { [] }
+        },
+        [{ key: "service.name", value: { string_value: "Azure Activity Log" } }],
+        [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
+        [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
+    )
+
+    workspace.lsis.shed.otlp.log_record.body = { string_value: ingress }
+    workspace.lsis.shed.otlp.log_record.attributes = concat(
+        [{ key: "event.kind", value: { string_value: "event" } }],
+        [{ key: "event.category", value: { array_value: { values: [{ string_value: azure_activity_otlp_event_category(workspace.az.category) }] } } }],
+        [{ key: "event.type", value: { array_value: { values: [{ string_value: "change" }] } } }],
+        switch workspace.az.operationName != null {
+            true { [{ key: "event.action", value: { string_value: workspace.az.operationName } }] }
+            default { [] }
+        },
+        switch workspace.az.correlationId != null {
+            true { [{ key: "event.id", value: { string_value: workspace.az.correlationId } }] }
+            default { [] }
+        },
+        switch azure_activity_otlp_event_outcome(workspace.lsis.parsed.status_id) != null {
+            true { [{ key: "event.outcome", value: { string_value: azure_activity_otlp_event_outcome(workspace.lsis.parsed.status_id) } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.message != null {
+            true { [{ key: "message", value: { string_value: workspace.lsis.parsed.message } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.actor.user.name != null {
+            true { [{ key: "user.name", value: { string_value: workspace.lsis.parsed.actor.user.name } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.actor.user.uid != null {
+            true { [{ key: "user.id", value: { string_value: workspace.lsis.parsed.actor.user.uid } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.src_endpoint.ip != null {
+            true { [{ key: "source.ip", value: { string_value: workspace.lsis.parsed.src_endpoint.ip } }] }
+            default { [] }
+        },
+        switch workspace.az.tenantId != null {
+            true { [{ key: "azure.tenant.id", value: { string_value: workspace.az.tenantId } }] }
+            default { [] }
+        },
+        switch workspace.az.category != null {
+            true { [{ key: "azure.activity.category", value: { string_value: workspace.az.category } }] }
+            default { [] }
+        },
+        switch workspace.az.resultType != null {
+            true { [{ key: "azure.activity.result_type", value: { string_value: workspace.az.resultType } }] }
+            default { [] }
+        },
+        switch workspace.az.durationMs != null {
+            true { [{ key: "azure.activity.duration_ms", value: { int_value: to_int(workspace.az.durationMs) } }] }
+            default { [] }
+        }
+    )
 }

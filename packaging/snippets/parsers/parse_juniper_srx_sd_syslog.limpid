@@ -5,7 +5,8 @@
 //                .hostname (optional, String) — collector-side override (parser prefers the wire's HOSTNAME field via classify)
 // Writes:      workspace.lsis.parsed.* — RT_FLOW / APPTRACK → 4001, RT_IDP / RT_IDS /
 //              RT_UTM (AV, antispam, content-filter) / RT_AAMW / RT_SECINTEL →
-//              2004, RT_UTM WEBFILTER_URL_* → 4002. Per-daemon table below.
+//              2004, RT_UTM WEBFILTER_URL_* → 4002. juniper_srx_sd_syslog_to_otlp
+//              writes source-owned OTLP Resource, Scope, Body, and attributes.
 // Category:    Network firewall / IPS
 // Test corpus: public (elastic/integrations juniper_srx fixtures — 88 events
 //              across RT_FLOW / APPTRACK / RT_IDP / RT_IDS / RT_UTM / RT_AAMW /
@@ -968,6 +969,153 @@ def process parse_juniper_srx_sd_syslog_secintel_record {
             session_id:      parse_juniper_srx_sd_syslog_kv(sd, "session-id-32"),
             username:        parse_juniper_srx_sd_syslog_kv_or_null(sd, "username"),
             threat_severity: workspace.srx_sd_secintel_severity.raw
+        }
+    )
+}
+
+def function juniper_srx_sd_syslog_otlp_event_kind(class_uid) {
+    switch class_uid {
+        2004    { "alert" }
+        default { "event" }
+    }
+}
+
+def function juniper_srx_sd_syslog_otlp_event_category(class_uid) {
+    switch class_uid {
+        2004    { "intrusion_detection" }
+        4002    { "web" }
+        default { "network" }
+    }
+}
+
+def function juniper_srx_sd_syslog_otlp_event_type(class_uid) {
+    switch class_uid {
+        2004    { "indicator" }
+        4002    { "access" }
+        default { "connection" }
+    }
+}
+
+def function juniper_srx_sd_syslog_otlp_event_outcome(status_id) {
+    switch status_id {
+        1       { "success" }
+        2       { "failure" }
+        default { null }
+    }
+}
+
+def process juniper_srx_sd_syslog_to_otlp {
+    workspace.lsis.shed.otlp.resource.attributes = concat(
+        [{ key: "observer.vendor", value: { string_value: "Juniper Networks" } }],
+        [{ key: "observer.product", value: { string_value: "Junos OS (SRX)" } }],
+        [{ key: "observer.type", value: { string_value: "firewall" } }],
+        switch workspace.srx_sd_class.host != null {
+            true { [{ key: "host.name", value: { string_value: workspace.srx_sd_class.host } }] }
+            default { [] }
+        },
+        [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
+        [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
+    )
+    workspace.lsis.shed.otlp.scope.name = switch workspace.srx_sd_class.daemon != null {
+        true    { "RT_${workspace.srx_sd_class.daemon}" }
+        default { null }
+    }
+    workspace.lsis.shed.otlp.log_record.body = { string_value: workspace.juniper_srx_sd_syslog.body }
+    workspace.lsis.shed.otlp.log_record.attributes = concat(
+        [{ key: "event.kind", value: { string_value: juniper_srx_sd_syslog_otlp_event_kind(workspace.lsis.parsed.class_uid) } }],
+        [{ key: "event.category", value: { array_value: { values: [{ string_value: juniper_srx_sd_syslog_otlp_event_category(workspace.lsis.parsed.class_uid) }] } } }],
+        [{ key: "event.type", value: { array_value: { values: [{ string_value: juniper_srx_sd_syslog_otlp_event_type(workspace.lsis.parsed.class_uid) }] } } }],
+        switch workspace.srx_sd_class.msgid != null {
+            true { [{ key: "event.code", value: { string_value: workspace.srx_sd_class.msgid } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.unmapped.action != null {
+            true { [{ key: "event.action", value: { string_value: workspace.lsis.parsed.unmapped.action } }] }
+            default { [] }
+        },
+        switch juniper_srx_sd_syslog_otlp_event_outcome(workspace.lsis.parsed.status_id) != null {
+            true { [{ key: "event.outcome", value: { string_value: juniper_srx_sd_syslog_otlp_event_outcome(workspace.lsis.parsed.status_id) } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.message != null {
+            true { [{ key: "message", value: { string_value: workspace.lsis.parsed.message } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.actor.user.name != null {
+            true { [{ key: "user.name", value: { string_value: workspace.lsis.parsed.actor.user.name } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.src_endpoint.ip != null {
+            true { [{ key: "source.ip", value: { string_value: workspace.lsis.parsed.src_endpoint.ip } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.src_endpoint.port != null {
+            true { [{ key: "source.port", value: { int_value: workspace.lsis.parsed.src_endpoint.port } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.src_endpoint.zone != null {
+            true { [{ key: "source.zone", value: { string_value: workspace.lsis.parsed.src_endpoint.zone } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.dst_endpoint.ip != null {
+            true { [{ key: "destination.ip", value: { string_value: workspace.lsis.parsed.dst_endpoint.ip } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.dst_endpoint.port != null {
+            true { [{ key: "destination.port", value: { int_value: workspace.lsis.parsed.dst_endpoint.port } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.dst_endpoint.zone != null {
+            true { [{ key: "destination.zone", value: { string_value: workspace.lsis.parsed.dst_endpoint.zone } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.connection_info.protocol_name != null {
+            true { [{ key: "network.transport", value: { string_value: workspace.lsis.parsed.connection_info.protocol_name } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.connection_info.protocol_num != null {
+            true { [{ key: "network.iana_number", value: { int_value: workspace.lsis.parsed.connection_info.protocol_num } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.connection_info.session.uid != null {
+            true { [{ key: "juniper.session.id", value: { string_value: workspace.lsis.parsed.connection_info.session.uid } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.app_name != null {
+            true { [{ key: "network.application", value: { string_value: workspace.lsis.parsed.app_name } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.traffic.bytes_in != null {
+            true { [{ key: "source.bytes", value: { int_value: workspace.lsis.parsed.traffic.bytes_in } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.traffic.bytes_out != null {
+            true { [{ key: "destination.bytes", value: { int_value: workspace.lsis.parsed.traffic.bytes_out } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.http_request.url.url_string != null {
+            true { [{ key: "url.full", value: { string_value: workspace.lsis.parsed.http_request.url.url_string } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.finding_info.title != null {
+            true { [{ key: "rule.name", value: { string_value: workspace.lsis.parsed.finding_info.title } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.finding_info.uid != null {
+            true { [{ key: "rule.id", value: { string_value: workspace.lsis.parsed.finding_info.uid } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.unmapped.policy_name != null {
+            true { [{ key: "juniper.policy.name", value: { string_value: workspace.lsis.parsed.unmapped.policy_name } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.unmapped.rule_name != null {
+            true { [{ key: "juniper.rule.name", value: { string_value: workspace.lsis.parsed.unmapped.rule_name } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.unmapped.extra.threat_severity != null {
+            true { [{ key: "juniper.secintel.severity", value: { string_value: workspace.lsis.parsed.unmapped.extra.threat_severity } }] }
+            default { [] }
         }
     )
 }

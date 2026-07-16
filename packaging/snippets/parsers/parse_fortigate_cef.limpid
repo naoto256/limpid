@@ -11,7 +11,8 @@
 //              system timezone. Correct either environment, override this
 //              slot, or use a custom parser when that assumption is false.
 // Writes:      workspace.lsis.parsed.* — class per subtype (traffic → 4001,
-//              IPS / virus → 2004, …); see the subtype leaves below.
+//              IPS / virus → 2004, …); fortigate_cef_to_otlp writes
+//              source-owned OTLP Resource, Body, and LogRecord attributes.
 // Category:    Network firewall / IPS
 // Test corpus: real (anonymised FortiGate captures — the dialect-quirks
 //              block below was verified against them)
@@ -912,4 +913,153 @@ def process parse_fortigate_cef_event_security_rating {
             workspace.cef.device_version
         )
     }
+}
+
+def function fortigate_cef_otlp_event_kind(class_uid) {
+    switch class_uid {
+        2003    { "alert" }
+        2004    { "alert" }
+        default { "event" }
+    }
+}
+
+def function fortigate_cef_otlp_event_category(class_uid) {
+    switch class_uid {
+        2003    { "configuration" }
+        2004    { "intrusion_detection" }
+        3002    { "authentication" }
+        4002    { "web" }
+        4003    { "network" }
+        4009    { "email" }
+        6003    { "file" }
+        6004    { "web" }
+        default { "network" }
+    }
+}
+
+def function fortigate_cef_otlp_event_type(class_uid) {
+    switch class_uid {
+        2003    { "info" }
+        2004    { "indicator" }
+        3002    { "start" }
+        4002    { "access" }
+        4009    { "info" }
+        6003    { "info" }
+        6004    { "access" }
+        default { "connection" }
+    }
+}
+
+def function fortigate_cef_otlp_event_outcome(status_id) {
+    switch status_id {
+        1       { "success" }
+        2       { "failure" }
+        default { null }
+    }
+}
+
+def process fortigate_cef_to_otlp {
+    workspace.lsis.shed.otlp.resource.attributes = concat(
+        switch workspace.cef.device_vendor != null {
+            true { [{ key: "observer.vendor", value: { string_value: workspace.cef.device_vendor } }] }
+            default { [] }
+        },
+        switch workspace.cef.device_product != null {
+            true { [{ key: "observer.product", value: { string_value: workspace.cef.device_product } }] }
+            default { [] }
+        },
+        switch workspace.cef.device_version != null {
+            true { [{ key: "observer.version", value: { string_value: workspace.cef.device_version } }] }
+            default { [] }
+        },
+        [{ key: "observer.type", value: { string_value: "firewall" } }],
+        [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
+        [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
+    )
+    workspace.lsis.shed.otlp.log_record.body = { string_value: workspace.syslog.msg }
+    workspace.lsis.shed.otlp.log_record.attributes = concat(
+        [{ key: "event.kind", value: { string_value: fortigate_cef_otlp_event_kind(workspace.lsis.parsed.class_uid) } }],
+        [{ key: "event.category", value: { array_value: { values: [{ string_value: fortigate_cef_otlp_event_category(workspace.lsis.parsed.class_uid) }] } } }],
+        [{ key: "event.type", value: { array_value: { values: [{ string_value: fortigate_cef_otlp_event_type(workspace.lsis.parsed.class_uid) }] } } }],
+        switch workspace.cef.cat != null {
+            true { [{ key: "event.action", value: { string_value: workspace.cef.cat } }] }
+            default { [] }
+        },
+        switch fortigate_cef_otlp_event_outcome(workspace.lsis.parsed.status_id) != null {
+            true { [{ key: "event.outcome", value: { string_value: fortigate_cef_otlp_event_outcome(workspace.lsis.parsed.status_id) } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.message != null {
+            true { [{ key: "message", value: { string_value: workspace.lsis.parsed.message } }] }
+            default { [] }
+        },
+        switch coalesce(workspace.lsis.parsed.actor.user.name, workspace.lsis.parsed.user.name) != null {
+            true { [{ key: "user.name", value: { string_value: coalesce(workspace.lsis.parsed.actor.user.name, workspace.lsis.parsed.user.name) } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.src_endpoint.ip != null {
+            true { [{ key: "source.ip", value: { string_value: workspace.lsis.parsed.src_endpoint.ip } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.src_endpoint.port != null {
+            true { [{ key: "source.port", value: { int_value: workspace.lsis.parsed.src_endpoint.port } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.dst_endpoint.ip != null {
+            true { [{ key: "destination.ip", value: { string_value: workspace.lsis.parsed.dst_endpoint.ip } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.dst_endpoint.port != null {
+            true { [{ key: "destination.port", value: { int_value: workspace.lsis.parsed.dst_endpoint.port } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.connection_info.protocol_name != null {
+            true { [{ key: "network.transport", value: { string_value: workspace.lsis.parsed.connection_info.protocol_name } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.connection_info.protocol_num != null {
+            true { [{ key: "network.iana_number", value: { int_value: workspace.lsis.parsed.connection_info.protocol_num } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.app_name != null {
+            true { [{ key: "network.application", value: { string_value: workspace.lsis.parsed.app_name } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.traffic.bytes_in != null {
+            true { [{ key: "source.bytes", value: { int_value: workspace.lsis.parsed.traffic.bytes_in } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.traffic.bytes_out != null {
+            true { [{ key: "destination.bytes", value: { int_value: workspace.lsis.parsed.traffic.bytes_out } }] }
+            default { [] }
+        },
+        switch coalesce(workspace.lsis.parsed.http_request.url.url_string, workspace.lsis.parsed.url.url_string) != null {
+            true { [{ key: "url.full", value: { string_value: coalesce(workspace.lsis.parsed.http_request.url.url_string, workspace.lsis.parsed.url.url_string) } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.http_request.http_method != null {
+            true { [{ key: "http.request.method", value: { string_value: workspace.lsis.parsed.http_request.http_method } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.dns_query.hostname != null {
+            true { [{ key: "dns.question.name", value: { string_value: workspace.lsis.parsed.dns_query.hostname } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.dns_query.type != null {
+            true { [{ key: "dns.question.type", value: { string_value: workspace.lsis.parsed.dns_query.type } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.finding_info.title != null {
+            true { [{ key: "rule.name", value: { string_value: workspace.lsis.parsed.finding_info.title } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.finding_info.uid != null {
+            true { [{ key: "fortinet.finding.id", value: { string_value: workspace.lsis.parsed.finding_info.uid } }] }
+            default { [] }
+        },
+        switch workspace.cef.severity != null {
+            true { [{ key: "fortinet.cef.severity", value: { int_value: to_int(workspace.cef.severity) } }] }
+            default { [] }
+        }
+    )
 }

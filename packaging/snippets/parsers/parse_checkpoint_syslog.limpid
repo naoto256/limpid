@@ -5,7 +5,8 @@
 //                .hostname (optional, String) — collector-side hostname override
 // Writes:      workspace.lsis.parsed.* — firewall actions → 4001, threat actions →
 //              2004, auth actions → 3002; unknown actions land in 4001 with
-//              the action preserved in unmapped.
+//              the action preserved in unmapped. checkpoint_syslog_to_otlp
+//              writes source-owned OTLP Resource, Body, and attributes.
 // Category:    Network firewall / IPS
 // Test corpus: public (elastic/integrations checkpoint corpus — ~80 events
 //              across 8 product types)
@@ -465,5 +466,109 @@ def process parse_checkpoint_syslog_auth_record {
         checkpoint_syslog_time_ns(workspace.cp_syslog_class.timestamp),
         workspace.checkpoint_syslog_severity.number,
         workspace.checkpoint_syslog_severity.text
+    )
+}
+
+def function checkpoint_syslog_otlp_event_kind(class_uid) {
+    switch class_uid {
+        2004    { "alert" }
+        default { "event" }
+    }
+}
+
+def function checkpoint_syslog_otlp_event_category(class_uid) {
+    switch class_uid {
+        2004    { "intrusion_detection" }
+        3002    { "authentication" }
+        default { "network" }
+    }
+}
+
+def function checkpoint_syslog_otlp_event_type(class_uid) {
+    switch class_uid {
+        2004    { "indicator" }
+        3002    { "start" }
+        default { "connection" }
+    }
+}
+
+def function checkpoint_syslog_otlp_event_outcome(status_id) {
+    switch status_id {
+        1       { "success" }
+        2       { "failure" }
+        default { null }
+    }
+}
+
+def process checkpoint_syslog_to_otlp {
+    let sd = workspace.cp_syslog_class.sd
+    let product = parse_checkpoint_syslog_kv_or_null(sd, "product")
+    workspace.lsis.shed.otlp.resource.attributes = concat(
+        [{ key: "observer.vendor", value: { string_value: "Check Point Software Technologies" } }],
+        switch product != null {
+            true { [{ key: "observer.product", value: { string_value: product } }] }
+            default { [] }
+        },
+        [{ key: "observer.type", value: { string_value: "firewall" } }],
+        switch workspace.cp_syslog_class.host != null {
+            true { [{ key: "host.name", value: { string_value: workspace.cp_syslog_class.host } }] }
+            default { [] }
+        },
+        [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
+        [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
+    )
+    workspace.lsis.shed.otlp.log_record.body = { string_value: workspace.checkpoint_syslog.body }
+    workspace.lsis.shed.otlp.log_record.attributes = concat(
+        [{ key: "event.kind", value: { string_value: checkpoint_syslog_otlp_event_kind(workspace.lsis.parsed.class_uid) } }],
+        [{ key: "event.category", value: { array_value: { values: [{ string_value: checkpoint_syslog_otlp_event_category(workspace.lsis.parsed.class_uid) }] } } }],
+        [{ key: "event.type", value: { array_value: { values: [{ string_value: checkpoint_syslog_otlp_event_type(workspace.lsis.parsed.class_uid) }] } } }],
+        switch parse_checkpoint_syslog_kv_or_null(sd, "action") != null {
+            true { [{ key: "event.action", value: { string_value: parse_checkpoint_syslog_kv_or_null(sd, "action") } }] }
+            default { [] }
+        },
+        switch checkpoint_syslog_otlp_event_outcome(workspace.lsis.parsed.status_id) != null {
+            true { [{ key: "event.outcome", value: { string_value: checkpoint_syslog_otlp_event_outcome(workspace.lsis.parsed.status_id) } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.message != null {
+            true { [{ key: "message", value: { string_value: workspace.lsis.parsed.message } }] }
+            default { [] }
+        },
+        switch coalesce(workspace.lsis.parsed.actor.user.name, workspace.lsis.parsed.user.name) != null {
+            true { [{ key: "user.name", value: { string_value: coalesce(workspace.lsis.parsed.actor.user.name, workspace.lsis.parsed.user.name) } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.src_endpoint.ip != null {
+            true { [{ key: "source.ip", value: { string_value: workspace.lsis.parsed.src_endpoint.ip } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.src_endpoint.port != null {
+            true { [{ key: "source.port", value: { int_value: workspace.lsis.parsed.src_endpoint.port } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.dst_endpoint.ip != null {
+            true { [{ key: "destination.ip", value: { string_value: workspace.lsis.parsed.dst_endpoint.ip } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.dst_endpoint.port != null {
+            true { [{ key: "destination.port", value: { int_value: workspace.lsis.parsed.dst_endpoint.port } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.connection_info.protocol_name != null {
+            true { [{ key: "network.transport", value: { string_value: workspace.lsis.parsed.connection_info.protocol_name } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.finding_info.title != null {
+            true { [{ key: "rule.name", value: { string_value: workspace.lsis.parsed.finding_info.title } }] }
+            default { [] }
+        },
+        switch parse_checkpoint_syslog_kv_or_null(sd, "rule_uid") != null {
+            true { [{ key: "checkpoint.rule.id", value: { string_value: parse_checkpoint_syslog_kv_or_null(sd, "rule_uid") } }] }
+            default { [] }
+        },
+        switch parse_checkpoint_syslog_kv_or_null(sd, "layer_name") != null {
+            true { [{ key: "checkpoint.layer.name", value: { string_value: parse_checkpoint_syslog_kv_or_null(sd, "layer_name") } }] }
+            default { [] }
+        }
     )
 }
