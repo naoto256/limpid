@@ -70,6 +70,46 @@ it as `SeverityText`; an explicit
 `shed.otlp.log_record.severity_text` value still takes precedence.
 Source-less records continue to use OTLP's zero/empty defaults.
 
+### Breaking — OTLP placement is owned by per-source adapters
+
+Every bundled raw-source parser with canonical OTLP output now ships a sibling
+`<source>_to_otlp` process. The inbound `parse_ocsf` compatibility parser is
+the sole parser without this adapter.
+The adapter owns source-specific OTLP Resource, Scope, Body, and LogRecord
+attribute construction; the canonical pipeline is
+`parse_<source> | <source>_to_otlp | compose_otlp | otlp_to_egress`.
+Attribute names follow OpenTelemetry semantic conventions and ECS before a
+vendor namespace, and adapters do not export internal OCSF taxonomy integers.
+
+`compose_otlp` now accepts ten optional shed slots and only performs mappings
+that are source-independent. Explicit shed scalar overrides take precedence
+over canonical `parsed.time`, `parsed.severity_number`, and `parsed.severity`;
+observed time defaults to `received_at`. Resource attributes, Scope fields,
+Body, and LogRecord attributes are shed-only and are omitted when unset. The
+composer no longer synthesizes the forwarder hostname, a fixed `limpid` Scope,
+or a string Body, and event time never falls back to observation time. Body is
+an OTLP AnyValue object whose variant is chosen by the adapter.
+
+This is breaking for out-of-tree OTLP pipelines that called `compose_otlp`
+without a source adapter or relied on those synthesized defaults. Insert or
+author a per-source adapter first. Deployment-specific target adjustments may
+replace adapter shed slots after that stage; they do not replace the adapter.
+OTLP transport configuration and already encoded `egress` payloads are
+unchanged.
+
+### Changed — parsers preserve source event time in epoch nanoseconds
+
+Semantic parsers now normalize supported source timestamps into
+`workspace.lsis.parsed.time` as exact epoch nanoseconds, including values above
+2^53. Sources with explicit offsets or epoch timestamps retain their stated
+instant. For local wall-clock formats, vendor documentation determines the
+default timezone: documented device-local formats use the limpid host's system
+timezone, while formats with no authoritative timezone contract default to
+UTC. Source-specific `workspace.<source>.timezone` overrides accept IANA names
+or fixed offsets and reject invalid values loudly. Transport-only syslog and
+journald parsers continue to leave semantic event time to the downstream source
+parser.
+
 ### Breaking — `Int` arithmetic stays exact across the full i64 range
 
 When both operands are `Int`, the `+`, `-`, `*`, `/`, and `%` operators now use checked i64 arithmetic instead of converting through `f64`. This prevents epoch-nanosecond values and other integers above 2^53 from silently losing precision. Integer division truncates toward zero (`5 / 2 == 2`, `-5 / 2 == -2`), remainder follows the dividend's sign, and integer division or remainder by zero continues to return `Int(0)`.

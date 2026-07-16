@@ -10,12 +10,12 @@ prefix.
 
 ```
 /usr/share/limpid/snippets/
-├─ parsers/      per-vendor / per-format parsers, populating
-│                workspace.lsis.parsed.* (the LSIS facts layer —
-│                see LSIS below)
+├─ parsers/      per-vendor / per-format parsers and sibling target
+│                adapters, populating workspace.lsis.parsed.* facts
+│                and source-owned workspace.lsis.shed.<target>.* slots
 ├─ composers/    target-shape rendering. Each composer reads
 │                workspace.lsis.parsed.* (facts) and/or
-│                workspace.lsis.shed.<consumer>.* (caller-supplied
+│                workspace.lsis.shed.<consumer>.* (adapter-owned
 │                hand-off slots) and writes its finished wire form
 │                to workspace.lsis.composed.<slot>
 ├─ filters/      pre-parser noise filters (drop / pass-through by
@@ -63,14 +63,15 @@ boundary when neither a number nor source-specific severity text is available.
 
 ### `workspace.lsis.shed.*` — plumbing (a hand-off contract)
 
-Tentative values written by glue blocks for the *next* stage: a
+Tentative values written by a target adapter for the *next* stage: a
 payload to wrap, target-specific attributes to attach. This layer has
 no vocabulary of its own. Names borrow the consumer's vocabulary
 (`shed.otlp.log_record.body` mirrors the OTLP proto), and each
 consuming snippet's header defines the slots it eats. Meaning comes
 from *who writes for whom*, not from the name globally. Values are
 scoped to one hand-off; nothing under `shed.` is a fact about the
-event.
+event. A deployment may adjust a slot after the source adapter when a
+specific target needs a different representation.
 
 ### `workspace.lsis.composed.*` — products (a registry contract)
 
@@ -127,7 +128,7 @@ consumers:
 
 | Consumer | Shed sub-tree | See header |
 |---|---|---|
-| `compose_otlp` | `workspace.lsis.shed.otlp.*` (resource attributes; scope name/version/attributes; log_record body/attributes/severity_text/observed-time overrides) + parsed time/severity graceful reads; observed time defaults to `received_at` | `composers/compose_otlp.limpid` |
+| `compose_otlp` | Ten optional `workspace.lsis.shed.otlp.*` slots: resource attributes; scope name/version/attributes; LogRecord time, observed time, severity number, severity text, body, and attributes. Explicit scalar overrides precede canonical parsed time/severity; observed time defaults to `received_at`; structural slots are omitted when unset. | `composers/compose_otlp.limpid` |
 | `compose_rfc5424` | `workspace.lsis.shed.rfc5424.*` (pri / timestamp / hostname / app_name / procid / msgid / sd / msg) | `composers/compose_rfc5424.limpid` |
 
 `compose_ocsf` reads `parsed.*` directly. `compose_replayable` reads the ambient
@@ -263,9 +264,7 @@ other Filebeat-flattened wire, wrap the parse step explicitly:
 ```limpid
 process {
     workspace.foo = {
-        body:     nest_dotted_keys(parse_json(ingress)),
-        hostname: hostname(),
-        time:     to_int(received_at)
+        body: nest_dotted_keys(parse_json(ingress))
     }
 } | parse_foo | compose_ocsf | ocsf_to_egress
 ```
@@ -308,9 +307,10 @@ directly.
 The library follows four contracts:
 
 1. **LSIS strata (`parsed` / `shed` / `composed`).** Parsers populate
-   `workspace.lsis.parsed.*` with facts about the event; composers
-   read `parsed.*` (facts) and optionally `shed.*` (caller-supplied
-   hand-off slots) and write finished wire forms to
+   `workspace.lsis.parsed.*` with facts about the event; their target
+   adapters populate source-specific `shed.*` hand-off slots. Composers
+   read canonical facts and/or adapter-owned shed slots and write
+   finished wire forms to
    `workspace.lsis.composed.<slot>`. See the LSIS section above for
    the layer contracts and the shed / composed slot registries.
    Transport-namespace intermediates (`workspace.cef`,
@@ -331,15 +331,14 @@ The library follows four contracts:
    sole writer of `egress` per pipeline. `grep 'egress = '
    packaging/snippets/` names the writer for every terminal.
 
-4. **Bridges belong to the consumer.** When a composer reads
-   something other than its plain shed vocabulary — a transport
-   namespace, another composer's `composed` product, an ad-hoc
-   caller value — the reader that decided to reach outside pays the
-   cost. Named bridges (e.g. `journald_to_rfc5424`) live in the
-   consuming composer's file, not in a shared bridges/ directory;
-   ad-hoc glue blocks in the pipeline (`{ workspace.lsis.shed.otlp.
-   log_record.body = workspace.lsis.composed.ocsf }`) do the same
-   job when the mapping is one line.
+4. **Adapters own target placement.** Every OTLP-capable raw-source parser
+   carries a sibling `<source>_to_otlp` adapter. It chooses the OTLP
+   Body variant and places source facts into Resource, Scope, and
+   LogRecord attributes. Transport-to-wire bridges such as
+   `journald_to_rfc5424` remain with their consuming composer. An
+   anonymous block may adjust adapter output for a deployment-specific
+   target, but it does not replace the source adapter. The inbound
+   `parse_ocsf` compatibility parser is the sole parser without an OTLP adapter.
 
 ## Pipeline shapes
 
@@ -354,17 +353,20 @@ body):
 
 ```
 process <vendor_parser>
+      | <vendor>_to_otlp
       | compose_ocsf
       | {
           workspace.lsis.shed.otlp.log_record.body =
-              workspace.lsis.composed.ocsf
+              { string_value: workspace.lsis.composed.ocsf }
         }
       | compose_otlp
       | otlp_to_egress
 ```
 
-Target-specific attributes (e.g. Azure Monitor Pipeline's
-CommonSecurityLog columns) go in the same glue block via
+The adapter establishes the normal OTLP placement before
+`compose_ocsf`. Target-specific attributes (e.g. Azure Monitor
+Pipeline's CommonSecurityLog columns) may replace a shed slot in the
+same post-adapter adjustment block via
 `workspace.lsis.shed.otlp.log_record.attributes = [ ... ]`; see the
 `compose_otlp` header for the full example.
 
