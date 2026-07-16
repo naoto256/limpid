@@ -209,7 +209,7 @@ regions.
 | File | Summary | Writes |
 |---|---|---|
 | `composers/compose_ocsf.limpid` | Renders the LSIS intermediate to OCSF 1.3.0 JSON (27-class priority set), dispatched by class_uid. | `workspace.lsis.composed.ocsf` |
-| `composers/compose_otlp.limpid` | Assembles an OTLP-1.0.0 ResourceLogs proto envelope from per-field shed slots + parsed-layer graceful reads. Emits a single LogRecord per event, encoded as protobuf bytes for both otlp_http and otlp_grpc. | `workspace.lsis.composed.otlp` |
+| `composers/compose_otlp.limpid` | Assembles one OTLP-1.0.0 ResourceLogs envelope from canonical LSIS scalars and source-adapter shed slots. Emits protobuf bytes for both otlp_http and otlp_grpc. | `workspace.lsis.composed.otlp` |
 | `composers/compose_replayable.limpid` | Serialises the event into the minimal replay-record shape `{ received_at, source, ingress }` — the same three fields the error_log (DLQ) preserves and `inject --json` consumes. | `workspace.lsis.composed.replayable` |
 | `composers/compose_rfc5424.limpid` | Assembles a single-line RFC 5424 syslog record from per-field shed slots (https://datatracker.ietf.org/doc/html/rfc5424). | `workspace.lsis.composed.rfc5424` |
 <!-- END: inventory:composers -->

@@ -1462,6 +1462,7 @@ def pipeline p {
         for relative in [
             "packaging/snippets/functions/timestamp_converter.limpid",
             "packaging/snippets/functions/severity_converter.limpid",
+            "packaging/snippets/parsers/parse_fortigate_syslog.limpid",
             "packaging/snippets/composers/compose_ocsf.limpid",
             "packaging/snippets/composers/compose_otlp.limpid",
         ] {
@@ -1484,8 +1485,17 @@ def pipeline ocsf_in_otlp {
     process compose_ocsf
           | {
               workspace.lsis.shed.otlp.log_record.body =
-                  workspace.lsis.composed.ocsf
+                  { string_value: workspace.lsis.composed.ocsf }
             }
+          | compose_otlp
+          | otlp_to_egress
+    output o
+}
+
+def pipeline fortigate_native_otlp {
+    input i
+    process parse_fortigate_syslog
+          | fortigate_syslog_to_otlp
           | compose_otlp
           | otlp_to_egress
     output o
@@ -1511,6 +1521,25 @@ def pipeline ocsf_in_otlp {
         workspace: serde_json::Value,
         received_at: chrono::DateTime<chrono::Utc>,
     ) -> opentelemetry_proto::tonic::logs::v1::LogRecord {
+        let resource_logs = run_packaged_otlp_resource_logs_at(
+            cfg,
+            funcs,
+            pipeline_name,
+            &[],
+            workspace,
+            received_at,
+        );
+        resource_logs.scope_logs[0].log_records[0].clone()
+    }
+
+    fn run_packaged_otlp_resource_logs_at(
+        cfg: &CompiledConfig,
+        funcs: &FunctionRegistry,
+        pipeline_name: &str,
+        ingress: &[u8],
+        workspace: serde_json::Value,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) -> opentelemetry_proto::tonic::logs::v1::ResourceLogs {
         use crate::dsl::value::OwnedValue;
         use crate::dsl::value_json::json_to_value;
         use crate::event::OwnedEvent;
@@ -1519,7 +1548,7 @@ def pipeline ocsf_in_otlp {
         use prost::Message;
 
         let mut event = OwnedEvent::new(
-            Bytes::new(),
+            Bytes::copy_from_slice(ingress),
             "127.0.0.1:0".parse().expect("valid test source"),
         );
         event.received_at = received_at;
@@ -1545,18 +1574,91 @@ def pipeline ocsf_in_otlp {
             &mut bumpalo::Bump::new(),
         )
         .expect("composer pipeline must run");
-        assert_eq!(result.termination, PipelineTermination::Finished);
+        assert_eq!(
+            result.termination,
+            PipelineTermination::Finished,
+            "pipeline errors: {:?}",
+            result.errored
+        );
         assert_eq!(result.outputs.len(), 1);
 
-        let resource_logs = ResourceLogs::decode(result.outputs[0].1.egress.as_ref())
-            .expect("composer output must decode as ResourceLogs");
-        resource_logs.scope_logs[0].log_records[0].clone()
+        ResourceLogs::decode(result.outputs[0].1.egress.as_ref())
+            .expect("composer output must decode as ResourceLogs")
+    }
+
+    fn otlp_string_attribute<'a>(
+        attributes: &'a [opentelemetry_proto::tonic::common::v1::KeyValue],
+        key: &str,
+    ) -> Option<&'a str> {
+        use opentelemetry_proto::tonic::common::v1::any_value;
+
+        attributes.iter().find_map(|attribute| {
+            if attribute.key != key {
+                return None;
+            }
+            match attribute
+                .value
+                .as_ref()
+                .and_then(|value| value.value.as_ref())
+            {
+                Some(any_value::Value::StringValue(value)) => Some(value.as_str()),
+                _ => None,
+            }
+        })
+    }
+
+    fn otlp_int_attribute(
+        attributes: &[opentelemetry_proto::tonic::common::v1::KeyValue],
+        key: &str,
+    ) -> Option<i64> {
+        use opentelemetry_proto::tonic::common::v1::any_value;
+
+        attributes.iter().find_map(|attribute| {
+            if attribute.key != key {
+                return None;
+            }
+            match attribute
+                .value
+                .as_ref()
+                .and_then(|value| value.value.as_ref())
+            {
+                Some(any_value::Value::IntValue(value)) => Some(*value),
+                _ => None,
+            }
+        })
+    }
+
+    fn otlp_string_array_attribute<'a>(
+        attributes: &'a [opentelemetry_proto::tonic::common::v1::KeyValue],
+        key: &str,
+    ) -> Option<Vec<&'a str>> {
+        use opentelemetry_proto::tonic::common::v1::any_value;
+
+        attributes.iter().find_map(|attribute| {
+            if attribute.key != key {
+                return None;
+            }
+            let Some(any_value::Value::ArrayValue(array)) = attribute
+                .value
+                .as_ref()
+                .and_then(|value| value.value.as_ref())
+            else {
+                return None;
+            };
+            array
+                .values
+                .iter()
+                .map(|value| match value.value.as_ref() {
+                    Some(any_value::Value::StringValue(value)) => Some(value.as_str()),
+                    _ => None,
+                })
+                .collect()
+        })
     }
 
     #[test]
     fn packaged_compose_otlp_projects_canonical_severity() {
         use crate::functions::{FunctionRegistry, register_builtins, register_user_functions};
-        use opentelemetry_proto::tonic::common::v1::any_value;
         use serde_json::json;
 
         let cfg = compile_packaged_otlp_composers().unwrap();
@@ -1619,10 +1721,20 @@ def pipeline ocsf_in_otlp {
         );
         assert_eq!(text_only.severity_number, 0);
         assert_eq!(text_only.severity_text, "UNDEFINED");
-        assert!(matches!(
-            text_only.body.and_then(|body| body.value),
-            Some(any_value::Value::StringValue(body)) if body.is_empty()
-        ));
+        assert!(text_only.body.is_none());
+
+        let number_overridden = run_packaged_otlp_composer(
+            &cfg,
+            &funcs,
+            "direct_otlp",
+            json!({
+                "lsis": {
+                    "parsed": { "severity_number": 9 },
+                    "shed": { "otlp": { "log_record": { "severity_number": 21 } } }
+                }
+            }),
+        );
+        assert_eq!(number_overridden.severity_number, 21);
     }
 
     #[test]
@@ -1745,7 +1857,227 @@ def pipeline ocsf_in_otlp {
             }),
             received_at,
         );
-        assert_eq!(source_less.time_unix_nano, received_ns);
+        assert_eq!(source_less.time_unix_nano, 0);
         assert_eq!(source_less.observed_time_unix_nano, received_ns);
+
+        let event_time_overridden = run_packaged_otlp_composer_at(
+            &cfg,
+            &funcs,
+            "direct_otlp",
+            json!({
+                "lsis": {
+                    "parsed": { "time": event_ns },
+                    "shed": {
+                        "otlp": {
+                            "log_record": { "time_unix_nano": override_ns }
+                        }
+                    }
+                }
+            }),
+            received_at,
+        );
+        assert_eq!(event_time_overridden.time_unix_nano, override_ns);
+        assert_eq!(event_time_overridden.observed_time_unix_nano, received_ns);
+    }
+
+    #[test]
+    fn packaged_compose_otlp_omits_defaults_and_preserves_anyvalue_body() {
+        use crate::functions::{FunctionRegistry, register_builtins, register_user_functions};
+        use opentelemetry_proto::tonic::common::v1::any_value;
+        use serde_json::json;
+
+        let cfg = compile_packaged_otlp_composers().unwrap();
+        let mut funcs = FunctionRegistry::new();
+        register_builtins(&mut funcs, crate::runtime::init_tables(&cfg).unwrap());
+        register_user_functions(&mut funcs, &cfg);
+
+        let received_at = chrono::DateTime::from_timestamp(1_784_073_600, 123_456_789)
+            .expect("valid receive timestamp");
+        let resource_logs = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "direct_otlp",
+            &[],
+            json!({
+                "lsis": {
+                    "shed": {
+                        "otlp": {
+                            "log_record": {
+                                "body": { "int_value": 9_007_199_254_740_993_i64 }
+                            }
+                        }
+                    }
+                }
+            }),
+            received_at,
+        );
+        assert!(resource_logs.resource.is_none());
+        assert!(resource_logs.scope_logs[0].scope.is_none());
+        let record = &resource_logs.scope_logs[0].log_records[0];
+        assert_eq!(record.time_unix_nano, 0);
+        assert_eq!(record.observed_time_unix_nano, 1_784_073_600_123_456_789);
+        assert!(record.attributes.is_empty());
+        assert!(matches!(
+            record.body.as_ref().and_then(|body| body.value.as_ref()),
+            Some(any_value::Value::IntValue(9_007_199_254_740_993))
+        ));
+    }
+
+    #[test]
+    fn packaged_fortigate_native_otlp_adapter_projects_traffic_and_ips() {
+        use crate::functions::{FunctionRegistry, register_builtins, register_user_functions};
+        use opentelemetry_proto::tonic::common::v1::any_value;
+        use serde_json::json;
+
+        let cfg = compile_packaged_otlp_composers().unwrap();
+        let mut funcs = FunctionRegistry::new();
+        register_builtins(&mut funcs, crate::runtime::init_tables(&cfg).unwrap());
+        register_user_functions(&mut funcs, &cfg);
+        let received_at = chrono::DateTime::from_timestamp(1_784_073_600, 123_456_789)
+            .expect("valid receive timestamp");
+
+        let traffic_wire = br#"<0>date=2026-04-27 time=10:00:00 devname="fw01" devid="FGT-001" osname="FortiOS 7.4" level="notice" type="traffic" subtype="forward" srcip=192.0.2.10 srcport=54321 src_port=54322 dstip=198.51.100.5 dstport=443 dst_port=444 proto=6 action="accept" sentbyte=1024 rcvdbyte=512"#;
+        let traffic = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "fortigate_native_otlp",
+            traffic_wire,
+            json!({}),
+            received_at,
+        );
+        let resource_attributes = &traffic.resource.as_ref().expect("resource").attributes;
+        assert_eq!(
+            otlp_string_attribute(resource_attributes, "observer.vendor"),
+            Some("Fortinet")
+        );
+        assert_eq!(
+            otlp_string_attribute(resource_attributes, "observer.product"),
+            Some("FortiGate")
+        );
+        assert_eq!(
+            otlp_string_attribute(resource_attributes, "observer.type"),
+            Some("firewall")
+        );
+        assert_eq!(
+            otlp_string_attribute(resource_attributes, "observer.serial_number"),
+            Some("FGT-001")
+        );
+        assert_eq!(
+            otlp_string_attribute(resource_attributes, "host.name"),
+            Some("fw01")
+        );
+        assert_eq!(
+            otlp_string_attribute(resource_attributes, "telemetry.sdk.name"),
+            Some("limpid")
+        );
+        assert!(otlp_string_attribute(resource_attributes, "telemetry.sdk.version").is_some());
+        assert!(traffic.scope_logs[0].scope.is_none());
+        let traffic_record = &traffic.scope_logs[0].log_records[0];
+        assert_eq!(traffic_record.severity_number, 10);
+        assert_eq!(traffic_record.severity_text, "notice");
+        assert_eq!(
+            otlp_string_attribute(&traffic_record.attributes, "event.kind"),
+            Some("event")
+        );
+        assert_eq!(
+            otlp_string_array_attribute(&traffic_record.attributes, "event.category"),
+            Some(vec!["network"])
+        );
+        assert_eq!(
+            otlp_string_array_attribute(&traffic_record.attributes, "event.type"),
+            Some(vec!["connection", "allowed"])
+        );
+        assert_eq!(
+            otlp_string_attribute(&traffic_record.attributes, "source.ip"),
+            Some("192.0.2.10")
+        );
+        assert_eq!(
+            otlp_int_attribute(&traffic_record.attributes, "source.port"),
+            Some(54321)
+        );
+        assert_eq!(
+            traffic_record
+                .attributes
+                .iter()
+                .filter(|attribute| attribute.key == "source.port")
+                .count(),
+            1
+        );
+        assert_eq!(
+            otlp_int_attribute(&traffic_record.attributes, "destination.port"),
+            Some(443)
+        );
+        assert_eq!(
+            traffic_record
+                .attributes
+                .iter()
+                .filter(|attribute| attribute.key == "destination.port")
+                .count(),
+            1
+        );
+        assert_eq!(
+            otlp_string_attribute(&traffic_record.attributes, "network.transport"),
+            Some("tcp")
+        );
+        assert_eq!(
+            otlp_int_attribute(&traffic_record.attributes, "destination.bytes"),
+            Some(512)
+        );
+        assert!(traffic_record.attributes.iter().all(
+            |attribute| !attribute.key.starts_with("lsis.")
+                && !attribute.key.starts_with("metadata.")
+                && !attribute.key.starts_with("ocsf.")
+        ));
+        assert!(
+            traffic_record
+                .attributes
+                .iter()
+                .all(|attribute| attribute.key != "class_uid"
+                    && attribute.key != "category_uid"
+                    && attribute.key != "activity_id")
+        );
+        assert!(matches!(
+            traffic_record.body.as_ref().and_then(|body| body.value.as_ref()),
+            Some(any_value::Value::StringValue(body)) if body.as_bytes() == &traffic_wire[3..]
+        ));
+
+        let ips_wire = br#"<191>date=2026-04-27 time=10:01:00 devname="fw02" devid="FGT-002" level="error" type="utm" subtype="ips" action="blocked" attack="Example exploit" attackid="4242" srcip=192.0.2.20 srcport=40000 dstip=198.51.100.20 dstport=443 proto=6 msg="blocked exploit""#;
+        let ips = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "fortigate_native_otlp",
+            ips_wire,
+            json!({}),
+            received_at,
+        );
+        let ips_record = &ips.scope_logs[0].log_records[0];
+        assert_eq!(ips_record.severity_number, 17);
+        assert_eq!(ips_record.severity_text, "error");
+        assert_eq!(
+            otlp_string_attribute(&ips_record.attributes, "event.kind"),
+            Some("alert")
+        );
+        assert_eq!(
+            otlp_string_array_attribute(&ips_record.attributes, "event.category"),
+            Some(vec!["intrusion_detection"])
+        );
+        assert_eq!(
+            otlp_string_array_attribute(&ips_record.attributes, "event.type"),
+            Some(vec!["denied"])
+        );
+        assert_eq!(
+            otlp_string_attribute(&ips_record.attributes, "fortinet.attack.name"),
+            Some("Example exploit")
+        );
+        assert_eq!(
+            otlp_string_attribute(&ips_record.attributes, "fortinet.attack.id"),
+            Some("4242")
+        );
+        assert!(
+            ips_record
+                .attributes
+                .iter()
+                .all(|attribute| attribute.key != "threat.technique.name")
+        );
     }
 }
