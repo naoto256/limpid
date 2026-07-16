@@ -4,6 +4,9 @@
 //              (date=... time=... type=...)
 // Writes:      workspace.lsis.parsed.* — same classes as parse_fortigate_cef
 //              (the LSIS contract is format-agnostic).
+//              fortigate_syslog_to_otlp additionally writes the
+//              source-specific workspace.lsis.shed.otlp Resource, Body,
+//              and LogRecord attributes consumed by compose_otlp.
 // Category:    Network firewall / IPS
 // Test corpus: synthetic (FortiOS "default"-format sample wires in this header)
 //
@@ -176,6 +179,383 @@ def function fortigate_syslog_metadata(version_hint) {
         },
         version: "1.3.0"
     }
+}
+
+// ---------------------------------------------------------------------------
+// OTLP source adapter
+// ---------------------------------------------------------------------------
+//
+// The adapter owns only source-specific placement and AnyValue construction.
+// Canonical time and severity scalars remain in `workspace.lsis.parsed` and
+// are read directly by compose_otlp unless a caller provides an exceptional
+// shed override. FortiOS native logs do not carry an instrumentation-scope
+// identity, so this adapter deliberately leaves all scope slots unset.
+
+def function fortigate_syslog_otlp_event_kind(log_type, subtype) {
+    switch log_type + ":" + subtype {
+        "utm:ips"             { "alert" }
+        "utm:anomaly"         { "alert" }
+        "utm:virus"           { "alert" }
+        "utm:dlp"             { "alert" }
+        "utm:app-ctrl"        { "alert" }
+        "utm:application"     { "alert" }
+        "utm:waf"             { "alert" }
+        "utm:ssl"             { "alert" }
+        "event:security-rating" { "alert" }
+        default               { "event" }
+    }
+}
+
+def function fortigate_syslog_otlp_event_category(log_type, subtype) {
+    switch log_type + ":" + subtype {
+        "utm:ips"             { "intrusion_detection" }
+        "utm:anomaly"         { "intrusion_detection" }
+        "utm:webfilter"       { "web" }
+        "utm:virus"           { "malware" }
+        "utm:dlp"             { "file" }
+        "utm:waf"             { "intrusion_detection" }
+        "utm:ssl"             { "intrusion_detection" }
+        "utm:emailfilter"     { "email" }
+        "event:user"          { "authentication" }
+        "event:vpn"           { "authentication" }
+        "event:system"        { "configuration" }
+        "event:security-rating" { "configuration" }
+        default               { "network" }
+    }
+}
+
+// ECS event.type is an array. Firewall connection records retain the
+// connection classification alongside their source action disposition.
+def function fortigate_syslog_otlp_event_types(log_type, action) {
+    switch log_type {
+        "traffic" {
+            switch action {
+                "accept"     { [{ string_value: "connection" }, { string_value: "allowed" }] }
+                "deny"       { [{ string_value: "connection" }, { string_value: "denied" }] }
+                "block"      { [{ string_value: "connection" }, { string_value: "denied" }] }
+                "start"      { [{ string_value: "connection" }, { string_value: "start" }] }
+                "close"      { [{ string_value: "connection" }, { string_value: "end" }] }
+                "client-rst" { [{ string_value: "connection" }, { string_value: "end" }] }
+                "server-rst" { [{ string_value: "connection" }, { string_value: "end" }] }
+                "timeout"    { [{ string_value: "connection" }, { string_value: "end" }] }
+                default      { [{ string_value: "connection" }] }
+            }
+        }
+        default {
+            switch action {
+                "allowed"           { [{ string_value: "allowed" }] }
+                "accept"            { [{ string_value: "allowed" }] }
+                "pass"              { [{ string_value: "allowed" }] }
+                "passthrough"       { [{ string_value: "allowed" }] }
+                "permit"            { [{ string_value: "allowed" }] }
+                "blocked"           { [{ string_value: "denied" }] }
+                "block"             { [{ string_value: "denied" }] }
+                "deny"              { [{ string_value: "denied" }] }
+                "dropped"           { [{ string_value: "denied" }] }
+                "drop"              { [{ string_value: "denied" }] }
+                "quarantined"       { [{ string_value: "denied" }] }
+                "login"             { [{ string_value: "start" }] }
+                "logon"             { [{ string_value: "start" }] }
+                "auth-logon"        { [{ string_value: "start" }] }
+                "tunnel-up"         { [{ string_value: "start" }] }
+                "client-connect"    { [{ string_value: "start" }] }
+                "client-associate"  { [{ string_value: "start" }] }
+                "logout"            { [{ string_value: "end" }] }
+                "logoff"            { [{ string_value: "end" }] }
+                "auth-logoff"       { [{ string_value: "end" }] }
+                "tunnel-down"       { [{ string_value: "end" }] }
+                "client-disconnect" { [{ string_value: "end" }] }
+                default             { [{ string_value: "info" }] }
+            }
+        }
+    }
+}
+
+def function fortigate_syslog_otlp_event_outcome(status_id) {
+    switch status_id {
+        1       { "success" }
+        2       { "failure" }
+        default { null }
+    }
+}
+
+// ECS tls.version carries only the numeric version. Keep the original FortiOS
+// spelling separately under fortinet.tls.version.
+def function fortigate_syslog_otlp_tls_version(version_text) {
+    switch version_text {
+        "tls1"   { "1.0" }
+        "tls1.0" { "1.0" }
+        "tls1.1" { "1.1" }
+        "tls1.2" { "1.2" }
+        "tls1.3" { "1.3" }
+        default  { null }
+    }
+}
+
+def process fortigate_syslog_to_otlp {
+    workspace.lsis.shed.otlp.resource.attributes = concat(
+        [{ key: "observer.vendor", value: { string_value: "Fortinet" } }],
+        [{ key: "observer.product", value: { string_value: "FortiGate" } }],
+        [{ key: "observer.type", value: { string_value: "firewall" } }],
+        switch workspace.kv.devid != null {
+            true { [{ key: "observer.serial_number", value: { string_value: workspace.kv.devid } }] }
+            default { [] }
+        },
+        switch workspace.kv.osname != null {
+            true { [{ key: "observer.version", value: { string_value: workspace.kv.osname } }] }
+            default { [] }
+        },
+        switch workspace.kv.devname != null {
+            true { [{ key: "host.name", value: { string_value: workspace.kv.devname } }] }
+            default { [] }
+        },
+        [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
+        [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
+    )
+
+    workspace.lsis.shed.otlp.log_record.body = {
+        string_value: syslog.strip_pri(ingress)
+    }
+
+    workspace.lsis.shed.otlp.log_record.attributes = concat(
+        [{ key: "event.kind", value: { string_value: fortigate_syslog_otlp_event_kind(workspace.kv.type, workspace.kv.subtype) } }],
+        [{ key: "event.category", value: { array_value: { values: [{ string_value: fortigate_syslog_otlp_event_category(workspace.kv.type, workspace.kv.subtype) }] } } }],
+        [{ key: "event.type", value: { array_value: { values: fortigate_syslog_otlp_event_types(workspace.kv.type, workspace.kv.action) } } }],
+        switch workspace.kv.action != null {
+            true { [{ key: "event.action", value: { string_value: workspace.kv.action } }] }
+            default { [] }
+        },
+        switch fortigate_syslog_otlp_event_outcome(workspace.lsis.parsed.status_id) != null {
+            true { [{ key: "event.outcome", value: { string_value: fortigate_syslog_otlp_event_outcome(workspace.lsis.parsed.status_id) } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.message != null {
+            true { [{ key: "message", value: { string_value: workspace.lsis.parsed.message } }] }
+            default { [] }
+        },
+        switch workspace.kv.logdesc != null {
+            true { [{ key: "event.reason", value: { string_value: workspace.kv.logdesc } }] }
+            default { [] }
+        },
+        switch workspace.kv.srcip != null {
+            true { [{ key: "source.ip", value: { string_value: workspace.kv.srcip } }] }
+            default { [] }
+        },
+        switch coalesce(workspace.kv.srcport, workspace.kv.src_port) != null {
+            true { [{ key: "source.port", value: { int_value: to_int(coalesce(workspace.kv.srcport, workspace.kv.src_port)) } }] }
+            default { [] }
+        },
+        switch workspace.kv.srcmac != null {
+            true { [{ key: "source.mac", value: { string_value: workspace.kv.srcmac } }] }
+            default { [] }
+        },
+        switch workspace.kv.sentbyte != null {
+            true { [{ key: "source.bytes", value: { int_value: to_int(workspace.kv.sentbyte) } }] }
+            default { [] }
+        },
+        switch workspace.kv.dstip != null {
+            true { [{ key: "destination.ip", value: { string_value: workspace.kv.dstip } }] }
+            default { [] }
+        },
+        switch coalesce(workspace.kv.dstport, workspace.kv.dst_port) != null {
+            true { [{ key: "destination.port", value: { int_value: to_int(coalesce(workspace.kv.dstport, workspace.kv.dst_port)) } }] }
+            default { [] }
+        },
+        switch workspace.kv.apmac != null {
+            true { [{ key: "destination.mac", value: { string_value: workspace.kv.apmac } }] }
+            default { [] }
+        },
+        switch workspace.kv.rcvdbyte != null {
+            true { [{ key: "destination.bytes", value: { int_value: to_int(workspace.kv.rcvdbyte) } }] }
+            default { [] }
+        },
+        switch fortigate_syslog_proto_name(to_int(workspace.kv.proto)) != null {
+            true { [{ key: "network.transport", value: { string_value: fortigate_syslog_proto_name(to_int(workspace.kv.proto)) } }] }
+            default { [] }
+        },
+        switch workspace.kv.proto != null {
+            true { [{ key: "network.iana_number", value: { int_value: to_int(workspace.kv.proto) } }] }
+            default { [] }
+        },
+        switch workspace.kv.user != null {
+            true { [{ key: "user.name", value: { string_value: workspace.kv.user } }] }
+            default { [] }
+        },
+        switch workspace.kv.url != null {
+            true { [{ key: "url.full", value: { string_value: workspace.kv.url } }] }
+            default { [] }
+        },
+        switch workspace.kv.method != null {
+            true { [{ key: "http.request.method", value: { string_value: workspace.kv.method } }] }
+            default { [] }
+        },
+        switch workspace.kv.qname != null {
+            true { [{ key: "dns.question.name", value: { string_value: workspace.kv.qname } }] }
+            default { [] }
+        },
+        switch workspace.kv.qtype != null {
+            true { [{ key: "dns.question.type", value: { string_value: workspace.kv.qtype } }] }
+            default { [] }
+        },
+        switch workspace.kv.error != null {
+            true { [{ key: "fortinet.dns.error", value: { string_value: workspace.kv.error } }] }
+            default { [] }
+        },
+        switch workspace.kv.subtype == "emailfilter" and workspace.kv.from != null {
+            true { [{ key: "email.from.address", value: { array_value: { values: [{ string_value: workspace.kv.from }] } } }] }
+            default { [] }
+        },
+        switch workspace.kv.subtype == "emailfilter" and workspace.kv.to != null {
+            true { [{ key: "email.to.address", value: { array_value: { values: [{ string_value: workspace.kv.to }] } } }] }
+            default { [] }
+        },
+        switch workspace.kv.subtype == "emailfilter" and workspace.kv.subject != null {
+            true { [{ key: "email.subject", value: { string_value: workspace.kv.subject } }] }
+            default { [] }
+        },
+        switch workspace.kv.subtype == "emailfilter" and workspace.kv.msgid != null {
+            true { [{ key: "email.message_id", value: { string_value: workspace.kv.msgid } }] }
+            default { [] }
+        },
+        switch workspace.kv.filename != null {
+            true { [{ key: "file.name", value: { string_value: workspace.kv.filename } }] }
+            default { [] }
+        },
+        switch workspace.kv.filesize != null {
+            true { [{ key: "file.size", value: { int_value: to_int(workspace.kv.filesize) } }] }
+            default { [] }
+        },
+        switch workspace.kv.analyticscksum != null {
+            true { [{ key: "file.hash.sha256", value: { string_value: workspace.kv.analyticscksum } }] }
+            default { [] }
+        },
+        switch fortigate_syslog_otlp_tls_version(workspace.kv.tlsver) != null {
+            true { [{ key: "tls.version", value: { string_value: fortigate_syslog_otlp_tls_version(workspace.kv.tlsver) } }] }
+            default { [] }
+        },
+        switch workspace.kv.sni != null {
+            true { [{ key: "tls.client.server_name", value: { string_value: workspace.kv.sni } }] }
+            default { [] }
+        },
+        switch workspace.kv.hostname != null {
+            true { [{ key: "destination.domain", value: { string_value: workspace.kv.hostname } }] }
+            default { [] }
+        },
+        [{ key: "fortinet.log.type", value: { string_value: workspace.kv.type } }],
+        [{ key: "fortinet.log.subtype", value: { string_value: workspace.kv.subtype } }],
+        switch workspace.kv.attack != null {
+            true { [{ key: "fortinet.attack.name", value: { string_value: workspace.kv.attack } }] }
+            default { [] }
+        },
+        switch workspace.kv.attackid != null {
+            true { [{ key: "fortinet.attack.id", value: { string_value: workspace.kv.attackid } }] }
+            default { [] }
+        },
+        switch workspace.kv.catdesc != null {
+            true { [{ key: "fortinet.web.category", value: { string_value: workspace.kv.catdesc } }] }
+            default { [] }
+        },
+        switch workspace.kv.virus != null {
+            true { [{ key: "fortinet.malware.name", value: { string_value: workspace.kv.virus } }] }
+            default { [] }
+        },
+        switch workspace.kv.virusid != null {
+            true { [{ key: "fortinet.malware.id", value: { string_value: workspace.kv.virusid } }] }
+            default { [] }
+        },
+        switch workspace.kv.filtername != null {
+            true { [{ key: "fortinet.dlp.filter.name", value: { string_value: workspace.kv.filtername } }] }
+            default { [] }
+        },
+        switch workspace.kv.filteridx != null {
+            true { [{ key: "fortinet.dlp.filter.id", value: { string_value: workspace.kv.filteridx } }] }
+            default { [] }
+        },
+        switch workspace.kv.app != null {
+            true { [{ key: "fortinet.application.name", value: { string_value: workspace.kv.app } }] }
+            default { [] }
+        },
+        switch workspace.kv.appid != null {
+            true { [{ key: "fortinet.application.id", value: { string_value: workspace.kv.appid } }] }
+            default { [] }
+        },
+        switch workspace.kv.signature != null {
+            true { [{ key: "fortinet.waf.signature.name", value: { string_value: workspace.kv.signature } }] }
+            default { [] }
+        },
+        switch workspace.kv.signatureid != null {
+            true { [{ key: "fortinet.waf.signature.id", value: { string_value: workspace.kv.signatureid } }] }
+            default { [] }
+        },
+        switch workspace.kv.eventsubtype != null {
+            true { [{ key: "fortinet.tls.event_subtype", value: { string_value: workspace.kv.eventsubtype } }] }
+            default { [] }
+        },
+        switch workspace.kv.tlsver != null {
+            true { [{ key: "fortinet.tls.version", value: { string_value: workspace.kv.tlsver } }] }
+            default { [] }
+        },
+        switch workspace.kv.profile != null {
+            true { [{ key: "fortinet.tls.profile", value: { string_value: workspace.kv.profile } }] }
+            default { [] }
+        },
+        switch workspace.kv.voip_proto != null {
+            true { [{ key: "fortinet.voip.protocol", value: { string_value: workspace.kv.voip_proto } }] }
+            default { [] }
+        },
+        switch workspace.kv.kind != null {
+            true { [{ key: "fortinet.voip.kind", value: { string_value: workspace.kv.kind } }] }
+            default { [] }
+        },
+        switch workspace.kv.status != null {
+            true { [{ key: "fortinet.voip.status", value: { string_value: workspace.kv.status } }] }
+            default { [] }
+        },
+        switch workspace.kv.call_id != null {
+            true { [{ key: "fortinet.voip.call_id", value: { string_value: workspace.kv.call_id } }] }
+            default { [] }
+        },
+        switch workspace.kv.subtype == "voip" and workspace.kv.from != null {
+            true { [{ key: "fortinet.voip.from", value: { string_value: workspace.kv.from } }] }
+            default { [] }
+        },
+        switch workspace.kv.subtype == "voip" and workspace.kv.to != null {
+            true { [{ key: "fortinet.voip.to", value: { string_value: workspace.kv.to } }] }
+            default { [] }
+        },
+        switch workspace.kv.auditreporttype != null {
+            true { [{ key: "fortinet.security_rating.report_type", value: { string_value: workspace.kv.auditreporttype } }] }
+            default { [] }
+        },
+        switch workspace.kv.auditid != null {
+            true { [{ key: "fortinet.security_rating.audit_id", value: { string_value: workspace.kv.auditid } }] }
+            default { [] }
+        },
+        switch workspace.kv.auditscore != null {
+            true { [{ key: "fortinet.security_rating.score", value: { string_value: workspace.kv.auditscore } }] }
+            default { [] }
+        },
+        switch workspace.kv.criticalcount != null {
+            true { [{ key: "fortinet.security_rating.critical_count", value: { int_value: to_int(workspace.kv.criticalcount) } }] }
+            default { [] }
+        },
+        switch workspace.kv.highcount != null {
+            true { [{ key: "fortinet.security_rating.high_count", value: { int_value: to_int(workspace.kv.highcount) } }] }
+            default { [] }
+        },
+        switch workspace.kv.mediumcount != null {
+            true { [{ key: "fortinet.security_rating.medium_count", value: { int_value: to_int(workspace.kv.mediumcount) } }] }
+            default { [] }
+        },
+        switch workspace.kv.lowcount != null {
+            true { [{ key: "fortinet.security_rating.low_count", value: { int_value: to_int(workspace.kv.lowcount) } }] }
+            default { [] }
+        },
+        switch workspace.kv.passedcount != null {
+            true { [{ key: "fortinet.security_rating.passed_count", value: { int_value: to_int(workspace.kv.passedcount) } }] }
+            default { [] }
+        }
+    )
 }
 
 // ---------------------------------------------------------------------------
