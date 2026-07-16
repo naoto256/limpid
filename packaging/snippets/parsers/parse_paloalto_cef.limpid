@@ -1,6 +1,14 @@
 // Summary:     Palo Alto Networks PAN-OS CEF → LSIS, dispatched by CEF
 //              name (TRAFFIC / THREAT / URL / …).
 // Reads:       ingress (raw wire) — syslog-wrapped CEF (CEF:0|Palo Alto Networks|PAN-OS|...)
+//              workspace.paloalto_cef.timezone (optional, String) — source
+//              device timezone override as an IANA name or fixed offset; the
+//              legacy RFC 3164 wrapper defaults to UTC when this is absent
+//              (PAN-OS documents configurable device time zones but does not
+//              assign a zone to this legacy CEF wrapper timestamp)
+//              https://docs.paloaltonetworks.com/ngfw/help/10-1/device/device-setup-management
+//              UTC is the intentional pack default; override this slot or use
+//              a custom parser when the source zone is known to differ.
 // Writes:      workspace.lsis.parsed.* — TRAFFIC → 4001, THREAT / WILDFIRE → 2004,
 //              URL → 6004, GLOBALPROTECT / AUTHENTICATION → 3002; see the
 //              subtype leaves below.
@@ -37,6 +45,8 @@
 // Vendor-specific mapping helpers (PAN-OS CEF dialect)
 // ---------------------------------------------------------------------------
 
+include "../functions/parse_datetime_rfc3164.limpid"
+
 // PAN-OS 10 CEF templates emit header severity on an exact numeric 1-5
 // scale, separate from the outer syslog PRI. Map that source scale to
 // OTel SeverityNumber:
@@ -58,7 +68,15 @@ def function paloalto_cef_severity_number(sev) {
 }
 
 def process parse_paloalto_cef_normalize_severity {
+    switch workspace.paloalto_cef.timezone {
+        "local" { error "parse_paloalto_cef: source timezone must be an IANA name or fixed offset, not local" }
+    }
     let severity_number = paloalto_cef_severity_number(workspace.cef.severity)
+    let source_timezone = coalesce(workspace.paloalto_cef.timezone, "UTC")
+    workspace.paloalto_cef.time = switch true {
+        workspace.cef.timestamp == null { null }
+        default                         { to_int(parse_datetime_rfc3164(workspace.cef.timestamp, source_timezone)) }
+    }
     switch true {
         workspace.cef.severity != null and severity_number == null {
             error "parse_paloalto_cef: invalid PAN-OS CEF severity ${workspace.cef.severity}"
@@ -119,6 +137,7 @@ include "../functions/proto_num.limpid"
 def process parse_paloalto_cef {
     workspace.syslog = syslog.parse(ingress)
     workspace.cef    = cef.parse(workspace.syslog.msg)
+    workspace.cef.timestamp = workspace.syslog.timestamp
     switch workspace.cef.name {
         "TRAFFIC"        { process parse_paloalto_cef_traffic }
         "THREAT"         { process parse_paloalto_cef_threat }
@@ -157,6 +176,7 @@ def process parse_paloalto_cef_traffic {
         category_uid:    4,
         activity_id:     paloalto_cef_traffic_action_to_activity_id(workspace.cef.act),
         severity_number: workspace.paloalto_cef.severity_number,
+        time:            workspace.paloalto_cef.time,
         src_endpoint: {
             ip:   workspace.cef.src,
             port: to_int(workspace.cef.spt)
@@ -220,6 +240,7 @@ def process parse_paloalto_cef_threat {
         category_uid:    2,
         activity_id:     1,
         severity_number: workspace.paloalto_cef.severity_number,
+        time:            workspace.paloalto_cef.time,
         disposition_id: paloalto_cef_threat_disposition_id(workspace.cef.act),
         finding_info: {
             title: workspace.cef.signature_id,
@@ -288,6 +309,7 @@ def process parse_paloalto_cef_url {
         category_uid:    6,
         activity_id:     activity,
         severity_number: workspace.paloalto_cef.severity_number,
+        time:            workspace.paloalto_cef.time,
         src_endpoint: {
             ip:   workspace.cef.src,
             port: to_int(workspace.cef.spt)
@@ -353,6 +375,7 @@ def process parse_paloalto_cef_wildfire {
         category_uid:    2,
         activity_id:     1,
         severity_number: workspace.paloalto_cef.severity_number,
+        time:            workspace.paloalto_cef.time,
         disposition_id: disposition,
         finding_info: {
             title: workspace.cef.cs1,
@@ -419,8 +442,8 @@ def process parse_paloalto_cef_globalprotect {
         category_uid:    3,
         activity_id:     activity,
         severity_number: workspace.paloalto_cef.severity_number,
+        time:            workspace.paloalto_cef.time,
         status_id:       status,
-        time:            received_at,
         user: { name: workspace.cef.suser },
         src_endpoint: { ip: workspace.cef.src },
         message:      workspace.cef.reason,
@@ -460,6 +483,7 @@ def process parse_paloalto_cef_authentication {
         category_uid:    3,
         activity_id:     1,
         severity_number: workspace.paloalto_cef.severity_number,
+        time:            workspace.paloalto_cef.time,
         status_id:       status,
         user:         { name: workspace.cef.suser },
         src_endpoint: { ip: workspace.cef.src },

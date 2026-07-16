@@ -696,6 +696,29 @@ mod tests {
     }
 
     #[test]
+    fn strftime_iana_timezone() {
+        let bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = dummy_owned();
+        let bevent = owned.view_in(&arena);
+        let reg = make_registry();
+        let result = reg
+            .call(
+                None,
+                "strftime",
+                &[
+                    ts_value("2026-04-19T10:30:45+00:00"),
+                    Value::String(arena.alloc_str("%Y-%m-%d %H:%M")),
+                    Value::String(arena.alloc_str("Asia/Tokyo")),
+                ],
+                &bevent,
+                &arena,
+            )
+            .unwrap();
+        assert_eq!(result, Value::String("2026-04-19 19:30"));
+    }
+
+    #[test]
     fn strftime_rejects_string_input() {
         let bump = bumpalo::Bump::new();
         let arena = EventArena::new(&bump);

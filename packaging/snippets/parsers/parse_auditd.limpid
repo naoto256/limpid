@@ -3,7 +3,6 @@
 // Reads:       workspace.auditd.* (bridge — see Bridges below)
 //                .body (required, String) — the auditd record
 //                .hostname (optional, String) — host where audit ran
-//                .time (optional, Int) — epoch nanoseconds
 // Writes:      workspace.lsis.parsed.* — 3002 (Authentication), 3001 (Account Change),
 //              1007 (Process Activity), 1001 (File System Activity), 2004
 //              (Detection Finding), dispatched by record type; unmapped types
@@ -37,14 +36,13 @@
 //
 //           - file tail (most common — `audisp-syslog` writes
 //             `/var/log/audit/audit.log` and limpid tails it):
-//                 { workspace.auditd = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_auditd | compose_ocsf | ocsf_to_egress
+//                 { workspace.auditd = { body: ingress, hostname: hostname() } } | parse_auditd | compose_ocsf | ocsf_to_egress
 //
 //           - syslog transport (audispd-syslog plugin):
 //                 process parse_syslog | {
 //                     workspace.auditd = {
 //                         body:     workspace.syslog.msg,
-//                         hostname: workspace.syslog.hostname,
-//                         time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
+//                         hostname: workspace.syslog.hostname
 //                     }
 //                 } | parse_auditd | compose_ocsf | ocsf_to_egress
 //
@@ -52,8 +50,7 @@
 //                 process parse_journald | {
 //                     workspace.auditd = {
 //                         body:     workspace.journald.MESSAGE,
-//                         hostname: workspace.journald._HOSTNAME,
-//                         time:     to_int(workspace.journald.__REALTIME_TIMESTAMP) * 1000
+//                         hostname: workspace.journald._HOSTNAME
 //                     }
 //                 } | parse_auditd | compose_ocsf | ocsf_to_egress
 //
@@ -402,10 +399,24 @@ def function auditd_finding_record(title, status_id, host, time_ns, type, extra_
 // Main parser
 // ---------------------------------------------------------------------------
 
+def process parse_auditd_normalize_time {
+    workspace.auditd_timestamp = regex_parse(
+        workspace.auditd.body,
+        "msg=audit\\((?P<seconds>\\d+)\\.(?P<millis>\\d{3}):"
+    )
+    switch workspace.auditd_timestamp {
+        null { error "parse_auditd: invalid audit event timestamp: ${workspace.auditd.body}" }
+        default {
+            workspace.auditd.time = to_int(workspace.auditd_timestamp.seconds) * 1000000000 + to_int(workspace.auditd_timestamp.millis) * 1000000
+        }
+    }
+}
+
 def process parse_auditd {
     // @requires: workspace.auditd.body      (required, String)
     // @requires: workspace.auditd.hostname  (optional, String)
-    // @requires: workspace.auditd.time      (optional, Int — epoch ns)
+    // The intrinsic `msg=audit(<seconds>.<millis>:...)` timestamp is
+    // normalized to exact epoch nanoseconds.
     workspace.auditd_class = parse_auditd_classify(workspace.auditd.body)
     switch true {
         workspace.auditd_class == null {
@@ -414,14 +425,30 @@ def process parse_auditd {
         // Kind-based arms first so 1007-class lifecycle events route
         // to the lifecycle dispatcher rather than the generic process
         // one (both fall under OCSF 1007 Process Activity).
-        workspace.auditd_class.kind == "system_lifecycle" { process parse_auditd_lifecycle_dispatch }
-        workspace.auditd_class.class_uid == 3002 { process parse_auditd_auth_dispatch }
-        workspace.auditd_class.class_uid == 3001 { process parse_auditd_account_dispatch }
-        workspace.auditd_class.class_uid == 1007 { process parse_auditd_process_dispatch }
-        workspace.auditd_class.class_uid == 1001 { process parse_auditd_file_dispatch }
-        workspace.auditd_class.class_uid == 4001 { process parse_auditd_network_dispatch }
-        workspace.auditd_class.class_uid == 2002 { process parse_auditd_config_dispatch }
-        workspace.auditd_class.class_uid == 2004 { process parse_auditd_finding_dispatch }
+        workspace.auditd_class.kind == "system_lifecycle" {
+            process parse_auditd_lifecycle_dispatch
+        }
+        workspace.auditd_class.class_uid == 3002 {
+            process parse_auditd_auth_dispatch
+        }
+        workspace.auditd_class.class_uid == 3001 {
+            process parse_auditd_account_dispatch
+        }
+        workspace.auditd_class.class_uid == 1007 {
+            process parse_auditd_process_dispatch
+        }
+        workspace.auditd_class.class_uid == 1001 {
+            process parse_auditd_file_dispatch
+        }
+        workspace.auditd_class.class_uid == 4001 {
+            process parse_auditd_network_dispatch
+        }
+        workspace.auditd_class.class_uid == 2002 {
+            process parse_auditd_config_dispatch
+        }
+        workspace.auditd_class.class_uid == 2004 {
+            process parse_auditd_finding_dispatch
+        }
         default {
             error "parse_auditd: unsupported auditd type ${workspace.auditd_class.type}: ${workspace.auditd.body}"
         }
@@ -433,6 +460,7 @@ def process parse_auditd {
 // ---------------------------------------------------------------------------
 
 def process parse_auditd_auth_dispatch {
+    process parse_auditd_normalize_time
     let body = workspace.auditd.body
     let inner = parse_auditd_inner_msg(body)
     let acct = parse_auditd_any_kv(body, inner, "acct")
@@ -476,6 +504,7 @@ def process parse_auditd_auth_dispatch {
 // ---------------------------------------------------------------------------
 
 def process parse_auditd_account_dispatch {
+    process parse_auditd_normalize_time
     let body = workspace.auditd.body
     let inner = parse_auditd_inner_msg(body)
     let inner_or_empty = coalesce(inner, "")
@@ -522,6 +551,7 @@ def process parse_auditd_account_dispatch {
 // ---------------------------------------------------------------------------
 
 def process parse_auditd_process_dispatch {
+    process parse_auditd_normalize_time
     let body = workspace.auditd.body
     let comm = parse_auditd_outer_kv_quoted(body, "comm")
     let exe = parse_auditd_outer_kv_quoted(body, "exe")
@@ -564,6 +594,7 @@ def process parse_auditd_process_dispatch {
 // ---------------------------------------------------------------------------
 
 def process parse_auditd_file_dispatch {
+    process parse_auditd_normalize_time
     let body = workspace.auditd.body
     let path_name = parse_auditd_outer_kv_quoted(body, "name")
     let cwd = parse_auditd_outer_kv_quoted(body, "cwd")
@@ -624,6 +655,7 @@ def function auditd_lifecycle_record(activity_id, status_id, comm, exe, pid_str,
 }
 
 def process parse_auditd_lifecycle_dispatch {
+    process parse_auditd_normalize_time
     let body = workspace.auditd.body
     let inner = parse_auditd_inner_msg(body)
     let inner_or_empty = coalesce(inner, "")
@@ -696,6 +728,7 @@ def function auditd_network_event_record(activity_id, status_id, src_ip, dst_ip,
 }
 
 def process parse_auditd_network_dispatch {
+    process parse_auditd_normalize_time
     let body = workspace.auditd.body
     let src = parse_auditd_outer_kv(body, "src")
     let dst = parse_auditd_outer_kv(body, "dst")
@@ -763,6 +796,7 @@ def function auditd_config_record(title, comm, exe, pid_str, host, time_ns, type
 }
 
 def process parse_auditd_config_dispatch {
+    process parse_auditd_normalize_time
     let body = workspace.auditd.body
     let inner = parse_auditd_inner_msg(body)
     let inner_or_empty = coalesce(inner, "")
@@ -803,6 +837,7 @@ def process parse_auditd_config_dispatch {
 // ---------------------------------------------------------------------------
 
 def process parse_auditd_finding_dispatch {
+    process parse_auditd_normalize_time
     let body = workspace.auditd.body
     let title = switch workspace.auditd_class.kind {
         "avc"        { "SELinux access vector cache denial" }

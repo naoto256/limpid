@@ -5,7 +5,6 @@
 // Reads:       workspace.sysmon.* (bridge — see Bridges below)
 //   .body (required, Object) — parsed Sysmon event (caller does `parse_json(ingress)`)
 //   .hostname (optional, String) — collector override
-//   .time (optional, Int) — epoch ns override
 // Writes:      workspace.lsis.parsed.* — EventID 1 (ProcessCreate) → 1007,
 //              3 (NetworkConnect) → 4001, 11 (FileCreate) → 1001;
 //              unknown EventIDs route to error_log.
@@ -37,13 +36,12 @@
 //                 process parse_syslog | {
 //                     workspace.sysmon = {
 //                         body:     parse_json(workspace.syslog.msg),
-//                         hostname: workspace.syslog.hostname,
-//                         time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
+//                         hostname: workspace.syslog.hostname
 //                     }
 //                 } | parse_sysmon | compose_ocsf | ocsf_to_egress
 //
 //           - Direct JSON-line tail (when the forwarder writes a JSONL file):
-//                 process { workspace.sysmon = { body: parse_json(ingress), hostname: hostname(), time: to_int(received_at) } } | parse_sysmon | compose_ocsf | ocsf_to_egress
+//                 process { workspace.sysmon = { body: parse_json(ingress), hostname: hostname() } } | parse_sysmon | compose_ocsf | ocsf_to_egress
 //
 // Coverage scope (v0.7.1):
 //
@@ -82,7 +80,8 @@ include "../functions/proto_num.limpid"
 def process parse_sysmon {
     // @requires: workspace.sysmon.body      (required, Object — already parse_json'd)
     // @requires: workspace.sysmon.hostname  (optional, String)
-    // @requires: workspace.sysmon.time      (optional, Int — epoch ns)
+    // `body.EventTime` is the event time and is normalized from RFC 3339.
+    workspace.sysmon.time = to_int(parse_datetime_rfc3339(workspace.sysmon.body.EventTime))
     switch workspace.sysmon.body.EventID {
         1  { process parse_sysmon_process_create }
         3  { process parse_sysmon_network_connect }

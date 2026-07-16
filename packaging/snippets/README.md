@@ -236,7 +236,8 @@ regions.
 | File | Signature | Used by |
 |---|---|---|
 | `functions/http_method_activity_id.limpid` | `http_method_activity_id(method) → Int` | `parse_combined_log`, `parse_suricata`, `parse_zeek_default` |
-| `functions/parse_datetime_rfc3164.limpid` | `parse_datetime_rfc3164(text) → Timestamp` | — |
+| `functions/parse_datetime_rfc3164.limpid` | `parse_datetime_rfc3164(text, timezone) → Timestamp \| null;` | `parse_asa`, `parse_fortigate_cef`, `parse_juniper_srx_syslog`, `parse_paloalto_cef` |
+| `functions/parse_datetime_rfc3164.limpid` | `parse_datetime_rfc3164_in_timezone(text, timezone) → Timestamp` | `parse_datetime_rfc3164` |
 | `functions/proto_num.limpid` | `proto_num(name) → Int \| null` | `parse_checkpoint_leef`, `parse_checkpoint_syslog`, `parse_juniper_srx_sd_syslog`, `parse_juniper_srx_syslog`, `parse_paloalto_cef`, `parse_paloalto_syslog`, `parse_suricata`, `parse_sysmon`, `parse_zeek_default`, `parse_zeek_full` |
 | `functions/severity_converter.limpid` | `ocsf_severity_id_to_otel_severity_number(severity_id) → Int \| null` | `parse_ocsf` |
 | `functions/severity_converter.limpid` | `otel_severity_number_to_ocsf_severity_id(severity_number) → Int \| null` | `compose_ocsf` |
