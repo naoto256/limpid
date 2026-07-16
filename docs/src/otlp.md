@@ -154,11 +154,11 @@ The "Resource describes the source" rule above is unambiguous *if* you
 know the source's identity. In a real forwarder the identity has to
 come from somewhere. There are three popular sources:
 
-| Source | What it produces | Used by |
+| Source | What it produces | limpid policy |
 |---|---|---|
-| Auto-detection | `host.name = $(hostname)`, `service.name` from a config or env | OTel Collector receivers, most SDKs |
-| Per-source mapping | `service.name = workspace.cef.device_vendor` (computed per Event) | bespoke pipelines, CEF/syslog forwarders |
-| Hand-authored | `resource { attributes [...] }` block in the config | this is uncommon, but it's what limpid expects |
+| Auto-detection | `host.name = $(hostname)`, `service.name` from a config or env | Rejected for aggregated external logs |
+| Per-source adapter | Source-backed identity placed per Event | Packaged canonical path |
+| Post-adapter adjustment | Deployment-known target attributes | Explicit deployment seam |
 
 The OTel Collector's `host` and `resource` processors lean heavily on
 auto-detection — it Just Works for the common case where one collector
@@ -168,8 +168,12 @@ inherits the *forwarder's* `host.name`, contradicting External Logs
 guidance.
 
 The community has not converged. limpid takes the position that the
-forwarder doesn't know enough at the input layer to make this call
-correctly, and pushes it into the snippet (§5.4).
+generic input and composer do not know enough to make this call
+correctly. Each OTLP-capable raw-source parser has a sibling
+`<source>_to_otlp` adapter that places source-backed identity per Event
+(§5.4). A
+deployment may adjust that adapter output afterward when it owns
+additional facts.
 
 ### 4.2 What goes in `body`
 
@@ -186,8 +190,9 @@ permits all of these, and different ecosystems use different shapes:
   string in `string_value` because their backends parse it
   downstream regardless.
 
-limpid does not pick one. The DSL snippet builds whatever AnyValue
-shape the destination expects. See §5.7 for the bridging convention.
+limpid does not pick one globally. The parser-owned source adapter
+builds the AnyValue shape the destination expects. See §5.7 for the
+post-adapter adjustment convention.
 
 ### 4.3 Whether the originating timestamp is in `time_unix_nano` or `observed_time_unix_nano`
 
@@ -207,18 +212,15 @@ example, sets only `time_unix_nano` from the journal entry's
 
 limpid's snippet convention is:
 
-- `time_unix_nano = workspace.event_time_ns` (the source-claimed time
-  the parser extracted from the wire — `syslog_timestamp`, `cef_rt`,
-  etc.). Composer snippets should `coalesce(workspace.event_time_ns,
-  received_at)` defensively: an absent key encodes as `timeUnixNano: 0`
-  on the wire (proto3 default), and the encoder does not warn on
-  absent keys — only on present-but-uncoercible values.
-- `observed_time_unix_nano = received_at` by default. The packaged
-  `compose_otlp` snippet preserves the Event receive timestamp at
-  nanosecond precision. A caller sets
-  `workspace.lsis.shed.otlp.log_record.observed_time_unix_nano` only to
-  carry an explicit earlier observation point; that override takes
-  precedence over the default.
+- A parser normalizes source-claimed event time into
+  `workspace.lsis.parsed.time` as epoch nanoseconds. `compose_otlp`
+  selects `coalesce(shed.log_record.time_unix_nano, parsed.time)`.
+  When both are absent, `time_unix_nano` is omitted; observation time
+  is never substituted for event time.
+- `observed_time_unix_nano` selects
+  `coalesce(shed.log_record.observed_time_unix_nano, received_at)`.
+  The Event receive timestamp is therefore the default observation
+  time, while an explicit earlier observation point can override it.
 
 The spec is comfortable with this split; the practice in the wild is
 not consistent.
@@ -227,8 +229,8 @@ not consistent.
 
 `InstrumentationScope` is "the *library* that emitted the log." For an
 SDK this is meaningful — `io.opentelemetry.slf4j` vs `okhttp3`, etc.
-For a forwarder receiving syslog from a network device, there is no
-library. Implementations handle this differently:
+For a forwarder receiving syslog from a network device, there may be no
+source-backed library identity. Implementations handle this differently:
 
 - **Skip it.** Some receivers leave `scope` unset, producing a
   `ScopeLogs` with `scope: null`. This is technically valid but most
@@ -241,10 +243,11 @@ library. Implementations handle this differently:
   `scope.name = "syslog"` or the vendor (`"fortinet.fortigate"`).
   This is more useful for filtering downstream.
 
-limpid's input modules synthesise minimally: they emit a singleton
-ScopeLogs with no scope data on the wire (`scope: None` in the proto)
-and let the snippet author decide whether to populate it during
-composition. The output simply forwards what the snippet built.
+limpid's per-source adapters set Scope only when the source exposes a
+logger or instrumentation identity. Otherwise `compose_otlp` emits a
+singleton ScopeLogs with no scope data on the wire (`scope: None` in the
+proto). A deployment-owned identity may be supplied through an explicit
+post-adapter adjustment. The composer does not synthesize one.
 
 ### 4.5 Concat vs merge in batches (`batch_level`)
 
@@ -348,43 +351,45 @@ Bytes on the hop, decode-on-demand in the snippet.
 faster, and is the canonical form in the spec. The output transport
 re-encodes on the way out if the configured protocol is `http_json`.
 
-### 5.3 Source time vs `received_at`: the composer's call
+### 5.3 Source time vs `received_at`
 
-The answer to 4.3 is that limpid itself does not decide — the composer
-snippet does. The runtime cannot pick `time_unix_nano` vs
-`observed_time_unix_nano` on its own because, by Principle 2, the
-input never parses the body to extract a source-claimed time. The
-responsibility is split across three layers:
+The answer to 4.3 follows the parser/adapter/composer split. The input
+does not parse a payload, but the semantic parser does:
 
 - **Input** sets `Event.received_at = Utc::now()` (wall-clock,
   always present).
-- **Parser snippet** (`syslog.parse`, `cef.parse`, vendor-specific
-  parsers) extracts the source-claimed time and writes it to
-  workspace (`workspace.syslog.timestamp`, `workspace.cef.rt`, …).
-- **Composer snippet** maps both into the OTLP fields:
+- **Parser snippet** extracts source-claimed time and normalizes it to
+  `workspace.lsis.parsed.time` as epoch nanoseconds.
+- **Source adapter** may set an explicit target override only when the
+  canonical scalar is not the intended OTLP value.
+- **`compose_otlp`** applies the fixed chains:
 
   ```
-  time_unix_nano          ← source-claimed time, fallback received_at
-  observed_time_unix_nano ← received_at
+  time_unix_nano          <- coalesce(shed override, parsed.time), else omit
+  observed_time_unix_nano <- coalesce(shed override, received_at)
   ```
 
-Users assemble a HashLit (typically in `workspace.otlp`) and encode
-via `otlp.encode_resourcelog_protobuf` — see [OTLP function reference](./functions/expression-functions.md#otlp---opentelemetry-protocol-logs-signal). Sources
-that expose no usable source time (or where the source clock is
-known-bad and you want to ignore it) are handled in the composing
-expression by overriding the default — Rust never sees the decision.
+The composer never substitutes observation time for an absent event
+time. A deployment that intentionally overrides event time does so in
+the adapter output before composition.
+
+Timezone interpretation follows the source contract. A vendor-defined
+zone wins. Device-local timestamps default to the limpid host's system
+timezone, while a documented specification gap defaults to UTC. Parsers
+that accept local timestamps expose a source-specific timezone override;
+their headers document the exact default and accepted values.
 
 This is also why the `Event.timestamp` → `Event.received_at` rename
 that landed in v0.5.0 was made: a forwarder must not silently conflate
 wall-clock and source-clock semantics. See the breaking change entry in
 [CHANGELOG.md](../../CHANGELOG.md).
 
-### 5.4 Resource attributes are user-authored
+### 5.4 Resource attributes are source-adapter-owned
 
 limpid does **not** auto-detect `host.name`, `service.name`,
-`os.type`, or any other Resource attribute. The `resource { ... }`
-block in the OTLP output (and the per-Event `resource` field in
-the snippet's HashLit) is the only source of those values.
+`os.type`, or any other Resource attribute. The parser-owned
+`<source>_to_otlp` adapter places source-backed identity into
+`workspace.lsis.shed.otlp.resource.attributes` per Event.
 
 **Why no auto-detect.** As §4.1 notes, the OTel Collector's
 auto-detect is correct for one common case (one collector =
@@ -396,23 +401,24 @@ violate External Logs guidance for every record it emits.
 The right value comes from the parser: a CEF line carries the
 device hostname in `dvchost`; a syslog line carries the source
 in the HOSTNAME field; a Kafka record carries it as a key.
-A snippet extracts that and writes it into the Resource attributes
-the snippet builds, per record. The forwarder's identity (who
+A source adapter extracts that and writes it into Resource attributes
+per record. The forwarder's identity (who
 relayed) is unrelated and uninteresting; the source's identity (who
 emitted) is what `host.name` and `service.name` should describe.
 
-**The config-block fallback.** Configs that only ever forward one
-service's logs can hand-author the Resource block; the snippet then
-produces records that all share the same Resource and `batch_level=resource`
-collapses them efficiently on the wire. Both modes are first-class.
+Deployment-owned facts may replace or extend an adapter slot in an
+explicit block immediately after the adapter. That is a target-specific
+adjustment seam, not a substitute for source-aware placement.
 
 ### 5.5 SeverityNumber mapping is in snippets, not Rust
 
-Mapping syslog priorities → OTLP `severity_number`, or CEF severity
-strings → OTLP `severity_number`, is a per-source decision: a CEF
-producer's "High" means OTLP 13 (WARN) for some vendors and OTLP 17
-(ERROR) for others. limpid does not bake any mapping into Rust;
-snippets carry the table.
+Mapping a severity field in the log payload to OTLP
+`severity_number` is a per-source decision: a producer's "High" may
+mean OTLP 13 (WARN) for one vendor and OTLP 19 (ERROR3) for another.
+Syslog PRI is transport metadata and is never promoted or used as a
+fallback for canonical severity. limpid does not bake source mappings
+into Rust; parser snippets carry exact tables and reject unknown
+non-null source values.
 
 The reference snippet library that landed in v0.7.0 (and was expanded
 across the 0.7.x line) ships opinionated mappings for common vendors — see
@@ -420,13 +426,12 @@ across the 0.7.x line) ships opinionated mappings for common vendors — see
 follow the table conventions documented there.
 
 `compose_otlp` projects the parser's canonical
-`workspace.lsis.parsed.severity_number` directly into
-`SeverityNumber`. When the parser also preserved an exact source token
-in `workspace.lsis.parsed.severity`, the composer uses it as
-`SeverityText`. A caller may replace that text for a specific target by
-setting `workspace.lsis.shed.otlp.log_record.severity_text`; the explicit
-shed value takes precedence. If neither canonical severity field is
-known, OTLP's zero/empty defaults are left on the wire.
+`workspace.lsis.parsed.severity_number` into `SeverityNumber`, after
+an explicit `shed.otlp.log_record.severity_number` override. When the
+parser also preserved exact source text in
+`workspace.lsis.parsed.severity`, the composer uses it as
+`SeverityText`, after the corresponding shed override. Missing values
+are omitted from the encoded LogRecord.
 
 ### 5.6 Retry: transport-level only
 
@@ -470,25 +475,26 @@ kvlist. limpid's snippet author chooses, per pipeline:
 - **kvlist** for structured composition where the receiver natively
   understands the OTLP attribute model (the OTel-native path)
 
-A common pattern for cloud-bound pipelines is to run `compose_ocsf`
-so the OCSF JSON lands in `workspace.lsis.composed.ocsf`, then hand
-it into `compose_otlp` via the shed slot in a glue block:
+A source adapter chooses the normal Body variant. A cloud-bound
+deployment that intentionally wraps composed OCSF JSON changes that
+choice in a target-specific adjustment after the adapter:
 
 ```
 process parse_x
+      | x_to_otlp
       | compose_ocsf
       | {
           workspace.lsis.shed.otlp.log_record.body =
-              workspace.lsis.composed.ocsf
+              { string_value: workspace.lsis.composed.ocsf }
         }
       | compose_otlp
       | otlp_to_egress
 ```
 
 The composed slot holds the already-serialised string, so no
-per-event `to_json`. This matches what most cloud backends expect,
-lets the OCSF schema do the structuring work, and avoids fighting the
-OTLP attribute namespace.
+per-event `to_json` is needed. The explicit `string_value` tag selects
+the OTLP AnyValue variant without forcing every source Body to a
+string.
 
 ---
 
@@ -515,9 +521,10 @@ does not synthesise them and does not maintain a trace context.
 
 ### 6.3 Service identity auto-detection
 
-Restated for clarity: see §5.4. No `hostname()`-as-`host.name`,
-no `cargo_pkg_version()`-as-`service.version`, no `$HOSTNAME` env
-fallback. The snippet decides.
+Restated for clarity: see §5.4. No composer-side
+`hostname()`-as-`host.name`, `cargo_pkg_version()`-as-`service.version`,
+or `$HOSTNAME` fallback. The per-source adapter places source-backed
+identity; otherwise the attribute is absent.
 
 ### 6.4 Schema URL inference
 
@@ -534,11 +541,9 @@ ask; it is not part of the 0.5.0 → 0.7.x cycle.
 
 ### *"Why doesn't `service.name` show up in my OTLP output?"*
 
-Because no snippet wrote it. limpid will not auto-detect or default
-the field. The composer snippet must include it in the Resource
-attributes, typically extracted from a parser field like
-`workspace.cef.device_vendor` or hand-coded in the config's
-`resource { ... }` block. See §5.4.
+Because the source adapter did not have a source-backed value for it.
+limpid will not auto-detect or default the field. Add a deployment-owned
+value only in an explicit post-adapter adjustment. See §5.4.
 
 ### *"Why is my body a JSON string instead of structured attributes?"*
 
@@ -554,13 +559,12 @@ sender's behaviour on receiving that report is unspecified, and the
 "retry just the rejects" interpretation contradicts the
 field's terminal-state semantics. See §3.3 and §5.6.
 
-### *"Why do I have to author Resource attributes? OTel Collector handles this for me."*
+### *"Why does the source adapter author Resource attributes? OTel Collector handles this for me."*
 
 Because OTel Collector's auto-detection is correct for one common
 deployment shape and wrong for limpid's primary one (multi-source
-forwarder). See §4.1 and §5.4. If you only forward one service's
-logs, hand-author the `resource { ... }` block once and it stops
-being a per-record concern.
+forwarder). See §4.1 and §5.4. If a deployment owns additional stable
+identity, add it through the post-adapter adjustment seam.
 
 ### *"Why is `received_at` not the event time?"*
 
@@ -572,12 +576,10 @@ that landed in v0.5.0. See §5.3 and the
 
 ### *"Can I send Resource attributes from the input layer?"*
 
-Not in the 0.5.0 → 0.7.x cycle. Inputs do not interpret payloads (Principle 2). The
-parser snippet that runs in the process layer extracts the source's
-identity into workspace fields; the composer snippet then writes
-them into the Resource. If the same one-Resource pipeline is
-common, hand-author the config's `resource { ... }` block once and
-the snippet just references it.
+Inputs do not interpret payloads (Principle 2). The semantic parser
+extracts source identity, and its sibling OTLP adapter places that
+identity into Resource attributes. The generic composer does not make
+that source-specific placement decision.
 
 ### *"limpid is not OTel-conformant because it does X / does not do Y."*
 

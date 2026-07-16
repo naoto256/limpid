@@ -91,7 +91,7 @@ The optional `defaults` argument is a hash literal whose keys fill in any field 
 
 This function does **not** rewrite `egress` — it only populates the workspace. The wire payload is whatever the next hop expects to receive, which is almost always still a syslog line; rewrites to `egress` are usually surgical (e.g. `syslog.set_pri(egress, 16, 6)` to renormalise the PRI byte), not wholesale replacements.
 
-If you only need the PRI value (e.g. to route on severity without tokenising the rest of the header), reach for the lighter [`syslog.extract_pri`](#syslog-extract_pri-text) instead.
+If you only need the PRI value (e.g. to route on transport priority without tokenising the rest of the header), reach for the lighter [`syslog.extract_pri`](#syslog-extract_pri-text) instead. PRI is not an LSIS canonical event severity source.
 
 ### syslog.strip_pri(text)
 
@@ -190,18 +190,22 @@ so authors write directly against the OTLP spec. The JSON form
 applies the canonical OTLP/JSON conventions (camelCase, u64-as-string,
 bytes-as-hex) at the wire boundary.
 
+This is the low-level function shape. Packaged pipelines use
+`parse_<source> | <source>_to_otlp | compose_otlp | otlp_to_egress`,
+so the source adapter owns Resource, Scope, Body, and attribute placement.
+
 ```limpid
 workspace.otlp = {
     resource: {
         attributes: [
-            { key: "service.name", value: { string_value: "limpid" } },
-            { key: "host.name",    value: { string_value: hostname() } }
+            { key: "observer.vendor", value: { string_value: workspace.device.vendor } },
+            { key: "observer.product", value: { string_value: workspace.device.product } }
         ]
     },
     scope_logs: [{
-        scope: { name: "limpid", version: version() },
         log_records: [{
-            time_unix_nano: coalesce(workspace.event_time_ns, received_at),  // defensive: fall back to ingest time if upstream did not populate event_time_ns — see [otlp.md §4.3](../otlp.md#43-whether-the-originating-timestamp-is-in-time_unix_nano-or-observed_time_unix_nano)
+            time_unix_nano: workspace.lsis.parsed.time,
+            observed_time_unix_nano: received_at,
             severity_number: 9,                   // 9=INFO, 13=WARN, 17=ERROR, 21=FATAL
             severity_text: "INFO",
             body: { string_value: workspace.message },
@@ -522,13 +526,16 @@ Resolved at every call (no caching) — successive calls within the same process
 ### coalesce(a, b, c, ...)
 
 Return the leftmost argument that is not `null`; if every argument is
-`null`, return `null`. Variadic: accepts ≥ 1 argument. Designed for the
-"prefer parsed value, fall back to environment" pattern that recurs
-throughout composers and parsers.
+`null`, return `null`. Variadic: accepts ≥ 1 argument. It is commonly used
+for explicit override chains without inventing a fallback value.
 
 ```limpid
-// Composer: prefer parsed event time, fall back to received_at
-let event_time = coalesce(workspace.lsis.parsed.time, received_at)
+// OTLP composer: an explicit target override wins over canonical event time;
+// when both are absent, null_omit leaves time_unix_nano off the wire.
+let event_time = coalesce(
+    workspace.lsis.shed.otlp.log_record.time_unix_nano,
+    workspace.lsis.parsed.time
+)
 
 // Parser: pick first source IP that is populated
 workspace.lsis.parsed.src_endpoint.ip = coalesce(
@@ -1012,7 +1019,7 @@ Returns the hostname of the machine running the limpid daemon. Resolved at every
 workspace.forwarded_by = hostname()
 ```
 
-Useful for tagging events with the forwarder's identity (e.g. when several limpid hosts feed a central collector) or populating OTLP `host.name` resource attributes.
+Useful for tagging events with the forwarder's identity (e.g. when several limpid hosts feed a central collector). For external logs, do not use the forwarder's hostname as OTLP Resource `host.name`; the parser-owned source adapter places source identity instead.
 
 ### version()
 

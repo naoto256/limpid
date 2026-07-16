@@ -11,8 +11,8 @@
 // Writes:      workspace.lsis.composed.ocsf — OCSF 1.3.0 JSON, one object per
 //              event (String). Pipe `| ocsf_to_egress` (defined at
 //              the foot of this file) to emit it as the wire form;
-//              envelope composers (e.g. compose_otlp) read the slot
-//              directly instead.
+//              a source adapter may be followed by a target-specific
+//              adjustment that selects this slot as an envelope body.
 // Test corpus: spec-only (OCSF 1.3.0 schema; per-class leaf shapes
 //              cross-checked against schema.ocsf.io class definitions)
 //
@@ -76,8 +76,9 @@
 // `category_uid`, `activity_id`, `type_uid`, `severity_id`, `time`,
 // `metadata`) are emitted uniformly. Canonical OTel `severity_number` is
 // converted at this boundary. Bundled parsers use that canonical field;
-// legacy `severity_id` remains an explicit lower-priority compatibility input
-// for out-of-tree callers.
+// the legacy `severity_id` read is only a lower-priority compatibility path
+// for existing out-of-tree callers. New parsers must write
+// `severity_number` and leave the legacy field unset.
 //
 // Root `time` policy:
 //   LSIS record-level timestamps are Unix epoch nanoseconds; OCSF
