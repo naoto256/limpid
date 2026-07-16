@@ -2,6 +2,8 @@
 // Reads:       ingress (raw wire) — one CloudTrail event JSON object per
 //              ingress (unwrap {"Records":[...]} at the transport layer)
 // Writes:      workspace.lsis.parsed.* — 6003 (API Activity).
+//              cloudtrail_to_otlp additionally writes source-specific
+//              workspace.lsis.shed.otlp Resource, Body, and LogRecord attributes.
 // Category:    Cloud audit (API control plane)
 // Test corpus: public (FLAWS CloudTrail dataset, 1M events)
 //
@@ -210,4 +212,96 @@ def process parse_cloudtrail {
             version: "1.3.0"
         }
     }
+}
+
+def function cloudtrail_otlp_event_outcome(status_id) {
+    switch status_id {
+        1       { "success" }
+        2       { "failure" }
+        default { null }
+    }
+}
+
+def function cloudtrail_otlp_event_types(read_only) {
+    switch read_only {
+        true    { [{ string_value: "access" }] }
+        false   { [{ string_value: "change" }] }
+        default { [{ string_value: "info" }] }
+    }
+}
+
+def process cloudtrail_to_otlp {
+    workspace.lsis.shed.otlp.resource.attributes = concat(
+        [{ key: "cloud.provider", value: { string_value: "aws" } }],
+        switch workspace.lsis.parsed.cloud.account.uid != null {
+            true { [{ key: "cloud.account.id", value: { string_value: workspace.lsis.parsed.cloud.account.uid } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.cloud.region != null {
+            true { [{ key: "cloud.region", value: { string_value: workspace.lsis.parsed.cloud.region } }] }
+            default { [] }
+        },
+        [{ key: "service.name", value: { string_value: "AWS CloudTrail" } }],
+        [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
+        [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
+    )
+
+    workspace.lsis.shed.otlp.log_record.body = { string_value: ingress }
+    workspace.lsis.shed.otlp.log_record.attributes = concat(
+        [{ key: "event.kind", value: { string_value: "event" } }],
+        [{ key: "event.category", value: { array_value: { values: [{ string_value: "configuration" }] } } }],
+        [{ key: "event.type", value: { array_value: { values: cloudtrail_otlp_event_types(workspace.ct.readOnly) } } }],
+        switch workspace.ct.eventName != null {
+            true { [{ key: "event.action", value: { string_value: workspace.ct.eventName } }] }
+            default { [] }
+        },
+        switch workspace.ct.eventID != null {
+            true { [{ key: "event.id", value: { string_value: workspace.ct.eventID } }] }
+            default { [] }
+        },
+        switch cloudtrail_otlp_event_outcome(workspace.lsis.parsed.status_id) != null {
+            true { [{ key: "event.outcome", value: { string_value: cloudtrail_otlp_event_outcome(workspace.lsis.parsed.status_id) } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.message != null {
+            true { [{ key: "message", value: { string_value: workspace.lsis.parsed.message } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.actor.user.name != null {
+            true { [{ key: "user.name", value: { string_value: workspace.lsis.parsed.actor.user.name } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.actor.user.uid != null {
+            true { [{ key: "user.id", value: { string_value: workspace.lsis.parsed.actor.user.uid } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.src_endpoint.ip != null {
+            true { [{ key: "source.ip", value: { string_value: workspace.lsis.parsed.src_endpoint.ip } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.http_request.user_agent != null {
+            true { [{ key: "user_agent.original", value: { string_value: workspace.lsis.parsed.http_request.user_agent } }] }
+            default { [] }
+        },
+        switch workspace.ct.eventSource != null {
+            true { [{ key: "aws.cloudtrail.event_source", value: { string_value: workspace.ct.eventSource } }] }
+            default { [] }
+        },
+        switch workspace.ct.eventType != null {
+            true { [{ key: "aws.cloudtrail.event_type", value: { string_value: workspace.ct.eventType } }] }
+            default { [] }
+        },
+        switch workspace.ct.eventCategory != null {
+            true { [{ key: "aws.cloudtrail.event_category", value: { string_value: workspace.ct.eventCategory } }] }
+            default { [] }
+        },
+        switch workspace.ct.requestID != null {
+            true { [{ key: "aws.cloudtrail.request_id", value: { string_value: workspace.ct.requestID } }] }
+            default { [] }
+        },
+        switch workspace.ct.errorCode != null {
+            true { [{ key: "error.code", value: { string_value: workspace.ct.errorCode } }] }
+            default { [] }
+        }
+    )
 }

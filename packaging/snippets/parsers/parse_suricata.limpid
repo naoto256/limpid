@@ -6,6 +6,8 @@
 //   .hostname (optional, String) — collector override
 //   .time (optional, Int) — epoch ns override
 // Writes:      workspace.lsis.parsed.* — alert → 2004, dns → 4003, http → 4002,
+//              suricata_to_otlp additionally writes source-specific
+//              workspace.lsis.shed.otlp Resource, Scope, Body, and LogRecord attributes.
 //              tls / flow / fileinfo → 4001; stats dropped; other
 //              event_types route to error_log.
 // Category:    OSS NDR
@@ -470,5 +472,164 @@ def process parse_suricata_fileinfo {
         workspace.suricata.body,
         workspace.suricata.hostname,
         suricata_time_ns(workspace.suricata.body, workspace.suricata.time)
+    )
+}
+
+def function suricata_otlp_event_kind(event_type) {
+    switch event_type {
+        "alert" { "alert" }
+        default { "event" }
+    }
+}
+
+def function suricata_otlp_event_category(event_type) {
+    switch event_type {
+        "alert"    { "intrusion_detection" }
+        "dns"      { "network" }
+        "http"     { "web" }
+        "fileinfo" { "file" }
+        default    { "network" }
+    }
+}
+
+def function suricata_otlp_event_type(event_type) {
+    switch event_type {
+        "alert"    { "indicator" }
+        "fileinfo" { "info" }
+        default    { "connection" }
+    }
+}
+
+def function suricata_otlp_event_outcome(status_id) {
+    switch status_id {
+        1       { "success" }
+        2       { "failure" }
+        default { null }
+    }
+}
+
+def process suricata_to_otlp {
+    let body = workspace.suricata.body
+    workspace.lsis.shed.otlp.resource.attributes = concat(
+        [{ key: "observer.vendor", value: { string_value: "OISF" } }],
+        [{ key: "observer.product", value: { string_value: "Suricata" } }],
+        [{ key: "observer.type", value: { string_value: "ids" } }],
+        switch workspace.suricata.hostname != null {
+            true { [{ key: "host.name", value: { string_value: workspace.suricata.hostname } }] }
+            default { [] }
+        },
+        [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
+        [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
+    )
+    workspace.lsis.shed.otlp.scope.name = "suricata"
+    workspace.lsis.shed.otlp.log_record.body = { string_value: ingress }
+    workspace.lsis.shed.otlp.log_record.attributes = concat(
+        [{ key: "event.kind", value: { string_value: suricata_otlp_event_kind(body.event_type) } }],
+        [{ key: "event.category", value: { array_value: { values: [{ string_value: suricata_otlp_event_category(body.event_type) }] } } }],
+        [{ key: "event.type", value: { array_value: { values: [{ string_value: suricata_otlp_event_type(body.event_type) }] } } }],
+        switch body.event_type != null {
+            true { [{ key: "event.action", value: { string_value: body.event_type } }] }
+            default { [] }
+        },
+        switch suricata_otlp_event_outcome(workspace.lsis.parsed.status_id) != null {
+            true { [{ key: "event.outcome", value: { string_value: suricata_otlp_event_outcome(workspace.lsis.parsed.status_id) } }] }
+            default { [] }
+        },
+        switch body.src_ip != null {
+            true { [{ key: "source.ip", value: { string_value: body.src_ip } }] }
+            default { [] }
+        },
+        switch body.src_port != null {
+            true { [{ key: "source.port", value: { int_value: to_int(body.src_port) } }] }
+            default { [] }
+        },
+        switch body.dest_ip != null {
+            true { [{ key: "destination.ip", value: { string_value: body.dest_ip } }] }
+            default { [] }
+        },
+        switch body.dest_port != null {
+            true { [{ key: "destination.port", value: { int_value: to_int(body.dest_port) } }] }
+            default { [] }
+        },
+        switch body.proto != null {
+            true { [{ key: "network.transport", value: { string_value: lower(body.proto) } }] }
+            default { [] }
+        },
+        switch body.app_proto != null {
+            true { [{ key: "network.protocol.name", value: { string_value: body.app_proto } }] }
+            default { [] }
+        },
+        switch body.community_id != null {
+            true { [{ key: "network.community_id", value: { string_value: body.community_id } }] }
+            default { [] }
+        },
+        switch body.flow_id != null {
+            true { [{ key: "suricata.flow.id", value: { string_value: "${body.flow_id}" } }] }
+            default { [] }
+        },
+        switch body.in_iface != null {
+            true { [{ key: "observer.ingress.interface.name", value: { string_value: body.in_iface } }] }
+            default { [] }
+        },
+        switch body.alert.signature != null {
+            true { [{ key: "rule.name", value: { string_value: body.alert.signature } }] }
+            default { [] }
+        },
+        switch body.alert.signature_id != null {
+            true { [{ key: "rule.id", value: { string_value: "${body.alert.signature_id}" } }] }
+            default { [] }
+        },
+        switch body.alert.category != null {
+            true { [{ key: "rule.category", value: { string_value: body.alert.category } }] }
+            default { [] }
+        },
+        switch body.alert.action != null {
+            true { [{ key: "suricata.alert.action", value: { string_value: body.alert.action } }] }
+            default { [] }
+        },
+        switch body.alert.severity != null {
+            true { [{ key: "suricata.alert.priority", value: { int_value: to_int(body.alert.severity) } }] }
+            default { [] }
+        },
+        switch body.http.http_method != null {
+            true { [{ key: "http.request.method", value: { string_value: body.http.http_method } }] }
+            default { [] }
+        },
+        switch body.http.hostname != null {
+            true { [{ key: "url.domain", value: { string_value: body.http.hostname } }] }
+            default { [] }
+        },
+        switch body.http.url != null {
+            true { [{ key: "url.path", value: { string_value: body.http.url } }] }
+            default { [] }
+        },
+        switch body.http.status != null {
+            true { [{ key: "http.response.status_code", value: { int_value: to_int(body.http.status) } }] }
+            default { [] }
+        },
+        switch body.dns.rrname != null {
+            true { [{ key: "dns.question.name", value: { string_value: body.dns.rrname } }] }
+            default { [] }
+        },
+        switch body.dns.rrtype != null {
+            true { [{ key: "dns.question.type", value: { string_value: body.dns.rrtype } }] }
+            default { [] }
+        },
+        switch body.tls.sni != null {
+            true { [{ key: "tls.client.server_name", value: { string_value: body.tls.sni } }] }
+            default { [] }
+        },
+        switch body.tls.version != null {
+            true { [{ key: "tls.version", value: { string_value: body.tls.version } }] }
+            default { [] }
+        },
+        switch body.fileinfo.filename != null {
+            true { [{ key: "file.name", value: { string_value: body.fileinfo.filename } }] }
+            default { [] }
+        },
+        switch body.fileinfo.size != null {
+            true { [{ key: "file.size", value: { int_value: to_int(body.fileinfo.size) } }] }
+            default { [] }
+        }
     )
 }

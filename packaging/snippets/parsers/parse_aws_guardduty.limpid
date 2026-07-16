@@ -4,6 +4,8 @@
 // Reads:       ingress (raw wire) — one GuardDuty finding object per ingress
 //              (identical across EventBridge / SNS / S3 delivery)
 // Writes:      workspace.lsis.parsed.* — 2004 (Detection Finding), one finding → one
+//              aws_guardduty_to_otlp additionally writes source-specific
+//              workspace.lsis.shed.otlp Resource, Body, and LogRecord attributes.
 //              record; unknown ThreatPurpose values route to error_log.
 // Category:    Cloud security findings
 // Test corpus: spec-only (AWS documentation per-finding-type sample bodies;
@@ -413,4 +415,90 @@ def process parse_aws_guardduty_dispatch {
             error "parse_aws_guardduty: unknown ThreatPurpose category `${workspace.gd_type.category}` (full type `${workspace.gd.type}`); GuardDuty closed taxonomy was extended — extend the dispatcher"
         }
     }
+}
+
+// Only GuardDuty ThreatPurpose values that have an exact ATT&CK tactic
+// counterpart are exposed under the public threat.tactic namespace.
+// AWS-specific buckets remain under aws.guardduty.*.
+def function aws_guardduty_otlp_tactic_name(category) {
+    switch category {
+        "Recon"               { "Reconnaissance" }
+        "Discovery"           { "Discovery" }
+        "InitialAccess"       { "Initial Access" }
+        "Execution"           { "Execution" }
+        "Persistence"         { "Persistence" }
+        "PrivilegeEscalation" { "Privilege Escalation" }
+        "DefenseEvasion"      { "Defense Evasion" }
+        "Exfiltration"        { "Exfiltration" }
+        "Impact"              { "Impact" }
+        default               { null }
+    }
+}
+
+def process aws_guardduty_to_otlp {
+    workspace.lsis.shed.otlp.resource.attributes = concat(
+        [{ key: "cloud.provider", value: { string_value: "aws" } }],
+        switch workspace.gd.accountId != null {
+            true { [{ key: "cloud.account.id", value: { string_value: workspace.gd.accountId } }] }
+            default { [] }
+        },
+        switch workspace.gd.region != null {
+            true { [{ key: "cloud.region", value: { string_value: workspace.gd.region } }] }
+            default { [] }
+        },
+        switch workspace.gd.arn != null {
+            true { [{ key: "cloud.resource_id", value: { string_value: workspace.gd.arn } }] }
+            default { [] }
+        },
+        [{ key: "service.name", value: { string_value: "AWS GuardDuty" } }],
+        [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
+        [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
+    )
+
+    workspace.lsis.shed.otlp.log_record.body = { string_value: ingress }
+    workspace.lsis.shed.otlp.log_record.attributes = concat(
+        [{ key: "event.kind", value: { string_value: "alert" } }],
+        [{ key: "event.category", value: { array_value: { values: [{ string_value: "intrusion_detection" }] } } }],
+        [{ key: "event.type", value: { array_value: { values: [{ string_value: "indicator" }] } } }],
+        switch workspace.gd.id != null {
+            true { [{ key: "event.id", value: { string_value: workspace.gd.id } }] }
+            default { [] }
+        },
+        switch workspace.gd.type != null {
+            true { [{ key: "event.code", value: { string_value: workspace.gd.type } }] }
+            default { [] }
+        },
+        switch workspace.gd.title != null {
+            true { [{ key: "rule.name", value: { string_value: workspace.gd.title } }] }
+            default { [] }
+        },
+        switch workspace.gd.description != null {
+            true { [{ key: "message", value: { string_value: workspace.gd.description } }] }
+            default { [] }
+        },
+        switch aws_guardduty_otlp_tactic_name(workspace.gd_type.category) != null {
+            true { [{ key: "threat.tactic.name", value: { string_value: aws_guardduty_otlp_tactic_name(workspace.gd_type.category) } }] }
+            default { [] }
+        },
+        switch workspace.gd_type.threat_name != null {
+            true { [{ key: "aws.guardduty.threat.name", value: { string_value: workspace.gd_type.threat_name } }] }
+            default { [] }
+        },
+        switch workspace.gd.service.detectorId != null {
+            true { [{ key: "aws.guardduty.detector.id", value: { string_value: workspace.gd.service.detectorId } }] }
+            default { [] }
+        },
+        switch workspace.gd_type.resource_type != null {
+            true { [{ key: "aws.guardduty.resource.type", value: { string_value: workspace.gd_type.resource_type } }] }
+            default { [] }
+        },
+        switch workspace.gd.service.count != null {
+            true { [{ key: "aws.guardduty.finding.count", value: { int_value: to_int(workspace.gd.service.count) } }] }
+            default { [] }
+        },
+        switch workspace.gd.service.archived != null {
+            true { [{ key: "aws.guardduty.finding.archived", value: { bool_value: workspace.gd.service.archived } }] }
+            default { [] }
+        }
+    )
 }

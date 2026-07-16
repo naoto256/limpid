@@ -6,7 +6,8 @@
 // Writes:      workspace.lsis.parsed.* — 3002 (Authentication), 3001 (Account Change),
 //              1007 (Process Activity), 1001 (File System Activity), 2004
 //              (Detection Finding), dispatched by record type; unmapped types
-//              route to error_log. Per-type table below.
+//              route to error_log. auditd_to_otlp writes source-owned OTLP
+//              Resource, Scope, Body, and LogRecord attributes.
 // Category:    Endpoint / host audit (Unix)
 // Test corpus: public (elastic/integrations auditd corpus — 69 records across
 //              ~45 record types)
@@ -859,5 +860,64 @@ def process parse_auditd_finding_dispatch {
             sig:      parse_auditd_outer_kv(body, "sig"),
             res:      parse_auditd_outer_kv(body, "res")
         }
+    )
+}
+
+def function auditd_otlp_event_kind(class_uid) {
+    switch class_uid { 2004 { "alert" } default { "event" } }
+}
+
+def function auditd_otlp_event_category(class_uid) {
+    switch class_uid {
+        1001 { "file" }
+        1007 { "process" }
+        2004 { "intrusion_detection" }
+        3001 { "iam" }
+        3002 { "authentication" }
+        default { "host" }
+    }
+}
+
+def function auditd_otlp_event_type(class_uid) {
+    switch class_uid {
+        1001 { "change" }
+        1007 { "start" }
+        2004 { "indicator" }
+        3001 { "change" }
+        3002 { "start" }
+        default { "info" }
+    }
+}
+
+def function auditd_otlp_event_outcome(status_id) {
+    switch status_id { 1 { "success" } 2 { "failure" } default { null } }
+}
+
+def process auditd_to_otlp {
+    workspace.lsis.shed.otlp.resource.attributes = concat(
+        [{ key: "observer.vendor", value: { string_value: "Linux" } }],
+        [{ key: "observer.product", value: { string_value: "Linux Audit" } }],
+        [{ key: "observer.type", value: { string_value: "host" } }],
+        switch workspace.auditd.hostname != null { true { [{ key: "host.name", value: { string_value: workspace.auditd.hostname } }] } default { [] } },
+        [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
+        [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
+    )
+    workspace.lsis.shed.otlp.scope.name = "auditd"
+    workspace.lsis.shed.otlp.log_record.body = { string_value: workspace.auditd.body }
+    workspace.lsis.shed.otlp.log_record.attributes = concat(
+        [{ key: "event.kind", value: { string_value: auditd_otlp_event_kind(workspace.lsis.parsed.class_uid) } }],
+        [{ key: "event.category", value: { array_value: { values: [{ string_value: auditd_otlp_event_category(workspace.lsis.parsed.class_uid) }] } } }],
+        [{ key: "event.type", value: { array_value: { values: [{ string_value: auditd_otlp_event_type(workspace.lsis.parsed.class_uid) }] } } }],
+        switch workspace.auditd_class.type != null { true { [{ key: "event.code", value: { string_value: workspace.auditd_class.type } }] } default { [] } },
+        switch auditd_otlp_event_outcome(workspace.lsis.parsed.status_id) != null { true { [{ key: "event.outcome", value: { string_value: auditd_otlp_event_outcome(workspace.lsis.parsed.status_id) } }] } default { [] } },
+        switch coalesce(workspace.lsis.parsed.actor.user.name, workspace.lsis.parsed.user.name) != null { true { [{ key: "user.name", value: { string_value: coalesce(workspace.lsis.parsed.actor.user.name, workspace.lsis.parsed.user.name) } }] } default { [] } },
+        switch workspace.lsis.parsed.actor.user.name != null and workspace.lsis.parsed.user.name != null { true { [{ key: "user.target.name", value: { string_value: workspace.lsis.parsed.user.name } }] } default { [] } },
+        switch workspace.lsis.parsed.process.name != null { true { [{ key: "process.name", value: { string_value: workspace.lsis.parsed.process.name } }] } default { [] } },
+        switch workspace.lsis.parsed.process.pid != null { true { [{ key: "process.pid", value: { int_value: workspace.lsis.parsed.process.pid } }] } default { [] } },
+        switch workspace.lsis.parsed.file.name != null { true { [{ key: "file.name", value: { string_value: workspace.lsis.parsed.file.name } }] } default { [] } },
+        switch workspace.lsis.parsed.file.path != null { true { [{ key: "file.path", value: { string_value: workspace.lsis.parsed.file.path } }] } default { [] } },
+        switch workspace.lsis.parsed.src_endpoint.ip != null { true { [{ key: "source.ip", value: { string_value: workspace.lsis.parsed.src_endpoint.ip } }] } default { [] } },
+        switch workspace.lsis.parsed.dst_endpoint.ip != null { true { [{ key: "destination.ip", value: { string_value: workspace.lsis.parsed.dst_endpoint.ip } }] } default { [] } },
+        switch workspace.lsis.parsed.finding_info.title != null { true { [{ key: "rule.name", value: { string_value: workspace.lsis.parsed.finding_info.title } }] } default { [] } }
     )
 }

@@ -5,6 +5,8 @@
 // Reads:       ingress (raw wire) — one audit Event object per ingress
 //              (no {"items":[...]} envelope)
 // Writes:      workspace.lsis.parsed.* — 6003 (API Activity) for resource requests,
+//              k8s_audit_to_otlp additionally writes source-specific
+//              workspace.lsis.shed.otlp Resource, Scope, Body, and LogRecord attributes.
 //              3002 (Authentication) for authentication.k8s.io objectRefs;
 //              unknown kinds route to error_log.
 // Category:    Container / orchestration
@@ -315,4 +317,107 @@ def process parse_k8s_audit_authn {
             version: "1.3.0"
         }
     }
+}
+
+def function k8s_audit_otlp_event_type(verb) {
+    switch verb {
+        "get"              { "access" }
+        "list"             { "access" }
+        "watch"            { "access" }
+        "proxy"            { "access" }
+        "create"           { "creation" }
+        "update"           { "change" }
+        "patch"            { "change" }
+        "delete"           { "deletion" }
+        "deletecollection" { "deletion" }
+        default            { "info" }
+    }
+}
+
+def function k8s_audit_otlp_event_outcome(status_id) {
+    switch status_id {
+        1       { "success" }
+        2       { "failure" }
+        default { null }
+    }
+}
+
+def process k8s_audit_to_otlp {
+    workspace.lsis.shed.otlp.resource.attributes = concat(
+        [{ key: "observer.vendor", value: { string_value: "Kubernetes" } }],
+        [{ key: "observer.product", value: { string_value: "kube-apiserver" } }],
+        [{ key: "observer.type", value: { string_value: "audit" } }],
+        [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
+        [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
+    )
+    workspace.lsis.shed.otlp.scope.name = "kube-apiserver"
+    workspace.lsis.shed.otlp.log_record.body = { string_value: ingress }
+    workspace.lsis.shed.otlp.log_record.attributes = concat(
+        [{ key: "event.kind", value: { string_value: "event" } }],
+        [{ key: "event.category", value: { array_value: { values: switch workspace.k8s.objectRef.apiGroup {
+            "authentication.k8s.io" { [{ string_value: "authentication" }] }
+            default                 { [{ string_value: "configuration" }] }
+        } } } }],
+        [{ key: "event.type", value: { array_value: { values: [{ string_value: k8s_audit_otlp_event_type(workspace.k8s.verb) }] } } }],
+        switch workspace.k8s.verb != null {
+            true { [{ key: "event.action", value: { string_value: workspace.k8s.verb } }] }
+            default { [] }
+        },
+        switch workspace.k8s.auditID != null {
+            true { [{ key: "event.id", value: { string_value: workspace.k8s.auditID } }] }
+            default { [] }
+        },
+        switch k8s_audit_otlp_event_outcome(workspace.lsis.parsed.status_id) != null {
+            true { [{ key: "event.outcome", value: { string_value: k8s_audit_otlp_event_outcome(workspace.lsis.parsed.status_id) } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.message != null {
+            true { [{ key: "message", value: { string_value: workspace.lsis.parsed.message } }] }
+            default { [] }
+        },
+        switch workspace.k8s.user.username != null {
+            true { [{ key: "user.name", value: { string_value: workspace.k8s.user.username } }] }
+            default { [] }
+        },
+        switch workspace.k8s.user.uid != null {
+            true { [{ key: "user.id", value: { string_value: workspace.k8s.user.uid } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.src_endpoint.ip != null {
+            true { [{ key: "source.ip", value: { string_value: workspace.lsis.parsed.src_endpoint.ip } }] }
+            default { [] }
+        },
+        switch workspace.k8s.userAgent != null {
+            true { [{ key: "user_agent.original", value: { string_value: workspace.k8s.userAgent } }] }
+            default { [] }
+        },
+        switch workspace.k8s.requestURI != null {
+            true { [{ key: "url.path", value: { string_value: workspace.k8s.requestURI } }] }
+            default { [] }
+        },
+        switch workspace.k8s.responseStatus.code != null {
+            true { [{ key: "http.response.status_code", value: { int_value: to_int(workspace.k8s.responseStatus.code) } }] }
+            default { [] }
+        },
+        switch workspace.k8s.objectRef.namespace != null {
+            true { [{ key: "k8s.namespace.name", value: { string_value: workspace.k8s.objectRef.namespace } }] }
+            default { [] }
+        },
+        switch workspace.k8s.objectRef.name != null {
+            true { [{ key: "k8s.audit.resource.name", value: { string_value: workspace.k8s.objectRef.name } }] }
+            default { [] }
+        },
+        switch workspace.k8s.objectRef.resource != null {
+            true { [{ key: "k8s.audit.resource.type", value: { string_value: workspace.k8s.objectRef.resource } }] }
+            default { [] }
+        },
+        switch workspace.k8s.level != null {
+            true { [{ key: "k8s.audit.level", value: { string_value: workspace.k8s.level } }] }
+            default { [] }
+        },
+        switch workspace.k8s.stage != null {
+            true { [{ key: "k8s.audit.stage", value: { string_value: workspace.k8s.stage } }] }
+            default { [] }
+        }
+    )
 }

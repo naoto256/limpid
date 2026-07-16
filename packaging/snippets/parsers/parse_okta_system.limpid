@@ -5,6 +5,8 @@
 // Reads:       ingress (raw wire) — one LogEvent object per ingress (unwrap
 //              Event Hooks data.events[] upstream)
 // Writes:      workspace.lsis.parsed.* — user.session/user.authentication → 3002,
+//              okta_system_to_otlp additionally writes source-specific
+//              workspace.lsis.shed.otlp Resource, Scope, Body, and LogRecord attributes.
 //              user.lifecycle → 3001, user.account → 3005, group.* → 3006;
 //              other eventTypes route to error_log.
 // Category:    Identity / IdP
@@ -642,4 +644,115 @@ def process parse_okta_group_privilege {
             )
         }
     }
+}
+
+def function okta_otlp_event_category(event_type) {
+    switch true {
+        starts_with(event_type, "user.session.")        { "authentication" }
+        starts_with(event_type, "user.authentication.") { "authentication" }
+        default                                          { "iam" }
+    }
+}
+
+def function okta_otlp_event_type(event_type) {
+    switch true {
+        event_type == "user.session.start"              { "start" }
+        event_type == "user.session.end"                { "end" }
+        starts_with(event_type, "user.authentication.") { "access" }
+        starts_with(event_type, "user.lifecycle.create") { "user" }
+        starts_with(event_type, "group.lifecycle.create") { "group" }
+        default                                           { "change" }
+    }
+}
+
+def function okta_otlp_event_outcome(result) {
+    switch result {
+        "SUCCESS" { "success" }
+        "ALLOW"   { "success" }
+        "FAILURE" { "failure" }
+        "DENY"    { "failure" }
+        default   { null }
+    }
+}
+
+def process okta_system_to_otlp {
+    let target_user = okta_first_target(workspace.okta.target, "User")
+    let target_group = okta_first_target(workspace.okta.target, "UserGroup")
+    workspace.lsis.shed.otlp.resource.attributes = concat(
+        [{ key: "cloud.provider", value: { string_value: "okta" } }],
+        [{ key: "service.name", value: { string_value: "Okta System Log" } }],
+        [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
+        [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
+    )
+    workspace.lsis.shed.otlp.scope.name = "okta.system_log"
+    workspace.lsis.shed.otlp.log_record.body = { string_value: ingress }
+    workspace.lsis.shed.otlp.log_record.attributes = concat(
+        [{ key: "event.kind", value: { string_value: "event" } }],
+        [{ key: "event.category", value: { array_value: { values: [{ string_value: okta_otlp_event_category(workspace.okta.eventType) }] } } }],
+        [{ key: "event.type", value: { array_value: { values: [{ string_value: okta_otlp_event_type(workspace.okta.eventType) }] } } }],
+        switch workspace.okta.eventType != null {
+            true { [{ key: "event.action", value: { string_value: workspace.okta.eventType } }] }
+            default { [] }
+        },
+        switch workspace.okta.uuid != null {
+            true { [{ key: "event.id", value: { string_value: workspace.okta.uuid } }] }
+            default { [] }
+        },
+        switch okta_otlp_event_outcome(workspace.okta.outcome.result) != null {
+            true { [{ key: "event.outcome", value: { string_value: okta_otlp_event_outcome(workspace.okta.outcome.result) } }] }
+            default { [] }
+        },
+        switch workspace.okta.displayMessage != null {
+            true { [{ key: "message", value: { string_value: workspace.okta.displayMessage } }] }
+            default { [] }
+        },
+        switch workspace.okta.actor.alternateId != null {
+            true { [{ key: "user.name", value: { string_value: workspace.okta.actor.alternateId } }] }
+            default { [] }
+        },
+        switch workspace.okta.actor.displayName != null {
+            true { [{ key: "user.full_name", value: { string_value: workspace.okta.actor.displayName } }] }
+            default { [] }
+        },
+        switch workspace.okta.actor.id != null {
+            true { [{ key: "user.id", value: { string_value: workspace.okta.actor.id } }] }
+            default { [] }
+        },
+        switch target_user.alternateId != null {
+            true { [{ key: "user.target.name", value: { string_value: target_user.alternateId } }] }
+            default { [] }
+        },
+        switch target_user.displayName != null {
+            true { [{ key: "user.target.full_name", value: { string_value: target_user.displayName } }] }
+            default { [] }
+        },
+        switch target_user.id != null {
+            true { [{ key: "user.target.id", value: { string_value: target_user.id } }] }
+            default { [] }
+        },
+        switch target_group.displayName != null {
+            true { [{ key: "group.name", value: { string_value: target_group.displayName } }] }
+            default { [] }
+        },
+        switch target_group.id != null {
+            true { [{ key: "group.id", value: { string_value: target_group.id } }] }
+            default { [] }
+        },
+        switch workspace.okta.client.ipAddress != null {
+            true { [{ key: "source.ip", value: { string_value: workspace.okta.client.ipAddress } }] }
+            default { [] }
+        },
+        switch workspace.okta.client.userAgent.rawUserAgent != null {
+            true { [{ key: "user_agent.original", value: { string_value: workspace.okta.client.userAgent.rawUserAgent } }] }
+            default { [] }
+        },
+        switch workspace.okta.transaction.id != null {
+            true { [{ key: "okta.transaction.id", value: { string_value: workspace.okta.transaction.id } }] }
+            default { [] }
+        },
+        switch workspace.okta.outcome.reason != null {
+            true { [{ key: "event.reason", value: { string_value: workspace.okta.outcome.reason } }] }
+            default { [] }
+        }
+    )
 }
