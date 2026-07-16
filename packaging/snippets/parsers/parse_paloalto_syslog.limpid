@@ -12,7 +12,8 @@
 //              a custom parser when the source zone is known to differ.
 // Writes:      workspace.lsis.parsed.* — TRAFFIC → 4001, THREAT → 2004
 //              (url → 6004, wildfire → 2004), GLOBALPROTECT /
-//              AUTHENTICATION → 3002; see the subtype leaves below.
+//              AUTHENTICATION → 3002; paloalto_syslog_to_otlp writes
+//              source-owned OTLP Resource, Body, and LogRecord attributes.
 // Category:    Network firewall / IPS
 // Test corpus: synthetic (documentation-derived sample wires in this header)
 //
@@ -719,4 +720,153 @@ def process parse_paloalto_syslog_authentication {
             version: "1.3.0"
         }
     }
+}
+
+def function paloalto_syslog_otlp_event_kind(class_uid) {
+    switch class_uid {
+        2004    { "alert" }
+        default { "event" }
+    }
+}
+
+def function paloalto_syslog_otlp_event_category(class_uid) {
+    switch class_uid {
+        2004    { "intrusion_detection" }
+        3002    { "authentication" }
+        6004    { "web" }
+        default { "network" }
+    }
+}
+
+def function paloalto_syslog_otlp_event_type(class_uid) {
+    switch class_uid {
+        2004    { "indicator" }
+        3002    { "start" }
+        6004    { "access" }
+        default { "connection" }
+    }
+}
+
+def function paloalto_syslog_otlp_event_outcome(status_id) {
+    switch status_id {
+        1       { "success" }
+        2       { "failure" }
+        default { null }
+    }
+}
+
+def process paloalto_syslog_to_otlp {
+    workspace.lsis.shed.otlp.resource.attributes = concat(
+        [{ key: "observer.vendor", value: { string_value: "Palo Alto Networks" } }],
+        [{ key: "observer.product", value: { string_value: "PAN-OS" } }],
+        [{ key: "observer.type", value: { string_value: "firewall" } }],
+        switch workspace.pan.Serial != null and workspace.pan.Serial != "" {
+            true { [{ key: "observer.serial_number", value: { string_value: workspace.pan.Serial } }] }
+            default { [] }
+        },
+        switch workspace.pan.DeviceName != null and workspace.pan.DeviceName != "" {
+            true { [{ key: "host.name", value: { string_value: workspace.pan.DeviceName } }] }
+            default { [] }
+        },
+        [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
+        [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
+    )
+    workspace.lsis.shed.otlp.log_record.body = { string_value: workspace.syslog.msg }
+    workspace.lsis.shed.otlp.log_record.attributes = concat(
+        [{ key: "event.kind", value: { string_value: paloalto_syslog_otlp_event_kind(workspace.lsis.parsed.class_uid) } }],
+        [{ key: "event.category", value: { array_value: { values: [{ string_value: paloalto_syslog_otlp_event_category(workspace.lsis.parsed.class_uid) }] } } }],
+        [{ key: "event.type", value: { array_value: { values: [{ string_value: paloalto_syslog_otlp_event_type(workspace.lsis.parsed.class_uid) }] } } }],
+        switch coalesce(workspace.pan.EventID, workspace.pan.Subtype, workspace.pan.Type) != null {
+            true { [{ key: "event.code", value: { string_value: coalesce(workspace.pan.EventID, workspace.pan.Subtype, workspace.pan.Type) } }] }
+            default { [] }
+        },
+        switch workspace.pan.Action != null {
+            true { [{ key: "event.action", value: { string_value: workspace.pan.Action } }] }
+            default { [] }
+        },
+        switch paloalto_syslog_otlp_event_outcome(workspace.lsis.parsed.status_id) != null {
+            true { [{ key: "event.outcome", value: { string_value: paloalto_syslog_otlp_event_outcome(workspace.lsis.parsed.status_id) } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.message != null {
+            true { [{ key: "message", value: { string_value: workspace.lsis.parsed.message } }] }
+            default { [] }
+        },
+        switch coalesce(workspace.lsis.parsed.actor.user.name, workspace.lsis.parsed.user.name) != null {
+            true { [{ key: "user.name", value: { string_value: coalesce(workspace.lsis.parsed.actor.user.name, workspace.lsis.parsed.user.name) } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.src_endpoint.ip != null {
+            true { [{ key: "source.ip", value: { string_value: workspace.lsis.parsed.src_endpoint.ip } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.src_endpoint.port != null {
+            true { [{ key: "source.port", value: { int_value: workspace.lsis.parsed.src_endpoint.port } }] }
+            default { [] }
+        },
+        switch workspace.pan.SourceZone != null and workspace.pan.SourceZone != "" {
+            true { [{ key: "source.zone", value: { string_value: workspace.pan.SourceZone } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.dst_endpoint.ip != null {
+            true { [{ key: "destination.ip", value: { string_value: workspace.lsis.parsed.dst_endpoint.ip } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.dst_endpoint.port != null {
+            true { [{ key: "destination.port", value: { int_value: workspace.lsis.parsed.dst_endpoint.port } }] }
+            default { [] }
+        },
+        switch workspace.pan.DestinationZone != null and workspace.pan.DestinationZone != "" {
+            true { [{ key: "destination.zone", value: { string_value: workspace.pan.DestinationZone } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.connection_info.protocol_name != null {
+            true { [{ key: "network.transport", value: { string_value: workspace.lsis.parsed.connection_info.protocol_name } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.connection_info.protocol_num != null {
+            true { [{ key: "network.iana_number", value: { int_value: workspace.lsis.parsed.connection_info.protocol_num } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.app_name != null {
+            true { [{ key: "network.application", value: { string_value: workspace.lsis.parsed.app_name } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.traffic.bytes_in != null {
+            true { [{ key: "source.bytes", value: { int_value: workspace.lsis.parsed.traffic.bytes_in } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.traffic.bytes_out != null {
+            true { [{ key: "destination.bytes", value: { int_value: workspace.lsis.parsed.traffic.bytes_out } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.session_uid != null {
+            true { [{ key: "palo_alto.session.id", value: { string_value: workspace.lsis.parsed.session_uid } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.rule != null {
+            true { [{ key: "rule.name", value: { string_value: workspace.lsis.parsed.rule } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.http_request.url.url_string != null {
+            true { [{ key: "url.full", value: { string_value: workspace.lsis.parsed.http_request.url.url_string } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.http_request.user_agent != null {
+            true { [{ key: "user_agent.original", value: { string_value: workspace.lsis.parsed.http_request.user_agent } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.http_request.referrer != null {
+            true { [{ key: "http.request.referrer", value: { string_value: workspace.lsis.parsed.http_request.referrer } }] }
+            default { [] }
+        },
+        switch workspace.lsis.parsed.finding_info.title != null {
+            true { [{ key: "palo_alto.threat.name", value: { string_value: workspace.lsis.parsed.finding_info.title } }] }
+            default { [] }
+        },
+        switch workspace.pan.FileHash != null and workspace.pan.FileHash != "" {
+            true { [{ key: "palo_alto.file.hash", value: { string_value: workspace.pan.FileHash } }] }
+            default { [] }
+        }
+    )
 }

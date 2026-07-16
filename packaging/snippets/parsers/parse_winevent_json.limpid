@@ -4,8 +4,8 @@
 //              per ingress
 // Writes:      workspace.lsis.parsed.* — 3002 (logon/logoff), 1007 (process),
 //              3001 (account change), 3006 (group management), dispatched
-//              by EventID; unmapped IDs route to error_log. Per-ID table
-//              below.
+//              by EventID; unmapped IDs route to error_log. winevent_json_to_otlp
+//              writes source-owned OTLP Resource, Scope, Body, and attributes.
 // Category:    Endpoint / host audit (Windows)
 // Test corpus: public (OTRF / Mordor dataset)
 //
@@ -461,5 +461,57 @@ def process parse_winevent_group_member_remove {
         winevent_actor_user(we.SubjectUserName, we.SubjectDomainName),
         we.Hostname,
         "Group member removed"
+    )
+}
+
+def function winevent_json_otlp_event_category(class_uid) {
+    switch class_uid {
+        1007 { "process" }
+        3001 { "iam" }
+        3006 { "iam" }
+        default { "authentication" }
+    }
+}
+
+def function winevent_json_otlp_event_type(class_uid, activity_id) {
+    switch class_uid {
+        1007 { switch activity_id { 2 { "end" } default { "start" } } }
+        3001 { "change" }
+        3006 { "change" }
+        default { switch activity_id { 2 { "end" } default { "start" } } }
+    }
+}
+
+def function winevent_json_otlp_event_outcome(status_id) {
+    switch status_id { 1 { "success" } 2 { "failure" } default { null } }
+}
+
+def process winevent_json_to_otlp {
+    workspace.lsis.shed.otlp.resource.attributes = concat(
+        [{ key: "observer.vendor", value: { string_value: "Microsoft" } }],
+        [{ key: "observer.product", value: { string_value: "Windows Event Log" } }],
+        [{ key: "observer.type", value: { string_value: "host" } }],
+        switch workspace.winevent.Hostname != null { true { [{ key: "host.name", value: { string_value: workspace.winevent.Hostname } }] } default { [] } },
+        [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
+        [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
+    )
+    workspace.lsis.shed.otlp.scope.name = workspace.winevent.Channel
+    workspace.lsis.shed.otlp.log_record.body = { string_value: ingress }
+    workspace.lsis.shed.otlp.log_record.attributes = concat(
+        [{ key: "event.kind", value: { string_value: "event" } }],
+        [{ key: "event.category", value: { array_value: { values: [{ string_value: winevent_json_otlp_event_category(workspace.lsis.parsed.class_uid) }] } } }],
+        [{ key: "event.type", value: { array_value: { values: [{ string_value: winevent_json_otlp_event_type(workspace.lsis.parsed.class_uid, workspace.lsis.parsed.activity_id) }] } } }],
+        switch workspace.winevent.EventID != null { true { [{ key: "event.code", value: { string_value: "${workspace.winevent.EventID}" } }] } default { [] } },
+        switch winevent_json_otlp_event_outcome(workspace.lsis.parsed.status_id) != null { true { [{ key: "event.outcome", value: { string_value: winevent_json_otlp_event_outcome(workspace.lsis.parsed.status_id) } }] } default { [] } },
+        switch workspace.lsis.parsed.actor.user.name != null { true { [{ key: "user.name", value: { string_value: workspace.lsis.parsed.actor.user.name } }] } default { [] } },
+        switch workspace.lsis.parsed.actor.user.uid != null { true { [{ key: "user.id", value: { string_value: workspace.lsis.parsed.actor.user.uid } }] } default { [] } },
+        switch workspace.lsis.parsed.user.name != null { true { [{ key: "user.target.name", value: { string_value: workspace.lsis.parsed.user.name } }] } default { [] } },
+        switch workspace.lsis.parsed.user.uid != null { true { [{ key: "user.target.id", value: { string_value: workspace.lsis.parsed.user.uid } }] } default { [] } },
+        switch workspace.lsis.parsed.process.name != null { true { [{ key: "process.name", value: { string_value: workspace.lsis.parsed.process.name } }] } default { [] } },
+        switch workspace.lsis.parsed.process.pid != null { true { [{ key: "process.pid", value: { int_value: workspace.lsis.parsed.process.pid } }] } default { [] } },
+        switch workspace.lsis.parsed.process.parent_process.name != null { true { [{ key: "process.parent.name", value: { string_value: workspace.lsis.parsed.process.parent_process.name } }] } default { [] } },
+        switch workspace.lsis.parsed.process.parent_process.pid != null { true { [{ key: "process.parent.pid", value: { int_value: workspace.lsis.parsed.process.parent_process.pid } }] } default { [] } },
+        switch workspace.lsis.parsed.src_endpoint.ip != null { true { [{ key: "source.ip", value: { string_value: workspace.lsis.parsed.src_endpoint.ip } }] } default { [] } },
+        switch workspace.lsis.parsed.src_endpoint.port != null { true { [{ key: "source.port", value: { int_value: workspace.lsis.parsed.src_endpoint.port } }] } default { [] } }
     )
 }

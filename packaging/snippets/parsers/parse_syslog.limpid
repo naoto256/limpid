@@ -5,7 +5,9 @@
 //              BSD vs RFC 5424 auto-detected
 // Writes:      workspace.syslog.{pri, facility, severity, timestamp,
 //              hostname, appname, procid, msgid, msg} — the transport
-//              namespace, not LSIS.
+//              namespace, not LSIS. syslog_to_otlp writes source-owned OTLP
+//              Resource, Scope, Body, and transport attributes without
+//              promoting PRI severity to canonical severity.
 // Category:    Transport
 // Test corpus: synthetic (RFC 3164 / RFC 5424 sample wires in this header)
 //
@@ -28,7 +30,35 @@
 //
 // Sample input (RFC 3164):
 //   <38>Apr 30 01:23:45 host01 sshd[12345]: Accepted publickey for alice from 192.0.2.10 port 51234 ssh2
+//
+// RFC 3164 section 4.1.2 defines HOSTNAME as the originating device's
+// hostname, so syslog_to_otlp retains it as Resource `host.name`.
+// Relays that rewrite HOSTNAME must be corrected or normalized by the
+// deployment before this adapter; the transport parser cannot recover the
+// original value. Syslog can transport any event vocabulary, so this adapter
+// does not invent an ECS event.category or event.type.
+// https://www.rfc-editor.org/rfc/rfc3164#section-4.1.2
 
 def process parse_syslog {
     workspace.syslog = syslog.parse(ingress)
+}
+
+def process syslog_to_otlp {
+    workspace.lsis.shed.otlp.resource.attributes = concat(
+        switch workspace.syslog.hostname != null { true { [{ key: "host.name", value: { string_value: workspace.syslog.hostname } }] } default { [] } },
+        [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
+        [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
+    )
+    workspace.lsis.shed.otlp.scope.name = workspace.syslog.appname
+    workspace.lsis.shed.otlp.log_record.body = switch workspace.syslog.msg != null {
+        true    { { string_value: workspace.syslog.msg } }
+        default { null }
+    }
+    workspace.lsis.shed.otlp.log_record.attributes = concat(
+        [{ key: "event.kind", value: { string_value: "event" } }],
+        switch workspace.syslog.msgid != null { true { [{ key: "event.code", value: { string_value: workspace.syslog.msgid } }] } default { [] } },
+        switch workspace.syslog.severity != null { true { [{ key: "log.syslog.severity.code", value: { int_value: workspace.syslog.severity } }] } default { [] } },
+        switch workspace.syslog.facility != null { true { [{ key: "log.syslog.facility.code", value: { int_value: workspace.syslog.facility } }] } default { [] } },
+        switch workspace.syslog.procid != null and workspace.syslog.procid != "-" { true { [{ key: "log.syslog.procid", value: { string_value: workspace.syslog.procid } }] } default { [] } }
+    )
 }

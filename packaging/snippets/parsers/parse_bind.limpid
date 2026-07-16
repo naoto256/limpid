@@ -8,7 +8,8 @@
 //                  system timezone for BIND's local wall time
 //                  https://bind9.readthedocs.io/en/v9.18.13/reference.html#namedconf-statement-print-time
 // Writes:      workspace.lsis.parsed.* — 4003 (DNS Activity). Only the queries
-//              channel; other BIND log categories route to error_log.
+//              channel; bind_to_otlp writes source-owned OTLP Resource,
+//              Scope, Body, and LogRecord attributes.
 // Category:    DNS server
 // Test corpus: synthetic (sample querylog lines in this header)
 //
@@ -169,5 +170,30 @@ def process parse_bind_query_record {
         workspace.bind.pid,
         workspace.bind.hostname,
         bind_time_ns(workspace.bind_query.timestamp, workspace.bind.timezone)
+    )
+}
+
+def process bind_to_otlp {
+    workspace.lsis.shed.otlp.resource.attributes = concat(
+        [{ key: "observer.vendor", value: { string_value: "Internet Systems Consortium" } }],
+        [{ key: "observer.product", value: { string_value: "BIND" } }],
+        [{ key: "observer.type", value: { string_value: "dns" } }],
+        switch workspace.bind.hostname != null { true { [{ key: "host.name", value: { string_value: workspace.bind.hostname } }] } default { [] } },
+        [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
+        [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
+    )
+    workspace.lsis.shed.otlp.scope.name = "named"
+    workspace.lsis.shed.otlp.log_record.body = { string_value: workspace.bind.body }
+    workspace.lsis.shed.otlp.log_record.attributes = concat(
+        [{ key: "event.kind", value: { string_value: "event" } }],
+        [{ key: "event.category", value: { array_value: { values: [{ string_value: "network" }] } } }],
+        [{ key: "event.type", value: { array_value: { values: [{ string_value: "protocol" }] } } }],
+        switch workspace.bind.pid != null { true { [{ key: "process.pid", value: { int_value: to_int(workspace.bind.pid) } }] } default { [] } },
+        switch workspace.lsis.parsed.src_endpoint.ip != null { true { [{ key: "source.ip", value: { string_value: workspace.lsis.parsed.src_endpoint.ip } }] } default { [] } },
+        switch workspace.lsis.parsed.src_endpoint.port != null { true { [{ key: "source.port", value: { int_value: workspace.lsis.parsed.src_endpoint.port } }] } default { [] } },
+        switch workspace.lsis.parsed.dst_endpoint.ip != null { true { [{ key: "destination.ip", value: { string_value: workspace.lsis.parsed.dst_endpoint.ip } }] } default { [] } },
+        switch workspace.lsis.parsed.query.hostname != null { true { [{ key: "dns.question.name", value: { string_value: workspace.lsis.parsed.query.hostname } }] } default { [] } },
+        switch workspace.lsis.parsed.query.type != null { true { [{ key: "dns.question.type", value: { string_value: workspace.lsis.parsed.query.type } }] } default { [] } },
+        switch workspace.bind_query.qclass != null { true { [{ key: "dns.question.class", value: { string_value: workspace.bind_query.qclass } }] } default { [] } }
     )
 }

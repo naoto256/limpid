@@ -1462,7 +1462,39 @@ def pipeline p {
         for relative in [
             "packaging/snippets/functions/timestamp_converter.limpid",
             "packaging/snippets/functions/severity_converter.limpid",
+            "packaging/snippets/functions/proto_num.limpid",
+            "packaging/snippets/functions/http_method_activity_id.limpid",
+            "packaging/snippets/functions/parse_datetime_rfc3164.limpid",
+            "packaging/snippets/parsers/parse_asa.limpid",
+            "packaging/snippets/parsers/parse_auditd.limpid",
+            "packaging/snippets/parsers/parse_aws_guardduty.limpid",
+            "packaging/snippets/parsers/parse_aws_vpc_flow.limpid",
+            "packaging/snippets/parsers/parse_azure_activity.limpid",
+            "packaging/snippets/parsers/parse_bind.limpid",
+            "packaging/snippets/parsers/parse_checkpoint_leef.limpid",
+            "packaging/snippets/parsers/parse_checkpoint_syslog.limpid",
+            "packaging/snippets/parsers/parse_cloudtrail.limpid",
+            "packaging/snippets/parsers/parse_combined_log.limpid",
+            "packaging/snippets/parsers/parse_fortigate_cef.limpid",
             "packaging/snippets/parsers/parse_fortigate_syslog.limpid",
+            "packaging/snippets/parsers/parse_juniper_srx_sd_syslog.limpid",
+            "packaging/snippets/parsers/parse_juniper_srx_syslog.limpid",
+            "packaging/snippets/parsers/parse_journald.limpid",
+            "packaging/snippets/parsers/parse_k8s_audit.limpid",
+            "packaging/snippets/parsers/parse_nsp.limpid",
+            "packaging/snippets/parsers/parse_okta_system.limpid",
+            "packaging/snippets/parsers/parse_openssh.limpid",
+            "packaging/snippets/parsers/parse_paloalto_cef.limpid",
+            "packaging/snippets/parsers/parse_paloalto_syslog.limpid",
+            "packaging/snippets/parsers/parse_postfix.limpid",
+            "packaging/snippets/parsers/parse_sudo.limpid",
+            "packaging/snippets/parsers/parse_suricata.limpid",
+            "packaging/snippets/parsers/parse_syslog.limpid",
+            "packaging/snippets/parsers/parse_sysmon.limpid",
+            "packaging/snippets/parsers/parse_winevent_json.limpid",
+            "packaging/snippets/parsers/parse_zeek_default.limpid",
+            "packaging/snippets/parsers/parse_zeek_soc.limpid",
+            "packaging/snippets/parsers/parse_zeek_full.limpid",
             "packaging/snippets/composers/compose_ocsf.limpid",
             "packaging/snippets/composers/compose_otlp.limpid",
         ] {
@@ -1498,6 +1530,180 @@ def pipeline fortigate_native_otlp {
           | fortigate_syslog_to_otlp
           | compose_otlp
           | otlp_to_egress
+    output o
+}
+
+def pipeline guardduty_otlp {
+    input i
+    process parse_aws_guardduty | aws_guardduty_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline vpc_flow_otlp {
+    input i
+    process parse_aws_vpc_flow | aws_vpc_flow_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline azure_activity_otlp {
+    input i
+    process parse_azure_activity | azure_activity_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline cloudtrail_otlp {
+    input i
+    process parse_cloudtrail | cloudtrail_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline k8s_audit_otlp {
+    input i
+    process parse_k8s_audit | k8s_audit_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline okta_system_otlp {
+    input i
+    process parse_okta_system | okta_system_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline suricata_otlp {
+    input i
+    process parse_suricata | suricata_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline asa_otlp {
+    input i
+    process parse_asa | asa_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline checkpoint_leef_otlp {
+    input i
+    process parse_checkpoint_leef | checkpoint_leef_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline checkpoint_syslog_otlp {
+    input i
+    process parse_checkpoint_syslog | checkpoint_syslog_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline fortigate_cef_otlp {
+    input i
+    process parse_fortigate_cef | fortigate_cef_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline juniper_legacy_otlp {
+    input i
+    process parse_juniper_srx_syslog | juniper_srx_syslog_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline juniper_structured_otlp {
+    input i
+    process parse_juniper_srx_sd_syslog | juniper_srx_sd_syslog_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline nsp_otlp {
+    input i
+    process parse_nsp | nsp_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline paloalto_cef_otlp {
+    input i
+    process parse_paloalto_cef | paloalto_cef_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline paloalto_native_otlp {
+    input i
+    process parse_paloalto_syslog | paloalto_syslog_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline auditd_otlp {
+    input i
+    process parse_auditd | auditd_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline bind_otlp {
+    input i
+    process parse_bind | bind_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline combined_log_otlp {
+    input i
+    process parse_combined_log | combined_log_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline journald_otlp {
+    input i
+    process parse_journald | journald_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline openssh_otlp {
+    input i
+    process parse_openssh | openssh_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline postfix_otlp {
+    input i
+    process parse_postfix | postfix_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline sudo_otlp {
+    input i
+    process parse_sudo | sudo_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline syslog_otlp {
+    input i
+    process parse_syslog | syslog_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline sysmon_otlp {
+    input i
+    process parse_sysmon | sysmon_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline winevent_otlp {
+    input i
+    process parse_winevent_json | winevent_json_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline zeek_default_otlp {
+    input i
+    process parse_zeek_default | zeek_default_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline zeek_soc_otlp {
+    input i
+    process parse_zeek_soc | zeek_soc_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline zeek_full_otlp {
+    input i
+    process parse_zeek_full | zeek_full_to_otlp | compose_otlp | otlp_to_egress
     output o
 }
 "#,
@@ -2329,6 +2535,34 @@ def pipeline fortigate_native_otlp {
         })
     }
 
+    fn assert_otlp_attribute_contract(
+        attributes: &[opentelemetry_proto::tonic::common::v1::KeyValue],
+    ) {
+        use std::collections::HashSet;
+
+        let mut keys = HashSet::new();
+        for attribute in attributes {
+            assert!(
+                keys.insert(attribute.key.as_str()),
+                "duplicate OTLP key: {}",
+                attribute.key
+            );
+            assert!(!attribute.key.starts_with("lsis."));
+            assert!(!attribute.key.starts_with("metadata."));
+            assert!(!attribute.key.starts_with("ocsf."));
+            assert!(!matches!(
+                attribute.key.as_str(),
+                "class_uid"
+                    | "category_uid"
+                    | "activity_id"
+                    | "type_uid"
+                    | "status_id"
+                    | "severity_id"
+                    | "disposition_id"
+            ));
+        }
+    }
+
     #[test]
     fn packaged_compose_otlp_projects_canonical_severity() {
         use crate::functions::{FunctionRegistry, register_builtins, register_user_functions};
@@ -2754,5 +2988,706 @@ def pipeline fortigate_native_otlp {
                 .iter()
                 .all(|attribute| attribute.key != "threat.technique.name")
         );
+    }
+
+    #[test]
+    fn packaged_cloud_and_json_otlp_adapters_preserve_source_contracts() {
+        use crate::functions::{FunctionRegistry, register_builtins, register_user_functions};
+        use opentelemetry_proto::tonic::common::v1::any_value;
+        use serde_json::json;
+
+        let cfg = compile_packaged_otlp_composers().unwrap();
+        let mut funcs = FunctionRegistry::new();
+        register_builtins(&mut funcs, crate::runtime::init_tables(&cfg).unwrap());
+        register_user_functions(&mut funcs, &cfg);
+        let received_at = chrono::DateTime::from_timestamp(1_784_073_600, 123_456_789)
+            .expect("valid receive timestamp");
+
+        let guardduty_wire = br#"{"schemaVersion":"2.0","accountId":"123456789012","region":"us-east-1","partition":"aws","id":"finding-1","arn":"arn:aws:guardduty:us-east-1:123456789012:detector/detector-1/finding/finding-1","type":"Recon:EC2/Portscan","resource":{"resourceType":"Instance","instanceDetails":{"instanceId":"i-99999999"}},"service":{"action":{"actionType":"PORT_PROBE"},"archived":false,"count":3,"detectorId":"detector-1","eventFirstSeen":"2026-05-20T03:14:15Z","eventLastSeen":"2026-05-20T04:00:00Z"},"severity":2.0,"title":"Port scan","description":"An instance port was probed.","createdAt":"2026-05-20T03:14:16Z","updatedAt":"2026-05-20T04:00:01Z"}"#;
+        let guardduty = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "guardduty_otlp",
+            guardduty_wire,
+            json!({}),
+            received_at,
+        );
+        assert_eq!(
+            otlp_string_attribute(
+                &guardduty.resource.as_ref().expect("resource").attributes,
+                "cloud.provider"
+            ),
+            Some("aws")
+        );
+        let guardduty_record = &guardduty.scope_logs[0].log_records[0];
+        assert_eq!(guardduty_record.severity_number, 13);
+        assert_eq!(
+            otlp_string_attribute(&guardduty_record.attributes, "event.kind"),
+            Some("alert")
+        );
+        assert_eq!(
+            otlp_string_attribute(&guardduty_record.attributes, "threat.tactic.name"),
+            Some("Reconnaissance")
+        );
+        assert_otlp_attribute_contract(&guardduty_record.attributes);
+
+        let vpc_wire = b"5 123456789012 eni-0a1b 192.0.2.10 198.51.100.5 54321 443 6 10 4000 1714000000 1714000060 ACCEPT OK vpc-1 subnet-1 i-1 19 IPv4 192.0.2.10 198.51.100.5 ap-northeast-1 apne1-az1 - - - - egress -";
+        let vpc = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "vpc_flow_otlp",
+            vpc_wire,
+            json!({}),
+            received_at,
+        );
+        let vpc_record = &vpc.scope_logs[0].log_records[0];
+        assert_eq!(vpc_record.time_unix_nano, 1_714_000_000_000_000_000);
+        assert_eq!(vpc_record.severity_number, 0);
+        assert_eq!(
+            otlp_int_attribute(&vpc_record.attributes, "event.start"),
+            Some(1_714_000_000_000_000_000)
+        );
+        assert_eq!(
+            otlp_int_attribute(&vpc_record.attributes, "event.end"),
+            Some(1_714_000_060_000_000_000)
+        );
+        assert_otlp_attribute_contract(&vpc_record.attributes);
+
+        let azure_wire = br#"{"time":"2026-04-29T10:00:00.1234567Z","resourceId":"/subscriptions/sub-1/resourceGroups/rg1/providers/Microsoft.Compute/virtualMachines/vm1","operationName":"MICROSOFT.COMPUTE/VIRTUALMACHINES/WRITE","category":"Administrative","level":"Informational","resultType":"Success","resultSignature":"Succeeded.","durationMs":1234,"callerIpAddress":"203.0.113.10","correlationId":"corr-1","tenantId":"tenant-1","subscriptionId":"sub-1","caller":"alice@example.com","identity":{"claims":{"oid":"user-1"}},"properties":{"statusCode":"Created"}}"#;
+        let azure = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "azure_activity_otlp",
+            azure_wire,
+            json!({}),
+            received_at,
+        );
+        let azure_record = &azure.scope_logs[0].log_records[0];
+        assert_eq!(azure_record.severity_number, 9);
+        assert_eq!(azure_record.severity_text, "Informational");
+        assert_eq!(
+            otlp_string_attribute(&azure_record.attributes, "user.name"),
+            Some("alice@example.com")
+        );
+        assert_otlp_attribute_contract(&azure_record.attributes);
+
+        let cloudtrail_wire = br#"{"eventVersion":"1.08","userIdentity":{"type":"IAMUser","userName":"alice","principalId":"AIDA1","accountId":"123"},"eventTime":"2026-04-29T10:00:00Z","eventSource":"s3.amazonaws.com","eventName":"GetObject","awsRegion":"us-east-1","sourceIPAddress":"203.0.113.10","userAgent":"aws-cli/2.x","readOnly":true,"eventID":"event-1","requestID":"request-1","eventType":"AwsApiCall","managementEvent":true,"recipientAccountId":"123","eventCategory":"Management"}"#;
+        let cloudtrail = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "cloudtrail_otlp",
+            cloudtrail_wire,
+            json!({}),
+            received_at,
+        );
+        let cloudtrail_record = &cloudtrail.scope_logs[0].log_records[0];
+        assert_eq!(cloudtrail_record.severity_number, 0);
+        assert_eq!(
+            otlp_string_attribute(&cloudtrail_record.attributes, "event.action"),
+            Some("GetObject")
+        );
+        assert_eq!(
+            otlp_string_attribute(&cloudtrail_record.attributes, "user.name"),
+            Some("alice")
+        );
+        assert_otlp_attribute_contract(&cloudtrail_record.attributes);
+
+        let k8s_wire = br#"{"kind":"Event","apiVersion":"audit.k8s.io/v1","level":"RequestResponse","auditID":"audit-1","stage":"ResponseComplete","requestURI":"/api/v1/namespaces/default/pods","verb":"create","user":{"username":"system:serviceaccount:default:deployer","uid":"abc-123","groups":["system:authenticated"]},"sourceIPs":["192.0.2.10"],"userAgent":"kubectl/v1.29.0","objectRef":{"resource":"pods","namespace":"default","apiGroup":"","apiVersion":"v1"},"responseStatus":{"code":201},"requestReceivedTimestamp":"2026-04-29T10:00:00.000000Z","stageTimestamp":"2026-04-29T10:00:00.123456Z"}"#;
+        let k8s = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "k8s_audit_otlp",
+            k8s_wire,
+            json!({}),
+            received_at,
+        );
+        assert_eq!(
+            k8s.scope_logs[0]
+                .scope
+                .as_ref()
+                .map(|scope| scope.name.as_str()),
+            Some("kube-apiserver")
+        );
+        let k8s_record = &k8s.scope_logs[0].log_records[0];
+        assert_eq!(k8s_record.severity_number, 0);
+        assert_eq!(
+            otlp_int_attribute(&k8s_record.attributes, "http.response.status_code"),
+            Some(201)
+        );
+        assert_otlp_attribute_contract(&k8s_record.attributes);
+
+        let okta_wire = br#"{"uuid":"okta-event-1","eventType":"user.session.start","published":"2026-04-29T10:00:00.000Z","severity":"INFO","outcome":{"result":"SUCCESS"},"actor":{"id":"00u-admin","type":"User","alternateId":"admin@example.com","displayName":"Admin Example"},"client":{"ipAddress":"192.0.2.10","userAgent":{"rawUserAgent":"Mozilla/5.0"}},"target":[{"type":"User","id":"00u-target","alternateId":"alice@example.com","displayName":"Alice Example"}],"transaction":{"id":"transaction-1"}}"#;
+        let okta = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "okta_system_otlp",
+            okta_wire,
+            json!({}),
+            received_at,
+        );
+        let okta_record = &okta.scope_logs[0].log_records[0];
+        assert_eq!(okta_record.severity_number, 9);
+        assert_eq!(okta_record.severity_text, "INFO");
+        assert_eq!(
+            otlp_string_attribute(&okta_record.attributes, "user.name"),
+            Some("admin@example.com")
+        );
+        assert_eq!(
+            otlp_string_attribute(&okta_record.attributes, "user.target.name"),
+            Some("alice@example.com")
+        );
+        assert_otlp_attribute_contract(&okta_record.attributes);
+
+        let suricata_wire = br#"{"timestamp":"2026-04-29T10:00:00.123456Z","event_type":"alert","src_ip":"192.0.2.10","src_port":54321,"dest_ip":"198.51.100.5","dest_port":443,"proto":"TCP","app_proto":"tls","flow_id":42,"community_id":"1:example","in_iface":"eth0","alert":{"signature_id":1001,"signature":"Example signature","category":"Attempted Administrator Privilege Gain","severity":1,"action":"blocked"},"tls":{"sni":"example.test","version":"TLS 1.3"}}"#;
+        let suricata_body: serde_json::Value = serde_json::from_slice(suricata_wire).unwrap();
+        let suricata = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "suricata_otlp",
+            suricata_wire,
+            json!({"suricata": {"body": suricata_body, "hostname": "sensor-1"}}),
+            received_at,
+        );
+        let suricata_record = &suricata.scope_logs[0].log_records[0];
+        assert_eq!(suricata_record.severity_number, 21);
+        assert_eq!(
+            otlp_string_attribute(&suricata_record.attributes, "rule.name"),
+            Some("Example signature")
+        );
+        assert_eq!(
+            otlp_string_attribute(&suricata_record.attributes, "network.transport"),
+            Some("tcp")
+        );
+        assert_otlp_attribute_contract(&suricata_record.attributes);
+
+        for resource_logs in [guardduty, vpc, azure, cloudtrail, k8s, okta, suricata] {
+            let record = &resource_logs.scope_logs[0].log_records[0];
+            assert!(matches!(
+                record.body.as_ref().and_then(|body| body.value.as_ref()),
+                Some(any_value::Value::StringValue(_))
+            ));
+            assert_otlp_attribute_contract(
+                &resource_logs
+                    .resource
+                    .as_ref()
+                    .expect("resource")
+                    .attributes,
+            );
+        }
+    }
+
+    #[test]
+    fn packaged_network_security_otlp_adapters_preserve_source_contracts() {
+        use crate::functions::{FunctionRegistry, register_builtins, register_user_functions};
+        use opentelemetry_proto::tonic::common::v1::any_value;
+        use serde_json::json;
+
+        let cfg = compile_packaged_otlp_composers().unwrap();
+        let mut funcs = FunctionRegistry::new();
+        register_builtins(&mut funcs, crate::runtime::init_tables(&cfg).unwrap());
+        register_user_functions(&mut funcs, &cfg);
+        let received_at = chrono::DateTime::from_timestamp(1_784_073_600, 123_456_789)
+            .expect("valid receive timestamp");
+
+        let asa_wire = b"<166>Apr 27 10:00:00 fw-asa01 : %ASA-6-302013: Built outbound TCP connection 12345 for outside:198.51.100.5/443 (198.51.100.5/443) to inside:10.0.0.5/54321 (10.0.0.5/54321)";
+        let asa = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "asa_otlp",
+            asa_wire,
+            json!({"asa": {"timezone": "UTC"}}),
+            received_at,
+        );
+        let asa_record = &asa.scope_logs[0].log_records[0];
+        assert_eq!(asa_record.severity_number, 9);
+        assert_eq!(
+            otlp_string_attribute(&asa_record.attributes, "network.transport"),
+            Some("tcp")
+        );
+        assert_eq!(
+            otlp_string_attribute(&asa_record.attributes, "event.code"),
+            Some("302013")
+        );
+
+        let leef_wire = b"<14>1 2026-04-30T01:23:45Z cpgw01 CheckPoint - - LEEF:2.0|Check Point|VPN-1 & FireWall-1|R81|Accept|cat=Firewall\tsrc=192.0.2.10\tdst=198.51.100.5\tsrcPort=51234\tdstPort=443\tproto=tcp\trule=12\trule_name=Allow-Internet\taction=Accept\tservice=https\tusrName=alice";
+        let checkpoint_leef = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "checkpoint_leef_otlp",
+            leef_wire,
+            json!({"checkpoint_leef": {"body": String::from_utf8_lossy(leef_wire)}}),
+            received_at,
+        );
+        let leef_record = &checkpoint_leef.scope_logs[0].log_records[0];
+        assert_eq!(leef_record.severity_number, 0);
+        assert_eq!(
+            otlp_string_attribute(&leef_record.attributes, "user.name"),
+            Some("alice")
+        );
+
+        let checkpoint_wire = b"<134>1 2026-04-30T01:23:45Z cpgw01 CheckPoint - - [action:\"Accept\"; product:\"VPN-1 & FireWall-1\"; src:\"192.0.2.10\"; s_port:\"54321\"; dst:\"198.51.100.5\"; service:\"443\"; proto:\"tcp\"; rule_name:\"Allow\"; rule_uid:\"rule-1\"; severity:\"Informational\"]";
+        let checkpoint = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "checkpoint_syslog_otlp",
+            checkpoint_wire,
+            json!({"checkpoint_syslog": {"body": String::from_utf8_lossy(checkpoint_wire)}}),
+            received_at,
+        );
+        let checkpoint_record = &checkpoint.scope_logs[0].log_records[0];
+        assert_eq!(checkpoint_record.severity_number, 9);
+        assert_eq!(checkpoint_record.severity_text, "Informational");
+        assert_eq!(
+            otlp_string_attribute(&checkpoint_record.attributes, "checkpoint.rule.id"),
+            Some("rule-1")
+        );
+
+        let fortigate_cef_wire = b"<129>Apr 27 10:00:00 fw01 CEF:0|Fortinet|Fortigate|v7.4.11|16384|utm:ips signature|7|deviceExternalId=FG-EXAMPLE cat=utm:ips FTNTFGTsubtype=ips FTNTFGTseverity=high src=192.0.2.10 spt=36208 dst=198.51.100.5 dpt=9100 proto=6 act=detected FTNTFGTattack=Example-Signature FTNTFGTattackid=4242 msg=Example-detection";
+        let fortigate_cef = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "fortigate_cef_otlp",
+            fortigate_cef_wire,
+            json!({"fortigate_cef": {"timezone": "UTC"}}),
+            received_at,
+        );
+        let fortigate_cef_record = &fortigate_cef.scope_logs[0].log_records[0];
+        assert_eq!(fortigate_cef_record.severity_number, 19);
+        assert_eq!(
+            otlp_string_attribute(&fortigate_cef_record.attributes, "rule.name"),
+            Some("Example-Signature")
+        );
+
+        let juniper_legacy_wire = b"<14>May 16 13:32:30 srx01 RT_IDP: IDP_ATTACK_LOG_EVENT: IDP: at 1778905950, SIG Attack log <198.51.100.10/63074->192.0.2.100/445> for TCP protocol and service SERVICE_IDP application SMB by rule Tap of rulebase IPS in policy Tap. attack: id=19519, repeat=0, action=DROP, threat-severity=HIGH, name=SMB:CVE-2017-0143-001";
+        let juniper_legacy = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "juniper_legacy_otlp",
+            juniper_legacy_wire,
+            json!({"juniper_srx_syslog": {"body": String::from_utf8_lossy(juniper_legacy_wire), "timezone": "UTC"}}),
+            received_at,
+        );
+        let juniper_legacy_record = &juniper_legacy.scope_logs[0].log_records[0];
+        assert_eq!(juniper_legacy_record.severity_number, 19);
+        assert_eq!(juniper_legacy_record.severity_text, "HIGH");
+        assert_eq!(
+            otlp_string_attribute(&juniper_legacy_record.attributes, "rule.id"),
+            Some("19519")
+        );
+
+        let juniper_sd_wire = b"<134>1 2026-04-30T01:23:45Z srx01 RT_FLOW - RT_FLOW_SESSION_CREATE [junos@2636.1.1.1.2.39 source-address=\"192.0.2.10\" source-port=\"54321\" destination-address=\"198.51.100.5\" destination-port=\"443\" protocol-id=\"6\" policy-name=\"allow-web\" source-zone-name=\"trust\" destination-zone-name=\"untrust\" session-id-32=\"123\" application=\"HTTPS\"]";
+        let juniper_structured = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "juniper_structured_otlp",
+            juniper_sd_wire,
+            json!({"juniper_srx_sd_syslog": {"body": String::from_utf8_lossy(juniper_sd_wire)}}),
+            received_at,
+        );
+        let juniper_sd_record = &juniper_structured.scope_logs[0].log_records[0];
+        assert_eq!(juniper_sd_record.severity_number, 0);
+        assert_eq!(
+            otlp_string_attribute(&juniper_sd_record.attributes, "juniper.session.id"),
+            Some("123")
+        );
+
+        let nsp_wire = b"admin_domain=Default alert_id=12345 alert_type=Signature app_protocol=HTTP confidence=Tentative attack_count=1 attack_id=0x40000123 attack_name=SQL-Injection severity=High alert_signature=HTTP-SQL-INJ-001 attack_time=\"2026-05-16 10:00:00\" category=Application dest_ip=192.0.2.10 dest_name=webserver01 dest_port=80 device_name=nsp-sensor-01 direction=Inbound confidence= file_name= file_hash= file_type= virus_name= action_status= error_status= protocol=TCP result=Blocked src_ip=198.51.100.5 src_name= src_port=54321";
+        let nsp = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "nsp_otlp",
+            nsp_wire,
+            json!({"nsp": {"body": String::from_utf8_lossy(nsp_wire), "timezone": "UTC"}}),
+            received_at,
+        );
+        let nsp_record = &nsp.scope_logs[0].log_records[0];
+        assert_eq!(nsp_record.severity_number, 19);
+        assert_eq!(nsp_record.severity_text, "High");
+        assert_eq!(
+            otlp_string_attribute(&nsp_record.attributes, "rule.id"),
+            Some("0x40000123")
+        );
+        assert_eq!(
+            otlp_string_attribute(&nsp_record.attributes, "event.id"),
+            Some("12345")
+        );
+
+        let paloalto_cef_wire = b"<134>Apr 27 10:00:00 fw-pan01 CEF:0|Palo Alto Networks|PAN-OS|10.2.0|end|TRAFFIC|3|src=192.0.2.10 spt=54321 dst=198.51.100.5 dpt=443 proto=tcp act=allow in=2048 out=1024 app=ssl suser=alice";
+        let paloalto_cef = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "paloalto_cef_otlp",
+            paloalto_cef_wire,
+            json!({"paloalto_cef": {"timezone": "UTC"}}),
+            received_at,
+        );
+        let paloalto_cef_record = &paloalto_cef.scope_logs[0].log_records[0];
+        assert_eq!(paloalto_cef_record.severity_number, 17);
+        assert_eq!(
+            otlp_string_attribute(&paloalto_cef_record.attributes, "user.name"),
+            Some("alice")
+        );
+
+        let mut pan_fields = vec![""; 53];
+        pan_fields[1] = "2026/04/27 10:00:00";
+        pan_fields[2] = "012345678";
+        pan_fields[3] = "TRAFFIC";
+        pan_fields[4] = "end";
+        pan_fields[6] = "2026/04/27 10:00:01";
+        pan_fields[7] = "192.0.2.10";
+        pan_fields[8] = "198.51.100.5";
+        pan_fields[11] = "allow-web";
+        pan_fields[12] = "alice";
+        pan_fields[14] = "ssl";
+        pan_fields[16] = "trust";
+        pan_fields[17] = "untrust";
+        pan_fields[22] = "98765";
+        pan_fields[24] = "54321";
+        pan_fields[25] = "443";
+        pan_fields[29] = "tcp";
+        pan_fields[30] = "allow";
+        pan_fields[32] = "1024";
+        pan_fields[33] = "2048";
+        pan_fields[44] = "10";
+        pan_fields[45] = "20";
+        pan_fields[52] = "fw-pan01";
+        let paloalto_native_wire =
+            format!("<134>Apr 27 10:00:00 fw-pan01 {}", pan_fields.join(","));
+        let paloalto_native = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "paloalto_native_otlp",
+            paloalto_native_wire.as_bytes(),
+            json!({"paloalto_syslog": {"timezone": "UTC"}}),
+            received_at,
+        );
+        let paloalto_native_record = &paloalto_native.scope_logs[0].log_records[0];
+        assert_eq!(paloalto_native_record.severity_number, 0);
+        assert_eq!(
+            otlp_string_attribute(&paloalto_native_record.attributes, "rule.name"),
+            Some("allow-web")
+        );
+        assert_eq!(
+            otlp_string_attribute(&paloalto_native_record.attributes, "palo_alto.session.id"),
+            Some("98765")
+        );
+
+        for resource_logs in [
+            asa,
+            checkpoint_leef,
+            checkpoint,
+            fortigate_cef,
+            juniper_legacy,
+            juniper_structured,
+            nsp,
+            paloalto_cef,
+            paloalto_native,
+        ] {
+            let record = &resource_logs.scope_logs[0].log_records[0];
+            assert!(matches!(
+                record.body.as_ref().and_then(|body| body.value.as_ref()),
+                Some(any_value::Value::StringValue(_))
+            ));
+            assert_otlp_attribute_contract(&record.attributes);
+            assert_otlp_attribute_contract(
+                &resource_logs
+                    .resource
+                    .as_ref()
+                    .expect("resource")
+                    .attributes,
+            );
+        }
+    }
+
+    #[test]
+    fn packaged_host_transport_and_zeek_otlp_adapters_preserve_source_contracts() {
+        use crate::functions::{FunctionRegistry, register_builtins, register_user_functions};
+        use opentelemetry_proto::tonic::common::v1::any_value;
+        use serde_json::json;
+
+        let cfg = compile_packaged_otlp_composers().unwrap();
+        let mut funcs = FunctionRegistry::new();
+        register_builtins(&mut funcs, crate::runtime::init_tables(&cfg).unwrap());
+        register_user_functions(&mut funcs, &cfg);
+        let received_at = chrono::DateTime::from_timestamp(1_784_073_600, 123_456_789)
+            .expect("valid receive timestamp");
+
+        let auditd_wire = b"type=USER_LOGIN msg=audit(1710000000.123:42): pid=100 uid=0 auid=1000 ses=1 msg='op=login acct=alice exe=/usr/bin/login hostname=? addr=192.0.2.10 terminal=tty1 res=success'";
+        let auditd = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "auditd_otlp",
+            auditd_wire,
+            json!({"auditd": {"body": String::from_utf8_lossy(auditd_wire), "hostname": "host-1"}}),
+            received_at,
+        );
+        assert_eq!(
+            auditd.scope_logs[0]
+                .scope
+                .as_ref()
+                .map(|scope| scope.name.as_str()),
+            Some("auditd")
+        );
+
+        let bind_wire = b"30-Apr-2026 01:23:45.123 client @0x7fef10003330 192.0.2.10#54321 (example.com): query: example.com IN A +E(0) (198.51.100.53)";
+        let bind = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "bind_otlp",
+            bind_wire,
+            json!({"bind": {"body": String::from_utf8_lossy(bind_wire), "hostname": "dns-1", "pid": "123", "timezone": "UTC"}}),
+            received_at,
+        );
+        assert_eq!(
+            otlp_string_attribute(
+                &bind.scope_logs[0].log_records[0].attributes,
+                "dns.question.name"
+            ),
+            Some("example.com")
+        );
+
+        let combined_wire = b"192.0.2.10 - alice [29/Apr/2026:13:55:36 +0900] \"GET /index.html HTTP/1.1\" 200 2326 \"https://example.com/\" \"Mozilla/5.0\"";
+        let combined = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "combined_log_otlp",
+            combined_wire,
+            json!({"combined_log": {"body": String::from_utf8_lossy(combined_wire), "hostname": "web-1"}}),
+            received_at,
+        );
+        assert_eq!(
+            otlp_int_attribute(
+                &combined.scope_logs[0].log_records[0].attributes,
+                "http.response.status_code"
+            ),
+            Some(200)
+        );
+
+        let journald_wire = br#"{"MESSAGE":"accepted","PRIORITY":"6","SYSLOG_FACILITY":"4","SYSLOG_IDENTIFIER":"sshd","_PID":"42","_UID":"1000","_HOSTNAME":"host-1","_SYSTEMD_UNIT":"sshd.service","_TRANSPORT":"syslog"}"#;
+        let journald = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "journald_otlp",
+            journald_wire,
+            json!({}),
+            received_at,
+        );
+        let journald_record = &journald.scope_logs[0].log_records[0];
+        assert_eq!(journald_record.severity_number, 0);
+        assert_eq!(
+            otlp_string_array_attribute(&journald_record.attributes, "event.category"),
+            Some(vec!["host"])
+        );
+        assert_eq!(
+            otlp_string_array_attribute(&journald_record.attributes, "event.type"),
+            Some(vec!["info"])
+        );
+        assert_eq!(
+            otlp_int_attribute(&journald_record.attributes, "log.syslog.severity.code"),
+            Some(6)
+        );
+
+        let openssh_wire =
+            b"Accepted publickey for alice from 192.0.2.10 port 54321 ssh2: RSA SHA256:abcd";
+        let openssh = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "openssh_otlp",
+            openssh_wire,
+            json!({"openssh": {"body": String::from_utf8_lossy(openssh_wire), "hostname": "host-1", "pid": "42", "time": 1710000000123456789i64}}),
+            received_at,
+        );
+        assert_eq!(
+            otlp_string_attribute(
+                &openssh.scope_logs[0].log_records[0].attributes,
+                "user.name"
+            ),
+            Some("alice")
+        );
+
+        let postfix_wire = b"postfix/qmgr[1111]: ABCDEF1234: from=<bob@example.org>, size=3222, nrcpt=1 (queue active)";
+        let postfix = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "postfix_otlp",
+            postfix_wire,
+            json!({"postfix": {"body": String::from_utf8_lossy(postfix_wire), "hostname": "mail-1", "time": 1710000000123456789i64}}),
+            received_at,
+        );
+        assert_eq!(
+            otlp_string_attribute(
+                &postfix.scope_logs[0].log_records[0].attributes,
+                "email.message_id"
+            ),
+            Some("ABCDEF1234")
+        );
+
+        let sudo_wire =
+            b"pam_unix(sudo:session): session opened for user root(uid=0) by alice(uid=1000)";
+        let sudo = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "sudo_otlp",
+            sudo_wire,
+            json!({"sudo": {"body": String::from_utf8_lossy(sudo_wire), "hostname": "host-1", "pid": "99", "time": 1710000000123456789i64}}),
+            received_at,
+        );
+        let sudo_record = &sudo.scope_logs[0].log_records[0];
+        assert_eq!(
+            otlp_string_attribute(&sudo_record.attributes, "user.name"),
+            Some("alice")
+        );
+        assert_eq!(
+            otlp_string_attribute(&sudo_record.attributes, "user.target.name"),
+            Some("root")
+        );
+
+        let syslog_wire = b"<165>1 2026-04-30T01:23:45Z host-1 app 42 ID47 - message";
+        let syslog = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "syslog_otlp",
+            syslog_wire,
+            json!({}),
+            received_at,
+        );
+        let syslog_record = &syslog.scope_logs[0].log_records[0];
+        assert_eq!(syslog_record.severity_number, 0);
+        assert_eq!(
+            otlp_string_array_attribute(&syslog_record.attributes, "event.category"),
+            None
+        );
+        assert_eq!(
+            otlp_string_array_attribute(&syslog_record.attributes, "event.type"),
+            None
+        );
+        assert_eq!(
+            otlp_int_attribute(&syslog_record.attributes, "log.syslog.severity.code"),
+            Some(5)
+        );
+
+        let sysmon_body = json!({
+            "EventID": 3,
+            "Channel": "Microsoft-Windows-Sysmon/Operational",
+            "EventTime": "2026-04-29T10:00:00.123456Z",
+            "Computer": "WORKSTATION1",
+            "EventData": {"UtcTime":"2026-04-29 10:00:00.123","ProcessId":"42","Image":"C:\\\\Windows\\\\app.exe","User":"CORP\\\\alice","Protocol":"tcp","SourceIp":"192.0.2.10","SourcePort":"54321","DestinationIp":"198.51.100.5","DestinationPort":"443","Initiated":"true"}
+        });
+        let sysmon_wire = serde_json::to_vec(&sysmon_body).unwrap();
+        let sysmon = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "sysmon_otlp",
+            &sysmon_wire,
+            json!({"sysmon": {"body": sysmon_body}}),
+            received_at,
+        );
+        assert_eq!(
+            otlp_string_attribute(
+                &sysmon.scope_logs[0].log_records[0].attributes,
+                "event.code"
+            ),
+            Some("3")
+        );
+
+        let winevent_wire = br#"{"EventID":4624,"Channel":"Security","EventType":"INFO","Severity":"INFO","Hostname":"WORKSTATION1","EventTime":"2026-04-29 10:00:00","TargetUserName":"alice","TargetDomainName":"CORP","TargetUserSid":"S-1-5-21-1001","SubjectUserName":"SYSTEM","SubjectDomainName":"NT AUTHORITY","LogonType":"3","IpAddress":"192.0.2.10","IpPort":"54321"}"#;
+        let winevent = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "winevent_otlp",
+            winevent_wire,
+            json!({}),
+            received_at,
+        );
+        let winevent_record = &winevent.scope_logs[0].log_records[0];
+        assert_eq!(winevent_record.severity_number, 9);
+        assert_eq!(
+            otlp_string_attribute(&winevent_record.attributes, "user.target.name"),
+            Some("CORP\\alice")
+        );
+
+        let zeek_conn_body = json!({"_path":"conn","ts":1710000000.125,"uid":"C1","id":{"orig_h":"192.0.2.10","orig_p":54321,"resp_h":"198.51.100.5","resp_p":443},"proto":"tcp","service":"ssl","duration":1.5,"orig_bytes":100,"resp_bytes":200,"orig_pkts":2,"resp_pkts":3,"conn_state":"SF"});
+        let zeek_conn_wire = serde_json::to_vec(&zeek_conn_body).unwrap();
+        let zeek_default = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "zeek_default_otlp",
+            &zeek_conn_wire,
+            json!({"zeek": {"body": zeek_conn_body, "hostname": "sensor-1"}}),
+            received_at,
+        );
+        assert_eq!(
+            otlp_string_attribute(
+                &zeek_default.scope_logs[0].log_records[0].attributes,
+                "event.code"
+            ),
+            Some("conn")
+        );
+
+        let zeek_ssh_body = json!({"_path":"ssh","ts":1710000000.25,"uid":"C2","id":{"orig_h":"192.0.2.10","orig_p":54321,"resp_h":"198.51.100.5","resp_p":22},"auth_success":true,"client":"OpenSSH","server":"OpenSSH","cipher_alg":"aes256-gcm"});
+        let zeek_ssh_wire = serde_json::to_vec(&zeek_ssh_body).unwrap();
+        let zeek_soc = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "zeek_soc_otlp",
+            &zeek_ssh_wire,
+            json!({"zeek": {"body": zeek_ssh_body, "hostname": "sensor-1"}}),
+            received_at,
+        );
+        assert_eq!(
+            otlp_string_attribute(
+                &zeek_soc.scope_logs[0].log_records[0].attributes,
+                "event.code"
+            ),
+            Some("ssh")
+        );
+
+        let zeek_custom_body = json!({"_path":"custom_protocol","ts":1710000000.5,"uid":"C3","id":{"orig_h":"192.0.2.10","orig_p":1000,"resp_h":"198.51.100.5","resp_p":2000},"proto":"tcp","custom":"kept"});
+        let zeek_custom_wire = serde_json::to_vec(&zeek_custom_body).unwrap();
+        let zeek_full = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "zeek_full_otlp",
+            &zeek_custom_wire,
+            json!({"zeek": {"body": zeek_custom_body, "hostname": "sensor-1"}}),
+            received_at,
+        );
+        assert_eq!(
+            otlp_string_attribute(
+                &zeek_full.scope_logs[0].log_records[0].attributes,
+                "event.code"
+            ),
+            Some("custom_protocol")
+        );
+
+        for resource_logs in [
+            auditd,
+            bind,
+            combined,
+            journald,
+            openssh,
+            postfix,
+            sudo,
+            syslog,
+            sysmon,
+            winevent,
+            zeek_default,
+            zeek_soc,
+            zeek_full,
+        ] {
+            let record = &resource_logs.scope_logs[0].log_records[0];
+            assert!(matches!(
+                record.body.as_ref().and_then(|body| body.value.as_ref()),
+                Some(any_value::Value::StringValue(_))
+            ));
+            assert_otlp_attribute_contract(&record.attributes);
+            assert_otlp_attribute_contract(
+                &resource_logs
+                    .resource
+                    .as_ref()
+                    .expect("resource")
+                    .attributes,
+            );
+        }
     }
 }
