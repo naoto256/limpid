@@ -161,6 +161,8 @@ def function azure_resource_type(resource_id) {
 // build into one helper-style def process so each leaf is one line.
 
 def process parse_azure_activity_record {
+    workspace.az.severity_number = azure_activity_severity_number(workspace.az.level)
+    process validate_azure_activity_severity_number
     let verb     = azure_operation_verb(workspace.az.operationName)
     let activity = azure_activity_id(verb)
     let status   = azure_status_id(workspace.az.resultType)
@@ -262,7 +264,6 @@ def process parse_azure_activity_record {
 
 def process parse_azure_activity {
     workspace.az = parse_json(ingress)
-    workspace.az.severity_number = azure_activity_severity_number(workspace.az.level)
 
     // Loud-fail on missing required fields. An Activity Log event
     // without category / operationName / resourceId / time is
@@ -283,7 +284,6 @@ def process parse_azure_activity {
             error "parse_azure_activity: missing time: ${ingress}"
         }
         default {
-            process validate_azure_activity_severity_number
             switch workspace.az.category {
                 "Administrative"  { process parse_azure_activity_record }
                 "ServiceHealth"   { process parse_azure_activity_record }

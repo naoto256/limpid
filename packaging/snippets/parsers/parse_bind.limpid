@@ -3,7 +3,10 @@
 //                .body (required, String) — the query log line
 //                .pid (optional, String) — named pid
 //                .hostname (optional, String) — DNS server hostname
-//                .time (optional, Int) — epoch nanoseconds of arrival
+//                .timezone (optional, String) — source timezone override as an
+//                  IANA name or fixed offset; defaults to the limpid host's
+//                  system timezone for BIND's local wall time
+//                  https://bind9.readthedocs.io/en/v9.18.13/reference.html#namedconf-statement-print-time
 // Writes:      workspace.lsis.parsed.* — 4003 (DNS Activity). Only the queries
 //              channel; other BIND log categories route to error_log.
 // Category:    DNS server
@@ -26,14 +29,15 @@
 //           the server has multiple `view` clauses configured.
 // Bridges —  transport-agnostic. The BIND timestamp inside the body
 //           carries millisecond precision in a BIND-specific format
-//           (`30-Apr-2026 01:23:45.123`); the OCSF `time` field is
-//           populated from the upstream transport time when available
-//           (more accurate for SIEM correlation than the BIND
-//           timestamp, which is local-TZ-by-default). Two typical
-//           bridges:
+//           (`30-Apr-2026 01:23:45.123`) and is local-TZ-by-default.
+//           The caller may override that source timezone explicitly. Without
+//           an override, the pack assumes BIND and limpid use the same correct
+//           system timezone. Correct either environment, supply the override,
+//           or use a custom parser when that assumption does not hold.
+//           Two typical bridges are shown below.
 //
 //           - file tail (most common — limpid runs on the DNS server):
-//                 { workspace.bind = { body: ingress, pid: null, hostname: hostname(), time: to_int(received_at) } } | parse_bind | compose_ocsf | ocsf_to_egress
+//                 { workspace.bind = { body: ingress, pid: null, hostname: hostname(), timezone: "America/New_York" } } | parse_bind | compose_ocsf | ocsf_to_egress
 //
 //           - syslog transport (named logs via syslog instead of file):
 //                 process parse_syslog | {
@@ -41,7 +45,7 @@
 //                         body:     workspace.syslog.msg,
 //                         pid:      workspace.syslog.procid,
 //                         hostname: workspace.syslog.hostname,
-//                         time:     to_int(parse_datetime_rfc3339(workspace.syslog.timestamp))
+//                         timezone: "America/New_York"
 //                     }
 //                 } | parse_bind | compose_ocsf | ocsf_to_egress
 //
@@ -51,7 +55,7 @@
 //                         body:     workspace.journald.MESSAGE,
 //                         pid:      coalesce(workspace.journald._PID, workspace.journald.SYSLOG_PID),
 //                         hostname: workspace.journald._HOSTNAME,
-//                         time:     to_int(workspace.journald.__REALTIME_TIMESTAMP) * 1000
+//                         timezone: "America/New_York"
 //                     }
 //                 } | parse_bind | compose_ocsf | ocsf_to_egress
 //
@@ -77,6 +81,14 @@
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+def function bind_time_ns(timestamp, timezone) {
+    to_int(strptime(
+        timestamp,
+        "%d-%b-%Y %H:%M:%S%.3f",
+        coalesce(timezone, "local")
+    ))
+}
 
 // Build the OCSF DNS Activity (4003) record skeleton. Activity is
 // hard-coded to 1 (Query) — BIND `querylog` emits one line per inbound
@@ -130,10 +142,10 @@ def process parse_bind {
     // @requires: workspace.bind.body       (required, String)
     // @requires: workspace.bind.pid        (optional, String)
     // @requires: workspace.bind.hostname   (optional, String)
-    // @requires: workspace.bind.time       (optional, Int — epoch ns)
+    // @requires: workspace.bind.timezone   (optional, String — IANA name or fixed offset)
     workspace.bind_query = regex_parse(
         workspace.bind.body,
-        "^\\S+ \\S+ client (?:@\\S+ )?(?P<client_ip>[0-9A-Fa-f:.]+)#(?P<client_port>\\d+)(?: \\(\\S+\\):)? (?:query: )?(?P<qname>\\S+) (?P<qclass>\\S+) (?P<qtype>\\S+)(?: (?P<flags>\\S+))?(?: \\((?P<server_ip>[0-9A-Fa-f:.]+)\\))?\\s*$"
+        "^(?P<timestamp>\\S+ \\S+) client (?:@\\S+ )?(?P<client_ip>[0-9A-Fa-f:.]+)#(?P<client_port>\\d+)(?: \\(\\S+\\):)? (?:query: )?(?P<qname>\\S+) (?P<qclass>\\S+) (?P<qtype>\\S+)(?: (?P<flags>\\S+))?(?: \\((?P<server_ip>[0-9A-Fa-f:.]+)\\))?\\s*$"
     )
     switch true {
         workspace.bind_query == null {
@@ -144,6 +156,9 @@ def process parse_bind {
 }
 
 def process parse_bind_query_record {
+    switch workspace.bind.timezone {
+        "local" { error "parse_bind: source timezone must be an IANA name or fixed offset, not local" }
+    }
     workspace.lsis.parsed = bind_dns_record(
         workspace.bind_query.client_ip,
         workspace.bind_query.client_port,
@@ -153,6 +168,6 @@ def process parse_bind_query_record {
         workspace.bind_query.server_ip,
         workspace.bind.pid,
         workspace.bind.hostname,
-        workspace.bind.time
+        bind_time_ns(workspace.bind_query.timestamp, workspace.bind.timezone)
     )
 }

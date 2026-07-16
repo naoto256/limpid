@@ -203,6 +203,7 @@ def process parse_aws_vpc_flow_v2_record {
         activity_id:  activity,
         type_uid:     4001 * 100 + activity,
         status_id:    aws_vpc_flow_status_id(action),
+        time:         aws_vpc_flow_epoch_seconds_to_nanos(f.start),
         start_time:   aws_vpc_flow_epoch_seconds_to_nanos(f.start),
         end_time:     aws_vpc_flow_epoch_seconds_to_nanos(f.end),
         src_endpoint: {
@@ -280,6 +281,7 @@ def process parse_aws_vpc_flow_v5_record {
         activity_id:  activity,
         type_uid:     4001 * 100 + activity,
         status_id:    aws_vpc_flow_status_id(action),
+        time:         aws_vpc_flow_epoch_seconds_to_nanos(f.start),
         start_time:   aws_vpc_flow_epoch_seconds_to_nanos(f.start),
         end_time:     aws_vpc_flow_epoch_seconds_to_nanos(f.end),
         src_endpoint: {

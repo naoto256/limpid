@@ -1,6 +1,7 @@
-// Summary:     RFC 3164 BSD syslog timestamp (`Apr 30 01:23:45`) →
-//              UTC-normalised Timestamp, with year-rollover clamp.
-// Signature:   parse_datetime_rfc3164(text) → Timestamp
+// Summary:     RFC 3164 BSD syslog timestamp (`Apr 30 01:23:45`) plus
+//              a resolved source timezone → Timestamp, with year-rollover clamp.
+// Signature:   parse_datetime_rfc3164(text, timezone) → Timestamp | null;
+//              parse_datetime_rfc3164_in_timezone(text, timezone) → Timestamp
 // Test corpus: unit (RFC 3164 timestamp shapes; year-end rollover
 //              clamp cases)
 //
@@ -14,25 +15,24 @@
 //      year (year-end rollover). This is what rsyslog / syslog-ng /
 //      Vector / Fluent Bit all converge on.
 //
-//   2. The wire carries no timezone. We assume UTC. Operators on
-//      non-UTC senders should fork this snippet and substitute the
-//      `"UTC"` argument with their own offset / "local". The
-//      timezone is unrecoverable from the wire; whichever choice is
-//      made is an assumption.
+//   2. The wire carries no timezone. The caller resolves the vendor-specific
+//      default or an operator override before calling this helper. `local`
+//      means the limpid host's system timezone; `UTC`, IANA names, and fixed
+//      offsets are also accepted. An invalid timezone is a loud error.
 //
 // For modern senders (RFC 5424 syslog, OTLP, OCSF, AWS CloudTrail,
 // most cloud audit logs) use the built-in `parse_datetime_rfc3339`
 // directly — it accepts the `Z` literal and any numeric offset
 // transparently.
 
-def function parse_datetime_rfc3164(text) {
+def function parse_datetime_rfc3164_in_timezone(text, timezone) {
     let now_ts   = timestamp()
-    let now_year = to_int(strftime(now_ts, "%Y", "UTC"))
+    let now_year = to_int(strftime(now_ts, "%Y", timezone))
 
     let tentative = strptime(
         "${now_year} ${text}",
         "%Y %b %_d %H:%M:%S",
-        "UTC"
+        timezone
     )
 
     // future-clamp: tentative > now + 24h ⇒ wire is from last year
@@ -41,9 +41,16 @@ def function parse_datetime_rfc3164(text) {
             strptime(
                 "${now_year - 1} ${text}",
                 "%Y %b %_d %H:%M:%S",
-                "UTC"
+                timezone
             )
         }
         default { tentative }
+    }
+}
+
+def function parse_datetime_rfc3164(text, timezone) {
+    switch timezone {
+        null    { null }
+        default { parse_datetime_rfc3164_in_timezone(text, timezone) }
     }
 }

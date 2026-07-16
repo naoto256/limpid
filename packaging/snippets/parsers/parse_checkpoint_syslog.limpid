@@ -3,7 +3,6 @@
 // Reads:       workspace.checkpoint_syslog.* (bridge — see Bridges below)
 //                .body (required, String) — the full RFC 5424 wire
 //                .hostname (optional, String) — collector-side hostname override
-//                .time (optional, Int) — epoch nanoseconds
 // Writes:      workspace.lsis.parsed.* — firewall actions → 4001, threat actions →
 //              2004, auth actions → 3002; unknown actions land in 4001 with
 //              the action preserved in unmapped.
@@ -41,7 +40,7 @@
 //           does not expose the SD block.
 //
 //           - syslog (UDP/TCP):
-//                 { workspace.checkpoint_syslog = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_checkpoint_syslog | compose_ocsf | ocsf_to_egress
+//                 { workspace.checkpoint_syslog = { body: ingress, hostname: source.ip } } | parse_checkpoint_syslog | compose_ocsf | ocsf_to_egress
 //
 // Per-action dispatch (LSIS class depends on the action / product combination):
 //             firewall actions (Accept / Drop / Reject / Decrypt)        → 4001 Network Activity
@@ -98,6 +97,14 @@ def function parse_checkpoint_syslog_kv_or_null(sd, name) {
         v == "N/A" { null }
         v == ""    { null }
         default    { v }
+    }
+}
+
+def function checkpoint_syslog_time_ns(timestamp) {
+    switch timestamp {
+        null    { null }
+        "-"     { null }
+        default { to_int(parse_datetime_rfc3339(timestamp)) }
     }
 }
 
@@ -350,14 +357,14 @@ def function parse_checkpoint_syslog_classify(body) {
     //   - R81+ Log Fields:  `<PRI>1 ts host CP-GW - Log [Fields@<EID> key=value ...]`
     let cp = regex_parse(
         body,
-        "^<\\d+>1 \\S+ (?P<host>\\S+) CheckPoint \\S+ - \\[(?P<sd>.*)\\]\\s*$"
+        "^<\\d+>1 (?P<timestamp>\\S+) (?P<host>\\S+) CheckPoint \\S+ - \\[(?P<sd>.*)\\]\\s*$"
     )
     switch true {
         cp != null { cp }
         default {
             regex_parse(
                 body,
-                "^<\\d+>1 \\S+ (?P<host>\\S+) \\S+ - Log \\[Fields@\\S+ (?P<sd>.*)\\]\\s*$"
+                "^<\\d+>1 (?P<timestamp>\\S+) (?P<host>\\S+) \\S+ - Log \\[Fields@\\S+ (?P<sd>.*)\\]\\s*$"
             )
         }
     }
@@ -370,7 +377,7 @@ def function parse_checkpoint_syslog_classify(body) {
 def process parse_checkpoint_syslog {
     // @requires: workspace.checkpoint_syslog.body      (required, String)
     // @requires: workspace.checkpoint_syslog.hostname  (optional, String)
-    // @requires: workspace.checkpoint_syslog.time      (optional, Int — epoch ns)
+    // The RFC 5424 TIMESTAMP in `.body` is the event time.
     workspace.cp_syslog_class = parse_checkpoint_syslog_classify(workspace.checkpoint_syslog.body)
     switch true {
         workspace.cp_syslog_class == null {
@@ -424,7 +431,7 @@ def process parse_checkpoint_syslog_network_record_proc {
         parse_checkpoint_syslog_kv(sd, "rule_uid"),
         parse_checkpoint_syslog_kv(sd, "layer_name"),
         coalesce(workspace.cp_syslog_class.host, workspace.checkpoint_syslog.hostname),
-        workspace.checkpoint_syslog.time,
+        checkpoint_syslog_time_ns(workspace.cp_syslog_class.timestamp),
         workspace.checkpoint_syslog_severity.number,
         workspace.checkpoint_syslog_severity.text
     )
@@ -442,7 +449,7 @@ def process parse_checkpoint_syslog_finding_record_proc {
         parse_checkpoint_syslog_kv(sd, "service"),
         parse_checkpoint_syslog_kv(sd, "proto"),
         coalesce(workspace.cp_syslog_class.host, workspace.checkpoint_syslog.hostname),
-        workspace.checkpoint_syslog.time,
+        checkpoint_syslog_time_ns(workspace.cp_syslog_class.timestamp),
         workspace.checkpoint_syslog_severity.number,
         workspace.checkpoint_syslog_severity.text
     )
@@ -455,7 +462,7 @@ def process parse_checkpoint_syslog_auth_record {
         sd,
         parse_checkpoint_syslog_kv(sd, "action"),
         coalesce(workspace.cp_syslog_class.host, workspace.checkpoint_syslog.hostname),
-        workspace.checkpoint_syslog.time,
+        checkpoint_syslog_time_ns(workspace.cp_syslog_class.timestamp),
         workspace.checkpoint_syslog_severity.number,
         workspace.checkpoint_syslog_severity.text
     )

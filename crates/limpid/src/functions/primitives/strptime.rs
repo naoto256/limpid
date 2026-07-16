@@ -4,8 +4,9 @@
 //! Inverse of `strftime`. Takes an arbitrary timestamp string plus its
 //! `strftime`-style format. The parsed timezone is used to *decode* the
 //! wall time correctly but is not stored: `Value::Timestamp` is
-//! UTC-normalised. To render in the original (or any other) offset,
-//! pass the explicit `timezone` argument to `strftime`.
+//! UTC-normalised. The original timezone identity is not retained;
+//! callers choose an explicit supported timezone when rendering with
+//! `strftime`.
 //!
 //! Timezone handling on input:
 //! - If the format includes an offset (`%z`, `%:z`, `%#z`), the parsed
@@ -13,7 +14,8 @@
 //!   is rejected as conflicting.
 //! - If the format produces a naive datetime (no offset), the 3rd
 //!   argument supplies the timezone for decoding: `"local"`, `"UTC"`,
-//!   or a literal offset (`+09:00`, `-0530`).
+//!   an IANA timezone name (`Asia/Tokyo`), or a literal offset
+//!   (`+09:00`, `-0530`).
 //! - A naive datetime with no 3rd argument is a loud error — limpid
 //!   never silently assumes UTC. Callers explicitly pick.
 
@@ -66,11 +68,11 @@ fn parse_with_tz(value: &str, fmt: &str, tz: Option<&str>) -> Result<DateTime<Fi
     })?;
     let tz = tz.ok_or_else(|| {
         anyhow::anyhow!(
-            "strptime(): format produced a naive datetime; pass a timezone as the third argument ('local', 'UTC', or ±HH:MM)"
+            "strptime(): format produced a naive datetime; pass a timezone as the third argument ('local', 'UTC', an IANA name, or ±HH:MM)"
         )
     })?;
-    let offset = match tz {
-        "local" => *chrono::Local
+    match tz {
+        "local" => Ok(chrono::Local
             .from_local_datetime(&naive)
             .single()
             .ok_or_else(|| {
@@ -79,14 +81,66 @@ fn parse_with_tz(value: &str, fmt: &str, tz: Option<&str>) -> Result<DateTime<Fi
                     value
                 )
             })?
-            .offset(),
-        "UTC" | "utc" => FixedOffset::east_opt(0).unwrap(),
-        offset_str => parse_fixed_offset(offset_str).ok_or_else(|| {
-            anyhow::anyhow!(
-                "strptime(): invalid timezone '{}' (expected 'local', 'UTC', or ±HH:MM)",
-                offset_str
-            )
-        })?,
-    };
-    Ok(offset.from_utc_datetime(&(naive - offset)))
+            .fixed_offset()),
+        "UTC" | "utc" => {
+            let offset = FixedOffset::east_opt(0).unwrap();
+            Ok(offset.from_utc_datetime(&naive))
+        }
+        timezone => {
+            if let Some(offset) = parse_fixed_offset(timezone) {
+                return Ok(offset.from_utc_datetime(&(naive - offset)));
+            }
+            let zone = timezone.parse::<chrono_tz::Tz>().map_err(|_| {
+                anyhow::anyhow!(
+                    "strptime(): invalid timezone '{}' (expected 'local', 'UTC', an IANA name, or ±HH:MM)",
+                    timezone
+                )
+            })?;
+            Ok(zone
+                .from_local_datetime(&naive)
+                .single()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "strptime(): ambiguous or invalid local time '{}' in timezone '{}' (DST transition?)",
+                        value,
+                        timezone
+                    )
+                })?
+                .fixed_offset())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_iana_timezone_to_exact_utc_instant() {
+        let parsed = parse_with_tz(
+            "2026-04-30 10:23:45.123",
+            "%Y-%m-%d %H:%M:%S%.3f",
+            Some("Asia/Tokyo"),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.with_timezone(&Utc).timestamp_nanos_opt().unwrap(),
+            1_777_512_225_123_000_000
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_iana_local_time() {
+        let error = parse_with_tz(
+            "2026-11-01 01:30:00",
+            "%Y-%m-%d %H:%M:%S",
+            Some("America/New_York"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ambiguous or invalid local time")
+        );
+    }
 }

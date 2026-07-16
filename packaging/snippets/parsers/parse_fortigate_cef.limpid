@@ -1,6 +1,15 @@
 // Summary:     Fortinet FortiGate CEF (FortiOS set format cef) → LSIS,
 //              dispatched by CEF cat subtype.
 // Reads:       ingress (raw wire) — syslog-wrapped CEF (CEF:0|Fortinet|Fortigate|...)
+//              workspace.fortigate_cef.timezone (optional, String) — source
+//              device timezone override as an IANA name or fixed offset; the
+//              RFC 3164 timestamp defaults to the limpid host's system timezone
+//              (FortiOS logs follow the configured device time zone, while
+//              the documented CEF wrapper omits the zone itself)
+//              https://docs.fortinet.com/document/fortigate/7.4.0/fortios-log-message-reference/949981/traffic-log-support-for-cef
+//              The default assumes FortiGate and limpid have the same correct
+//              system timezone. Correct either environment, override this
+//              slot, or use a custom parser when that assumption is false.
 // Writes:      workspace.lsis.parsed.* — class per subtype (traffic → 4001,
 //              IPS / virus → 2004, …); see the subtype leaves below.
 // Category:    Network firewall / IPS
@@ -33,6 +42,8 @@
 // Vendor-specific mapping helpers (FortiGate CEF dialect)
 // ---------------------------------------------------------------------------
 
+include "../functions/parse_datetime_rfc3164.limpid"
+
 // FortiGate CEF header priority → OTel SeverityNumber.
 // Fortinet defines this dialect as 1 Debug through 8 Emergency; these
 // labels follow the syslog semantic mapping in the OTel Logs Data Model
@@ -52,7 +63,15 @@ def function fortigate_cef_severity_number(sev) {
 }
 
 def process validate_fortigate_cef_severity_number {
+    switch workspace.fortigate_cef.timezone {
+        "local" { error "parse_fortigate_cef: source timezone must be an IANA name or fixed offset, not local" }
+    }
     workspace.cef.severity_number = fortigate_cef_severity_number(workspace.cef.severity)
+    let source_timezone = coalesce(workspace.fortigate_cef.timezone, "local")
+    workspace.cef.time = switch true {
+        workspace.cef.timestamp == null { null }
+        default                         { to_int(parse_datetime_rfc3164(workspace.cef.timestamp, source_timezone)) }
+    }
     switch workspace.cef.severity != null and workspace.cef.severity_number == null {
         true { error "parse_fortigate_cef: invalid FortiGate CEF priority ${workspace.cef.severity}" }
     }
@@ -138,7 +157,7 @@ def function fortigate_cef_metadata(vendor, product, version) {
 def process parse_fortigate_cef {
     workspace.syslog = syslog.parse(ingress)
     workspace.cef    = cef.parse(workspace.syslog.msg)
-    process validate_fortigate_cef_severity_number
+    workspace.cef.timestamp = workspace.syslog.timestamp
     switch workspace.cef.cat {
         // Traffic logs (Network Activity 4001)
         "traffic:forward"    { process parse_fortigate_cef_traffic }
@@ -176,12 +195,14 @@ def process parse_fortigate_cef {
 // Standard CEF fields used (unprefixed):
 //   src / spt / dst / dpt / proto / act / app / in / out / msg
 def process parse_fortigate_cef_traffic {
+    process validate_fortigate_cef_severity_number
     let proto_num = to_int(workspace.cef.proto)
     workspace.lsis.parsed = {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  fortigate_cef_action_to_activity_id(workspace.cef.act),
         severity_number: workspace.cef.severity_number,
+        time:            workspace.cef.time,
         src_endpoint: {
             ip:   workspace.cef.src,
             port: to_int(workspace.cef.spt)
@@ -217,11 +238,13 @@ def process parse_fortigate_cef_traffic {
 //   FTNTFGTref       — reference URL (vendor ext)
 //   src / spt / dst / dpt / proto / act / msg — standard CEF
 def process parse_fortigate_cef_utm_ips {
+    process validate_fortigate_cef_severity_number
     workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
         severity_number: workspace.cef.severity_number,
+        time:            workspace.cef.time,
         disposition_id: fortigate_cef_utm_disposition_id(workspace.cef.act),
         finding_info: {
             title: workspace.cef.FTNTFGTattack,
@@ -261,6 +284,7 @@ def process parse_fortigate_cef_utm_ips {
 //   FTNTFGTcat             — numeric category id
 //   suser                  — authenticated username (standard CEF)
 def process parse_fortigate_cef_utm_webfilter {
+    process validate_fortigate_cef_severity_number
     let activity = switch workspace.cef.act {
         "blocked"     { 2 }
         "block"       { 2 }
@@ -275,6 +299,7 @@ def process parse_fortigate_cef_utm_webfilter {
         category_uid: 6,
         activity_id:  activity,
         severity_number: workspace.cef.severity_number,
+        time:            workspace.cef.time,
         src_endpoint: {
             ip:   workspace.cef.src,
             port: to_int(workspace.cef.spt)
@@ -315,11 +340,13 @@ def process parse_fortigate_cef_utm_webfilter {
 //   FTNTFGTfilename — infected filename
 //   FTNTFGTfilehash — file hash
 def process parse_fortigate_cef_utm_antivirus {
+    process validate_fortigate_cef_severity_number
     workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
         severity_number: workspace.cef.severity_number,
+        time:            workspace.cef.time,
         disposition_id: fortigate_cef_utm_disposition_id(workspace.cef.act),
         finding_info: {
             title:   workspace.cef.FTNTFGTvirus,
@@ -367,11 +394,13 @@ def process parse_fortigate_cef_utm_antivirus {
 // Subtype leaf: utm:dlp → OCSF Detection Finding (2004)
 // ---------------------------------------------------------------------------
 def process parse_fortigate_cef_utm_dlp {
+    process validate_fortigate_cef_severity_number
     workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
         severity_number: workspace.cef.severity_number,
+        time:            workspace.cef.time,
         disposition_id: fortigate_cef_utm_disposition_id(workspace.cef.act),
         finding_info: {
             title: workspace.cef.FTNTFGTfiltername,
@@ -412,11 +441,13 @@ def process parse_fortigate_cef_utm_dlp {
 //
 // Application control: app name + risk level + user.
 def process parse_fortigate_cef_utm_appctrl {
+    process validate_fortigate_cef_severity_number
     workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
         severity_number: workspace.cef.severity_number,
+        time:            workspace.cef.time,
         disposition_id: fortigate_cef_utm_disposition_id(workspace.cef.act),
         finding_info: {
             title: workspace.cef.app,
@@ -452,6 +483,7 @@ def process parse_fortigate_cef_utm_appctrl {
 //
 // FortiGate DNS filter — qname / qtype / response code / verdict.
 def process parse_fortigate_cef_utm_dns {
+    process validate_fortigate_cef_severity_number
     let activity = switch workspace.cef.act {
         "blocked"     { 1 }
         "redirected"  { 1 }
@@ -472,6 +504,7 @@ def process parse_fortigate_cef_utm_dns {
         category_uid: 4,
         activity_id:  activity,
         severity_number: workspace.cef.severity_number,
+        time:            workspace.cef.time,
         rcode_id:     rcode,
         src_endpoint: { ip: workspace.cef.src },
         dst_endpoint: { ip: workspace.cef.dst },
@@ -494,6 +527,7 @@ def process parse_fortigate_cef_utm_dns {
 //
 // FortiGate email filter — sender / recipient / subject / message-id.
 def process parse_fortigate_cef_utm_emailfilter {
+    process validate_fortigate_cef_severity_number
     let activity = switch workspace.cef.act {
         "blocked"     { 6 }
         "quarantined" { 6 }
@@ -505,6 +539,7 @@ def process parse_fortigate_cef_utm_emailfilter {
         category_uid: 4,
         activity_id:  activity,
         severity_number: workspace.cef.severity_number,
+        time:            workspace.cef.time,
         direction_id: 0,
         src_endpoint: { ip: workspace.cef.src },
         dst_endpoint: { ip: workspace.cef.dst },
@@ -529,11 +564,13 @@ def process parse_fortigate_cef_utm_emailfilter {
 //
 // FortiGate Web Application Firewall — signature + matched URL.
 def process parse_fortigate_cef_utm_waf {
+    process validate_fortigate_cef_severity_number
     workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
         severity_number: workspace.cef.severity_number,
+        time:            workspace.cef.time,
         disposition_id: fortigate_cef_utm_disposition_id(workspace.cef.act),
         finding_info: {
             title: workspace.cef.FTNTFGTsignature,
@@ -588,11 +625,13 @@ def process parse_fortigate_cef_utm_waf {
 //   src / spt / dst / dpt / proto / msg — standard CEF
 //   act                  — engine verdict (`info` / `block`)
 def process parse_fortigate_cef_utm_ssl {
+    process validate_fortigate_cef_severity_number
     workspace.lsis.parsed = {
         class_uid:    2004,
         category_uid: 2,
         activity_id:    1,
         severity_number: workspace.cef.severity_number,
+        time:            workspace.cef.time,
         disposition_id: fortigate_cef_utm_disposition_id(workspace.cef.act),
         finding_info: {
             title: workspace.cef.FTNTFGTeventsubtype,
@@ -641,6 +680,7 @@ def process parse_fortigate_cef_utm_ssl {
 //   src / spt / dst / dpt — endpoints (5060 typical for SIP)
 //   proto              — IP proto (17 UDP / 6 TCP)
 def process parse_fortigate_cef_utm_voip {
+    process validate_fortigate_cef_severity_number
     let activity = switch workspace.cef.outcome {
         "start"  { 1 }
         "end"    { 2 }
@@ -651,6 +691,7 @@ def process parse_fortigate_cef_utm_voip {
         category_uid: 4,
         activity_id:  activity,
         severity_number: workspace.cef.severity_number,
+        time:            workspace.cef.time,
         src_endpoint: {
             ip:   workspace.cef.src,
             port: to_int(workspace.cef.spt)
@@ -677,6 +718,7 @@ def process parse_fortigate_cef_utm_voip {
 // Subtype leaf: event:user → OCSF Authentication (3002)
 // ---------------------------------------------------------------------------
 def process parse_fortigate_cef_event_user {
+    process validate_fortigate_cef_severity_number
     let activity = switch workspace.cef.act {
         "login"           { 1 }
         "logon"           { 1 }
@@ -700,6 +742,7 @@ def process parse_fortigate_cef_event_user {
         category_uid: 3,
         activity_id:  activity,
         severity_number: workspace.cef.severity_number,
+        time:            workspace.cef.time,
         status_id:    status,
         user: {
             name: workspace.cef.suser
@@ -720,6 +763,7 @@ def process parse_fortigate_cef_event_user {
 // Subtype leaf: event:vpn → OCSF Authentication (3002)
 // ---------------------------------------------------------------------------
 def process parse_fortigate_cef_event_vpn {
+    process validate_fortigate_cef_severity_number
     let activity = switch workspace.cef.act {
         "tunnel-up"       { 1 }
         "ssl-login-fail"  { 1 }
@@ -737,6 +781,7 @@ def process parse_fortigate_cef_event_vpn {
         category_uid: 3,
         activity_id:  activity,
         severity_number: workspace.cef.severity_number,
+        time:            workspace.cef.time,
         status_id:    status,
         user: {
             name: workspace.cef.suser
@@ -762,11 +807,13 @@ def process parse_fortigate_cef_event_vpn {
 // because they're posture / configuration signals, with `act` carrying
 // the specific event name and `FTNTFGTlogdesc` the human description.
 def process parse_fortigate_cef_event_system {
+    process validate_fortigate_cef_severity_number
     workspace.lsis.parsed = {
         class_uid:    2003,
         category_uid: 2,
         activity_id:  1,
         severity_number: workspace.cef.severity_number,
+        time:            workspace.cef.time,
         finding_info: {
             title: workspace.cef.act,
             desc:  workspace.cef.FTNTFGTlogdesc,
@@ -788,6 +835,7 @@ def process parse_fortigate_cef_event_system {
 // Subtype leaf: event:wireless → OCSF Network Activity (4001)
 // ---------------------------------------------------------------------------
 def process parse_fortigate_cef_event_wireless {
+    process validate_fortigate_cef_severity_number
     let activity = switch workspace.cef.act {
         "client-connect"    { 1 }
         "client-associate"  { 1 }
@@ -800,6 +848,7 @@ def process parse_fortigate_cef_event_wireless {
         category_uid: 4,
         activity_id:  activity,
         severity_number: workspace.cef.severity_number,
+        time:            workspace.cef.time,
         src_endpoint: {
             ip:  workspace.cef.src,
             mac: workspace.cef.FTNTFGTsrcmac
@@ -836,11 +885,13 @@ def process parse_fortigate_cef_event_wireless {
 //   FTNTFGTlowcount       — number of low findings
 //   FTNTFGTpassedcount    — number of passed checks
 def process parse_fortigate_cef_event_security_rating {
+    process validate_fortigate_cef_severity_number
     workspace.lsis.parsed = {
         class_uid:    2003,
         category_uid: 2,
         activity_id:  1,
         severity_number: workspace.cef.severity_number,
+        time:            workspace.cef.time,
         finding_info: {
             title: "Security Rating " + workspace.cef.FTNTFGTauditreporttype,
             uid:   workspace.cef.FTNTFGTauditid,

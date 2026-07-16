@@ -1505,6 +1505,679 @@ def pipeline fortigate_native_otlp {
         compile(&src)
     }
 
+    fn run_packaged_parser_pipeline(
+        parser: &str,
+        setup: Option<&str>,
+        process: &str,
+        ingress: &[u8],
+    ) -> PipelineRunResult {
+        use crate::event::OwnedEvent;
+        use crate::functions::{FunctionRegistry, register_builtins, register_user_functions};
+        use bytes::Bytes;
+        use std::io::Write;
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let snippets = root.join("packaging/snippets");
+        let mut config_file = tempfile::Builder::new()
+            .prefix(".limpid-parser-test-")
+            .tempfile_in(&snippets)
+            .expect("temporary packaged parser config");
+        writeln!(config_file, "include \"parsers/{parser}.limpid\"").expect("write parser include");
+        writeln!(
+            config_file,
+            "def input i {{ type syslog_tcp bind \"127.0.0.1:5514\" }}\n\
+             def output o {{ type stdout }}\n\
+             def pipeline p {{\n\
+                 input i"
+        )
+        .expect("write parser pipeline header");
+        if let Some(setup) = setup {
+            writeln!(config_file, "    process {{ {setup} }}").expect("write parser setup");
+        }
+        writeln!(
+            config_file,
+            "    process {process}\n\
+                 process {{ egress = to_json(workspace.lsis.parsed) }}\n\
+                 output o\n\
+             }}"
+        )
+        .expect("write parser pipeline body");
+        config_file.flush().expect("flush parser config");
+
+        let (config, source_map) = crate::config::load_config_with_source_map(config_file.path())
+            .expect("load packaged parser with include closure");
+        let cfg = CompiledConfig::from_config(config).expect("compile packaged parser");
+        cfg.validate().expect("validate packaged parser pipeline");
+        let diagnostics = crate::check::analyze(&cfg, &source_map);
+        assert!(
+            diagnostics.is_empty(),
+            "packaged parser analyzer diagnostics: {diagnostics:#?}"
+        );
+        let mut funcs = FunctionRegistry::new();
+        register_builtins(&mut funcs, crate::runtime::init_tables(&cfg).unwrap());
+        register_user_functions(&mut funcs, &cfg);
+
+        let event = OwnedEvent::new(
+            Bytes::copy_from_slice(ingress),
+            "127.0.0.1:0".parse().expect("valid test source"),
+        );
+        run_pipeline(
+            cfg.pipelines.get("p").expect("test pipeline"),
+            &event,
+            &cfg,
+            &funcs,
+            None,
+            None,
+            OutputCapturePolicy::CaptureAll,
+            &mut bumpalo::Bump::new(),
+        )
+        .expect("packaged parser pipeline must run")
+    }
+
+    fn run_packaged_parser_json(
+        parser: &str,
+        setup: Option<&str>,
+        process: &str,
+        ingress: &[u8],
+    ) -> serde_json::Value {
+        let result = run_packaged_parser_pipeline(parser, setup, process, ingress);
+        assert_eq!(
+            result.termination,
+            PipelineTermination::Finished,
+            "pipeline errors: {:?}",
+            result.errored
+        );
+        assert_eq!(result.outputs.len(), 1);
+        serde_json::from_slice(&result.outputs[0].1.egress).expect("parser egress must be JSON")
+    }
+
+    fn paloalto_traffic_wire(generate_time: &str) -> Vec<u8> {
+        let mut fields = vec![""; 53];
+        fields[0] = "1";
+        fields[1] = generate_time;
+        fields[2] = "012345678";
+        fields[3] = "TRAFFIC";
+        fields[4] = "end";
+        fields[6] = generate_time;
+        fields[7] = "192.0.2.10";
+        fields[8] = "198.51.100.5";
+        fields[14] = "ssl";
+        fields[24] = "54321";
+        fields[25] = "443";
+        fields[29] = "tcp";
+        fields[30] = "allow";
+        fields[31] = "1536";
+        fields[32] = "1024";
+        fields[33] = "512";
+        fields[34] = "3";
+        fields[35] = generate_time;
+        fields[36] = "60";
+        fields[44] = "2";
+        fields[45] = "1";
+        fields[46] = "aged-out";
+        fields[51] = "vsys1";
+        fields[52] = "fw-pan01";
+        format!("<134>Apr 30 01:23:45 fw-pan01 {}", fields.join(",")).into_bytes()
+    }
+
+    #[test]
+    fn packaged_parsers_preserve_source_event_time_as_nanoseconds() {
+        use chrono::{Datelike, Duration, TimeZone, Timelike, Utc};
+
+        let rfc3164_time = Utc::now() - Duration::days(2);
+        let rfc3164_wire = rfc3164_time.format("%b %e %H:%M:%S").to_string();
+        let rfc3164_expected = Utc
+            .with_ymd_and_hms(
+                rfc3164_time.year(),
+                rfc3164_time.month(),
+                rfc3164_time.day(),
+                rfc3164_time.hour(),
+                rfc3164_time.minute(),
+                rfc3164_time.second(),
+            )
+            .single()
+            .expect("valid RFC 3164 fixture time")
+            .timestamp_nanos_opt()
+            .expect("fixture fits i64");
+
+        let asa = run_packaged_parser_json(
+            "parse_asa",
+            Some("workspace.asa = { timezone: \"UTC\" }"),
+            "parse_asa",
+            format!(
+                "<165>{rfc3164_wire} fw-asa01 : %ASA-6-605005: Login permitted from 192.0.2.10/54321 to outside:198.51.100.5/SSH for user admin"
+            )
+            .as_bytes(),
+        );
+        assert_eq!(asa["time"], rfc3164_expected);
+
+        let auditd = run_packaged_parser_json(
+            "parse_auditd",
+            Some("workspace.auditd = { body: ingress }"),
+            "parse_auditd",
+            b"type=USER_LOGIN msg=audit(1710000000.123:1): pid=42 uid=0 auid=1000 ses=1 res=success acct=alice addr=192.0.2.10 terminal=pts/0 exe=/usr/bin/login",
+        );
+        assert_eq!(auditd["time"], 1_710_000_000_123_000_000_i64);
+
+        let bind = run_packaged_parser_json(
+            "parse_bind",
+            Some(
+                "workspace.bind = { body: ingress, hostname: \"dns01\", timezone: \"Asia/Tokyo\" }",
+            ),
+            "parse_bind",
+            b"30-Apr-2026 10:23:45.123 client @0x1 192.0.2.10#54321 (example.com): query: example.com IN A +E(0) (198.51.100.53)",
+        );
+        assert_eq!(bind["time"], 1_777_512_225_123_000_000_i64);
+
+        let checkpoint_leef = run_packaged_parser_json(
+            "parse_checkpoint_leef",
+            Some("workspace.checkpoint_leef = { body: ingress }"),
+            "parse_checkpoint_leef",
+            b"<14>1 2026-04-30T01:23:45.123456789Z cpgw01 CheckPoint - - LEEF:2.0|Check Point|VPN-1 & FireWall-1|R81|Accept|src=192.0.2.10\tdst=198.51.100.5\tsrcPort=51234\tdstPort=443\tproto=tcp\taction=Accept",
+        );
+        assert_eq!(checkpoint_leef["time"], 1_777_512_225_123_456_789_i64);
+
+        let checkpoint_syslog = run_packaged_parser_json(
+            "parse_checkpoint_syslog",
+            Some("workspace.checkpoint_syslog = { body: ingress }"),
+            "parse_checkpoint_syslog",
+            b"<14>1 2026-04-30T01:23:45.123456789Z cpgw01 CheckPoint - - [action:\"Accept\"; src:\"192.0.2.10\"; dst:\"198.51.100.5\"; service:\"443\"; proto:\"tcp\"; product:\"VPN-1 & FireWall-1\"; severity:\"Low\"]",
+        );
+        assert_eq!(checkpoint_syslog["time"], 1_777_512_225_123_456_789_i64);
+
+        let fortigate_cef = run_packaged_parser_json(
+            "parse_fortigate_cef",
+            Some("workspace.fortigate_cef = { timezone: \"UTC\" }"),
+            "parse_fortigate_cef",
+            format!(
+                "<129>{rfc3164_wire} fw01 CEF:0|Fortinet|Fortigate|v7.4.11|16384|utm:ips signature|7|cat=utm:ips src=192.0.2.10 dst=198.51.100.5 proto=6 act=detected FTNTFGTattack=test FTNTFGTattackid=42"
+            )
+            .as_bytes(),
+        );
+        assert_eq!(fortigate_cef["time"], rfc3164_expected);
+
+        let fortigate_native = run_packaged_parser_json(
+            "parse_fortigate_syslog",
+            None,
+            "parse_fortigate_syslog",
+            b"<134>eventtime=1777284000123456789 level=notice type=traffic subtype=forward srcip=192.0.2.10 dstip=198.51.100.5 proto=6 action=accept",
+        );
+        assert_eq!(fortigate_native["time"], 1_777_284_000_123_456_789_i64);
+
+        let juniper_sd = run_packaged_parser_json(
+            "parse_juniper_srx_sd_syslog",
+            Some("workspace.juniper_srx_sd_syslog = { body: ingress }"),
+            "parse_juniper_srx_sd_syslog",
+            b"<14>1 2026-04-30T01:23:45.123456789Z srx01 RT_FLOW - RT_FLOW_SESSION_CREATE [junos@2636 source-address=\"192.0.2.10\" source-port=\"54321\" destination-address=\"198.51.100.5\" destination-port=\"443\" protocol-id=\"6\" policy-name=\"allow-web\"]",
+        );
+        assert_eq!(juniper_sd["time"], 1_777_512_225_123_456_789_i64);
+
+        let juniper_legacy = run_packaged_parser_json(
+            "parse_juniper_srx_syslog",
+            Some(
+                "workspace.juniper_srx_syslog = { body: ingress, timezone: \"UTC\" }",
+            ),
+            "parse_juniper_srx_syslog",
+            format!(
+                "<14>{rfc3164_wire} srx01 RT_IDP: IDP_ATTACK_LOG_EVENT: IDP: at 1778905950, SIG Attack log <198.51.100.10/63074->192.0.2.100/445> for TCP protocol and service SERVICE_IDP application SMB by rule Tap of rulebase IPS in policy Tap. attack: id=19519, repeat=0, action=DROP, threat-severity=HIGH, name=Example, NAT <198.51.100.10:0->0.0.0.0:0>"
+            )
+            .as_bytes(),
+        );
+        assert_eq!(juniper_legacy["time"], rfc3164_expected);
+
+        let nsp = run_packaged_parser_json(
+            "parse_nsp",
+            Some(
+                "workspace.nsp = { body: ingress, hostname: \"nsp01\", timezone: \"+09:00\" }",
+            ),
+            "parse_nsp",
+            b"admin_domain=Default alert_id=12345 alert_type=Signature app_protocol=HTTP confidence=Tentative attack_count=1 attack_id=42 attack_name=Example severity=High alert_signature=SIG attack_time=2026-05-16 10:00:00 category=Exploit dest_ip=192.0.2.10 dest_name=web01 dest_port=80 device_name=nsp01 direction=Inbound confidence= file_name= file_hash= file_type= virus_name= action_status= error_status= protocol=TCP result=Blocked src_ip=198.51.100.5 src_name= src_port=54321",
+        );
+        let nsp_expected = Utc
+            .with_ymd_and_hms(2026, 5, 16, 1, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_nanos_opt()
+            .unwrap();
+        assert_eq!(nsp["time"], nsp_expected);
+
+        let paloalto_cef = run_packaged_parser_json(
+            "parse_paloalto_cef",
+            Some("workspace.paloalto_cef = { timezone: \"UTC\" }"),
+            "parse_paloalto_cef",
+            format!(
+                "<134>{rfc3164_wire} fw-pan01 CEF:0|Palo Alto Networks|PAN-OS|10.2.0|end|TRAFFIC|3|src=192.0.2.10 dst=198.51.100.5 proto=tcp act=allow"
+            )
+            .as_bytes(),
+        );
+        assert_eq!(paloalto_cef["time"], rfc3164_expected);
+
+        let paloalto_native_wire = paloalto_traffic_wire("2026/04/30 10:23:45");
+        let paloalto_native = run_packaged_parser_json(
+            "parse_paloalto_syslog",
+            Some("workspace.paloalto_syslog = { timezone: \"Asia/Tokyo\" }"),
+            "parse_paloalto_syslog",
+            &paloalto_native_wire,
+        );
+        assert_eq!(paloalto_native["time"], 1_777_512_225_000_000_000_i64);
+
+        let sysmon = run_packaged_parser_json(
+            "parse_sysmon",
+            Some("workspace.sysmon = { body: parse_json(ingress) }"),
+            "parse_sysmon",
+            br#"{"EventID":11,"EventTime":"2026-04-30T01:23:45.123456789Z","Computer":"host01","EventData":{"TargetFilename":"C:\\Temp\\x.txt","User":"alice","Image":"C:\\Windows\\cmd.exe","ProcessId":"42"}}"#,
+        );
+        assert_eq!(sysmon["time"], 1_777_512_225_123_456_789_i64);
+
+        let vpc = run_packaged_parser_json(
+            "parse_aws_vpc_flow",
+            None,
+            "parse_aws_vpc_flow",
+            b"2 123456789012 eni-0a1b2c3d4e5f6a7b8 192.0.2.10 198.51.100.5 54321 443 6 10 4000 1714000000 1714000060 ACCEPT OK",
+        );
+        assert_eq!(vpc["time"], 1_714_000_000_000_000_000_i64);
+        assert_eq!(vpc["start_time"], vpc["time"]);
+        assert_eq!(vpc["end_time"], 1_714_000_060_000_000_000_i64);
+    }
+
+    #[test]
+    fn offsetless_source_times_use_vendor_defaults_and_timezone_overrides() {
+        use chrono::TimeZone;
+
+        if std::env::var_os("LIMPID_SYSTEM_TZ_TEST_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("pipeline::tests::offsetless_source_times_use_vendor_defaults_and_timezone_overrides")
+                .env("LIMPID_SYSTEM_TZ_TEST_CHILD", "1")
+                .env("TZ", "America/New_York")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let bind_default_timezone = run_packaged_parser_json(
+            "parse_bind",
+            Some("workspace.bind = { body: ingress }"),
+            "parse_bind",
+            b"30-Apr-2026 10:23:45.123 client @0x1 192.0.2.10#54321 (example.com): query: example.com IN A +E(0) (198.51.100.53)",
+        );
+        let bind_default_expected = chrono_tz::America::New_York
+            .with_ymd_and_hms(2026, 4, 30, 10, 23, 45)
+            .single()
+            .unwrap()
+            .timestamp_nanos_opt()
+            .unwrap()
+            + 123_000_000;
+        assert_eq!(bind_default_timezone["time"], bind_default_expected);
+
+        let bind_override = run_packaged_parser_json(
+            "parse_bind",
+            Some("workspace.bind = { body: ingress, timezone: \"UTC\" }"),
+            "parse_bind",
+            b"30-Apr-2026 10:23:45.123 client @0x1 192.0.2.10#54321 (example.com): query: example.com IN A +E(0) (198.51.100.53)",
+        );
+        let bind_override_expected = chrono::Utc
+            .with_ymd_and_hms(2026, 4, 30, 10, 23, 45)
+            .single()
+            .unwrap()
+            .timestamp_nanos_opt()
+            .unwrap()
+            + 123_000_000;
+        assert_eq!(bind_override["time"], bind_override_expected);
+
+        let nsp_body = b"admin_domain=Default alert_id=12345 alert_type=Signature app_protocol=HTTP confidence=Tentative attack_count=1 attack_id=42 attack_name=Example severity=High alert_signature=SIG attack_time=2026-05-16 10:00:00 category=Exploit dest_ip=192.0.2.10 dest_name=web01 dest_port=80 device_name=nsp01 direction=Inbound confidence= file_name= file_hash= file_type= virus_name= action_status= error_status= protocol=TCP result=Blocked src_ip=198.51.100.5 src_name= src_port=54321";
+        let nsp_default_timezone = run_packaged_parser_json(
+            "parse_nsp",
+            Some("workspace.nsp = { body: ingress }"),
+            "parse_nsp",
+            nsp_body,
+        );
+        let nsp_utc_expected = chrono::Utc
+            .with_ymd_and_hms(2026, 5, 16, 10, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_nanos_opt()
+            .unwrap();
+        assert_eq!(nsp_default_timezone["time"], nsp_utc_expected);
+
+        let nsp_override = run_packaged_parser_json(
+            "parse_nsp",
+            Some("workspace.nsp = { body: ingress, timezone: \"America/New_York\" }"),
+            "parse_nsp",
+            nsp_body,
+        );
+        let nsp_override_expected = chrono_tz::America::New_York
+            .with_ymd_and_hms(2026, 5, 16, 10, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp_nanos_opt()
+            .unwrap();
+        assert_eq!(nsp_override["time"], nsp_override_expected);
+
+        let nsp_explicit_utc = run_packaged_parser_json(
+            "parse_nsp",
+            Some("workspace.nsp = { body: ingress }"),
+            "parse_nsp",
+            b"admin_domain=Default alert_id=12345 alert_type=Signature app_protocol=HTTP confidence=Tentative attack_count=1 attack_id=42 attack_name=Example severity=High alert_signature=SIG attack_time=2026-05-16 10:00:00 UTC category=Exploit dest_ip=192.0.2.10 dest_name=web01 dest_port=80 device_name=nsp01 direction=Inbound confidence= file_name= file_hash= file_type= virus_name= action_status= error_status= protocol=TCP result=Blocked src_ip=198.51.100.5 src_name= src_port=54321",
+        );
+        assert_eq!(nsp_explicit_utc["time"], nsp_utc_expected);
+
+        let paloalto_wire = paloalto_traffic_wire("2026/04/30 10:23:45");
+        let paloalto_default_timezone = run_packaged_parser_json(
+            "parse_paloalto_syslog",
+            None,
+            "parse_paloalto_syslog",
+            &paloalto_wire,
+        );
+        let paloalto_utc_expected = chrono::Utc
+            .with_ymd_and_hms(2026, 4, 30, 10, 23, 45)
+            .single()
+            .unwrap()
+            .timestamp_nanos_opt()
+            .unwrap();
+        assert_eq!(paloalto_default_timezone["time"], paloalto_utc_expected);
+
+        let paloalto_override = run_packaged_parser_json(
+            "parse_paloalto_syslog",
+            Some("workspace.paloalto_syslog = { timezone: \"America/New_York\" }"),
+            "parse_paloalto_syslog",
+            &paloalto_wire,
+        );
+        let paloalto_override_expected = chrono_tz::America::New_York
+            .with_ymd_and_hms(2026, 4, 30, 10, 23, 45)
+            .single()
+            .unwrap()
+            .timestamp_nanos_opt()
+            .unwrap();
+        assert_eq!(paloalto_override["time"], paloalto_override_expected);
+
+        for (parser, setup, process, ingress) in [
+            (
+                "parse_bind",
+                "workspace.bind = { body: ingress, timezone: \"Not/AZone\" }",
+                "parse_bind",
+                b"30-Apr-2026 10:23:45.123 client @0x1 192.0.2.10#54321 (example.com): query: example.com IN A +E(0) (198.51.100.53)".as_slice(),
+            ),
+            (
+                "parse_nsp",
+                "workspace.nsp = { body: ingress, timezone: \"Not/AZone\" }",
+                "parse_nsp",
+                nsp_body.as_slice(),
+            ),
+            (
+                "parse_paloalto_syslog",
+                "workspace.paloalto_syslog = { timezone: \"Not/AZone\" }",
+                "parse_paloalto_syslog",
+                paloalto_wire.as_slice(),
+            ),
+            (
+                "parse_bind",
+                "workspace.bind = { body: ingress, timezone: \"local\" }",
+                "parse_bind",
+                b"30-Apr-2026 10:23:45.123 client @0x1 192.0.2.10#54321 (example.com): query: example.com IN A +E(0) (198.51.100.53)".as_slice(),
+            ),
+            (
+                "parse_nsp",
+                "workspace.nsp = { body: ingress, timezone: \"local\" }",
+                "parse_nsp",
+                nsp_body.as_slice(),
+            ),
+            (
+                "parse_paloalto_syslog",
+                "workspace.paloalto_syslog = { timezone: \"local\" }",
+                "parse_paloalto_syslog",
+                paloalto_wire.as_slice(),
+            ),
+        ] {
+            let result = run_packaged_parser_pipeline(parser, Some(setup), process, ingress);
+            assert_eq!(result.termination, PipelineTermination::Errored);
+            assert!(result.outputs.is_empty());
+            assert_eq!(result.errored.len(), 1);
+            let reason = match &result.errored[0] {
+                ErroredEventContext::Process { reason, .. } => reason,
+                other => panic!("expected process error, got {other:?}"),
+            };
+            assert!(reason.contains("timezone"), "error was {reason:?}");
+        }
+    }
+
+    #[test]
+    fn rfc3164_source_times_use_vendor_defaults_and_timezone_overrides() {
+        use chrono::{Datelike, Duration, TimeZone, Timelike, Utc};
+
+        if std::env::var_os("LIMPID_SYSTEM_TZ_TEST_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("pipeline::tests::rfc3164_source_times_use_vendor_defaults_and_timezone_overrides")
+                .env("LIMPID_SYSTEM_TZ_TEST_CHILD", "1")
+                .env("TZ", "America/New_York")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let source_time = Utc::now() - Duration::days(2);
+        let wire_time = source_time.format("%b %e %H:%M:%S").to_string();
+        let expected = Utc
+            .with_ymd_and_hms(
+                source_time.year(),
+                source_time.month(),
+                source_time.day(),
+                source_time.hour(),
+                source_time.minute(),
+                source_time.second(),
+            )
+            .single()
+            .unwrap()
+            .timestamp_nanos_opt()
+            .unwrap();
+        let local_expected = chrono_tz::America::New_York
+            .with_ymd_and_hms(
+                source_time.year(),
+                source_time.month(),
+                source_time.day(),
+                source_time.hour(),
+                source_time.minute(),
+                source_time.second(),
+            )
+            .single()
+            .unwrap()
+            .timestamp_nanos_opt()
+            .unwrap();
+
+        let cases = [
+            (
+                "parse_asa",
+                "workspace.asa = { timezone: \"UTC\" }",
+                "workspace.asa = { timezone: \"Not/AZone\" }",
+                "workspace.asa = { timezone: \"local\" }",
+                format!(
+                    "<165>{wire_time} fw-asa01 : %ASA-6-605005: Login permitted from 192.0.2.10/54321 to outside:198.51.100.5/SSH for user admin"
+                )
+                .into_bytes(),
+            ),
+            (
+                "parse_fortigate_cef",
+                "workspace.fortigate_cef = { timezone: \"UTC\" }",
+                "workspace.fortigate_cef = { timezone: \"Not/AZone\" }",
+                "workspace.fortigate_cef = { timezone: \"local\" }",
+                format!(
+                    "<129>{wire_time} fw01 CEF:0|Fortinet|Fortigate|v7.4.11|16384|utm:ips signature|7|cat=utm:ips src=192.0.2.10 dst=198.51.100.5 proto=6 act=detected FTNTFGTattack=test FTNTFGTattackid=42"
+                )
+                .into_bytes(),
+            ),
+            (
+                "parse_juniper_srx_syslog",
+                "workspace.juniper_srx_syslog = { body: ingress, timezone: \"UTC\" }",
+                "workspace.juniper_srx_syslog = { body: ingress, timezone: \"Not/AZone\" }",
+                "workspace.juniper_srx_syslog = { body: ingress, timezone: \"local\" }",
+                format!(
+                    "<14>{wire_time} srx01 RT_IDP: IDP_ATTACK_LOG_EVENT: IDP: at 1778905950, SIG Attack log <198.51.100.10/63074->192.0.2.100/445> for TCP protocol and service SERVICE_IDP application SMB by rule Tap of rulebase IPS in policy Tap. attack: id=19519, repeat=0, action=DROP, threat-severity=HIGH, name=Example, NAT <198.51.100.10:0->0.0.0.0:0>"
+                )
+                .into_bytes(),
+            ),
+            (
+                "parse_paloalto_cef",
+                "workspace.paloalto_cef = { timezone: \"UTC\" }",
+                "workspace.paloalto_cef = { timezone: \"Not/AZone\" }",
+                "workspace.paloalto_cef = { timezone: \"local\" }",
+                format!(
+                    "<134>{wire_time} fw-pan01 CEF:0|Palo Alto Networks|PAN-OS|10.2.0|end|TRAFFIC|3|src=192.0.2.10 dst=198.51.100.5 proto=tcp act=allow"
+                )
+                .into_bytes(),
+            ),
+        ];
+
+        for (parser, supplied_setup, invalid_setup, local_setup, ingress) in cases {
+            let supplied = run_packaged_parser_json(parser, Some(supplied_setup), parser, &ingress);
+            assert_eq!(supplied["time"], expected, "{parser} supplied timezone");
+
+            let default_setup = match parser {
+                "parse_juniper_srx_syslog" => {
+                    Some("workspace.juniper_srx_syslog = { body: ingress }")
+                }
+                _ => None,
+            };
+            let defaulted = run_packaged_parser_json(parser, default_setup, parser, &ingress);
+            let default_expected = match parser {
+                "parse_fortigate_cef" | "parse_juniper_srx_syslog" => local_expected,
+                "parse_asa" | "parse_paloalto_cef" => expected,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                defaulted["time"], default_expected,
+                "{parser} default timezone"
+            );
+
+            for invalid_setup in [invalid_setup, local_setup] {
+                let invalid =
+                    run_packaged_parser_pipeline(parser, Some(invalid_setup), parser, &ingress);
+                assert_eq!(
+                    invalid.termination,
+                    PipelineTermination::Errored,
+                    "{parser}"
+                );
+                assert!(
+                    invalid.outputs.is_empty(),
+                    "{parser} emitted invalid timezone"
+                );
+                let reason = match &invalid.errored[0] {
+                    ErroredEventContext::Process { reason, .. } => reason,
+                    other => panic!("expected process error, got {other:?}"),
+                };
+                assert!(reason.contains("timezone"), "{parser}: {reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn time_normalization_runs_at_public_leaf_boundaries() {
+        let auditd = run_packaged_parser_json(
+            "parse_auditd",
+            Some(
+                "workspace.auditd = { body: ingress }; workspace.auditd_class = parse_auditd_classify(workspace.auditd.body)",
+            ),
+            "parse_auditd_auth_dispatch",
+            b"type=USER_LOGIN msg=audit(1710000000.123:1): pid=42 uid=0 auid=1000 ses=1 res=success acct=alice addr=192.0.2.10 terminal=pts/0 exe=/usr/bin/login",
+        );
+        assert_eq!(auditd["time"], 1_710_000_000_123_000_000_i64);
+
+        let juniper = run_packaged_parser_json(
+            "parse_juniper_srx_sd_syslog",
+            Some(
+                "workspace.juniper_srx_sd_syslog = { body: ingress }; workspace.srx_sd_class = parse_juniper_srx_sd_syslog_classify(workspace.juniper_srx_sd_syslog.body)",
+            ),
+            "parse_juniper_srx_sd_syslog_flow_create",
+            b"<14>1 2026-04-30T01:23:45.123456789Z srx01 RT_FLOW - RT_FLOW_SESSION_CREATE [junos@2636 source-address=\"192.0.2.10\" source-port=\"54321\" destination-address=\"198.51.100.5\" destination-port=\"443\" protocol-id=\"6\" policy-name=\"allow-web\"]",
+        );
+        assert_eq!(juniper["time"], 1_777_512_225_123_456_789_i64);
+    }
+
+    #[test]
+    fn packaged_parser_public_leaves_reject_invalid_source_severity() {
+        let cases = [
+            (
+                "parse_asa",
+                "workspace.asa = { level: \"8\", body: \"Login permitted from 192.0.2.10/54321 to outside:198.51.100.5/SSH for user admin\" }",
+                "parse_asa_605005_login_permitted",
+                "invalid ASA payload severity level 8",
+            ),
+            (
+                "parse_aws_guardduty",
+                "workspace.gd = { type: \"Recon:EC2/Test\", severity: 11 }; workspace.gd_type = aws_guardduty_split_type(workspace.gd.type); workspace.gd_tactic = \"Reconnaissance\"",
+                "parse_aws_guardduty_finding",
+                "invalid GuardDuty severity 11",
+            ),
+            (
+                "parse_azure_activity",
+                "workspace.az = { level: \"TRACE\" }",
+                "parse_azure_activity_record",
+                "invalid Azure Activity Log level TRACE",
+            ),
+            (
+                "parse_fortigate_cef",
+                "workspace.cef = { severity: 0 }",
+                "parse_fortigate_cef_traffic",
+                "invalid FortiGate CEF priority 0",
+            ),
+            (
+                "parse_okta_system",
+                "workspace.okta = { severity: \"TRACE\" }",
+                "parse_okta_user_authentication",
+                "invalid Okta System Log severity TRACE",
+            ),
+            (
+                "parse_winevent_json",
+                "workspace.winevent = { EventType: \"TRACE\" }",
+                "parse_winevent_4624_logon_success",
+                "invalid NXLog Windows Event severity TRACE",
+            ),
+        ];
+
+        for (parser, setup, process, expected_error) in cases {
+            let result = run_packaged_parser_pipeline(parser, Some(setup), process, b"fixture");
+            assert_eq!(
+                result.termination,
+                PipelineTermination::Errored,
+                "{parser}:{process} unexpectedly succeeded"
+            );
+            assert!(
+                result.outputs.is_empty(),
+                "{parser}:{process} emitted output"
+            );
+            assert_eq!(result.errored.len(), 1);
+            let reason = match &result.errored[0] {
+                ErroredEventContext::Process { reason, .. } => reason,
+                other => panic!("expected process error, got {other:?}"),
+            };
+            assert!(
+                reason.contains(expected_error),
+                "{parser}:{process} error was {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn packaged_fortigate_dns_uses_rcode_not_error() {
+        let with_rcode = run_packaged_parser_json(
+            "parse_fortigate_syslog",
+            None,
+            "parse_fortigate_syslog",
+            b"<134>eventtime=1777284000123456789 level=notice type=utm subtype=dns action=blocked srcip=192.0.2.10 dstip=198.51.100.5 qname=example.test qtype=A rcode=NXDOMAIN error=SERVFAIL",
+        );
+        assert_eq!(with_rcode["rcode_id"], 3);
+
+        let without_rcode = run_packaged_parser_json(
+            "parse_fortigate_syslog",
+            None,
+            "parse_fortigate_syslog",
+            b"<134>eventtime=1777284000123456789 level=notice type=utm subtype=dns action=blocked srcip=192.0.2.10 dstip=198.51.100.5 qname=example.test qtype=A error=NXDOMAIN",
+        );
+        assert!(without_rcode["rcode_id"].is_null());
+    }
+
     fn run_packaged_otlp_composer(
         cfg: &CompiledConfig,
         funcs: &FunctionRegistry,
@@ -1936,7 +2609,7 @@ def pipeline fortigate_native_otlp {
         let received_at = chrono::DateTime::from_timestamp(1_784_073_600, 123_456_789)
             .expect("valid receive timestamp");
 
-        let traffic_wire = br#"<0>date=2026-04-27 time=10:00:00 devname="fw01" devid="FGT-001" osname="FortiOS 7.4" level="notice" type="traffic" subtype="forward" srcip=192.0.2.10 srcport=54321 src_port=54322 dstip=198.51.100.5 dstport=443 dst_port=444 proto=6 action="accept" sentbyte=1024 rcvdbyte=512"#;
+        let traffic_wire = br#"<0>eventtime=1777284000123456789 date=2026-04-27 time=10:00:00 devname="fw01" devid="FGT-001" osname="FortiOS 7.4" level="notice" type="traffic" subtype="forward" srcip=192.0.2.10 srcport=54321 src_port=54322 dstip=198.51.100.5 dstport=443 dst_port=444 proto=6 action="accept" sentbyte=1024 rcvdbyte=512"#;
         let traffic = run_packaged_otlp_resource_logs_at(
             &cfg,
             &funcs,
@@ -1973,6 +2646,7 @@ def pipeline fortigate_native_otlp {
         assert!(otlp_string_attribute(resource_attributes, "telemetry.sdk.version").is_some());
         assert!(traffic.scope_logs[0].scope.is_none());
         let traffic_record = &traffic.scope_logs[0].log_records[0];
+        assert_eq!(traffic_record.time_unix_nano, 1_777_284_000_123_456_789);
         assert_eq!(traffic_record.severity_number, 10);
         assert_eq!(traffic_record.severity_text, "notice");
         assert_eq!(
@@ -2041,7 +2715,7 @@ def pipeline fortigate_native_otlp {
             Some(any_value::Value::StringValue(body)) if body.as_bytes() == &traffic_wire[3..]
         ));
 
-        let ips_wire = br#"<191>date=2026-04-27 time=10:01:00 devname="fw02" devid="FGT-002" level="error" type="utm" subtype="ips" action="blocked" attack="Example exploit" attackid="4242" srcip=192.0.2.20 srcport=40000 dstip=198.51.100.20 dstport=443 proto=6 msg="blocked exploit""#;
+        let ips_wire = br#"<191>eventtime=1777284060987654321 date=2026-04-27 time=10:01:00 devname="fw02" devid="FGT-002" level="error" type="utm" subtype="ips" action="blocked" attack="Example exploit" attackid="4242" srcip=192.0.2.20 srcport=40000 dstip=198.51.100.20 dstport=443 proto=6 msg="blocked exploit""#;
         let ips = run_packaged_otlp_resource_logs_at(
             &cfg,
             &funcs,
@@ -2051,6 +2725,7 @@ def pipeline fortigate_native_otlp {
             received_at,
         );
         let ips_record = &ips.scope_logs[0].log_records[0];
+        assert_eq!(ips_record.time_unix_nano, 1_777_284_060_987_654_321);
         assert_eq!(ips_record.severity_number, 17);
         assert_eq!(ips_record.severity_text, "error");
         assert_eq!(

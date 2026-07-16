@@ -2,6 +2,14 @@
 //              dispatched by the positional Type field.
 // Reads:       ingress (raw wire) — syslog-wrapped positional CSV
 //              (FUTURE_USE,RecvTime,Serial,Type,Subtype,...)
+//              workspace.paloalto_syslog.timezone (optional, String) — source
+//              timezone override as an IANA name or fixed offset; legacy
+//              Receive/Generated Time defaults to UTC when absent
+//              (PAN-OS defines Receive/Generated Time meanings but gives a
+//              zone only for the separate high-resolution timestamp)
+//              https://docs.paloaltonetworks.com/ngfw/administration/monitoring/use-syslog-for-monitoring/syslog-field-descriptions/traffic-log-fields
+//              UTC is the intentional pack default; override this slot or use
+//              a custom parser when the source zone is known to differ.
 // Writes:      workspace.lsis.parsed.* — TRAFFIC → 4001, THREAT → 2004
 //              (url → 6004, wildfire → 2004), GLOBALPROTECT /
 //              AUTHENTICATION → 3002; see the subtype leaves below.
@@ -36,7 +44,7 @@
 //      schema and maps to canonical workspace.lsis.parsed.
 //
 // Sample input (RFC 3164 syslog wrapper around CSV, TRAFFIC):
-//   <134>Apr 27 10:00:00 fw-pan01 1,2026-04-27 10:00:00,012345678,TRAFFIC,end,2049,2026-04-27 10:00:00,192.0.2.10,198.51.100.5,...
+//   <134>Apr 27 10:00:00 fw-pan01 1,2026/04/27 10:00:00,012345678,TRAFFIC,end,2049,2026/04/27 10:00:00,192.0.2.10,198.51.100.5,...
 
 // ---------------------------------------------------------------------------
 // Vendor-specific mapping helpers (PAN-OS dialect)
@@ -71,6 +79,24 @@ def process parse_paloalto_syslog_normalize_threat_severity {
                 number: severity_number,
                 text:   severity
             }
+        }
+    }
+}
+
+def process parse_paloalto_syslog_normalize_time {
+    switch workspace.paloalto_syslog.timezone {
+        "local" { error "parse_paloalto_syslog: source timezone must be an IANA name or fixed offset, not local" }
+    }
+    let source_timezone = coalesce(workspace.paloalto_syslog.timezone, "UTC")
+    workspace.paloalto_syslog.time = switch true {
+        workspace.pan.GenerateTime == null { null }
+        workspace.pan.GenerateTime == ""   { null }
+        default {
+            to_int(strptime(
+                workspace.pan.GenerateTime,
+                "%Y/%m/%d %H:%M:%S",
+                source_timezone
+            ))
         }
     }
 }
@@ -203,10 +229,12 @@ def process parse_paloalto_syslog_traffic {
         "VirtualSystemName", // 52
         "DeviceName"         // 53
     ])
+    process parse_paloalto_syslog_normalize_time
     workspace.lsis.parsed = {
         class_uid:    4001,
         category_uid: 4,
         activity_id:  paloalto_syslog_traffic_action_to_activity_id(workspace.pan.Action),
+        time:         workspace.paloalto_syslog.time,
         src_endpoint: {
             ip:       workspace.pan.SourceAddress,
             port:     to_int(workspace.pan.SourcePort),
@@ -346,6 +374,7 @@ def process parse_paloalto_syslog_threat {
 // ---------------------------------------------------------------------------
 def process parse_paloalto_syslog_threat_url {
     process parse_paloalto_syslog_normalize_threat_severity
+    process parse_paloalto_syslog_normalize_time
     let activity = switch workspace.pan.Action {
         "block-url"    { 2 }
         "block"        { 2 }
@@ -366,6 +395,7 @@ def process parse_paloalto_syslog_threat_url {
         activity_id:     activity,
         severity_number: workspace.paloalto_syslog_severity.number,
         severity:        workspace.paloalto_syslog_severity.text,
+        time:            workspace.paloalto_syslog.time,
         src_endpoint: {
             ip:   workspace.pan.SourceAddress,
             port: to_int(workspace.pan.SourcePort)
@@ -403,12 +433,14 @@ def process parse_paloalto_syslog_threat_url {
 // ---------------------------------------------------------------------------
 def process parse_paloalto_syslog_threat_wildfire {
     process parse_paloalto_syslog_normalize_threat_severity
+    process parse_paloalto_syslog_normalize_time
     workspace.lsis.parsed = {
         class_uid:       2004,
         category_uid:    2,
         activity_id:     1,
         severity_number: workspace.paloalto_syslog_severity.number,
         severity:        workspace.paloalto_syslog_severity.text,
+        time:            workspace.paloalto_syslog.time,
         disposition_id: paloalto_syslog_threat_disposition_id(workspace.pan.Action),
         finding_info: {
             title: workspace.pan.ThreatName,
@@ -453,12 +485,14 @@ def process parse_paloalto_syslog_threat_wildfire {
 // ---------------------------------------------------------------------------
 def process parse_paloalto_syslog_threat_virus {
     process parse_paloalto_syslog_normalize_threat_severity
+    process parse_paloalto_syslog_normalize_time
     workspace.lsis.parsed = {
         class_uid:       2004,
         category_uid:    2,
         activity_id:     1,
         severity_number: workspace.paloalto_syslog_severity.number,
         severity:        workspace.paloalto_syslog_severity.text,
+        time:            workspace.paloalto_syslog.time,
         disposition_id: paloalto_syslog_threat_disposition_id(workspace.pan.Action),
         finding_info: {
             title: workspace.pan.ThreatName,
@@ -503,12 +537,14 @@ def process parse_paloalto_syslog_threat_virus {
 // ---------------------------------------------------------------------------
 def process parse_paloalto_syslog_threat_generic {
     process parse_paloalto_syslog_normalize_threat_severity
+    process parse_paloalto_syslog_normalize_time
     workspace.lsis.parsed = {
         class_uid:       2004,
         category_uid:    2,
         activity_id:     1,
         severity_number: workspace.paloalto_syslog_severity.number,
         severity:        workspace.paloalto_syslog_severity.text,
+        time:            workspace.paloalto_syslog.time,
         disposition_id: paloalto_syslog_threat_disposition_id(workspace.pan.Action),
         finding_info: {
             title: workspace.pan.ThreatName,
@@ -574,6 +610,7 @@ def process parse_paloalto_syslog_globalprotect {
         "ErrorCode",        // 27
         "Description"       // 28
     ])
+    process parse_paloalto_syslog_normalize_time
     let activity = switch workspace.pan.Stage {
         "before-login"  { 1 }
         "login"         { 1 }
@@ -593,6 +630,7 @@ def process parse_paloalto_syslog_globalprotect {
         category_uid: 3,
         activity_id:  activity,
         status_id:    status,
+        time:         workspace.paloalto_syslog.time,
         user: {
             name: workspace.pan.SourceUser
         },
@@ -656,6 +694,7 @@ def process parse_paloalto_syslog_authentication {
         "DeviceName",        // 29
         "SourceAddress"      // 30
     ])
+    process parse_paloalto_syslog_normalize_time
     let status = switch workspace.pan.EventType {
         "success" { 1 }
         "failure" { 2 }
@@ -666,6 +705,7 @@ def process parse_paloalto_syslog_authentication {
         category_uid: 3,
         activity_id:  1,
         status_id:    status,
+        time:         workspace.paloalto_syslog.time,
         user: {
             name: workspace.pan.SourceUser
         },

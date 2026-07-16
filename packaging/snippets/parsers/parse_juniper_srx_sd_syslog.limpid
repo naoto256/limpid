@@ -3,7 +3,6 @@
 // Reads:       workspace.juniper_srx_sd_syslog.* (bridge — see Bridges below)
 //                .body (required, String) — the full RFC 5424 wire INCLUDING the leading `<PRI>1`
 //                .hostname (optional, String) — collector-side override (parser prefers the wire's HOSTNAME field via classify)
-//                .time (optional, Int) — epoch nanoseconds of arrival
 // Writes:      workspace.lsis.parsed.* — RT_FLOW / APPTRACK → 4001, RT_IDP / RT_IDS /
 //              RT_UTM (AV, antispam, content-filter) / RT_AAMW / RT_SECINTEL →
 //              2004, RT_UTM WEBFILTER_URL_* → 4002. Per-daemon table below.
@@ -32,10 +31,10 @@
 //           lives entirely in SD. Two typical bridges:
 //
 //           - syslog (UDP/TCP):
-//                 { workspace.juniper_srx_sd_syslog = { body: ingress, hostname: source.ip, time: to_int(received_at) } } | parse_juniper_srx_sd_syslog | compose_ocsf | ocsf_to_egress
+//                 { workspace.juniper_srx_sd_syslog = { body: ingress, hostname: source.ip } } | parse_juniper_srx_sd_syslog | compose_ocsf | ocsf_to_egress
 //
 //           - tail of a forwarded text file:
-//                 { workspace.juniper_srx_sd_syslog = { body: ingress, hostname: hostname(), time: to_int(received_at) } } | parse_juniper_srx_sd_syslog | compose_ocsf | ocsf_to_egress
+//                 { workspace.juniper_srx_sd_syslog = { body: ingress, hostname: hostname() } } | parse_juniper_srx_sd_syslog | compose_ocsf | ocsf_to_egress
 //
 // Per-daemon dispatch (LSIS class depends on the daemon / MSGID):
 //             RT_FLOW (incl. APPTRACK_*)                                            → 4001 Network Activity
@@ -335,7 +334,7 @@ def function parse_juniper_srx_sd_syslog_classify(body) {
     // The `(?:junos@\S+ )?` group makes the prefix optional.
     let header = regex_parse(
         body,
-        "^<\\d+>1 \\S+ (?P<host>\\S+) RT_(?P<daemon>[A-Z]+) - (?P<msgid>[A-Z][A-Z0-9_]+) \\[(?:junos@\\S+ )?(?P<sd>.*)\\]\\s*$"
+        "^<\\d+>1 (?P<timestamp>\\S+) (?P<host>\\S+) RT_(?P<daemon>[A-Z]+) - (?P<msgid>[A-Z][A-Z0-9_]+) \\[(?:junos@\\S+ )?(?P<sd>.*)\\]\\s*$"
     )
     switch true {
         header == null { null }
@@ -347,21 +346,40 @@ def function parse_juniper_srx_sd_syslog_classify(body) {
 // Main process — dispatch by daemon
 // ---------------------------------------------------------------------------
 
+def process parse_juniper_srx_sd_syslog_normalize_time {
+    workspace.juniper_srx_sd_syslog.time = switch workspace.srx_sd_class.timestamp {
+        "-"     { null }
+        default { to_int(parse_datetime_rfc3339(workspace.srx_sd_class.timestamp)) }
+    }
+}
+
 def process parse_juniper_srx_sd_syslog {
     // @requires: workspace.juniper_srx_sd_syslog.body      (required, String)
     // @requires: workspace.juniper_srx_sd_syslog.hostname  (optional, String)
-    // @requires: workspace.juniper_srx_sd_syslog.time      (optional, Int — epoch ns)
+    // The RFC 5424 TIMESTAMP in `.body` is the event time.
     workspace.srx_sd_class = parse_juniper_srx_sd_syslog_classify(workspace.juniper_srx_sd_syslog.body)
     switch true {
         workspace.srx_sd_class == null {
             error "parse_juniper_srx_sd_syslog: not a recognised RT_<daemon> sd-syslog line: ${workspace.juniper_srx_sd_syslog.body}"
         }
-        workspace.srx_sd_class.daemon == "FLOW"     { process parse_juniper_srx_sd_syslog_flow_dispatch }
-        workspace.srx_sd_class.daemon == "IDP"      { process parse_juniper_srx_sd_syslog_idp_dispatch }
-        workspace.srx_sd_class.daemon == "IDS"      { process parse_juniper_srx_sd_syslog_screen_record }
-        workspace.srx_sd_class.daemon == "UTM"      { process parse_juniper_srx_sd_syslog_utm_dispatch }
-        workspace.srx_sd_class.daemon == "AAMW"     { process parse_juniper_srx_sd_syslog_aamw_dispatch }
-        workspace.srx_sd_class.daemon == "SECINTEL" { process parse_juniper_srx_sd_syslog_secintel_record }
+        workspace.srx_sd_class.daemon == "FLOW" {
+            process parse_juniper_srx_sd_syslog_flow_dispatch
+        }
+        workspace.srx_sd_class.daemon == "IDP" {
+            process parse_juniper_srx_sd_syslog_idp_dispatch
+        }
+        workspace.srx_sd_class.daemon == "IDS" {
+            process parse_juniper_srx_sd_syslog_screen_record
+        }
+        workspace.srx_sd_class.daemon == "UTM" {
+            process parse_juniper_srx_sd_syslog_utm_dispatch
+        }
+        workspace.srx_sd_class.daemon == "AAMW" {
+            process parse_juniper_srx_sd_syslog_aamw_dispatch
+        }
+        workspace.srx_sd_class.daemon == "SECINTEL" {
+            process parse_juniper_srx_sd_syslog_secintel_record
+        }
         default {
             error "parse_juniper_srx_sd_syslog: unsupported Junos daemon RT_${workspace.srx_sd_class.daemon}: ${workspace.juniper_srx_sd_syslog.body}"
         }
@@ -411,6 +429,7 @@ def function parse_juniper_srx_sd_syslog_flow_fields(sd) {
 }
 
 def process parse_juniper_srx_sd_syslog_flow_create {
+    process parse_juniper_srx_sd_syslog_normalize_time
     workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
     workspace.lsis.parsed = juniper_srx_sd_syslog_network_record(
         1, 1,
@@ -429,6 +448,7 @@ def process parse_juniper_srx_sd_syslog_flow_create {
 }
 
 def process parse_juniper_srx_sd_syslog_flow_close {
+    process parse_juniper_srx_sd_syslog_normalize_time
     workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
     workspace.lsis.parsed = juniper_srx_sd_syslog_network_record(
         2, 1,
@@ -448,6 +468,7 @@ def process parse_juniper_srx_sd_syslog_flow_close {
 }
 
 def process parse_juniper_srx_sd_syslog_flow_deny {
+    process parse_juniper_srx_sd_syslog_normalize_time
     workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
     workspace.lsis.parsed = juniper_srx_sd_syslog_network_record(
         6, 2,
@@ -466,6 +487,7 @@ def process parse_juniper_srx_sd_syslog_flow_deny {
 }
 
 def process parse_juniper_srx_sd_syslog_apptrack_create {
+    process parse_juniper_srx_sd_syslog_normalize_time
     workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
     workspace.lsis.parsed = juniper_srx_sd_syslog_network_record(
         1, 1,
@@ -484,6 +506,7 @@ def process parse_juniper_srx_sd_syslog_apptrack_create {
 }
 
 def process parse_juniper_srx_sd_syslog_apptrack_close {
+    process parse_juniper_srx_sd_syslog_normalize_time
     workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
     workspace.lsis.parsed = juniper_srx_sd_syslog_network_record(
         2, 1,
@@ -503,6 +526,7 @@ def process parse_juniper_srx_sd_syslog_apptrack_close {
 }
 
 def process parse_juniper_srx_sd_syslog_apptrack_volume {
+    process parse_juniper_srx_sd_syslog_normalize_time
     workspace.srx_sd_fields = parse_juniper_srx_sd_syslog_flow_fields(workspace.srx_sd_class.sd)
     workspace.lsis.parsed = juniper_srx_sd_syslog_network_record(
         99, 1,
@@ -554,6 +578,7 @@ def process parse_juniper_srx_sd_syslog_normalize_idp_severity {
 }
 
 def process parse_juniper_srx_sd_syslog_idp_attack {
+    process parse_juniper_srx_sd_syslog_normalize_time
     process parse_juniper_srx_sd_syslog_normalize_idp_severity
     let sd = workspace.srx_sd_class.sd
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
@@ -587,6 +612,7 @@ def process parse_juniper_srx_sd_syslog_idp_attack {
 }
 
 def process parse_juniper_srx_sd_syslog_idp_appddos {
+    process parse_juniper_srx_sd_syslog_normalize_time
     process parse_juniper_srx_sd_syslog_normalize_idp_severity
     let sd = workspace.srx_sd_class.sd
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
@@ -620,6 +646,7 @@ def process parse_juniper_srx_sd_syslog_idp_appddos {
 // ---------------------------------------------------------------------------
 
 def process parse_juniper_srx_sd_syslog_screen_record {
+    process parse_juniper_srx_sd_syslog_normalize_time
     let sd = workspace.srx_sd_class.sd
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
     let attack = parse_juniper_srx_sd_syslog_kv(sd, "attack-name")
@@ -669,6 +696,7 @@ def process parse_juniper_srx_sd_syslog_utm_dispatch {
 }
 
 def process parse_juniper_srx_sd_syslog_utm_webfilter {
+    process parse_juniper_srx_sd_syslog_normalize_time
     let sd = workspace.srx_sd_class.sd
     let permitted = workspace.srx_sd_class.msgid == "WEBFILTER_URL_PERMITTED"
     workspace.lsis.parsed = juniper_srx_sd_syslog_http_record(
@@ -689,6 +717,7 @@ def process parse_juniper_srx_sd_syslog_utm_webfilter {
 }
 
 def process parse_juniper_srx_sd_syslog_utm_antivirus {
+    process parse_juniper_srx_sd_syslog_normalize_time
     let sd = workspace.srx_sd_class.sd
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
     let virus = coalesce(parse_juniper_srx_sd_syslog_kv(sd, "virus-name"), workspace.srx_sd_class.msgid)
@@ -718,6 +747,7 @@ def process parse_juniper_srx_sd_syslog_utm_antivirus {
 }
 
 def process parse_juniper_srx_sd_syslog_utm_antispam {
+    process parse_juniper_srx_sd_syslog_normalize_time
     let sd = workspace.srx_sd_class.sd
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
     workspace.lsis.parsed = juniper_srx_sd_syslog_finding_record(
@@ -746,6 +776,7 @@ def process parse_juniper_srx_sd_syslog_utm_antispam {
 }
 
 def process parse_juniper_srx_sd_syslog_utm_content {
+    process parse_juniper_srx_sd_syslog_normalize_time
     let sd = workspace.srx_sd_class.sd
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
     workspace.lsis.parsed = juniper_srx_sd_syslog_finding_record(
@@ -791,6 +822,7 @@ def process parse_juniper_srx_sd_syslog_aamw_dispatch {
 }
 
 def process parse_juniper_srx_sd_syslog_aamw_action {
+    process parse_juniper_srx_sd_syslog_normalize_time
     let sd = workspace.srx_sd_class.sd
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
     let mal = coalesce(parse_juniper_srx_sd_syslog_kv_or_null(sd, "malware-info"), "AAMW action")
@@ -825,6 +857,7 @@ def process parse_juniper_srx_sd_syslog_aamw_action {
 }
 
 def process parse_juniper_srx_sd_syslog_aamw_malware {
+    process parse_juniper_srx_sd_syslog_normalize_time
     let sd = workspace.srx_sd_class.sd
     let mal = coalesce(parse_juniper_srx_sd_syslog_kv_or_null(sd, "malware-info"), "AAMW malware")
     workspace.lsis.parsed = juniper_srx_sd_syslog_finding_record(
@@ -851,6 +884,7 @@ def process parse_juniper_srx_sd_syslog_aamw_malware {
 }
 
 def process parse_juniper_srx_sd_syslog_aamw_host {
+    process parse_juniper_srx_sd_syslog_normalize_time
     let sd = workspace.srx_sd_class.sd
     workspace.lsis.parsed = juniper_srx_sd_syslog_finding_record(
         null, null,
@@ -901,6 +935,7 @@ def process parse_juniper_srx_sd_syslog_normalize_secintel_severity {
 }
 
 def process parse_juniper_srx_sd_syslog_secintel_record {
+    process parse_juniper_srx_sd_syslog_normalize_time
     process parse_juniper_srx_sd_syslog_normalize_secintel_severity
     let sd = workspace.srx_sd_class.sd
     let action = parse_juniper_srx_sd_syslog_kv(sd, "action")
