@@ -277,6 +277,16 @@ def function sysmon_otlp_event_type(class_uid) {
 }
 
 def process sysmon_to_otlp {
+    let process_name = coalesce(workspace.lsis.parsed.process.name, workspace.lsis.parsed.actor.process.name)
+    let process_pid = coalesce(workspace.lsis.parsed.process.pid, workspace.lsis.parsed.actor.process.pid)
+    let parent_process_name = switch workspace.lsis.parsed.class_uid {
+        1007    { workspace.lsis.parsed.actor.process.name }
+        default { null }
+    }
+    let parent_process_pid = switch workspace.lsis.parsed.class_uid {
+        1007    { workspace.lsis.parsed.actor.process.pid }
+        default { null }
+    }
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "observer.vendor", value: { string_value: "Microsoft" } }],
         [{ key: "observer.product", value: { string_value: "Sysmon" } }],
@@ -293,10 +303,10 @@ def process sysmon_to_otlp {
         [{ key: "event.type", value: { array_value: { values: [{ string_value: sysmon_otlp_event_type(workspace.lsis.parsed.class_uid) }] } } }],
         [{ key: "event.code", value: { string_value: "${workspace.sysmon.body.EventID}" } }],
         switch workspace.lsis.parsed.actor.user.name != null { true { [{ key: "user.name", value: { string_value: workspace.lsis.parsed.actor.user.name } }] } default { [] } },
-        switch workspace.lsis.parsed.process.name != null { true { [{ key: "process.name", value: { string_value: workspace.lsis.parsed.process.name } }] } default { [] } },
-        switch workspace.lsis.parsed.process.pid != null { true { [{ key: "process.pid", value: { int_value: workspace.lsis.parsed.process.pid } }] } default { [] } },
-        switch workspace.lsis.parsed.process.parent_process.name != null { true { [{ key: "process.parent.name", value: { string_value: workspace.lsis.parsed.process.parent_process.name } }] } default { [] } },
-        switch workspace.lsis.parsed.process.parent_process.pid != null { true { [{ key: "process.parent.pid", value: { int_value: workspace.lsis.parsed.process.parent_process.pid } }] } default { [] } },
+        switch process_name != null { true { [{ key: "process.name", value: { string_value: process_name } }] } default { [] } },
+        switch process_pid != null { true { [{ key: "process.pid", value: { int_value: process_pid } }] } default { [] } },
+        switch parent_process_name != null { true { [{ key: "process.parent.name", value: { string_value: parent_process_name } }] } default { [] } },
+        switch parent_process_pid != null { true { [{ key: "process.parent.pid", value: { int_value: parent_process_pid } }] } default { [] } },
         switch workspace.lsis.parsed.src_endpoint.ip != null { true { [{ key: "source.ip", value: { string_value: workspace.lsis.parsed.src_endpoint.ip } }] } default { [] } },
         switch workspace.lsis.parsed.src_endpoint.port != null { true { [{ key: "source.port", value: { int_value: workspace.lsis.parsed.src_endpoint.port } }] } default { [] } },
         switch workspace.lsis.parsed.dst_endpoint.ip != null { true { [{ key: "destination.ip", value: { string_value: workspace.lsis.parsed.dst_endpoint.ip } }] } default { [] } },

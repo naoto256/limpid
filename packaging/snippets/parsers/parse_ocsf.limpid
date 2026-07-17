@@ -4,7 +4,8 @@
 //              per ingress (class_uid at the root)
 // Writes:      workspace.lsis.parsed.* — same class and fields as the input,
 //              except root `.time` is normalized from ms to ns and
-//              `.severity_id` becomes canonical `.severity_number`.
+//              `.severity_id` becomes canonical `.severity_number`, except
+//              OCSF Other (99), which remains in the legacy compatibility slot.
 // Category:    Vendor-neutral
 // Test corpus: spec-only (OCSF 1.3.0 class instances; round-trips with
 //              compose_ocsf)
@@ -48,10 +49,13 @@ def process parse_ocsf {
 
     let source_severity_id = workspace.lsis.parsed.severity_id
     let severity_number = ocsf_severity_id_to_otel_severity_number(source_severity_id)
-    switch source_severity_id != null and source_severity_id != 99 and severity_number == null {
+    switch source_severity_id != null and source_severity_id != 0 and source_severity_id != 99 and severity_number == null {
         true { error "parse_ocsf: invalid OCSF severity_id ${source_severity_id}" }
     }
-    workspace.lsis.parsed.severity_id = null
+    workspace.lsis.parsed.severity_id = switch source_severity_id {
+        99      { 99 }
+        default { null }
+    }
     workspace.lsis.parsed.severity_number = severity_number
 
     switch workspace.lsis.parsed.time != null {
