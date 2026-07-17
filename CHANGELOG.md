@@ -10,6 +10,8 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [0.7.14] - 2026-07-16
 
+> source-owned OTLP semantics
+
 ### Changed — snippet severity is canonical OpenTelemetry severity
 
 Bundled semantic parsers now write normalized OTel `SeverityNumber` values to
@@ -117,6 +119,12 @@ parser.
 When both operands are `Int`, the `+`, `-`, `*`, `/`, and `%` operators now use checked i64 arithmetic instead of converting through `f64`. This prevents epoch-nanosecond values and other integers above 2^53 from silently losing precision. Integer division truncates toward zero (`5 / 2 == 2`, `-5 / 2 == -2`), remainder follows the dividend's sign, and integer division or remainder by zero continues to return `Int(0)`.
 
 This changes `Int / Int` from fractional floating-point division to truncating integer division. Use a `Float` operand (`value / 2.0`) when fractional output is intended. Any i64 overflow, including `i64::MIN / -1` and `i64::MIN % -1`, is now an evaluation error rather than an approximate floating-point fallback. Mixed `Int` / `Float` expressions continue to use the existing floating-point path.
+
+### Fixed — OTLP adapters preserve parser-owned facts and ECS classifications
+
+Per-source OTLP adapters now read the exact LSIS paths written by every supported parser route. The fixes retain DNS, HTTP, process, file, user, and delegated Zeek facts; normalize ECS direction and lifecycle classifications; preserve RFC 5424 NILVALUE semantics; and correct source/destination byte attribution. A static read/write-path sweep across all 30 adapters plus decoded OTLP route coverage now guards against silent field omission.
+
+OCSF Other (99) remains available through the legacy compatibility slot when no OTel numeric mapping exists, while OCSF Unknown (0) remains canonically unset. Juniper SecIntel keeps its numeric severity mapping and preserves the raw source value without synthesizing SeverityText.
 
 ## [0.7.13] - 2026-07-11
 
