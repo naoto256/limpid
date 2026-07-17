@@ -981,8 +981,8 @@ def process fortigate_cef_to_otlp {
         [{ key: "event.kind", value: { string_value: fortigate_cef_otlp_event_kind(workspace.lsis.parsed.class_uid) } }],
         [{ key: "event.category", value: { array_value: { values: [{ string_value: fortigate_cef_otlp_event_category(workspace.lsis.parsed.class_uid) }] } } }],
         [{ key: "event.type", value: { array_value: { values: [{ string_value: fortigate_cef_otlp_event_type(workspace.lsis.parsed.class_uid) }] } } }],
-        switch workspace.cef.cat != null {
-            true { [{ key: "event.action", value: { string_value: workspace.cef.cat } }] }
+        switch workspace.cef.act != null {
+            true { [{ key: "event.action", value: { string_value: workspace.cef.act } }] }
             default { [] }
         },
         switch fortigate_cef_otlp_event_outcome(workspace.lsis.parsed.status_id) != null {
@@ -1033,20 +1033,20 @@ def process fortigate_cef_to_otlp {
             true { [{ key: "destination.bytes", value: { int_value: workspace.lsis.parsed.traffic.bytes_out } }] }
             default { [] }
         },
-        switch coalesce(workspace.lsis.parsed.http_request.url.url_string, workspace.lsis.parsed.url.url_string) != null {
-            true { [{ key: "url.full", value: { string_value: coalesce(workspace.lsis.parsed.http_request.url.url_string, workspace.lsis.parsed.url.url_string) } }] }
+        switch workspace.lsis.parsed.http_request.url.url_string != null {
+            true { [{ key: "url.full", value: { string_value: workspace.lsis.parsed.http_request.url.url_string } }] }
             default { [] }
         },
         switch workspace.lsis.parsed.http_request.http_method != null {
             true { [{ key: "http.request.method", value: { string_value: workspace.lsis.parsed.http_request.http_method } }] }
             default { [] }
         },
-        switch workspace.lsis.parsed.dns_query.hostname != null {
-            true { [{ key: "dns.question.name", value: { string_value: workspace.lsis.parsed.dns_query.hostname } }] }
+        switch workspace.lsis.parsed.query.hostname != null {
+            true { [{ key: "dns.question.name", value: { string_value: workspace.lsis.parsed.query.hostname } }] }
             default { [] }
         },
-        switch workspace.lsis.parsed.dns_query.type != null {
-            true { [{ key: "dns.question.type", value: { string_value: workspace.lsis.parsed.dns_query.type } }] }
+        switch workspace.lsis.parsed.query.type != null {
+            true { [{ key: "dns.question.type", value: { string_value: workspace.lsis.parsed.query.type } }] }
             default { [] }
         },
         switch workspace.lsis.parsed.finding_info.title != null {

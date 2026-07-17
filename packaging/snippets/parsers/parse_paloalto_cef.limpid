@@ -519,10 +519,12 @@ def function paloalto_cef_otlp_event_category(class_uid) {
     }
 }
 
-def function paloalto_cef_otlp_event_type(class_uid) {
+def function paloalto_cef_otlp_event_type(class_uid, activity_id) {
     switch class_uid {
         2004    { "indicator" }
-        3002    { "start" }
+        3002 {
+            switch activity_id { 2 { "end" } default { "start" } }
+        }
         6004    { "access" }
         default { "connection" }
     }
@@ -558,7 +560,7 @@ def process paloalto_cef_to_otlp {
     workspace.lsis.shed.otlp.log_record.attributes = concat(
         [{ key: "event.kind", value: { string_value: paloalto_cef_otlp_event_kind(workspace.lsis.parsed.class_uid) } }],
         [{ key: "event.category", value: { array_value: { values: [{ string_value: paloalto_cef_otlp_event_category(workspace.lsis.parsed.class_uid) }] } } }],
-        [{ key: "event.type", value: { array_value: { values: [{ string_value: paloalto_cef_otlp_event_type(workspace.lsis.parsed.class_uid) }] } } }],
+        [{ key: "event.type", value: { array_value: { values: [{ string_value: paloalto_cef_otlp_event_type(workspace.lsis.parsed.class_uid, workspace.lsis.parsed.activity_id) }] } } }],
         switch workspace.cef.name != null {
             true { [{ key: "event.code", value: { string_value: workspace.cef.name } }] }
             default { [] }
@@ -607,8 +609,8 @@ def process paloalto_cef_to_otlp {
             true { [{ key: "network.application", value: { string_value: workspace.lsis.parsed.app_name } }] }
             default { [] }
         },
-        switch coalesce(workspace.lsis.parsed.http_request.url.url_string, workspace.lsis.parsed.url.url_string) != null {
-            true { [{ key: "url.full", value: { string_value: coalesce(workspace.lsis.parsed.http_request.url.url_string, workspace.lsis.parsed.url.url_string) } }] }
+        switch workspace.lsis.parsed.http_request.url.url_string != null {
+            true { [{ key: "url.full", value: { string_value: workspace.lsis.parsed.http_request.url.url_string } }] }
             default { [] }
         },
         switch workspace.lsis.parsed.http_request.http_method != null {

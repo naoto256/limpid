@@ -2563,6 +2563,664 @@ def pipeline zeek_full_otlp {
         }
     }
 
+    fn collect_expr_parsed_reads(expr: &Expr, reads: &mut std::collections::BTreeSet<String>) {
+        if let ExprKind::Ident(parts) = &expr.kind
+            && parts.starts_with(&["workspace".into(), "lsis".into(), "parsed".into()])
+            && parts.len() > 3
+        {
+            reads.insert(parts[3..].join("."));
+        }
+        crate::dsl::ast::walk_children(expr, |child| collect_expr_parsed_reads(child, reads));
+    }
+
+    fn collect_statement_parsed_reads(
+        statements: &[ProcessStatement],
+        reads: &mut std::collections::BTreeSet<String>,
+    ) {
+        for statement in statements {
+            match statement {
+                ProcessStatement::Assign(_, expr)
+                | ProcessStatement::LetBinding(_, expr)
+                | ProcessStatement::ExprStmt(expr) => collect_expr_parsed_reads(expr, reads),
+                ProcessStatement::Error(Some(expr)) => collect_expr_parsed_reads(expr, reads),
+                ProcessStatement::If(chain) => {
+                    for (condition, body) in &chain.branches {
+                        collect_expr_parsed_reads(condition, reads);
+                        for branch in body {
+                            if let BranchBody::Process(statement) = branch {
+                                collect_statement_parsed_reads(
+                                    std::slice::from_ref(statement),
+                                    reads,
+                                );
+                            }
+                        }
+                    }
+                    if let Some(body) = &chain.else_body {
+                        for branch in body {
+                            if let BranchBody::Process(statement) = branch {
+                                collect_statement_parsed_reads(
+                                    std::slice::from_ref(statement),
+                                    reads,
+                                );
+                            }
+                        }
+                    }
+                }
+                ProcessStatement::Switch(scrutinee, arms) => {
+                    collect_expr_parsed_reads(scrutinee, reads);
+                    for arm in arms {
+                        if let Some(pattern) = &arm.pattern {
+                            collect_expr_parsed_reads(pattern, reads);
+                        }
+                        for branch in &arm.body {
+                            if let BranchBody::Process(statement) = branch {
+                                collect_statement_parsed_reads(
+                                    std::slice::from_ref(statement),
+                                    reads,
+                                );
+                            }
+                        }
+                    }
+                }
+                ProcessStatement::TryCatch(try_body, catch_body) => {
+                    collect_statement_parsed_reads(try_body, reads);
+                    collect_statement_parsed_reads(catch_body, reads);
+                }
+                ProcessStatement::ProcessCall(_)
+                | ProcessStatement::Drop
+                | ProcessStatement::Error(None) => {}
+            }
+        }
+    }
+
+    fn collect_written_shape(
+        expr: &Expr,
+        prefix: &str,
+        config: &CompiledConfig,
+        writes: &mut std::collections::BTreeSet<String>,
+        active_functions: &mut std::collections::HashSet<String>,
+    ) {
+        match &expr.kind {
+            ExprKind::HashLit(fields) => {
+                for (key, value) in fields {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    collect_written_shape(value, &path, config, writes, active_functions);
+                }
+            }
+            ExprKind::SwitchExpr { arms, .. } => {
+                for arm in arms {
+                    collect_written_shape(&arm.body, prefix, config, writes, active_functions);
+                }
+            }
+            ExprKind::FuncCall { name, .. } if config.functions.contains_key(name) => {
+                if !active_functions.insert(name.clone()) {
+                    return;
+                }
+                let function = &config.functions[name];
+                let return_expr = match &function.body.ret.kind {
+                    ExprKind::Ident(parts) if parts.len() == 1 => function
+                        .body
+                        .lets
+                        .iter()
+                        .rev()
+                        .find(|binding| binding.name == parts[0])
+                        .map(|binding| &binding.value)
+                        .unwrap_or(&function.body.ret),
+                    _ => &function.body.ret,
+                };
+                collect_written_shape(return_expr, prefix, config, writes, active_functions);
+                active_functions.remove(name);
+            }
+            ExprKind::Ident(parts) if parts.len() == 1 => {
+                writes.insert(format!("{prefix}.*"));
+            }
+            _ if !prefix.is_empty() => {
+                writes.insert(prefix.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_reachable_parsed_writes(
+        process_name: &str,
+        config: &CompiledConfig,
+        visited_processes: &mut std::collections::HashSet<String>,
+        writes: &mut std::collections::BTreeSet<String>,
+    ) {
+        if !visited_processes.insert(process_name.to_string()) {
+            return;
+        }
+        let process = config
+            .processes
+            .get(process_name)
+            .unwrap_or_else(|| panic!("missing packaged process {process_name}"));
+
+        fn walk(
+            statements: &[ProcessStatement],
+            config: &CompiledConfig,
+            visited_processes: &mut std::collections::HashSet<String>,
+            writes: &mut std::collections::BTreeSet<String>,
+        ) {
+            for statement in statements {
+                match statement {
+                    ProcessStatement::Assign(AssignTarget::Workspace(path), expr)
+                        if path.starts_with(&["lsis".into(), "parsed".into()]) =>
+                    {
+                        let prefix = path[2..].join(".");
+                        collect_written_shape(
+                            expr,
+                            &prefix,
+                            config,
+                            writes,
+                            &mut std::collections::HashSet::new(),
+                        );
+                    }
+                    ProcessStatement::ProcessCall(name) => {
+                        collect_reachable_parsed_writes(name, config, visited_processes, writes)
+                    }
+                    ProcessStatement::If(chain) => {
+                        for (_, body) in &chain.branches {
+                            for branch in body {
+                                if let BranchBody::Process(statement) = branch {
+                                    walk(
+                                        std::slice::from_ref(statement),
+                                        config,
+                                        visited_processes,
+                                        writes,
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(body) = &chain.else_body {
+                            for branch in body {
+                                if let BranchBody::Process(statement) = branch {
+                                    walk(
+                                        std::slice::from_ref(statement),
+                                        config,
+                                        visited_processes,
+                                        writes,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    ProcessStatement::Switch(_, arms) => {
+                        for arm in arms {
+                            for branch in &arm.body {
+                                if let BranchBody::Process(statement) = branch {
+                                    walk(
+                                        std::slice::from_ref(statement),
+                                        config,
+                                        visited_processes,
+                                        writes,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    ProcessStatement::TryCatch(try_body, catch_body) => {
+                        walk(try_body, config, visited_processes, writes);
+                        walk(catch_body, config, visited_processes, writes);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        walk(&process.body, config, visited_processes, writes);
+    }
+
+    #[test]
+    fn packaged_otlp_adapter_parsed_reads_are_written_by_source_parsers() {
+        let config = compile_packaged_otlp_composers().unwrap();
+        let mut adapters = config
+            .processes
+            .keys()
+            .filter(|name| name.ends_with("_to_otlp"))
+            .cloned()
+            .collect::<Vec<_>>();
+        adapters.sort();
+        assert_eq!(
+            adapters.len(),
+            30,
+            "packaged source adapter inventory drift"
+        );
+
+        let mut mismatches = Vec::new();
+        for adapter_name in adapters {
+            let source_name = adapter_name.trim_end_matches("_to_otlp");
+            let parser_name = format!("parse_{source_name}");
+            let mut reads = std::collections::BTreeSet::new();
+            collect_statement_parsed_reads(&config.processes[&adapter_name].body, &mut reads);
+
+            let mut writes = std::collections::BTreeSet::new();
+            collect_reachable_parsed_writes(
+                &parser_name,
+                &config,
+                &mut std::collections::HashSet::new(),
+                &mut writes,
+            );
+
+            for read in reads {
+                let matched = writes.iter().any(|write| {
+                    write == &read
+                        || write.strip_suffix(".*").is_some_and(|prefix| {
+                            read == prefix || read.starts_with(&format!("{prefix}."))
+                        })
+                });
+                if !matched {
+                    mismatches.push(format!(
+                        "{adapter_name} reads parsed.{read}, but {parser_name} never writes it"
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "packaged OTLP adapter/parser path mismatches:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    #[test]
+    fn packaged_ocsf_severity_unknown_and_other_normalize_without_canonical_zero() {
+        let unknown = run_packaged_parser_json(
+            "parse_ocsf",
+            None,
+            "parse_ocsf",
+            br#"{"class_uid":4001,"severity_id":0}"#,
+        );
+        assert!(unknown["severity_id"].is_null());
+        assert!(unknown["severity_number"].is_null());
+
+        let other = run_packaged_parser_json(
+            "parse_ocsf",
+            None,
+            "parse_ocsf",
+            br#"{"class_uid":4001,"severity_id":99}"#,
+        );
+        assert_eq!(other["severity_id"], 99);
+        assert!(other["severity_number"].is_null());
+
+        let error = run_packaged_parser_json(
+            "parse_ocsf",
+            None,
+            "parse_ocsf",
+            br#"{"class_uid":4001,"severity_id":3}"#,
+        );
+        assert!(error["severity_id"].is_null());
+        assert_eq!(error["severity_number"], 17);
+    }
+
+    #[test]
+    fn packaged_changed_otlp_routes_preserve_classification_and_fact_paths() {
+        use crate::functions::{FunctionRegistry, register_builtins, register_user_functions};
+        use serde_json::json;
+
+        let cfg = compile_packaged_otlp_composers().unwrap();
+        let mut funcs = FunctionRegistry::new();
+        register_builtins(&mut funcs, crate::runtime::init_tables(&cfg).unwrap());
+        register_user_functions(&mut funcs, &cfg);
+        let received_at = chrono::DateTime::from_timestamp(1_784_073_600, 123_456_789)
+            .expect("valid receive timestamp");
+
+        for (wire, expected_kind, expected_category, expected_type) in [
+            (
+                b"type=USER_END msg=audit(1710000000.123:43): pid=100 uid=0 auid=1000 ses=1 msg='op=PAM:session_close acct=alice exe=/usr/bin/sshd hostname=? addr=192.0.2.10 terminal=ssh res=success'".as_slice(),
+                "event",
+                "authentication",
+                "end",
+            ),
+            (
+                b"type=SERVICE_STOP msg=audit(1710000000.123:44): pid=1 uid=0 auid=0 ses=1 comm=\"systemd\" exe=\"/usr/lib/systemd/systemd\" unit=\"sshd.service\" res=success".as_slice(),
+                "event",
+                "process",
+                "end",
+            ),
+            (
+                b"type=CONFIG_CHANGE msg=audit(1710000000.123:45): pid=1 uid=0 auid=0 ses=1 op=updated_rules res=success".as_slice(),
+                "event",
+                "configuration",
+                "change",
+            ),
+            (
+                b"type=SOCKADDR msg=audit(1710000000.123:46): saddr=02000035C000020A0000000000000000 src=192.0.2.10 dst=198.51.100.5 res=success".as_slice(),
+                "event",
+                "network",
+                "info",
+            ),
+            (
+                b"type=AVC msg=audit(1710000000.123:47): avc: denied { read } for pid=42 comm=\"cat\" scontext=a tcontext=b tclass=file".as_slice(),
+                "alert",
+                "intrusion_detection",
+                "info",
+            ),
+        ] {
+            let resource_logs = run_packaged_otlp_resource_logs_at(
+                &cfg,
+                &funcs,
+                "auditd_otlp",
+                wire,
+                json!({"auditd": {"body": String::from_utf8_lossy(wire), "hostname": "host-1"}}),
+                received_at,
+            );
+            let attributes = &resource_logs.scope_logs[0].log_records[0].attributes;
+            assert_eq!(
+                otlp_string_attribute(attributes, "event.kind"),
+                Some(expected_kind)
+            );
+            assert_eq!(
+                otlp_string_array_attribute(attributes, "event.category"),
+                Some(vec![expected_category])
+            );
+            assert_eq!(
+                otlp_string_array_attribute(attributes, "event.type"),
+                Some(vec![expected_type])
+            );
+        }
+
+        for (category, expected_kind, expected_category, expected_type) in [
+            ("Security", "alert", Some("intrusion_detection"), "info"),
+            ("Alert", "alert", Some("intrusion_detection"), "info"),
+            ("Administrative", "event", Some("configuration"), "change"),
+            ("ServiceHealth", "event", None, "info"),
+            ("Recommendation", "event", None, "info"),
+        ] {
+            let body = json!({
+                "time": "2026-04-29T10:00:00Z",
+                "resourceId": "/subscriptions/sub-1/resourceGroups/rg1/providers/Microsoft.Compute/virtualMachines/vm1",
+                "category": category,
+                "level": "Informational",
+                "operationName": "Example operation",
+                "resultType": "Success"
+            });
+            let wire = serde_json::to_vec(&body).unwrap();
+            let resource_logs = run_packaged_otlp_resource_logs_at(
+                &cfg,
+                &funcs,
+                "azure_activity_otlp",
+                &wire,
+                json!({}),
+                received_at,
+            );
+            let attributes = &resource_logs.scope_logs[0].log_records[0].attributes;
+            assert_eq!(
+                otlp_string_attribute(attributes, "event.kind"),
+                Some(expected_kind)
+            );
+            assert_eq!(
+                otlp_string_array_attribute(attributes, "event.category"),
+                expected_category.map(|value| vec![value])
+            );
+            assert_eq!(
+                otlp_string_array_attribute(attributes, "event.type"),
+                Some(vec![expected_type])
+            );
+        }
+
+        let checkpoint_wire = b"<134>1 2026-04-30T01:23:45Z - CheckPoint - - [action:\"Accept\"; product:\"VPN-1 & FireWall-1\"; src:\"192.0.2.10\"; dst:\"198.51.100.5\"; proto:\"tcp\"; severity:\"Informational\"; sys_message::\"Allowed connection\"]";
+        let checkpoint = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "checkpoint_syslog_otlp",
+            checkpoint_wire,
+            json!({"checkpoint_syslog": {"body": String::from_utf8_lossy(checkpoint_wire), "hostname": "fallback-fw"}}),
+            received_at,
+        );
+        assert_eq!(
+            otlp_string_attribute(
+                &checkpoint.resource.as_ref().expect("resource").attributes,
+                "host.name"
+            ),
+            Some("fallback-fw")
+        );
+        assert_eq!(
+            otlp_string_attribute(
+                &checkpoint.scope_logs[0].log_records[0].attributes,
+                "message"
+            ),
+            Some("Allowed connection")
+        );
+
+        let fortigate_dns_wire = b"<129>Apr 27 10:00:00 fw01 CEF:0|Fortinet|Fortigate|v7.4.11|dns|utm:dns|3|cat=utm:dns act=blocked src=192.0.2.10 dst=198.51.100.5 FTNTFGTqname=example.test FTNTFGTqtype=A FTNTFGTrcode=NXDOMAIN";
+        let fortigate_dns = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "fortigate_cef_otlp",
+            fortigate_dns_wire,
+            json!({"fortigate_cef": {"timezone": "UTC"}}),
+            received_at,
+        );
+        let fortigate_dns_attributes = &fortigate_dns.scope_logs[0].log_records[0].attributes;
+        assert_eq!(
+            otlp_string_attribute(fortigate_dns_attributes, "event.action"),
+            Some("blocked")
+        );
+        assert_eq!(
+            otlp_string_attribute(fortigate_dns_attributes, "dns.question.name"),
+            Some("example.test")
+        );
+        assert_eq!(
+            otlp_string_attribute(fortigate_dns_attributes, "dns.question.type"),
+            Some("A")
+        );
+
+        let openssh_wire = b"Disconnected from user alice 192.0.2.10 port 54321";
+        let openssh = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "openssh_otlp",
+            openssh_wire,
+            json!({"openssh": {"body": String::from_utf8_lossy(openssh_wire), "hostname": "host-1"}}),
+            received_at,
+        );
+        assert_eq!(
+            otlp_string_array_attribute(
+                &openssh.scope_logs[0].log_records[0].attributes,
+                "event.type"
+            ),
+            Some(vec!["end"])
+        );
+
+        let paloalto_cef_wire = b"<134>Apr 27 10:00:00 fw-pan01 CEF:0|Palo Alto Networks|PAN-OS|10.2.0|gp|GLOBALPROTECT|3|act=logout suser=alice src=192.0.2.10";
+        let paloalto_cef = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "paloalto_cef_otlp",
+            paloalto_cef_wire,
+            json!({"paloalto_cef": {"timezone": "UTC"}}),
+            received_at,
+        );
+        assert_eq!(
+            otlp_string_array_attribute(
+                &paloalto_cef.scope_logs[0].log_records[0].attributes,
+                "event.type"
+            ),
+            Some(vec!["end"])
+        );
+
+        let mut pan_fields = vec![""; 28];
+        pan_fields[1] = "2026/04/27 10:00:00";
+        pan_fields[2] = "012345678";
+        pan_fields[3] = "GLOBALPROTECT";
+        pan_fields[6] = "2026/04/27 10:00:01";
+        pan_fields[8] = "gateway-logout";
+        pan_fields[9] = "disconnected";
+        pan_fields[12] = "alice";
+        pan_fields[15] = "192.0.2.10";
+        pan_fields[27] = "Disconnected";
+        let paloalto_native_wire =
+            format!("<134>Apr 27 10:00:00 fw-pan01 {}", pan_fields.join(","));
+        let paloalto_native = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "paloalto_native_otlp",
+            paloalto_native_wire.as_bytes(),
+            json!({"paloalto_syslog": {"timezone": "UTC"}}),
+            received_at,
+        );
+        assert_eq!(
+            otlp_string_array_attribute(
+                &paloalto_native.scope_logs[0].log_records[0].attributes,
+                "event.type"
+            ),
+            Some(vec!["end"])
+        );
+
+        for (event_id, event_data, expected_name, expected_parent, expected_file) in [
+            (
+                1,
+                json!({"UtcTime":"2026-04-29 10:00:00.123","ProcessId":"42","Image":"C:\\Windows\\app.exe","CommandLine":"app.exe","User":"CORP\\alice","ParentProcessId":"7","ParentImage":"C:\\Windows\\parent.exe"}),
+                Some("app.exe"),
+                Some("parent.exe"),
+                None,
+            ),
+            (
+                3,
+                json!({"UtcTime":"2026-04-29 10:00:00.123","ProcessId":"43","Image":"C:\\Windows\\net.exe","User":"CORP\\alice","Protocol":"tcp","SourceIp":"192.0.2.10","SourcePort":"54321","DestinationIp":"198.51.100.5","DestinationPort":"443","Initiated":"true"}),
+                Some("net.exe"),
+                None,
+                None,
+            ),
+            (
+                11,
+                json!({"UtcTime":"2026-04-29 10:00:00.123","ProcessId":"44","Image":"C:\\Windows\\file.exe","User":"CORP\\alice","TargetFilename":"C:\\Temp\\created.txt"}),
+                Some("file.exe"),
+                None,
+                Some("created.txt"),
+            ),
+        ] {
+            let body = json!({
+                "EventID": event_id,
+                "Channel": "Microsoft-Windows-Sysmon/Operational",
+                "EventTime": "2026-04-29T10:00:00.123456Z",
+                "Computer": "WORKSTATION1",
+                "EventData": event_data
+            });
+            let wire = serde_json::to_vec(&body).unwrap();
+            let resource_logs = run_packaged_otlp_resource_logs_at(
+                &cfg,
+                &funcs,
+                "sysmon_otlp",
+                &wire,
+                json!({"sysmon": {"body": body}}),
+                received_at,
+            );
+            let attributes = &resource_logs.scope_logs[0].log_records[0].attributes;
+            assert_eq!(
+                otlp_string_attribute(attributes, "process.name"),
+                expected_name
+            );
+            assert_eq!(
+                otlp_string_attribute(attributes, "process.parent.name"),
+                expected_parent
+            );
+            assert_eq!(
+                otlp_string_attribute(attributes, "file.name"),
+                expected_file
+            );
+        }
+
+        let zeek_dns_body = json!({"_path":"dns","ts":1710000000.125,"uid":"D1","id":{"orig_h":"192.0.2.10","orig_p":54321,"resp_h":"198.51.100.53","resp_p":53},"query":"example.test","qtype_name":"A","qclass_name":"C_INTERNET","rcode_name":"NOERROR","answers":["198.51.100.5"]});
+        let zeek_dns_wire = serde_json::to_vec(&zeek_dns_body).unwrap();
+        let zeek_dns = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "zeek_default_otlp",
+            &zeek_dns_wire,
+            json!({"zeek": {"body": zeek_dns_body, "hostname": "sensor-1"}}),
+            received_at,
+        );
+        assert_eq!(
+            otlp_string_attribute(
+                &zeek_dns.scope_logs[0].log_records[0].attributes,
+                "dns.question.name"
+            ),
+            Some("example.test")
+        );
+
+        let zeek_http_body = json!({"_path":"http","ts":1710000000.25,"uid":"H1","id":{"orig_h":"192.0.2.10","orig_p":54321,"resp_h":"198.51.100.5","resp_p":80},"method":"GET","host":"example.test","uri":"/index.html","status_code":200});
+        let zeek_http_wire = serde_json::to_vec(&zeek_http_body).unwrap();
+        for pipeline in ["zeek_default_otlp", "zeek_soc_otlp", "zeek_full_otlp"] {
+            let resource_logs = run_packaged_otlp_resource_logs_at(
+                &cfg,
+                &funcs,
+                pipeline,
+                &zeek_http_wire,
+                json!({"zeek": {"body": zeek_http_body.clone(), "hostname": "sensor-1"}}),
+                received_at,
+            );
+            let attributes = &resource_logs.scope_logs[0].log_records[0].attributes;
+            assert_eq!(
+                otlp_string_array_attribute(attributes, "event.category"),
+                Some(vec!["web"])
+            );
+            assert_eq!(
+                otlp_string_array_attribute(attributes, "event.type"),
+                Some(vec!["access"])
+            );
+            assert_eq!(
+                otlp_string_attribute(attributes, "url.domain"),
+                Some("example.test")
+            );
+            assert_eq!(
+                otlp_string_attribute(attributes, "url.path"),
+                Some("/index.html")
+            );
+        }
+
+        let zeek_notice_body = json!({"_path":"notice","ts":1710000000.5,"uid":"N1","id":{"orig_h":"192.0.2.10","orig_p":1,"resp_h":"198.51.100.5","resp_p":2},"note":"Scan::Port_Scan","msg":"Example notice","sub":"scan","actions":["Notice::ACTION_LOG"]});
+        let zeek_notice_wire = serde_json::to_vec(&zeek_notice_body).unwrap();
+        for pipeline in ["zeek_default_otlp", "zeek_soc_otlp", "zeek_full_otlp"] {
+            let resource_logs = run_packaged_otlp_resource_logs_at(
+                &cfg,
+                &funcs,
+                pipeline,
+                &zeek_notice_wire,
+                json!({"zeek": {"body": zeek_notice_body.clone(), "hostname": "sensor-1"}}),
+                received_at,
+            );
+            let attributes = &resource_logs.scope_logs[0].log_records[0].attributes;
+            assert_eq!(
+                otlp_string_attribute(attributes, "event.kind"),
+                Some("alert")
+            );
+            assert_eq!(
+                otlp_string_array_attribute(attributes, "event.category"),
+                Some(vec!["intrusion_detection"])
+            );
+            assert_eq!(
+                otlp_string_array_attribute(attributes, "event.type"),
+                Some(vec!["info"])
+            );
+        }
+
+        let zeek_smb_body = json!({"_path":"smb_files","ts":1710000000.75,"uid":"S1","id":{"orig_h":"192.0.2.10","orig_p":54321,"resp_h":"198.51.100.5","resp_p":445},"action":"SMB::FILE_OPEN","name":"report.txt","path":"\\\\share"});
+        let zeek_smb_wire = serde_json::to_vec(&zeek_smb_body).unwrap();
+        for pipeline in ["zeek_soc_otlp", "zeek_full_otlp"] {
+            let resource_logs = run_packaged_otlp_resource_logs_at(
+                &cfg,
+                &funcs,
+                pipeline,
+                &zeek_smb_wire,
+                json!({"zeek": {"body": zeek_smb_body.clone(), "hostname": "sensor-1"}}),
+                received_at,
+            );
+            assert_eq!(
+                otlp_string_attribute(
+                    &resource_logs.scope_logs[0].log_records[0].attributes,
+                    "file.name"
+                ),
+                Some("report.txt")
+            );
+        }
+    }
+
     #[test]
     fn packaged_compose_otlp_projects_canonical_severity() {
         use crate::functions::{FunctionRegistry, register_builtins, register_user_functions};
@@ -3051,6 +3709,10 @@ def pipeline zeek_full_otlp {
             otlp_int_attribute(&vpc_record.attributes, "event.end"),
             Some(1_714_000_060_000_000_000)
         );
+        assert_eq!(
+            otlp_string_attribute(&vpc_record.attributes, "network.direction"),
+            Some("outbound")
+        );
         assert_otlp_attribute_contract(&vpc_record.attributes);
 
         let azure_wire = br#"{"time":"2026-04-29T10:00:00.1234567Z","resourceId":"/subscriptions/sub-1/resourceGroups/rg1/providers/Microsoft.Compute/virtualMachines/vm1","operationName":"MICROSOFT.COMPUTE/VIRTUALMACHINES/WRITE","category":"Administrative","level":"Informational","resultType":"Success","resultSignature":"Succeeded.","durationMs":1234,"callerIpAddress":"203.0.113.10","correlationId":"corr-1","tenantId":"tenant-1","subscriptionId":"sub-1","caller":"alice@example.com","identity":{"claims":{"oid":"user-1"}},"properties":{"statusCode":"Created"}}"#;
@@ -3257,6 +3919,10 @@ def pipeline zeek_full_otlp {
             otlp_string_attribute(&fortigate_cef_record.attributes, "rule.name"),
             Some("Example-Signature")
         );
+        assert_eq!(
+            otlp_string_attribute(&fortigate_cef_record.attributes, "event.action"),
+            Some("detected")
+        );
 
         let juniper_legacy_wire = b"<14>May 16 13:32:30 srx01 RT_IDP: IDP_ATTACK_LOG_EVENT: IDP: at 1778905950, SIG Attack log <198.51.100.10/63074->192.0.2.100/445> for TCP protocol and service SERVICE_IDP application SMB by rule Tap of rulebase IPS in policy Tap. attack: id=19519, repeat=0, action=DROP, threat-severity=HIGH, name=SMB:CVE-2017-0143-001";
         let juniper_legacy = run_packaged_otlp_resource_logs_at(
@@ -3289,6 +3955,26 @@ def pipeline zeek_full_otlp {
         assert_eq!(
             otlp_string_attribute(&juniper_sd_record.attributes, "juniper.session.id"),
             Some("123")
+        );
+
+        let juniper_secintel_wire = b"<134>1 2026-04-30T01:23:45Z srx01 RT_SECINTEL - SECINTEL_ACTION_LOG [junos@2636 source-address=\"192.0.2.10\" source-port=\"54321\" destination-address=\"198.51.100.5\" destination-port=\"443\" protocol-id=\"6\" action=\"BLOCK\" feed-name=\"Example feed\" threat-severity=\"7\"]";
+        let juniper_secintel = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "juniper_structured_otlp",
+            juniper_secintel_wire,
+            json!({"juniper_srx_sd_syslog": {"body": String::from_utf8_lossy(juniper_secintel_wire)}}),
+            received_at,
+        );
+        let juniper_secintel_record = &juniper_secintel.scope_logs[0].log_records[0];
+        assert_eq!(juniper_secintel_record.severity_number, 19);
+        assert_eq!(juniper_secintel_record.severity_text, "");
+        assert_eq!(
+            otlp_string_attribute(
+                &juniper_secintel_record.attributes,
+                "juniper.secintel.severity"
+            ),
+            Some("7")
         );
 
         let nsp_wire = b"admin_domain=Default alert_id=12345 alert_type=Signature app_protocol=HTTP confidence=Tentative attack_count=1 attack_id=0x40000123 attack_name=SQL-Injection severity=High alert_signature=HTTP-SQL-INJ-001 attack_time=\"2026-05-16 10:00:00\" category=Application dest_ip=192.0.2.10 dest_name=webserver01 dest_port=80 device_name=nsp-sensor-01 direction=Inbound confidence= file_name= file_hash= file_type= virus_name= action_status= error_status= protocol=TCP result=Blocked src_ip=198.51.100.5 src_name= src_port=54321";
@@ -3371,6 +4057,14 @@ def pipeline zeek_full_otlp {
             otlp_string_attribute(&paloalto_native_record.attributes, "palo_alto.session.id"),
             Some("98765")
         );
+        assert_eq!(
+            otlp_int_attribute(&paloalto_native_record.attributes, "source.bytes"),
+            Some(1024)
+        );
+        assert_eq!(
+            otlp_int_attribute(&paloalto_native_record.attributes, "destination.bytes"),
+            Some(2048)
+        );
 
         for resource_logs in [
             asa,
@@ -3379,6 +4073,7 @@ def pipeline zeek_full_otlp {
             fortigate_cef,
             juniper_legacy,
             juniper_structured,
+            juniper_secintel,
             nsp,
             paloalto_cef,
             paloalto_native,

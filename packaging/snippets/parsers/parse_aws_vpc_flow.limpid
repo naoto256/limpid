@@ -427,7 +427,7 @@ def process aws_vpc_flow_to_otlp {
             default { [] }
         },
         switch workspace.lsis.parsed.connection_info.direction != null {
-            true { [{ key: "network.direction", value: { string_value: workspace.lsis.parsed.connection_info.direction } }] }
+            true { [{ key: "network.direction", value: { string_value: lower(workspace.lsis.parsed.connection_info.direction) } }] }
             default { [] }
         },
         switch workspace.lsis.parsed.start_time != null {
