@@ -10,11 +10,13 @@ SIGHUP).
 
 > **Status:** the snippet library was introduced in v0.7.0 and has
 > expanded across the 0.7.x line. It currently ships 31 parser files
-> (vendor parsers — FortiGate / ASA / Checkpoint / Palo Alto / Sysmon /
-> CloudTrail / Zeek / Suricata / OCSF / Juniper SRX / ... — plus the
-> transport parsers `parse_syslog` and `parse_journald`), the OCSF
-> 1.3.0 27-class composer, the RFC 5424 and replay-shape composers,
-> one filter, and several reusable functions. See the table below
+> (source / vocabulary parsers — FortiGate / ASA / Checkpoint / Palo Alto /
+> Sysmon / CloudTrail / Zeek / Suricata / OCSF / Juniper SRX / ... — plus the
+> transport parsers `parse_syslog` and `parse_journald`), 30 sibling
+> per-source OTLP adapters, the OCSF 1.3.0 27-class composer, the RFC 5424
+> and replay-shape composers, one filter, and several reusable functions.
+> The inbound `parse_ocsf` compatibility parser is the sole parser without
+> an OTLP adapter. See the table below
 > for the full current inventory; coverage continues to grow on the
 > 0.7.x cadence.
 
@@ -70,7 +72,8 @@ SIGHUP).
   `ResourceLogs` proto envelope. Each OTLP-capable raw-source parser file
   carries a sibling `<source>_to_otlp` adapter; it
   owns source-specific Resource, Scope, Body, and LogRecord attribute
-  placement. The canonical shape is
+  placement. The composer maps canonical parsed time and severity plus ten
+  optional shed slots. The canonical shape is
   `parse_<source> | <source>_to_otlp | compose_otlp | otlp_to_egress`.
   Deployment-specific target adjustments may replace shed slots after the
   adapter; they do not replace the adapter itself. The inbound `parse_ocsf`
@@ -116,8 +119,10 @@ contracts.
   RFC 3164 wire carries neither year nor timezone, so the helper
   applies the current-year + future-clamp policy after the calling
   parser resolves its vendor-specific timezone default or explicit
-  override. `local` means the limpid host's system timezone; `UTC`,
-  IANA names, and fixed offsets are also accepted.
+  override. A vendor-defined fixed zone wins; documented device-local
+  formats default to `local` (the limpid host's system timezone), and
+  formats with no authoritative timezone contract default to `UTC`.
+  IANA names and fixed offsets are also accepted as explicit overrides.
   For RFC 5424 / OTLP / OCSF input use the built-in
   `parse_datetime_rfc3339` primitive directly.
 - `functions/http_method_activity_id.limpid` —

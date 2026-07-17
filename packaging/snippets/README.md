@@ -10,7 +10,7 @@ prefix.
 
 ```
 /usr/share/limpid/snippets/
-├─ parsers/      per-vendor / per-format parsers and sibling target
+├─ parsers/      per-source / per-format parsers and sibling target
 │                adapters, populating workspace.lsis.parsed.* facts
 │                and source-owned workspace.lsis.shed.<target>.* slots
 ├─ composers/    target-shape rendering. Each composer reads
@@ -139,6 +139,10 @@ RFC 5424 fields that the pack cannot synthesise on the caller's behalf).
 
 ## What's included
 
+The current pack contains 31 parser files. Thirty expose a sibling
+`<source>_to_otlp` adapter; the inbound `parse_ocsf` compatibility parser is
+the sole exception.
+
 The four tables below are regenerated from snippet header metadata
 by `cargo xtask gen-snippet-inventory`; do not hand-edit the marked
 regions.
@@ -245,6 +249,12 @@ regions.
 | `functions/timestamp_converter.limpid` | `timestamp_ns_to_ms(value) → Int \| null` | `compose_ocsf` |
 | `functions/timestamp_converter.limpid` | `timestamp_ms_to_ns(value) → Int \| null` | `parse_ocsf` |
 <!-- END: inventory:functions -->
+
+Timestamp interpretation follows each source contract. A vendor-defined fixed
+zone wins; documented device-local formats default to `local` (the limpid
+host's system timezone), and formats with no authoritative timezone contract
+default to `UTC`. Source-specific timezone slots override those defaults with
+an IANA name or fixed offset and reject invalid values loudly.
 
 ### Filebeat-flat JSON: `nest_dotted_keys` primitive
 

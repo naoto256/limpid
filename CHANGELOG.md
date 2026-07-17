@@ -68,13 +68,14 @@ retain their OTel `SeverityNumber` on the OTLP wire. When a parser also
 preserves the exact source spelling in `parsed.severity`, the composer uses
 it as `SeverityText`; an explicit
 `shed.otlp.log_record.severity_text` value still takes precedence.
-Source-less records continue to use OTLP's zero/empty defaults.
+Source-less records omit both fields; protobuf decoders expose the standard
+zero/empty defaults.
 
 ### Breaking — OTLP placement is owned by per-source adapters
 
-Every bundled raw-source parser with canonical OTLP output now ships a sibling
-`<source>_to_otlp` process. The inbound `parse_ocsf` compatibility parser is
-the sole parser without this adapter.
+Thirty of the 31 bundled parser files now ship a sibling `<source>_to_otlp`
+process. The inbound `parse_ocsf` compatibility parser is the sole parser
+without this adapter.
 The adapter owns source-specific OTLP Resource, Scope, Body, and LogRecord
 attribute construction; the canonical pipeline is
 `parse_<source> | <source>_to_otlp | compose_otlp | otlp_to_egress`.
@@ -95,18 +96,19 @@ without a source adapter or relied on those synthesized defaults. Insert or
 author a per-source adapter first. Deployment-specific target adjustments may
 replace adapter shed slots after that stage; they do not replace the adapter.
 OTLP transport configuration and already encoded `egress` payloads are
-unchanged.
+unchanged. Public authoring docs, snippet headers, and the pack README now use
+the same parser → adapter → composer contract.
 
 ### Changed — parsers preserve source event time in epoch nanoseconds
 
 Semantic parsers now normalize supported source timestamps into
 `workspace.lsis.parsed.time` as exact epoch nanoseconds, including values above
 2^53. Sources with explicit offsets or epoch timestamps retain their stated
-instant. For local wall-clock formats, vendor documentation determines the
-default timezone: documented device-local formats use the limpid host's system
-timezone, while formats with no authoritative timezone contract default to
-UTC. Source-specific `workspace.<source>.timezone` overrides accept IANA names
-or fixed offsets and reject invalid values loudly. Transport-only syslog and
+instant. Vendor-defined fixed zones are honored directly. For local wall-clock
+formats, documented device-local formats use the limpid host's system timezone,
+while formats with no authoritative timezone contract default to UTC.
+Source-specific `workspace.<source>.timezone` overrides accept IANA names or
+fixed offsets and reject invalid values loudly. Transport-only syslog and
 journald parsers continue to leave semantic event time to the downstream source
 parser.
 
