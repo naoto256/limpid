@@ -5,15 +5,16 @@
 // Test corpus: unit (OCSF 1.3.0 and OTel severity boundary tables)
 
 // These partial functions encode only the published standard-to-standard
-// boundary. Null stays null. OCSF Other (99) also maps to null because its
-// meaning lives in the sibling `severity` text, not in an OTel numeric band.
+// boundary. Null stays null. OCSF Unknown (0) maps to an unset canonical
+// SeverityNumber, and Other (99) also maps to null because its meaning lives
+// in the sibling `severity` text, not in an OTel numeric band.
 // Values outside either standard's domain return null; protocol-boundary
 // processes compare the source and result and raise an operator-readable
 // error for invalid non-null input.
 
 def function ocsf_severity_id_to_otel_severity_number(severity_id) {
     switch severity_id {
-        0       { 0 }
+        0       { null }
         1       { 9 }
         2       { 13 }
         3       { 17 }
@@ -27,7 +28,6 @@ def function ocsf_severity_id_to_otel_severity_number(severity_id) {
 
 def function otel_severity_number_to_ocsf_severity_id(severity_number) {
     switch severity_number {
-        0       { 0 }
         1       { 1 }
         2       { 1 }
         3       { 1 }

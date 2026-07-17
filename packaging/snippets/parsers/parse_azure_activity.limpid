@@ -303,13 +303,31 @@ def process parse_azure_activity {
     }
 }
 
+def function azure_activity_otlp_event_kind(category) {
+    switch category {
+        "Security" { "alert" }
+        "Alert"    { "alert" }
+        default    { "event" }
+    }
+}
+
 def function azure_activity_otlp_event_category(category) {
     switch category {
         "Security"       { "intrusion_detection" }
         "Alert"          { "intrusion_detection" }
-        "ServiceHealth"  { "availability" }
-        "ResourceHealth" { "availability" }
-        default          { "configuration" }
+        "Administrative" { "configuration" }
+        "Autoscale"      { "configuration" }
+        "Policy"         { "configuration" }
+        default          { null }
+    }
+}
+
+def function azure_activity_otlp_event_type(category) {
+    switch category {
+        "Administrative" { "change" }
+        "Autoscale"      { "change" }
+        "Policy"         { "change" }
+        default          { "info" }
     }
 }
 
@@ -339,9 +357,12 @@ def process azure_activity_to_otlp {
 
     workspace.lsis.shed.otlp.log_record.body = { string_value: ingress }
     workspace.lsis.shed.otlp.log_record.attributes = concat(
-        [{ key: "event.kind", value: { string_value: "event" } }],
-        [{ key: "event.category", value: { array_value: { values: [{ string_value: azure_activity_otlp_event_category(workspace.az.category) }] } } }],
-        [{ key: "event.type", value: { array_value: { values: [{ string_value: "change" }] } } }],
+        [{ key: "event.kind", value: { string_value: azure_activity_otlp_event_kind(workspace.az.category) } }],
+        switch azure_activity_otlp_event_category(workspace.az.category) != null {
+            true { [{ key: "event.category", value: { array_value: { values: [{ string_value: azure_activity_otlp_event_category(workspace.az.category) }] } } }] }
+            default { [] }
+        },
+        [{ key: "event.type", value: { array_value: { values: [{ string_value: azure_activity_otlp_event_type(workspace.az.category) }] } } }],
         switch workspace.az.operationName != null {
             true { [{ key: "event.action", value: { string_value: workspace.az.operationName } }] }
             default { [] }

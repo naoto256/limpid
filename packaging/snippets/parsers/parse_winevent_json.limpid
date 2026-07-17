@@ -504,13 +504,9 @@ def process winevent_json_to_otlp {
         switch workspace.winevent.EventID != null { true { [{ key: "event.code", value: { string_value: "${workspace.winevent.EventID}" } }] } default { [] } },
         switch winevent_json_otlp_event_outcome(workspace.lsis.parsed.status_id) != null { true { [{ key: "event.outcome", value: { string_value: winevent_json_otlp_event_outcome(workspace.lsis.parsed.status_id) } }] } default { [] } },
         switch workspace.lsis.parsed.actor.user.name != null { true { [{ key: "user.name", value: { string_value: workspace.lsis.parsed.actor.user.name } }] } default { [] } },
-        switch workspace.lsis.parsed.actor.user.uid != null { true { [{ key: "user.id", value: { string_value: workspace.lsis.parsed.actor.user.uid } }] } default { [] } },
         switch workspace.lsis.parsed.user.name != null { true { [{ key: "user.target.name", value: { string_value: workspace.lsis.parsed.user.name } }] } default { [] } },
-        switch workspace.lsis.parsed.user.uid != null { true { [{ key: "user.target.id", value: { string_value: workspace.lsis.parsed.user.uid } }] } default { [] } },
         switch workspace.lsis.parsed.process.name != null { true { [{ key: "process.name", value: { string_value: workspace.lsis.parsed.process.name } }] } default { [] } },
-        switch workspace.lsis.parsed.process.pid != null { true { [{ key: "process.pid", value: { int_value: workspace.lsis.parsed.process.pid } }] } default { [] } },
         switch workspace.lsis.parsed.process.parent_process.name != null { true { [{ key: "process.parent.name", value: { string_value: workspace.lsis.parsed.process.parent_process.name } }] } default { [] } },
-        switch workspace.lsis.parsed.process.parent_process.pid != null { true { [{ key: "process.parent.pid", value: { int_value: workspace.lsis.parsed.process.parent_process.pid } }] } default { [] } },
         switch workspace.lsis.parsed.src_endpoint.ip != null { true { [{ key: "source.ip", value: { string_value: workspace.lsis.parsed.src_endpoint.ip } }] } default { [] } },
         switch workspace.lsis.parsed.src_endpoint.port != null { true { [{ key: "source.port", value: { int_value: workspace.lsis.parsed.src_endpoint.port } }] } default { [] } }
     )

@@ -738,10 +738,12 @@ def function paloalto_syslog_otlp_event_category(class_uid) {
     }
 }
 
-def function paloalto_syslog_otlp_event_type(class_uid) {
+def function paloalto_syslog_otlp_event_type(class_uid, activity_id) {
     switch class_uid {
         2004    { "indicator" }
-        3002    { "start" }
+        3002 {
+            switch activity_id { 2 { "end" } default { "start" } }
+        }
         6004    { "access" }
         default { "connection" }
     }
@@ -775,7 +777,7 @@ def process paloalto_syslog_to_otlp {
     workspace.lsis.shed.otlp.log_record.attributes = concat(
         [{ key: "event.kind", value: { string_value: paloalto_syslog_otlp_event_kind(workspace.lsis.parsed.class_uid) } }],
         [{ key: "event.category", value: { array_value: { values: [{ string_value: paloalto_syslog_otlp_event_category(workspace.lsis.parsed.class_uid) }] } } }],
-        [{ key: "event.type", value: { array_value: { values: [{ string_value: paloalto_syslog_otlp_event_type(workspace.lsis.parsed.class_uid) }] } } }],
+        [{ key: "event.type", value: { array_value: { values: [{ string_value: paloalto_syslog_otlp_event_type(workspace.lsis.parsed.class_uid, workspace.lsis.parsed.activity_id) }] } } }],
         switch coalesce(workspace.pan.EventID, workspace.pan.Subtype, workspace.pan.Type) != null {
             true { [{ key: "event.code", value: { string_value: coalesce(workspace.pan.EventID, workspace.pan.Subtype, workspace.pan.Type) } }] }
             default { [] }
@@ -832,12 +834,12 @@ def process paloalto_syslog_to_otlp {
             true { [{ key: "network.application", value: { string_value: workspace.lsis.parsed.app_name } }] }
             default { [] }
         },
-        switch workspace.lsis.parsed.traffic.bytes_in != null {
-            true { [{ key: "source.bytes", value: { int_value: workspace.lsis.parsed.traffic.bytes_in } }] }
+        switch workspace.lsis.parsed.traffic.bytes_out != null {
+            true { [{ key: "source.bytes", value: { int_value: workspace.lsis.parsed.traffic.bytes_out } }] }
             default { [] }
         },
-        switch workspace.lsis.parsed.traffic.bytes_out != null {
-            true { [{ key: "destination.bytes", value: { int_value: workspace.lsis.parsed.traffic.bytes_out } }] }
+        switch workspace.lsis.parsed.traffic.bytes_in != null {
+            true { [{ key: "destination.bytes", value: { int_value: workspace.lsis.parsed.traffic.bytes_in } }] }
             default { [] }
         },
         switch workspace.lsis.parsed.session_uid != null {

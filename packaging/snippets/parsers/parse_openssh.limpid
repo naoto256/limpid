@@ -445,6 +445,10 @@ def function openssh_otlp_event_outcome(status_id) {
     switch status_id { 1 { "success" } 2 { "failure" } default { null } }
 }
 
+def function openssh_otlp_event_type(activity_id) {
+    switch activity_id { 2 { "end" } default { "start" } }
+}
+
 def process openssh_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "observer.vendor", value: { string_value: "OpenBSD" } }],
@@ -459,7 +463,7 @@ def process openssh_to_otlp {
     workspace.lsis.shed.otlp.log_record.attributes = concat(
         [{ key: "event.kind", value: { string_value: "event" } }],
         [{ key: "event.category", value: { array_value: { values: [{ string_value: "authentication" }] } } }],
-        [{ key: "event.type", value: { array_value: { values: [{ string_value: "start" }] } } }],
+        [{ key: "event.type", value: { array_value: { values: [{ string_value: openssh_otlp_event_type(workspace.lsis.parsed.activity_id) }] } } }],
         switch workspace.ssh.kind != null { true { [{ key: "event.action", value: { string_value: workspace.ssh.kind } }] } default { [] } },
         switch openssh_otlp_event_outcome(workspace.lsis.parsed.status_id) != null { true { [{ key: "event.outcome", value: { string_value: openssh_otlp_event_outcome(workspace.lsis.parsed.status_id) } }] } default { [] } },
         switch workspace.lsis.parsed.user.name != null { true { [{ key: "user.name", value: { string_value: workspace.lsis.parsed.user.name } }] } default { [] } },

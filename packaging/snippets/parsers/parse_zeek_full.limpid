@@ -412,6 +412,17 @@ def process parse_zeek_full_catchall {
 }
 
 def function zeek_full_otlp_event_kind(class_uid) { switch class_uid { 2004 { "alert" } default { "event" } } }
+def function zeek_full_otlp_event_category(class_uid) { switch class_uid { 2004 { "intrusion_detection" } 3002 { "authentication" } 4002 { "web" } 4009 { "email" } default { "network" } } }
+def function zeek_full_otlp_event_type(class_uid, activity_id) {
+    switch class_uid {
+        2004 { "info" }
+        3002 { switch activity_id { 2 { "end" } default { "start" } } }
+        4002 { "access" }
+        4009 { "info" }
+        default { "protocol" }
+    }
+}
+def function zeek_full_otlp_event_outcome(status_id) { switch status_id { 1 { "success" } 2 { "failure" } default { null } } }
 
 def process zeek_full_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
@@ -426,15 +437,22 @@ def process zeek_full_to_otlp {
     workspace.lsis.shed.otlp.log_record.body = { string_value: ingress }
     workspace.lsis.shed.otlp.log_record.attributes = concat(
         [{ key: "event.kind", value: { string_value: zeek_full_otlp_event_kind(workspace.lsis.parsed.class_uid) } }],
-        [{ key: "event.category", value: { array_value: { values: [{ string_value: "network" }] } } }],
-        [{ key: "event.type", value: { array_value: { values: [{ string_value: "protocol" }] } } }],
+        [{ key: "event.category", value: { array_value: { values: [{ string_value: zeek_full_otlp_event_category(workspace.lsis.parsed.class_uid) }] } } }],
+        [{ key: "event.type", value: { array_value: { values: [{ string_value: zeek_full_otlp_event_type(workspace.lsis.parsed.class_uid, workspace.lsis.parsed.activity_id) }] } } }],
         switch workspace.zeek.body._path != null { true { [{ key: "event.code", value: { string_value: workspace.zeek.body._path } }] } default { [] } },
+        switch zeek_full_otlp_event_outcome(workspace.lsis.parsed.status_id) != null { true { [{ key: "event.outcome", value: { string_value: zeek_full_otlp_event_outcome(workspace.lsis.parsed.status_id) } }] } default { [] } },
+        switch coalesce(workspace.lsis.parsed.actor.user.name, workspace.lsis.parsed.user.name) != null { true { [{ key: "user.name", value: { string_value: coalesce(workspace.lsis.parsed.actor.user.name, workspace.lsis.parsed.user.name) } }] } default { [] } },
         switch workspace.lsis.parsed.src_endpoint.ip != null { true { [{ key: "source.ip", value: { string_value: workspace.lsis.parsed.src_endpoint.ip } }] } default { [] } },
         switch workspace.lsis.parsed.src_endpoint.port != null { true { [{ key: "source.port", value: { int_value: workspace.lsis.parsed.src_endpoint.port } }] } default { [] } },
         switch workspace.lsis.parsed.dst_endpoint.ip != null { true { [{ key: "destination.ip", value: { string_value: workspace.lsis.parsed.dst_endpoint.ip } }] } default { [] } },
         switch workspace.lsis.parsed.dst_endpoint.port != null { true { [{ key: "destination.port", value: { int_value: workspace.lsis.parsed.dst_endpoint.port } }] } default { [] } },
         switch workspace.lsis.parsed.connection_info.protocol_name != null { true { [{ key: "network.transport", value: { string_value: workspace.lsis.parsed.connection_info.protocol_name } }] } default { [] } },
         switch workspace.lsis.parsed.app_name != null { true { [{ key: "network.application", value: { string_value: workspace.lsis.parsed.app_name } }] } default { [] } },
+        switch workspace.lsis.parsed.file.name != null { true { [{ key: "file.name", value: { string_value: workspace.lsis.parsed.file.name } }] } default { [] } },
+        switch workspace.lsis.parsed.query.hostname != null { true { [{ key: "dns.question.name", value: { string_value: workspace.lsis.parsed.query.hostname } }] } default { [] } },
+        switch workspace.lsis.parsed.http_request.url.hostname != null { true { [{ key: "url.domain", value: { string_value: workspace.lsis.parsed.http_request.url.hostname } }] } default { [] } },
+        switch workspace.lsis.parsed.http_request.url.path != null { true { [{ key: "url.path", value: { string_value: workspace.lsis.parsed.http_request.url.path } }] } default { [] } },
+        switch workspace.lsis.parsed.http_response.code != null { true { [{ key: "http.response.status_code", value: { int_value: workspace.lsis.parsed.http_response.code } }] } default { [] } },
         switch workspace.lsis.parsed.finding_info.title != null { true { [{ key: "rule.name", value: { string_value: workspace.lsis.parsed.finding_info.title } }] } default { [] } },
         switch workspace.lsis.parsed.finding_info.uid != null { true { [{ key: "rule.id", value: { string_value: workspace.lsis.parsed.finding_info.uid } }] } default { [] } }
     )

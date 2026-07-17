@@ -188,6 +188,7 @@ def function checkpoint_syslog_network_record(sd, action, src, src_port, dst, ds
         severity:        severity,
         status_id:    checkpoint_syslog_status_id(action),
         time:         time_ns,
+        message:      parse_checkpoint_syslog_kv_or_null(sd, "sys_message"),
         src_endpoint: {
             ip:   src,
             port: checkpoint_syslog_int_opt(src_port)
@@ -243,6 +244,7 @@ def function checkpoint_syslog_finding_record(sd, action, src, src_port, dst, ds
         severity:        severity,
         status_id:    checkpoint_syslog_status_id(action),
         time:         time_ns,
+        message:      parse_checkpoint_syslog_kv_or_null(sd, "sys_message"),
         finding_info: {
             uid:   parse_checkpoint_syslog_kv(sd, "protection_id"),
             title: attack,
@@ -321,6 +323,7 @@ def function checkpoint_syslog_auth_record(sd, action, host, time_ns, severity_n
         severity:        severity,
         status_id:    status,
         time:         time_ns,
+        message:      parse_checkpoint_syslog_kv_or_null(sd, "sys_message"),
         user: { name: user },
         actor: { user: { name: user } },
         src_endpoint: { ip: src_ip },
@@ -368,6 +371,14 @@ def function parse_checkpoint_syslog_classify(body) {
                 "^<\\d+>1 (?P<timestamp>\\S+) (?P<host>\\S+) \\S+ - Log \\[Fields@\\S+ (?P<sd>.*)\\]\\s*$"
             )
         }
+    }
+}
+
+def function checkpoint_syslog_source_host(wire_host, fallback_host) {
+    switch wire_host {
+        "-"     { fallback_host }
+        null    { fallback_host }
+        default { wire_host }
     }
 }
 
@@ -431,7 +442,7 @@ def process parse_checkpoint_syslog_network_record_proc {
         parse_checkpoint_syslog_kv(sd, "rule_name"),
         parse_checkpoint_syslog_kv(sd, "rule_uid"),
         parse_checkpoint_syslog_kv(sd, "layer_name"),
-        coalesce(workspace.cp_syslog_class.host, workspace.checkpoint_syslog.hostname),
+        checkpoint_syslog_source_host(workspace.cp_syslog_class.host, workspace.checkpoint_syslog.hostname),
         checkpoint_syslog_time_ns(workspace.cp_syslog_class.timestamp),
         workspace.checkpoint_syslog_severity.number,
         workspace.checkpoint_syslog_severity.text
@@ -449,7 +460,7 @@ def process parse_checkpoint_syslog_finding_record_proc {
         parse_checkpoint_syslog_kv(sd, "dst"),
         parse_checkpoint_syslog_kv(sd, "service"),
         parse_checkpoint_syslog_kv(sd, "proto"),
-        coalesce(workspace.cp_syslog_class.host, workspace.checkpoint_syslog.hostname),
+        checkpoint_syslog_source_host(workspace.cp_syslog_class.host, workspace.checkpoint_syslog.hostname),
         checkpoint_syslog_time_ns(workspace.cp_syslog_class.timestamp),
         workspace.checkpoint_syslog_severity.number,
         workspace.checkpoint_syslog_severity.text
@@ -462,7 +473,7 @@ def process parse_checkpoint_syslog_auth_record {
     workspace.lsis.parsed = checkpoint_syslog_auth_record(
         sd,
         parse_checkpoint_syslog_kv(sd, "action"),
-        coalesce(workspace.cp_syslog_class.host, workspace.checkpoint_syslog.hostname),
+        checkpoint_syslog_source_host(workspace.cp_syslog_class.host, workspace.checkpoint_syslog.hostname),
         checkpoint_syslog_time_ns(workspace.cp_syslog_class.timestamp),
         workspace.checkpoint_syslog_severity.number,
         workspace.checkpoint_syslog_severity.text
@@ -503,6 +514,7 @@ def function checkpoint_syslog_otlp_event_outcome(status_id) {
 def process checkpoint_syslog_to_otlp {
     let sd = workspace.cp_syslog_class.sd
     let product = parse_checkpoint_syslog_kv_or_null(sd, "product")
+    let source_host = checkpoint_syslog_source_host(workspace.cp_syslog_class.host, workspace.checkpoint_syslog.hostname)
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "observer.vendor", value: { string_value: "Check Point Software Technologies" } }],
         switch product != null {
@@ -510,8 +522,8 @@ def process checkpoint_syslog_to_otlp {
             default { [] }
         },
         [{ key: "observer.type", value: { string_value: "firewall" } }],
-        switch workspace.cp_syslog_class.host != null {
-            true { [{ key: "host.name", value: { string_value: workspace.cp_syslog_class.host } }] }
+        switch source_host != null {
+            true { [{ key: "host.name", value: { string_value: source_host } }] }
             default { [] }
         },
         [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
