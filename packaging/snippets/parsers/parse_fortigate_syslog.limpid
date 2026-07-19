@@ -1,6 +1,9 @@
 // Summary:     Fortinet FortiGate native key=value syslog (FortiOS
 //              "default" format) → same LSIS shape as parse_fortigate_cef.
-// Reads:       ingress (raw wire) — syslog priority + KV body
+// Reads:       ingress (raw wire) — `<PRI>` + FortiGate KV body, NOT RFC 3164
+//              (no timestamp/hostname header between the priority and the
+//              body, so there is no meaningful `parse_syslog` stage to
+//              front this parser with; it strips the PRI itself)
 //              (`eventtime` is epoch seconds on older FortiOS and
 //              epoch nanoseconds on FortiOS 6.2.1+)
 // Writes:      workspace.lsis.parsed.* — same classes as parse_fortigate_cef

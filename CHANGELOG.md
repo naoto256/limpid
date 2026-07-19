@@ -8,6 +8,32 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+### Changed — transport / format unwrapping separated from vocabulary parsing (breaking)
+
+Bundled vocabulary parsers no longer unwrap their transport or format
+layers internally: `parse_asa` / `parse_paloalto_syslog` stopped calling
+`syslog.parse(ingress)` and `parse_fortigate_cef` / `parse_paloalto_cef`
+additionally stopped calling `cef.parse(...)`. Each layer is its own
+pipeline stage — a new `parsers/parse_cef.limpid` (transport/format-style
+`parse_cef` + generic `cef_to_otlp` adapter for the vendor-independent
+ArcSight CEF surface) joins `parse_syslog`. The separation lets a
+pipeline inspect and drop events after each stage without paying the
+next stage's parse cost, and keeps the stages independently composable.
+`parse_fortigate_syslog` is deliberately unchanged: FortiGate's native
+`<PRI>date=...` wire is not RFC 3164, so there is no meaningful
+transport stage to split out (it keeps stripping the PRI itself).
+
+Out-of-tree pipelines using these four parsers must update their chains
+(extraction results are unchanged — the same primitives run at the new
+stages):
+
+| 0.7.14 chain | 0.7.15 chain |
+|---|---|
+| `parse_asa \| ...` | `parse_syslog \| parse_asa \| ...` |
+| `parse_paloalto_syslog \| ...` | `parse_syslog \| parse_paloalto_syslog \| ...` |
+| `parse_fortigate_cef \| ...` | `parse_syslog \| parse_cef \| parse_fortigate_cef \| ...` |
+| `parse_paloalto_cef \| ...` | `parse_syslog \| parse_cef \| parse_paloalto_cef \| ...` |
+
 ### Changed — dependency dedupe
 
 Bumped `axum` to 0.8 and `webpki-roots` to 1.0 so the dependency graph no
