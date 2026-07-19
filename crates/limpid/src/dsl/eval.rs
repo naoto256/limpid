@@ -237,16 +237,15 @@ pub fn eval_expr_with_scope<'bump>(
     }
 }
 
-/// Evaluate a primitive call that carries a trailing `{ |id| body }`
-/// block argument.
+/// Evaluate a primitive call that carries a trailing block argument.
 ///
 /// Only `map` / `filter` / `find` / `reduce` accept block-args (other
-/// names bail with a clear error). For each, the array argument is
-/// evaluated up-front (so type errors surface deterministically), then
-/// the block body is re-evaluated per element with the bound identifier
-/// pushed onto a child copy of the caller's [`LocalScope`]. Locals
-/// introduced inside the block body do not leak back to the caller —
-/// each iteration runs against a fresh clone.
+/// names bail with a clear error). Each primitive evaluates its collection
+/// argument up-front and dispatches on its runtime `Array` / `Object` type.
+/// The block body is then re-evaluated per element or entry with its
+/// arguments pushed onto a child copy of the caller's [`LocalScope`]. Locals
+/// introduced inside the block body do not leak back to the caller; each
+/// iteration runs against a fresh clone.
 #[allow(clippy::too_many_arguments)]
 fn eval_block_primitive<'bump>(
     namespace: Option<&str>,
@@ -306,31 +305,52 @@ fn eval_block_body<'bump>(
     eval_expr_with_scope(&block.body.ret, event, funcs, &scope, arena)
 }
 
-fn expect_one_arg_array<'bump>(
+fn expect_collection_arg<'bump>(
     name: &str,
     args: &[Expr],
+    expected_args: usize,
     event: &BorrowedEvent<'bump>,
     funcs: &FunctionRegistry,
     scope: &LocalScope<'bump>,
     arena: &'bump EventArena<'bump>,
-) -> Result<&'bump [Value<'bump>]> {
-    if args.len() != 1 {
+) -> Result<Value<'bump>> {
+    if args.len() != expected_args {
         bail!(
-            "{}() with a block expects 1 array argument, got {}",
+            "{}() with a block expects {} argument(s), got {}",
             name,
+            expected_args,
             args.len()
         );
     }
     let v = eval_expr_with_scope(&args[0], event, funcs, scope, arena)?;
     match v {
-        Value::Array(items) => Ok(items),
-        Value::Null => Ok(&[]),
+        Value::Array(_) | Value::Object(_) | Value::Null => Ok(v),
         other => bail!(
-            "{}() expects an array as its first argument, got {}",
+            "{}() expects an array or object as its first argument, got {}",
             name,
             other.type_name()
         ),
     }
+}
+
+fn expect_block_arity(
+    name: &str,
+    block: &BlockArg,
+    collection_type: &str,
+    expected: usize,
+    example: &str,
+) -> Result<()> {
+    if block.params.len() != expected {
+        bail!(
+            "{}() over an {} requires exactly {} block parameter(s) (`{}`); got {}",
+            name,
+            collection_type,
+            expected,
+            example,
+            block.params.len()
+        );
+    }
+    Ok(())
 }
 
 fn eval_map<'bump>(
@@ -341,19 +361,43 @@ fn eval_map<'bump>(
     scope: &LocalScope<'bump>,
     arena: &'bump EventArena<'bump>,
 ) -> Result<Value<'bump>> {
-    if block.params.len() != 1 {
-        bail!(
-            "map block takes exactly 1 parameter (`{{ |x| ... }}`); got {}",
-            block.params.len()
-        );
+    match expect_collection_arg("map", args, 1, event, funcs, scope, arena)? {
+        Value::Array(items) => {
+            expect_block_arity("map", block, "array", 1, "{ |x| ... }")?;
+            let mut out = ArrayBuilder::with_capacity(arena, items.len());
+            for item in items {
+                out.push(eval_block_body(
+                    block,
+                    &[*item],
+                    event,
+                    funcs,
+                    scope,
+                    arena,
+                )?);
+            }
+            Ok(out.finish())
+        }
+        Value::Object(entries) => {
+            expect_block_arity("map", block, "object", 2, "{ |key, value| ... }")?;
+            let mut out = ArrayBuilder::with_capacity(arena, entries.len());
+            for (key, value) in entries {
+                out.push(eval_block_body(
+                    block,
+                    &[Value::String(key), *value],
+                    event,
+                    funcs,
+                    scope,
+                    arena,
+                )?);
+            }
+            Ok(out.finish())
+        }
+        Value::Null => {
+            expect_block_arity("map", block, "array", 1, "{ |x| ... }")?;
+            Ok(ArrayBuilder::new(arena).finish())
+        }
+        _ => unreachable!("expect_collection_arg accepts only array, object, or null"),
     }
-    let items = expect_one_arg_array("map", args, event, funcs, scope, arena)?;
-    let mut out = ArrayBuilder::with_capacity(arena, items.len());
-    for item in items {
-        let v = eval_block_body(block, &[*item], event, funcs, scope, arena)?;
-        out.push(v);
-    }
-    Ok(out.finish())
 }
 
 fn eval_filter<'bump>(
@@ -364,21 +408,42 @@ fn eval_filter<'bump>(
     scope: &LocalScope<'bump>,
     arena: &'bump EventArena<'bump>,
 ) -> Result<Value<'bump>> {
-    if block.params.len() != 1 {
-        bail!(
-            "filter block takes exactly 1 parameter (`{{ |x| ... }}`); got {}",
-            block.params.len()
-        );
-    }
-    let items = expect_one_arg_array("filter", args, event, funcs, scope, arena)?;
-    let mut out = ArrayBuilder::new(arena);
-    for item in items {
-        let v = eval_block_body(block, &[*item], event, funcs, scope, arena)?;
-        if v.is_truthy() {
-            out.push(*item);
+    match expect_collection_arg("filter", args, 1, event, funcs, scope, arena)? {
+        Value::Array(items) => {
+            expect_block_arity("filter", block, "array", 1, "{ |x| ... }")?;
+            let mut out = ArrayBuilder::new(arena);
+            for item in items {
+                if eval_block_body(block, &[*item], event, funcs, scope, arena)?.is_truthy() {
+                    out.push(*item);
+                }
+            }
+            Ok(out.finish())
         }
+        Value::Object(entries) => {
+            expect_block_arity("filter", block, "object", 2, "{ |key, value| ... }")?;
+            let mut out = ObjectBuilder::with_capacity(arena, entries.len());
+            for (key, value) in entries {
+                if eval_block_body(
+                    block,
+                    &[Value::String(key), *value],
+                    event,
+                    funcs,
+                    scope,
+                    arena,
+                )?
+                .is_truthy()
+                {
+                    out.push(key, *value);
+                }
+            }
+            Ok(out.finish())
+        }
+        Value::Null => {
+            expect_block_arity("filter", block, "array", 1, "{ |x| ... }")?;
+            Ok(ArrayBuilder::new(arena).finish())
+        }
+        _ => unreachable!("expect_collection_arg accepts only array, object, or null"),
     }
-    Ok(out.finish())
 }
 
 fn eval_find<'bump>(
@@ -389,20 +454,43 @@ fn eval_find<'bump>(
     scope: &LocalScope<'bump>,
     arena: &'bump EventArena<'bump>,
 ) -> Result<Value<'bump>> {
-    if block.params.len() != 1 {
-        bail!(
-            "find block takes exactly 1 parameter (`{{ |x| ... }}`); got {}",
-            block.params.len()
-        );
-    }
-    let items = expect_one_arg_array("find", args, event, funcs, scope, arena)?;
-    for item in items {
-        let v = eval_block_body(block, &[*item], event, funcs, scope, arena)?;
-        if v.is_truthy() {
-            return Ok(*item);
+    match expect_collection_arg("find", args, 1, event, funcs, scope, arena)? {
+        Value::Array(items) => {
+            expect_block_arity("find", block, "array", 1, "{ |x| ... }")?;
+            for item in items {
+                if eval_block_body(block, &[*item], event, funcs, scope, arena)?.is_truthy() {
+                    return Ok(*item);
+                }
+            }
+            Ok(Value::Null)
         }
+        Value::Object(entries) => {
+            expect_block_arity("find", block, "object", 2, "{ |key, value| ... }")?;
+            for (key, value) in entries {
+                if eval_block_body(
+                    block,
+                    &[Value::String(key), *value],
+                    event,
+                    funcs,
+                    scope,
+                    arena,
+                )?
+                .is_truthy()
+                {
+                    let mut pair = ArrayBuilder::with_capacity(arena, 2);
+                    pair.push(Value::String(key));
+                    pair.push(*value);
+                    return Ok(pair.finish());
+                }
+            }
+            Ok(Value::Null)
+        }
+        Value::Null => {
+            expect_block_arity("find", block, "array", 1, "{ |x| ... }")?;
+            Ok(Value::Null)
+        }
+        _ => unreachable!("expect_collection_arg accepts only array, object, or null"),
     }
-    Ok(Value::Null)
 }
 
 fn eval_reduce<'bump>(
@@ -413,30 +501,37 @@ fn eval_reduce<'bump>(
     scope: &LocalScope<'bump>,
     arena: &'bump EventArena<'bump>,
 ) -> Result<Value<'bump>> {
-    if block.params.len() != 2 {
-        bail!(
-            "reduce block takes exactly 2 parameters (`{{ |acc, x| ... }}`); got {}",
-            block.params.len()
-        );
+    let collection = expect_collection_arg("reduce", args, 2, event, funcs, scope, arena)?;
+    match collection {
+        Value::Array(_) | Value::Null => {
+            expect_block_arity("reduce", block, "array", 2, "{ |acc, x| ... }")?;
+        }
+        Value::Object(_) => {
+            expect_block_arity("reduce", block, "object", 3, "{ |acc, key, value| ... }")?;
+        }
+        _ => unreachable!("expect_collection_arg accepts only array, object, or null"),
     }
-    if args.len() != 2 {
-        bail!(
-            "reduce() with a block expects 2 arguments (array, init), got {}",
-            args.len()
-        );
-    }
-    let arr_val = eval_expr_with_scope(&args[0], event, funcs, scope, arena)?;
-    let items: &[Value<'bump>] = match arr_val {
-        Value::Array(items) => items,
-        Value::Null => &[],
-        other => bail!(
-            "reduce() expects an array as its first argument, got {}",
-            other.type_name()
-        ),
-    };
     let mut acc = eval_expr_with_scope(&args[1], event, funcs, scope, arena)?;
-    for item in items {
-        acc = eval_block_body(block, &[acc, *item], event, funcs, scope, arena)?;
+    match collection {
+        Value::Array(items) => {
+            for item in items {
+                acc = eval_block_body(block, &[acc, *item], event, funcs, scope, arena)?;
+            }
+        }
+        Value::Object(entries) => {
+            for (key, value) in entries {
+                acc = eval_block_body(
+                    block,
+                    &[acc, Value::String(key), *value],
+                    event,
+                    funcs,
+                    scope,
+                    arena,
+                )?;
+            }
+        }
+        Value::Null => {}
+        _ => unreachable!("expect_collection_arg accepts only array, object, or null"),
     }
     Ok(acc)
 }

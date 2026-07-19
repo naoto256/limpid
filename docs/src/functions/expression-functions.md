@@ -709,31 +709,37 @@ workspace.lsis.parsed.src_endpoint.port = to_int(workspace.cef.extension.spt)  /
 
 Motivation: CEF extension values and CSV column values arrive as strings even when carrying numeric content. OCSF schemas commonly require `Integer` for those same fields (ports, session IDs, byte counts). `to_int` is the schema-agnostic cast used by SIEM parser snippets.
 
-## Array helpers
+## Collection helpers
 
 Arrays in limpid are **ordered but index-hidden** — you construct them with `[a, b, c]` literals, but the DSL deliberately omits positional access (`arr[n]`) and positional writes (`arr[n] = v`). Element identity (or whole-array transforms) is the addressing model; see [User-defined Processes → Arrays](../processing/user-defined.md#arrays) for the rationale and the per-primitive references below.
 
-Four primitives — `map`, `filter`, `find`, `reduce` — take a **block argument** (`{ |x| ... }`) per element. Block syntax and the universal pipe operator `|>` are documented in [DSL Syntax Basics → Block argument](../dsl-syntax.md#block-argument).
+Four primitives — `map`, `filter`, `find`, `reduce` — take a **block argument** per array element or object entry. Array blocks bind `{ |x| ... }`; object blocks bind `{ |key, value| ... }`. Block syntax and the universal pipe operator `|>` are documented in [DSL Syntax Basics → Block argument](../dsl-syntax.md#block-argument).
 
-### map(array) { |x| body }
+### map(array) { |x| body } / map(object) { |key, value| body }
 
 Per-element transform; returns a new array of the same length, with each element replaced by the block's return value. Construction order is preserved. `Null` input → empty array.
 
+For an object, visits each entry in insertion order and returns an array containing each block result. Keys are bound as strings. Duplicate keys remain separate visits.
+
 ```limpid
 workspace.upper_users = map(workspace.events) { |e| upper(e.user) }
+workspace.headers = map(workspace.headers_by_name) { |key, value| "${key}: ${value}" }
 ```
 
-### filter(array) { |x| predicate }
+### filter(array) { |x| predicate } / filter(object) { |key, value| predicate }
 
 Keep elements where the block returns a truthy value. Order-preserving; non-truthy elements (`false`, `null`, `0`, `""`, empty containers) are dropped.
 
+For an object, returns an object containing the original entries whose block result is truthy. Entry order and duplicate keys are preserved. `Null` retains the established array behavior and returns an empty array.
+
 ```limpid
 workspace.alerts = filter(workspace.events) { |e| e.severity >= 7 }
+workspace.public = filter(workspace.fields) { |key, value| not starts_with(key, "_") }
 ```
 
 Equivalent to `compact` for null removal: `filter(arr) { |x| x != null }` drops `null` entries (no separate `compact` primitive ships — `null_omit` operates on objects, not arrays).
 
-### find(array) { |x| predicate }
+### find(array) { |x| predicate } / find(object) { |key, value| predicate }
 
 First element where the block returns truthy, or `null` if no match. An earlier `find_by(arr, key, value)` shape was removed in the 0.7.x cycle; the block-arg form composes for arbitrary predicates:
 
@@ -743,16 +749,23 @@ workspace.user    = find(workspace.evidence) { |e| e.entityType == "User" }
 workspace.recent  = find(workspace.events)   { |e| e.received_at > workspace.cutoff }
 ```
 
+For an object, returns the first matching entry as a two-element `[key, value]` array, or `null` when no entry matches.
+
 Non-object elements no longer have to be skipped silently — predicate logic decides what counts as a match.
 
-### reduce(array, init) { |acc, x| step }
+### reduce(array, init) { |acc, x| step } / reduce(object, init) { |acc, key, value| step }
 
 Left fold. The block takes two parameters: the running accumulator (`init` on the first iteration) and the current element. The block's return value becomes the new accumulator. Empty array → `init` unchanged.
+
+For an object, the block takes the accumulator, key, and value. Entries are folded in insertion order, including duplicate keys. Empty object → `init` unchanged. `Null` follows the array convention and also returns `init`.
 
 ```limpid
 let total = reduce(workspace.amounts, 0) { |acc, x| acc + x }
 let joined = reduce(workspace.tags, "") { |acc, t| acc + "," + t }
+let total_bytes = reduce(workspace.byte_fields, 0) { |acc, key, value| acc + value }
 ```
+
+Block arity is checked against the evaluated collection type. Array calls require one block parameter (`map` / `filter` / `find`) or two (`reduce`); object calls require two or three respectively. A mismatch is an error rather than an ignored binding.
 
 ### first(array) / last(array)
 
@@ -878,7 +891,7 @@ is_array(null)          // false
 is_array({a: 1})        // false (Object, not Array)
 ```
 
-Designed for snippet parsers that consume vendor JSON whose nominally-array fields may arrive as scalars when upstream is malformed. The pattern is **pre-validate intake shape, emit a parser-authored error on mismatch** — rather than fall through to `find()` / `map()` / `filter()` and surface a generic `<primitive>() expects an array` runtime error:
+Designed for snippet parsers that consume vendor JSON whose nominally-array fields may arrive as scalars when upstream is malformed. The pattern is **pre-validate intake shape, emit a parser-authored error on mismatch** — rather than fall through to `find()` / `map()` / `filter()` and surface a generic `<primitive>() expects an array or object` runtime error:
 
 ```limpid
 def process parse_okta_system {

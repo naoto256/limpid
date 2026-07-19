@@ -262,7 +262,7 @@ The expression form has no side effects (no `workspace.x = …`, no `process foo
 
 The constructs not detailed above live on the page they semantically belong to:
 
-- **`try-catch`** — process-body only. See [User-defined Processes → Control flow](./processing/user-defined.md#control-flow) for the syntax and the `error` name binding inside `catch`. Iteration over arrays is *not* a control-flow construct in limpid: use the block-arg primitives (`map`, `filter`, `find`, `reduce`) instead — see [Arrays](./processing/user-defined.md#arrays).
+- **`try-catch`** — process-body only. See [User-defined Processes → Control flow](./processing/user-defined.md#control-flow) for the syntax and the `error` name binding inside `catch`. Iteration over arrays and objects is *not* a control-flow construct in limpid: use the block-arg primitives (`map`, `filter`, `find`, `reduce`) instead — see [Arrays](./processing/user-defined.md#arrays).
 - **`drop` / `finish` / `error`** — pipeline routing. `drop` terminates the event silently (intended discard, counted as `events_dropped`); `finish` ends the pipeline early without dropping (counted as `events_finished`); `error <expr?>` routes the event to the [error log](./operations/error-log.md) with an operator-readable reason (counted as `events_errored`, same as a runtime process failure). `drop` and `error` are also allowed inside a process body; `finish` is pipeline-only. See [Pipelines → drop, finish, and error](./pipelines/drop-finish-error.md) for when to choose which.
 
 ## Pipe operator
@@ -289,22 +289,24 @@ The right-hand side can be:
 - A bare identifier (zero-arg form): `arr |> first` ≡ `arr |> first()`.
 - A bare identifier with a trailing block argument: `arr |> map { |x| x.id }` ≡ `arr |> map() { |x| x.id }`.
 
-All three forms produce identical FuncCall AST after the parser splices the LHS as the first argument. The bare form is purely ergonomic — useful when the pipe is the only argument source and the function has no other positional inputs (`first` / `last` / `distinct` / `sum`) or only takes a block (`map` / `filter` / `find` over the pipe-fed array).
+All three forms produce identical FuncCall AST after the parser splices the LHS as the first argument. The bare form is purely ergonomic — useful when the pipe is the only argument source and the function has no other positional inputs (`first` / `last` / `distinct` / `sum`) or only takes a block (`map` / `filter` / `find` over the pipe-fed collection).
 
 ## Block argument
 
-The block-arg primitives — `map`, `filter`, `find`, `reduce` — accept a trailing block argument that binds one (or, for `reduce`, two) identifier per element and runs the body against it:
+The block-arg primitives — `map`, `filter`, `find`, `reduce` — accept a trailing block argument. Arrays bind one identifier per element (two for `reduce`); objects bind `key, value` per entry (three including the accumulator for `reduce`):
 
 ```limpid
 let evens = filter(workspace.nums) { |n| n % 2 == 0 }
 let doubled = map(workspace.nums) { |n| n * 2 }
 let user_alert = find(workspace.alerts) { |a| a.user == "alice" }
 let total = reduce(workspace.amounts, 0) { |acc, x| acc + x }
+let headers = map(workspace.headers) { |key, value| "${key}: ${value}" }
+let byte_total = reduce(workspace.fields, 0) { |acc, key, value| acc + value }
 ```
 
 The body has the same shape as a `def function` body: zero or more `let` bindings followed by a required trailing return expression. Locals introduced inside the body do not leak back to the caller — each iteration starts with a fresh child of the caller's scope.
 
-Only `map` / `filter` / `find` / `reduce` accept block-args today; attaching one to any other function is a clear error. See [Built-in Functions → Array operations](./functions/expression-functions.md) for the per-primitive details and edge cases.
+Only `map` / `filter` / `find` / `reduce` accept block-args today; attaching one to any other function, or using the wrong number of block parameters for the runtime collection type, is a clear error. See [Built-in Functions → Collection helpers](./functions/expression-functions.md#collection-helpers) for the per-primitive details and edge cases.
 
 ## Reserved identifiers
 
