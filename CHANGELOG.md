@@ -8,6 +8,16 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+### Changed — dependency dedupe
+
+Bumped `axum` to 0.8 and `webpki-roots` to 1.0 so the dependency graph no
+longer carries two major versions of `axum` / `axum-core` / `matchit` /
+`webpki-roots`. The remaining `getrandom` 0.2/0.3 split (ring vs rand 0.9)
+is an upstream limitation and is documented as version-scoped skips in
+`deny.toml`; the newest getrandom line (currently 0.4, dev-only via
+`tempfile`) is deliberately not skipped so any future additional split
+still warns.
+
 ## [0.7.14] - 2026-07-16
 
 > source-owned OTLP semantics

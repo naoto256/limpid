@@ -32,7 +32,7 @@ gethostname = "0.5"
 async-trait = "0.1"
 maxminddb = "0.27"
 tokio-rustls = "0.26"
-webpki-roots = "0.26"
+webpki-roots = "1.0"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 flate2 = "1"
 sha2 = "0.10"
@@ -67,9 +67,9 @@ rdkafka = { version = "0.36", features = ["cmake-build", "ssl", "sasl"], optiona
 opentelemetry-proto = { version = "0.32", features = ["logs", "gen-tonic", "with-serde"] }
 tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
 prost = "0.14"
-axum = "0.7"
+axum = "0.8"
 # axum-server with rustls support for the otlp_http TLS / mTLS path.
-# axum 0.7's bundled `axum::serve` is hardcoded to `TcpListener`; switching
+# axum's bundled `axum::serve` is hardcoded to `TcpListener`; switching
 # to axum_server::bind / bind_rustls lets the same Router run on either
 # transport without rolling a manual hyper accept loop.
 axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
