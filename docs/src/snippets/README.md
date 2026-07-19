@@ -9,10 +9,11 @@ a vendor adds a field (the snippet is plain DSL: edit the file and
 SIGHUP).
 
 > **Status:** the snippet library was introduced in v0.7.0 and has
-> expanded across the 0.7.x line. It currently ships 31 parser files
+> expanded across the 0.7.x line. It currently ships 32 parser files
 > (source / vocabulary parsers — FortiGate / ASA / Checkpoint / Palo Alto /
 > Sysmon / CloudTrail / Zeek / Suricata / OCSF / Juniper SRX / ... — plus the
-> transport parsers `parse_syslog` and `parse_journald`), 30 sibling
+> transport / format parsers `parse_syslog`, `parse_journald`, and
+> `parse_cef`), 31 sibling
 > per-source OTLP adapters, the OCSF 1.3.0 27-class composer, the RFC 5424
 > and replay-shape composers, one filter, and several reusable functions.
 > The inbound `parse_ocsf` compatibility parser is the sole parser without
@@ -29,12 +30,13 @@ SIGHUP).
 | **Transport** | | |
 | `parsers/parse_syslog.limpid` | RFC 3164 / 5424 syslog wire (transport, populates `workspace.syslog.*`) | n/a |
 | `parsers/parse_journald.limpid` | systemd journald JSON (transport, populates `workspace.journald.*`) | n/a |
+| `parsers/parse_cef.limpid` | ArcSight CEF format from a syslog body (populates `workspace.cef.*`; chains as `parse_syslog \| parse_cef \| parse_<vendor>_cef`) | n/a |
 | **Security devices / cloud audit** | | |
-| `parsers/parse_fortigate_cef.limpid` | FortiGate (CEF wrap) | 4001 / 2004 / 3002 / 6002 |
+| `parsers/parse_fortigate_cef.limpid` | FortiGate (CEF wrap; chain `parse_syslog \| parse_cef \|` upstream) | 4001 / 2004 / 3002 / 6002 |
 | `parsers/parse_fortigate_syslog.limpid` | FortiGate (native KV syslog) | (same as CEF) |
-| `parsers/parse_paloalto_cef.limpid` | PAN-OS (CEF wrap) | 4001 / 2004 / 6004 / 3002 |
-| `parsers/parse_paloalto_syslog.limpid` | PAN-OS (native CSV syslog) | (same as CEF) |
-| `parsers/parse_asa.limpid` | Cisco ASA / FTD-in-ASA-mode (syslog) | 3002 / 4001 |
+| `parsers/parse_paloalto_cef.limpid` | PAN-OS (CEF wrap; chain `parse_syslog \| parse_cef \|` upstream) | 4001 / 2004 / 6004 / 3002 |
+| `parsers/parse_paloalto_syslog.limpid` | PAN-OS (native CSV syslog; chain `parse_syslog \|` upstream) | (same as CEF) |
+| `parsers/parse_asa.limpid` | Cisco ASA / FTD-in-ASA-mode (syslog; chain `parse_syslog \|` upstream) | 3002 / 4001 |
 | `parsers/parse_cloudtrail.limpid` | AWS CloudTrail (JSON) | 6003 API Activity |
 | `parsers/parse_juniper_srx_sd_syslog.limpid` | Juniper SRX RT_FLOW (RFC 5424 + Junos SD, `set security log format sd-syslog` mode) | 4001 Network Activity |
 | `parsers/parse_juniper_srx_syslog.limpid` | Juniper SRX RT_IDP / IDP_ATTACK_LOG_EVENT (RFC 3164 unstructured, default `syslog` mode) | 2004 Detection Finding |
@@ -139,9 +141,12 @@ contracts.
 
 ## Quick start
 
-The basic pattern is two `include` lines + a two-stage pipeline:
+The basic pattern is a few `include` lines + a staged pipeline
+(transport → format → vendor vocabulary → composer):
 
 ```limpid
+include "/usr/share/limpid/snippets/parsers/parse_syslog.limpid"
+include "/usr/share/limpid/snippets/parsers/parse_cef.limpid"
 include "/usr/share/limpid/snippets/parsers/parse_fortigate_cef.limpid"
 include "/usr/share/limpid/snippets/composers/compose_ocsf.limpid"
 
@@ -156,12 +161,13 @@ def output security_lake {
 
 def pipeline fw_to_security_lake {
     input fw_syslog
-    process parse_fortigate_cef | compose_ocsf | ocsf_to_egress
+    process parse_syslog | parse_cef | parse_fortigate_cef | compose_ocsf | ocsf_to_egress
     output security_lake
 }
 ```
 
-`parse_fortigate_cef` writes facts to `workspace.lsis.parsed.*`;
+`parse_syslog` unwraps the transport, `parse_cef` decodes the CEF
+format, and `parse_fortigate_cef` writes facts to `workspace.lsis.parsed.*`;
 `compose_ocsf` reads from there and writes the OCSF JSON record to
 `workspace.lsis.composed.ocsf`; the one-line `ocsf_to_egress`
 companion at the tail of the pipeline moves the slot to `egress`.
@@ -176,11 +182,11 @@ For mixed-vendor inputs, dispatch upstream of the parser:
 def pipeline mixed_in {
     input multi_vendor_syslog
     if contains(ingress, "CEF:0|Palo Alto Networks") {
-        process parse_paloalto_cef | compose_ocsf | ocsf_to_egress
+        process parse_syslog | parse_cef | parse_paloalto_cef | compose_ocsf | ocsf_to_egress
     } else if contains(ingress, "CEF:0|Fortinet") {
-        process parse_fortigate_cef | compose_ocsf | ocsf_to_egress
+        process parse_syslog | parse_cef | parse_fortigate_cef | compose_ocsf | ocsf_to_egress
     } else {
-        process parse_paloalto_syslog | compose_ocsf | ocsf_to_egress
+        process parse_syslog | parse_paloalto_syslog | compose_ocsf | ocsf_to_egress
     }
     output security_lake
 }

@@ -132,7 +132,7 @@ Rule of thumb: if the catch block has nothing useful to do besides stamp `worksp
 
 ```limpid
 def process parse_asa {
-    workspace.syslog = syslog.parse(ingress)
+    // workspace.syslog.* was populated by `parse_syslog` upstream
     let mid = regex_extract(workspace.syslog.msg, "%ASA-\\d-(\\d+):")
     switch mid {
         "605004" { process parse_asa_auth_success }
