@@ -102,7 +102,9 @@ before customising it; package upgrades replace files under
 See the [pack
 README](../../../packaging/snippets/README.md#slot-registry--composed-layer)
 for the full composed / shed slot registries and the LSIS layer
-contracts.
+contracts. The same README defines the authoring schema: each file declares a
+`Facade`, and every listed process or function has an adjacent contract block.
+Private dispatch leaves remain unlisted and need no public header.
 
 ### Filters
 
@@ -123,7 +125,7 @@ contracts.
   `severity` text rather than an invented OTel number.
 
 - `functions/parse_datetime_rfc3164.limpid` —
-  `parse_datetime_rfc3164(text, timezone) → Timestamp | null`. LPL
+  `parse_datetime_rfc3164(String, String) → Timestamp | Null`. LPL
   counterpart to the built-in `parse_datetime_rfc3339` primitive.
   RFC 3164 wire carries neither year nor timezone, so the helper
   applies the current-year + future-clamp policy after the calling
@@ -136,16 +138,17 @@ contracts.
   For RFC 5424 / OTLP / OCSF input use the built-in
   `parse_datetime_rfc3339` primitive directly.
 - `functions/timestamp_converter.limpid` — exact integer boundary helpers
-  `timestamp_ns_to_ms(value) → Int | null` and
-  `timestamp_ms_to_ns(value) → Int | null`. `compose_ocsf` uses the first;
+  `timestamp_ns_to_ms(Int | Timestamp | Null) → Int | Null` and
+  `timestamp_ms_to_ns(Int | Null) → Int | Null`.
+  `compose_ocsf` uses the first;
   `parse_ocsf` uses the second. Helpers shared by multiple source schemas
   live under `functions/`; source-local helpers stay beside their parser.
 - `functions/http_method_activity_id.limpid` —
-  `http_method_activity_id(method) → Int`. HTTP request method
+  `http_method_activity_id(String) → Int`. HTTP request method
   (`GET` / `POST` / `PUT` / `DELETE` / `HEAD` / `OPTIONS` /
   `CONNECT` / `TRACE`) → OCSF 4002 HTTP Activity `activity_id`,
   with `99` (Other) for anything outside the OCSF 1.3.0 enumeration.
-- `functions/proto_num.limpid` — `proto_num(name) → Int | null`.
+- `functions/proto_num.limpid` — `proto_num(String) → Int | Null`.
   Transport-layer protocol name (case-insensitive `tcp` / `udp` /
   `icmp` / …) → IANA protocol number for OCSF
   `connection_info.protocol_num`. Returns `null` rather than a
