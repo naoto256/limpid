@@ -8,6 +8,17 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+### Changed — snippet headers declare file facades and member contracts
+
+Packaged snippets now separate file-level metadata from the contracts of each
+public process or function. A `Facade:` list names the externally callable
+members, and an adjacent `Process:` or `Function:` block documents each public
+member without forcing internal dispatch leaves into the public surface.
+`Reads:` and `Writes:` accept multiple independently validated workspace roots,
+so adapters and bridges can state their real cross-namespace boundaries. The
+header linter rejects missing, orphaned, misplaced, and signature-mismatched
+member blocks, and the generated inventory consumes the same facade metadata.
+
 ### Fixed — analyzer contracts match runtime value shapes
 
 Static checking now models ingress and egress as String-or-Bytes payloads,
