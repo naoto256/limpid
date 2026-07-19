@@ -120,8 +120,9 @@ contracts.
   applies the current-year + future-clamp policy after the calling
   parser resolves its vendor-specific timezone default or explicit
   override. A vendor-defined fixed zone wins; documented device-local
-  formats default to `local` (the limpid host's system timezone), and
-  formats with no authoritative timezone contract default to `UTC`.
+  formats and formats with no authoritative timezone contract both
+  default to `local` (the limpid host's system timezone — the device
+  most likely shares the host's zone).
   IANA names and fixed offsets are also accepted as explicit overrides.
   For RFC 5424 / OTLP / OCSF input use the built-in
   `parse_datetime_rfc3339` primitive directly.

@@ -374,8 +374,9 @@ time. A deployment that intentionally overrides event time does so in
 the adapter output before composition.
 
 Timezone interpretation follows the source contract. A vendor-defined
-zone wins. Device-local timestamps default to the limpid host's system
-timezone, while a documented specification gap defaults to UTC. Parsers
+zone wins. Device-local timestamps and timestamps whose specification
+leaves the zone undocumented both default to the limpid host's system
+timezone (the device most likely shares the host's zone). Parsers
 that accept local timestamps expose a source-specific timezone override;
 their headers document the exact default and accepted values.
 

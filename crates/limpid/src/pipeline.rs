@@ -2045,21 +2045,21 @@ def pipeline zeek_full_otlp {
             .unwrap()
             .timestamp_nanos_opt()
             .unwrap();
-        assert_eq!(nsp_default_timezone["time"], nsp_utc_expected);
-
-        let nsp_override = run_packaged_parser_json(
-            "parse_nsp",
-            Some("workspace.nsp = { body: ingress, timezone: \"America/New_York\" }"),
-            "parse_nsp",
-            nsp_body,
-        );
-        let nsp_override_expected = chrono_tz::America::New_York
+        let nsp_local_expected = chrono_tz::America::New_York
             .with_ymd_and_hms(2026, 5, 16, 10, 0, 0)
             .single()
             .unwrap()
             .timestamp_nanos_opt()
             .unwrap();
-        assert_eq!(nsp_override["time"], nsp_override_expected);
+        assert_eq!(nsp_default_timezone["time"], nsp_local_expected);
+
+        let nsp_override = run_packaged_parser_json(
+            "parse_nsp",
+            Some("workspace.nsp = { body: ingress, timezone: \"UTC\" }"),
+            "parse_nsp",
+            nsp_body,
+        );
+        assert_eq!(nsp_override["time"], nsp_utc_expected);
 
         let nsp_explicit_utc = run_packaged_parser_json(
             "parse_nsp",
@@ -2076,21 +2076,21 @@ def pipeline zeek_full_otlp {
             "parse_paloalto_syslog",
             &paloalto_wire,
         );
-        let paloalto_utc_expected = chrono::Utc
+        let paloalto_local_expected = chrono_tz::America::New_York
             .with_ymd_and_hms(2026, 4, 30, 10, 23, 45)
             .single()
             .unwrap()
             .timestamp_nanos_opt()
             .unwrap();
-        assert_eq!(paloalto_default_timezone["time"], paloalto_utc_expected);
+        assert_eq!(paloalto_default_timezone["time"], paloalto_local_expected);
 
         let paloalto_override = run_packaged_parser_json(
             "parse_paloalto_syslog",
-            Some("workspace.paloalto_syslog = { timezone: \"America/New_York\" }"),
+            Some("workspace.paloalto_syslog = { timezone: \"UTC\" }"),
             "parse_paloalto_syslog",
             &paloalto_wire,
         );
-        let paloalto_override_expected = chrono_tz::America::New_York
+        let paloalto_override_expected = chrono::Utc
             .with_ymd_and_hms(2026, 4, 30, 10, 23, 45)
             .single()
             .unwrap()
@@ -2247,11 +2247,10 @@ def pipeline zeek_full_otlp {
                 _ => None,
             };
             let defaulted = run_packaged_parser_json(parser, default_setup, parser, &ingress);
-            let default_expected = match parser {
-                "parse_fortigate_cef" | "parse_juniper_srx_syslog" => local_expected,
-                "parse_asa" | "parse_paloalto_cef" => expected,
-                _ => unreachable!(),
-            };
+            // All RFC 3164 parsers with an undocumented source zone default to
+            // the limpid host's system timezone (host-local most-likely
+            // assumption); only vendor-documented UTC formats default to UTC.
+            let default_expected = local_expected;
             assert_eq!(
                 defaulted["time"], default_expected,
                 "{parser} default timezone"

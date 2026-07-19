@@ -4,12 +4,14 @@
 //              (FUTURE_USE,RecvTime,Serial,Type,Subtype,...)
 //              workspace.paloalto_syslog.timezone (optional, String) — source
 //              timezone override as an IANA name or fixed offset; legacy
-//              Receive/Generated Time defaults to UTC when absent
-//              (PAN-OS defines Receive/Generated Time meanings but gives a
-//              zone only for the separate high-resolution timestamp)
+//              Receive/Generated Time defaults to the limpid host's system
+//              timezone (PAN-OS defines Receive/Generated Time meanings but
+//              gives a zone only for the separate high-resolution timestamp)
 //              https://docs.paloaltonetworks.com/ngfw/administration/monitoring/use-syslog-for-monitoring/syslog-field-descriptions/traffic-log-fields
-//              UTC is the intentional pack default; override this slot or use
-//              a custom parser when the source zone is known to differ.
+//              The default assumes the firewall and limpid share the same
+//              correct system timezone — the most likely deployment when the
+//              zone is undocumented. Override this slot with an IANA name or
+//              fixed offset when the source zone is known to differ.
 // Writes:      workspace.lsis.parsed.* — TRAFFIC → 4001, THREAT → 2004
 //              (url → 6004, wildfire → 2004), GLOBALPROTECT /
 //              AUTHENTICATION → 3002; paloalto_syslog_to_otlp writes
@@ -88,7 +90,7 @@ def process parse_paloalto_syslog_normalize_time {
     switch workspace.paloalto_syslog.timezone {
         "local" { error "parse_paloalto_syslog: source timezone must be an IANA name or fixed offset, not local" }
     }
-    let source_timezone = coalesce(workspace.paloalto_syslog.timezone, "UTC")
+    let source_timezone = coalesce(workspace.paloalto_syslog.timezone, "local")
     workspace.paloalto_syslog.time = switch true {
         workspace.pan.GenerateTime == null { null }
         workspace.pan.GenerateTime == ""   { null }
