@@ -299,13 +299,13 @@ def process juniper_srx_syslog_to_otlp {
             true { [{ key: "host.name", value: { string_value: workspace.srx_syslog_class.host } }] }
             default { [] }
         },
+        switch workspace.srx_syslog_class.daemon != null {
+            true { [{ key: "service.name", value: { string_value: "RT_${workspace.srx_syslog_class.daemon}" } }] }
+            default { [] }
+        },
         [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
         [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
     )
-    workspace.lsis.shed.otlp.scope.name = switch workspace.srx_syslog_class.daemon != null {
-        true    { "RT_${workspace.srx_syslog_class.daemon}" }
-        default { null }
-    }
     workspace.lsis.shed.otlp.log_record.body = { string_value: workspace.juniper_srx_syslog.body }
     workspace.lsis.shed.otlp.log_record.attributes = concat(
         [{ key: "event.kind", value: { string_value: "alert" } }],

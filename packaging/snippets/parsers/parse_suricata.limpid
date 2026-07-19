@@ -7,7 +7,7 @@
 //   .time (optional, Int) — epoch ns override
 // Writes:      workspace.lsis.parsed.* — alert → 2004, dns → 4003, http → 4002,
 //              suricata_to_otlp additionally writes source-specific
-//              workspace.lsis.shed.otlp Resource, Scope, Body, and LogRecord attributes.
+//              workspace.lsis.shed.otlp Resource, Body, and LogRecord attributes.
 //              tls / flow / fileinfo → 4001; stats dropped; other
 //              event_types route to error_log.
 // Category:    OSS NDR
@@ -518,10 +518,10 @@ def process suricata_to_otlp {
             true { [{ key: "host.name", value: { string_value: workspace.suricata.hostname } }] }
             default { [] }
         },
+        [{ key: "service.name", value: { string_value: "suricata" } }],
         [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
         [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
     )
-    workspace.lsis.shed.otlp.scope.name = "suricata"
     workspace.lsis.shed.otlp.log_record.body = { string_value: ingress }
     workspace.lsis.shed.otlp.log_record.attributes = concat(
         [{ key: "event.kind", value: { string_value: suricata_otlp_event_kind(body.event_type) } }],

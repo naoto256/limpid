@@ -6,7 +6,7 @@
 //                .hostname (optional, String) — host where sudo ran
 //                .time (optional, Int) — epoch nanoseconds
 // Writes:      workspace.lsis.parsed.* — 3003 (Authorize Session);
-//              sudo_to_otlp writes source-owned OTLP Resource, Scope, Body,
+//              sudo_to_otlp writes source-owned OTLP Resource, Body,
 //              and LogRecord attributes.
 // Category:    Endpoint / host audit (Unix)
 // Test corpus: synthetic (sample sudo bodies in this header)
@@ -494,10 +494,10 @@ def process sudo_to_otlp {
         [{ key: "observer.product", value: { string_value: "sudo" } }],
         [{ key: "observer.type", value: { string_value: "host" } }],
         switch workspace.sudo.hostname != null { true { [{ key: "host.name", value: { string_value: workspace.sudo.hostname } }] } default { [] } },
+        [{ key: "service.name", value: { string_value: "sudo" } }],
         [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
         [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
     )
-    workspace.lsis.shed.otlp.scope.name = "sudo"
     workspace.lsis.shed.otlp.log_record.body = { string_value: workspace.sudo.body }
     workspace.lsis.shed.otlp.log_record.attributes = concat(
         [{ key: "event.kind", value: { string_value: "event" } }],

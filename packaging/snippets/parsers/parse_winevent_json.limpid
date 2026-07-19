@@ -492,6 +492,7 @@ def process winevent_json_to_otlp {
         [{ key: "observer.product", value: { string_value: "Windows Event Log" } }],
         [{ key: "observer.type", value: { string_value: "host" } }],
         switch workspace.winevent.Hostname != null { true { [{ key: "host.name", value: { string_value: workspace.winevent.Hostname } }] } default { [] } },
+        switch workspace.winevent.SourceName != null { true { [{ key: "service.name", value: { string_value: workspace.winevent.SourceName } }] } default { [] } },
         [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
         [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
     )

@@ -9,7 +9,7 @@
 //                  https://bind9.readthedocs.io/en/v9.18.13/reference.html#namedconf-statement-print-time
 // Writes:      workspace.lsis.parsed.* — 4003 (DNS Activity). Only the queries
 //              channel; bind_to_otlp writes source-owned OTLP Resource,
-//              Scope, Body, and LogRecord attributes.
+//              Body, and LogRecord attributes.
 // Category:    DNS server
 // Test corpus: synthetic (sample querylog lines in this header)
 //
@@ -179,10 +179,10 @@ def process bind_to_otlp {
         [{ key: "observer.product", value: { string_value: "BIND" } }],
         [{ key: "observer.type", value: { string_value: "dns" } }],
         switch workspace.bind.hostname != null { true { [{ key: "host.name", value: { string_value: workspace.bind.hostname } }] } default { [] } },
+        [{ key: "service.name", value: { string_value: "named" } }],
         [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
         [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
     )
-    workspace.lsis.shed.otlp.scope.name = "named"
     workspace.lsis.shed.otlp.log_record.body = { string_value: workspace.bind.body }
     workspace.lsis.shed.otlp.log_record.attributes = concat(
         [{ key: "event.kind", value: { string_value: "event" } }],

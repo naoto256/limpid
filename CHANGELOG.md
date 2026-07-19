@@ -18,6 +18,23 @@ is an upstream limitation and is documented as version-scoped skips in
 `tempfile`) is deliberately not skipped so any future additional split
 still warns.
 
+### Fixed — OTLP Scope/Resource placement follows the spec's two-tier identity reading
+
+The bundled `<source>_to_otlp` adapters shipped in 0.7.14 placed program-level
+identity in the InstrumentationScope, inverting the OpenTelemetry Logs Data
+Model reading in which the program (process) that produced the record is
+Resource identity and only a logger / channel / stream *within* a program is
+Scope identity. Program names now land in Resource `service.name` — syslog
+APP-NAME, `sshd`, `sudo`, `auditd`, `named`, `suricata`, `kube-apiserver`,
+Juniper SRX daemon names, the full Postfix `postfix/<program>` spelling, the
+Sysmon provider `Microsoft-Windows-Sysmon`, journald's
+`SYSLOG_IDENTIFIER`/`_SYSTEMD_UNIT`, the Windows event `SourceName`, and Okta
+(`okta`, retiring the invented `okta.system_log` spelling) — while
+`scope.name` is reserved for genuine logger/channel identities: the Windows
+event `Channel`, the Sysmon `Channel` when the forwarder ships it, Zeek's
+`_path`, and the static `journald` structuring layer. Sources that do not name
+themselves continue to leave both unset.
+
 ## [0.7.14] - 2026-07-16
 
 > source-owned OTLP semantics

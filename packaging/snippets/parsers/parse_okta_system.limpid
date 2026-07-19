@@ -6,7 +6,7 @@
 //              Event Hooks data.events[] upstream)
 // Writes:      workspace.lsis.parsed.* — user.session/user.authentication → 3002,
 //              okta_system_to_otlp additionally writes source-specific
-//              workspace.lsis.shed.otlp Resource, Scope, Body, and LogRecord attributes.
+//              workspace.lsis.shed.otlp Resource, Body, and LogRecord attributes.
 //              user.lifecycle → 3001, user.account → 3005, group.* → 3006;
 //              other eventTypes route to error_log.
 // Category:    Identity / IdP
@@ -680,11 +680,10 @@ def process okta_system_to_otlp {
     let target_group = okta_first_target(workspace.okta.target, "UserGroup")
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "cloud.provider", value: { string_value: "okta" } }],
-        [{ key: "service.name", value: { string_value: "Okta System Log" } }],
+        [{ key: "service.name", value: { string_value: "okta" } }],
         [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
         [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
     )
-    workspace.lsis.shed.otlp.scope.name = "okta.system_log"
     workspace.lsis.shed.otlp.log_record.body = { string_value: ingress }
     workspace.lsis.shed.otlp.log_record.attributes = concat(
         [{ key: "event.kind", value: { string_value: "event" } }],

@@ -60,10 +60,11 @@ def process parse_journald {
 def process journald_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         switch workspace.journald._HOSTNAME != null { true { [{ key: "host.name", value: { string_value: workspace.journald._HOSTNAME } }] } default { [] } },
+        switch coalesce(workspace.journald.SYSLOG_IDENTIFIER, workspace.journald._SYSTEMD_UNIT) != null { true { [{ key: "service.name", value: { string_value: coalesce(workspace.journald.SYSLOG_IDENTIFIER, workspace.journald._SYSTEMD_UNIT) } }] } default { [] } },
         [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
         [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
     )
-    workspace.lsis.shed.otlp.scope.name = coalesce(workspace.journald.SYSLOG_IDENTIFIER, workspace.journald._SYSTEMD_UNIT)
+    workspace.lsis.shed.otlp.scope.name = "journald"
     workspace.lsis.shed.otlp.scope.attributes = concat(
         switch workspace.journald._SYSTEMD_UNIT != null { true { [{ key: "systemd.unit", value: { string_value: workspace.journald._SYSTEMD_UNIT } }] } default { [] } },
         switch workspace.journald._TRANSPORT != null { true { [{ key: "systemd.transport", value: { string_value: workspace.journald._TRANSPORT } }] } default { [] } }
