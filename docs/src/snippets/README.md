@@ -3,10 +3,12 @@
 A maintained set of vendor parsers and target-schema composers,
 shipped with the `limpid` package and installed under
 `/usr/share/limpid/snippets/`. Operators get vendor logs into a
-SIEM / data lake in OCSF form by adding a single `include` line to
-their config — no parser to write from scratch, no recompile when
-a vendor adds a field (the snippet is plain DSL: edit the file and
-SIGHUP).
+SIEM / data lake in OCSF form by including the parser, its declared
+helper dependencies, and the target composer. No parser has to be
+written from scratch, and changing DSL does not require recompiling
+the daemon. Copy an installed snippet into an operator-owned path
+before customising it; package upgrades replace files under
+`/usr/share/limpid/snippets/`.
 
 > **Status:** the snippet library was introduced in v0.7.0 and has
 > expanded across the 0.7.x line. It currently ships 32 parser files
@@ -25,7 +27,7 @@ SIGHUP).
 
 ### Parsers
 
-| Snippet | Source | OCSF class(es) emitted |
+| Snippet | Source | LSIS class facts produced |
 |---|---|---|
 | **Transport** | | |
 | `parsers/parse_syslog.limpid` | RFC 3164 / 5424 syslog wire (transport, populates `workspace.syslog.*`) | n/a |
@@ -37,7 +39,12 @@ SIGHUP).
 | `parsers/parse_paloalto_cef.limpid` | PAN-OS (CEF wrap; chain `parse_syslog \| parse_cef \|` upstream) | 4001 / 2004 / 6004 / 3002 |
 | `parsers/parse_paloalto_syslog.limpid` | PAN-OS (native CSV syslog; chain `parse_syslog \|` upstream) | (same as CEF) |
 | `parsers/parse_asa.limpid` | Cisco ASA / FTD-in-ASA-mode (syslog; chain `parse_syslog \|` upstream) | 3002 / 4001 |
+| `parsers/parse_aws_guardduty.limpid` | AWS GuardDuty findings (JSON) | 2004 Detection Finding |
+| `parsers/parse_aws_vpc_flow.limpid` | AWS VPC Flow Logs (text v2/v5) | 4001 Network Activity |
+| `parsers/parse_azure_activity.limpid` | Azure Activity Log (JSON) | 6003 API Activity |
 | `parsers/parse_cloudtrail.limpid` | AWS CloudTrail (JSON) | 6003 API Activity |
+| `parsers/parse_k8s_audit.limpid` | Kubernetes Audit API events (JSON) | 6003 / 3002 |
+| `parsers/parse_okta_system.limpid` | Okta System Log events (JSON) | 3001 / 3002 / 3005 / 3006 |
 | `parsers/parse_juniper_srx_sd_syslog.limpid` | Juniper SRX RT_FLOW (RFC 5424 + Junos SD, `set security log format sd-syslog` mode) | 4001 Network Activity |
 | `parsers/parse_juniper_srx_syslog.limpid` | Juniper SRX RT_IDP / IDP_ATTACK_LOG_EVENT (RFC 3164 unstructured, default `syslog` mode) | 2004 Detection Finding |
 | `parsers/parse_nsp.limpid` | Trellix / McAfee Network Security Platform IPS alerts (standard syslog KV template, real-traffic verified) | 2004 Detection Finding |
@@ -128,6 +135,11 @@ contracts.
   IANA names and fixed offsets are also accepted as explicit overrides.
   For RFC 5424 / OTLP / OCSF input use the built-in
   `parse_datetime_rfc3339` primitive directly.
+- `functions/timestamp_converter.limpid` — exact integer boundary helpers
+  `timestamp_ns_to_ms(value) → Int | null` and
+  `timestamp_ms_to_ns(value) → Int | null`. `compose_ocsf` uses the first;
+  `parse_ocsf` uses the second. Helpers shared by multiple source schemas
+  live under `functions/`; source-local helpers stay beside their parser.
 - `functions/http_method_activity_id.limpid` —
   `http_method_activity_id(method) → Int`. HTTP request method
   (`GET` / `POST` / `PUT` / `DELETE` / `HEAD` / `OPTIONS` /
@@ -268,11 +280,11 @@ systems below):
   attack-scenario dataset (Empire mimikatz logonpasswords trace,
   702 Security-channel events).
 
-The remaining classes for which `compose_ocsf` has a leaf but no
-parser yet emits to (most of category 2 Findings; some of category
-4 sub-protocols like DNS / DHCP / RDP / SMB / SSH / FTP /
-NetworkFile; some of category 6 like Datastore / Scan) are
-candidates for upcoming snippets in 0.7.x point releases.
+The remaining classes for which `compose_ocsf` has a leaf but no bundled
+parser currently produces facts are Registry Key Activity (1008), Registry
+Value Activity (1009), Compliance Finding (2003), Incident Finding (2005),
+Network File Activity (4010), Datastore Activity (6005), and Scan Activity
+(6007). These are candidates for future snippets.
 
 ## Authoring your own snippets
 
@@ -283,10 +295,13 @@ conventions are:
   (`parse_fortigate_cef` + `parse_fortigate_syslog`) because CEF and
   native KV are different wire shapes; OpenSSH is one file because
   sshd's wire is one shape across syslog and journald.
-- **File header** carries `// Vendor:` / `// Wire:` / `// Output:`
-  lines describing the source, plus per-shape sample lines anonymised
-  to RFC 5321 / 5737 forms (`example.com`, `192.0.2.x`,
-  `198.51.100.x`).
+- **Canonical file header** follows the per-kind schema documented in the
+  [pack README](../../../packaging/snippets/README.md#authoring-conventions):
+  parser files declare `Summary`, `Reads`, `Writes`, `Category`, and
+  `Test corpus`; composers and shared functions use their corresponding
+  schemas. The header is the source for generated inventory. Keep sample
+  wires in the header and anonymise them with documentation domains and
+  RFC 5737 addresses.
 - **Two-tier dispatch**: the top-level `def process parse_<vendor>`
   strips the wrapper and routes by header field (`switch
   workspace.<vendor>.<key>`); per-leaf `def process` re-parses the

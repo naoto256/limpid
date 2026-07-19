@@ -138,6 +138,7 @@ Evaluated values are coerced to strings:
 | Bool | `true` / `false` |
 | Null | empty string |
 | Timestamp | RFC3339 (`2026-04-19T10:30:45+00:00`) |
+| Bytes | `<bytes>` (use `to_string(...)` for an intentional text decoding) |
 | Object / Array | JSON |
 
 For full control over structured values, wrap them in `to_json(...)` yourself.
