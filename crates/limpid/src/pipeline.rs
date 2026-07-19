@@ -3763,11 +3763,12 @@ def pipeline zeek_full_otlp {
             json!({}),
             received_at,
         );
+        assert!(k8s.scope_logs[0].scope.is_none());
         assert_eq!(
-            k8s.scope_logs[0]
-                .scope
-                .as_ref()
-                .map(|scope| scope.name.as_str()),
+            otlp_string_attribute(
+                &k8s.resource.as_ref().expect("resource").attributes,
+                "service.name"
+            ),
             Some("kube-apiserver")
         );
         let k8s_record = &k8s.scope_logs[0].log_records[0];
@@ -4116,11 +4117,12 @@ def pipeline zeek_full_otlp {
             json!({"auditd": {"body": String::from_utf8_lossy(auditd_wire), "hostname": "host-1"}}),
             received_at,
         );
+        assert!(auditd.scope_logs[0].scope.is_none());
         assert_eq!(
-            auditd.scope_logs[0]
-                .scope
-                .as_ref()
-                .map(|scope| scope.name.as_str()),
+            otlp_string_attribute(
+                &auditd.resource.as_ref().expect("resource").attributes,
+                "service.name"
+            ),
             Some("auditd")
         );
 
