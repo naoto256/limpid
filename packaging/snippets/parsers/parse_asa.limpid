@@ -3,10 +3,11 @@
 // Reads:       ingress (raw wire) — syslog-wrapped %ASA-<level>-<msg_id> messages
 //              workspace.asa.timezone (optional, String) — source device
 //              timezone override as an IANA name or fixed offset; the legacy
-//              RFC 3164 timestamp defaults to UTC when this is absent
-//              (Cisco documents UTC only for RFC 5424; the accepted legacy
-//              RFC 3164 form has no documented zone, so UTC is the intentional
-//              pack default; override it when the device zone is known)
+//              RFC 3164 timestamp defaults to the limpid host's system
+//              timezone (Cisco documents UTC only for RFC 5424; the accepted
+//              legacy RFC 3164 form has no documented zone, so the pack
+//              assumes the device shares the host's zone — the most likely
+//              deployment; override it when the device zone is known)
 //              https://www.cisco.com/c/en/us/td/docs/security/asa/asa-cli-reference/I-R/asa-command-ref-I-R/m_log-lz.html
 // Writes:      workspace.lsis.parsed.* — 3002 (Authentication) and 4001 (Network
 //              asa_to_otlp additionally writes source-specific
@@ -117,7 +118,7 @@ def process validate_asa_severity_number {
         "local" { error "parse_asa: source timezone must be an IANA name or fixed offset, not local" }
     }
     workspace.asa.severity_number = asa_severity_number(to_int(workspace.asa.level))
-    let source_timezone = coalesce(workspace.asa.timezone, "UTC")
+    let source_timezone = coalesce(workspace.asa.timezone, "local")
     workspace.asa.time = switch workspace.asa.timestamp {
         null    { null }
         default { to_int(parse_datetime_rfc3164(workspace.asa.timestamp, source_timezone)) }

@@ -18,6 +18,20 @@ is an upstream limitation and is documented as version-scoped skips in
 `tempfile`) is deliberately not skipped so any future additional split
 still warns.
 
+### Fixed — undocumented RFC 3164-family timezone default is host-local, not UTC
+
+Bundled parsers whose legacy timestamp format leaves the source zone
+undocumented (`parse_asa`, `parse_nsp`, `parse_paloalto_cef`,
+`parse_paloalto_syslog`) previously assumed UTC. No vendor specification
+documents UTC wall-clock for these formats, so the pack default now follows
+the ruling already applied to `parse_fortigate_cef` /
+`parse_juniper_srx_syslog`: a vendor-documented UTC format keeps UTC, and a
+documented device-local zone or a specification gap defaults to the limpid
+host's system timezone — the most likely assumption being that the device
+shares the host's zone. The `workspace.<parser>.timezone` override contract
+is unchanged: IANA names and fixed offsets are accepted, explicit `local`
+is still rejected.
+
 ### Fixed — OTLP Scope/Resource placement follows the spec's two-tier identity reading
 
 The bundled `<source>_to_otlp` adapters shipped in 0.7.14 placed program-level

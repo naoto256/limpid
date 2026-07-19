@@ -3,12 +3,14 @@
 // Reads:       ingress (raw wire) — syslog-wrapped CEF (CEF:0|Palo Alto Networks|PAN-OS|...)
 //              workspace.paloalto_cef.timezone (optional, String) — source
 //              device timezone override as an IANA name or fixed offset; the
-//              legacy RFC 3164 wrapper defaults to UTC when this is absent
-//              (PAN-OS documents configurable device time zones but does not
-//              assign a zone to this legacy CEF wrapper timestamp)
+//              legacy RFC 3164 wrapper defaults to the limpid host's system
+//              timezone (PAN-OS documents configurable device time zones but
+//              does not assign a zone to this legacy CEF wrapper timestamp)
 //              https://docs.paloaltonetworks.com/ngfw/help/10-1/device/device-setup-management
-//              UTC is the intentional pack default; override this slot or use
-//              a custom parser when the source zone is known to differ.
+//              The default assumes the firewall and limpid share the same
+//              correct system timezone — the most likely deployment when the
+//              zone is undocumented. Override this slot with an IANA name or
+//              fixed offset when the source zone is known to differ.
 // Writes:      workspace.lsis.parsed.* — TRAFFIC → 4001, THREAT / WILDFIRE → 2004,
 //              URL → 6004, GLOBALPROTECT / AUTHENTICATION → 3002; see the
 //              subtype leaves below. paloalto_cef_to_otlp writes source-owned
@@ -76,7 +78,7 @@ def process parse_paloalto_cef_normalize_severity {
         "local" { error "parse_paloalto_cef: source timezone must be an IANA name or fixed offset, not local" }
     }
     let severity_number = paloalto_cef_severity_number(workspace.cef.severity)
-    let source_timezone = coalesce(workspace.paloalto_cef.timezone, "UTC")
+    let source_timezone = coalesce(workspace.paloalto_cef.timezone, "local")
     workspace.paloalto_cef.time = switch true {
         workspace.cef.timestamp == null { null }
         default                         { to_int(parse_datetime_rfc3164(workspace.cef.timestamp, source_timezone)) }
