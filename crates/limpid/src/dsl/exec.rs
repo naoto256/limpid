@@ -1003,6 +1003,38 @@ mod tests {
         })
     }
 
+    fn int_object(entries: &[(&str, i64)]) -> Expr {
+        e(ExprKind::HashLit(
+            entries
+                .iter()
+                .map(|(key, value)| ((*key).into(), e(ExprKind::IntLit(*value))))
+                .collect(),
+        ))
+    }
+
+    fn block_call_error(name: &str, collection: Expr, params: Vec<&str>) -> String {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
+        let event = make_event();
+        let bevent = event.view_in(&arena);
+        let mut args = vec![collection];
+        if name == "reduce" {
+            args.push(e(ExprKind::IntLit(0)));
+        }
+        let stmts = vec![ProcessStatement::Assign(
+            AssignTarget::Workspace(vec!["result".into()]),
+            block_call(name, args, params, e(ExprKind::BoolLit(true))),
+        )];
+        expect_exec_err(exec_process_body(
+            &stmts,
+            bevent,
+            &NoopRegistry,
+            &make_funcs(),
+            &arena,
+        ))
+        .to_string()
+    }
+
     #[test]
     fn test_exec_array_literal_into_workspace() {
         let _bump = ::bumpalo::Bump::new();
@@ -1232,6 +1264,245 @@ mod tests {
             }
             ExecResult::Dropped => panic!("unexpected drop"),
         }
+    }
+
+    #[test]
+    fn test_exec_block_object_primitives_preserve_entry_order_and_duplicates() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
+        let event = make_event();
+        let bevent = event.view_in(&arena);
+        let entries = || e(ExprKind::Ident(vec!["workspace".into(), "entries".into()]));
+        let key = || e(ExprKind::Ident(vec!["key".into()]));
+        let value = || e(ExprKind::Ident(vec!["value".into()]));
+        let stmts = vec![
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["entries".into()]),
+                int_object(&[("a", 1), ("a", 2), ("b", 3)]),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["mapped".into()]),
+                block_call(
+                    "map",
+                    vec![entries()],
+                    vec!["key", "value"],
+                    e(ExprKind::ArrayLit(vec![key(), value()])),
+                ),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["filtered".into()]),
+                block_call(
+                    "filter",
+                    vec![entries()],
+                    vec!["key", "value"],
+                    e(ExprKind::BoolLit(true)),
+                ),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["found".into()]),
+                block_call(
+                    "find",
+                    vec![entries()],
+                    vec!["key", "value"],
+                    e(ExprKind::BinOp(
+                        Box::new(value()),
+                        BinOp::Eq,
+                        Box::new(e(ExprKind::IntLit(2))),
+                    )),
+                ),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["total".into()]),
+                block_call(
+                    "reduce",
+                    vec![entries(), e(ExprKind::IntLit(0))],
+                    vec!["acc", "key", "value"],
+                    e(ExprKind::BinOp(
+                        Box::new(e(ExprKind::Ident(vec!["acc".into()]))),
+                        BinOp::Add,
+                        Box::new(value()),
+                    )),
+                ),
+            ),
+        ];
+
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
+            ExecResult::Continue(ev) => {
+                assert_eq!(
+                    ev.workspace_get("mapped").unwrap().to_owned_value(),
+                    OwnedValue::Array(vec![
+                        OwnedValue::Array(
+                            vec![OwnedValue::String("a".into()), OwnedValue::Int(1),]
+                        ),
+                        OwnedValue::Array(
+                            vec![OwnedValue::String("a".into()), OwnedValue::Int(2),]
+                        ),
+                        OwnedValue::Array(
+                            vec![OwnedValue::String("b".into()), OwnedValue::Int(3),]
+                        ),
+                    ])
+                );
+                let Some(Value::Object(filtered)) = ev.workspace_get("filtered") else {
+                    panic!("filter(object) did not return an object");
+                };
+                assert_eq!(
+                    filtered,
+                    &[
+                        ("a", Value::Int(1)),
+                        ("a", Value::Int(2)),
+                        ("b", Value::Int(3)),
+                    ]
+                );
+                assert_eq!(
+                    ev.workspace_get("found").unwrap().to_owned_value(),
+                    OwnedValue::Array(vec![OwnedValue::String("a".into()), OwnedValue::Int(2),])
+                );
+                assert_eq!(ev.workspace_get("total"), Some(Value::Int(6)));
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
+    }
+
+    #[test]
+    fn test_exec_block_object_primitives_handle_empty_and_null_collections() {
+        let _bump = ::bumpalo::Bump::new();
+        let arena = crate::dsl::arena::EventArena::new(&_bump);
+        let event = make_event();
+        let bevent = event.view_in(&arena);
+        let empty = || e(ExprKind::HashLit(vec![]));
+        let null = || e(ExprKind::Null);
+        let stmts = vec![
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["map_empty".into()]),
+                block_call(
+                    "map",
+                    vec![empty()],
+                    vec!["key", "value"],
+                    e(ExprKind::Null),
+                ),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["filter_empty".into()]),
+                block_call(
+                    "filter",
+                    vec![empty()],
+                    vec!["key", "value"],
+                    e(ExprKind::BoolLit(true)),
+                ),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["find_empty".into()]),
+                block_call(
+                    "find",
+                    vec![empty()],
+                    vec!["key", "value"],
+                    e(ExprKind::BoolLit(true)),
+                ),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["reduce_empty".into()]),
+                block_call(
+                    "reduce",
+                    vec![empty(), e(ExprKind::IntLit(7))],
+                    vec!["acc", "key", "value"],
+                    e(ExprKind::Ident(vec!["acc".into()])),
+                ),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["map_null".into()]),
+                block_call("map", vec![null()], vec!["value"], e(ExprKind::Null)),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["filter_null".into()]),
+                block_call(
+                    "filter",
+                    vec![null()],
+                    vec!["value"],
+                    e(ExprKind::BoolLit(true)),
+                ),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["find_null".into()]),
+                block_call(
+                    "find",
+                    vec![null()],
+                    vec!["value"],
+                    e(ExprKind::BoolLit(true)),
+                ),
+            ),
+            ProcessStatement::Assign(
+                AssignTarget::Workspace(vec!["reduce_null".into()]),
+                block_call(
+                    "reduce",
+                    vec![null(), e(ExprKind::IntLit(7))],
+                    vec!["acc", "value"],
+                    e(ExprKind::Ident(vec!["acc".into()])),
+                ),
+            ),
+        ];
+
+        match exec_process_body(&stmts, bevent, &NoopRegistry, &make_funcs(), &arena).unwrap() {
+            ExecResult::Continue(ev) => {
+                assert_eq!(
+                    ev.workspace_get("map_empty").unwrap().to_owned_value(),
+                    OwnedValue::Array(vec![])
+                );
+                assert!(matches!(
+                    ev.workspace_get("filter_empty"),
+                    Some(Value::Object(entries)) if entries.is_empty()
+                ));
+                assert_eq!(ev.workspace_get("find_empty"), Some(Value::Null));
+                assert_eq!(ev.workspace_get("reduce_empty"), Some(Value::Int(7)));
+                assert_eq!(
+                    ev.workspace_get("map_null").unwrap().to_owned_value(),
+                    OwnedValue::Array(vec![])
+                );
+                assert_eq!(
+                    ev.workspace_get("filter_null").unwrap().to_owned_value(),
+                    OwnedValue::Array(vec![])
+                );
+                assert_eq!(ev.workspace_get("find_null"), Some(Value::Null));
+                assert_eq!(ev.workspace_get("reduce_null"), Some(Value::Int(7)));
+            }
+            ExecResult::Dropped => panic!("unexpected drop"),
+        }
+    }
+
+    #[test]
+    fn test_exec_block_primitives_reject_collection_arity_mismatches() {
+        for name in ["map", "filter", "find"] {
+            let err = block_call_error(name, int_object(&[("a", 1)]), vec!["value"]);
+            assert!(
+                err.contains(&format!("{}() over an object requires exactly 2", name)),
+                "unexpected {name} object arity error: {err}"
+            );
+
+            let err = block_call_error(
+                name,
+                e(ExprKind::ArrayLit(vec![e(ExprKind::IntLit(1))])),
+                vec!["key", "value"],
+            );
+            assert!(
+                err.contains(&format!("{}() over an array requires exactly 1", name)),
+                "unexpected {name} array arity error: {err}"
+            );
+        }
+
+        let err = block_call_error("reduce", int_object(&[("a", 1)]), vec!["acc", "value"]);
+        assert!(
+            err.contains("reduce() over an object requires exactly 3"),
+            "unexpected reduce object arity error: {err}"
+        );
+
+        let err = block_call_error(
+            "reduce",
+            e(ExprKind::ArrayLit(vec![e(ExprKind::IntLit(1))])),
+            vec!["acc", "key", "value"],
+        );
+        assert!(
+            err.contains("reduce() over an array requires exactly 2"),
+            "unexpected reduce array arity error: {err}"
+        );
     }
 
     #[test]

@@ -497,6 +497,55 @@ def pipeline p {
     assert_eq!(out.status.code(), Some(2));
 }
 
+#[test]
+fn block_collection_overloads_pass_strict_static_checking() {
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("block_collections.conf");
+    fs::write(
+        &conf,
+        r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p {
+    input i
+    process {
+        let fields = {alpha: 1, beta: 2}
+        let mapped = map(fields) { |key, value| "${key}:${value}" }
+        let selected = filter(fields) { |key, value| value > 0 }
+        let found = find(fields) { |key, value| key == "alpha" }
+        let total = reduce(fields, 0) { |acc, key, value| acc + value }
+
+        let array_mapped = map([1, 2]) { |value| value + 1 }
+        let array_selected = filter([1, 2]) { |value| value > 0 }
+        let array_found = find([1, 2]) { |value| value == 2 }
+        let array_total = reduce([1, 2], 0) { |acc, value| acc + value }
+        let empty_mapped = map(null) { |value| value }
+        let empty_filtered = filter(null) { |value| value }
+        let empty_found = find(null) { |value| value != null }
+        let empty_total = reduce(null, 0) { |acc, value| acc + value }
+
+        workspace.object_shape = parse_kv("gamma=3", " ", selected)
+        workspace.array_shape = append(array_selected, 3)
+        workspace.results = [
+            mapped, found, total,
+            array_mapped, array_found, array_total,
+            empty_mapped, empty_filtered, empty_found, empty_total,
+        ]
+    }
+    output o
+}
+"#,
+    )
+    .unwrap();
+
+    let out = run_with_flags(&conf, &["--strict-warnings"]);
+    assert!(
+        out.status.success(),
+        "strict check failed: stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Global block schema (v0.7.2)
 // ---------------------------------------------------------------------------
