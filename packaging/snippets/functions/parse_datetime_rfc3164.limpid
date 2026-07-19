@@ -16,9 +16,15 @@
 //      Vector / Fluent Bit all converge on.
 //
 //   2. The wire carries no timezone. The caller resolves the vendor-specific
-//      default or an operator override before calling this helper. `local`
-//      means the limpid host's system timezone; `UTC`, IANA names, and fixed
-//      offsets are also accepted. An invalid timezone is a loud error.
+//      default or an operator override before calling this helper. This helper
+//      itself accepts `local` (the limpid host's system timezone), `UTC`, IANA
+//      names, and fixed offsets; invalid values are a loud error. Note that
+//      the pack's RFC 3164 parsers (parse_asa, parse_fortigate_cef,
+//      parse_juniper_srx_syslog, parse_paloalto_cef) additionally reject an
+//      explicit `local` in their `workspace.<parser>.timezone` override slot
+//      — a slot value is a source-device declaration, distinct from the
+//      internal device-local fallback used when the slot is unset. See each
+//      parser's guard comment for the full rationale.
 //
 // For modern senders (RFC 5424 syslog, OTLP, OCSF, AWS CloudTrail,
 // most cloud audit logs) use the built-in `parse_datetime_rfc3339`
