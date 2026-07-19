@@ -1100,6 +1100,72 @@ def pipeline p {
         );
     }
 
+    #[test]
+    fn coalesce_narrows_nullable_collection_before_len() {
+        let src = r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p {
+    input i
+    process {
+        if true { workspace.items = [] }
+        else { workspace.items = null }
+        workspace.has_items = len(coalesce(workspace.items, [])) > 0
+    }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        assert!(warnings(&diags).is_empty(), "got: {:?}", diags);
+    }
+
+    #[test]
+    fn null_presence_checks_do_not_warn_after_call_site_specialization() {
+        let src = r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def process guard_optional_fields {
+    if true { workspace.optional = "value" }
+    else { workspace.optional = null }
+    workspace.has_optional = workspace.optional != null
+    workspace.has_name = workspace.name != null
+    workspace.has_labels = workspace.labels != null
+}
+def pipeline p {
+    input i
+    process {
+        workspace.name = "source"
+        workspace.labels = []
+    }
+    process guard_optional_fields
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        assert!(warnings(&diags).is_empty(), "got: {:?}", diags);
+    }
+
+    #[test]
+    fn non_null_equality_type_mismatches_still_warn() {
+        let src = r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p {
+    input i
+    process { workspace.mismatch = "1" == 1 }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            warnings(&diags)
+                .iter()
+                .any(|warning| warning.message.contains("always evaluates the same")),
+            "got: {:?}",
+            diags
+        );
+    }
+
     // ----- DiagKind tagging / promotion -----------------------------------
 
     #[test]
