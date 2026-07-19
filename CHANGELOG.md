@@ -77,6 +77,17 @@ stages):
 | `parse_fortigate_cef \| ...` | `parse_syslog \| parse_cef \| parse_fortigate_cef \| ...` |
 | `parse_paloalto_cef \| ...` | `parse_syslog \| parse_cef \| parse_paloalto_cef \| ...` |
 
+### Added — block primitives iterate object entries
+
+`map`, `filter`, `find`, and `reduce` now accept Object values in addition to
+arrays. Object blocks bind each key as a String alongside its value, visit
+entries in insertion order without deduplicating repeated keys, and use
+type-specific arity checks so an array-shaped block cannot silently consume an
+object (or vice versa). `map` returns an array of block results, `filter`
+returns the retained object entries, `find` returns the first matching
+`[key, value]` pair, and `reduce` folds `|acc, key, value|` over the entries.
+Null inputs retain the existing array behavior.
+
 ### Changed — dependency dedupe
 
 Bumped `axum` to 0.8 and `webpki-roots` to 1.0 so the dependency graph no

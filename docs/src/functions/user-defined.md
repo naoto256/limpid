@@ -132,7 +132,7 @@ def function endpoint_label(host, port) {
 }
 ```
 
-Anything an expression can do (binary ops, primitive calls, hash literals, array literals, nested function calls) is fair game inside `let` RHS or the trailing expression. The block-arg primitives — `map`, `filter`, `find`, `reduce` — are pure expressions over arrays and compose freely inside a function body. What you cannot do is write a *statement* — no assignments to anything, no `drop` / `error` / `process foo` / `output foo`, no statement-form `if` / `switch` / `try-catch`. Use the expression-form alternatives.
+Anything an expression can do (binary ops, primitive calls, hash literals, array literals, nested function calls) is fair game inside `let` RHS or the trailing expression. The block-arg primitives — `map`, `filter`, `find`, `reduce` — are pure expressions over arrays or objects and compose freely inside a function body. Array blocks bind the element (plus the accumulator for `reduce`); object blocks bind key and value (plus the accumulator for `reduce`). What you cannot do is write a *statement* — no assignments to anything, no `drop` / `error` / `process foo` / `output foo`, no statement-form `if` / `switch` / `try-catch`. Use the expression-form alternatives.
 
 ## Restrictions (enforced at `--check` time)
 

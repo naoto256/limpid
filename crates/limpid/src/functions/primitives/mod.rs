@@ -18,6 +18,8 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
+use crate::dsl::field_schema::FieldType;
+
 use super::FunctionRegistry;
 use super::table::TableStore;
 
@@ -119,6 +121,11 @@ pub fn register(reg: &mut FunctionRegistry, table_store: TableStore) {
 // ---------------------------------------------------------------------------
 // Shared helpers used by multiple primitive implementations.
 // ---------------------------------------------------------------------------
+
+/// Static input contract shared by block collection primitives.
+pub(super) fn block_collection_type() -> FieldType {
+    FieldType::Union(vec![FieldType::Array, FieldType::Object, FieldType::Null])
+}
 
 /// Coerce a value to a string the way DSL arithmetic / string
 /// primitives expect: string-through, null-as-empty, everything else via

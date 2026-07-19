@@ -56,12 +56,20 @@ pub fn infer(expr: &Expr, bindings: &Bindings, registry: &FunctionRegistry) -> F
         ExprKind::FuncCall {
             namespace,
             name,
-            args: _,
+            args,
             block_arg: _,
-        } => registry
-            .signature(namespace.as_deref(), name)
-            .map(|s| s.ret.clone())
-            .unwrap_or(FieldType::Any),
+        } => {
+            if namespace.is_none() && name == "filter" {
+                args.first()
+                    .map(|arg| filter_return_type(infer(arg, bindings, registry)))
+                    .unwrap_or(FieldType::Any)
+            } else {
+                registry
+                    .signature(namespace.as_deref(), name)
+                    .map(|s| s.ret.clone())
+                    .unwrap_or(FieldType::Any)
+            }
+        }
         ExprKind::BinOp(_l, op, _r) => match op {
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 FieldType::Bool
@@ -98,6 +106,21 @@ pub fn infer(expr: &Expr, bindings: &Bindings, registry: &FunctionRegistry) -> F
                 FieldType::union(result, FieldType::Null)
             }
         }
+    }
+}
+
+fn filter_return_type(input: FieldType) -> FieldType {
+    match input {
+        FieldType::Array | FieldType::Null => FieldType::Array,
+        FieldType::Object => FieldType::Object,
+        FieldType::Union(members) => members
+            .into_iter()
+            .map(filter_return_type)
+            .reduce(FieldType::union)
+            .unwrap_or(FieldType::Any),
+        // An unknown or invalid input stays unknown to avoid cascading
+        // diagnostics after the call-site argument check.
+        _ => FieldType::Any,
     }
 }
 
@@ -225,18 +248,48 @@ pub fn check_types(
             namespace,
             name,
             args,
-            block_arg: _,
+            block_arg,
         } => {
-            walk_children(expr, |child| {
+            for arg in args {
                 check_types(
-                    child,
+                    arg,
                     pipeline_name,
                     bindings,
                     registry,
                     fallback_span,
                     diagnostics,
-                )
-            });
+                );
+            }
+            if let Some(block) = block_arg {
+                let mut block_bindings = bindings.clone();
+                block_bindings.push_let_scope();
+                for (index, param) in block.params.iter().enumerate() {
+                    block_bindings.bind_let(
+                        param,
+                        block_parameter_type(name, args, index, bindings, registry),
+                    );
+                }
+                for local in &block.body.lets {
+                    check_types(
+                        &local.value,
+                        pipeline_name,
+                        &block_bindings,
+                        registry,
+                        fallback_span,
+                        diagnostics,
+                    );
+                    let ty = infer(&local.value, &block_bindings, registry);
+                    block_bindings.bind_let(&local.name, ty);
+                }
+                check_types(
+                    &block.body.ret,
+                    pipeline_name,
+                    &block_bindings,
+                    registry,
+                    fallback_span,
+                    diagnostics,
+                );
+            }
             // Function-call-level diagnostic (unknown function, arg
             // type mismatch) anchors to the call expression itself; the
             // per-argument diagnostic below prefers the individual arg
@@ -295,6 +348,28 @@ pub fn check_types(
                 diagnostics,
             )
         }),
+    }
+}
+
+fn block_parameter_type(
+    name: &str,
+    args: &[Expr],
+    index: usize,
+    bindings: &Bindings,
+    registry: &FunctionRegistry,
+) -> FieldType {
+    let collection = args
+        .first()
+        .map(|arg| infer(arg, bindings, registry))
+        .unwrap_or(FieldType::Any);
+    match (name, collection, index) {
+        ("map" | "filter" | "find", FieldType::Object, 0) => FieldType::String,
+        ("reduce", _, 0) => args
+            .get(1)
+            .map(|arg| infer(arg, bindings, registry))
+            .unwrap_or(FieldType::Any),
+        ("reduce", FieldType::Object, 1) => FieldType::String,
+        _ => FieldType::Any,
     }
 }
 

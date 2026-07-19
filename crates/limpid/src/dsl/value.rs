@@ -657,9 +657,9 @@ impl<'bump> ObjectBuilder<'bump> {
         }
     }
 
-    /// Push an entry. Insertion order is preserved by the underlying
-    /// arena vec; duplicate keys are NOT detected here (debug builds may
-    /// add a `debug_assert!` later — release stays linear-scan-fast).
+    /// Push an entry. Insertion order and duplicate keys are intentionally
+    /// preserved by the underlying arena vec; callers that iterate an Object
+    /// must observe every stored entry.
     pub fn push(&mut self, key: &'bump str, value: Value<'bump>) {
         self.entries.push((key, value));
     }

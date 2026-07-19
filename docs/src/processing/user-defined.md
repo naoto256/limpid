@@ -2,7 +2,7 @@
 
 limpid ships a [Snippet Library](../snippets/README.md) of pre-built processes for common parsing / mapping work (introduced in v0.7.0, expanded across the 0.7.x line). Sooner or later you'll hit a situation the library doesn't cover — a vendor format we haven't shipped, a one-off enrichment, a dedup or rate-limit shape that's specific to your environment — and want to write your own. This page covers how.
 
-You define a process with `def process <name> { ... }`. Inside the body you call functions, assign to event slots and workspace, branch with `if` / `switch` / `try`, transform arrays with the block-arg primitives (`map`, `filter`, `find`, `reduce`), and call other processes by name.
+You define a process with `def process <name> { ... }`. Inside the body you call functions, assign to event slots and workspace, branch with `if` / `switch` / `try`, transform arrays and objects with the block-arg primitives (`map`, `filter`, `find`, `reduce`), and call other processes by name.
 
 ## Defining a process
 
@@ -182,6 +182,17 @@ The library steers toward identity-based access so snippets stay correct under u
 | Dynamic key access | `path(obj, "k1", "k2", ...)` (object only; integer keys rejected) |
 | Add to back / front | `append(arr, v)`, `prepend(arr, v)` |
 | Serialise to JSON | `to_json(arr)` |
+
+The same four block primitives iterate objects in insertion order with explicit key/value bindings:
+
+| Operation | Object form | Result |
+|-----------|-------------|--------|
+| Transform | `map(obj) { \|key, value\| <expr> }` | Array of block results |
+| Filter | `filter(obj) { \|key, value\| <bool> }` | Object containing the retained entries |
+| Pick | `find(obj) { \|key, value\| <bool> }` | First `[key, value]` pair or `null` |
+| Fold | `reduce(obj, init) { \|acc, key, value\| <step> }` | Final accumulator |
+
+Object iteration sees every stored entry as-is. Insertion order is preserved and duplicate keys are visited and retained; these primitives do not normalize an object into a unique-key map. A `null` collection follows the established array behavior: `map` / `filter` return an empty array, `find` returns `null`, and `reduce` returns `init`.
 
 Block-arg primitives (`map`, `filter`, `find`, `reduce`) and the pipe operator (`|>`) are documented in [DSL Syntax Basics → Block argument](../dsl-syntax.md#block-argument) and [Pipe operator](../dsl-syntax.md#pipe-operator).
 
