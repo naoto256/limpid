@@ -5,9 +5,9 @@
 // Reads:       ingress (raw wire) — one space-separated flow-log record per
 //              line; dispatch by the leading version token
 // Writes:      workspace.lsis.parsed.* — 4001 (Network Activity); unknown version
-//              aws_vpc_flow_to_otlp additionally writes source-specific
-//              workspace.lsis.shed.otlp Resource, Body, and LogRecord attributes.
-//              tokens route to error_log.
+//              tokens route to error_log. aws_vpc_flow_to_otlp additionally writes
+//              source-specific workspace.lsis.shed.otlp Resource, Body, and
+//              LogRecord attributes.
 // Category:    Cloud network (data plane)
 // Test corpus: spec-only (AWS VPC Flow Logs documentation column layouts;
 //              synthesised sample lines below cover ACCEPT / REJECT / NODATA /

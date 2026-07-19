@@ -14,9 +14,8 @@
 // `parse_journald` is a thin LOTL wrapper: limpid's `input journal`
 // emits ingress as `journalctl -o json`-byte-identical JSON, and this
 // snippet just hands it to `parse_json`. No vendor-specific decoding
-// happens here — field names stay journald-canonical so downstream
-// composers (e.g. `compose_rfc5424`) can read them by their original
-// name.
+// happens here — field names stay journald-canonical. Target-specific
+// adapters or named bridges read that namespace; generic composers do not.
 //
 // Field naming notes —
 //   PRIORITY               — syslog severity (0-7), JSON string ("6")
@@ -50,7 +49,7 @@
 //    "MESSAGE":"Accepted publickey for alice from 192.0.2.10 port 51234 ssh2"}
 //
 // Typical pipeline —
-//   process parse_journald | compose_rfc5424 | rfc5424_to_egress
+//   process parse_journald | journald_to_rfc5424 | compose_rfc5424 | rfc5424_to_egress
 //   process parse_journald | parse_openssh | compose_ocsf | ocsf_to_egress
 
 def process parse_journald {

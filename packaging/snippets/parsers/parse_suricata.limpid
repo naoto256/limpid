@@ -6,10 +6,10 @@
 //   .hostname (optional, String) — collector override
 //   .time (optional, Int) — epoch ns override
 // Writes:      workspace.lsis.parsed.* — alert → 2004, dns → 4003, http → 4002,
-//              suricata_to_otlp additionally writes source-specific
-//              workspace.lsis.shed.otlp Resource, Body, and LogRecord attributes.
-//              tls / flow / fileinfo → 4001; stats dropped; other
-//              event_types route to error_log.
+//              tls / flow / fileinfo → 4001; stats dropped; other event_types
+//              route to error_log. suricata_to_otlp additionally writes
+//              source-specific workspace.lsis.shed.otlp Resource, Body, and
+//              LogRecord attributes.
 // Category:    OSS NDR
 // Test corpus: public (elastic/integrations suricata corpus — 63 events
 //              across alert / dns / http / tls / flow / fileinfo / stats;

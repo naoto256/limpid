@@ -25,7 +25,7 @@ Errors raised by these primitives (a `parse_json` on malformed input, a `to_int`
 
 ### Bare statements vs assignments
 
-A parser function returns a `Value::Object` whose keys are taken from the parse — `hostname`, `appname`, `msg` for `syslog.parse`; `version`, `name`, `severity`, plus CEF extension keys (`src`, `dst`, `act`, …) for `cef.parse`; whatever the source JSON contains for `parse_json`. There are two ways to consume that object inside a process body.
+A parser function returns a `Value::Object` whose keys are taken from the parse — `hostname`, `appname`, `msg` for `syslog.parse`; `version`, `name`, `severity`, `extension_raw`, plus nested CEF extension keys (`extension.src`, `extension.dst`, `extension.act`, …) for `cef.parse`; whatever the source JSON contains for `parse_json`. There are two ways to consume that object inside a process body.
 
 **Bare statement** — the returned object's top-level keys are merged directly into `workspace`:
 
@@ -165,9 +165,10 @@ Returns a `Value::Object`:
 | `signature_id`   | String         | vendor-specific event id |
 | `name`           | String         | human-readable event name |
 | `severity`       | Int \| String  | vendor severity (0–10), or the raw string when the producer sent garbage |
-| `ext`            | String         | raw extension blob from the wire — present only when the Extension section was non-empty (mirrors `syslog.parse`'s treatment of `msg`) |
+| `extension_raw`  | String         | raw extension blob from the wire — present only when the Extension section was non-empty (mirrors `syslog.parse`'s treatment of `msg`) |
+| `extension`      | Object         | split Extension `key=value` pairs; keys are data-driven |
 
-Extension `key=value` pairs from the CEF tail (e.g. `src=10.0.0.1 dst=192.168.1.1 act=block`) are emitted **both** as the raw blob in `ext` **and** split into siblings of the header keys (`src`, `dst`, `act`, … — those names are part of CEF, not a limpid convention). The split form is what authors typically read from downstream; the raw `ext` is for passthrough / re-emission, debugging the splitter, or surfacing dialect-specific extension content the splitter doesn't decode (escape sequences, custom separators).
+Extension `key=value` pairs from the CEF tail (e.g. `src=10.0.0.1 dst=192.168.1.1 act=block`) are emitted both as the raw blob in `extension_raw` and under `extension.<key>` (`extension.src`, `extension.dst`, `extension.act`, …). Isolating the data-driven keys prevents them from shadowing positional header fields. The raw form is for passthrough / re-emission, debugging the splitter, or dialect-specific extension content the splitter does not decode.
 
 The optional `defaults` argument behaves the same as in `syslog.parse`.
 
@@ -231,9 +232,10 @@ Encode the HashLit as a `ResourceLogs` proto3 message and return
 the raw wire bytes. Pair with the [`otlp_http` output](../outputs/otlp_http.md) / [`otlp_grpc` output](../outputs/otlp_grpc.md)'s
 `http_protobuf` or `grpc` protocol.
 
-### otlp.decode_resourcelog_protobuf(bytes) → Object
+### otlp.decode_resourcelog_protobuf(bytes_or_string) → Object
 
-Inverse of `encode_resourcelog_protobuf`. Used by snippets that
+Inverse of `encode_resourcelog_protobuf`. Accepts `Bytes` or a `String`
+whose UTF-8 storage contains the protobuf octets. Used by snippets that
 need to inspect / transform an inbound OTLP record:
 
 ```limpid
@@ -256,7 +258,7 @@ manually through `output http` to a non-OTLP-aware HTTP receiver.
 > `http_json` / `http_protobuf` choice) should keep using
 > `otlp.encode_resourcelog_protobuf` for the egress bytes.
 
-### otlp.decode_resourcelog_json(s) → Object
+### otlp.decode_resourcelog_json(string_or_bytes) → Object
 
 Decode an OTLP/JSON-encoded `ResourceLogs` string (or UTF-8 bytes)
 back into the snake_case HashLit form.
@@ -455,7 +457,7 @@ strftime(received_at, "%H:%M", "+09:00")   // fixed offset
 |----------|-------------|
 | `timestamp` | a `Value::Timestamp` (from `received_at`, `timestamp()`, or `strptime`). Passing a string is a type error. |
 | `format` | `chrono` strftime format. |
-| `timezone` *(optional)* | `"local"`, `"UTC"` (case-insensitive), or `±HH:MM` / `±HHMM`. If omitted, the timestamp's own offset is used. |
+| `timezone` *(optional)* | `"local"` or `"UTC"` (case-insensitive), an IANA name such as `Asia/Tokyo` (case-sensitive), or `±HH:MM` / `±HHMM`. If omitted, output is UTC. |
 
 An invalid timezone specifier is a loud error — `strftime` never silently returns an empty string.
 
@@ -473,7 +475,7 @@ strptime("2026-04-15 10:30:00", "%Y-%m-%d %H:%M:%S", "local")  // naive + local
 |----------|-------------|
 | `value` | timestamp string |
 | `format` | `chrono` strftime format |
-| `timezone` *(required when format produces a naive datetime)* | `"local"`, `"UTC"`, or `±HH:MM` / `±HHMM` |
+| `timezone` *(required when format produces a naive datetime)* | `"local"` or `"UTC"` (case-insensitive), an IANA name such as `Asia/Tokyo` (case-sensitive), or `±HH:MM` / `±HHMM` |
 
 If the format includes an offset specifier (`%z`, `%:z`, `%#z`), the third argument is rejected as conflicting. If the format produces a naive datetime, the third argument is required — limpid never silently assumes UTC.
 
@@ -668,9 +670,10 @@ Errors on unknown encoding or malformed input (odd hex length,
 invalid hex digit, malformed base64). The default `utf8` form is
 lossless because Rust strings are always valid UTF-8.
 
-### to_string(b, encoding="utf8", strict=true)
+### to_string(string_or_bytes, encoding="utf8", strict=true)
 
-Convert raw bytes to a string. Counterpart of `to_bytes`.
+Interpret a raw `Bytes` value as text, or pass a `String` through the same
+encoding operation. Counterpart of `to_bytes`.
 
 | Encoding | `strict` | Behaviour |
 |----------|----------|-----------|
@@ -685,7 +688,7 @@ workspace.message = to_string(ingress, "utf8", false)        // lossy fallback
 workspace.signature_b64 = to_string(workspace.sig, "base64") // bytes → printable
 ```
 
-Text-only primitives (`upper`, `regex_*`, `format`, `to_int`,
+Text-only primitives (`upper`, `regex_*`, `strftime`, `to_int`,
 `contains`, etc.) reject `Bytes` to keep failure modes explicit;
 `to_string` is the way to opt into a textual interpretation.
 
@@ -780,7 +783,7 @@ Use these only when the order is itself the contract (chronology, "most recent",
 
 ### concat(a, b, ...)
 
-Variadic array concatenation; every argument must be an `Array`. Mixed input bails (no scalar auto-wrap — wrap explicitly if you want a single element: `concat(arr, [x])`).
+Variadic array concatenation with at least one argument; every argument must be an `Array`. Mixed input bails (no scalar auto-wrap — wrap explicitly if you want a single element: `concat(arr, [x])`).
 
 ```limpid
 workspace.all_tags = concat(workspace.host_tags, workspace.role_tags, ["pii"])
@@ -867,6 +870,7 @@ Cardinality primitive — works for every container-like type:
 |-------|--------|
 | `Array` | Number of elements |
 | `String` | Number of Unicode characters (not bytes) |
+| `Bytes` | Number of bytes |
 | `Object` | Number of top-level keys |
 | `Null` | `Null` |
 | Scalars (`Int` / `Float` / `Bool`) | `Null` |

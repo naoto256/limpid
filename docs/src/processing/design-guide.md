@@ -62,18 +62,25 @@ The split config is longer. It is also easier to test, easier to tap between ste
 
 Every process has an implicit contract with its neighbours in the pipeline: *what do I expect to be present when I run, and what do I leave behind for the next stage?*
 
-Because the DSL does not check that contract today, you document it in comments using a small, machine-parseable convention. The grammar is parseable enough that a future static-analysis pass could promote these tags to a real check (warning when a pipeline links a composer to a parser that does not produce the required fields), but limpid does not commit to that — write them because they help the next reader, not because the analyzer will catch you. Pretending the contracts do not exist costs the first person who has to modify the snippet a year later.
+The shipped snippet pack declares its file-level contract in the canonical
+header schema (`Summary`, `Reads`, `Writes`, and kind-specific fields) described
+in the [pack README](../../../packaging/snippets/README.md#authoring-conventions).
+Inside a large file, leaf-local `@requires` / `@produces` comments may add useful
+detail, but they do not replace the canonical header and the analyzer does not
+consume them.
 
 ### The `@requires` / `@produces` tag convention
 
-Put tags in the first block of comments inside the process body. One tag per line. Each tag names a field path in `workspace.*` (or, less commonly, `egress`).
+When a file contains several leaves, put supplemental tags in the first comment
+block inside the leaf. One tag per line. Each tag names a field path in
+`workspace.*` (or, less commonly, `egress`).
 
 ```
 def process compose_ocsf_authentication {
     // @requires: workspace.lsis.parsed.severity_number      (optional; normalized OTel SeverityNumber)
     // @requires: workspace.lsis.parsed.severity             (optional; exact source severity text)
     // @requires: workspace.lsis.parsed.src_endpoint.ip      (recommended)
-    // @requires: workspace.lsis.parsed.actor.user.name      (recommended)
+    // @requires: workspace.lsis.parsed.user.name            (recommended)
     // @produces: workspace.lsis.composed.ocsf  (OCSF Authentication Activity, JSON string)
     //
     // Expects: the calling pipeline has run a vendor parser that
@@ -89,9 +96,27 @@ def process compose_ocsf_authentication {
     // single-writer invariant — see the [pack
     // README](../../../packaging/snippets/README.md#slot-registry--composed-layer).
 
-    workspace.lsis.parsed.class_uid   = 3002
-    workspace.lsis.parsed.activity_id = 1
-    workspace.lsis.composed.ocsf      = to_json(workspace.lsis.parsed)
+    process validate_ocsf_severity_number
+    let activity = workspace.lsis.parsed.activity_id
+    workspace.lsis.composed.ocsf = to_json(null_omit({
+        class_uid: 3002,
+        category_uid: 3,
+        activity_id: activity,
+        type_uid: 3002 * 100 + activity,
+        time: timestamp_ns_to_ms(coalesce(workspace.lsis.parsed.time, received_at)),
+        severity_id: compose_ocsf_severity_id(
+            workspace.lsis.parsed.severity_number,
+            workspace.lsis.parsed.severity_id,
+            workspace.lsis.parsed.severity
+        ),
+        severity: workspace.lsis.parsed.severity,
+        status_id: workspace.lsis.parsed.status_id,
+        user: workspace.lsis.parsed.user,
+        actor: workspace.lsis.parsed.actor,
+        src_endpoint: workspace.lsis.parsed.src_endpoint,
+        dst_endpoint: workspace.lsis.parsed.dst_endpoint,
+        metadata: workspace.lsis.parsed.metadata
+    }))
 }
 ```
 
@@ -103,7 +128,9 @@ Requirement levels follow the OCSF / ECS convention:
 | `recommended` | The process will run without it, but output quality degrades (lower fidelity, missing enrichment). |
 | `optional` | Nice to have. Documented so a future reader knows the field exists and is consumed. |
 
-Free-form prose comments explaining "what this process does" are fine *in addition to* the tags — but they are not a substitute. Prose drifts; structured tags survive review because tooling can check them.
+Free-form prose comments explaining "what this process does" are fine in
+addition to the tags. For shipped snippets, neither form substitutes for the
+canonical file header that header lint and inventory generation validate.
 
 ### Why make contracts explicit
 

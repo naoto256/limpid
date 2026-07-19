@@ -5,10 +5,10 @@
 // Reads:       ingress (raw wire) — one LogEvent object per ingress (unwrap
 //              Event Hooks data.events[] upstream)
 // Writes:      workspace.lsis.parsed.* — user.session/user.authentication → 3002,
-//              okta_system_to_otlp additionally writes source-specific
-//              workspace.lsis.shed.otlp Resource, Body, and LogRecord attributes.
 //              user.lifecycle → 3001, user.account → 3005, group.* → 3006;
-//              other eventTypes route to error_log.
+//              other eventTypes route to error_log. okta_system_to_otlp additionally
+//              writes source-specific workspace.lsis.shed.otlp Resource, Body,
+//              and LogRecord attributes.
 // Category:    Identity / IdP
 // Test corpus: synthetic (synthesised from the Okta System Log API reference
 //              — eventType taxonomy and LogEvent schema; live-corpus
