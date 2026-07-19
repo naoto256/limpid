@@ -139,7 +139,7 @@ RFC 5424 fields that the pack cannot synthesise on the caller's behalf).
 
 ## What's included
 
-The current pack contains 31 parser files. Thirty expose a sibling
+The current pack contains 32 parser files. Thirty-one expose a sibling
 `<source>_to_otlp` adapter; the inbound `parse_ocsf` compatibility parser is
 the sole exception.
 
@@ -157,6 +157,7 @@ regions.
 | File | Summary |
 |---|---|
 | **Transport** | |
+| `parsers/parse_cef.limpid` | ArcSight CEF message (from a syslog body) → workspace.cef.* format fields (format-layer parser; interpreting the vendor dialect on top is the next stage's job). |
 | `parsers/parse_journald.limpid` | journalctl -o json lines → workspace.journald.* transport fields (transport-layer parser). |
 | `parsers/parse_syslog.limpid` | RFC 3164 / RFC 5424 syslog wire → workspace.syslog.* transport fields (transport-layer parser; bridging the body into a vocabulary intake is the caller's job). |
 | **Network firewall / IPS** | |
@@ -288,6 +289,8 @@ process {
 Drop a snippet into your `/etc/limpid/limpid.conf`:
 
 ```limpid
+include "/usr/share/limpid/snippets/parsers/parse_syslog.limpid"
+include "/usr/share/limpid/snippets/parsers/parse_cef.limpid"
 include "/usr/share/limpid/snippets/parsers/parse_fortigate_cef.limpid"
 include "/usr/share/limpid/snippets/composers/compose_ocsf.limpid"
 
@@ -302,12 +305,16 @@ def output ocsf_stdout {
 
 def pipeline fw_to_ocsf {
     input fw_syslog
-    process parse_fortigate_cef | compose_ocsf | ocsf_to_egress
+    process parse_syslog | parse_cef | parse_fortigate_cef | compose_ocsf | ocsf_to_egress
     output ocsf_stdout
 }
 ```
 
-That's it. The parser writes facts to `workspace.lsis.parsed.*`;
+That's it. Each stage owns one layer: `parse_syslog` unwraps the
+transport, `parse_cef` decodes the CEF format, and the vendor parser
+interprets the dialect — so a pipeline can inspect and drop events
+between stages without paying the next parse. The vendor parser writes
+facts to `workspace.lsis.parsed.*`;
 `compose_ocsf` reads `workspace.lsis.parsed.*` and writes OCSF JSON
 to `workspace.lsis.composed.ocsf`; the one-line `ocsf_to_egress`
 step at the tail of the pipeline hands that slot off to `egress`.
@@ -356,17 +363,21 @@ The library follows four contracts:
 
 ## Pipeline shapes
 
-Schema wire form:
+Schema wire form (transport / format stages precede the vendor parser
+when the wire is layered — e.g. `parse_syslog | parse_asa`,
+`parse_syslog | parse_cef | parse_fortigate_cef`; single-layer wires
+such as FortiGate native KV or JSON-body sources go straight to the
+vendor parser):
 
 ```
-process <vendor_parser> | compose_ocsf | ocsf_to_egress
+process [<transport_parser> | [<format_parser> |]] <vendor_parser> | compose_ocsf | ocsf_to_egress
 ```
 
 Envelope-wrapped schema (OTLP wrapping the OCSF JSON as the log
 body):
 
 ```
-process <vendor_parser>
+process [<transport_parser> | [<format_parser> |]] <vendor_parser>
       | <vendor>_to_otlp
       | compose_ocsf
       | {
