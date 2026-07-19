@@ -111,6 +111,20 @@ ignore = [
 multiple-versions = "warn"
 wildcards = "deny"
 
+# Duplicate-version exemptions. Each entry MUST carry a rationale comment
+# and the condition under which it can be removed.
+skip = [
+    # getrandom is split upstream: ring (used by the rustls stack) is
+    # pinned to getrandom 0.2, while rand 0.9 (pulled in by
+    # opentelemetry_sdk) requires getrandom 0.3. Unresolvable until ring
+    # migrates. Only these two lines are exempted; the newest line
+    # (currently 0.4, dev-only via tempfile) is left unskipped so a
+    # future additional split still warns. Remove these entries once
+    # `cargo tree -d` shows a single getrandom version.
+    { crate = "getrandom@0.2" },
+    { crate = "getrandom@0.3" },
+]
+
 [sources]
 # Only crates.io is accepted as a registry. git deps and unknown
 # registries are rejected — we want every dep to be reproducible via
