@@ -8,6 +8,15 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+### Fixed — nullable expression inference follows runtime control flow
+
+The static analyzer now removes skipped `Null` members from non-final
+`coalesce` arguments while preserving the final argument's nullability, and
+infers `len` from its concrete input type. Equality checks against `null` are
+treated as presence guards rather than incompatible-type comparisons. These
+rules prevent reusable composers from producing strict-check false positives
+after a source adapter specializes an otherwise optional field.
+
 ### Changed — snippet headers declare file facades and member contracts
 
 Packaged snippets now separate file-level metadata from the contracts of each
