@@ -110,6 +110,9 @@ def function asa_severity_number(level) {
 }
 
 def process validate_asa_severity_number {
+    // The timezone slot declares the source device's zone. Explicit "local"
+    // is rejected because it follows the limpid host's OS, does not identify
+    // the source, and can mask misconfiguration when host TZ happens to match.
     switch workspace.asa.timezone {
         "local" { error "parse_asa: source timezone must be an IANA name or fixed offset, not local" }
     }

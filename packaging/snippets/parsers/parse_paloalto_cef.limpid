@@ -69,6 +69,9 @@ def function paloalto_cef_severity_number(sev) {
 }
 
 def process parse_paloalto_cef_normalize_severity {
+    // The timezone slot declares the source device's zone. Explicit "local"
+    // is rejected because it follows the limpid host's OS, does not identify
+    // the source, and can mask misconfiguration when host TZ happens to match.
     switch workspace.paloalto_cef.timezone {
         "local" { error "parse_paloalto_cef: source timezone must be an IANA name or fixed offset, not local" }
     }
