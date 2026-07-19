@@ -128,7 +128,7 @@ fn filter_return_type(input: FieldType) -> FieldType {
 /// reserved-event-ident table.
 ///
 /// Reserved idents (always present, fixed type):
-/// - `ingress` / `egress` — String (raw bytes UTF-8-decoded)
+/// - `ingress` / `egress` — String or Bytes (transport payload)
 /// - `source` — Object `{ ip: String, port: Int }` (since v0.5.6;
 ///   pre-0.5.6 this was a flat String). `source.ip` and `source.port`
 ///   are the canonical accessors.
@@ -145,8 +145,12 @@ fn ident_type(parts: &[String], bindings: &Bindings) -> FieldType {
     }
     // Reserved event idents: always exist, fixed type.
     match parts.first().map(String::as_str) {
-        Some("ingress") if parts.len() == 1 => return FieldType::String,
-        Some("egress") if parts.len() == 1 => return FieldType::String,
+        Some("ingress") if parts.len() == 1 => {
+            return FieldType::union(FieldType::String, FieldType::Bytes);
+        }
+        Some("egress") if parts.len() == 1 => {
+            return FieldType::union(FieldType::String, FieldType::Bytes);
+        }
         Some("received_at") if parts.len() == 1 => return FieldType::Timestamp,
         Some("error") if parts.len() == 1 => return FieldType::String,
         // `source` is an Object since v0.5.6 — `source.ip` (String) and
@@ -163,6 +167,9 @@ fn ident_type(parts: &[String], bindings: &Bindings) -> FieldType {
             }
             if let Some(t) = bindings.get_workspace(parts) {
                 return t.clone();
+            }
+            if bindings.is_workspace_path_wildcard(parts) {
+                return FieldType::Any;
             }
             // Walk up looking for an ancestor binding (Object).
             for i in (2..parts.len()).rev() {
@@ -594,14 +601,26 @@ fn check_fn_call(
         return;
     };
     if !arity_in_range(sig, args.len()) {
-        // Wrong-arity calls are caught loudly at runtime; double-flagging
-        // is just noise. Skip.
+        if namespace.is_none() && registry.is_user_function(name) {
+            diagnostics.push(warning(
+                pipeline_name,
+                format!(
+                    "function `{}` expects {}, got {}",
+                    name,
+                    expected_arity(sig),
+                    args.len()
+                ),
+                span,
+            ));
+        }
         return;
     }
     for (i, actual) in args.iter().enumerate() {
         let expected = expected_arg_type(sig, i);
         let actual_ty = infer(actual, bindings, registry);
-        if !type_compatible(expected, &actual_ty) {
+        if !type_compatible(expected, &actual_ty)
+            && !reserved_payload_matches_text(expected, actual, &actual_ty)
+        {
             let display = qualified_name(namespace, name);
             // Prefer the tight per-argument span from the AST; fall
             // back to the call-level span only when the arg came from
@@ -618,6 +637,45 @@ fn check_fn_call(
                 ),
                 arg_span,
             ));
+        }
+    }
+}
+
+/// `ingress` and `egress` are event-dependent transport payloads: valid
+/// UTF-8 arrives as `String`, while invalid UTF-8 remains `Bytes`. A direct
+/// text consumer is therefore valid for the String arm and may reject the
+/// Bytes arm at runtime. Keep this exception local to the reserved payloads;
+/// ordinary unions still require every member to satisfy the argument type.
+fn reserved_payload_matches_text(
+    expected: &FieldType,
+    actual: &Expr,
+    actual_ty: &FieldType,
+) -> bool {
+    if expected != &FieldType::String
+        || actual_ty != &FieldType::union(FieldType::String, FieldType::Bytes)
+    {
+        return false;
+    }
+
+    matches!(
+        &actual.kind,
+        ExprKind::Ident(parts)
+            if parts.len() == 1 && matches!(parts[0].as_str(), "ingress" | "egress")
+    )
+}
+
+fn expected_arity(sig: &FunctionSig) -> String {
+    match sig.arity {
+        Arity::Fixed => match sig.args.len() {
+            1 => "1 argument".to_string(),
+            n => format!("{n} arguments"),
+        },
+        Arity::Optional { required } => {
+            format!("{} to {} arguments", required, sig.args.len())
+        }
+        Arity::Variadic { min } => {
+            let noun = if min == 1 { "argument" } else { "arguments" };
+            format!("at least {min} {noun}")
         }
     }
 }

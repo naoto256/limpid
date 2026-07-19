@@ -24,7 +24,10 @@ use crate::functions::{FunctionRegistry, FunctionSig};
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(
         "csv_parse",
-        FunctionSig::fixed(&[FieldType::String, FieldType::Any], FieldType::Object),
+        FunctionSig::fixed(
+            &[FieldType::String, FieldType::Any],
+            FieldType::union(FieldType::Object, FieldType::Null),
+        ),
         |arena, args, _event| Ok(parse(arena, &args[0], &args[1])),
     );
 }

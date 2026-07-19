@@ -68,7 +68,10 @@ pub fn register(reg: &mut FunctionRegistry) {
     reg.register_in_with_sig(
         "otlp",
         "decode_resourcelog_protobuf",
-        FunctionSig::fixed(&[FieldType::Bytes], FieldType::Object),
+        FunctionSig::fixed(
+            &[FieldType::union(FieldType::String, FieldType::Bytes)],
+            FieldType::Object,
+        ),
         |arena, args, _event| {
             let bytes: &[u8] = match &args[0] {
                 Value::Bytes(b) => b,
@@ -97,7 +100,10 @@ pub fn register(reg: &mut FunctionRegistry) {
     reg.register_in_with_sig(
         "otlp",
         "decode_resourcelog_json",
-        FunctionSig::fixed(&[FieldType::String], FieldType::Object),
+        FunctionSig::fixed(
+            &[FieldType::union(FieldType::String, FieldType::Bytes)],
+            FieldType::Object,
+        ),
         |arena, args, _event| {
             let s: &str = match &args[0] {
                 Value::String(s) => s,

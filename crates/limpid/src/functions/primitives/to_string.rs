@@ -12,7 +12,11 @@ pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(
         "to_string",
         FunctionSig::optional(
-            &[FieldType::Bytes, FieldType::String, FieldType::Bool],
+            &[
+                FieldType::union(FieldType::String, FieldType::Bytes),
+                FieldType::String,
+                FieldType::Bool,
+            ],
             1,
             FieldType::String,
         ),

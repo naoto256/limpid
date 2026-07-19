@@ -1599,9 +1599,7 @@ def pipeline p { input i; output o }
     fn function_call_site_resolves() {
         // Call sites referencing a user-defined function don't emit an
         // "unknown function" warning — `register_user_function` made
-        // the analyzer aware of it. (Arity mismatches are deferred to
-        // runtime by design; the analyzer skips wrong-arity warnings
-        // to avoid double-flagging.)
+        // the analyzer aware of it.
         let src = r#"
 def function takes_two(a, b) { a + b }
 def input i { type syslog_tcp bind "0.0.0.0:514" }
@@ -1618,6 +1616,83 @@ def pipeline p {
                 .iter()
                 .any(|w| w.message.contains("unknown function")),
             "user function should resolve at the call site, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn user_function_wrong_arity_is_reported() {
+        let src = r#"
+def function takes_two(a, b) { a + b }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p {
+    input i
+    process { workspace.x = takes_two(1) }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            warnings(&diags).iter().any(|w| {
+                w.message
+                    .contains("function `takes_two` expects 2 arguments, got 1")
+            }),
+            "expected user-function arity warning, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn payload_consumers_accept_string_or_bytes_reserved_idents() {
+        let src = r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p {
+    input i
+    process {
+        workspace.parsed = parse_json(ingress)
+        workspace.syslog = syslog.parse(ingress)
+        workspace.text = to_string(ingress)
+        workspace.pb = otlp.decode_resourcelog_protobuf(ingress)
+        workspace.json = otlp.decode_resourcelog_json(egress)
+    }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            !warnings(&diags)
+                .iter()
+                .any(|w| w.message.contains("expects") && w.message.contains("got")),
+            "payload union should match the registered consumers: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn ordinary_string_bytes_union_remains_strict_for_text_consumers() {
+        let src = r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p {
+    input i
+    process {
+        if true { workspace.payload = "text" }
+        else { workspace.payload = to_bytes("binary") }
+        workspace.parsed = parse_json(workspace.payload)
+    }
+    output o
+}
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            warnings(&diags).iter().any(|w| {
+                w.message
+                    .contains("function `parse_json` argument 1 expects String")
+                    && w.message.contains("Union(String | Bytes)")
+            }),
+            "ordinary unions must not inherit the reserved-payload exception: {:?}",
             diags
         );
     }

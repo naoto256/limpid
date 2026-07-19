@@ -9,7 +9,10 @@ use crate::functions::{FunctionRegistry, FunctionSig};
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(
         "prepend",
-        FunctionSig::fixed(&[FieldType::Array, FieldType::Any], FieldType::Array),
+        FunctionSig::fixed(
+            &[FieldType::Array, FieldType::Any],
+            FieldType::union(FieldType::Array, FieldType::Null),
+        ),
         |arena, args, _event| Ok(push_front(arena, &args[0], &args[1])),
     );
 }
