@@ -8,6 +8,24 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+### Fixed — cef.parse honors the header escapes `\|` and `\\`
+
+The header splitter treated every `|` as a field separator, so a
+spec-legal escaped pipe (`\|`) inside a header field shifted all
+subsequent fields — for `CEF:0|V|P|1.0|sig|deny\|drop|3|act=block` the
+name became `deny\`, the severity slot received the string `drop`, and
+the extension section received `3|act=block`, misclassifying telemetry
+severity downstream. The splitter now separates only on unescaped
+pipes and decodes the two generic structural escapes that participate
+in field splitting (`\|` → `|`, `\\` → `\`); sequences outside those
+two (`\x` etc.) are kept literally, and the spec's field-specific
+escaping for vulnerability spellings in deviceEventClassId / name is
+field-internal grammar the generic primitive passes through raw. The
+bug predates this release in the primitive itself; the new generic
+`parse_cef` / `cef_to_otlp` path widens its blast radius to every CEF
+pipeline, so it is fixed in 0.7.15. Extension-section escapes remain
+undecoded (unchanged, documented scope).
+
 ### Changed — cef.parse isolates Extension keys from the positional header (breaking)
 
 `cef.parse()` previously flattened the data-driven Extension key=value
