@@ -10,7 +10,8 @@
 //                .device_product (optional, String) — CEF header product
 //                .device_version (optional, String) — CEF header version
 //                (plus the per-leaf standard / `cs<n>` extension keys
-//                documented on each subtype leaf below)
+//                under workspace.cef.extension.*, documented on each
+//                subtype leaf below)
 //              workspace.syslog.* (transport intake)
 //                .timestamp (optional, String) — RFC 3164 wire timestamp
 //                .msg (optional, String) — syslog body, retained by
@@ -207,28 +208,28 @@ def process parse_paloalto_cef_traffic {
     workspace.lsis.parsed = {
         class_uid:       4001,
         category_uid:    4,
-        activity_id:     paloalto_cef_traffic_action_to_activity_id(workspace.cef.act),
+        activity_id:     paloalto_cef_traffic_action_to_activity_id(workspace.cef.extension.act),
         severity_number: workspace.paloalto_cef.severity_number,
         time:            workspace.paloalto_cef.time,
         src_endpoint: {
-            ip:   workspace.cef.src,
-            port: to_int(workspace.cef.spt)
+            ip:   workspace.cef.extension.src,
+            port: to_int(workspace.cef.extension.spt)
         },
         dst_endpoint: {
-            ip:   workspace.cef.dst,
-            port: to_int(workspace.cef.dpt)
+            ip:   workspace.cef.extension.dst,
+            port: to_int(workspace.cef.extension.dpt)
         },
         connection_info: {
-            protocol_num:  proto_num(workspace.cef.proto),
-            protocol_name: lower(workspace.cef.proto)
+            protocol_num:  proto_num(workspace.cef.extension.proto),
+            protocol_name: lower(workspace.cef.extension.proto)
         },
         traffic: {
-            bytes_in:  to_int(workspace.cef.in),
-            bytes_out: to_int(workspace.cef.out)
+            bytes_in:  to_int(workspace.cef.extension.in),
+            bytes_out: to_int(workspace.cef.extension.out)
         },
-        app_name: workspace.cef.app,
+        app_name: workspace.cef.extension.app,
         actor: {
-            user: { name: workspace.cef.suser }
+            user: { name: workspace.cef.extension.suser }
         },
         unmapped: {
             cef_severity: workspace.cef.severity
@@ -274,7 +275,7 @@ def process parse_paloalto_cef_threat {
         activity_id:     1,
         severity_number: workspace.paloalto_cef.severity_number,
         time:            workspace.paloalto_cef.time,
-        disposition_id: paloalto_cef_threat_disposition_id(workspace.cef.act),
+        disposition_id: paloalto_cef_threat_disposition_id(workspace.cef.extension.act),
         finding_info: {
             title: workspace.cef.signature_id,
             types: ["Threat"]
@@ -283,15 +284,15 @@ def process parse_paloalto_cef_threat {
             technique: { name: workspace.cef.signature_id }
         },
         src_endpoint: {
-            ip:   workspace.cef.src,
-            port: to_int(workspace.cef.spt)
+            ip:   workspace.cef.extension.src,
+            port: to_int(workspace.cef.extension.spt)
         },
         dst_endpoint: {
-            ip:   workspace.cef.dst,
-            port: to_int(workspace.cef.dpt)
+            ip:   workspace.cef.extension.dst,
+            port: to_int(workspace.cef.extension.dpt)
         },
         actor: {
-            user: { name: workspace.cef.suser }
+            user: { name: workspace.cef.extension.suser }
         },
         unmapped: {
             cef_severity: workspace.cef.severity
@@ -326,7 +327,7 @@ def process parse_paloalto_cef_threat {
 //   app                     — application context
 def process parse_paloalto_cef_url {
     process parse_paloalto_cef_normalize_severity
-    let activity = switch workspace.cef.act {
+    let activity = switch workspace.cef.extension.act {
         "block-url" { 2 }
         "block"     { 2 }
         "deny"      { 2 }
@@ -344,25 +345,25 @@ def process parse_paloalto_cef_url {
         severity_number: workspace.paloalto_cef.severity_number,
         time:            workspace.paloalto_cef.time,
         src_endpoint: {
-            ip:   workspace.cef.src,
-            port: to_int(workspace.cef.spt)
+            ip:   workspace.cef.extension.src,
+            port: to_int(workspace.cef.extension.spt)
         },
         dst_endpoint: {
-            ip:   workspace.cef.dst,
-            port: to_int(workspace.cef.dpt)
+            ip:   workspace.cef.extension.dst,
+            port: to_int(workspace.cef.extension.dpt)
         },
         http_request: {
-            url:         { url_string: workspace.cef.request },
-            http_method: workspace.cef.requestMethod
+            url:         { url_string: workspace.cef.extension.request },
+            http_method: workspace.cef.extension.requestMethod
         },
         web_resources: [
             {
-                url:      { url_string: workspace.cef.request },
-                category: workspace.cef.cs2
+                url:      { url_string: workspace.cef.extension.request },
+                category: workspace.cef.extension.cs2
             }
         ],
         actor: {
-            user: { name: workspace.cef.suser }
+            user: { name: workspace.cef.extension.suser }
         },
         unmapped: {
             cef_severity: workspace.cef.severity
@@ -396,7 +397,7 @@ def process parse_paloalto_cef_url {
 //   request                — fetch URL when HTTP-delivered
 def process parse_paloalto_cef_wildfire {
     process parse_paloalto_cef_normalize_severity
-    let disposition = switch workspace.cef.cs1 {
+    let disposition = switch workspace.cef.extension.cs1 {
         "malicious" { 2 }
         "phishing"  { 2 }
         "grayware"  { 6 }
@@ -411,26 +412,26 @@ def process parse_paloalto_cef_wildfire {
         time:            workspace.paloalto_cef.time,
         disposition_id: disposition,
         finding_info: {
-            title: workspace.cef.cs1,
-            uid:   workspace.cef.cs2,
+            title: workspace.cef.extension.cs1,
+            uid:   workspace.cef.extension.cs2,
             types: ["Malware"]
         },
         malware: [
             {
-                name:               workspace.cef.cs1,
+                name:               workspace.cef.extension.cs1,
                 classification_ids: [1]
             }
         ],
         evidences: [
             {
                 file: {
-                    name:   workspace.cef.fname,
-                    hashes: [{ value: workspace.cef.fileHash }]
+                    name:   workspace.cef.extension.fname,
+                    hashes: [{ value: workspace.cef.extension.fileHash }]
                 }
             }
         ],
-        src_endpoint: { ip: workspace.cef.src },
-        dst_endpoint: { ip: workspace.cef.dst },
+        src_endpoint: { ip: workspace.cef.extension.src },
+        dst_endpoint: { ip: workspace.cef.extension.dst },
         unmapped: {
             cef_severity: workspace.cef.severity
         },
@@ -458,7 +459,7 @@ def process parse_paloalto_cef_wildfire {
 //   reason           — failure reason (when applicable)
 def process parse_paloalto_cef_globalprotect {
     process parse_paloalto_cef_normalize_severity
-    let activity = switch workspace.cef.act {
+    let activity = switch workspace.cef.extension.act {
         "login"        { 1 }
         "connected"    { 1 }
         "logout"       { 2 }
@@ -466,7 +467,7 @@ def process parse_paloalto_cef_globalprotect {
         "failed"       { 1 }
         default        { 0 }
     }
-    let status = switch workspace.cef.act {
+    let status = switch workspace.cef.extension.act {
         "failed" { 2 }
         default  { 1 }
     }
@@ -477,9 +478,9 @@ def process parse_paloalto_cef_globalprotect {
         severity_number: workspace.paloalto_cef.severity_number,
         time:            workspace.paloalto_cef.time,
         status_id:       status,
-        user: { name: workspace.cef.suser },
-        src_endpoint: { ip: workspace.cef.src },
-        message:      workspace.cef.reason,
+        user: { name: workspace.cef.extension.suser },
+        src_endpoint: { ip: workspace.cef.extension.src },
+        message:      workspace.cef.extension.reason,
         unmapped: {
             cef_severity: workspace.cef.severity
         },
@@ -506,7 +507,7 @@ def process parse_paloalto_cef_globalprotect {
 //   reason  — failure reason
 def process parse_paloalto_cef_authentication {
     process parse_paloalto_cef_normalize_severity
-    let status = switch workspace.cef.act {
+    let status = switch workspace.cef.extension.act {
         "success" { 1 }
         "failure" { 2 }
         default   { 0 }
@@ -518,9 +519,9 @@ def process parse_paloalto_cef_authentication {
         severity_number: workspace.paloalto_cef.severity_number,
         time:            workspace.paloalto_cef.time,
         status_id:       status,
-        user:         { name: workspace.cef.suser },
-        src_endpoint: { ip: workspace.cef.src },
-        message:      workspace.cef.reason,
+        user:         { name: workspace.cef.extension.suser },
+        src_endpoint: { ip: workspace.cef.extension.src },
+        message:      workspace.cef.extension.reason,
         unmapped: {
             cef_severity: workspace.cef.severity
         },
@@ -597,8 +598,8 @@ def process paloalto_cef_to_otlp {
             true { [{ key: "event.code", value: { string_value: workspace.cef.name } }] }
             default { [] }
         },
-        switch workspace.cef.act != null {
-            true { [{ key: "event.action", value: { string_value: workspace.cef.act } }] }
+        switch workspace.cef.extension.act != null {
+            true { [{ key: "event.action", value: { string_value: workspace.cef.extension.act } }] }
             default { [] }
         },
         switch paloalto_cef_otlp_event_outcome(workspace.lsis.parsed.status_id) != null {

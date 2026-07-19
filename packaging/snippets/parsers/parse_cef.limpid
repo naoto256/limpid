@@ -8,8 +8,13 @@
 //                .hostname (optional, String) — originating host, retained
 //                     by cef_to_otlp as Resource `host.name`
 // Writes:      workspace.cef.{version, device_vendor, device_product,
-//              device_version, signature_id, name, severity, ext, <ext-key>…}
-//              — the CEF format namespace, not LSIS. cef_to_otlp writes
+//              device_version, signature_id, name, severity} — the seven
+//              positional header fields — plus workspace.cef.extension_raw
+//              (raw Extension blob) and workspace.cef.extension.<key>
+//              (split key=value pairs, isolated in their own sub-object
+//              so data-driven extension keys can never shadow a
+//              positional header field). The CEF format namespace, not
+//              LSIS. cef_to_otlp writes
 //              source-owned OTLP Resource, Body, LogRecord attributes, and
 //              the shed severity slots mapped from the CEF 0-10 scale.
 // Category:    Transport
@@ -128,10 +133,12 @@ def function cef_severity_number(sev) {
 //     ("alert raised", "utm:ips signature"), which does NOT meet OTel
 //     semconv `event.name`'s low-cardinality identifier contract — so it
 //     stays in the CEF namespace as `cef.name`.
-//   * Standard extension keys whose semconv equivalent is self-evident
-//     are placed under the semconv name (src → source.ip, request →
-//     url.full, …). Spec-defined keys without a self-evident semconv
-//     home are passed through under `cef.<key>`. The DSL has no
+//   * Standard extension keys (read from `workspace.cef.extension.*` —
+//     the data-driven plane, isolated from the positional header) whose
+//     semconv equivalent is self-evident are placed under the semconv
+//     name (src → source.ip, request → url.full, …). Spec-defined keys
+//     without a self-evident semconv home are passed through under
+//     `cef.<key>`. The DSL has no
 //     object-key iteration, so the passthrough is a curated table of
 //     the spec dictionary's common keys rather than a wildcard; nothing
 //     is lost — the Body carries the complete original CEF message.
@@ -171,80 +178,80 @@ def process cef_to_otlp {
             true { [{ key: "event.code", value: { string_value: workspace.cef.signature_id } }] }
             default { [] }
         },
-        switch workspace.cef.act != null {
-            true { [{ key: "event.action", value: { string_value: workspace.cef.act } }] }
+        switch workspace.cef.extension.act != null {
+            true { [{ key: "event.action", value: { string_value: workspace.cef.extension.act } }] }
             default { [] }
         },
-        switch workspace.cef.msg != null {
-            true { [{ key: "message", value: { string_value: workspace.cef.msg } }] }
+        switch workspace.cef.extension.msg != null {
+            true { [{ key: "message", value: { string_value: workspace.cef.extension.msg } }] }
             default { [] }
         },
-        switch workspace.cef.src != null {
-            true { [{ key: "source.ip", value: { string_value: workspace.cef.src } }] }
+        switch workspace.cef.extension.src != null {
+            true { [{ key: "source.ip", value: { string_value: workspace.cef.extension.src } }] }
             default { [] }
         },
-        switch workspace.cef.spt != null {
-            true { [{ key: "source.port", value: { int_value: to_int(workspace.cef.spt) } }] }
+        switch workspace.cef.extension.spt != null {
+            true { [{ key: "source.port", value: { int_value: to_int(workspace.cef.extension.spt) } }] }
             default { [] }
         },
-        switch workspace.cef.smac != null {
-            true { [{ key: "source.mac", value: { string_value: workspace.cef.smac } }] }
+        switch workspace.cef.extension.smac != null {
+            true { [{ key: "source.mac", value: { string_value: workspace.cef.extension.smac } }] }
             default { [] }
         },
-        switch workspace.cef.shost != null {
-            true { [{ key: "source.domain", value: { string_value: workspace.cef.shost } }] }
+        switch workspace.cef.extension.shost != null {
+            true { [{ key: "source.domain", value: { string_value: workspace.cef.extension.shost } }] }
             default { [] }
         },
-        switch workspace.cef.in != null {
-            true { [{ key: "source.bytes", value: { int_value: to_int(workspace.cef.in) } }] }
+        switch workspace.cef.extension.in != null {
+            true { [{ key: "source.bytes", value: { int_value: to_int(workspace.cef.extension.in) } }] }
             default { [] }
         },
-        switch workspace.cef.dst != null {
-            true { [{ key: "destination.ip", value: { string_value: workspace.cef.dst } }] }
+        switch workspace.cef.extension.dst != null {
+            true { [{ key: "destination.ip", value: { string_value: workspace.cef.extension.dst } }] }
             default { [] }
         },
-        switch workspace.cef.dpt != null {
-            true { [{ key: "destination.port", value: { int_value: to_int(workspace.cef.dpt) } }] }
+        switch workspace.cef.extension.dpt != null {
+            true { [{ key: "destination.port", value: { int_value: to_int(workspace.cef.extension.dpt) } }] }
             default { [] }
         },
-        switch workspace.cef.dmac != null {
-            true { [{ key: "destination.mac", value: { string_value: workspace.cef.dmac } }] }
+        switch workspace.cef.extension.dmac != null {
+            true { [{ key: "destination.mac", value: { string_value: workspace.cef.extension.dmac } }] }
             default { [] }
         },
-        switch workspace.cef.dhost != null {
-            true { [{ key: "destination.domain", value: { string_value: workspace.cef.dhost } }] }
+        switch workspace.cef.extension.dhost != null {
+            true { [{ key: "destination.domain", value: { string_value: workspace.cef.extension.dhost } }] }
             default { [] }
         },
-        switch workspace.cef.out != null {
-            true { [{ key: "destination.bytes", value: { int_value: to_int(workspace.cef.out) } }] }
+        switch workspace.cef.extension.out != null {
+            true { [{ key: "destination.bytes", value: { int_value: to_int(workspace.cef.extension.out) } }] }
             default { [] }
         },
-        switch workspace.cef.suser != null {
-            true { [{ key: "user.name", value: { string_value: workspace.cef.suser } }] }
+        switch workspace.cef.extension.suser != null {
+            true { [{ key: "user.name", value: { string_value: workspace.cef.extension.suser } }] }
             default { [] }
         },
-        switch workspace.cef.duser != null {
-            true { [{ key: "destination.user.name", value: { string_value: workspace.cef.duser } }] }
+        switch workspace.cef.extension.duser != null {
+            true { [{ key: "destination.user.name", value: { string_value: workspace.cef.extension.duser } }] }
             default { [] }
         },
-        switch workspace.cef.proto != null {
-            true { [{ key: "network.transport", value: { string_value: lower(workspace.cef.proto) } }] }
+        switch workspace.cef.extension.proto != null {
+            true { [{ key: "network.transport", value: { string_value: lower(workspace.cef.extension.proto) } }] }
             default { [] }
         },
-        switch workspace.cef.app != null {
-            true { [{ key: "network.application", value: { string_value: workspace.cef.app } }] }
+        switch workspace.cef.extension.app != null {
+            true { [{ key: "network.application", value: { string_value: workspace.cef.extension.app } }] }
             default { [] }
         },
-        switch workspace.cef.request != null {
-            true { [{ key: "url.full", value: { string_value: workspace.cef.request } }] }
+        switch workspace.cef.extension.request != null {
+            true { [{ key: "url.full", value: { string_value: workspace.cef.extension.request } }] }
             default { [] }
         },
-        switch workspace.cef.requestMethod != null {
-            true { [{ key: "http.request.method", value: { string_value: workspace.cef.requestMethod } }] }
+        switch workspace.cef.extension.requestMethod != null {
+            true { [{ key: "http.request.method", value: { string_value: workspace.cef.extension.requestMethod } }] }
             default { [] }
         },
-        switch workspace.cef.fname != null {
-            true { [{ key: "file.name", value: { string_value: workspace.cef.fname } }] }
+        switch workspace.cef.extension.fname != null {
+            true { [{ key: "file.name", value: { string_value: workspace.cef.extension.fname } }] }
             default { [] }
         },
         // CEF namespace — header fields and spec keys without a
@@ -261,32 +268,32 @@ def process cef_to_otlp {
             true { [{ key: "cef.severity", value: { string_value: "${workspace.cef.severity}" } }] }
             default { [] }
         },
-        switch workspace.cef.cat != null {
-            true { [{ key: "cef.cat", value: { string_value: workspace.cef.cat } }] }
+        switch workspace.cef.extension.cat != null {
+            true { [{ key: "cef.cat", value: { string_value: workspace.cef.extension.cat } }] }
             default { [] }
         },
-        switch workspace.cef.outcome != null {
-            true { [{ key: "cef.outcome", value: { string_value: workspace.cef.outcome } }] }
+        switch workspace.cef.extension.outcome != null {
+            true { [{ key: "cef.outcome", value: { string_value: workspace.cef.extension.outcome } }] }
             default { [] }
         },
-        switch workspace.cef.reason != null {
-            true { [{ key: "cef.reason", value: { string_value: workspace.cef.reason } }] }
+        switch workspace.cef.extension.reason != null {
+            true { [{ key: "cef.reason", value: { string_value: workspace.cef.extension.reason } }] }
             default { [] }
         },
-        switch workspace.cef.externalId != null {
-            true { [{ key: "cef.externalId", value: { string_value: workspace.cef.externalId } }] }
+        switch workspace.cef.extension.externalId != null {
+            true { [{ key: "cef.externalId", value: { string_value: workspace.cef.extension.externalId } }] }
             default { [] }
         },
-        switch workspace.cef.deviceExternalId != null {
-            true { [{ key: "cef.deviceExternalId", value: { string_value: workspace.cef.deviceExternalId } }] }
+        switch workspace.cef.extension.deviceExternalId != null {
+            true { [{ key: "cef.deviceExternalId", value: { string_value: workspace.cef.extension.deviceExternalId } }] }
             default { [] }
         },
-        switch workspace.cef.fileHash != null {
-            true { [{ key: "cef.fileHash", value: { string_value: workspace.cef.fileHash } }] }
+        switch workspace.cef.extension.fileHash != null {
+            true { [{ key: "cef.fileHash", value: { string_value: workspace.cef.extension.fileHash } }] }
             default { [] }
         },
-        switch workspace.cef.cnt != null {
-            true { [{ key: "cef.cnt", value: { int_value: to_int(workspace.cef.cnt) } }] }
+        switch workspace.cef.extension.cnt != null {
+            true { [{ key: "cef.cnt", value: { int_value: to_int(workspace.cef.extension.cnt) } }] }
             default { [] }
         }
     )

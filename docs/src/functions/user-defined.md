@@ -19,8 +19,8 @@ Use one anywhere an expression goes:
 def process parse_fortigate_cef_traffic {
     workspace.lsis.parsed = {
         connection_info: {
-            protocol_num:  workspace.cef.proto,
-            protocol_name: normalize_proto(workspace.cef.proto)
+            protocol_num:  workspace.cef.extension.proto,
+            protocol_name: normalize_proto(workspace.cef.extension.proto)
         },
         // ... other canonical fields ...
     }
@@ -43,15 +43,15 @@ Anywhere an expression is evaluated — there's no callsite restriction on the f
   def output proto_udp { type file path "/var/log/limpid/udp/events.log" }
   def pipeline split {
       input syslog_udp
-      process parse_cef                                  // sets workspace.cef.proto
-      switch normalize_proto(workspace.cef.proto) {
+      process parse_cef                                  // sets workspace.cef.extension.proto
+      switch normalize_proto(workspace.cef.extension.proto) {
           "tcp" { output proto_tcp }
           "udp" { output proto_udp }
       }
   }
   ```
 - **HashLit values**: `workspace.lsis.parsed = { severity_number: severity_number_from_label(...), ... }`.
-- **Function arguments**: `lower(normalize_proto(workspace.cef.proto))`.
+- **Function arguments**: `lower(normalize_proto(workspace.cef.extension.proto))`.
 - **Binary operands**: `if double_score(s) > threshold { ... }`.
 
 The purity contract restricts the **body** of the function (no Event reads, no side effects). The call site is dispatch-wise unrestricted: it operates in the surrounding expression's evaluation context, which can read whatever that surface allows (full Event in process bodies / pipeline expressions; event-intrinsic only in output config templates) and pass concrete values into the function.
