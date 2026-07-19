@@ -6,7 +6,7 @@ Built-in functions are primitives implemented in Rust and shipped with the daemo
 def process parse_cef_line {
     workspace.syslog = syslog.parse(ingress)
     workspace.cef    = cef.parse(workspace.syslog.msg)
-    workspace.payload = parse_json(workspace.cef.msg)
+    workspace.payload = parse_json(workspace.cef.extension.msg)
 }
 ```
 
@@ -40,7 +40,7 @@ def process parse_fw_flat {
 ```limpid
 def process parse_fw_namespaced {
     workspace.syslog = syslog.parse(ingress)   // workspace.syslog.hostname, workspace.syslog.msg, ...
-    workspace.cef    = cef.parse(ingress)      // workspace.cef.version, workspace.cef.src, ...
+    workspace.cef    = cef.parse(ingress)      // workspace.cef.version, workspace.cef.extension.src, ...
 }
 ```
 
@@ -539,8 +539,8 @@ let event_time = coalesce(
 
 // Parser: pick first source IP that is populated
 workspace.lsis.parsed.src_endpoint.ip = coalesce(
-    workspace.cef.src,
-    workspace.cef.sourceTranslatedAddress,
+    workspace.cef.extension.src,
+    workspace.cef.extension.sourceTranslatedAddress,
     workspace.syslog.hostname
 )
 ```
@@ -573,11 +573,11 @@ it would hide the signal.
 
 ```limpid
 workspace.payload = {
-    src: workspace.cef.src,
-    dst: workspace.cef.dst,
-    user: workspace.cef.suser,        // may be null on machine-only events
+    src: workspace.cef.extension.src,
+    dst: workspace.cef.extension.dst,
+    user: workspace.cef.extension.suser,        // may be null on machine-only events
     evidences: [
-        { file: workspace.cef.fname, hash: workspace.cef.fhash }
+        { file: workspace.cef.extension.fname, hash: workspace.cef.extension.fhash }
     ]
 }
 egress = to_json(null_omit(workspace.payload))
@@ -694,7 +694,7 @@ Text-only primitives (`upper`, `regex_*`, `format`, `to_int`,
 Coerces a value to a 64-bit signed integer. Returns `null` on unparseable input, matching the partial-data policy of `regex_extract` and `table_lookup`.
 
 ```limpid
-workspace.lsis.parsed.src_endpoint.port = to_int(workspace.cef.spt)  // CEF ext: "54321" → 54321
+workspace.lsis.parsed.src_endpoint.port = to_int(workspace.cef.extension.spt)  // CEF ext: "54321" → 54321
 ```
 
 | Input | Result |

@@ -128,8 +128,8 @@ def pipeline siem {
     // Parse and enrich
     process {
         workspace.cef = cef.parse(ingress)
-        if workspace.cef.src != null {
-            workspace.geo = geoip(workspace.cef.src)
+        if workspace.cef.extension.src != null {
+            workspace.geo = geoip(workspace.cef.extension.src)
         }
         egress = to_json(workspace)
     }

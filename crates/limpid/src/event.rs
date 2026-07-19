@@ -176,7 +176,8 @@ pub struct OwnedEvent {
     /// captured under a per-schema namespace
     /// (`workspace.syslog = syslog.parse(ingress)` then
     /// `workspace.syslog.timestamp`; CEF's `rt` extension surfaces as
-    /// `workspace.cef.rt` after `workspace.cef = cef.parse(...)`).
+    /// `workspace.cef.extension.rt` after
+    /// `workspace.cef = cef.parse(...)`).
     pub received_at: DateTime<Utc>,
     pub source: SocketAddr,
     pub ingress: Bytes,

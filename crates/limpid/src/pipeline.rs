@@ -3934,6 +3934,36 @@ def pipeline zeek_full_otlp {
             Some("host01")
         );
 
+        // Collision isolation: extension keys named after header fields
+        // (`severity=`, `name=`, `ext=`) must not shadow the positional
+        // header values — cef.parse isolates them under the nested
+        // `extension` sub-object, so the record's severity still comes
+        // from the header (7 → ERROR 17), not the injected `severity=9`.
+        let generic_cef_collision_wire = b"<134>Apr 27 10:00:00 host01 CEF:0|ArcSight|Console|6.9|100|realname|7|severity=9 name=fakename ext=x src=192.0.2.10";
+        let generic_cef_collision = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "cef_otlp",
+            generic_cef_collision_wire,
+            json!({}),
+            received_at,
+        );
+        let generic_cef_collision_record = &generic_cef_collision.scope_logs[0].log_records[0];
+        assert_eq!(generic_cef_collision_record.severity_number, 17);
+        assert_eq!(generic_cef_collision_record.severity_text, "7");
+        assert_eq!(
+            otlp_string_attribute(&generic_cef_collision_record.attributes, "cef.severity"),
+            Some("7")
+        );
+        assert_eq!(
+            otlp_string_attribute(&generic_cef_collision_record.attributes, "cef.name"),
+            Some("realname")
+        );
+        assert_eq!(
+            otlp_string_attribute(&generic_cef_collision_record.attributes, "source.ip"),
+            Some("192.0.2.10")
+        );
+
         // CEF also documents string Severity values (Unknown / Low /
         // Medium / High / Very-High). A single band-wide value takes the
         // band's smallest SeverityNumber: "High" → ERROR (17).
@@ -4172,6 +4202,7 @@ def pipeline zeek_full_otlp {
         for resource_logs in [
             asa,
             generic_cef,
+            generic_cef_collision,
             generic_cef_string,
             generic_cef_unknown,
             checkpoint_leef,
