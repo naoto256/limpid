@@ -35,7 +35,7 @@ Routes the event to the [error log](../operations/error-log.md) (DLQ) with an op
 
 ```
 def process parse_fortigate_cef {
-    workspace.cef = cef.parse(workspace.syslog.msg)
+    // workspace.cef.* was populated by `parse_syslog | parse_cef` upstream
     switch workspace.cef.name {
         "traffic" { process parse_fortigate_cef_traffic }
         "utm"     { process parse_fortigate_cef_utm }
