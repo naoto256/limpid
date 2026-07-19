@@ -1,0 +1,293 @@
+// Summary:     ArcSight CEF message (from a syslog body) → workspace.cef.*
+//              format fields (format-layer parser; interpreting the
+//              vendor dialect on top is the next stage's job).
+// Reads:       workspace.syslog.* (transport intake — populated by
+//              parse_syslog upstream)
+//                .msg (required, String) — syslog body carrying the
+//                     `CEF:...` message
+//                .hostname (optional, String) — originating host, retained
+//                     by cef_to_otlp as Resource `host.name`
+// Writes:      workspace.cef.{version, device_vendor, device_product,
+//              device_version, signature_id, name, severity, ext, <ext-key>…}
+//              — the CEF format namespace, not LSIS. cef_to_otlp writes
+//              source-owned OTLP Resource, Body, LogRecord attributes, and
+//              the shed severity slots mapped from the CEF 0-10 scale.
+// Category:    Transport
+// Test corpus: synthetic (sample wires in this header)
+//
+// Wire —    ArcSight CEF as carried in a syslog body —
+//          `CEF:Version|Device Vendor|Device Product|Device Version|Signature ID|Name|Severity|Extensions`
+//          The outer syslog wrapper (`<PRI>`, timestamp, hostname) is
+//          transport, unwrapped by `parse_syslog` upstream; this parser
+//          consumes the body only.
+//
+// Thin wrapper around the `cef.parse()` primitive, mirroring
+// parse_syslog's role one layer up the stack. Exists so a pipeline can
+// express format stacking explicitly:
+//
+//   process parse_syslog | parse_cef | parse_<vendor>_cef | compose_<target>
+//
+// rather than having every vendor CEF parser inline
+// `cef.parse(workspace.syslog.msg)` itself. The separation buys two
+// things: a pipeline can inspect `workspace.syslog.*` / `workspace.cef.*`
+// and drop or route events *before* paying the next stage's parse cost,
+// and each stage stays independently composable (a non-syslog CEF
+// carrier only needs a different bridge into `workspace.syslog.msg` —
+// the CEF stage is unchanged).
+//
+// Non-CEF or absent bodies are loud errors (DLQ), matching the pack's
+// loud-fail-fast policy: `cef.parse` itself rejects input that does not
+// start with `CEF:` or lacks the 7 header fields.
+//
+// Sample input (RFC 3164 wrapper, generic ArcSight example):
+//   <134>Apr 27 10:00:00 host01 CEF:0|ArcSight|Console|6.9|100|alert raised|7|src=192.0.2.10 spt=51234 dst=198.51.100.5 dpt=443 act=blocked msg=Example alert
+//
+// Sample input (RFC 5424 wrapper):
+//   <134>1 2026-04-30T01:23:45Z host01 - - - - CEF:0|Vendor|Product|1.0|100|name|5|src=192.0.2.10 dst=198.51.100.5
+//
+// Vendor dialects (FortiGate `cat=` routing, PAN-OS `name`-encoded log
+// types, `FTNTFGT*` extension prefixes, …) are out of scope here — they
+// belong to the per-vendor parsers (`parse_fortigate_cef`,
+// `parse_paloalto_cef`) stacked after this stage.
+
+def process parse_cef {
+    switch workspace.syslog.msg {
+        null    { error "parse_cef: no syslog body to parse (workspace.syslog.msg is null)" }
+        default { workspace.cef = cef.parse(workspace.syslog.msg) }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Generic OTLP source adapter
+// ---------------------------------------------------------------------------
+//
+// The CEF header and the standard extension dictionary are defined by the
+// ArcSight CEF specification independent of any vendor, so a generic
+// adapter is legitimate here — unlike the vendor severity dialects
+// (FortiGate's 1-8, PAN-OS's 1-5) that need their own adapters.
+//
+// Severity — the CEF specification defines header Severity with two
+// valid notations: an integer 0-10 reflecting event importance, grouped
+// as 0-3 Low / 4-6 Medium / 7-8 High / 9-10 Very-High, and the string
+// values Unknown / Low / Medium / High / Very-High naming those groups
+// directly. The OTel Logs Data Model defines SeverityNumber bands
+// INFO 9-12 / WARN 13-16 / ERROR 17-20 / FATAL 21-24, with unspecified
+// band-internal steps available for finer source scales. The Data Model
+// appendix carries no official CEF mapping example, so this table
+// follows the Data Model body's mapping principles — place each source
+// band on a target band, order finer values inside the band, and give a
+// single band-wide value the band's smallest number:
+//
+//   CEF band            CEF value → SeverityNumber
+//   Low       (0-3)     0 → 9   1 → 10   2 → 11   3 → 12   (INFO..INFO4)
+//   Medium    (4-6)     4 → 13  5 → 14   6 → 15            (WARN..WARN3)
+//   High      (7-8)     7 → 17  8 → 18                     (ERROR..ERROR2)
+//   Very-High (9-10)    9 → 21  10 → 22                    (FATAL..FATAL2)
+//
+//   CEF string          "Low" → 9   "Medium" → 13   "High" → 17
+//                       "Very-High" → 21   (band minimum each)
+//                       "Unknown" → unset (no importance claim to map)
+//
+// Low maps to INFO (not TRACE/DEBUG — CEF 0 is a least-important event,
+// not diagnostic verbosity), Very-High to FATAL; consecutive CEF values
+// take consecutive numbers from each band floor, so the integer mapping
+// is order-preserving and injective — distinct source severities remain
+// distinguishable after conversion. String values are matched exactly
+// in the specification's capitalized spelling (the CEF guide documents
+// no case-insensitive allowance). True out-of-domain values (integers
+// outside 0-10, strings other than the five documented words) leave
+// severity_number unset; the raw value is retained as severity_text and
+// the `cef.severity` attribute either way.
+def function cef_severity_number(sev) {
+    switch sev {
+        0           { 9 }
+        1           { 10 }
+        2           { 11 }
+        3           { 12 }
+        4           { 13 }
+        5           { 14 }
+        6           { 15 }
+        7           { 17 }
+        8           { 18 }
+        9           { 21 }
+        10          { 22 }
+        "Low"       { 9 }
+        "Medium"    { 13 }
+        "High"      { 17 }
+        "Very-High" { 21 }
+        "Unknown"   { null }
+        default     { null }
+    }
+}
+
+// Attribute placement notes —
+//
+//   * `event.code` ← Signature ID: the CEF header's unique per-event-type
+//     identifier, which is exactly ECS `event.code`'s contract.
+//   * The CEF header Name is a free-form human-readable description
+//     ("alert raised", "utm:ips signature"), which does NOT meet OTel
+//     semconv `event.name`'s low-cardinality identifier contract — so it
+//     stays in the CEF namespace as `cef.name`.
+//   * Standard extension keys whose semconv equivalent is self-evident
+//     are placed under the semconv name (src → source.ip, request →
+//     url.full, …). Spec-defined keys without a self-evident semconv
+//     home are passed through under `cef.<key>`. The DSL has no
+//     object-key iteration, so the passthrough is a curated table of
+//     the spec dictionary's common keys rather than a wildcard; nothing
+//     is lost — the Body carries the complete original CEF message.
+//   * Timestamp extensions (rt / start / end) are not parsed here: CEF
+//     permits both epoch-milliseconds and several textual formats, so
+//     interpreting them needs vendor knowledge. Vendor parsers own time.
+def process cef_to_otlp {
+    workspace.lsis.shed.otlp.resource.attributes = concat(
+        switch workspace.cef.device_vendor != null {
+            true { [{ key: "observer.vendor", value: { string_value: workspace.cef.device_vendor } }] }
+            default { [] }
+        },
+        switch workspace.cef.device_product != null {
+            true { [{ key: "observer.product", value: { string_value: workspace.cef.device_product } }] }
+            default { [] }
+        },
+        switch workspace.cef.device_version != null {
+            true { [{ key: "observer.version", value: { string_value: workspace.cef.device_version } }] }
+            default { [] }
+        },
+        switch workspace.syslog.hostname != null {
+            true { [{ key: "host.name", value: { string_value: workspace.syslog.hostname } }] }
+            default { [] }
+        },
+        [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
+        [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
+    )
+    workspace.lsis.shed.otlp.log_record.body = { string_value: workspace.syslog.msg }
+    workspace.lsis.shed.otlp.log_record.severity_number = cef_severity_number(workspace.cef.severity)
+    workspace.lsis.shed.otlp.log_record.severity_text = switch workspace.cef.severity {
+        null    { null }
+        default { "${workspace.cef.severity}" }
+    }
+    workspace.lsis.shed.otlp.log_record.attributes = concat(
+        [{ key: "event.kind", value: { string_value: "event" } }],
+        switch workspace.cef.signature_id != null {
+            true { [{ key: "event.code", value: { string_value: workspace.cef.signature_id } }] }
+            default { [] }
+        },
+        switch workspace.cef.act != null {
+            true { [{ key: "event.action", value: { string_value: workspace.cef.act } }] }
+            default { [] }
+        },
+        switch workspace.cef.msg != null {
+            true { [{ key: "message", value: { string_value: workspace.cef.msg } }] }
+            default { [] }
+        },
+        switch workspace.cef.src != null {
+            true { [{ key: "source.ip", value: { string_value: workspace.cef.src } }] }
+            default { [] }
+        },
+        switch workspace.cef.spt != null {
+            true { [{ key: "source.port", value: { int_value: to_int(workspace.cef.spt) } }] }
+            default { [] }
+        },
+        switch workspace.cef.smac != null {
+            true { [{ key: "source.mac", value: { string_value: workspace.cef.smac } }] }
+            default { [] }
+        },
+        switch workspace.cef.shost != null {
+            true { [{ key: "source.domain", value: { string_value: workspace.cef.shost } }] }
+            default { [] }
+        },
+        switch workspace.cef.in != null {
+            true { [{ key: "source.bytes", value: { int_value: to_int(workspace.cef.in) } }] }
+            default { [] }
+        },
+        switch workspace.cef.dst != null {
+            true { [{ key: "destination.ip", value: { string_value: workspace.cef.dst } }] }
+            default { [] }
+        },
+        switch workspace.cef.dpt != null {
+            true { [{ key: "destination.port", value: { int_value: to_int(workspace.cef.dpt) } }] }
+            default { [] }
+        },
+        switch workspace.cef.dmac != null {
+            true { [{ key: "destination.mac", value: { string_value: workspace.cef.dmac } }] }
+            default { [] }
+        },
+        switch workspace.cef.dhost != null {
+            true { [{ key: "destination.domain", value: { string_value: workspace.cef.dhost } }] }
+            default { [] }
+        },
+        switch workspace.cef.out != null {
+            true { [{ key: "destination.bytes", value: { int_value: to_int(workspace.cef.out) } }] }
+            default { [] }
+        },
+        switch workspace.cef.suser != null {
+            true { [{ key: "user.name", value: { string_value: workspace.cef.suser } }] }
+            default { [] }
+        },
+        switch workspace.cef.duser != null {
+            true { [{ key: "destination.user.name", value: { string_value: workspace.cef.duser } }] }
+            default { [] }
+        },
+        switch workspace.cef.proto != null {
+            true { [{ key: "network.transport", value: { string_value: lower(workspace.cef.proto) } }] }
+            default { [] }
+        },
+        switch workspace.cef.app != null {
+            true { [{ key: "network.application", value: { string_value: workspace.cef.app } }] }
+            default { [] }
+        },
+        switch workspace.cef.request != null {
+            true { [{ key: "url.full", value: { string_value: workspace.cef.request } }] }
+            default { [] }
+        },
+        switch workspace.cef.requestMethod != null {
+            true { [{ key: "http.request.method", value: { string_value: workspace.cef.requestMethod } }] }
+            default { [] }
+        },
+        switch workspace.cef.fname != null {
+            true { [{ key: "file.name", value: { string_value: workspace.cef.fname } }] }
+            default { [] }
+        },
+        // CEF namespace — header fields and spec keys without a
+        // self-evident semconv home.
+        switch workspace.cef.version != null {
+            true { [{ key: "cef.version", value: { string_value: workspace.cef.version } }] }
+            default { [] }
+        },
+        switch workspace.cef.name != null {
+            true { [{ key: "cef.name", value: { string_value: workspace.cef.name } }] }
+            default { [] }
+        },
+        switch workspace.cef.severity != null {
+            true { [{ key: "cef.severity", value: { string_value: "${workspace.cef.severity}" } }] }
+            default { [] }
+        },
+        switch workspace.cef.cat != null {
+            true { [{ key: "cef.cat", value: { string_value: workspace.cef.cat } }] }
+            default { [] }
+        },
+        switch workspace.cef.outcome != null {
+            true { [{ key: "cef.outcome", value: { string_value: workspace.cef.outcome } }] }
+            default { [] }
+        },
+        switch workspace.cef.reason != null {
+            true { [{ key: "cef.reason", value: { string_value: workspace.cef.reason } }] }
+            default { [] }
+        },
+        switch workspace.cef.externalId != null {
+            true { [{ key: "cef.externalId", value: { string_value: workspace.cef.externalId } }] }
+            default { [] }
+        },
+        switch workspace.cef.deviceExternalId != null {
+            true { [{ key: "cef.deviceExternalId", value: { string_value: workspace.cef.deviceExternalId } }] }
+            default { [] }
+        },
+        switch workspace.cef.fileHash != null {
+            true { [{ key: "cef.fileHash", value: { string_value: workspace.cef.fileHash } }] }
+            default { [] }
+        },
+        switch workspace.cef.cnt != null {
+            true { [{ key: "cef.cnt", value: { int_value: to_int(workspace.cef.cnt) } }] }
+            default { [] }
+        }
+    )
+}
