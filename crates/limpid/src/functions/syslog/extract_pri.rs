@@ -12,7 +12,10 @@ pub fn register(reg: &mut FunctionRegistry) {
     reg.register_in_with_sig(
         "syslog",
         "extract_pri",
-        FunctionSig::fixed(&[FieldType::String], FieldType::Int),
+        FunctionSig::fixed(
+            &[FieldType::String],
+            FieldType::union(FieldType::Int, FieldType::Null),
+        ),
         |_arena, args, _event| {
             let input = val_to_str(&args[0])?;
             Ok(parse_leading_pri(&input)

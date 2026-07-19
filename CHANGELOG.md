@@ -8,6 +8,19 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+### Fixed — analyzer contracts match runtime value shapes
+
+Static checking now models ingress and egress as String-or-Bytes payloads,
+accepts both runtime input forms for `to_string` and the OTLP decoders, and
+preserves nullable returns for partial primitives instead of claiming a value
+is always present. `cef.parse` limits its data-driven workspace wildcard to
+`workspace.extension.*`, so unrelated workspace paths are no longer widened.
+User-defined function calls now report arity mismatches during `--check` with
+the same expected-versus-actual shape used by runtime diagnostics.
+
+The `strftime` and `strptime` timezone keywords `UTC` and `local` are now
+ASCII case-insensitive; IANA timezone names remain case-sensitive.
+
 ### Fixed — cef.parse honors the header escapes `\|` and `\\`
 
 The header splitter treated every `|` as a field separator, so a

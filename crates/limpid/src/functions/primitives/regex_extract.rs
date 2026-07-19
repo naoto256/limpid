@@ -15,7 +15,10 @@ use crate::functions::{FunctionRegistry, FunctionSig};
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(
         "regex_extract",
-        FunctionSig::fixed(&[FieldType::String, FieldType::String], FieldType::String),
+        FunctionSig::fixed(
+            &[FieldType::String, FieldType::String],
+            FieldType::union(FieldType::String, FieldType::Null),
+        ),
         |arena, args, _event| {
             let target = val_to_str(&args[0])?;
             let pattern = val_to_str(&args[1])?;

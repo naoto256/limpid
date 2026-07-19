@@ -34,6 +34,7 @@ pub fn register(reg: &mut FunctionRegistry) {
         name: "parse_kv",
         produces: Vec::new(),
         wildcards: true,
+        scoped_wildcards: Vec::new(),
         // Retained for documentation; the extractor below takes over
         // the actual scan because parse_kv's defaults position depends
         // on the type of `args[1]`.

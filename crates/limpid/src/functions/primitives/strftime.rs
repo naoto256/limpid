@@ -47,8 +47,10 @@ pub fn register(reg: &mut FunctionRegistry) {
 
             let formatted = match tz.as_deref() {
                 None => dt.format(&fmt).to_string(),
-                Some("local") => dt.with_timezone(&chrono::Local).format(&fmt).to_string(),
-                Some("UTC") | Some("utc") => {
+                Some(timezone) if timezone.eq_ignore_ascii_case("local") => {
+                    dt.with_timezone(&chrono::Local).format(&fmt).to_string()
+                }
+                Some(timezone) if timezone.eq_ignore_ascii_case("UTC") => {
                     dt.with_timezone(&chrono::Utc).format(&fmt).to_string()
                 }
                 Some(timezone) => {

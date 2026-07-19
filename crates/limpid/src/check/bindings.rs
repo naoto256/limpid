@@ -28,7 +28,7 @@
 //! [`super::outputs::check_pipeline_only_reference`] regardless of
 //! upstream binding status.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::dsl::field_schema::FieldType;
 
@@ -42,6 +42,9 @@ pub struct Bindings {
     /// analyzer can no longer tell which workspace keys exist, so any
     /// `workspace.*` read is admitted without flagging.
     wildcard: bool,
+    /// Data-driven subtrees admitted without widening unrelated workspace
+    /// paths, for example `workspace.extension.*` from `cef.parse`.
+    scoped_wildcards: HashSet<String>,
     /// Stack of `let` scopes; the innermost (top) scope wins on lookup.
     let_scopes: Vec<HashMap<String, FieldType>>,
 }
@@ -78,6 +81,20 @@ impl Bindings {
     /// (parse_json, parse_kv) ran without HashLit defaults.
     pub fn set_workspace_wildcard(&mut self) {
         self.wildcard = true;
+    }
+
+    pub fn set_workspace_scoped_wildcard(&mut self, path: &[String]) {
+        self.scoped_wildcards.insert(path.join("."));
+    }
+
+    pub fn is_workspace_path_wildcard(&self, path: &[String]) -> bool {
+        if self.wildcard {
+            return true;
+        }
+        let dotted = path.join(".");
+        self.scoped_wildcards
+            .iter()
+            .any(|scope| dotted == *scope || dotted.starts_with(&format!("{scope}.")))
     }
 
     #[allow(dead_code)] // currently consulted only from tests; kept on the
@@ -142,7 +159,19 @@ impl Bindings {
         self.workspace = merged;
         // Wildcard only survives if both sides wildcarded — otherwise
         // the precise side's known keys win.
-        self.wildcard = self.wildcard && other.wildcard;
+        let self_global = self.wildcard;
+        let other_global = other.wildcard;
+        self.wildcard = self_global && other_global;
+        self.scoped_wildcards = match (self_global, other_global) {
+            (true, true) => HashSet::new(),
+            (true, false) => other.scoped_wildcards.clone(),
+            (false, true) => self.scoped_wildcards.clone(),
+            (false, false) => self
+                .scoped_wildcards
+                .intersection(&other.scoped_wildcards)
+                .cloned()
+                .collect(),
+        };
     }
 }
 
@@ -235,5 +264,17 @@ mod tests {
         // so the precise side's `workspace.x` is dropped — paths must
         // be bound on *both* sides.
         assert!(a.get_workspace(&["workspace".into(), "x".into()]).is_none());
+    }
+
+    #[test]
+    fn scoped_wildcard_admits_only_its_subtree() {
+        let mut b = Bindings::new();
+        b.set_workspace_scoped_wildcard(&["workspace".into(), "extension".into()]);
+        assert!(b.is_workspace_path_wildcard(&[
+            "workspace".into(),
+            "extension".into(),
+            "src".into(),
+        ]));
+        assert!(!b.is_workspace_path_wildcard(&["workspace".into(), "unrelated".into(),]));
     }
 }

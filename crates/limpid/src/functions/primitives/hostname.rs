@@ -22,7 +22,7 @@ use crate::functions::{FunctionRegistry, FunctionSig};
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(
         "hostname",
-        FunctionSig::fixed(&[], FieldType::String),
+        FunctionSig::fixed(&[], FieldType::union(FieldType::String, FieldType::Null)),
         |arena, _args, _event| {
             let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 gethostname::gethostname().to_string_lossy().into_owned()

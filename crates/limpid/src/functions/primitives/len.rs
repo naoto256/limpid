@@ -15,7 +15,10 @@ use crate::functions::{FunctionRegistry, FunctionSig};
 pub fn register(reg: &mut FunctionRegistry) {
     reg.register_with_sig(
         "len",
-        FunctionSig::fixed(&[FieldType::Any], FieldType::Int),
+        FunctionSig::fixed(
+            &[FieldType::Any],
+            FieldType::union(FieldType::Int, FieldType::Null),
+        ),
         |_arena, args, _event| Ok(measure(&args[0])),
     );
 }

@@ -145,9 +145,10 @@ pub type DefaultsArgExtractor =
 /// needs to know *which keys* a bare `parse_xxx(text)` call contributes
 /// to workspace, with *what types*, so downstream `workspace.*` references
 /// type-check. `produces` is the static answer; `wildcards = true` means
-/// the key set is data-driven (e.g. `parse_json`) and the analyzer should
-/// fall back to wildcard unless the caller pins a schema via the
-/// optional defaults HashLit argument.
+/// the whole key set is data-driven (e.g. `parse_json`) and the analyzer
+/// should fall back to wildcard unless the caller pins a schema via the
+/// optional defaults HashLit argument. `scoped_wildcards` handles parsers
+/// such as `cef.parse`, where only one nested subtree is data-driven.
 ///
 /// Parsers are registered alongside their implementation; the analyzer
 /// looks them up via [`FunctionRegistry::parser`].
@@ -183,10 +184,14 @@ pub struct ParserInfo {
     /// `(workspace key, type)` pairs the parser is known to emit. Empty
     /// when `wildcards = true` and there's no static structure.
     pub produces: Vec<FieldSpec>,
-    /// True when the output key set is determined by the input rather
-    /// than statically known (parse_json, parse_kv, parse_cef
-    /// extensions, etc.).
+    /// True when the entire output key set is determined by the input
+    /// rather than statically known (for example `parse_json` or
+    /// `parse_kv`).
     pub wildcards: bool,
+    /// Dynamic output subtrees whose keys are data-driven while the rest
+    /// of workspace remains statically described. Each path includes the
+    /// `workspace` root (for example `workspace.extension`).
+    pub scoped_wildcards: Vec<Vec<String>>,
     /// Positional indices where a `defaults` HashLit may appear. The
     /// analyzer scans these slots and uses the first HashLit found to
     /// pin precise workspace keys; if none match, wildcard parsers fall
@@ -389,6 +394,11 @@ impl FunctionRegistry {
     pub fn parser(&self, namespace: Option<&str>, name: &str) -> Option<&ParserInfo> {
         let key = (namespace.map(str::to_string), name.to_string());
         self.parsers.get(&key)
+    }
+
+    /// Whether `name` resolves to a user-defined flat function.
+    pub fn is_user_function(&self, name: &str) -> bool {
+        self.user_definitions.contains_key(name)
     }
 
     /// Dispatch a function call. `namespace = None` hits the flat
@@ -597,6 +607,27 @@ mod tests {
         )
     }
 
+    #[test]
+    fn partial_primitive_signatures_are_nullable() {
+        let reg = make_registry();
+        for (namespace, name, present) in [
+            (None, "regex_extract", FieldType::String),
+            (Some("syslog"), "extract_pri", FieldType::Int),
+            (None, "to_int", FieldType::Int),
+            (None, "len", FieldType::Int),
+            (None, "csv_parse", FieldType::Object),
+            (None, "append", FieldType::Array),
+            (None, "prepend", FieldType::Array),
+            (None, "hostname", FieldType::String),
+        ] {
+            assert_eq!(
+                reg.signature(namespace, name).unwrap().ret,
+                FieldType::union(present, FieldType::Null),
+                "{name} return contract"
+            );
+        }
+    }
+
     fn ts_value(s: &str) -> Value<'static> {
         Value::Timestamp(
             chrono::DateTime::parse_from_rfc3339(s)
@@ -663,13 +694,36 @@ mod tests {
                 &[
                     ts_value("2026-04-19T10:30:45+09:00"),
                     Value::String(arena.alloc_str("%Y-%m-%dT%H:%M:%S%z")),
-                    Value::String(arena.alloc_str("UTC")),
+                    Value::String(arena.alloc_str("uTc")),
                 ],
                 &bevent,
                 &arena,
             )
             .unwrap();
         assert_eq!(result, Value::String("2026-04-19T01:30:45+0000"));
+    }
+
+    #[test]
+    fn strftime_local_keyword_is_ascii_case_insensitive() {
+        let bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = dummy_owned();
+        let bevent = owned.view_in(&arena);
+        let reg = make_registry();
+        let result = reg
+            .call(
+                None,
+                "strftime",
+                &[
+                    ts_value("2026-04-19T10:30:45+00:00"),
+                    Value::String(arena.alloc_str("%Y-%m-%d")),
+                    Value::String(arena.alloc_str("LoCaL")),
+                ],
+                &bevent,
+                &arena,
+            )
+            .unwrap();
+        assert!(matches!(result, Value::String(_)));
     }
 
     #[test]
