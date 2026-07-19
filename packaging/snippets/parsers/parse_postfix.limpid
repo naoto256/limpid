@@ -1,14 +1,6 @@
-// Summary:     Postfix mail-flow log bodies (postfix/<program>[pid]: tag
-//              included) → LSIS Email Activity.
-// Reads:       workspace.postfix.* (bridge — see Bridges below)
-//                .body (required, String) — the postfix-tagged body
-//                .hostname (optional, String) — host where the MTA ran
-//                .time (optional, Int) — epoch nanoseconds
-// Writes:      workspace.lsis.parsed.* — 4009 (Email Activity) for mail-flow programs
-//              (smtp / smtpd / qmgr / bounce); daemon-control noise routes to
-//              error_log. postfix_to_otlp writes source-owned OTLP Resource,
-//              Body, and LogRecord attributes.
-// Category:    Mail (MTA)
+// Facade: process parse_postfix,
+//         process postfix_to_otlp
+// Category: Mail (MTA)
 // Test corpus: synthetic (sample postfix lines in this header)
 //
 // Vendor notes — The Postfix Project (Wietse Venema's MTA — covers Postfix
@@ -121,6 +113,14 @@ def function postfix_status_id(s) {
 // pipeline boundary thanks to the v0.7.0
 // process-call error-propagation fix.
 
+// Process: parse_postfix
+// Summary: Postfix mail-flow log bodies (postfix/<program>[pid]: tag included) → LSIS Email Activity.
+// Reads: workspace.postfix.* (bridge — see Bridges below)
+//        .body (required, String) — the postfix-tagged body
+//        .hostname (optional, String) — host where the MTA ran
+//        .time (optional, Int) — epoch nanoseconds
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_postfix {
     // @requires: workspace.postfix.body      (required, String) — postfix-tagged body
     // @requires: workspace.postfix.hostname  (optional, String)
@@ -374,6 +374,18 @@ def function postfix_otlp_event_outcome(status_id) {
     switch status_id { 1 { "success" } 2 { "failure" } default { null } }
 }
 
+// Process: postfix_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.pf.*
+//        .program (optional, String)
+//        workspace.postfix.*
+//        .hostname (optional, String)
+//        workspace.lsis.parsed.*
+//        .status_id (optional, Int)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process postfix_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "service.name", value: { string_value: switch workspace.pf.program != null { true { "postfix/${workspace.pf.program}" } default { "postfix" } } } }],

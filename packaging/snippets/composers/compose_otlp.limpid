@@ -1,45 +1,5 @@
-// Summary:     Assembles one OTLP-1.0.0 ResourceLogs envelope from canonical
-//              LSIS scalars and source-adapter shed slots. Emits protobuf
-//              bytes for both otlp_http and otlp_grpc.
-// Reads:       workspace.lsis.parsed.* — canonical scalar facts:
-//                .time             (optional, Int) — event time in
-//                                  epoch nanoseconds.
-//                .severity_number  (optional, Int) — OTel SeverityNumber.
-//                .severity         (optional, String) — exact source text.
-//              workspace.lsis.shed.otlp.* — source-adapter output in OTLP
-//              vocabulary. Each slot is optional and replaces, rather than
-//              merges with, any lower-priority value:
-//                .resource.attributes (optional, Array) — OTLP KeyValue list.
-//                .scope.name (optional, String) — instrumentation scope name.
-//                .scope.version (optional, String) — instrumentation scope version.
-//                .scope.attributes (optional, Array) — OTLP KeyValue list.
-//                .log_record.time_unix_nano (optional, Int) — event-time override.
-//                .log_record.observed_time_unix_nano (optional, Int) — observation-time override.
-//                .log_record.severity_number (optional, Int) — severity override.
-//                .log_record.severity_text (optional, String) — severity-text override.
-//                .log_record.body (optional, Object) — tagged OTLP AnyValue.
-//                .log_record.attributes (optional, Array) — OTLP KeyValue list.
-//              `resource.attributes`, all scope slots, `body`, and LogRecord
-//              attributes are adapter-owned because their construction or
-//              placement is source-specific. Body is an OTLP AnyValue object;
-//              the adapter chooses its variant. Missing slots are omitted.
-//              Canonical scalar fallback chains are
-//                time             = coalesce(shed override, parsed.time)
-//                severity_number  = coalesce(shed override,
-//                                            parsed.severity_number)
-//                severity_text    = coalesce(shed override, parsed.severity)
-//                observed_time    = coalesce(shed override, received_at)
-//              Event time never falls back to `received_at`.
-//
-// Slots deliberately NOT exposed today — `log_record.trace_id`,
-// `log_record.span_id`, `log_record.event_name`, and the
-// `dropped_attributes_count` / `flags` housekeeping fields. These have
-// no implementation-driving caller in the pack today; they are added
-// on the same coalesce-with-default pattern above when a real caller
-// needs them.
-// Writes:      workspace.lsis.composed.otlp — ResourceLogs proto bytes
-//              (Bytes). Pipe `| otlp_to_egress` (foot of file) to emit
-//              for `output otlp_http` / `output otlp_grpc`.
+// Facade: process compose_otlp,
+//         process otlp_to_egress
 // Test corpus: spec-only (OTLP/1.0.0 proto shape;
 //              otlp.encode_resourcelog_protobuf reference in
 //              docs/src/functions/expression-functions.md)
@@ -56,6 +16,25 @@
 // canonical-scalar overrides. `compose_otlp` performs no source placement,
 // hostname synthesis, fixed scope naming, or Body coercion.
 
+// Process: compose_otlp
+// Summary: Assembles one OTLP-1.0.0 ResourceLogs envelope from canonical LSIS scalars and source-adapter shed slots. Emits protobuf bytes for both otlp_http and otlp_grpc.
+// Reads: workspace.lsis.parsed.* — canonical scalar facts:
+//        .time             (optional, Int) — event time in
+//        .severity_number  (optional, Int) — OTel SeverityNumber.
+//        .severity         (optional, String) — exact source text.
+//        workspace.lsis.shed.otlp.* — source-adapter output in OTLP
+//        .resource.attributes (optional, Array) — OTLP KeyValue list.
+//        .scope.name (optional, String) — instrumentation scope name.
+//        .scope.version (optional, String) — instrumentation scope version.
+//        .scope.attributes (optional, Array) — OTLP KeyValue list.
+//        .log_record.time_unix_nano (optional, Int) — event-time override.
+//        .log_record.observed_time_unix_nano (optional, Int) — observation-time override.
+//        .log_record.severity_number (optional, Int) — severity override.
+//        .log_record.severity_text (optional, String) — severity-text override.
+//        .log_record.body (optional, Object) — tagged OTLP AnyValue.
+//        .log_record.attributes (optional, Array) — OTLP KeyValue list.
+// Writes: workspace.lsis.composed.*
+//         .otlp (required, Bytes)
 def process compose_otlp {
     workspace.lsis.composed.otlp = otlp.encode_resourcelog_protobuf(null_omit({
         resource: switch len(coalesce(workspace.lsis.shed.otlp.resource.attributes, [])) > 0 {
@@ -108,6 +87,12 @@ def process compose_otlp {
 // Moves the OTLP ResourceLogs proto bytes from `workspace.lsis.composed.otlp`
 // to `egress`. Pipelines that emit OTLP as the wire form pipe
 // `compose_otlp | otlp_to_egress`.
+
+// Process: otlp_to_egress
+// Summary: Emit the composed OTLP protobuf bytes as the event payload.
+// Reads: workspace.lsis.composed.*
+//        .otlp (required, Bytes)
+// Writes: egress
 def process otlp_to_egress {
     egress = workspace.lsis.composed.otlp
 }

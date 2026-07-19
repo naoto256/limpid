@@ -1,16 +1,6 @@
-// Summary:     ISC BIND 9 querylog lines → LSIS DNS Activity.
-// Reads:       workspace.bind.* (bridge — see Bridges below)
-//                .body (required, String) — the query log line
-//                .pid (optional, String) — named pid
-//                .hostname (optional, String) — DNS server hostname
-//                .timezone (optional, String) — source timezone override as an
-//                  IANA name or fixed offset; defaults to the limpid host's
-//                  system timezone for BIND's local wall time
-//                  https://bind9.readthedocs.io/en/v9.18.13/reference.html#namedconf-statement-print-time
-// Writes:      workspace.lsis.parsed.* — 4003 (DNS Activity). Only the queries
-//              channel; bind_to_otlp writes source-owned OTLP Resource,
-//              Body, and LogRecord attributes.
-// Category:    DNS server
+// Facade: process parse_bind,
+//         process bind_to_otlp
+// Category: DNS server
 // Test corpus: synthetic (sample querylog lines in this header)
 //
 // Vendor notes — ISC BIND 9 (Internet Systems Consortium) — the dominant
@@ -139,6 +129,15 @@ def function bind_dns_record(client_ip, client_port_str, qname, qclass, qtype, s
 // Main parser
 // ---------------------------------------------------------------------------
 
+// Process: parse_bind
+// Summary: ISC BIND 9 querylog lines → LSIS DNS Activity.
+// Reads: workspace.bind.* (bridge — see Bridges below)
+//        .body (required, String) — the query log line
+//        .pid (optional, String) — named pid
+//        .hostname (optional, String) — DNS server hostname
+//        .timezone (optional, String) — source timezone override as an
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_bind {
     // @requires: workspace.bind.body       (required, String)
     // @requires: workspace.bind.pid        (optional, String)
@@ -173,6 +172,18 @@ def process parse_bind_query_record {
     )
 }
 
+// Process: bind_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.bind.*
+//        .hostname (optional, String)
+//        workspace.lsis.parsed.*
+//        .src_endpoint.ip (optional, String)
+//        workspace.bind_query.*
+//        .qclass (optional, String)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process bind_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "observer.vendor", value: { string_value: "Internet Systems Consortium" } }],

@@ -1,34 +1,6 @@
-// Summary:     Fortinet FortiGate CEF (FortiOS set format cef) → LSIS,
-//              dispatched by CEF cat subtype.
-// Reads:       workspace.cef.* (format intake — populated by
-//              parse_syslog | parse_cef upstream)
-//                .extension.cat (required, String) — FortiGate
-//                     `cat=<category>:<subtype>` extension, the dispatch key
-//                .severity (optional, Int) — CEF header priority
-//                     (FortiGate dialect 1-8)
-//                .device_vendor (optional, String) — CEF header vendor
-//                .device_product (optional, String) — CEF header product
-//                .device_version (optional, String) — CEF header version
-//                (plus the per-leaf standard / `FTNTFGT*` extension keys
-//                under workspace.cef.extension.*, documented on each
-//                subtype leaf below)
-//              workspace.syslog.* (transport intake)
-//                .timestamp (optional, String) — RFC 3164 wire timestamp
-//                .msg (optional, String) — syslog body, retained by
-//                     fortigate_cef_to_otlp as the OTLP Body
-//              workspace.fortigate_cef.timezone (optional, String) — source
-//              device timezone override as an IANA name or fixed offset; the
-//              RFC 3164 timestamp defaults to the limpid host's system timezone
-//              (FortiOS logs follow the configured device time zone, while
-//              the documented CEF wrapper omits the zone itself)
-//              https://docs.fortinet.com/document/fortigate/7.4.0/fortios-log-message-reference/949981/traffic-log-support-for-cef
-//              The default assumes FortiGate and limpid have the same correct
-//              system timezone. Correct either environment, override this
-//              slot, or use a custom parser when that assumption is false.
-// Writes:      workspace.lsis.parsed.* — class per subtype (traffic → 4001,
-//              IPS / virus → 2004, …); fortigate_cef_to_otlp writes
-//              source-owned OTLP Resource, Body, and LogRecord attributes.
-// Category:    Network firewall / IPS
+// Facade: process parse_fortigate_cef,
+//         process fortigate_cef_to_otlp
+// Category: Network firewall / IPS
 // Test corpus: real (anonymised FortiGate captures — the dialect-quirks
 //              block below was verified against them)
 //
@@ -189,6 +161,21 @@ def function fortigate_cef_metadata(vendor, product, version) {
 // because the CEF wrapper itself carries no timestamp; the per-leaf
 // validate process interprets it in the declared device timezone.
 
+// Process: parse_fortigate_cef
+// Summary: Fortinet FortiGate CEF (FortiOS set format cef) → LSIS, dispatched by CEF cat subtype.
+// Reads: workspace.cef.* (format intake — populated by
+//        .extension.cat (required, String) — FortiGate
+//        .severity (optional, Int) — CEF header priority
+//        .device_vendor (optional, String) — CEF header vendor
+//        .device_product (optional, String) — CEF header product
+//        .device_version (optional, String) — CEF header version
+//        workspace.syslog.* (transport intake)
+//        .timestamp (optional, String) — RFC 3164 wire timestamp
+//        .msg (optional, String) — syslog body, retained by
+//        workspace.fortigate_cef.*
+//        .timezone (optional, String) — source
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_fortigate_cef {
     workspace.cef.timestamp = workspace.syslog.timestamp
     switch workspace.cef.extension.cat {
@@ -990,6 +977,18 @@ def function fortigate_cef_otlp_event_outcome(status_id) {
     }
 }
 
+// Process: fortigate_cef_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.cef.*
+//        .device_vendor (optional, String)
+//        workspace.syslog.*
+//        .msg (optional, String)
+//        workspace.lsis.parsed.*
+//        .class_uid (optional, Int)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process fortigate_cef_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         switch workspace.cef.device_vendor != null {

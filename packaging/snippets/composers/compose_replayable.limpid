@@ -1,13 +1,5 @@
-// Summary:     Serialises the event into the minimal replay-record
-//              shape `{ received_at, source, ingress }` — the same
-//              three fields the error_log (DLQ) preserves and
-//              `inject --json` consumes.
-// Reads:       ingress (passed through verbatim) — plus the ambient
-//              event metadata `received_at` / `source`, which every
-//              process can read unconditionally.
-// Writes:      workspace.lsis.composed.replayable — replay record JSONL line
-//              (String). Pipe `| replayable_to_egress` (foot of
-//              file) to emit it as the capture stream.
+// Facade: process compose_replayable,
+//         process replayable_to_egress
 // Test corpus: spec-only (mirrors the error_log DLQ record shape;
 //              round-trips through `limpidctl inject --json`)
 //
@@ -42,6 +34,11 @@
 // captures *all* events. Both round-trip through `inject --json`
 // without preprocessing.
 
+// Process: compose_replayable
+// Summary: Serialises the event into the minimal replay-record shape `{ received_at, source, ingress }` — the same three fields the error_log (DLQ) preserves and `inject --json` consumes.
+// Reads: ingress
+// Writes: workspace.lsis.composed.*
+//         .replayable (required, String)
 def process compose_replayable {
     // Since v0.5.6 the DSL `source` ident is the canonical
     // `{ip, port}` object — same shape `inject --json` expects — so
@@ -61,6 +58,12 @@ def process compose_replayable {
 // Moves the replay record from `workspace.lsis.composed.replayable` to
 // `egress`. Pipelines that emit the capture stream as the wire form
 // pipe `compose_replayable | replayable_to_egress`.
+
+// Process: replayable_to_egress
+// Summary: Emit the composed replay record as the event payload.
+// Reads: workspace.lsis.composed.*
+//        .replayable (required, String)
+// Writes: egress
 def process replayable_to_egress {
     egress = workspace.lsis.composed.replayable
 }

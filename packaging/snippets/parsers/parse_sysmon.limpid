@@ -1,17 +1,10 @@
-// Microsoft Sysmon parser (vocabulary)
-//
-// Summary:     Microsoft Sysmon Windows-event JSON (forwarder-shipped) → LSIS,
-//              dispatched by EventID.
-// Reads:       workspace.sysmon.* (bridge — see Bridges below)
-//   .body (required, Object) — parsed Sysmon event (caller does `parse_json(ingress)`)
-//   .hostname (optional, String) — collector override
-// Writes:      workspace.lsis.parsed.* — EventID 1 (ProcessCreate) → 1007,
-//              3 (NetworkConnect) → 4001, 11 (FileCreate) → 1001;
-//              unknown EventIDs route to error_log. sysmon_to_otlp writes
-//              source-owned OTLP Resource, Scope, Body, and attributes.
-// Category:    EDR
+// Facade: process parse_sysmon,
+//         process sysmon_to_otlp
+// Category: EDR
 // Test corpus: spec-only (Sysmon event schema reference; EventIDs 1 / 3 / 11
 //              only — the bulk of EDR/SOC consumption)
+//
+// Microsoft Sysmon parser (vocabulary)
 //
 // Vendor notes — Microsoft Sysinternals Sysmon (System Monitor) — the
 //           Windows kernel telemetry agent that produces detailed
@@ -78,6 +71,13 @@ include "../functions/proto_num.limpid"
 // Main parser
 // ---------------------------------------------------------------------------
 
+// Process: parse_sysmon
+// Summary: Microsoft Sysmon Windows-event JSON (forwarder-shipped) → LSIS, dispatched by EventID.
+// Reads: workspace.sysmon.* (bridge — see Bridges below)
+//        .body (required, Object) — parsed Sysmon event (caller does `parse_json(ingress)`)
+//        .hostname (optional, String) — collector override
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_sysmon {
     // @requires: workspace.sysmon.body      (required, Object — already parse_json'd)
     // @requires: workspace.sysmon.hostname  (optional, String)
@@ -276,6 +276,17 @@ def function sysmon_otlp_event_type(class_uid) {
     switch class_uid { 1001 { "creation" } 1007 { "start" } default { "connection" } }
 }
 
+// Process: sysmon_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.lsis.parsed.*
+//        .process.name (optional, String)
+//        workspace.sysmon.*
+//        .body.Computer (optional, String)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .scope.name (optional, String)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process sysmon_to_otlp {
     let process_name = coalesce(workspace.lsis.parsed.process.name, workspace.lsis.parsed.actor.process.name)
     let process_pid = coalesce(workspace.lsis.parsed.process.pid, workspace.lsis.parsed.actor.process.pid)

@@ -1,26 +1,6 @@
-// Summary:     Cisco ASA / FTD (ASA-syslog-compatibility) %ASA syslog
-//              messages → LSIS Authentication + Network Activity.
-// Reads:       workspace.syslog.* (transport intake — populated by
-//              parse_syslog upstream)
-//                .msg (required, String) — syslog body carrying the
-//                     `%ASA-<level>-<msg_id>` message
-//                .timestamp (optional, String) — RFC 3164 wire timestamp
-//                .hostname (optional, String) — originating device, retained
-//                     by asa_to_otlp as Resource `host.name`
-//              workspace.asa.timezone (optional, String) — source device
-//              timezone override as an IANA name or fixed offset; the legacy
-//              RFC 3164 timestamp defaults to the limpid host's system
-//              timezone (Cisco documents UTC only for RFC 5424; the accepted
-//              legacy RFC 3164 form has no documented zone, so the pack
-//              assumes the device shares the host's zone — the most likely
-//              deployment; override it when the device zone is known)
-//              https://www.cisco.com/c/en/us/td/docs/security/asa/asa-cli-reference/I-R/asa-command-ref-I-R/m_log-lz.html
-// Writes:      workspace.lsis.parsed.* — 3002 (Authentication) and 4001 (Network
-//              Activity), dispatched by message ID; unmapped IDs route to
-//              error_log. Per-ID table below. asa_to_otlp additionally writes
-//              source-specific workspace.lsis.shed.otlp Resource, Body, and
-//              LogRecord attributes.
-// Category:    Network firewall / IPS
+// Facade: process parse_asa,
+//         process asa_to_otlp
+// Category: Network firewall / IPS
 // Test corpus: synthetic (sample wires in this header; several message-ID
 //              leaves are not yet exercised against live captures — see
 //              per-leaf NOTEs)
@@ -152,6 +132,16 @@ def process validate_asa_severity_number {
 // switch can dispatch by message ID. Each leaf re-parses the
 // remaining body text against its message-ID-specific shape.
 
+// Process: parse_asa
+// Summary: Cisco ASA / FTD (ASA-syslog-compatibility) %ASA syslog messages → LSIS Authentication + Network Activity.
+// Reads: workspace.syslog.* (transport intake — populated by
+//        .msg (required, String) — syslog body carrying the
+//        .timestamp (optional, String) — RFC 3164 wire timestamp
+//        .hostname (optional, String) — originating device, retained
+//        workspace.asa.*
+//        .timezone (optional, String) — source device
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_asa {
     let source_timezone = workspace.asa.timezone
     workspace.asa = regex_parse(
@@ -567,6 +557,18 @@ def function asa_otlp_event_outcome(status_id) {
     }
 }
 
+// Process: asa_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.syslog.*
+//        .hostname (optional, String)
+//        workspace.asa.*
+//        .body (optional, String)
+//        workspace.lsis.parsed.*
+//        .class_uid (optional, Int)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process asa_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "observer.vendor", value: { string_value: "Cisco" } }],

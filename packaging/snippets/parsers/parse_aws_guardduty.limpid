@@ -1,16 +1,11 @@
-// AWS GuardDuty finding JSON parser
-//
-// Summary:     AWS GuardDuty findings JSON → LSIS Detection Finding.
-// Reads:       ingress (raw wire) — one GuardDuty finding object per ingress
-//              (identical across EventBridge / SNS / S3 delivery)
-// Writes:      workspace.lsis.parsed.* — 2004 (Detection Finding), one finding → one
-//              record; unknown ThreatPurpose values route to error_log.
-//              aws_guardduty_to_otlp additionally writes source-specific
-//              workspace.lsis.shed.otlp Resource, Body, and LogRecord attributes.
-// Category:    Cloud security findings
+// Facade: process parse_aws_guardduty,
+//         process aws_guardduty_to_otlp
+// Category: Cloud security findings
 // Test corpus: spec-only (AWS documentation per-finding-type sample bodies;
 //              cross-referenced against the CreateSampleFindings API shape —
 //              verify against live findings before production rollout)
+//
+// AWS GuardDuty finding JSON parser
 //
 // Vendor notes — Amazon Web Services GuardDuty — the AWS-native threat
 //           detection service. Findings synthesise signals from
@@ -289,6 +284,11 @@ def function aws_guardduty_finding_record(body, type_parts, attack_tactic, sever
 // vocabulary (loud-fail-fast on a category AWS hasn't published
 // yet) and to populate the MITRE-aligned `attacks[].tactic.name`.
 
+// Process: parse_aws_guardduty
+// Summary: AWS GuardDuty findings JSON → LSIS Detection Finding.
+// Reads: ingress
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_aws_guardduty {
     workspace.gd = parse_json(ingress)
     workspace.gd_type = aws_guardduty_split_type(workspace.gd.type)
@@ -435,6 +435,16 @@ def function aws_guardduty_otlp_tactic_name(category) {
     }
 }
 
+// Process: aws_guardduty_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.gd.*
+//        .accountId (optional, String)
+//        workspace.gd_type.*
+//        .category (optional, String)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process aws_guardduty_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "cloud.provider", value: { string_value: "aws" } }],
