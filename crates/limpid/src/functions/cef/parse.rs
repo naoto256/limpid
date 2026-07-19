@@ -79,28 +79,43 @@ fn parse_impl<'bump>(
         .strip_prefix("CEF:")
         .ok_or_else(|| anyhow::anyhow!("cef.parse(): input does not start with `CEF:`"))?;
 
+    // Of the escapes the CEF specification defines, two are generic
+    // structural escapes relevant to header field splitting: `\|`
+    // (literal pipe) and `\\` (literal backslash). Only an unescaped
+    // `|` is a field separator; a naive `find('|')` would split on the
+    // escaped form and shift every subsequent header field (name
+    // absorbs the fragment, severity receives the next field,
+    // extensions receive the severity). The spec's field-specific
+    // escaping (`=` / `%` / `#` when carrying vulnerability spellings
+    // in deviceEventClassId / name) is field-internal grammar this
+    // generic primitive does not interpret — those spellings pass
+    // through raw.
     let mut parts: [&str; 7] = [""; 7];
     let mut remaining = body;
     for slot in parts.iter_mut() {
-        if let Some(pos) = remaining.find('|') {
-            *slot = &remaining[..pos];
-            remaining = &remaining[pos + 1..];
+        if let Some((field, rest)) = split_unescaped_pipe(remaining) {
+            *slot = field;
+            remaining = rest;
         } else {
             bail!("cef.parse(): incomplete CEF header");
         }
     }
 
     let mut builder = ObjectBuilder::new(arena);
-    builder.push("version", Value::String(arena.alloc_str(parts[0])));
-    builder.push("device_vendor", Value::String(arena.alloc_str(parts[1])));
-    builder.push("device_product", Value::String(arena.alloc_str(parts[2])));
-    builder.push("device_version", Value::String(arena.alloc_str(parts[3])));
-    builder.push("signature_id", Value::String(arena.alloc_str(parts[4])));
-    builder.push("name", Value::String(arena.alloc_str(parts[5])));
-    let severity_value = parts[6]
+    builder.push("version", unescape_header_field(arena, parts[0]));
+    builder.push("device_vendor", unescape_header_field(arena, parts[1]));
+    builder.push("device_product", unescape_header_field(arena, parts[2]));
+    builder.push("device_version", unescape_header_field(arena, parts[3]));
+    builder.push("signature_id", unescape_header_field(arena, parts[4]));
+    builder.push("name", unescape_header_field(arena, parts[5]));
+    let severity_text = match unescape_header_field(arena, parts[6]) {
+        Value::String(s) => s,
+        _ => unreachable!("unescape_header_field always returns a String"),
+    };
+    let severity_value = severity_text
         .parse::<i64>()
         .map(Value::Int)
-        .unwrap_or_else(|_| Value::String(arena.alloc_str(parts[6])));
+        .unwrap_or(Value::String(severity_text));
     builder.push("severity", severity_value);
 
     // Emit the raw extension blob (omitted when empty, to mirror
@@ -129,6 +144,62 @@ fn parse_impl<'bump>(
     } else {
         Ok(parsed)
     }
+}
+
+/// Split the input at the first **unescaped** `|`, returning the raw
+/// (still-escaped) field and the rest after the separator.
+///
+/// A `\` consumes the following byte, so `\|` never separates and the
+/// pipe after `\\` (an escaped backslash) does — `a\\|b` splits into
+/// the field `a\\` and rest `b`. Scanning bytes is UTF-8-safe because
+/// `\` and `|` are ASCII and cannot occur inside a multi-byte sequence.
+fn split_unescaped_pipe(input: &str) -> Option<(&str, &str)> {
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if i + 1 < bytes.len() => i += 2,
+            b'|' => return Some((&input[..i], &input[i + 1..])),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Decode the generic structural header escapes in a raw field:
+/// `\|` → `|` and `\\` → `\` — the two escapes that participate in
+/// field splitting. The spec's field-specific escaping (`=` / `%` /
+/// `#` for vulnerability spellings in deviceEventClassId / name) is
+/// field-internal grammar this generic primitive does not interpret;
+/// those spellings are preserved raw. Sequences outside the two
+/// structural escapes (`\x`, …) and a trailing lone `\` are kept
+/// literally — lenient by design, so a producer's stray backslash
+/// degrades to visible bytes instead of a parse error or silent data
+/// loss. Extension-section escapes are a separate scope and are
+/// deliberately not decoded here (see the `extension_raw` FieldSpec
+/// note).
+fn unescape_header_field<'bump>(arena: &'bump EventArena<'bump>, field: &str) -> Value<'bump> {
+    if !field.contains('\\') {
+        return Value::String(arena.alloc_str(field));
+    }
+    let mut out = String::with_capacity(field.len());
+    let mut chars = field.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('|') => out.push('|'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Value::String(arena.alloc_str(&out))
 }
 
 fn parse_cef_extensions<'bump>(
@@ -509,18 +580,14 @@ mod tests {
     }
 
     #[test]
-    fn header_with_escaped_pipe_keeps_literal() {
-        // CEF spec: `\|` inside a header field is a literal pipe, NOT
-        // a field separator. A regression that split on every `|`
-        // unconditionally would corrupt every CEF event with a piped
-        // value (common in proxy logs). Pin the current behaviour so
-        // a refactor of the header splitter can't silently drop the
-        // escape handling.
-        //
-        // NOTE: this test pins whatever behaviour parse_cef_header
-        // implements TODAY. If the parser doesn't currently handle
-        // `\|` as an escape it will assert on the byte-split result;
-        // either way the test guards against silent changes.
+    fn header_escaped_pipe_is_literal_not_separator() {
+        // CEF spec: `\|` inside a header field is a literal pipe, NOT a
+        // field separator. Splitting on it shifts every subsequent
+        // header field — name absorbed `deny\`, severity received
+        // `drop`, and the extension blob received `3|act=block`, so the
+        // positionally-determined severity was silently misclassified
+        // downstream. The splitter must honor the escape and the stored
+        // field must be unescaped.
         let bump = ::bumpalo::Bump::new();
         let arena = EventArena::new(&bump);
         let owned = dummy_event();
@@ -529,16 +596,154 @@ mod tests {
         // 7 fields; the `name` field contains an escaped pipe.
         let line = arena.alloc_str("CEF:0|V|P|1.0|sig|deny\\|drop|3|act=block");
         let v = parse_into(&reg, &bevent, &arena, line);
-        // Just verify parse succeeded and produced an Object — the
-        // exact name value depends on whether the parser unescapes.
-        // The regression we care about is "splitter doesn't blow up
-        // on escaped pipe AND the 7-field shape is preserved".
         let Value::Object(entries) = v else {
             panic!("expected Object on escaped-pipe input");
         };
-        // The trailing `act=block` is what tells us the 7-field
-        // count was respected (the 8th field is the extension blob).
+        assert_eq!(lookup(entries, "name"), Some(Value::String("deny|drop")));
+        assert_eq!(lookup(entries, "severity"), Some(Value::Int(3)));
+        assert_eq!(
+            lookup(entries, "extension_raw"),
+            Some(Value::String("act=block"))
+        );
         assert_eq!(ext_lookup(entries, "act"), Some(Value::String("block")));
+    }
+
+    #[test]
+    fn header_escaped_backslash_unescapes_to_single_backslash() {
+        // CEF spec: `\\` inside a header field is a literal backslash.
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = dummy_event();
+        let bevent = owned.view_in(&arena);
+        let reg = make_registry();
+        let line = arena.alloc_str("CEF:0|V|A\\\\B|1.0|sig|name|3|act=block");
+        let v = parse_into(&reg, &bevent, &arena, line);
+        let Value::Object(entries) = v else {
+            panic!("expected Object");
+        };
+        assert_eq!(
+            lookup(entries, "device_product"),
+            Some(Value::String("A\\B"))
+        );
+        assert_eq!(lookup(entries, "severity"), Some(Value::Int(3)));
+    }
+
+    #[test]
+    fn header_pipe_after_escaped_backslash_separates() {
+        // `\\` consumes both backslashes, so the pipe that follows an
+        // escaped backslash IS a separator: the field `a\\` ends there
+        // and unescapes to `a\`.
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = dummy_event();
+        let bevent = owned.view_in(&arena);
+        let reg = make_registry();
+        let line = arena.alloc_str("CEF:0|a\\\\|P|1.0|sig|name|3|act=block");
+        let v = parse_into(&reg, &bevent, &arena, line);
+        let Value::Object(entries) = v else {
+            panic!("expected Object");
+        };
+        assert_eq!(lookup(entries, "device_vendor"), Some(Value::String("a\\")));
+        assert_eq!(lookup(entries, "device_product"), Some(Value::String("P")));
+        assert_eq!(lookup(entries, "severity"), Some(Value::Int(3)));
+    }
+
+    #[test]
+    fn header_undefined_escape_is_preserved() {
+        // Only `\|` and `\\` are the generic structural escapes that
+        // participate in field splitting. A sequence outside those two
+        // (`\x`) is kept literally (lenient): a producer's stray
+        // backslash degrades to visible bytes rather than a parse
+        // error or silent loss.
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = dummy_event();
+        let bevent = owned.view_in(&arena);
+        let reg = make_registry();
+        let line = arena.alloc_str("CEF:0|V|a\\xb|1.0|sig|tail\\|3|7|act=block");
+        let v = parse_into(&reg, &bevent, &arena, line);
+        let Value::Object(entries) = v else {
+            panic!("expected Object");
+        };
+        // `\x` is not a structural escape — both bytes survive.
+        assert_eq!(
+            lookup(entries, "device_product"),
+            Some(Value::String("a\\xb"))
+        );
+        // The `\|` inside `tail\|3` is consumed as an escape, so the
+        // name field runs through the literal pipe to the next
+        // unescaped separator — name `tail|3`, severity 7 from the
+        // following field.
+        assert_eq!(lookup(entries, "name"), Some(Value::String("tail|3")));
+        assert_eq!(lookup(entries, "severity"), Some(Value::Int(7)));
+    }
+
+    #[test]
+    fn header_unescape_preserves_trailing_backslash() {
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+
+        assert_eq!(
+            unescape_header_field(&arena, "tail\\"),
+            Value::String("tail\\")
+        );
+    }
+
+    #[test]
+    fn extension_raw_trailing_backslash_is_preserved() {
+        // A trailing lone `\` at the end of the *extension* section
+        // reaches `extension_raw` unmodified — the extension plane is
+        // not header-unescaped. (A complete header field ending in a
+        // lone `\` is structurally unobservable through the splitter:
+        // an odd backslash immediately before `|` always reads as the
+        // `\|` escape, so the header-side lone-backslash policy is
+        // exercised only via the unescape helper's terminal branch.)
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = dummy_event();
+        let bevent = owned.view_in(&arena);
+        let reg = make_registry();
+        let line = arena.alloc_str("CEF:0|V|P|1.0|sig|name|3|msg=x\\");
+        let v = parse_into(&reg, &bevent, &arena, line);
+        let Value::Object(entries) = v else {
+            panic!("expected Object");
+        };
+        assert_eq!(lookup(entries, "severity"), Some(Value::Int(3)));
+        assert_eq!(
+            lookup(entries, "extension_raw"),
+            Some(Value::String("msg=x\\"))
+        );
+    }
+
+    #[test]
+    fn header_escape_handles_utf8_and_odd_backslash_parity() {
+        // Pin two shapes the reviewer confirmed the splitter handles:
+        // multi-byte UTF-8 around an escaped pipe (the byte scan keys
+        // on ASCII `\` / `|`, which cannot occur inside a multi-byte
+        // sequence), and odd backslash parity before a pipe —
+        // `a\\\|b` is an escaped backslash followed by an escaped
+        // pipe, so nothing separates and the field unescapes to
+        // `a\|b`.
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = dummy_event();
+        let bevent = owned.view_in(&arena);
+        let reg = make_registry();
+        let line = arena.alloc_str("CEF:0|V|日本\\|語|1.0|sig|a\\\\\\|b|3|act=block");
+        let v = parse_into(&reg, &bevent, &arena, line);
+        let Value::Object(entries) = v else {
+            panic!("expected Object");
+        };
+        assert_eq!(
+            lookup(entries, "device_product"),
+            Some(Value::String("日本|語"))
+        );
+        assert_eq!(lookup(entries, "name"), Some(Value::String("a\\|b")));
+        assert_eq!(lookup(entries, "severity"), Some(Value::Int(3)));
+        assert_eq!(
+            lookup(entries, "extension_raw"),
+            Some(Value::String("act=block"))
+        );
     }
 
     #[test]
