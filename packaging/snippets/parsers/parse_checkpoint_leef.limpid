@@ -1,13 +1,6 @@
-// Summary:     Check Point LEEF 2.0 (log_exporter syslog) traffic events →
-//              LSIS Network Activity.
-// Reads:       workspace.checkpoint_leef.* (bridge — see Bridges below)
-//                .body (required, String) — full syslog wire
-//                .hostname (optional, String) — collector-side hostname override
-// Writes:      workspace.lsis.parsed.* — 4001 (Network Activity) for traffic EventIDs
-//              (Accept / Drop / Reject / Block); other LEEF events route to
-//              error_log; checkpoint_leef_to_otlp writes source-owned OTLP
-//              Resource, Body, and LogRecord attributes.
-// Category:    Network firewall / IPS
+// Facade: process parse_checkpoint_leef,
+//         process checkpoint_leef_to_otlp
+// Category: Network firewall / IPS
 // Test corpus: synthetic (anonymised RFC 5737 sample wire in this header)
 //
 // Vendor notes — Check Point Software Technologies — VPN-1 / FireWall-1 /
@@ -86,6 +79,13 @@ def function parse_checkpoint_leef_kv(ext, name) {
 // Main parser
 // ---------------------------------------------------------------------------
 
+// Process: parse_checkpoint_leef
+// Summary: Check Point LEEF 2.0 (log_exporter syslog) traffic events → LSIS Network Activity.
+// Reads: workspace.checkpoint_leef.* (bridge — see Bridges below)
+//        .body (required, String) — full syslog wire
+//        .hostname (optional, String) — collector-side hostname override
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_checkpoint_leef {
     // @requires: workspace.checkpoint_leef.body      (required, String)
     // @requires: workspace.checkpoint_leef.hostname  (optional, String)
@@ -185,6 +185,18 @@ def function checkpoint_leef_otlp_event_outcome(status_id) {
     }
 }
 
+// Process: checkpoint_leef_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.cp_header.*
+//        .product (optional, String)
+//        workspace.checkpoint_leef.*
+//        .body (optional, String)
+//        workspace.lsis.parsed.*
+//        .status_id (optional, Int)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process checkpoint_leef_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "observer.vendor", value: { string_value: "Check Point" } }],

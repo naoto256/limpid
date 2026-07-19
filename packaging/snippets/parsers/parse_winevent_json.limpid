@@ -1,12 +1,6 @@
-// Summary:     Windows Event Log JSON (NXLog field-naming shape;
-//              Security channel) → LSIS, dispatched by EventID.
-// Reads:       ingress (raw wire) — one Windows event record JSON object
-//              per ingress
-// Writes:      workspace.lsis.parsed.* — 3002 (logon/logoff), 1007 (process),
-//              3001 (account change), 3006 (group management), dispatched
-//              by EventID; unmapped IDs route to error_log. winevent_json_to_otlp
-//              writes source-owned OTLP Resource, Scope, Body, and attributes.
-// Category:    Endpoint / host audit (Windows)
+// Facade: process parse_winevent_json,
+//         process winevent_json_to_otlp
+// Category: Endpoint / host audit (Windows)
 // Test corpus: public (OTRF / Mordor dataset)
 //
 // Scope — Microsoft Windows Event Log channels (Security, System,
@@ -141,6 +135,11 @@ def process parse_winevent_json_normalize_severity {
     }
 }
 
+// Process: parse_winevent_json
+// Summary: Windows Event Log JSON (NXLog field-naming shape; Security channel) → LSIS, dispatched by EventID.
+// Reads: ingress
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_winevent_json {
     // parse_json always returns a `Value::Object` (non-object JSON
     // is wrapped under a `_json` key per the primitive's contract);
@@ -486,6 +485,17 @@ def function winevent_json_otlp_event_outcome(status_id) {
     switch status_id { 1 { "success" } 2 { "failure" } default { null } }
 }
 
+// Process: winevent_json_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.winevent.*
+//        .Hostname (optional, String)
+//        workspace.lsis.parsed.*
+//        .class_uid (optional, Int)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .scope.name (optional, String)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process winevent_json_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "observer.vendor", value: { string_value: "Microsoft" } }],

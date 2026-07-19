@@ -1,8 +1,7 @@
-// Summary:     Converts record-level Unix epoch timestamps between the LSIS
-//              nanosecond scale and the OCSF millisecond scale.
-// Signature:   timestamp_ns_to_ms(value) → Int | null
-//              timestamp_ms_to_ns(value) → Int | null
+// Facade: function timestamp_ns_to_ms,
+//         function timestamp_ms_to_ns
 // Test corpus: unit (exact epoch arithmetic and null passthrough)
+//
 
 // LSIS retains record-level timestamps as Unix epoch nanoseconds. OCSF
 // `timestamp_t` uses Unix epoch milliseconds. These helpers make that output
@@ -14,6 +13,9 @@
 // `compose_ocsf`; Int inputs remain exact. Null remains null, and arithmetic
 // errors such as an overflowing ms-to-ns conversion propagate to the caller.
 
+// Function: timestamp_ns_to_ms
+// Summary: Converts record-level Unix epoch timestamps between the LSIS nanosecond scale and the OCSF millisecond scale.
+// Signature: timestamp_ns_to_ms(Int | Timestamp | Null) → Int | Null
 def function timestamp_ns_to_ms(value) {
     switch value == null {
         true    { null }
@@ -21,6 +23,9 @@ def function timestamp_ns_to_ms(value) {
     }
 }
 
+// Function: timestamp_ms_to_ns
+// Summary: Converts record-level Unix epoch timestamps between the LSIS nanosecond scale and the OCSF millisecond scale.
+// Signature: timestamp_ms_to_ns(Int | Null) → Int | Null
 def function timestamp_ms_to_ns(value) {
     switch value == null {
         true    { null }

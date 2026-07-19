@@ -1,8 +1,7 @@
-// Summary:     Converts severity values between OCSF 1.3.0 severity_id and
-//              OpenTelemetry SeverityNumber without guessing unknown values.
-// Signature:   ocsf_severity_id_to_otel_severity_number(severity_id) → Int | null
-//              otel_severity_number_to_ocsf_severity_id(severity_number) → Int | null
+// Facade: function ocsf_severity_id_to_otel_severity_number,
+//         function otel_severity_number_to_ocsf_severity_id
 // Test corpus: unit (OCSF 1.3.0 and OTel severity boundary tables)
+//
 
 // These partial functions encode only the published standard-to-standard
 // boundary. Null stays null. OCSF Unknown (0) maps to an unset canonical
@@ -12,6 +11,9 @@
 // processes compare the source and result and raise an operator-readable
 // error for invalid non-null input.
 
+// Function: ocsf_severity_id_to_otel_severity_number
+// Summary: Converts severity values between OCSF 1.3.0 severity_id and OpenTelemetry SeverityNumber without guessing unknown values.
+// Signature: ocsf_severity_id_to_otel_severity_number(Int | Null) → Int | Null
 def function ocsf_severity_id_to_otel_severity_number(severity_id) {
     switch severity_id {
         0       { null }
@@ -26,6 +28,9 @@ def function ocsf_severity_id_to_otel_severity_number(severity_id) {
     }
 }
 
+// Function: otel_severity_number_to_ocsf_severity_id
+// Summary: Converts severity values between OCSF 1.3.0 severity_id and OpenTelemetry SeverityNumber without guessing unknown values.
+// Signature: otel_severity_number_to_ocsf_severity_id(Int | Null) → Int | Null
 def function otel_severity_number_to_ocsf_severity_id(severity_number) {
     switch severity_number {
         1       { 1 }

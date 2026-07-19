@@ -1,19 +1,12 @@
-// Okta System Log parser
-//
-// Summary:     Okta System Log events JSON (System Log API v1) → LSIS
-//              identity classes, dispatched by eventType.
-// Reads:       ingress (raw wire) — one LogEvent object per ingress (unwrap
-//              Event Hooks data.events[] upstream)
-// Writes:      workspace.lsis.parsed.* — user.session/user.authentication → 3002,
-//              user.lifecycle → 3001, user.account → 3005, group.* → 3006;
-//              other eventTypes route to error_log. okta_system_to_otlp additionally
-//              writes source-specific workspace.lsis.shed.otlp Resource, Body,
-//              and LogRecord attributes.
-// Category:    Identity / IdP
+// Facade: process parse_okta_system,
+//         process okta_system_to_otlp
+// Category: Identity / IdP
 // Test corpus: synthetic (synthesised from the Okta System Log API reference
 //              — eventType taxonomy and LogEvent schema; live-corpus
 //              parse-rate not yet measured, NOTE-flagged subtypes below
 //              unverified)
+//
+// Okta System Log parser
 //
 // Vendor notes — Okta Workforce Identity Cloud (Okta, Inc.) — System
 //              Log is the authoritative audit-event stream emitted
@@ -230,6 +223,11 @@ def process parse_okta_system_normalize_severity {
     }
 }
 
+// Process: parse_okta_system
+// Summary: Okta System Log events JSON (System Log API v1) → LSIS identity classes, dispatched by eventType.
+// Reads: ingress
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_okta_system {
     // parse_json on malformed JSON bails to the DLQ via the standard
     // error-log policy, so no explicit null-check arm is needed here.
@@ -675,6 +673,14 @@ def function okta_otlp_event_outcome(result) {
     }
 }
 
+// Process: okta_system_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.okta.*
+//        .target (optional, Array)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process okta_system_to_otlp {
     let target_user = okta_first_target(workspace.okta.target, "User")
     let target_group = okta_first_target(workspace.okta.target, "UserGroup")

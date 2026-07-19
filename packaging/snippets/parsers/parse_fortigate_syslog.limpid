@@ -1,17 +1,6 @@
-// Summary:     Fortinet FortiGate native key=value syslog (FortiOS
-//              "default" format) → same LSIS shape as parse_fortigate_cef.
-// Reads:       ingress (raw wire) — `<PRI>` + FortiGate KV body, NOT RFC 3164
-//              (no timestamp/hostname header between the priority and the
-//              body, so there is no meaningful `parse_syslog` stage to
-//              front this parser with; it strips the PRI itself)
-//              (`eventtime` is epoch seconds on older FortiOS and
-//              epoch nanoseconds on FortiOS 6.2.1+)
-// Writes:      workspace.lsis.parsed.* — same classes as parse_fortigate_cef
-//              (the LSIS contract is format-agnostic).
-//              fortigate_syslog_to_otlp additionally writes the
-//              source-specific workspace.lsis.shed.otlp Resource, Body,
-//              and LogRecord attributes consumed by compose_otlp.
-// Category:    Network firewall / IPS
+// Facade: process parse_fortigate_syslog,
+//         process fortigate_syslog_to_otlp
+// Category: Network firewall / IPS
 // Test corpus: synthetic (FortiOS "default"-format sample wires in this header)
 //
 // Wire —    syslog priority + KV body — `<priority>date=... time=... type=... ...`
@@ -153,6 +142,11 @@ def function fortigate_syslog_proto_name(num) {
 // switch site per format — mirrors the CEF parser shape (which dispatches
 // on `cat`, the CEF field that already carries `type:subtype`).
 
+// Process: parse_fortigate_syslog
+// Summary: Fortinet FortiGate native key=value syslog (FortiOS "default" format) → same LSIS shape as parse_fortigate_cef.
+// Reads: ingress
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_fortigate_syslog {
     workspace.kv = parse_kv(syslog.strip_pri(ingress))
     let cat = workspace.kv.type + ":" + workspace.kv.subtype
@@ -314,6 +308,18 @@ def function fortigate_syslog_otlp_tls_version(version_text) {
     }
 }
 
+// Process: fortigate_syslog_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.kv.*
+//        .devid (optional, String)
+//        workspace.lsis.parsed.*
+//        .status_id (optional, Int)
+//        workspace.fortigate_syslog.*
+//        .severity_number (optional, Int)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process fortigate_syslog_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "observer.vendor", value: { string_value: "Fortinet" } }],

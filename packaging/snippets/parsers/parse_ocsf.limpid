@@ -1,12 +1,5 @@
-// Summary:     Parses OCSF JSON into LSIS, normalizing root time to epoch
-//              nanoseconds and severity_id to OTel SeverityNumber.
-// Reads:       ingress (raw wire) — one OCSF class instance JSON object
-//              per ingress (class_uid at the root)
-// Writes:      workspace.lsis.parsed.* — same class and fields as the input,
-//              except root `.time` is normalized from ms to ns and
-//              `.severity_id` becomes canonical `.severity_number`, except
-//              OCSF Other (99), which remains in the legacy compatibility slot.
-// Category:    Vendor-neutral
+// Facade: process parse_ocsf
+// Category: Vendor-neutral
 // Test corpus: spec-only (OCSF 1.3.0 class instances; round-trips with
 //              compose_ocsf)
 //
@@ -44,6 +37,11 @@
 include "../functions/timestamp_converter.limpid"
 include "../functions/severity_converter.limpid"
 
+// Process: parse_ocsf
+// Summary: Parses OCSF JSON into LSIS, normalizing root time to epoch nanoseconds and severity_id to OTel SeverityNumber.
+// Reads: ingress
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_ocsf {
     workspace.lsis.parsed = parse_json(ingress)
 

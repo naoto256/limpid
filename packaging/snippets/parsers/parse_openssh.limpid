@@ -1,14 +1,6 @@
-// Summary:     OpenSSH sshd application bodies (post-transport-unwrap) → LSIS
-//              Authentication.
-// Reads:       workspace.openssh.* (bridge — see Bridges below)
-//                .body (required, String) — sshd body
-//                .pid (optional, String) — process id as string
-//                .hostname (optional, String) — SSH server hostname
-//                .time (optional, Int) — epoch nanoseconds of the event
-// Writes:      workspace.lsis.parsed.* — 3002 (Authentication);
-//              openssh_to_otlp writes source-owned OTLP Resource,
-//              Body, and LogRecord attributes.
-// Category:    Endpoint / host audit (Unix)
+// Facade: process parse_openssh,
+//         process openssh_to_otlp
+// Category: Endpoint / host audit (Unix)
 // Test corpus: synthetic (sample sshd bodies in this header)
 //
 // Vendor notes — OpenSSH (the OpenBSD project's reference implementation of SSH —
@@ -146,6 +138,15 @@ def function openssh_auth_record(activity_id, status_id, user, ip, port_str, pid
 // route to the matching leaf.
 // ---------------------------------------------------------------------------
 
+// Process: parse_openssh
+// Summary: OpenSSH sshd application bodies (post-transport-unwrap) → LSIS Authentication.
+// Reads: workspace.openssh.* (bridge — see Bridges below)
+//        .body (required, String) — sshd body
+//        .pid (optional, String) — process id as string
+//        .hostname (optional, String) — SSH server hostname
+//        .time (optional, Int) — epoch nanoseconds of the event
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_openssh {
     // @requires: workspace.openssh.body       (required, String)
     // @requires: workspace.openssh.pid        (optional, String)
@@ -449,6 +450,18 @@ def function openssh_otlp_event_type(activity_id) {
     switch activity_id { 2 { "end" } default { "start" } }
 }
 
+// Process: openssh_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.openssh.*
+//        .hostname (optional, String)
+//        workspace.lsis.parsed.*
+//        .activity_id (optional, Int)
+//        workspace.ssh.*
+//        .kind (optional, String)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process openssh_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "observer.vendor", value: { string_value: "OpenBSD" } }],

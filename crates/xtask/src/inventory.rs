@@ -10,7 +10,7 @@
 //!   <!-- BEGIN: inventory:filters -->   ... <!-- END: inventory:filters -->
 //!   <!-- BEGIN: inventory:functions --> ... <!-- END: inventory:functions -->
 //!
-//! Governing principle: header values that are AUTHORED (Summary /
+//! Governing principle: facade-member values that are AUTHORED (Summary /
 //! Writes / Signature) are copied verbatim into the table cells.
 //! Derived values (function Used-by, composer Writes first token)
 //! are computed here from the shipped snippet bodies rather than
@@ -28,7 +28,7 @@
 
 use std::path::Path;
 
-use crate::header::{SnippetHeader, SnippetKind, parse_signature, signature_entries};
+use crate::header::{MemberKind, SnippetHeader, SnippetKind, parse_signature};
 
 /// Ordered, authoritative list of allowed parser categories.
 ///
@@ -164,7 +164,15 @@ pub fn render_functions_table(all_headers: &[SnippetHeader]) -> String {
         .iter()
         .filter(|h| h.kind == SnippetKind::Function)
     {
-        for sig in signature_entries(h.get("Signature").unwrap_or("")) {
+        for facade in h
+            .facade
+            .iter()
+            .filter(|member| member.kind == MemberKind::Function)
+        {
+            let sig = h
+                .member(MemberKind::Function, &facade.name)
+                .and_then(|member| member.get("Signature"))
+                .unwrap_or("");
             let name = parse_signature(sig).map(|(n, _)| n).unwrap_or_default();
             let callers = derive_used_by(&name, &h.file, all_headers);
             let callers_cell = if callers.is_empty() {
@@ -286,23 +294,50 @@ fn contains_call(line: &str, func_name: &str) -> bool {
 /// cell renders on a single row. Missing Summary → empty string
 /// (lint has already reported it as an error before we get here).
 fn summary_of(h: &SnippetHeader) -> String {
-    h.get("Summary")
+    h.facade
+        .first()
+        .and_then(|facade| h.member(facade.kind, &facade.name))
+        .and_then(|member| member.get("Summary"))
         .unwrap_or("")
         .replace('\n', " ")
         .trim()
         .to_string()
 }
 
-/// The first whitespace-separated token of the Writes value's first
-/// line (e.g. `workspace.lsis.ocsf`). Empty when Writes is missing.
+/// The concrete slot described by the first root and dot declaration in
+/// `Writes:` (e.g. `workspace.lsis.composed.*` + `.ocsf` becomes
+/// `workspace.lsis.composed.ocsf`). Reserved `egress` is returned as-is.
 fn writes_first_token(h: &SnippetHeader) -> String {
-    let writes = h.get("Writes").unwrap_or("");
-    let first_line = writes.split('\n').next().unwrap_or("");
-    first_line
-        .split_whitespace()
+    let writes = h
+        .facade
+        .iter()
+        .find(|facade| facade.kind == MemberKind::Process)
+        .and_then(|facade| h.member(MemberKind::Process, &facade.name))
+        .and_then(|member| member.get("Writes"))
+        .unwrap_or("");
+    let mut lines = writes.lines();
+    let root = lines
         .next()
         .unwrap_or("")
-        .to_string()
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    if root == "egress" || root == "ingress" {
+        return root.to_string();
+    }
+    let Some(prefix) = root.strip_suffix(".*") else {
+        return root.to_string();
+    };
+    let field = lines
+        .map(str::trim_start)
+        .find_map(|line| line.strip_prefix('.'))
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap_or("");
+    if field.is_empty() {
+        root.to_string()
+    } else {
+        format!("{prefix}.{field}")
+    }
 }
 
 /// Escape characters that would break markdown table cells. Pipe is
@@ -388,7 +423,7 @@ mod tests {
         let def_file = "/repo/packaging/snippets/functions/proto_num.limpid";
         let def_content = "\
 // Summary:     IANA proto
-// Signature:   proto_num(name) → Int | null
+// Signature:   proto_num(String) → Int | Null
 // Test corpus: unit (registry)
 
 def function proto_num(name) {
@@ -469,7 +504,7 @@ def process z {
         // the guardrail should be surgical.
         let def_content = "\
 // Summary:     Self-caller
-// Signature:   selfy(x) → Int
+// Signature:   selfy(Int) → Int
 // Test corpus: unit (docs)
 
 def function selfy(x) {
@@ -491,12 +526,17 @@ def function selfy(x) {
             SnippetKind::Function,
             "/repo/packaging/snippets/functions/timestamp_converter.limpid",
             "\
-// Summary:     Timestamp unit conversions
-// Signature:   timestamp_ms_to_ns(value) → Int
-//              timestamp_ns_to_ms(value) → Int
+// Facade: function timestamp_ms_to_ns, function timestamp_ns_to_ms
 // Test corpus: unit (timestamp boundaries)
 
+// Function: timestamp_ms_to_ns
+// Summary: converts milliseconds to nanoseconds
+// Signature: timestamp_ms_to_ns(Int) → Int
 def function timestamp_ms_to_ns(value) {}
+
+// Function: timestamp_ns_to_ms
+// Summary: converts nanoseconds to milliseconds
+// Signature: timestamp_ns_to_ms(Int) → Int
 def function timestamp_ns_to_ms(value) {}
 ",
         );
@@ -532,13 +572,13 @@ def process compose_ms {
         );
 
         let out = render_functions_table(&[family, ms_caller, ns_caller]);
-        assert_eq!(out.matches("timestamp_ms_to_ns(value)").count(), 1);
-        assert_eq!(out.matches("timestamp_ns_to_ms(value)").count(), 1);
+        assert_eq!(out.matches("timestamp_ms_to_ns(Int)").count(), 1);
+        assert_eq!(out.matches("timestamp_ns_to_ms(Int)").count(), 1);
         assert!(out.contains(
-            "| `functions/timestamp_converter.limpid` | `timestamp_ms_to_ns(value) → Int` | `parse_ms` |"
+            "| `functions/timestamp_converter.limpid` | `timestamp_ms_to_ns(Int) → Int` | `parse_ms` |"
         ));
         assert!(out.contains(
-            "| `functions/timestamp_converter.limpid` | `timestamp_ns_to_ms(value) → Int` | `compose_ms` |"
+            "| `functions/timestamp_converter.limpid` | `timestamp_ns_to_ms(Int) → Int` | `compose_ms` |"
         ));
     }
 
@@ -581,15 +621,20 @@ def process compose_ms {
             SnippetKind::Composer,
             "/r/packaging/snippets/composers/compose_ocsf.limpid",
             "\
-// Summary:     Renders LSIS to OCSF 1.3.0
-// Reads:       workspace.lsis.* (LSIS)
-//                .class_uid (required, Int) — dispatch discriminator
-// Writes:      workspace.lsis.ocsf — OCSF 1.3.0 JSON string
+// Facade: process compose_ocsf
 // Test corpus: real (r)
+
+// Process: compose_ocsf
+// Summary: Renders LSIS to OCSF 1.3.0
+// Reads: workspace.lsis.parsed.*
+//                .class_uid (required, Int) — dispatch discriminator
+// Writes: workspace.lsis.composed.*
+//                .ocsf (required, Object)
+def process compose_ocsf {}
 ",
         );
         let out = render_composers_table(&[c]);
-        assert!(out.contains("`workspace.lsis.ocsf`"));
+        assert!(out.contains("`workspace.lsis.composed.ocsf`"));
         assert!(out.contains("Renders LSIS to OCSF 1.3.0"));
     }
 

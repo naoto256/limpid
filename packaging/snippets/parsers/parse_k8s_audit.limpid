@@ -1,19 +1,12 @@
-// Kubernetes audit event JSON parser
-//
-// Summary:     Kubernetes audit Event JSON (audit.k8s.io/v1) → LSIS API
-//              Activity + Authentication.
-// Reads:       ingress (raw wire) — one audit Event object per ingress
-//              (no {"items":[...]} envelope)
-// Writes:      workspace.lsis.parsed.* — 6003 (API Activity) for resource requests,
-//              3002 (Authentication) for authentication.k8s.io objectRefs;
-//              unknown kinds route to error_log. k8s_audit_to_otlp additionally
-//              writes source-specific workspace.lsis.shed.otlp Resource, Body,
-//              and LogRecord attributes.
-// Category:    Container / orchestration
+// Facade: process parse_k8s_audit,
+//         process k8s_audit_to_otlp
+// Category: Container / orchestration
 // Test corpus: spec-only (Kubernetes audit policy reference, kube-apiserver
 //              v1.29 audit.k8s.io/v1 schema; verb → activity_id per the OCSF
 //              6003 spec — verify against your apiserver's audit-policy
 //              output before production)
+//
+// Kubernetes audit event JSON parser
 //
 // Wire —        Kubernetes audit Event JSON — one event per `ingress`.
 //              kube-apiserver emits one JSON object per event (line-
@@ -131,6 +124,11 @@ def function k8s_audit_pick_src_ip(source_ips) {
 // Main parser
 // ---------------------------------------------------------------------------
 
+// Process: parse_k8s_audit
+// Summary: Kubernetes audit Event JSON (audit.k8s.io/v1) → LSIS API Activity + Authentication.
+// Reads: ingress
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_k8s_audit {
     workspace.k8s = parse_json(ingress)
     workspace.k8s_class = k8s_audit_classify(workspace.k8s)
@@ -342,6 +340,16 @@ def function k8s_audit_otlp_event_outcome(status_id) {
     }
 }
 
+// Process: k8s_audit_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.k8s.*
+//        .objectRef.apiGroup (optional, String)
+//        workspace.lsis.parsed.*
+//        .status_id (optional, Int)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process k8s_audit_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "observer.vendor", value: { string_value: "Kubernetes" } }],

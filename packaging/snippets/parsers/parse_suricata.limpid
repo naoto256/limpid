@@ -1,19 +1,11 @@
-// Suricata EVE JSON parser (vocabulary)
-//
-// Summary:     Suricata EVE JSON events → LSIS, dispatched by event_type.
-// Reads:       workspace.suricata.* (bridge — see Bridges below)
-//   .body (required, Object) — parsed EVE event (caller does `parse_json(ingress)`)
-//   .hostname (optional, String) — collector override
-//   .time (optional, Int) — epoch ns override
-// Writes:      workspace.lsis.parsed.* — alert → 2004, dns → 4003, http → 4002,
-//              tls / flow / fileinfo → 4001; stats dropped; other event_types
-//              route to error_log. suricata_to_otlp additionally writes
-//              source-specific workspace.lsis.shed.otlp Resource, Body, and
-//              LogRecord attributes.
-// Category:    OSS NDR
+// Facade: process parse_suricata,
+//         process suricata_to_otlp
+// Category: OSS NDR
 // Test corpus: public (elastic/integrations suricata corpus — 63 events
 //              across alert / dns / http / tls / flow / fileinfo / stats;
 //              Suricata 4.x-6.x EVE)
+//
+// Suricata EVE JSON parser (vocabulary)
 //
 // Vendor notes — OISF Suricata — open-source IDS / IPS / NSM that emits
 //           "Extensible Event Format" (EVE) as line-delimited JSON.
@@ -407,6 +399,14 @@ def function suricata_fileinfo_record(body, host, time_ns) {
 // Main process — dispatch by event_type
 // ---------------------------------------------------------------------------
 
+// Process: parse_suricata
+// Summary: Suricata EVE JSON events → LSIS, dispatched by event_type.
+// Reads: workspace.suricata.* (bridge — see Bridges below)
+//        .body (required, Object) — parsed EVE event (caller does `parse_json(ingress)`)
+//        .hostname (optional, String) — collector override
+//        .time (optional, Int) — epoch ns override
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_suricata {
     // @requires: workspace.suricata.body      (required, Object — parsed EVE event)
     // @requires: workspace.suricata.hostname  (optional, String)
@@ -508,6 +508,16 @@ def function suricata_otlp_event_outcome(status_id) {
     }
 }
 
+// Process: suricata_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.suricata.*
+//        .body (optional, Object)
+//        workspace.lsis.parsed.*
+//        .status_id (optional, Int)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process suricata_to_otlp {
     let body = workspace.suricata.body
     workspace.lsis.shed.otlp.resource.attributes = concat(

@@ -1,18 +1,16 @@
-// Zeek (formerly Bro) JSON parser — default-enabled scripts (vocabulary)
-//
-// Summary:     Zeek default-enabled JSON streams (conn / dns / http / ssl /
-//              files / x509 / weird / notice) → LSIS, dispatched by _path.
-// Reads:       workspace.zeek.* (bridge — see Bridges below)
-//   .body (required, Object) — parsed Zeek event (caller does `parse_json(ingress)`)
-//   .hostname (optional, String) — collector override
-//   .time (optional, Int) — epoch ns override
-// Writes:      workspace.lsis.parsed.* — conn / ssl / files / x509 → 4001,
-//              dns → 4003, http → 4002, weird / notice → 2004; other
-//              _paths route to error_log. zeek_default_to_otlp writes
-//              source-owned OTLP Resource, Scope, Body, and attributes.
-// Category:    OSS NDR
+// Facade: process parse_zeek_default,
+//         function zeek_time_ns,
+//         function zeek_endpoint,
+//         function zeek_default_hostname,
+//         function zeek_metadata,
+//         process parse_zeek_default_native,
+//         process parse_zeek_default_flat,
+//         process zeek_default_to_otlp
+// Category: OSS NDR
 // Test corpus: public (elastic/integrations zeek corpus — 61 events across
 //              the 8 default streams, pre-unflattened to native nested form)
+//
+// Zeek (formerly Bro) JSON parser — default-enabled scripts (vocabulary)
 //
 // Vendor notes — Zeek Project — open-source network monitoring framework
 //           that passively observes traffic and emits per-protocol
@@ -64,6 +62,10 @@ include "../functions/http_method_activity_id.limpid"
 // Zeek `ts` is a float Unix epoch in seconds with microsecond
 // precision. Convert to nanoseconds (OCSF `time` convention) without
 // losing sub-second resolution.
+
+// Function: zeek_time_ns
+// Summary: Resolve Zeek event time to epoch nanoseconds.
+// Signature: zeek_time_ns(Object, Int | Null) → Int | Null
 def function zeek_time_ns(body, override) {
     coalesce(
         switch true {
@@ -75,6 +77,10 @@ def function zeek_time_ns(body, override) {
 }
 
 // Build the canonical OCSF endpoint from Zeek's nested `id` object.
+
+// Function: zeek_endpoint
+// Summary: Build one canonical endpoint from a Zeek id tuple.
+// Signature: zeek_endpoint(Object | Null, String) → Object | Null
 def function zeek_endpoint(id_obj, side) {
     switch true {
         id_obj == null { null }
@@ -171,6 +177,10 @@ def function zeek_http_status_id(code) {
 //     emitted this" than the limpid host's own name. Use it
 //     directly (string-shape — operators can resolve to a real
 //     hostname downstream if they want).
+
+// Function: zeek_default_hostname
+// Summary: Resolve the source-backed hostname used by Zeek records.
+// Signature: zeek_default_hostname(String | Null, String | Null) → String | Null
 def function zeek_default_hostname(src_ip, local_name) {
     switch true {
         src_ip == "127.0.0.1" { local_name }
@@ -179,6 +189,10 @@ def function zeek_default_hostname(src_ip, local_name) {
 }
 
 // Constant metadata block stamped on every Zeek-derived record.
+
+// Function: zeek_metadata
+// Summary: Build the shared Zeek product metadata object.
+// Signature: zeek_metadata() → Object
 def function zeek_metadata() {
     {
         product: {
@@ -481,6 +495,13 @@ def function zeek_notice_record(body, host, time_ns) {
 //                 Runs `nest_dotted_keys` first to recover the native
 //                 nested shape before dispatch.
 
+// Process: parse_zeek_default_native
+// Summary: Bridge one native Zeek JSON event into the shared Zeek intake.
+// Reads: ingress
+// Writes: workspace.zeek.*
+//         .body (required, Object)
+//         workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_zeek_default_native {
     workspace.zeek = {
         body:     parse_json(ingress),
@@ -490,6 +511,13 @@ def process parse_zeek_default_native {
     process parse_zeek_default
 }
 
+// Process: parse_zeek_default_flat
+// Summary: Bridge one flat Zeek JSON event into the shared Zeek intake.
+// Reads: ingress
+// Writes: workspace.zeek.*
+//         .body (required, Object)
+//         workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_zeek_default_flat {
     workspace.zeek = {
         body:     nest_dotted_keys(parse_json(ingress)),
@@ -503,6 +531,14 @@ def process parse_zeek_default_flat {
 // Main process — dispatch by `_path`
 // ---------------------------------------------------------------------------
 
+// Process: parse_zeek_default
+// Summary: Zeek default-enabled JSON streams (conn / dns / http / ssl / files / x509 / weird / notice) → LSIS, dispatched by _path.
+// Reads: workspace.zeek.* (bridge — see Bridges below)
+//        .body (required, Object) — parsed Zeek event (caller does `parse_json(ingress)`)
+//        .hostname (optional, String) — collector override
+//        .time (optional, Int) — epoch ns override
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_zeek_default {
     // @requires: workspace.zeek.body      (required, Object — parsed Zeek event)
     // @requires: workspace.zeek.hostname  (optional, String)
@@ -591,6 +627,17 @@ def function zeek_default_otlp_event_category(class_uid) { switch class_uid { 20
 def function zeek_default_otlp_event_type(class_uid) { switch class_uid { 2004 { "info" } 4002 { "access" } default { "protocol" } } }
 def function zeek_default_otlp_event_outcome(status_id) { switch status_id { 1 { "success" } 2 { "failure" } default { null } } }
 
+// Process: zeek_default_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.zeek.*
+//        .hostname (optional, String)
+//        workspace.lsis.parsed.*
+//        .class_uid (optional, Int)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .scope.name (optional, String)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process zeek_default_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "observer.vendor", value: { string_value: "Zeek Project" } }],

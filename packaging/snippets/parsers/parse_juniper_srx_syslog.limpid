@@ -1,21 +1,6 @@
-// Summary:     Juniper SRX unstructured syslog mode (RFC 3164 + MSGID prefix)
-//              → LSIS Detection Finding.
-// Reads:       workspace.juniper_srx_syslog.* (bridge — see Bridges below)
-//                .body (required, String) — the syslog wire
-//                .hostname (optional, String) — collector-side hostname
-//                .timezone (optional, String) — source device timezone override
-//                  as an IANA name or fixed offset; defaults to the limpid
-//                  host's system timezone for RFC 3164 time
-//                  (Junos security logs may use the configured local zone)
-//                  https://www.juniper.net/documentation/us/en/software/junos/cli-reference/topics/ref/command/show-security-log.html
-//                  The default assumes Junos and limpid have the same correct
-//                  system timezone. Correct either environment, override this
-//                  slot, or use a custom parser when that assumption is false.
-// Writes:      workspace.lsis.parsed.* — RT_IDP IDP_ATTACK_LOG_EVENT → 2004 (Detection
-//              Finding); other daemons / subtypes route to error_log until
-//              their shapes are added. juniper_srx_syslog_to_otlp writes
-//              source-owned OTLP Resource, Body, and LogRecord attributes.
-// Category:    Network firewall / IPS
+// Facade: process parse_juniper_srx_syslog,
+//         process juniper_srx_syslog_to_otlp
+// Category: Network firewall / IPS
 // Test corpus: real (anonymised real-traffic samples, RFC 5737-rewritten, in
 //              this header)
 //
@@ -208,6 +193,14 @@ def process parse_juniper_srx_syslog_normalize_time {
     ))
 }
 
+// Process: parse_juniper_srx_syslog
+// Summary: Juniper SRX unstructured syslog mode (RFC 3164 + MSGID prefix) → LSIS Detection Finding.
+// Reads: workspace.juniper_srx_syslog.* (bridge — see Bridges below)
+//        .body (required, String) — the syslog wire
+//        .hostname (optional, String) — collector-side hostname
+//        .timezone (optional, String) — source device timezone override
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_juniper_srx_syslog {
     // @requires: workspace.juniper_srx_syslog.body      (required, String)
     // @requires: workspace.juniper_srx_syslog.hostname  (optional, String)
@@ -290,6 +283,18 @@ def function juniper_srx_syslog_otlp_event_outcome(status_id) {
     }
 }
 
+// Process: juniper_srx_syslog_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.srx_syslog_class.*
+//        .host (optional, String)
+//        workspace.juniper_srx_syslog.*
+//        .body (optional, String)
+//        workspace.lsis.parsed.*
+//        .unmapped.action (optional, String)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process juniper_srx_syslog_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "observer.vendor", value: { string_value: "Juniper Networks" } }],

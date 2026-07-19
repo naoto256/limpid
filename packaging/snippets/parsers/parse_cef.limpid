@@ -1,23 +1,6 @@
-// Summary:     ArcSight CEF message (from a syslog body) → workspace.cef.*
-//              format fields (format-layer parser; interpreting the
-//              vendor dialect on top is the next stage's job).
-// Reads:       workspace.syslog.* (transport intake — populated by
-//              parse_syslog upstream)
-//                .msg (required, String) — syslog body carrying the
-//                     `CEF:...` message
-//                .hostname (optional, String) — originating host, retained
-//                     by cef_to_otlp as Resource `host.name`
-// Writes:      workspace.cef.{version, device_vendor, device_product,
-//              device_version, signature_id, name, severity} — the seven
-//              positional header fields — plus workspace.cef.extension_raw
-//              (raw Extension blob) and workspace.cef.extension.<key>
-//              (split key=value pairs, isolated in their own sub-object
-//              so data-driven extension keys can never shadow a
-//              positional header field). The CEF format namespace, not
-//              LSIS. cef_to_otlp writes
-//              source-owned OTLP Resource, Body, LogRecord attributes, and
-//              the shed severity slots mapped from the CEF 0-10 scale.
-// Category:    Transport
+// Facade: process parse_cef,
+//         process cef_to_otlp
+// Category: Transport
 // Test corpus: synthetic (sample wires in this header)
 //
 // Wire —    ArcSight CEF as carried in a syslog body —
@@ -55,6 +38,13 @@
 // belong to the per-vendor parsers (`parse_fortigate_cef`,
 // `parse_paloalto_cef`) stacked after this stage.
 
+// Process: parse_cef
+// Summary: ArcSight CEF message (from a syslog body) → workspace.cef.* format fields (format-layer parser; interpreting the vendor dialect on top is the next stage's job).
+// Reads: workspace.syslog.* (transport intake — populated by
+//        .msg (required, String) — syslog body carrying the
+//        .hostname (optional, String) — originating host, retained
+// Writes: workspace.cef.*
+//         .name (required, String)
 def process parse_cef {
     switch workspace.syslog.msg {
         null    { error "parse_cef: no syslog body to parse (workspace.syslog.msg is null)" }
@@ -145,6 +135,19 @@ def function cef_severity_number(sev) {
 //   * Timestamp extensions (rt / start / end) are not parsed here: CEF
 //     permits both epoch-milliseconds and several textual formats, so
 //     interpreting them needs vendor knowledge. Vendor parsers own time.
+
+// Process: cef_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.cef.*
+//        .device_vendor (optional, String)
+//        workspace.syslog.*
+//        .hostname (optional, String)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.severity_number (optional, Int)
+//         .log_record.severity_text (optional, String)
+//         .log_record.attributes (optional, Array)
 def process cef_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         switch workspace.cef.device_vendor != null {

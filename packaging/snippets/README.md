@@ -241,14 +241,13 @@ regions.
 
 | File | Signature | Used by |
 |---|---|---|
-| `functions/http_method_activity_id.limpid` | `http_method_activity_id(method) → Int` | `parse_combined_log`, `parse_suricata`, `parse_zeek_default` |
-| `functions/parse_datetime_rfc3164.limpid` | `parse_datetime_rfc3164(text, timezone) → Timestamp \| null;` | `parse_asa`, `parse_fortigate_cef`, `parse_juniper_srx_syslog`, `parse_paloalto_cef` |
-| `functions/parse_datetime_rfc3164.limpid` | `parse_datetime_rfc3164_in_timezone(text, timezone) → Timestamp` | `parse_datetime_rfc3164` |
-| `functions/proto_num.limpid` | `proto_num(name) → Int \| null` | `parse_checkpoint_leef`, `parse_checkpoint_syslog`, `parse_juniper_srx_sd_syslog`, `parse_juniper_srx_syslog`, `parse_paloalto_cef`, `parse_paloalto_syslog`, `parse_suricata`, `parse_sysmon`, `parse_zeek_default`, `parse_zeek_full` |
-| `functions/severity_converter.limpid` | `ocsf_severity_id_to_otel_severity_number(severity_id) → Int \| null` | `parse_ocsf` |
-| `functions/severity_converter.limpid` | `otel_severity_number_to_ocsf_severity_id(severity_number) → Int \| null` | `compose_ocsf` |
-| `functions/timestamp_converter.limpid` | `timestamp_ns_to_ms(value) → Int \| null` | `compose_ocsf` |
-| `functions/timestamp_converter.limpid` | `timestamp_ms_to_ns(value) → Int \| null` | `parse_ocsf` |
+| `functions/http_method_activity_id.limpid` | `http_method_activity_id(String) → Int` | `parse_combined_log`, `parse_suricata`, `parse_zeek_default` |
+| `functions/parse_datetime_rfc3164.limpid` | `parse_datetime_rfc3164(String, String) → Timestamp \| Null` | `parse_asa`, `parse_fortigate_cef`, `parse_juniper_srx_syslog`, `parse_paloalto_cef` |
+| `functions/proto_num.limpid` | `proto_num(String) → Int \| Null` | `parse_checkpoint_leef`, `parse_checkpoint_syslog`, `parse_juniper_srx_sd_syslog`, `parse_juniper_srx_syslog`, `parse_paloalto_cef`, `parse_paloalto_syslog`, `parse_suricata`, `parse_sysmon`, `parse_zeek_default`, `parse_zeek_full` |
+| `functions/severity_converter.limpid` | `ocsf_severity_id_to_otel_severity_number(Int \| Null) → Int \| Null` | `parse_ocsf` |
+| `functions/severity_converter.limpid` | `otel_severity_number_to_ocsf_severity_id(Int \| Null) → Int \| Null` | `compose_ocsf` |
+| `functions/timestamp_converter.limpid` | `timestamp_ns_to_ms(Int \| Timestamp \| Null) → Int \| Null` | `compose_ocsf` |
+| `functions/timestamp_converter.limpid` | `timestamp_ms_to_ns(Int \| Null) → Int \| Null` | `parse_ocsf` |
 <!-- END: inventory:functions -->
 
 Timestamp interpretation follows each source contract. A vendor-defined fixed
@@ -401,29 +400,54 @@ appropriate parser per branch.
 
 ## Authoring conventions
 
-Every snippet header carries a canonical key set determined by the
-file's parent directory:
+Every snippet has one file-level facade header followed by a contract block
+immediately above each public member. The file's parent directory still
+determines its inventory kind.
 
-| Kind | Directory | Required keys (canonical order) |
-|---|---|---|
-| parser | `parsers/` | `Summary`, `Reads`, `Writes`, `Category`, `Test corpus` |
-| composer | `composers/` | `Summary`, `Reads`, `Writes`, `Test corpus` |
-| filter | `filters/` | `Summary`, `Reads`, `Effect`, `Test corpus` |
-| function | `functions/` | `Summary`, `Signature`, `Test corpus` |
+| Scope | Required keys (canonical order) |
+|---|---|
+| parser file | `Facade`, `Category`, `Test corpus` |
+| composer / filter / function file | `Facade`, `Test corpus` |
+| facade process | `Process`, `Summary`, `Reads`, `Writes` |
+| facade function | `Function`, `Summary`, `Signature` |
+
+`Facade:` is a comma-separated list of `process <name>` and `function <name>`
+entries. A leading-space continuation line extends the list. Every listed
+member must have exactly one adjacent member block whose heading and following
+definition agree. A top-level definition omitted from `Facade:` is private to
+the file and has no member block; an unlisted member block is an error.
+
+```limpid
+// Facade: process parse_example, process example_to_otlp,
+//         function example_kind
+// Category: Vendor-neutral
+// Test corpus: synthetic (header examples)
+//
+// File-wide design prose follows here.
+
+// Process: parse_example
+// Summary: Normalize one example event into canonical facts.
+// Reads: workspace.example.*
+//        .body (required, Object)
+//        workspace.example_config.*
+//        .mode (optional, String)
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
+def process parse_example { ... }
+```
 
 **Governing principle.** A header holds only knowledge the author
 alone knows. Anything derivable from other keys, other files, or
 the body is banned from the header and surfaces in the generated
 inventory instead — that is why parsers carry `Category` but
 composers / filters do not (their axis would duplicate
-Reads/Writes/Effect), and why `Used by:` for a function is derived
+their process contracts), and why `Used by:` for a function is derived
 by the inventory generator rather than authored.
 
-### `Reads:` — universal stream-contract grammar
+### `Reads:` / `Writes:` — per-process contract grammar
 
-Every kind that flows events (parser / composer / filter) declares
-its input contract on the `Reads:` value. The first token of the
-first line names the stream source:
+Every facade process declares its input and output contracts. A contract is
+either a reserved event field or one or more workspace roots:
 
 - **Raw wire.** First token `ingress` — the snippet reads bytes off
   the wire. Dot-line intake rows are forbidden.
@@ -432,20 +456,20 @@ first line names the stream source:
   // Reads:       ingress (raw wire) — syslog-wrapped %ASA messages
   ```
 
-- **Bridge / reader.** First token `workspace.<ns>.*` — the snippet
-  reads a workspace namespace populated by an upstream process. At
-  least one dot-line intake row is required per intake field:
+- **Workspace roots.** A root is `workspace.<ns>.*`. Each root owns the
+  following dot-lines until the next root and requires at least one dot-line.
+  Multiple roots are permitted:
 
   ```
-  // Reads:       workspace.openssh.* (bridge — see Bridges below)
-  //                .body       (required, String)  — sshd body
-  //                .pid        (optional, String)  — process id
-  //                .hostname   (optional, String)  — SSH server host
-  //                .time       (optional, Int)     — epoch nanoseconds
+  // Reads: workspace.openssh.*
+  //        .body       (required, String)  — sshd body
+  //        .pid        (optional, String)  — process id
+  //        workspace.pipeline_options.*
+  //        .hostname   (optional, String)  — source-backed override
   ```
 
   Each dot-line matches the regex
-  `^\.<IDENT>\s+\((required|optional), <String|Int|Float|Bool|Object|Array|Timestamp>\)`.
+  `^\.<IDENT>\s+\((required|optional), <String|Int|Float|Bool|Object|Array|Timestamp|Bytes>\)`.
   Trailing prose after the closing paren is permitted. Leading
   underscores in the identifier are permitted (journald's `_PID` /
   `__REALTIME_TIMESTAMP` are real intake fields).
@@ -454,14 +478,11 @@ Ambient event metadata (`received_at`, `source`, `ingress` when
 passed through unchanged, `hostname()`) is not declared in `Reads:`
 — every process can read those unconditionally.
 
-### `Writes:` — LSIS-slot contract
-
-`Writes:` names the LSIS slot(s) the snippet produces. Parsers
-write facts to `workspace.lsis.parsed.*` and enumerate the LSIS
-`class_uid` facts their dispatcher produces (using OCSF class identifiers);
-composers write a single
-`workspace.lsis.composed.<slot>` from the composed-layer registry
-above.
+`Writes:` uses the same multi-root grammar. It additionally accepts the
+reserved `egress` and `ingress` forms. Parsers normally write canonical facts
+under `workspace.lsis.parsed.*`; transport and format parsers instead name
+their transport namespace. Composers write a composed-layer slot, while their
+terminal facade process writes `egress`.
 
 ### `Category:` — parser-only, closed vocabulary
 
@@ -470,9 +491,8 @@ Parsers pick a `Category:` value from the 17-entry whitelist in
 groups rows by this key. To add a category, extend the slice and
 document the addition here.
 
-Composers and filters have no `Category:` axis — the LSIS slot the
-composer writes and the drop / pass predicate the filter enforces
-are already visible on their `Writes:` / `Effect:` keys.
+Composers and filters have no `Category:` axis — their process contracts expose
+the relevant composition slot or pass/drop boundary.
 
 ### `Test corpus:` — provenance vocabulary
 

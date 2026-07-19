@@ -1,15 +1,6 @@
-// Summary:     RFC 3164 / RFC 5424 syslog wire → workspace.syslog.*
-//              transport fields (transport-layer parser; bridging the body
-//              into a vocabulary intake is the caller's job).
-// Reads:       ingress (raw wire) — <PRI>-prefixed syslog line, RFC 3164
-//              BSD vs RFC 5424 auto-detected
-// Writes:      workspace.syslog.{pri, facility, severity, timestamp,
-//              hostname, appname, procid, msgid, msg} — the transport
-//              namespace, not LSIS. syslog_to_otlp writes source-owned OTLP
-//              Resource (APP-NAME as `service.name`), Body, and transport
-//              attributes without promoting PRI severity to canonical
-//              severity.
-// Category:    Transport
+// Facade: process parse_syslog,
+//         process syslog_to_otlp
+// Category: Transport
 // Test corpus: synthetic (RFC 3164 / RFC 5424 sample wires in this header)
 //
 // Typically the first process in a pipeline whose `input` is `syslog_tcp`
@@ -40,10 +31,23 @@
 // does not invent an ECS event.category or event.type.
 // https://www.rfc-editor.org/rfc/rfc3164#section-4.1.2
 
+// Process: parse_syslog
+// Summary: RFC 3164 / RFC 5424 syslog wire → workspace.syslog.* transport fields (transport-layer parser; bridging the body into a vocabulary intake is the caller's job).
+// Reads: ingress
+// Writes: workspace.syslog.*
+//         .msg (optional, String)
 def process parse_syslog {
     workspace.syslog = syslog.parse(ingress)
 }
 
+// Process: syslog_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.syslog.*
+//        .hostname (optional, String)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process syslog_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         switch workspace.syslog.hostname != null { true { [{ key: "host.name", value: { string_value: workspace.syslog.hostname } }] } default { [] } },

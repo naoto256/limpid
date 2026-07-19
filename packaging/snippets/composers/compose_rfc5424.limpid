@@ -1,28 +1,6 @@
-// Summary:     Assembles a single-line RFC 5424 syslog record from
-//              per-field shed slots
-//              (https://datatracker.ietf.org/doc/html/rfc5424).
-// Reads:       workspace.lsis.shed.rfc5424.* — per-field intake
-//              (RFC 5424 ABNF vocabulary):
-//                .pri        (optional, Int)    — default 14 (user.info)
-//                .timestamp  (optional, String) — default is `received_at`
-//                             formatted as RFC 3339 with microsecond UTC
-//                             precision. Callers supplying their own value
-//                             MUST also supply the RFC 5424 wire form.
-//                .hostname   (optional, String) — default hostname()
-//                .app_name   (optional, String) — default "-"
-//                .procid     (optional, String) — default "-"
-//                .msgid      (optional, String) — default "-"
-//                .sd         (optional, String) — default "-"
-//                .msg        (required, String) — the log body. If the slot
-//                             is absent the record still assembles with an
-//                             empty MSG, which is spec-compliant (RFC 5424
-//                             § 6 grammar makes MSG optional); required is
-//                             the intended contract from the composer's
-//                             point of view, and absence is a caller bug
-//                             to flag.
-// Writes:      workspace.lsis.composed.rfc5424 — single-line RFC 5424
-//              record (String). Pipe `| rfc5424_to_egress` (foot of file)
-//              to emit it as the wire form.
+// Facade: process compose_rfc5424,
+//         process journald_to_rfc5424,
+//         process rfc5424_to_egress
 // Test corpus: spec-only (RFC 5424 § 6 frame shape; field decisions
 //              documented below)
 //
@@ -97,6 +75,19 @@ def function rfc5424_pri_from(facility_str, severity_str) {
 // Generic RFC 5424 body composer — reads shed.rfc5424.*, writes composed.
 // ---------------------------------------------------------------------------
 
+// Process: compose_rfc5424
+// Summary: Assembles a single-line RFC 5424 syslog record from per-field shed slots (https://datatracker.ietf.org/doc/html/rfc5424).
+// Reads: workspace.lsis.shed.rfc5424.* — per-field intake
+//        .pri        (optional, Int)    — default 14 (user.info)
+//        .timestamp  (optional, String) — default is `received_at`
+//        .hostname   (optional, String) — default hostname()
+//        .app_name   (optional, String) — default "-"
+//        .procid     (optional, String) — default "-"
+//        .msgid      (optional, String) — default "-"
+//        .sd         (optional, String) — default "-"
+//        .msg        (required, String) — the log body. If the slot
+// Writes: workspace.lsis.composed.*
+//         .rfc5424 (required, String)
 def process compose_rfc5424 {
     let pri       = coalesce(workspace.lsis.shed.rfc5424.pri, 14)
     let ts        = coalesce(
@@ -158,6 +149,12 @@ def process compose_rfc5424 {
 //       output relay
 //   }
 
+// Process: journald_to_rfc5424
+// Summary: Bridge parsed journald transport fields into RFC 5424 shed slots.
+// Reads: workspace.journald.*
+//        .MESSAGE (required, String)
+// Writes: workspace.lsis.shed.rfc5424.*
+//         .msg (required, String)
 def process journald_to_rfc5424 {
     workspace.lsis.shed.rfc5424.pri      = rfc5424_pri_from(
                                               workspace.journald.SYSLOG_FACILITY,
@@ -183,6 +180,12 @@ def process journald_to_rfc5424 {
 // `egress`. Pipelines that emit RFC 5424 as the wire form pipe
 // `compose_rfc5424 | rfc5424_to_egress` (usually preceded by a bridge
 // or glue block that populates the shed slots).
+
+// Process: rfc5424_to_egress
+// Summary: Emit the composed RFC 5424 record as the event payload.
+// Reads: workspace.lsis.composed.*
+//        .rfc5424 (required, String)
+// Writes: egress
 def process rfc5424_to_egress {
     egress = workspace.lsis.composed.rfc5424
 }

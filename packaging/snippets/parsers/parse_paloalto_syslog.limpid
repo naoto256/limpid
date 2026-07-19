@@ -1,24 +1,6 @@
-// Summary:     Palo Alto Networks PAN-OS native CSV syslog → LSIS,
-//              dispatched by the positional Type field.
-// Reads:       workspace.syslog.* (transport intake — populated by
-//              parse_syslog upstream)
-//                .msg (required, String) — syslog body carrying the positional
-//                     CSV row (FUTURE_USE,RecvTime,Serial,Type,Subtype,...)
-//              workspace.paloalto_syslog.timezone (optional, String) — source
-//              timezone override as an IANA name or fixed offset; legacy
-//              Receive/Generated Time defaults to the limpid host's system
-//              timezone (PAN-OS defines Receive/Generated Time meanings but
-//              gives a zone only for the separate high-resolution timestamp)
-//              https://docs.paloaltonetworks.com/ngfw/administration/monitoring/use-syslog-for-monitoring/syslog-field-descriptions/traffic-log-fields
-//              The default assumes the firewall and limpid share the same
-//              correct system timezone — the most likely deployment when the
-//              zone is undocumented. Override this slot with an IANA name or
-//              fixed offset when the source zone is known to differ.
-// Writes:      workspace.lsis.parsed.* — TRAFFIC → 4001, THREAT → 2004
-//              (url → 6004, wildfire → 2004), GLOBALPROTECT /
-//              AUTHENTICATION → 3002; paloalto_syslog_to_otlp writes
-//              source-owned OTLP Resource, Body, and LogRecord attributes.
-// Category:    Network firewall / IPS
+// Facade: process parse_paloalto_syslog,
+//         process paloalto_syslog_to_otlp
+// Category: Network firewall / IPS
 // Test corpus: synthetic (documentation-derived sample wires in this header)
 //
 // Typical pipeline —
@@ -162,6 +144,14 @@ include "../functions/proto_num.limpid"
 // ignored at this stage; the matched leaf re-parses the full row with
 // its own schema.
 
+// Process: parse_paloalto_syslog
+// Summary: Palo Alto Networks PAN-OS native CSV syslog → LSIS, dispatched by the positional Type field.
+// Reads: workspace.syslog.* (transport intake — populated by
+//        .msg (required, String) — syslog body carrying the positional
+//        workspace.paloalto_syslog.*
+//        .timezone (optional, String) — source
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_paloalto_syslog {
     workspace.pan_header = csv_parse(workspace.syslog.msg, ["", "", "", "Type", "Subtype"])
     switch workspace.pan_header.Type {
@@ -769,6 +759,18 @@ def function paloalto_syslog_otlp_event_outcome(status_id) {
     }
 }
 
+// Process: paloalto_syslog_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.pan.*
+//        .Serial (optional, String)
+//        workspace.syslog.*
+//        .msg (optional, String)
+//        workspace.lsis.parsed.*
+//        .class_uid (optional, Int)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process paloalto_syslog_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "observer.vendor", value: { string_value: "Palo Alto Networks" } }],

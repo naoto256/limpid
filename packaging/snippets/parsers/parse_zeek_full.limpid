@@ -1,20 +1,12 @@
-// Zeek full-scope parser (vocabulary)
-//
-// Summary:     Zeek full-scope extension — remaining protocol streams, drop
-//              arms for low-signal streams, and a catch-all that wraps
-//              unknown _paths into 4001/unmapped, on top of parse_zeek_soc.
-// Reads:       workspace.zeek.* (bridge — see Bridges in parse_zeek_default.limpid)
-//   .body (required, Object) — parsed Zeek event (caller does `parse_json(ingress)`)
-//   .hostname (optional, String) — collector override
-//   .time (optional, Int) — epoch ns override
-// Writes:      workspace.lsis.parsed.* — 14 protocol streams → 4001 (generic);
-//              stats / capture_loss / known_* / software dropped; catch-all
-//              wraps any other _path into 4001 with the raw body under
-//              unmapped. zeek_full_to_otlp writes source-owned OTLP Resource,
-//              Scope, Body, and LogRecord attributes.
-// Category:    OSS NDR
+// Facade: process parse_zeek_full,
+//         process parse_zeek_full_native,
+//         process parse_zeek_full_flat,
+//         process zeek_full_to_otlp
+// Category: OSS NDR
 // Test corpus: spec-only (Zeek script reference; catch-all and drop arms are
 //              shape-level, not corpus-verified)
+//
+// Zeek full-scope parser (vocabulary)
 //
 // Extends `parse_zeek_soc.limpid` with:
 //   - Specialised handlers for the rest of the Zeek default protocol
@@ -76,6 +68,13 @@ include "parse_zeek_soc.limpid"
 // Convenience entry points — see parse_zeek_default.limpid for rationale.
 // ---------------------------------------------------------------------------
 
+// Process: parse_zeek_full_native
+// Summary: Bridge one native Zeek JSON event into the shared Zeek intake.
+// Reads: ingress
+// Writes: workspace.zeek.*
+//         .body (required, Object)
+//         workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_zeek_full_native {
     workspace.zeek = {
         body:     parse_json(ingress),
@@ -85,6 +84,13 @@ def process parse_zeek_full_native {
     process parse_zeek_full
 }
 
+// Process: parse_zeek_full_flat
+// Summary: Bridge one flat Zeek JSON event into the shared Zeek intake.
+// Reads: ingress
+// Writes: workspace.zeek.*
+//         .body (required, Object)
+//         workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_zeek_full_flat {
     workspace.zeek = {
         body:     nest_dotted_keys(parse_json(ingress)),
@@ -265,6 +271,14 @@ def function zeek_rfb_record(body, host, time_ns) {
 // catch-all.
 // ---------------------------------------------------------------------------
 
+// Process: parse_zeek_full
+// Summary: Zeek full-scope extension — remaining protocol streams, drop arms for low-signal streams, and a catch-all that wraps unknown _paths into 4001/unmapped, on top of parse_zeek_soc.
+// Reads: workspace.zeek.* (bridge — see Bridges in parse_zeek_default.limpid)
+//        .body (required, Object) — parsed Zeek event (caller does `parse_json(ingress)`)
+//        .hostname (optional, String) — collector override
+//        .time (optional, Int) — epoch ns override
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_zeek_full {
     switch workspace.zeek.body._path {
         // High-signal full-extra
@@ -424,6 +438,17 @@ def function zeek_full_otlp_event_type(class_uid, activity_id) {
 }
 def function zeek_full_otlp_event_outcome(status_id) { switch status_id { 1 { "success" } 2 { "failure" } default { null } } }
 
+// Process: zeek_full_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.zeek.*
+//        .hostname (optional, String)
+//        workspace.lsis.parsed.*
+//        .class_uid (optional, Int)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .scope.name (optional, String)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process zeek_full_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "observer.vendor", value: { string_value: "Zeek Project" } }],
