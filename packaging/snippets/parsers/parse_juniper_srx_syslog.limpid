@@ -193,6 +193,11 @@ def function juniper_srx_syslog_idp_finding_record(src_ip, src_port_str, dst_ip,
 // ---------------------------------------------------------------------------
 
 def process parse_juniper_srx_syslog_normalize_time {
+    // The timezone slot declares the source device's zone. Explicit "local"
+    // is rejected because it follows the limpid host's OS, does not identify
+    // the source, and can mask misconfiguration when host TZ happens to match.
+    // (An unset slot still falls back to "local" internally per the SRX
+    // device-local default below; that default is not equivalent to declaring it.)
     switch workspace.juniper_srx_syslog.timezone {
         "local" { error "parse_juniper_srx_syslog: source timezone must be an IANA name or fixed offset, not local" }
     }
