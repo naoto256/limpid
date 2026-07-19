@@ -6,8 +6,9 @@
 // Writes:      workspace.syslog.{pri, facility, severity, timestamp,
 //              hostname, appname, procid, msgid, msg} — the transport
 //              namespace, not LSIS. syslog_to_otlp writes source-owned OTLP
-//              Resource, Scope, Body, and transport attributes without
-//              promoting PRI severity to canonical severity.
+//              Resource (APP-NAME as `service.name`), Body, and transport
+//              attributes without promoting PRI severity to canonical
+//              severity.
 // Category:    Transport
 // Test corpus: synthetic (RFC 3164 / RFC 5424 sample wires in this header)
 //
@@ -46,10 +47,10 @@ def process parse_syslog {
 def process syslog_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         switch workspace.syslog.hostname != null { true { [{ key: "host.name", value: { string_value: workspace.syslog.hostname } }] } default { [] } },
+        switch workspace.syslog.appname != null { true { [{ key: "service.name", value: { string_value: workspace.syslog.appname } }] } default { [] } },
         [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
         [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
     )
-    workspace.lsis.shed.otlp.scope.name = workspace.syslog.appname
     workspace.lsis.shed.otlp.log_record.body = switch workspace.syslog.msg != null {
         true    { { string_value: workspace.syslog.msg } }
         default { null }

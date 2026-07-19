@@ -7,7 +7,7 @@
 // Writes:      workspace.lsis.parsed.* — 4009 (Email Activity) for mail-flow programs
 //              (smtp / smtpd / qmgr / bounce); daemon-control noise routes to
 //              error_log. postfix_to_otlp writes source-owned OTLP Resource,
-//              Scope, Body, and LogRecord attributes.
+//              Body, and LogRecord attributes.
 // Category:    Mail (MTA)
 // Test corpus: synthetic (sample postfix lines in this header)
 //
@@ -376,12 +376,11 @@ def function postfix_otlp_event_outcome(status_id) {
 
 def process postfix_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
-        [{ key: "service.name", value: { string_value: "postfix" } }],
+        [{ key: "service.name", value: { string_value: switch workspace.pf.program != null { true { "postfix/${workspace.pf.program}" } default { "postfix" } } } }],
         switch workspace.postfix.hostname != null { true { [{ key: "host.name", value: { string_value: workspace.postfix.hostname } }] } default { [] } },
         [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
         [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
     )
-    workspace.lsis.shed.otlp.scope.name = switch workspace.pf.program != null { true { "postfix/${workspace.pf.program}" } default { "postfix" } }
     workspace.lsis.shed.otlp.log_record.body = { string_value: workspace.postfix.body }
     workspace.lsis.shed.otlp.log_record.attributes = concat(
         [{ key: "event.kind", value: { string_value: "event" } }],

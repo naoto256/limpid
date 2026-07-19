@@ -6,7 +6,7 @@
 //              (no {"items":[...]} envelope)
 // Writes:      workspace.lsis.parsed.* — 6003 (API Activity) for resource requests,
 //              k8s_audit_to_otlp additionally writes source-specific
-//              workspace.lsis.shed.otlp Resource, Scope, Body, and LogRecord attributes.
+//              workspace.lsis.shed.otlp Resource, Body, and LogRecord attributes.
 //              3002 (Authentication) for authentication.k8s.io objectRefs;
 //              unknown kinds route to error_log.
 // Category:    Container / orchestration
@@ -347,10 +347,10 @@ def process k8s_audit_to_otlp {
         [{ key: "observer.vendor", value: { string_value: "Kubernetes" } }],
         [{ key: "observer.product", value: { string_value: "kube-apiserver" } }],
         [{ key: "observer.type", value: { string_value: "audit" } }],
+        [{ key: "service.name", value: { string_value: "kube-apiserver" } }],
         [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
         [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
     )
-    workspace.lsis.shed.otlp.scope.name = "kube-apiserver"
     workspace.lsis.shed.otlp.log_record.body = { string_value: ingress }
     workspace.lsis.shed.otlp.log_record.attributes = concat(
         [{ key: "event.kind", value: { string_value: "event" } }],

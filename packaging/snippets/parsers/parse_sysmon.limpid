@@ -292,10 +292,11 @@ def process sysmon_to_otlp {
         [{ key: "observer.product", value: { string_value: "Sysmon" } }],
         [{ key: "observer.type", value: { string_value: "host" } }],
         switch workspace.sysmon.body.Computer != null { true { [{ key: "host.name", value: { string_value: workspace.sysmon.body.Computer } }] } default { [] } },
+        [{ key: "service.name", value: { string_value: "Microsoft-Windows-Sysmon" } }],
         [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
         [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
     )
-    workspace.lsis.shed.otlp.scope.name = "Microsoft-Windows-Sysmon"
+    workspace.lsis.shed.otlp.scope.name = workspace.sysmon.body.Channel
     workspace.lsis.shed.otlp.log_record.body = { string_value: ingress }
     workspace.lsis.shed.otlp.log_record.attributes = concat(
         [{ key: "event.kind", value: { string_value: "event" } }],
