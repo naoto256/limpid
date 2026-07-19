@@ -16,10 +16,10 @@
 //              deployment; override it when the device zone is known)
 //              https://www.cisco.com/c/en/us/td/docs/security/asa/asa-cli-reference/I-R/asa-command-ref-I-R/m_log-lz.html
 // Writes:      workspace.lsis.parsed.* — 3002 (Authentication) and 4001 (Network
-//              asa_to_otlp additionally writes source-specific
-//              workspace.lsis.shed.otlp Resource, Body, and LogRecord attributes.
 //              Activity), dispatched by message ID; unmapped IDs route to
-//              error_log. Per-ID table below.
+//              error_log. Per-ID table below. asa_to_otlp additionally writes
+//              source-specific workspace.lsis.shed.otlp Resource, Body, and
+//              LogRecord attributes.
 // Category:    Network firewall / IPS
 // Test corpus: synthetic (sample wires in this header; several message-ID
 //              leaves are not yet exercised against live captures — see

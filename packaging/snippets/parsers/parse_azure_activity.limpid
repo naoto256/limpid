@@ -4,10 +4,9 @@
 // Reads:       ingress (raw wire) — one Activity Log event per ingress (flat
 //              per-record form; unwrap Event Hub batches upstream)
 // Writes:      workspace.lsis.parsed.* — 6003 (API Activity), dispatched over the
+//              8 documented categories; unknown categories route to error_log.
 //              azure_activity_to_otlp additionally writes source-specific
 //              workspace.lsis.shed.otlp Resource, Body, and LogRecord attributes.
-//              8 documented categories; unknown categories route to
-//              error_log.
 // Category:    Cloud audit (API control plane)
 // Test corpus: spec-only (Microsoft Learn Azure Activity Log schema reference
 //              + documentation samples for the 8 categories; no live capture)

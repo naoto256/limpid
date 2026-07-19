@@ -457,8 +457,9 @@ passed through unchanged, `hostname()`) is not declared in `Reads:`
 ### `Writes:` — LSIS-slot contract
 
 `Writes:` names the LSIS slot(s) the snippet produces. Parsers
-write facts to `workspace.lsis.parsed.*` and enumerate the OCSF
-class(es) their dispatcher emits; composers write a single
+write facts to `workspace.lsis.parsed.*` and enumerate the LSIS
+`class_uid` facts their dispatcher produces (using OCSF class identifiers);
+composers write a single
 `workspace.lsis.composed.<slot>` from the composed-layer registry
 above.
 

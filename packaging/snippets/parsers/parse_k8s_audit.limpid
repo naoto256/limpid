@@ -5,10 +5,10 @@
 // Reads:       ingress (raw wire) — one audit Event object per ingress
 //              (no {"items":[...]} envelope)
 // Writes:      workspace.lsis.parsed.* — 6003 (API Activity) for resource requests,
-//              k8s_audit_to_otlp additionally writes source-specific
-//              workspace.lsis.shed.otlp Resource, Body, and LogRecord attributes.
 //              3002 (Authentication) for authentication.k8s.io objectRefs;
-//              unknown kinds route to error_log.
+//              unknown kinds route to error_log. k8s_audit_to_otlp additionally
+//              writes source-specific workspace.lsis.shed.otlp Resource, Body,
+//              and LogRecord attributes.
 // Category:    Container / orchestration
 // Test corpus: spec-only (Kubernetes audit policy reference, kube-apiserver
 //              v1.29 audit.k8s.io/v1 schema; verb → activity_id per the OCSF

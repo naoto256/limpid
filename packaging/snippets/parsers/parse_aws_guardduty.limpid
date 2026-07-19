@@ -4,9 +4,9 @@
 // Reads:       ingress (raw wire) — one GuardDuty finding object per ingress
 //              (identical across EventBridge / SNS / S3 delivery)
 // Writes:      workspace.lsis.parsed.* — 2004 (Detection Finding), one finding → one
+//              record; unknown ThreatPurpose values route to error_log.
 //              aws_guardduty_to_otlp additionally writes source-specific
 //              workspace.lsis.shed.otlp Resource, Body, and LogRecord attributes.
-//              record; unknown ThreatPurpose values route to error_log.
 // Category:    Cloud security findings
 // Test corpus: spec-only (AWS documentation per-finding-type sample bodies;
 //              cross-referenced against the CreateSampleFindings API shape —
