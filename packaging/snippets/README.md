@@ -251,9 +251,10 @@ regions.
 <!-- END: inventory:functions -->
 
 Timestamp interpretation follows each source contract. A vendor-defined fixed
-zone wins; documented device-local formats default to `local` (the limpid
-host's system timezone), and formats with no authoritative timezone contract
-default to `UTC`. Source-specific timezone slots override those defaults with
+zone wins; documented device-local formats and formats with no authoritative
+timezone contract both default to `local` (the limpid host's system timezone —
+the most likely assumption is that the device shares the host's zone).
+Source-specific timezone slots override those defaults with
 an IANA name or fixed offset and reject invalid values loudly.
 Explicit `local` is not accepted in an override slot — `local` is a
 host-dependent internal default, not a source-device declaration; each

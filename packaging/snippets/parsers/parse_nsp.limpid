@@ -5,11 +5,13 @@
 //                .hostname (optional, String) — collector-side hostname
 //                .timezone (optional, String) — source timezone override as an
 //                  IANA name or fixed offset for attack_time values without
-//                  ` UTC`; defaults to UTC when absent
+//                  ` UTC`; defaults to the limpid host's system timezone
 //                  (the standard-template timestamp zone is not specified in
 //                  the available vendor documentation; explicit ` UTC` is
-//                  interpreted as UTC. UTC is the intentional pack default;
-//                  override it or use a custom parser when the source differs)
+//                  interpreted as UTC. The default assumes the Manager and
+//                  limpid share the same correct system timezone — the most
+//                  likely deployment when the zone is undocumented; override
+//                  it or use a custom parser when the source differs)
 // Writes:      workspace.lsis.parsed.* — 2004 (Detection Finding);
 //              nsp_to_otlp writes source-owned OTLP Resource, Body, and
 //              LogRecord attributes.
@@ -314,7 +316,7 @@ def process parse_nsp_normalize_time {
     switch workspace.nsp.timezone {
         "local" { error "parse_nsp: source timezone must be an IANA name or fixed offset, not local" }
     }
-    let source_timezone = coalesce(workspace.nsp.timezone, "UTC")
+    let source_timezone = coalesce(workspace.nsp.timezone, "local")
     workspace.nsp.timezone_probe = strptime(
         "2000-01-15 12:00:00",
         "%Y-%m-%d %H:%M:%S",
