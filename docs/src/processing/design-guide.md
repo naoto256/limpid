@@ -62,12 +62,13 @@ The split config is longer. It is also easier to test, easier to tap between ste
 
 Every process has an implicit contract with its neighbours in the pipeline: *what do I expect to be present when I run, and what do I leave behind for the next stage?*
 
-The shipped snippet pack declares its file-level contract in the canonical
-header schema (`Summary`, `Reads`, `Writes`, and kind-specific fields) described
+The shipped snippet pack declares its public surface in the canonical header
+schema: a file-level `Facade` plus adjacent per-member `Summary`, `Reads`,
+`Writes`, or `Signature` contracts described
 in the [pack README](../../../packaging/snippets/README.md#authoring-conventions).
-Inside a large file, leaf-local `@requires` / `@produces` comments may add useful
-detail, but they do not replace the canonical header and the analyzer does not
-consume them.
+Inside a large file, private leaf-local `@requires` / `@produces` comments may
+add useful detail, but they do not replace a facade member block and the
+analyzer does not consume them.
 
 ### The `@requires` / `@produces` tag convention
 
@@ -130,7 +131,8 @@ Requirement levels follow the OCSF / ECS convention:
 
 Free-form prose comments explaining "what this process does" are fine in
 addition to the tags. For shipped snippets, neither form substitutes for the
-canonical file header that header lint and inventory generation validate.
+canonical facade and member headers that header lint and inventory generation
+validate.
 
 ### Why make contracts explicit
 
