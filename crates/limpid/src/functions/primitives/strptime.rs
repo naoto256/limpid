@@ -72,7 +72,7 @@ fn parse_with_tz(value: &str, fmt: &str, tz: Option<&str>) -> Result<DateTime<Fi
         )
     })?;
     match tz {
-        "local" => Ok(chrono::Local
+        timezone if timezone.eq_ignore_ascii_case("local") => Ok(chrono::Local
             .from_local_datetime(&naive)
             .single()
             .ok_or_else(|| {
@@ -82,7 +82,7 @@ fn parse_with_tz(value: &str, fmt: &str, tz: Option<&str>) -> Result<DateTime<Fi
                 )
             })?
             .fixed_offset()),
-        "UTC" | "utc" => {
+        timezone if timezone.eq_ignore_ascii_case("UTC") => {
             let offset = FixedOffset::east_opt(0).unwrap();
             Ok(offset.from_utc_datetime(&naive))
         }
@@ -142,5 +142,13 @@ mod tests {
                 .to_string()
                 .contains("ambiguous or invalid local time")
         );
+    }
+
+    #[test]
+    fn timezone_keywords_are_ascii_case_insensitive() {
+        let utc = parse_with_tz("2026-04-30 10:23:45", "%Y-%m-%d %H:%M:%S", Some("uTc")).unwrap();
+        assert_eq!(utc.offset().local_minus_utc(), 0);
+
+        parse_with_tz("2026-04-30 10:23:45", "%Y-%m-%d %H:%M:%S", Some("LoCaL")).unwrap();
     }
 }

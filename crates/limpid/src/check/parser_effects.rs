@@ -32,6 +32,9 @@ pub(super) fn apply_parser_effects(
     for spec in &info.produces {
         bindings.bind_workspace(&spec.path, spec.ty.clone());
     }
+    for path in &info.scoped_wildcards {
+        bindings.set_workspace_scoped_wildcard(path);
+    }
 
     // Defaults arg (HashLit): every declared key becomes a workspace
     // binding too, with type inferred from the literal value. This is
@@ -218,5 +221,25 @@ mod tests {
         apply_parser_effects(None, "regex_parse", &args, &reg, &mut bindings);
         assert!(bindings.is_workspace_wildcard());
         assert!(bindings.get_workspace(&ws("user")).is_none());
+    }
+
+    #[test]
+    fn cef_parse_wildcards_only_the_extension_subtree() {
+        let reg = registry();
+        let mut bindings = Bindings::new();
+        apply_parser_effects(
+            Some("cef"),
+            "parse",
+            &[ident("ingress")],
+            &reg,
+            &mut bindings,
+        );
+        assert!(!bindings.is_workspace_wildcard());
+        assert!(bindings.is_workspace_path_wildcard(&[
+            "workspace".into(),
+            "extension".into(),
+            "src".into(),
+        ]));
+        assert!(!bindings.is_workspace_path_wildcard(&["workspace".into(), "unrelated".into(),]));
     }
 }

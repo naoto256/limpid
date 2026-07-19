@@ -63,7 +63,8 @@ pub fn register(reg: &mut FunctionRegistry) {
             // data-driven (wildcards).
             FieldSpec::new(&["workspace", "extension"], FieldType::Object),
         ],
-        wildcards: true,
+        wildcards: false,
+        scoped_wildcards: vec![vec!["workspace".to_string(), "extension".to_string()]],
         defaults_arg_indices: &[1],
         defaults_arg_extractor: None,
     });
