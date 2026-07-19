@@ -1,6 +1,20 @@
 // Summary:     Fortinet FortiGate CEF (FortiOS set format cef) → LSIS,
 //              dispatched by CEF cat subtype.
-// Reads:       ingress (raw wire) — syslog-wrapped CEF (CEF:0|Fortinet|Fortigate|...)
+// Reads:       workspace.cef.* (format intake — populated by
+//              parse_syslog | parse_cef upstream)
+//                .cat (required, String) — FortiGate `cat=<category>:<subtype>`
+//                     extension, the dispatch key
+//                .severity (optional, Int) — CEF header priority
+//                     (FortiGate dialect 1-8)
+//                .device_vendor (optional, String) — CEF header vendor
+//                .device_product (optional, String) — CEF header product
+//                .device_version (optional, String) — CEF header version
+//                (plus the per-leaf standard / `FTNTFGT*` extension keys
+//                documented on each subtype leaf below)
+//              workspace.syslog.* (transport intake)
+//                .timestamp (optional, String) — RFC 3164 wire timestamp
+//                .msg (optional, String) — syslog body, retained by
+//                     fortigate_cef_to_otlp as the OTLP Body
 //              workspace.fortigate_cef.timezone (optional, String) — source
 //              device timezone override as an IANA name or fixed offset; the
 //              RFC 3164 timestamp defaults to the limpid host's system timezone
@@ -16,6 +30,16 @@
 // Category:    Network firewall / IPS
 // Test corpus: real (anonymised FortiGate captures — the dialect-quirks
 //              block below was verified against them)
+//
+// Typical pipeline —
+//
+//   process parse_syslog | parse_cef | parse_fortigate_cef | compose_ocsf | ocsf_to_egress
+//
+// Transport (`parse_syslog`) and format (`parse_cef`) are separate
+// upstream stages; this parser interprets the FortiGate dialect on the
+// already-parsed `workspace.cef.*`. Separating the stages lets a
+// pipeline inspect and drop events after each stage without paying the
+// next stage's parse cost.
 //
 // Wire —    syslog-wrapped CEF — `<PRI>Mmm DD HH:MM:SS host CEF:0|Fortinet|Fortigate|...`
 //          ArcSight CEF header + FortiGate-specific extension keys
@@ -151,7 +175,7 @@ def function fortigate_cef_metadata(vendor, product, version) {
 }
 
 // ---------------------------------------------------------------------------
-// Top-level dispatcher: parse syslog wrapper + CEF body, dispatch on `cat`
+// Top-level dispatcher: read the parsed CEF intake, dispatch on `cat`
 // ---------------------------------------------------------------------------
 //
 // The CEF `cat` extension carries the canonical `<category>:<subtype>`
@@ -159,10 +183,12 @@ def function fortigate_cef_metadata(vendor, product, version) {
 // dispatchers (the previous `name=utm` then `subtype=ips` form fails on
 // real FortiGate output where `name=utm:ips signature` and
 // `cat=utm:ips`).
+//
+// The RFC 3164 wrapper timestamp is copied into the CEF namespace here
+// because the CEF wrapper itself carries no timestamp; the per-leaf
+// validate process interprets it in the declared device timezone.
 
 def process parse_fortigate_cef {
-    workspace.syslog = syslog.parse(ingress)
-    workspace.cef    = cef.parse(workspace.syslog.msg)
     workspace.cef.timestamp = workspace.syslog.timestamp
     switch workspace.cef.cat {
         // Traffic logs (Network Activity 4001)

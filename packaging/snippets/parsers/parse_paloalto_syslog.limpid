@@ -1,7 +1,9 @@
 // Summary:     Palo Alto Networks PAN-OS native CSV syslog → LSIS,
 //              dispatched by the positional Type field.
-// Reads:       ingress (raw wire) — syslog-wrapped positional CSV
-//              (FUTURE_USE,RecvTime,Serial,Type,Subtype,...)
+// Reads:       workspace.syslog.* (transport intake — populated by
+//              parse_syslog upstream)
+//                .msg (required, String) — syslog body carrying the positional
+//                     CSV row (FUTURE_USE,RecvTime,Serial,Type,Subtype,...)
 //              workspace.paloalto_syslog.timezone (optional, String) — source
 //              timezone override as an IANA name or fixed offset; legacy
 //              Receive/Generated Time defaults to the limpid host's system
@@ -18,6 +20,15 @@
 //              source-owned OTLP Resource, Body, and LogRecord attributes.
 // Category:    Network firewall / IPS
 // Test corpus: synthetic (documentation-derived sample wires in this header)
+//
+// Typical pipeline —
+//
+//   process parse_syslog | parse_paloalto_syslog | compose_ocsf | ocsf_to_egress
+//
+// The syslog wrapper is unwrapped by `parse_syslog` upstream; this
+// parser consumes the CSV row from `workspace.syslog.msg`. Separating
+// the stages lets a pipeline inspect and drop events after
+// `parse_syslog` without paying the vocabulary parse cost.
 //
 // Wire —    syslog-wrapped CSV — `<priority>timestamp host FUTURE_USE,RecvTime,Serial,Type,Subtype,...`
 //          PAN-OS native CSV log format (positional, ~60-117 fields per
@@ -152,7 +163,6 @@ include "../functions/proto_num.limpid"
 // its own schema.
 
 def process parse_paloalto_syslog {
-    workspace.syslog = syslog.parse(ingress)
     workspace.pan_header = csv_parse(workspace.syslog.msg, ["", "", "", "Type", "Subtype"])
     switch workspace.pan_header.Type {
         "TRAFFIC"        { process parse_paloalto_syslog_traffic }

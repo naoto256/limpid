@@ -1472,6 +1472,7 @@ def pipeline p {
             "packaging/snippets/parsers/parse_azure_activity.limpid",
             "packaging/snippets/parsers/parse_bind.limpid",
             "packaging/snippets/parsers/parse_checkpoint_leef.limpid",
+            "packaging/snippets/parsers/parse_cef.limpid",
             "packaging/snippets/parsers/parse_checkpoint_syslog.limpid",
             "packaging/snippets/parsers/parse_cloudtrail.limpid",
             "packaging/snippets/parsers/parse_combined_log.limpid",
@@ -1577,7 +1578,13 @@ def pipeline suricata_otlp {
 
 def pipeline asa_otlp {
     input i
-    process parse_asa | asa_to_otlp | compose_otlp | otlp_to_egress
+    process parse_syslog | parse_asa | asa_to_otlp | compose_otlp | otlp_to_egress
+    output o
+}
+
+def pipeline cef_otlp {
+    input i
+    process parse_syslog | parse_cef | cef_to_otlp | compose_otlp | otlp_to_egress
     output o
 }
 
@@ -1595,7 +1602,7 @@ def pipeline checkpoint_syslog_otlp {
 
 def pipeline fortigate_cef_otlp {
     input i
-    process parse_fortigate_cef | fortigate_cef_to_otlp | compose_otlp | otlp_to_egress
+    process parse_syslog | parse_cef | parse_fortigate_cef | fortigate_cef_to_otlp | compose_otlp | otlp_to_egress
     output o
 }
 
@@ -1619,13 +1626,13 @@ def pipeline nsp_otlp {
 
 def pipeline paloalto_cef_otlp {
     input i
-    process parse_paloalto_cef | paloalto_cef_to_otlp | compose_otlp | otlp_to_egress
+    process parse_syslog | parse_cef | parse_paloalto_cef | paloalto_cef_to_otlp | compose_otlp | otlp_to_egress
     output o
 }
 
 def pipeline paloalto_native_otlp {
     input i
-    process parse_paloalto_syslog | paloalto_syslog_to_otlp | compose_otlp | otlp_to_egress
+    process parse_syslog | parse_paloalto_syslog | paloalto_syslog_to_otlp | compose_otlp | otlp_to_egress
     output o
 }
 
@@ -1712,7 +1719,7 @@ def pipeline zeek_full_otlp {
     }
 
     fn run_packaged_parser_pipeline(
-        parser: &str,
+        parsers: &[&str],
         setup: Option<&str>,
         process: &str,
         ingress: &[u8],
@@ -1728,7 +1735,10 @@ def pipeline zeek_full_otlp {
             .prefix(".limpid-parser-test-")
             .tempfile_in(&snippets)
             .expect("temporary packaged parser config");
-        writeln!(config_file, "include \"parsers/{parser}.limpid\"").expect("write parser include");
+        for parser in parsers {
+            writeln!(config_file, "include \"parsers/{parser}.limpid\"")
+                .expect("write parser include");
+        }
         writeln!(
             config_file,
             "def input i {{ type syslog_tcp bind \"127.0.0.1:5514\" }}\n\
@@ -1781,12 +1791,12 @@ def pipeline zeek_full_otlp {
     }
 
     fn run_packaged_parser_json(
-        parser: &str,
+        parsers: &[&str],
         setup: Option<&str>,
         process: &str,
         ingress: &[u8],
     ) -> serde_json::Value {
-        let result = run_packaged_parser_pipeline(parser, setup, process, ingress);
+        let result = run_packaged_parser_pipeline(parsers, setup, process, ingress);
         assert_eq!(
             result.termination,
             PipelineTermination::Finished,
@@ -1847,9 +1857,9 @@ def pipeline zeek_full_otlp {
             .expect("fixture fits i64");
 
         let asa = run_packaged_parser_json(
-            "parse_asa",
+            &["parse_syslog", "parse_asa"],
             Some("workspace.asa = { timezone: \"UTC\" }"),
-            "parse_asa",
+            "parse_syslog | parse_asa",
             format!(
                 "<165>{rfc3164_wire} fw-asa01 : %ASA-6-605005: Login permitted from 192.0.2.10/54321 to outside:198.51.100.5/SSH for user admin"
             )
@@ -1858,7 +1868,7 @@ def pipeline zeek_full_otlp {
         assert_eq!(asa["time"], rfc3164_expected);
 
         let auditd = run_packaged_parser_json(
-            "parse_auditd",
+            &["parse_auditd"],
             Some("workspace.auditd = { body: ingress }"),
             "parse_auditd",
             b"type=USER_LOGIN msg=audit(1710000000.123:1): pid=42 uid=0 auid=1000 ses=1 res=success acct=alice addr=192.0.2.10 terminal=pts/0 exe=/usr/bin/login",
@@ -1866,7 +1876,7 @@ def pipeline zeek_full_otlp {
         assert_eq!(auditd["time"], 1_710_000_000_123_000_000_i64);
 
         let bind = run_packaged_parser_json(
-            "parse_bind",
+            &["parse_bind"],
             Some(
                 "workspace.bind = { body: ingress, hostname: \"dns01\", timezone: \"Asia/Tokyo\" }",
             ),
@@ -1876,7 +1886,7 @@ def pipeline zeek_full_otlp {
         assert_eq!(bind["time"], 1_777_512_225_123_000_000_i64);
 
         let checkpoint_leef = run_packaged_parser_json(
-            "parse_checkpoint_leef",
+            &["parse_checkpoint_leef"],
             Some("workspace.checkpoint_leef = { body: ingress }"),
             "parse_checkpoint_leef",
             b"<14>1 2026-04-30T01:23:45.123456789Z cpgw01 CheckPoint - - LEEF:2.0|Check Point|VPN-1 & FireWall-1|R81|Accept|src=192.0.2.10\tdst=198.51.100.5\tsrcPort=51234\tdstPort=443\tproto=tcp\taction=Accept",
@@ -1884,7 +1894,7 @@ def pipeline zeek_full_otlp {
         assert_eq!(checkpoint_leef["time"], 1_777_512_225_123_456_789_i64);
 
         let checkpoint_syslog = run_packaged_parser_json(
-            "parse_checkpoint_syslog",
+            &["parse_checkpoint_syslog"],
             Some("workspace.checkpoint_syslog = { body: ingress }"),
             "parse_checkpoint_syslog",
             b"<14>1 2026-04-30T01:23:45.123456789Z cpgw01 CheckPoint - - [action:\"Accept\"; src:\"192.0.2.10\"; dst:\"198.51.100.5\"; service:\"443\"; proto:\"tcp\"; product:\"VPN-1 & FireWall-1\"; severity:\"Low\"]",
@@ -1892,9 +1902,9 @@ def pipeline zeek_full_otlp {
         assert_eq!(checkpoint_syslog["time"], 1_777_512_225_123_456_789_i64);
 
         let fortigate_cef = run_packaged_parser_json(
-            "parse_fortigate_cef",
+            &["parse_syslog", "parse_cef", "parse_fortigate_cef"],
             Some("workspace.fortigate_cef = { timezone: \"UTC\" }"),
-            "parse_fortigate_cef",
+            "parse_syslog | parse_cef | parse_fortigate_cef",
             format!(
                 "<129>{rfc3164_wire} fw01 CEF:0|Fortinet|Fortigate|v7.4.11|16384|utm:ips signature|7|cat=utm:ips src=192.0.2.10 dst=198.51.100.5 proto=6 act=detected FTNTFGTattack=test FTNTFGTattackid=42"
             )
@@ -1903,7 +1913,7 @@ def pipeline zeek_full_otlp {
         assert_eq!(fortigate_cef["time"], rfc3164_expected);
 
         let fortigate_native = run_packaged_parser_json(
-            "parse_fortigate_syslog",
+            &["parse_fortigate_syslog"],
             None,
             "parse_fortigate_syslog",
             b"<134>eventtime=1777284000123456789 level=notice type=traffic subtype=forward srcip=192.0.2.10 dstip=198.51.100.5 proto=6 action=accept",
@@ -1911,7 +1921,7 @@ def pipeline zeek_full_otlp {
         assert_eq!(fortigate_native["time"], 1_777_284_000_123_456_789_i64);
 
         let juniper_sd = run_packaged_parser_json(
-            "parse_juniper_srx_sd_syslog",
+            &["parse_juniper_srx_sd_syslog"],
             Some("workspace.juniper_srx_sd_syslog = { body: ingress }"),
             "parse_juniper_srx_sd_syslog",
             b"<14>1 2026-04-30T01:23:45.123456789Z srx01 RT_FLOW - RT_FLOW_SESSION_CREATE [junos@2636 source-address=\"192.0.2.10\" source-port=\"54321\" destination-address=\"198.51.100.5\" destination-port=\"443\" protocol-id=\"6\" policy-name=\"allow-web\"]",
@@ -1919,7 +1929,7 @@ def pipeline zeek_full_otlp {
         assert_eq!(juniper_sd["time"], 1_777_512_225_123_456_789_i64);
 
         let juniper_legacy = run_packaged_parser_json(
-            "parse_juniper_srx_syslog",
+            &["parse_juniper_srx_syslog"],
             Some(
                 "workspace.juniper_srx_syslog = { body: ingress, timezone: \"UTC\" }",
             ),
@@ -1932,7 +1942,7 @@ def pipeline zeek_full_otlp {
         assert_eq!(juniper_legacy["time"], rfc3164_expected);
 
         let nsp = run_packaged_parser_json(
-            "parse_nsp",
+            &["parse_nsp"],
             Some(
                 "workspace.nsp = { body: ingress, hostname: \"nsp01\", timezone: \"+09:00\" }",
             ),
@@ -1948,9 +1958,9 @@ def pipeline zeek_full_otlp {
         assert_eq!(nsp["time"], nsp_expected);
 
         let paloalto_cef = run_packaged_parser_json(
-            "parse_paloalto_cef",
+            &["parse_syslog", "parse_cef", "parse_paloalto_cef"],
             Some("workspace.paloalto_cef = { timezone: \"UTC\" }"),
-            "parse_paloalto_cef",
+            "parse_syslog | parse_cef | parse_paloalto_cef",
             format!(
                 "<134>{rfc3164_wire} fw-pan01 CEF:0|Palo Alto Networks|PAN-OS|10.2.0|end|TRAFFIC|3|src=192.0.2.10 dst=198.51.100.5 proto=tcp act=allow"
             )
@@ -1960,15 +1970,15 @@ def pipeline zeek_full_otlp {
 
         let paloalto_native_wire = paloalto_traffic_wire("2026/04/30 10:23:45");
         let paloalto_native = run_packaged_parser_json(
-            "parse_paloalto_syslog",
+            &["parse_syslog", "parse_paloalto_syslog"],
             Some("workspace.paloalto_syslog = { timezone: \"Asia/Tokyo\" }"),
-            "parse_paloalto_syslog",
+            "parse_syslog | parse_paloalto_syslog",
             &paloalto_native_wire,
         );
         assert_eq!(paloalto_native["time"], 1_777_512_225_000_000_000_i64);
 
         let sysmon = run_packaged_parser_json(
-            "parse_sysmon",
+            &["parse_sysmon"],
             Some("workspace.sysmon = { body: parse_json(ingress) }"),
             "parse_sysmon",
             br#"{"EventID":11,"EventTime":"2026-04-30T01:23:45.123456789Z","Computer":"host01","EventData":{"TargetFilename":"C:\\Temp\\x.txt","User":"alice","Image":"C:\\Windows\\cmd.exe","ProcessId":"42"}}"#,
@@ -1976,7 +1986,7 @@ def pipeline zeek_full_otlp {
         assert_eq!(sysmon["time"], 1_777_512_225_123_456_789_i64);
 
         let vpc = run_packaged_parser_json(
-            "parse_aws_vpc_flow",
+            &["parse_aws_vpc_flow"],
             None,
             "parse_aws_vpc_flow",
             b"2 123456789012 eni-0a1b2c3d4e5f6a7b8 192.0.2.10 198.51.100.5 54321 443 6 10 4000 1714000000 1714000060 ACCEPT OK",
@@ -2003,7 +2013,7 @@ def pipeline zeek_full_otlp {
         }
 
         let bind_default_timezone = run_packaged_parser_json(
-            "parse_bind",
+            &["parse_bind"],
             Some("workspace.bind = { body: ingress }"),
             "parse_bind",
             b"30-Apr-2026 10:23:45.123 client @0x1 192.0.2.10#54321 (example.com): query: example.com IN A +E(0) (198.51.100.53)",
@@ -2018,7 +2028,7 @@ def pipeline zeek_full_otlp {
         assert_eq!(bind_default_timezone["time"], bind_default_expected);
 
         let bind_override = run_packaged_parser_json(
-            "parse_bind",
+            &["parse_bind"],
             Some("workspace.bind = { body: ingress, timezone: \"UTC\" }"),
             "parse_bind",
             b"30-Apr-2026 10:23:45.123 client @0x1 192.0.2.10#54321 (example.com): query: example.com IN A +E(0) (198.51.100.53)",
@@ -2034,7 +2044,7 @@ def pipeline zeek_full_otlp {
 
         let nsp_body = b"admin_domain=Default alert_id=12345 alert_type=Signature app_protocol=HTTP confidence=Tentative attack_count=1 attack_id=42 attack_name=Example severity=High alert_signature=SIG attack_time=2026-05-16 10:00:00 category=Exploit dest_ip=192.0.2.10 dest_name=web01 dest_port=80 device_name=nsp01 direction=Inbound confidence= file_name= file_hash= file_type= virus_name= action_status= error_status= protocol=TCP result=Blocked src_ip=198.51.100.5 src_name= src_port=54321";
         let nsp_default_timezone = run_packaged_parser_json(
-            "parse_nsp",
+            &["parse_nsp"],
             Some("workspace.nsp = { body: ingress }"),
             "parse_nsp",
             nsp_body,
@@ -2054,7 +2064,7 @@ def pipeline zeek_full_otlp {
         assert_eq!(nsp_default_timezone["time"], nsp_local_expected);
 
         let nsp_override = run_packaged_parser_json(
-            "parse_nsp",
+            &["parse_nsp"],
             Some("workspace.nsp = { body: ingress, timezone: \"UTC\" }"),
             "parse_nsp",
             nsp_body,
@@ -2062,7 +2072,7 @@ def pipeline zeek_full_otlp {
         assert_eq!(nsp_override["time"], nsp_utc_expected);
 
         let nsp_explicit_utc = run_packaged_parser_json(
-            "parse_nsp",
+            &["parse_nsp"],
             Some("workspace.nsp = { body: ingress }"),
             "parse_nsp",
             b"admin_domain=Default alert_id=12345 alert_type=Signature app_protocol=HTTP confidence=Tentative attack_count=1 attack_id=42 attack_name=Example severity=High alert_signature=SIG attack_time=2026-05-16 10:00:00 UTC category=Exploit dest_ip=192.0.2.10 dest_name=web01 dest_port=80 device_name=nsp01 direction=Inbound confidence= file_name= file_hash= file_type= virus_name= action_status= error_status= protocol=TCP result=Blocked src_ip=198.51.100.5 src_name= src_port=54321",
@@ -2071,9 +2081,9 @@ def pipeline zeek_full_otlp {
 
         let paloalto_wire = paloalto_traffic_wire("2026/04/30 10:23:45");
         let paloalto_default_timezone = run_packaged_parser_json(
-            "parse_paloalto_syslog",
+            &["parse_syslog", "parse_paloalto_syslog"],
             None,
-            "parse_paloalto_syslog",
+            "parse_syslog | parse_paloalto_syslog",
             &paloalto_wire,
         );
         let paloalto_local_expected = chrono_tz::America::New_York
@@ -2085,9 +2095,9 @@ def pipeline zeek_full_otlp {
         assert_eq!(paloalto_default_timezone["time"], paloalto_local_expected);
 
         let paloalto_override = run_packaged_parser_json(
-            "parse_paloalto_syslog",
+            &["parse_syslog", "parse_paloalto_syslog"],
             Some("workspace.paloalto_syslog = { timezone: \"UTC\" }"),
-            "parse_paloalto_syslog",
+            "parse_syslog | parse_paloalto_syslog",
             &paloalto_wire,
         );
         let paloalto_override_expected = chrono::Utc
@@ -2100,39 +2110,39 @@ def pipeline zeek_full_otlp {
 
         for (parser, setup, process, ingress) in [
             (
-                "parse_bind",
+                &["parse_bind"][..],
                 "workspace.bind = { body: ingress, timezone: \"Not/AZone\" }",
                 "parse_bind",
                 b"30-Apr-2026 10:23:45.123 client @0x1 192.0.2.10#54321 (example.com): query: example.com IN A +E(0) (198.51.100.53)".as_slice(),
             ),
             (
-                "parse_nsp",
+                &["parse_nsp"][..],
                 "workspace.nsp = { body: ingress, timezone: \"Not/AZone\" }",
                 "parse_nsp",
                 nsp_body.as_slice(),
             ),
             (
-                "parse_paloalto_syslog",
+                &["parse_syslog", "parse_paloalto_syslog"][..],
                 "workspace.paloalto_syslog = { timezone: \"Not/AZone\" }",
-                "parse_paloalto_syslog",
+                "parse_syslog | parse_paloalto_syslog",
                 paloalto_wire.as_slice(),
             ),
             (
-                "parse_bind",
+                &["parse_bind"][..],
                 "workspace.bind = { body: ingress, timezone: \"local\" }",
                 "parse_bind",
                 b"30-Apr-2026 10:23:45.123 client @0x1 192.0.2.10#54321 (example.com): query: example.com IN A +E(0) (198.51.100.53)".as_slice(),
             ),
             (
-                "parse_nsp",
+                &["parse_nsp"][..],
                 "workspace.nsp = { body: ingress, timezone: \"local\" }",
                 "parse_nsp",
                 nsp_body.as_slice(),
             ),
             (
-                "parse_paloalto_syslog",
+                &["parse_syslog", "parse_paloalto_syslog"][..],
                 "workspace.paloalto_syslog = { timezone: \"local\" }",
-                "parse_paloalto_syslog",
+                "parse_syslog | parse_paloalto_syslog",
                 paloalto_wire.as_slice(),
             ),
         ] {
@@ -2195,7 +2205,8 @@ def pipeline zeek_full_otlp {
 
         let cases = [
             (
-                "parse_asa",
+                &["parse_syslog", "parse_asa"][..],
+                "parse_syslog | parse_asa",
                 "workspace.asa = { timezone: \"UTC\" }",
                 "workspace.asa = { timezone: \"Not/AZone\" }",
                 "workspace.asa = { timezone: \"local\" }",
@@ -2205,7 +2216,8 @@ def pipeline zeek_full_otlp {
                 .into_bytes(),
             ),
             (
-                "parse_fortigate_cef",
+                &["parse_syslog", "parse_cef", "parse_fortigate_cef"][..],
+                "parse_syslog | parse_cef | parse_fortigate_cef",
                 "workspace.fortigate_cef = { timezone: \"UTC\" }",
                 "workspace.fortigate_cef = { timezone: \"Not/AZone\" }",
                 "workspace.fortigate_cef = { timezone: \"local\" }",
@@ -2215,6 +2227,7 @@ def pipeline zeek_full_otlp {
                 .into_bytes(),
             ),
             (
+                &["parse_juniper_srx_syslog"][..],
                 "parse_juniper_srx_syslog",
                 "workspace.juniper_srx_syslog = { body: ingress, timezone: \"UTC\" }",
                 "workspace.juniper_srx_syslog = { body: ingress, timezone: \"Not/AZone\" }",
@@ -2225,7 +2238,8 @@ def pipeline zeek_full_otlp {
                 .into_bytes(),
             ),
             (
-                "parse_paloalto_cef",
+                &["parse_syslog", "parse_cef", "parse_paloalto_cef"][..],
+                "parse_syslog | parse_cef | parse_paloalto_cef",
                 "workspace.paloalto_cef = { timezone: \"UTC\" }",
                 "workspace.paloalto_cef = { timezone: \"Not/AZone\" }",
                 "workspace.paloalto_cef = { timezone: \"local\" }",
@@ -2236,43 +2250,44 @@ def pipeline zeek_full_otlp {
             ),
         ];
 
-        for (parser, supplied_setup, invalid_setup, local_setup, ingress) in cases {
-            let supplied = run_packaged_parser_json(parser, Some(supplied_setup), parser, &ingress);
-            assert_eq!(supplied["time"], expected, "{parser} supplied timezone");
+        for (parsers, process, supplied_setup, invalid_setup, local_setup, ingress) in cases {
+            let supplied =
+                run_packaged_parser_json(parsers, Some(supplied_setup), process, &ingress);
+            assert_eq!(supplied["time"], expected, "{process} supplied timezone");
 
-            let default_setup = match parser {
+            let default_setup = match process {
                 "parse_juniper_srx_syslog" => {
                     Some("workspace.juniper_srx_syslog = { body: ingress }")
                 }
                 _ => None,
             };
-            let defaulted = run_packaged_parser_json(parser, default_setup, parser, &ingress);
+            let defaulted = run_packaged_parser_json(parsers, default_setup, process, &ingress);
             // All RFC 3164 parsers with an undocumented source zone default to
             // the limpid host's system timezone (host-local most-likely
             // assumption); only vendor-documented UTC formats default to UTC.
             let default_expected = local_expected;
             assert_eq!(
                 defaulted["time"], default_expected,
-                "{parser} default timezone"
+                "{process} default timezone"
             );
 
             for invalid_setup in [invalid_setup, local_setup] {
                 let invalid =
-                    run_packaged_parser_pipeline(parser, Some(invalid_setup), parser, &ingress);
+                    run_packaged_parser_pipeline(parsers, Some(invalid_setup), process, &ingress);
                 assert_eq!(
                     invalid.termination,
                     PipelineTermination::Errored,
-                    "{parser}"
+                    "{process}"
                 );
                 assert!(
                     invalid.outputs.is_empty(),
-                    "{parser} emitted invalid timezone"
+                    "{process} emitted invalid timezone"
                 );
                 let reason = match &invalid.errored[0] {
                     ErroredEventContext::Process { reason, .. } => reason,
                     other => panic!("expected process error, got {other:?}"),
                 };
-                assert!(reason.contains("timezone"), "{parser}: {reason}");
+                assert!(reason.contains("timezone"), "{process}: {reason}");
             }
         }
     }
@@ -2280,7 +2295,7 @@ def pipeline zeek_full_otlp {
     #[test]
     fn time_normalization_runs_at_public_leaf_boundaries() {
         let auditd = run_packaged_parser_json(
-            "parse_auditd",
+            &["parse_auditd"],
             Some(
                 "workspace.auditd = { body: ingress }; workspace.auditd_class = parse_auditd_classify(workspace.auditd.body)",
             ),
@@ -2290,7 +2305,7 @@ def pipeline zeek_full_otlp {
         assert_eq!(auditd["time"], 1_710_000_000_123_000_000_i64);
 
         let juniper = run_packaged_parser_json(
-            "parse_juniper_srx_sd_syslog",
+            &["parse_juniper_srx_sd_syslog"],
             Some(
                 "workspace.juniper_srx_sd_syslog = { body: ingress }; workspace.srx_sd_class = parse_juniper_srx_sd_syslog_classify(workspace.juniper_srx_sd_syslog.body)",
             ),
@@ -2304,54 +2319,51 @@ def pipeline zeek_full_otlp {
     fn packaged_parser_public_leaves_reject_invalid_source_severity() {
         let cases = [
             (
-                "parse_asa",
+                &["parse_asa"][..],
                 "workspace.asa = { level: \"8\", body: \"Login permitted from 192.0.2.10/54321 to outside:198.51.100.5/SSH for user admin\" }",
                 "parse_asa_605005_login_permitted",
                 "invalid ASA payload severity level 8",
             ),
             (
-                "parse_aws_guardduty",
+                &["parse_aws_guardduty"][..],
                 "workspace.gd = { type: \"Recon:EC2/Test\", severity: 11 }; workspace.gd_type = aws_guardduty_split_type(workspace.gd.type); workspace.gd_tactic = \"Reconnaissance\"",
                 "parse_aws_guardduty_finding",
                 "invalid GuardDuty severity 11",
             ),
             (
-                "parse_azure_activity",
+                &["parse_azure_activity"][..],
                 "workspace.az = { level: \"TRACE\" }",
                 "parse_azure_activity_record",
                 "invalid Azure Activity Log level TRACE",
             ),
             (
-                "parse_fortigate_cef",
+                &["parse_fortigate_cef"][..],
                 "workspace.cef = { severity: 0 }",
                 "parse_fortigate_cef_traffic",
                 "invalid FortiGate CEF priority 0",
             ),
             (
-                "parse_okta_system",
+                &["parse_okta_system"][..],
                 "workspace.okta = { severity: \"TRACE\" }",
                 "parse_okta_user_authentication",
                 "invalid Okta System Log severity TRACE",
             ),
             (
-                "parse_winevent_json",
+                &["parse_winevent_json"][..],
                 "workspace.winevent = { EventType: \"TRACE\" }",
                 "parse_winevent_4624_logon_success",
                 "invalid NXLog Windows Event severity TRACE",
             ),
         ];
 
-        for (parser, setup, process, expected_error) in cases {
-            let result = run_packaged_parser_pipeline(parser, Some(setup), process, b"fixture");
+        for (parsers, setup, process, expected_error) in cases {
+            let result = run_packaged_parser_pipeline(parsers, Some(setup), process, b"fixture");
             assert_eq!(
                 result.termination,
                 PipelineTermination::Errored,
-                "{parser}:{process} unexpectedly succeeded"
+                "{process} unexpectedly succeeded"
             );
-            assert!(
-                result.outputs.is_empty(),
-                "{parser}:{process} emitted output"
-            );
+            assert!(result.outputs.is_empty(), "{process} emitted output");
             assert_eq!(result.errored.len(), 1);
             let reason = match &result.errored[0] {
                 ErroredEventContext::Process { reason, .. } => reason,
@@ -2359,7 +2371,7 @@ def pipeline zeek_full_otlp {
             };
             assert!(
                 reason.contains(expected_error),
-                "{parser}:{process} error was {reason:?}"
+                "{process} error was {reason:?}"
             );
         }
     }
@@ -2367,7 +2379,7 @@ def pipeline zeek_full_otlp {
     #[test]
     fn packaged_fortigate_dns_uses_rcode_not_error() {
         let with_rcode = run_packaged_parser_json(
-            "parse_fortigate_syslog",
+            &["parse_fortigate_syslog"],
             None,
             "parse_fortigate_syslog",
             b"<134>eventtime=1777284000123456789 level=notice type=utm subtype=dns action=blocked srcip=192.0.2.10 dstip=198.51.100.5 qname=example.test qtype=A rcode=NXDOMAIN error=SERVFAIL",
@@ -2375,7 +2387,7 @@ def pipeline zeek_full_otlp {
         assert_eq!(with_rcode["rcode_id"], 3);
 
         let without_rcode = run_packaged_parser_json(
-            "parse_fortigate_syslog",
+            &["parse_fortigate_syslog"],
             None,
             "parse_fortigate_syslog",
             b"<134>eventtime=1777284000123456789 level=notice type=utm subtype=dns action=blocked srcip=192.0.2.10 dstip=198.51.100.5 qname=example.test qtype=A error=NXDOMAIN",
@@ -2785,7 +2797,7 @@ def pipeline zeek_full_otlp {
         adapters.sort();
         assert_eq!(
             adapters.len(),
-            30,
+            31,
             "packaged source adapter inventory drift"
         );
 
@@ -2829,7 +2841,7 @@ def pipeline zeek_full_otlp {
     #[test]
     fn packaged_ocsf_severity_unknown_and_other_normalize_without_canonical_zero() {
         let unknown = run_packaged_parser_json(
-            "parse_ocsf",
+            &["parse_ocsf"],
             None,
             "parse_ocsf",
             br#"{"class_uid":4001,"severity_id":0}"#,
@@ -2838,7 +2850,7 @@ def pipeline zeek_full_otlp {
         assert!(unknown["severity_number"].is_null());
 
         let other = run_packaged_parser_json(
-            "parse_ocsf",
+            &["parse_ocsf"],
             None,
             "parse_ocsf",
             br#"{"class_uid":4001,"severity_id":99}"#,
@@ -2847,7 +2859,7 @@ def pipeline zeek_full_otlp {
         assert!(other["severity_number"].is_null());
 
         let error = run_packaged_parser_json(
-            "parse_ocsf",
+            &["parse_ocsf"],
             None,
             "parse_ocsf",
             br#"{"class_uid":4001,"severity_id":3}"#,
@@ -3871,7 +3883,98 @@ def pipeline zeek_full_otlp {
             Some("302013")
         );
 
-        let leef_wire = b"<14>1 2026-04-30T01:23:45Z cpgw01 CheckPoint - - LEEF:2.0|Check Point|VPN-1 & FireWall-1|R81|Accept|cat=Firewall\tsrc=192.0.2.10\tdst=198.51.100.5\tsrcPort=51234\tdstPort=443\tproto=tcp\trule=12\trule_name=Allow-Internet\taction=Accept\tservice=https\tusrName=alice";
+        // Generic transport/format chain: parse_syslog | parse_cef |
+        // cef_to_otlp with no vendor stage. CEF header severity 7 sits in
+        // the spec's High band (7-8) and must land on ERROR (17); the raw
+        // header fields surface as event.code / cef.* attributes.
+        let generic_cef_wire = b"<134>Apr 27 10:00:00 host01 CEF:0|ArcSight|Console|6.9|100|alert raised|7|src=192.0.2.10 spt=51234 dst=198.51.100.5 dpt=443 act=blocked msg=Example alert";
+        let generic_cef = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "cef_otlp",
+            generic_cef_wire,
+            json!({}),
+            received_at,
+        );
+        let generic_cef_record = &generic_cef.scope_logs[0].log_records[0];
+        assert_eq!(generic_cef_record.severity_number, 17);
+        assert_eq!(generic_cef_record.severity_text, "7");
+        assert_eq!(
+            otlp_string_attribute(&generic_cef_record.attributes, "event.code"),
+            Some("100")
+        );
+        assert_eq!(
+            otlp_string_attribute(&generic_cef_record.attributes, "cef.name"),
+            Some("alert raised")
+        );
+        assert_eq!(
+            otlp_string_attribute(&generic_cef_record.attributes, "event.action"),
+            Some("blocked")
+        );
+        assert_eq!(
+            otlp_string_attribute(&generic_cef_record.attributes, "source.ip"),
+            Some("192.0.2.10")
+        );
+        assert_eq!(
+            otlp_int_attribute(&generic_cef_record.attributes, "destination.port"),
+            Some(443)
+        );
+        assert_eq!(
+            otlp_string_attribute(
+                &generic_cef.resource.as_ref().expect("resource").attributes,
+                "observer.vendor"
+            ),
+            Some("ArcSight")
+        );
+        assert_eq!(
+            otlp_string_attribute(
+                &generic_cef.resource.as_ref().expect("resource").attributes,
+                "host.name"
+            ),
+            Some("host01")
+        );
+
+        // CEF also documents string Severity values (Unknown / Low /
+        // Medium / High / Very-High). A single band-wide value takes the
+        // band's smallest SeverityNumber: "High" → ERROR (17).
+        let generic_cef_string_wire = b"<134>Apr 27 10:00:00 host01 CEF:0|ArcSight|Console|6.9|100|alert raised|High|src=192.0.2.10 act=blocked";
+        let generic_cef_string = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "cef_otlp",
+            generic_cef_string_wire,
+            json!({}),
+            received_at,
+        );
+        let generic_cef_string_record = &generic_cef_string.scope_logs[0].log_records[0];
+        assert_eq!(generic_cef_string_record.severity_number, 17);
+        assert_eq!(generic_cef_string_record.severity_text, "High");
+        assert_eq!(
+            otlp_string_attribute(&generic_cef_string_record.attributes, "cef.severity"),
+            Some("High")
+        );
+
+        // "Unknown" is spec-valid but makes no importance claim, so
+        // severity_number stays unset (proto default 0) while the raw
+        // value is preserved as severity_text / cef.severity.
+        let generic_cef_unknown_wire = b"<134>Apr 27 10:00:00 host01 CEF:0|ArcSight|Console|6.9|100|alert raised|Unknown|src=192.0.2.10 act=blocked";
+        let generic_cef_unknown = run_packaged_otlp_resource_logs_at(
+            &cfg,
+            &funcs,
+            "cef_otlp",
+            generic_cef_unknown_wire,
+            json!({}),
+            received_at,
+        );
+        let generic_cef_unknown_record = &generic_cef_unknown.scope_logs[0].log_records[0];
+        assert_eq!(generic_cef_unknown_record.severity_number, 0);
+        assert_eq!(generic_cef_unknown_record.severity_text, "Unknown");
+        assert_eq!(
+            otlp_string_attribute(&generic_cef_unknown_record.attributes, "cef.severity"),
+            Some("Unknown")
+        );
+
+        let leef_wire =b"<14>1 2026-04-30T01:23:45Z cpgw01 CheckPoint - - LEEF:2.0|Check Point|VPN-1 & FireWall-1|R81|Accept|cat=Firewall\tsrc=192.0.2.10\tdst=198.51.100.5\tsrcPort=51234\tdstPort=443\tproto=tcp\trule=12\trule_name=Allow-Internet\taction=Accept\tservice=https\tusrName=alice";
         let checkpoint_leef = run_packaged_otlp_resource_logs_at(
             &cfg,
             &funcs,
@@ -4068,6 +4171,9 @@ def pipeline zeek_full_otlp {
 
         for resource_logs in [
             asa,
+            generic_cef,
+            generic_cef_string,
+            generic_cef_unknown,
             checkpoint_leef,
             checkpoint,
             fortigate_cef,

@@ -1,6 +1,12 @@
 // Summary:     Cisco ASA / FTD (ASA-syslog-compatibility) %ASA syslog
 //              messages → LSIS Authentication + Network Activity.
-// Reads:       ingress (raw wire) — syslog-wrapped %ASA-<level>-<msg_id> messages
+// Reads:       workspace.syslog.* (transport intake — populated by
+//              parse_syslog upstream)
+//                .msg (required, String) — syslog body carrying the
+//                     `%ASA-<level>-<msg_id>` message
+//                .timestamp (optional, String) — RFC 3164 wire timestamp
+//                .hostname (optional, String) — originating device, retained
+//                     by asa_to_otlp as Resource `host.name`
 //              workspace.asa.timezone (optional, String) — source device
 //              timezone override as an IANA name or fixed offset; the legacy
 //              RFC 3164 timestamp defaults to the limpid host's system
@@ -23,6 +29,16 @@
 // Firepower Threat Defense (FTD) running in ASA-syslog-compatibility mode.
 // Pure FTD eStreamer / Snort-3 / FMC syslog has its own format and would
 // land in a separate parser file (`parse_firepower_*.limpid`).
+//
+// Typical pipeline —
+//
+//   process parse_syslog | parse_asa | compose_ocsf | ocsf_to_egress
+//
+// The transport wrapper is unwrapped by `parse_syslog` upstream; this
+// parser consumes the syslog body (and transport timestamp / hostname)
+// from `workspace.syslog.*`. Separating the stages lets a pipeline
+// inspect and drop events after `parse_syslog` without paying the
+// vocabulary parse cost.
 //
 // Wire —    syslog-wrapped ASA messages —
 //          `<priority>timestamp host : %ASA-<level>-<msg_id>: <body>`
@@ -138,7 +154,6 @@ def process validate_asa_severity_number {
 
 def process parse_asa {
     let source_timezone = workspace.asa.timezone
-    workspace.syslog = syslog.parse(ingress)
     workspace.asa = regex_parse(
         workspace.syslog.msg,
         "^(?:[^:]*: )?%ASA-(?P<level>\\d)-(?P<msg_id>\\d+): (?P<body>.*)$"
