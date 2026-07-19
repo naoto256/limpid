@@ -8,6 +8,18 @@
 //!
 //! The input must start with `CEF:` — syslog wrapper handling is the
 //! caller's responsibility.
+//!
+//! The seven positionally-determined header fields land as direct keys
+//! of the result object; the data-driven Extension key=value pairs are
+//! isolated under the nested `extension` sub-object (raw blob under
+//! `extension_raw`). The two planes carry different trust: header
+//! values are fixed by position, extension keys are whatever the
+//! producer (or an injected payload) put on the wire, so they must not
+//! share a namespace. Before this split, an extension such as
+//! `severity=9` or `name=x` was pushed as a duplicate sibling of the
+//! header key — arena field reads resolved first-wins (header) but the
+//! owned workspace snapshot resolved last-wins, so downstream processes
+//! saw the header value silently replaced by the extension value.
 
 use crate::dsl::arena::EventArena;
 use crate::dsl::value::{ObjectBuilder, Value};
@@ -37,15 +49,19 @@ pub fn register(reg: &mut FunctionRegistry) {
                 FieldType::Union(vec![FieldType::Int, FieldType::String]),
             ),
             // Raw extension blob, as it appeared on the wire (before
-            // the `key=value` split that flattens individual fields
-            // into siblings of the header keys). Present only when the
-            // Extension section was non-empty; omitted otherwise to
-            // mirror `syslog.parse`'s treatment of `msg`. Useful for
+            // the `key=value` split). Present only when the Extension
+            // section was non-empty; omitted otherwise to mirror
+            // `syslog.parse`'s treatment of `msg`. Useful for
             // passthrough / re-emission, debugging the splitter, or
             // surfacing dialect-specific extension content that the
             // splitter doesn't decode (escape sequences, custom
             // separators).
-            FieldSpec::new(&["workspace", "ext"], FieldType::String),
+            FieldSpec::new(&["workspace", "extension_raw"], FieldType::String),
+            // Split extension key=value pairs, isolated in their own
+            // sub-object so data-driven keys can never collide with the
+            // positional header fields above. Individual keys are
+            // data-driven (wildcards).
+            FieldSpec::new(&["workspace", "extension"], FieldType::Object),
         ],
         wildcards: true,
         defaults_arg_indices: &[1],
@@ -88,15 +104,17 @@ fn parse_impl<'bump>(
     builder.push("severity", severity_value);
 
     // Emit the raw extension blob (omitted when empty, to mirror
-    // `syslog.parse`'s treatment of `msg`). This must come BEFORE the
-    // split so the raw form is captured before the splitter consumes
-    // its input; the split itself does not mutate `remaining`, but
-    // keeping the ordering explicit avoids future regressions.
+    // `syslog.parse`'s treatment of `msg`), then the split pairs in
+    // their own `extension` sub-object. The nesting is the collision
+    // barrier: extension keys named after header fields (`severity=`,
+    // `name=`, dialect quirks or log injection alike) stay in the
+    // extension plane and can never shadow a positional header value.
     if !remaining.is_empty() {
-        builder.push("ext", Value::String(arena.alloc_str(remaining)));
+        builder.push("extension_raw", Value::String(arena.alloc_str(remaining)));
+        let mut ext_builder = ObjectBuilder::new(arena);
+        parse_cef_extensions(arena, remaining, &mut ext_builder);
+        builder.push("extension", ext_builder.finish());
     }
-
-    parse_cef_extensions(arena, remaining, &mut builder);
 
     let parsed = builder.finish();
 
@@ -210,6 +228,17 @@ mod tests {
             .expect("parse should succeed")
     }
 
+    /// Look a key up inside the nested `extension` sub-object.
+    fn ext_lookup<'bump>(
+        entries: &'bump [(&'bump str, Value<'bump>)],
+        key: &str,
+    ) -> Option<Value<'bump>> {
+        let Some(Value::Object(ext)) = lookup(entries, "extension") else {
+            return None;
+        };
+        lookup(ext, key)
+    }
+
     #[test]
     fn header_fields_extracted() {
         let bump = ::bumpalo::Bump::new();
@@ -241,11 +270,11 @@ mod tests {
     }
 
     #[test]
-    fn extension_split_into_flat_keys_and_raw_ext() {
-        // Both forms must be present: the flat per-key form
-        // (`workspace.cef.src` etc., the documented authoring
-        // surface) AND the raw `ext` blob (the spec-bug fix —
-        // previously the raw form was lost).
+    fn extension_split_into_nested_keys_and_raw_blob() {
+        // Both forms must be present: the split per-key form under the
+        // nested `extension` sub-object (the documented authoring
+        // surface, isolated from the positional header plane) AND the
+        // raw `extension_raw` blob.
         let bump = ::bumpalo::Bump::new();
         let arena = EventArena::new(&bump);
         let owned = dummy_event();
@@ -258,24 +287,24 @@ mod tests {
         let Value::Object(entries) = v else {
             panic!("expected Object");
         };
-        // Flat per-key form
-        assert_eq!(lookup(entries, "src"), Some(Value::String("10.0.0.1")));
-        assert_eq!(lookup(entries, "dst"), Some(Value::String("10.0.0.2")));
-        assert_eq!(lookup(entries, "act"), Some(Value::String("accept")));
-        // Raw ext blob
+        // Split per-key form, isolated under `extension`
+        assert_eq!(ext_lookup(entries, "src"), Some(Value::String("10.0.0.1")));
+        assert_eq!(ext_lookup(entries, "dst"), Some(Value::String("10.0.0.2")));
+        assert_eq!(ext_lookup(entries, "act"), Some(Value::String("accept")));
+        // Raw blob
         assert_eq!(
-            lookup(entries, "ext"),
+            lookup(entries, "extension_raw"),
             Some(Value::String("src=10.0.0.1 dst=10.0.0.2 act=accept"))
         );
     }
 
     #[test]
-    fn empty_extensions_omits_ext_field() {
-        // CEF allows an empty Extension section. When empty, `ext`
-        // must be omitted entirely (mirrors syslog.parse's treatment
-        // of empty `msg`), so callers can write `if workspace.cef.ext
-        // { ... }` against a presence test rather than against an
-        // empty-string test.
+    fn empty_extensions_omits_extension_fields() {
+        // CEF allows an empty Extension section. When empty, both
+        // `extension_raw` and the `extension` sub-object must be
+        // omitted entirely (mirrors syslog.parse's treatment of empty
+        // `msg`), so callers can write presence tests rather than
+        // empty-string tests.
         let bump = ::bumpalo::Bump::new();
         let arena = EventArena::new(&bump);
         let owned = dummy_event();
@@ -289,10 +318,14 @@ mod tests {
         // Header still emitted.
         assert_eq!(lookup(entries, "version"), Some(Value::String("0")));
         assert_eq!(lookup(entries, "severity"), Some(Value::Int(5)));
-        // ext must be absent (not "" or null).
+        // Both extension planes must be absent (not "" or null).
         assert!(
-            lookup(entries, "ext").is_none(),
-            "ext key must be omitted when Extensions are empty"
+            lookup(entries, "extension_raw").is_none(),
+            "extension_raw must be omitted when Extensions are empty"
+        );
+        assert!(
+            lookup(entries, "extension").is_none(),
+            "extension sub-object must be omitted when Extensions are empty"
         );
     }
 
@@ -333,11 +366,11 @@ mod tests {
             panic!("expected Object");
         };
         assert_eq!(
-            lookup(entries, "msg"),
+            ext_lookup(entries, "msg"),
             Some(Value::String("Failed login attempt"))
         );
-        assert_eq!(lookup(entries, "user"), Some(Value::String("alice")));
-        assert_eq!(lookup(entries, "src"), Some(Value::String("10.0.0.1")));
+        assert_eq!(ext_lookup(entries, "user"), Some(Value::String("alice")));
+        assert_eq!(ext_lookup(entries, "src"), Some(Value::String("10.0.0.1")));
     }
 
     #[test]
@@ -439,10 +472,10 @@ mod tests {
             panic!("expected Object");
         };
         assert_eq!(
-            lookup(entries, "request"),
+            ext_lookup(entries, "request"),
             Some(Value::String("https://x.example.com/a?b=1&c=2"))
         );
-        assert_eq!(lookup(entries, "src"), Some(Value::String("10.0.0.1")));
+        assert_eq!(ext_lookup(entries, "src"), Some(Value::String("10.0.0.1")));
     }
 
     #[test]
@@ -464,12 +497,15 @@ mod tests {
         let Value::Object(entries) = v else {
             panic!("expected Object");
         };
-        assert_eq!(lookup(entries, "vendor_field"), Some(Value::String("v1")));
         assert_eq!(
-            lookup(entries, "cs1Label"),
+            ext_lookup(entries, "vendor_field"),
+            Some(Value::String("v1"))
+        );
+        assert_eq!(
+            ext_lookup(entries, "cs1Label"),
             Some(Value::String("Source IP"))
         );
-        assert_eq!(lookup(entries, "cs1"), Some(Value::String("10.0.0.1")));
+        assert_eq!(ext_lookup(entries, "cs1"), Some(Value::String("10.0.0.1")));
     }
 
     #[test]
@@ -502,7 +538,7 @@ mod tests {
         };
         // The trailing `act=block` is what tells us the 7-field
         // count was respected (the 8th field is the extension blob).
-        assert_eq!(lookup(entries, "act"), Some(Value::String("block")));
+        assert_eq!(ext_lookup(entries, "act"), Some(Value::String("block")));
     }
 
     #[test]
@@ -510,8 +546,9 @@ mod tests {
         // Some vendors emit the same key twice (intentionally for
         // multi-value sources, accidentally for buggy templates).
         // `ObjectBuilder` does not deduplicate, so both `src` entries
-        // are emitted in source order; `lookup` returns the first
-        // match, making the observable semantics first-one-wins. Pin
+        // are emitted in source order inside the `extension`
+        // sub-object; `ext_lookup` returns the first match, making the
+        // observable semantics first-one-wins. Pin
         // it here so a future change to dedup or reverse insertion
         // order is a visible, intentional break instead of a silent
         // downstream-pipeline behaviour flip.
@@ -526,7 +563,50 @@ mod tests {
         let Value::Object(entries) = v else {
             panic!("expected Object");
         };
-        assert_eq!(lookup(entries, "src"), Some(Value::String("10.0.0.1")));
-        assert_eq!(lookup(entries, "dst"), Some(Value::String("8.8.8.8")));
+        assert_eq!(ext_lookup(entries, "src"), Some(Value::String("10.0.0.1")));
+        assert_eq!(ext_lookup(entries, "dst"), Some(Value::String("8.8.8.8")));
+    }
+
+    #[test]
+    fn header_named_extension_keys_cannot_shadow_header_fields() {
+        // Extensions named after header fields (`severity=`, `name=`,
+        // `ext=`) — dialect quirks, buggy templates, or log injection —
+        // must stay isolated in the `extension` sub-object. Before the
+        // split, `ObjectBuilder` pushed them as duplicate siblings of
+        // the header keys: arena field reads resolved first-wins (the
+        // header), but the owned workspace snapshot resolved last-wins,
+        // so a downstream process read `severity = "9"` in place of the
+        // positional header value 7. The nesting removes the duplicate
+        // keys entirely.
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = dummy_event();
+        let bevent = owned.view_in(&arena);
+        let reg = make_registry();
+        let line = arena
+            .alloc_str("CEF:0|Vendor|Product|1.0|100|realname|7|severity=9 name=fakename ext=x");
+        let v = parse_into(&reg, &bevent, &arena, line);
+        let Value::Object(entries) = v else {
+            panic!("expected Object");
+        };
+        // Header plane untouched.
+        assert_eq!(lookup(entries, "severity"), Some(Value::Int(7)));
+        assert_eq!(lookup(entries, "name"), Some(Value::String("realname")));
+        // No duplicate top-level keys: each header key appears once.
+        for key in ["severity", "name"] {
+            assert_eq!(
+                entries.iter().filter(|(k, _)| *k == key).count(),
+                1,
+                "header key {key} must appear exactly once"
+            );
+        }
+        // Colliding extensions isolated in the extension plane.
+        assert_eq!(ext_lookup(entries, "severity"), Some(Value::String("9")));
+        assert_eq!(ext_lookup(entries, "name"), Some(Value::String("fakename")));
+        assert_eq!(ext_lookup(entries, "ext"), Some(Value::String("x")));
+        assert_eq!(
+            lookup(entries, "extension_raw"),
+            Some(Value::String("severity=9 name=fakename ext=x"))
+        );
     }
 }

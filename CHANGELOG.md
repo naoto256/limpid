@@ -8,6 +8,31 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+### Changed — cef.parse isolates Extension keys from the positional header (breaking)
+
+`cef.parse()` previously flattened the data-driven Extension key=value
+pairs into the same object as the seven positionally-determined header
+fields. An extension named after a header field (`severity=`, `name=`
+— dialect quirk, buggy template, or log injection alike) was pushed as
+a duplicate sibling key: arena field reads resolved to the header
+(first-wins) but the persisted workspace snapshot resolved to the
+extension value (last-wins), so downstream processes saw the header
+silently replaced. Data of different trust levels must not share a
+plane, so the split pairs now land in a nested sub-object and the raw
+blob is renamed to avoid confusion with it:
+
+| 0.7.14 path | 0.7.15 path |
+|---|---|
+| `workspace.cef.<extension-key>` | `workspace.cef.extension.<extension-key>` |
+| `workspace.cef.ext` (raw blob) | `workspace.cef.extension_raw` |
+
+Header fields (`version` / `device_vendor` / `device_product` /
+`device_version` / `signature_id` / `name` / `severity`) are unchanged.
+Out-of-tree pipelines reading extension keys off `cef.parse()` output
+must add the `extension.` segment. The bundled CEF parsers
+(`parse_cef` / `parse_fortigate_cef` / `parse_paloalto_cef`) are
+updated accordingly.
+
 ### Changed — transport / format unwrapping separated from vocabulary parsing (breaking)
 
 Bundled vocabulary parsers no longer unwrap their transport or format

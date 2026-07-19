@@ -272,7 +272,7 @@ The two-sided rule of thumb for `workspace.lsis.parsed.*`:
 - **Parsers fill `workspace.lsis.parsed` in canonical LSIS shape — OCSF-vocabulary, not OCSF-bound.** Whenever a vendor field has a clean OCSF home, use the OCSF field name (`src_endpoint.ip`, `actor.user.name`). When it doesn't, carry it on `workspace.lsis.parsed` under a vendor-meaningful name; do not throw the data away just because OCSF has no slot.
 - **Composers may assume `workspace.lsis.parsed` follows canonical LSIS shape — but they must not assume strict OCSF compliance.** A composer reads the fields it needs and tolerates extras / absences. An OCSF composer renders `workspace.lsis.parsed.*` to OCSF JSON in the `workspace.lsis.composed.ocsf` slot; an ECS composer would translate the same facts into an ECS JSON slot, taking advantage of the OCSF-vocabulary overlap without depending on it.
 
-A parser must not write vendor-specific format names into the facts layer (`workspace.cef.src`, `workspace.fgt_session_id` left at top level); a composer must not read vendor-specific format names directly (`workspace.cef.src`). The contract between them is `workspace.lsis.parsed.*`, full stop. Each rename or pass-through layer beyond that is a drift risk.
+A parser must not write vendor-specific format names into the facts layer (`workspace.cef.extension.src`, `workspace.fgt_session_id` left at top level); a composer must not read vendor-specific format names directly (`workspace.cef.extension.src`). The contract between them is `workspace.lsis.parsed.*`, full stop. Each rename or pass-through layer beyond that is a drift risk.
 
 ### Keep composers pure
 

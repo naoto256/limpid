@@ -67,7 +67,7 @@ After editing the config, reload the daemon to pick up the change — either `su
 
 FortiGate `traffic` events are too noisy to forward to AMA, but you still want them in the on-disk archive for after-the-fact investigation. So: archive everything, then drop FortiGate traffic, then forward what's left.
 
-To recognise a FortiGate traffic event you need to parse the FortiGate event into a shape you can branch on. The `include` directive can pull in DSL parts from the shipped snippet library at `/usr/share/limpid/snippets/`. The wire is layered — syslog transport around a CEF-formatted body around FortiGate's dialect — and the library ships one parser per layer: `parse_syslog` unwraps the transport into `workspace.syslog.*`, `parse_cef` decodes the CEF header / extensions into `workspace.cef.*`, and `parse_fortigate_cef` interprets the FortiGate dialect and fills `workspace.lsis.parsed.*` — the facts layer of LSIS, the pack's shared naming convention for parser output (see the [pack snippet README](../packaging/snippets/README.md#lsis--the-limpid-snippet-intermediate-schema) for the full three-layer contract). In particular the FortiGate `cat=<category>:<subtype>` extension lands at `workspace.cef.cat` (e.g. `traffic:forward`, `utm:ips`, `event:system`) after `parse_cef`, and is the reliable key for routing. (The set of shipped snippets will grow over time — see [Snippet Library](./snippets/README.md) for what is available today.)
+To recognise a FortiGate traffic event you need to parse the FortiGate event into a shape you can branch on. The `include` directive can pull in DSL parts from the shipped snippet library at `/usr/share/limpid/snippets/`. The wire is layered — syslog transport around a CEF-formatted body around FortiGate's dialect — and the library ships one parser per layer: `parse_syslog` unwraps the transport into `workspace.syslog.*`, `parse_cef` decodes the CEF header / extensions into `workspace.cef.*`, and `parse_fortigate_cef` interprets the FortiGate dialect and fills `workspace.lsis.parsed.*` — the facts layer of LSIS, the pack's shared naming convention for parser output (see the [pack snippet README](../packaging/snippets/README.md#lsis--the-limpid-snippet-intermediate-schema) for the full three-layer contract). In particular the FortiGate `cat=<category>:<subtype>` extension lands at `workspace.cef.extension.cat` (e.g. `traffic:forward`, `utm:ips`, `event:system`) after `parse_cef`, and is the reliable key for routing. (The set of shipped snippets will grow over time — see [Snippet Library](./snippets/README.md) for what is available today.)
 
 ```limpid
 // /etc/limpid/limpid.conf  — add at the top
@@ -95,7 +95,7 @@ def pipeline main {
     input fw_tcp
     output archive                                            // everything goes to disk
     process parse_syslog | parse_cef | parse_fortigate_cef    // transport | format | vendor vocabulary
-    if workspace.cef.cat == "traffic:forward" { drop }        // drop the noise
+    if workspace.cef.extension.cat == "traffic:forward" { drop }        // drop the noise
     output ama                                                // only the survivors reach AMA
 }
 ```
@@ -106,7 +106,7 @@ The first is the magic from Step 2. Even though the `process` and `if drop` afte
 
 The second is what the pipeline body actually contains: an `input`, two `output`s, a `process`, and an `if/drop`. There is no separate "filter" or "router" abstraction — routing decisions live in the pipeline as ordinary statements, in the order they execute. That mirrors how you'd describe the pipeline in words: "archive everything, parse it as FortiGate, drop traffic events, forward the rest to AMA."
 
-Worth one more note: `parse_cef` populates `workspace.cef.cat` (from the FortiGate `cat=` extension) and `parse_fortigate_cef` builds `workspace.lsis.parsed.*` from it; the `if` reads from `workspace.cef.cat`. The daemon itself knows nothing about FortiGate — that knowledge lives entirely in the snippet, which maps the FortiGate event into limpid's canonical intermediate.
+Worth one more note: `parse_cef` populates `workspace.cef.extension.cat` (from the FortiGate `cat=` extension) and `parse_fortigate_cef` builds `workspace.lsis.parsed.*` from it; the `if` reads from `workspace.cef.extension.cat`. The daemon itself knows nothing about FortiGate — that knowledge lives entirely in the snippet, which maps the FortiGate event into limpid's canonical intermediate.
 
 ## Step 4 — Confirm the drop is actually happening
 
@@ -212,7 +212,7 @@ def pipeline main {
     input fw_tcp
     output archive
     process parse_syslog | parse_cef | parse_fortigate_cef
-    if workspace.cef.cat == "traffic:forward" { drop }
+    if workspace.cef.extension.cat == "traffic:forward" { drop }
     output ama
 }
 ```
@@ -244,7 +244,7 @@ table {
 ```limpid
 // /etc/limpid/processes/dedup_fortigate_traffic.limpid
 def process dedup_fortigate_traffic {
-    if workspace.cef.cat == "traffic:forward" {
+    if workspace.cef.extension.cat == "traffic:forward" {
         let key = workspace.lsis.parsed.src_endpoint.ip + "|" + workspace.lsis.parsed.dst_endpoint.ip
         if table_lookup("traffic_seen", key) != null {
             drop

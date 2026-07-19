@@ -2,15 +2,16 @@
 //              dispatched by CEF cat subtype.
 // Reads:       workspace.cef.* (format intake — populated by
 //              parse_syslog | parse_cef upstream)
-//                .cat (required, String) — FortiGate `cat=<category>:<subtype>`
-//                     extension, the dispatch key
+//                .extension.cat (required, String) — FortiGate
+//                     `cat=<category>:<subtype>` extension, the dispatch key
 //                .severity (optional, Int) — CEF header priority
 //                     (FortiGate dialect 1-8)
 //                .device_vendor (optional, String) — CEF header vendor
 //                .device_product (optional, String) — CEF header product
 //                .device_version (optional, String) — CEF header version
 //                (plus the per-leaf standard / `FTNTFGT*` extension keys
-//                documented on each subtype leaf below)
+//                under workspace.cef.extension.*, documented on each
+//                subtype leaf below)
 //              workspace.syslog.* (transport intake)
 //                .timestamp (optional, String) — RFC 3164 wire timestamp
 //                .msg (optional, String) — syslog body, retained by
@@ -190,7 +191,7 @@ def function fortigate_cef_metadata(vendor, product, version) {
 
 def process parse_fortigate_cef {
     workspace.cef.timestamp = workspace.syslog.timestamp
-    switch workspace.cef.cat {
+    switch workspace.cef.extension.cat {
         // Traffic logs (Network Activity 4001)
         "traffic:forward"    { process parse_fortigate_cef_traffic }
         "traffic:local"      { process parse_fortigate_cef_traffic }
@@ -216,7 +217,7 @@ def process parse_fortigate_cef {
         "event:system"           { process parse_fortigate_cef_event_system }
         "event:wireless"         { process parse_fortigate_cef_event_wireless }
         "event:security-rating"  { process parse_fortigate_cef_event_security_rating }
-        default { error "parse_fortigate_cef: unsupported FortiGate CEF cat: ${workspace.cef.cat}" }
+        default { error "parse_fortigate_cef: unsupported FortiGate CEF cat: ${workspace.cef.extension.cat}" }
     }
 }
 
@@ -228,30 +229,30 @@ def process parse_fortigate_cef {
 //   src / spt / dst / dpt / proto / act / app / in / out / msg
 def process parse_fortigate_cef_traffic {
     process validate_fortigate_cef_severity_number
-    let proto_num = to_int(workspace.cef.proto)
+    let proto_num = to_int(workspace.cef.extension.proto)
     workspace.lsis.parsed = {
         class_uid:    4001,
         category_uid: 4,
-        activity_id:  fortigate_cef_action_to_activity_id(workspace.cef.act),
+        activity_id:  fortigate_cef_action_to_activity_id(workspace.cef.extension.act),
         severity_number: workspace.cef.severity_number,
         time:            workspace.cef.time,
         src_endpoint: {
-            ip:   workspace.cef.src,
-            port: to_int(workspace.cef.spt)
+            ip:   workspace.cef.extension.src,
+            port: to_int(workspace.cef.extension.spt)
         },
         dst_endpoint: {
-            ip:   workspace.cef.dst,
-            port: to_int(workspace.cef.dpt)
+            ip:   workspace.cef.extension.dst,
+            port: to_int(workspace.cef.extension.dpt)
         },
         connection_info: {
             protocol_num:  proto_num,
             protocol_name: fortigate_cef_proto_name(proto_num)
         },
         traffic: {
-            bytes_in:  to_int(workspace.cef.in),
-            bytes_out: to_int(workspace.cef.out)
+            bytes_in:  to_int(workspace.cef.extension.in),
+            bytes_out: to_int(workspace.cef.extension.out)
         },
-        message:  workspace.cef.msg,
+        message:  workspace.cef.extension.msg,
         metadata: fortigate_cef_metadata(
             workspace.cef.device_vendor,
             workspace.cef.device_product,
@@ -277,25 +278,25 @@ def process parse_fortigate_cef_utm_ips {
         activity_id:    1,
         severity_number: workspace.cef.severity_number,
         time:            workspace.cef.time,
-        disposition_id: fortigate_cef_utm_disposition_id(workspace.cef.act),
+        disposition_id: fortigate_cef_utm_disposition_id(workspace.cef.extension.act),
         finding_info: {
-            title: workspace.cef.FTNTFGTattack,
-            uid:   workspace.cef.FTNTFGTattackid,
+            title: workspace.cef.extension.FTNTFGTattack,
+            uid:   workspace.cef.extension.FTNTFGTattackid,
             types: ["IDS/IPS"],
-            src_url: { url_string: workspace.cef.FTNTFGTref }
+            src_url: { url_string: workspace.cef.extension.FTNTFGTref }
         },
         attack: {
-            technique: { name: workspace.cef.FTNTFGTattack }
+            technique: { name: workspace.cef.extension.FTNTFGTattack }
         },
         src_endpoint: {
-            ip:   workspace.cef.src,
-            port: to_int(workspace.cef.spt)
+            ip:   workspace.cef.extension.src,
+            port: to_int(workspace.cef.extension.spt)
         },
         dst_endpoint: {
-            ip:   workspace.cef.dst,
-            port: to_int(workspace.cef.dpt)
+            ip:   workspace.cef.extension.dst,
+            port: to_int(workspace.cef.extension.dpt)
         },
-        message:  workspace.cef.msg,
+        message:  workspace.cef.extension.msg,
         metadata: fortigate_cef_metadata(
             workspace.cef.device_vendor,
             workspace.cef.device_product,
@@ -317,7 +318,7 @@ def process parse_fortigate_cef_utm_ips {
 //   suser                  — authenticated username (standard CEF)
 def process parse_fortigate_cef_utm_webfilter {
     process validate_fortigate_cef_severity_number
-    let activity = switch workspace.cef.act {
+    let activity = switch workspace.cef.extension.act {
         "blocked"     { 2 }
         "block"       { 2 }
         "passthrough" { 1 }
@@ -333,27 +334,27 @@ def process parse_fortigate_cef_utm_webfilter {
         severity_number: workspace.cef.severity_number,
         time:            workspace.cef.time,
         src_endpoint: {
-            ip:   workspace.cef.src,
-            port: to_int(workspace.cef.spt)
+            ip:   workspace.cef.extension.src,
+            port: to_int(workspace.cef.extension.spt)
         },
         dst_endpoint: {
-            ip:   workspace.cef.dst,
-            port: to_int(workspace.cef.dpt)
+            ip:   workspace.cef.extension.dst,
+            port: to_int(workspace.cef.extension.dpt)
         },
         http_request: {
-            url:        { url_string: workspace.cef.request },
-            http_method: workspace.cef.requestMethod
+            url:        { url_string: workspace.cef.extension.request },
+            http_method: workspace.cef.extension.requestMethod
         },
         web_resources: [
             {
-                url:      { url_string: workspace.cef.request },
-                category: workspace.cef.FTNTFGTcatdesc
+                url:      { url_string: workspace.cef.extension.request },
+                category: workspace.cef.extension.FTNTFGTcatdesc
             }
         ],
         actor: {
-            user: { name: workspace.cef.suser }
+            user: { name: workspace.cef.extension.suser }
         },
-        message:  workspace.cef.msg,
+        message:  workspace.cef.extension.msg,
         metadata: fortigate_cef_metadata(
             workspace.cef.device_vendor,
             workspace.cef.device_product,
@@ -379,16 +380,16 @@ def process parse_fortigate_cef_utm_antivirus {
         activity_id:    1,
         severity_number: workspace.cef.severity_number,
         time:            workspace.cef.time,
-        disposition_id: fortigate_cef_utm_disposition_id(workspace.cef.act),
+        disposition_id: fortigate_cef_utm_disposition_id(workspace.cef.extension.act),
         finding_info: {
-            title:   workspace.cef.FTNTFGTvirus,
-            uid:     workspace.cef.FTNTFGTvirusid,
+            title:   workspace.cef.extension.FTNTFGTvirus,
+            uid:     workspace.cef.extension.FTNTFGTvirusid,
             types:   ["Malware"],
-            src_url: { url_string: workspace.cef.FTNTFGTref }
+            src_url: { url_string: workspace.cef.extension.FTNTFGTref }
         },
         malware: [
             {
-                name:               workspace.cef.FTNTFGTvirus,
+                name:               workspace.cef.extension.FTNTFGTvirus,
                 classification_ids: [1]
             }
         ],
@@ -399,21 +400,21 @@ def process parse_fortigate_cef_utm_antivirus {
         evidences: [
             {
                 file: {
-                    name:   workspace.cef.fname,
-                    hashes: [{ value: workspace.cef.FTNTFGTanalyticscksum }]
+                    name:   workspace.cef.extension.fname,
+                    hashes: [{ value: workspace.cef.extension.FTNTFGTanalyticscksum }]
                 },
-                url: { url_string: workspace.cef.request }
+                url: { url_string: workspace.cef.extension.request }
             }
         ],
         src_endpoint: {
-            ip:   workspace.cef.src,
-            port: to_int(workspace.cef.spt)
+            ip:   workspace.cef.extension.src,
+            port: to_int(workspace.cef.extension.spt)
         },
         dst_endpoint: {
-            ip:   workspace.cef.dst,
-            port: to_int(workspace.cef.dpt)
+            ip:   workspace.cef.extension.dst,
+            port: to_int(workspace.cef.extension.dpt)
         },
-        message:  workspace.cef.msg,
+        message:  workspace.cef.extension.msg,
         metadata: fortigate_cef_metadata(
             workspace.cef.device_vendor,
             workspace.cef.device_product,
@@ -433,32 +434,32 @@ def process parse_fortigate_cef_utm_dlp {
         activity_id:    1,
         severity_number: workspace.cef.severity_number,
         time:            workspace.cef.time,
-        disposition_id: fortigate_cef_utm_disposition_id(workspace.cef.act),
+        disposition_id: fortigate_cef_utm_disposition_id(workspace.cef.extension.act),
         finding_info: {
-            title: workspace.cef.FTNTFGTfiltername,
-            uid:   workspace.cef.FTNTFGTfilteridx,
+            title: workspace.cef.extension.FTNTFGTfiltername,
+            uid:   workspace.cef.extension.FTNTFGTfilteridx,
             types: ["Data Loss"]
         },
         evidences: [
             {
                 file: {
-                    name: workspace.cef.FTNTFGTfilename,
-                    size: to_int(workspace.cef.FTNTFGTfilesize)
+                    name: workspace.cef.extension.FTNTFGTfilename,
+                    size: to_int(workspace.cef.extension.FTNTFGTfilesize)
                 }
             }
         ],
         actor: {
-            user: { name: workspace.cef.suser }
+            user: { name: workspace.cef.extension.suser }
         },
         src_endpoint: {
-            ip:   workspace.cef.src,
-            port: to_int(workspace.cef.spt)
+            ip:   workspace.cef.extension.src,
+            port: to_int(workspace.cef.extension.spt)
         },
         dst_endpoint: {
-            ip:   workspace.cef.dst,
-            port: to_int(workspace.cef.dpt)
+            ip:   workspace.cef.extension.dst,
+            port: to_int(workspace.cef.extension.dpt)
         },
-        message:  workspace.cef.msg,
+        message:  workspace.cef.extension.msg,
         metadata: fortigate_cef_metadata(
             workspace.cef.device_vendor,
             workspace.cef.device_product,
@@ -480,27 +481,27 @@ def process parse_fortigate_cef_utm_appctrl {
         activity_id:    1,
         severity_number: workspace.cef.severity_number,
         time:            workspace.cef.time,
-        disposition_id: fortigate_cef_utm_disposition_id(workspace.cef.act),
+        disposition_id: fortigate_cef_utm_disposition_id(workspace.cef.extension.act),
         finding_info: {
-            title: workspace.cef.app,
-            uid:   workspace.cef.FTNTFGTappid,
+            title: workspace.cef.extension.app,
+            uid:   workspace.cef.extension.FTNTFGTappid,
             types: ["Application"]
         },
         evidences: [
-            { process: { name: workspace.cef.app } }
+            { process: { name: workspace.cef.extension.app } }
         ],
         actor: {
-            user: { name: workspace.cef.suser }
+            user: { name: workspace.cef.extension.suser }
         },
         src_endpoint: {
-            ip:   workspace.cef.src,
-            port: to_int(workspace.cef.spt)
+            ip:   workspace.cef.extension.src,
+            port: to_int(workspace.cef.extension.spt)
         },
         dst_endpoint: {
-            ip:   workspace.cef.dst,
-            port: to_int(workspace.cef.dpt)
+            ip:   workspace.cef.extension.dst,
+            port: to_int(workspace.cef.extension.dpt)
         },
-        message:  workspace.cef.msg,
+        message:  workspace.cef.extension.msg,
         metadata: fortigate_cef_metadata(
             workspace.cef.device_vendor,
             workspace.cef.device_product,
@@ -516,13 +517,13 @@ def process parse_fortigate_cef_utm_appctrl {
 // FortiGate DNS filter — qname / qtype / response code / verdict.
 def process parse_fortigate_cef_utm_dns {
     process validate_fortigate_cef_severity_number
-    let activity = switch workspace.cef.act {
+    let activity = switch workspace.cef.extension.act {
         "blocked"     { 1 }
         "redirected"  { 1 }
         "passthrough" { 6 }
         default       { 6 }
     }
-    let rcode = switch workspace.cef.FTNTFGTerror {
+    let rcode = switch workspace.cef.extension.FTNTFGTerror {
         "NOERROR"  { 0 }
         "FORMERR"  { 1 }
         "SERVFAIL" { 2 }
@@ -538,13 +539,13 @@ def process parse_fortigate_cef_utm_dns {
         severity_number: workspace.cef.severity_number,
         time:            workspace.cef.time,
         rcode_id:     rcode,
-        src_endpoint: { ip: workspace.cef.src },
-        dst_endpoint: { ip: workspace.cef.dst },
+        src_endpoint: { ip: workspace.cef.extension.src },
+        dst_endpoint: { ip: workspace.cef.extension.dst },
         query: {
-            hostname: workspace.cef.FTNTFGTqname,
-            type:     workspace.cef.FTNTFGTqtype
+            hostname: workspace.cef.extension.FTNTFGTqname,
+            type:     workspace.cef.extension.FTNTFGTqtype
         },
-        message:  workspace.cef.msg,
+        message:  workspace.cef.extension.msg,
         metadata: fortigate_cef_metadata(
             workspace.cef.device_vendor,
             workspace.cef.device_product,
@@ -560,7 +561,7 @@ def process parse_fortigate_cef_utm_dns {
 // FortiGate email filter — sender / recipient / subject / message-id.
 def process parse_fortigate_cef_utm_emailfilter {
     process validate_fortigate_cef_severity_number
-    let activity = switch workspace.cef.act {
+    let activity = switch workspace.cef.extension.act {
         "blocked"     { 6 }
         "quarantined" { 6 }
         "passthrough" { 6 }
@@ -573,15 +574,15 @@ def process parse_fortigate_cef_utm_emailfilter {
         severity_number: workspace.cef.severity_number,
         time:            workspace.cef.time,
         direction_id: 0,
-        src_endpoint: { ip: workspace.cef.src },
-        dst_endpoint: { ip: workspace.cef.dst },
+        src_endpoint: { ip: workspace.cef.extension.src },
+        dst_endpoint: { ip: workspace.cef.extension.dst },
         email: {
-            from:        workspace.cef.suser,
-            to:          [workspace.cef.duser],
-            subject:     workspace.cef.FTNTFGTsubject,
-            message_uid: workspace.cef.FTNTFGTmsgid
+            from:        workspace.cef.extension.suser,
+            to:          [workspace.cef.extension.duser],
+            subject:     workspace.cef.extension.FTNTFGTsubject,
+            message_uid: workspace.cef.extension.FTNTFGTmsgid
         },
-        message:  workspace.cef.msg,
+        message:  workspace.cef.extension.msg,
         metadata: fortigate_cef_metadata(
             workspace.cef.device_vendor,
             workspace.cef.device_product,
@@ -603,35 +604,35 @@ def process parse_fortigate_cef_utm_waf {
         activity_id:    1,
         severity_number: workspace.cef.severity_number,
         time:            workspace.cef.time,
-        disposition_id: fortigate_cef_utm_disposition_id(workspace.cef.act),
+        disposition_id: fortigate_cef_utm_disposition_id(workspace.cef.extension.act),
         finding_info: {
-            title: workspace.cef.FTNTFGTsignature,
-            uid:   workspace.cef.FTNTFGTsignatureid,
+            title: workspace.cef.extension.FTNTFGTsignature,
+            uid:   workspace.cef.extension.FTNTFGTsignatureid,
             types: ["WAF"]
         },
         attack: {
-            technique: { name: workspace.cef.FTNTFGTsignature }
+            technique: { name: workspace.cef.extension.FTNTFGTsignature }
         },
         evidences: [
             {
                 http_request: {
-                    url:         { url_string: workspace.cef.request },
-                    http_method: workspace.cef.requestMethod
+                    url:         { url_string: workspace.cef.extension.request },
+                    http_method: workspace.cef.extension.requestMethod
                 }
             }
         ],
         actor: {
-            user: { name: workspace.cef.suser }
+            user: { name: workspace.cef.extension.suser }
         },
         src_endpoint: {
-            ip:   workspace.cef.src,
-            port: to_int(workspace.cef.spt)
+            ip:   workspace.cef.extension.src,
+            port: to_int(workspace.cef.extension.spt)
         },
         dst_endpoint: {
-            ip:   workspace.cef.dst,
-            port: to_int(workspace.cef.dpt)
+            ip:   workspace.cef.extension.dst,
+            port: to_int(workspace.cef.extension.dpt)
         },
-        message:  workspace.cef.msg,
+        message:  workspace.cef.extension.msg,
         metadata: fortigate_cef_metadata(
             workspace.cef.device_vendor,
             workspace.cef.device_product,
@@ -664,26 +665,26 @@ def process parse_fortigate_cef_utm_ssl {
         activity_id:    1,
         severity_number: workspace.cef.severity_number,
         time:            workspace.cef.time,
-        disposition_id: fortigate_cef_utm_disposition_id(workspace.cef.act),
+        disposition_id: fortigate_cef_utm_disposition_id(workspace.cef.extension.act),
         finding_info: {
-            title: workspace.cef.FTNTFGTeventsubtype,
-            desc:  workspace.cef.msg,
+            title: workspace.cef.extension.FTNTFGTeventsubtype,
+            desc:  workspace.cef.extension.msg,
             types: ["TLS Anomaly"]
         },
         tls: {
-            version: workspace.cef.FTNTFGTtlsver,
-            sni:     workspace.cef.FTNTFGTsni
+            version: workspace.cef.extension.FTNTFGTtlsver,
+            sni:     workspace.cef.extension.FTNTFGTsni
         },
         src_endpoint: {
-            ip:   workspace.cef.src,
-            port: to_int(workspace.cef.spt)
+            ip:   workspace.cef.extension.src,
+            port: to_int(workspace.cef.extension.spt)
         },
         dst_endpoint: {
-            ip:       workspace.cef.dst,
-            port:     to_int(workspace.cef.dpt),
-            hostname: workspace.cef.dhost
+            ip:       workspace.cef.extension.dst,
+            port:     to_int(workspace.cef.extension.dpt),
+            hostname: workspace.cef.extension.dhost
         },
-        message:  workspace.cef.msg,
+        message:  workspace.cef.extension.msg,
         metadata: fortigate_cef_metadata(
             workspace.cef.device_vendor,
             workspace.cef.device_product,
@@ -713,7 +714,7 @@ def process parse_fortigate_cef_utm_ssl {
 //   proto              — IP proto (17 UDP / 6 TCP)
 def process parse_fortigate_cef_utm_voip {
     process validate_fortigate_cef_severity_number
-    let activity = switch workspace.cef.outcome {
+    let activity = switch workspace.cef.extension.outcome {
         "start"  { 1 }
         "end"    { 2 }
         default  { 6 }
@@ -725,19 +726,19 @@ def process parse_fortigate_cef_utm_voip {
         severity_number: workspace.cef.severity_number,
         time:            workspace.cef.time,
         src_endpoint: {
-            ip:   workspace.cef.src,
-            port: to_int(workspace.cef.spt)
+            ip:   workspace.cef.extension.src,
+            port: to_int(workspace.cef.extension.spt)
         },
         dst_endpoint: {
-            ip:   workspace.cef.dst,
-            port: to_int(workspace.cef.dpt)
+            ip:   workspace.cef.extension.dst,
+            port: to_int(workspace.cef.extension.dpt)
         },
         connection_info: {
-            protocol_num:  to_int(workspace.cef.proto),
-            protocol_name: fortigate_cef_proto_name(to_int(workspace.cef.proto))
+            protocol_num:  to_int(workspace.cef.extension.proto),
+            protocol_name: fortigate_cef_proto_name(to_int(workspace.cef.extension.proto))
         },
-        app_name: workspace.cef.FTNTFGTvoip_proto,
-        message:  "VoIP " + workspace.cef.FTNTFGTkind + " " + workspace.cef.suser + " -> " + workspace.cef.duser + " (call_id=" + workspace.cef.FTNTFGTcall_id + ")",
+        app_name: workspace.cef.extension.FTNTFGTvoip_proto,
+        message:  "VoIP " + workspace.cef.extension.FTNTFGTkind + " " + workspace.cef.extension.suser + " -> " + workspace.cef.extension.duser + " (call_id=" + workspace.cef.extension.FTNTFGTcall_id + ")",
         metadata: fortigate_cef_metadata(
             workspace.cef.device_vendor,
             workspace.cef.device_product,
@@ -751,7 +752,7 @@ def process parse_fortigate_cef_utm_voip {
 // ---------------------------------------------------------------------------
 def process parse_fortigate_cef_event_user {
     process validate_fortigate_cef_severity_number
-    let activity = switch workspace.cef.act {
+    let activity = switch workspace.cef.extension.act {
         "login"           { 1 }
         "logon"           { 1 }
         "auth-logon"      { 1 }
@@ -763,7 +764,7 @@ def process parse_fortigate_cef_event_user {
         "login-failed"    { 1 }
         default           { 0 }
     }
-    let status = switch workspace.cef.act {
+    let status = switch workspace.cef.extension.act {
         "auth-fail"       { 2 }
         "failed-login"    { 2 }
         "login-failed"    { 2 }
@@ -777,12 +778,12 @@ def process parse_fortigate_cef_event_user {
         time:            workspace.cef.time,
         status_id:    status,
         user: {
-            name: workspace.cef.suser
+            name: workspace.cef.extension.suser
         },
         src_endpoint: {
-            ip: workspace.cef.src
+            ip: workspace.cef.extension.src
         },
-        message:  workspace.cef.msg,
+        message:  workspace.cef.extension.msg,
         metadata: fortigate_cef_metadata(
             workspace.cef.device_vendor,
             workspace.cef.device_product,
@@ -796,7 +797,7 @@ def process parse_fortigate_cef_event_user {
 // ---------------------------------------------------------------------------
 def process parse_fortigate_cef_event_vpn {
     process validate_fortigate_cef_severity_number
-    let activity = switch workspace.cef.act {
+    let activity = switch workspace.cef.extension.act {
         "tunnel-up"       { 1 }
         "ssl-login-fail"  { 1 }
         "ssl-new-con"     { 1 }
@@ -804,7 +805,7 @@ def process parse_fortigate_cef_event_vpn {
         "ssl-disconnect"  { 2 }
         default           { 0 }
     }
-    let status = switch workspace.cef.act {
+    let status = switch workspace.cef.extension.act {
         "ssl-login-fail"  { 2 }
         default           { 1 }
     }
@@ -816,12 +817,12 @@ def process parse_fortigate_cef_event_vpn {
         time:            workspace.cef.time,
         status_id:    status,
         user: {
-            name: workspace.cef.suser
+            name: workspace.cef.extension.suser
         },
         src_endpoint: {
-            ip: workspace.cef.src
+            ip: workspace.cef.extension.src
         },
-        message:  workspace.cef.msg,
+        message:  workspace.cef.extension.msg,
         metadata: fortigate_cef_metadata(
             workspace.cef.device_vendor,
             workspace.cef.device_product,
@@ -847,14 +848,14 @@ def process parse_fortigate_cef_event_system {
         severity_number: workspace.cef.severity_number,
         time:            workspace.cef.time,
         finding_info: {
-            title: workspace.cef.act,
-            desc:  workspace.cef.FTNTFGTlogdesc,
+            title: workspace.cef.extension.act,
+            desc:  workspace.cef.extension.FTNTFGTlogdesc,
             types: ["System Event"]
         },
         actor: {
-            user: { name: workspace.cef.suser }
+            user: { name: workspace.cef.extension.suser }
         },
-        message:  workspace.cef.msg,
+        message:  workspace.cef.extension.msg,
         metadata: fortigate_cef_metadata(
             workspace.cef.device_vendor,
             workspace.cef.device_product,
@@ -868,7 +869,7 @@ def process parse_fortigate_cef_event_system {
 // ---------------------------------------------------------------------------
 def process parse_fortigate_cef_event_wireless {
     process validate_fortigate_cef_severity_number
-    let activity = switch workspace.cef.act {
+    let activity = switch workspace.cef.extension.act {
         "client-connect"    { 1 }
         "client-associate"  { 1 }
         "client-disconnect" { 2 }
@@ -882,14 +883,14 @@ def process parse_fortigate_cef_event_wireless {
         severity_number: workspace.cef.severity_number,
         time:            workspace.cef.time,
         src_endpoint: {
-            ip:  workspace.cef.src,
-            mac: workspace.cef.FTNTFGTsrcmac
+            ip:  workspace.cef.extension.src,
+            mac: workspace.cef.extension.FTNTFGTsrcmac
         },
         dst_endpoint: {
-            ip:  workspace.cef.dst,
-            mac: workspace.cef.FTNTFGTapmac
+            ip:  workspace.cef.extension.dst,
+            mac: workspace.cef.extension.FTNTFGTapmac
         },
-        message:  workspace.cef.msg,
+        message:  workspace.cef.extension.msg,
         metadata: fortigate_cef_metadata(
             workspace.cef.device_vendor,
             workspace.cef.device_product,
@@ -925,18 +926,18 @@ def process parse_fortigate_cef_event_security_rating {
         severity_number: workspace.cef.severity_number,
         time:            workspace.cef.time,
         finding_info: {
-            title: "Security Rating " + workspace.cef.FTNTFGTauditreporttype,
-            uid:   workspace.cef.FTNTFGTauditid,
-            desc:  workspace.cef.FTNTFGTlogdesc,
+            title: "Security Rating " + workspace.cef.extension.FTNTFGTauditreporttype,
+            uid:   workspace.cef.extension.FTNTFGTauditid,
+            desc:  workspace.cef.extension.FTNTFGTlogdesc,
             types: ["Security Audit"]
         },
         unmapped: {
-            audit_score:    workspace.cef.FTNTFGTauditscore,
-            critical_count: to_int(workspace.cef.FTNTFGTcriticalcount),
-            high_count:     to_int(workspace.cef.FTNTFGThighcount),
-            medium_count:   to_int(workspace.cef.FTNTFGTmediumcount),
-            low_count:      to_int(workspace.cef.FTNTFGTlowcount),
-            passed_count:   to_int(workspace.cef.FTNTFGTpassedcount)
+            audit_score:    workspace.cef.extension.FTNTFGTauditscore,
+            critical_count: to_int(workspace.cef.extension.FTNTFGTcriticalcount),
+            high_count:     to_int(workspace.cef.extension.FTNTFGThighcount),
+            medium_count:   to_int(workspace.cef.extension.FTNTFGTmediumcount),
+            low_count:      to_int(workspace.cef.extension.FTNTFGTlowcount),
+            passed_count:   to_int(workspace.cef.extension.FTNTFGTpassedcount)
         },
         metadata: fortigate_cef_metadata(
             workspace.cef.device_vendor,
@@ -1012,8 +1013,8 @@ def process fortigate_cef_to_otlp {
         [{ key: "event.kind", value: { string_value: fortigate_cef_otlp_event_kind(workspace.lsis.parsed.class_uid) } }],
         [{ key: "event.category", value: { array_value: { values: [{ string_value: fortigate_cef_otlp_event_category(workspace.lsis.parsed.class_uid) }] } } }],
         [{ key: "event.type", value: { array_value: { values: [{ string_value: fortigate_cef_otlp_event_type(workspace.lsis.parsed.class_uid) }] } } }],
-        switch workspace.cef.act != null {
-            true { [{ key: "event.action", value: { string_value: workspace.cef.act } }] }
+        switch workspace.cef.extension.act != null {
+            true { [{ key: "event.action", value: { string_value: workspace.cef.extension.act } }] }
             default { [] }
         },
         switch fortigate_cef_otlp_event_outcome(workspace.lsis.parsed.status_id) != null {

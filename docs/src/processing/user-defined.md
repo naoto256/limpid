@@ -10,11 +10,11 @@ You define a process with `def process <name> { ... }`. Inside the body you call
 def process enrich_fortigate {
     workspace.cef = cef.parse(workspace.syslog.msg)   // capture parser output
 
-    if workspace.cef.src != null {
-        workspace.geo = geoip(workspace.cef.src)
+    if workspace.cef.extension.src != null {
+        workspace.geo = geoip(workspace.cef.extension.src)
     }
 
-    egress = "${workspace.cef.device_product} ${workspace.cef.src} -> ${workspace.cef.dst} ${workspace.cef.act}"
+    egress = "${workspace.cef.device_product} ${workspace.cef.extension.src} -> ${workspace.cef.extension.dst} ${workspace.cef.extension.act}"
 }
 ```
 
