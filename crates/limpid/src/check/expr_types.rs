@@ -59,10 +59,24 @@ pub fn infer(expr: &Expr, bindings: &Bindings, registry: &FunctionRegistry) -> F
             args,
             block_arg: _,
         } => {
-            if namespace.is_none() && name == "filter" {
-                args.first()
-                    .map(|arg| filter_return_type(infer(arg, bindings, registry)))
-                    .unwrap_or(FieldType::Any)
+            if namespace.is_none() {
+                match name.as_str() {
+                    "filter" => args
+                        .first()
+                        .map(|arg| filter_return_type(infer(arg, bindings, registry)))
+                        .unwrap_or(FieldType::Any),
+                    "coalesce" => {
+                        coalesce_return_type(args.iter().map(|arg| infer(arg, bindings, registry)))
+                    }
+                    "len" => args
+                        .first()
+                        .map(|arg| len_return_type(infer(arg, bindings, registry)))
+                        .unwrap_or(FieldType::Any),
+                    _ => registry
+                        .signature(None, name)
+                        .map(|s| s.ret.clone())
+                        .unwrap_or(FieldType::Any),
+                }
             } else {
                 registry
                     .signature(namespace.as_deref(), name)
@@ -121,6 +135,67 @@ fn filter_return_type(input: FieldType) -> FieldType {
         // An unknown or invalid input stays unknown to avoid cascading
         // diagnostics after the call-site argument check.
         _ => FieldType::Any,
+    }
+}
+
+/// Infer the first non-null result of `coalesce` without losing the
+/// possibility that its final argument is null. Earlier arguments contribute
+/// only their non-null members because runtime evaluation skips their nulls.
+fn coalesce_return_type(types: impl IntoIterator<Item = FieldType>) -> FieldType {
+    let types: Vec<FieldType> = types.into_iter().collect();
+    let final_can_be_null = types.last().is_some_and(type_can_be_null);
+    let mut result = types
+        .into_iter()
+        .filter_map(type_without_null)
+        .reduce(FieldType::union);
+
+    if final_can_be_null {
+        result = Some(match result {
+            Some(non_null) => FieldType::union(non_null, FieldType::Null),
+            None => FieldType::Null,
+        });
+    }
+    result.unwrap_or(FieldType::Any)
+}
+
+fn type_can_be_null(ty: &FieldType) -> bool {
+    match ty {
+        FieldType::Null | FieldType::Any => true,
+        FieldType::Union(members) => members.iter().any(type_can_be_null),
+        _ => false,
+    }
+}
+
+fn type_without_null(ty: FieldType) -> Option<FieldType> {
+    match ty {
+        FieldType::Null => None,
+        FieldType::Union(members) => members
+            .into_iter()
+            .filter_map(type_without_null)
+            .reduce(FieldType::union),
+        other => Some(other),
+    }
+}
+
+/// `len` returns null exactly for null or non-collection scalar inputs. Keep
+/// the registered broad contract for `Any`, but preserve precise input types
+/// after expression-level narrowing.
+fn len_return_type(input: FieldType) -> FieldType {
+    match input {
+        FieldType::String | FieldType::Object | FieldType::Array | FieldType::Bytes => {
+            FieldType::Int
+        }
+        FieldType::Null
+        | FieldType::Bool
+        | FieldType::Int
+        | FieldType::Float
+        | FieldType::Timestamp => FieldType::Null,
+        FieldType::Union(members) => members
+            .into_iter()
+            .map(len_return_type)
+            .reduce(FieldType::union)
+            .unwrap_or(FieldType::Any),
+        FieldType::Any => FieldType::union(FieldType::Int, FieldType::Null),
     }
 }
 
@@ -501,7 +576,12 @@ fn check_binop(
 
     match op {
         BinOp::Eq | BinOp::Ne => {
-            if !type_compatible(&lt, &rt) && !type_compatible(&rt, &lt) {
+            // Equality against null is a presence check. A reusable process
+            // may receive a concrete call-site type in one pipeline and a
+            // nullable type in another, so call-site specialization must not
+            // turn its generic guard into an always-same warning.
+            let null_presence_check = lt == FieldType::Null || rt == FieldType::Null;
+            if !null_presence_check && !type_compatible(&lt, &rt) && !type_compatible(&rt, &lt) {
                 diagnostics.push(warning(
                     pipeline_name,
                     format!(
@@ -732,5 +812,57 @@ fn warning(pipeline: &str, message: String, span: Option<Span>) -> Diagnostic {
         message: format!("[pipeline {}] {}", pipeline, message),
         span,
         help: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coalesce_removes_null_from_non_final_arguments() {
+        assert_eq!(
+            coalesce_return_type([
+                FieldType::union(FieldType::Array, FieldType::Null),
+                FieldType::Array,
+            ]),
+            FieldType::Array
+        );
+        assert_eq!(
+            coalesce_return_type([
+                FieldType::union(FieldType::String, FieldType::Null),
+                FieldType::Null,
+                FieldType::Int,
+            ]),
+            FieldType::union(FieldType::String, FieldType::Int)
+        );
+    }
+
+    #[test]
+    fn coalesce_preserves_null_only_from_the_final_argument() {
+        assert_eq!(
+            coalesce_return_type([
+                FieldType::String,
+                FieldType::union(FieldType::Int, FieldType::Null),
+            ]),
+            FieldType::union(
+                FieldType::union(FieldType::String, FieldType::Int),
+                FieldType::Null,
+            )
+        );
+        assert_eq!(
+            coalesce_return_type([FieldType::Null, FieldType::Null]),
+            FieldType::Null
+        );
+    }
+
+    #[test]
+    fn len_reflects_nullable_and_non_nullable_inputs() {
+        assert_eq!(len_return_type(FieldType::Array), FieldType::Int);
+        assert_eq!(len_return_type(FieldType::Null), FieldType::Null);
+        assert_eq!(
+            len_return_type(FieldType::union(FieldType::Array, FieldType::Null)),
+            FieldType::union(FieldType::Int, FieldType::Null)
+        );
     }
 }
