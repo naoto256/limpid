@@ -6,7 +6,7 @@
 //                .hostname (optional, String) — SSH server hostname
 //                .time (optional, Int) — epoch nanoseconds of the event
 // Writes:      workspace.lsis.parsed.* — 3002 (Authentication);
-//              openssh_to_otlp writes source-owned OTLP Resource, Scope,
+//              openssh_to_otlp writes source-owned OTLP Resource,
 //              Body, and LogRecord attributes.
 // Category:    Endpoint / host audit (Unix)
 // Test corpus: synthetic (sample sshd bodies in this header)
@@ -455,10 +455,10 @@ def process openssh_to_otlp {
         [{ key: "observer.product", value: { string_value: "OpenSSH" } }],
         [{ key: "observer.type", value: { string_value: "host" } }],
         switch workspace.openssh.hostname != null { true { [{ key: "host.name", value: { string_value: workspace.openssh.hostname } }] } default { [] } },
+        [{ key: "service.name", value: { string_value: "sshd" } }],
         [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
         [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
     )
-    workspace.lsis.shed.otlp.scope.name = "sshd"
     workspace.lsis.shed.otlp.log_record.body = { string_value: workspace.openssh.body }
     workspace.lsis.shed.otlp.log_record.attributes = concat(
         [{ key: "event.kind", value: { string_value: "event" } }],

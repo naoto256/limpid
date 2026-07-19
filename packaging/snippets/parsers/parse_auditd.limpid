@@ -7,7 +7,7 @@
 //              1007 (Process Activity), 1001 (File System Activity), 2004
 //              (Detection Finding), dispatched by record type; unmapped types
 //              route to error_log. auditd_to_otlp writes source-owned OTLP
-//              Resource, Scope, Body, and LogRecord attributes.
+//              Resource, Body, and LogRecord attributes.
 // Category:    Endpoint / host audit (Unix)
 // Test corpus: public (elastic/integrations auditd corpus — 69 records across
 //              ~45 record types)
@@ -914,10 +914,10 @@ def process auditd_to_otlp {
         [{ key: "observer.product", value: { string_value: "Linux Audit" } }],
         [{ key: "observer.type", value: { string_value: "host" } }],
         switch workspace.auditd.hostname != null { true { [{ key: "host.name", value: { string_value: workspace.auditd.hostname } }] } default { [] } },
+        [{ key: "service.name", value: { string_value: "auditd" } }],
         [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
         [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
     )
-    workspace.lsis.shed.otlp.scope.name = "auditd"
     workspace.lsis.shed.otlp.log_record.body = { string_value: workspace.auditd.body }
     workspace.lsis.shed.otlp.log_record.attributes = concat(
         [{ key: "event.kind", value: { string_value: auditd_otlp_event_kind(workspace.lsis.parsed.class_uid) } }],

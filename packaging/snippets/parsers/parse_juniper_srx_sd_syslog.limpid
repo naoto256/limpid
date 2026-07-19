@@ -6,7 +6,7 @@
 // Writes:      workspace.lsis.parsed.* — RT_FLOW / APPTRACK → 4001, RT_IDP / RT_IDS /
 //              RT_UTM (AV, antispam, content-filter) / RT_AAMW / RT_SECINTEL →
 //              2004, RT_UTM WEBFILTER_URL_* → 4002. juniper_srx_sd_syslog_to_otlp
-//              writes source-owned OTLP Resource, Scope, Body, and attributes.
+//              writes source-owned OTLP Resource, Body, and attributes.
 // Category:    Network firewall / IPS
 // Test corpus: public (elastic/integrations juniper_srx fixtures — 88 events
 //              across RT_FLOW / APPTRACK / RT_IDP / RT_IDS / RT_UTM / RT_AAMW /
@@ -1013,13 +1013,13 @@ def process juniper_srx_sd_syslog_to_otlp {
             true { [{ key: "host.name", value: { string_value: workspace.srx_sd_class.host } }] }
             default { [] }
         },
+        switch workspace.srx_sd_class.daemon != null {
+            true { [{ key: "service.name", value: { string_value: "RT_${workspace.srx_sd_class.daemon}" } }] }
+            default { [] }
+        },
         [{ key: "telemetry.sdk.name", value: { string_value: "limpid" } }],
         [{ key: "telemetry.sdk.version", value: { string_value: version() } }]
     )
-    workspace.lsis.shed.otlp.scope.name = switch workspace.srx_sd_class.daemon != null {
-        true    { "RT_${workspace.srx_sd_class.daemon}" }
-        default { null }
-    }
     workspace.lsis.shed.otlp.log_record.body = { string_value: workspace.juniper_srx_sd_syslog.body }
     workspace.lsis.shed.otlp.log_record.attributes = concat(
         [{ key: "event.kind", value: { string_value: juniper_srx_sd_syslog_otlp_event_kind(workspace.lsis.parsed.class_uid) } }],
