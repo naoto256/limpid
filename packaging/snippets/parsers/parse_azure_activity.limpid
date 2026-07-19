@@ -1,15 +1,10 @@
-// Azure Activity Log JSON parser
-//
-// Summary:     Azure Activity Log events JSON → LSIS API Activity.
-// Reads:       ingress (raw wire) — one Activity Log event per ingress (flat
-//              per-record form; unwrap Event Hub batches upstream)
-// Writes:      workspace.lsis.parsed.* — 6003 (API Activity), dispatched over the
-//              8 documented categories; unknown categories route to error_log.
-//              azure_activity_to_otlp additionally writes source-specific
-//              workspace.lsis.shed.otlp Resource, Body, and LogRecord attributes.
-// Category:    Cloud audit (API control plane)
+// Facade: process parse_azure_activity,
+//         process azure_activity_to_otlp
+// Category: Cloud audit (API control plane)
 // Test corpus: spec-only (Microsoft Learn Azure Activity Log schema reference
 //              + documentation samples for the 8 categories; no live capture)
+//
+// Azure Activity Log JSON parser
 //
 // Wire —        JSON — one Activity Log event per `ingress`. Azure emits
 //              Activity Log records in two delivery shapes (event hub
@@ -263,6 +258,11 @@ def process parse_azure_activity_record {
 // `error` so a future Azure RP addition surfaces in the DLQ on day
 // one rather than silently zero-mapping.
 
+// Process: parse_azure_activity
+// Summary: Azure Activity Log events JSON → LSIS API Activity.
+// Reads: ingress
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_azure_activity {
     workspace.az = parse_json(ingress)
 
@@ -338,6 +338,16 @@ def function azure_activity_otlp_event_outcome(status_id) {
     }
 }
 
+// Process: azure_activity_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.az.*
+//        .subscriptionId (optional, String)
+//        workspace.lsis.parsed.*
+//        .status_id (optional, Int)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process azure_activity_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "cloud.provider", value: { string_value: "azure" } }],

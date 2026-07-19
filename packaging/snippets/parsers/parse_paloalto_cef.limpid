@@ -1,36 +1,6 @@
-// Summary:     Palo Alto Networks PAN-OS CEF → LSIS, dispatched by CEF
-//              name (TRAFFIC / THREAT / URL / …).
-// Reads:       workspace.cef.* (format intake — populated by
-//              parse_syslog | parse_cef upstream)
-//                .name (required, String) — CEF header Name, which PAN-OS
-//                     uses to encode the log type (the dispatch key)
-//                .severity (optional, Int) — CEF header severity
-//                     (PAN-OS dialect 1-5)
-//                .device_vendor (optional, String) — CEF header vendor
-//                .device_product (optional, String) — CEF header product
-//                .device_version (optional, String) — CEF header version
-//                (plus the per-leaf standard / `cs<n>` extension keys
-//                under workspace.cef.extension.*, documented on each
-//                subtype leaf below)
-//              workspace.syslog.* (transport intake)
-//                .timestamp (optional, String) — RFC 3164 wire timestamp
-//                .msg (optional, String) — syslog body, retained by
-//                     paloalto_cef_to_otlp as the OTLP Body
-//              workspace.paloalto_cef.timezone (optional, String) — source
-//              device timezone override as an IANA name or fixed offset; the
-//              legacy RFC 3164 wrapper defaults to the limpid host's system
-//              timezone (PAN-OS documents configurable device time zones but
-//              does not assign a zone to this legacy CEF wrapper timestamp)
-//              https://docs.paloaltonetworks.com/ngfw/help/10-1/device/device-setup-management
-//              The default assumes the firewall and limpid share the same
-//              correct system timezone — the most likely deployment when the
-//              zone is undocumented. Override this slot with an IANA name or
-//              fixed offset when the source zone is known to differ.
-// Writes:      workspace.lsis.parsed.* — TRAFFIC → 4001, THREAT / WILDFIRE → 2004,
-//              URL → 6004, GLOBALPROTECT / AUTHENTICATION → 3002; see the
-//              subtype leaves below. paloalto_cef_to_otlp writes source-owned
-//              OTLP Resource, Body, and LogRecord attributes.
-// Category:    Network firewall / IPS
+// Facade: process parse_paloalto_cef,
+//         process paloalto_cef_to_otlp
+// Category: Network firewall / IPS
 // Test corpus: synthetic (documentation-derived sample wires in this header)
 //
 // Typical pipeline —
@@ -170,6 +140,21 @@ include "../functions/proto_num.limpid"
 // because the CEF wrapper itself carries no timestamp; the per-leaf
 // normalize process interprets it in the declared device timezone.
 
+// Process: parse_paloalto_cef
+// Summary: Palo Alto Networks PAN-OS CEF → LSIS, dispatched by CEF name (TRAFFIC / THREAT / URL / …).
+// Reads: workspace.cef.* (format intake — populated by
+//        .name (required, String) — CEF header Name, which PAN-OS
+//        .severity (optional, Int) — CEF header severity
+//        .device_vendor (optional, String) — CEF header vendor
+//        .device_product (optional, String) — CEF header product
+//        .device_version (optional, String) — CEF header version
+//        workspace.syslog.* (transport intake)
+//        .timestamp (optional, String) — RFC 3164 wire timestamp
+//        .msg (optional, String) — syslog body, retained by
+//        workspace.paloalto_cef.*
+//        .timezone (optional, String) — source
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_paloalto_cef {
     workspace.cef.timestamp = workspace.syslog.timestamp
     switch workspace.cef.name {
@@ -571,6 +556,18 @@ def function paloalto_cef_otlp_event_outcome(status_id) {
     }
 }
 
+// Process: paloalto_cef_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.cef.*
+//        .device_vendor (optional, String)
+//        workspace.syslog.*
+//        .msg (optional, String)
+//        workspace.lsis.parsed.*
+//        .class_uid (optional, Int)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process paloalto_cef_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         switch workspace.cef.device_vendor != null {

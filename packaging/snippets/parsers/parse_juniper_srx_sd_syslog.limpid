@@ -1,13 +1,6 @@
-// Summary:     Juniper SRX sd-syslog (RFC 5424 + [junos@ SD block]) → LSIS by
-//              daemon / MSGID.
-// Reads:       workspace.juniper_srx_sd_syslog.* (bridge — see Bridges below)
-//                .body (required, String) — the full RFC 5424 wire INCLUDING the leading `<PRI>1`
-//                .hostname (optional, String) — collector-side override (parser prefers the wire's HOSTNAME field via classify)
-// Writes:      workspace.lsis.parsed.* — RT_FLOW / APPTRACK → 4001, RT_IDP / RT_IDS /
-//              RT_UTM (AV, antispam, content-filter) / RT_AAMW / RT_SECINTEL →
-//              2004, RT_UTM WEBFILTER_URL_* → 4002. juniper_srx_sd_syslog_to_otlp
-//              writes source-owned OTLP Resource, Body, and attributes.
-// Category:    Network firewall / IPS
+// Facade: process parse_juniper_srx_sd_syslog,
+//         process juniper_srx_sd_syslog_to_otlp
+// Category: Network firewall / IPS
 // Test corpus: public (elastic/integrations juniper_srx fixtures — 88 events
 //              across RT_FLOW / APPTRACK / RT_IDP / RT_IDS / RT_UTM / RT_AAMW /
 //              RT_SECINTEL)
@@ -354,6 +347,13 @@ def process parse_juniper_srx_sd_syslog_normalize_time {
     }
 }
 
+// Process: parse_juniper_srx_sd_syslog
+// Summary: Juniper SRX sd-syslog (RFC 5424 + [junos@ SD block]) → LSIS by daemon / MSGID.
+// Reads: workspace.juniper_srx_sd_syslog.* (bridge — see Bridges below)
+//        .body (required, String) — the full RFC 5424 wire INCLUDING the leading `<PRI>1`
+//        .hostname (optional, String) — collector-side override (parser prefers the wire's HOSTNAME field via classify)
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_juniper_srx_sd_syslog {
     // @requires: workspace.juniper_srx_sd_syslog.body      (required, String)
     // @requires: workspace.juniper_srx_sd_syslog.hostname  (optional, String)
@@ -1004,6 +1004,18 @@ def function juniper_srx_sd_syslog_otlp_event_outcome(status_id) {
     }
 }
 
+// Process: juniper_srx_sd_syslog_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.srx_sd_class.*
+//        .host (optional, String)
+//        workspace.juniper_srx_sd_syslog.*
+//        .body (optional, String)
+//        workspace.lsis.parsed.*
+//        .class_uid (optional, Int)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process juniper_srx_sd_syslog_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "observer.vendor", value: { string_value: "Juniper Networks" } }],

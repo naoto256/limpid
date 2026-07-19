@@ -1,7 +1,4 @@
-// Summary:     RFC 3164 BSD syslog timestamp (`Apr 30 01:23:45`) plus
-//              a resolved source timezone → Timestamp, with year-rollover clamp.
-// Signature:   parse_datetime_rfc3164(text, timezone) → Timestamp | null;
-//              parse_datetime_rfc3164_in_timezone(text, timezone) → Timestamp
+// Facade: function parse_datetime_rfc3164
 // Test corpus: unit (RFC 3164 timestamp shapes; year-end rollover
 //              clamp cases)
 //
@@ -55,6 +52,9 @@ def function parse_datetime_rfc3164_in_timezone(text, timezone) {
     }
 }
 
+// Function: parse_datetime_rfc3164
+// Summary: RFC 3164 BSD syslog timestamp (`Apr 30 01:23:45`) plus a resolved source timezone → Timestamp, with year-rollover clamp.
+// Signature: parse_datetime_rfc3164(String, String) → Timestamp | Null
 def function parse_datetime_rfc3164(text, timezone) {
     switch timezone {
         null    { null }

@@ -1,14 +1,6 @@
-// Summary:     Linux kernel audit records (auditd / audispd / auditbeat wire
-//              text) → LSIS, dispatched by record type.
-// Reads:       workspace.auditd.* (bridge — see Bridges below)
-//                .body (required, String) — the auditd record
-//                .hostname (optional, String) — host where audit ran
-// Writes:      workspace.lsis.parsed.* — 3002 (Authentication), 3001 (Account Change),
-//              1007 (Process Activity), 1001 (File System Activity), 2004
-//              (Detection Finding), dispatched by record type; unmapped types
-//              route to error_log. auditd_to_otlp writes source-owned OTLP
-//              Resource, Body, and LogRecord attributes.
-// Category:    Endpoint / host audit (Unix)
+// Facade: process parse_auditd,
+//         process auditd_to_otlp
+// Category: Endpoint / host audit (Unix)
 // Test corpus: public (elastic/integrations auditd corpus — 69 records across
 //              ~45 record types)
 //
@@ -413,6 +405,13 @@ def process parse_auditd_normalize_time {
     }
 }
 
+// Process: parse_auditd
+// Summary: Linux kernel audit records (auditd / audispd / auditbeat wire text) → LSIS, dispatched by record type.
+// Reads: workspace.auditd.* (bridge — see Bridges below)
+//        .body (required, String) — the auditd record
+//        .hostname (optional, String) — host where audit ran
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_auditd {
     // @requires: workspace.auditd.body      (required, String)
     // @requires: workspace.auditd.hostname  (optional, String)
@@ -908,6 +907,18 @@ def function auditd_otlp_event_outcome(status_id) {
     switch status_id { 1 { "success" } 2 { "failure" } default { null } }
 }
 
+// Process: auditd_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.auditd.*
+//        .hostname (optional, String)
+//        workspace.lsis.parsed.*
+//        .class_uid (optional, Int)
+//        workspace.auditd_class.*
+//        .type (optional, String)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process auditd_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "observer.vendor", value: { string_value: "Linux" } }],

@@ -1,18 +1,12 @@
-// AWS VPC Flow Logs parser
-//
-// Summary:     AWS VPC Flow Logs text records (v2 default + v5 custom
-//              formats) → LSIS Network Activity.
-// Reads:       ingress (raw wire) — one space-separated flow-log record per
-//              line; dispatch by the leading version token
-// Writes:      workspace.lsis.parsed.* — 4001 (Network Activity); unknown version
-//              tokens route to error_log. aws_vpc_flow_to_otlp additionally writes
-//              source-specific workspace.lsis.shed.otlp Resource, Body, and
-//              LogRecord attributes.
-// Category:    Cloud network (data plane)
+// Facade: process parse_aws_vpc_flow,
+//         process aws_vpc_flow_to_otlp
+// Category: Cloud network (data plane)
 // Test corpus: spec-only (AWS VPC Flow Logs documentation column layouts;
 //              synthesised sample lines below cover ACCEPT / REJECT / NODATA /
 //              SKIPDATA and IPv4 + IPv6 — verify the v5 leaf against live
 //              delivery before production)
+//
+// AWS VPC Flow Logs parser
 //
 // Vendor notes — Amazon Web Services VPC Flow Logs — flow-level network
 //              telemetry emitted per ENI / subnet / VPC. Both v2 (the
@@ -169,6 +163,11 @@ def function aws_vpc_flow_epoch_seconds_to_nanos(s) {
 // re-parses the line against its own column count and writes a 4001
 // record. Unknown versions → error.
 
+// Process: parse_aws_vpc_flow
+// Summary: AWS VPC Flow Logs text records (v2 default + v5 custom formats) → LSIS Network Activity.
+// Reads: ingress
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_aws_vpc_flow {
     let version = regex_parse(ingress, "^(?P<v>\\S+)")
     switch true {
@@ -369,6 +368,14 @@ def function aws_vpc_flow_otlp_event_types(status_id) {
     }
 }
 
+// Process: aws_vpc_flow_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.lsis.parsed.*
+//        .cloud.account.uid (optional, String)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process aws_vpc_flow_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "cloud.provider", value: { string_value: "aws" } }],

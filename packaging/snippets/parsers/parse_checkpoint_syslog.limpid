@@ -1,13 +1,6 @@
-// Summary:     Check Point Syslog-Exporter records (RFC 5424 + Junos-style SD)
-//              → LSIS by action/product.
-// Reads:       workspace.checkpoint_syslog.* (bridge — see Bridges below)
-//                .body (required, String) — the full RFC 5424 wire
-//                .hostname (optional, String) — collector-side hostname override
-// Writes:      workspace.lsis.parsed.* — firewall actions → 4001, threat actions →
-//              2004, auth actions → 3002; unknown actions land in 4001 with
-//              the action preserved in unmapped. checkpoint_syslog_to_otlp
-//              writes source-owned OTLP Resource, Body, and attributes.
-// Category:    Network firewall / IPS
+// Facade: process parse_checkpoint_syslog,
+//         process checkpoint_syslog_to_otlp
+// Category: Network firewall / IPS
 // Test corpus: public (elastic/integrations checkpoint corpus — ~80 events
 //              across 8 product types)
 //
@@ -386,6 +379,13 @@ def function checkpoint_syslog_source_host(wire_host, fallback_host) {
 // Main process — dispatch by class (decided heuristically from action / product)
 // ---------------------------------------------------------------------------
 
+// Process: parse_checkpoint_syslog
+// Summary: Check Point Syslog-Exporter records (RFC 5424 + Junos-style SD) → LSIS by action/product.
+// Reads: workspace.checkpoint_syslog.* (bridge — see Bridges below)
+//        .body (required, String) — the full RFC 5424 wire
+//        .hostname (optional, String) — collector-side hostname override
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_checkpoint_syslog {
     // @requires: workspace.checkpoint_syslog.body      (required, String)
     // @requires: workspace.checkpoint_syslog.hostname  (optional, String)
@@ -511,6 +511,18 @@ def function checkpoint_syslog_otlp_event_outcome(status_id) {
     }
 }
 
+// Process: checkpoint_syslog_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.cp_syslog_class.*
+//        .sd (optional, Object)
+//        workspace.checkpoint_syslog.*
+//        .hostname (optional, String)
+//        workspace.lsis.parsed.*
+//        .class_uid (optional, Int)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process checkpoint_syslog_to_otlp {
     let sd = workspace.cp_syslog_class.sd
     let product = parse_checkpoint_syslog_kv_or_null(sd, "product")

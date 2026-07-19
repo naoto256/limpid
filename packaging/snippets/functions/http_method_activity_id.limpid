@@ -1,7 +1,4 @@
-// Summary:     HTTP request method → OCSF 4002 HTTP Activity
-//              `activity_id` (spec-standard enumeration,
-//              vendor-independent).
-// Signature:   http_method_activity_id(method) → Int
+// Facade: function http_method_activity_id
 // Test corpus: unit (OCSF 1.3.0 class 4002 activity_id enumeration)
 //
 // This mapping is OCSF spec standard (4002 class definition,
@@ -25,6 +22,9 @@
 // Lowercase / mixed-case method strings (rare, non-compliant) fall
 // through to 99.
 
+// Function: http_method_activity_id
+// Summary: HTTP request method → OCSF 4002 HTTP Activity `activity_id` (spec-standard enumeration, vendor-independent).
+// Signature: http_method_activity_id(String) → Int
 def function http_method_activity_id(method) {
     switch method {
         "CONNECT" { 1 }

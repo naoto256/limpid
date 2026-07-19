@@ -1,21 +1,6 @@
-// Summary:     Trellix (McAfee) Network Security Platform standard-template KV
-//              alerts → LSIS Detection Finding.
-// Reads:       workspace.nsp.* (bridge — see Bridges below)
-//                .body (required, String) — the KV body
-//                .hostname (optional, String) — collector-side hostname
-//                .timezone (optional, String) — source timezone override as an
-//                  IANA name or fixed offset for attack_time values without
-//                  ` UTC`; defaults to the limpid host's system timezone
-//                  (the standard-template timestamp zone is not specified in
-//                  the available vendor documentation; explicit ` UTC` is
-//                  interpreted as UTC. The default assumes the Manager and
-//                  limpid share the same correct system timezone — the most
-//                  likely deployment when the zone is undocumented; override
-//                  it or use a custom parser when the source differs)
-// Writes:      workspace.lsis.parsed.* — 2004 (Detection Finding);
-//              nsp_to_otlp writes source-owned OTLP Resource, Body, and
-//              LogRecord attributes.
-// Category:    Network firewall / IPS
+// Facade: process parse_nsp,
+//         process nsp_to_otlp
+// Category: Network firewall / IPS
 // Test corpus: real (Trellix NSP Manager capture — 56/56 alerts across HTTP /
 //              SSH / SSL / NETBIOS-SS / TELNET / NTP / BACKDOOR signature
 //              categories)
@@ -338,6 +323,14 @@ def process parse_nsp_normalize_time {
     }
 }
 
+// Process: parse_nsp
+// Summary: Trellix (McAfee) Network Security Platform standard-template KV alerts → LSIS Detection Finding.
+// Reads: workspace.nsp.* (bridge — see Bridges below)
+//        .body (required, String) — the KV body
+//        .hostname (optional, String) — collector-side hostname
+//        .timezone (optional, String) — source timezone override as an
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_nsp {
     // @requires: workspace.nsp.body      (required, String)
     // @requires: workspace.nsp.hostname  (optional, String)
@@ -376,6 +369,18 @@ def function nsp_otlp_event_outcome(status_id) {
     }
 }
 
+// Process: nsp_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.nsp_kv.*
+//        .device_name (optional, String)
+//        workspace.nsp.*
+//        .body (optional, String)
+//        workspace.lsis.parsed.*
+//        .status_id (optional, Int)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process nsp_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "observer.vendor", value: { string_value: "Trellix" } }],

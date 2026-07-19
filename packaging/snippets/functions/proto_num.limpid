@@ -1,7 +1,4 @@
-// Summary:     IANA protocol number for a transport-layer protocol
-//              name — the universal mapping for filling
-//              `connection_info.protocol_num` on an LSIS record.
-// Signature:   proto_num(name) → Int | null
+// Facade: function proto_num
 // Test corpus: unit (IANA "Assigned Internet Protocol Numbers"
 //              registry, RFC 5237)
 //
@@ -30,6 +27,9 @@
 // Out of scope (return null): OSPF, IGMP, IPv4/IPv6 encapsulated,
 // EtherIP, PIM, etc. Add when a vendor parser surfaces them.
 
+// Function: proto_num
+// Summary: IANA protocol number for a transport-layer protocol name — the universal mapping for filling `connection_info.protocol_num` on an LSIS record.
+// Signature: proto_num(String) → Int | Null
 def function proto_num(name) {
     switch lower(name) {
         "tcp"    { 6 }

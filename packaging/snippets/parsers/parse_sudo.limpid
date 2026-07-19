@@ -1,14 +1,6 @@
-// Summary:     sudo / sudoedit application bodies (post-transport-unwrap) →
-//              LSIS Authorize Session.
-// Reads:       workspace.sudo.* (bridge — see Bridges below)
-//                .body (required, String) — the sudo body
-//                .pid (optional, String) — process id as string
-//                .hostname (optional, String) — host where sudo ran
-//                .time (optional, Int) — epoch nanoseconds
-// Writes:      workspace.lsis.parsed.* — 3003 (Authorize Session);
-//              sudo_to_otlp writes source-owned OTLP Resource, Body,
-//              and LogRecord attributes.
-// Category:    Endpoint / host audit (Unix)
+// Facade: process parse_sudo,
+//         process sudo_to_otlp
+// Category: Endpoint / host audit (Unix)
 // Test corpus: synthetic (sample sudo bodies in this header)
 //
 // Vendor notes — sudo (the Sudo Project — sudo/sudoedit; not pfexec, not
@@ -243,6 +235,15 @@ def function parse_sudo_message(msg) {
 // Top-level dispatcher
 // ---------------------------------------------------------------------------
 
+// Process: parse_sudo
+// Summary: sudo / sudoedit application bodies (post-transport-unwrap) → LSIS Authorize Session.
+// Reads: workspace.sudo.* (bridge — see Bridges below)
+//        .body (required, String) — the sudo body
+//        .pid (optional, String) — process id as string
+//        .hostname (optional, String) — host where sudo ran
+//        .time (optional, Int) — epoch nanoseconds
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_sudo {
     // @requires: workspace.sudo.body       (required, String)
     // @requires: workspace.sudo.pid        (optional, String)
@@ -488,6 +489,18 @@ def function sudo_otlp_event_outcome(status_id) {
     switch status_id { 1 { "success" } 2 { "failure" } default { null } }
 }
 
+// Process: sudo_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.sudo.*
+//        .hostname (optional, String)
+//        workspace.sudo_class.*
+//        .kind (optional, String)
+//        workspace.lsis.parsed.*
+//        .status_id (optional, Int)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process sudo_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "observer.vendor", value: { string_value: "Sudo Project" } }],

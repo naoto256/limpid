@@ -1,22 +1,13 @@
-// Zeek SOC-scope parser (vocabulary)
-//
-// Summary:     Zeek SOC-scope extension — auth / protocol streams (ssh, smtp,
-//              ftp, dhcp, kerberos, ntlm, radius, smb_*, dce_rpc, snmp, rdp)
-//              on top of parse_zeek_default.
-// Reads:       workspace.zeek.* (bridge — see Bridges in parse_zeek_default.limpid)
-//   .body (required, Object) — parsed Zeek event (caller does `parse_json(ingress)`)
-//   .hostname (optional, String) — collector override
-//   .time (optional, Int) — epoch ns override
-// Writes:      workspace.lsis.parsed.* — ssh → 4007, smtp → 4009, ftp → 4008,
-//              dhcp → 4004, kerberos / ntlm / radius → 3002,
-//              smb_mapping / smb_cmd / smb_files → 4006,
-//              dce_rpc / snmp → 4001, rdp → 4005; stock streams fall
-//              through to parse_zeek_default. zeek_soc_to_otlp writes
-//              source-owned OTLP Resource, Scope, Body, and attributes.
-// Category:    OSS NDR
+// Facade: process parse_zeek_soc,
+//         process parse_zeek_soc_native,
+//         process parse_zeek_soc_flat,
+//         process zeek_soc_to_otlp
+// Category: OSS NDR
 // Test corpus: spec-only (Zeek per-protocol log reference; SOC-extra streams
 //              not yet corpus-verified — the stock streams inherit
 //              parse_zeek_default's public-corpus verification)
+//
+// Zeek SOC-scope parser (vocabulary)
 //
 // Composition — this file transitively includes parse_zeek_default,
 // so operators picking the SOC scope only write a single include line
@@ -516,6 +507,13 @@ def function zeek_rdp_record(body, host, time_ns) {
 // rationale. Mirror naming: `_native` / `_flat`.
 // ---------------------------------------------------------------------------
 
+// Process: parse_zeek_soc_native
+// Summary: Bridge one native Zeek JSON event into the shared Zeek intake.
+// Reads: ingress
+// Writes: workspace.zeek.*
+//         .body (required, Object)
+//         workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_zeek_soc_native {
     workspace.zeek = {
         body:     parse_json(ingress),
@@ -525,6 +523,13 @@ def process parse_zeek_soc_native {
     process parse_zeek_soc
 }
 
+// Process: parse_zeek_soc_flat
+// Summary: Bridge one flat Zeek JSON event into the shared Zeek intake.
+// Reads: ingress
+// Writes: workspace.zeek.*
+//         .body (required, Object)
+//         workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_zeek_soc_flat {
     workspace.zeek = {
         body:     nest_dotted_keys(parse_json(ingress)),
@@ -538,6 +543,14 @@ def process parse_zeek_soc_flat {
 // Main process — dispatch SOC-extra _paths, fall through to default
 // ---------------------------------------------------------------------------
 
+// Process: parse_zeek_soc
+// Summary: Zeek SOC-scope extension — auth / protocol streams (ssh, smtp, ftp, dhcp, kerberos, ntlm, radius, smb_*, dce_rpc, snmp, rdp) on top of parse_zeek_default.
+// Reads: workspace.zeek.* (bridge — see Bridges in parse_zeek_default.limpid)
+//        .body (required, Object) — parsed Zeek event (caller does `parse_json(ingress)`)
+//        .hostname (optional, String) — collector override
+//        .time (optional, Int) — epoch ns override
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_zeek_soc {
     // @requires: workspace.zeek.body      (required, Object)
     // @requires: workspace.zeek.hostname  (optional, String)
@@ -651,6 +664,17 @@ def function zeek_soc_otlp_event_type(class_uid, activity_id) {
 }
 def function zeek_soc_otlp_event_outcome(status_id) { switch status_id { 1 { "success" } 2 { "failure" } default { null } } }
 
+// Process: zeek_soc_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.zeek.*
+//        .hostname (optional, String)
+//        workspace.lsis.parsed.*
+//        .class_uid (optional, Int)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .scope.name (optional, String)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process zeek_soc_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         [{ key: "observer.vendor", value: { string_value: "Zeek Project" } }],

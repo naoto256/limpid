@@ -1,12 +1,6 @@
-// Summary:     journalctl -o json lines → workspace.journald.* transport
-//              fields (transport-layer parser).
-// Reads:       ingress (raw wire) — one journalctl -o json line (UTF-8
-//              JSON object) per ingress
-// Writes:      workspace.journald.* — all fields as journald exposes them;
-//              the transport namespace, not LSIS. journald_to_otlp writes
-//              source-owned OTLP Resource, Scope, Body, and attributes
-//              without promoting PRIORITY to canonical severity.
-// Category:    Transport
+// Facade: process parse_journald,
+//         process journald_to_otlp
+// Category: Transport
 // Test corpus: synthetic (journalctl -o json sample wire in this header)
 //
 // Typically the first process in a pipeline whose `input` is `type journal`.
@@ -52,10 +46,25 @@
 //   process parse_journald | journald_to_rfc5424 | compose_rfc5424 | rfc5424_to_egress
 //   process parse_journald | parse_openssh | compose_ocsf | ocsf_to_egress
 
+// Process: parse_journald
+// Summary: journalctl -o json lines → workspace.journald.* transport fields (transport-layer parser).
+// Reads: ingress
+// Writes: workspace.journald.*
+//         .MESSAGE (optional, String)
 def process parse_journald {
     workspace.journald = parse_json(ingress)
 }
 
+// Process: journald_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.journald.*
+//        ._HOSTNAME (optional, String)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .scope.name (optional, String)
+//         .scope.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process journald_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         switch workspace.journald._HOSTNAME != null { true { [{ key: "host.name", value: { string_value: workspace.journald._HOSTNAME } }] } default { [] } },

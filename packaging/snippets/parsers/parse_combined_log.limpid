@@ -1,11 +1,6 @@
-// Summary:     Apache / Nginx combined log format → LSIS HTTP Activity.
-// Reads:       workspace.combined_log.* (bridge — see Bridges below)
-//                .body (required, String) — the CLF line
-//                .hostname (optional, String) — web server hostname
-// Writes:      workspace.lsis.parsed.* — 4002 (HTTP Activity);
-//              combined_log_to_otlp writes source-owned OTLP Resource, Body,
-//              and LogRecord attributes.
-// Category:    Web / proxy access
+// Facade: process parse_combined_log,
+//         process combined_log_to_otlp
+// Category: Web / proxy access
 // Test corpus: synthetic (sample CLF lines in this header)
 //
 // Vendor notes — Apache Software Foundation (Apache HTTP Server) — Nginx
@@ -86,6 +81,14 @@ def function combined_log_status_id(code) {
 
 // Top-level dispatcher: regex-match the line, route to the record
 // leaf on success or to error_log on a malformed line.
+
+// Process: parse_combined_log
+// Summary: Apache / Nginx combined log format → LSIS HTTP Activity.
+// Reads: workspace.combined_log.* (bridge — see Bridges below)
+//        .body (required, String) — the CLF line
+//        .hostname (optional, String) — web server hostname
+// Writes: workspace.lsis.parsed.*
+//         .class_uid (required, Int)
 def process parse_combined_log {
     // @requires: workspace.combined_log.body      (required, String)
     // @requires: workspace.combined_log.hostname  (optional, String)
@@ -161,6 +164,16 @@ def function combined_log_otlp_event_outcome(status_id) {
     switch status_id { 1 { "success" } 2 { "failure" } default { null } }
 }
 
+// Process: combined_log_to_otlp
+// Summary: Project source facts and canonical scalars into source-owned OTLP fields.
+// Reads: workspace.combined_log.*
+//        .hostname (optional, String)
+//        workspace.lsis.parsed.*
+//        .status_id (optional, Int)
+// Writes: workspace.lsis.shed.otlp.*
+//         .resource.attributes (optional, Array)
+//         .log_record.body (optional, Object)
+//         .log_record.attributes (optional, Array)
 def process combined_log_to_otlp {
     workspace.lsis.shed.otlp.resource.attributes = concat(
         switch workspace.combined_log.hostname != null { true { [{ key: "host.name", value: { string_value: workspace.combined_log.hostname } }] } default { [] } },
