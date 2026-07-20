@@ -8,81 +8,7 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
-### Fixed — nullable expression inference follows runtime control flow
-
-The static analyzer now removes skipped `Null` members from non-final
-`coalesce` arguments while preserving the final argument's nullability, and
-infers `len` from its concrete input type. Equality checks against `null` are
-treated as presence guards rather than incompatible-type comparisons. These
-rules prevent reusable composers from producing strict-check false positives
-after a source adapter specializes an otherwise optional field.
-
-### Changed — snippet headers declare file facades and member contracts
-
-Packaged snippets now separate file-level metadata from the contracts of each
-public process or function. A `Facade:` list names the externally callable
-members, and an adjacent `Process:` or `Function:` block documents each public
-member without forcing internal dispatch leaves into the public surface.
-`Reads:` and `Writes:` accept multiple independently validated workspace roots,
-so adapters and bridges can state their real cross-namespace boundaries. The
-header linter rejects missing, orphaned, misplaced, and signature-mismatched
-member blocks, and the generated inventory consumes the same facade metadata.
-
-### Fixed — analyzer contracts match runtime value shapes
-
-Static checking now models ingress and egress as String-or-Bytes payloads,
-accepts both runtime input forms for `to_string` and the OTLP decoders, and
-preserves nullable returns for partial primitives instead of claiming a value
-is always present. `cef.parse` limits its data-driven workspace wildcard to
-`workspace.extension.*`, so unrelated workspace paths are no longer widened.
-User-defined function calls now report arity mismatches during `--check` with
-the same expected-versus-actual shape used by runtime diagnostics.
-
-The `strftime` and `strptime` timezone keywords `UTC` and `local` are now
-ASCII case-insensitive; IANA timezone names remain case-sensitive.
-
-### Fixed — cef.parse honors the header escapes `\|` and `\\`
-
-The header splitter treated every `|` as a field separator, so a
-spec-legal escaped pipe (`\|`) inside a header field shifted all
-subsequent fields — for `CEF:0|V|P|1.0|sig|deny\|drop|3|act=block` the
-name became `deny\`, the severity slot received the string `drop`, and
-the extension section received `3|act=block`, misclassifying telemetry
-severity downstream. The splitter now separates only on unescaped
-pipes and decodes the two generic structural escapes that participate
-in field splitting (`\|` → `|`, `\\` → `\`); sequences outside those
-two (`\x` etc.) are kept literally, and the spec's field-specific
-escaping for vulnerability spellings in deviceEventClassId / name is
-field-internal grammar the generic primitive passes through raw. The
-bug predates this release in the primitive itself; the new generic
-`parse_cef` / `cef_to_otlp` path widens its blast radius to every CEF
-pipeline, so it is fixed in 0.7.15. Extension-section escapes remain
-undecoded (unchanged, documented scope).
-
-### Changed — cef.parse isolates Extension keys from the positional header (breaking)
-
-`cef.parse()` previously flattened the data-driven Extension key=value
-pairs into the same object as the seven positionally-determined header
-fields. An extension named after a header field (`severity=`, `name=`
-— dialect quirk, buggy template, or log injection alike) was pushed as
-a duplicate sibling key: arena field reads resolved to the header
-(first-wins) but the persisted workspace snapshot resolved to the
-extension value (last-wins), so downstream processes saw the header
-silently replaced. Data of different trust levels must not share a
-plane, so the split pairs now land in a nested sub-object and the raw
-blob is renamed to avoid confusion with it:
-
-| 0.7.14 path | 0.7.15 path |
-|---|---|
-| `workspace.cef.<extension-key>` | `workspace.cef.extension.<extension-key>` |
-| `workspace.cef.ext` (raw blob) | `workspace.cef.extension_raw` |
-
-Header fields (`version` / `device_vendor` / `device_product` /
-`device_version` / `signature_id` / `name` / `severity`) are unchanged.
-Out-of-tree pipelines reading extension keys off `cef.parse()` output
-must add the `extension.` segment. The bundled CEF parsers
-(`parse_cef` / `parse_fortigate_cef` / `parse_paloalto_cef`) are
-updated accordingly.
+## [0.7.15] - 2026-07-20
 
 ### Changed — transport / format unwrapping separated from vocabulary parsing (breaking)
 
@@ -110,40 +36,30 @@ stages):
 | `parse_fortigate_cef \| ...` | `parse_syslog \| parse_cef \| parse_fortigate_cef \| ...` |
 | `parse_paloalto_cef \| ...` | `parse_syslog \| parse_cef \| parse_paloalto_cef \| ...` |
 
-### Added — block primitives iterate object entries
+### Changed — cef.parse isolates Extension keys from the positional header (breaking)
 
-`map`, `filter`, `find`, and `reduce` now accept Object values in addition to
-arrays. Object blocks bind each key as a String alongside its value, visit
-entries in insertion order without deduplicating repeated keys, and use
-type-specific arity checks so an array-shaped block cannot silently consume an
-object (or vice versa). `map` returns an array of block results, `filter`
-returns the retained object entries, `find` returns the first matching
-`[key, value]` pair, and `reduce` folds `|acc, key, value|` over the entries.
-Null inputs retain the existing array behavior.
+`cef.parse()` previously flattened the data-driven Extension key=value
+pairs into the same object as the seven positionally-determined header
+fields. An extension named after a header field (`severity=`, `name=`
+— dialect quirk, buggy template, or log injection alike) was pushed as
+a duplicate sibling key: arena field reads resolved to the header
+(first-wins) but the persisted workspace snapshot resolved to the
+extension value (last-wins), so downstream processes saw the header
+silently replaced. Data of different trust levels must not share a
+plane, so the split pairs now land in a nested sub-object and the raw
+blob is renamed to avoid confusion with it:
 
-### Changed — dependency dedupe
+| 0.7.14 path | 0.7.15 path |
+|---|---|
+| `workspace.cef.<extension-key>` | `workspace.cef.extension.<extension-key>` |
+| `workspace.cef.ext` (raw blob) | `workspace.cef.extension_raw` |
 
-Bumped `axum` to 0.8 and `webpki-roots` to 1.0 so the dependency graph no
-longer carries two major versions of `axum` / `axum-core` / `matchit` /
-`webpki-roots`. The remaining `getrandom` 0.2/0.3 split (ring vs rand 0.9)
-is an upstream limitation and is documented as version-scoped skips in
-`deny.toml`; the newest getrandom line (currently 0.4, dev-only via
-`tempfile`) is deliberately not skipped so any future additional split
-still warns.
-
-### Fixed — undocumented RFC 3164-family timezone default is host-local, not UTC
-
-Bundled parsers whose legacy timestamp format leaves the source zone
-undocumented (`parse_asa`, `parse_nsp`, `parse_paloalto_cef`,
-`parse_paloalto_syslog`) previously assumed UTC. No vendor specification
-documents UTC wall-clock for these formats, so the pack default now follows
-the ruling already applied to `parse_fortigate_cef` /
-`parse_juniper_srx_syslog`: a vendor-documented UTC format keeps UTC, and a
-documented device-local zone or a specification gap defaults to the limpid
-host's system timezone — the most likely assumption being that the device
-shares the host's zone. The `workspace.<parser>.timezone` override contract
-is unchanged: IANA names and fixed offsets are accepted, explicit `local`
-is still rejected.
+Header fields (`version` / `device_vendor` / `device_product` /
+`device_version` / `signature_id` / `name` / `severity`) are unchanged.
+Out-of-tree pipelines reading extension keys off `cef.parse()` output
+must add the `extension.` segment. The bundled CEF parsers
+(`parse_cef` / `parse_fortigate_cef` / `parse_paloalto_cef`) are
+updated accordingly.
 
 ### Fixed — OTLP Scope/Resource placement follows the spec's two-tier identity reading
 
@@ -161,6 +77,92 @@ Sysmon provider `Microsoft-Windows-Sysmon`, journald's
 event `Channel`, the Sysmon `Channel` when the forwarder ships it, Zeek's
 `_path`, and the static `journald` structuring layer. Sources that do not name
 themselves continue to leave both unset.
+
+### Fixed — undocumented RFC 3164-family timezone default is host-local, not UTC
+
+Bundled parsers whose legacy timestamp format leaves the source zone
+undocumented (`parse_asa`, `parse_nsp`, `parse_paloalto_cef`,
+`parse_paloalto_syslog`) previously assumed UTC. No vendor specification
+documents UTC wall-clock for these formats, so the pack default now follows
+the ruling already applied to `parse_fortigate_cef` /
+`parse_juniper_srx_syslog`: a vendor-documented UTC format keeps UTC, and a
+documented device-local zone or a specification gap defaults to the limpid
+host's system timezone — the most likely assumption being that the device
+shares the host's zone. The `workspace.<parser>.timezone` override contract
+is unchanged: IANA names and fixed offsets are accepted, explicit `local`
+is still rejected.
+
+### Fixed — cef.parse honors the header escapes `\|` and `\\`
+
+The header splitter treated every `|` as a field separator, so a
+spec-legal escaped pipe (`\|`) inside a header field shifted all
+subsequent fields — for `CEF:0|V|P|1.0|sig|deny\|drop|3|act=block` the
+name became `deny\`, the severity slot received the string `drop`, and
+the extension section received `3|act=block`, misclassifying telemetry
+severity downstream. The splitter now separates only on unescaped
+pipes and decodes the two generic structural escapes that participate
+in field splitting (`\|` → `|`, `\\` → `\`); sequences outside those
+two (`\x` etc.) are kept literally, and the spec's field-specific
+escaping for vulnerability spellings in deviceEventClassId / name is
+field-internal grammar the generic primitive passes through raw. The
+bug predates this release in the primitive itself; the new generic
+`parse_cef` / `cef_to_otlp` path widens its blast radius to every CEF
+pipeline, so it is fixed in 0.7.15. Extension-section escapes remain
+undecoded (unchanged, documented scope).
+
+### Added — block primitives iterate object entries
+
+`map`, `filter`, `find`, and `reduce` now accept Object values in addition to
+arrays. Object blocks bind each key as a String alongside its value, visit
+entries in insertion order without deduplicating repeated keys, and use
+type-specific arity checks so an array-shaped block cannot silently consume an
+object (or vice versa). `map` returns an array of block results, `filter`
+returns the retained object entries, `find` returns the first matching
+`[key, value]` pair, and `reduce` folds `|acc, key, value|` over the entries.
+Null inputs retain the existing array behavior.
+
+### Fixed — analyzer contracts match runtime value shapes
+
+Static checking now models ingress and egress as String-or-Bytes payloads,
+accepts both runtime input forms for `to_string` and the OTLP decoders, and
+preserves nullable returns for partial primitives instead of claiming a value
+is always present. `cef.parse` limits its data-driven workspace wildcard to
+`workspace.extension.*`, so unrelated workspace paths are no longer widened.
+User-defined function calls now report arity mismatches during `--check` with
+the same expected-versus-actual shape used by runtime diagnostics.
+
+The `strftime` and `strptime` timezone keywords `UTC` and `local` are now
+ASCII case-insensitive; IANA timezone names remain case-sensitive.
+
+### Fixed — nullable expression inference follows runtime control flow
+
+The static analyzer now removes skipped `Null` members from non-final
+`coalesce` arguments while preserving the final argument's nullability, and
+infers `len` from its concrete input type. Equality checks against `null` are
+treated as presence guards rather than incompatible-type comparisons. These
+rules prevent reusable composers from producing strict-check false positives
+after a source adapter specializes an otherwise optional field.
+
+### Changed — snippet headers declare file facades and member contracts
+
+Packaged snippets now separate file-level metadata from the contracts of each
+public process or function. A `Facade:` list names the externally callable
+members, and an adjacent `Process:` or `Function:` block documents each public
+member without forcing internal dispatch leaves into the public surface.
+`Reads:` and `Writes:` accept multiple independently validated workspace roots,
+so adapters and bridges can state their real cross-namespace boundaries. The
+header linter rejects missing, orphaned, misplaced, and signature-mismatched
+member blocks, and the generated inventory consumes the same facade metadata.
+
+### Changed — dependency dedupe
+
+Bumped `axum` to 0.8 and `webpki-roots` to 1.0 so the dependency graph no
+longer carries two major versions of `axum` / `axum-core` / `matchit` /
+`webpki-roots`. The remaining `getrandom` 0.2/0.3 split (ring vs rand 0.9)
+is an upstream limitation and is documented as version-scoped skips in
+`deny.toml`; the newest getrandom line (currently 0.4, dev-only via
+`tempfile`) is deliberately not skipped so any future additional split
+still warns.
 
 ## [0.7.14] - 2026-07-16
 
@@ -2274,7 +2276,8 @@ See `docs/src/operations/upgrade-0.3.md` for end-to-end migration recipes includ
 
 Initial public release. Rust + tokio log pipeline daemon replacing rsyslog / syslog-ng / fluentd with a single readable DSL (`def input`, `def process`, `def output`, `def pipeline`). Includes syslog (UDP/TCP/ TLS) / tail / journal / unix socket inputs; file / HTTP / Kafka / TCP / UDP / unix socket / stdout outputs; in-DSL expression language with parsers (JSON / KV / CEF / syslog), regex, string templates, tables with TTL, GeoIP; control socket (`limpidctl tap`, `stats`, `health`); hot reload via `SIGHUP` with automatic rollback; per-output disk-backed queues.
 
-[Unreleased]: https://github.com/naoto256/limpid/compare/v0.7.14...HEAD
+[Unreleased]: https://github.com/naoto256/limpid/compare/v0.7.15...HEAD
+[0.7.15]: https://github.com/naoto256/limpid/compare/v0.7.14...v0.7.15
 [0.7.14]: https://github.com/naoto256/limpid/compare/v0.7.13...v0.7.14
 [0.7.13]: https://github.com/naoto256/limpid/compare/v0.7.12...v0.7.13
 [0.7.12]: https://github.com/naoto256/limpid/compare/v0.7.11...v0.7.12
