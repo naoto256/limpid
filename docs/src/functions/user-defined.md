@@ -43,7 +43,7 @@ Anywhere an expression is evaluated — there's no callsite restriction on the f
   def output proto_udp { type file path "/var/log/limpid/udp/events.log" }
   def pipeline split {
       input syslog_udp
-      process parse_cef                                  // sets workspace.cef.extension.proto
+      process parse_syslog | parse_cef                   // unwrap transport, then parse CEF
       switch normalize_proto(workspace.cef.extension.proto) {
           "tcp" { output proto_tcp }
           "udp" { output proto_udp }
