@@ -28,7 +28,7 @@ Bad names give away the problem:
 
 If you catch yourself writing `and` in a process name, split it:
 
-```
+```limpid
 // Don't: one process doing three things — and parsing events you're
 // about to drop is wasted work.
 def process parse_and_enrich_fortigate {
@@ -76,7 +76,7 @@ When a file contains several leaves, put supplemental tags in the first comment
 block inside the leaf. One tag per line. Each tag names a field path in
 `workspace.*` (or, less commonly, `egress`).
 
-```
+```limpid
 def process compose_ocsf_authentication {
     // @requires: workspace.lsis.parsed.severity_number      (optional; normalized OTel SeverityNumber)
     // @requires: workspace.lsis.parsed.severity             (optional; exact source severity text)
@@ -152,7 +152,7 @@ If you need dedup, rate-limiting, or aggregation, use a primitive that limpid sh
 
 ### "God" processes with config-driven branches
 
-```
+```limpid
 // Don't — one body, many shapes, none of which is clearly the contract.
 def process fw_dispatch {
     if workspace.vendor == "Fortinet" {
@@ -170,7 +170,7 @@ def process fw_dispatch {
 
 Split these into `parse_fortigate`, `parse_paloalto`, `parse_cisco` and dispatch at the pipeline level with `switch`. The switch is load-bearing routing information — it deserves to be in the pipeline where routing lives, not hidden inside a process that reads like a parser.
 
-```
+```limpid
 def pipeline fw {
     input fw_syslog
     switch workspace.vendor {
@@ -239,7 +239,7 @@ Do not pack multiple unrelated schemas into a single file.
 
 Pick one canonical intermediate shape and have every parser write into it; have every composer read from it. limpid's library uses the namespace `workspace.lsis` for this — the Limpid Snippet Intermediate Schema (LSIS), stratified into `parsed` / `shed` / `composed` layers. See the [pack README](../../../packaging/snippets/README.md#lsis--the-limpid-snippet-intermediate-schema) for the layer contracts and slot registries; the summary that matters for this guide is the flow:
 
-```
+```text
 ingress
    │
    ▼
@@ -317,7 +317,7 @@ A vocabulary parser (or any snippet that consumes prior layer state in
 timestamp from. That binding is invisible from the dispatcher body, so
 state it explicitly in a header block at the top of the file:
 
-```
+```text
 // Vendor:   OpenSSH
 // Wire:     sshd application body (Accepted publickey for ... / Failed
 //           password for ... / Disconnected from ... etc.)
