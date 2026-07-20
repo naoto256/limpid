@@ -1232,8 +1232,13 @@ def process example_to_otlp { }
     #[test]
     fn egress_write_is_valid_without_dot_declarations() {
         let source = clean_parser().replace(
-            "// Writes: workspace.lsis.shed.otlp.*\n//   .body (required, Object)",
+            "// Writes: workspace.lsis.shed.otlp.*\n//   .body (required, Bytes)",
             "// Writes: egress (OTLP protobuf bytes)",
+        );
+        assert_ne!(
+            source,
+            clean_parser(),
+            "egress fixture replacement must change the source"
         );
         assert!(
             lint(&parser(&source)).is_empty(),
