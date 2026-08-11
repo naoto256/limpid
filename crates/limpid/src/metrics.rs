@@ -271,6 +271,26 @@ mod registry_core {
             name: String,
             labelset: Vec<(String, String)>,
         },
+        /// Configured boundaries are rejected rather than repaired:
+        /// every bound must be finite (`NaN` cannot participate in a
+        /// total numeric ordering, and `+Inf` duplicates the implicit
+        /// `+Inf` bucket), and strictly ascending order is required
+        /// so the cumulative shape assembled by `snapshot_series` is
+        /// well defined.
+        InvalidBuckets {
+            name: String,
+            labelset: Vec<(String, String)>,
+        },
+        /// The wire schema identifies each series by its exported
+        /// label map, which keys labels by name; a registration
+        /// carrying duplicate label names would collapse to a map
+        /// indistinguishable from other layouts. Registration is
+        /// rejected instead of exporting the ambiguity.
+        DuplicateLabelName {
+            name: String,
+            labelset: Vec<(String, String)>,
+            label: String,
+        },
         DuplicateSeries {
             name: String,
             labelset: Vec<(String, String)>,
@@ -297,6 +317,18 @@ mod registry_core {
                 Self::MissingHelp { name, labelset } => write!(
                     formatter,
                     "metric help is required: name={name:?}, labelset={labelset:?}"
+                ),
+                Self::InvalidBuckets { name, labelset } => write!(
+                    formatter,
+                    "invalid histogram buckets: name={name:?}, labelset={labelset:?}; boundaries must be finite and strictly increasing"
+                ),
+                Self::DuplicateLabelName {
+                    name,
+                    labelset,
+                    label,
+                } => write!(
+                    formatter,
+                    "duplicate metric label name: name={name:?}, labelset={labelset:?}, label={label:?}"
                 ),
                 Self::DuplicateSeries { name, labelset } => write!(
                     formatter,
@@ -408,6 +440,13 @@ mod registry_core {
             labels: BTreeMap<String, String>,
             value: u64,
         },
+        /// `buckets` carries cumulative Prometheus counts for the
+        /// finite upper bounds configured on the histogram. The
+        /// implicit `+Inf` bucket is intentionally absent from this
+        /// array; Prometheus translators must synthesise it as a
+        /// `+Inf` sample whose value equals `count`. `count` includes
+        /// observations above the last configured bound, so the
+        /// synthesised `+Inf` value stays authoritative.
         Histogram {
             labels: BTreeMap<String, String>,
             buckets: Vec<(f64, u64)>,
@@ -513,6 +552,7 @@ mod registry_core {
             labels: Labels,
         ) -> Result<Arc<Counter>, MetricsError> {
             let labels = canonical_labels(labels);
+            validate_unique_label_names(&name, &labels)?;
             validate_metric_name(&name, &labels)?;
             let help = require_help(&name, &labels, help)?;
             let handle = Arc::new(Counter {
@@ -557,6 +597,7 @@ mod registry_core {
             labels: Labels,
         ) -> Result<Arc<Gauge>, MetricsError> {
             let labels = canonical_labels(labels);
+            validate_unique_label_names(&name, &labels)?;
             validate_metric_name(&name, &labels)?;
             let help = require_help(&name, &labels, help)?;
             let handle = Arc::new(Gauge {
@@ -602,8 +643,10 @@ mod registry_core {
             boundaries: Vec<f64>,
         ) -> Result<Arc<Histogram>, MetricsError> {
             let labels = canonical_labels(labels);
+            validate_unique_label_names(&name, &labels)?;
             validate_metric_name(&name, &labels)?;
             let help = require_help(&name, &labels, help)?;
+            validate_histogram_boundaries(&name, &labels, &boundaries)?;
             let handle = Arc::new(Histogram {
                 bucket_counts: boundaries.iter().map(|_| AtomicU64::new(0)).collect(),
                 boundaries,
@@ -763,6 +806,38 @@ mod registry_core {
     fn canonical_labels(mut labels: Labels) -> Labels {
         labels.sort_unstable();
         labels
+    }
+
+    fn validate_unique_label_names(name: &str, labels: &Labels) -> Result<(), MetricsError> {
+        let duplicate = labels
+            .windows(2)
+            .find(|pair| pair[0].0 == pair[1].0)
+            .map(|pair| pair[0].0.clone());
+        match duplicate {
+            Some(label) => Err(MetricsError::DuplicateLabelName {
+                name: name.to_owned(),
+                labelset: labels.clone(),
+                label,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    fn validate_histogram_boundaries(
+        name: &str,
+        labels: &Labels,
+        boundaries: &[f64],
+    ) -> Result<(), MetricsError> {
+        let all_finite = boundaries.iter().all(|boundary| boundary.is_finite());
+        let strictly_increasing = boundaries.windows(2).all(|pair| pair[0] < pair[1]);
+        if all_finite && strictly_increasing {
+            Ok(())
+        } else {
+            Err(MetricsError::InvalidBuckets {
+                name: name.to_owned(),
+                labelset: labels.clone(),
+            })
+        }
     }
 
     fn label_names(labels: &Labels) -> Vec<String> {
@@ -970,6 +1045,65 @@ mod registry_tests {
         }
     }
 
+    fn assert_invalid_buckets<T>(
+        result: Result<T, MetricsError>,
+        expected_name: &str,
+        expected_label: (&str, &str),
+    ) {
+        let error = match result {
+            Ok(_) => panic!("histogram registration unexpectedly accepted invalid buckets"),
+            Err(error) => error,
+        };
+        let diagnostic = error.to_string();
+        match error {
+            MetricsError::InvalidBuckets { name, labelset } => {
+                assert_eq!(name, expected_name);
+                assert!(
+                    labelset.contains(&(expected_label.0.to_owned(), expected_label.1.to_owned()))
+                );
+            }
+            other => panic!("expected InvalidBuckets, got {other:?}"),
+        }
+        assert!(diagnostic.contains(expected_name));
+        assert!(diagnostic.contains(expected_label.0));
+        assert!(diagnostic.contains(expected_label.1));
+        assert!(diagnostic.contains("finite"));
+        assert!(diagnostic.contains("strictly increasing"));
+    }
+
+    fn assert_duplicate_label_name<T>(
+        result: Result<T, MetricsError>,
+        expected_name: &str,
+        expected_labelset: &[(&str, &str)],
+        expected_duplicate: &str,
+    ) {
+        let error = match result {
+            Ok(_) => panic!("metric registration unexpectedly accepted a duplicate label name"),
+            Err(error) => error,
+        };
+        let diagnostic = error.to_string();
+        match error {
+            MetricsError::DuplicateLabelName {
+                name,
+                labelset,
+                label,
+            } => {
+                assert_eq!(name, expected_name);
+                assert_eq!(label, expected_duplicate);
+                for &(key, value) in expected_labelset {
+                    assert!(labelset.contains(&(key.to_owned(), value.to_owned())));
+                }
+            }
+            other => panic!("expected DuplicateLabelName, got {other:?}"),
+        }
+        assert!(diagnostic.contains(expected_name));
+        assert!(diagnostic.contains(expected_duplicate));
+        for &(key, value) in expected_labelset {
+            assert!(diagnostic.contains(key));
+            assert!(diagnostic.contains(value));
+        }
+    }
+
     fn snapshot_json(registry: &Registry) -> Value {
         let snapshot: MetricsSnapshot = registry.snapshot();
         serde_json::to_value(snapshot).expect("snapshot must serialize")
@@ -1141,6 +1275,97 @@ mod registry_tests {
                 .build(),
             "limpid_test_empty_counter_help_total",
             ("source", "counter"),
+        );
+    }
+
+    #[test]
+    fn histogram_builder_validates_finite_strictly_increasing_boundaries() {
+        let invalid = [
+            ("nan", vec![f64::NAN]),
+            ("positive_infinity", vec![f64::INFINITY]),
+            ("negative_infinity", vec![f64::NEG_INFINITY]),
+            ("descending", vec![1.0, 0.5]),
+            ("equal", vec![0.5, 0.5]),
+        ];
+        for (case, boundaries) in invalid {
+            let registry = Registry::new();
+            let name = format!("limpid_test_invalid_{case}_seconds");
+            assert_invalid_buckets(
+                registry
+                    .histogram(&name)
+                    .help("Invalid histogram boundaries test.")
+                    .label("source", case)
+                    .buckets(&boundaries)
+                    .build(),
+                &name,
+                ("source", case),
+            );
+        }
+
+        let registry = Registry::new();
+        build_ok(
+            registry
+                .histogram("limpid_test_empty_buckets_seconds")
+                .help("Empty histogram boundaries test.")
+                .label("source", "empty")
+                .buckets(&[])
+                .build(),
+        );
+        build_ok(
+            registry
+                .histogram("limpid_test_single_bucket_seconds")
+                .help("Single histogram boundary test.")
+                .label("source", "single")
+                .buckets(&[0.5])
+                .build(),
+        );
+        build_ok(
+            registry
+                .histogram("limpid_test_ascending_buckets_seconds")
+                .help("Ascending histogram boundaries test.")
+                .label("source", "ascending")
+                .buckets(&[0.1, 0.5, 1.0])
+                .build(),
+        );
+    }
+
+    #[test]
+    fn every_builder_rejects_duplicate_label_names() {
+        let registry = Registry::new();
+        assert_duplicate_label_name(
+            registry
+                .counter("limpid_test_duplicate_counter_label_total")
+                .help("Duplicate counter label test.")
+                .label("source", "one")
+                .label("source", "two")
+                .build(),
+            "limpid_test_duplicate_counter_label_total",
+            &[("source", "one"), ("source", "two")],
+            "source",
+        );
+        assert_duplicate_label_name(
+            registry
+                .gauge("limpid_test_duplicate_gauge_label")
+                .help("Duplicate gauge label test.")
+                .label("source", "one")
+                .label("region", "west")
+                .label("source", "two")
+                .build(),
+            "limpid_test_duplicate_gauge_label",
+            &[("source", "one"), ("region", "west"), ("source", "two")],
+            "source",
+        );
+        assert_duplicate_label_name(
+            registry
+                .histogram("limpid_test_duplicate_histogram_label_seconds")
+                .help("Duplicate histogram label test.")
+                .label("source", "one")
+                .label("source", "two")
+                .buckets(&[0.1, 1.0])
+                .build(),
+            "limpid_test_duplicate_histogram_label_seconds",
+            &[("source", "one"), ("source", "two")],
+            "source",
         );
     }
 
