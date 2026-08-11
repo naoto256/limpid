@@ -12,6 +12,8 @@
 //!
 //! Connects to limpid's control socket (default: /var/run/limpid/control.sock).
 
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -49,8 +51,11 @@ enum Command {
     /// Show pipeline/input/output metrics
     Stats {
         /// Output raw JSON instead of formatted text
-        #[arg(long)]
+        #[arg(long, conflicts_with = "details")]
         json: bool,
+        /// Show every metric family and series with complete labels
+        #[arg(long, conflicts_with = "json")]
+        details: bool,
     },
     /// Check daemon health
     Health {
@@ -216,11 +221,13 @@ fn main() {
                 format_list(&response);
             }
         }
-        Command::Stats { json } => {
+        Command::Stats { json, details } => {
             let response = query_command(&cli.socket, "stats");
             exit_on_daemon_error(&response);
             if json {
                 print!("{}", response);
+            } else if details {
+                format_stats_details(&response);
             } else {
                 format_stats(&response);
             }
@@ -444,126 +451,402 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
+const PIPELINE_METRICS: [&str; 6] = [
+    "limpid_pipeline_events_received_total",
+    "limpid_pipeline_events_finished_total",
+    "limpid_pipeline_events_dropped_total",
+    "limpid_pipeline_events_discarded_total",
+    "limpid_pipeline_events_errored_total",
+    "limpid_pipeline_events_errored_unwritable_total",
+];
+const INPUT_METRICS: [&str; 3] = [
+    "limpid_input_events_received_total",
+    "limpid_input_events_invalid_total",
+    "limpid_input_events_injected_total",
+];
+const OUTPUT_METRICS: [&str; 7] = [
+    "limpid_output_events_received_total",
+    "limpid_output_events_injected_total",
+    "limpid_output_events_written_total",
+    "limpid_output_events_failed_total",
+    "limpid_output_retries_total",
+    "limpid_output_events_wedged_total",
+    "limpid_output_events_errored_unwritable_total",
+];
+
+type MetricValues = BTreeMap<String, u64>;
+
 fn format_stats(json: &str) {
-    let v: serde_json::Value = match serde_json::from_str(json) {
-        Ok(v) => v,
-        Err(_) => {
-            print!("{}", json);
-            return;
+    match render_default_stats(json) {
+        Some(rendered) => print!("{}", rendered),
+        None => print!("{}", json),
+    }
+}
+
+/// Renders the operator table (Pipelines, Inputs, Outputs) from a
+/// schema v1 snapshot. Families outside the canonical 16 are
+/// skipped here so the layout stays operator-runbook-shaped —
+/// well-formed non-canonical families render under `--details`,
+/// malformed ones trigger the raw fallback there too. A canonical
+/// family that fails validation returns `None`, so the caller falls
+/// back to the raw response rather than emit a partial table that
+/// omits or lies about a counter.
+fn render_default_stats(json: &str) -> Option<String> {
+    let snapshot: serde_json::Value = serde_json::from_str(json).ok()?;
+    if snapshot.get("schema")?.as_u64()? != 1 {
+        return None;
+    }
+    let metrics = snapshot.get("metrics")?.as_array()?;
+    let mut families = BTreeMap::<String, MetricValues>::new();
+
+    for metric in metrics {
+        let metric = metric.as_object()?;
+        let name = metric.get("name")?.as_str()?;
+        let Some(label_name) = known_metric_label(name) else {
+            continue;
+        };
+        if metric.get("type")?.as_str()? != "counter" || families.contains_key(name) {
+            return None;
         }
+        let series = metric.get("series")?.as_array()?;
+        if series.is_empty() {
+            return None;
+        }
+        let mut values = MetricValues::new();
+        for item in series {
+            let item = item.as_object()?;
+            let labels = item.get("labels")?.as_object()?;
+            if labels.len() != 1 {
+                return None;
+            }
+            let scope = labels.get(label_name)?.as_str()?;
+            let value = item.get("value")?.as_u64()?;
+            if values.insert(scope.to_owned(), value).is_some() {
+                return None;
+            }
+        }
+        families.insert(name.to_owned(), values);
+    }
+
+    validate_metric_group(&families, &PIPELINE_METRICS)?;
+    validate_metric_group(&families, &INPUT_METRICS)?;
+    validate_metric_group(&families, &OUTPUT_METRICS)?;
+
+    let mut rendered = String::new();
+    writeln!(rendered, "Pipelines:").ok()?;
+    for name in families.get(PIPELINE_METRICS[0])?.keys() {
+        let received = metric_value(&families, PIPELINE_METRICS[0], name)?;
+        let finished = metric_value(&families, PIPELINE_METRICS[1], name)?;
+        let dropped = metric_value(&families, PIPELINE_METRICS[2], name)?;
+        let discarded = metric_value(&families, PIPELINE_METRICS[3], name)?;
+        let errored = metric_value(&families, PIPELINE_METRICS[4], name)?;
+        let unwritable = metric_value(&families, PIPELINE_METRICS[5], name)?;
+        // Both errored and errored_unwritable zero → compact row
+        // (steady state). Either non-zero → the errored column is
+        // shown (its value may be 0); the errored_unwritable column
+        // is appended only when it is itself non-zero.
+        if errored == 0 && unwritable == 0 {
+            writeln!(
+                rendered,
+                "  {:<24} {:>8} received  {:>8} finished  {:>8} dropped  {:>8} discarded",
+                name, received, finished, dropped, discarded
+            )
+            .ok()?;
+        } else {
+            write!(
+                rendered,
+                "  {:<24} {:>8} received  {:>8} finished  {:>8} dropped  {:>8} discarded  {:>8} errored",
+                name, received, finished, dropped, discarded, errored
+            )
+            .ok()?;
+            if unwritable > 0 {
+                write!(rendered, "  {:>8} errored_unwritable", unwritable).ok()?;
+            }
+            rendered.push('\n');
+        }
+    }
+
+    writeln!(rendered, "\nInputs:").ok()?;
+    for name in families.get(INPUT_METRICS[0])?.keys() {
+        writeln!(
+            rendered,
+            "  {:<24} {:>8} received  {:>8} invalid  {:>8} injected",
+            name,
+            metric_value(&families, INPUT_METRICS[0], name)?,
+            metric_value(&families, INPUT_METRICS[1], name)?,
+            metric_value(&families, INPUT_METRICS[2], name)?,
+        )
+        .ok()?;
+    }
+
+    writeln!(rendered, "\nOutputs:").ok()?;
+    for name in families.get(OUTPUT_METRICS[0])?.keys() {
+        let received = metric_value(&families, OUTPUT_METRICS[0], name)?;
+        let injected = metric_value(&families, OUTPUT_METRICS[1], name)?;
+        let written = metric_value(&families, OUTPUT_METRICS[2], name)?;
+        let failed = metric_value(&families, OUTPUT_METRICS[3], name)?;
+        let retries = metric_value(&families, OUTPUT_METRICS[4], name)?;
+        let wedged = metric_value(&families, OUTPUT_METRICS[5], name)?;
+        let unwritable = metric_value(&families, OUTPUT_METRICS[6], name)?;
+        write!(
+            rendered,
+            "  {:<24} {:>8} received  {:>8} injected  {:>8} written  {:>8} failed  {:>8} retries",
+            name, received, injected, written, failed, retries
+        )
+        .ok()?;
+        // Alarm columns (`wedged`, `errored_unwritable`) print only
+        // when non-zero — same rationale as the pipeline row above.
+        if wedged > 0 {
+            write!(rendered, "  {:>8} wedged", wedged).ok()?;
+        }
+        if unwritable > 0 {
+            write!(rendered, "  {:>8} errored_unwritable", unwritable).ok()?;
+        }
+        rendered.push('\n');
+    }
+    Some(rendered)
+}
+
+fn known_metric_label(name: &str) -> Option<&'static str> {
+    if PIPELINE_METRICS.contains(&name) {
+        Some("pipeline")
+    } else if INPUT_METRICS.contains(&name) {
+        Some("input")
+    } else if OUTPUT_METRICS.contains(&name) {
+        Some("output")
+    } else {
+        None
+    }
+}
+
+fn validate_metric_group(families: &BTreeMap<String, MetricValues>, names: &[&str]) -> Option<()> {
+    let expected = families.get(*names.first()?)?;
+    for name in names {
+        let values = families.get(*name)?;
+        if !values.keys().eq(expected.keys()) {
+            return None;
+        }
+    }
+    Some(())
+}
+
+fn metric_value(
+    families: &BTreeMap<String, MetricValues>,
+    metric: &str,
+    scope: &str,
+) -> Option<u64> {
+    families.get(metric)?.get(scope).copied()
+}
+
+struct DetailMetric {
+    name: String,
+    help: String,
+    kind: DetailKind,
+}
+
+enum DetailKind {
+    Counter(Vec<ValueDetail>),
+    Gauge(Vec<ValueDetail>),
+    Histogram(Vec<HistogramDetail>),
+}
+
+struct ValueDetail {
+    labels: Vec<(String, String)>,
+    value: u64,
+}
+
+struct HistogramDetail {
+    labels: Vec<(String, String)>,
+    buckets: Vec<(f64, u64)>,
+    sum: f64,
+    count: u64,
+}
+
+fn format_stats_details(json: &str) {
+    match render_stats_details(json) {
+        Some(rendered) => print!("{}", rendered),
+        None => print!("{}", json),
+    }
+}
+
+fn render_stats_details(json: &str) -> Option<String> {
+    let snapshot: serde_json::Value = serde_json::from_str(json).ok()?;
+    if snapshot.get("schema")?.as_u64()? != 1 {
+        return None;
+    }
+    let mut metrics: Vec<DetailMetric> = snapshot
+        .get("metrics")?
+        .as_array()?
+        .iter()
+        .map(parse_detail_metric)
+        .collect::<Option<_>>()?;
+    // If a canonical family is present but the canonical set
+    // fails default validation, `--details` also bails to the
+    // raw fallback so no partial human view of the canonical
+    // subset leaks. Well-formed non-canonical families are
+    // intentionally unaffected — the fallback scopes to the
+    // canonical subset only.
+    if metrics
+        .iter()
+        .any(|metric| known_metric_label(&metric.name).is_some())
+        && render_default_stats(json).is_none()
+    {
+        return None;
+    }
+    metrics.sort_by(|left, right| left.name.cmp(&right.name));
+    if metrics.windows(2).any(|pair| pair[0].name == pair[1].name) {
+        return None;
+    }
+
+    let mut rendered = String::new();
+    for metric in metrics {
+        writeln!(rendered, "{}:", metric.name).ok()?;
+        writeln!(rendered, "  type: {}", metric.kind.name()).ok()?;
+        writeln!(rendered, "  help: {}", metric.help).ok()?;
+        match metric.kind {
+            DetailKind::Counter(series) | DetailKind::Gauge(series) => {
+                for item in series {
+                    writeln!(rendered, "  labels: {}", format_labels(&item.labels)).ok()?;
+                    writeln!(rendered, "    value: {}", item.value).ok()?;
+                }
+            }
+            DetailKind::Histogram(series) => {
+                for item in series {
+                    writeln!(rendered, "  labels: {}", format_labels(&item.labels)).ok()?;
+                    write!(rendered, "    buckets:").ok()?;
+                    for (bound, count) in item.buckets {
+                        write!(rendered, " {} => {}", bound, count).ok()?;
+                    }
+                    rendered.push('\n');
+                    writeln!(rendered, "    sum: {}", item.sum).ok()?;
+                    writeln!(rendered, "    count: {}", item.count).ok()?;
+                }
+            }
+        }
+    }
+    Some(rendered)
+}
+
+impl DetailKind {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Counter(_) => "counter",
+            Self::Gauge(_) => "gauge",
+            Self::Histogram(_) => "histogram",
+        }
+    }
+}
+
+fn parse_detail_metric(value: &serde_json::Value) -> Option<DetailMetric> {
+    let metric = value.as_object()?;
+    let name = metric.get("name")?.as_str()?.to_owned();
+    let help = metric.get("help")?.as_str()?.to_owned();
+    let series = metric.get("series")?.as_array()?;
+    let kind = match metric.get("type")?.as_str()? {
+        "counter" => DetailKind::Counter(parse_value_details(series)?),
+        "gauge" => DetailKind::Gauge(parse_value_details(series)?),
+        "histogram" => DetailKind::Histogram(parse_histogram_details(series)?),
+        _ => return None,
     };
+    Some(DetailMetric { name, help, kind })
+}
 
-    let get = |m: &serde_json::Value, k: &str| m.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
-
-    // Pipelines first — the main concept.
-    if let Some(pipelines) = v.get("pipelines").and_then(|v| v.as_object()) {
-        let mut names: Vec<&String> = pipelines.keys().collect();
-        names.sort();
-        if !names.is_empty() {
-            println!("Pipelines:");
-            for name in &names {
-                let m = &pipelines[*name];
-                let errored = get(m, "events_errored");
-                let unwritable = get(m, "events_errored_unwritable");
-                // Default row keeps the human-eye scan compact. The
-                // errored / errored_unwritable columns only print when
-                // they're non-zero — they're alarm signals, not steady-
-                // state numbers, so a column of zeros across every
-                // pipeline would just be visual noise.
-                if errored == 0 && unwritable == 0 {
-                    println!(
-                        "  {:<24} {:>8} received  {:>8} finished  {:>8} dropped  {:>8} discarded",
-                        name,
-                        get(m, "events_received"),
-                        get(m, "events_finished"),
-                        get(m, "events_dropped"),
-                        get(m, "events_discarded"),
-                    );
-                } else {
-                    println!(
-                        "  {:<24} {:>8} received  {:>8} finished  {:>8} dropped  {:>8} discarded  {:>8} errored{}",
-                        name,
-                        get(m, "events_received"),
-                        get(m, "events_finished"),
-                        get(m, "events_dropped"),
-                        get(m, "events_discarded"),
-                        errored,
-                        if unwritable > 0 {
-                            format!("  {:>8} errored_unwritable", unwritable)
-                        } else {
-                            String::new()
-                        },
-                    );
-                }
-            }
-        }
+fn parse_value_details(series: &[serde_json::Value]) -> Option<Vec<ValueDetail>> {
+    let mut parsed: Vec<ValueDetail> = series
+        .iter()
+        .map(|value| {
+            let value = value.as_object()?;
+            Some(ValueDetail {
+                labels: parse_labels(value.get("labels")?)?,
+                value: value.get("value")?.as_u64()?,
+            })
+        })
+        .collect::<Option<_>>()?;
+    parsed.sort_by(|left, right| left.labels.cmp(&right.labels));
+    if parsed
+        .windows(2)
+        .any(|pair| pair[0].labels == pair[1].labels)
+    {
+        return None;
     }
+    Some(parsed)
+}
 
-    if let Some(inputs) = v.get("inputs").and_then(|v| v.as_object()) {
-        let mut names: Vec<&String> = inputs.keys().collect();
-        names.sort();
-        if !names.is_empty() {
-            println!("\nInputs:");
-            for name in &names {
-                let m = &inputs[*name];
-                println!(
-                    "  {:<24} {:>8} received  {:>8} invalid  {:>8} injected",
-                    name,
-                    get(m, "events_received"),
-                    get(m, "events_invalid"),
-                    get(m, "events_injected"),
-                );
+fn parse_histogram_details(series: &[serde_json::Value]) -> Option<Vec<HistogramDetail>> {
+    let mut parsed: Vec<HistogramDetail> = series
+        .iter()
+        .map(|value| {
+            let value = value.as_object()?;
+            let buckets = value
+                .get("buckets")?
+                .as_array()?
+                .iter()
+                .map(|bucket| {
+                    let bucket = bucket.as_array()?;
+                    if bucket.len() != 2 {
+                        return None;
+                    }
+                    let bound = bucket[0].as_f64()?;
+                    if !bound.is_finite() {
+                        return None;
+                    }
+                    Some((bound, bucket[1].as_u64()?))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            if buckets.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+                return None;
             }
-        }
+            if buckets.windows(2).any(|pair| pair[0].1 > pair[1].1) {
+                return None;
+            }
+            // Bucket counts and the total `count` are loaded from
+            // independent atomics in the daemon, so observe ordering
+            // permits a transient last-bucket count that exceeds the
+            // total — do not reject on that inequality.
+            let sum = value.get("sum")?.as_f64()?;
+            if !sum.is_finite() {
+                return None;
+            }
+            Some(HistogramDetail {
+                labels: parse_labels(value.get("labels")?)?,
+                buckets,
+                sum,
+                count: value.get("count")?.as_u64()?,
+            })
+        })
+        .collect::<Option<_>>()?;
+    parsed.sort_by(|left, right| left.labels.cmp(&right.labels));
+    if parsed
+        .windows(2)
+        .any(|pair| pair[0].labels == pair[1].labels)
+    {
+        return None;
     }
+    Some(parsed)
+}
 
-    if let Some(outputs) = v.get("outputs").and_then(|v| v.as_object()) {
-        let mut names: Vec<&String> = outputs.keys().collect();
-        names.sort();
-        if !names.is_empty() {
-            println!("\nOutputs:");
-            for name in &names {
-                let m = &outputs[*name];
-                let wedged = get(m, "events_wedged");
-                let unwritable = get(m, "events_errored_unwritable");
-                // Same shape as the pipelines row above: the alarm
-                // columns (`wedged`, `errored_unwritable`) only print
-                // when non-zero. Zero-across-all-outputs would just be
-                // visual noise on a steady-state row.
-                if wedged == 0 && unwritable == 0 {
-                    println!(
-                        "  {:<24} {:>8} received  {:>8} injected  {:>8} written  {:>8} failed  {:>8} retries",
-                        name,
-                        get(m, "events_received"),
-                        get(m, "events_injected"),
-                        get(m, "events_written"),
-                        get(m, "events_failed"),
-                        get(m, "retries"),
-                    );
-                } else {
-                    println!(
-                        "  {:<24} {:>8} received  {:>8} injected  {:>8} written  {:>8} failed  {:>8} retries{}{}",
-                        name,
-                        get(m, "events_received"),
-                        get(m, "events_injected"),
-                        get(m, "events_written"),
-                        get(m, "events_failed"),
-                        get(m, "retries"),
-                        if wedged > 0 {
-                            format!("  {:>8} wedged", wedged)
-                        } else {
-                            String::new()
-                        },
-                        if unwritable > 0 {
-                            format!("  {:>8} errored_unwritable", unwritable)
-                        } else {
-                            String::new()
-                        },
-                    );
-                }
-            }
-        }
+fn parse_labels(value: &serde_json::Value) -> Option<Vec<(String, String)>> {
+    let mut labels: Vec<(String, String)> = value
+        .as_object()?
+        .iter()
+        .map(|(key, value)| Some((key.clone(), value.as_str()?.to_owned())))
+        .collect::<Option<_>>()?;
+    labels.sort();
+    Some(labels)
+}
+
+fn format_labels(labels: &[(String, String)]) -> String {
+    if labels.is_empty() {
+        return "{}".to_owned();
     }
+    labels
+        .iter()
+        .map(|(key, value)| {
+            let quoted = serde_json::to_string(value).expect("strings always serialize");
+            format!("{}={}", key, quoted)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn format_list(json: &str) {
