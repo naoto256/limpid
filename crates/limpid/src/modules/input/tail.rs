@@ -14,7 +14,6 @@
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -73,7 +72,7 @@ impl Module for TailInput {
     fn from_properties(
         name: &str,
         properties: &crate::dsl::module_props::ModuleProperties,
-        _ctx: &crate::modules::BuildContext,
+        ctx: &crate::modules::BuildContext,
     ) -> Result<Self> {
         let properties = properties.user_properties();
         let path = props::get_string(properties, "path")
@@ -87,7 +86,7 @@ impl Module for TailInput {
             path: PathBuf::from(path),
             state_file,
             poll_interval,
-            metrics: Arc::new(InputMetrics::default()),
+            metrics: InputMetrics::register(&ctx.metrics, name)?,
         })
     }
 }
@@ -361,7 +360,7 @@ impl TailInput {
                 continue;
             }
 
-            self.metrics.events_received.fetch_add(1, Ordering::Relaxed);
+            self.metrics.events_received.inc();
 
             // Stamp the event with the post-line offset. When the pipeline
             // worker finishes (or fans out across multiple workers and the
@@ -468,7 +467,7 @@ mod tests {
             path: path.to_path_buf(),
             state_file: state_file.map(|p| p.to_path_buf()),
             poll_interval: Duration::from_millis(10),
-            metrics: Arc::new(InputMetrics::default()),
+            metrics: InputMetrics::for_testing(),
         }
     }
 

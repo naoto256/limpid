@@ -277,8 +277,7 @@ impl QueueSender {
         };
         if let Some(m) = &self.metrics {
             if result.is_ok() {
-                m.events_received
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                m.events_received.inc();
             } else {
                 // Enqueue failure: memory-queue receiver dropped (=
                 // consumer task gone, daemon usually shutting down),
@@ -290,8 +289,7 @@ impl QueueSender {
                 // metrics; the pipeline-side caller additionally
                 // routes the lost event through the dead-letter
                 // path.
-                m.events_failed
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                m.events_failed.inc();
             }
         }
         result
@@ -1338,7 +1336,6 @@ fn handle_ack_disposition(
     name: &str,
     metrics: &crate::metrics::OutputMetrics,
 ) {
-    use std::sync::atomic::Ordering;
     match disposition {
         AckDisposition::Delivered => {
             // The output bumped `events_written` itself on the success
@@ -1389,7 +1386,7 @@ fn handle_ack_disposition(
                  panic logs)",
                 name
             );
-            metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+            metrics.events_failed.inc();
         }
     }
 }
@@ -1419,12 +1416,11 @@ fn record_wedge_transition_if_first(
     name: &str,
     metrics: &crate::metrics::OutputMetrics,
 ) {
-    use std::sync::atomic::Ordering;
     let is_disk_position = matches!(position, AckPosition::Disk { .. });
     let is_dropped_on_disk = matches!(disposition, AckDisposition::Dropped) && is_disk_position;
     if is_dropped_on_disk && !*wedged {
         *wedged = true;
-        metrics.events_wedged.fetch_add(1, Ordering::Relaxed);
+        metrics.events_wedged.inc();
         tracing::error!(
             "output '{}': disk queue wedged after AckDisposition::Dropped at position {:?} — \
              the consumer will drain in-flight events and stop accepting new ones. Fix the \
@@ -1450,7 +1446,7 @@ mod wedge_transition_helper_tests {
     #[test]
     fn first_dropped_on_disk_sets_wedge_and_bumps() {
         let mut wedged = false;
-        let metrics = OutputMetrics::default();
+        let metrics = OutputMetrics::for_testing();
         record_wedge_transition_if_first(
             disk_pos(1),
             AckDisposition::Dropped,
@@ -1465,7 +1461,7 @@ mod wedge_transition_helper_tests {
     #[test]
     fn subsequent_dropped_on_disk_is_idempotent() {
         let mut wedged = true;
-        let metrics = OutputMetrics::default();
+        let metrics = OutputMetrics::for_testing();
         record_wedge_transition_if_first(
             disk_pos(2),
             AckDisposition::Dropped,
@@ -1480,7 +1476,7 @@ mod wedge_transition_helper_tests {
     #[test]
     fn dropped_on_memory_is_noop() {
         let mut wedged = false;
-        let metrics = OutputMetrics::default();
+        let metrics = OutputMetrics::for_testing();
         record_wedge_transition_if_first(
             AckPosition::Memory,
             AckDisposition::Dropped,
@@ -1495,7 +1491,7 @@ mod wedge_transition_helper_tests {
     #[test]
     fn recovered_on_disk_is_noop() {
         let mut wedged = false;
-        let metrics = OutputMetrics::default();
+        let metrics = OutputMetrics::for_testing();
         record_wedge_transition_if_first(
             disk_pos(3),
             AckDisposition::Recovered,
@@ -1510,7 +1506,7 @@ mod wedge_transition_helper_tests {
     #[test]
     fn delivered_on_disk_is_noop() {
         let mut wedged = false;
-        let metrics = OutputMetrics::default();
+        let metrics = OutputMetrics::for_testing();
         record_wedge_transition_if_first(
             disk_pos(4),
             AckDisposition::Delivered,
@@ -1565,7 +1561,7 @@ mod consumer_lifecycle_tests {
             Self {
                 script: Mutex::new(script),
                 calls: std::sync::atomic::AtomicUsize::new(0),
-                metrics: Arc::new(crate::metrics::OutputMetrics::default()),
+                metrics: crate::metrics::OutputMetrics::for_testing(),
             }
         }
         fn calls(&self) -> usize {
@@ -1743,7 +1739,7 @@ mod consumer_lifecycle_tests {
             Outcome::Delivered,
             Outcome::Delivered,
         ]));
-        let metrics = Arc::new(crate::metrics::OutputMetrics::default());
+        let metrics = crate::metrics::OutputMetrics::for_testing();
         let (sender, shutdown, handle) =
             spawn_consumer(writer.clone() as Arc<dyn Output>, Arc::clone(&metrics)).await;
         for _ in 0..3 {
@@ -1770,7 +1766,7 @@ mod consumer_lifecycle_tests {
             return;
         }
         let writer = Arc::new(ScriptedWriter::new(vec![Outcome::Bug]));
-        let metrics = Arc::new(crate::metrics::OutputMetrics::default());
+        let metrics = crate::metrics::OutputMetrics::for_testing();
         let (sender, shutdown, handle) =
             spawn_consumer(writer.clone() as Arc<dyn Output>, Arc::clone(&metrics)).await;
         sender.send(owned_event()).await.unwrap();
@@ -1814,7 +1810,7 @@ mod consumer_lifecycle_tests {
                 shutdown_mode: mode,
                 shutdown_called: std::sync::atomic::AtomicBool::new(false),
                 consume_calls: std::sync::atomic::AtomicUsize::new(0),
-                metrics: Arc::new(crate::metrics::OutputMetrics::default()),
+                metrics: crate::metrics::OutputMetrics::for_testing(),
             }
         }
     }
@@ -1864,7 +1860,7 @@ mod consumer_lifecycle_tests {
                         // Mirror the real shutdown DLQ recovery path:
                         // failed final flush → resolve Recovered after
                         // routing each event to error_log.
-                        self.metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+                        self.metrics.events_failed.inc();
                         ack.resolve_recovered();
                     }
                 }
@@ -1884,7 +1880,7 @@ mod consumer_lifecycle_tests {
     #[tokio::test]
     async fn shutdown_drains_batched_buffer_before_consumer_exits() {
         let writer = Arc::new(BatchedMockWriter::new(ShutdownMode::DeliverAll));
-        let metrics = Arc::new(crate::metrics::OutputMetrics::default());
+        let metrics = crate::metrics::OutputMetrics::for_testing();
         let (sender, shutdown, handle) =
             spawn_consumer(writer.clone() as Arc<dyn Output>, Arc::clone(&metrics)).await;
         for _ in 0..5 {
@@ -1922,7 +1918,7 @@ mod consumer_lifecycle_tests {
     #[tokio::test]
     async fn shutdown_routes_failed_batch_to_dlq() {
         let writer = Arc::new(BatchedMockWriter::new(ShutdownMode::FailAll));
-        let metrics = Arc::new(crate::metrics::OutputMetrics::default());
+        let metrics = crate::metrics::OutputMetrics::for_testing();
         let (sender, shutdown, handle) =
             spawn_consumer(writer.clone() as Arc<dyn Output>, Arc::clone(&metrics)).await;
         for _ in 0..3 {
@@ -2317,7 +2313,7 @@ mod consumer_lifecycle_tests {
             send_calls: AtomicUsize::new(0),
             shutdown_called: AtomicBool::new(false),
             shutdown_wedged_called: AtomicBool::new(false),
-            metrics: Arc::new(crate::metrics::OutputMetrics::default()),
+            metrics: crate::metrics::OutputMetrics::for_testing(),
         });
         let metrics = Arc::clone(&writer.metrics);
         let (sender, shutdown_tx, handle) = spawn_consumer_with_queue(

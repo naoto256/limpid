@@ -16,7 +16,6 @@ use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::task::{Context as TaskContext, Poll};
 use std::time::Instant;
 
@@ -222,7 +221,7 @@ impl Module for SyslogTcpOutput {
             retry,
             error_log,
             error_log_fallback: ctx.error_log_fallback,
-            metrics: Arc::new(OutputMetrics::default()),
+            metrics: OutputMetrics::register(&ctx.metrics, name)?,
             shutdown_signal: ctx.shutdown_signal.clone(),
         })
     }
@@ -386,13 +385,13 @@ impl Output for SyslogTcpOutput {
             };
             match write_result {
                 Ok(()) => {
-                    self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.events_written.inc();
                     ack.resolve_delivered();
                     return Ok(());
                 }
                 Err(e) => {
                     attempt += 1;
-                    self.metrics.retries.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.retries.inc();
                     if attempt >= self.retry.max_attempts {
                         let reason =
                             format!("output write failed after {} attempts: {}", attempt, e);

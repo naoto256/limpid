@@ -1,10 +1,12 @@
-//! Shared metrics counters.
+//! Shared self-describing metrics registry and fully-labelled handles.
 //!
-//! Each component owns its own `Arc<XxxMetrics>` and counts internally.
-//! `MetricsRegistry` holds references for aggregated access (stats command).
-//! Runtime never counts — it only distributes handles.
+//! Metric-emitting inputs, the pipeline worker, and outputs hold
+//! their corresponding per-role bundle (`InputMetrics`,
+//! `PipelineMetrics`, `OutputMetrics`); each bundle's `register`
+//! helper materialises its canonical fully-labelled counter series
+//! in the shared registry.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,27 +16,50 @@ use serde::Serialize;
 pub struct InputMetrics {
     /// Events actually received by the input module (network, socket, file, etc).
     /// Injected events are NOT counted here — see `events_injected`.
-    pub events_received: AtomicU64,
-    pub events_invalid: AtomicU64,
+    pub(crate) events_received: Arc<registry_core::Counter>,
+    pub(crate) events_invalid: Arc<registry_core::Counter>,
     /// Events pushed into this input's channel via `limpidctl inject`.
-    pub events_injected: AtomicU64,
+    pub(crate) events_injected: Arc<registry_core::Counter>,
 }
 
-impl Default for InputMetrics {
-    fn default() -> Self {
-        Self {
-            events_received: AtomicU64::new(0),
-            events_invalid: AtomicU64::new(0),
-            events_injected: AtomicU64::new(0),
+impl InputMetrics {
+    pub(crate) fn register(registry: &Registry, input: &str) -> Result<Arc<Self>, MetricsError> {
+        macro_rules! counter {
+            ($name:literal, $help:literal) => {
+                registry
+                    .counter($name)
+                    .label("input", input)
+                    .help($help)
+                    .build()?
+            };
         }
+        Ok(Arc::new(Self {
+            events_received: counter!(
+                "limpid_input_events_received_total",
+                "Total events received by the input."
+            ),
+            events_invalid: counter!(
+                "limpid_input_events_invalid_total",
+                "Total invalid events rejected by the input."
+            ),
+            events_injected: counter!(
+                "limpid_input_events_injected_total",
+                "Total events injected into the input through the control socket."
+            ),
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_testing() -> Arc<Self> {
+        Self::register(&Registry::new(), "test-input").expect("test input metrics must register")
     }
 }
 
 pub struct PipelineMetrics {
-    pub events_received: AtomicU64,
-    pub events_finished: AtomicU64,
-    pub events_dropped: AtomicU64,
-    pub events_discarded: AtomicU64,
+    pub(crate) events_received: Arc<registry_core::Counter>,
+    pub(crate) events_finished: Arc<registry_core::Counter>,
+    pub(crate) events_dropped: Arc<registry_core::Counter>,
+    pub(crate) events_discarded: Arc<registry_core::Counter>,
     /// Events for which a `process` statement raised a runtime error
     /// (unknown identifier, type mismatch, regex compile failure, …).
     /// The event is routed to the dead-letter queue: the configured
@@ -45,37 +70,70 @@ pub struct PipelineMetrics {
     /// from `events_discarded` so operators can tell a config-bug-
     /// shaped routing miss apart from a logic-bug-shaped runtime
     /// failure.
-    pub events_errored: AtomicU64,
+    pub(crate) events_errored: Arc<registry_core::Counter>,
     /// Subset of `events_errored` for which the configured
     /// `error_log` write itself failed (disk full, permissions,
     /// rotation race). The runtime falls back to a structured
     /// `tracing::error!` line, but operators should alarm on this
     /// counter — it means the replay path may be incomplete.
-    pub events_errored_unwritable: AtomicU64,
+    pub(crate) events_errored_unwritable: Arc<registry_core::Counter>,
 }
 
-impl Default for PipelineMetrics {
-    fn default() -> Self {
-        Self {
-            events_received: AtomicU64::new(0),
-            events_finished: AtomicU64::new(0),
-            events_dropped: AtomicU64::new(0),
-            events_discarded: AtomicU64::new(0),
-            events_errored: AtomicU64::new(0),
-            events_errored_unwritable: AtomicU64::new(0),
+impl PipelineMetrics {
+    pub(crate) fn register(registry: &Registry, pipeline: &str) -> Result<Arc<Self>, MetricsError> {
+        macro_rules! counter {
+            ($name:literal, $help:literal) => {
+                registry
+                    .counter($name)
+                    .label("pipeline", pipeline)
+                    .help($help)
+                    .build()?
+            };
         }
+        Ok(Arc::new(Self {
+            events_received: counter!(
+                "limpid_pipeline_events_received_total",
+                "Total events received by the pipeline."
+            ),
+            events_finished: counter!(
+                "limpid_pipeline_events_finished_total",
+                "Total events that finished pipeline processing."
+            ),
+            events_dropped: counter!(
+                "limpid_pipeline_events_dropped_total",
+                "Total events dropped by the pipeline."
+            ),
+            events_discarded: counter!(
+                "limpid_pipeline_events_discarded_total",
+                "Total events discarded by pipeline routing."
+            ),
+            events_errored: counter!(
+                "limpid_pipeline_events_errored_total",
+                "Total events that encountered a pipeline processing error."
+            ),
+            events_errored_unwritable: counter!(
+                "limpid_pipeline_events_errored_unwritable_total",
+                "Total pipeline errors whose recovery record could not be written."
+            ),
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_testing() -> Arc<Self> {
+        Self::register(&Registry::new(), "test-pipeline")
+            .expect("test pipeline metrics must register")
     }
 }
 
 pub struct OutputMetrics {
     /// Total events that entered this output's queue (from pipelines + injects).
     /// `events_received - events_injected` = events delivered via pipelines.
-    pub events_received: AtomicU64,
+    pub(crate) events_received: Arc<registry_core::Counter>,
     /// Events pushed into this output's queue via `limpidctl inject`.
-    pub events_injected: AtomicU64,
-    pub events_written: AtomicU64,
-    pub events_failed: AtomicU64,
-    pub retries: AtomicU64,
+    pub(crate) events_injected: Arc<registry_core::Counter>,
+    pub(crate) events_written: Arc<registry_core::Counter>,
+    pub(crate) events_failed: Arc<registry_core::Counter>,
+    pub(crate) retries: Arc<registry_core::Counter>,
     /// Disk queue consumers that stopped accepting new events after
     /// observing an `AckDisposition::Dropped` — `Dropped` cannot
     /// advance a disk cursor without hiding data loss, and
@@ -89,7 +147,7 @@ pub struct OutputMetrics {
     /// daemon so the disk queue can replay from the wedge point.
     /// See `docs/src/operations/error-log.md` for the manual
     /// intervention runbook.
-    pub events_wedged: AtomicU64,
+    pub(crate) events_wedged: Arc<registry_core::Counter>,
     /// Sink-side counterpart to `PipelineMetrics::events_errored_unwritable`:
     /// bumped when an output's own `route_event_to_dlq` call
     /// failed to write the DLQ record (`error_log` was configured
@@ -104,141 +162,52 @@ pub struct OutputMetrics {
     /// replay path so the event is actually lost, and this counter
     /// is the operator alarm signal for that loss rather than a
     /// durable trace of it.
-    pub events_errored_unwritable: AtomicU64,
+    pub(crate) events_errored_unwritable: Arc<registry_core::Counter>,
 }
 
-impl Default for OutputMetrics {
-    fn default() -> Self {
-        Self {
-            events_received: AtomicU64::new(0),
-            events_injected: AtomicU64::new(0),
-            events_written: AtomicU64::new(0),
-            events_failed: AtomicU64::new(0),
-            retries: AtomicU64::new(0),
-            events_wedged: AtomicU64::new(0),
-            events_errored_unwritable: AtomicU64::new(0),
+impl OutputMetrics {
+    pub(crate) fn register(registry: &Registry, output: &str) -> Result<Arc<Self>, MetricsError> {
+        macro_rules! counter {
+            ($name:literal, $help:literal) => {
+                registry
+                    .counter($name)
+                    .label("output", output)
+                    .help($help)
+                    .build()?
+            };
         }
-    }
-}
-
-/// Central registry holding Arc references to all metrics counters.
-pub struct MetricsRegistry {
-    inputs: HashMap<String, Arc<InputMetrics>>,
-    pipelines: HashMap<String, Arc<PipelineMetrics>>,
-    outputs: HashMap<String, Arc<OutputMetrics>>,
-}
-
-impl MetricsRegistry {
-    pub fn new() -> Self {
-        Self {
-            inputs: HashMap::new(),
-            pipelines: HashMap::new(),
-            outputs: HashMap::new(),
-        }
-    }
-
-    /// Collect a metrics handle from a module that owns it.
-    pub fn register_input(&mut self, name: &str, metrics: Arc<InputMetrics>) {
-        self.inputs.insert(name.to_string(), metrics);
-    }
-
-    /// Collect a metrics handle from a pipeline worker that owns it.
-    pub fn register_pipeline(&mut self, name: &str, metrics: Arc<PipelineMetrics>) {
-        self.pipelines.insert(name.to_string(), metrics);
-    }
-
-    /// Collect a metrics handle from an output module that owns it.
-    pub fn register_output(&mut self, name: &str, metrics: Arc<OutputMetrics>) {
-        self.outputs.insert(name.to_string(), metrics);
+        Ok(Arc::new(Self {
+            events_received: counter!(
+                "limpid_output_events_received_total",
+                "Total events received by the output queue."
+            ),
+            events_injected: counter!(
+                "limpid_output_events_injected_total",
+                "Total events injected into the output through the control socket."
+            ),
+            events_written: counter!(
+                "limpid_output_events_written_total",
+                "Total events successfully written by the output."
+            ),
+            events_failed: counter!(
+                "limpid_output_events_failed_total",
+                "Total events that reached a terminal failure disposition for this output."
+            ),
+            retries: counter!("limpid_output_retries_total", "Total output write retries."),
+            events_wedged: counter!(
+                "limpid_output_events_wedged_total",
+                "Total disk queue consumers wedged after an unrecoverable drop."
+            ),
+            events_errored_unwritable: counter!(
+                "limpid_output_events_errored_unwritable_total",
+                "Total output errors whose recovery record could not be written."
+            ),
+        }))
     }
 
-    pub fn to_json(&self) -> String {
-        let mut map = serde_json::Map::new();
-
-        // Pipelines first — they're the main concept.
-        let mut pipelines = serde_json::Map::new();
-        for (name, m) in &self.pipelines {
-            let mut p = serde_json::Map::new();
-            p.insert(
-                "events_received".into(),
-                m.events_received.load(Ordering::Relaxed).into(),
-            );
-            p.insert(
-                "events_finished".into(),
-                m.events_finished.load(Ordering::Relaxed).into(),
-            );
-            p.insert(
-                "events_dropped".into(),
-                m.events_dropped.load(Ordering::Relaxed).into(),
-            );
-            p.insert(
-                "events_discarded".into(),
-                m.events_discarded.load(Ordering::Relaxed).into(),
-            );
-            p.insert(
-                "events_errored".into(),
-                m.events_errored.load(Ordering::Relaxed).into(),
-            );
-            p.insert(
-                "events_errored_unwritable".into(),
-                m.events_errored_unwritable.load(Ordering::Relaxed).into(),
-            );
-            pipelines.insert(name.clone(), serde_json::Value::Object(p));
-        }
-        map.insert("pipelines".into(), serde_json::Value::Object(pipelines));
-
-        let mut inputs = serde_json::Map::new();
-        for (name, m) in &self.inputs {
-            let mut i = serde_json::Map::new();
-            i.insert(
-                "events_received".into(),
-                m.events_received.load(Ordering::Relaxed).into(),
-            );
-            i.insert(
-                "events_invalid".into(),
-                m.events_invalid.load(Ordering::Relaxed).into(),
-            );
-            i.insert(
-                "events_injected".into(),
-                m.events_injected.load(Ordering::Relaxed).into(),
-            );
-            inputs.insert(name.clone(), serde_json::Value::Object(i));
-        }
-        map.insert("inputs".into(), serde_json::Value::Object(inputs));
-
-        let mut outputs = serde_json::Map::new();
-        for (name, m) in &self.outputs {
-            let mut o = serde_json::Map::new();
-            o.insert(
-                "events_received".into(),
-                m.events_received.load(Ordering::Relaxed).into(),
-            );
-            o.insert(
-                "events_injected".into(),
-                m.events_injected.load(Ordering::Relaxed).into(),
-            );
-            o.insert(
-                "events_written".into(),
-                m.events_written.load(Ordering::Relaxed).into(),
-            );
-            o.insert(
-                "events_failed".into(),
-                m.events_failed.load(Ordering::Relaxed).into(),
-            );
-            o.insert("retries".into(), m.retries.load(Ordering::Relaxed).into());
-            o.insert(
-                "events_wedged".into(),
-                m.events_wedged.load(Ordering::Relaxed).into(),
-            );
-            o.insert(
-                "events_errored_unwritable".into(),
-                m.events_errored_unwritable.load(Ordering::Relaxed).into(),
-            );
-            outputs.insert(name.clone(), serde_json::Value::Object(o));
-        }
-        map.insert("outputs".into(), serde_json::Value::Object(outputs));
-
-        serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_default()
+    #[cfg(test)]
+    pub(crate) fn for_testing() -> Arc<Self> {
+        Self::register(&Registry::new(), "test-output").expect("test output metrics must register")
     }
 }
 
@@ -251,9 +220,6 @@ impl MetricsRegistry {
 /// must propagate to daemon startup and must not be swallowed at the
 /// emit site.
 ///
-/// The module intentionally coexists unwired with the active legacy
-/// `MetricsRegistry` above; the `#[allow(dead_code)]` is temporary and
-/// applies only while no in-tree consumer of this module exists.
 #[allow(dead_code)]
 mod registry_core {
     use super::*;
@@ -355,6 +321,11 @@ mod registry_core {
     impl Counter {
         pub(crate) fn inc(&self) {
             self.value.fetch_add(1, Ordering::Relaxed);
+        }
+
+        #[cfg(test)]
+        pub(crate) fn load(&self, _ordering: Ordering) -> u64 {
+            self.value.load(Ordering::Relaxed)
         }
     }
 
@@ -996,8 +967,11 @@ pub(crate) use registry_core::{MetricsError, MetricsSnapshot, Registry};
 
 #[cfg(test)]
 mod registry_tests {
-    use super::{MetricsError, MetricsSnapshot, Registry};
+    use super::{
+        InputMetrics, MetricsError, MetricsSnapshot, OutputMetrics, PipelineMetrics, Registry,
+    };
     use serde_json::Value;
+    use std::sync::Arc;
 
     fn build_ok<T>(result: Result<T, MetricsError>) -> T {
         match result {
@@ -1556,5 +1530,168 @@ mod registry_tests {
             .collect();
         assert_eq!(values_by_source.get("one"), Some(&1));
         assert_eq!(values_by_source.get("two"), Some(&2));
+    }
+
+    #[test]
+    fn documented_metric_bundles_share_one_registry_without_shadow_series() {
+        let registry = Registry::new();
+        let input: Arc<InputMetrics> = build_ok(InputMetrics::register(&registry, "ingress"));
+        let pipeline: Arc<PipelineMetrics> =
+            build_ok(PipelineMetrics::register(&registry, "route"));
+        let output: Arc<OutputMetrics> = build_ok(OutputMetrics::register(&registry, "egress"));
+        let input_shared = Arc::clone(&input);
+        let pipeline_shared = Arc::clone(&pipeline);
+        let output_shared = Arc::clone(&output);
+
+        macro_rules! inc {
+            ($counter:expr, $times:expr) => {
+                for _ in 0..$times {
+                    $counter.inc();
+                }
+            };
+        }
+
+        inc!(input_shared.events_received, 1);
+        inc!(input.events_invalid, 2);
+        inc!(input.events_injected, 3);
+        inc!(pipeline_shared.events_received, 4);
+        inc!(pipeline.events_finished, 5);
+        inc!(pipeline.events_dropped, 6);
+        inc!(pipeline.events_discarded, 7);
+        inc!(pipeline.events_errored, 8);
+        inc!(pipeline.events_errored_unwritable, 9);
+        inc!(output_shared.events_received, 10);
+        inc!(output.events_injected, 11);
+        inc!(output.events_written, 12);
+        inc!(output.events_failed, 13);
+        inc!(output.retries, 14);
+        inc!(output.events_wedged, 15);
+        inc!(output.events_errored_unwritable, 16);
+
+        let snapshot = snapshot_json(&registry);
+        let metrics = snapshot["metrics"]
+            .as_array()
+            .expect("metrics must be an array");
+        assert_eq!(
+            metrics.len(),
+            16,
+            "only the documented metric set is registered"
+        );
+
+        let expected = [
+            ("limpid_input_events_received_total", "input", "ingress", 1),
+            ("limpid_input_events_invalid_total", "input", "ingress", 2),
+            ("limpid_input_events_injected_total", "input", "ingress", 3),
+            (
+                "limpid_pipeline_events_received_total",
+                "pipeline",
+                "route",
+                4,
+            ),
+            (
+                "limpid_pipeline_events_finished_total",
+                "pipeline",
+                "route",
+                5,
+            ),
+            (
+                "limpid_pipeline_events_dropped_total",
+                "pipeline",
+                "route",
+                6,
+            ),
+            (
+                "limpid_pipeline_events_discarded_total",
+                "pipeline",
+                "route",
+                7,
+            ),
+            (
+                "limpid_pipeline_events_errored_total",
+                "pipeline",
+                "route",
+                8,
+            ),
+            (
+                "limpid_pipeline_events_errored_unwritable_total",
+                "pipeline",
+                "route",
+                9,
+            ),
+            (
+                "limpid_output_events_received_total",
+                "output",
+                "egress",
+                10,
+            ),
+            (
+                "limpid_output_events_injected_total",
+                "output",
+                "egress",
+                11,
+            ),
+            ("limpid_output_events_written_total", "output", "egress", 12),
+            ("limpid_output_events_failed_total", "output", "egress", 13),
+            ("limpid_output_retries_total", "output", "egress", 14),
+            ("limpid_output_events_wedged_total", "output", "egress", 15),
+            (
+                "limpid_output_events_errored_unwritable_total",
+                "output",
+                "egress",
+                16,
+            ),
+        ];
+        for (name, label, label_value, value) in expected {
+            let family = metric(&snapshot, name);
+            assert_eq!(family["type"], "counter");
+            assert!(
+                family["help"].as_str().is_some_and(|help| !help.is_empty()),
+                "{name} must remain self-describing"
+            );
+            let series = family["series"]
+                .as_array()
+                .expect("series must be an array");
+            assert_eq!(series.len(), 1, "{name} must have exactly one series");
+            let series = &series[0];
+            let labels = series["labels"]
+                .as_object()
+                .expect("labels must be an object");
+            assert_eq!(labels.len(), 1, "{name} must have exactly one label");
+            assert_eq!(
+                labels.get(label).and_then(Value::as_str),
+                Some(label_value),
+                "{name} must have the documented labelset"
+            );
+            assert_eq!(series["value"], value);
+        }
+
+        let duplicate = match OutputMetrics::register(&registry, "egress") {
+            Ok(_) => panic!("the bundle must register into the supplied shared registry"),
+            Err(error) => error,
+        };
+        let diagnostic = duplicate.to_string();
+        assert_output_duplicate(&duplicate, "egress", &diagnostic);
+    }
+
+    fn assert_output_duplicate(error: &MetricsError, label_value: &str, diagnostic: &str) {
+        let (name, labelset) = match error {
+            MetricsError::DuplicateSeries { name, labelset } => (name, labelset),
+            other => panic!("expected DuplicateSeries, got {other:?}"),
+        };
+        assert!(
+            [
+                "limpid_output_events_received_total",
+                "limpid_output_events_injected_total",
+                "limpid_output_events_written_total",
+                "limpid_output_events_failed_total",
+                "limpid_output_retries_total",
+                "limpid_output_events_wedged_total",
+                "limpid_output_events_errored_unwritable_total",
+            ]
+            .contains(&name.as_str())
+        );
+        assert_eq!(labelset, &[("output".to_owned(), label_value.to_owned())]);
+        assert!(diagnostic.contains(&format!("name={name:?}")));
+        assert!(diagnostic.contains(&format!("labelset={labelset:?}")));
     }
 }

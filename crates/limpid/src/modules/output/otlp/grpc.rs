@@ -288,7 +288,7 @@ impl Module for OtlpGrpcOutput {
 
         let retry_config = RetryConfig::from_output_properties(properties)?;
 
-        let metrics = Arc::new(OutputMetrics::default());
+        let metrics = OutputMetrics::register(&ctx.metrics, name)?;
         let policy = OtlpGrpcSinkPolicy {
             peers,
             rotation,

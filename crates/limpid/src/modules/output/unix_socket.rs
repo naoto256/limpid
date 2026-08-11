@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
@@ -131,7 +132,7 @@ impl Module for UnixSocketOutput {
             retry,
             error_log: ctx.error_log.as_ref().map(Arc::clone),
             error_log_fallback: ctx.error_log_fallback,
-            metrics: Arc::new(OutputMetrics::default()),
+            metrics: OutputMetrics::register(&ctx.metrics, name)?,
             shutdown_signal: ctx.shutdown_signal.clone(),
             allowed_peer_uids,
         })
@@ -195,13 +196,13 @@ impl Output for UnixSocketOutput {
                     // success bump) does not double-count against the
                     // transport helper. Sibling syslog_udp uses the
                     // identical shape after the previous fix.
-                    self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.events_written.inc();
                     ack.resolve_delivered();
                     return Ok(());
                 }
                 Err(e) => {
                     attempt += 1;
-                    self.metrics.retries.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.retries.inc();
                     if attempt >= self.retry.max_attempts {
                         let reason =
                             format!("output write failed after {} attempts: {}", attempt, e);

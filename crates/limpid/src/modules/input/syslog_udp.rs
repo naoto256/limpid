@@ -2,6 +2,7 @@
 //! Invalid PRI messages are dropped with a warning.
 
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::atomic::Ordering;
 
 use anyhow::Result;
@@ -46,9 +47,9 @@ impl Module for SyslogUdpInput {
     }
 
     fn from_properties(
-        _name: &str,
+        name: &str,
         properties: &crate::dsl::module_props::ModuleProperties,
-        _ctx: &crate::modules::BuildContext,
+        ctx: &crate::modules::BuildContext,
     ) -> Result<Self> {
         let properties = properties.user_properties();
         let bind =
@@ -57,7 +58,7 @@ impl Module for SyslogUdpInput {
         Ok(Self {
             bind_addr: bind,
             rate_limit,
-            metrics: Arc::new(InputMetrics::default()),
+            metrics: InputMetrics::register(&ctx.metrics, name)?,
         })
     }
 }
@@ -104,11 +105,11 @@ impl Input for SyslogUdpInput {
 
                             if let Err(e) = validate_pri(data) {
                                 warn!("syslog_udp [{}]: dropping invalid message ({})", addr, e);
-                                metrics.events_invalid.fetch_add(1, Ordering::Relaxed);
+                                metrics.events_invalid.inc();
                                 continue;
                             }
 
-                            metrics.events_received.fetch_add(1, Ordering::Relaxed);
+                            metrics.events_received.inc();
 
                             if let Some(ref limiter) = limiter {
                                 limiter.acquire().await;
@@ -157,7 +158,7 @@ mod tests {
         tokio::sync::mpsc::Receiver<Event>,
         Arc<InputMetrics>,
     ) {
-        let metrics = Arc::new(InputMetrics::default());
+        let metrics = InputMetrics::for_testing();
         let input = SyslogUdpInput {
             bind_addr,
             rate_limit: None,

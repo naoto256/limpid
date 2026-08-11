@@ -94,9 +94,9 @@ impl Module for JournalInput {
     }
 
     fn from_properties(
-        _name: &str,
+        name: &str,
         properties: &crate::dsl::module_props::ModuleProperties,
-        _ctx: &crate::modules::BuildContext,
+        ctx: &crate::modules::BuildContext,
     ) -> Result<Self> {
         let properties = properties.user_properties();
         // Repeatable `match` — walk every occurrence so multi-filter
@@ -130,7 +130,7 @@ impl Module for JournalInput {
                     "input '{}': journal `match` requires `FIELD=value` shape (got \"{}\") — \
                      each match string must contain '='; see \
                      `docs/src/inputs/journal.md` for the filter combining rules",
-                    _name,
+                    name,
                     m
                 );
             }
@@ -146,7 +146,7 @@ impl Module for JournalInput {
             matches,
             state_file,
             poll_interval,
-            metrics: Arc::new(InputMetrics::default()),
+            metrics: InputMetrics::register(&ctx.metrics, name)?,
         })
     }
 }
@@ -248,7 +248,7 @@ impl Input for JournalInput {
                 entry = entry_rx.recv() => {
                     match entry {
                         Some((bytes, cursor)) => {
-                            metrics.events_received.fetch_add(1, Ordering::Relaxed);
+                            metrics.events_received.inc();
                             let ack = Arc::new(AckHandle::new(
                                 AckPosition::Cursor(cursor),
                                 ack_tx.clone(),
