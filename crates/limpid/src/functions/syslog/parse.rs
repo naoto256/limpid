@@ -135,7 +135,7 @@ fn parse_rfc3164<'bump>(
     builder: &mut ObjectBuilder<'bump>,
 ) {
     let mut rest = input;
-    let timestamp_str = match nth_space(rest, 3) {
+    let timestamp_str = match rfc3164_timestamp_end(rest) {
         Some(idx) => {
             let s = &rest[..idx];
             rest = &rest[idx..];
@@ -253,16 +253,72 @@ fn next_token(input: &str) -> (&str, &str) {
     }
 }
 
-fn nth_space(input: &str, n: usize) -> Option<usize> {
-    let mut count = 0;
-    for (i, b) in input.bytes().enumerate() {
-        if b == b' ' {
-            count += 1;
-            if count == n {
-                return Some(i + 1);
+/// Returns the byte offset just past the ASCII space that follows
+/// the RFC 3164 header's three non-empty fields (separated by the
+/// required ASCII-space shape), or `None` when the input does not
+/// begin with that shape.
+///
+/// Separator cardinality is exact: field 1 → 1 or 2 ASCII spaces →
+/// field 2 → exactly one ASCII space → field 3. Only the first gap
+/// ever varies, because `%e` widens a single-digit day with one
+/// leading space. Any non-space whitespace character (`\t`, `\n`,
+/// `NBSP`, `EM SPACE`, …) is rejected: the RFC 3164 header is
+/// defined against ASCII, and downstream parsing expects only that
+/// shape.
+///
+/// Only literal ASCII spaces reach the returned offset, so
+/// `offset + 1` is always a UTF-8 boundary. Content validation
+/// (month name, day range, time validity) is deferred to the
+/// downstream parser; this function checks shape only.
+fn rfc3164_timestamp_end(input: &str) -> Option<usize> {
+    let mut field = 0;
+    let mut month_spaces = 0;
+
+    for (offset, ch) in input.char_indices() {
+        if ch != ' ' && ch.is_whitespace() {
+            return None;
+        }
+
+        match field {
+            0 => {
+                if ch == ' ' {
+                    if offset == 0 {
+                        return None;
+                    }
+                    field = 1;
+                    month_spaces = 1;
+                }
             }
+            1 => {
+                if ch == ' ' {
+                    month_spaces += 1;
+                    if month_spaces > 2 {
+                        return None;
+                    }
+                } else {
+                    field = 2;
+                }
+            }
+            2 => {
+                if ch == ' ' {
+                    field = 3;
+                }
+            }
+            3 => {
+                if ch == ' ' {
+                    return None;
+                }
+                field = 4;
+            }
+            4 => {
+                if ch == ' ' {
+                    return Some(offset + 1);
+                }
+            }
+            _ => unreachable!(),
         }
     }
+
     None
 }
 
@@ -369,6 +425,42 @@ mod tests {
             lookup(entries, "msg"),
             Some(Value::String("Failed password"))
         );
+    }
+
+    #[test]
+    fn rfc3164_space_padded_single_digit_day_keeps_complete_timestamp() {
+        let bump = ::bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let owned = dummy_event();
+        let bevent = owned.view_in(&arena);
+        let reg = make_registry();
+        let line = arena.alloc_str("<134>Aug  9 02:38:03 myhost sshd: Accepted password");
+        let v = parse_into(&reg, &bevent, &arena, line);
+        let Value::Object(entries) = v else {
+            panic!("expected Object");
+        };
+        assert_eq!(
+            lookup(entries, "timestamp"),
+            Some(Value::String("Aug  9 02:38:03"))
+        );
+        assert_eq!(lookup(entries, "hostname"), Some(Value::String("myhost")));
+        assert_eq!(lookup(entries, "appname"), Some(Value::String("sshd")));
+        assert_eq!(
+            lookup(entries, "msg"),
+            Some(Value::String("Accepted password"))
+        );
+    }
+
+    #[test]
+    fn rfc3164_timestamp_separator_cardinality_is_exact() {
+        assert!(rfc3164_timestamp_end("Aug 19 02:38:03 host").is_some());
+        assert!(rfc3164_timestamp_end("Aug  9 02:38:03 host").is_some());
+        assert_eq!(rfc3164_timestamp_end("Aug   9 02:38:03 host"), None);
+        assert_eq!(rfc3164_timestamp_end("Aug  9  02:38:03 host"), None);
+        assert_eq!(rfc3164_timestamp_end("Aug\t9 02:38:03 host"), None);
+        assert_eq!(rfc3164_timestamp_end("Aug\n9 02:38:03 host"), None);
+        assert_eq!(rfc3164_timestamp_end("Aug\u{00a0}9 02:38:03 host"), None);
+        assert_eq!(rfc3164_timestamp_end("Au\u{2003}g  9 02:38:03 host"), None);
     }
 
     #[test]

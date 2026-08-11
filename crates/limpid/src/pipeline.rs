@@ -1837,6 +1837,35 @@ def pipeline zeek_full_otlp {
     }
 
     #[test]
+    fn juniper_rfc3164_space_padded_single_digit_day_preserves_source_time() {
+        use chrono::{Datelike, Duration, TimeZone, Utc};
+
+        let now = Utc::now();
+        let this_year = Utc
+            .with_ymd_and_hms(now.year(), 8, 9, 2, 38, 3)
+            .single()
+            .expect("valid RFC 3164 fixture time");
+        let expected = if this_year > now + Duration::days(1) {
+            Utc.with_ymd_and_hms(now.year() - 1, 8, 9, 2, 38, 3)
+                .single()
+                .expect("valid previous-year RFC 3164 fixture time")
+        } else {
+            this_year
+        }
+        .timestamp_nanos_opt()
+        .expect("fixture fits i64");
+
+        let event = run_packaged_parser_json(
+            &["parse_juniper_srx_syslog"],
+            Some("workspace.juniper_srx_syslog = { body: ingress, timezone: \"UTC\" }"),
+            "parse_juniper_srx_syslog",
+            b"<14>Aug  9 02:38:03 srx01 RT_IDP: IDP_ATTACK_LOG_EVENT: IDP: at 1778905950, SIG Attack log <198.51.100.10/63074->192.0.2.100/445> for TCP protocol and service SERVICE_IDP application SMB by rule Tap of rulebase IPS in policy Tap. attack: id=19519, repeat=0, action=DROP, threat-severity=HIGH, name=Example, NAT <198.51.100.10:0->0.0.0.0:0>",
+        );
+
+        assert_eq!(event["time"], expected);
+    }
+
+    #[test]
     fn packaged_parsers_preserve_source_event_time_as_nanoseconds() {
         use chrono::{Datelike, Duration, TimeZone, Timelike, Utc};
 
