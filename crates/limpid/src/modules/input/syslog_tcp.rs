@@ -164,7 +164,7 @@ impl Module for SyslogTcpInput {
     fn from_properties(
         name: &str,
         properties: &crate::dsl::module_props::ModuleProperties,
-        _ctx: &crate::modules::BuildContext,
+        ctx: &crate::modules::BuildContext,
     ) -> anyhow::Result<Self> {
         let properties = properties.user_properties();
         let tls_config =
@@ -199,7 +199,7 @@ impl Module for SyslogTcpInput {
             tls_config,
             max_connections,
             rate_limit,
-            metrics: Arc::new(InputMetrics::default()),
+            metrics: InputMetrics::register(&ctx.metrics, name)?,
         })
     }
 }
@@ -491,8 +491,7 @@ pub(crate) async fn read_octet_counting<R: tokio::io::AsyncRead + Unpin>(
                 addr, e,
             );
             if let Some(m) = metrics {
-                m.events_invalid
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                m.events_invalid.inc();
             }
             return CloseReason::FramingError(format!("invalid PRI: {}", e));
         }
@@ -507,8 +506,7 @@ pub(crate) async fn read_octet_counting<R: tokio::io::AsyncRead + Unpin>(
             return CloseReason::ChannelClosed;
         }
         if let Some(m) = metrics {
-            m.events_received
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            m.events_received.inc();
         }
     }
 }
@@ -635,8 +633,7 @@ pub(crate) async fn read_non_transparent<R: tokio::io::AsyncRead + Unpin>(
                                 addr, e
                             );
                             if let Some(m) = metrics {
-                                m.events_invalid
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                m.events_invalid.inc();
                             }
                         } else {
                             if let Some(limiter) = limiter {
@@ -648,8 +645,7 @@ pub(crate) async fn read_non_transparent<R: tokio::io::AsyncRead + Unpin>(
                                 return CloseReason::ChannelClosed;
                             }
                             if let Some(m) = metrics {
-                                m.events_received
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                m.events_received.inc();
                             }
                         }
                     }
@@ -679,8 +675,7 @@ pub(crate) async fn read_non_transparent<R: tokio::io::AsyncRead + Unpin>(
                 addr, e,
             );
             if let Some(m) = metrics {
-                m.events_invalid
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                m.events_invalid.inc();
             }
             return CloseReason::FramingError(format!("invalid PRI: {}", e));
         }
@@ -695,8 +690,7 @@ pub(crate) async fn read_non_transparent<R: tokio::io::AsyncRead + Unpin>(
             return CloseReason::ChannelClosed;
         }
         if let Some(m) = metrics {
-            m.events_received
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            m.events_received.inc();
         }
     }
 }
@@ -1200,7 +1194,7 @@ mod tests {
         tokio::sync::mpsc::Receiver<Event>,
         Arc<InputMetrics>,
     ) {
-        let metrics = Arc::new(InputMetrics::default());
+        let metrics = InputMetrics::for_testing();
         let input = SyslogTcpInput {
             bind_addr,
             framing: TcpFraming::OctetCounting,

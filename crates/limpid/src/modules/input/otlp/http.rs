@@ -54,7 +54,6 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -170,7 +169,7 @@ impl Module for OtlpHttpInput {
     fn from_properties(
         name: &str,
         properties: &crate::dsl::module_props::ModuleProperties,
-        _ctx: &crate::modules::BuildContext,
+        ctx: &crate::modules::BuildContext,
     ) -> Result<Self> {
         let properties = properties.user_properties();
         let tls_config =
@@ -216,7 +215,7 @@ impl Module for OtlpHttpInput {
             request_rate_limit,
             max_concurrent_requests,
             tls_config,
-            metrics: Arc::new(InputMetrics::default()),
+            metrics: InputMetrics::register(&ctx.metrics, name)?,
         })
     }
 }
@@ -345,10 +344,7 @@ async fn handle_logs(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    state
-        .metrics
-        .events_received
-        .fetch_add(1, Ordering::Relaxed);
+    state.metrics.events_received.inc();
 
     // Concurrency cap (semaphore) bounds simultaneous decode work.
     // Combined with body_limit, this turns the worst-case decode
@@ -397,7 +393,7 @@ async fn handle_logs(
                     "otlp_http [{peer}]: JSON decode failed: {}",
                     truncate_decode_err(&e.to_string())
                 );
-                state.metrics.events_invalid.fetch_add(1, Ordering::Relaxed);
+                state.metrics.events_invalid.inc();
                 return (StatusCode::BAD_REQUEST, "invalid OTLP/JSON payload").into_response();
             }
         },
@@ -408,7 +404,7 @@ async fn handle_logs(
                     "otlp_http [{peer}]: protobuf decode failed: {}",
                     truncate_decode_err(&e.to_string())
                 );
-                state.metrics.events_invalid.fetch_add(1, Ordering::Relaxed);
+                state.metrics.events_invalid.inc();
                 return (StatusCode::BAD_REQUEST, "invalid OTLP/protobuf payload").into_response();
             }
         },

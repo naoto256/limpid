@@ -1,7 +1,6 @@
 //! Stdout output: prints event messages to standard output (debugging/testing).
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
 
@@ -43,7 +42,7 @@ impl Module for StdoutOutput {
             retry,
             error_log: ctx.error_log.as_ref().map(Arc::clone),
             error_log_fallback: ctx.error_log_fallback,
-            metrics: Arc::new(OutputMetrics::default()),
+            metrics: OutputMetrics::register(&ctx.metrics, name)?,
             shutdown_signal: ctx.shutdown_signal.clone(),
         })
     }
@@ -98,13 +97,13 @@ impl Output for StdoutOutput {
         loop {
             match self.write_event(event) {
                 Ok(()) => {
-                    self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.events_written.inc();
                     ack.resolve_delivered();
                     return Ok(());
                 }
                 Err(e) => {
                     attempt += 1;
-                    self.metrics.retries.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.retries.inc();
                     if attempt >= self.retry.max_attempts {
                         let reason =
                             format!("output write failed after {} attempts: {}", attempt, e);
@@ -189,5 +188,59 @@ impl Output for StdoutOutput {
         )
         .await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod metrics_registration_tests {
+    use super::*;
+    use crate::dsl::module_props::ModuleProperties;
+    use crate::metrics::{MetricsError, OutputMetrics, Registry};
+
+    fn assert_output_duplicate(error: &MetricsError, label_value: &str, diagnostic: &str) {
+        let (name, labelset) = match error {
+            MetricsError::DuplicateSeries { name, labelset } => (name, labelset),
+            other => panic!("expected DuplicateSeries, got {other:?}"),
+        };
+        assert!(
+            [
+                "limpid_output_events_received_total",
+                "limpid_output_events_injected_total",
+                "limpid_output_events_written_total",
+                "limpid_output_events_failed_total",
+                "limpid_output_retries_total",
+                "limpid_output_events_wedged_total",
+                "limpid_output_events_errored_unwritable_total",
+            ]
+            .contains(&name.as_str())
+        );
+        assert_eq!(labelset, &[("output".to_owned(), label_value.to_owned())]);
+        assert!(diagnostic.contains(&format!("name={name:?}")));
+        assert!(diagnostic.contains(&format!("labelset={labelset:?}")));
+    }
+
+    #[test]
+    fn factory_uses_the_shared_registry_and_propagates_registration_conflicts() {
+        let registry = Arc::new(Registry::new());
+        OutputMetrics::register(&registry, "conflicting")
+            .expect("preseeded output metrics must register");
+        let mut ctx = crate::modules::BuildContext::for_testing();
+        ctx.metrics = Arc::clone(&registry);
+        let properties = ModuleProperties::from_parts("stdout", Vec::new());
+
+        let error = match StdoutOutput::from_properties("conflicting", &properties, &ctx) {
+            Ok(_) => panic!("factory unexpectedly swallowed the registration conflict"),
+            Err(error) => error,
+        };
+        let diagnostic = format!("{error:#}");
+        let metrics_error = error
+            .chain()
+            .find_map(|source| source.downcast_ref::<MetricsError>())
+            .unwrap_or_else(|| {
+                panic!(
+                    "MetricsError must remain downcastable in the anyhow source chain: {error:#}"
+                )
+            });
+        assert_output_duplicate(metrics_error, "conflicting", &diagnostic);
     }
 }

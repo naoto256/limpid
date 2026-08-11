@@ -9,7 +9,6 @@ pub mod http;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use opentelemetry_proto::tonic::{
@@ -82,7 +81,7 @@ pub async fn split_request(
                 let mut buf = Vec::with_capacity(singleton.encoded_len());
                 if let Err(e) = singleton.encode(&mut buf) {
                     warn!("{transport_name} [{peer}]: re-encode failed: {e}");
-                    metrics.events_invalid.fetch_add(1, Ordering::Relaxed);
+                    metrics.events_invalid.inc();
                     rejected += 1;
                     continue;
                 }

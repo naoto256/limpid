@@ -30,7 +30,6 @@
 //! own them.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -446,7 +445,7 @@ impl Module for KafkaOutput {
             retry,
             error_log,
             error_log_fallback: ctx.error_log_fallback,
-            metrics: Arc::new(OutputMetrics::default()),
+            metrics: OutputMetrics::register(&ctx.metrics, name)?,
             shutdown_signal: ctx.shutdown_signal.clone(),
         })
     }
@@ -499,7 +498,7 @@ impl Output for KafkaOutput {
             // or by the runtime SIGTERM budget.
             match self.try_send(event, shutdown.clone()).await {
                 Ok(KafkaTrySendOutcome::Delivered) => {
-                    self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.events_written.inc();
                     ack.resolve_delivered();
                     return Ok(());
                 }
@@ -523,7 +522,7 @@ impl Output for KafkaOutput {
                 }
                 Err(e) => {
                     attempt += 1;
-                    self.metrics.retries.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.retries.inc();
                     if attempt >= self.retry.max_attempts {
                         let reason =
                             format!("output write failed after {} attempts: {}", attempt, e);
@@ -1230,7 +1229,7 @@ mod tests {
             retry: RetryConfig::default(),
             error_log: None,
             error_log_fallback: crate::error_log::ErrorLogFallback::default(),
-            metrics: Arc::new(OutputMetrics::default()),
+            metrics: OutputMetrics::for_testing(),
             shutdown_signal: rx.clone(),
         };
         let event = Event::new(
