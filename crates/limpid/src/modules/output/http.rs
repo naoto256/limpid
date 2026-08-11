@@ -403,7 +403,7 @@ impl Module for HttpOutput {
         let rotation = RotatingPeers::new(peers.len());
 
         let retry = RetryConfig::from_output_properties(properties)?;
-        let metrics = Arc::new(OutputMetrics::default());
+        let metrics = OutputMetrics::register(&ctx.metrics, name)?;
         let policy = HttpSinkPolicy {
             peers,
             rotation,

@@ -41,6 +41,10 @@ use crate::metrics::{InputMetrics, OutputMetrics};
 #[derive(Clone)]
 pub struct BuildContext {
     pub funcs: Arc<crate::functions::FunctionRegistry>,
+    /// Shared metrics registry — one instance is distributed to every
+    /// module so all counters land in the same `stats` snapshot. A
+    /// fresh registry is paired with each `Runtime::start`.
+    pub metrics: Arc<crate::metrics::Registry>,
     pub error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
     /// Operator-selected confidentiality policy for tracing-side DLQ
     /// fallback emission (unset `error_log`, or `error_log` write
@@ -155,6 +159,7 @@ impl BuildContext {
         Box::leak(Box::new(_tx));
         Self {
             funcs: Arc::new(crate::functions::FunctionRegistry::new()),
+            metrics: Arc::new(crate::metrics::Registry::new()),
             error_log: None,
             error_log_fallback: crate::error_log::ErrorLogFallback::default(),
             shutdown_signal: rx,
@@ -566,10 +571,9 @@ pub async fn finalize_shutdown_singleton_disposition(
     event: &Event,
     ack: crate::queue::QueueAckHandle,
 ) {
-    use std::sync::atomic::Ordering;
     match result {
         Ok(()) => {
-            metrics.events_written.fetch_add(1, Ordering::Relaxed);
+            metrics.events_written.inc();
             ack.resolve_delivered();
         }
         Err(e) => {
@@ -636,10 +640,9 @@ pub async fn finalize_shutdown_singleton_disposition_ambiguous(
     event: &Event,
     ack: crate::queue::QueueAckHandle,
 ) {
-    use std::sync::atomic::Ordering;
     match result {
         Ok(()) => {
-            metrics.events_written.fetch_add(1, Ordering::Relaxed);
+            metrics.events_written.inc();
             ack.resolve_delivered();
         }
         Err(e) => {
@@ -699,8 +702,6 @@ pub async fn route_shutdown_batch_to_dlq(
     events: Vec<(Event, crate::queue::QueueAckHandle)>,
     flush_err: &anyhow::Error,
 ) {
-    use std::sync::atomic::Ordering;
-
     if events.is_empty() {
         return;
     }
@@ -726,9 +727,7 @@ pub async fn route_shutdown_batch_to_dlq(
                         Some(position),
                         Some(&write_err),
                     );
-                    metrics
-                        .events_errored_unwritable
-                        .fetch_add(1, Ordering::Relaxed);
+                    metrics.events_errored_unwritable.inc();
                     DlqRouteOutcome::Dropped
                 }
             };
@@ -815,8 +814,6 @@ pub async fn route_shutdown_batch_ambiguous_to_dlq(
     events: Vec<(Event, crate::queue::QueueAckHandle)>,
     flush_err: &anyhow::Error,
 ) {
-    use std::sync::atomic::Ordering;
-
     if events.is_empty() {
         return;
     }
@@ -843,9 +840,7 @@ pub async fn route_shutdown_batch_ambiguous_to_dlq(
                     Some(position),
                     Some(&write_err),
                 );
-                metrics
-                    .events_errored_unwritable
-                    .fetch_add(1, Ordering::Relaxed);
+                metrics.events_errored_unwritable.inc();
             }
             // The DLQ record has been written (or the tracing
             // fallback fired per ladder) for operator visibility,
@@ -1066,10 +1061,9 @@ pub fn resolve_ack_from_dlq_outcome(
     metrics: &OutputMetrics,
 ) {
     use crate::queue::AckPosition;
-    use std::sync::atomic::Ordering;
     match (outcome, ack.position()) {
         (DlqRouteOutcome::Recovered, _) | (DlqRouteOutcome::Dropped, AckPosition::Memory) => {
-            metrics.events_failed.fetch_add(1, Ordering::Relaxed);
+            metrics.events_failed.inc();
             ack.resolve_recovered();
         }
         (DlqRouteOutcome::Dropped, AckPosition::Disk { .. }) => {
@@ -1133,7 +1127,6 @@ pub async fn route_event_to_dlq(
     position: crate::queue::AckPosition,
     reason: &str,
 ) -> DlqRouteOutcome {
-    use std::sync::atomic::Ordering;
     if let Some(writer) = error_log {
         let ctx = crate::pipeline::ErroredEventContext::Output {
             timestamp: chrono::Utc::now(),
@@ -1169,9 +1162,7 @@ pub async fn route_event_to_dlq(
                     Some(position),
                     Some(&write_err),
                 );
-                metrics
-                    .events_errored_unwritable
-                    .fetch_add(1, Ordering::Relaxed);
+                metrics.events_errored_unwritable.inc();
                 DlqRouteOutcome::Dropped
             }
         }
@@ -1557,7 +1548,7 @@ mod resolve_ack_from_dlq_outcome_tests {
     #[tokio::test]
     async fn recovered_outcome_resolves_recovered_on_memory() {
         let (ack, mut rx) = QueueAckHandle::for_test();
-        let metrics = OutputMetrics::default();
+        let metrics = OutputMetrics::for_testing();
         resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Recovered, &metrics);
         assert_eq!(
             rx.recv().await,
@@ -1573,7 +1564,7 @@ mod resolve_ack_from_dlq_outcome_tests {
             offset: 128,
         };
         let (ack, mut rx) = QueueAckHandle::for_test_with_position(position);
-        let metrics = OutputMetrics::default();
+        let metrics = OutputMetrics::for_testing();
         resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Recovered, &metrics);
         assert_eq!(rx.recv().await, Some((position, AckDisposition::Recovered)));
         assert_eq!(metrics.events_failed.load(Ordering::Relaxed), 1);
@@ -1591,7 +1582,7 @@ mod resolve_ack_from_dlq_outcome_tests {
     #[tokio::test]
     async fn dropped_outcome_resolves_recovered_on_memory() {
         let (ack, mut rx) = QueueAckHandle::for_test();
-        let metrics = OutputMetrics::default();
+        let metrics = OutputMetrics::for_testing();
         resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Dropped, &metrics);
         assert_eq!(
             rx.recv().await,
@@ -1615,7 +1606,7 @@ mod resolve_ack_from_dlq_outcome_tests {
             offset: 4242,
         };
         let (ack, mut rx) = QueueAckHandle::for_test_with_position(position);
-        let metrics = OutputMetrics::default();
+        let metrics = OutputMetrics::for_testing();
         resolve_ack_from_dlq_outcome(ack, DlqRouteOutcome::Dropped, &metrics);
         assert_eq!(rx.recv().await, Some((position, AckDisposition::Dropped)));
         assert_eq!(metrics.events_failed.load(Ordering::Relaxed), 0);

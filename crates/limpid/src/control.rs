@@ -30,7 +30,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::dsl::ast::*;
 use crate::event::Event;
-use crate::metrics::MetricsRegistry;
+use crate::metrics::Registry;
 use crate::pipeline::CompiledConfig;
 use crate::queue::QueueSender;
 use crate::tap::TapRegistry;
@@ -413,7 +413,7 @@ fn parent_dir_owner_is_untrusted(uid: u32, self_euid: u32) -> bool {
 pub struct ControlServer {
     socket_path: PathBuf,
     tap: TapRegistry,
-    metrics: Arc<MetricsRegistry>,
+    metrics: Arc<Registry>,
     config: Arc<CompiledConfig>,
     input_senders: Arc<HashMap<String, InputInjectTarget>>,
     output_senders: Arc<HashMap<String, QueueSender>>,
@@ -424,7 +424,7 @@ impl ControlServer {
     pub fn new(
         socket_path: Option<String>,
         tap: TapRegistry,
-        metrics: Arc<MetricsRegistry>,
+        metrics: Arc<Registry>,
         config: Arc<CompiledConfig>,
         input_senders: HashMap<String, InputInjectTarget>,
         output_senders: Arc<HashMap<String, QueueSender>>,
@@ -751,7 +751,7 @@ impl ControlServer {
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     tap: Arc<TapRegistry>,
-    metrics: Arc<MetricsRegistry>,
+    metrics: Arc<Registry>,
     config: Arc<CompiledConfig>,
     input_senders: Arc<HashMap<String, InputInjectTarget>>,
     output_senders: Arc<HashMap<String, QueueSender>>,
@@ -874,7 +874,8 @@ async fn handle_connection(
                 let uptime = started_at.elapsed().as_secs();
                 json!({"status": "ok", "uptime_seconds": uptime}).to_string()
             }
-            "stats" => metrics.to_json(),
+            "stats" => serde_json::to_string(&metrics.snapshot())
+                .expect("MetricsSnapshot serialization must remain infallible"),
             "list" => build_list_json(&config),
             _ => json!({"error": format!("unknown command '{}'", cmd)}).to_string(),
         };
@@ -1098,9 +1099,7 @@ async fn handle_inject(
             Target::Input(tx, metrics) => {
                 let sent = tx.send(event).await.is_ok();
                 if sent {
-                    metrics
-                        .events_injected
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    metrics.events_injected.inc();
                 }
                 sent
             }
@@ -1112,8 +1111,7 @@ async fn handle_inject(
                 // is the only entry.
                 let sent = tx.send(event).await.is_ok();
                 if sent && let Some(m) = tx.metrics() {
-                    m.events_injected
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    m.events_injected.inc();
                 }
                 sent
             }
@@ -1256,10 +1254,19 @@ def pipeline p { input i; output o }
         )
         .expect("compile");
 
+        let metrics = Arc::new(crate::metrics::Registry::new());
+        let received = metrics
+            .counter("limpid_input_events_received_total")
+            .help("Total events received by an input.")
+            .label("input", "control_test")
+            .build()
+            .expect("test metric registration must succeed");
+        received.inc();
+
         let server = ControlServer::new(
             Some(socket_path.to_string_lossy().into_owned()),
             TapRegistry::new(),
-            Arc::new(MetricsRegistry::new()),
+            metrics,
             Arc::new(config),
             HashMap::new(),
             Arc::new(HashMap::new()),
@@ -1319,15 +1326,26 @@ def pipeline p { input i; output o }
     async fn stats_command_as_built_by_limpidctl_and_prometheus() {
         let (socket_path, _dir, shutdown_tx) = spawn_server().await;
         let resp = send_command(&socket_path, "stats").await;
-        // Any well-formed JSON object counts as "parsed", as opposed to
-        // the `{"error":"unknown command '...'"}"` fallback.
         assert!(
             !resp.contains("unknown command"),
             "stats command was not recognised: {}",
             resp
         );
         let parsed: serde_json::Value = serde_json::from_str(resp.trim()).expect("valid JSON");
-        assert!(parsed.is_object(), "stats response not an object: {}", resp);
+        assert_eq!(parsed["schema"], 1);
+        let metrics = parsed["metrics"]
+            .as_array()
+            .expect("stats metrics must be an array");
+        let family = metrics
+            .iter()
+            .find(|metric| metric["name"] == "limpid_input_events_received_total")
+            .expect("stats must serialize the typed registry snapshot");
+        assert_eq!(family["type"], "counter");
+        assert_eq!(family["series"][0]["labels"]["input"], "control_test");
+        assert_eq!(family["series"][0]["value"], 1);
+        assert!(parsed.get("inputs").is_none());
+        assert!(parsed.get("pipelines").is_none());
+        assert!(parsed.get("outputs").is_none());
         let _ = shutdown_tx.send(true);
     }
 

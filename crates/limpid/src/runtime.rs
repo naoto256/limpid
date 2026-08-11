@@ -2,7 +2,7 @@
 //! into a running system.
 //!
 //! Runtime does NOT count metrics — each component counts its own.
-//! Runtime only collects metrics handles into MetricsRegistry for stats.
+//! Runtime distributes one shared metrics registry to every component.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ use crate::dsl::ast::*;
 use crate::dsl::props;
 use crate::event::Event;
 use crate::functions::FunctionRegistry;
-use crate::metrics::{MetricsRegistry, PipelineMetrics};
+use crate::metrics::{PipelineMetrics, Registry};
 use crate::modules::{self, HasMetrics, ModuleRegistry};
 use crate::pipeline::CompiledConfig;
 use crate::queue::{self, QueueConfig, QueueSender};
@@ -32,6 +32,14 @@ pub struct Runtime {
 
 impl Runtime {
     pub async fn start(config: CompiledConfig, config_file: PathBuf) -> Result<Self> {
+        Self::start_with_registry(config, config_file, Arc::new(Registry::new())).await
+    }
+
+    pub(crate) async fn start_with_registry(
+        config: CompiledConfig,
+        config_file: PathBuf,
+        metrics_registry: Arc<Registry>,
+    ) -> Result<Self> {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
@@ -50,7 +58,6 @@ impl Runtime {
         config.validate()?;
         let registry = Arc::new(registry);
 
-        let mut metrics_registry = MetricsRegistry::new();
         let tap = TapRegistry::new();
 
         // Optional dead-letter queue for events that fail in `process`
@@ -116,6 +123,7 @@ impl Runtime {
         // land as new fields on this struct rather than as new parameters.
         let build_ctx = crate::modules::BuildContext {
             funcs: Arc::clone(&func_registry),
+            metrics: Arc::clone(&metrics_registry),
             error_log: error_log.as_ref().map(Arc::clone),
             error_log_fallback,
             shutdown_signal: shutdown_rx.clone(),
@@ -168,9 +176,7 @@ impl Runtime {
             sender.attach_metrics(Arc::clone(&created.metrics));
             output_senders.insert(name.clone(), sender);
 
-            // Collect metrics handle (output owns the data, we just hold a reference)
             let output_metrics = Arc::clone(&created.metrics);
-            metrics_registry.register_output(name, created.metrics);
             tap.register(&format!("output {}", name)).await;
 
             output_receivers.push((name.clone(), receiver, created.output, output_metrics));
@@ -207,8 +213,10 @@ impl Runtime {
         let mut input_pipelines: HashMap<String, Vec<Arc<PipelineWorker>>> = HashMap::new();
 
         for pipeline_def in config.pipelines.values() {
-            let worker = Arc::new(PipelineWorker::new(pipeline_def.clone()));
-            metrics_registry.register_pipeline(&pipeline_def.name, worker.metrics());
+            let worker = Arc::new(PipelineWorker::new(
+                pipeline_def.clone(),
+                &metrics_registry,
+            )?);
             let input_names = get_pipeline_inputs(pipeline_def);
             for input_name in input_names {
                 input_pipelines
@@ -297,12 +305,10 @@ impl Runtime {
                 input_name.clone(),
                 (sender_for_inject, Arc::clone(&created.metrics)),
             );
-            metrics_registry.register_input(&input_name, created.metrics);
             handles.push(created.handle);
         }
 
         // --- 4. Start control socket (after all metrics are registered) ---
-        let metrics_registry = Arc::new(metrics_registry);
         let control_path = config
             .global_blocks
             .get("control")
@@ -485,11 +491,9 @@ struct PipelineWorker {
 }
 
 impl PipelineWorker {
-    fn new(def: PipelineDef) -> Self {
-        Self {
-            def,
-            metrics: Arc::new(PipelineMetrics::default()),
-        }
+    fn new(def: PipelineDef, registry: &Registry) -> Result<Self, crate::metrics::MetricsError> {
+        let metrics = PipelineMetrics::register(registry, &def.name)?;
+        Ok(Self { def, metrics })
     }
 }
 
@@ -696,10 +700,7 @@ async fn process_event(
 ) {
     ctx.tap.emit(input_tap_key, event).await;
     for (i, worker) in workers.iter().enumerate() {
-        worker
-            .metrics
-            .events_received
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        worker.metrics.events_received.inc();
 
         // Pass the event by reference. `run_pipeline` views it into
         // the arena (read-only on the input owned form) and any DLQ
@@ -719,16 +720,10 @@ async fn process_event(
                 use crate::pipeline::PipelineTermination;
                 match result.termination {
                     PipelineTermination::Dropped => {
-                        worker
-                            .metrics
-                            .events_dropped
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        worker.metrics.events_dropped.inc();
                     }
                     PipelineTermination::Errored => {
-                        worker
-                            .metrics
-                            .events_errored
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        worker.metrics.events_errored.inc();
                         // Drain every accumulated DLQ record. For a
                         // pipeline-side failure this is exactly one
                         // record; for a runtime-side per-failed-output
@@ -755,15 +750,9 @@ async fn process_event(
                     }
                     PipelineTermination::Finished => {
                         if !result.had_outputs {
-                            worker
-                                .metrics
-                                .events_discarded
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            worker.metrics.events_discarded.inc();
                         } else {
-                            worker
-                                .metrics
-                                .events_finished
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            worker.metrics.events_finished.inc();
                         }
                     }
                 }
@@ -781,10 +770,7 @@ async fn process_event(
                 // `PipelineTermination::Errored` so the metric +
                 // file record stay consistent across both shapes
                 // of runtime error.
-                worker
-                    .metrics
-                    .events_errored
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                worker.metrics.events_errored.inc();
                 let owned = event.to_owned();
                 let err_ctx = crate::pipeline::ErroredEventContext::Process {
                     timestamp: chrono::Utc::now(),
@@ -830,9 +816,7 @@ async fn write_errored_to_dlq(
     match error_log {
         Some(writer) => {
             if let Err(e) = writer.write(err_ctx).await {
-                worker_metrics
-                    .events_errored_unwritable
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                worker_metrics.events_errored_unwritable.inc();
                 crate::modules::emit_dlq_tracing_fallback(
                     /* error_log_configured */ true,
                     error_log_fallback,
@@ -876,11 +860,34 @@ mod tests {
     use super::*;
     use crate::dsl::parser::parse_config;
     use crate::event::Event;
+    use crate::metrics::{MetricsError, OutputMetrics, Registry};
     use bytes::Bytes;
     use std::net::SocketAddr;
     use std::str::FromStr;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
+
+    fn assert_output_duplicate(error: &MetricsError, label_value: &str, diagnostic: &str) {
+        let (name, labelset) = match error {
+            MetricsError::DuplicateSeries { name, labelset } => (name, labelset),
+            other => panic!("expected DuplicateSeries, got {other:?}"),
+        };
+        assert!(
+            [
+                "limpid_output_events_received_total",
+                "limpid_output_events_injected_total",
+                "limpid_output_events_written_total",
+                "limpid_output_events_failed_total",
+                "limpid_output_retries_total",
+                "limpid_output_events_wedged_total",
+                "limpid_output_events_errored_unwritable_total",
+            ]
+            .contains(&name.as_str())
+        );
+        assert_eq!(labelset, &[("output".to_owned(), label_value.to_owned())]);
+        assert!(diagnostic.contains(&format!("name={name:?}")));
+        assert!(diagnostic.contains(&format!("labelset={labelset:?}")));
+    }
 
     fn pipeline_def(src: &str) -> PipelineDef {
         let cfg = parse_config(src).unwrap();
@@ -890,6 +897,56 @@ mod tests {
             }
         }
         panic!("no pipeline in src");
+    }
+
+    #[tokio::test]
+    async fn startup_preserves_metric_registration_errors_from_real_factories() {
+        let config = CompiledConfig::from_config(
+            parse_config("def output conflicting { type stdout }").expect("parse"),
+        )
+        .expect("compile");
+        let registry = Arc::new(Registry::new());
+        OutputMetrics::register(&registry, "conflicting")
+            .expect("preseeded output metrics must register");
+
+        let error = match Runtime::start_with_registry(
+            config,
+            PathBuf::from("metrics-conflict-test.limpid"),
+            registry,
+        )
+        .await
+        {
+            Ok(_) => panic!("daemon startup unexpectedly swallowed the registration conflict"),
+            Err(error) => error,
+        };
+        let diagnostic = format!("{error:#}");
+        let metrics_error = error
+            .chain()
+            .find_map(|source| source.downcast_ref::<MetricsError>())
+            .unwrap_or_else(|| {
+                panic!(
+                    "MetricsError must remain downcastable in the startup error chain: {error:#}"
+                )
+            });
+        assert_output_duplicate(metrics_error, "conflicting", &diagnostic);
+    }
+
+    #[tokio::test]
+    async fn public_start_delegates_to_the_registry_wired_startup_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o750))
+            .expect("secure control parent");
+        let socket = dir.path().join("control.sock");
+        let source = format!("control {{ socket {:?} }}", socket.display().to_string());
+        let config =
+            CompiledConfig::from_config(parse_config(&source).expect("parse")).expect("compile");
+
+        let runtime = Runtime::start(config, PathBuf::from("public-start-test.limpid"))
+            .await
+            .expect("public start must use the working registry-wired startup path");
+        runtime.shutdown().await;
     }
 
     #[test]
@@ -924,7 +981,10 @@ mod tests {
         // Minimal pipeline with a single `drop` step; the body doesn't matter
         // for this test — we only care that events flow through the worker.
         let def = pipeline_def("def pipeline p { input a, b; drop }");
-        let worker = Arc::new(PipelineWorker::new(def));
+        let metrics_registry = Registry::new();
+        let worker = Arc::new(
+            PipelineWorker::new(def, &metrics_registry).expect("pipeline metrics must register"),
+        );
         let workers: Arc<Vec<Arc<PipelineWorker>>> = Arc::new(vec![Arc::clone(&worker)]);
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -1017,7 +1077,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("dlq.jsonl");
         let writer = Arc::new(crate::error_log::ErrorLogWriter::new(log_path.clone()));
-        let metrics = PipelineMetrics::default();
+        let metrics = PipelineMetrics::for_testing();
         let err_ctx = make_err_ctx("simulated runtime error");
 
         write_errored_to_dlq(
@@ -1057,7 +1117,7 @@ mod tests {
         // line is observed via `tracing` subscribers in operator
         // setups; the test here pins the no-panic contract so the
         // logged-only branch can't regress to an unwrap somewhere.
-        let metrics = PipelineMetrics::default();
+        let metrics = PipelineMetrics::for_testing();
         let err_ctx = make_err_ctx("no DLQ configured");
 
         write_errored_to_dlq(

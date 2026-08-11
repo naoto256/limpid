@@ -615,9 +615,9 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
         let rejected = outcome.rejected.min(count);
         let written = count - rejected;
         if written > 0 {
-            self.metrics
-                .events_written
-                .fetch_add(written, Ordering::Relaxed);
+            for _ in 0..written {
+                self.metrics.events_written.inc();
+            }
         }
         let split = (count - rejected) as usize;
         let mut iter = shippable.into_iter();
@@ -727,7 +727,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                 }
                 Some(Err(e)) => {
                     attempt += 1;
-                    self.metrics.retries.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.retries.inc();
                     if attempt >= self.retry.max_attempts {
                         break e;
                     }

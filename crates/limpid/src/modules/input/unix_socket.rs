@@ -7,7 +7,6 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -190,7 +189,7 @@ impl Module for UnixSocketInput {
     fn from_properties(
         name: &str,
         properties: &crate::dsl::module_props::ModuleProperties,
-        _ctx: &crate::modules::BuildContext,
+        ctx: &crate::modules::BuildContext,
     ) -> Result<Self> {
         let properties = properties.user_properties();
         let path = props::get_string(properties, "path")
@@ -212,7 +211,7 @@ impl Module for UnixSocketInput {
             .with_context(|| format!("input '{}': unix_socket startup validation failed", name))?;
         Ok(Self {
             path,
-            metrics: Arc::new(InputMetrics::default()),
+            metrics: InputMetrics::register(&ctx.metrics, name)?,
         })
     }
 }
@@ -424,11 +423,11 @@ impl Input for UnixSocketInput {
 
                             if let Err(e) = validate_pri(data) {
                                 warn!("unix_socket: dropping invalid message ({})", e);
-                                self.metrics.events_invalid.fetch_add(1, Ordering::Relaxed);
+                                self.metrics.events_invalid.inc();
                                 continue;
                             }
 
-                            self.metrics.events_received.fetch_add(1, Ordering::Relaxed);
+                            self.metrics.events_received.inc();
 
                             let event = Event::new(Bytes::copy_from_slice(data), source_addr);
                             if tx.send(event).await.is_err() {
@@ -477,7 +476,7 @@ mod tests {
     ) {
         let input = UnixSocketInput {
             path: path.display().to_string(),
-            metrics: Arc::new(InputMetrics::default()),
+            metrics: InputMetrics::for_testing(),
         };
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);

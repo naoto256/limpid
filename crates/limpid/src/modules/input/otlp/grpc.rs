@@ -34,7 +34,6 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
 use opentelemetry_proto::tonic::collector::logs::v1::{
@@ -94,7 +93,7 @@ impl Module for OtlpGrpcInput {
     fn from_properties(
         name: &str,
         properties: &crate::dsl::module_props::ModuleProperties,
-        _ctx: &crate::modules::BuildContext,
+        ctx: &crate::modules::BuildContext,
     ) -> Result<Self> {
         let properties = properties.user_properties();
         let bind =
@@ -105,7 +104,7 @@ impl Module for OtlpGrpcInput {
             bind_addr: bind,
             rate_limit,
             tls,
-            metrics: Arc::new(InputMetrics::default()),
+            metrics: InputMetrics::register(&ctx.metrics, name)?,
         })
     }
 }
@@ -216,7 +215,7 @@ impl LogsService for LogsServiceImpl {
         // Track every RPC as a "received" event for backpressure
         // visibility — even if the body is empty / malformed we want
         // to see the flow through input metrics.
-        self.metrics.events_received.fetch_add(1, Ordering::Relaxed);
+        self.metrics.events_received.inc();
 
         // Fallback: tonic should always know the peer for a
         // TCP-served RPC, but a non-TCP transport (uds, mock) might
@@ -408,7 +407,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let svc = LogsServiceImpl {
             tx,
-            metrics: Arc::new(InputMetrics::default()),
+            metrics: InputMetrics::for_testing(),
             rate_limiter: None,
         };
         let req = Request::new(ExportLogsServiceRequest {
@@ -450,7 +449,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let svc = LogsServiceImpl {
             tx,
-            metrics: Arc::new(InputMetrics::default()),
+            metrics: InputMetrics::for_testing(),
             rate_limiter: None,
         };
         let req = Request::new(ExportLogsServiceRequest {
@@ -467,7 +466,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let svc = LogsServiceImpl {
             tx,
-            metrics: Arc::new(InputMetrics::default()),
+            metrics: InputMetrics::for_testing(),
             rate_limiter: None,
         };
         let lr = |t: u64| LogRecord {

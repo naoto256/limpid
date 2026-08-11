@@ -20,7 +20,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
 use tokio::fs::OpenOptions;
@@ -178,7 +177,7 @@ impl Module for FileOutput {
             retry,
             error_log,
             error_log_fallback: ctx.error_log_fallback,
-            metrics: Arc::new(OutputMetrics::default()),
+            metrics: OutputMetrics::register(&ctx.metrics, name)?,
             shutdown_signal: ctx.shutdown_signal.clone(),
         })
     }
@@ -261,7 +260,7 @@ impl Output for FileOutput {
                 }
                 Err(e) => {
                     attempt += 1;
-                    self.metrics.retries.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.retries.inc();
                     if attempt >= self.retry.max_attempts {
                         let reason =
                             format!("output write failed after {} attempts: {}", attempt, e);
@@ -601,7 +600,7 @@ impl FileOutput {
         // than the event count claims. The syscall is cheap and turns
         // "write returned Ok" into an OS-visible commitment.
         file.flush().await?;
-        self.metrics.events_written.fetch_add(1, Ordering::Relaxed);
+        self.metrics.events_written.inc();
 
         Ok(())
     }
@@ -1229,7 +1228,7 @@ mod tests {
             retry: RetryConfig::default(),
             error_log: None,
             error_log_fallback: crate::error_log::ErrorLogFallback::default(),
-            metrics: Arc::new(OutputMetrics::default()),
+            metrics: OutputMetrics::for_testing(),
             shutdown_signal: crate::modules::BuildContext::for_testing().shutdown_signal,
         }
     }
@@ -2195,7 +2194,7 @@ mod tests {
             },
             error_log: None,
             error_log_fallback: crate::error_log::ErrorLogFallback::default(),
-            metrics: Arc::new(OutputMetrics::default()),
+            metrics: OutputMetrics::for_testing(),
             shutdown_signal: shutdown_rx,
         };
 
