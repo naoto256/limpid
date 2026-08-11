@@ -91,9 +91,14 @@ def function juniper_srx_syslog_action_status_id(action) {
 // collector forwarding many SRXs still reports each event's true
 // origin.
 def function parse_juniper_srx_syslog_classify(text) {
+    // Accepts the RFC 3164 `%e` day padding (a single-digit day widens
+    // to two chars with a leading space). The header is extracted here
+    // rather than via parse_syslog; the separator shape must match the
+    // contract implemented by the sibling helper `rfc3164_timestamp_end`
+    // in the syslog parser.
     let m = regex_parse(
         text,
-        "^<\\d+>(?P<timestamp>\\S+ \\S+ \\S+) (?P<host>\\S+) RT_(?P<daemon>[A-Z]+): (?P<msgid>[A-Z][A-Z0-9_]+): (?P<body>.*)$"
+        "^<\\d+>(?P<timestamp>\\S+[ ]{1,2}\\S+ \\S+) (?P<host>\\S+) RT_(?P<daemon>[A-Z]+): (?P<msgid>[A-Z][A-Z0-9_]+): (?P<body>.*)$"
     )
     switch true {
         m == null { null }
