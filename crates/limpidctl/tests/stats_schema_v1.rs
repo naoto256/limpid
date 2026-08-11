@@ -388,7 +388,7 @@ fn details_renders_all_types_with_deterministic_order_and_complete_fields() {
                 "type": "counter",
                 "help": "Accepted events.",
                 "series": [
-                    {"labels": {"a": "two", "z": "last"}, "value": 2},
+                    {"labels": {"a": "two", "z": "first"}, "value": 2},
                     {"labels": {"a": "one", "z": "last"}, "value": 1}
                 ]
             },
@@ -422,27 +422,29 @@ fn details_renders_all_types_with_deterministic_order_and_complete_fields() {
     assert!(counter_block.contains("counter"));
     assert!(counter_block.contains("Accepted events."));
     assert!(text.find("a=\"one\"").unwrap() < text.find("a=\"two\"").unwrap());
-    assert!(counter_block.contains("a=\"one\", z=\"last\""));
-    assert!(counter_block.contains("value"));
-    assert!(counter_block.contains('1'));
-    assert!(counter_block.contains('2'));
+    assert!(counter_block.contains(
+        r#"  labels: a="one", z="last"
+    value: 1
+"#
+    ));
+    assert!(counter_block.contains(
+        r#"  labels: a="two", z="first"
+    value: 2
+"#
+    ));
     assert!(gauge_block.contains("gauge"));
     assert!(gauge_block.contains("Current depth."));
-    assert!(gauge_block.contains(r#"env="prod\"east\\one\nline""#));
-    assert!(gauge_block.contains("value"));
-    assert!(gauge_block.contains('9'));
+    assert!(gauge_block.contains(
+        r#"  labels: env="prod\"east\\one\nline"
+    value: 9
+"#
+    ));
     assert!(histogram_block.contains("histogram"));
     assert!(histogram_block.contains("Latency distribution."));
     assert!(histogram_block.contains("route=\"west\""));
-    assert!(histogram_block.contains("buckets"));
-    assert!(histogram_block.contains("0.125"));
-    assert!(histogram_block.contains("17"));
-    assert!(histogram_block.contains("0.875"));
-    assert!(histogram_block.contains("29"));
-    assert!(histogram_block.contains("sum"));
-    assert!(histogram_block.contains("13.75"));
-    assert!(histogram_block.contains("count"));
-    assert!(histogram_block.contains("31"));
+    assert!(histogram_block.contains("    buckets: 0.125 => 17 0.875 => 29\n"));
+    assert!(histogram_block.contains("    sum: 13.75\n"));
+    assert!(histogram_block.contains("    count: 31\n"));
     assert!(!histogram_block.contains("+Inf"));
 }
 
