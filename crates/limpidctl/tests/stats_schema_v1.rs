@@ -1,0 +1,596 @@
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixListener;
+use std::path::PathBuf;
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+
+static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
+
+fn process_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn socket_path() -> (PathBuf, PathBuf) {
+    let id = NEXT_SOCKET.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("limpidctl-stats-{}-{id}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("control.sock");
+    (dir, socket)
+}
+
+fn run_stats(response: &str, args: &[&str]) -> Output {
+    let _process_guard = process_lock();
+    let (dir, socket) = socket_path();
+    let server_socket = socket.clone();
+    let response = response.to_owned();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (child_started_tx, child_started_rx) = mpsc::sync_channel(1);
+    let server = thread::spawn(move || {
+        let listener = match UnixListener::bind(&server_socket) {
+            Ok(listener) => listener,
+            Err(error) => {
+                let _ = ready_tx.send(Err(format!(
+                    "failed to bind control socket {server_socket:?}: {error}"
+                )));
+                return;
+            }
+        };
+        if let Err(error) = listener.set_nonblocking(true) {
+            let _ = ready_tx.send(Err(format!(
+                "failed to configure control socket {server_socket:?}: {error}"
+            )));
+            return;
+        }
+        ready_tx
+            .send(Ok(()))
+            .expect("stats test caller dropped before server readiness");
+        child_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("limpidctl child was not started within 2 seconds of server readiness");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break Some(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        break None;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("failed to accept control connection: {error}"),
+            }
+        };
+        let Some(ref mut stream) = stream else {
+            return;
+        };
+        let mut request = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        assert_eq!(request, "stats\n");
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+
+    match ready_rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            server.join().unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+            panic!("stats test server setup failed: {error}");
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            server.join().unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+            panic!("stats test server did not become ready within 2 seconds");
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let panic = server.join().err();
+            std::fs::remove_dir_all(dir).unwrap();
+            panic!("stats test server disconnected before readiness: {panic:?}");
+        }
+    }
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_limpidctl"));
+    command.arg("--socket").arg(&socket).arg("stats");
+    command.args(args);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = command.spawn().unwrap();
+    child_started_tx
+        .send(())
+        .expect("stats test server stopped before limpidctl child startup");
+    let output = child.wait_with_output().unwrap();
+
+    server.join().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    output
+}
+
+fn counter_family(
+    name: &str,
+    label: &str,
+    help: &str,
+    values: &[(&str, u64)],
+    reverse_series: bool,
+) -> Value {
+    let mut series: Vec<Value> = values
+        .iter()
+        .map(|(scope, value)| json!({"labels": {label: scope}, "value": value}))
+        .collect();
+    if reverse_series {
+        series.reverse();
+    }
+    json!({"name": name, "type": "counter", "help": help, "series": series})
+}
+
+fn histogram_snapshot(buckets: Value) -> String {
+    format!(
+        "{}\n",
+        json!({
+            "schema": 1,
+            "metrics": [{
+                "name": "metric_histogram",
+                "type": "histogram",
+                "help": "Histogram validation fixture.",
+                "series": [{
+                    "labels": {"scope": "one"},
+                    "buckets": buckets,
+                    "sum": 3.5,
+                    "count": 3
+                }]
+            }]
+        })
+    )
+}
+
+fn canonical_snapshot(reverse: bool) -> Value {
+    let mut metrics = vec![
+        counter_family(
+            "limpid_pipeline_events_received_total",
+            "pipeline",
+            "received",
+            &[
+                ("unwritable_only", 30),
+                ("compact", 10),
+                ("errored_only", 20),
+            ],
+            reverse,
+        ),
+        counter_family(
+            "limpid_pipeline_events_finished_total",
+            "pipeline",
+            "finished",
+            &[
+                ("unwritable_only", 29),
+                ("compact", 9),
+                ("errored_only", 19),
+            ],
+            false,
+        ),
+        counter_family(
+            "limpid_pipeline_events_dropped_total",
+            "pipeline",
+            "dropped",
+            &[("unwritable_only", 0), ("compact", 1), ("errored_only", 0)],
+            false,
+        ),
+        counter_family(
+            "limpid_pipeline_events_discarded_total",
+            "pipeline",
+            "discarded",
+            &[("unwritable_only", 1), ("compact", 0), ("errored_only", 1)],
+            false,
+        ),
+        counter_family(
+            "limpid_pipeline_events_errored_total",
+            "pipeline",
+            "errored",
+            &[("unwritable_only", 0), ("compact", 0), ("errored_only", 4)],
+            false,
+        ),
+        counter_family(
+            "limpid_pipeline_events_errored_unwritable_total",
+            "pipeline",
+            "unwritable",
+            &[("unwritable_only", 3), ("compact", 0), ("errored_only", 0)],
+            false,
+        ),
+        counter_family(
+            "limpid_input_events_received_total",
+            "input",
+            "received",
+            &[("zeta", 210), ("alpha", 110)],
+            false,
+        ),
+        counter_family(
+            "limpid_input_events_invalid_total",
+            "input",
+            "invalid",
+            &[("zeta", 3), ("alpha", 2)],
+            false,
+        ),
+        counter_family(
+            "limpid_input_events_injected_total",
+            "input",
+            "injected",
+            &[("zeta", 4), ("alpha", 3)],
+            false,
+        ),
+        counter_family(
+            "limpid_output_events_received_total",
+            "output",
+            "received",
+            &[
+                ("unwritable_only", 130),
+                ("compact", 110),
+                ("wedged_only", 120),
+            ],
+            false,
+        ),
+        counter_family(
+            "limpid_output_events_injected_total",
+            "output",
+            "injected",
+            &[("unwritable_only", 3), ("compact", 1), ("wedged_only", 2)],
+            false,
+        ),
+        counter_family(
+            "limpid_output_events_written_total",
+            "output",
+            "written",
+            &[
+                ("unwritable_only", 125),
+                ("compact", 105),
+                ("wedged_only", 115),
+            ],
+            false,
+        ),
+        counter_family(
+            "limpid_output_events_failed_total",
+            "output",
+            "failed",
+            &[("unwritable_only", 2), ("compact", 2), ("wedged_only", 2)],
+            false,
+        ),
+        counter_family(
+            "limpid_output_retries_total",
+            "output",
+            "retries",
+            &[("unwritable_only", 5), ("compact", 3), ("wedged_only", 4)],
+            false,
+        ),
+        counter_family(
+            "limpid_output_events_wedged_total",
+            "output",
+            "wedged",
+            &[("unwritable_only", 0), ("compact", 0), ("wedged_only", 2)],
+            false,
+        ),
+        counter_family(
+            "limpid_output_events_errored_unwritable_total",
+            "output",
+            "unwritable",
+            &[("unwritable_only", 1), ("compact", 0), ("wedged_only", 0)],
+            false,
+        ),
+    ];
+    if reverse {
+        metrics.reverse();
+    }
+    json!({"schema": 1, "metrics": metrics})
+}
+
+fn expected_default_table() -> String {
+    format!(
+        "Pipelines:\n\
+         {compact_pipeline}\n\
+         {errored_pipeline}\n\
+         {unwritable_pipeline}\n\
+         \nInputs:\n\
+         {alpha_input}\n\
+         {zeta_input}\n\
+         \nOutputs:\n\
+         {compact_output}\n\
+         {unwritable_output}\n\
+         {wedged_output}\n",
+        compact_pipeline = format_args!(
+            "  {:<24} {:>8} received  {:>8} finished  {:>8} dropped  {:>8} discarded",
+            "compact", 10, 9, 1, 0
+        ),
+        errored_pipeline = format_args!(
+            "  {:<24} {:>8} received  {:>8} finished  {:>8} dropped  {:>8} discarded  {:>8} errored",
+            "errored_only", 20, 19, 0, 1, 4
+        ),
+        unwritable_pipeline = format_args!(
+            "  {:<24} {:>8} received  {:>8} finished  {:>8} dropped  {:>8} discarded  {:>8} errored  {:>8} errored_unwritable",
+            "unwritable_only", 30, 29, 0, 1, 0, 3
+        ),
+        alpha_input = format_args!(
+            "  {:<24} {:>8} received  {:>8} invalid  {:>8} injected",
+            "alpha", 110, 2, 3
+        ),
+        zeta_input = format_args!(
+            "  {:<24} {:>8} received  {:>8} invalid  {:>8} injected",
+            "zeta", 210, 3, 4
+        ),
+        compact_output = format_args!(
+            "  {:<24} {:>8} received  {:>8} injected  {:>8} written  {:>8} failed  {:>8} retries",
+            "compact", 110, 1, 105, 2, 3
+        ),
+        unwritable_output = format_args!(
+            "  {:<24} {:>8} received  {:>8} injected  {:>8} written  {:>8} failed  {:>8} retries  {:>8} errored_unwritable",
+            "unwritable_only", 130, 3, 125, 2, 5, 1
+        ),
+        wedged_output = format_args!(
+            "  {:<24} {:>8} received  {:>8} injected  {:>8} written  {:>8} failed  {:>8} retries  {:>8} wedged",
+            "wedged_only", 120, 2, 115, 2, 4, 2
+        ),
+    )
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8(output.stdout.clone()).unwrap()
+}
+
+#[test]
+fn default_stats_maps_schema_v1_to_the_existing_sorted_table() {
+    let expected = expected_default_table();
+    for reverse in [false, true] {
+        let response = format!("{}\n", canonical_snapshot(reverse));
+        let output = run_stats(&response, &[]);
+        assert!(output.status.success(), "{:?}", output);
+        assert_eq!(stdout(&output), expected);
+    }
+}
+
+#[test]
+fn json_mode_preserves_the_complete_control_response() {
+    let response = concat!(
+        "{\"schema\":1,\"metrics\":[",
+        "{\"name\":\"custom_gauge\",\"type\":\"gauge\",\"help\":\"all fields\",",
+        "\"series\":[{\"labels\":{\"scope\":\"one\"},\"value\":7}]}",
+        "]}\n"
+    );
+    let output = run_stats(response, &["--json"]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout == response.as_bytes(), "raw JSON was changed");
+}
+
+#[test]
+fn details_renders_all_types_with_deterministic_order_and_complete_fields() {
+    let payload = json!({
+        "schema": 1,
+        "metrics": [
+            {
+                "name": "metric_zeta",
+                "type": "histogram",
+                "help": "Latency distribution.",
+                "series": [{
+                    "labels": {"route": "west"},
+                    "buckets": [[0.125, 17], [0.875, 29]],
+                    "sum": 13.75,
+                    "count": 31
+                }]
+            },
+            {
+                "name": "metric_alpha",
+                "type": "counter",
+                "help": "Accepted events.",
+                "series": [
+                    {"labels": {"a": "two", "z": "last"}, "value": 2},
+                    {"labels": {"a": "one", "z": "last"}, "value": 1}
+                ]
+            },
+            {
+                "name": "metric_middle",
+                "type": "gauge",
+                "help": "Current depth.",
+                "series": [{
+                    "labels": {"env": "prod\"east\\one\nline"},
+                    "value": 9
+                }]
+            }
+        ]
+    });
+    let response = format!("{payload}\n");
+    let output = run_stats(&response, &["--details"]);
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = stdout(&output);
+
+    let counter = text.find("metric_alpha").unwrap();
+    let gauge = text.find("metric_middle").unwrap();
+    let histogram = text.find("metric_zeta").unwrap();
+    assert!(counter < gauge && gauge < histogram);
+    let counter_block = &text[counter..gauge];
+    let gauge_block = &text[gauge..histogram];
+    let histogram_block = &text[histogram..];
+    assert!(counter_block.contains("counter"));
+    assert!(counter_block.contains("Accepted events."));
+    assert!(text.find("a=\"one\"").unwrap() < text.find("a=\"two\"").unwrap());
+    assert!(counter_block.contains("a=\"one\", z=\"last\""));
+    assert!(counter_block.contains("value"));
+    assert!(counter_block.contains('1'));
+    assert!(counter_block.contains('2'));
+    assert!(gauge_block.contains("gauge"));
+    assert!(gauge_block.contains("Current depth."));
+    assert!(gauge_block.contains(r#"env="prod\"east\\one\nline""#));
+    assert!(gauge_block.contains("value"));
+    assert!(gauge_block.contains('9'));
+    assert!(histogram_block.contains("histogram"));
+    assert!(histogram_block.contains("Latency distribution."));
+    assert!(histogram_block.contains("route=\"west\""));
+    assert!(histogram_block.contains("buckets"));
+    assert!(histogram_block.contains("0.125"));
+    assert!(histogram_block.contains("17"));
+    assert!(histogram_block.contains("0.875"));
+    assert!(histogram_block.contains("29"));
+    assert!(histogram_block.contains("sum"));
+    assert!(histogram_block.contains("13.75"));
+    assert!(histogram_block.contains("count"));
+    assert!(histogram_block.contains("31"));
+    assert!(!histogram_block.contains("+Inf"));
+}
+
+#[test]
+fn details_rejects_invalid_histogram_sequences_without_repair() {
+    for buckets in [
+        json!([]),
+        json!([[0.5, 1]]),
+        json!([[0.125, 1], [0.875, 1], [2.0, 3]]),
+        // Bucket and total atomics are loaded independently, so observe ordering
+        // permits a transient last-bucket count greater than the total count.
+        json!([[0.125, 1], [0.875, 2], [2.0, 4]]),
+    ] {
+        let response = histogram_snapshot(buckets);
+        let output = run_stats(&response, &["--details"]);
+        assert!(output.status.success(), "{:?}", output);
+        assert_ne!(output.stdout, response.as_bytes());
+        assert!(stdout(&output).contains("metric_histogram"));
+    }
+
+    for buckets in [
+        json!([[1.0, 1], [1.0, 2]]),
+        json!([[2.0, 1], [1.0, 2]]),
+        json!([[1.0, 2], [2.0, 1]]),
+    ] {
+        let response = histogram_snapshot(buckets);
+        let output = run_stats(&response, &["--details"]);
+        assert!(output.status.success(), "{:?}", output);
+        assert_eq!(output.stdout, response.as_bytes());
+    }
+}
+
+#[test]
+fn default_ignores_unknown_families_but_details_includes_them() {
+    let mut payload = canonical_snapshot(false);
+    payload["metrics"].as_array_mut().unwrap().push(json!({
+        "name": "future_metric",
+        "type": "gauge",
+        "help": "Future metric.",
+        "series": [{"labels": {"scope": "future"}, "value": 42}]
+    }));
+    let response = format!("{payload}\n");
+
+    let default_output = run_stats(&response, &[]);
+    assert!(default_output.status.success(), "{:?}", default_output);
+    assert_eq!(stdout(&default_output), expected_default_table());
+    assert!(!stdout(&default_output).contains("future_metric"));
+
+    let details_output = run_stats(&response, &["--details"]);
+    assert!(details_output.status.success(), "{:?}", details_output);
+    assert!(stdout(&details_output).contains("future_metric"));
+    assert!(stdout(&details_output).contains("scope=\"future\""));
+    assert!(stdout(&details_output).contains("42"));
+}
+
+#[test]
+fn malformed_known_families_fall_back_to_the_raw_response() {
+    let canonical = canonical_snapshot(false);
+    let mut cases = Vec::new();
+
+    let mut missing = canonical.clone();
+    missing["metrics"].as_array_mut().unwrap().remove(0);
+    cases.push(missing);
+
+    let mut duplicate = canonical.clone();
+    let duplicate_family = duplicate["metrics"][0].clone();
+    duplicate["metrics"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate_family);
+    cases.push(duplicate);
+
+    let mut wrong_type = canonical.clone();
+    wrong_type["metrics"][0]["type"] = json!("gauge");
+    cases.push(wrong_type);
+
+    let mut wrong_label = canonical.clone();
+    wrong_label["metrics"][0]["series"][0]["labels"] = json!({"wrong": "zeta"});
+    cases.push(wrong_label);
+
+    let mut extra_label = canonical.clone();
+    extra_label["metrics"][0]["series"][0]["labels"] =
+        json!({"pipeline": "unwritable_only", "extra": "x"});
+    cases.push(extra_label);
+
+    let mut wrong_value = canonical;
+    wrong_value["metrics"][0]["series"][0]["value"] = json!("30");
+    cases.push(wrong_value);
+
+    for (index, payload) in cases.into_iter().enumerate() {
+        let response = format!("{payload}\n");
+        let output = run_stats(&response, &[]);
+        assert!(
+            output.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stdout == response.as_bytes(),
+            "malformed known family did not use raw fallback"
+        );
+        if index == 0 {
+            let details = run_stats(&response, &["--details"]);
+            assert!(
+                details.status.success(),
+                "stderr={}",
+                String::from_utf8_lossy(&details.stderr)
+            );
+            assert!(
+                details.stdout == response.as_bytes(),
+                "malformed known family did not use details raw fallback"
+            );
+        }
+    }
+}
+
+#[test]
+fn invalid_and_unsupported_responses_preserve_raw_fallback() {
+    for response in [
+        "not json at all\n",
+        "{\"schema\":2,\"metrics\":[]}\n",
+        "{\"schema\":1,\"metrics\":\"wrong\"}\n",
+    ] {
+        for args in [&[][..], &["--details"][..]] {
+            let output = run_stats(response, args);
+            assert!(
+                output.status.success(),
+                "stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.stdout == response.as_bytes(),
+                "invalid or unsupported response did not use raw fallback"
+            );
+        }
+    }
+}
+
+#[test]
+fn json_and_details_are_mutually_exclusive() {
+    let _process_guard = process_lock();
+    let output = Command::new(env!("CARGO_BIN_EXE_limpidctl"))
+        .args(["stats", "--json", "--details"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--json"));
+    assert!(stderr.contains("--details"));
+    assert!(stderr.contains("cannot be used with"));
+}
