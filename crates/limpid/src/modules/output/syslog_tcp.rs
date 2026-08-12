@@ -520,8 +520,8 @@ impl SyslogTcpOutput {
         shutdown: &mut tokio::sync::watch::Receiver<bool>,
     ) -> SyslogTcpWriteOutcome {
         let framing = self.framing;
-        let confirmed_len = framed_len(framing, payload.egress.len());
         let connectors = self.connectors.clone();
+        let metrics = Arc::clone(&self.metrics);
         let result = self
             .peers
             .write_with_rotation_shutdown_aware(
@@ -531,6 +531,7 @@ impl SyslogTcpOutput {
                     let address = peer.address();
                     let server_name = peer.host.clone();
                     let connector = connectors[idx].clone();
+                    let metrics = Arc::clone(&metrics);
                     Box::pin(async move {
                         if state.conn.is_none() {
                             // Pre-send phase: connect + TLS handshake
@@ -613,13 +614,15 @@ impl SyslogTcpOutput {
                         // Dropped → disk queue holds cursor and
                         // replays on next start.
                         let stream = state.conn.as_mut().expect("connection should be present");
-                        let write_result = tokio::time::timeout(
-                            PEER_WRITE_TIMEOUT,
-                            write_framed(stream, framing, &egress),
-                        )
+                        let write_result = tokio::time::timeout(PEER_WRITE_TIMEOUT, async {
+                            let confirmed_len = write_framed(stream, framing, &egress).await?;
+                            metrics.bytes_written.inc_by(confirmed_len as u64);
+                            Ok::<(), anyhow::Error>(())
+                        })
                         .await
-                        .map_err(|_| anyhow::anyhow!("syslog_tcp write to {} timed out", address))
-                        .and_then(|res| res);
+                        .map_err(|_| {
+                            anyhow::anyhow!("syslog_tcp write to {} timed out", address)
+                        })?;
                         if write_result.is_err() {
                             state.conn = None;
                         }
@@ -631,10 +634,7 @@ impl SyslogTcpOutput {
             .await;
 
         match result {
-            Ok(()) => {
-                self.metrics.bytes_written.inc_by(confirmed_len as u64);
-                SyslogTcpWriteOutcome::Delivered
-            }
+            Ok(()) => SyslogTcpWriteOutcome::Delivered,
             Err(PeerSendError::PreSendShutdown) => SyslogTcpWriteOutcome::PreSendShutdown,
             Err(e) => SyslogTcpWriteOutcome::Err(e.into()),
         }
@@ -650,8 +650,8 @@ impl SyslogTcpOutput {
     /// this method would tick the counter.
     async fn write_payload(&self, payload: SyslogPayload) -> Result<()> {
         let framing = self.framing;
-        let confirmed_len = framed_len(framing, payload.egress.len());
         let connectors = self.connectors.clone();
+        let metrics = Arc::clone(&self.metrics);
         let result = self
             .peers
             .write_with_rotation_now(move |idx, peer, state| {
@@ -659,6 +659,7 @@ impl SyslogTcpOutput {
                 let address = peer.address();
                 let server_name = peer.host.clone();
                 let connector = connectors[idx].clone();
+                let metrics = Arc::clone(&metrics);
                 Box::pin(async move {
                     if state.conn.is_none() {
                         let tcp = tokio::time::timeout(
@@ -695,13 +696,13 @@ impl SyslogTcpOutput {
                     }
 
                     let stream = state.conn.as_mut().expect("connection should be present");
-                    let write_result = tokio::time::timeout(
-                        PEER_WRITE_TIMEOUT,
-                        write_framed(stream, framing, &egress),
-                    )
+                    let write_result = tokio::time::timeout(PEER_WRITE_TIMEOUT, async {
+                        let confirmed_len = write_framed(stream, framing, &egress).await?;
+                        metrics.bytes_written.inc_by(confirmed_len as u64);
+                        Ok::<(), anyhow::Error>(())
+                    })
                     .await
-                    .map_err(|_| anyhow::anyhow!("syslog_tcp write to {} timed out", address))
-                    .and_then(|res| res);
+                    .map_err(|_| anyhow::anyhow!("syslog_tcp write to {} timed out", address))?;
                     if write_result.is_err() {
                         state.conn = None;
                     }
@@ -711,30 +712,9 @@ impl SyslogTcpOutput {
             .await;
 
         match result {
-            Ok(()) => {
-                self.metrics.bytes_written.inc_by(confirmed_len as u64);
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(err) => Err(anyhow::anyhow!("{}", err)),
         }
-    }
-}
-
-/// Length of the exact buffer handed to the write path. Must
-/// mirror the framing bytes the stream adds (octet-count digits
-/// plus SP for `OctetCounting`, trailing LF for `NonTransparent`);
-/// drift here would silently mis-count sent bytes.
-fn framed_len(framing: SyslogFraming, payload_len: usize) -> usize {
-    match framing {
-        SyslogFraming::OctetCounting => {
-            let digits = if payload_len == 0 {
-                1
-            } else {
-                payload_len.ilog10() as usize + 1
-            };
-            digits + 1 + payload_len
-        }
-        SyslogFraming::NonTransparent => payload_len + 1,
     }
 }
 
@@ -821,6 +801,218 @@ mod tests {
             expected.len() as u64,
             "the generated octet-count header belongs to the adapter buffer"
         );
+    }
+
+    #[test]
+    fn byte_confirmation_is_owned_by_the_framed_write_result() {
+        fn statement_end(source: &str, start: usize) -> usize {
+            let mut parens = 0usize;
+            let mut brackets = 0usize;
+            let mut braces = 0usize;
+            for (offset, byte) in source.as_bytes()[start..].iter().enumerate() {
+                match byte {
+                    b'(' => parens += 1,
+                    b')' => parens -= 1,
+                    b'[' => brackets += 1,
+                    b']' => brackets -= 1,
+                    b'{' => braces += 1,
+                    b'}' => braces -= 1,
+                    b';' if parens == 0 && brackets == 0 && braces == 0 => {
+                        return start + offset + 1;
+                    }
+                    _ => {}
+                }
+            }
+            panic!("let statement must have a balanced terminator");
+        }
+
+        fn call_end(source: &str, call: &str) -> usize {
+            assert!(
+                source.starts_with(call),
+                "initializer must start directly with {call}"
+            );
+            let open = call.len() - 1;
+            let mut depth = 0usize;
+            for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
+                match byte {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return open + offset + 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("framed-write call must be balanced");
+        }
+
+        fn assert_normal_await_propagation(mut suffix: &str) {
+            suffix = suffix.trim();
+            suffix = suffix
+                .strip_prefix(".await")
+                .expect("write_framed's successful value must be awaited directly");
+            loop {
+                suffix = suffix.trim();
+                if suffix == "?" {
+                    return;
+                }
+                let method = [".context(", ".with_context("]
+                    .into_iter()
+                    .find(|method| suffix.starts_with(method))
+                    .expect("only ordinary error-context propagation may follow await");
+                let end = call_end(suffix, method);
+                suffix = &suffix[end..];
+            }
+        }
+
+        fn write_binding<'a>(body: &'a str, write: &str) -> (&'a str, usize) {
+            let write_start = body.find(write).expect("framed write must exist");
+            let mut search_end = write_start;
+            while let Some(binding_start) = body[..search_end].rfind("let ") {
+                let end = statement_end(body, binding_start);
+                if write_start < end {
+                    let statement = &body[binding_start..end];
+                    let (left, right) = statement
+                        .strip_prefix("let ")
+                        .expect("binding must start with let")
+                        .split_once('=')
+                        .expect("binding must have an initializer");
+                    assert_eq!(
+                        right.matches(write).count(),
+                        1,
+                        "the binding RHS must contain exactly one framed write"
+                    );
+                    let initializer = right
+                        .trim()
+                        .strip_suffix(';')
+                        .expect("let initializer must end at its statement terminator")
+                        .trim();
+                    let call_end = call_end(initializer, write);
+                    assert_normal_await_propagation(&initializer[call_end..]);
+                    let identifier = left
+                        .split_once(':')
+                        .map_or(left, |(identifier, _)| identifier)
+                        .trim();
+                    assert!(
+                        !identifier.is_empty()
+                            && !identifier.as_bytes()[0].is_ascii_digit()
+                            && identifier
+                                .bytes()
+                                .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric()),
+                        "the framed result must use a plain local identifier"
+                    );
+                    return (identifier, end);
+                }
+                search_end = binding_start;
+            }
+            panic!("write_framed must occur inside a let initializer");
+        }
+
+        fn assert_confirmed_result_ownership(body: &str) {
+            assert_eq!(
+                body.matches("write_framed(").count(),
+                1,
+                "each send path must perform exactly one framed write"
+            );
+            assert!(
+                !body.contains("framed_len("),
+                "callers must not independently reconstruct the framing length"
+            );
+
+            let (confirmed, statement_end) = write_binding(body, "write_framed(");
+
+            let bump = "bytes_written.inc_by(";
+            assert_eq!(
+                body.matches(bump).count(),
+                1,
+                "each successful send path must record exactly one confirmed length"
+            );
+            let bump_start = body.find(bump).expect("confirmed byte bump must exist");
+            assert!(
+                statement_end <= bump_start,
+                "the framed-result binding must end before the byte bump"
+            );
+            let argument_start = bump_start + bump.len();
+            let argument_end = body[argument_start..]
+                .find(')')
+                .map(|offset| argument_start + offset)
+                .expect("byte bump must close");
+            let argument = body[argument_start..argument_end]
+                .trim()
+                .strip_suffix(" as u64")
+                .unwrap_or(body[argument_start..argument_end].trim());
+            assert_eq!(
+                argument, confirmed,
+                "the byte bump must consume the same local bound by write_framed"
+            );
+        }
+
+        fn assert_rejected(body: &str) {
+            assert!(
+                std::panic::catch_unwind(|| assert_confirmed_result_ownership(body)).is_err(),
+                "counterexample must fail the ownership check: {body}"
+            );
+        }
+
+        assert_confirmed_result_ownership(
+            "let renamed: usize =\n                 write_framed(stream, framing_for(mode), &payload).await?;\
+             bytes_written.inc_by(renamed as u64);",
+        );
+        assert_confirmed_result_ownership(
+            "let contextual = write_framed(stream, framing, payload)\n\
+                 .await\n\
+                 .context(\"write failed\")?;\
+             bytes_written.inc_by(contextual as u64);",
+        );
+        assert_rejected(
+            "let confirmed = { write_framed(stream, framing, payload).await?; \
+                 payload.len() + 1 }; bytes_written.inc_by(confirmed as u64);",
+        );
+        assert_rejected(
+            "let confirmed = { let _ = write_framed(stream, framing, payload).await?; 0 }; \
+             bytes_written.inc_by(confirmed as u64);",
+        );
+        assert_rejected(
+            "let confirmed = payload.len() + 1; write_framed(stream, framing, payload).await?; \
+             bytes_written.inc_by(confirmed as u64);",
+        );
+        assert_rejected(
+            "let n = 0; write_framed(stream, framing, payload).await?; \
+             bytes_written.inc_by(n as u64);",
+        );
+        assert_rejected("let n = write_framed(stream, framing, payload).await?;");
+        assert_rejected(
+            "let n = write_framed(stream, framing, payload).await?; \
+             bytes_written.inc_by(n as u64); bytes_written.inc_by(n as u64);",
+        );
+        assert_rejected(
+            "let n = write_framed(stream, framing, payload).await?; \
+             bytes_written.inc_by(payload.len() as u64);",
+        );
+        assert_rejected(
+            "let n = write_framed(stream, framing, payload).await?; let old = framed_len(f, 1); \
+             bytes_written.inc_by(n as u64);",
+        );
+
+        let src = include_str!("syslog_tcp.rs");
+        let shutdown_aware_start = src
+            .find("async fn write_payload_shutdown_aware(")
+            .expect("shutdown-aware writer must exist");
+        let normal_start = src[shutdown_aware_start..]
+            .find("async fn write_payload(&self")
+            .map(|offset| shutdown_aware_start + offset)
+            .expect("normal writer must follow shutdown-aware writer");
+        let helper_end = src[normal_start..]
+            .find("\n}\n")
+            .map(|offset| normal_start + offset)
+            .expect("writer impl must have a top-level end");
+        let shutdown_aware = &src[shutdown_aware_start..normal_start];
+        let normal = &src[normal_start..helper_end];
+
+        assert_confirmed_result_ownership(shutdown_aware);
+        assert_confirmed_result_ownership(normal);
     }
 
     #[tokio::test]
