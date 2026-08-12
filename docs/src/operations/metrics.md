@@ -74,9 +74,9 @@ daemon startup instead of being ignored.
 
 ## Current metric families
 
-These are the 16 counter families currently registered by the daemon. Each
-series has exactly the fixed label shown; the label value is the configured
-component name.
+These are the current counter families registered by the daemon. Each series
+has exactly the fixed label shown; the label value is the configured component
+name, so label cardinality is bounded by the configured components.
 
 ### Pipelines
 
@@ -106,6 +106,7 @@ original event is preserved when the configured error-log write succeeds; see
 | `limpid_input_events_received_total` | `input` | Events received from the source; injected events are excluded. |
 | `limpid_input_events_invalid_total` | `input` | Events rejected by the input parser or protocol boundary. |
 | `limpid_input_events_injected_total` | `input` | Events pushed into the input through `limpidctl inject`. |
+| `limpid_input_bytes_received_total` | `input` | Logical bytes received by the input adapter before validation. |
 
 Keeping `received` and `injected` separate makes source traffic distinguishable
 from synthetic and replay traffic.
@@ -121,6 +122,7 @@ from synthetic and replay traffic.
 | `limpid_output_retries_total` | `output` | Retry attempts across all events. |
 | `limpid_output_events_wedged_total` | `output` | Disk-queue fail-stop wedges observed by the output. |
 | `limpid_output_events_errored_unwritable_total` | `output` | Sink-side error-log writes that failed. |
+| `limpid_output_bytes_written_total` | `output` | Logical bytes whose transfer to the destination was confirmed. |
 
 `events_failed` includes retry-budget exhaustion, per-event render failures in
 batched output flushes, shutdown-drain leftovers after a final flush failure,
@@ -141,6 +143,32 @@ Useful relationships are approximate during concurrent updates:
 - `output.received - output.injected` is traffic delivered by pipelines.
 - `output.received - output.written - output.failed` approximates events still
   pending in the queue.
+
+### Byte-counter boundary
+
+The byte counters measure logical buffers at adapter boundaries, not physical
+wire traffic. They exclude transport overhead such as TCP/IP, TLS, HTTP/2, and
+Kafka protocol framing. They include framing, line feeds, compression, or
+serialization only when that is part of the exact buffer the adapter receives
+or hands to its transport.
+
+`limpid_input_bytes_received_total{input}` counts a logical input buffer before
+validation, so invalid input is included and an empty buffer adds zero. A
+partially read tail record is counted once when it becomes complete; rewinding
+or rereading it does not count it again. For structured sources without an
+equivalent raw adapter buffer, OTLP gRPC uses the decoded request's canonical
+protobuf encoded length, and journal input uses the length of the generated
+JSON buffer.
+
+`limpid_output_bytes_written_total{output}` counts the complete prepared body
+only when the adapter can confirm its transfer to the transport. This includes
+an HTTP non-success response and an OTLP partial rejection because the complete
+request body was transferred. A connection or send failure without transfer
+confirmation adds zero. A retry counts a confirmed attempt once, including
+during shutdown, and the byte count is never apportioned to the accepted subset
+of a batch. File, standard output, Unix-socket, and syslog counters include any
+line feed or header added to the handed-off buffer; syslog UDP uses the length
+confirmed by `send`.
 
 ## Viewing metrics with limpidctl
 

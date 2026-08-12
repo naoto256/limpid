@@ -167,7 +167,12 @@ impl Output for UnixSocketOutput {
             )
             .await
             {
-                WriteReconnectOutcome::Delivered => Ok(()),
+                WriteReconnectOutcome::Delivered => {
+                    self.metrics
+                        .bytes_written
+                        .inc_by((event.egress.len() + 1) as u64);
+                    Ok(())
+                }
                 WriteReconnectOutcome::Err(e) => Err(e),
                 WriteReconnectOutcome::PreSendShutdown => {
                     let reason = format!(
@@ -287,7 +292,13 @@ impl Output for UnixSocketOutput {
         )
         .await
         {
-            Ok(r) => r,
+            Ok(Ok(())) => {
+                self.metrics
+                    .bytes_written
+                    .inc_by((event.egress.len() + 1) as u64);
+                Ok(())
+            }
+            Ok(Err(error)) => Err(error),
             Err(_) => Err(anyhow::anyhow!(
                 "timed out after {:?}",
                 crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT
@@ -458,6 +469,11 @@ mod tests {
             0,
             "successful send must not bump events_failed"
         );
+        assert_eq!(
+            output.metrics.bytes_written.load(Ordering::Relaxed),
+            (event.egress.len() + 1) as u64,
+            "the newline in the Unix-stream frame is part of the transferred buffer"
+        );
     }
 
     /// Shutdown-drain success via `finalize_shutdown_singleton_disposition`
@@ -492,6 +508,65 @@ mod tests {
             0,
             "successful drain must not bump events_failed"
         );
+        assert_eq!(
+            output.metrics.bytes_written.load(Ordering::Relaxed),
+            (event.egress.len() + 1) as u64,
+            "shutdown and steady-state count the same framed buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_peer_counts_neither_bytes_nor_written_events() {
+        use crate::dsl::ast::{Expr, ExprKind, Property};
+        use crate::dsl::module_props::ModuleProperties;
+
+        let dir = TempDir::new().unwrap();
+        let socket_path = dir.path().join("missing.sock");
+        let props = ModuleProperties::from_parts(
+            "unix_socket",
+            vec![
+                Property::KeyValue {
+                    key: "path".into(),
+                    key_span: None,
+                    value: Expr::spanless(ExprKind::StringLit(
+                        socket_path.to_str().unwrap().to_string(),
+                    )),
+                    value_span: None,
+                },
+                Property::Block {
+                    key: "retry".into(),
+                    key_span: None,
+                    properties: vec![Property::KeyValue {
+                        key: "max_attempts".into(),
+                        key_span: None,
+                        value: Expr::spanless(ExprKind::IntLit(1)),
+                        value_span: None,
+                    }],
+                },
+            ],
+        );
+        let output = UnixSocketOutput::from_properties(
+            "unix-failure",
+            &props,
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
+        let event = Event::new(
+            Bytes::from_static(b"unreachable"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let (ack, _ack_rx) = QueueAckHandle::for_test();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            output.consume(&event, ack),
+        )
+        .await
+        .expect("missing peer failure must remain bounded")
+        .unwrap();
+
+        assert_eq!(output.metrics.bytes_written.load(Ordering::Relaxed), 0);
+        assert_eq!(output.metrics.events_written.load(Ordering::Relaxed), 0);
     }
 
     /// Structural pin: `consume_shutdown` routes its result through

@@ -53,6 +53,7 @@ use bytes::Bytes;
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, logs_service_client::LogsServiceClient,
 };
+use prost::Message;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 use crate::dsl::ast::Property;
@@ -95,6 +96,7 @@ struct OtlpGrpcSinkPolicy {
     rotation: RotatingPeers,
     batch_level: BatchLevel,
     headers: Vec<(String, String)>,
+    metrics: Arc<OutputMetrics>,
 }
 
 pub struct OtlpGrpcOutput {
@@ -294,6 +296,7 @@ impl Module for OtlpGrpcOutput {
             rotation,
             batch_level,
             headers,
+            metrics: Arc::clone(&metrics),
         };
         // The shared skeleton spawns the flusher actor; see
         // `crate::modules::output::batched` for the actor / shutdown
@@ -386,6 +389,7 @@ impl BatchSinkPolicy for OtlpGrpcSinkPolicy {
         let idx = self.rotation.select().await;
         match send_once(&self.peers[idx], self, req).await {
             Ok(outcome) => {
+                self.metrics.bytes_written.inc_by(req.encoded_len() as u64);
                 self.rotation.mark_success(idx).await;
                 Ok(outcome)
             }
@@ -890,12 +894,15 @@ mod tests {
             &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
-        consume(
-            &output,
-            &event_with_egress(singleton_bytes(1_700_000_000_000_000_000)),
-        )
-        .await
-        .unwrap();
+        let payload = singleton_bytes(1_700_000_000_000_000_000);
+        let expected_bytes = output
+            .sink
+            .inner
+            .policy
+            .prepare(vec![payload.clone()])
+            .unwrap()
+            .encoded_len() as u64;
+        consume(&output, &event_with_egress(payload)).await.unwrap();
 
         let probe = || {
             let g = received.try_lock().ok()?;
@@ -907,6 +914,11 @@ mod tests {
         assert_eq!(got.len(), 1);
         let lr = &got[0].resource_logs[0].scope_logs[0].log_records[0];
         assert_eq!(lr.time_unix_nano, 1_700_000_000_000_000_000);
+        assert_eq!(
+            output.metrics.bytes_written.load(Ordering::Relaxed),
+            expected_bytes,
+            "gRPC output counts the canonical serialized request once"
+        );
     }
 
     /// Test-only LogsService that ALWAYS reports `partial_success.
@@ -971,8 +983,16 @@ mod tests {
         )
         .unwrap();
 
-        for i in 0..3 {
-            let ev = event_with_egress(singleton_bytes(1_000_000_000 + i));
+        let payloads: Vec<_> = (0..3).map(|i| singleton_bytes(1_000_000_000 + i)).collect();
+        let expected_bytes = output
+            .sink
+            .inner
+            .policy
+            .prepare(payloads.clone())
+            .unwrap()
+            .encoded_len() as u64;
+        for payload in payloads {
+            let ev = event_with_egress(payload);
             // With batch_size=3 the per-event disposition isn't observable
             // via the test shim's freshly-allocated handle channel — the
             // first two events stay buffered (handle held by the output)
@@ -1005,6 +1025,11 @@ mod tests {
         assert_eq!(
             failed, 2,
             "expected 2 failed, got {failed} (written={written})"
+        );
+        assert_eq!(
+            output.metrics.bytes_written.load(Ordering::Relaxed),
+            expected_bytes,
+            "partial rejection still confirms transfer of the full canonical request"
         );
     }
 
@@ -1107,6 +1132,16 @@ mod tests {
             matches!(disp, crate::queue::AckDisposition::Recovered),
             "stalled peer must surface as Recovered, got {:?}",
             disp
+        );
+        assert_eq!(
+            output.metrics.bytes_written.load(Ordering::Relaxed),
+            0,
+            "a stalled peer never confirms transfer of the prepared request"
+        );
+        assert_eq!(
+            output.metrics.events_written.load(Ordering::Relaxed),
+            0,
+            "the event and byte success counters remain independent on failure"
         );
         let _ = output.shutdown(None).await;
         stall.abort();

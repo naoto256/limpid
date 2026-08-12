@@ -80,10 +80,19 @@ impl StdoutOutput {
     /// on the payload and then fail on the delimiter, leaving an
     /// unterminated line that a retry would double.
     fn write_event(&self, event: &Event) -> Result<()> {
-        use std::io::Write;
-        let buf = super::frame_with_newline(&event.egress);
         let mut out = std::io::stdout().lock();
+        self.write_event_to(&mut out, event)
+    }
+
+    /// Private writer seam: `write_event` locks stdout and delegates
+    /// here so the confirmed-bytes contract stays testable against
+    /// an arbitrary `impl Write`. The counter bump follows the
+    /// `write_all` `?`, so a partial or failing write leaves the
+    /// counter untouched.
+    fn write_event_to(&self, out: &mut impl std::io::Write, event: &Event) -> Result<()> {
+        let buf = super::frame_with_newline(&event.egress);
         out.write_all(&buf).context("stdout write failed")?;
+        self.metrics.bytes_written.inc_by(buf.len() as u64);
         Ok(())
     }
 }
@@ -211,6 +220,7 @@ mod metrics_registration_tests {
                 "limpid_output_retries_total",
                 "limpid_output_events_wedged_total",
                 "limpid_output_events_errored_unwritable_total",
+                "limpid_output_bytes_written_total",
             ]
             .contains(&name.as_str())
         );
@@ -242,5 +252,97 @@ mod metrics_registration_tests {
                 )
             });
         assert_output_duplicate(metrics_error, "conflicting", &diagnostic);
+    }
+
+    #[tokio::test]
+    async fn successful_write_counts_payload_and_adapter_newline_once() {
+        let ctx = crate::modules::BuildContext::for_testing();
+        let properties = ModuleProperties::from_parts("stdout", Vec::new());
+        let output = StdoutOutput::from_properties("stdout-bytes", &properties, &ctx).unwrap();
+        let payload = bytes::Bytes::from_static(b"stdout-payload");
+        let event = crate::event::Event::new(payload.clone(), "127.0.0.1:0".parse().unwrap());
+        let (ack, _ack_rx) = crate::queue::QueueAckHandle::for_test();
+
+        output.consume(&event, ack).await.unwrap();
+
+        assert_eq!(
+            output
+                .metrics
+                .bytes_written
+                .load(std::sync::atomic::Ordering::Relaxed),
+            (payload.len() + 1) as u64
+        );
+        assert_eq!(
+            output
+                .metrics
+                .events_written
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "event and byte counters remain independent"
+        );
+    }
+
+    #[test]
+    fn writer_seam_counts_only_a_fully_confirmed_stdout_frame() {
+        use std::io::{self, Write};
+
+        struct AlwaysFails;
+
+        impl Write for AlwaysFails {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "test failure"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let ctx = crate::modules::BuildContext::for_testing();
+        let properties = ModuleProperties::from_parts("stdout", Vec::new());
+        let output = StdoutOutput::from_properties("stdout-writer", &properties, &ctx).unwrap();
+        let event = crate::event::Event::new(
+            bytes::Bytes::from_static(b"stdout-payload"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+
+        let mut written = Vec::new();
+        output.write_event_to(&mut written, &event).unwrap();
+        assert_eq!(written, b"stdout-payload\n");
+        assert_eq!(
+            output
+                .metrics
+                .bytes_written
+                .load(std::sync::atomic::Ordering::Relaxed),
+            written.len() as u64
+        );
+        assert_eq!(
+            output
+                .metrics
+                .events_written
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the private write seam owns bytes, not event disposition"
+        );
+
+        let mut failing = AlwaysFails;
+        output
+            .write_event_to(&mut failing, &event)
+            .expect_err("an unconfirmed stdout write must fail");
+        assert_eq!(
+            output
+                .metrics
+                .bytes_written
+                .load(std::sync::atomic::Ordering::Relaxed),
+            written.len() as u64,
+            "a failed write must not add any bytes"
+        );
+        assert_eq!(
+            output
+                .metrics
+                .events_written
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 }

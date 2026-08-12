@@ -467,7 +467,7 @@ pub(crate) async fn read_octet_counting<R: tokio::io::AsyncRead + Unpin>(
 ) -> CloseReason {
     loop {
         // --- Read MSG-LEN SP ---
-        let msg_len = match read_msg_len(reader, addr).await {
+        let msg_len = match read_msg_len(reader, addr, metrics).await {
             Ok(n) => n,
             Err(reason) => return reason,
         };
@@ -481,6 +481,9 @@ pub(crate) async fn read_octet_counting<R: tokio::io::AsyncRead + Unpin>(
             }
             Ok(Err(e)) => return CloseReason::IoError(e),
             Err(_) => return CloseReason::Timeout,
+        }
+        if let Some(m) = metrics {
+            m.bytes_received.inc_by(msg_len as u64);
         }
 
         // --- Validate PRI (RFC 5424 §6.2.1) ---
@@ -520,6 +523,7 @@ pub(crate) async fn read_octet_counting<R: tokio::io::AsyncRead + Unpin>(
 async fn read_msg_len<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
     addr: SocketAddr,
+    metrics: Option<&InputMetrics>,
 ) -> std::result::Result<usize, CloseReason> {
     let mut len_buf = [0u8; 1];
     let mut len_str = String::with_capacity(8);
@@ -535,6 +539,9 @@ async fn read_msg_len<R: tokio::io::AsyncRead + Unpin>(
         }
 
         let byte = len_buf[0];
+        if let Some(m) = metrics {
+            m.bytes_received.inc();
+        }
 
         if byte == b' ' {
             // End of MSG-LEN
@@ -618,8 +625,11 @@ pub(crate) async fn read_non_transparent<R: tokio::io::AsyncRead + Unpin>(
         buf.clear();
 
         // Read until we hit LF, NUL, or EOF
-        match read_until_delimiter(reader, &mut buf, addr).await {
+        let delimiter_len = match read_until_delimiter(reader, &mut buf, addr).await {
             Ok(false) => {
+                if let Some(m) = metrics {
+                    m.bytes_received.inc_by(buf.len() as u64);
+                }
                 // EOF — emit any remaining data as final message
                 if !buf.is_empty() {
                     // Strip trailing CR
@@ -654,8 +664,12 @@ pub(crate) async fn read_non_transparent<R: tokio::io::AsyncRead + Unpin>(
             }
             Ok(true) => {
                 // Delimiter found — buf contains message without trailer
+                1usize
             }
             Err(reason) => return reason,
+        };
+        if let Some(m) = metrics {
+            m.bytes_received.inc_by((buf.len() + delimiter_len) as u64);
         }
 
         // Strip trailing CR (for CRLF case)
@@ -767,8 +781,9 @@ mod tests {
         let data = b"10 <134>hello18 <165>world message";
         let mut reader = BufReader::new(&data[..]);
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let metrics = InputMetrics::for_testing();
 
-        let reason = read_octet_counting(&mut reader, addr(), &tx, None, None).await;
+        let reason = read_octet_counting(&mut reader, addr(), &tx, None, Some(&metrics)).await;
         drop(tx);
         assert!(matches!(reason, CloseReason::Eof));
 
@@ -779,6 +794,13 @@ mod tests {
         assert_eq!(&*e2.ingress, b"<165>world message");
 
         assert!(rx.recv().await.is_none());
+        assert_eq!(
+            metrics
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            data.len() as u64,
+            "octet-count headers and separators are adapter framing bytes"
+        );
     }
 
     #[tokio::test]
@@ -787,9 +809,17 @@ mod tests {
         let data = b"5 hello";
         let mut reader = BufReader::new(&data[..]);
         let (tx, _rx) = tokio::sync::mpsc::channel(10);
+        let metrics = InputMetrics::for_testing();
 
-        let reason = read_octet_counting(&mut reader, addr(), &tx, None, None).await;
+        let reason = read_octet_counting(&mut reader, addr(), &tx, None, Some(&metrics)).await;
         assert!(matches!(reason, CloseReason::FramingError(_)));
+        assert_eq!(
+            metrics
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            data.len() as u64,
+            "invalid payload bytes are still received bytes"
+        );
     }
 
     #[tokio::test]
@@ -840,14 +870,22 @@ mod tests {
         let data = b"<134>hello\n<165>world\n";
         let mut reader = BufReader::new(&data[..]);
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let metrics = InputMetrics::for_testing();
 
-        let reason = read_non_transparent(&mut reader, addr(), &tx, None, None).await;
+        let reason = read_non_transparent(&mut reader, addr(), &tx, None, Some(&metrics)).await;
         drop(tx);
         assert!(matches!(reason, CloseReason::Eof));
 
         assert_eq!(&*rx.recv().await.unwrap().ingress, b"<134>hello");
         assert_eq!(&*rx.recv().await.unwrap().ingress, b"<165>world");
         assert!(rx.recv().await.is_none());
+        assert_eq!(
+            metrics
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            data.len() as u64,
+            "line delimiters are adapter framing bytes"
+        );
     }
 
     #[tokio::test]

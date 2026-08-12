@@ -420,6 +420,7 @@ impl Input for UnixSocketInput {
                     match result {
                         Ok(len) => {
                             let data = &buf[..len];
+                            self.metrics.bytes_received.inc_by(len as u64);
 
                             if let Err(e) = validate_pri(data) {
                                 warn!("unix_socket: dropping invalid message ({})", e);
@@ -474,14 +475,27 @@ mod tests {
         tokio::sync::watch::Sender<bool>,
         tokio::sync::mpsc::Receiver<Event>,
     ) {
+        let (handle, shutdown, events, _metrics) = spawn_with_path_and_metrics(path);
+        (handle, shutdown, events)
+    }
+
+    fn spawn_with_path_and_metrics(
+        path: &std::path::Path,
+    ) -> (
+        tokio::task::JoinHandle<Result<()>>,
+        tokio::sync::watch::Sender<bool>,
+        tokio::sync::mpsc::Receiver<Event>,
+        Arc<InputMetrics>,
+    ) {
+        let metrics = InputMetrics::for_testing();
         let input = UnixSocketInput {
             path: path.display().to_string(),
-            metrics: InputMetrics::for_testing(),
+            metrics: Arc::clone(&metrics),
         };
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);
         let handle = tokio::spawn(async move { input.run(tx, sd_rx).await });
-        (handle, sd_tx, rx)
+        (handle, sd_tx, rx, metrics)
     }
 
     #[tokio::test]
@@ -640,7 +654,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("sock");
 
-        let (handle, sd_tx, mut rx) = spawn_with_path(&socket_path);
+        let (handle, sd_tx, mut rx, metrics) = spawn_with_path_and_metrics(&socket_path);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let sender = StdUnixDatagram::unbound().unwrap();
@@ -651,6 +665,35 @@ mod tests {
             .expect("recv timed out")
             .expect("channel closed");
         assert_eq!(&event.ingress[..], b"<13>test message");
+        assert_eq!(
+            metrics
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            b"<13>test message".len() as u64
+        );
+        let _ = sd_tx.send(true);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn invalid_datagram_still_counts_adapter_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("sock");
+        let (handle, sd_tx, mut rx, metrics) = spawn_with_path_and_metrics(&socket_path);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let invalid = b"not syslog";
+        let sender = StdUnixDatagram::unbound().unwrap();
+        sender.send_to(invalid, &socket_path).unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(got.is_err(), "invalid datagram must not become an Event");
+        assert_eq!(
+            metrics
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            invalid.len() as u64
+        );
+
         let _ = sd_tx.send(true);
         let _ = handle.await;
     }
