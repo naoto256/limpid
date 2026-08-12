@@ -218,11 +218,17 @@ where
 /// guarantee — a timeout-cancelled `write_all` mid-loop can
 /// still leave partial bytes, which the at-least-once retry
 /// contract acknowledges.
+///
+/// The exact frame-buffer length is returned only after both
+/// `write_all` and `flush` complete successfully — this is
+/// adapter-level completion, not peer receipt. A mid-write or
+/// mid-flush error surfaces as `Err` and yields no confirmed
+/// length.
 pub async fn write_framed<S>(
     stream: &mut S,
     framing: SyslogFraming,
     payload: &Bytes,
-) -> anyhow::Result<()>
+) -> anyhow::Result<usize>
 where
     S: AsyncWrite + Unpin,
 {
@@ -244,7 +250,7 @@ where
     };
     stream.write_all(&buf).await?;
     stream.flush().await?;
-    Ok(())
+    Ok(buf.len())
 }
 
 /// Per-peer mutable state. C is the connection type (TcpStream,
@@ -1085,5 +1091,93 @@ mod tests {
         let mut got = Vec::new();
         server.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, b"<134>hello\n");
+    }
+
+    #[tokio::test]
+    async fn write_framed_returns_the_confirmed_exact_frame_length() {
+        use tokio::io::AsyncReadExt;
+
+        for framing in [SyslogFraming::OctetCounting, SyslogFraming::NonTransparent] {
+            for payload_len in [0usize, 9, 10, 99, 100] {
+                let payload = Bytes::from(vec![b'x'; payload_len]);
+                let expected = match framing {
+                    SyslogFraming::OctetCounting => {
+                        let mut frame = format!("{} ", payload.len()).into_bytes();
+                        frame.extend_from_slice(&payload);
+                        frame
+                    }
+                    SyslogFraming::NonTransparent => {
+                        let mut frame = payload.to_vec();
+                        frame.push(b'\n');
+                        frame
+                    }
+                };
+                let (mut writer, mut reader) = tokio::io::duplex(1024);
+                let payload_clone = payload.clone();
+                let task = tokio::spawn(async move {
+                    let confirmed: usize = write_framed(&mut writer, framing, &payload_clone)
+                        .await
+                        .expect("write and flush");
+                    confirmed
+                });
+                let mut actual = Vec::new();
+                reader.read_to_end(&mut actual).await.unwrap();
+                let confirmed = task.await.unwrap();
+
+                assert_eq!(actual, expected, "framing={framing:?}, len={payload_len}");
+                assert_eq!(
+                    confirmed,
+                    expected.len(),
+                    "write_framed must return the length of the exact buffer it wrote and flushed"
+                );
+            }
+        }
+    }
+
+    struct FlushFailure {
+        written: Vec<u8>,
+    }
+
+    impl tokio::io::AsyncWrite for FlushFailure {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.written.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "injected flush failure",
+            )))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn write_framed_has_no_confirmed_length_before_flush_succeeds() {
+        let payload = Bytes::from_static(b"1234567890");
+        let mut writer = FlushFailure {
+            written: Vec::new(),
+        };
+
+        let result = write_framed(&mut writer, SyslogFraming::OctetCounting, &payload).await;
+        assert!(
+            result.is_err(),
+            "flush failure cannot confirm a frame length"
+        );
+        assert_eq!(writer.written, b"10 1234567890");
     }
 }

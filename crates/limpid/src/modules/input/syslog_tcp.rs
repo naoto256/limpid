@@ -474,16 +474,9 @@ pub(crate) async fn read_octet_counting<R: tokio::io::AsyncRead + Unpin>(
 
         // --- Read SYSLOG-MSG (exactly msg_len bytes) ---
         let mut buf = vec![0u8; msg_len];
-        match tokio::time::timeout(IDLE_TIMEOUT, reader.read_exact(&mut buf)).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return CloseReason::Eof;
-            }
-            Ok(Err(e)) => return CloseReason::IoError(e),
-            Err(_) => return CloseReason::Timeout,
-        }
-        if let Some(m) = metrics {
-            m.bytes_received.inc_by(msg_len as u64);
+        match read_exact_counted(reader, &mut buf, metrics).await {
+            Ok(()) => {}
+            Err(reason) => return reason,
         }
 
         // --- Validate PRI (RFC 5424 §6.2.1) ---
@@ -511,6 +504,49 @@ pub(crate) async fn read_octet_counting<R: tokio::io::AsyncRead + Unpin>(
         if let Some(m) = metrics {
             m.events_received.inc();
         }
+    }
+}
+
+/// Read exactly `buf.len()` bytes, counting each successful
+/// non-zero `read().await` result against `metrics` as it is
+/// returned. If a subsequent read fails or the outer timeout
+/// fires mid-frame, the partial-read bytes stay counted — they
+/// reached the adapter, and counting what was received before
+/// the failure preserves that fact.
+async fn read_exact_counted<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    buf: &mut [u8],
+    metrics: Option<&InputMetrics>,
+) -> std::result::Result<(), CloseReason> {
+    match tokio::time::timeout(IDLE_TIMEOUT, async {
+        let mut offset = 0usize;
+        while offset < buf.len() {
+            match reader.read(&mut buf[offset..]).await {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "syslog frame ended before its declared length",
+                    ));
+                }
+                Ok(n) => {
+                    if let Some(m) = metrics {
+                        m.bytes_received.inc_by(n as u64);
+                    }
+                    offset += n;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    })
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Err(CloseReason::Eof)
+        }
+        Ok(Err(error)) => Err(CloseReason::IoError(error)),
+        Err(_) => Err(CloseReason::Timeout),
     }
 }
 
@@ -625,11 +661,8 @@ pub(crate) async fn read_non_transparent<R: tokio::io::AsyncRead + Unpin>(
         buf.clear();
 
         // Read until we hit LF, NUL, or EOF
-        let delimiter_len = match read_until_delimiter(reader, &mut buf, addr).await {
+        match read_until_delimiter(reader, &mut buf, addr, metrics).await {
             Ok(false) => {
-                if let Some(m) = metrics {
-                    m.bytes_received.inc_by(buf.len() as u64);
-                }
                 // EOF — emit any remaining data as final message
                 if !buf.is_empty() {
                     // Strip trailing CR
@@ -662,14 +695,8 @@ pub(crate) async fn read_non_transparent<R: tokio::io::AsyncRead + Unpin>(
                 }
                 return CloseReason::Eof;
             }
-            Ok(true) => {
-                // Delimiter found — buf contains message without trailer
-                1usize
-            }
+            Ok(true) => {}
             Err(reason) => return reason,
-        };
-        if let Some(m) = metrics {
-            m.bytes_received.inc_by((buf.len() + delimiter_len) as u64);
         }
 
         // Strip trailing CR (for CRLF case)
@@ -717,6 +744,7 @@ async fn read_until_delimiter<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
     buf: &mut Vec<u8>,
     addr: SocketAddr,
+    metrics: Option<&InputMetrics>,
 ) -> std::result::Result<bool, CloseReason> {
     loop {
         // Use fill_buf + consume to leverage the BufReader's internal buffer
@@ -738,6 +766,9 @@ async fn read_until_delimiter<R: tokio::io::AsyncRead + Unpin>(
             // Consume up to and including the delimiter
             let consume_len = pos + 1;
             reader.consume(consume_len);
+            if let Some(m) = metrics {
+                m.bytes_received.inc_by(consume_len as u64);
+            }
             return Ok(true);
         }
 
@@ -758,6 +789,9 @@ async fn read_until_delimiter<R: tokio::io::AsyncRead + Unpin>(
 
         buf.extend_from_slice(available);
         reader.consume(len);
+        if let Some(m) = metrics {
+            m.bytes_received.inc_by(len as u64);
+        }
     }
 }
 
@@ -768,7 +802,66 @@ async fn read_until_delimiter<R: tokio::io::AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use tokio::io::BufReader;
+
+    enum ReadStep {
+        Data(Vec<u8>),
+        Error(std::io::ErrorKind),
+        Pending,
+    }
+
+    struct ScriptedReader {
+        steps: VecDeque<ReadStep>,
+    }
+
+    impl ScriptedReader {
+        fn new(steps: impl IntoIterator<Item = ReadStep>) -> Self {
+            Self {
+                steps: steps.into_iter().collect(),
+            }
+        }
+    }
+
+    impl tokio::io::AsyncRead for ScriptedReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            dst: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            loop {
+                match self.steps.pop_front() {
+                    Some(ReadStep::Data(bytes)) => {
+                        if bytes.is_empty() {
+                            continue;
+                        }
+                        let len = bytes.len().min(dst.remaining());
+                        dst.put_slice(&bytes[..len]);
+                        if len < bytes.len() {
+                            self.steps.push_front(ReadStep::Data(bytes[len..].to_vec()));
+                        }
+                        return Poll::Ready(Ok(()));
+                    }
+                    Some(ReadStep::Error(kind)) => {
+                        return Poll::Ready(Err(std::io::Error::from(kind)));
+                    }
+                    Some(ReadStep::Pending) => {
+                        self.steps.push_front(ReadStep::Pending);
+                        return Poll::Pending;
+                    }
+                    None => return Poll::Ready(Ok(())),
+                }
+            }
+        }
+    }
+
+    fn bytes_received(metrics: &InputMetrics) -> u64 {
+        metrics
+            .bytes_received
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 
     fn addr() -> SocketAddr {
         "127.0.0.1:514".parse().unwrap()
@@ -858,9 +951,73 @@ mod tests {
         let data = b"20 <134>hello";
         let mut reader = BufReader::new(&data[..]);
         let (tx, _rx) = tokio::sync::mpsc::channel(10);
+        let metrics = InputMetrics::for_testing();
 
-        let reason = read_octet_counting(&mut reader, addr(), &tx, None, None).await;
+        let reason = read_octet_counting(&mut reader, addr(), &tx, None, Some(&metrics)).await;
         assert!(matches!(reason, CloseReason::Eof));
+        assert_eq!(
+            bytes_received(&metrics),
+            data.len() as u64,
+            "count the received prefix, separator, and only the payload bytes actually read"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oc_counts_partial_payload_before_io_error() {
+        let scripted = ScriptedReader::new([
+            ReadStep::Data(b"8 ".to_vec()),
+            ReadStep::Data(b"<13".to_vec()),
+            ReadStep::Error(std::io::ErrorKind::ConnectionReset),
+        ]);
+        let mut reader = BufReader::with_capacity(3, scripted);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let metrics = InputMetrics::for_testing();
+
+        let reason = read_octet_counting(&mut reader, addr(), &tx, None, Some(&metrics)).await;
+        assert!(matches!(reason, CloseReason::IoError(_)));
+        assert_eq!(bytes_received(&metrics), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_oc_counts_partial_payload_before_timeout() {
+        let scripted = ScriptedReader::new([
+            ReadStep::Data(b"8 ".to_vec()),
+            ReadStep::Data(b"<13".to_vec()),
+            ReadStep::Pending,
+        ]);
+        let mut reader = BufReader::with_capacity(3, scripted);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let metrics = InputMetrics::for_testing();
+
+        let reason = read_octet_counting(&mut reader, addr(), &tx, None, Some(&metrics)).await;
+        assert!(matches!(reason, CloseReason::Timeout));
+        assert_eq!(bytes_received(&metrics), 5);
+    }
+
+    #[tokio::test]
+    async fn test_oc_oversize_declaration_counts_prefix_only() {
+        let data = format!("{} ", MAX_MESSAGE_SIZE + 1);
+        let mut reader = BufReader::new(data.as_bytes());
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let metrics = InputMetrics::for_testing();
+
+        let reason = read_octet_counting(&mut reader, addr(), &tx, None, Some(&metrics)).await;
+        assert!(matches!(reason, CloseReason::FramingError(_)));
+        assert_eq!(bytes_received(&metrics), data.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_oc_complete_then_partial_accumulates_without_reset_or_double_bump() {
+        let data = b"10 <134>hello20 <134>hello";
+        let mut reader = BufReader::new(&data[..]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let metrics = InputMetrics::for_testing();
+
+        let reason = read_octet_counting(&mut reader, addr(), &tx, None, Some(&metrics)).await;
+        assert!(matches!(reason, CloseReason::Eof));
+        assert_eq!(&*rx.recv().await.unwrap().ingress, b"<134>hello");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(bytes_received(&metrics), data.len() as u64);
     }
 
     // --- Non-Transparent Framing ---
@@ -919,15 +1076,69 @@ mod tests {
     #[tokio::test]
     async fn test_ntf_eof_without_trailer() {
         // Message without trailing delimiter — should still be emitted
-        let data = b"<134>unterminated";
-        let mut reader = BufReader::new(&data[..]);
+        let scripted = ScriptedReader::new([
+            ReadStep::Data(b"<134>".to_vec()),
+            ReadStep::Data(b"unterminated".to_vec()),
+        ]);
+        let mut reader = BufReader::with_capacity(5, scripted);
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let metrics = InputMetrics::for_testing();
 
-        let reason = read_non_transparent(&mut reader, addr(), &tx, None, None).await;
+        let reason = read_non_transparent(&mut reader, addr(), &tx, None, Some(&metrics)).await;
         drop(tx);
         assert!(matches!(reason, CloseReason::Eof));
 
         assert_eq!(&*rx.recv().await.unwrap().ingress, b"<134>unterminated");
+        assert_eq!(bytes_received(&metrics), b"<134>unterminated".len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_ntf_counts_consumed_chunks_before_io_error() {
+        let scripted = ScriptedReader::new([
+            ReadStep::Data(b"<134>".to_vec()),
+            ReadStep::Data(b"partial".to_vec()),
+            ReadStep::Error(std::io::ErrorKind::ConnectionReset),
+        ]);
+        let mut reader = BufReader::with_capacity(7, scripted);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let metrics = InputMetrics::for_testing();
+
+        let reason = read_non_transparent(&mut reader, addr(), &tx, None, Some(&metrics)).await;
+        assert!(matches!(reason, CloseReason::IoError(_)));
+        assert_eq!(bytes_received(&metrics), b"<134>partial".len() as u64);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_ntf_counts_consumed_chunks_before_timeout() {
+        let scripted = ScriptedReader::new([
+            ReadStep::Data(b"<134>".to_vec()),
+            ReadStep::Data(b"partial".to_vec()),
+            ReadStep::Pending,
+        ]);
+        let mut reader = BufReader::with_capacity(7, scripted);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let metrics = InputMetrics::for_testing();
+
+        let reason = read_non_transparent(&mut reader, addr(), &tx, None, Some(&metrics)).await;
+        assert!(matches!(reason, CloseReason::Timeout));
+        assert_eq!(bytes_received(&metrics), b"<134>partial".len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_ntf_oversize_counts_only_prior_consumed_chunks() {
+        const CHUNK: usize = 8;
+        let data = vec![b'x'; MAX_MESSAGE_SIZE + CHUNK];
+        let mut reader = BufReader::with_capacity(CHUNK, &data[..]);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let metrics = InputMetrics::for_testing();
+
+        let reason = read_non_transparent(&mut reader, addr(), &tx, None, Some(&metrics)).await;
+        assert!(matches!(reason, CloseReason::FramingError(_)));
+        assert_eq!(
+            bytes_received(&metrics),
+            MAX_MESSAGE_SIZE as u64,
+            "the chunk rejected by the size guard remains unread and uncounted"
+        );
     }
 
     #[tokio::test]
