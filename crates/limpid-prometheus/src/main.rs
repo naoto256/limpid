@@ -290,6 +290,9 @@ fn parse_snapshot(root: &serde_json::Value) -> Result<Vec<ExpositionFamily>, Str
             .ok_or_else(|| "metric family must be an object".to_string())?;
         require_exact_fields(metric, &["name", "type", "help", "series"], "metric family")?;
         let name = required_nonempty_string(metric, "name", "metric family")?.to_string();
+        if !is_legacy_metric_name(&name) {
+            return Err(format!("invalid Prometheus metric name: {name:?}"));
+        }
         if !names.insert(name.clone()) {
             return Err(format!("duplicate metric family: {name}"));
         }
@@ -428,6 +431,11 @@ fn parse_labels(value: Option<&serde_json::Value>, metric_name: &str) -> Result<
         .ok_or_else(|| format!("metric {metric_name} labels must be an object"))?;
     let mut parsed = Vec::with_capacity(labels.len());
     for (key, value) in labels {
+        if !is_legacy_label_name(key) {
+            return Err(format!(
+                "metric {metric_name} has invalid Prometheus label name: {key:?}"
+            ));
+        }
         let value = value
             .as_str()
             .ok_or_else(|| format!("metric {metric_name} label {key} must be a string"))?;
@@ -435,6 +443,33 @@ fn parse_labels(value: Option<&serde_json::Value>, metric_name: &str) -> Result<
     }
     parsed.sort();
     Ok(parsed)
+}
+
+/// Prometheus text 0.0.4 metric-name grammar; the sidecar
+/// emits legacy names unquoted, so anything outside this
+/// grammar would break exposition. The daemon's registry is
+/// intentionally unconstrained — the check lives here so an
+/// invalid name returns Err for the whole snapshot before
+/// rendering begins.
+fn is_legacy_metric_name(name: &str) -> bool {
+    matches!(name.as_bytes(), [first, rest @ ..]
+        if (first.is_ascii_alphabetic() || matches!(first, b'_' | b':'))
+            && rest
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':')))
+}
+
+/// Prometheus label-name grammar. Same wire-contract rationale
+/// as `is_legacy_metric_name`, plus the `__` prefix is
+/// reserved by Prometheus for internal labels and rejected
+/// here rather than passed through the sidecar.
+fn is_legacy_label_name(name: &str) -> bool {
+    !name.starts_with("__")
+        && matches!(name.as_bytes(), [first, rest @ ..]
+            if (first.is_ascii_alphabetic() || *first == b'_')
+                && rest
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_'))
 }
 
 fn parse_buckets(
@@ -890,6 +925,124 @@ mod tests {
 
         let empty_histogram = r#"{"schema":1,"metrics":[{"name":"metric","type":"histogram","help":"Metric.","series":[{"labels":{},"buckets":[],"sum":0.0,"count":0}]}]}"#;
         assert!(json_to_prometheus(empty_histogram).is_ok());
+    }
+
+    #[test]
+    fn prometheus_legacy_metric_name_grammar_is_enforced_before_rendering() {
+        for name in ["a", "_", ":", "A0_:"] {
+            let snapshot = serde_json::json!({
+                "schema": 1,
+                "metrics": [{
+                    "name": name,
+                    "type": "counter",
+                    "help": "Valid.",
+                    "series": [{"labels": {}, "value": 1}]
+                }]
+            });
+            assert!(
+                json_to_prometheus(&snapshot.to_string()).is_ok(),
+                "{name:?}"
+            );
+        }
+
+        for name in [
+            "0bad",
+            "bad name",
+            "bad{",
+            "bad=",
+            "bad\"",
+            "bad\nname",
+            "é",
+        ] {
+            let snapshot = serde_json::json!({
+                "schema": 1,
+                "metrics": [
+                    {
+                        "name": "valid_metric",
+                        "type": "counter",
+                        "help": "Valid.",
+                        "series": [{"labels": {}, "value": 1}]
+                    },
+                    {
+                        "name": name,
+                        "type": "counter",
+                        "help": "Invalid.",
+                        "series": [{"labels": {}, "value": 2}]
+                    }
+                ]
+            });
+            assert!(
+                json_to_prometheus(&snapshot.to_string()).is_err(),
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prometheus_legacy_label_name_grammar_is_enforced_for_every_metric_type() {
+        for label in ["a", "_", "A0_"] {
+            let snapshot = serde_json::json!({
+                "schema": 1,
+                "metrics": [{
+                    "name": "valid_metric",
+                    "type": "gauge",
+                    "help": "Valid.",
+                    "series": [{"labels": {label: "value"}, "value": 1}]
+                }]
+            });
+            assert!(
+                json_to_prometheus(&snapshot.to_string()).is_ok(),
+                "{label:?}"
+            );
+        }
+
+        let invalid = [
+            "",
+            "0bad",
+            "bad:name",
+            "bad name",
+            "bad{",
+            "bad=",
+            "bad\"",
+            "bad\nname",
+            "é",
+            "__x",
+            "__",
+        ];
+        for (index, label) in invalid.into_iter().enumerate() {
+            let (metric_type, series) = match index % 3 {
+                0 => (
+                    "counter",
+                    serde_json::json!({"labels": {label: "value"}, "value": 1}),
+                ),
+                1 => (
+                    "gauge",
+                    serde_json::json!({"labels": {label: "value"}, "value": 1}),
+                ),
+                _ => (
+                    "histogram",
+                    serde_json::json!({
+                        "labels": {label: "value"},
+                        "buckets": [],
+                        "sum": 0.0,
+                        "count": 0
+                    }),
+                ),
+            };
+            let snapshot = serde_json::json!({
+                "schema": 1,
+                "metrics": [{
+                    "name": "invalid_label_metric",
+                    "type": metric_type,
+                    "help": "Invalid.",
+                    "series": [series]
+                }]
+            });
+            assert!(
+                json_to_prometheus(&snapshot.to_string()).is_err(),
+                "{label:?}"
+            );
+        }
     }
 
     #[test]
