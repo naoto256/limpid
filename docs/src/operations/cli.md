@@ -104,12 +104,20 @@ limpidctl list --json
 
 # Show metrics
 limpidctl stats
+limpidctl stats --details
 limpidctl stats --json
 
 # Health check
 limpidctl health
 limpidctl health --json
 ```
+
+`limpidctl stats` renders the established operator table from the schema-v1
+snapshot. `stats --details` instead renders every counter, gauge, and histogram
+family and series in deterministic human-readable order. `stats --json` prints
+the complete control-socket response unchanged. `--details` and `--json` are
+mutually exclusive. See [Metrics](./metrics.md#viewing-metrics-with-limpidctl)
+for the formatting, validation, and raw-fallback contracts.
 
 ### Global options
 
@@ -161,7 +169,9 @@ See [Debug Tap](./tap.md) for details.
 
 ## limpid-prometheus
 
-Prometheus exporter — converts limpid's JSON stats to Prometheus text exposition format.
+Prometheus exporter — validates a complete schema-v1 stats snapshot and
+converts its generic counter, gauge, and histogram families to Prometheus text
+exposition format 0.0.4.
 
 ```bash
 limpid-prometheus --bind 127.0.0.1:9100 --socket /var/run/limpid/control.sock
@@ -175,6 +185,9 @@ limpid-prometheus --bind 127.0.0.1:9100 --socket /var/run/limpid/control.sock
 | Endpoint | Response |
 |----------|----------|
 | `GET /health` | `OK` (plain text) |
-| `GET /metrics` | Prometheus text format (`text/plain; version=0.0.4`) |
+| `GET /metrics` | Prometheus text format (`text/plain; version=0.0.4; charset=utf-8`) |
 
-See [Metrics](./metrics.md) for the full list of exported metrics.
+Translation is all-or-nothing: malformed snapshots produce an error comment,
+not partial samples. See [Metrics](./metrics.md#prometheus-exposition) for the
+generic mapping, deterministic exposition order, histogram-derived series,
+name validation, and source-`le` collision handling.

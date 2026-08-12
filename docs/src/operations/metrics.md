@@ -1,119 +1,286 @@
 # Metrics
 
-limpid tracks metrics at every level of the pipeline. Each component counts its own metrics — the runtime only collects and reports them.
+limpid records counters at the input, pipeline, and output boundaries. One
+self-describing registry owns the metric families and their fully labelled
+series. The daemon exposes a read-only snapshot through the existing `stats`
+control command; `limpidctl` and `limpid-prometheus` are consumers of that
+snapshot, not alternate metric stores.
 
-## Pipeline metrics
+The current runtime metrics are counters. Schema v1 also defines gauge and
+histogram series so consumers can render any registered family without a list
+of hard-coded names.
 
-| Metric | Meaning |
-|--------|---------|
-| `received` | Events entering the pipeline |
-| `finished` | Events that reached at least one output |
-| `dropped` | Events explicitly discarded by `drop` |
-| `discarded` | Events that completed without reaching any output |
-| `errored` | Events that failed at any pipeline-side producer site — process / pipeline-skeleton runtime errors and runtime-side output enqueue failures — routed to the [error log](./error-log.md) for inspection and replay |
-| `errored_unwritable` | Subset of `errored` where the configured `error_log` write itself failed (disk full / permissions / rotation race) |
+## Stats schema v1
 
-**`events_discarded`** is a signal of possible misconfiguration — the event went through the entire pipeline but was never sent anywhere.
+`limpidctl stats --json` prints the complete control-socket response unchanged.
+The top-level object has `schema: 1` and a `metrics` array. Every family carries
+its name, type, non-empty help text, and complete series:
 
-**`events_errored`** is the pipeline-side rollup of every event that ended in a Process flavor DLQ record (process body raised, pipeline-skeleton eval failed, explicit `error <expr>`) plus runtime-side output enqueue failures. Sink-side terminal failures (retry exhausted, shutdown drain, batched render failure, OTLP partial-success rejects) are counted separately under the per-output `events_failed`. The original event is preserved in the [error log](./error-log.md) for replay — `jq -c 'select(.kind == "process") | .event' /var/log/limpid/errored.jsonl | limpidctl inject input <name> --json` for Process records, `jq -c 'select(.kind == "output") | .event' ... | limpidctl inject output <name> --json` for Output records (see [Error Log → Replay](./error-log.md#replay)).
+```json
+{
+  "schema": 1,
+  "metrics": [
+    {
+      "name": "limpid_output_events_written_total",
+      "type": "counter",
+      "help": "Total events successfully written by the output.",
+      "series": [
+        {"labels": {"output": "sink"}, "value": 42}
+      ]
+    },
+    {
+      "name": "example_queue_depth",
+      "type": "gauge",
+      "help": "Current example queue depth.",
+      "series": [
+        {"labels": {"queue": "primary"}, "value": 3}
+      ]
+    },
+    {
+      "name": "example_latency_seconds",
+      "type": "histogram",
+      "help": "Example operation latency.",
+      "series": [
+        {
+          "labels": {"route": "west"},
+          "buckets": [[0.1, 7], [0.5, 11]],
+          "sum": 2.75,
+          "count": 12
+        }
+      ]
+    }
+  ]
+}
+```
 
-**`events_errored_unwritable`** is alarm-level — non-zero means a DLQ write to the configured `error_log` file fell back to the `tracing::error!` channel (disk full, permissions, rotation race). The counter is emitted under two labels that share the metric name and both need to be watched:
+Counter and gauge series contain `labels` and `value`. Histogram `buckets` are
+finite upper-bound/count pairs. Counts are cumulative and inclusive (`<=`), so
+bounds must be strictly increasing and counts must be nondecreasing. An empty
+bucket list is valid. `count` includes every observation, including values above
+the last finite bound; `sum` is the accumulated observation sum.
 
-- **Pipeline-side** (`limpid_pipeline_events_errored_unwritable_total{pipeline=...}`) — Process-flavor records and the output-enqueue subset of Output-flavor records, both routed through `runtime::write_errored_to_dlq`.
-- **Output-side** (`limpid_output_events_errored_unwritable_total{output=...}`) — sink-side Output-flavor DLQ writes (retry exhaustion, shutdown drain, batched render failure, partial-success reject) routed through `modules::route_event_to_dlq`. On a disk queue a sink-side DLQ-write failure also triggers the fail-stop wedge (see `events_wedged` below and the [Outputs disposition contract](../outputs/README.md#disposition-contract)) so the cursor holds for replay on next daemon start.
+Schema v1 deliberately does not contain an explicit `+Inf` bucket. A
+Prometheus consumer derives `le="+Inf"` from `count`. Bucket, sum, and count
+atomics are loaded independently, so a concurrent snapshot may transiently show
+the last finite bucket above `count`; consumers must not clamp or reject that
+state. Array order is not a data contract.
 
-Investigate the underlying cause before assuming replay coverage is complete; see [Error Log → When the DLQ write itself fails](./error-log.md#when-the-dlq-write-itself-fails).
+Registration fixes labels on each handle. Counter increments, gauge sets, and
+histogram observations therefore do not accept labels and do not perform a
+label lookup, lock, or allocation on their update path. Invalid metric names,
+missing help, duplicate label names, invalid histogram boundaries, duplicate
+series, or conflicting family metadata fail registration and propagate through
+daemon startup instead of being ignored.
 
-## Input metrics
+## Current metric families
 
-| Metric | Meaning |
-|--------|---------|
-| `received` | Events received from the source (network, socket, file, etc.) — **does not include injected events** |
-| `invalid` | Events rejected (invalid PRI header, etc.) |
-| `injected` | Events pushed into this input's channel via `limpidctl inject` |
+These are the 16 counter families currently registered by the daemon. Each
+series has exactly the fixed label shown; the label value is the configured
+component name.
 
-The split between `received` and `injected` keeps "real" traffic distinguishable from synthetic/replay events.
+### Pipelines
 
-## Output metrics
+| Metric | Label | Meaning |
+| --- | --- | --- |
+| `limpid_pipeline_events_received_total` | `pipeline` | Events entering the pipeline. |
+| `limpid_pipeline_events_finished_total` | `pipeline` | Events that reached at least one output. |
+| `limpid_pipeline_events_dropped_total` | `pipeline` | Events explicitly discarded by `drop`. |
+| `limpid_pipeline_events_discarded_total` | `pipeline` | Events that completed without reaching any output. |
+| `limpid_pipeline_events_errored_total` | `pipeline` | Events that failed at a pipeline-side producer site and were routed to the [error log](./error-log.md). |
+| `limpid_pipeline_events_errored_unwritable_total` | `pipeline` | Pipeline-side error-log writes that failed. |
 
-| Metric | Meaning |
-|--------|---------|
-| `received` | Total events that entered this output's queue (from pipelines + injects) |
-| `injected` | Events pushed into this output's queue via `limpidctl inject` |
-| `written` | Events successfully written to the destination |
-| `failed` | Events whose final state on this output was a terminal failure. Includes retry-budget exhaustion, per-event render failures on batched outputs' `flush()`, shutdown-drain leftovers when the final flush fails, and — for the OTLP outputs (`otlp_grpc` / `otlp_http`) — the receiver's `partial_success.rejected_log_records`, which are events the server *accepted at the transport layer* but refused at the validation layer (dropped per the [`partial_success` policy](../otlp.md#56-retry-transport-level-only)). |
-| `retries` | Total retry attempts across all events |
-| `wedged` | Disk-queue fail-stop wedges observed by this output — alarm-level. Non-zero means the consumer stopped accepting new events on this output and will replay from the wedged cursor on next daemon start (see [Outputs disposition contract](../outputs/README.md#disposition-contract)). Only printed by `limpidctl stats` when non-zero. |
-| `errored_unwritable` | Sink-side counterpart of the pipeline-side `events_errored_unwritable` — alarm-level. Non-zero means a `route_event_to_dlq` write to `error_log` failed for this output; investigate DLQ file health. Only printed by `limpidctl stats` when non-zero. |
+`events_discarded` is a possible routing-misconfiguration signal: the event
+completed the pipeline but was never sent anywhere.
 
-`received - injected` = events delivered via pipelines. `received - written - failed` ≈ events pending in the queue (useful for disk queues).
+`events_errored` is the pipeline-side rollup of Process-flavour DLQ records
+(process body errors, pipeline-skeleton evaluation failures, and explicit
+`error <expr>`) plus runtime-side output enqueue failures. Sink-side terminal
+failures are counted under the corresponding output's `events_failed`. The
+original event is preserved when the configured error-log write succeeds; see
+[Error Log → Replay](./error-log.md#replay).
 
-`events_failed` is the per-output rollup of every terminal sink-side failure (retry exhausted, render failure, shutdown-drain leftover, OTLP `partial_success.rejected_log_records`). The recovery shape depends on the disposition path each event took:
+### Inputs
 
-- **Recovered** (any queue). Either `control { error_log }` is set and the DLQ file write succeeded — the event is persisted as an Output-flavor record ready for replay (see [Error Log → Producer sites](./error-log.md#producer-sites)) — or `error_log` is unset and the operator has declared no durable recovery is required. The tracing-side fallback runs per the `error_log_fallback` [ladder](./error-log.md#tracing-fallback-ladder-error_log_fallback) (default: one-line summary, no payload; `Meta` / `Full` on explicit opt-in) but is best-effort, not load-bearing recovery. The `--check` recovery-readiness warning flags the no-`error_log` case at configuration time so an operator who wanted file-based recovery notices the missing setting before the first failure.
-- **Dropped on a disk queue.** The DLQ file write itself failed *and* the queue backend is disk. The fail-stop wedge fires (`events_wedged` bumps once) and the disk cursor **holds** at the offending position. The event is not lost — it replays from the wedge point on the next daemon start once the operator fixes the underlying DLQ health issue.
-- **Dropped on a memory queue.** Same DLQ-write failure, but the memory backend has no cursor to hold and no replay path across restarts. The consumer bumps `events_failed`, resolves the ack, and moves on. The event **is** actually lost — this is the only steady-state path that produces genuine loss. Bug paths (`consume` returning `Err` without resolving the handle) and shutdown task-aborts land in the same shape on memory queues; disk queues catch them via the same wedge.
+| Metric | Label | Meaning |
+| --- | --- | --- |
+| `limpid_input_events_received_total` | `input` | Events received from the source; injected events are excluded. |
+| `limpid_input_events_invalid_total` | `input` | Events rejected by the input parser or protocol boundary. |
+| `limpid_input_events_injected_total` | `input` | Events pushed into the input through `limpidctl inject`. |
 
-Evaluate `events_failed` alongside the DLQ file's contents, `events_errored_unwritable` (both label sides), and `events_wedged` — the combination tells whether a spike is recoverable, wedged pending intervention, or actually lost.
+Keeping `received` and `injected` separate makes source traffic distinguishable
+from synthetic and replay traffic.
 
-## Viewing metrics
+### Outputs
 
-### Command line
+| Metric | Label | Meaning |
+| --- | --- | --- |
+| `limpid_output_events_received_total` | `output` | Events entering the output queue from pipelines and injection. |
+| `limpid_output_events_injected_total` | `output` | Events injected directly into the output queue. |
+| `limpid_output_events_written_total` | `output` | Events successfully written to the destination. |
+| `limpid_output_events_failed_total` | `output` | Events that reached a terminal failure disposition for this output. |
+| `limpid_output_retries_total` | `output` | Retry attempts across all events. |
+| `limpid_output_events_wedged_total` | `output` | Disk-queue fail-stop wedges observed by the output. |
+| `limpid_output_events_errored_unwritable_total` | `output` | Sink-side error-log writes that failed. |
+
+`events_failed` includes retry-budget exhaustion, per-event render failures in
+batched output flushes, shutdown-drain leftovers after a final flush failure,
+and OTLP `partial_success.rejected_log_records`. Evaluate it with the DLQ file,
+`events_errored_unwritable`, and `events_wedged`:
+
+- When the DLQ write succeeds, the Output-flavour record is recoverable.
+- When a disk queue's DLQ write fails, the fail-stop wedge holds the cursor for
+  replay after the operator restores DLQ health.
+- When a memory queue's DLQ write fails, there is no durable cursor and the
+  event is lost.
+
+See the [output disposition contract](../outputs/README.md#disposition-contract)
+and [Error Log → When the DLQ write itself fails](./error-log.md#when-the-dlq-write-itself-fails).
+
+Useful relationships are approximate during concurrent updates:
+
+- `output.received - output.injected` is traffic delivered by pipelines.
+- `output.received - output.written - output.failed` approximates events still
+  pending in the queue.
+
+## Viewing metrics with limpidctl
 
 ```bash
-# Human-readable table (pipelines first, then inputs and outputs)
+# Operator-focused table: Pipelines, Inputs, then Outputs
 sudo limpidctl stats
 
-# JSON (for scripting)
+# Generic human view of every schema-v1 family and series
+sudo limpidctl stats --details
+
+# Complete raw control-socket response, byte-for-byte
 sudo limpidctl stats --json
 ```
 
-### HTTP (Prometheus)
+The default table preserves the established 16-counter operator view. Component
+names are sorted and alarm fields such as `wedged` and `errored_unwritable` are
+shown under their existing conditional rules. Unknown future families are
+ignored in this mode. If a known family is missing, duplicated, has the wrong
+type or value, or does not have exactly its fixed label, limpidctl prints the
+raw response rather than inventing a zero or a partial table.
 
-Run `limpid-prometheus` as a separate process. It queries limpid's control socket and converts JSON stats to Prometheus text exposition format:
+`--details` replaces the default table with a generic view. Families are sorted
+by metric name, series by their canonical label key/value tuples, and labels by
+key. Every family shows its name, type, help, complete labels, and values.
+Histograms show the finite cumulative buckets stored in schema v1 plus `sum`
+and `count`; they do not synthesize `+Inf` in this human view.
+
+`--json` bypasses parsing and formatting. It cannot be combined with
+`--details`. Invalid JSON, unsupported schemas, and malformed schema-v1 data
+retain the existing successful raw-response fallback for the human modes.
+
+The deterministic human ordering is for reproducibility and testing only. It
+does not assign display or query semantics to a metric, series, or dashboard.
+
+## Prometheus exposition
+
+Run the sidecar against limpid's control socket:
 
 ```bash
-limpid-prometheus --bind 127.0.0.1:9100 --socket /var/run/limpid/control.sock
+limpid-prometheus --bind 127.0.0.1:9100 \
+  --socket /var/run/limpid/control.sock
 ```
 
-Then configure Prometheus to scrape `http://127.0.0.1:9100/metrics`.
+Prometheus can then scrape `http://127.0.0.1:9100/metrics`. The exporter reads a
+complete schema-v1 snapshot and emits Prometheus text exposition format 0.0.4:
 
-Exposed metrics:
+- Families are sorted by metric name; `# HELP` precedes `# TYPE`, followed by
+  samples.
+- Series are sorted by canonical source-label key/value tuples, and rendered
+  labels are sorted by key.
+- HELP backslashes and newlines, and label-value backslashes, double quotes,
+  and newlines, are escaped for text format 0.0.4.
+- Counters and gauges emit the schema `value` directly.
+- A histogram named `n` emits finite cumulative `n_bucket` samples, an implicit
+  `n_bucket{le="+Inf"}` whose value is `count`, then `n_sum` and `n_count`.
 
-| Metric | Type | Labels |
-|--------|------|--------|
-| `limpid_pipeline_events_received_total` | counter | `pipeline` |
-| `limpid_pipeline_events_finished_total` | counter | `pipeline` |
-| `limpid_pipeline_events_dropped_total` | counter | `pipeline` |
-| `limpid_pipeline_events_discarded_total` | counter | `pipeline` |
-| `limpid_pipeline_events_errored_total` | counter | `pipeline` |
-| `limpid_pipeline_events_errored_unwritable_total` | counter | `pipeline` |
-| `limpid_input_events_received_total` | counter | `input` |
-| `limpid_input_events_invalid_total` | counter | `input` |
-| `limpid_input_events_injected_total` | counter | `input` |
-| `limpid_output_events_received_total` | counter | `output` |
-| `limpid_output_events_injected_total` | counter | `output` |
-| `limpid_output_events_written_total` | counter | `output` |
-| `limpid_output_events_failed_total` | counter | `output` |
-| `limpid_output_retries_total` | counter | `output` |
-| `limpid_output_events_wedged_total` | counter | `output` |
-| `limpid_output_events_errored_unwritable_total` | counter | `output` |
+This ordering is a reproducible exposition surface only; it has no PromQL or
+Grafana ordering meaning.
 
-limpid itself has no Prometheus dependency — the format conversion is entirely `limpid-prometheus`'s job.
+The translator validates the entire snapshot before exposing any samples. It
+rejects malformed or unsupported families, duplicate family names, inconsistent
+label-name sets within a family, duplicate source or mapped labelsets, invalid
+histogram sequences, and collisions between a declared family name and another
+histogram's derived `_bucket`, `_sum`, or `_count` name. A failure produces the
+existing `# error: ...` response body instead of partial exposition.
 
-## Understanding the numbers
+### Prometheus names and histogram `le`
 
-A healthy pipeline looks like:
+The schema registry's validation policy and Prometheus's unquoted text-format
+identifier policy are separate boundaries. The sidecar requires exported
+metric names to match `[A-Za-z_:][A-Za-z0-9_:]*`. Source label names must match
+`[A-Za-z_][A-Za-z0-9_]*` and must not start with the Prometheus-reserved `__`
+prefix. It rejects invalid names; it does not normalize or quote them. These
+sidecar checks do not add label-name or reserved-name validation to the core
+registry.
 
-```
+Prometheus histogram buckets need the special `le` label. When a histogram
+source series already contains exact key `le`, the sidecar shifts the complete
+source underscore chain injectively before rendering:
+
+| Schema source key | Prometheus source-label key |
+| --- | --- |
+| `le` | `le_` |
+| `le_` | `le__` |
+| `le__` | `le___` |
+
+The generated bucket boundary keeps exact key `le`. The same shifted source
+labels are used on finite and `+Inf` bucket, sum, and count samples. The shift is
+conditional: a histogram without source `le` keeps an existing `le_` unchanged,
+and counter or gauge labels named `le` are never shifted.
+
+limpid itself has no Prometheus dependency; validation, collision handling, and
+text conversion above belong entirely to `limpid-prometheus`.
+
+## Operational scrape checkpoint
+
+Prometheus defaults to a one-minute scrape interval and a 10-second scrape
+timeout. The release checkpoint therefore measures sequential end-to-end
+scrapes for stable per-scrape observations; it is not a load, concurrency, or
+scrapes-per-second benchmark.
+
+The canonical harness runs the real sidecar through both production boundaries
+(schema-v1 control socket and HTTP `/metrics`) at three deterministic payload
+scales:
+
+| Profile | Families | Series per family | Histogram finite buckets |
+| --- | ---: | ---: | ---: |
+| P0 | current 16 counters | 1 | none |
+| P1 | 48 (16 each counter/gauge/histogram) | 8 | 8 |
+| P2 | 96 (32 each counter/gauge/histogram) | 32 | 16 |
+
+For each profile it parses text format 0.0.4 and requires complete ordered
+semantic equivalence with the source snapshot: HELP, TYPE, sample namespaces,
+labels, values, histogram buckets, sum, and count must all match. It records
+response bytes, sample count, median/p95/max end-to-end latency, process CPU
+time, and peak RSS when the platform can report it. It also reports the maximum
+latency as a fraction of and margin to the 10-second timeout. Correctness is
+mandatory and any scaling cliff is reviewed; there is no arbitrary throughput
+or latency threshold. A separate one-request P0 smoke uses a real daemon control
+socket as an integration check. Machine-specific results remain in the
+canonical harness receipt and PR evidence, not in this product contract.
+
+## Interpreting the counters
+
+A healthy pipeline table might look like:
+
+```text
 Pipelines:
   main             100 received        95 finished     5 dropped     0 discarded
 ```
 
-Warning signs:
+Investigate these signals:
 
-- **`discarded > 0`** — events are reaching the end of the pipeline without hitting any `output`. Check your routing logic.
-- **`failed > 0`** — output writes are failing. Check connectivity to the destination.
-- **`retries` growing** — transient failures are occurring. May indicate network instability or destination overload.
-- **`received` growing but `finished + dropped` not** — pipeline is backed up (unlikely with async queues, but possible).
-- **`output.received > output.written + output.failed`** — events are pending in the queue (expected for disk queues under backpressure).
+- `discarded > 0`: an event completed without reaching an output; check routing.
+- `failed > 0`: output events reached terminal failure; inspect destination and
+  recovery disposition.
+- `retries` growing: transient destination failures are occurring.
+- `received` growing while `finished + dropped` does not: pipeline work may be
+  backed up.
+- `output.received > output.written + output.failed`: events remain pending,
+  commonly under disk-queue backpressure.
+- `errored_unwritable > 0` or `wedged > 0`: treat as an alarm and restore DLQ or
+  disk-queue health before assuming replay coverage is complete.
