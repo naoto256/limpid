@@ -629,7 +629,10 @@ impl Output for KafkaOutput {
         // does not support at this boundary.
         let (_no_shutdown_tx, no_shutdown_rx) = tokio::sync::watch::channel(false);
         let result = match self.try_send(event, no_shutdown_rx).await {
-            Ok(KafkaTrySendOutcome::Delivered) => Ok(()),
+            Ok(KafkaTrySendOutcome::Delivered) => {
+                self.metrics.bytes_written.inc_by(event.egress.len() as u64);
+                Ok(())
+            }
             Ok(KafkaTrySendOutcome::PreSendShutdown) => {
                 // The receiver we passed can never observe
                 // shutdown — this branch is a defensive
@@ -1286,6 +1289,90 @@ mod tests {
                 .count(),
             1,
             "steady-state Kafka delivery must record the payload once"
+        );
+    }
+
+    fn match_arm_block<'a>(source: &'a str, pattern: &str) -> &'a str {
+        let pattern_start = source.find(pattern).expect("match arm must exist");
+        let arrow = source[pattern_start..]
+            .find("=>")
+            .map(|offset| pattern_start + offset)
+            .expect("match arm must have an arrow");
+        let block_start = source[arrow..]
+            .find('{')
+            .map(|offset| arrow + offset)
+            .expect("match arm must have a block");
+        let mut depth = 0usize;
+        for (offset, byte) in source.as_bytes()[block_start..].iter().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[block_start..=block_start + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("match arm block must be balanced");
+    }
+
+    #[test]
+    fn delivered_arm_extraction_is_order_independent() {
+        let reordered = r#"
+            match outcome {
+                Ok(KafkaTrySendOutcome::PreSendShutdown) => { unreachable!() }
+                Err(error) => { return Err(error); }
+                Ok(KafkaTrySendOutcome::Delivered) => {
+                    self.metrics.bytes_written.inc_by(event.egress.len() as u64);
+                    Ok(())
+                }
+            }
+        "#;
+        assert!(
+            match_arm_block(reordered, "Ok(KafkaTrySendOutcome::Delivered)")
+                .contains("bytes_written.inc_by(event.egress.len() as u64)"),
+            "Delivered-arm ownership must remain detectable after arm reordering"
+        );
+    }
+
+    #[test]
+    fn shutdown_delivered_branch_owns_one_kafka_payload_byte_bump() {
+        let src = include_str!("kafka.rs");
+        let steady_start = src
+            .find("async fn consume(&self, event: &Event")
+            .expect("Kafka consume implementation must exist");
+        let shutdown_start = src[steady_start..]
+            .find("async fn consume_shutdown(")
+            .map(|offset| steady_start + offset)
+            .expect("consume_shutdown must follow consume");
+        let shutdown_end = src[shutdown_start..]
+            .find("impl KafkaOutput {")
+            .map(|offset| shutdown_start + offset)
+            .expect("consume_shutdown must end before the next impl");
+        let steady_body = &src[steady_start..shutdown_start];
+        let shutdown_body = &src[shutdown_start..shutdown_end];
+
+        assert_eq!(
+            steady_body
+                .matches("bytes_written.inc_by(event.egress.len() as u64)")
+                .count(),
+            1,
+            "steady-state Delivered must count the payload exactly once"
+        );
+        let delivered_arm = match_arm_block(shutdown_body, "Ok(KafkaTrySendOutcome::Delivered)");
+        assert!(
+            delivered_arm.contains("bytes_written.inc_by(event.egress.len() as u64)"),
+            "shutdown delivery must count the payload at the delivery-report boundary"
+        );
+        assert_eq!(
+            shutdown_body
+                .matches("bytes_written.inc_by(event.egress.len() as u64)")
+                .count(),
+            1,
+            "shutdown Delivered must count the payload exactly once; Err and defensive \
+             PreSendShutdown paths must remain zero"
         );
     }
 }

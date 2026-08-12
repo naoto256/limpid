@@ -167,12 +167,7 @@ impl Output for UnixSocketOutput {
             )
             .await
             {
-                WriteReconnectOutcome::Delivered => {
-                    self.metrics
-                        .bytes_written
-                        .inc_by((event.egress.len() + 1) as u64);
-                    Ok(())
-                }
+                WriteReconnectOutcome::Delivered => Ok(()),
                 WriteReconnectOutcome::Err(e) => Err(e),
                 WriteReconnectOutcome::PreSendShutdown => {
                     let reason = format!(
@@ -292,12 +287,7 @@ impl Output for UnixSocketOutput {
         )
         .await
         {
-            Ok(Ok(())) => {
-                self.metrics
-                    .bytes_written
-                    .inc_by((event.egress.len() + 1) as u64);
-                Ok(())
-            }
+            Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(anyhow::anyhow!(
                 "timed out after {:?}",
@@ -381,6 +371,11 @@ impl PersistentConn for UnixSocketOutput {
         let buf = super::frame_with_newline(payload);
         stream.write_all(&buf).await?;
         stream.flush().await?;
+        // After `write_all` and `flush` both return successfully,
+        // record the exact framed-buffer length as adapter-confirmed;
+        // this does not assert peer receipt. Callers must not
+        // duplicate the bump on their success arms.
+        self.metrics.bytes_written.inc_by(buf.len() as u64);
         Ok(())
     }
 }
@@ -513,6 +508,229 @@ mod tests {
             (event.egress.len() + 1) as u64,
             "shutdown and steady-state count the same framed buffer"
         );
+    }
+
+    #[test]
+    fn concrete_writer_owns_confirmed_newline_frame_bytes() {
+        fn braced_body<'a>(source: &'a str, signature: &str) -> &'a str {
+            let signature_start = source.find(signature).expect("function must exist");
+            let block_start = source[signature_start..]
+                .find('{')
+                .map(|offset| signature_start + offset)
+                .expect("function must have a body");
+            let mut depth = 0usize;
+            for (offset, byte) in source.as_bytes()[block_start..].iter().enumerate() {
+                match byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &source[block_start..=block_start + offset];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("function body must be balanced");
+        }
+
+        fn assert_writer_ownership(source: &str, caller_paths: &str) {
+            let writer = braced_body(source, "async fn write_frame(&self");
+            let frame_call = "super::frame_with_newline(payload)";
+            assert_eq!(
+                writer.matches(frame_call).count(),
+                1,
+                "the concrete writer must construct one exact framed buffer"
+            );
+            let call_start = writer.find(frame_call).expect("framing call must exist");
+            let binding_start = writer[..call_start]
+                .rfind("let ")
+                .expect("framed buffer must have a local binding");
+            let statement_end = writer[call_start..]
+                .find(';')
+                .map(|offset| call_start + offset + 1)
+                .expect("framed-buffer binding must end");
+            let statement = &writer[binding_start..statement_end];
+            let (left, right) = statement
+                .strip_prefix("let ")
+                .expect("binding must start with let")
+                .split_once('=')
+                .expect("binding must have an initializer");
+            assert_eq!(
+                right.matches(frame_call).count(),
+                1,
+                "the framed buffer must originate in the same let statement"
+            );
+            let identifier = left
+                .split_once(':')
+                .map_or(left, |(identifier, _)| identifier)
+                .trim();
+            assert!(
+                !identifier.is_empty()
+                    && !identifier.as_bytes()[0].is_ascii_digit()
+                    && identifier
+                        .bytes()
+                        .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric()),
+                "the framed buffer must use a plain local identifier"
+            );
+
+            let write_pattern = format!("write_all(&{identifier})");
+            let bump_pattern = format!("bytes_written.inc_by({identifier}.len() as u64)");
+            assert_eq!(
+                writer.matches(&write_pattern).count(),
+                1,
+                "the exact framed local must flow to one write_all"
+            );
+            assert_eq!(
+                writer.matches(&bump_pattern).count(),
+                1,
+                "the exact framed local must flow to one byte bump"
+            );
+            let write = writer
+                .find(&write_pattern)
+                .expect("framed write must exist");
+            let flush = writer
+                .find("flush().await")
+                .expect("the concrete writer must flush before confirming bytes");
+            let bump = writer.find(&bump_pattern).expect("byte bump must exist");
+            assert!(
+                statement_end <= write && write < flush && flush < bump,
+                "bytes are confirmed only after the exact buffer is written and flushed"
+            );
+            assert!(
+                !caller_paths.contains("bytes_written")
+                    && !caller_paths.contains("event.egress.len() + 1"),
+                "callers must not own byte bumps or reconstruct the exact newline frame length"
+            );
+        }
+
+        fn assert_rejected(source: &str, caller_paths: &str) {
+            assert!(
+                std::panic::catch_unwind(|| assert_writer_ownership(source, caller_paths)).is_err(),
+                "counterexample must fail the ownership check"
+            );
+        }
+
+        let renamed = r#"
+            async fn write_frame(&self, payload: &Bytes) {
+                let framed_local = super::frame_with_newline(payload);
+                attempt += 1;
+                stream.write_all(&framed_local).await?;
+                stream.flush().await?;
+                self.metrics.bytes_written.inc_by(framed_local.len() as u64);
+            }
+            // trailing comment and unrelated helper placement are allowed.
+            fn helper() { let attempt = 1 + 1; }
+        "#;
+        assert_writer_ownership(renamed, "attempt += 1;");
+        assert_rejected(
+            &renamed.replace("write_all(&framed_local)", "write_all(payload)"),
+            "",
+        );
+        assert_rejected(
+            r#"
+                async fn write_frame(&self, payload: &Bytes) {
+                    let framed_local = super::frame_with_newline(payload);
+                    stream.write_all(&framed_local).await?;
+                    self.metrics.bytes_written.inc_by(framed_local.len() as u64);
+                    stream.flush().await?;
+                }
+            "#,
+            "",
+        );
+        assert_rejected(renamed, "self.metrics.bytes_written.inc_by(1);");
+        assert_rejected(
+            r#"
+                async fn write_frame(&self, payload: &Bytes) {
+                    let framed_local = super::frame_with_newline(payload);
+                    stream.write_all(&framed_local).await?;
+                    stream.flush().await?;
+                    self.metrics.bytes_written.inc_by(framed_local.len() as u64);
+                    self.metrics.bytes_written.inc_by(framed_local.len() as u64);
+                }
+            "#,
+            "",
+        );
+        assert_rejected(renamed, "let n = event.egress.len() + 1;");
+
+        let src = include_str!("unix_socket.rs");
+        let consume_start = src
+            .find("async fn consume(&self, event: &Event")
+            .expect("consume must exist");
+        let impl_end = src[consume_start..]
+            .find("impl PersistentConn for UnixSocketOutput")
+            .map(|offset| consume_start + offset)
+            .expect("PersistentConn impl must follow Output impl");
+        let output_paths = &src[consume_start..impl_end];
+        assert_writer_ownership(src, output_paths);
+    }
+
+    #[tokio::test]
+    async fn write_frame_failure_counts_no_bytes() {
+        let dir = TempDir::new().unwrap();
+        let output = build_test_output(&dir.path().join("unused.sock")).await;
+        let (mut writer, peer) = tokio::net::UnixStream::pair().unwrap();
+        drop(peer);
+
+        let result = <UnixSocketOutput as PersistentConn>::write_frame(
+            &output,
+            &mut writer,
+            &Bytes::from_static(b"payload"),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a closed peer cannot confirm transferred bytes"
+        );
+        assert_eq!(output.metrics.bytes_written.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn retry_counts_only_the_eventually_confirmed_frame_once() {
+        use tokio::io::AsyncReadExt;
+
+        let dir = TempDir::new().unwrap();
+        let socket_path = dir.path().join("retry.sock");
+        let output = std::sync::Arc::new(build_test_output_with_retry(&socket_path).await);
+        let event = Event::new(
+            Bytes::from_static(b"retry-payload"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let expected = super::super::frame_with_newline(&event.egress);
+        let (ack, _rx) = QueueAckHandle::for_test();
+        let output_for_task = output.clone();
+        let event_for_task = event.clone();
+        let consume = tokio::spawn(async move {
+            output_for_task.consume(&event_for_task, ack).await.unwrap();
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while output.metrics.retries.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first failed connection attempt must remain bounded");
+
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        let expected_len = expected.len();
+        let receiver = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut actual = vec![0; expected_len];
+            stream.read_exact(&mut actual).await.unwrap();
+            actual
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), consume)
+            .await
+            .expect("retry must complete")
+            .unwrap();
+        assert_eq!(receiver.await.unwrap(), expected);
+        assert_eq!(
+            output.metrics.bytes_written.load(Ordering::Relaxed),
+            expected.len() as u64
+        );
+        assert_eq!(output.metrics.events_written.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -797,5 +1015,53 @@ mod tests {
         );
         UnixSocketOutput::from_properties("u", &props, &crate::modules::BuildContext::for_testing())
             .expect("build")
+    }
+
+    async fn build_test_output_with_retry(socket_path: &std::path::Path) -> UnixSocketOutput {
+        use crate::dsl::ast::{Expr, ExprKind, Property};
+        use crate::dsl::module_props::ModuleProperties;
+        let props = ModuleProperties::from_parts(
+            "unix_socket",
+            vec![
+                Property::KeyValue {
+                    key: "path".into(),
+                    key_span: None,
+                    value: Expr::spanless(ExprKind::StringLit(
+                        socket_path.to_str().unwrap().to_string(),
+                    )),
+                    value_span: None,
+                },
+                Property::Block {
+                    key: "retry".into(),
+                    key_span: None,
+                    properties: vec![
+                        Property::KeyValue {
+                            key: "max_attempts".into(),
+                            key_span: None,
+                            value: Expr::spanless(ExprKind::IntLit(3)),
+                            value_span: None,
+                        },
+                        Property::KeyValue {
+                            key: "initial_wait".into(),
+                            key_span: None,
+                            value: Expr::spanless(ExprKind::StringLit("20ms".into())),
+                            value_span: None,
+                        },
+                        Property::KeyValue {
+                            key: "max_wait".into(),
+                            key_span: None,
+                            value: Expr::spanless(ExprKind::StringLit("20ms".into())),
+                            value_span: None,
+                        },
+                    ],
+                },
+            ],
+        );
+        UnixSocketOutput::from_properties(
+            "u-retry",
+            &props,
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .expect("build")
     }
 }
