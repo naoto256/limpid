@@ -278,8 +278,9 @@ Investigate these signals:
 - `failed > 0`: output events reached terminal failure; inspect destination and
   recovery disposition.
 - `retries` growing: transient destination failures are occurring.
-- `received` growing while `finished + dropped` does not: pipeline work may be
-  backed up.
+- A sustained gap between `received` and
+  `finished + dropped + discarded + errored` may mean pipeline work is in flight
+  or backed up.
 - `output.received > output.written + output.failed`: events remain pending,
   commonly under disk-queue backpressure.
 - `errored_unwritable > 0` or `wedged > 0`: treat as an alarm and restore DLQ or
