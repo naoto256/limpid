@@ -20,6 +20,7 @@ pub struct InputMetrics {
     pub(crate) events_invalid: Arc<registry_core::Counter>,
     /// Events pushed into this input's channel via `limpidctl inject`.
     pub(crate) events_injected: Arc<registry_core::Counter>,
+    pub(crate) bytes_received: Arc<registry_core::Counter>,
 }
 
 impl InputMetrics {
@@ -45,6 +46,10 @@ impl InputMetrics {
             events_injected: counter!(
                 "limpid_input_events_injected_total",
                 "Total events injected into the input through the control socket."
+            ),
+            bytes_received: counter!(
+                "limpid_input_bytes_received_total",
+                "Total logical bytes received by the input adapter before validation."
             ),
         }))
     }
@@ -163,6 +168,7 @@ pub struct OutputMetrics {
     /// is the operator alarm signal for that loss rather than a
     /// durable trace of it.
     pub(crate) events_errored_unwritable: Arc<registry_core::Counter>,
+    pub(crate) bytes_written: Arc<registry_core::Counter>,
 }
 
 impl OutputMetrics {
@@ -201,6 +207,10 @@ impl OutputMetrics {
             events_errored_unwritable: counter!(
                 "limpid_output_events_errored_unwritable_total",
                 "Total output errors whose recovery record could not be written."
+            ),
+            bytes_written: counter!(
+                "limpid_output_bytes_written_total",
+                "Total logical bytes whose transfer was confirmed by the output adapter."
             ),
         }))
     }
@@ -321,6 +331,10 @@ mod registry_core {
     impl Counter {
         pub(crate) fn inc(&self) {
             self.value.fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub(crate) fn inc_by(&self, value: u64) {
+            self.value.fetch_add(value, Ordering::Relaxed);
         }
 
         #[cfg(test)]
@@ -1533,6 +1547,28 @@ mod registry_tests {
     }
 
     #[test]
+    fn counter_inc_by_adds_the_exact_delta_and_zero_is_a_noop() {
+        let registry = Registry::new();
+        let counter = build_ok(
+            registry
+                .counter("limpid_test_bytes_total")
+                .help("Test byte counter.")
+                .label("input", "fixture")
+                .build(),
+        );
+
+        counter.inc_by(0);
+        counter.inc_by(4_096);
+        counter.inc();
+
+        let snapshot = snapshot_json(&registry);
+        assert_eq!(
+            metric(&snapshot, "limpid_test_bytes_total")["series"][0]["value"],
+            4_097
+        );
+    }
+
+    #[test]
     fn documented_metric_bundles_share_one_registry_without_shadow_series() {
         let registry = Registry::new();
         let input: Arc<InputMetrics> = build_ok(InputMetrics::register(&registry, "ingress"));
@@ -1554,6 +1590,7 @@ mod registry_tests {
         inc!(input_shared.events_received, 1);
         inc!(input.events_invalid, 2);
         inc!(input.events_injected, 3);
+        input.bytes_received.inc_by(17);
         inc!(pipeline_shared.events_received, 4);
         inc!(pipeline.events_finished, 5);
         inc!(pipeline.events_dropped, 6);
@@ -1567,6 +1604,7 @@ mod registry_tests {
         inc!(output.retries, 14);
         inc!(output.events_wedged, 15);
         inc!(output.events_errored_unwritable, 16);
+        output.bytes_written.inc_by(23);
 
         let snapshot = snapshot_json(&registry);
         let metrics = snapshot["metrics"]
@@ -1574,7 +1612,7 @@ mod registry_tests {
             .expect("metrics must be an array");
         assert_eq!(
             metrics.len(),
-            16,
+            18,
             "only the documented metric set is registered"
         );
 
@@ -1582,6 +1620,7 @@ mod registry_tests {
             ("limpid_input_events_received_total", "input", "ingress", 1),
             ("limpid_input_events_invalid_total", "input", "ingress", 2),
             ("limpid_input_events_injected_total", "input", "ingress", 3),
+            ("limpid_input_bytes_received_total", "input", "ingress", 17),
             (
                 "limpid_pipeline_events_received_total",
                 "pipeline",
@@ -1640,6 +1679,7 @@ mod registry_tests {
                 "egress",
                 16,
             ),
+            ("limpid_output_bytes_written_total", "output", "egress", 23),
         ];
         for (name, label, label_value, value) in expected {
             let family = metric(&snapshot, name);
@@ -1687,6 +1727,7 @@ mod registry_tests {
                 "limpid_output_retries_total",
                 "limpid_output_events_wedged_total",
                 "limpid_output_events_errored_unwritable_total",
+                "limpid_output_bytes_written_total",
             ]
             .contains(&name.as_str())
         );

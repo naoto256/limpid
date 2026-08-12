@@ -134,6 +134,7 @@ struct OtlpHttpSinkPolicy {
     protocol: HttpProtocol,
     batch_level: BatchLevel,
     headers: Vec<(String, String)>,
+    metrics: Arc<OutputMetrics>,
 }
 
 pub struct OtlpHttpOutput {
@@ -413,6 +414,7 @@ impl Module for OtlpHttpOutput {
             protocol,
             batch_level,
             headers,
+            metrics: Arc::clone(&metrics),
         };
         // The shared skeleton spawns the flusher actor; see
         // `crate::modules::output::batched` for the actor / shutdown
@@ -531,6 +533,7 @@ async fn send_once(
         HttpProtocol::Json => serde_json::to_vec(req)
             .map_err(|e| anyhow!("output otlp_http: JSON encode failed: {e}"))?,
     };
+    let body_len = body.len();
     let mut http_req = peer
         .client
         .post(&peer.endpoint)
@@ -543,6 +546,7 @@ async fn send_once(
         .send()
         .await
         .with_context(|| format!("output otlp_http: POST {} failed", peer.endpoint))?;
+    policy.metrics.bytes_written.inc_by(body_len as u64);
     let status = resp.status();
     if !status.is_success() {
         // 4 KiB byte cap, 500 chars on the lossy decode for the log
@@ -1062,6 +1066,7 @@ def output o {{
     ) -> (
         SocketAddr,
         Arc<Mutex<Vec<ExportLogsServiceRequest>>>,
+        Arc<Mutex<Vec<usize>>>,
         tokio::task::JoinHandle<()>,
     ) {
         use axum::{
@@ -1075,6 +1080,7 @@ def output o {{
         #[derive(Clone)]
         struct AppState {
             received: Arc<Mutex<Vec<ExportLogsServiceRequest>>>,
+            received_body_lengths: Arc<Mutex<Vec<usize>>>,
             protocol: &'static str,
         }
 
@@ -1088,6 +1094,7 @@ def output o {{
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
+            let body_len = body.len();
             let req: ExportLogsServiceRequest = match state.protocol {
                 "http_protobuf" => {
                     if !ct.starts_with("application/x-protobuf") {
@@ -1122,6 +1129,7 @@ def output o {{
                 }
                 _ => unreachable!("test-only enumeration"),
             };
+            state.received_body_lengths.lock().await.push(body_len);
             state.received.lock().await.push(req);
             (StatusCode::OK, "").into_response()
         }
@@ -1129,16 +1137,18 @@ def output o {{
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let received = Arc::new(Mutex::new(Vec::new()));
+        let received_body_lengths = Arc::new(Mutex::new(Vec::new()));
         let app = Router::new()
             .route("/v1/logs", post(handle))
             .with_state(AppState {
                 received: Arc::clone(&received),
+                received_body_lengths: Arc::clone(&received_body_lengths),
                 protocol,
             });
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        (addr, received, handle)
+        (addr, received, received_body_lengths, handle)
     }
 
     #[tokio::test]
@@ -1331,8 +1341,110 @@ def output o {{
     }
 
     #[tokio::test]
+    async fn non_success_response_confirms_the_full_prepared_body() {
+        use axum::{Router, extract::State, http::StatusCode, routing::post};
+
+        #[derive(Clone)]
+        struct AppState {
+            body_lengths: Arc<Mutex<Vec<usize>>>,
+        }
+
+        async fn reject(State(state): State<AppState>, body: axum::body::Bytes) -> StatusCode {
+            state.body_lengths.lock().await.push(body.len());
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body_lengths = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/logs", post(reject))
+            .with_state(AppState {
+                body_lengths: Arc::clone(&body_lengths),
+            });
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let endpoint = format!("http://{}/v1/logs", addr);
+        let mut props = one_peer_props(&endpoint);
+        props.push(prop_str("protocol", "http_protobuf"));
+        props.push(prop_int("batch_size", 1));
+        props.push(Property::Block {
+            key: "retry".into(),
+            key_span: None,
+            properties: vec![
+                prop_int("max_attempts", 1),
+                prop_str("initial_wait", "1ms"),
+                prop_str("max_wait", "1ms"),
+            ],
+        });
+        let output = OtlpHttpOutput::from_properties(
+            "test",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
+        let disp = consume_and_wait_disposition(
+            &output,
+            &event_with_egress(singleton_bytes(789)),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(disp, crate::queue::AckDisposition::Recovered));
+        let body_lengths = body_lengths.lock().await.clone();
+        assert_eq!(body_lengths.len(), 1);
+        assert_eq!(
+            output.metrics.bytes_written.load(Ordering::Relaxed),
+            body_lengths[0] as u64,
+            "a non-success response still confirms transfer of the prepared body"
+        );
+        assert_eq!(output.metrics.events_written.load(Ordering::Relaxed), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn connection_failure_without_a_receipt_counts_no_bytes() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let endpoint = format!("http://{}/v1/logs", addr);
+        let mut props = one_peer_props(&endpoint);
+        props.push(prop_str("protocol", "http_protobuf"));
+        props.push(prop_int("batch_size", 1));
+        props.push(Property::Block {
+            key: "retry".into(),
+            key_span: None,
+            properties: vec![
+                prop_int("max_attempts", 1),
+                prop_str("initial_wait", "1ms"),
+                prop_str("max_wait", "1ms"),
+            ],
+        });
+        let output = OtlpHttpOutput::from_properties(
+            "test",
+            &mp(&props),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
+        let disp = consume_and_wait_disposition(
+            &output,
+            &event_with_egress(singleton_bytes(790)),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(disp, crate::queue::AckDisposition::Recovered));
+        assert_eq!(output.metrics.bytes_written.load(Ordering::Relaxed), 0);
+        assert_eq!(output.metrics.events_written.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn round_trip_protobuf() {
-        let (addr, received, server) = run_http_collector("http_protobuf").await;
+        let (addr, received, received_body_lengths, server) =
+            run_http_collector("http_protobuf").await;
         let endpoint = format!("http://{}/v1/logs", addr);
         let mut props = one_peer_props(&endpoint);
         props.push(prop_str("protocol", "http_protobuf"));
@@ -1357,11 +1469,18 @@ def output o {{
             got[0].resource_logs[0].scope_logs[0].log_records[0].time_unix_nano,
             123
         );
+        let body_lengths = received_body_lengths.lock().await.clone();
+        assert_eq!(body_lengths.len(), 1);
+        assert_eq!(
+            output.metrics.bytes_written.load(Ordering::Relaxed),
+            body_lengths[0] as u64,
+            "protobuf bytes match the body received by the collector"
+        );
     }
 
     #[tokio::test]
     async fn round_trip_json() {
-        let (addr, received, server) = run_http_collector("http_json").await;
+        let (addr, received, received_body_lengths, server) = run_http_collector("http_json").await;
         let endpoint = format!("http://{}/v1/logs", addr);
         let mut props = one_peer_props(&endpoint);
         props.push(prop_str("protocol", "http_json"));
@@ -1385,6 +1504,13 @@ def output o {{
         assert_eq!(
             got[0].resource_logs[0].scope_logs[0].log_records[0].time_unix_nano,
             456
+        );
+        let body_lengths = received_body_lengths.lock().await.clone();
+        assert_eq!(body_lengths.len(), 1);
+        assert_eq!(
+            output.metrics.bytes_written.load(Ordering::Relaxed),
+            body_lengths[0] as u64,
+            "JSON bytes use the actual serialized body, not protobuf encoded_len"
         );
     }
 
@@ -1455,8 +1581,16 @@ def output o {{
         )
         .unwrap();
 
-        for i in 0..3 {
-            let ev = event_with_egress(singleton_bytes(900_000_000 + i));
+        let payloads: Vec<_> = (0..3).map(|i| singleton_bytes(900_000_000 + i)).collect();
+        let expected_bytes = output
+            .sink
+            .inner
+            .policy
+            .prepare(payloads.clone())
+            .unwrap()
+            .encoded_len() as u64;
+        for payload in payloads {
+            let ev = event_with_egress(payload);
             // With batch_size=3 the per-event disposition isn't observable
             // via the test shim's freshly-allocated handle channel — the
             // first two events stay buffered (handle held by the output)
@@ -1487,6 +1621,11 @@ def output o {{
         assert_eq!(
             failed, 2,
             "expected 2 failed, got {failed} (written={written})"
+        );
+        assert_eq!(
+            output.metrics.bytes_written.load(Ordering::Relaxed),
+            expected_bytes,
+            "partial_success does not apportion the transferred request body"
         );
     }
 
@@ -1609,7 +1748,8 @@ def output o {{
         // `shutdown()` must signal/join the actor and final-drain
         // any leftover buffer with one bounded send attempt (or
         // DLQ drain) so every parked handle resolves.
-        let (addr, received, server) = run_http_collector("http_protobuf").await;
+        let (addr, received, _received_body_lengths, server) =
+            run_http_collector("http_protobuf").await;
         let endpoint = format!("http://{}/v1/logs", addr);
         let mut props = one_peer_props(&endpoint);
         props.push(prop_str("protocol", "http_protobuf"));
@@ -1899,7 +2039,8 @@ def output o {{
 
     #[tokio::test]
     async fn shutdown_success_does_not_touch_error_log() {
-        let (addr, received, server) = run_http_collector("http_protobuf").await;
+        let (addr, received, _received_body_lengths, server) =
+            run_http_collector("http_protobuf").await;
         let endpoint = format!("http://{}/v1/logs", addr);
         let mut props = one_peer_props(&endpoint);
         props.push(prop_str("protocol", "http_protobuf"));

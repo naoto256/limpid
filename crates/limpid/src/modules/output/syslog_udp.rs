@@ -306,7 +306,6 @@ impl SyslogUdpOutput {
                     let address = peer.address();
                     let metrics = Arc::clone(&metrics);
                     Box::pin(async move {
-                        let _ = &metrics; // silence unused-if-no-write-path lint
                         if state.conn.is_none() {
                             // Pre-send phase: DNS lookup, ephemeral
                             // bind, and UDP `connect` are all
@@ -458,7 +457,9 @@ impl SyslogUdpOutput {
                         if send_result.is_err() {
                             state.conn = None;
                         }
-                        send_result.map(|_| ())
+                        send_result.map(|len| {
+                            metrics.bytes_written.inc_by(len as u64);
+                        })
                     })
                 },
                 shutdown,
@@ -483,11 +484,13 @@ impl SyslogUdpOutput {
     /// [`Self::write_payload_shutdown_aware`] so its pre-send DNS /
     /// bind / connect phase can race the shutdown signal.
     async fn write_payload(&self, payload: SyslogPayload) -> Result<()> {
+        let metrics = Arc::clone(&self.metrics);
         let result = self
             .peers
             .write_with_rotation_now(move |_idx, peer, state| {
                 let egress = payload.egress.clone();
                 let address = peer.address();
+                let metrics = Arc::clone(&metrics);
                 Box::pin(async move {
                     if state.conn.is_none() {
                         // Resolve the peer address and walk every
@@ -582,7 +585,9 @@ impl SyslogUdpOutput {
                     if send_result.is_err() {
                         state.conn = None;
                     }
-                    send_result.map(|_| ())
+                    send_result.map(|len| {
+                        metrics.bytes_written.inc_by(len as u64);
+                    })
                 })
             })
             .await;
@@ -895,6 +900,11 @@ mod tests {
             0,
             "successful send must not bump events_failed"
         );
+        assert_eq!(
+            output.metrics.bytes_written.load(Ordering::Relaxed),
+            event.egress.len() as u64,
+            "UDP counts the length confirmed by send"
+        );
     }
 
     /// Shutdown-drain success bumps `events_written` exactly once,
@@ -950,5 +960,54 @@ mod tests {
             0,
             "successful drain must not bump events_failed"
         );
+        assert_eq!(
+            output.metrics.bytes_written.load(Ordering::Relaxed),
+            event.egress.len() as u64,
+            "shutdown and steady-state use the same confirmed-byte contract"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_datagram_send_error_counts_no_confirmed_bytes() {
+        use crate::event::Event;
+        use crate::queue::QueueAckHandle;
+        use bytes::Bytes;
+
+        let listener = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().unwrap().port() as i64;
+        let output = SyslogUdpOutput::build(
+            "udp-failure",
+            &mp(&[
+                block(
+                    "peer",
+                    vec![
+                        kv("host", ExprKind::StringLit("127.0.0.1".into())),
+                        kv("port", ExprKind::IntLit(port)),
+                    ],
+                ),
+                block(
+                    "retry",
+                    vec![
+                        kv("max_attempts", ExprKind::IntLit(1)),
+                        kv("initial_wait", ExprKind::StringLit("1ms".into())),
+                        kv("max_wait", ExprKind::StringLit("1ms".into())),
+                    ],
+                ),
+            ]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .expect("build");
+        // Exceeds the maximum UDP payload on every supported platform, so
+        // send must fail locally without depending on ICMP timing.
+        let event = Event::new(Bytes::from(vec![0; 65_536]), "127.0.0.1:0".parse().unwrap());
+        let (ack, _ack_rx) = QueueAckHandle::for_test();
+
+        tokio::time::timeout(Duration::from_secs(2), output.consume(&event, ack))
+            .await
+            .expect("oversized datagram failure must remain bounded")
+            .unwrap();
+
+        assert_eq!(output.metrics.bytes_written.load(Ordering::Relaxed), 0);
+        assert_eq!(output.metrics.events_written.load(Ordering::Relaxed), 0);
     }
 }

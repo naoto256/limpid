@@ -191,6 +191,7 @@ struct HttpSinkPolicy {
     content_type: String,
     headers: Vec<(String, String)>,
     compress: bool,
+    metrics: Arc<OutputMetrics>,
 }
 
 pub struct HttpOutput {
@@ -411,6 +412,7 @@ impl Module for HttpOutput {
             content_type,
             headers,
             compress,
+            metrics: Arc::clone(&metrics),
         };
         // The shared skeleton spawns the flusher actor that owns
         // every send — both batched flushes and singleton
@@ -570,6 +572,7 @@ async fn send_once(peer: &HttpPeer, policy: &HttpSinkPolicy, body: &[u8]) -> Res
         .send()
         .await
         .with_context(|| format!("http output: request to {} failed", peer.url))?;
+    policy.metrics.bytes_written.inc_by(body.len() as u64);
 
     let status = response.status();
     if !status.is_success() {
@@ -602,6 +605,7 @@ mod tests {
     use crate::event::Event;
     use crate::modules::output::syslog_peers::PEER_COOLDOWN;
     use std::net::SocketAddr;
+    use std::sync::atomic::Ordering;
     use std::time::Instant;
     use tokio::sync::Mutex;
 
@@ -623,6 +627,15 @@ mod tests {
             key: key.to_string(),
             key_span: None,
             value: Expr::spanless(ExprKind::IntLit(val)),
+            value_span: None,
+        }
+    }
+
+    fn prop_bool(key: &str, val: bool) -> Property {
+        Property::KeyValue {
+            key: key.to_string(),
+            key_span: None,
+            value: Expr::spanless(ExprKind::BoolLit(val)),
             value_span: None,
         }
     }
@@ -953,6 +966,68 @@ mod tests {
         server.abort();
         let got = received.lock().await.clone();
         assert_eq!(got, vec!["hello-single".to_string()]);
+        assert_eq!(
+            output.metrics.bytes_written.load(Ordering::Relaxed),
+            b"hello-single".len() as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn compressed_batch_counts_the_exact_prepared_body() {
+        use axum::{Router, extract::State, http::StatusCode, routing::post};
+
+        #[derive(Clone)]
+        struct Capture(Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>);
+        async fn capture(State(state): State<Capture>, body: axum::body::Bytes) -> StatusCode {
+            state.0.lock().await.push(body.to_vec());
+            StatusCode::OK
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bodies = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/", post(capture))
+            .with_state(Capture(Arc::clone(&bodies)));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let output = HttpOutput::from_properties(
+            "compressed-bytes",
+            &mp(&[
+                peer_block(&format!("http://{addr}/")),
+                prop_int("batch_size", 2),
+                prop_bool("compress", true),
+            ]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
+        let payloads = vec![
+            bytes::Bytes::from_static(b"compress-one"),
+            bytes::Bytes::from_static(b"compress-two"),
+        ];
+        let expected = output.sink.inner.policy.prepare(payloads.clone()).unwrap();
+
+        for payload in payloads {
+            let event = Event::new(payload, "127.0.0.1:0".parse().unwrap());
+            consume(&output, &event).await.unwrap();
+        }
+        for _ in 0..50 {
+            if !bodies.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        server.abort();
+        assert_eq!(
+            bodies.lock().await.as_slice(),
+            std::slice::from_ref(&expected)
+        );
+        assert_eq!(
+            output.metrics.bytes_written.load(Ordering::Relaxed),
+            expected.len() as u64,
+            "gzip bytes, not pre-compression payload bytes, define the adapter boundary"
+        );
     }
 
     #[tokio::test]
@@ -1062,6 +1137,67 @@ mod tests {
         );
         s_a.abort();
         s_b.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_connection_then_confirmed_retry_counts_the_body_once() {
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead_listener.local_addr().unwrap();
+        drop(dead_listener);
+        let (healthy_addr, received, server) = run_echo_collector().await;
+        let retry = Property::Block {
+            key: "retry".into(),
+            key_span: None,
+            properties: vec![
+                prop_int("max_attempts", 2),
+                prop_str("initial_wait", "1ms"),
+                prop_str("max_wait", "1ms"),
+                Property::KeyValue {
+                    key: "backoff".into(),
+                    key_span: None,
+                    value: Expr::spanless(ExprKind::Ident(vec!["fixed".into()])),
+                    value_span: None,
+                },
+            ],
+        };
+        let output = HttpOutput::from_properties(
+            "retry-bytes",
+            &mp(&[
+                peers_block_with(vec![
+                    peer_block(&format!("http://{dead_addr}/")),
+                    peer_block(&format!("http://{healthy_addr}/")),
+                ]),
+                prop_int("batch_size", 1),
+                retry,
+            ]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
+
+        let disposition = consume_and_wait_disposition(
+            &output,
+            &event_with("retry-once"),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            disposition,
+            crate::queue::AckDisposition::Delivered
+        ));
+        for _ in 0..50 {
+            if !received.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        server.abort();
+        assert_eq!(received.lock().await.as_slice(), &["retry-once"]);
+        assert_eq!(
+            output.metrics.bytes_written.load(Ordering::Relaxed),
+            b"retry-once".len() as u64,
+            "the failed connection contributes zero; the confirmed retry contributes once"
+        );
     }
 
     #[test]
@@ -1585,14 +1721,19 @@ def output o {{
         // exhausts the budget and DLQ-routes both events.
         let (ack2, mut rx2) = QueueAckHandle::for_test();
         output.consume(&event_with("e2"), ack2).await.unwrap();
+        let dispositions = tokio::time::timeout(Duration::from_secs(2), async {
+            (rx1.recv().await, rx2.recv().await)
+        })
+        .await;
         server.abort();
 
+        let (disp1, disp2) = dispositions.expect("batch acknowledgements must resolve promptly");
         assert!(matches!(
-            rx1.recv().await,
+            disp1,
             Some((_, crate::queue::AckDisposition::Recovered))
         ));
         assert!(matches!(
-            rx2.recv().await,
+            disp2,
             Some((_, crate::queue::AckDisposition::Recovered))
         ));
         assert_eq!(
@@ -1605,6 +1746,12 @@ def output o {{
         let body = tokio::fs::read_to_string(&dlq_path).await.unwrap();
         let n_lines = body.lines().count();
         assert_eq!(n_lines, 2, "expected one DLQ record per buffered event");
+        assert_eq!(output.metrics.events_written.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            output.metrics.bytes_written.load(Ordering::Relaxed),
+            b"e1\ne2".len() as u64,
+            "a non-2xx response still confirms transfer of the complete prepared body"
+        );
     }
 
     #[tokio::test]
@@ -1710,6 +1857,11 @@ def output o {{
         assert!(
             body.contains("ev1") && body.contains("ev2"),
             "shutdown POST must carry the buffered events; got: {body}"
+        );
+        assert_eq!(
+            output.metrics.bytes_written.load(Ordering::Relaxed),
+            b"ev1\nev2".len() as u64,
+            "shutdown counts the exact joined body once"
         );
     }
 

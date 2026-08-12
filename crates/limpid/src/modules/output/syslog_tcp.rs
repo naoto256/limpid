@@ -520,6 +520,7 @@ impl SyslogTcpOutput {
         shutdown: &mut tokio::sync::watch::Receiver<bool>,
     ) -> SyslogTcpWriteOutcome {
         let framing = self.framing;
+        let confirmed_len = framed_len(framing, payload.egress.len());
         let connectors = self.connectors.clone();
         let result = self
             .peers
@@ -630,7 +631,10 @@ impl SyslogTcpOutput {
             .await;
 
         match result {
-            Ok(()) => SyslogTcpWriteOutcome::Delivered,
+            Ok(()) => {
+                self.metrics.bytes_written.inc_by(confirmed_len as u64);
+                SyslogTcpWriteOutcome::Delivered
+            }
             Err(PeerSendError::PreSendShutdown) => SyslogTcpWriteOutcome::PreSendShutdown,
             Err(e) => SyslogTcpWriteOutcome::Err(e.into()),
         }
@@ -646,6 +650,7 @@ impl SyslogTcpOutput {
     /// this method would tick the counter.
     async fn write_payload(&self, payload: SyslogPayload) -> Result<()> {
         let framing = self.framing;
+        let confirmed_len = framed_len(framing, payload.egress.len());
         let connectors = self.connectors.clone();
         let result = self
             .peers
@@ -706,9 +711,30 @@ impl SyslogTcpOutput {
             .await;
 
         match result {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.metrics.bytes_written.inc_by(confirmed_len as u64);
+                Ok(())
+            }
             Err(err) => Err(anyhow::anyhow!("{}", err)),
         }
+    }
+}
+
+/// Length of the exact buffer handed to the write path. Must
+/// mirror the framing bytes the stream adds (octet-count digits
+/// plus SP for `OctetCounting`, trailing LF for `NonTransparent`);
+/// drift here would silently mis-count sent bytes.
+fn framed_len(framing: SyslogFraming, payload_len: usize) -> usize {
+    match framing {
+        SyslogFraming::OctetCounting => {
+            let digits = if payload_len == 0 {
+                1
+            } else {
+                payload_len.ilog10() as usize + 1
+            };
+            digits + 1 + payload_len
+        }
+        SyslogFraming::NonTransparent => payload_len + 1,
     }
 }
 
@@ -721,6 +747,8 @@ mod tests {
     use super::*;
     use crate::dsl::ast::{Expr, ExprKind, Property};
     use crate::dsl::schema::SchemaErrorKind;
+    use bytes::Bytes;
+    use std::sync::atomic::Ordering;
     use tempfile::TempDir;
 
     /// Structural pin: `consume_shutdown` routes its result through
@@ -753,6 +781,88 @@ mod tests {
             "consume_shutdown must not fall back to the plain finalizer — the wire state \
              cannot be proved pre-boundary from outside write_payload."
         );
+    }
+
+    #[tokio::test]
+    async fn successful_octet_counted_write_includes_the_generated_header() {
+        use crate::event::Event;
+        use crate::queue::QueueAckHandle;
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expected = b"10 <134>hello";
+        let receiver = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0; expected.len()];
+            stream.read_exact(&mut buf).await.unwrap();
+            buf
+        });
+        let output = SyslogTcpOutput::from_properties(
+            "tcp-bytes",
+            &mp(&[
+                peer_plain("127.0.0.1", addr.port() as i64),
+                kv("framing", ExprKind::Ident(vec!["octet_counting".into()])),
+            ]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
+        let event = Event::new(
+            Bytes::from_static(b"<134>hello"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let (ack, _ack_rx) = QueueAckHandle::for_test();
+
+        output.consume(&event, ack).await.unwrap();
+
+        assert_eq!(receiver.await.unwrap(), expected);
+        assert_eq!(
+            output.metrics.bytes_written.load(Ordering::Relaxed),
+            expected.len() as u64,
+            "the generated octet-count header belongs to the adapter buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_failure_counts_neither_bytes_nor_written_events() {
+        use crate::event::Event;
+        use crate::queue::QueueAckHandle;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let output = SyslogTcpOutput::from_properties(
+            "tcp-failure",
+            &mp(&[
+                peer_plain("127.0.0.1", port as i64),
+                block(
+                    "retry",
+                    vec![
+                        kv("max_attempts", ExprKind::IntLit(1)),
+                        kv("initial_wait", ExprKind::StringLit("1ms".into())),
+                        kv("max_wait", ExprKind::StringLit("1ms".into())),
+                    ],
+                ),
+            ]),
+            &crate::modules::BuildContext::for_testing(),
+        )
+        .unwrap();
+        let event = Event::new(
+            Bytes::from_static(b"<134>unreachable"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let (ack, _ack_rx) = QueueAckHandle::for_test();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            output.consume(&event, ack),
+        )
+        .await
+        .expect("connection failure must remain bounded")
+        .unwrap();
+
+        assert_eq!(output.metrics.bytes_written.load(Ordering::Relaxed), 0);
+        assert_eq!(output.metrics.events_written.load(Ordering::Relaxed), 0);
     }
 
     struct PemFiles {

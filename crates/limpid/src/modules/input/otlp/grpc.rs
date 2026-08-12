@@ -40,6 +40,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
     logs_service_server::{LogsService, LogsServiceServer},
 };
+use prost::Message;
 use tokio::sync::mpsc;
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tonic::{Request, Response, Status};
@@ -216,6 +217,9 @@ impl LogsService for LogsServiceImpl {
         // visibility — even if the body is empty / malformed we want
         // to see the flow through input metrics.
         self.metrics.events_received.inc();
+        self.metrics
+            .bytes_received
+            .inc_by(request.get_ref().encoded_len() as u64);
 
         // Fallback: tonic should always know the peer for a
         // TCP-served RPC, but a non-TCP transport (uds, mock) might
@@ -405,12 +409,13 @@ mod tests {
         // Drive the service trait directly (no socket) so the test
         // exercises the splitting logic without taking up a port.
         let (tx, mut rx) = mpsc::channel(8);
+        let metrics = InputMetrics::for_testing();
         let svc = LogsServiceImpl {
             tx,
-            metrics: InputMetrics::for_testing(),
+            metrics: Arc::clone(&metrics),
             rate_limiter: None,
         };
-        let req = Request::new(ExportLogsServiceRequest {
+        let request = ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
                 resource: Some(Resource {
                     attributes: vec![],
@@ -434,7 +439,9 @@ mod tests {
                 }],
                 schema_url: String::new(),
             }],
-        });
+        };
+        let expected_bytes = request.encoded_len() as u64;
+        let req = Request::new(request);
         let resp = svc.export(req).await.unwrap();
         assert!(resp.into_inner().partial_success.is_none());
         let event = rx.recv().await.expect("event must have been emitted");
@@ -442,14 +449,22 @@ mod tests {
         assert_eq!(decoded.scope_logs.len(), 1);
         assert_eq!(decoded.scope_logs[0].log_records.len(), 1);
         assert_eq!(decoded.scope_logs[0].log_records[0].time_unix_nano, 42);
+        assert_eq!(
+            metrics
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            expected_bytes,
+            "gRPC input uses the canonical protobuf encoded length once per request"
+        );
     }
 
     #[tokio::test]
     async fn empty_request_is_a_noop() {
         let (tx, mut rx) = mpsc::channel(8);
+        let metrics = InputMetrics::for_testing();
         let svc = LogsServiceImpl {
             tx,
-            metrics: InputMetrics::for_testing(),
+            metrics: Arc::clone(&metrics),
             rate_limiter: None,
         };
         let req = Request::new(ExportLogsServiceRequest {
@@ -459,6 +474,13 @@ mod tests {
         assert!(resp.into_inner().partial_success.is_none());
         // No event should have been emitted.
         assert!(rx.try_recv().is_err());
+        assert_eq!(
+            metrics
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "an empty canonical protobuf message contributes zero bytes"
+        );
     }
 
     #[tokio::test]

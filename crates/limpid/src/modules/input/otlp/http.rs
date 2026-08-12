@@ -345,6 +345,7 @@ async fn handle_logs(
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
     state.metrics.events_received.inc();
+    state.metrics.bytes_received.inc_by(body.len() as u64);
 
     // Concurrency cap (semaphore) bounds simultaneous decode work.
     // Combined with body_limit, this turns the worst-case decode
@@ -771,6 +772,7 @@ mod tests {
     #[tokio::test]
     async fn body_limit_accepts_request_under_cap() {
         use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -785,6 +787,7 @@ mod tests {
             &crate::modules::BuildContext::for_testing(),
         )
         .unwrap();
+        let metrics = input.metrics();
         let (tx, mut rx) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let server_task = tokio::spawn(async move {
@@ -792,12 +795,22 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // Empty request is well under any size cap.
+        // A valid non-empty canonical protobuf request is well under the cap.
         let req = ExportLogsServiceRequest {
-            resource_logs: vec![],
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 123,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
         };
         let mut body = Vec::new();
         req.encode(&mut body).unwrap();
+        let expected_bytes = body.len() as u64;
         let resp = reqwest::Client::new()
             .post(format!("http://{}/v1/logs", addr))
             .header("Content-Type", "application/x-protobuf")
@@ -806,13 +819,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
-
-        // Empty payload → no Events emitted (events_received still
-        // bumped per RPC, but the channel stays clean).
-        assert!(rx.try_recv().is_err());
+        let _received = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for decoded event")
+            .expect("valid request must emit an event");
+        assert_eq!(
+            metrics
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            expected_bytes,
+            "valid input counts the canonical request body exactly once"
+        );
 
         let _ = shutdown_tx.send(true);
         let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn invalid_body_counts_logical_bytes_before_validation_and_empty_is_zero() {
+        let (tx, _rx) = mpsc::channel(8);
+        let metrics = InputMetrics::for_testing();
+        let state = AppState {
+            tx,
+            metrics: Arc::clone(&metrics),
+            rate_limiter: None,
+            request_limiter: None,
+            concurrency: None,
+        };
+        let peer: SocketAddr = "127.0.0.1:4318".parse().unwrap();
+        let invalid = axum::body::Bytes::from_static(b"not protobuf");
+
+        let response = handle_logs(
+            State(state.clone()),
+            ConnectInfo(peer),
+            HeaderMap::new(),
+            invalid.clone(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            metrics
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            invalid.len() as u64
+        );
+
+        let response = handle_logs(
+            State(state),
+            ConnectInfo(peer),
+            HeaderMap::new(),
+            axum::body::Bytes::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            metrics
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            invalid.len() as u64,
+            "an empty request must not change the byte counter"
+        );
     }
 
     #[test]

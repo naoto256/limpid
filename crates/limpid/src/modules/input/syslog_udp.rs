@@ -102,6 +102,7 @@ impl Input for SyslogUdpInput {
                     match result {
                         Ok((len, addr)) => {
                             let data = &buf[..len];
+                            metrics.bytes_received.inc_by(len as u64);
 
                             if let Err(e) = validate_pri(data) {
                                 warn!("syslog_udp [{}]: dropping invalid message ({})", addr, e);
@@ -196,6 +197,10 @@ mod tests {
         assert_eq!(&event.ingress[..], b"<13>hello");
         assert_eq!(metrics.events_received.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.events_invalid.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics.bytes_received.load(Ordering::Relaxed),
+            b"<13>hello".len() as u64
+        );
 
         let _ = sd_tx.send(true);
         let _ = handle.await;
@@ -223,6 +228,28 @@ mod tests {
         );
         assert_eq!(metrics.events_invalid.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.events_received.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics.bytes_received.load(Ordering::Relaxed),
+            b"not a valid syslog line".len() as u64,
+            "validation must not hide bytes that reached the adapter"
+        );
+
+        let _ = sd_tx.send(true);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn empty_datagram_is_a_zero_byte_noop() {
+        let port = pick_port();
+        let bind = format!("127.0.0.1:{port}");
+        let (handle, sd_tx, _rx, metrics) = spawn_input(bind.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let sender = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.send_to(&[], &bind).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(metrics.bytes_received.load(Ordering::Relaxed), 0);
 
         let _ = sd_tx.send(true);
         let _ = handle.await;
