@@ -498,6 +498,11 @@ impl Output for KafkaOutput {
             // or by the runtime SIGTERM budget.
             match self.try_send(event, shutdown.clone()).await {
                 Ok(KafkaTrySendOutcome::Delivered) => {
+                    // `FutureProducer` resolves each message through
+                    // an async delivery report — count only in the
+                    // Delivered arm so the counter tracks a successful
+                    // delivery report, not a client-side enqueue.
+                    self.metrics.bytes_written.inc_by(event.egress.len() as u64);
                     self.metrics.events_written.inc();
                     ack.resolve_delivered();
                     return Ok(());
@@ -1244,6 +1249,43 @@ mod tests {
                 KafkaTrySendOutcome::Delivered => "Delivered",
                 KafkaTrySendOutcome::PreSendShutdown => "PreSendShutdown",
             }
+        );
+        assert_eq!(
+            output
+                .metrics
+                .bytes_written
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "pre-send shutdown confirms no Kafka payload transfer"
+        );
+    }
+
+    #[test]
+    fn delivered_branch_owns_the_kafka_payload_byte_bump() {
+        let src = include_str!("kafka.rs");
+        let start = src
+            .find("async fn consume(&self, event: &Event")
+            .expect("Kafka consume implementation must exist");
+        let end = src[start..]
+            .find("async fn consume_shutdown(")
+            .expect("consume_shutdown must follow consume");
+        let body = &src[start..start + end];
+        let delivered = body
+            .find("KafkaTrySendOutcome::Delivered")
+            .expect("delivery branch must exist");
+        let pre_send = body
+            .find("KafkaTrySendOutcome::PreSendShutdown")
+            .expect("pre-send branch must exist");
+        let delivered_arm = &body[delivered..pre_send];
+        assert!(
+            delivered_arm.contains("bytes_written.inc_by(event.egress.len() as u64)"),
+            "Kafka bytes must bump exactly at the delivery-report boundary"
+        );
+        assert_eq!(
+            body.matches("bytes_written.inc_by(event.egress.len() as u64)")
+                .count(),
+            1,
+            "steady-state Kafka delivery must record the payload once"
         );
     }
 }

@@ -357,6 +357,7 @@ impl TailInput {
             // Trim trailing newline
             let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
             if trimmed.is_empty() {
+                self.metrics.bytes_received.inc_by(bytes_read as u64);
                 continue;
             }
 
@@ -394,6 +395,11 @@ impl TailInput {
                 current_offset -= bytes_read as u64;
                 break;
             }
+            // Count only after the send succeeds — the rewind and
+            // incomplete-line branches above must not have fired for
+            // this line, otherwise a retry would double-count the
+            // same bytes.
+            self.metrics.bytes_received.inc_by(bytes_read as u64);
         }
 
         Ok(current_offset)
@@ -550,6 +556,14 @@ mod tests {
             .await
             .unwrap();
         let _ = rx.recv().await; // drain "complete"
+        assert_eq!(
+            input
+                .metrics
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            b"complete\n".len() as u64,
+            "an incomplete trailing line is not counted before completion"
+        );
         // Writer appends the newline.
         {
             let mut f = std::fs::OpenOptions::new()
@@ -565,6 +579,14 @@ mod tests {
         assert_eq!(off2, 17);
         let e = rx.recv().await.unwrap();
         assert_eq!(&e.ingress[..], b"partial");
+        assert_eq!(
+            input
+                .metrics
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            b"complete\npartial\n".len() as u64,
+            "the completed line, including its delimiter, is counted once"
+        );
     }
 
     #[test]
@@ -673,6 +695,31 @@ mod tests {
         assert_eq!(
             next_off, 0,
             "send failure must rewind so the un-sent line is retried",
+        );
+        assert_eq!(
+            input
+                .metrics
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a rewound line must not be counted before its successful completion"
+        );
+
+        std::fs::write(&path, b"line1\n").unwrap();
+        let (retry_tx, mut retry_rx) = tokio::sync::mpsc::channel::<Event>(1);
+        let next_off = input
+            .read_new_lines(0, &retry_tx, dummy_addr(), dummy_ack_tx(), 0)
+            .await
+            .unwrap();
+        assert_eq!(next_off, b"line1\n".len() as u64);
+        assert_eq!(&retry_rx.recv().await.unwrap().ingress[..], b"line1");
+        assert_eq!(
+            input
+                .metrics
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            b"line1\n".len() as u64,
+            "rewind and re-read must not double count"
         );
     }
 

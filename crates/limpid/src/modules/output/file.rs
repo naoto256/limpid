@@ -600,6 +600,7 @@ impl FileOutput {
         // than the event count claims. The syscall is cheap and turns
         // "write returned Ok" into an OS-visible commitment.
         file.flush().await?;
+        self.metrics.bytes_written.inc_by(buf.len() as u64);
         self.metrics.events_written.inc();
 
         Ok(())
@@ -1172,6 +1173,7 @@ mod tests {
     use crate::event::Event;
     use crate::functions::table::TableStore;
     use std::net::SocketAddr;
+    use std::sync::atomic::Ordering;
 
     /// Test helper: resolve a path against an OwnedEvent without
     /// duplicating arena boilerplate at every call site. Mirrors what
@@ -1552,6 +1554,11 @@ mod tests {
         expected.push(b'\n');
         let on_disk = std::fs::read(&path).unwrap();
         assert_eq!(on_disk, expected, "bytes must survive verbatim");
+        assert_eq!(
+            out.metrics.bytes_written.load(Ordering::Relaxed),
+            expected.len() as u64,
+            "the adapter-added newline is part of the confirmed write buffer"
+        );
         // Belt-and-braces: the U+FFFD replacement sequence must NOT
         // appear at any offset in the on-disk output.
         assert!(
@@ -1983,6 +1990,8 @@ mod tests {
             0,
             "payload must not have been written when metadata apply failed"
         );
+        assert_eq!(out.metrics.bytes_written.load(Ordering::Relaxed), 0);
+        assert_eq!(out.metrics.events_written.load(Ordering::Relaxed), 0);
     }
 
     /// The output birth-mode contract exists to close a specific

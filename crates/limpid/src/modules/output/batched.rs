@@ -614,11 +614,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
         let count = shippable.len() as u64;
         let rejected = outcome.rejected.min(count);
         let written = count - rejected;
-        if written > 0 {
-            for _ in 0..written {
-                self.metrics.events_written.inc();
-            }
-        }
+        self.metrics.events_written.inc_by(written);
         let split = (count - rejected) as usize;
         let mut iter = shippable.into_iter();
         for (_, ack, _permit) in iter.by_ref().take(split) {

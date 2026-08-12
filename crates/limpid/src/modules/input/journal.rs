@@ -249,6 +249,7 @@ impl Input for JournalInput {
                     match entry {
                         Some((bytes, cursor)) => {
                             metrics.events_received.inc();
+                            metrics.bytes_received.inc_by(bytes.len() as u64);
                             let ack = Arc::new(AckHandle::new(
                                 AckPosition::Cursor(cursor),
                                 ack_tx.clone(),
@@ -541,6 +542,27 @@ mod tests {
             started.elapsed() < Duration::from_millis(50),
             "pre-set flag must short-circuit immediately; took {:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn generated_json_buffer_length_is_recorded_at_the_async_adapter_boundary() {
+        let src = include_str!("journal.rs");
+        let start = src
+            .find("Some((bytes, cursor)) =>")
+            .expect("journal adapter branch must exist");
+        let end = src[start..]
+            .find("let event = Event::with_ack(")
+            .expect("journal Event construction must follow receipt");
+        let receipt = &src[start..start + end];
+        assert!(
+            receipt.contains("bytes_received.inc_by(bytes.len() as u64)"),
+            "journal counts the generated JSON Vec, not an unavailable physical wire size"
+        );
+        assert_eq!(
+            receipt.matches("bytes_received.inc_by(").count(),
+            1,
+            "each generated JSON buffer is counted once"
         );
     }
 
