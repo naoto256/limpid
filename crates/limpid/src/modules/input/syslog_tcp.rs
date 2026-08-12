@@ -1126,7 +1126,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ntf_oversize_counts_only_prior_consumed_chunks() {
-        const CHUNK: usize = 8;
+        const CHUNK: usize = 7;
         let data = vec![b'x'; MAX_MESSAGE_SIZE + CHUNK];
         let mut reader = BufReader::with_capacity(CHUNK, &data[..]);
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
@@ -1136,7 +1136,7 @@ mod tests {
         assert!(matches!(reason, CloseReason::FramingError(_)));
         assert_eq!(
             bytes_received(&metrics),
-            MAX_MESSAGE_SIZE as u64,
+            (MAX_MESSAGE_SIZE - (MAX_MESSAGE_SIZE % CHUNK)) as u64,
             "the chunk rejected by the size guard remains unread and uncounted"
         );
     }
@@ -1423,10 +1423,9 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Accept-loop end-to-end tests: max_connections wire enforcement +
-    // valid-event delivery. Coverage-gap audit Agent A flagged these
-    // paths as High risk: the framing helpers are well-tested but the
-    // listener that wraps them is not.
+    // Accept-loop end-to-end tests cover max_connections wire enforcement
+    // and valid-event delivery through the listener, complementing the
+    // focused framing-helper tests.
     // ---------------------------------------------------------------------
 
     fn pick_port() -> u16 {
