@@ -14,6 +14,7 @@
 //! scrape segment behind a firewall — because anyone who can reach
 //! the port can read pipeline names and event counts.
 
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
@@ -201,175 +202,434 @@ async fn handle_request(
 fn json_to_prometheus(json: &str) -> Result<String, String> {
     let root: serde_json::Value =
         serde_json::from_str(json).map_err(|e| format!("invalid json: {}", e))?;
-
-    let mut out = String::new();
-
-    if let Some(inputs) = root.get("inputs").and_then(|v| v.as_object()) {
-        write_counter(
-            &mut out,
-            "limpid_input_events_received_total",
-            "Total events received by input.",
-            "input",
-            inputs,
-            "events_received",
-        );
-        write_counter(
-            &mut out,
-            "limpid_input_events_invalid_total",
-            "Total invalid events rejected by input.",
-            "input",
-            inputs,
-            "events_invalid",
-        );
-        write_counter(
-            &mut out,
-            "limpid_input_events_injected_total",
-            "Total events injected into this input's channel via limpidctl inject.",
-            "input",
-            inputs,
-            "events_injected",
-        );
-    }
-
-    if let Some(pipelines) = root.get("pipelines").and_then(|v| v.as_object()) {
-        write_counter(
-            &mut out,
-            "limpid_pipeline_events_received_total",
-            "Total events received by pipeline.",
-            "pipeline",
-            pipelines,
-            "events_received",
-        );
-        write_counter(
-            &mut out,
-            "limpid_pipeline_events_finished_total",
-            "Total events that finished pipeline processing.",
-            "pipeline",
-            pipelines,
-            "events_finished",
-        );
-        write_counter(
-            &mut out,
-            "limpid_pipeline_events_dropped_total",
-            "Total events explicitly dropped by pipeline.",
-            "pipeline",
-            pipelines,
-            "events_dropped",
-        );
-        write_counter(
-            &mut out,
-            "limpid_pipeline_events_discarded_total",
-            "Total events that finished the pipeline without reaching any output (likely a routing misconfiguration).",
-            "pipeline",
-            pipelines,
-            "events_discarded",
-        );
-        write_counter(
-            &mut out,
-            "limpid_pipeline_events_errored_total",
-            "Total events whose processing raised a runtime error; routed to the dead-letter queue (configured error_log file, or a structured tracing line).",
-            "pipeline",
-            pipelines,
-            "events_errored",
-        );
-        write_counter(
-            &mut out,
-            "limpid_pipeline_events_errored_unwritable_total",
-            "Subset of events_errored where the configured error_log write itself failed; alarm on this — the replay path may be incomplete.",
-            "pipeline",
-            pipelines,
-            "events_errored_unwritable",
-        );
-    }
-
-    if let Some(outputs) = root.get("outputs").and_then(|v| v.as_object()) {
-        write_counter(
-            &mut out,
-            "limpid_output_events_received_total",
-            "Total events that entered this output's queue (from pipelines + injects).",
-            "output",
-            outputs,
-            "events_received",
-        );
-        write_counter(
-            &mut out,
-            "limpid_output_events_injected_total",
-            "Total events injected into this output's queue via limpidctl inject.",
-            "output",
-            outputs,
-            "events_injected",
-        );
-        write_counter(
-            &mut out,
-            "limpid_output_events_written_total",
-            "Total events successfully written by output.",
-            "output",
-            outputs,
-            "events_written",
-        );
-        write_counter(
-            &mut out,
-            "limpid_output_events_failed_total",
-            "Total events whose final disposition on this output was a terminal failure: retry-budget exhaustion, per-event render or prepare failure, shutdown-drain leftover, OTLP partial_success rejects, or a Dropped disposition (bug path or DLQ-write failure). See docs/src/operations/metrics.md for the producer-site list.",
-            "output",
-            outputs,
-            "events_failed",
-        );
-        write_counter(
-            &mut out,
-            "limpid_output_retries_total",
-            "Total retry attempts by output.",
-            "output",
-            outputs,
-            "retries",
-        );
-        write_counter(
-            &mut out,
-            "limpid_output_events_wedged_total",
-            "Total disk-queue fail-stop wedges observed by this output; alarm on this — the consumer has stopped accepting new events and will replay from the wedged cursor on next daemon start.",
-            "output",
-            outputs,
-            "events_wedged",
-        );
-        write_counter(
-            &mut out,
-            "limpid_output_events_errored_unwritable_total",
-            "Sink-side counterpart of limpid_pipeline_events_errored_unwritable_total: DLQ (error_log) write failures observed while routing an output-side failure through the DLQ. Alarm on this — the replay path may be incomplete.",
-            "output",
-            outputs,
-            "events_errored_unwritable",
-        );
-    }
-
-    Ok(out)
+    let families = parse_snapshot(&root)?;
+    Ok(render_snapshot(&families))
 }
 
-fn write_counter(
-    out: &mut String,
-    metric: &str,
-    help: &str,
-    label_key: &str,
-    instances: &serde_json::Map<String, serde_json::Value>,
-    json_field: &str,
-) {
-    let mut samples: Vec<(&str, u64)> = Vec::new();
-    for (name, obj) in instances {
-        if let Some(val) = obj.get(json_field).and_then(|v| v.as_u64()) {
-            samples.push((name.as_str(), val));
+type Labels = Vec<(String, String)>;
+
+#[derive(Clone, Copy)]
+enum ExpositionType {
+    Counter,
+    Gauge,
+    Histogram,
+}
+
+impl ExpositionType {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "counter" => Ok(Self::Counter),
+            "gauge" => Ok(Self::Gauge),
+            "histogram" => Ok(Self::Histogram),
+            other => Err(format!("unsupported metric type: {other}")),
         }
     }
-    if samples.is_empty() {
-        return;
-    }
-    samples.sort_by_key(|(name, _)| *name);
 
-    writeln!(out, "# HELP {metric} {help}").unwrap();
-    writeln!(out, "# TYPE {metric} counter").unwrap();
-    for (name, val) in &samples {
-        let escaped = escape_label_value(name);
-        writeln!(out, "{metric}{{{label_key}=\"{escaped}\"}} {val}").unwrap();
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Counter => "counter",
+            Self::Gauge => "gauge",
+            Self::Histogram => "histogram",
+        }
     }
-    writeln!(out).unwrap();
+}
+
+enum ExpositionSeries {
+    Value {
+        labels: Labels,
+        value: u64,
+    },
+    Histogram {
+        labels: Labels,
+        buckets: Vec<(f64, u64)>,
+        sum: f64,
+        count: u64,
+    },
+}
+
+impl ExpositionSeries {
+    fn labels(&self) -> &Labels {
+        match self {
+            Self::Value { labels, .. } | Self::Histogram { labels, .. } => labels,
+        }
+    }
+}
+
+struct ExpositionFamily {
+    name: String,
+    metric_type: ExpositionType,
+    help: String,
+    series: Vec<ExpositionSeries>,
+}
+
+/// Validates and canonicalises a schema v1 snapshot into
+/// families ready for exposition. A single validation failure
+/// returns `Err`, suppressing the whole render rather than
+/// emitting a partial body that omits or misrepresents metric
+/// samples. Families and series are sorted for byte-stable
+/// output; Prometheus text format has no display-order
+/// semantics, so this is a reproducibility contract, not
+/// Grafana display ordering.
+fn parse_snapshot(root: &serde_json::Value) -> Result<Vec<ExpositionFamily>, String> {
+    let root = root
+        .as_object()
+        .ok_or_else(|| "schema-v1 snapshot must be an object".to_string())?;
+    if root.get("schema").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err("unsupported or missing metrics schema".to_string());
+    }
+    let metrics = root
+        .get("metrics")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "schema-v1 snapshot requires a metrics array".to_string())?;
+
+    let mut names = BTreeSet::new();
+    let mut families = Vec::with_capacity(metrics.len());
+    for metric in metrics {
+        let metric = metric
+            .as_object()
+            .ok_or_else(|| "metric family must be an object".to_string())?;
+        require_exact_fields(metric, &["name", "type", "help", "series"], "metric family")?;
+        let name = required_nonempty_string(metric, "name", "metric family")?.to_string();
+        if !names.insert(name.clone()) {
+            return Err(format!("duplicate metric family: {name}"));
+        }
+        let metric_type = ExpositionType::parse(required_string(metric, "type", &name)?)?;
+        let help = required_nonempty_string(metric, "help", &name)?.to_string();
+        let raw_series = metric
+            .get("series")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("metric {name} requires a series array"))?;
+
+        let mut labelsets = BTreeSet::new();
+        let mut family_label_keys = None;
+        let mut series = Vec::with_capacity(raw_series.len());
+        for raw in raw_series {
+            let parsed = parse_series(raw, metric_type, &name)?;
+            if !labelsets.insert(parsed.labels().clone()) {
+                return Err(format!("metric {name} contains a duplicate labelset"));
+            }
+            let label_keys = parsed
+                .labels()
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            match &family_label_keys {
+                Some(expected) if expected != &label_keys => {
+                    return Err(format!(
+                        "metric {name} series must use the same label-name set"
+                    ));
+                }
+                None => family_label_keys = Some(label_keys),
+                _ => {}
+            }
+            series.push(parsed);
+        }
+        validate_exported_labelsets(&series, metric_type, &name)?;
+        series.sort_by(|left, right| left.labels().cmp(right.labels()));
+        families.push(ExpositionFamily {
+            name,
+            metric_type,
+            help,
+            series,
+        });
+    }
+    validate_histogram_namespaces(&families, &names)?;
+    families.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(families)
+}
+
+fn validate_exported_labelsets(
+    series: &[ExpositionSeries],
+    metric_type: ExpositionType,
+    metric_name: &str,
+) -> Result<(), String> {
+    let mut exported_labelsets = BTreeSet::new();
+    for series in series {
+        let exported_labels = match metric_type {
+            ExpositionType::Histogram => map_histogram_labels(series.labels()),
+            ExpositionType::Counter | ExpositionType::Gauge => series.labels().clone(),
+        };
+        if !exported_labelsets.insert(exported_labels) {
+            return Err(format!(
+                "metric {metric_name} contains duplicate exported labelsets"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_histogram_namespaces(
+    families: &[ExpositionFamily],
+    declared_names: &BTreeSet<String>,
+) -> Result<(), String> {
+    for family in families {
+        if matches!(family.metric_type, ExpositionType::Histogram) {
+            for suffix in ["_bucket", "_sum", "_count"] {
+                let derived = format!("{}{suffix}", family.name);
+                if declared_names.contains(&derived) {
+                    return Err(format!(
+                        "histogram {} derived name collides with declared family {derived}",
+                        family.name
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_series(
+    value: &serde_json::Value,
+    metric_type: ExpositionType,
+    metric_name: &str,
+) -> Result<ExpositionSeries, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("metric {metric_name} series must be an object"))?;
+    let labels = parse_labels(object.get("labels"), metric_name)?;
+    match metric_type {
+        ExpositionType::Counter | ExpositionType::Gauge => {
+            require_exact_fields(object, &["labels", "value"], "value series")?;
+            let value = object
+                .get("value")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| format!("metric {metric_name} value must be a u64"))?;
+            Ok(ExpositionSeries::Value { labels, value })
+        }
+        ExpositionType::Histogram => {
+            require_exact_fields(
+                object,
+                &["labels", "buckets", "sum", "count"],
+                "histogram series",
+            )?;
+            let buckets = parse_buckets(object.get("buckets"), metric_name)?;
+            let sum = object
+                .get("sum")
+                .and_then(serde_json::Value::as_f64)
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| format!("metric {metric_name} sum must be finite"))?;
+            let count = object
+                .get("count")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| format!("metric {metric_name} count must be a u64"))?;
+            Ok(ExpositionSeries::Histogram {
+                labels,
+                buckets,
+                sum,
+                count,
+            })
+        }
+    }
+}
+
+fn parse_labels(value: Option<&serde_json::Value>, metric_name: &str) -> Result<Labels, String> {
+    let labels = value
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| format!("metric {metric_name} labels must be an object"))?;
+    let mut parsed = Vec::with_capacity(labels.len());
+    for (key, value) in labels {
+        let value = value
+            .as_str()
+            .ok_or_else(|| format!("metric {metric_name} label {key} must be a string"))?;
+        parsed.push((key.clone(), value.to_string()));
+    }
+    parsed.sort();
+    Ok(parsed)
+}
+
+fn parse_buckets(
+    value: Option<&serde_json::Value>,
+    metric_name: &str,
+) -> Result<Vec<(f64, u64)>, String> {
+    let raw = value
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("metric {metric_name} buckets must be an array"))?;
+    let mut buckets = Vec::with_capacity(raw.len());
+    for bucket in raw {
+        let tuple = bucket
+            .as_array()
+            .filter(|tuple| tuple.len() == 2)
+            .ok_or_else(|| format!("metric {metric_name} bucket must be a pair"))?;
+        let bound = tuple[0]
+            .as_f64()
+            .filter(|bound| bound.is_finite())
+            .ok_or_else(|| format!("metric {metric_name} bucket bound must be finite"))?;
+        let count = tuple[1]
+            .as_u64()
+            .ok_or_else(|| format!("metric {metric_name} bucket count must be a u64"))?;
+        if let Some((previous_bound, previous_count)) = buckets.last() {
+            if previous_bound >= &bound {
+                return Err(format!(
+                    "metric {metric_name} bucket bounds must be strictly increasing"
+                ));
+            }
+            if previous_count > &count {
+                return Err(format!(
+                    "metric {metric_name} cumulative bucket counts must not decrease"
+                ));
+            }
+        }
+        buckets.push((bound, count));
+    }
+    Ok(buckets)
+}
+
+fn require_exact_fields(
+    object: &serde_json::Map<String, serde_json::Value>,
+    fields: &[&str],
+    context: &str,
+) -> Result<(), String> {
+    if object.len() == fields.len() && fields.iter().all(|field| object.contains_key(*field)) {
+        Ok(())
+    } else {
+        Err(format!("{context} has invalid fields"))
+    }
+}
+
+fn required_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    context: &str,
+) -> Result<&'a str, String> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{context} requires string field {field}"))
+}
+
+fn required_nonempty_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    context: &str,
+) -> Result<&'a str, String> {
+    let value = required_string(object, field, context)?;
+    if value.is_empty() {
+        Err(format!("{context} field {field} must not be empty"))
+    } else {
+        Ok(value)
+    }
+}
+
+fn render_snapshot(families: &[ExpositionFamily]) -> String {
+    let mut out = String::new();
+    for family in families {
+        writeln!(out, "# HELP {} {}", family.name, escape_help(&family.help)).unwrap();
+        writeln!(
+            out,
+            "# TYPE {} {}",
+            family.name,
+            family.metric_type.as_str()
+        )
+        .unwrap();
+        for series in &family.series {
+            match series {
+                ExpositionSeries::Value { labels, value } => {
+                    write_sample(&mut out, &family.name, labels, *value);
+                }
+                ExpositionSeries::Histogram {
+                    labels,
+                    buckets,
+                    sum,
+                    count,
+                } => {
+                    let labels = map_histogram_labels(labels);
+                    for (bound, bucket_count) in buckets {
+                        let bucket_labels = with_bucket_bound(&labels, &bound.to_string());
+                        write_sample(
+                            &mut out,
+                            &format!("{}_bucket", family.name),
+                            &bucket_labels,
+                            *bucket_count,
+                        );
+                    }
+                    let infinite_labels = with_bucket_bound(&labels, "+Inf");
+                    // The +Inf bucket count is the snapshot's total
+                    // `count`, not clamped against the last finite
+                    // bucket. Per-bucket and total counters are
+                    // separately loaded `Relaxed` atomics; when
+                    // snapshot loads interleave with `observe`, a
+                    // transient last>total is a legitimate
+                    // cross-atomic snapshot skew — clamping or
+                    // rejecting would hide it and misrepresent
+                    // observed values.
+                    write_sample(
+                        &mut out,
+                        &format!("{}_bucket", family.name),
+                        &infinite_labels,
+                        *count,
+                    );
+                    write_sample(&mut out, &format!("{}_sum", family.name), &labels, *sum);
+                    write_sample(&mut out, &format!("{}_count", family.name), &labels, *count);
+                }
+            }
+        }
+        writeln!(out).unwrap();
+    }
+    out
+}
+
+/// Sidecar-only fix for the `le` label reserved by Prometheus
+/// histogram exposition. When a source series contains a
+/// label named `le`, the entire `le`, `le_`, `le__`, …
+/// underscore chain is shifted by one so the appended bucket
+/// bound gets an unambiguous `le=` slot; the shift is
+/// injective and applied consistently to bucket, sum, and
+/// count samples. The daemon-side registry stays unconstrained
+/// by this rule — only exposition rewrites.
+fn map_histogram_labels(labels: &Labels) -> Labels {
+    if !labels.iter().any(|(key, _)| key == "le") {
+        return labels.clone();
+    }
+    let mut mapped = labels
+        .iter()
+        .map(|(key, value)| {
+            let key = if key == "le"
+                || key.strip_prefix("le").is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.bytes().all(|byte| byte == b'_')
+                }) {
+                format!("{key}_")
+            } else {
+                key.clone()
+            };
+            (key, value.clone())
+        })
+        .collect::<Labels>();
+    mapped.sort();
+    mapped
+}
+
+fn with_bucket_bound(labels: &Labels, bound: &str) -> Labels {
+    let mut labels = labels.clone();
+    labels.push(("le".to_string(), bound.to_string()));
+    labels.sort();
+    labels
+}
+
+fn write_sample<T: std::fmt::Display>(out: &mut String, name: &str, labels: &Labels, value: T) {
+    out.push_str(name);
+    if !labels.is_empty() {
+        out.push('{');
+        for (index, (key, value)) in labels.iter().enumerate() {
+            if index != 0 {
+                out.push(',');
+            }
+            write!(out, "{key}=\"{}\"", escape_label_value(value)).unwrap();
+        }
+        out.push('}');
+    }
+    writeln!(out, " {value}").unwrap();
+}
+
+fn escape_help(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Escape a Prometheus label value: \, ", and newline must be escaped.
@@ -446,37 +706,310 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::net::{TcpStream, UnixListener};
 
-    /// Alarm counters observable in the stats JSON must be emitted as
-    /// Prometheus samples so operators can build alerts on them. The
-    /// output-side `events_wedged` (disk-queue fail-stop wedge) and
-    /// `events_errored_unwritable` (sink-side DLQ-write failure) are
-    /// documented as alarm signals in
-    /// `docs/src/operations/error-log.md` and must appear in the
-    /// scrape output alongside the pipeline-side alarm counter.
     #[test]
-    fn output_alarm_counters_are_exported() {
-        let json = r#"{
-            "outputs": {
-                "primary": {
-                    "events_received": 100,
-                    "events_injected": 0,
-                    "events_written": 90,
-                    "events_failed": 10,
-                    "retries": 3,
-                    "events_wedged": 1,
-                    "events_errored_unwritable": 2
+    fn schema_v1_rejects_inconsistent_and_colliding_labelsets() {
+        let cases = [
+            (
+                "counter label-name mismatch",
+                serde_json::json!([{
+                    "name": "counter_metric",
+                    "type": "counter",
+                    "help": "Counter.",
+                    "series": [
+                        {"labels": {"left": "one"}, "value": 1},
+                        {"labels": {"right": "two"}, "value": 2}
+                    ]
+                }]),
+            ),
+            (
+                "histogram label-name mismatch",
+                serde_json::json!([{
+                    "name": "histogram_metric",
+                    "type": "histogram",
+                    "help": "Histogram.",
+                    "series": [
+                        {"labels": {"left": "one"}, "buckets": [], "sum": 0.0, "count": 0},
+                        {"labels": {"right": "two"}, "buckets": [], "sum": 0.0, "count": 0}
+                    ]
+                }]),
+            ),
+            (
+                "histogram mapped labelset collision",
+                serde_json::json!([{
+                    "name": "histogram_metric",
+                    "type": "histogram",
+                    "help": "Histogram.",
+                    "series": [
+                        {"labels": {"le": "x"}, "buckets": [], "sum": 0.0, "count": 0},
+                        {"labels": {"le_": "x"}, "buckets": [], "sum": 0.0, "count": 0}
+                    ]
+                }]),
+            ),
+        ];
+
+        for (case, metrics) in cases {
+            let snapshot = serde_json::json!({"schema": 1, "metrics": metrics});
+            assert!(json_to_prometheus(&snapshot.to_string()).is_err(), "{case}");
+        }
+
+        let different_values = serde_json::json!({
+            "schema": 1,
+            "metrics": [{
+                "name": "counter_metric",
+                "type": "counter",
+                "help": "Counter.",
+                "series": [
+                    {"labels": {"scope": "one"}, "value": 1},
+                    {"labels": {"scope": "two"}, "value": 2}
+                ]
+            }]
+        });
+        assert!(json_to_prometheus(&different_values.to_string()).is_ok());
+    }
+
+    #[test]
+    fn mapped_histogram_labelsets_are_deduplicated_defensively() {
+        let series = [
+            ExpositionSeries::Histogram {
+                labels: vec![("le".to_string(), "x".to_string())],
+                buckets: Vec::new(),
+                sum: 0.0,
+                count: 0,
+            },
+            ExpositionSeries::Histogram {
+                labels: vec![("le_".to_string(), "x".to_string())],
+                buckets: Vec::new(),
+                sum: 0.0,
+                count: 0,
+            },
+        ];
+        assert!(
+            validate_exported_labelsets(&series, ExpositionType::Histogram, "histogram_metric")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn schema_v1_rejects_histogram_derived_family_name_collisions() {
+        let histogram = |name: &str| {
+            serde_json::json!({
+                "name": name,
+                "type": "histogram",
+                "help": "Histogram.",
+                "series": [{"labels": {}, "buckets": [], "sum": 0.0, "count": 0}]
+            })
+        };
+        let counter = |name: &str| {
+            serde_json::json!({
+                "name": name,
+                "type": "counter",
+                "help": "Counter.",
+                "series": [{"labels": {}, "value": 0}]
+            })
+        };
+        let cases = [
+            vec![histogram("latency"), counter("latency_bucket")],
+            vec![counter("latency_sum"), histogram("latency")],
+            vec![histogram("latency"), counter("latency_count")],
+        ];
+
+        for metrics in cases {
+            let snapshot = serde_json::json!({"schema": 1, "metrics": metrics});
+            assert!(json_to_prometheus(&snapshot.to_string()).is_err());
+        }
+    }
+
+    #[test]
+    fn schema_v1_validation_rejects_malformed_families_and_series() {
+        let cases = [
+            (
+                "duplicate family name",
+                r#"{"schema":1,"metrics":[{"name":"same","type":"counter","help":"One.","series":[]},{"name":"same","type":"gauge","help":"Two.","series":[]}]}"#,
+            ),
+            (
+                "duplicate canonical labelset",
+                r#"{"schema":1,"metrics":[{"name":"metric","type":"counter","help":"Metric.","series":[{"labels":{"a":"one","b":"two"},"value":1},{"labels":{"b":"two","a":"one"},"value":2}]}]}"#,
+            ),
+            (
+                "missing family field",
+                r#"{"schema":1,"metrics":[{"name":"metric","type":"counter","series":[]}]}"#,
+            ),
+            (
+                "extra family field",
+                r#"{"schema":1,"metrics":[{"name":"metric","type":"counter","help":"Metric.","series":[],"extra":true}]}"#,
+            ),
+            (
+                "missing series field",
+                r#"{"schema":1,"metrics":[{"name":"metric","type":"counter","help":"Metric.","series":[{"labels":{}}]}]}"#,
+            ),
+            (
+                "extra series field",
+                r#"{"schema":1,"metrics":[{"name":"metric","type":"counter","help":"Metric.","series":[{"labels":{},"value":1,"extra":true}]}]}"#,
+            ),
+            (
+                "unsupported type",
+                r#"{"schema":1,"metrics":[{"name":"metric","type":"summary","help":"Metric.","series":[]}]}"#,
+            ),
+            (
+                "equal histogram bounds",
+                r#"{"schema":1,"metrics":[{"name":"metric","type":"histogram","help":"Metric.","series":[{"labels":{},"buckets":[[1.0,1],[1.0,2]],"sum":1.0,"count":2}]}]}"#,
+            ),
+            (
+                "descending histogram bounds",
+                r#"{"schema":1,"metrics":[{"name":"metric","type":"histogram","help":"Metric.","series":[{"labels":{},"buckets":[[2.0,1],[1.0,2]],"sum":1.0,"count":2}]}]}"#,
+            ),
+            (
+                "decreasing cumulative counts",
+                r#"{"schema":1,"metrics":[{"name":"metric","type":"histogram","help":"Metric.","series":[{"labels":{},"buckets":[[1.0,2],[2.0,1]],"sum":1.0,"count":2}]}]}"#,
+            ),
+            (
+                "malformed bucket tuple",
+                r#"{"schema":1,"metrics":[{"name":"metric","type":"histogram","help":"Metric.","series":[{"labels":{},"buckets":[[1.0]],"sum":1.0,"count":1}]}]}"#,
+            ),
+            (
+                "non-u64 bucket count",
+                r#"{"schema":1,"metrics":[{"name":"metric","type":"histogram","help":"Metric.","series":[{"labels":{},"buckets":[[1.0,1.5]],"sum":1.0,"count":1}]}]}"#,
+            ),
+            (
+                "non-u64 total count",
+                r#"{"schema":1,"metrics":[{"name":"metric","type":"histogram","help":"Metric.","series":[{"labels":{},"buckets":[],"sum":1.0,"count":1.5}]}]}"#,
+            ),
+            (
+                "non-finite bound represented as null",
+                r#"{"schema":1,"metrics":[{"name":"metric","type":"histogram","help":"Metric.","series":[{"labels":{},"buckets":[[null,1]],"sum":1.0,"count":1}]}]}"#,
+            ),
+            (
+                "non-finite sum represented as null",
+                r#"{"schema":1,"metrics":[{"name":"metric","type":"histogram","help":"Metric.","series":[{"labels":{},"buckets":[],"sum":null,"count":0}]}]}"#,
+            ),
+        ];
+
+        for (case, json) in cases {
+            assert!(json_to_prometheus(json).is_err(), "{case}");
+        }
+
+        let empty_histogram = r#"{"schema":1,"metrics":[{"name":"metric","type":"histogram","help":"Metric.","series":[{"labels":{},"buckets":[],"sum":0.0,"count":0}]}]}"#;
+        assert!(json_to_prometheus(empty_histogram).is_ok());
+    }
+
+    #[test]
+    fn schema_v1_translation_is_generic_deterministic_and_prometheus_exact() {
+        let snapshot = serde_json::json!({
+            "schema": 1,
+            "metrics": [
+                {
+                    "name": "metric_zeta_seconds",
+                    "type": "histogram",
+                    "help": "Latency distribution.",
+                    "series": [{
+                        "labels": {
+                            "route": "west",
+                            "le__": "source-two",
+                            "az": "two",
+                            "le": "source-zero",
+                            "le_": "source-one"
+                        },
+                        "buckets": [[0.125, 17], [0.875, 37]],
+                        "sum": 13.75,
+                        "count": 31
+                    }]
+                },
+                {
+                    "name": "metric_yankee_seconds",
+                    "type": "histogram",
+                    "help": "Non-colliding histogram.",
+                    "series": [{
+                        "labels": {"zone": "north", "le_": "unchanged"},
+                        "buckets": [[1.5, 3]],
+                        "sum": 2.5,
+                        "count": 3
+                    }]
+                },
+                {
+                    "name": "metric_alpha_total",
+                    "type": "counter",
+                    "help": "Count\\path\nnext",
+                    "series": [
+                        {"labels": {"z": "first", "le": "counter-two", "a": "two"}, "value": 2},
+                        {"labels": {"z": "last", "a": "one", "le": "counter-one"}, "value": 1}
+                    ]
+                },
+                {
+                    "name": "metric_middle",
+                    "type": "gauge",
+                    "help": "Current depth.",
+                    "series": [{
+                        "labels": {"le": "gauge", "env": "prod\"east\\one\nline"},
+                        "value": 9
+                    }]
                 }
-            }
-        }"#;
-        let out = json_to_prometheus(json).unwrap();
-        assert!(
-            out.contains("limpid_output_events_wedged_total{output=\"primary\"} 1"),
-            "expected events_wedged sample:\n{out}"
-        );
-        assert!(
-            out.contains("limpid_output_events_errored_unwritable_total{output=\"primary\"} 2"),
-            "expected sink-side events_errored_unwritable sample:\n{out}"
-        );
+            ]
+        });
+
+        let expected = r#"# HELP metric_alpha_total Count\\path\nnext
+# TYPE metric_alpha_total counter
+metric_alpha_total{a="one",le="counter-one",z="last"} 1
+metric_alpha_total{a="two",le="counter-two",z="first"} 2
+
+# HELP metric_middle Current depth.
+# TYPE metric_middle gauge
+metric_middle{env="prod\"east\\one\nline",le="gauge"} 9
+
+# HELP metric_yankee_seconds Non-colliding histogram.
+# TYPE metric_yankee_seconds histogram
+metric_yankee_seconds_bucket{le="1.5",le_="unchanged",zone="north"} 3
+metric_yankee_seconds_bucket{le="+Inf",le_="unchanged",zone="north"} 3
+metric_yankee_seconds_sum{le_="unchanged",zone="north"} 2.5
+metric_yankee_seconds_count{le_="unchanged",zone="north"} 3
+
+# HELP metric_zeta_seconds Latency distribution.
+# TYPE metric_zeta_seconds histogram
+metric_zeta_seconds_bucket{az="two",le="0.125",le_="source-zero",le__="source-one",le___="source-two",route="west"} 17
+metric_zeta_seconds_bucket{az="two",le="0.875",le_="source-zero",le__="source-one",le___="source-two",route="west"} 37
+metric_zeta_seconds_bucket{az="two",le="+Inf",le_="source-zero",le__="source-one",le___="source-two",route="west"} 31
+metric_zeta_seconds_sum{az="two",le_="source-zero",le__="source-one",le___="source-two",route="west"} 13.75
+metric_zeta_seconds_count{az="two",le_="source-zero",le__="source-one",le___="source-two",route="west"} 31
+
+"#;
+
+        assert_eq!(json_to_prometheus(&snapshot.to_string()).unwrap(), expected);
+    }
+
+    #[test]
+    fn schema_v1_translation_rejects_legacy_unsupported_and_partial_snapshots() {
+        let cases = [
+            ("invalid json", "{"),
+            ("legacy envelope", r#"{"inputs": {}}"#),
+            ("unsupported schema", r#"{"schema": 2, "metrics": []}"#),
+            ("missing metrics", r#"{"schema": 1}"#),
+            (
+                "malformed family after valid family",
+                r#"{
+                    "schema": 1,
+                    "metrics": [
+                        {
+                            "name": "valid_arbitrary_total",
+                            "type": "counter",
+                            "help": "Valid.",
+                            "series": [{"labels": {"scope": "one"}, "value": 1}]
+                        },
+                        {
+                            "name": "broken_arbitrary_gauge",
+                            "type": "gauge",
+                            "help": "Broken.",
+                            "series": [{"labels": {"scope": "two"}, "value": true}]
+                        }
+                    ]
+                }"#,
+            ),
+        ];
+
+        for (case, json) in cases {
+            assert!(
+                json_to_prometheus(json).is_err(),
+                "{case} must fail without partial exposition"
+            );
+        }
     }
 
     #[tokio::test]
