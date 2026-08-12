@@ -8,6 +8,22 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+### Changed — metrics use one self-describing schema-v1 registry
+
+The daemon now registers its existing input, pipeline, and output counters in a
+shared self-describing registry and serves typed schema-v1 snapshots from the
+existing `stats` command. `limpidctl stats` preserves the operator table,
+`stats --details` provides a generic human view of counter, gauge, and histogram
+families, and `stats --json` preserves the complete raw response.
+
+`limpid-prometheus` now translates schema-v1 families generically to Prometheus
+text format 0.0.4, validates complete snapshots before rendering, emits
+histogram bucket/sum/count series with an implicit `+Inf` bucket, and handles a
+source histogram `le` label through a lossless underscore-chain shift. The
+canonical sidecar checkpoint exercises the real control-socket and HTTP scrape
+path at three payload scales; detailed machine observations remain in the
+benchmark harness receipt rather than this product changelog.
+
 ## [0.7.15] - 2026-07-20
 
 ### Changed — transport / format unwrapping separated from vocabulary parsing (breaking)
