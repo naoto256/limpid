@@ -59,6 +59,12 @@ bounds must be strictly increasing and counts must be nondecreasing. An empty
 bucket list is valid. `count` includes every observation, including values above
 the last finite bound; `sum` is the accumulated observation sum.
 
+Consumers ignore unknown fields at every level of the schema-v1 envelope,
+metric family, and value or histogram series so additive metadata remains
+forward-compatible. The documented fields above remain required and retain
+their exact types; ignoring an unknown field does not make a missing or
+malformed required field valid.
+
 Schema v1 deliberately does not contain an explicit `+Inf` bucket. A
 Prometheus consumer derives `le="+Inf"` from `count`. Bucket, sum, and count
 atomics are loaded independently, so a concurrent snapshot may transiently show
