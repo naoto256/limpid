@@ -712,6 +712,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
             };
             match send_outcome {
                 Some(Ok(outcome)) => {
+                    self.metrics.in_retry.set(0);
                     self.resolve_send_success(shippable, outcome).await;
                     return;
                 }
@@ -727,6 +728,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                     if attempt >= self.retry.max_attempts {
                         break e;
                     }
+                    self.metrics.in_retry.set(1);
                     // Cooperative shutdown cancel: if `shutdown()`
                     // signalled mid-retry, abandon the budget and
                     // route the shippable batch straight to DLQ.
@@ -780,6 +782,7 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
                 }
             }
         };
+        self.metrics.in_retry.set(0);
         // Terminal disposition: split by why we left the loop.
         //
         // - Shutdown cancelled the in-flight send → the wire state

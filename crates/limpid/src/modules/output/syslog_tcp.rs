@@ -365,6 +365,7 @@ impl Output for SyslogTcpOutput {
                 SyslogTcpWriteOutcome::Delivered => Ok(()),
                 SyslogTcpWriteOutcome::Err(e) => Err(e),
                 SyslogTcpWriteOutcome::PreSendShutdown => {
+                    self.metrics.in_retry.set(0);
                     let reason = format!(
                         "output '{}': write attempt abandoned on shutdown (pre-send)",
                         self.name
@@ -385,6 +386,7 @@ impl Output for SyslogTcpOutput {
             };
             match write_result {
                 Ok(()) => {
+                    self.metrics.in_retry.set(0);
                     self.metrics.events_written.inc();
                     ack.resolve_delivered();
                     return Ok(());
@@ -393,6 +395,7 @@ impl Output for SyslogTcpOutput {
                     attempt += 1;
                     self.metrics.retries.inc();
                     if attempt >= self.retry.max_attempts {
+                        self.metrics.in_retry.set(0);
                         let reason =
                             format!("output write failed after {} attempts: {}", attempt, e);
                         let __dlq_outcome = crate::modules::route_event_to_dlq(
@@ -412,6 +415,7 @@ impl Output for SyslogTcpOutput {
                         );
                         return Ok(());
                     }
+                    self.metrics.in_retry.set(1);
                     tracing::warn!(
                         "output '{}': write failed (attempt {}/{}): {} — retrying in {:?}",
                         self.name,
@@ -428,6 +432,7 @@ impl Output for SyslogTcpOutput {
                     // shutdown arm. Route the pending event to DLQ, resolve
                     // `Recovered`, and return.
                     if crate::modules::sleep_or_shutdown(&mut shutdown, wait).await {
+                        self.metrics.in_retry.set(0);
                         let reason = format!(
                             "output write failed and shutdown observed mid-retry \
                              after {} attempts: {}",
@@ -729,6 +734,7 @@ mod tests {
     use crate::dsl::schema::SchemaErrorKind;
     use bytes::Bytes;
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     /// Structural pin: `consume_shutdown` routes its result through
@@ -1055,6 +1061,60 @@ mod tests {
 
         assert_eq!(output.metrics.bytes_written.load(Ordering::Relaxed), 0);
         assert_eq!(output.metrics.events_written.load(Ordering::Relaxed), 0);
+        assert_eq!(output.metrics.in_retry.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn connection_backoff_sets_retry_gauge_until_shutdown() {
+        use crate::event::Event;
+        use crate::queue::QueueAckHandle;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut ctx = crate::modules::BuildContext::for_testing();
+        ctx.shutdown_signal = shutdown_rx;
+        let output = Arc::new(
+            SyslogTcpOutput::from_properties(
+                "tcp-retry",
+                &mp(&[
+                    peer_plain("127.0.0.1", port as i64),
+                    block(
+                        "retry",
+                        vec![
+                            kv("max_attempts", ExprKind::IntLit(3)),
+                            kv("initial_wait", ExprKind::StringLit("5s".into())),
+                            kv("max_wait", ExprKind::StringLit("5s".into())),
+                        ],
+                    ),
+                ]),
+                &ctx,
+            )
+            .unwrap(),
+        );
+        let event = Event::new(
+            Bytes::from_static(b"<134>unreachable"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let (ack, _ack_rx) = QueueAckHandle::for_test();
+        let task_output = Arc::clone(&output);
+        let task = tokio::spawn(async move { task_output.consume(&event, ack).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while output.metrics.retries.load(Ordering::Relaxed) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("connection failure must enter backoff");
+        assert_eq!(output.metrics.in_retry.load(Ordering::Relaxed), 1);
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("shutdown must stop TCP retry")
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.metrics.in_retry.load(Ordering::Relaxed), 0);
     }
 
     struct PemFiles {
