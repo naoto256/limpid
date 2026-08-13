@@ -74,7 +74,7 @@ daemon startup instead of being ignored.
 
 ## Current metric families
 
-These are the current counter families registered by the daemon. Each series
+These are the current metric families registered by the daemon. Each series
 has exactly the fixed label shown; the label value is the configured component
 name, so label cardinality is bounded by the configured components.
 
@@ -88,6 +88,7 @@ name, so label cardinality is bounded by the configured components.
 | `limpid_pipeline_events_discarded_total` | `pipeline` | Events that completed without reaching any output. |
 | `limpid_pipeline_events_errored_total` | `pipeline` | Events that failed at a pipeline-side producer site and were routed to the [error log](./error-log.md). |
 | `limpid_pipeline_events_errored_unwritable_total` | `pipeline` | Pipeline-side error-log writes that failed. |
+| `limpid_pipeline_inflight` | `pipeline` | Pipeline executions currently in progress, including terminal bookkeeping. |
 
 `events_discarded` is a possible routing-misconfiguration signal: the event
 completed the pipeline but was never sent anywhere.
@@ -123,6 +124,8 @@ from synthetic and replay traffic.
 | `limpid_output_events_wedged_total` | `output` | Disk-queue fail-stop wedges observed by the output. |
 | `limpid_output_events_errored_unwritable_total` | `output` | Sink-side error-log writes that failed. |
 | `limpid_output_bytes_written_total` | `output` | Logical bytes whose transfer to the destination was confirmed. |
+| `limpid_output_queue_depth` | `output` | Current unread or unacknowledged output queue depth. |
+| `limpid_output_in_retry` | `output` | Whether an output retry cycle is active (`0` or `1`). |
 
 `events_failed` includes retry-budget exhaustion, per-event render failures in
 batched output flushes, shutdown-drain leftovers after a final flush failure,
@@ -143,6 +146,29 @@ Useful relationships are approximate during concurrent updates:
 - `output.received - output.injected` is traffic delivered by pipelines.
 - `output.received - output.written - output.failed` approximates events still
   pending in the queue.
+
+### Runtime gauges
+
+`limpid_output_queue_depth{output}` reports the memory receiver's current
+length for memory queues. For disk queues it reports the saturating difference
+between the current write-segment sequence and acknowledged-segment sequence.
+The disk value therefore tracks durable segment progress rather than an exact
+event count. Both backends publish zero when their consumer terminates.
+
+`limpid_output_in_retry{output}` changes to one after the first failed attempt
+enters a retry cycle. It returns to zero when an attempt succeeds, the retry
+budget is exhausted, or shutdown interrupts the cycle. An output that observes
+shutdown before making an attempt remains zero.
+
+`limpid_pipeline_inflight{pipeline}` increments immediately before pipeline
+execution and decrements only after its terminal counters and any error-log
+work have completed. It therefore includes executions waiting on terminal
+bookkeeping, not only expression evaluation.
+
+Gauge updates and snapshot reads are concurrent relaxed atomic operations. A
+snapshot is a useful point-in-time observation of each series, but values from
+different series are not loaded as one transaction and need not describe the
+same instant.
 
 ### Byte-counter boundary
 

@@ -231,6 +231,11 @@ impl DiskQueueSender {
 }
 
 impl DiskQueueReceiver {
+    pub(crate) fn depth(&self) -> u64 {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.write_seq.saturating_sub(state.acked_seq)
+    }
+
     pub async fn recv(&mut self) -> Option<(Event, AckPosition)> {
         loop {
             // Register for notification BEFORE checking — prevents missed-wakeup race.
@@ -730,6 +735,26 @@ mod tests {
 
         let (e2, _p2) = rx.recv().await.unwrap();
         assert_eq!(String::from_utf8_lossy(&e2.ingress), "<134>msg2");
+    }
+
+    #[test]
+    fn disk_queue_depth_is_the_saturating_write_acked_sequence_difference() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_sender, receiver) =
+            create_disk_queue(dir.path().to_str().expect("UTF-8 temp path"), 0).unwrap();
+
+        {
+            let mut state = receiver.state.lock().unwrap();
+            state.write_seq = 9;
+            state.acked_seq = 4;
+        }
+        assert_eq!(receiver.depth(), 5);
+
+        {
+            let mut state = receiver.state.lock().unwrap();
+            state.acked_seq = 12;
+        }
+        assert_eq!(receiver.depth(), 0, "depth must never underflow");
     }
 
     #[test]

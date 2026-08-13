@@ -95,17 +95,28 @@ impl StdoutOutput {
         self.metrics.bytes_written.inc_by(buf.len() as u64);
         Ok(())
     }
-}
 
-#[async_trait::async_trait]
-impl Output for StdoutOutput {
-    async fn consume(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
+    /// Retry-loop seam shared by `consume` and its test scaffolding.
+    /// Production callers pass a closure that delegates to
+    /// `write_event`; test callers pass a scripted closure so
+    /// retry / shutdown / gauge state can be exercised without an
+    /// actual stdout write.
+    async fn consume_with_write<F>(
+        &self,
+        event: &Event,
+        ack: QueueAckHandle,
+        mut write: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&Event) -> Result<()> + Send,
+    {
         let mut attempt = 0u32;
         let mut wait = self.retry.initial_wait;
         let mut shutdown = self.shutdown_signal.clone();
         loop {
-            match self.write_event(event) {
+            match write(event) {
                 Ok(()) => {
+                    self.metrics.in_retry.set(0);
                     self.metrics.events_written.inc();
                     ack.resolve_delivered();
                     return Ok(());
@@ -114,6 +125,7 @@ impl Output for StdoutOutput {
                     attempt += 1;
                     self.metrics.retries.inc();
                     if attempt >= self.retry.max_attempts {
+                        self.metrics.in_retry.set(0);
                         let reason =
                             format!("output write failed after {} attempts: {}", attempt, e);
                         let __dlq_outcome = crate::modules::route_event_to_dlq(
@@ -133,6 +145,7 @@ impl Output for StdoutOutput {
                         );
                         return Ok(());
                     }
+                    self.metrics.in_retry.set(1);
                     tracing::warn!(
                         "output '{}': write failed (attempt {}/{}): {} — retrying in {:?}",
                         self.name,
@@ -149,6 +162,7 @@ impl Output for StdoutOutput {
                     // shutdown arm. Route the pending event to DLQ, resolve
                     // `Recovered`, and return.
                     if crate::modules::sleep_or_shutdown(&mut shutdown, wait).await {
+                        self.metrics.in_retry.set(0);
                         let reason = format!(
                             "output write failed and shutdown observed mid-retry \
                              after {} attempts: {}",
@@ -175,6 +189,14 @@ impl Output for StdoutOutput {
                 }
             }
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl Output for StdoutOutput {
+    async fn consume(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
+        self.consume_with_write(event, ack, |event| self.write_event(event))
+            .await
     }
 
     async fn consume_shutdown(&self, event: &Event, ack: QueueAckHandle) -> Result<()> {
@@ -336,6 +358,148 @@ mod metrics_registration_tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             written.len() as u64,
             "a failed write must not add any bytes"
+        );
+        assert_eq!(
+            output
+                .metrics
+                .events_written
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scripted_retry_exposes_backoff_then_clears_on_success() {
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let output = Arc::new(StdoutOutput {
+            name: "stdout-retry".to_owned(),
+            retry: RetryConfig {
+                max_attempts: 2,
+                initial_wait: std::time::Duration::from_millis(50),
+                max_wait: std::time::Duration::from_millis(50),
+                backoff: crate::queue::BackoffStrategy::Fixed,
+            },
+            error_log: None,
+            error_log_fallback: crate::error_log::ErrorLogFallback::default(),
+            metrics: OutputMetrics::for_testing(),
+            shutdown_signal: shutdown_rx,
+        });
+        let event = crate::event::Event::new(
+            bytes::Bytes::from_static(b"retry"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let (ack, mut ack_rx) = QueueAckHandle::for_test();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (failed_tx, failed_rx) = tokio::sync::oneshot::channel();
+        let failed_tx = Arc::new(std::sync::Mutex::new(Some(failed_tx)));
+        let task_output = Arc::clone(&output);
+        let task_attempts = Arc::clone(&attempts);
+        let task = tokio::spawn(async move {
+            task_output
+                .consume_with_write(&event, ack, move |_| {
+                    let attempt = task_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if attempt == 0 {
+                        failed_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+                        anyhow::bail!("scripted first failure");
+                    }
+                    Ok(())
+                })
+                .await
+        });
+
+        failed_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            output
+                .metrics
+                .in_retry
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        tokio::time::advance(output.retry.initial_wait).await;
+        task.await.unwrap().unwrap();
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(
+            output
+                .metrics
+                .in_retry
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            output
+                .metrics
+                .retries
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            output
+                .metrics
+                .events_written
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert!(matches!(
+            ack_rx.recv().await,
+            Some((_, crate::queue::AckDisposition::Delivered))
+        ));
+    }
+
+    #[tokio::test]
+    async fn active_shutdown_clears_scripted_retry_state() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let output = Arc::new(StdoutOutput {
+            name: "stdout-shutdown".to_owned(),
+            retry: RetryConfig {
+                max_attempts: 3,
+                initial_wait: std::time::Duration::from_secs(5),
+                max_wait: std::time::Duration::from_secs(5),
+                backoff: crate::queue::BackoffStrategy::Fixed,
+            },
+            error_log: None,
+            error_log_fallback: crate::error_log::ErrorLogFallback::default(),
+            metrics: OutputMetrics::for_testing(),
+            shutdown_signal: shutdown_rx,
+        });
+        let event = crate::event::Event::new(
+            bytes::Bytes::from_static(b"shutdown"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let (ack, _ack_rx) = QueueAckHandle::for_test();
+        let (failed_tx, failed_rx) = tokio::sync::oneshot::channel();
+        let failed_tx = Arc::new(std::sync::Mutex::new(Some(failed_tx)));
+        let task_output = Arc::clone(&output);
+        let task = tokio::spawn(async move {
+            task_output
+                .consume_with_write(&event, ack, move |_| {
+                    if let Some(tx) = failed_tx.lock().unwrap().take() {
+                        tx.send(()).unwrap();
+                    }
+                    anyhow::bail!("scripted persistent failure")
+                })
+                .await
+        });
+        failed_rx.await.unwrap();
+        assert_eq!(
+            output
+                .metrics
+                .in_retry
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("shutdown must stop retry")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            output
+                .metrics
+                .in_retry
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
         );
         assert_eq!(
             output

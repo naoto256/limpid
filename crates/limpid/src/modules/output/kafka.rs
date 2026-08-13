@@ -498,6 +498,7 @@ impl Output for KafkaOutput {
             // or by the runtime SIGTERM budget.
             match self.try_send(event, shutdown.clone()).await {
                 Ok(KafkaTrySendOutcome::Delivered) => {
+                    self.metrics.in_retry.set(0);
                     // `FutureProducer` resolves each message through
                     // an async delivery report — count only in the
                     // Delivered arm so the counter tracks a successful
@@ -508,6 +509,7 @@ impl Output for KafkaOutput {
                     return Ok(());
                 }
                 Ok(KafkaTrySendOutcome::PreSendShutdown) => {
+                    self.metrics.in_retry.set(0);
                     let reason = format!(
                         "output '{}': write attempt abandoned on shutdown (pre-send)",
                         self.name
@@ -529,6 +531,7 @@ impl Output for KafkaOutput {
                     attempt += 1;
                     self.metrics.retries.inc();
                     if attempt >= self.retry.max_attempts {
+                        self.metrics.in_retry.set(0);
                         let reason =
                             format!("output write failed after {} attempts: {}", attempt, e);
                         let __dlq_outcome = crate::modules::route_event_to_dlq(
@@ -548,6 +551,7 @@ impl Output for KafkaOutput {
                         );
                         return Ok(());
                     }
+                    self.metrics.in_retry.set(1);
                     tracing::warn!(
                         "output '{}': write failed (attempt {}/{}): {} — retrying in {:?}",
                         self.name,
@@ -564,6 +568,7 @@ impl Output for KafkaOutput {
                     // shutdown arm. Route the pending event to DLQ, resolve
                     // `Recovered`, and return.
                     if crate::modules::sleep_or_shutdown(&mut shutdown, wait).await {
+                        self.metrics.in_retry.set(0);
                         let reason = format!(
                             "output write failed and shutdown observed mid-retry \
                              after {} attempts: {}",
@@ -754,6 +759,7 @@ impl KafkaOutput {
 mod tests {
     use super::*;
     use crate::dsl::ast::{Expr, ExprKind, Property};
+    use std::sync::atomic::Ordering;
     use tempfile::TempDir;
 
     fn kv(key: &str, kind: ExprKind) -> Property {
@@ -1261,6 +1267,60 @@ mod tests {
             0,
             "pre-send shutdown confirms no Kafka payload transfer"
         );
+        assert_eq!(output.metrics.retries.load(Ordering::Relaxed), 0);
+        assert_eq!(output.metrics.in_retry.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn brokerless_failure_sets_retry_gauge_until_shutdown() {
+        use crate::event::Event;
+        use crate::queue::QueueAckHandle;
+        use bytes::Bytes;
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut client = ClientConfig::new();
+        client
+            .set("bootstrap.servers", "127.0.0.1:1")
+            .set("message.timeout.ms", "100");
+        let output = Arc::new(KafkaOutput {
+            name: "k-retry".into(),
+            producer: client.create().expect("build producer"),
+            topic: "t".into(),
+            key_field: None,
+            queue_timeout: Duration::from_millis(100),
+            retry: RetryConfig {
+                max_attempts: 3,
+                initial_wait: Duration::from_secs(5),
+                max_wait: Duration::from_secs(5),
+                backoff: crate::queue::BackoffStrategy::Fixed,
+            },
+            error_log: None,
+            error_log_fallback: crate::error_log::ErrorLogFallback::default(),
+            metrics: OutputMetrics::for_testing(),
+            shutdown_signal: shutdown_rx,
+        });
+        let event = Event::new(
+            Bytes::from_static(b"payload"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let (ack, _ack_rx) = QueueAckHandle::for_test();
+        let task_output = Arc::clone(&output);
+        let task = tokio::spawn(async move { task_output.consume(&event, ack).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while output.metrics.retries.load(Ordering::Relaxed) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("brokerless send must enter backoff");
+        assert_eq!(output.metrics.in_retry.load(Ordering::Relaxed), 1);
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("shutdown must stop Kafka retry")
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.metrics.in_retry.load(Ordering::Relaxed), 0);
     }
 
     #[test]

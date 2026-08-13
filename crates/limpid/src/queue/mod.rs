@@ -526,6 +526,13 @@ enum ReceiverInner {
 }
 
 impl QueueReceiver {
+    pub(crate) fn depth(&self) -> u64 {
+        match &self.inner {
+            ReceiverInner::Memory(rx) => rx.len() as u64,
+            ReceiverInner::Disk(rx) => rx.depth(),
+        }
+    }
+
     /// Which backend is behind this receiver. See [`QueueBackendKind`].
     pub fn backend_kind(&self) -> QueueBackendKind {
         match &self.inner {
@@ -1074,6 +1081,7 @@ pub async fn run_queue_consumer(
     // follows the first push is synchronous, the only state that can
     // survive across select re-entries is an empty buffer.
     let mut batch: Vec<(Event, AckPosition)> = Vec::with_capacity(RECV_BATCH_MAX);
+    metrics.queue_depth.set(receiver.depth());
 
     loop {
         tokio::select! {
@@ -1124,6 +1132,7 @@ pub async fn run_queue_consumer(
                         QueueBackendKind::Memory => {
                             receiver.close();
                             while let Some((event, position)) = receiver.recv().await {
+                                metrics.queue_depth.set(receiver.depth());
                                 if let Some(tap) = &tap {
                                     tap.emit(&format!("output {}", name), &event).await;
                                 }
@@ -1206,6 +1215,7 @@ pub async fn run_queue_consumer(
                     // stay at the in-flight front.
                 } else {
                     receiver.ack_to(position);
+                    metrics.queue_depth.set(receiver.depth());
                 }
                 in_flight = in_flight.saturating_sub(1);
                 // Natural queue-closure or wedge exit: the
@@ -1222,6 +1232,7 @@ pub async fn run_queue_consumer(
             }
 
             n = receiver.recv_many(&mut batch, RECV_BATCH_MAX), if accepting => {
+                metrics.queue_depth.set(receiver.depth());
                 if n == 0 {
                     // `recv_many` returned 0 ⇔ `recv().await` observed
                     // `None` ⇔ queue closed and empty. Same semantics as
@@ -1309,6 +1320,7 @@ pub async fn run_queue_consumer(
         let is_dropped_on_disk = matches!(disposition, AckDisposition::Dropped) && is_disk_position;
         if !is_dropped_on_disk {
             receiver.ack_to(position);
+            metrics.queue_depth.set(receiver.depth());
         }
         in_flight = in_flight.saturating_sub(1);
     }
@@ -1319,6 +1331,7 @@ pub async fn run_queue_consumer(
             in_flight,
         );
     }
+    metrics.queue_depth.set(0);
 
     if wedged {
         tracing::error!(
@@ -1614,6 +1627,37 @@ mod consumer_lifecycle_tests {
         }
     }
 
+    struct StalledWriter {
+        metrics: Arc<crate::metrics::OutputMetrics>,
+        entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: tokio::sync::Notify,
+    }
+
+    impl HasMetrics for StalledWriter {
+        type Stats = crate::metrics::OutputMetrics;
+
+        fn metrics(&self) -> Arc<Self::Stats> {
+            Arc::clone(&self.metrics)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Output for StalledWriter {
+        async fn consume(&self, _event: &Event, ack: QueueAckHandle) -> anyhow::Result<()> {
+            let entered = self.entered.lock().unwrap().take();
+            if let Some(entered) = entered {
+                let _ = entered.send(());
+                self.release.notified().await;
+            }
+            ack.resolve_delivered();
+            Ok(())
+        }
+
+        async fn consume_shutdown(&self, event: &Event, ack: QueueAckHandle) -> anyhow::Result<()> {
+            self.consume(event, ack).await
+        }
+    }
+
     // ---- queue boundary error tests ----
 
     #[tokio::test]
@@ -1635,6 +1679,86 @@ mod consumer_lifecycle_tests {
             matches!(err, QueueSendError::ChannelClosed),
             "expected ChannelClosed, got {:?}",
             err
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_queue_depth_is_the_current_receiver_length() {
+        let (sender, mut receiver) = create_queue(
+            "depth".into(),
+            QueueConfig {
+                queue_type: QueueType::Memory,
+                capacity: 4,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(receiver.depth(), 0);
+        sender.send(owned_event()).await.unwrap();
+        sender.send(owned_event()).await.unwrap();
+        assert_eq!(receiver.depth(), 2);
+        receiver.recv().await.expect("first queued event");
+        assert_eq!(receiver.depth(), 1);
+        receiver.recv().await.expect("second queued event");
+        assert_eq!(receiver.depth(), 0);
+    }
+
+    #[tokio::test]
+    async fn consumer_publishes_memory_backlog_and_clears_depth_on_close() {
+        let event_count = RECV_BATCH_MAX + 6;
+        let (sender, receiver) = create_queue(
+            "depth-consumer".into(),
+            QueueConfig {
+                queue_type: QueueType::Memory,
+                capacity: event_count + 4,
+            },
+        )
+        .unwrap();
+        for _ in 0..event_count {
+            sender.send(owned_event()).await.unwrap();
+        }
+
+        let metrics = crate::metrics::OutputMetrics::for_testing();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let writer = Arc::new(StalledWriter {
+            metrics: Arc::clone(&metrics),
+            entered: Mutex::new(Some(entered_tx)),
+            release: tokio::sync::Notify::new(),
+        });
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_queue_consumer(
+            receiver,
+            writer.clone(),
+            None,
+            Arc::clone(&metrics),
+            None,
+            shutdown_rx,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx)
+            .await
+            .expect("consumer must reach stalled writer")
+            .expect("stalled writer readiness sender");
+        assert_eq!(metrics.queue_depth.load(Ordering::Relaxed), 6);
+
+        writer.release.notify_one();
+        drop(sender);
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("consumer must drain and close")
+            .expect("consumer task must not panic");
+        assert_eq!(metrics.queue_depth.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn queue_consumer_publishes_receiver_depth_through_the_output_handle() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("pub async fn run_queue_consumer(")
+            .expect("queue consumer must exist");
+        let body = &source[start..];
+        assert!(
+            body.contains("metrics.queue_depth.set") && body.contains("receiver.depth()"),
+            "queue consumer must publish backend depth through its pre-resolved gauge"
         );
     }
 
@@ -2988,6 +3112,7 @@ mod consumer_lifecycle_tests {
             3,
             "memory drain must deliver all buffered events to consume_shutdown",
         );
+        assert_eq!(metrics.queue_depth.load(Ordering::Relaxed), 0);
     }
 
     /// Disk backend: shutdown must NOT drain unread WAL entries
@@ -3025,6 +3150,7 @@ mod consumer_lifecycle_tests {
             .await
             .expect("consumer must exit")
             .expect("consumer task must not panic");
+        assert_eq!(metrics.queue_depth.load(Ordering::Relaxed), 0);
 
         assert_eq!(
             writer.calls(),

@@ -136,6 +136,7 @@ impl Output for SyslogUdpOutput {
                 SyslogUdpWriteOutcome::Delivered => Ok(()),
                 SyslogUdpWriteOutcome::Err(e) => Err(e),
                 SyslogUdpWriteOutcome::PreSendShutdown => {
+                    self.metrics.in_retry.set(0);
                     let reason = format!(
                         "output '{}': write attempt abandoned on shutdown (pre-send)",
                         self.name
@@ -156,6 +157,7 @@ impl Output for SyslogUdpOutput {
             };
             match write_result {
                 Ok(()) => {
+                    self.metrics.in_retry.set(0);
                     // `write_payload_shutdown_aware` (and its transport-
                     // only sibling `write_payload`) intentionally do NOT
                     // bump `events_written`; disposition ownership lives
@@ -172,6 +174,7 @@ impl Output for SyslogUdpOutput {
                     attempt += 1;
                     self.metrics.retries.inc();
                     if attempt >= self.retry.max_attempts {
+                        self.metrics.in_retry.set(0);
                         let reason =
                             format!("output write failed after {} attempts: {}", attempt, e);
                         let __dlq_outcome = crate::modules::route_event_to_dlq(
@@ -191,6 +194,7 @@ impl Output for SyslogUdpOutput {
                         );
                         return Ok(());
                     }
+                    self.metrics.in_retry.set(1);
                     tracing::warn!(
                         "output '{}': write failed (attempt {}/{}): {} — retrying in {:?}",
                         self.name,
@@ -207,6 +211,7 @@ impl Output for SyslogUdpOutput {
                     // shutdown arm. Route the pending event to DLQ, resolve
                     // `Recovered`, and return.
                     if crate::modules::sleep_or_shutdown(&mut shutdown, wait).await {
+                        self.metrics.in_retry.set(0);
                         let reason = format!(
                             "output write failed and shutdown observed mid-retry \
                              after {} attempts: {}",
@@ -1009,5 +1014,62 @@ mod tests {
 
         assert_eq!(output.metrics.bytes_written.load(Ordering::Relaxed), 0);
         assert_eq!(output.metrics.events_written.load(Ordering::Relaxed), 0);
+        assert_eq!(output.metrics.in_retry.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn oversized_datagram_backoff_sets_retry_gauge_until_shutdown() {
+        use crate::event::Event;
+        use crate::queue::QueueAckHandle;
+        use bytes::Bytes;
+
+        let listener = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().unwrap().port() as i64;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut ctx = crate::modules::BuildContext::for_testing();
+        ctx.shutdown_signal = shutdown_rx;
+        let output = Arc::new(
+            SyslogUdpOutput::build(
+                "udp-retry",
+                &mp(&[
+                    block(
+                        "peer",
+                        vec![
+                            kv("host", ExprKind::StringLit("127.0.0.1".into())),
+                            kv("port", ExprKind::IntLit(port)),
+                        ],
+                    ),
+                    block(
+                        "retry",
+                        vec![
+                            kv("max_attempts", ExprKind::IntLit(3)),
+                            kv("initial_wait", ExprKind::StringLit("5s".into())),
+                            kv("max_wait", ExprKind::StringLit("5s".into())),
+                        ],
+                    ),
+                ]),
+                &ctx,
+            )
+            .expect("build"),
+        );
+        let event = Event::new(Bytes::from(vec![0; 65_536]), "127.0.0.1:0".parse().unwrap());
+        let (ack, _ack_rx) = QueueAckHandle::for_test();
+        let task_output = Arc::clone(&output);
+        let task = tokio::spawn(async move { task_output.consume(&event, ack).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while output.metrics.retries.load(Ordering::Relaxed) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("oversized datagram must enter backoff");
+        assert_eq!(output.metrics.in_retry.load(Ordering::Relaxed), 1);
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("shutdown must stop UDP retry")
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.metrics.in_retry.load(Ordering::Relaxed), 0);
     }
 }

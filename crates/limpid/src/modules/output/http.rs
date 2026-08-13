@@ -2141,6 +2141,14 @@ def output o {{
             3,
             "the retries metric counts every failed attempt"
         );
+        assert_eq!(
+            output
+                .metrics
+                .in_retry
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "retry exhaustion must clear the retry state"
+        );
     }
 
     /// Regression pin: the retry backoff sleep must NOT wake early when
@@ -2199,6 +2207,14 @@ def output o {{
         assert_eq!(
             after_first, 1,
             "expected exactly the initial attempt to have hit the server before the notify race, got {after_first}"
+        );
+        assert_eq!(
+            output
+                .metrics
+                .in_retry
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the output must remain visibly in retry throughout backoff"
         );
 
         // Fire the threshold-flush notify while the retry loop is
@@ -2297,6 +2313,14 @@ def output o {{
         assert!(
             elapsed < Duration::from_millis(1500),
             "shutdown must short-circuit the retry sleep — took {elapsed:?} against a 5s floor"
+        );
+        assert_eq!(
+            output
+                .metrics
+                .in_retry
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "shutdown must clear retry state"
         );
 
         server.abort();

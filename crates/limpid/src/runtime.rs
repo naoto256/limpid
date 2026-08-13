@@ -715,6 +715,7 @@ async fn process_event(
         if i > 0 {
             bump.reset();
         }
+        worker.metrics.inflight.inc();
         match run_pipeline_with_outputs(&worker.def, event, ctx, bump).await {
             Ok(result) => {
                 use crate::pipeline::PipelineTermination;
@@ -788,6 +789,7 @@ async fn process_event(
                 .await;
             }
         }
+        worker.metrics.inflight.dec();
     }
 }
 
@@ -1055,6 +1057,94 @@ mod tests {
         // All 8 events should have been attributed to the shared worker.
         assert_eq!(worker.metrics.events_received.load(Ordering::Relaxed), 8);
         assert_eq!(worker.metrics.events_dropped.load(Ordering::Relaxed), 8);
+        assert_eq!(worker.metrics.inflight.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn pipeline_inflight_counts_concurrent_runs_and_returns_to_zero() {
+        let def = pipeline_def("def pipeline p { input a, b; output sink; finish }");
+        let metrics_registry = Registry::new();
+        let worker = Arc::new(
+            PipelineWorker::new(def, &metrics_registry).expect("pipeline metrics must register"),
+        );
+        let workers: Arc<Vec<Arc<PipelineWorker>>> = Arc::new(vec![Arc::clone(&worker)]);
+
+        let (queue_sender, mut queue_receiver) = crate::queue::create_queue(
+            "sink".to_owned(),
+            crate::queue::QueueConfig {
+                queue_type: crate::queue::QueueType::Memory,
+                capacity: 1,
+            },
+        )
+        .expect("memory queue");
+        queue_sender
+            .send(Event::new(
+                Bytes::from_static(b"filler"),
+                "127.0.0.1:0".parse().unwrap(),
+            ))
+            .await
+            .expect("prefill queue");
+
+        let cfg = CompiledConfig::from_config(parse_config("").unwrap()).unwrap();
+        let tap = TapRegistry::new();
+        tap.register("input a").await;
+        tap.register("input b").await;
+        let ctx = Arc::new(PipelineContext {
+            output_senders: Arc::new(HashMap::from([("sink".to_owned(), queue_sender)])),
+            disk_outputs: Arc::new(HashSet::new()),
+            config: Arc::new(cfg),
+            funcs: Arc::new(FunctionRegistry::new()),
+            tap,
+            error_log: None,
+            error_log_fallback: crate::error_log::ErrorLogFallback::default(),
+        });
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (tx_a, rx_a) = mpsc::channel(1);
+        let (tx_b, rx_b) = mpsc::channel(1);
+        let h_a = {
+            let workers = Arc::clone(&workers);
+            let ctx = Arc::clone(&ctx);
+            let shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                run_pipeline_workers(rx_a, &workers, &ctx, "a", shutdown).await;
+            })
+        };
+        let h_b = {
+            let workers = Arc::clone(&workers);
+            let ctx = Arc::clone(&ctx);
+            tokio::spawn(async move {
+                run_pipeline_workers(rx_b, &workers, &ctx, "b", shutdown_rx).await;
+            })
+        };
+
+        let addr = SocketAddr::from_str("127.0.0.1:0").unwrap();
+        tx_a.send(Event::new(Bytes::from_static(b"a"), addr))
+            .await
+            .unwrap();
+        tx_b.send(Event::new(Bytes::from_static(b"b"), addr))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while worker.metrics.inflight.load(Ordering::Relaxed) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both blocked pipeline runs must become observable");
+
+        for _ in 0..3 {
+            queue_receiver.recv().await.expect("queued event");
+        }
+        drop(tx_a);
+        drop(tx_b);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            h_a.await.unwrap();
+            h_b.await.unwrap();
+        })
+        .await
+        .expect("pipeline workers must drain");
+        assert_eq!(worker.metrics.inflight.load(Ordering::Relaxed), 0);
+        assert_eq!(worker.metrics.events_finished.load(Ordering::Relaxed), 2);
     }
 
     fn make_err_ctx(reason: &str) -> crate::pipeline::ErroredEventContext {
@@ -1193,6 +1283,65 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["sink_a".to_string(), "sink_b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn pipeline_inflight_covers_errored_termination_and_direct_error_dlq_work() {
+        for (body, reason) in [
+            ("error \"terminal failure\"", "terminal failure"),
+            (
+                "error missing_runtime_function()",
+                "missing_runtime_function",
+            ),
+        ] {
+            let def = pipeline_def(&format!("def pipeline p {{ input i; {body} }}"));
+            let registry = Registry::new();
+            let worker = Arc::new(
+                PipelineWorker::new(def, &registry).expect("pipeline metrics must register"),
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let log_path = dir.path().join("pipeline-errors.jsonl");
+            let error_log = Arc::new(crate::error_log::ErrorLogWriter::new(log_path.clone()));
+            let guard = error_log.hold_write_lock_for_testing().await;
+            let cfg = CompiledConfig::from_config(parse_config("").unwrap()).unwrap();
+            let ctx = PipelineContext {
+                output_senders: Arc::new(HashMap::new()),
+                disk_outputs: Arc::new(HashSet::new()),
+                config: Arc::new(cfg),
+                funcs: Arc::new(FunctionRegistry::new()),
+                tap: TapRegistry::new(),
+                error_log: Some(Arc::clone(&error_log)),
+                error_log_fallback: crate::error_log::ErrorLogFallback::default(),
+            };
+            let event = Event::new(
+                Bytes::from_static(b"payload"),
+                SocketAddr::from_str("127.0.0.1:0").unwrap(),
+            );
+            let task_worker = Arc::clone(&worker);
+            let task = tokio::spawn(async move {
+                let mut bump = bumpalo::Bump::new();
+                process_event(&event, &[task_worker], &ctx, "input i", &mut bump).await;
+            });
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while worker.metrics.events_errored.load(Ordering::Relaxed) != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("runtime error must reach terminal bookkeeping");
+            assert!(!task.is_finished(), "DLQ write must still be held");
+            assert_eq!(worker.metrics.inflight.load(Ordering::Relaxed), 1);
+
+            drop(guard);
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("DLQ completion must release the pipeline")
+                .expect("pipeline task must not panic");
+            assert_eq!(worker.metrics.inflight.load(Ordering::Relaxed), 0);
+            let record = tokio::fs::read_to_string(&log_path).await.unwrap();
+            assert!(record.contains(reason), "unexpected DLQ record: {record}");
+        }
     }
 
     /// Structural pin: the pipeline worker's shutdown arm closes
