@@ -82,6 +82,7 @@ pub struct PipelineMetrics {
     /// `tracing::error!` line, but operators should alarm on this
     /// counter — it means the replay path may be incomplete.
     pub(crate) events_errored_unwritable: Arc<registry_core::Counter>,
+    pub(crate) inflight: Arc<registry_core::Gauge>,
 }
 
 impl PipelineMetrics {
@@ -90,6 +91,15 @@ impl PipelineMetrics {
             ($name:literal, $help:literal) => {
                 registry
                     .counter($name)
+                    .label("pipeline", pipeline)
+                    .help($help)
+                    .build()?
+            };
+        }
+        macro_rules! gauge {
+            ($name:literal, $help:literal) => {
+                registry
+                    .gauge($name)
                     .label("pipeline", pipeline)
                     .help($help)
                     .build()?
@@ -119,6 +129,10 @@ impl PipelineMetrics {
             events_errored_unwritable: counter!(
                 "limpid_pipeline_events_errored_unwritable_total",
                 "Total pipeline errors whose recovery record could not be written."
+            ),
+            inflight: gauge!(
+                "limpid_pipeline_inflight",
+                "Pipeline executions currently in progress, including terminal bookkeeping."
             ),
         }))
     }
@@ -169,6 +183,8 @@ pub struct OutputMetrics {
     /// durable trace of it.
     pub(crate) events_errored_unwritable: Arc<registry_core::Counter>,
     pub(crate) bytes_written: Arc<registry_core::Counter>,
+    pub(crate) queue_depth: Arc<registry_core::Gauge>,
+    pub(crate) in_retry: Arc<registry_core::Gauge>,
 }
 
 impl OutputMetrics {
@@ -177,6 +193,15 @@ impl OutputMetrics {
             ($name:literal, $help:literal) => {
                 registry
                     .counter($name)
+                    .label("output", output)
+                    .help($help)
+                    .build()?
+            };
+        }
+        macro_rules! gauge {
+            ($name:literal, $help:literal) => {
+                registry
+                    .gauge($name)
                     .label("output", output)
                     .help($help)
                     .build()?
@@ -211,6 +236,14 @@ impl OutputMetrics {
             bytes_written: counter!(
                 "limpid_output_bytes_written_total",
                 "Total logical bytes whose transfer was confirmed by the output adapter."
+            ),
+            queue_depth: gauge!(
+                "limpid_output_queue_depth",
+                "Current unread or unacknowledged depth of the output queue."
+            ),
+            in_retry: gauge!(
+                "limpid_output_in_retry",
+                "Whether this output currently has an active retry cycle."
             ),
         }))
     }
@@ -350,6 +383,29 @@ mod registry_core {
     impl Gauge {
         pub(crate) fn set(&self, value: u64) {
             self.value.store(value, Ordering::Relaxed);
+        }
+
+        pub(crate) fn inc(&self) {
+            self.value.fetch_add(1, Ordering::Relaxed);
+        }
+
+        /// Decrement by one, saturating at zero. `fetch_update`
+        /// carries the concurrent CAS, and `checked_sub` keeps an
+        /// underflow at zero instead of wrapping to `u64::MAX`; the
+        /// `debug_assert!` surfaces a lifecycle imbalance loudly in
+        /// debug builds.
+        pub(crate) fn dec(&self) {
+            let updated = self
+                .value
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    value.checked_sub(1)
+                });
+            debug_assert!(updated.is_ok(), "gauge decrement underflow");
+        }
+
+        #[cfg(test)]
+        pub(crate) fn load(&self, _ordering: Ordering) -> u64 {
+            self.value.load(Ordering::Relaxed)
         }
     }
 
@@ -1579,6 +1635,21 @@ mod registry_tests {
         let pipeline_shared = Arc::clone(&pipeline);
         let output_shared = Arc::clone(&output);
 
+        let initial = snapshot_json(&registry);
+        for (name, label, label_value) in [
+            ("limpid_pipeline_inflight", "pipeline", "route"),
+            ("limpid_output_queue_depth", "output", "egress"),
+            ("limpid_output_in_retry", "output", "egress"),
+        ] {
+            let family = metric(&initial, name);
+            assert_eq!(family["type"], "gauge");
+            let series = family["series"].as_array().expect("gauge series array");
+            assert_eq!(series.len(), 1, "{name} must be prepopulated once");
+            assert_eq!(series[0]["labels"].as_object().unwrap().len(), 1);
+            assert_eq!(series[0]["labels"][label], label_value);
+            assert_eq!(series[0]["value"], 0, "{name} must start at zero");
+        }
+
         macro_rules! inc {
             ($counter:expr, $times:expr) => {
                 for _ in 0..$times {
@@ -1597,6 +1668,7 @@ mod registry_tests {
         inc!(pipeline.events_discarded, 7);
         inc!(pipeline.events_errored, 8);
         inc!(pipeline.events_errored_unwritable, 9);
+        pipeline.inflight.set(2);
         inc!(output_shared.events_received, 10);
         inc!(output.events_injected, 11);
         inc!(output.events_written, 12);
@@ -1605,6 +1677,8 @@ mod registry_tests {
         inc!(output.events_wedged, 15);
         inc!(output.events_errored_unwritable, 16);
         output.bytes_written.inc_by(23);
+        output.queue_depth.set(3);
+        output.in_retry.set(1);
 
         let snapshot = snapshot_json(&registry);
         let metrics = snapshot["metrics"]
@@ -1612,7 +1686,7 @@ mod registry_tests {
             .expect("metrics must be an array");
         assert_eq!(
             metrics.len(),
-            18,
+            21,
             "only the documented metric set is registered"
         );
 
@@ -1705,12 +1779,113 @@ mod registry_tests {
             assert_eq!(series["value"], value);
         }
 
+        let expected_gauges = [
+            ("limpid_pipeline_inflight", "pipeline", "route", 2),
+            ("limpid_output_queue_depth", "output", "egress", 3),
+            ("limpid_output_in_retry", "output", "egress", 1),
+        ];
+        for (name, label, label_value, value) in expected_gauges {
+            let family = metric(&snapshot, name);
+            assert_eq!(family["type"], "gauge");
+            assert!(
+                family["help"].as_str().is_some_and(|help| !help.is_empty()),
+                "{name} must remain self-describing"
+            );
+            let series = family["series"]
+                .as_array()
+                .expect("series must be an array");
+            assert_eq!(series.len(), 1, "{name} must have exactly one series");
+            let labels = series[0]["labels"]
+                .as_object()
+                .expect("labels must be an object");
+            assert_eq!(labels.len(), 1, "{name} must have exactly one label");
+            assert_eq!(labels.get(label).and_then(Value::as_str), Some(label_value));
+            assert_eq!(series[0]["value"], value);
+        }
+
         let duplicate = match OutputMetrics::register(&registry, "egress") {
             Ok(_) => panic!("the bundle must register into the supplied shared registry"),
             Err(error) => error,
         };
         let diagnostic = duplicate.to_string();
         assert_output_duplicate(&duplicate, "egress", &diagnostic);
+    }
+
+    #[test]
+    fn gauge_delta_updates_are_atomic_across_threads() {
+        const THREADS: usize = 8;
+        const UPDATES: usize = 1_000;
+
+        let registry = Registry::new();
+        let gauge = build_ok(
+            registry
+                .gauge("limpid_test_concurrent_inflight")
+                .help("Concurrent gauge delta test.")
+                .label("pipeline", "unit")
+                .build(),
+        );
+        let start = Arc::new(std::sync::Barrier::new(THREADS + 1));
+        let incremented = Arc::new(std::sync::Barrier::new(THREADS + 1));
+        let decrement = Arc::new(std::sync::Barrier::new(THREADS + 1));
+
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                let gauge = Arc::clone(&gauge);
+                let start = Arc::clone(&start);
+                let incremented = Arc::clone(&incremented);
+                let decrement = Arc::clone(&decrement);
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..UPDATES {
+                        gauge.inc();
+                    }
+                    incremented.wait();
+                    decrement.wait();
+                    for _ in 0..UPDATES {
+                        gauge.dec();
+                    }
+                });
+            }
+            start.wait();
+            incremented.wait();
+            let incremented_value = metric(
+                &snapshot_json(&registry),
+                "limpid_test_concurrent_inflight",
+            )["series"][0]["value"]
+                .clone();
+            decrement.wait();
+            assert_eq!(incremented_value, THREADS * UPDATES);
+        });
+
+        assert_eq!(
+            metric(&snapshot_json(&registry), "limpid_test_concurrent_inflight")["series"][0]["value"],
+            0
+        );
+    }
+
+    #[test]
+    fn gauge_decrement_underflow_never_wraps_the_exported_value() {
+        let registry = Registry::new();
+        let gauge = build_ok(
+            registry
+                .gauge("limpid_test_saturating_gauge")
+                .help("Saturating gauge test.")
+                .label("pipeline", "unit")
+                .build(),
+        );
+
+        #[cfg(debug_assertions)]
+        assert!(
+            std::panic::catch_unwind(|| gauge.dec()).is_err(),
+            "debug builds must surface a lifecycle imbalance"
+        );
+        #[cfg(not(debug_assertions))]
+        gauge.dec();
+
+        assert_eq!(
+            metric(&snapshot_json(&registry), "limpid_test_saturating_gauge")["series"][0]["value"],
+            0
+        );
     }
 
     fn assert_output_duplicate(error: &MetricsError, label_value: &str, diagnostic: &str) {
@@ -1728,11 +1903,37 @@ mod registry_tests {
                 "limpid_output_events_wedged_total",
                 "limpid_output_events_errored_unwritable_total",
                 "limpid_output_bytes_written_total",
+                "limpid_output_queue_depth",
+                "limpid_output_in_retry",
             ]
             .contains(&name.as_str())
         );
         assert_eq!(labelset, &[("output".to_owned(), label_value.to_owned())]);
         assert!(diagnostic.contains(&format!("name={name:?}")));
         assert!(diagnostic.contains(&format!("labelset={labelset:?}")));
+    }
+
+    #[test]
+    fn every_retry_loop_updates_the_pre_resolved_retry_gauge() {
+        let carriers = [
+            ("batched", include_str!("modules/output/batched.rs")),
+            ("file", include_str!("modules/output/file.rs")),
+            ("kafka", include_str!("modules/output/kafka.rs")),
+            ("stdout", include_str!("modules/output/stdout.rs")),
+            ("syslog_tcp", include_str!("modules/output/syslog_tcp.rs")),
+            ("syslog_udp", include_str!("modules/output/syslog_udp.rs")),
+            ("unix_socket", include_str!("modules/output/unix_socket.rs")),
+        ];
+
+        for (name, source) in carriers {
+            assert!(
+                source.contains("retries.inc()"),
+                "{name} must retain its retry counter"
+            );
+            assert!(
+                source.contains("in_retry"),
+                "{name} must update the shared fixed-label retry gauge"
+            );
+        }
     }
 }

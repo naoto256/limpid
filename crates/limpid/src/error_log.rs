@@ -316,6 +316,16 @@ impl ErrorLogWriter {
         }
     }
 
+    /// Hold the writer's `write_lock` so tests can observe
+    /// lifecycle state — such as the pipeline's `inflight`
+    /// gauge — while DLQ completion is blocked. The returned
+    /// guard serializes against every real `write` call, so
+    /// none can complete until the guard is dropped.
+    #[cfg(test)]
+    pub(crate) async fn hold_write_lock_for_testing(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.write_lock.lock().await
+    }
+
     /// Validate that the `error_log` path is reachable at startup.
     ///
     /// Checks:

@@ -170,6 +170,7 @@ impl Output for UnixSocketOutput {
                 WriteReconnectOutcome::Delivered => Ok(()),
                 WriteReconnectOutcome::Err(e) => Err(e),
                 WriteReconnectOutcome::PreSendShutdown => {
+                    self.metrics.in_retry.set(0);
                     let reason = format!(
                         "output '{}': write attempt abandoned on shutdown (pre-send)",
                         self.name
@@ -190,6 +191,7 @@ impl Output for UnixSocketOutput {
             };
             match write_result {
                 Ok(()) => {
+                    self.metrics.in_retry.set(0);
                     // Metric ownership stays with the caller so
                     // `finalize_shutdown_singleton_disposition` on the
                     // shutdown-drain path (which also owns the
@@ -204,6 +206,7 @@ impl Output for UnixSocketOutput {
                     attempt += 1;
                     self.metrics.retries.inc();
                     if attempt >= self.retry.max_attempts {
+                        self.metrics.in_retry.set(0);
                         let reason =
                             format!("output write failed after {} attempts: {}", attempt, e);
                         let __dlq_outcome = crate::modules::route_event_to_dlq(
@@ -223,6 +226,7 @@ impl Output for UnixSocketOutput {
                         );
                         return Ok(());
                     }
+                    self.metrics.in_retry.set(1);
                     tracing::warn!(
                         "output '{}': write failed (attempt {}/{}): {} — retrying in {:?}",
                         self.name,
@@ -239,6 +243,7 @@ impl Output for UnixSocketOutput {
                     // shutdown arm. Route the pending event to DLQ, resolve
                     // `Recovered`, and return.
                     if crate::modules::sleep_or_shutdown(&mut shutdown, wait).await {
+                        self.metrics.in_retry.set(0);
                         let reason = format!(
                             "output write failed and shutdown observed mid-retry \
                              after {} attempts: {}",
@@ -711,6 +716,7 @@ mod tests {
         })
         .await
         .expect("first failed connection attempt must remain bounded");
+        assert_eq!(output.metrics.in_retry.load(Ordering::Relaxed), 1);
 
         let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
         let expected_len = expected.len();
@@ -731,6 +737,7 @@ mod tests {
             expected.len() as u64
         );
         assert_eq!(output.metrics.events_written.load(Ordering::Relaxed), 1);
+        assert_eq!(output.metrics.in_retry.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
