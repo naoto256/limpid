@@ -288,7 +288,6 @@ fn parse_snapshot(root: &serde_json::Value) -> Result<Vec<ExpositionFamily>, Str
         let metric = metric
             .as_object()
             .ok_or_else(|| "metric family must be an object".to_string())?;
-        require_exact_fields(metric, &["name", "type", "help", "series"], "metric family")?;
         let name = required_nonempty_string(metric, "name", "metric family")?.to_string();
         if !is_legacy_metric_name(&name) {
             return Err(format!("invalid Prometheus metric name: {name:?}"));
@@ -392,7 +391,6 @@ fn parse_series(
     let labels = parse_labels(object.get("labels"), metric_name)?;
     match metric_type {
         ExpositionType::Counter | ExpositionType::Gauge => {
-            require_exact_fields(object, &["labels", "value"], "value series")?;
             let value = object
                 .get("value")
                 .and_then(serde_json::Value::as_u64)
@@ -400,11 +398,6 @@ fn parse_series(
             Ok(ExpositionSeries::Value { labels, value })
         }
         ExpositionType::Histogram => {
-            require_exact_fields(
-                object,
-                &["labels", "buckets", "sum", "count"],
-                "histogram series",
-            )?;
             let buckets = parse_buckets(object.get("buckets"), metric_name)?;
             let sum = object
                 .get("sum")
@@ -507,18 +500,6 @@ fn parse_buckets(
         buckets.push((bound, count));
     }
     Ok(buckets)
-}
-
-fn require_exact_fields(
-    object: &serde_json::Map<String, serde_json::Value>,
-    fields: &[&str],
-    context: &str,
-) -> Result<(), String> {
-    if object.len() == fields.len() && fields.iter().all(|field| object.contains_key(*field)) {
-        Ok(())
-    } else {
-        Err(format!("{context} has invalid fields"))
-    }
 }
 
 fn required_string<'a>(
@@ -870,16 +851,8 @@ mod tests {
                 r#"{"schema":1,"metrics":[{"name":"metric","type":"counter","series":[]}]}"#,
             ),
             (
-                "extra family field",
-                r#"{"schema":1,"metrics":[{"name":"metric","type":"counter","help":"Metric.","series":[],"extra":true}]}"#,
-            ),
-            (
                 "missing series field",
                 r#"{"schema":1,"metrics":[{"name":"metric","type":"counter","help":"Metric.","series":[{"labels":{}}]}]}"#,
-            ),
-            (
-                "extra series field",
-                r#"{"schema":1,"metrics":[{"name":"metric","type":"counter","help":"Metric.","series":[{"labels":{},"value":1,"extra":true}]}]}"#,
             ),
             (
                 "unsupported type",
@@ -925,6 +898,63 @@ mod tests {
 
         let empty_histogram = r#"{"schema":1,"metrics":[{"name":"metric","type":"histogram","help":"Metric.","series":[{"labels":{},"buckets":[],"sum":0.0,"count":0}]}]}"#;
         assert!(json_to_prometheus(empty_histogram).is_ok());
+    }
+
+    #[test]
+    fn schema_v1_ignores_unknown_fields_at_every_wire_level() {
+        let baseline = serde_json::json!({
+            "schema": 1,
+            "metrics": [
+                {
+                    "name": "requests_total",
+                    "type": "counter",
+                    "help": "Requests.",
+                    "series": [{"labels": {"route": "west"}, "value": 7}]
+                },
+                {
+                    "name": "latency_seconds",
+                    "type": "histogram",
+                    "help": "Latency.",
+                    "series": [{
+                        "labels": {"route": "west"},
+                        "buckets": [[0.5, 2], [1.0, 3]],
+                        "sum": 1.75,
+                        "count": 4
+                    }]
+                }
+            ]
+        });
+        let expected = json_to_prometheus(&baseline.to_string()).unwrap();
+
+        let mut root = baseline.clone();
+        root["future_root"] = serde_json::json!({"version": 2});
+
+        let mut family = baseline.clone();
+        family["metrics"][0]["future_family"] = serde_json::json!(["ignored"]);
+
+        let mut value_series = baseline.clone();
+        value_series["metrics"][0]["series"][0]["future_value_series"] =
+            serde_json::json!({"ignored": true});
+
+        let mut histogram_series = baseline.clone();
+        histogram_series["metrics"][1]["series"][0]["future_histogram_series"] =
+            serde_json::json!("ignored");
+
+        let translations = [
+            ("root", root),
+            ("family", family),
+            ("value series", value_series),
+            ("histogram series", histogram_series),
+        ]
+        .map(|(level, snapshot)| (level, json_to_prometheus(&snapshot.to_string())));
+
+        for (level, translation) in translations {
+            assert_eq!(
+                translation.unwrap(),
+                expected,
+                "unknown {level} field must not change exposition"
+            );
+        }
     }
 
     #[test]
