@@ -1116,6 +1116,7 @@ dependencies = [
  "glob",
  "indexmap",
  "libc",
+ "limpid-metrics-schema",
  "maxminddb",
  "md-5",
  "opentelemetry-proto",
@@ -1144,6 +1145,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "limpid-metrics-schema"
+version = "0.7.15"
+dependencies = [
+ "serde",
+ "serde_json",
+ "syn",
+]
+
+[[package]]
 name = "limpid-prometheus"
 version = "0.7.15"
 dependencies = [
@@ -1151,6 +1161,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "limpid-metrics-schema",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1163,6 +1174,7 @@ dependencies = [
  "chrono",
  "clap",
  "libc",
+ "limpid-metrics-schema",
  "serde_json",
 ]
 

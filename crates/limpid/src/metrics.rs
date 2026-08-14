@@ -11,7 +11,10 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
+pub(crate) use limpid_metrics_schema::MetricsSnapshot;
+use limpid_metrics_schema::{
+    HistogramSeries, MetricFamily as SnapshotFamily, ValueSeries as SnapshotValueSeries,
+};
 
 pub struct InputMetrics {
     /// Events actually received by the input module (network, socket, file, etc).
@@ -451,49 +454,11 @@ mod registry_core {
         }
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-    #[serde(rename_all = "lowercase")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum MetricType {
         Counter,
         Gauge,
         Histogram,
-    }
-
-    #[derive(Serialize)]
-    pub(crate) struct MetricsSnapshot {
-        schema: u32,
-        metrics: Vec<MetricSnapshot>,
-    }
-
-    #[derive(Serialize)]
-    struct MetricSnapshot {
-        name: String,
-        #[serde(rename = "type")]
-        metric_type: MetricType,
-        help: String,
-        series: Vec<SeriesSnapshot>,
-    }
-
-    #[derive(Serialize)]
-    #[serde(untagged)]
-    enum SeriesSnapshot {
-        Value {
-            labels: BTreeMap<String, String>,
-            value: u64,
-        },
-        /// `buckets` carries cumulative Prometheus counts for the
-        /// finite upper bounds configured on the histogram. The
-        /// implicit `+Inf` bucket is intentionally absent from this
-        /// array; Prometheus translators must synthesise it as a
-        /// `+Inf` sample whose value equals `count`. `count` includes
-        /// observations above the last configured bound, so the
-        /// synthesised `+Inf` value stays authoritative.
-        Histogram {
-            labels: BTreeMap<String, String>,
-            buckets: Vec<(f64, u64)>,
-            sum: f64,
-            count: u64,
-        },
     }
 
     #[derive(Clone, PartialEq, Eq, Hash)]
@@ -573,17 +538,8 @@ mod registry_core {
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let metrics = inner
-                .families
-                .iter()
-                .map(|family| MetricSnapshot {
-                    name: family.name.clone(),
-                    metric_type: family.kind.metric_type(),
-                    help: family.help.clone(),
-                    series: snapshot_series(&family.kind),
-                })
-                .collect();
-            MetricsSnapshot { schema: 1, metrics }
+            let metrics = inner.families.iter().map(snapshot_family).collect();
+            MetricsSnapshot::new(metrics)
         }
 
         fn register_counter(
@@ -983,47 +939,72 @@ mod registry_core {
             })
     }
 
-    fn snapshot_series(kind: &FamilyKind) -> Vec<SeriesSnapshot> {
-        match kind {
-            FamilyKind::Counter(series) => series
-                .iter()
-                .map(|series| SeriesSnapshot::Value {
-                    labels: labels_map(&series.labels),
-                    value: series.handle.value.load(Ordering::Relaxed),
-                })
-                .collect(),
-            FamilyKind::Gauge(series) => series
-                .iter()
-                .map(|series| SeriesSnapshot::Value {
-                    labels: labels_map(&series.labels),
-                    value: series.handle.value.load(Ordering::Relaxed),
-                })
-                .collect(),
-            FamilyKind::Histogram(series) => series
-                .iter()
-                .map(|series| {
-                    // Fold the raw per-bucket counts into the
-                    // cumulative shape Prometheus expects (see the
-                    // `Histogram` doc for why storage stays raw).
-                    let mut cumulative = 0;
-                    let buckets = series
-                        .handle
-                        .boundaries
-                        .iter()
-                        .zip(&series.handle.bucket_counts)
-                        .map(|(boundary, count)| {
-                            cumulative += count.load(Ordering::Relaxed);
-                            (*boundary, cumulative)
-                        })
-                        .collect();
-                    SeriesSnapshot::Histogram {
-                        labels: labels_map(&series.labels),
-                        buckets,
-                        sum: f64::from_bits(series.handle.sum_bits.load(Ordering::Relaxed)),
-                        count: series.handle.count.load(Ordering::Relaxed),
-                    }
-                })
-                .collect(),
+    fn snapshot_family(family: &MetricFamily) -> SnapshotFamily {
+        match &family.kind {
+            FamilyKind::Counter(series) => SnapshotFamily::counter(
+                family.name.clone(),
+                family.help.clone(),
+                snapshot_value_series(series),
+            ),
+            FamilyKind::Gauge(series) => SnapshotFamily::gauge(
+                family.name.clone(),
+                family.help.clone(),
+                snapshot_value_series(series),
+            ),
+            FamilyKind::Histogram(series) => SnapshotFamily::histogram(
+                family.name.clone(),
+                family.help.clone(),
+                series
+                    .iter()
+                    .map(|series| {
+                        let mut cumulative = 0;
+                        let buckets = series
+                            .handle
+                            .boundaries
+                            .iter()
+                            .zip(&series.handle.bucket_counts)
+                            .map(|(boundary, count)| {
+                                cumulative += count.load(Ordering::Relaxed);
+                                (*boundary, cumulative)
+                            })
+                            .collect();
+                        HistogramSeries::new(
+                            labels_map(&series.labels),
+                            buckets,
+                            f64::from_bits(series.handle.sum_bits.load(Ordering::Relaxed)),
+                            series.handle.count.load(Ordering::Relaxed),
+                        )
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    fn snapshot_value_series<T>(series: &[ValueSeries<T>]) -> Vec<SnapshotValueSeries>
+    where
+        T: ValueHandle,
+    {
+        series
+            .iter()
+            .map(|series| {
+                SnapshotValueSeries::new(labels_map(&series.labels), series.handle.load_value())
+            })
+            .collect()
+    }
+
+    trait ValueHandle {
+        fn load_value(&self) -> u64;
+    }
+
+    impl ValueHandle for Counter {
+        fn load_value(&self) -> u64 {
+            self.value.load(Ordering::Relaxed)
+        }
+    }
+
+    impl ValueHandle for Gauge {
+        fn load_value(&self) -> u64 {
+            self.value.load(Ordering::Relaxed)
         }
     }
 
@@ -1033,7 +1014,7 @@ mod registry_core {
 }
 
 #[allow(unused_imports)]
-pub(crate) use registry_core::{MetricsError, MetricsSnapshot, Registry};
+pub(crate) use registry_core::{MetricsError, Registry};
 
 #[cfg(test)]
 mod registry_tests {
@@ -1151,6 +1132,28 @@ mod registry_tests {
     fn snapshot_json(registry: &Registry) -> Value {
         let snapshot: MetricsSnapshot = registry.snapshot();
         serde_json::to_value(snapshot).expect("snapshot must serialize")
+    }
+
+    #[test]
+    fn registry_snapshot_matches_the_shared_wire_dto() {
+        let registry = Registry::new();
+        build_ok(
+            registry
+                .counter("limpid_test_events_total")
+                .help("Test events.")
+                .label("source", "unit")
+                .build(),
+        )
+        .inc();
+
+        let shared: limpid_metrics_schema::MetricsSnapshot = registry.snapshot();
+        assert_eq!(
+            serde_json::to_string(&shared).unwrap(),
+            r#"{"schema":1,"metrics":[{"name":"limpid_test_events_total","type":"counter","help":"Test events.","series":[{"labels":{"source":"unit"},"value":1}]}]}"#
+        );
+        let produced = serde_json::to_value(&shared).unwrap();
+        assert_eq!(produced["schema"], 1);
+        assert_eq!(produced["metrics"][0]["name"], "limpid_test_events_total");
     }
 
     fn metric<'a>(snapshot: &'a Value, name: &str) -> &'a Value {
