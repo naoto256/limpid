@@ -252,3 +252,5 @@ def process enrich_and_tag {
 ```
 
 Each call runs the named process's body against the same event in sequence. Only the named single-call form works here — the `|`-chain shape (`process strip_headers | enrich`) and inline anonymous processes (`process { ... }`) are pipeline-side composition primitives, not process-body statements. See [Pipelines → Routing](../pipelines/routing.md) for those.
+
+Process calls must form an acyclic graph. Direct recursion and mutual recursion are rejected at config-load time, including cycles that cross included files or appear only inside `if`, `switch`, or `try` / `catch` branches. Repetition over event collections belongs in bounded collection primitives such as `map`, `filter`, and `reduce`; process calls compose a finite parser and transformation graph.

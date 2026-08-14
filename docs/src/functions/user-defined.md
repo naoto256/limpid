@@ -140,7 +140,7 @@ The body **may not**:
 
 - **read from the Event** — `ingress`, `egress`, `source`, `received_at`, `error`, and any `workspace.*` path are rejected. Functions are pure transformations of their arguments; coupling them to the surrounding pipeline context defeats the point.
 - **invoke any routing op** — `process foo`, `drop`, [`error`](../processing/user-defined.md#error), `output` are all rejected. A function returns a value; routing decisions belong at pipeline level, and the side effects of a `def process` body don't fit the function contract. (`finish` is a pipeline-only statement and is not reachable from a function body even in principle — listed here for completeness.)
-- **recurse**, directly or mutually. The analyzer detects cycles in the function-to-function call graph and rejects them at config-load time. If you genuinely need recursion, write a `def process` instead.
+- **recurse**, directly or mutually. The analyzer detects cycles in the function-to-function call graph and rejects them at config-load time. Process call graphs are also required to be acyclic.
 - **call an unknown function** — every function call inside the body must resolve to either a built-in primitive, a user-defined `def function`, or (if a block-arg primitive's block) the block parameters. Calls to names that don't exist (typos, references to removed primitives) are rejected, with a near-match hint when available.
 
 ```
@@ -187,7 +187,7 @@ The analyzer's cycle check catches mutual recursion across any chain length.
 | Any assignment (`x = …`) | ❌ | ✅ allowed |
 | `drop` / `error` / `output foo` / `process foo` | ❌ | ✅ allowed |
 | Calls another `def function` | ✅ | ✅ |
-| Recursion | ❌ | ✅ allowed (operator-responsible) |
+| Recursion | ❌ | ❌ |
 | Composable in expressions / HashLit | ✅ | ❌ (statement only) |
 
 Rule of thumb: **if the result is a single value the caller wants to embed somewhere**, write a function. **If the result is a side effect on the Event**, write a process.

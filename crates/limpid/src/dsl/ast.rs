@@ -150,9 +150,8 @@ pub enum ProcessStatement {
 /// without an Event in hand.
 ///
 /// Recursion (direct or mutual) is rejected at analyzer time; this
-/// keeps the type-inference step a simple post-order traversal and
-/// avoids the small set of patterns where recursion would be useful
-/// (those belong in `def process`).
+/// keeps the type-inference step a simple post-order traversal. Process
+/// call graphs are likewise required to be acyclic.
 #[derive(Debug, Clone)]
 pub struct FunctionDef {
     pub name: String,
