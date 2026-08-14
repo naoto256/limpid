@@ -474,8 +474,24 @@ const OUTPUT_METRICS: [&str; 7] = [
     "limpid_output_events_wedged_total",
     "limpid_output_events_errored_unwritable_total",
 ];
+const PROCESS_METRICS: [&str; 4] = [
+    "limpid_process_events_in_total",
+    "limpid_process_events_out_total",
+    "limpid_process_events_dropped_total",
+    "limpid_process_events_errored_total",
+];
 
 type MetricValues = BTreeMap<String, u64>;
+
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+struct ProcessIdentity {
+    pipeline: String,
+    step: usize,
+    process_path: String,
+    process_name: String,
+}
+
+type ProcessMetricValues = BTreeMap<ProcessIdentity, u64>;
 
 fn format_stats(json: &str) {
     let rendered = serde_json::from_str::<MetricsSnapshot>(json)
@@ -496,13 +512,47 @@ fn format_stats(json: &str) {
 /// back to the raw response rather than emit a partial table that
 /// omits or lies about a counter.
 fn render_default_stats(snapshot: &MetricsSnapshot) -> Option<String> {
+    render_default_stats_inner(snapshot, true)
+}
+
+fn render_default_stats_inner(
+    snapshot: &MetricsSnapshot,
+    validate_process_families: bool,
+) -> Option<String> {
     if snapshot.schema != 1 {
         return None;
     }
     let mut families = BTreeMap::<String, MetricValues>::new();
+    let mut process_families = BTreeMap::<String, ProcessMetricValues>::new();
 
     for metric in &snapshot.metrics {
         let name = metric.name();
+        if validate_process_families && PROCESS_METRICS.contains(&name) {
+            if metric.metric_type() != MetricType::Counter || process_families.contains_key(name) {
+                return None;
+            }
+            let series = metric.value_series()?;
+            if series.is_empty() {
+                return None;
+            }
+            let mut values = ProcessMetricValues::new();
+            for item in series {
+                if item.labels.len() != 4 {
+                    return None;
+                }
+                let identity = ProcessIdentity {
+                    pipeline: item.labels.get("pipeline")?.clone(),
+                    step: item.labels.get("step")?.parse().ok()?,
+                    process_path: item.labels.get("process_path")?.clone(),
+                    process_name: item.labels.get("process_name")?.clone(),
+                };
+                if values.insert(identity, item.value).is_some() {
+                    return None;
+                }
+            }
+            process_families.insert(name.to_owned(), values);
+            continue;
+        }
         let Some(label_name) = known_metric_label(name) else {
             continue;
         };
@@ -529,6 +579,11 @@ fn render_default_stats(snapshot: &MetricsSnapshot) -> Option<String> {
     validate_metric_group(&families, &PIPELINE_METRICS)?;
     validate_metric_group(&families, &INPUT_METRICS)?;
     validate_metric_group(&families, &OUTPUT_METRICS)?;
+    let process_identities = if validate_process_families {
+        validate_process_metric_group(&process_families)?
+    } else {
+        None
+    };
 
     let mut rendered = String::new();
     writeln!(rendered, "Pipelines:").ok()?;
@@ -602,7 +657,49 @@ fn render_default_stats(snapshot: &MetricsSnapshot) -> Option<String> {
         }
         rendered.push('\n');
     }
+    if let Some(identities) = process_identities {
+        writeln!(rendered, "\nProcesses:").ok()?;
+        for identity in identities.keys() {
+            writeln!(
+                rendered,
+                "  {}  {}  {}  {}  {} in  {} out  {} dropped  {} errored",
+                identity.pipeline,
+                identity.step,
+                identity.process_path,
+                identity.process_name,
+                process_metric_value(&process_families, PROCESS_METRICS[0], identity)?,
+                process_metric_value(&process_families, PROCESS_METRICS[1], identity)?,
+                process_metric_value(&process_families, PROCESS_METRICS[2], identity)?,
+                process_metric_value(&process_families, PROCESS_METRICS[3], identity)?,
+            )
+            .ok()?;
+        }
+    }
     Some(rendered)
+}
+
+fn validate_process_metric_group(
+    families: &BTreeMap<String, ProcessMetricValues>,
+) -> Option<Option<&ProcessMetricValues>> {
+    if families.is_empty() {
+        return Some(None);
+    }
+    let expected = families.get(PROCESS_METRICS[0])?;
+    for name in PROCESS_METRICS {
+        let values = families.get(name)?;
+        if !values.keys().eq(expected.keys()) {
+            return None;
+        }
+    }
+    Some(Some(expected))
+}
+
+fn process_metric_value(
+    families: &BTreeMap<String, ProcessMetricValues>,
+    metric: &str,
+    identity: &ProcessIdentity,
+) -> Option<u64> {
+    families.get(metric)?.get(identity).copied()
 }
 
 fn known_metric_label(name: &str) -> Option<&'static str> {
@@ -688,7 +785,7 @@ fn render_stats_details(snapshot: &MetricsSnapshot) -> Option<String> {
     if metrics
         .iter()
         .any(|metric| known_metric_label(&metric.name).is_some())
-        && render_default_stats(snapshot).is_none()
+        && render_default_stats_inner(snapshot, false).is_none()
     {
         return None;
     }

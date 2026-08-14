@@ -350,6 +350,262 @@ fn default_stats_maps_schema_v1_to_the_existing_sorted_table() {
     }
 }
 
+fn process_snapshot() -> Value {
+    let mut payload = canonical_snapshot(false);
+    for (name, root_value, leaf_value) in [
+        ("limpid_process_events_in_total", 4, 3),
+        ("limpid_process_events_out_total", 4, 1),
+        ("limpid_process_events_dropped_total", 0, 1),
+        ("limpid_process_events_errored_total", 0, 1),
+    ] {
+        payload["metrics"].as_array_mut().unwrap().push(json!({
+            "name": name,
+            "type": "counter",
+            "help": "Process invocation fixture.",
+            "series": [
+                {
+                    "labels": {
+                        "pipeline": "compact",
+                        "step": "10",
+                        "process_path": "/dispatch/leaf",
+                        "process_name": "leaf"
+                    },
+                    "value": leaf_value
+                },
+                {
+                    "labels": {
+                        "pipeline": "compact",
+                        "step": "2",
+                        "process_path": "/dispatch",
+                        "process_name": "dispatch"
+                    },
+                    "value": root_value
+                }
+            ]
+        }));
+    }
+    payload
+}
+
+fn family_mut<'a>(payload: &'a mut Value, name: &str) -> &'a mut Value {
+    payload["metrics"]
+        .as_array_mut()
+        .expect("metrics")
+        .iter_mut()
+        .find(|family| family["name"] == name)
+        .unwrap_or_else(|| panic!("missing {name}"))
+}
+
+fn for_each_process_family_mut(payload: &mut Value, mut update: impl FnMut(&mut Value)) {
+    for name in [
+        "limpid_process_events_in_total",
+        "limpid_process_events_out_total",
+        "limpid_process_events_dropped_total",
+        "limpid_process_events_errored_total",
+    ] {
+        update(family_mut(payload, name));
+    }
+}
+
+fn process_default_validator_only_defects() -> Vec<(&'static str, Value)> {
+    let mut cases = Vec::new();
+
+    let mut missing_label = process_snapshot();
+    for_each_process_family_mut(&mut missing_label, |family| {
+        family["series"][0]["labels"]
+            .as_object_mut()
+            .unwrap()
+            .remove("process_name");
+    });
+    cases.push(("missing label", missing_label));
+
+    let mut extra_label = process_snapshot();
+    for_each_process_family_mut(&mut extra_label, |family| {
+        family["series"][0]["labels"]
+            .as_object_mut()
+            .unwrap()
+            .insert("extra".to_owned(), json!("x"));
+    });
+    cases.push(("extra label", extra_label));
+
+    let mut non_numeric_step = process_snapshot();
+    for_each_process_family_mut(&mut non_numeric_step, |family| {
+        family["series"][0]["labels"]["step"] = json!("ten");
+    });
+    cases.push(("non-numeric step", non_numeric_step));
+
+    cases
+}
+
+fn line_tokens(text: &str, token: &str) -> Vec<String> {
+    text.lines()
+        .find(|line| line.split_whitespace().any(|part| part == token))
+        .unwrap_or_else(|| panic!("missing line containing {token:?} in {text:?}"))
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn process_counters_render_a_numerically_sorted_default_invocation_table() {
+    let payload = process_snapshot();
+    let response = format!("{payload}\n");
+
+    let default = run_stats(&response, &[]);
+    assert!(default.status.success(), "{default:?}");
+    let default = stdout(&default);
+    assert!(default.starts_with(&expected_default_table()));
+    let process_header = default
+        .lines()
+        .find(|line| line.trim() == "Processes:")
+        .expect("default output must include the process section")
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    assert_eq!(process_header, ["Processes:"]);
+    assert_eq!(
+        line_tokens(&default, "/dispatch"),
+        [
+            "compact",
+            "2",
+            "/dispatch",
+            "dispatch",
+            "4",
+            "in",
+            "4",
+            "out",
+            "0",
+            "dropped",
+            "0",
+            "errored",
+        ]
+    );
+    assert_eq!(
+        line_tokens(&default, "/dispatch/leaf"),
+        [
+            "compact",
+            "10",
+            "/dispatch/leaf",
+            "leaf",
+            "3",
+            "in",
+            "1",
+            "out",
+            "1",
+            "dropped",
+            "1",
+            "errored",
+        ]
+    );
+    let root = default.find("/dispatch ").expect("root row");
+    let leaf = default.find("/dispatch/leaf ").expect("leaf row");
+    assert!(root < leaf, "step 2 must sort before step 10 numerically");
+
+    let details = run_stats(&response, &["--details"]);
+    assert!(details.status.success(), "{details:?}");
+    let details = stdout(&details);
+    for name in [
+        "limpid_process_events_in_total",
+        "limpid_process_events_out_total",
+        "limpid_process_events_dropped_total",
+        "limpid_process_events_errored_total",
+    ] {
+        assert!(details.contains(name), "missing {name}");
+    }
+    assert!(details.contains(
+        r#"pipeline="compact", process_name="leaf", process_path="/dispatch/leaf", step="10""#
+    ));
+
+    let json = run_stats(&response, &["--json"]);
+    assert!(json.status.success(), "{json:?}");
+    assert_eq!(json.stdout, response.as_bytes());
+}
+
+#[test]
+fn malformed_process_families_fall_back_to_the_whole_raw_response() {
+    let mut cases = Vec::new();
+
+    let mut missing_family = process_snapshot();
+    missing_family["metrics"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|family| family["name"] != "limpid_process_events_errored_total");
+    cases.push(("missing family", missing_family));
+
+    let mut duplicate_series = process_snapshot();
+    let duplicate = duplicate_series["metrics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|family| family["name"] == "limpid_process_events_in_total")
+        .unwrap()["series"][0]
+        .clone();
+    family_mut(&mut duplicate_series, "limpid_process_events_in_total")["series"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate);
+    cases.push(("duplicate exact series", duplicate_series));
+
+    let mut wrong_type = process_snapshot();
+    family_mut(&mut wrong_type, "limpid_process_events_out_total")["type"] = json!("gauge");
+    cases.push(("wrong family type", wrong_type));
+
+    cases.extend(process_default_validator_only_defects());
+
+    let mut mismatched_identity = process_snapshot();
+    family_mut(&mut mismatched_identity, "limpid_process_events_out_total")["series"][0]["labels"]
+        ["process_path"] = json!("/dispatch/other");
+    cases.push(("mismatched identities", mismatched_identity));
+
+    let mut invalid_value = process_snapshot();
+    family_mut(&mut invalid_value, "limpid_process_events_in_total")["series"][0]["value"] =
+        json!("3");
+    cases.push(("invalid value", invalid_value));
+
+    let mut did_not_fall_back = Vec::new();
+    for (name, payload) in cases {
+        let response = format!("{payload}\n");
+        let output = run_stats(&response, &[]);
+        assert!(output.status.success(), "{name}: {output:?}");
+        if output.stdout != response.as_bytes() {
+            did_not_fall_back.push(name);
+        }
+    }
+    assert!(
+        did_not_fall_back.is_empty(),
+        "each single defect must cause a whole raw fallback; rendered: {did_not_fall_back:?}"
+    );
+}
+
+#[test]
+fn details_remains_generic_for_process_default_validator_only_defects() {
+    for (name, payload) in process_default_validator_only_defects() {
+        let response = format!("{payload}\n");
+        let output = run_stats(&response, &["--details"]);
+        assert!(output.status.success(), "{name}: {output:?}");
+        assert_ne!(
+            output.stdout,
+            response.as_bytes(),
+            "{name} is DTO-valid and must remain generic in details mode"
+        );
+        assert!(stdout(&output).contains("limpid_process_events_in_total"));
+    }
+}
+
+#[test]
+fn details_remains_generic_when_process_families_are_incomplete() {
+    let mut payload = process_snapshot();
+    payload["metrics"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|family| family["name"] != "limpid_process_events_errored_total");
+    let response = format!("{payload}\n");
+
+    let output = run_stats(&response, &["--details"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_ne!(output.stdout, response.as_bytes());
+    assert!(stdout(&output).contains("limpid_process_events_in_total"));
+}
+
 #[test]
 fn json_mode_preserves_the_complete_control_response() {
     let response = concat!(

@@ -1104,6 +1104,89 @@ metric_zeta_seconds_count{az="two",le_="source-zero",le__="source-one",le___="so
     }
 
     #[test]
+    fn schema_v1_translation_accepts_process_dimensions_generically() {
+        let snapshot = serde_json::json!({
+            "schema": 1,
+            "metrics": [
+                {
+                    "name": "limpid_process_events_in_total",
+                    "type": "counter",
+                    "help": "Process invocations started.",
+                    "series": [{
+                        "labels": {
+                            "step": "2",
+                            "pipeline": "main",
+                            "process_name": "leaf",
+                            "process_path": "/dispatch/leaf"
+                        },
+                        "value": 7
+                    }]
+                },
+                {
+                    "name": "limpid_process_events_out_total",
+                    "type": "counter",
+                    "help": "Process invocations continued.",
+                    "series": [{
+                        "labels": {
+                            "pipeline": "main",
+                            "step": "2",
+                            "process_path": "/dispatch/leaf",
+                            "process_name": "leaf"
+                        },
+                        "value": 5
+                    }]
+                },
+                {
+                    "name": "limpid_process_events_dropped_total",
+                    "type": "counter",
+                    "help": "Process invocations dropped.",
+                    "series": [{
+                        "labels": {
+                            "pipeline": "main",
+                            "step": "2",
+                            "process_path": "/dispatch/leaf",
+                            "process_name": "leaf"
+                        },
+                        "value": 1
+                    }]
+                },
+                {
+                    "name": "limpid_process_events_errored_total",
+                    "type": "counter",
+                    "help": "Process invocations errored.",
+                    "series": [{
+                        "labels": {
+                            "pipeline": "main",
+                            "step": "2",
+                            "process_path": "/dispatch/leaf",
+                            "process_name": "leaf"
+                        },
+                        "value": 1
+                    }]
+                }
+            ]
+        });
+        let expected = r#"# HELP limpid_process_events_dropped_total Process invocations dropped.
+# TYPE limpid_process_events_dropped_total counter
+limpid_process_events_dropped_total{pipeline="main",process_name="leaf",process_path="/dispatch/leaf",step="2"} 1
+
+# HELP limpid_process_events_errored_total Process invocations errored.
+# TYPE limpid_process_events_errored_total counter
+limpid_process_events_errored_total{pipeline="main",process_name="leaf",process_path="/dispatch/leaf",step="2"} 1
+
+# HELP limpid_process_events_in_total Process invocations started.
+# TYPE limpid_process_events_in_total counter
+limpid_process_events_in_total{pipeline="main",process_name="leaf",process_path="/dispatch/leaf",step="2"} 7
+
+# HELP limpid_process_events_out_total Process invocations continued.
+# TYPE limpid_process_events_out_total counter
+limpid_process_events_out_total{pipeline="main",process_name="leaf",process_path="/dispatch/leaf",step="2"} 5
+
+"#;
+        assert_eq!(json_to_prometheus(&snapshot.to_string()).unwrap(), expected);
+    }
+
+    #[test]
     fn schema_v1_translation_rejects_legacy_unsupported_and_partial_snapshots() {
         let cases = [
             ("invalid json", "{"),
