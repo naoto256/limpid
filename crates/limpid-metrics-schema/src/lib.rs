@@ -1,13 +1,65 @@
-//! Wire-only data transfer objects for schema-v1 metrics snapshots.
+//! Schema-v1 metric definitions and wire data transfer objects.
 //!
-//! These wire DTOs keep the daemon's runtime state out of consumer
-//! dependency graphs. Serde is the crate's only production dependency,
-//! and architecture tests enforce that boundary.
+//! The well-known dropped hierarchy, process metric vocabulary, and path
+//! helpers are pure schema definitions. The wire DTOs keep the daemon's
+//! runtime state out of consumer dependency graphs. Serde is the crate's only
+//! production dependency, and architecture tests enforce that boundary.
 
 use std::collections::BTreeMap;
 
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
+
+pub const PROCESS_EVENTS_IN_TOTAL: &str = "limpid_process_events_in_total";
+pub const PROCESS_EVENTS_OUT_TOTAL: &str = "limpid_process_events_out_total";
+pub const PROCESS_EVENTS_ERRORED_TOTAL: &str = "limpid_process_events_errored_total";
+pub const EVENTS_DROPPED_TOTAL: &str = "limpid_events_dropped_total";
+pub const EVENTS_DROPPED_OWN_TOTAL: &str = "limpid_events_dropped_own_total";
+
+pub const PROCESS_LABEL_PIPELINE: &str = "pipeline";
+pub const PROCESS_LABEL_STEP: &str = "step";
+pub const PROCESS_LABEL_PATH: &str = "process_path";
+pub const PROCESS_LABEL_NAME: &str = "process_name";
+
+pub const PROCESS_PATH_SEPARATOR: char = '/';
+pub const PROCESS_PATH_ROOT: &str = "/";
+pub const DROPPED_ROOT_STEP: &str = "0";
+pub const DROPPED_ROOT_PROCESS_NAME: &str = "";
+
+pub fn process_path_leaf(path: &str) -> Option<&str> {
+    if !is_process_path(path) || path == PROCESS_PATH_ROOT {
+        return None;
+    }
+    path.rsplit_once(PROCESS_PATH_SEPARATOR)
+        .map(|(_, leaf)| leaf)
+}
+
+pub fn process_path_parent(path: &str) -> Option<&str> {
+    if !is_process_path(path) || path == PROCESS_PATH_ROOT {
+        return None;
+    }
+    let (parent, _) = path.rsplit_once(PROCESS_PATH_SEPARATOR)?;
+    Some(if parent.is_empty() {
+        PROCESS_PATH_ROOT
+    } else {
+        parent
+    })
+}
+
+pub fn is_direct_child(parent: &str, child: &str) -> bool {
+    is_process_path(parent)
+        && is_process_path(child)
+        && process_path_parent(child).is_some_and(|candidate| candidate == parent)
+}
+
+fn is_process_path(path: &str) -> bool {
+    path == PROCESS_PATH_ROOT
+        || path
+            .strip_prefix(PROCESS_PATH_SEPARATOR)
+            .is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.split('/').all(|part| !part.is_empty())
+            })
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MetricsSnapshot {

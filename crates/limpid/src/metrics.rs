@@ -13,7 +13,10 @@ use std::sync::{Arc, Mutex};
 
 pub(crate) use limpid_metrics_schema::MetricsSnapshot;
 use limpid_metrics_schema::{
-    HistogramSeries, MetricFamily as SnapshotFamily, ValueSeries as SnapshotValueSeries,
+    DROPPED_ROOT_PROCESS_NAME, DROPPED_ROOT_STEP, EVENTS_DROPPED_TOTAL, HistogramSeries,
+    MetricFamily as SnapshotFamily, PROCESS_EVENTS_ERRORED_TOTAL, PROCESS_EVENTS_IN_TOTAL,
+    PROCESS_EVENTS_OUT_TOTAL, PROCESS_LABEL_NAME, PROCESS_LABEL_PATH, PROCESS_LABEL_PIPELINE,
+    PROCESS_LABEL_STEP, PROCESS_PATH_ROOT, ValueSeries as SnapshotValueSeries,
 };
 
 pub(crate) fn register_build_info(
@@ -132,10 +135,14 @@ impl PipelineMetrics {
                 "limpid_pipeline_events_finished_total",
                 "Total events that finished pipeline processing."
             ),
-            events_dropped: counter!(
-                "limpid_pipeline_events_dropped_total",
-                "Total events dropped by the pipeline."
-            ),
+            events_dropped: registry
+                .counter(EVENTS_DROPPED_TOTAL)
+                .label(PROCESS_LABEL_PIPELINE, pipeline)
+                .label(PROCESS_LABEL_STEP, DROPPED_ROOT_STEP)
+                .label(PROCESS_LABEL_PATH, PROCESS_PATH_ROOT)
+                .label(PROCESS_LABEL_NAME, DROPPED_ROOT_PROCESS_NAME)
+                .help("Total events whose drop propagated through this processing node.")
+                .build()?,
             events_discarded: counter!(
                 "limpid_pipeline_events_discarded_total",
                 "Total events discarded by pipeline routing."
@@ -182,28 +189,28 @@ impl ProcessCounters {
         let counter = |name, help| {
             registry
                 .counter(name)
-                .label("pipeline", pipeline)
-                .label("step", &step)
-                .label("process_path", process_path)
-                .label("process_name", process_name)
+                .label(PROCESS_LABEL_PIPELINE, pipeline)
+                .label(PROCESS_LABEL_STEP, &step)
+                .label(PROCESS_LABEL_PATH, process_path)
+                .label(PROCESS_LABEL_NAME, process_name)
                 .help(help)
                 .build()
         };
         Ok(Self {
             incoming: counter(
-                "limpid_process_events_in_total",
+                PROCESS_EVENTS_IN_TOTAL,
                 "Total process invocation frames started.",
             )?,
             outgoing: counter(
-                "limpid_process_events_out_total",
+                PROCESS_EVENTS_OUT_TOTAL,
                 "Total process invocation frames that continued successfully.",
             )?,
             dropped: counter(
-                "limpid_process_events_dropped_total",
-                "Total process invocation frames terminated by a drop.",
+                EVENTS_DROPPED_TOTAL,
+                "Total events whose drop propagated through this processing node.",
             )?,
             errored: counter(
-                "limpid_process_events_errored_total",
+                PROCESS_EVENTS_ERRORED_TOTAL,
                 "Total process invocation frames terminated by an error.",
             )?,
         })
@@ -1821,12 +1828,6 @@ mod registry_tests {
                 5,
             ),
             (
-                "limpid_pipeline_events_dropped_total",
-                "pipeline",
-                "route",
-                6,
-            ),
-            (
                 "limpid_pipeline_events_discarded_total",
                 "pipeline",
                 "route",
@@ -1891,6 +1892,24 @@ mod registry_tests {
             );
             assert_eq!(series["value"], value);
         }
+
+        let dropped = metric(&snapshot, "limpid_events_dropped_total");
+        assert_eq!(dropped["type"], "counter");
+        assert_eq!(
+            dropped["help"],
+            "Total events whose drop propagated through this processing node."
+        );
+        assert_eq!(dropped["series"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            dropped["series"][0]["labels"],
+            serde_json::json!({
+                "pipeline": "route",
+                "step": "0",
+                "process_path": "/",
+                "process_name": "",
+            })
+        );
+        assert_eq!(dropped["series"][0]["value"], 6);
 
         let expected_gauges = [
             ("limpid_pipeline_inflight", "pipeline", "route", 2),
