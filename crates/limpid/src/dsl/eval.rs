@@ -774,20 +774,32 @@ pub fn values_match(left: &Value<'_>, right: &Value<'_>) -> bool {
 /// responsible for executing the returned body. Lets the pipeline and
 /// process executors share one first-match algorithm without coupling
 /// to either context.
+#[allow(dead_code)]
 pub fn select_switch_arm<'bump, 'a, F>(
     disc_val: &Value<'bump>,
     arms: &'a [SwitchStmtArm],
-    mut eval_pattern: F,
+    eval_pattern: F,
 ) -> Result<Option<&'a [BranchBody]>>
 where
     F: FnMut(&Expr) -> Result<Value<'bump>>,
 {
-    for arm in arms {
+    Ok(select_switch_arm_with_ordinal(disc_val, arms, eval_pattern)?.map(|(_, body)| body))
+}
+
+pub(crate) fn select_switch_arm_with_ordinal<'bump, 'a, F>(
+    disc_val: &Value<'bump>,
+    arms: &'a [SwitchStmtArm],
+    mut eval_pattern: F,
+) -> Result<Option<(usize, &'a [BranchBody])>>
+where
+    F: FnMut(&Expr) -> Result<Value<'bump>>,
+{
+    for (ordinal, arm) in arms.iter().enumerate() {
         let Some(pattern) = arm.pattern.as_ref() else {
-            return Ok(Some(&arm.body));
+            return Ok(Some((ordinal, &arm.body)));
         };
         if values_match(disc_val, &eval_pattern(pattern)?) {
-            return Ok(Some(&arm.body));
+            return Ok(Some((ordinal, &arm.body)));
         }
     }
     Ok(None)
@@ -802,19 +814,44 @@ where
 ///
 /// Same pure-dispatch shape as [`select_switch_arm`]: the caller
 /// supplies `eval_condition` and executes the returned body.
+#[allow(dead_code)]
 pub fn select_if_branch<'bump, 'a, F>(
     chain: &'a IfChain,
-    mut eval_condition: F,
+    eval_condition: F,
 ) -> Result<Option<&'a [BranchBody]>>
 where
     F: FnMut(&Expr) -> Result<Value<'bump>>,
 {
-    for (condition, body) in &chain.branches {
+    Ok(select_if_branch_with_ordinal(chain, eval_condition)?.map(|selection| selection.body))
+}
+
+/// Chosen branch plus its zero-based ordinal, so the caller can
+/// index the parallel metric plan without re-matching AST branches.
+/// `ordinal` is `None` for the else branch.
+pub(crate) struct SelectedIfBranch<'a> {
+    pub(crate) ordinal: Option<usize>,
+    pub(crate) body: &'a [BranchBody],
+}
+
+pub(crate) fn select_if_branch_with_ordinal<'bump, 'a, F>(
+    chain: &'a IfChain,
+    mut eval_condition: F,
+) -> Result<Option<SelectedIfBranch<'a>>>
+where
+    F: FnMut(&Expr) -> Result<Value<'bump>>,
+{
+    for (ordinal, (condition, body)) in chain.branches.iter().enumerate() {
         if eval_condition(condition)?.is_truthy() {
-            return Ok(Some(body));
+            return Ok(Some(SelectedIfBranch {
+                ordinal: Some(ordinal),
+                body,
+            }));
         }
     }
-    Ok(chain.else_body.as_deref())
+    Ok(chain.else_body.as_deref().map(|body| SelectedIfBranch {
+        ordinal: None,
+        body,
+    }))
 }
 
 /// String coercion used by templates, format() placeholders, and any

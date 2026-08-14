@@ -12,7 +12,8 @@ use thiserror::Error;
 use super::arena::EventArena;
 use super::ast::*;
 use super::eval::{
-    LocalScope, eval_expr_with_scope, select_if_branch, select_switch_arm, value_to_string,
+    LocalScope, eval_expr_with_scope, select_if_branch_with_ordinal,
+    select_switch_arm_with_ordinal, value_to_string,
 };
 use super::value::Value;
 use crate::event::BorrowedEvent;
@@ -47,6 +48,75 @@ pub trait ProcessRegistry {
     ) -> std::result::Result<Option<BorrowedEvent<'bump>>, ProcessError>;
 }
 
+/// Registry extension that accepts a metric token pre-resolved at
+/// startup. The token identifies the metric node independently of
+/// the process name — the same name at different call sites
+/// (including recursion) resolves to distinct or shared nodes decided
+/// at compile time — so the event path only needs one `Vec` index
+/// instead of walking the process tree.
+pub(crate) trait CompiledProcessRegistry: ProcessRegistry {
+    fn call_pre_resolved<'bump>(
+        &self,
+        name: &str,
+        metric_token: usize,
+        event: BorrowedEvent<'bump>,
+        arena: &'bump EventArena<'bump>,
+    ) -> std::result::Result<Option<BorrowedEvent<'bump>>, ProcessError>;
+}
+
+pub(crate) enum ProcessMetricStatement {
+    None,
+    Call(usize),
+    If {
+        branches: Vec<Vec<Self>>,
+        else_body: Option<Vec<Self>>,
+    },
+    Switch(Vec<Vec<Self>>),
+    TryCatch {
+        try_body: Vec<Self>,
+        catch_body: Vec<Self>,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum ProcessRegistryDispatch<'a> {
+    Plain(&'a dyn ProcessRegistry),
+    Compiled(&'a dyn CompiledProcessRegistry),
+}
+
+impl ProcessRegistryDispatch<'_> {
+    fn is_compiled(self) -> bool {
+        matches!(self, Self::Compiled(_))
+    }
+
+    fn call<'bump>(
+        self,
+        name: &str,
+        event: BorrowedEvent<'bump>,
+        arena: &'bump EventArena<'bump>,
+    ) -> std::result::Result<Option<BorrowedEvent<'bump>>, ProcessError> {
+        match self {
+            Self::Plain(registry) => registry.call(name, event, arena),
+            Self::Compiled(registry) => registry.call(name, event, arena),
+        }
+    }
+
+    fn call_pre_resolved<'bump>(
+        self,
+        name: &str,
+        metric_token: usize,
+        event: BorrowedEvent<'bump>,
+        arena: &'bump EventArena<'bump>,
+    ) -> std::result::Result<Option<BorrowedEvent<'bump>>, ProcessError> {
+        match self {
+            Self::Plain(registry) => registry.call(name, event, arena),
+            Self::Compiled(registry) => {
+                registry.call_pre_resolved(name, metric_token, event, arena)
+            }
+        }
+    }
+}
+
 /// Execute a sequence of process statements against an event.
 ///
 /// Each call starts with a fresh [`LocalScope`] — `let` bindings do not
@@ -61,8 +131,52 @@ pub fn exec_process_body<'bump>(
     funcs: &FunctionRegistry,
     arena: &'bump EventArena<'bump>,
 ) -> Result<ExecResult<'bump>> {
+    exec_process_body_inner(
+        stmts,
+        None,
+        event,
+        ProcessRegistryDispatch::Plain(registry),
+        funcs,
+        arena,
+    )
+}
+
+pub(crate) fn exec_process_body_with_metric_plan<'bump>(
+    stmts: &[ProcessStatement],
+    metric_stmts: &[ProcessMetricStatement],
+    event: BorrowedEvent<'bump>,
+    registry: &dyn CompiledProcessRegistry,
+    funcs: &FunctionRegistry,
+    arena: &'bump EventArena<'bump>,
+) -> Result<ExecResult<'bump>> {
+    exec_process_body_inner(
+        stmts,
+        Some(metric_stmts),
+        event,
+        ProcessRegistryDispatch::Compiled(registry),
+        funcs,
+        arena,
+    )
+}
+
+fn exec_process_body_inner<'bump>(
+    stmts: &[ProcessStatement],
+    metric_stmts: Option<&[ProcessMetricStatement]>,
+    event: BorrowedEvent<'bump>,
+    registry: ProcessRegistryDispatch<'_>,
+    funcs: &FunctionRegistry,
+    arena: &'bump EventArena<'bump>,
+) -> Result<ExecResult<'bump>> {
     let mut scope = LocalScope::new();
-    exec_stmts_with_scope(stmts, event, registry, funcs, &mut scope, arena)
+    exec_stmts_with_scope(
+        stmts,
+        metric_stmts,
+        event,
+        registry,
+        funcs,
+        &mut scope,
+        arena,
+    )
 }
 
 /// Run statements with the given local scope. `let` bindings mutate
@@ -73,14 +187,30 @@ pub fn exec_process_body<'bump>(
 /// semantics and matches how users read the code top-to-bottom.
 fn exec_stmts_with_scope<'bump>(
     stmts: &[ProcessStatement],
+    metric_stmts: Option<&[ProcessMetricStatement]>,
     mut event: BorrowedEvent<'bump>,
-    registry: &dyn ProcessRegistry,
+    registry: ProcessRegistryDispatch<'_>,
     funcs: &FunctionRegistry,
     scope: &mut LocalScope<'bump>,
     arena: &'bump EventArena<'bump>,
 ) -> Result<ExecResult<'bump>> {
-    for stmt in stmts {
-        match exec_process_stmt(stmt, event, registry, funcs, scope, arena)? {
+    if registry.is_compiled() {
+        let metric_stmts = metric_stmts
+            .ok_or_else(|| anyhow::anyhow!("compiled process metric plan is missing"))?;
+        if metric_stmts.len() != stmts.len() {
+            bail!("compiled process metric plan length does not match the process body");
+        }
+    }
+    for (index, stmt) in stmts.iter().enumerate() {
+        let metric_stmt = match registry {
+            ProcessRegistryDispatch::Compiled(_) => Some(
+                metric_stmts
+                    .and_then(|metrics| metrics.get(index))
+                    .ok_or_else(|| anyhow::anyhow!("compiled process metric entry is missing"))?,
+            ),
+            ProcessRegistryDispatch::Plain(_) => None,
+        };
+        match exec_process_stmt(stmt, metric_stmt, event, registry, funcs, scope, arena)? {
             ExecResult::Continue(e) => event = e,
             ExecResult::Dropped => return Ok(ExecResult::Dropped),
         }
@@ -90,8 +220,9 @@ fn exec_stmts_with_scope<'bump>(
 
 fn exec_process_stmt<'bump>(
     stmt: &ProcessStatement,
+    metric_stmt: Option<&ProcessMetricStatement>,
     mut event: BorrowedEvent<'bump>,
-    registry: &dyn ProcessRegistry,
+    registry: ProcessRegistryDispatch<'_>,
     funcs: &FunctionRegistry,
     scope: &mut LocalScope<'bump>,
     arena: &'bump EventArena<'bump>,
@@ -151,8 +282,17 @@ fn exec_process_stmt<'bump>(
             // `try`/`catch` arm below catches Err and runs the
             // recovery body with the original error message exposed
             // via `workspace._error`.
-            registry
-                .call(name, event, arena)
+            let result = match (registry, metric_stmt) {
+                (
+                    ProcessRegistryDispatch::Compiled(_),
+                    Some(ProcessMetricStatement::Call(token)),
+                ) => registry.call_pre_resolved(name, *token, event, arena),
+                (ProcessRegistryDispatch::Compiled(_), _) => {
+                    bail!("compiled process call token is missing or invalid")
+                }
+                (ProcessRegistryDispatch::Plain(_), _) => registry.call(name, event, arena),
+            };
+            result
                 .map(|opt_event| match opt_event {
                     Some(e) => ExecResult::Continue(e),
                     None => ExecResult::Dropped,
@@ -161,20 +301,60 @@ fn exec_process_stmt<'bump>(
         }
 
         ProcessStatement::If(if_chain) => {
-            match select_if_branch(if_chain, |c| {
+            match select_if_branch_with_ordinal(if_chain, |c| {
                 eval_expr_with_scope(c, &event, funcs, scope, arena)
             })? {
-                Some(body) => exec_branch_body_process(body, event, registry, funcs, scope, arena),
+                Some(selection) => {
+                    let metric_body = match (registry, metric_stmt) {
+                        (
+                            ProcessRegistryDispatch::Compiled(_),
+                            Some(ProcessMetricStatement::If {
+                                branches,
+                                else_body,
+                            }),
+                        ) => match selection.ordinal {
+                            Some(ordinal) => branches.get(ordinal).map(Vec::as_slice),
+                            None => else_body.as_deref(),
+                        },
+                        (ProcessRegistryDispatch::Compiled(_), _) => None,
+                        (ProcessRegistryDispatch::Plain(_), _) => None,
+                    };
+                    exec_branch_body_process(
+                        selection.body,
+                        metric_body,
+                        event,
+                        registry,
+                        funcs,
+                        scope,
+                        arena,
+                    )
+                }
                 None => Ok(ExecResult::Continue(event)),
             }
         }
 
         ProcessStatement::Switch(discriminant, arms) => {
             let disc_val = eval_expr_with_scope(discriminant, &event, funcs, scope, arena)?;
-            match select_switch_arm(&disc_val, arms, |e| {
+            match select_switch_arm_with_ordinal(&disc_val, arms, |e| {
                 eval_expr_with_scope(e, &event, funcs, scope, arena)
             })? {
-                Some(body) => exec_branch_body_process(body, event, registry, funcs, scope, arena),
+                Some((ordinal, body)) => {
+                    let metric_body = match metric_stmt {
+                        Some(ProcessMetricStatement::Switch(arms_metrics)) => {
+                            arms_metrics.get(ordinal).map(Vec::as_slice)
+                        }
+                        _ => None,
+                    };
+                    exec_branch_body_process(
+                        body,
+                        metric_body,
+                        event,
+                        registry,
+                        funcs,
+                        scope,
+                        arena,
+                    )
+                }
                 None => Ok(ExecResult::Continue(event)),
             }
         }
@@ -186,7 +366,15 @@ fn exec_process_stmt<'bump>(
             // scope the try started with.
             let event_backup = clone_borrowed_event(&event, arena);
             let scope_backup = scope.clone();
-            match exec_stmts_with_scope(try_body, event, registry, funcs, scope, arena) {
+            let (try_metrics, catch_metrics) = match metric_stmt {
+                Some(ProcessMetricStatement::TryCatch {
+                    try_body,
+                    catch_body,
+                }) => (Some(try_body.as_slice()), Some(catch_body.as_slice())),
+                _ => (None, None),
+            };
+            match exec_stmts_with_scope(try_body, try_metrics, event, registry, funcs, scope, arena)
+            {
                 Ok(result) => Ok(result),
                 Err(e) => {
                     *scope = scope_backup;
@@ -197,8 +385,15 @@ fn exec_process_stmt<'bump>(
                     let mut recovered = event_backup;
                     let msg = arena.alloc_str(&e.to_string());
                     recovered.workspace_set_str(arena, "_error", Value::String(msg));
-                    let mut result =
-                        exec_stmts_with_scope(catch_body, recovered, registry, funcs, scope, arena);
+                    let mut result = exec_stmts_with_scope(
+                        catch_body,
+                        catch_metrics,
+                        recovered,
+                        registry,
+                        funcs,
+                        scope,
+                        arena,
+                    );
                     // Clean up _error after catch body
                     if let Ok(ExecResult::Continue(ref mut evt)) = result {
                         evt.workspace_remove("_error");
@@ -245,16 +440,32 @@ fn exec_process_stmt<'bump>(
 
 fn exec_branch_body_process<'bump>(
     body: &[BranchBody],
+    metric_body: Option<&[ProcessMetricStatement]>,
     mut event: BorrowedEvent<'bump>,
-    registry: &dyn ProcessRegistry,
+    registry: ProcessRegistryDispatch<'_>,
     funcs: &FunctionRegistry,
     scope: &mut LocalScope<'bump>,
     arena: &'bump EventArena<'bump>,
 ) -> Result<ExecResult<'bump>> {
-    for item in body {
+    if registry.is_compiled() {
+        let metric_body = metric_body
+            .ok_or_else(|| anyhow::anyhow!("compiled process branch plan is missing"))?;
+        if metric_body.len() != body.len() {
+            bail!("compiled process branch plan length does not match the selected body");
+        }
+    }
+    for (index, item) in body.iter().enumerate() {
+        let metric_stmt = match registry {
+            ProcessRegistryDispatch::Compiled(_) => Some(
+                metric_body
+                    .and_then(|metrics| metrics.get(index))
+                    .ok_or_else(|| anyhow::anyhow!("compiled process branch entry is missing"))?,
+            ),
+            ProcessRegistryDispatch::Plain(_) => None,
+        };
         match item {
             BranchBody::Process(stmt) => {
-                match exec_process_stmt(stmt, event, registry, funcs, scope, arena)? {
+                match exec_process_stmt(stmt, metric_stmt, event, registry, funcs, scope, arena)? {
                     ExecResult::Continue(e) => event = e,
                     ExecResult::Dropped => return Ok(ExecResult::Dropped),
                 }

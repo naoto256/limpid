@@ -213,8 +213,9 @@ impl Runtime {
         let mut input_pipelines: HashMap<String, Vec<Arc<PipelineWorker>>> = HashMap::new();
 
         for pipeline_def in config.pipelines.values() {
-            let worker = Arc::new(PipelineWorker::new(
+            let worker = Arc::new(PipelineWorker::new_with_process_metrics(
                 pipeline_def.clone(),
+                &config.processes,
                 &metrics_registry,
             )?);
             let input_names = get_pipeline_inputs(pipeline_def);
@@ -488,12 +489,90 @@ struct PipelineContext {
 struct PipelineWorker {
     def: PipelineDef,
     metrics: Arc<PipelineMetrics>,
+    process_metrics: Option<Arc<crate::pipeline::PipelineProcessMetrics>>,
 }
 
 impl PipelineWorker {
+    #[cfg(test)]
     fn new(def: PipelineDef, registry: &Registry) -> Result<Self, crate::metrics::MetricsError> {
         let metrics = PipelineMetrics::register(registry, &def.name)?;
-        Ok(Self { def, metrics })
+        Ok(Self {
+            def,
+            metrics,
+            process_metrics: None,
+        })
+    }
+
+    fn new_with_process_metrics(
+        def: PipelineDef,
+        processes: &HashMap<String, crate::dsl::ast::ProcessDef>,
+        registry: &Registry,
+    ) -> anyhow::Result<Self> {
+        let metrics = PipelineMetrics::register(registry, &def.name)?;
+        let process_metrics = Arc::new(crate::pipeline::PipelineProcessMetrics::register(
+            &def, processes, registry,
+        )?);
+        Ok(Self {
+            def,
+            metrics,
+            process_metrics: Some(process_metrics),
+        })
+    }
+
+    #[cfg(test)]
+    fn compile_process_metric_plan_for_testing(
+        def: &PipelineDef,
+        processes: &HashMap<String, crate::dsl::ast::ProcessDef>,
+        registry: &Registry,
+    ) -> Result<CompiledProcessMetricPlan, crate::metrics::MetricsError> {
+        Ok(CompiledProcessMetricPlan {
+            pipeline_metrics: PipelineMetrics::register(registry, &def.name)?,
+            process_metrics: crate::pipeline::PipelineProcessMetrics::compile_raw(
+                def, processes, registry,
+            )?,
+        })
+    }
+
+    #[cfg(test)]
+    fn new_with_compiled_process_metrics_for_testing(
+        def: PipelineDef,
+        processes: &HashMap<String, crate::dsl::ast::ProcessDef>,
+        plan: CompiledProcessMetricPlan,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            process_metrics: Some(Arc::new(plan.process_metrics.validate(&def, processes)?)),
+            def,
+            metrics: plan.pipeline_metrics,
+        })
+    }
+}
+
+#[cfg(test)]
+struct CompiledProcessMetricPlan {
+    pipeline_metrics: Arc<PipelineMetrics>,
+    process_metrics: crate::pipeline::RawPipelineProcessMetrics,
+}
+
+#[cfg(test)]
+impl CompiledProcessMetricPlan {
+    fn process_metrics_mut_for_testing(
+        &mut self,
+    ) -> &mut crate::pipeline::RawPipelineProcessMetrics {
+        &mut self.process_metrics
+    }
+
+    fn root_token_for_testing(&self, step: usize) -> Option<usize> {
+        self.process_metrics.root_token_for_testing(step)
+    }
+
+    fn child_token_for_testing(&self, parent: usize, ordinal: usize) -> Option<usize> {
+        self.process_metrics
+            .child_token_for_testing(parent, ordinal)
+    }
+
+    fn metric_node_selection_trap_for_testing(&self) -> crate::pipeline::MetricNodeSelectionTrap {
+        self.process_metrics
+            .metric_node_selection_trap_for_testing()
     }
 }
 
@@ -575,8 +654,19 @@ async fn run_pipeline_workers(
     info!("pipeline worker for input '{}' stopped", input_name);
 }
 
+#[cfg(test)]
 async fn run_pipeline_with_outputs(
     pipeline: &PipelineDef,
+    event: &Event,
+    ctx: &PipelineContext,
+    bump: &mut bumpalo::Bump,
+) -> Result<crate::pipeline::PipelineRunResult> {
+    run_pipeline_with_outputs_inner(pipeline, None, event, ctx, bump).await
+}
+
+async fn run_pipeline_with_outputs_inner(
+    pipeline: &PipelineDef,
+    process_metrics: Option<&crate::pipeline::PipelineProcessMetrics>,
     event: &Event,
     ctx: &PipelineContext,
     bump: &mut bumpalo::Bump,
@@ -585,16 +675,29 @@ async fn run_pipeline_with_outputs(
     // passing `None` skips every trace push (and the `format!` /
     // `to_string` work behind it) in `run_pipeline`, since nothing
     // here reads `PipelineRunResult::trace`.
-    let mut result = crate::pipeline::run_pipeline(
-        pipeline,
-        event,
-        &ctx.config,
-        &ctx.funcs,
-        Some(&ctx.tap),
-        None,
-        crate::pipeline::OutputCapturePolicy::DiskOnly(&ctx.disk_outputs),
-        bump,
-    )?;
+    let mut result = match process_metrics {
+        Some(process_metrics) => crate::pipeline::run_pipeline_with_process_metrics(
+            pipeline,
+            event,
+            &ctx.config,
+            &ctx.funcs,
+            Some(&ctx.tap),
+            None,
+            crate::pipeline::OutputCapturePolicy::DiskOnly(&ctx.disk_outputs),
+            bump,
+            process_metrics,
+        )?,
+        None => crate::pipeline::run_pipeline(
+            pipeline,
+            event,
+            &ctx.config,
+            &ctx.funcs,
+            Some(&ctx.tap),
+            None,
+            crate::pipeline::OutputCapturePolicy::DiskOnly(&ctx.disk_outputs),
+            bump,
+        )?,
+    };
 
     // Drain the per-event outputs vec into the queues. After this
     // change every output statement enqueues a plain `OwnedEvent`
@@ -716,7 +819,15 @@ async fn process_event(
             bump.reset();
         }
         worker.metrics.inflight.inc();
-        match run_pipeline_with_outputs(&worker.def, event, ctx, bump).await {
+        match run_pipeline_with_outputs_inner(
+            &worker.def,
+            worker.process_metrics.as_deref(),
+            event,
+            ctx,
+            bump,
+        )
+        .await
+        {
             Ok(result) => {
                 use crate::pipeline::PipelineTermination;
                 match result.termination {
@@ -899,6 +1010,981 @@ mod tests {
             }
         }
         panic!("no pipeline in src");
+    }
+
+    fn compiled_config(src: &str) -> CompiledConfig {
+        CompiledConfig::from_config(parse_config(src).expect("parse config"))
+            .expect("compile config")
+    }
+
+    fn metric_series(registry: &Registry, name: &str) -> Vec<serde_json::Value> {
+        let snapshot = serde_json::to_value(registry.snapshot()).expect("serialize snapshot");
+        snapshot["metrics"]
+            .as_array()
+            .expect("metrics array")
+            .iter()
+            .find(|family| family["name"] == name)
+            .unwrap_or_else(|| panic!("missing metric family {name}"))["series"]
+            .as_array()
+            .expect("series array")
+            .clone()
+    }
+
+    fn series_value(registry: &Registry, family: &str, labels: &[(&str, &str)]) -> u64 {
+        let expected: serde_json::Map<String, serde_json::Value> = labels
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), serde_json::json!(value)))
+            .collect();
+        metric_series(registry, family)
+            .into_iter()
+            .find(|series| series["labels"].as_object() == Some(&expected))
+            .unwrap_or_else(|| panic!("missing {family} series for {expected:?}"))["value"]
+            .as_u64()
+            .expect("counter value")
+    }
+
+    #[test]
+    fn process_metrics_prepopulate_exact_static_dfs_topology() {
+        let config = compiled_config(
+            r#"
+def process leaf { egress = ingress }
+def process parent_one { process leaf }
+def process parent_two { process leaf }
+def process repeated { egress = ingress }
+def process dispatch { process leaf; process leaf; drop }
+def process branch_then { egress = ingress }
+def process branch_else { egress = ingress }
+def process arm_first { egress = ingress }
+def process arm_default { egress = ingress }
+def pipeline topology {
+    process parent_one | parent_two
+    process repeated
+    process repeated
+    process dispatch
+    if true { process branch_then } else { process branch_else }
+    switch "first" {
+        "first" { process arm_first }
+        default { process arm_default }
+    }
+    process { drop }
+    drop
+}
+"#,
+        );
+        let registry = Registry::new();
+        let def = config.pipelines.get("topology").expect("pipeline").clone();
+        let _worker = PipelineWorker::new_with_process_metrics(def, &config.processes, &registry)
+            .expect("register pipeline and process metrics");
+
+        let process_families = [
+            "limpid_process_events_in_total",
+            "limpid_process_events_out_total",
+            "limpid_process_events_dropped_total",
+            "limpid_process_events_errored_total",
+        ];
+        let expected = [
+            ("1", "/parent_one", "parent_one"),
+            ("1", "/parent_one/leaf", "leaf"),
+            ("2", "/parent_two", "parent_two"),
+            ("2", "/parent_two/leaf", "leaf"),
+            ("3", "/repeated", "repeated"),
+            ("4", "/repeated", "repeated"),
+            ("5", "/dispatch", "dispatch"),
+            ("5", "/dispatch/leaf", "leaf"),
+            ("6", "/branch_then", "branch_then"),
+            ("7", "/branch_else", "branch_else"),
+            ("8", "/arm_first", "arm_first"),
+            ("9", "/arm_default", "arm_default"),
+            ("10", "/(inline)", "(inline)"),
+        ];
+        for family in process_families {
+            let series = metric_series(&registry, family);
+            assert_eq!(series.len(), expected.len(), "{family}");
+            for (step, path, name) in expected {
+                assert_eq!(
+                    series_value(
+                        &registry,
+                        family,
+                        &[
+                            ("pipeline", "topology"),
+                            ("step", step),
+                            ("process_path", path),
+                            ("process_name", name),
+                        ],
+                    ),
+                    0,
+                    "{family} must be prepopulated"
+                );
+            }
+        }
+
+        let dropped = metric_series(&registry, "limpid_pipeline_events_dropped_total");
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(
+            dropped[0]["labels"],
+            serde_json::json!({"pipeline": "topology"})
+        );
+        assert_eq!(dropped[0]["value"], 0);
+    }
+
+    #[test]
+    fn process_metrics_fold_same_call_site_and_collapse_recursive_back_edges() {
+        let config = compiled_config(
+            r#"
+def process a { process b }
+def process b { process a }
+def process leaf { egress = ingress }
+def process dispatch { process leaf; process leaf }
+def pipeline bounded { process a; process dispatch }
+"#,
+        );
+        let registry = Registry::new();
+        let def = config.pipelines.get("bounded").expect("pipeline").clone();
+        let _worker = PipelineWorker::new_with_process_metrics(def, &config.processes, &registry)
+            .expect("register bounded process topology");
+        let series = metric_series(&registry, "limpid_process_events_in_total");
+        let paths: Vec<&str> = series
+            .iter()
+            .map(|series| series["labels"]["process_path"].as_str().expect("path"))
+            .collect();
+        assert_eq!(series.len(), 4);
+        assert_eq!(paths.iter().filter(|path| **path == "/a").count(), 1);
+        assert_eq!(paths.iter().filter(|path| **path == "/a/b").count(), 1);
+        assert_eq!(paths.iter().filter(|path| **path == "/dispatch").count(), 1);
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|path| **path == "/dispatch/leaf")
+                .count(),
+            1
+        );
+        assert!(!paths.contains(&"/a/b/a"));
+    }
+
+    #[tokio::test]
+    async fn process_metric_call_sites_compile_to_opaque_tokens_consumed_by_execution() {
+        let config = compiled_config(
+            r#"
+def process leaf { egress = ingress }
+def process parent_one { process leaf }
+def process parent_two { process leaf }
+def process dispatch { process leaf; process leaf }
+def process a { process b }
+def process b { process a }
+def pipeline p {
+    process parent_one
+    process parent_two
+    process dispatch
+    process a
+}
+"#,
+        );
+        let registry = Registry::new();
+        let def = config.pipelines.get("p").expect("pipeline").clone();
+        let plan = PipelineWorker::compile_process_metric_plan_for_testing(
+            &def,
+            &config.processes,
+            &registry,
+        )
+        .expect("compile process metric plan");
+
+        let parent_one = plan.root_token_for_testing(1).expect("parent_one token");
+        let parent_two = plan.root_token_for_testing(2).expect("parent_two token");
+        let dispatch = plan.root_token_for_testing(3).expect("dispatch token");
+        let a = plan.root_token_for_testing(4).expect("a token");
+        let parent_one_leaf = plan
+            .child_token_for_testing(parent_one, 0)
+            .expect("parent_one leaf token");
+        let parent_two_leaf = plan
+            .child_token_for_testing(parent_two, 0)
+            .expect("parent_two leaf token");
+        assert_ne!(
+            parent_one_leaf, parent_two_leaf,
+            "different parents must have different pre-resolved child frames"
+        );
+        assert_eq!(
+            plan.child_token_for_testing(dispatch, 0),
+            plan.child_token_for_testing(dispatch, 1),
+            "same-parent calls to the same callee must reuse one frame token"
+        );
+        let b = plan.child_token_for_testing(a, 0).expect("a-to-b token");
+        assert_eq!(
+            plan.child_token_for_testing(b, 0),
+            Some(a),
+            "an ancestor back-edge must reuse the ancestor token"
+        );
+
+        let execution_config = compiled_config(
+            r#"
+def process leaf { egress = ingress }
+def process dispatch { process leaf; process leaf }
+def pipeline execute { process dispatch; finish }
+"#,
+        );
+        let execution_registry = Registry::new();
+        let execution_def = execution_config
+            .pipelines
+            .get("execute")
+            .expect("execution pipeline")
+            .clone();
+        let execution_plan = PipelineWorker::compile_process_metric_plan_for_testing(
+            &execution_def,
+            &execution_config.processes,
+            &execution_registry,
+        )
+        .expect("compile executable process metric plan");
+        // This trap is owned by the metric-node selection seam used by execution,
+        // rather than by the test facade. Arming it after compilation permits the
+        // definition registry lookup but rejects per-event metric-node lookup.
+        let selection_trap = execution_plan.metric_node_selection_trap_for_testing();
+        let worker = Arc::new(
+            PipelineWorker::new_with_compiled_process_metrics_for_testing(
+                execution_def,
+                &execution_config.processes,
+                execution_plan,
+            )
+            .expect("execution must consume the compiled token plan"),
+        );
+        selection_trap.arm_for_testing();
+        let ctx = PipelineContext {
+            output_senders: Arc::new(HashMap::new()),
+            disk_outputs: Arc::new(HashSet::new()),
+            config: Arc::new(execution_config),
+            funcs: Arc::new(FunctionRegistry::new()),
+            tap: TapRegistry::new(),
+            error_log: None,
+            error_log_fallback: crate::error_log::ErrorLogFallback::default(),
+        };
+        process_event(
+            &fixture_event(),
+            &[worker],
+            &ctx,
+            "input compiled-plan",
+            &mut bumpalo::Bump::new(),
+        )
+        .await;
+        assert_eq!(
+            selection_trap.metric_node_lookup_attempts_for_testing(),
+            0,
+            "execution must select pre-resolved metric frames by call-site token"
+        );
+        assert_process_vector(
+            &execution_registry,
+            &[
+                ("pipeline", "execute"),
+                ("step", "1"),
+                ("process_path", "/dispatch"),
+                ("process_name", "dispatch"),
+            ],
+            [1, 1, 0, 0],
+        );
+        assert_process_vector(
+            &execution_registry,
+            &[
+                ("pipeline", "execute"),
+                ("step", "1"),
+                ("process_path", "/dispatch/leaf"),
+                ("process_name", "leaf"),
+            ],
+            [2, 2, 0, 0],
+        );
+        assert_process_conservation(&execution_registry);
+    }
+
+    async fn run_compiled_process_metric_fixture(
+        source: &str,
+        pipeline: &str,
+        mutate: impl FnOnce(&mut crate::pipeline::RawPipelineProcessMetrics),
+    ) -> (Registry, crate::pipeline::MetricNodeSelectionTrap) {
+        let config = compiled_config(source);
+        let registry = Registry::new();
+        let def = config
+            .pipelines
+            .get(pipeline)
+            .unwrap_or_else(|| panic!("missing pipeline {pipeline}"))
+            .clone();
+        let mut plan = PipelineWorker::compile_process_metric_plan_for_testing(
+            &def,
+            &config.processes,
+            &registry,
+        )
+        .expect("compile process metric plan");
+        mutate(plan.process_metrics_mut_for_testing());
+        let selection_trap = plan.metric_node_selection_trap_for_testing();
+        let worker = Arc::new(
+            PipelineWorker::new_with_compiled_process_metrics_for_testing(
+                def,
+                &config.processes,
+                plan,
+            )
+            .expect("construct worker from compiled metric plan"),
+        );
+        selection_trap.arm_for_testing();
+        let ctx = PipelineContext {
+            output_senders: Arc::new(HashMap::new()),
+            disk_outputs: Arc::new(HashSet::new()),
+            config: Arc::new(config),
+            funcs: Arc::new(FunctionRegistry::new()),
+            tap: TapRegistry::new(),
+            error_log: None,
+            error_log_fallback: crate::error_log::ErrorLogFallback::default(),
+        };
+        process_event(
+            &fixture_event(),
+            &[worker],
+            &ctx,
+            "input compiled-plan",
+            &mut bumpalo::Bump::new(),
+        )
+        .await;
+        (registry, selection_trap)
+    }
+
+    fn assert_compiled_plan_rejected_before_execution(
+        source: &str,
+        pipeline: &str,
+        mutate: impl FnOnce(&mut crate::pipeline::RawPipelineProcessMetrics),
+    ) {
+        let config = compiled_config(source);
+        let registry = Registry::new();
+        let def = config
+            .pipelines
+            .get(pipeline)
+            .unwrap_or_else(|| panic!("missing pipeline {pipeline}"))
+            .clone();
+        let mut plan = PipelineWorker::compile_process_metric_plan_for_testing(
+            &def,
+            &config.processes,
+            &registry,
+        )
+        .expect("compile raw process metric plan");
+        mutate(plan.process_metrics_mut_for_testing());
+        assert!(
+            PipelineWorker::new_with_compiled_process_metrics_for_testing(
+                def,
+                &config.processes,
+                plan,
+            )
+            .is_err(),
+            "invalid raw plan must be rejected during worker construction"
+        );
+        assert_eq!(
+            series_value(
+                &registry,
+                "limpid_pipeline_events_errored_total",
+                &[("pipeline", pipeline)],
+            ),
+            0,
+            "startup rejection must happen before an event is executed"
+        );
+        assert_eq!(
+            series_value(
+                &registry,
+                "limpid_pipeline_events_dropped_total",
+                &[("pipeline", pipeline)],
+            ),
+            0,
+            "the process body's drop side effect must not run during validation"
+        );
+        for series in metric_series(&registry, "limpid_process_events_in_total") {
+            assert_eq!(series["value"], 0, "no process frame may start at startup");
+        }
+        assert_process_conservation(&registry);
+    }
+
+    #[test]
+    fn compiled_metric_plan_mismatches_fail_closed_during_worker_construction() {
+        const NAMED: &str = r#"
+def process leaf { drop }
+def process root { process leaf }
+def pipeline p { process root; finish }
+"#;
+        assert_compiled_plan_rejected_before_execution(NAMED, "p", |metrics| {
+            metrics.remove_root_plan_for_testing()
+        });
+        assert_compiled_plan_rejected_before_execution(NAMED, "p", |metrics| {
+            metrics.replace_first_root_plan_with_none_for_testing();
+        });
+        assert_compiled_plan_rejected_before_execution(NAMED, "p", |metrics| {
+            metrics.invalidate_first_root_token_for_testing();
+        });
+        assert_compiled_plan_rejected_before_execution(NAMED, "p", |metrics| {
+            metrics.replace_first_process_body_plan_with_none_for_testing();
+        });
+        assert_compiled_plan_rejected_before_execution(NAMED, "p", |metrics| {
+            metrics.invalidate_first_nested_token_for_testing();
+        });
+        assert_compiled_plan_rejected_before_execution(
+            "def pipeline p { process { drop }; finish }",
+            "p",
+            |metrics| metrics.invalidate_first_inline_token_for_testing(),
+        );
+
+        assert_compiled_plan_rejected_before_execution(
+            "def process a { drop } def process b { drop } def pipeline p { process a | b }",
+            "p",
+            |metrics| metrics.swap_first_two_root_tokens_for_testing(),
+        );
+        assert_compiled_plan_rejected_before_execution(
+            r#"
+def process leaf { drop }
+def process parent_one { process leaf }
+def process parent_two { process leaf }
+def pipeline p { process parent_one; process parent_two }
+"#,
+            "p",
+            |metrics| metrics.swap_first_two_nested_tokens_for_testing(),
+        );
+        assert_compiled_plan_rejected_before_execution(
+            "def process named { drop } def pipeline p { process named | { drop } }",
+            "p",
+            |metrics| metrics.swap_first_two_root_tokens_for_testing(),
+        );
+    }
+
+    async fn assert_compiled_branch_selection(
+        source: &str,
+        pipeline: &str,
+        expected: &[(&str, &str, &str, [u64; 4])],
+    ) {
+        let (registry, trap) = run_compiled_process_metric_fixture(source, pipeline, |_| {}).await;
+        assert_eq!(
+            trap.metric_node_lookup_attempts_for_testing(),
+            0,
+            "branch execution must consume compiled ordinal plans without lookup"
+        );
+        for (step, path, name, vector) in expected {
+            assert_process_vector(
+                &registry,
+                &[
+                    ("pipeline", pipeline),
+                    ("step", step),
+                    ("process_path", path),
+                    ("process_name", name),
+                ],
+                *vector,
+            );
+        }
+        assert_process_conservation(&registry);
+    }
+
+    #[tokio::test]
+    async fn compiled_process_branches_use_selected_ordinals_for_nonfirst_and_fallback_bodies() {
+        const SOURCE: &str = r#"
+def process first { egress = ingress }
+def process selected { egress = ingress }
+def process fallback { egress = ingress }
+def process nonfirst {
+    if false { process first } else if true { process selected } else { process fallback }
+    switch "second" {
+        "first" { process first }
+        "second" { process selected }
+        default { process fallback }
+    }
+}
+def process defaults {
+    if false { process first } else if false { process selected } else { process fallback }
+    switch "missing" {
+        "first" { process first }
+        "second" { process selected }
+        default { process fallback }
+    }
+}
+def pipeline p_nonfirst { process nonfirst; finish }
+def pipeline p_fallback { process defaults; finish }
+"#;
+        assert_compiled_branch_selection(
+            SOURCE,
+            "p_nonfirst",
+            &[
+                ("1", "/nonfirst", "nonfirst", [1, 1, 0, 0]),
+                ("1", "/nonfirst/first", "first", [0, 0, 0, 0]),
+                ("1", "/nonfirst/selected", "selected", [2, 2, 0, 0]),
+                ("1", "/nonfirst/fallback", "fallback", [0, 0, 0, 0]),
+            ],
+        )
+        .await;
+        assert_compiled_branch_selection(
+            SOURCE,
+            "p_fallback",
+            &[
+                ("1", "/defaults", "defaults", [1, 1, 0, 0]),
+                ("1", "/defaults/first", "first", [0, 0, 0, 0]),
+                ("1", "/defaults/selected", "selected", [0, 0, 0, 0]),
+                ("1", "/defaults/fallback", "fallback", [2, 2, 0, 0]),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn compiled_pipeline_branches_use_selected_ordinals_for_nonfirst_and_fallback_bodies() {
+        const SOURCE: &str = r#"
+def process leaf { egress = ingress }
+def process parent { process leaf }
+def pipeline p_nonfirst {
+    if false { process parent } else if true { process parent } else { process parent }
+    switch "second" {
+        "first" { process parent }
+        "second" { process parent }
+        default { process parent }
+    }
+    finish
+}
+def pipeline p_fallback {
+    if false { process parent } else if false { process parent } else { process parent }
+    switch "missing" {
+        "first" { process parent }
+        "second" { process parent }
+        default { process parent }
+    }
+    finish
+}
+"#;
+        assert_compiled_branch_selection(
+            SOURCE,
+            "p_nonfirst",
+            &[
+                ("2", "/parent", "parent", [1, 1, 0, 0]),
+                ("2", "/parent/leaf", "leaf", [1, 1, 0, 0]),
+                ("5", "/parent", "parent", [1, 1, 0, 0]),
+                ("5", "/parent/leaf", "leaf", [1, 1, 0, 0]),
+            ],
+        )
+        .await;
+        assert_compiled_branch_selection(
+            SOURCE,
+            "p_fallback",
+            &[
+                ("3", "/parent", "parent", [1, 1, 0, 0]),
+                ("3", "/parent/leaf", "leaf", [1, 1, 0, 0]),
+                ("6", "/parent", "parent", [1, 1, 0, 0]),
+                ("6", "/parent/leaf", "leaf", [1, 1, 0, 0]),
+            ],
+        )
+        .await;
+    }
+
+    #[test]
+    fn process_metric_families_have_exact_counter_metadata_and_label_dimensions() {
+        let config = compiled_config(
+            "def process pass { egress = ingress } def pipeline p { process pass }",
+        );
+        let registry = Registry::new();
+        let def = config.pipelines.get("p").expect("pipeline").clone();
+        let _worker = PipelineWorker::new_with_process_metrics(def, &config.processes, &registry)
+            .expect("register metrics");
+        let snapshot = serde_json::to_value(registry.snapshot()).expect("snapshot");
+        for suffix in ["in", "out", "dropped", "errored"] {
+            let name = format!("limpid_process_events_{suffix}_total");
+            let family = snapshot["metrics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|family| family["name"] == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(family["type"], "counter");
+            assert!(family["help"].as_str().is_some_and(|help| !help.is_empty()));
+            let labels = family["series"][0]["labels"].as_object().unwrap();
+            assert_eq!(
+                labels.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["pipeline", "process_name", "process_path", "step"]
+            );
+        }
+    }
+
+    async fn run_process_metric_fixture(src: &str, pipeline: &str, mut event: Event) -> Registry {
+        let config = compiled_config(src);
+        let registry = Registry::new();
+        let def = config
+            .pipelines
+            .get(pipeline)
+            .unwrap_or_else(|| panic!("missing pipeline {pipeline}"))
+            .clone();
+        let worker = Arc::new(
+            PipelineWorker::new_with_process_metrics(def, &config.processes, &registry)
+                .expect("register process metrics"),
+        );
+        let ctx = PipelineContext {
+            output_senders: Arc::new(HashMap::new()),
+            disk_outputs: Arc::new(HashSet::new()),
+            config: Arc::new(config),
+            funcs: Arc::new(FunctionRegistry::new()),
+            tap: TapRegistry::new(),
+            error_log: None,
+            error_log_fallback: crate::error_log::ErrorLogFallback::default(),
+        };
+        if event.egress.is_empty() {
+            event.egress = event.ingress.clone();
+        }
+        process_event(
+            &event,
+            &[worker],
+            &ctx,
+            "input fixture",
+            &mut bumpalo::Bump::new(),
+        )
+        .await;
+        registry
+    }
+
+    fn fixture_event() -> Event {
+        Event::new(
+            Bytes::from_static(b"payload"),
+            SocketAddr::from_str("127.0.0.1:0").unwrap(),
+        )
+    }
+
+    fn assert_process_conservation(registry: &Registry) {
+        let family_names = [
+            "limpid_process_events_in_total",
+            "limpid_process_events_out_total",
+            "limpid_process_events_dropped_total",
+            "limpid_process_events_errored_total",
+        ];
+        let label_sets: Vec<std::collections::BTreeSet<Vec<(String, String)>>> = family_names
+            .iter()
+            .map(|family| {
+                metric_series(registry, family)
+                    .into_iter()
+                    .map(|series| {
+                        series["labels"]
+                            .as_object()
+                            .expect("labels")
+                            .iter()
+                            .map(|(key, value)| {
+                                (key.clone(), value.as_str().expect("label value").to_owned())
+                            })
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect();
+        for labels in &label_sets[1..] {
+            assert_eq!(
+                labels, &label_sets[0],
+                "all process terminal families must have the exact input label-set"
+            );
+        }
+
+        for input in metric_series(registry, "limpid_process_events_in_total") {
+            let labels = input["labels"].as_object().expect("labels");
+            let owned_labels: Vec<(String, String)> = labels
+                .iter()
+                .map(|(key, value)| (key.clone(), value.as_str().expect("label value").to_owned()))
+                .collect();
+            let labels: Vec<(&str, &str)> = owned_labels
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect();
+            let input = input["value"].as_u64().expect("input value");
+            let terminal: u64 = ["out", "dropped", "errored"]
+                .into_iter()
+                .map(|suffix| {
+                    series_value(
+                        registry,
+                        &format!("limpid_process_events_{suffix}_total"),
+                        &labels,
+                    )
+                })
+                .sum();
+            assert_eq!(input, terminal, "non-conserving process series {labels:?}");
+        }
+    }
+
+    fn assert_process_vector(registry: &Registry, labels: &[(&str, &str)], expected: [u64; 4]) {
+        let actual = ["in", "out", "dropped", "errored"].map(|suffix| {
+            series_value(
+                registry,
+                &format!("limpid_process_events_{suffix}_total"),
+                labels,
+            )
+        });
+        assert_eq!(actual, expected, "wrong process vector for {labels:?}");
+    }
+
+    #[tokio::test]
+    async fn process_invocations_conserve_continue_drop_and_caught_error_frames() {
+        let continued = run_process_metric_fixture(
+            r#"
+def process leaf { egress = ingress }
+def process dispatch { process leaf }
+def pipeline p { process dispatch; finish }
+"#,
+            "p",
+            fixture_event(),
+        )
+        .await;
+        for path in ["/dispatch", "/dispatch/leaf"] {
+            let labels = [
+                ("pipeline", "p"),
+                ("step", "1"),
+                ("process_path", path),
+                ("process_name", path.rsplit('/').next().unwrap()),
+            ];
+            assert_process_vector(&continued, &labels, [1, 1, 0, 0]);
+        }
+        assert_process_conservation(&continued);
+
+        let dropped = run_process_metric_fixture(
+            r#"
+def process leaf { drop }
+def process dispatch { process leaf }
+def pipeline p { process dispatch; finish }
+"#,
+            "p",
+            fixture_event(),
+        )
+        .await;
+        for (path, name) in [("/dispatch", "dispatch"), ("/dispatch/leaf", "leaf")] {
+            let labels = [
+                ("pipeline", "p"),
+                ("step", "1"),
+                ("process_path", path),
+                ("process_name", name),
+            ];
+            assert_process_vector(&dropped, &labels, [1, 0, 1, 0]);
+        }
+        assert_eq!(
+            series_value(
+                &dropped,
+                "limpid_pipeline_events_dropped_total",
+                &[("pipeline", "p")],
+            ),
+            1
+        );
+        assert_process_conservation(&dropped);
+
+        let caught = run_process_metric_fixture(
+            r#"
+def process fail { error "expected" }
+def process catcher { try { process fail } catch { egress = ingress } }
+def pipeline p { process catcher; finish }
+"#,
+            "p",
+            fixture_event(),
+        )
+        .await;
+        assert_process_vector(
+            &caught,
+            &[
+                ("pipeline", "p"),
+                ("step", "1"),
+                ("process_path", "/catcher"),
+                ("process_name", "catcher"),
+            ],
+            [1, 1, 0, 0],
+        );
+        assert_process_vector(
+            &caught,
+            &[
+                ("pipeline", "p"),
+                ("step", "1"),
+                ("process_path", "/catcher/fail"),
+                ("process_name", "fail"),
+            ],
+            [1, 0, 0, 1],
+        );
+        assert_eq!(
+            series_value(
+                &caught,
+                "limpid_pipeline_events_errored_total",
+                &[("pipeline", "p")],
+            ),
+            0,
+            "a caught process error must not become a pipeline error"
+        );
+        assert_process_conservation(&caught);
+
+        let uncaught = run_process_metric_fixture(
+            r#"
+def process fail { error "expected" }
+def process outer { process fail }
+def pipeline p { process outer; finish }
+"#,
+            "p",
+            fixture_event(),
+        )
+        .await;
+        for (path, name) in [("/outer", "outer"), ("/outer/fail", "fail")] {
+            let labels = [
+                ("pipeline", "p"),
+                ("step", "1"),
+                ("process_path", path),
+                ("process_name", name),
+            ];
+            assert_process_vector(&uncaught, &labels, [1, 0, 0, 1]);
+        }
+        assert_eq!(
+            series_value(
+                &uncaught,
+                "limpid_pipeline_events_errored_total",
+                &[("pipeline", "p")],
+            ),
+            1,
+            "one errored pipeline run is independent of its two errored frames"
+        );
+        assert_process_conservation(&uncaught);
+    }
+
+    #[tokio::test]
+    async fn pipeline_drop_counter_stays_event_based_while_process_drops_propagate_by_frame() {
+        for body in ["drop", "process { drop }", "process named"] {
+            let source =
+                format!("def process named {{ drop }} def pipeline p {{ {body}; finish }}");
+            let registry = run_process_metric_fixture(&source, "p", fixture_event()).await;
+            let dropped = metric_series(&registry, "limpid_pipeline_events_dropped_total");
+            assert_eq!(dropped.len(), 1, "{body}");
+            assert_eq!(dropped[0]["labels"], serde_json::json!({"pipeline": "p"}));
+            assert_eq!(
+                series_value(
+                    &registry,
+                    "limpid_pipeline_events_dropped_total",
+                    &[("pipeline", "p")],
+                ),
+                1,
+                "each dropped event must increment the plain pipeline counter once: {body}"
+            );
+            if body != "drop" {
+                assert_process_conservation(&registry);
+            }
+        }
+
+        let nested = run_process_metric_fixture(
+            r#"
+def process leaf { drop }
+def process outer { process leaf }
+def pipeline nested { process outer; finish }
+"#,
+            "nested",
+            fixture_event(),
+        )
+        .await;
+        let dropped = metric_series(&nested, "limpid_pipeline_events_dropped_total");
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(
+            dropped[0]["labels"],
+            serde_json::json!({"pipeline": "nested"})
+        );
+        assert_eq!(dropped[0]["value"], 1);
+        for (path, name) in [("/outer", "outer"), ("/outer/leaf", "leaf")] {
+            assert_process_vector(
+                &nested,
+                &[
+                    ("pipeline", "nested"),
+                    ("step", "1"),
+                    ("process_path", path),
+                    ("process_name", name),
+                ],
+                [1, 0, 1, 0],
+            );
+        }
+        assert_process_conservation(&nested);
+    }
+
+    #[tokio::test]
+    async fn recursive_invocations_reuse_the_ancestor_series_without_dynamic_growth() {
+        let mut event = fixture_event();
+        event
+            .workspace
+            .insert("depth".to_owned(), crate::dsl::value::OwnedValue::Int(0));
+        let registry = run_process_metric_fixture(
+            r#"
+def process a {
+    if workspace.depth < 2 {
+        workspace.depth = workspace.depth + 1
+        process b
+    }
+}
+def process b { process a }
+def pipeline p { process a; finish }
+"#,
+            "p",
+            event,
+        )
+        .await;
+        assert_process_vector(
+            &registry,
+            &[
+                ("pipeline", "p"),
+                ("step", "1"),
+                ("process_path", "/a"),
+                ("process_name", "a"),
+            ],
+            [3, 3, 0, 0],
+        );
+        assert_process_vector(
+            &registry,
+            &[
+                ("pipeline", "p"),
+                ("step", "1"),
+                ("process_path", "/a/b"),
+                ("process_name", "b"),
+            ],
+            [2, 2, 0, 0],
+        );
+        assert_eq!(
+            metric_series(&registry, "limpid_process_events_in_total").len(),
+            2,
+            "recursive calls must not register runtime series"
+        );
+        assert_process_conservation(&registry);
+    }
+
+    #[tokio::test]
+    async fn concurrent_tasks_share_prepopulated_process_handles_without_cardinality_growth() {
+        let config = compiled_config(
+            "def process pass { egress = ingress } def pipeline p { process pass; finish }",
+        );
+        let registry = Arc::new(Registry::new());
+        let def = config.pipelines.get("p").expect("pipeline").clone();
+        let worker = Arc::new(
+            PipelineWorker::new_with_process_metrics(def, &config.processes, &registry)
+                .expect("register metrics"),
+        );
+        let ctx = Arc::new(PipelineContext {
+            output_senders: Arc::new(HashMap::new()),
+            disk_outputs: Arc::new(HashSet::new()),
+            config: Arc::new(config),
+            funcs: Arc::new(FunctionRegistry::new()),
+            tap: TapRegistry::new(),
+            error_log: None,
+            error_log_fallback: crate::error_log::ErrorLogFallback::default(),
+        });
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let worker = Arc::clone(&worker);
+            let ctx = Arc::clone(&ctx);
+            tasks.push(tokio::spawn(async move {
+                process_event(
+                    &fixture_event(),
+                    &[worker],
+                    &ctx,
+                    "input concurrent",
+                    &mut bumpalo::Bump::new(),
+                )
+                .await;
+            }));
+        }
+        for task in tasks {
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("invocation must finish")
+                .expect("invocation task must not panic");
+        }
+        let labels = [
+            ("pipeline", "p"),
+            ("step", "1"),
+            ("process_path", "/pass"),
+            ("process_name", "pass"),
+        ];
+        assert_process_vector(&registry, &labels, [16, 16, 0, 0]);
+        assert_eq!(
+            metric_series(&registry, "limpid_process_events_in_total").len(),
+            1,
+            "shared pre-resolved handles must not grow metric cardinality"
+        );
+        assert_process_conservation(&registry);
     }
 
     #[tokio::test]

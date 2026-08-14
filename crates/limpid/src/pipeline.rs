@@ -14,15 +14,20 @@
 //! sends, DLQ persistence) keeps the same `OwnedEvent` shape it had
 //! before v0.6.0.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Result, bail};
 use tracing::trace;
 
 use crate::dsl::arena::EventArena;
 use crate::dsl::ast::*;
-use crate::dsl::eval::{eval_expr, select_if_branch, select_switch_arm, value_to_string};
-use crate::dsl::exec::{ExecResult, ProcessError, ProcessRegistry, exec_process_body};
+use crate::dsl::eval::{
+    eval_expr, select_if_branch_with_ordinal, select_switch_arm_with_ordinal, value_to_string,
+};
+use crate::dsl::exec::{
+    CompiledProcessRegistry, ExecResult, ProcessError, ProcessMetricStatement, ProcessRegistry,
+    exec_process_body, exec_process_body_with_metric_plan,
+};
 use crate::event::{BorrowedEvent, OwnedEvent};
 use crate::functions::FunctionRegistry;
 use crate::tap::TapRegistry;
@@ -418,6 +423,803 @@ pub struct PipelineRunResult {
     pub errored: Vec<ErroredEventContext>,
 }
 
+/// Pre-compiled metric plan for a pipeline's process invocations.
+/// The plan is validated once at startup, so event execution uses
+/// only O(1) token lookups. Validation rejects shape or identity
+/// mismatches before worker construction; defensive checked access
+/// returns an internal error instead of silently attributing an
+/// invocation to the wrong metric series.
+pub(crate) struct PipelineProcessMetrics {
+    nodes: Vec<ProcessMetricNode>,
+    statements: Vec<PipelineMetricStatement>,
+    #[cfg(test)]
+    selection_trap: std::sync::Arc<MetricNodeSelectionTrapState>,
+}
+
+struct ProcessMetricNode {
+    counters: crate::metrics::ProcessCounters,
+    body_plan: Vec<ProcessMetricStatement>,
+    #[cfg(test)]
+    call_sites: Vec<usize>,
+}
+
+pub(crate) struct RawPipelineProcessMetrics {
+    nodes: Vec<ProcessMetricNode>,
+    identities: Vec<ProcessMetricNodeIdentity>,
+    statements: Vec<PipelineMetricStatement>,
+    #[cfg(test)]
+    selection_trap: std::sync::Arc<MetricNodeSelectionTrapState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProcessMetricNodeIdentity {
+    parent: Option<usize>,
+    step: usize,
+    kind: ProcessMetricNodeKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProcessMetricNodeKind {
+    Named(String),
+    Inline,
+}
+
+enum PipelineMetricStatement {
+    None,
+    ProcessChain(Vec<usize>),
+    If {
+        branches: Vec<Vec<PipelineMetricStatement>>,
+        else_body: Option<Vec<PipelineMetricStatement>>,
+    },
+    Switch(Vec<Vec<PipelineMetricStatement>>),
+}
+
+impl PipelineProcessMetrics {
+    pub(crate) fn register(
+        pipeline: &PipelineDef,
+        processes: &HashMap<String, ProcessDef>,
+        registry: &crate::metrics::Registry,
+    ) -> anyhow::Result<Self> {
+        Self::compile_raw(pipeline, processes, registry)?.validate(pipeline, processes)
+    }
+
+    pub(crate) fn compile_raw(
+        pipeline: &PipelineDef,
+        processes: &HashMap<String, ProcessDef>,
+        registry: &crate::metrics::Registry,
+    ) -> Result<RawPipelineProcessMetrics, crate::metrics::MetricsError> {
+        let mut builder = ProcessMetricsBuilder {
+            pipeline: &pipeline.name,
+            processes,
+            registry,
+            nodes: Vec::new(),
+            identities: Vec::new(),
+            children: Vec::new(),
+            next_step: 1,
+        };
+        let statements = builder.pipeline_body(&pipeline.body)?;
+        Ok(RawPipelineProcessMetrics {
+            nodes: builder.nodes,
+            identities: builder.identities,
+            statements,
+            #[cfg(test)]
+            selection_trap: std::sync::Arc::new(MetricNodeSelectionTrapState::default()),
+        })
+    }
+
+    fn select_node(&self, token: usize) -> Option<&ProcessMetricNode> {
+        let node = self.nodes.get(token);
+        #[cfg(test)]
+        if node.is_none()
+            && self
+                .selection_trap
+                .armed
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.selection_trap
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        node
+    }
+}
+
+impl RawPipelineProcessMetrics {
+    pub(crate) fn validate(
+        self,
+        pipeline: &PipelineDef,
+        processes: &HashMap<String, ProcessDef>,
+    ) -> anyhow::Result<PipelineProcessMetrics> {
+        let mut validator = ProcessMetricPlanValidator {
+            raw: &self,
+            processes,
+            next_step: 1,
+            edges: HashMap::new(),
+            validated_nodes: HashSet::new(),
+        };
+        validator.pipeline_body(&pipeline.body, &self.statements)?;
+        if validator.validated_nodes.len() != self.nodes.len() {
+            anyhow::bail!("compiled process metric plan contains unreachable nodes");
+        }
+        Ok(PipelineProcessMetrics {
+            nodes: self.nodes,
+            statements: self.statements,
+            #[cfg(test)]
+            selection_trap: self.selection_trap,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn root_token_for_testing(&self, step: usize) -> Option<usize> {
+        self.identities
+            .iter()
+            .position(|identity| identity.parent.is_none() && identity.step == step)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn child_token_for_testing(&self, parent: usize, ordinal: usize) -> Option<usize> {
+        self.nodes.get(parent)?.call_sites.get(ordinal).copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn metric_node_selection_trap_for_testing(&self) -> MetricNodeSelectionTrap {
+        MetricNodeSelectionTrap(std::sync::Arc::clone(&self.selection_trap))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_root_plan_for_testing(&mut self) {
+        self.statements.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_first_root_plan_with_none_for_testing(&mut self) {
+        if let Some(statement) = self.statements.first_mut() {
+            *statement = PipelineMetricStatement::None;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invalidate_first_root_token_for_testing(&mut self) {
+        for statement in &mut self.statements {
+            if let PipelineMetricStatement::ProcessChain(tokens) = statement
+                && let Some(token) = tokens.first_mut()
+            {
+                *token = usize::MAX;
+                return;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn swap_first_two_root_tokens_for_testing(&mut self) {
+        for statement in &mut self.statements {
+            if let PipelineMetricStatement::ProcessChain(tokens) = statement
+                && tokens.len() >= 2
+            {
+                tokens.swap(0, 1);
+                return;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invalidate_first_nested_token_for_testing(&mut self) {
+        for node in &mut self.nodes {
+            if let Some(ProcessMetricStatement::Call(token)) = node
+                .body_plan
+                .iter_mut()
+                .find(|statement| matches!(statement, ProcessMetricStatement::Call(_)))
+            {
+                *token = usize::MAX;
+                return;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn swap_first_two_nested_tokens_for_testing(&mut self) {
+        let positions: Vec<(usize, usize)> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .flat_map(|(node_index, node)| {
+                node.body_plan
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, statement)| matches!(statement, ProcessMetricStatement::Call(_)))
+                    .map(move |(statement_index, _)| (node_index, statement_index))
+            })
+            .take(2)
+            .collect();
+        if let [(left_node, left_statement), (right_node, right_statement)] = positions.as_slice() {
+            let left = match self.nodes[*left_node].body_plan[*left_statement] {
+                ProcessMetricStatement::Call(token) => token,
+                _ => unreachable!(),
+            };
+            let right = match self.nodes[*right_node].body_plan[*right_statement] {
+                ProcessMetricStatement::Call(token) => token,
+                _ => unreachable!(),
+            };
+            self.nodes[*left_node].body_plan[*left_statement] = ProcessMetricStatement::Call(right);
+            self.nodes[*right_node].body_plan[*right_statement] =
+                ProcessMetricStatement::Call(left);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invalidate_first_inline_token_for_testing(&mut self) {
+        for statement in &mut self.statements {
+            if let PipelineMetricStatement::ProcessChain(tokens) = statement
+                && let Some(token) = tokens.first_mut()
+            {
+                *token = usize::MAX;
+                return;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_first_process_body_plan_with_none_for_testing(&mut self) {
+        for node in &mut self.nodes {
+            if let Some(statement) = node
+                .body_plan
+                .iter_mut()
+                .find(|statement| matches!(statement, ProcessMetricStatement::Call(_)))
+            {
+                *statement = ProcessMetricStatement::None;
+                return;
+            }
+        }
+    }
+}
+
+struct ProcessMetricPlanValidator<'a> {
+    raw: &'a RawPipelineProcessMetrics,
+    processes: &'a HashMap<String, ProcessDef>,
+    next_step: usize,
+    edges: HashMap<(usize, String), usize>,
+    validated_nodes: HashSet<usize>,
+}
+
+impl ProcessMetricPlanValidator<'_> {
+    fn pipeline_body(
+        &mut self,
+        statements: &[PipelineStatement],
+        plan: &[PipelineMetricStatement],
+    ) -> anyhow::Result<()> {
+        if statements.len() != plan.len() {
+            anyhow::bail!("compiled pipeline metric plan length mismatch");
+        }
+        for (statement, metric) in statements.iter().zip(plan) {
+            self.pipeline_statement(statement, metric)?;
+        }
+        Ok(())
+    }
+
+    fn pipeline_branch(
+        &mut self,
+        body: &[BranchBody],
+        plan: &[PipelineMetricStatement],
+    ) -> anyhow::Result<()> {
+        if body.len() != plan.len() {
+            anyhow::bail!("compiled pipeline branch metric plan length mismatch");
+        }
+        for (item, metric) in body.iter().zip(plan) {
+            let BranchBody::Pipeline(statement) = item else {
+                anyhow::bail!("process statement found in pipeline metric plan");
+            };
+            self.pipeline_statement(statement, metric)?;
+        }
+        Ok(())
+    }
+
+    fn pipeline_statement(
+        &mut self,
+        statement: &PipelineStatement,
+        metric: &PipelineMetricStatement,
+    ) -> anyhow::Result<()> {
+        match (statement, metric) {
+            (
+                PipelineStatement::ProcessChain(chain),
+                PipelineMetricStatement::ProcessChain(tokens),
+            ) => {
+                if chain.len() != tokens.len() {
+                    anyhow::bail!("compiled root process token count mismatch");
+                }
+                for (site, token) in chain.iter().zip(tokens) {
+                    let step = self.next_step;
+                    self.next_step += 1;
+                    let expected_kind = match site {
+                        ProcessChainElement::Named(name) => {
+                            ProcessMetricNodeKind::Named(name.clone())
+                        }
+                        ProcessChainElement::Inline(_) => ProcessMetricNodeKind::Inline,
+                    };
+                    let identity = self.raw.identities.get(*token).ok_or_else(|| {
+                        anyhow::anyhow!("compiled root process token is out of range")
+                    })?;
+                    if identity.parent.is_some()
+                        || identity.step != step
+                        || identity.kind != expected_kind
+                    {
+                        anyhow::bail!("compiled root process token identity mismatch");
+                    }
+                    match site {
+                        ProcessChainElement::Named(name) => {
+                            let body = self
+                                .processes
+                                .get(name)
+                                .map(|process| process.body.as_slice())
+                                .unwrap_or_default();
+                            self.process_body(*token, body, &mut vec![(name.clone(), *token)])?;
+                        }
+                        ProcessChainElement::Inline(body) => {
+                            self.process_body(*token, body, &mut Vec::new())?;
+                        }
+                    }
+                }
+            }
+            (
+                PipelineStatement::If(chain),
+                PipelineMetricStatement::If {
+                    branches,
+                    else_body,
+                },
+            ) => {
+                if chain.branches.len() != branches.len()
+                    || chain.else_body.is_some() != else_body.is_some()
+                {
+                    anyhow::bail!("compiled pipeline if metric plan shape mismatch");
+                }
+                for ((_, body), branch_plan) in chain.branches.iter().zip(branches) {
+                    self.pipeline_branch(body, branch_plan)?;
+                }
+                if let (Some(body), Some(branch_plan)) =
+                    (chain.else_body.as_deref(), else_body.as_deref())
+                {
+                    self.pipeline_branch(body, branch_plan)?;
+                }
+            }
+            (PipelineStatement::Switch(_, arms), PipelineMetricStatement::Switch(metric_arms)) => {
+                if arms.len() != metric_arms.len() {
+                    anyhow::bail!("compiled pipeline switch metric plan shape mismatch");
+                }
+                for (arm, arm_plan) in arms.iter().zip(metric_arms) {
+                    self.pipeline_branch(&arm.body, arm_plan)?;
+                }
+            }
+            (
+                PipelineStatement::Input(_)
+                | PipelineStatement::Output(_)
+                | PipelineStatement::Drop
+                | PipelineStatement::Finish
+                | PipelineStatement::Error(_),
+                PipelineMetricStatement::None,
+            ) => {}
+            _ => anyhow::bail!("compiled pipeline metric statement variant mismatch"),
+        }
+        Ok(())
+    }
+
+    fn process_body(
+        &mut self,
+        parent: usize,
+        statements: &[ProcessStatement],
+        ancestors: &mut Vec<(String, usize)>,
+    ) -> anyhow::Result<()> {
+        if !self.validated_nodes.insert(parent) {
+            return Ok(());
+        }
+        let plan = &self
+            .raw
+            .nodes
+            .get(parent)
+            .ok_or_else(|| anyhow::anyhow!("compiled process node is out of range"))?
+            .body_plan;
+        self.process_statements(parent, statements, plan, ancestors)
+    }
+
+    fn process_statements(
+        &mut self,
+        parent: usize,
+        statements: &[ProcessStatement],
+        plan: &[ProcessMetricStatement],
+        ancestors: &mut Vec<(String, usize)>,
+    ) -> anyhow::Result<()> {
+        if statements.len() != plan.len() {
+            anyhow::bail!("compiled process metric plan length mismatch");
+        }
+        for (statement, metric) in statements.iter().zip(plan) {
+            self.process_statement(parent, statement, metric, ancestors)?;
+        }
+        Ok(())
+    }
+
+    fn process_branch(
+        &mut self,
+        parent: usize,
+        body: &[BranchBody],
+        plan: &[ProcessMetricStatement],
+        ancestors: &mut Vec<(String, usize)>,
+    ) -> anyhow::Result<()> {
+        if body.len() != plan.len() {
+            anyhow::bail!("compiled process branch metric plan length mismatch");
+        }
+        for (item, metric) in body.iter().zip(plan) {
+            let BranchBody::Process(statement) = item else {
+                anyhow::bail!("pipeline statement found in process metric plan");
+            };
+            self.process_statement(parent, statement, metric, ancestors)?;
+        }
+        Ok(())
+    }
+
+    fn process_statement(
+        &mut self,
+        parent: usize,
+        statement: &ProcessStatement,
+        metric: &ProcessMetricStatement,
+        ancestors: &mut Vec<(String, usize)>,
+    ) -> anyhow::Result<()> {
+        match (statement, metric) {
+            (ProcessStatement::ProcessCall(name), ProcessMetricStatement::Call(token)) => {
+                let expected = if let Some((_, ancestor)) = ancestors
+                    .iter()
+                    .rev()
+                    .find(|(ancestor, _)| ancestor == name)
+                {
+                    *ancestor
+                } else if let Some(existing) = self.edges.get(&(parent, name.clone())) {
+                    *existing
+                } else {
+                    let identity = self.raw.identities.get(*token).ok_or_else(|| {
+                        anyhow::anyhow!("compiled nested process token is out of range")
+                    })?;
+                    let parent_identity = self.raw.identities.get(parent).ok_or_else(|| {
+                        anyhow::anyhow!("compiled parent process token is out of range")
+                    })?;
+                    if identity.parent != Some(parent)
+                        || identity.step != parent_identity.step
+                        || identity.kind != ProcessMetricNodeKind::Named(name.clone())
+                    {
+                        anyhow::bail!("compiled nested process token identity mismatch");
+                    }
+                    self.edges.insert((parent, name.clone()), *token);
+                    *token
+                };
+                if *token != expected {
+                    anyhow::bail!("compiled process call-site token identity mismatch");
+                }
+                if !self.validated_nodes.contains(token) {
+                    let body = self
+                        .processes
+                        .get(name)
+                        .map(|process| process.body.as_slice())
+                        .unwrap_or_default();
+                    ancestors.push((name.clone(), *token));
+                    self.process_body(*token, body, ancestors)?;
+                    ancestors.pop();
+                }
+            }
+            (
+                ProcessStatement::If(chain),
+                ProcessMetricStatement::If {
+                    branches,
+                    else_body,
+                },
+            ) => {
+                if chain.branches.len() != branches.len()
+                    || chain.else_body.is_some() != else_body.is_some()
+                {
+                    anyhow::bail!("compiled process if metric plan shape mismatch");
+                }
+                for ((_, body), branch_plan) in chain.branches.iter().zip(branches) {
+                    self.process_branch(parent, body, branch_plan, ancestors)?;
+                }
+                if let (Some(body), Some(branch_plan)) =
+                    (chain.else_body.as_deref(), else_body.as_deref())
+                {
+                    self.process_branch(parent, body, branch_plan, ancestors)?;
+                }
+            }
+            (ProcessStatement::Switch(_, arms), ProcessMetricStatement::Switch(metric_arms)) => {
+                if arms.len() != metric_arms.len() {
+                    anyhow::bail!("compiled process switch metric plan shape mismatch");
+                }
+                for (arm, arm_plan) in arms.iter().zip(metric_arms) {
+                    self.process_branch(parent, &arm.body, arm_plan, ancestors)?;
+                }
+            }
+            (
+                ProcessStatement::TryCatch(try_body, catch_body),
+                ProcessMetricStatement::TryCatch {
+                    try_body: try_plan,
+                    catch_body: catch_plan,
+                },
+            ) => {
+                self.process_statements(parent, try_body, try_plan, ancestors)?;
+                self.process_statements(parent, catch_body, catch_plan, ancestors)?;
+            }
+            (
+                ProcessStatement::Assign(_, _)
+                | ProcessStatement::LetBinding(_, _)
+                | ProcessStatement::Drop
+                | ProcessStatement::Error(_)
+                | ProcessStatement::ExprStmt(_),
+                ProcessMetricStatement::None,
+            ) => {}
+            _ => anyhow::bail!("compiled process metric statement variant mismatch"),
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct MetricNodeSelectionTrapState {
+    armed: std::sync::atomic::AtomicBool,
+    attempts: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+pub(crate) struct MetricNodeSelectionTrap(std::sync::Arc<MetricNodeSelectionTrapState>);
+
+#[cfg(test)]
+impl MetricNodeSelectionTrap {
+    pub(crate) fn arm_for_testing(&self) {
+        self.0
+            .armed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn metric_node_lookup_attempts_for_testing(&self) -> usize {
+        self.0.attempts.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+struct ProcessMetricsBuilder<'a> {
+    pipeline: &'a str,
+    processes: &'a HashMap<String, ProcessDef>,
+    registry: &'a crate::metrics::Registry,
+    nodes: Vec<ProcessMetricNode>,
+    identities: Vec<ProcessMetricNodeIdentity>,
+    children: Vec<HashMap<String, usize>>,
+    next_step: usize,
+}
+
+impl ProcessMetricsBuilder<'_> {
+    fn pipeline_body(
+        &mut self,
+        body: &[PipelineStatement],
+    ) -> Result<Vec<PipelineMetricStatement>, crate::metrics::MetricsError> {
+        body.iter()
+            .map(|statement| self.pipeline_statement(statement))
+            .collect()
+    }
+
+    fn pipeline_branch(
+        &mut self,
+        body: &[BranchBody],
+    ) -> Result<Vec<PipelineMetricStatement>, crate::metrics::MetricsError> {
+        body.iter()
+            .map(|item| match item {
+                BranchBody::Pipeline(statement) => self.pipeline_statement(statement),
+                BranchBody::Process(_) => Ok(PipelineMetricStatement::None),
+            })
+            .collect()
+    }
+
+    fn pipeline_statement(
+        &mut self,
+        statement: &PipelineStatement,
+    ) -> Result<PipelineMetricStatement, crate::metrics::MetricsError> {
+        match statement {
+            PipelineStatement::ProcessChain(chain) => {
+                let mut nodes = Vec::with_capacity(chain.len());
+                for element in chain {
+                    let step = self.next_step;
+                    self.next_step += 1;
+                    let (name, kind, body) = match element {
+                        ProcessChainElement::Named(name) => (
+                            name.as_str(),
+                            ProcessMetricNodeKind::Named(name.clone()),
+                            self.processes
+                                .get(name)
+                                .map(|process| process.body.as_slice()),
+                        ),
+                        ProcessChainElement::Inline(body) => (
+                            "(inline)",
+                            ProcessMetricNodeKind::Inline,
+                            Some(body.as_slice()),
+                        ),
+                    };
+                    nodes.push(self.add_node(
+                        ProcessMetricNodeIdentity {
+                            parent: None,
+                            step,
+                            kind,
+                        },
+                        name,
+                        format!("/{name}"),
+                        body,
+                        &mut Vec::new(),
+                    )?);
+                }
+                Ok(PipelineMetricStatement::ProcessChain(nodes))
+            }
+            PipelineStatement::If(chain) => {
+                let branches = chain
+                    .branches
+                    .iter()
+                    .map(|(_, body)| self.pipeline_branch(body))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let else_body = chain
+                    .else_body
+                    .as_deref()
+                    .map(|body| self.pipeline_branch(body))
+                    .transpose()?;
+                Ok(PipelineMetricStatement::If {
+                    branches,
+                    else_body,
+                })
+            }
+            PipelineStatement::Switch(_, arms) => Ok(PipelineMetricStatement::Switch(
+                arms.iter()
+                    .map(|arm| self.pipeline_branch(&arm.body))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )),
+            _ => Ok(PipelineMetricStatement::None),
+        }
+    }
+
+    fn add_node(
+        &mut self,
+        identity: ProcessMetricNodeIdentity,
+        name: &str,
+        path: String,
+        body: Option<&[ProcessStatement]>,
+        ancestors: &mut Vec<(String, usize)>,
+    ) -> Result<usize, crate::metrics::MetricsError> {
+        let id = self.nodes.len();
+        let step = identity.step;
+        self.nodes.push(ProcessMetricNode {
+            counters: crate::metrics::ProcessCounters::register(
+                self.registry,
+                self.pipeline,
+                step,
+                &path,
+                name,
+            )?,
+            body_plan: Vec::new(),
+            #[cfg(test)]
+            call_sites: Vec::new(),
+        });
+        self.identities.push(identity);
+        self.children.push(HashMap::new());
+        ancestors.push((name.to_owned(), id));
+        if let Some(body) = body {
+            self.nodes[id].body_plan = self.process_body(id, &path, step, body, ancestors)?;
+        }
+        ancestors.pop();
+        Ok(id)
+    }
+
+    fn process_body(
+        &mut self,
+        parent: usize,
+        parent_path: &str,
+        step: usize,
+        body: &[ProcessStatement],
+        ancestors: &mut Vec<(String, usize)>,
+    ) -> Result<Vec<ProcessMetricStatement>, crate::metrics::MetricsError> {
+        body.iter()
+            .map(|statement| {
+                self.process_statement(parent, parent_path, step, statement, ancestors)
+            })
+            .collect()
+    }
+
+    fn process_statement(
+        &mut self,
+        parent: usize,
+        parent_path: &str,
+        step: usize,
+        statement: &ProcessStatement,
+        ancestors: &mut Vec<(String, usize)>,
+    ) -> Result<ProcessMetricStatement, crate::metrics::MetricsError> {
+        match statement {
+            ProcessStatement::ProcessCall(name) => {
+                let child = if let Some(child) = self.children[parent].get(name) {
+                    *child
+                } else if let Some((_, ancestor)) = ancestors
+                    .iter()
+                    .rev()
+                    .find(|(ancestor, _)| ancestor == name)
+                {
+                    let child = *ancestor;
+                    self.children[parent].insert(name.clone(), child);
+                    child
+                } else {
+                    let body = self
+                        .processes
+                        .get(name)
+                        .map(|process| process.body.as_slice());
+                    let child = self.add_node(
+                        ProcessMetricNodeIdentity {
+                            parent: Some(parent),
+                            step,
+                            kind: ProcessMetricNodeKind::Named(name.clone()),
+                        },
+                        name,
+                        format!("{parent_path}/{name}"),
+                        body,
+                        ancestors,
+                    )?;
+                    self.children[parent].insert(name.clone(), child);
+                    child
+                };
+                #[cfg(test)]
+                self.nodes[parent].call_sites.push(child);
+                Ok(ProcessMetricStatement::Call(child))
+            }
+            ProcessStatement::If(chain) => {
+                let branches = chain
+                    .branches
+                    .iter()
+                    .map(|(_, body)| {
+                        self.process_branch(parent, parent_path, step, body, ancestors)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let else_body = chain
+                    .else_body
+                    .as_deref()
+                    .map(|body| self.process_branch(parent, parent_path, step, body, ancestors))
+                    .transpose()?;
+                Ok(ProcessMetricStatement::If {
+                    branches,
+                    else_body,
+                })
+            }
+            ProcessStatement::Switch(_, arms) => Ok(ProcessMetricStatement::Switch(
+                arms.iter()
+                    .map(|arm| self.process_branch(parent, parent_path, step, &arm.body, ancestors))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )),
+            ProcessStatement::TryCatch(try_body, catch_body) => {
+                Ok(ProcessMetricStatement::TryCatch {
+                    try_body: self.process_body(parent, parent_path, step, try_body, ancestors)?,
+                    catch_body: self.process_body(
+                        parent,
+                        parent_path,
+                        step,
+                        catch_body,
+                        ancestors,
+                    )?,
+                })
+            }
+            _ => Ok(ProcessMetricStatement::None),
+        }
+    }
+
+    fn process_branch(
+        &mut self,
+        parent: usize,
+        parent_path: &str,
+        step: usize,
+        body: &[BranchBody],
+        ancestors: &mut Vec<(String, usize)>,
+    ) -> Result<Vec<ProcessMetricStatement>, crate::metrics::MetricsError> {
+        body.iter()
+            .map(|item| match item {
+                BranchBody::Process(statement) => {
+                    self.process_statement(parent, parent_path, step, statement, ancestors)
+                }
+                BranchBody::Pipeline(_) => Ok(ProcessMetricStatement::None),
+            })
+            .collect()
+    }
+}
+
 /// A process registry backed by compiled DSL process definitions.
 ///
 /// Only user-defined `def process { ... }` blocks resolve here.
@@ -428,6 +1230,7 @@ struct DslProcessRegistry<'a> {
     processes: &'a HashMap<String, ProcessDef>,
     funcs: &'a FunctionRegistry,
     tap: Option<&'a TapRegistry>,
+    process_metrics: Option<&'a PipelineProcessMetrics>,
 }
 
 impl<'a> DslProcessRegistry<'a> {
@@ -435,11 +1238,82 @@ impl<'a> DslProcessRegistry<'a> {
         processes: &'a HashMap<String, ProcessDef>,
         funcs: &'a FunctionRegistry,
         tap: Option<&'a TapRegistry>,
+        process_metrics: Option<&'a PipelineProcessMetrics>,
     ) -> Self {
         Self {
             processes,
             funcs,
             tap,
+            process_metrics,
+        }
+    }
+
+    fn call_node<'bump>(
+        &self,
+        metric_token: Option<usize>,
+        name: &str,
+        event: BorrowedEvent<'bump>,
+        arena: &'bump EventArena<'bump>,
+    ) -> std::result::Result<Option<BorrowedEvent<'bump>>, ProcessError> {
+        let metric_node = match (self.process_metrics, metric_token) {
+            (Some(metrics), Some(token)) => Some(metrics.select_node(token).ok_or_else(|| {
+                ProcessError::Failed("compiled process metric token is out of range".to_owned())
+            })?),
+            (Some(_), None) => {
+                return Err(ProcessError::Failed(
+                    "compiled process metric token is missing".to_owned(),
+                ));
+            }
+            (None, _) => None,
+        };
+        if let Some(node) = metric_node {
+            node.counters.start();
+        }
+
+        let result = if let Some(process_def) = self.processes.get(name) {
+            trace!("process '{}' (user-defined): executing", name);
+            match metric_node {
+                Some(node) => exec_process_body_with_metric_plan(
+                    &process_def.body,
+                    &node.body_plan,
+                    event,
+                    self,
+                    self.funcs,
+                    arena,
+                ),
+                None => exec_process_body(&process_def.body, event, self, self.funcs, arena),
+            }
+            .map_err(|error| ProcessError::Failed(error.to_string()))
+        } else {
+            tracing::warn!(
+                "unknown process '{}', passing event through unchanged",
+                name
+            );
+            Ok(ExecResult::Continue(event))
+        };
+
+        match result {
+            Ok(ExecResult::Continue(event)) => {
+                if let Some(node) = metric_node {
+                    node.counters.continued();
+                }
+                trace!("process '{}': ok", name);
+                self.emit_tap(name, &event);
+                Ok(Some(event))
+            }
+            Ok(ExecResult::Dropped) => {
+                if let Some(node) = metric_node {
+                    node.counters.dropped();
+                }
+                trace!("process '{}': dropped", name);
+                Ok(None)
+            }
+            Err(error) => {
+                if let Some(node) = metric_node {
+                    node.counters.errored();
+                }
+                Err(error)
+            }
         }
     }
 }
@@ -451,30 +1325,19 @@ impl ProcessRegistry for DslProcessRegistry<'_> {
         event: BorrowedEvent<'bump>,
         arena: &'bump EventArena<'bump>,
     ) -> std::result::Result<Option<BorrowedEvent<'bump>>, ProcessError> {
-        if let Some(process_def) = self.processes.get(name) {
-            trace!("process '{}' (user-defined): executing", name);
-            return match exec_process_body(&process_def.body, event, self, self.funcs, arena) {
-                Ok(ExecResult::Continue(e)) => {
-                    trace!("process '{}': ok", name);
-                    self.emit_tap(name, &e);
-                    Ok(Some(e))
-                }
-                Ok(ExecResult::Dropped) => {
-                    trace!("process '{}': dropped", name);
-                    Ok(None)
-                }
-                Err(e) => Err(ProcessError::Failed(e.to_string())),
-            };
-        }
+        self.call_node(None, name, event, arena)
+    }
+}
 
-        // Unknown process — warn and pass through. Config validation in
-        // `CompiledConfig::validate` catches this up front; this branch
-        // is a safety net for paths that skip validation.
-        tracing::warn!(
-            "unknown process '{}', passing event through unchanged",
-            name
-        );
-        Ok(Some(event))
+impl CompiledProcessRegistry for DslProcessRegistry<'_> {
+    fn call_pre_resolved<'bump>(
+        &self,
+        name: &str,
+        metric_token: usize,
+        event: BorrowedEvent<'bump>,
+        arena: &'bump EventArena<'bump>,
+    ) -> std::result::Result<Option<BorrowedEvent<'bump>>, ProcessError> {
+        self.call_node(Some(metric_token), name, event, arena)
     }
 }
 
@@ -521,7 +1384,57 @@ pub fn run_pipeline(
     output_capture: OutputCapturePolicy<'_>,
     bump: &mut bumpalo::Bump,
 ) -> Result<PipelineRunResult> {
-    let registry = DslProcessRegistry::new(&config.processes, funcs, tap);
+    run_pipeline_inner(
+        pipeline,
+        event,
+        config,
+        funcs,
+        tap,
+        trace,
+        output_capture,
+        bump,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_pipeline_with_process_metrics(
+    pipeline: &PipelineDef,
+    event: &OwnedEvent,
+    config: &CompiledConfig,
+    funcs: &FunctionRegistry,
+    tap: Option<&TapRegistry>,
+    trace: Option<&mut Vec<TraceEntry>>,
+    output_capture: OutputCapturePolicy<'_>,
+    bump: &mut bumpalo::Bump,
+    process_metrics: &PipelineProcessMetrics,
+) -> Result<PipelineRunResult> {
+    run_pipeline_inner(
+        pipeline,
+        event,
+        config,
+        funcs,
+        tap,
+        trace,
+        output_capture,
+        bump,
+        Some(process_metrics),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_pipeline_inner(
+    pipeline: &PipelineDef,
+    event: &OwnedEvent,
+    config: &CompiledConfig,
+    funcs: &FunctionRegistry,
+    tap: Option<&TapRegistry>,
+    trace: Option<&mut Vec<TraceEntry>>,
+    output_capture: OutputCapturePolicy<'_>,
+    bump: &mut bumpalo::Bump,
+    process_metrics: Option<&PipelineProcessMetrics>,
+) -> Result<PipelineRunResult> {
+    let registry = DslProcessRegistry::new(&config.processes, funcs, tap, process_metrics);
     let mut trace = trace;
     let mut outputs = Vec::new();
 
@@ -565,7 +1478,13 @@ pub fn run_pipeline(
         outputs: &mut outputs,
         errored: &mut errored,
     };
-    let (_, termination) = exec_pipeline_body(&pipeline.body, bevent, &exec_ctx, &mut exec_out)?;
+    let (_, termination) = exec_pipeline_body(
+        &pipeline.body,
+        process_metrics.map(|metrics| metrics.statements.as_slice()),
+        bevent,
+        &exec_ctx,
+        &mut exec_out,
+    )?;
 
     let had_outputs = !outputs.is_empty();
     Ok(PipelineRunResult {
@@ -690,12 +1609,28 @@ impl PipelineExecOut<'_> {
 /// Returns (remaining event if any, how the pipeline terminated).
 fn exec_pipeline_body<'bump>(
     stmts: &[PipelineStatement],
+    metric_stmts: Option<&[PipelineMetricStatement]>,
     mut event: BorrowedEvent<'bump>,
     ctx: &PipelineExecCtx<'_, 'bump>,
     out: &mut PipelineExecOut<'_>,
 ) -> Result<(Option<BorrowedEvent<'bump>>, PipelineTermination)> {
-    for stmt in stmts {
-        match exec_pipeline_stmt(stmt, event, ctx, out)? {
+    if ctx.registry.process_metrics.is_some() {
+        let metric_stmts = metric_stmts
+            .ok_or_else(|| anyhow::anyhow!("compiled pipeline metric plan is missing"))?;
+        if metric_stmts.len() != stmts.len() {
+            bail!("compiled pipeline metric plan length does not match the pipeline body");
+        }
+    }
+    for (index, stmt) in stmts.iter().enumerate() {
+        let metric_stmt = match ctx.registry.process_metrics {
+            Some(_) => Some(
+                metric_stmts
+                    .and_then(|metrics| metrics.get(index))
+                    .ok_or_else(|| anyhow::anyhow!("compiled pipeline metric entry is missing"))?,
+            ),
+            None => None,
+        };
+        match exec_pipeline_stmt(stmt, metric_stmt, event, ctx, out)? {
             (Some(e), _) => event = e,
             (None, term) => return Ok((None, term)),
         }
@@ -705,6 +1640,7 @@ fn exec_pipeline_body<'bump>(
 
 fn exec_pipeline_stmt<'bump>(
     stmt: &PipelineStatement,
+    metric_stmt: Option<&PipelineMetricStatement>,
     event: BorrowedEvent<'bump>,
     ctx: &PipelineExecCtx<'_, 'bump>,
     out: &mut PipelineExecOut<'_>,
@@ -749,7 +1685,12 @@ fn exec_pipeline_stmt<'bump>(
 
         PipelineStatement::ProcessChain(chain) => {
             let mut current = event;
-            for element in chain {
+            let metric_nodes = match metric_stmt {
+                Some(PipelineMetricStatement::ProcessChain(nodes)) => Some(nodes.as_slice()),
+                _ => None,
+            };
+            for (index, element) in chain.iter().enumerate() {
+                let metric_token = metric_nodes.and_then(|nodes| nodes.get(index)).copied();
                 match element {
                     ProcessChainElement::Named(name) => {
                         // Snapshot the pre-call view before the registry
@@ -771,7 +1712,17 @@ fn exec_pipeline_stmt<'bump>(
                         // Err arm below, where the DLQ record's owned
                         // event has to cross the arena boundary anyway.
                         let backup_view = current.snapshot_in(ctx.arena);
-                        match ctx.registry.call(name, current, ctx.arena) {
+                        let call_result = match ctx.registry.process_metrics {
+                            Some(_) => {
+                                let token = metric_token.ok_or_else(|| {
+                                    anyhow::anyhow!("compiled root process token is missing")
+                                })?;
+                                ctx.registry
+                                    .call_pre_resolved(name, token, current, ctx.arena)
+                            }
+                            None => ctx.registry.call(name, current, ctx.arena),
+                        };
+                        match call_result {
                             Ok(Some(e)) => {
                                 out.push_trace(|| TraceEntry {
                                     stage: "process".into(),
@@ -819,8 +1770,38 @@ fn exec_pipeline_stmt<'bump>(
                         // shallow snapshot for the DLQ Err path; the
                         // heap materialization happens only on failure.
                         let backup_view = current.snapshot_in(ctx.arena);
-                        match exec_process_body(body, current, ctx.registry, ctx.funcs, ctx.arena) {
+                        let metric_node = match ctx.registry.process_metrics {
+                            Some(metrics) => {
+                                let token = metric_token.ok_or_else(|| {
+                                    anyhow::anyhow!("compiled inline process token is missing")
+                                })?;
+                                Some(metrics.select_node(token).ok_or_else(|| {
+                                    anyhow::anyhow!("compiled inline process token is out of range")
+                                })?)
+                            }
+                            None => None,
+                        };
+                        if let Some(node) = metric_node {
+                            node.counters.start();
+                        }
+                        let result = match metric_node {
+                            Some(node) => exec_process_body_with_metric_plan(
+                                body,
+                                &node.body_plan,
+                                current,
+                                ctx.registry,
+                                ctx.funcs,
+                                ctx.arena,
+                            ),
+                            None => {
+                                exec_process_body(body, current, ctx.registry, ctx.funcs, ctx.arena)
+                            }
+                        };
+                        match result {
                             Ok(ExecResult::Continue(e)) => {
+                                if let Some(node) = metric_node {
+                                    node.counters.continued();
+                                }
                                 out.push_trace(|| TraceEntry {
                                     stage: "process".into(),
                                     label: "(inline)".into(),
@@ -829,6 +1810,9 @@ fn exec_pipeline_stmt<'bump>(
                                 current = e;
                             }
                             Ok(ExecResult::Dropped) => {
+                                if let Some(node) = metric_node {
+                                    node.counters.dropped();
+                                }
                                 out.push_trace(|| TraceEntry {
                                     stage: "process".into(),
                                     label: "(inline)".into(),
@@ -837,6 +1821,9 @@ fn exec_pipeline_stmt<'bump>(
                                 return dropped();
                             }
                             Err(e) => {
+                                if let Some(node) = metric_node {
+                                    node.counters.errored();
+                                }
                                 tracing::warn!("inline process: {} — event routed to error_log", e);
                                 out.push_trace(|| TraceEntry {
                                     stage: "process".into(),
@@ -920,18 +1907,40 @@ fn exec_pipeline_stmt<'bump>(
         }
 
         PipelineStatement::If(if_chain) => {
-            match select_if_branch(if_chain, |c| eval_expr(c, &event, ctx.funcs, ctx.arena))? {
-                Some(body) => exec_pipeline_branch_body(body, event, ctx, out),
+            match select_if_branch_with_ordinal(if_chain, |c| {
+                eval_expr(c, &event, ctx.funcs, ctx.arena)
+            })? {
+                Some(selection) => {
+                    let metric_body = match metric_stmt {
+                        Some(PipelineMetricStatement::If {
+                            branches,
+                            else_body,
+                        }) => match selection.ordinal {
+                            Some(ordinal) => branches.get(ordinal).map(Vec::as_slice),
+                            None => else_body.as_deref(),
+                        },
+                        _ => None,
+                    };
+                    exec_pipeline_branch_body(selection.body, metric_body, event, ctx, out)
+                }
                 None => cont(event),
             }
         }
 
         PipelineStatement::Switch(discriminant, arms) => {
             let disc_val = eval_expr(discriminant, &event, ctx.funcs, ctx.arena)?;
-            match select_switch_arm(&disc_val, arms, |e| {
+            match select_switch_arm_with_ordinal(&disc_val, arms, |e| {
                 eval_expr(e, &event, ctx.funcs, ctx.arena)
             })? {
-                Some(body) => exec_pipeline_branch_body(body, event, ctx, out),
+                Some((ordinal, body)) => {
+                    let metric_body = match metric_stmt {
+                        Some(PipelineMetricStatement::Switch(metrics)) => {
+                            metrics.get(ordinal).map(Vec::as_slice)
+                        }
+                        _ => None,
+                    };
+                    exec_pipeline_branch_body(body, metric_body, event, ctx, out)
+                }
                 None => cont(event),
             }
         }
@@ -940,16 +1949,34 @@ fn exec_pipeline_stmt<'bump>(
 
 fn exec_pipeline_branch_body<'bump>(
     body: &[BranchBody],
+    metric_body: Option<&[PipelineMetricStatement]>,
     mut event: BorrowedEvent<'bump>,
     ctx: &PipelineExecCtx<'_, 'bump>,
     out: &mut PipelineExecOut<'_>,
 ) -> Result<(Option<BorrowedEvent<'bump>>, PipelineTermination)> {
-    for item in body {
+    if ctx.registry.process_metrics.is_some() {
+        let metric_body = metric_body
+            .ok_or_else(|| anyhow::anyhow!("compiled pipeline branch plan is missing"))?;
+        if metric_body.len() != body.len() {
+            bail!("compiled pipeline branch plan length does not match the selected body");
+        }
+    }
+    for (index, item) in body.iter().enumerate() {
+        let metric_stmt = match ctx.registry.process_metrics {
+            Some(_) => Some(
+                metric_body
+                    .and_then(|metrics| metrics.get(index))
+                    .ok_or_else(|| anyhow::anyhow!("compiled pipeline branch entry is missing"))?,
+            ),
+            None => None,
+        };
         match item {
-            BranchBody::Pipeline(stmt) => match exec_pipeline_stmt(stmt, event, ctx, out)? {
-                (Some(e), _) => event = e,
-                (None, term) => return Ok((None, term)),
-            },
+            BranchBody::Pipeline(stmt) => {
+                match exec_pipeline_stmt(stmt, metric_stmt, event, ctx, out)? {
+                    (Some(e), _) => event = e,
+                    (None, term) => return Ok((None, term)),
+                }
+            }
             BranchBody::Process(_) => {
                 bail!("process statement found in pipeline context")
             }
