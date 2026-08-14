@@ -61,6 +61,77 @@ def pipeline p { input i; output o }
 }
 
 #[test]
+fn check_accepts_explicit_or_omitted_node_id() {
+    for (case, node_id) in [("explicit", "node_id \"edge-a\"\n"), ("omitted", "")] {
+        let dir = TempDir::new().unwrap();
+        let conf = dir.path().join(format!("node-id-{case}.conf"));
+        fs::write(
+            &conf,
+            format!(
+                r#"{node_id}def input i {{ type syslog_tcp bind "0.0.0.0:514" }}
+def output o {{ type stdout }}
+def pipeline p {{ input i; output o }}
+"#
+            ),
+        )
+        .unwrap();
+
+        let out = run_check(&conf);
+        assert!(
+            out.status.success(),
+            "{case} node_id must be accepted: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+fn assert_node_id_rejected(case: &str, node_id: &str, diagnostic: &str) {
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join(format!("node-id-{case}.conf"));
+    fs::write(
+        &conf,
+        format!(
+            r#"{node_id}def input i {{ type syslog_tcp bind "0.0.0.0:514" }}
+def output o {{ type stdout }}
+def pipeline p {{ input i; output o }}
+"#
+        ),
+    )
+    .unwrap();
+
+    let out = run_check(&conf);
+    assert!(!out.status.success(), "{case} node_id must be rejected");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(diagnostic),
+        "{case} diagnostic must contain {diagnostic:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn check_rejects_empty_node_id_with_semantic_diagnostic() {
+    assert_node_id_rejected("empty", "node_id \"\"\n", "node_id must be non-empty");
+}
+
+#[test]
+fn check_rejects_non_string_node_id_with_semantic_diagnostic() {
+    assert_node_id_rejected(
+        "wrong-type",
+        "node_id 42\n",
+        "node_id requires a string value",
+    );
+}
+
+#[test]
+fn check_rejects_duplicate_node_id_with_semantic_diagnostic() {
+    assert_node_id_rejected(
+        "duplicate",
+        "node_id \"one\"\nnode_id \"two\"\n",
+        "duplicate node_id",
+    );
+}
+
+#[test]
 fn check_with_warning_still_exits_zero_and_mentions_warnings() {
     // `lower(workspace.count)` where count is bound as Int → analyzer
     // emits a warning but no error, so exit is 0.

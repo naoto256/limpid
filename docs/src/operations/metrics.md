@@ -6,7 +6,7 @@ series. The daemon exposes a read-only snapshot through the existing `stats`
 control command; `limpidctl` and `limpid-prometheus` are consumers of that
 snapshot, not alternate metric stores.
 
-The current runtime metrics are counters. Schema v1 also defines gauge and
+The current runtime metrics are counters and gauges. Schema v1 also defines
 histogram series so consumers can render any registered family without a list
 of hard-coded names.
 
@@ -84,6 +84,15 @@ These are the current metric families registered by the daemon. Their labels
 are fixed from the compiled configuration at registration time, so cardinality
 is bounded by that configuration. Process-family cardinality follows distinct
 compiled invocation paths rather than only process definition count.
+
+### Build information
+
+`limpid_build_info{version,node_id}` is a gauge with value `1`. `version` is
+the running limpid package version. `node_id` is the explicit top-level
+configuration value when set; otherwise it is the host name resolved once at
+startup. The series is registered before the control server starts and remains
+stable for that runtime. See [Node identity](../configuration.md#node-identity)
+for the same-host multi-instance deployment caveat.
 
 ### Pipelines
 

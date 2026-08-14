@@ -16,6 +16,21 @@ use limpid_metrics_schema::{
     HistogramSeries, MetricFamily as SnapshotFamily, ValueSeries as SnapshotValueSeries,
 };
 
+pub(crate) fn register_build_info(
+    registry: &Registry,
+    version: &str,
+    node_id: &str,
+) -> Result<(), MetricsError> {
+    let build_info = registry
+        .gauge("limpid_build_info")
+        .label("version", version)
+        .label("node_id", node_id)
+        .help("Build information for the running limpid node.")
+        .build()?;
+    build_info.set(1);
+    Ok(())
+}
+
 pub struct InputMetrics {
     /// Events actually received by the input module (network, socket, file, etc).
     /// Injected events are NOT counted here — see `events_injected`.
@@ -1218,6 +1233,29 @@ mod registry_tests {
         let produced = serde_json::to_value(&shared).unwrap();
         assert_eq!(produced["schema"], 1);
         assert_eq!(produced["metrics"][0]["name"], "limpid_test_events_total");
+    }
+
+    #[test]
+    fn build_info_is_one_prepopulated_gauge_with_fixed_labels() {
+        let registry = Registry::new();
+        super::register_build_info(&registry, "0.7.15", "node-a")
+            .expect("build info must register");
+
+        let snapshot = snapshot_json(&registry);
+        let family = metric(&snapshot, "limpid_build_info");
+        assert_eq!(family["type"], "gauge");
+        assert_eq!(
+            family["help"],
+            "Build information for the running limpid node."
+        );
+        assert_eq!(
+            family["series"],
+            serde_json::json!([{
+                "labels": {"node_id": "node-a", "version": "0.7.15"},
+                "value": 1
+            }])
+        );
+        assert_eq!(snapshot["metrics"].as_array().unwrap().len(), 1);
     }
 
     fn metric<'a>(snapshot: &'a Value, name: &str) -> &'a Value {
