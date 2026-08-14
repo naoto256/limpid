@@ -147,6 +147,70 @@ impl PipelineMetrics {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct ProcessCounters {
+    incoming: Arc<registry_core::Counter>,
+    outgoing: Arc<registry_core::Counter>,
+    dropped: Arc<registry_core::Counter>,
+    errored: Arc<registry_core::Counter>,
+}
+
+impl ProcessCounters {
+    pub(crate) fn register(
+        registry: &Registry,
+        pipeline: &str,
+        step: usize,
+        process_path: &str,
+        process_name: &str,
+    ) -> Result<Self, MetricsError> {
+        let step = step.to_string();
+        let counter = |name, help| {
+            registry
+                .counter(name)
+                .label("pipeline", pipeline)
+                .label("step", &step)
+                .label("process_path", process_path)
+                .label("process_name", process_name)
+                .help(help)
+                .build()
+        };
+        Ok(Self {
+            incoming: counter(
+                "limpid_process_events_in_total",
+                "Total process invocation frames started.",
+            )?,
+            outgoing: counter(
+                "limpid_process_events_out_total",
+                "Total process invocation frames that continued successfully.",
+            )?,
+            dropped: counter(
+                "limpid_process_events_dropped_total",
+                "Total process invocation frames terminated by a drop.",
+            )?,
+            errored: counter(
+                "limpid_process_events_errored_total",
+                "Total process invocation frames terminated by an error.",
+            )?,
+        })
+    }
+
+    pub(crate) fn start(&self) {
+        self.incoming.inc();
+    }
+
+    pub(crate) fn continued(&self) {
+        self.outgoing.inc();
+    }
+
+    pub(crate) fn dropped(&self) {
+        self.dropped.inc();
+    }
+
+    pub(crate) fn errored(&self) {
+        self.errored.inc();
+    }
+}
+
 pub struct OutputMetrics {
     /// Total events that entered this output's queue (from pipelines + injects).
     /// `events_received - events_injected` = events delivered via pipelines.

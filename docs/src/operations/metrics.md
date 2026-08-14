@@ -80,9 +80,9 @@ daemon startup instead of being ignored.
 
 ## Current metric families
 
-These are the current metric families registered by the daemon. Each series
-has exactly the fixed label shown; the label value is the configured component
-name, so label cardinality is bounded by the configured components.
+These are the current metric families registered by the daemon. Their labels
+are fixed from the compiled configuration at registration time, so cardinality
+is bounded by configured components and process sites.
 
 ### Pipelines
 
@@ -105,6 +105,32 @@ completed the pipeline but was never sent anywhere.
 failures are counted under the corresponding output's `events_failed`. The
 original event is preserved when the configured error-log write succeeds; see
 [Error Log → Replay](./error-log.md#replay).
+
+### Process invocations
+
+The four process counter families use the labels `pipeline`, `step`,
+`process_path`, and `process_name`:
+
+- `limpid_process_events_in_total` counts frame entry.
+- `limpid_process_events_out_total` counts frames that return `Continue`.
+- `limpid_process_events_dropped_total` counts frames terminated by `Drop`.
+- `limpid_process_events_errored_total` counts frames terminated by an error.
+
+These are invocation counters, not event counters. `step` is the root process
+site's one-based, pipeline-wide source-order position; nested calls share that
+root step. A named root has a path such as `/dispatch`, a nested call extends it
+to `/dispatch/leaf`, and an inline root uses `/(inline)`. Recursive back-edges
+reuse their ancestor series, so registration remains bounded by the compiled
+configuration. Every configured series is prepopulated with zero.
+
+Each frame records exactly one terminal result, so for an individual series
+`in = out + dropped + errored`. A nested drop propagates through its active
+caller frames. A nested error counts as errored for that frame even when a
+caller's catch block recovers and the caller returns normally. Consequently,
+summing process series double-counts nested invocations and is not an event
+flow total. The pipeline event families above remain the authoritative event
+flow: in particular, `limpid_pipeline_events_dropped_total{pipeline}` retains
+its existing single-label event semantics.
 
 ### Inputs
 
@@ -205,7 +231,7 @@ confirmed by `send`.
 ## Viewing metrics with limpidctl
 
 ```bash
-# Operator-focused table: Pipelines, Inputs, then Outputs
+# Operator-focused table: Pipelines, Inputs, Outputs, then Processes when present
 sudo limpidctl stats
 
 # Generic human view of every schema-v1 family and series
@@ -215,11 +241,13 @@ sudo limpidctl stats --details
 sudo limpidctl stats --json
 ```
 
-The default table preserves the established 16-counter operator view. Component
+The default table preserves the established component-counter view and appends
+a `Processes` invocation table when all four process families are present and
+valid. Process rows sort by pipeline, numeric step, path, and name. Component
 names are sorted and alarm fields such as `wedged` and `errored_unwritable` are
 shown under their existing conditional rules. Unknown future families are
 ignored in this mode. If a known family is missing, duplicated, has the wrong
-type or value, or does not have exactly its fixed label, limpidctl prints the
+type or value, or does not have exactly its fixed labels, limpidctl prints the
 raw response rather than inventing a zero or a partial table.
 
 `--details` replaces the default table with a generic view. Families are sorted
