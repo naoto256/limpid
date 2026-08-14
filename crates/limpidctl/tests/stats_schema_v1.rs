@@ -779,6 +779,40 @@ fn default_ignores_unknown_families_but_details_includes_them() {
 }
 
 #[test]
+fn build_info_is_generic_in_details_and_does_not_change_default_or_raw_json() {
+    let mut payload = canonical_snapshot(false);
+    payload["metrics"].as_array_mut().unwrap().push(json!({
+        "name": "limpid_build_info",
+        "type": "gauge",
+        "help": "Build information for the running limpid node.",
+        "series": [{
+            "labels": {"node_id": "edge-a", "version": "0.7.15"},
+            "value": 1
+        }]
+    }));
+    let response = format!("{payload}\n");
+
+    let default_output = run_stats(&response, &[]);
+    assert!(default_output.status.success(), "{default_output:?}");
+    assert_eq!(stdout(&default_output), expected_default_table());
+    assert!(!stdout(&default_output).contains("limpid_build_info"));
+
+    let details_output = run_stats(&response, &["--details"]);
+    assert!(details_output.status.success(), "{details_output:?}");
+    let details = stdout(&details_output);
+    assert!(details.contains("limpid_build_info"));
+    assert!(details.contains("gauge"));
+    assert!(details.contains("Build information for the running limpid node."));
+    assert!(details.contains("node_id=\"edge-a\""));
+    assert!(details.contains("version=\"0.7.15\""));
+    assert!(details.contains("value: 1"));
+
+    let json_output = run_stats(&response, &["--json"]);
+    assert!(json_output.status.success(), "{json_output:?}");
+    assert_eq!(json_output.stdout, response.as_bytes());
+}
+
+#[test]
 fn malformed_known_families_fall_back_to_the_raw_response() {
     let canonical = canonical_snapshot(false);
     let mut cases = Vec::new();

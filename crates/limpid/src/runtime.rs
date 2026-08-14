@@ -40,6 +40,24 @@ impl Runtime {
         config_file: PathBuf,
         metrics_registry: Arc<Registry>,
     ) -> Result<Self> {
+        Self::start_with_registry_and_node_id_resolver(
+            config,
+            config_file,
+            metrics_registry,
+            || Ok(gethostname::gethostname().to_string_lossy().into_owned()),
+        )
+        .await
+    }
+
+    pub(crate) async fn start_with_registry_and_node_id_resolver<F>(
+        config: CompiledConfig,
+        config_file: PathBuf,
+        metrics_registry: Arc<Registry>,
+        resolve_hostname: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce() -> Result<String>,
+    {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
@@ -56,6 +74,15 @@ impl Runtime {
         let func_registry = Arc::new(func_registry);
 
         config.validate()?;
+        let node_id = match &config.node_id {
+            Some(node_id) => node_id.clone(),
+            None => resolve_hostname()?,
+        };
+        crate::metrics::register_build_info(
+            &metrics_registry,
+            env!("CARGO_PKG_VERSION"),
+            &node_id,
+        )?;
         let registry = Arc::new(registry);
 
         let tap = TapRegistry::new();
@@ -2087,6 +2114,123 @@ def pipeline p { process a; finish }
             .await
             .expect("public start must use the working registry-wired startup path");
         runtime.shutdown().await;
+    }
+
+    async fn assert_startup_build_info(
+        configured_node_id: Option<&str>,
+        expected_node_id: &str,
+        expected_resolver_calls: usize,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o750))
+            .expect("secure control parent");
+        let socket = dir.path().join("control.sock");
+        let node_id = configured_node_id
+            .map(|node_id| format!("node_id \"{node_id}\"\n"))
+            .unwrap_or_default();
+        let source = format!(
+            "{node_id}control {{ socket {:?} }}",
+            socket.display().to_string()
+        );
+        let config = compiled_config(&source);
+        let registry = Arc::new(Registry::new());
+        let resolver_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::clone(&resolver_calls);
+
+        let runtime = Runtime::start_with_registry_and_node_id_resolver(
+            config,
+            PathBuf::from("build-info-startup-test.limpid"),
+            Arc::clone(&registry),
+            move || {
+                let call = calls.fetch_add(1, Ordering::Relaxed) + 1;
+                Ok(format!("resolved-host-{call}"))
+            },
+        )
+        .await
+        .expect("runtime must start");
+
+        let labels = [
+            ("node_id", expected_node_id),
+            ("version", env!("CARGO_PKG_VERSION")),
+        ];
+        assert_eq!(series_value(&registry, "limpid_build_info", &labels), 1);
+        assert_eq!(metric_series(&registry, "limpid_build_info").len(), 1);
+        assert_eq!(
+            resolver_calls.load(Ordering::Relaxed),
+            expected_resolver_calls,
+            "startup must resolve hostname exactly when node_id is omitted"
+        );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn startup_with_explicit_node_id_skips_hostname_and_registers_that_value() {
+        assert_startup_build_info(Some("configured-node"), "configured-node", 0).await;
+    }
+
+    #[tokio::test]
+    async fn startup_without_node_id_resolves_hostname_once_and_registers_that_value() {
+        assert_startup_build_info(None, "resolved-host-1", 1).await;
+    }
+
+    #[tokio::test]
+    async fn startup_propagates_duplicate_build_info_from_the_actual_registry() {
+        let config = compiled_config("node_id \"configured-node\"");
+        let registry = Arc::new(Registry::new());
+        crate::metrics::register_build_info(
+            &registry,
+            env!("CARGO_PKG_VERSION"),
+            "configured-node",
+        )
+        .expect("preseed build info");
+        let resolver_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::clone(&resolver_calls);
+
+        let error = match Runtime::start_with_registry_and_node_id_resolver(
+            config,
+            PathBuf::from("duplicate-build-info-startup-test.limpid"),
+            Arc::clone(&registry),
+            move || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok("unexpected-hostname".to_owned())
+            },
+        )
+        .await
+        {
+            Ok(runtime) => {
+                runtime.shutdown().await;
+                panic!("duplicate build-info registration must fail startup");
+            }
+            Err(error) => error,
+        };
+
+        let metrics_error = error
+            .downcast_ref::<MetricsError>()
+            .expect("startup error must retain MetricsError");
+        let expected_labelset = vec![
+            ("node_id".to_owned(), "configured-node".to_owned()),
+            ("version".to_owned(), env!("CARGO_PKG_VERSION").to_owned()),
+        ];
+        match metrics_error {
+            MetricsError::DuplicateSeries { name, labelset } => {
+                assert_eq!(name, "limpid_build_info");
+                assert_eq!(labelset, &expected_labelset);
+            }
+            other => panic!("expected DuplicateSeries, got {other:?}"),
+        }
+        let diagnostic = error.to_string();
+        assert!(
+            diagnostic.contains(&format!("name={:?}", "limpid_build_info")),
+            "diagnostic must identify the metric family: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains(&format!("labelset={expected_labelset:?}")),
+            "diagnostic must include the complete labelset: {diagnostic}"
+        );
+        assert_eq!(resolver_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(metric_series(&registry, "limpid_build_info").len(), 1);
     }
 
     #[test]

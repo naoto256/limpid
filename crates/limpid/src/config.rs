@@ -143,6 +143,7 @@ fn load_recursive(
         // earlier parent. Returning an empty config keeps duplication
         // out of the merged AST.
         return Ok(Config {
+            node_id: None,
             definitions: Vec::new(),
             global_blocks: Vec::new(),
             includes: Vec::new(),
@@ -197,6 +198,11 @@ fn load_recursive(
 
             let inc_config =
                 load_recursive(&inc_path, canonical_root, state, depth + 1, source_map)?;
+            if let Some(included_node_id) = inc_config.node_id
+                && config.node_id.replace(included_node_id).is_some()
+            {
+                bail!("duplicate node_id");
+            }
             config.definitions.extend(inc_config.definitions);
             config.global_blocks.extend(inc_config.global_blocks);
         }
@@ -368,6 +374,62 @@ mod tests {
             1,
             "shared.limpid should contribute its single definition exactly once"
         );
+    }
+
+    #[test]
+    fn included_node_id_is_retained_in_the_merged_config() {
+        let dir = TempDir::new().unwrap();
+        let main_conf = dir.path().join("main.conf");
+        let included = dir.path().join("included.limpid");
+
+        fs::write(&included, "node_id \"included-node\"").unwrap();
+        fs::write(&main_conf, "include \"included.limpid\"").unwrap();
+
+        let config = load_config(&main_conf).unwrap();
+        assert_eq!(config.node_id.as_deref(), Some("included-node"));
+    }
+
+    #[test]
+    fn distinct_node_id_declarations_across_includes_are_rejected() {
+        let dir = TempDir::new().unwrap();
+        let included_a = dir.path().join("a.limpid");
+        let included_b = dir.path().join("b.limpid");
+        fs::write(&included_a, "node_id \"included-a\"").unwrap();
+        fs::write(&included_b, "node_id \"included-b\"").unwrap();
+
+        for (case, source) in [
+            ("main-and-include", "node_id \"main\"\ninclude \"a.limpid\""),
+            ("two-includes", "include \"a.limpid\"\ninclude \"b.limpid\""),
+        ] {
+            let main_conf = dir.path().join(format!("{case}.conf"));
+            fs::write(&main_conf, source).unwrap();
+            let error = load_config(&main_conf).expect_err("duplicate node_id must fail");
+            assert!(
+                format!("{error:#}").contains("duplicate node_id"),
+                "{case} must report the semantic duplicate"
+            );
+        }
+    }
+
+    #[test]
+    fn diamond_included_node_id_is_adopted_once() {
+        let dir = TempDir::new().unwrap();
+        let shared = dir.path().join("shared.limpid");
+        let parent_a = dir.path().join("parent_a.limpid");
+        let parent_b = dir.path().join("parent_b.limpid");
+        let main_conf = dir.path().join("main.conf");
+
+        fs::write(&shared, "node_id \"shared-node\"").unwrap();
+        fs::write(&parent_a, "include \"shared.limpid\"").unwrap();
+        fs::write(&parent_b, "include \"shared.limpid\"").unwrap();
+        fs::write(
+            &main_conf,
+            "include \"parent_a.limpid\"\ninclude \"parent_b.limpid\"",
+        )
+        .unwrap();
+
+        let config = load_config(&main_conf).unwrap();
+        assert_eq!(config.node_id.as_deref(), Some("shared-node"));
     }
 
     #[test]

@@ -39,6 +39,7 @@ use crate::tap::TapRegistry;
 /// A fully resolved configuration ready for execution.
 #[derive(Clone)]
 pub struct CompiledConfig {
+    pub(crate) node_id: Option<String>,
     pub inputs: HashMap<String, InputDef>,
     pub outputs: HashMap<String, OutputDef>,
     pub processes: HashMap<String, ProcessDef>,
@@ -100,6 +101,7 @@ impl CompiledConfig {
         }
 
         let compiled = Self {
+            node_id: config.node_id,
             inputs,
             outputs,
             processes,

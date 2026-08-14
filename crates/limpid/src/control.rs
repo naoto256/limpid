@@ -1262,6 +1262,8 @@ def pipeline p { input i; output o }
             .build()
             .expect("test metric registration must succeed");
         received.inc();
+        crate::metrics::register_build_info(&metrics, "0.7.15", "control-node")
+            .expect("build info registration must succeed");
 
         let server = ControlServer::new(
             Some(socket_path.to_string_lossy().into_owned()),
@@ -1343,6 +1345,22 @@ def pipeline p { input i; output o }
         assert_eq!(family["type"], "counter");
         assert_eq!(family["series"][0]["labels"]["input"], "control_test");
         assert_eq!(family["series"][0]["value"], 1);
+        let build_info = metrics
+            .iter()
+            .find(|metric| metric["name"] == "limpid_build_info")
+            .expect("stats must include build info");
+        assert_eq!(build_info["type"], "gauge");
+        assert_eq!(
+            build_info["help"],
+            "Build information for the running limpid node."
+        );
+        assert_eq!(
+            build_info["series"],
+            serde_json::json!([{
+                "labels": {"node_id": "control-node", "version": "0.7.15"},
+                "value": 1
+            }])
+        );
         assert!(parsed.get("inputs").is_none());
         assert!(parsed.get("pipelines").is_none());
         assert!(parsed.get("outputs").is_none());
