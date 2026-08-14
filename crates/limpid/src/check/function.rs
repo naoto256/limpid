@@ -378,7 +378,7 @@ fn dfs_cycle<'a>(
                             ),
                             span: None,
                             help: Some(
-                                "use `def process` if you genuinely need recursion; otherwise rewrite the chain to be acyclic"
+                                "rewrite the function calls to form an acyclic graph"
                                     .to_string(),
                             ),
                         });

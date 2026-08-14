@@ -129,11 +129,11 @@ The four process counter families use the labels `pipeline`, `step`,
 These are invocation counters, not event counters. `step` is the root process
 site's one-based, pipeline-wide source-order position; nested calls share that
 root step. A named root has a path such as `/dispatch`, a nested call extends it
-to `/dispatch/leaf`, and an inline root uses `/(inline)`. Recursive back-edges
-reuse their ancestor series. Each distinct compiled invocation node owns four
-counter series; reusing a helper under different parents creates distinct path
-series, while ancestor recursion reuses the ancestor node and cannot grow the
-topology at runtime. Every configured series is prepopulated with zero.
+to `/dispatch/leaf`, and an inline root uses `/(inline)`. Process call graphs
+must be acyclic, so every invocation path is finite and known at config-load
+time. Each distinct compiled invocation node owns four counter series; reusing
+a helper under different parents creates distinct path series. Every
+configured series is prepopulated with zero.
 
 Each frame records exactly one terminal result, so for an individual series
 `in = out + dropped + errored`. A nested drop propagates through its active

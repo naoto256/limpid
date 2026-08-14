@@ -919,6 +919,37 @@ fn check_self_inclusion_is_rejected() {
     assert!(stderr.contains("cycle"), "stderr: {}", stderr);
 }
 
+#[test]
+fn check_rejects_process_cycle_across_included_files() {
+    let dir = TempDir::new().unwrap();
+    let first = dir.path().join("first.limpid");
+    let second = dir.path().join("second.limpid");
+    let main = dir.path().join("main.conf");
+    fs::write(&first, "def process first { process second }").unwrap();
+    fs::write(&second, "def process second { process first }").unwrap();
+    fs::write(
+        &main,
+        r#"
+include "first.limpid"
+include "second.limpid"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p { input i; output o }
+"#,
+    )
+    .unwrap();
+
+    let out = run_check(&main);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(!out.status.success(), "process cycle must fail --check");
+    assert!(
+        stderr.contains("process call cycle detected")
+            && stderr.contains("first")
+            && stderr.contains("second"),
+        "stderr: {stderr}"
+    );
+}
+
 // ---- daemon startup analyzer enforcement -----------------------------
 //
 // `--check` and daemon startup share the same compile-validate-analyze
@@ -1065,6 +1096,34 @@ def pipeline p { input i; output o }
         stderr.contains("egress") && stderr.contains("pipeline-mutable state"),
         "expected pipeline-mutable diagnostic; stderr: {}",
         stderr
+    );
+}
+
+#[test]
+fn daemon_startup_rejects_recursive_process_graph() {
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("daemon_process_cycle.conf");
+    fs::write(
+        &conf,
+        r#"
+def process a { process b }
+def process b { process a }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p { input i; process a; output o }
+"#,
+    )
+    .unwrap();
+
+    let out = run_daemon_attempt(&conf);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        !out.status.success(),
+        "daemon must reject process recursion"
+    );
+    assert!(
+        stderr.contains("process call cycle detected") && stderr.contains("rejected by analyzer"),
+        "stderr: {stderr}"
     );
 }
 

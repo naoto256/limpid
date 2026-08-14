@@ -396,6 +396,9 @@ mod registry_core {
             existing: String,
             requested: String,
         },
+        /// Defensive guard for callers that compile process metrics
+        /// without first running the config analyzer.
+        ProcessCallCycle { path: Vec<String> },
     }
 
     impl fmt::Display for MetricsError {
@@ -432,6 +435,11 @@ mod registry_core {
                 } => write!(
                     formatter,
                     "metric family metadata conflict: name={name:?}, existing={existing}, requested={requested}"
+                ),
+                Self::ProcessCallCycle { path } => write!(
+                    formatter,
+                    "process call cycle reached metric compilation: {}",
+                    path.join(" -> ")
                 ),
             }
         }

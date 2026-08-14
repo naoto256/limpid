@@ -1155,14 +1155,12 @@ def pipeline topology {
     }
 
     #[test]
-    fn process_metrics_fold_same_call_site_and_collapse_recursive_back_edges() {
+    fn process_metrics_reuse_same_callee_calls_within_one_parent() {
         let config = compiled_config(
             r#"
-def process a { process b }
-def process b { process a }
 def process leaf { egress = ingress }
 def process dispatch { process leaf; process leaf }
-def pipeline bounded { process a; process dispatch }
+def pipeline bounded { process dispatch }
 "#,
         );
         let registry = Registry::new();
@@ -1174,9 +1172,7 @@ def pipeline bounded { process a; process dispatch }
             .iter()
             .map(|series| series["labels"]["process_path"].as_str().expect("path"))
             .collect();
-        assert_eq!(series.len(), 4);
-        assert_eq!(paths.iter().filter(|path| **path == "/a").count(), 1);
-        assert_eq!(paths.iter().filter(|path| **path == "/a/b").count(), 1);
+        assert_eq!(series.len(), 2);
         assert_eq!(paths.iter().filter(|path| **path == "/dispatch").count(), 1);
         assert_eq!(
             paths
@@ -1185,7 +1181,6 @@ def pipeline bounded { process a; process dispatch }
                 .count(),
             1
         );
-        assert!(!paths.contains(&"/a/b/a"));
     }
 
     #[tokio::test]
@@ -1196,13 +1191,10 @@ def process leaf { egress = ingress }
 def process parent_one { process leaf }
 def process parent_two { process leaf }
 def process dispatch { process leaf; process leaf }
-def process a { process b }
-def process b { process a }
 def pipeline p {
     process parent_one
     process parent_two
     process dispatch
-    process a
 }
 "#,
         );
@@ -1218,7 +1210,6 @@ def pipeline p {
         let parent_one = plan.root_token_for_testing(1).expect("parent_one token");
         let parent_two = plan.root_token_for_testing(2).expect("parent_two token");
         let dispatch = plan.root_token_for_testing(3).expect("dispatch token");
-        let a = plan.root_token_for_testing(4).expect("a token");
         let parent_one_leaf = plan
             .child_token_for_testing(parent_one, 0)
             .expect("parent_one leaf token");
@@ -1234,13 +1225,6 @@ def pipeline p {
             plan.child_token_for_testing(dispatch, 1),
             "same-parent calls to the same callee must reuse one frame token"
         );
-        let b = plan.child_token_for_testing(a, 0).expect("a-to-b token");
-        assert_eq!(
-            plan.child_token_for_testing(b, 0),
-            Some(a),
-            "an ancestor back-edge must reuse the ancestor token"
-        );
-
         let execution_config = compiled_config(
             r#"
 def process leaf { egress = ingress }
@@ -1961,53 +1945,31 @@ def pipeline nested { process outer; finish }
         assert_process_conservation(&nested);
     }
 
-    #[tokio::test]
-    async fn recursive_invocations_reuse_the_ancestor_series_without_dynamic_growth() {
-        let mut event = fixture_event();
-        event
-            .workspace
-            .insert("depth".to_owned(), crate::dsl::value::OwnedValue::Int(0));
-        let registry = run_process_metric_fixture(
+    #[test]
+    fn process_metric_compilation_rejects_recursion_if_analysis_is_bypassed() {
+        let config = compiled_config(
             r#"
-def process a {
-    if workspace.depth < 2 {
-        workspace.depth = workspace.depth + 1
-        process b
-    }
-}
+def process a { process b }
 def process b { process a }
-def pipeline p { process a; finish }
+def pipeline p { process a }
 "#,
-            "p",
-            event,
-        )
-        .await;
-        assert_process_vector(
+        );
+        let registry = Registry::new();
+        let def = config.pipelines.get("p").expect("pipeline");
+        let error = match PipelineWorker::compile_process_metric_plan_for_testing(
+            def,
+            &config.processes,
             &registry,
-            &[
-                ("pipeline", "p"),
-                ("step", "1"),
-                ("process_path", "/a"),
-                ("process_name", "a"),
-            ],
-            [3, 3, 0, 0],
-        );
-        assert_process_vector(
-            &registry,
-            &[
-                ("pipeline", "p"),
-                ("step", "1"),
-                ("process_path", "/a/b"),
-                ("process_name", "b"),
-            ],
-            [2, 2, 0, 0],
-        );
-        assert_eq!(
-            metric_series(&registry, "limpid_process_events_in_total").len(),
-            2,
-            "recursive calls must not register runtime series"
-        );
-        assert_process_conservation(&registry);
+        ) {
+            Ok(_) => panic!("metric compilation must reject a recursive process graph"),
+            Err(error) => error,
+        };
+        match error {
+            crate::metrics::MetricsError::ProcessCallCycle { path } => {
+                assert_eq!(path, ["a", "b", "a"]);
+            }
+            other => panic!("unexpected metric compilation error: {other}"),
+        };
     }
 
     #[tokio::test]

@@ -51,9 +51,8 @@ pub trait ProcessRegistry {
 /// Registry extension that accepts a metric token pre-resolved at
 /// startup. The token identifies the metric node independently of
 /// the process name — the same name at different call sites
-/// (including recursion) resolves to distinct or shared nodes decided
-/// at compile time — so the event path only needs one `Vec` index
-/// instead of walking the process tree.
+/// resolves to nodes decided at compile time — so the event path only
+/// needs one `Vec` index instead of walking the process tree.
 pub(crate) trait CompiledProcessRegistry: ProcessRegistry {
     fn call_pre_resolved<'bump>(
         &self,

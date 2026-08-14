@@ -876,13 +876,10 @@ impl ProcessMetricPlanValidator<'_> {
     ) -> anyhow::Result<()> {
         match (statement, metric) {
             (ProcessStatement::ProcessCall(name), ProcessMetricStatement::Call(token)) => {
-                let expected = if let Some((_, ancestor)) = ancestors
-                    .iter()
-                    .rev()
-                    .find(|(ancestor, _)| ancestor == name)
-                {
-                    *ancestor
-                } else if let Some(existing) = self.edges.get(&(parent, name.clone())) {
+                if ancestors.iter().any(|(ancestor, _)| ancestor == name) {
+                    anyhow::bail!("compiled process metric plan contains a recursive process call");
+                }
+                let expected = if let Some(existing) = self.edges.get(&(parent, name.clone())) {
                     *existing
                 } else {
                     let identity = self.raw.identities.get(*token).ok_or_else(|| {
@@ -1153,14 +1150,17 @@ impl ProcessMetricsBuilder<'_> {
             ProcessStatement::ProcessCall(name) => {
                 let child = if let Some(child) = self.children[parent].get(name) {
                     *child
-                } else if let Some((_, ancestor)) = ancestors
+                } else if let Some((position, _)) = ancestors
                     .iter()
-                    .rev()
-                    .find(|(ancestor, _)| ancestor == name)
+                    .enumerate()
+                    .find(|(_, (ancestor, _))| ancestor == name)
                 {
-                    let child = *ancestor;
-                    self.children[parent].insert(name.clone(), child);
-                    child
+                    let mut path: Vec<String> = ancestors[position..]
+                        .iter()
+                        .map(|(ancestor, _)| ancestor.clone())
+                        .collect();
+                    path.push(name.clone());
+                    return Err(crate::metrics::MetricsError::ProcessCallCycle { path });
                 } else {
                     let body = self
                         .processes
