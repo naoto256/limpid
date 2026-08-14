@@ -83,7 +83,7 @@ fn collect_imports(
             }
         }
         syn::UseTree::Glob(_) => {
-            if is_runtime_path(prefix) {
+            if is_runtime_path(prefix) || is_sync_namespace(prefix) {
                 hits.push(format!("{}::*", prefix.join("::")));
             }
         }
@@ -109,12 +109,7 @@ impl<'ast> Visit<'ast> for RuntimeReferences {
 
     fn visit_attribute(&mut self, attribute: &'ast syn::Attribute) {
         if attribute.path().is_ident("serde") {
-            let _ = attribute.parse_nested_meta(|meta| {
-                if meta.path.is_ident("deny_unknown_fields") {
-                    self.hits.push("deny_unknown_fields".to_owned());
-                }
-                Ok(())
-            });
+            let _ = attribute.parse_nested_meta(|meta| inspect_serde_meta(meta, &mut self.hits));
         }
         syn::visit::visit_attribute(self, attribute);
     }
@@ -125,6 +120,21 @@ impl<'ast> Visit<'ast> for RuntimeReferences {
         }
         syn::visit::visit_lit_str(self, literal);
     }
+}
+
+fn inspect_serde_meta(
+    meta: syn::meta::ParseNestedMeta<'_>,
+    hits: &mut Vec<String>,
+) -> syn::Result<()> {
+    if meta.path.is_ident("deny_unknown_fields") {
+        hits.push("deny_unknown_fields".to_owned());
+    }
+    if meta.input.peek(syn::Token![=]) {
+        let _: syn::Expr = meta.value()?.parse()?;
+    } else if meta.input.peek(syn::token::Paren) {
+        meta.parse_nested_meta(|nested| inspect_serde_meta(nested, hits))?;
+    }
+    Ok(())
 }
 
 fn inspect(source: &str) -> Vec<String> {
@@ -200,6 +210,13 @@ fn purity_guard_allows_wire_collections_and_serde_derives() {
         fn decode<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
             serde::Deserialize::deserialize(deserializer)
         }
+
+        use serde::*;
+        use std::collections::*;
+        #[serde(rename = "wire", default)]
+        struct Additive;
+        #[serde(rename(serialize = "out", deserialize = "in"), bound(deserialize = "T: serde::Deserialize<'de>"))]
+        struct Generic<T>(T);
     "#;
     assert!(inspect(source).is_empty());
 }
@@ -213,8 +230,13 @@ fn purity_guard_detects_each_forbidden_runtime_reference() {
         "fn build(_: limpid::metrics::RuntimeBuilder) {}",
         "use std::sync::Arc as Shared; struct State(Shared<u64>);",
         "use std::sync::{Mutex as Lock, RwLock}; struct State(Lock<u64>, RwLock<u64>);",
+        "use std::sync::*; struct State(Arc<u64>);",
         "use std::sync as synchronization; struct State(synchronization::Arc<u64>);",
         "#[serde(deny_unknown_fields)] struct Closed;",
+        "#[serde(rename = \"wire\", deny_unknown_fields)] struct Closed;",
+        "#[serde(default, rename = \"wire\", deny_unknown_fields)] struct Closed;",
+        "#[serde(rename(serialize = \"out\", deserialize = \"in\"), deny_unknown_fields)] struct Closed;",
+        "#[serde(bound(deserialize = \"T: serde::Deserialize<'de>\"), deny_unknown_fields)] struct Closed<T>(T);",
         "const FAMILY: &str = \"limpid_runtime_total\";",
     ] {
         assert!(!inspect(source).is_empty(), "{source}");

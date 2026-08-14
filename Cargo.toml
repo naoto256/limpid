@@ -15,3 +15,6 @@ resolver = "3"
 # `crates.io` all stop warning about missing field.
 [workspace.package]
 license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+limpid-metrics-schema = { version = "0.7.15", path = "crates/limpid-metrics-schema" }

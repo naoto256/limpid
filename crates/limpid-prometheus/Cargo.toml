@@ -10,7 +10,7 @@ name = "limpid-prometheus"
 path = "src/main.rs"
 
 [dependencies]
-limpid-metrics-schema = { version = "0.7.15", path = "../limpid-metrics-schema" }
+limpid-metrics-schema = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 # Explicit feature list instead of "full": the exporter only needs the
 # multi-thread runtime + macros (tokio::main / spawn), sockets (net),
