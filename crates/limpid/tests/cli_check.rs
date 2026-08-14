@@ -944,8 +944,7 @@ def pipeline p { input i; output o }
     assert!(!out.status.success(), "process cycle must fail --check");
     assert!(
         stderr.contains("process call cycle detected")
-            && stderr.contains("first")
-            && stderr.contains("second"),
+            && stderr.contains("`first` → `second` → `first`"),
         "stderr: {stderr}"
     );
 }
