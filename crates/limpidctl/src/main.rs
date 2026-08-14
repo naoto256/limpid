@@ -662,7 +662,7 @@ fn render_default_stats_inner(
         for identity in identities.keys() {
             writeln!(
                 rendered,
-                "  {}  {}  {}  {}  {} in  {} out  {} dropped  {} errored",
+                "  {:<16} {:>4}  {:<32} {:<16} {:>8} in  {:>8} out  {:>8} dropped  {:>8} errored",
                 identity.pipeline,
                 identity.step,
                 identity.process_path,
