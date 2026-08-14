@@ -21,7 +21,10 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
-use limpid_metrics_schema::{MetricFamily, MetricType, MetricsSnapshot};
+use limpid_metrics_schema::{
+    DROPPED_ROOT_PROCESS_NAME, DROPPED_ROOT_STEP, EVENTS_DROPPED_TOTAL, MetricFamily, MetricType,
+    MetricsSnapshot, PROCESS_PATH_ROOT,
+};
 
 const DEFAULT_SOCKET: &str = "/var/run/limpid/control.sock";
 
@@ -455,7 +458,7 @@ fn format_duration(secs: u64) -> String {
 const PIPELINE_METRICS: [&str; 6] = [
     "limpid_pipeline_events_received_total",
     "limpid_pipeline_events_finished_total",
-    "limpid_pipeline_events_dropped_total",
+    "limpid_events_dropped_total",
     "limpid_pipeline_events_discarded_total",
     "limpid_pipeline_events_errored_total",
     "limpid_pipeline_events_errored_unwritable_total",
@@ -477,9 +480,10 @@ const OUTPUT_METRICS: [&str; 7] = [
 const PROCESS_METRICS: [&str; 4] = [
     "limpid_process_events_in_total",
     "limpid_process_events_out_total",
-    "limpid_process_events_dropped_total",
+    DROPPED_EVENTS_METRIC,
     "limpid_process_events_errored_total",
 ];
+const DROPPED_EVENTS_METRIC: &str = EVENTS_DROPPED_TOTAL;
 
 type MetricValues = BTreeMap<String, u64>;
 
@@ -527,6 +531,57 @@ fn render_default_stats_inner(
 
     for metric in &snapshot.metrics {
         let name = metric.name();
+        if name == DROPPED_EVENTS_METRIC {
+            if metric.metric_type() != MetricType::Counter
+                || families.contains_key(name)
+                || process_families.contains_key(name)
+            {
+                return None;
+            }
+            let series = metric.value_series()?;
+            if series.is_empty() {
+                return None;
+            }
+            let mut pipeline_values = MetricValues::new();
+            let mut process_values = ProcessMetricValues::new();
+            for item in series {
+                if item.labels.get("process_path").map(String::as_str) == Some(PROCESS_PATH_ROOT) {
+                    if item.labels.len() != 4 {
+                        return None;
+                    }
+                    let pipeline = item.labels.get("pipeline")?.clone();
+                    let step = item.labels.get("step")?;
+                    let process_name = item.labels.get("process_name")?;
+                    if step != DROPPED_ROOT_STEP || process_name != DROPPED_ROOT_PROCESS_NAME {
+                        return None;
+                    }
+                    if pipeline_values.insert(pipeline, item.value).is_some() {
+                        return None;
+                    }
+                } else if validate_process_families {
+                    if item.labels.len() != 4 {
+                        return None;
+                    }
+                    let identity = ProcessIdentity {
+                        pipeline: item.labels.get("pipeline")?.clone(),
+                        step: item.labels.get("step")?.parse().ok()?,
+                        process_path: item.labels.get("process_path")?.clone(),
+                        process_name: item.labels.get("process_name")?.clone(),
+                    };
+                    if process_values.insert(identity, item.value).is_some() {
+                        return None;
+                    }
+                }
+            }
+            if pipeline_values.is_empty() {
+                return None;
+            }
+            families.insert(name.to_owned(), pipeline_values);
+            if validate_process_families && !process_values.is_empty() {
+                process_families.insert(name.to_owned(), process_values);
+            }
+            continue;
+        }
         if validate_process_families && PROCESS_METRICS.contains(&name) {
             if metric.metric_type() != MetricType::Counter || process_families.contains_key(name) {
                 return None;
@@ -1102,11 +1157,21 @@ mod tests {
         let mut metrics = PIPELINE_METRICS
             .iter()
             .map(|name| {
+                let labels = if *name == DROPPED_EVENTS_METRIC {
+                    serde_json::json!({
+                        "pipeline": "route",
+                        "step": "0",
+                        "process_path": "/",
+                        "process_name": ""
+                    })
+                } else {
+                    serde_json::json!({"pipeline": "route"})
+                };
                 serde_json::json!({
                     "name": name,
                     "type": "counter",
                     "help": "Pipeline counter.",
-                    "series": [{"labels": {"pipeline": "route"}, "value": 1}]
+                    "series": [{"labels": labels, "value": 1}]
                 })
             })
             .chain(INPUT_METRICS.iter().map(|name| {

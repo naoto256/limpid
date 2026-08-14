@@ -130,6 +130,32 @@ fn counter_family(
     json!({"name": name, "type": "counter", "help": help, "series": series})
 }
 
+fn dropped_root_family(values: &[(&str, u64)], reverse_series: bool) -> Value {
+    let mut series: Vec<Value> = values
+        .iter()
+        .map(|(pipeline, value)| {
+            json!({
+                "labels": {
+                    "pipeline": pipeline,
+                    "step": "0",
+                    "process_path": "/",
+                    "process_name": ""
+                },
+                "value": value
+            })
+        })
+        .collect();
+    if reverse_series {
+        series.reverse();
+    }
+    json!({
+        "name": "limpid_events_dropped_total",
+        "type": "counter",
+        "help": "Total events whose drop propagated through this processing node.",
+        "series": series
+    })
+}
+
 fn histogram_snapshot(buckets: Value) -> String {
     format!(
         "{}\n",
@@ -174,10 +200,7 @@ fn canonical_snapshot(reverse: bool) -> Value {
             ],
             false,
         ),
-        counter_family(
-            "limpid_pipeline_events_dropped_total",
-            "pipeline",
-            "dropped",
+        dropped_root_family(
             &[("unwritable_only", 0), ("compact", 1), ("errored_only", 0)],
             false,
         ),
@@ -355,7 +378,6 @@ fn process_snapshot() -> Value {
     for (name, root_value, leaf_value) in [
         ("limpid_process_events_in_total", 4, 3),
         ("limpid_process_events_out_total", 4, 1),
-        ("limpid_process_events_dropped_total", 0, 1),
         ("limpid_process_events_errored_total", 0, 1),
     ] {
         payload["metrics"].as_array_mut().unwrap().push(json!({
@@ -384,6 +406,29 @@ fn process_snapshot() -> Value {
             ]
         }));
     }
+    family_mut(&mut payload, "limpid_events_dropped_total")["series"]
+        .as_array_mut()
+        .unwrap()
+        .extend([
+            json!({
+                "labels": {
+                    "pipeline": "compact",
+                    "step": "10",
+                    "process_path": "/dispatch/leaf",
+                    "process_name": "leaf"
+                },
+                "value": 1
+            }),
+            json!({
+                "labels": {
+                    "pipeline": "compact",
+                    "step": "2",
+                    "process_path": "/dispatch",
+                    "process_name": "dispatch"
+                },
+                "value": 0
+            }),
+        ]);
     payload
 }
 
@@ -400,11 +445,20 @@ fn for_each_process_family_mut(payload: &mut Value, mut update: impl FnMut(&mut 
     for name in [
         "limpid_process_events_in_total",
         "limpid_process_events_out_total",
-        "limpid_process_events_dropped_total",
+        "limpid_events_dropped_total",
         "limpid_process_events_errored_total",
     ] {
         update(family_mut(payload, name));
     }
+}
+
+fn first_process_series_mut(family: &mut Value) -> &mut Value {
+    family["series"]
+        .as_array_mut()
+        .expect("series")
+        .iter_mut()
+        .find(|series| series["labels"]["process_path"] != "/")
+        .expect("process series")
 }
 
 fn process_default_validator_only_defects() -> Vec<(&'static str, Value)> {
@@ -412,7 +466,7 @@ fn process_default_validator_only_defects() -> Vec<(&'static str, Value)> {
 
     let mut missing_label = process_snapshot();
     for_each_process_family_mut(&mut missing_label, |family| {
-        family["series"][0]["labels"]
+        first_process_series_mut(family)["labels"]
             .as_object_mut()
             .unwrap()
             .remove("process_name");
@@ -421,7 +475,7 @@ fn process_default_validator_only_defects() -> Vec<(&'static str, Value)> {
 
     let mut extra_label = process_snapshot();
     for_each_process_family_mut(&mut extra_label, |family| {
-        family["series"][0]["labels"]
+        first_process_series_mut(family)["labels"]
             .as_object_mut()
             .unwrap()
             .insert("extra".to_owned(), json!("x"));
@@ -430,7 +484,7 @@ fn process_default_validator_only_defects() -> Vec<(&'static str, Value)> {
 
     let mut non_numeric_step = process_snapshot();
     for_each_process_family_mut(&mut non_numeric_step, |family| {
-        family["series"][0]["labels"]["step"] = json!("ten");
+        first_process_series_mut(family)["labels"]["step"] = json!("ten");
     });
     cases.push(("non-numeric step", non_numeric_step));
 
@@ -528,7 +582,7 @@ fn process_counters_render_a_numerically_sorted_default_invocation_table() {
     for name in [
         "limpid_process_events_in_total",
         "limpid_process_events_out_total",
-        "limpid_process_events_dropped_total",
+        "limpid_events_dropped_total",
         "limpid_process_events_errored_total",
     ] {
         assert!(details.contains(name), "missing {name}");
@@ -596,6 +650,36 @@ fn malformed_process_families_fall_back_to_the_whole_raw_response() {
         did_not_fall_back.is_empty(),
         "each single defect must cause a whole raw fallback; rendered: {did_not_fall_back:?}"
     );
+}
+
+#[test]
+fn malformed_dropped_hierarchy_roots_fall_back_to_the_raw_response() {
+    let mut wrong_step = process_snapshot();
+    family_mut(&mut wrong_step, "limpid_events_dropped_total")["series"][0]["labels"]["step"] =
+        json!("1");
+
+    let mut nonempty_name = process_snapshot();
+    family_mut(&mut nonempty_name, "limpid_events_dropped_total")["series"][0]["labels"]["process_name"] =
+        json!("pipeline");
+
+    let mut missing_root = process_snapshot();
+    family_mut(&mut missing_root, "limpid_events_dropped_total")["series"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|series| series["labels"]["process_path"] != "/");
+
+    for (name, payload) in [
+        ("wrong root step", wrong_step),
+        ("non-empty root process name", nonempty_name),
+        ("missing root", missing_root),
+    ] {
+        let response = format!("{payload}\n");
+        for args in [&[][..], &["--details"][..]] {
+            let output = run_stats(&response, args);
+            assert!(output.status.success(), "{name}: {output:?}");
+            assert_eq!(output.stdout, response.as_bytes(), "{name}: {args:?}");
+        }
+    }
 }
 
 #[test]
