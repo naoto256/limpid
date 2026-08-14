@@ -65,6 +65,11 @@ forward-compatible. The documented fields above remain required and retain
 their exact types; ignoring an unknown field does not make a missing or
 malformed required field valid.
 
+The shared schema-v1 crate also defines the well-known dropped hierarchy,
+process family and label names, and the `/`-separated process-path relationship
+used by current consumers. These definitions do not add fields to the wire
+envelope.
+
 Schema v1 deliberately does not contain an explicit `+Inf` bucket. A
 Prometheus consumer derives `le="+Inf"` from `count`. Bucket, sum, and count
 atomics are loaded independently, so a concurrent snapshot may transiently show
@@ -100,7 +105,6 @@ for the same-host multi-instance deployment caveat.
 | --- | --- | --- |
 | `limpid_pipeline_events_received_total` | `pipeline` | Events entering the pipeline. |
 | `limpid_pipeline_events_finished_total` | `pipeline` | Events that reached at least one output. |
-| `limpid_pipeline_events_dropped_total` | `pipeline` | Events explicitly discarded by `drop`. |
 | `limpid_pipeline_events_discarded_total` | `pipeline` | Events that completed without reaching any output. |
 | `limpid_pipeline_events_errored_total` | `pipeline` | Events that failed at a pipeline-side producer site and were routed to the [error log](./error-log.md). |
 | `limpid_pipeline_events_errored_unwritable_total` | `pipeline` | Pipeline-side error-log writes that failed. |
@@ -118,31 +122,69 @@ original event is preserved when the configured error-log write succeeds; see
 
 ### Process invocations
 
-The four process counter families use the labels `pipeline`, `step`,
+The three process-only counter families use the labels `pipeline`, `step`,
 `process_path`, and `process_name`:
 
 - `limpid_process_events_in_total` counts frame entry.
 - `limpid_process_events_out_total` counts frames that return `Continue`.
-- `limpid_process_events_dropped_total` counts frames terminated by `Drop`.
 - `limpid_process_events_errored_total` counts frames terminated by an error.
 
 These are invocation counters, not event counters. `step` is the root process
 site's one-based, pipeline-wide source-order position; nested calls share that
-root step. A named root has a path such as `/dispatch`, a nested call extends it
-to `/dispatch/leaf`, and an inline root uses `/(inline)`. Process call graphs
-must be acyclic, so every invocation path is finite and known at config-load
-time. Each distinct compiled invocation node owns four counter series; reusing
-a helper under different parents creates distinct path series. Every
-configured series is prepopulated with zero.
+root step. `process_path` is a `/`-separated invocation hierarchy whose leaf is
+`process_name`: a named root has a path such as `/dispatch`, a nested call
+extends it to `/dispatch/leaf`, and an inline root uses `/(inline)`. Process
+call graphs must be acyclic, so every invocation path is finite and known at
+config-load time. Each distinct compiled invocation node owns three
+process-only counter series; reusing a helper under different parents creates
+distinct path series. Every configured series is prepopulated with zero.
 
 Each frame records exactly one terminal result, so for an individual series
 `in = out + dropped + errored`. A nested drop propagates through its active
 caller frames. A nested error counts as errored for that frame even when a
 caller's catch block recovers and the caller returns normally. Consequently,
 summing process series double-counts nested invocations and is not an event
-flow total. The pipeline event families above remain the authoritative event
-flow: in particular, `limpid_pipeline_events_dropped_total{pipeline}` retains
-its existing single-label event semantics.
+flow total.
+
+### Dropped-event hierarchy
+
+`limpid_events_dropped_total` is one counter family for both the pipeline
+frame and its process frames. Every series has the labels `pipeline`, `step`,
+`process_path`, and `process_name`. The pipeline frame is the root node and is
+represented by `step="0"`, `process_path="/"`, and an empty `process_name`.
+Its value is the number of events dropped from that pipeline. Process nodes
+use their ordinary one-based root step and invocation path. Their values count
+drops that propagated through that process frame.
+
+A drop therefore increments one finite path from the node that executed
+`drop` through every active caller to the pipeline root. Process call graphs
+are acyclic, so this hierarchy is fully known at config-load time. The source
+family exposes propagated totals at every node; its root is the authoritative
+pipeline dropped-event total.
+
+`limpid-prometheus` additionally synthesizes the counter
+`limpid_events_dropped_own_total` at scrape time. It has the same
+`pipeline`, `step`, `process_path`, and `process_name` labels as the source
+dropped family, with help text `Total events dropped directly at this
+processing node, excluding direct child drops.` For each source series it
+reports `max(0, parent - sum(direct children))`. A root process is a direct
+child of `/` when its `pipeline` matches; its one-based `step` identifies the
+root call site and does not have to match the root's reserved step `0`. Below a
+process node, a direct child's `process_path` is the parent path extended by
+`/` and exactly one non-empty segment, and all labels other than
+`process_path` and `process_name` must be equal. Missing intermediate paths are
+not bridged. The clamp accommodates independently read counter snapshots and
+arithmetic overflow without changing or rejecting the source family. If the
+source dropped family is absent, the derived family is absent too.
+
+The derived value at `/` counts drops executed directly in the pipeline body.
+At a process node it counts drops executed directly in that process body.
+
+Only dropped frames propagate through every active caller, making direct-child
+subtraction meaningful. Continue and error outcomes do not have that
+propagation invariant, so no corresponding `own` families are synthesized.
+The derived family is a sidecar exposition view rather than another daemon
+registry series; `limpid_events_dropped_total` remains authoritative.
 
 ### Inputs
 

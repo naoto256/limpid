@@ -28,7 +28,11 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use limpid_metrics_schema::{MetricFamily, MetricType, MetricsSnapshot};
+use limpid_metrics_schema::{
+    EVENTS_DROPPED_OWN_TOTAL, EVENTS_DROPPED_TOTAL, MetricFamily, MetricType, MetricsSnapshot,
+    PROCESS_LABEL_NAME, PROCESS_LABEL_PATH, PROCESS_LABEL_PIPELINE, PROCESS_PATH_ROOT,
+    process_path_parent,
+};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixStream};
@@ -63,6 +67,9 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
 /// as an in-flight one finishes — paired with `CONNECTION_TIMEOUT`,
 /// so an idle-forever peer can't perma-hold its slot.
 const MAX_CONCURRENT_CONNECTIONS: usize = 8;
+
+const DROPPED_OWN_HELP: &str =
+    "Total events dropped directly at this processing node, excluding direct child drops.";
 
 #[derive(Parser)]
 #[command(name = "limpid-prometheus", about = "Prometheus exporter for limpid")]
@@ -354,8 +361,93 @@ fn parse_snapshot(root: &MetricsSnapshot) -> Result<Vec<ExpositionFamily>, Strin
         });
     }
     validate_histogram_namespaces(&families, &names)?;
+    if let Some(derived) = derive_dropped_own(&families) {
+        families.push(derived);
+    }
     families.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(families)
+}
+
+fn derive_dropped_own(families: &[ExpositionFamily]) -> Option<ExpositionFamily> {
+    let source = families
+        .iter()
+        .find(|family| family.name == EVENTS_DROPPED_TOTAL)?;
+    if !matches!(source.metric_type, ExpositionType::Counter) {
+        return None;
+    }
+
+    let dimensions = |labels: &Labels| {
+        labels
+            .iter()
+            .filter(|(key, _)| key != PROCESS_LABEL_PATH && key != PROCESS_LABEL_NAME)
+            .cloned()
+            .collect::<Labels>()
+    };
+    let mut root_indices = BTreeMap::new();
+    let mut parent_indices = BTreeMap::new();
+    let mut series = Vec::with_capacity(source.series.len());
+    for source_series in &source.series {
+        let ExpositionSeries::Value {
+            labels,
+            value: source_value,
+        } = source_series
+        else {
+            return None;
+        };
+        if let Some(path) = label_value(labels, PROCESS_LABEL_PATH) {
+            if path == PROCESS_PATH_ROOT {
+                if let Some(pipeline) = label_value(labels, PROCESS_LABEL_PIPELINE) {
+                    root_indices.insert(pipeline.to_string(), series.len());
+                }
+            } else {
+                parent_indices.insert((dimensions(labels), path.to_string()), series.len());
+            }
+        }
+        series.push(ExpositionSeries::Value {
+            labels: labels.clone(),
+            value: *source_value,
+        });
+    }
+
+    for child in &source.series {
+        let ExpositionSeries::Value {
+            labels,
+            value: child_value,
+        } = child
+        else {
+            return None;
+        };
+        let Some(parent_path) =
+            label_value(labels, PROCESS_LABEL_PATH).and_then(process_path_parent)
+        else {
+            continue;
+        };
+        let parent_index = if parent_path == PROCESS_PATH_ROOT {
+            label_value(labels, PROCESS_LABEL_PIPELINE)
+                .and_then(|pipeline| root_indices.get(pipeline))
+        } else {
+            parent_indices.get(&(dimensions(labels), parent_path.to_string()))
+        };
+        let Some(parent_index) = parent_index else {
+            continue;
+        };
+        if let Some(ExpositionSeries::Value { value: own, .. }) = series.get_mut(*parent_index) {
+            *own = own.saturating_sub(*child_value);
+        }
+    }
+
+    Some(ExpositionFamily {
+        name: EVENTS_DROPPED_OWN_TOTAL.to_string(),
+        metric_type: ExpositionType::Counter,
+        help: DROPPED_OWN_HELP.to_string(),
+        series,
+    })
+}
+
+fn label_value<'a>(labels: &'a Labels, name: &str) -> Option<&'a str> {
+    labels
+        .iter()
+        .find_map(|(key, value)| (key == name).then_some(value.as_str()))
 }
 
 fn validate_exported_labelsets(
@@ -657,6 +749,69 @@ mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
     use tokio::net::{TcpStream, UnixListener};
+
+    const DROPPED_FAMILY: &str = "limpid_events_dropped_total";
+    const DROPPED_OWN_FAMILY: &str = "limpid_events_dropped_own_total";
+
+    fn dropped_series(
+        pipeline: &str,
+        step: &str,
+        path: &str,
+        name: &str,
+        value: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "labels": {
+                "pipeline": pipeline,
+                "step": step,
+                "process_path": path,
+                "process_name": name,
+            },
+            "value": value,
+        })
+    }
+
+    fn dropped_snapshot(series: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({
+            "schema": 1,
+            "metrics": [{
+                "name": DROPPED_FAMILY,
+                "type": "counter",
+                "help": "Total events whose drop propagated through this processing node.",
+                "series": series,
+            }]
+        })
+    }
+
+    fn derived_own_samples(snapshot: &serde_json::Value) -> Vec<String> {
+        let output = json_to_prometheus(&snapshot.to_string()).unwrap();
+        let help_prefix = format!("# HELP {DROPPED_OWN_FAMILY} ");
+        let help = output
+            .lines()
+            .find(|line| line.starts_with(&help_prefix))
+            .expect("derived family must include HELP metadata")
+            .to_ascii_lowercase();
+        assert!(help.contains("dropped"));
+        assert!(help.contains("direct child"));
+        assert!(output.contains(&format!("# TYPE {DROPPED_OWN_FAMILY} counter\n")));
+
+        let sample_prefix = format!("{DROPPED_OWN_FAMILY}{{");
+        let mut samples = output
+            .lines()
+            .filter(|line| line.starts_with(&sample_prefix))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        samples.sort();
+        samples
+    }
+
+    fn without_derived_own_family(output: &str) -> String {
+        let help_prefix = format!("# HELP {DROPPED_OWN_FAMILY} ");
+        output
+            .split_inclusive("\n\n")
+            .filter(|family| !family.starts_with(&help_prefix))
+            .collect()
+    }
 
     #[test]
     fn schema_v1_fixture_parses_through_the_shared_wire_dto() {
@@ -1162,7 +1317,7 @@ metric_zeta_seconds_count{az="two",le_="source-zero",le__="source-one",le___="so
                     }]
                 },
                 {
-                    "name": "limpid_process_events_dropped_total",
+                    "name": "limpid_events_dropped_total",
                     "type": "counter",
                     "help": "Process invocations dropped.",
                     "series": [{
@@ -1191,9 +1346,9 @@ metric_zeta_seconds_count{az="two",le_="source-zero",le__="source-one",le___="so
                 }
             ]
         });
-        let expected = r#"# HELP limpid_process_events_dropped_total Process invocations dropped.
-# TYPE limpid_process_events_dropped_total counter
-limpid_process_events_dropped_total{pipeline="main",process_name="leaf",process_path="/dispatch/leaf",step="2"} 1
+        let expected = r#"# HELP limpid_events_dropped_total Process invocations dropped.
+# TYPE limpid_events_dropped_total counter
+limpid_events_dropped_total{pipeline="main",process_name="leaf",process_path="/dispatch/leaf",step="2"} 1
 
 # HELP limpid_process_events_errored_total Process invocations errored.
 # TYPE limpid_process_events_errored_total counter
@@ -1208,6 +1363,314 @@ limpid_process_events_in_total{pipeline="main",process_name="leaf",process_path=
 limpid_process_events_out_total{pipeline="main",process_name="leaf",process_path="/dispatch/leaf",step="2"} 5
 
 "#;
+        let output = json_to_prometheus(&snapshot.to_string()).unwrap();
+        assert_eq!(without_derived_own_family(&output), expected);
+        assert_eq!(
+            derived_own_samples(&snapshot),
+            [
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"leaf\",process_path=\"/dispatch/leaf\",step=\"2\"} 1"
+            ]
+        );
+    }
+
+    #[test]
+    fn dropped_own_subtracts_the_direct_child_in_a_chain() {
+        let snapshot = dropped_snapshot(vec![
+            dropped_series("main", "1", "/dispatch", "dispatch", 10),
+            dropped_series("main", "1", "/dispatch/leaf", "leaf", 4),
+        ]);
+
+        assert_eq!(
+            derived_own_samples(&snapshot),
+            [
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"dispatch\",process_path=\"/dispatch\",step=\"1\"} 6",
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"leaf\",process_path=\"/dispatch/leaf\",step=\"1\"} 4",
+            ]
+        );
+    }
+
+    #[test]
+    fn dropped_own_treats_pipeline_root_as_the_parent_of_every_root_process_step() {
+        let snapshot = dropped_snapshot(vec![
+            dropped_series("main", "0", "/", "", 20),
+            dropped_series("main", "1", "/dispatch", "dispatch", 10),
+            dropped_series("main", "1", "/dispatch/leaf", "leaf", 4),
+            dropped_series("main", "2", "/normalize", "normalize", 6),
+            dropped_series("other", "0", "/", "", 5),
+            dropped_series("other", "1", "/dispatch", "dispatch", 3),
+        ]);
+
+        assert_eq!(
+            derived_own_samples(&snapshot),
+            [
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"\",process_path=\"/\",step=\"0\"} 4",
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"dispatch\",process_path=\"/dispatch\",step=\"1\"} 6",
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"leaf\",process_path=\"/dispatch/leaf\",step=\"1\"} 4",
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"normalize\",process_path=\"/normalize\",step=\"2\"} 6",
+                "limpid_events_dropped_own_total{pipeline=\"other\",process_name=\"\",process_path=\"/\",step=\"0\"} 2",
+                "limpid_events_dropped_own_total{pipeline=\"other\",process_name=\"dispatch\",process_path=\"/dispatch\",step=\"1\"} 3",
+            ]
+        );
+    }
+
+    #[test]
+    fn dropped_own_subtracts_every_direct_child_in_a_branch() {
+        let snapshot = dropped_snapshot(vec![
+            dropped_series("main", "1", "/dispatch", "dispatch", 10),
+            dropped_series("main", "1", "/dispatch/alpha", "alpha", 3),
+            dropped_series("main", "1", "/dispatch/beta", "beta", 4),
+        ]);
+
+        assert_eq!(
+            derived_own_samples(&snapshot),
+            [
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"alpha\",process_path=\"/dispatch/alpha\",step=\"1\"} 3",
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"beta\",process_path=\"/dispatch/beta\",step=\"1\"} 4",
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"dispatch\",process_path=\"/dispatch\",step=\"1\"} 3",
+            ]
+        );
+    }
+
+    #[test]
+    fn dropped_own_indexes_a_high_cardinality_branch_exactly() {
+        const CHILDREN: usize = 256;
+
+        let mut source = Vec::with_capacity(CHILDREN + 1);
+        source.push(dropped_series("main", "1", "/dispatch", "dispatch", 1_000));
+        let mut expected = Vec::with_capacity(CHILDREN + 1);
+        expected.push(
+            "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"dispatch\",process_path=\"/dispatch\",step=\"1\"} 744"
+                .to_string(),
+        );
+        for child in 0..CHILDREN {
+            let name = format!("leaf-{child:03}");
+            let path = format!("/dispatch/{name}");
+            source.push(dropped_series("main", "1", &path, &name, 1));
+            expected.push(format!(
+                "limpid_events_dropped_own_total{{pipeline=\"main\",process_name=\"{name}\",process_path=\"{path}\",step=\"1\"}} 1"
+            ));
+        }
+        expected.sort();
+
+        assert_eq!(derived_own_samples(&dropped_snapshot(source)), expected);
+    }
+
+    #[test]
+    fn dropped_own_clamps_when_direct_child_total_exceeds_u64() {
+        let snapshot = dropped_snapshot(vec![
+            dropped_series("main", "1", "/dispatch", "dispatch", u64::MAX),
+            dropped_series("main", "1", "/dispatch/alpha", "alpha", u64::MAX),
+            dropped_series("main", "1", "/dispatch/beta", "beta", 1),
+        ]);
+
+        assert_eq!(
+            derived_own_samples(&snapshot),
+            [
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"alpha\",process_path=\"/dispatch/alpha\",step=\"1\"} 18446744073709551615",
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"beta\",process_path=\"/dispatch/beta\",step=\"1\"} 1",
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"dispatch\",process_path=\"/dispatch\",step=\"1\"} 0",
+            ]
+        );
+    }
+
+    #[test]
+    fn dropped_own_clamps_snapshot_skew_at_zero() {
+        let snapshot = dropped_snapshot(vec![
+            dropped_series("main", "1", "/dispatch", "dispatch", 2),
+            dropped_series("main", "1", "/dispatch/leaf", "leaf", 5),
+        ]);
+
+        assert_eq!(
+            derived_own_samples(&snapshot),
+            [
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"dispatch\",process_path=\"/dispatch\",step=\"1\"} 0",
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"leaf\",process_path=\"/dispatch/leaf\",step=\"1\"} 5",
+            ]
+        );
+    }
+
+    #[test]
+    fn dropped_own_subtracts_only_direct_children_at_each_depth() {
+        let snapshot = dropped_snapshot(vec![
+            dropped_series("main", "1", "/dispatch", "dispatch", 10),
+            dropped_series("main", "1", "/dispatch/leaf", "leaf", 7),
+            dropped_series("main", "1", "/dispatch/leaf/grandchild", "grandchild", 2),
+        ]);
+
+        assert_eq!(
+            derived_own_samples(&snapshot),
+            [
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"dispatch\",process_path=\"/dispatch\",step=\"1\"} 3",
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"grandchild\",process_path=\"/dispatch/leaf/grandchild\",step=\"1\"} 2",
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"leaf\",process_path=\"/dispatch/leaf\",step=\"1\"} 5",
+            ]
+        );
+    }
+
+    #[test]
+    fn dropped_own_does_not_bridge_a_missing_intermediate_path() {
+        let snapshot = dropped_snapshot(vec![
+            dropped_series("main", "1", "/dispatch", "dispatch", 10),
+            dropped_series("main", "1", "/dispatch/missing/leaf", "leaf", 4),
+        ]);
+
+        assert_eq!(
+            derived_own_samples(&snapshot),
+            [
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"dispatch\",process_path=\"/dispatch\",step=\"1\"} 10",
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"leaf\",process_path=\"/dispatch/missing/leaf\",step=\"1\"} 4",
+            ]
+        );
+    }
+
+    #[test]
+    fn dropped_own_scopes_child_subtraction_by_pipeline_and_root_step() {
+        let snapshot = dropped_snapshot(vec![
+            dropped_series("main", "1", "/dispatch", "dispatch", 10),
+            dropped_series("main", "1", "/dispatch/leaf", "leaf", 4),
+            dropped_series("main", "2", "/dispatch", "dispatch", 8),
+            dropped_series("main", "2", "/dispatch/leaf", "leaf", 3),
+            dropped_series("other", "1", "/dispatch", "dispatch", 7),
+            dropped_series("other", "1", "/dispatch/leaf", "leaf", 2),
+        ]);
+
+        assert_eq!(
+            derived_own_samples(&snapshot),
+            [
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"dispatch\",process_path=\"/dispatch\",step=\"1\"} 6",
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"dispatch\",process_path=\"/dispatch\",step=\"2\"} 5",
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"leaf\",process_path=\"/dispatch/leaf\",step=\"1\"} 4",
+                "limpid_events_dropped_own_total{pipeline=\"main\",process_name=\"leaf\",process_path=\"/dispatch/leaf\",step=\"2\"} 3",
+                "limpid_events_dropped_own_total{pipeline=\"other\",process_name=\"dispatch\",process_path=\"/dispatch\",step=\"1\"} 5",
+                "limpid_events_dropped_own_total{pipeline=\"other\",process_name=\"leaf\",process_path=\"/dispatch/leaf\",step=\"1\"} 2",
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshots_without_dropped_hierarchy_do_not_gain_a_derived_family() {
+        let snapshot = serde_json::json!({
+            "schema": 1,
+            "metrics": [{
+                "name": "legacy_counter_total",
+                "type": "counter",
+                "help": "Legacy counter.",
+                "series": [{"labels": {"scope": "one"}, "value": 3}]
+            }]
+        });
+        let expected = concat!(
+            "# HELP legacy_counter_total Legacy counter.\n",
+            "# TYPE legacy_counter_total counter\n",
+            "legacy_counter_total{scope=\"one\"} 3\n\n"
+        );
+
+        assert_eq!(json_to_prometheus(&snapshot.to_string()).unwrap(), expected);
+    }
+
+    #[test]
+    fn non_counter_dropped_hierarchy_renders_without_a_derived_family() {
+        let snapshot = serde_json::json!({
+            "schema": 1,
+            "metrics": [{
+                "name": DROPPED_FAMILY,
+                "type": "gauge",
+                "help": "A generic gauge using the well-known family name.",
+                "series": [{
+                    "labels": {
+                        "pipeline": "main",
+                        "step": "1",
+                        "process_path": "/dispatch",
+                        "process_name": "dispatch"
+                    },
+                    "value": 3
+                }]
+            }]
+        });
+        let expected = concat!(
+            "# HELP limpid_events_dropped_total A generic gauge using the well-known family name.\n",
+            "# TYPE limpid_events_dropped_total gauge\n",
+            "limpid_events_dropped_total{pipeline=\"main\",process_name=\"dispatch\",process_path=\"/dispatch\",step=\"1\"} 3\n\n"
+        );
+
+        assert_eq!(json_to_prometheus(&snapshot.to_string()).unwrap(), expected);
+    }
+
+    #[test]
+    fn dropped_own_preserves_source_and_renders_the_full_canonical_exposition() {
+        let snapshot = serde_json::json!({
+            "schema": 1,
+            "metrics": [
+                {
+                    "name": "zeta_total",
+                    "type": "counter",
+                    "help": "A later family.",
+                    "series": [{"labels": {"scope": "z"}, "value": 9}]
+                },
+                {
+                    "name": DROPPED_FAMILY,
+                    "type": "counter",
+                    "help": "Total events whose drop propagated through this processing node.",
+                    "series": [
+                        {
+                            "labels": {
+                                "process_name": "",
+                                "pipeline": "main",
+                                "step": "0",
+                                "process_path": "/"
+                            },
+                            "value": 12
+                        },
+                        {
+                            "labels": {
+                                "step": "7",
+                                "process_path": "/dispatch/leaf",
+                                "pipeline": "main",
+                                "process_name": "leaf"
+                            },
+                            "value": 4
+                        },
+                        {
+                            "labels": {
+                                "process_name": "dispatch",
+                                "pipeline": "main",
+                                "step": "7",
+                                "process_path": "/dispatch"
+                            },
+                            "value": 10
+                        },
+                        {
+                            "labels": {
+                                "process_path": "opaque",
+                                "process_name": "opaque",
+                                "step": "8",
+                                "pipeline": "main"
+                            },
+                            "value": 3
+                        }
+                    ]
+                }
+            ]
+        });
+        let expected = r#"# HELP limpid_events_dropped_own_total Total events dropped directly at this processing node, excluding direct child drops.
+# TYPE limpid_events_dropped_own_total counter
+limpid_events_dropped_own_total{pipeline="main",process_name="",process_path="/",step="0"} 2
+limpid_events_dropped_own_total{pipeline="main",process_name="dispatch",process_path="/dispatch",step="7"} 6
+limpid_events_dropped_own_total{pipeline="main",process_name="leaf",process_path="/dispatch/leaf",step="7"} 4
+limpid_events_dropped_own_total{pipeline="main",process_name="opaque",process_path="opaque",step="8"} 3
+
+# HELP limpid_events_dropped_total Total events whose drop propagated through this processing node.
+# TYPE limpid_events_dropped_total counter
+limpid_events_dropped_total{pipeline="main",process_name="",process_path="/",step="0"} 12
+limpid_events_dropped_total{pipeline="main",process_name="dispatch",process_path="/dispatch",step="7"} 10
+limpid_events_dropped_total{pipeline="main",process_name="leaf",process_path="/dispatch/leaf",step="7"} 4
+limpid_events_dropped_total{pipeline="main",process_name="opaque",process_path="opaque",step="8"} 3
+
+# HELP zeta_total A later family.
+# TYPE zeta_total counter
+zeta_total{scope="z"} 9
+
+"#;
+
         assert_eq!(json_to_prometheus(&snapshot.to_string()).unwrap(), expected);
     }
 

@@ -1106,7 +1106,6 @@ def pipeline topology {
         let process_families = [
             "limpid_process_events_in_total",
             "limpid_process_events_out_total",
-            "limpid_process_events_dropped_total",
             "limpid_process_events_errored_total",
         ];
         let expected = [
@@ -1145,13 +1144,36 @@ def pipeline topology {
             }
         }
 
-        let dropped = metric_series(&registry, "limpid_pipeline_events_dropped_total");
-        assert_eq!(dropped.len(), 1);
+        let dropped = metric_series(&registry, "limpid_events_dropped_total");
+        assert_eq!(dropped.len(), expected.len() + 1);
         assert_eq!(
-            dropped[0]["labels"],
-            serde_json::json!({"pipeline": "topology"})
+            series_value(
+                &registry,
+                "limpid_events_dropped_total",
+                &[
+                    ("pipeline", "topology"),
+                    ("step", "0"),
+                    ("process_path", "/"),
+                    ("process_name", ""),
+                ],
+            ),
+            0
         );
-        assert_eq!(dropped[0]["value"], 0);
+        for (step, path, name) in expected {
+            assert_eq!(
+                series_value(
+                    &registry,
+                    "limpid_events_dropped_total",
+                    &[
+                        ("pipeline", "topology"),
+                        ("step", step),
+                        ("process_path", path),
+                        ("process_name", name),
+                    ],
+                ),
+                0
+            );
+        }
     }
 
     #[test]
@@ -1434,8 +1456,13 @@ def pipeline execute { process dispatch; finish }
         assert_eq!(
             series_value(
                 &registry,
-                "limpid_pipeline_events_dropped_total",
-                &[("pipeline", pipeline)],
+                "limpid_events_dropped_total",
+                &[
+                    ("pipeline", pipeline),
+                    ("step", "0"),
+                    ("process_path", "/"),
+                    ("process_name", ""),
+                ],
             ),
             0,
             "the process body's drop side effect must not run during validation"
@@ -1638,8 +1665,12 @@ def pipeline p_fallback {
         let _worker = PipelineWorker::new_with_process_metrics(def, &config.processes, &registry)
             .expect("register metrics");
         let snapshot = serde_json::to_value(registry.snapshot()).expect("snapshot");
-        for suffix in ["in", "out", "dropped", "errored"] {
-            let name = format!("limpid_process_events_{suffix}_total");
+        for name in [
+            "limpid_process_events_in_total",
+            "limpid_process_events_out_total",
+            "limpid_events_dropped_total",
+            "limpid_process_events_errored_total",
+        ] {
             let family = snapshot["metrics"]
                 .as_array()
                 .unwrap()
@@ -1702,7 +1733,7 @@ def pipeline p_fallback {
         let family_names = [
             "limpid_process_events_in_total",
             "limpid_process_events_out_total",
-            "limpid_process_events_dropped_total",
+            "limpid_events_dropped_total",
             "limpid_process_events_errored_total",
         ];
         let label_sets: Vec<std::collections::BTreeSet<Vec<(String, String)>>> = family_names
@@ -1710,6 +1741,7 @@ def pipeline p_fallback {
             .map(|family| {
                 metric_series(registry, family)
                     .into_iter()
+                    .filter(|series| series["labels"]["process_path"] != "/")
                     .map(|series| {
                         series["labels"]
                             .as_object()
@@ -1744,11 +1776,12 @@ def pipeline p_fallback {
             let terminal: u64 = ["out", "dropped", "errored"]
                 .into_iter()
                 .map(|suffix| {
-                    series_value(
-                        registry,
-                        &format!("limpid_process_events_{suffix}_total"),
-                        &labels,
-                    )
+                    let family = if suffix == "dropped" {
+                        "limpid_events_dropped_total".to_owned()
+                    } else {
+                        format!("limpid_process_events_{suffix}_total")
+                    };
+                    series_value(registry, &family, &labels)
                 })
                 .sum();
             assert_eq!(input, terminal, "non-conserving process series {labels:?}");
@@ -1757,11 +1790,12 @@ def pipeline p_fallback {
 
     fn assert_process_vector(registry: &Registry, labels: &[(&str, &str)], expected: [u64; 4]) {
         let actual = ["in", "out", "dropped", "errored"].map(|suffix| {
-            series_value(
-                registry,
-                &format!("limpid_process_events_{suffix}_total"),
-                labels,
-            )
+            let family = if suffix == "dropped" {
+                "limpid_events_dropped_total".to_owned()
+            } else {
+                format!("limpid_process_events_{suffix}_total")
+            };
+            series_value(registry, &family, labels)
         });
         assert_eq!(actual, expected, "wrong process vector for {labels:?}");
     }
@@ -1811,8 +1845,13 @@ def pipeline p { process dispatch; finish }
         assert_eq!(
             series_value(
                 &dropped,
-                "limpid_pipeline_events_dropped_total",
-                &[("pipeline", "p")],
+                "limpid_events_dropped_total",
+                &[
+                    ("pipeline", "p"),
+                    ("step", "0"),
+                    ("process_path", "/"),
+                    ("process_name", ""),
+                ],
             ),
             1
         );
@@ -1891,23 +1930,27 @@ def pipeline p { process outer; finish }
     }
 
     #[tokio::test]
-    async fn pipeline_drop_counter_stays_event_based_while_process_drops_propagate_by_frame() {
+    async fn dropped_events_share_one_rooted_pipeline_and_process_hierarchy() {
         for body in ["drop", "process { drop }", "process named"] {
             let source =
                 format!("def process named {{ drop }} def pipeline p {{ {body}; finish }}");
             let registry = run_process_metric_fixture(&source, "p", fixture_event()).await;
-            let dropped = metric_series(&registry, "limpid_pipeline_events_dropped_total");
-            assert_eq!(dropped.len(), 1, "{body}");
-            assert_eq!(dropped[0]["labels"], serde_json::json!({"pipeline": "p"}));
+            let dropped = metric_series(&registry, "limpid_events_dropped_total");
             assert_eq!(
                 series_value(
                     &registry,
-                    "limpid_pipeline_events_dropped_total",
-                    &[("pipeline", "p")],
+                    "limpid_events_dropped_total",
+                    &[
+                        ("pipeline", "p"),
+                        ("step", "0"),
+                        ("process_path", "/"),
+                        ("process_name", ""),
+                    ],
                 ),
                 1,
-                "each dropped event must increment the plain pipeline counter once: {body}"
+                "each dropped event must increment the hierarchy root once: {body}"
             );
+            assert_eq!(dropped.len(), if body == "drop" { 1 } else { 2 }, "{body}");
             if body != "drop" {
                 assert_process_conservation(&registry);
             }
@@ -1923,13 +1966,21 @@ def pipeline nested { process outer; finish }
             fixture_event(),
         )
         .await;
-        let dropped = metric_series(&nested, "limpid_pipeline_events_dropped_total");
-        assert_eq!(dropped.len(), 1);
+        let dropped = metric_series(&nested, "limpid_events_dropped_total");
+        assert_eq!(dropped.len(), 3);
         assert_eq!(
-            dropped[0]["labels"],
-            serde_json::json!({"pipeline": "nested"})
+            series_value(
+                &nested,
+                "limpid_events_dropped_total",
+                &[
+                    ("pipeline", "nested"),
+                    ("step", "0"),
+                    ("process_path", "/"),
+                    ("process_name", ""),
+                ],
+            ),
+            1
         );
-        assert_eq!(dropped[0]["value"], 1);
         for (path, name) in [("/outer", "outer"), ("/outer/leaf", "leaf")] {
             assert_process_vector(
                 &nested,

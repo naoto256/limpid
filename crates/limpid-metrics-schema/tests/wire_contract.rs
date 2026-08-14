@@ -1,4 +1,10 @@
-use limpid_metrics_schema::MetricsSnapshot;
+use limpid_metrics_schema::{
+    DROPPED_ROOT_PROCESS_NAME, DROPPED_ROOT_STEP, EVENTS_DROPPED_OWN_TOTAL, EVENTS_DROPPED_TOTAL,
+    MetricsSnapshot, PROCESS_EVENTS_ERRORED_TOTAL, PROCESS_EVENTS_IN_TOTAL,
+    PROCESS_EVENTS_OUT_TOTAL, PROCESS_LABEL_NAME, PROCESS_LABEL_PATH, PROCESS_LABEL_PIPELINE,
+    PROCESS_LABEL_STEP, PROCESS_PATH_ROOT, PROCESS_PATH_SEPARATOR, is_direct_child,
+    process_path_leaf, process_path_parent,
+};
 use serde_json::{Value, json};
 
 const FIXTURE: &str = include_str!("fixtures/schema-v1.json");
@@ -185,4 +191,82 @@ fn an_empty_histogram_bucket_list_is_valid() {
     let mut candidate = fixture();
     candidate["metrics"][2]["series"][0]["buckets"] = json!([]);
     assert!(serde_json::from_value::<MetricsSnapshot>(candidate).is_ok());
+}
+
+#[test]
+fn dropped_hierarchy_and_process_metric_names_are_the_well_known_schema_v1_vocabulary() {
+    assert_eq!(
+        [
+            PROCESS_EVENTS_IN_TOTAL,
+            PROCESS_EVENTS_OUT_TOTAL,
+            EVENTS_DROPPED_TOTAL,
+            PROCESS_EVENTS_ERRORED_TOTAL,
+            EVENTS_DROPPED_OWN_TOTAL,
+        ],
+        [
+            "limpid_process_events_in_total",
+            "limpid_process_events_out_total",
+            "limpid_events_dropped_total",
+            "limpid_process_events_errored_total",
+            "limpid_events_dropped_own_total",
+        ]
+    );
+    assert_eq!(
+        [
+            PROCESS_LABEL_PIPELINE,
+            PROCESS_LABEL_STEP,
+            PROCESS_LABEL_PATH,
+            PROCESS_LABEL_NAME,
+        ],
+        ["pipeline", "step", "process_path", "process_name"]
+    );
+    assert_eq!(PROCESS_PATH_SEPARATOR, '/');
+    assert_eq!(PROCESS_PATH_ROOT, "/");
+    assert_eq!(DROPPED_ROOT_STEP, "0");
+    assert_eq!(DROPPED_ROOT_PROCESS_NAME, "");
+}
+
+#[test]
+fn process_path_leaf_and_parent_follow_the_rooted_invocation_hierarchy() {
+    let cases = [
+        ("/dispatch/leaf", Some("leaf"), Some("/dispatch")),
+        ("/dispatch", Some("dispatch"), Some("/")),
+        ("/(inline)", Some("(inline)"), Some("/")),
+        ("/", None, None),
+        ("", None, None),
+        ("dispatch", None, None),
+        ("/dispatch/", None, None),
+        ("/dispatch//leaf", None, None),
+    ];
+
+    for (path, leaf, parent) in cases {
+        assert_eq!(process_path_leaf(path), leaf, "leaf for {path:?}");
+        assert_eq!(process_path_parent(path), parent, "parent for {path:?}");
+    }
+}
+
+#[test]
+fn direct_child_requires_exactly_one_valid_path_segment() {
+    for (parent, child) in [
+        ("/", "/dispatch"),
+        ("/dispatch", "/dispatch/leaf"),
+        ("/dispatch", "/dispatch/(inline)"),
+    ] {
+        assert!(is_direct_child(parent, child), "{parent:?} -> {child:?}");
+    }
+
+    for (parent, child) in [
+        ("/", "/dispatch/leaf"),
+        ("/dispatch", "/dispatch"),
+        ("/dispatch", "/dispatcher/leaf"),
+        ("/dispatch", "/dispatch/leaf/grandchild"),
+        ("/dispatch", "/dispatch/"),
+        ("/dispatch", "/dispatch//leaf"),
+        ("dispatch", "dispatch/leaf"),
+    ] {
+        assert!(
+            !is_direct_child(parent, child),
+            "{parent:?} must not own {child:?}"
+        );
+    }
 }

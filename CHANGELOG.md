@@ -8,6 +8,23 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+### Changed — dropped metrics use one rooted hierarchy (breaking)
+
+`limpid_pipeline_events_dropped_total{pipeline}` is replaced by the
+`limpid_events_dropped_total{pipeline,step,process_path,process_name}` family.
+The pipeline frame is the hierarchy root and uses `step="0"`,
+`process_path="/"`, and an empty `process_name`; process frames retain their
+one-based root step and compiled invocation path. Dashboards and alerts using
+the old family name must migrate to the unified family and select the root or
+process paths they need.
+
+`limpid-prometheus` additionally exposes
+`limpid_events_dropped_own_total` with the same labels. It subtracts direct
+child totals at scrape time, so the root series reports drops executed directly
+in the pipeline body and process series report drops executed directly in that
+process body. The daemon's source counter remains the propagated total at each
+node.
+
 ### Changed — process call graphs must be acyclic (breaking)
 
 `def process` declarations may still call other named processes, but direct

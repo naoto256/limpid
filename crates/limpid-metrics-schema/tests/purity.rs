@@ -113,13 +113,6 @@ impl<'ast> Visit<'ast> for RuntimeReferences {
         }
         syn::visit::visit_attribute(self, attribute);
     }
-
-    fn visit_lit_str(&mut self, literal: &'ast syn::LitStr) {
-        if literal.value().starts_with("limpid_") {
-            self.hits.push(literal.value());
-        }
-        syn::visit::visit_lit_str(self, literal);
-    }
 }
 
 fn inspect_serde_meta(
@@ -185,7 +178,7 @@ fn schema_crate_has_only_serde_as_a_normal_dependency() {
 }
 
 #[test]
-fn every_schema_source_file_is_free_of_runtime_types_and_semantics() {
+fn every_schema_source_file_is_free_of_runtime_implementation_types() {
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     rust_sources(&source_root, &mut files);
@@ -199,9 +192,10 @@ fn every_schema_source_file_is_free_of_runtime_types_and_semantics() {
 }
 
 #[test]
-fn purity_guard_allows_wire_collections_and_serde_derives() {
+fn purity_guard_allows_schema_definitions_wire_collections_and_serde_derives() {
     let source = r#"
         // std::sync::Arc and limpid::metrics::Registry in comments are inert.
+        const PROCESS_FAMILY: &str = "limpid_process_events_in_total";
         #[derive(serde::Serialize, serde::Deserialize)]
         struct WireValue {
             labels: std::collections::BTreeMap<String, String>,
@@ -237,7 +231,6 @@ fn purity_guard_detects_each_forbidden_runtime_reference() {
         "#[serde(default, rename = \"wire\", deny_unknown_fields)] struct Closed;",
         "#[serde(rename(serialize = \"out\", deserialize = \"in\"), deny_unknown_fields)] struct Closed;",
         "#[serde(bound(deserialize = \"T: serde::Deserialize<'de>\"), deny_unknown_fields)] struct Closed<T>(T);",
-        "const FAMILY: &str = \"limpid_runtime_total\";",
     ] {
         assert!(!inspect(source).is_empty(), "{source}");
     }
