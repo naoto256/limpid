@@ -1233,9 +1233,9 @@ def pipeline execute { process dispatch; finish }
             &execution_registry,
         )
         .expect("compile executable process metric plan");
-        // This trap is owned by the metric-node selection seam used by execution,
-        // rather than by the test facade. Arming it after compilation permits the
-        // definition registry lookup but rejects per-event metric-node lookup.
+        // This probe is owned by the metric-node selection seam used by execution,
+        // rather than by the test facade. Arming it after compilation measures the
+        // exact token-selection path without counting definition-registry lookups.
         let selection_trap = execution_plan.metric_node_selection_trap_for_testing();
         let worker = Arc::new(
             PipelineWorker::new_with_compiled_process_metrics_for_testing(
@@ -1264,9 +1264,14 @@ def pipeline execute { process dispatch; finish }
         )
         .await;
         assert_eq!(
-            selection_trap.metric_node_lookup_attempts_for_testing(),
+            selection_trap.total_token_selections_for_testing(),
+            3,
+            "dispatch once plus leaf twice must perform three token selections"
+        );
+        assert_eq!(
+            selection_trap.invalid_token_selections_for_testing(),
             0,
-            "execution must select pre-resolved metric frames by call-site token"
+            "compiled token selection must not access an invalid node"
         );
         assert_process_vector(
             &execution_registry,
@@ -1289,6 +1294,40 @@ def pipeline execute { process dispatch; finish }
             [2, 2, 0, 0],
         );
         assert_process_conservation(&execution_registry);
+    }
+
+    #[test]
+    fn process_metric_selection_probe_separates_total_and_invalid_tokens() {
+        let config = compiled_config(
+            "def process pass { egress = ingress } def pipeline p { process pass }",
+        );
+        let registry = Registry::new();
+        let def = config.pipelines.get("p").expect("pipeline").clone();
+        let plan = PipelineWorker::compile_process_metric_plan_for_testing(
+            &def,
+            &config.processes,
+            &registry,
+        )
+        .expect("compile process metric plan");
+        let probe = plan.metric_node_selection_trap_for_testing();
+        let worker = PipelineWorker::new_with_compiled_process_metrics_for_testing(
+            def,
+            &config.processes,
+            plan,
+        )
+        .expect("construct worker");
+        probe.arm_for_testing();
+
+        assert!(
+            !worker
+                .process_metrics
+                .as_ref()
+                .expect("process metrics")
+                .select_node_for_testing(usize::MAX),
+            "out-of-range token must not resolve"
+        );
+        assert_eq!(probe.total_token_selections_for_testing(), 1);
+        assert_eq!(probe.invalid_token_selections_for_testing(), 1);
     }
 
     async fn run_compiled_process_metric_fixture(
@@ -1359,6 +1398,8 @@ def pipeline execute { process dispatch; finish }
         )
         .expect("compile raw process metric plan");
         mutate(plan.process_metrics_mut_for_testing());
+        let selection_probe = plan.metric_node_selection_trap_for_testing();
+        selection_probe.arm_for_testing();
         assert!(
             PipelineWorker::new_with_compiled_process_metrics_for_testing(
                 def,
@@ -1368,6 +1409,8 @@ def pipeline execute { process dispatch; finish }
             .is_err(),
             "invalid raw plan must be rejected during worker construction"
         );
+        assert_eq!(selection_probe.total_token_selections_for_testing(), 0);
+        assert_eq!(selection_probe.invalid_token_selections_for_testing(), 0);
         assert_eq!(
             series_value(
                 &registry,
@@ -1448,10 +1491,19 @@ def pipeline p { process parent_one; process parent_two }
         expected: &[(&str, &str, &str, [u64; 4])],
     ) {
         let (registry, trap) = run_compiled_process_metric_fixture(source, pipeline, |_| {}).await;
+        let expected_selections = expected
+            .iter()
+            .map(|(_, _, _, vector)| vector[0] as usize)
+            .sum::<usize>();
         assert_eq!(
-            trap.metric_node_lookup_attempts_for_testing(),
+            trap.total_token_selections_for_testing(),
+            expected_selections,
+            "each invoked process frame must consume one compiled token"
+        );
+        assert_eq!(
+            trap.invalid_token_selections_for_testing(),
             0,
-            "branch execution must consume compiled ordinal plans without lookup"
+            "compiled branch selection must not access an invalid node"
         );
         for (step, path, name, vector) in expected {
             assert_process_vector(

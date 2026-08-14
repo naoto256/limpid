@@ -462,6 +462,28 @@ fn process_counters_render_a_numerically_sorted_default_invocation_table() {
         .split_whitespace()
         .collect::<Vec<_>>();
     assert_eq!(process_header, ["Processes:"]);
+    let root_row = default
+        .lines()
+        .find(|line| line.contains("/dispatch "))
+        .expect("root process row");
+    assert_eq!(
+        root_row,
+        format!(
+            "  {:<16} {:>4}  {:<32} {:<16} {:>8} in  {:>8} out  {:>8} dropped  {:>8} errored",
+            "compact", 2, "/dispatch", "dispatch", 4, 4, 0, 0
+        )
+    );
+    let leaf_row = default
+        .lines()
+        .find(|line| line.contains("/dispatch/leaf "))
+        .expect("leaf process row");
+    assert_eq!(
+        leaf_row,
+        format!(
+            "  {:<16} {:>4}  {:<32} {:<16} {:>8} in  {:>8} out  {:>8} dropped  {:>8} errored",
+            "compact", 10, "/dispatch/leaf", "leaf", 3, 1, 1, 1
+        )
+    );
     assert_eq!(
         line_tokens(&default, "/dispatch"),
         [
