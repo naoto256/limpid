@@ -8,6 +8,16 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+### Changed — process call graphs must be acyclic (breaking)
+
+`def process` declarations may still call other named processes, but direct
+and mutual recursion are now rejected at config-load time. The same validation
+applies to calls nested in control-flow branches and to definitions merged from
+included files. Existing acyclic parser, normalizer, and composer chains are
+unchanged. Configurations that relied on recursive process calls must rewrite
+the flow as a finite process graph or use the bounded collection primitives for
+collection traversal.
+
 ### Changed — metrics use one self-describing schema-v1 registry
 
 The daemon now registers its existing input, pipeline, and output counters in a

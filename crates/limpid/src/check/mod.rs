@@ -27,6 +27,7 @@
 //! - `expr_types`      — `Expr` → `FieldType` inference + arg-/op-checks
 //! - `outputs`         — output-side workspace reference checks
 //! - `parser_effects`  — parser `produces` → workspace merge
+//! - `process`         — process call-graph cycle rejection
 //! - `render`          — rustc-style snippet+caret diagnostic emit
 //! - `suggestions`     — Levenshtein "did you mean" hint
 //! - `recovery_readiness` — cross-cutting warning: recovery-worthy outputs without `error_log`
@@ -44,6 +45,7 @@ mod journal_match_format;
 mod module_props;
 mod outputs;
 mod parser_effects;
+mod process;
 mod recovery_readiness;
 pub mod render;
 pub mod suggestions;
@@ -286,6 +288,7 @@ pub fn analyze(config: &CompiledConfig, _source_map: &SourceMap) -> Vec<Diagnost
 
     let mut diagnostics = Vec::new();
     function::check_all_functions(config, &registry, &mut diagnostics);
+    process::check_process_cycles(config, &mut diagnostics);
     module_props::analyze_all(config, &module_registry, &mut diagnostics);
     global_props::analyze_all(config, &mut diagnostics);
     #[cfg(feature = "journal")]
@@ -1638,6 +1641,106 @@ def pipeline p { input i; output o }
         );
         let m = &cycle_errs[0].message;
         assert!(m.contains("a") && m.contains("b"), "got: {}", m);
+    }
+
+    #[test]
+    fn process_self_recursion_errors() {
+        let src = r#"
+def process rec {
+    process rec
+}
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p { input i; process rec; output o }
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            errors(&diags).iter().any(|e| {
+                e.message.contains("process call cycle detected")
+                    && e.message.contains("`rec` calls itself")
+            }),
+            "expected process self-recursion error, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn process_cycle_inside_all_branch_forms_errors_once() {
+        let src = r#"
+def process a {
+    if true {
+        process b
+    }
+}
+def process b {
+    switch "selected" {
+        "selected" { process c }
+    }
+}
+def process c {
+    try {
+        process a
+    } catch {
+        workspace.recovered = true
+    }
+}
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p { input i; process a; output o }
+"#;
+        let diags = analyze_str(src);
+        let cycle_errs: Vec<&Diagnostic> = errors(&diags)
+            .into_iter()
+            .filter(|e| e.message.contains("process call cycle detected"))
+            .collect();
+        assert_eq!(
+            cycle_errs.len(),
+            1,
+            "expected exactly one process cycle error, got: {:?}",
+            diags
+        );
+        let message = &cycle_errs[0].message;
+        assert!(
+            message.contains("a") && message.contains("b") && message.contains("c"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn unreachable_process_cycle_is_still_rejected() {
+        let src = r#"
+def process unused_a { process unused_b }
+def process unused_b { process unused_a }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p { input i; output o }
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            errors(&diags)
+                .iter()
+                .any(|e| e.message.contains("process call cycle detected")),
+            "expected unreachable process cycle to be rejected, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn acyclic_process_calls_remain_valid() {
+        let src = r#"
+def process leaf { workspace.done = true }
+def process middle { process leaf }
+def process root { process middle }
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output o { type stdout }
+def pipeline p { input i; process root; output o }
+"#;
+        let diags = analyze_str(src);
+        assert!(
+            errors(&diags).is_empty(),
+            "acyclic process graph must remain valid, got: {:?}",
+            diags
+        );
     }
 
     #[test]

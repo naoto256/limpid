@@ -210,7 +210,7 @@ The question "function or process?" has a clean answer:
 | Depends on a specific schema spec (RFC 5424, CEF, OCSF, …) | A namespaced built-in (`syslog.xxx`) if shipping with the daemon, otherwise a `def process` in a snippet |
 | Reads or writes `egress`, `workspace`, or `ingress` directly | A `def process` |
 | Can `drop`, or must run multiple statements in sequence | A `def process` |
-| Recursive | A `def process` (`def function` rejects recursion at `--check` time) |
+| Recursive | Not supported; both function and process call graphs must be acyclic |
 | Operator-specific policy (facility rewrite, vendor filter, site-specific routing) | Always a `def process`, defined close to the pipeline that uses it |
 
 A snippet library (the `functions/*.limpid` + `parsers/parse_*.limpid` + `composers/compose_*.limpid` collection that ships under `/usr/share/limpid/snippets/`) mixes the three: `def function` files under `functions/` for vendor-agnostic mappings (severity, proto, action), `def process` files under `parsers/parse_*` for vendor parsers and under `composers/compose_*` for the per-class composer bodies that consume Event state and write to `workspace.lsis.parsed` / `workspace.lsis.composed.<slot>`, and built-in primitives (`syslog.parse`, `cef.parse`, `to_json`, `regex_*`) as the building blocks underneath.
