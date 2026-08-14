@@ -29,6 +29,22 @@ Rules:
 - Nested includes are supported — an included file may itself contain `include` directives. The same file is loaded only once even if multiple parents reference it (diamond-safe). Cycles are detected and reported as a parse error.
 - Glob patterns are supported.
 
+## Node identity
+
+The optional top-level `node_id` identifies this daemon in build-information
+metrics:
+
+```limpid
+node_id "edge-a"
+```
+
+When it is omitted, limpid resolves the host name once during startup and uses
+that value for the lifetime of the runtime. Set `node_id` explicitly when an
+operator needs to distinguish multiple limpid instances on the same host. If
+multiple instances omit it, they expose the same host-derived identity;
+assigning distinct identities in that deployment is the operator's
+responsibility.
+
 ## Global blocks
 
 ### control

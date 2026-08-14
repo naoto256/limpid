@@ -668,6 +668,31 @@ mod tests {
     }
 
     #[test]
+    fn build_info_translates_through_the_generic_schema_v1_path() {
+        let snapshot = serde_json::json!({
+            "schema": 1,
+            "metrics": [{
+                "name": "limpid_build_info",
+                "type": "gauge",
+                "help": "Build information for the running limpid node.",
+                "series": [{
+                    "labels": {"node_id": "edge-a", "version": "0.7.15"},
+                    "value": 1
+                }]
+            }]
+        });
+
+        assert_eq!(
+            json_to_prometheus(&snapshot.to_string()).unwrap(),
+            concat!(
+                "# HELP limpid_build_info Build information for the running limpid node.\n",
+                "# TYPE limpid_build_info gauge\n",
+                "limpid_build_info{node_id=\"edge-a\",version=\"0.7.15\"} 1\n\n"
+            )
+        );
+    }
+
+    #[test]
     fn schema_v1_rejects_inconsistent_and_colliding_labelsets() {
         let cases = [
             (

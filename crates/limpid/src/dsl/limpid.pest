@@ -9,12 +9,18 @@ config = { SOI ~ top_level_item* ~ EOI }
 top_level_item = {
     definition
   | include_directive
+  | node_id_directive
   | global_block
 }
 
 // Include directive: `include "inputs/*.limpid"`
 include_directive = {
     kw_include ~ string_lit
+}
+
+// Optional stable identity exported by `limpid_build_info`.
+node_id_directive = {
+    kw_node_id ~ expr
 }
 
 definition = {
@@ -27,7 +33,7 @@ definition = {
 
 // Global config block: `name { key value ... }` (no `def` keyword)
 global_block = {
-    !kw_def ~ !kw_include ~ ident ~ "{" ~ property* ~ "}"
+    !kw_def ~ !kw_include ~ !kw_node_id ~ ident ~ "{" ~ property* ~ "}"
 }
 
 // -- Comments & whitespace ---------------------------------------------------
@@ -58,6 +64,7 @@ kw_true     = _{ "true" }
 kw_false    = _{ "false" }
 kw_null     = _{ "null" }
 kw_include  = _{ "include" }
+kw_node_id  = @{ "node_id" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_let      = _{ "let" }
 kw_function = _{ "function" }
 

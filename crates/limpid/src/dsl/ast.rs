@@ -8,6 +8,9 @@ use super::span::Span;
 /// A complete configuration file.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Optional operator-supplied node identity. The runtime resolves
+    /// the host name once at startup when this is absent.
+    pub(crate) node_id: Option<String>,
     pub definitions: Vec<Definition>,
     /// Global config blocks (e.g. `geoip { ... }`, `control { ... }`)
     pub global_blocks: Vec<GlobalBlock>,

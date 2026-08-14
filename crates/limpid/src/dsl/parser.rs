@@ -34,6 +34,7 @@ pub fn parse_config_with_file_id(input: &str, file_id: u32) -> Result<Config> {
     let mut definitions = Vec::new();
     let mut global_blocks = Vec::new();
     let mut includes = Vec::new();
+    let mut node_id = None;
 
     for pair in config_pair.into_inner() {
         match pair.as_rule() {
@@ -69,6 +70,24 @@ pub fn parse_config_with_file_id(input: &str, file_id: u32) -> Result<Config> {
                         let path_pair = first_inner(inner)?;
                         includes.push(parse_string_lit(&path_pair));
                     }
+                    Rule::node_id_directive => {
+                        let mut directive = inner.into_inner();
+                        let keyword = directive.next().expect("pest grammar invariant");
+                        debug_assert_eq!(keyword.as_rule(), Rule::kw_node_id);
+                        let value = parse_expr_from_pair(
+                            directive.next().expect("pest grammar invariant"),
+                            file_id,
+                        )?;
+                        let ExprKind::StringLit(value) = value.kind else {
+                            bail!("node_id requires a string value");
+                        };
+                        if value.is_empty() {
+                            bail!("node_id must be non-empty");
+                        }
+                        if node_id.replace(value).is_some() {
+                            bail!("duplicate node_id");
+                        }
+                    }
                     Rule::global_block => {
                         global_blocks.push(parse_global_block(inner, file_id)?);
                     }
@@ -81,6 +100,7 @@ pub fn parse_config_with_file_id(input: &str, file_id: u32) -> Result<Config> {
     }
 
     Ok(Config {
+        node_id,
         definitions,
         global_blocks,
         includes,
