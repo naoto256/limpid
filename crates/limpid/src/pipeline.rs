@@ -508,19 +508,30 @@ impl PipelineProcessMetrics {
     }
 
     fn select_node(&self, token: usize) -> Option<&ProcessMetricNode> {
+        #[cfg(test)]
+        let armed = self
+            .selection_trap
+            .armed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        if armed {
+            self.selection_trap
+                .total_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let node = self.nodes.get(token);
         #[cfg(test)]
-        if node.is_none()
-            && self
-                .selection_trap
-                .armed
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if armed && node.is_none() {
             self.selection_trap
-                .attempts
+                .invalid_attempts
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         node
+    }
+
+    #[cfg(test)]
+    pub(crate) fn select_node_for_testing(&self, token: usize) -> bool {
+        self.select_node(token).is_some()
     }
 }
 
@@ -958,7 +969,8 @@ impl ProcessMetricPlanValidator<'_> {
 #[derive(Default)]
 struct MetricNodeSelectionTrapState {
     armed: std::sync::atomic::AtomicBool,
-    attempts: std::sync::atomic::AtomicUsize,
+    total_attempts: std::sync::atomic::AtomicUsize,
+    invalid_attempts: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -972,8 +984,16 @@ impl MetricNodeSelectionTrap {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub(crate) fn metric_node_lookup_attempts_for_testing(&self) -> usize {
-        self.0.attempts.load(std::sync::atomic::Ordering::Relaxed)
+    pub(crate) fn total_token_selections_for_testing(&self) -> usize {
+        self.0
+            .total_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn invalid_token_selections_for_testing(&self) -> usize {
+        self.0
+            .invalid_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
