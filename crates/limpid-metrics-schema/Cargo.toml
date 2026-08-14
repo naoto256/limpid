@@ -1,0 +1,13 @@
+[package]
+name = "limpid-metrics-schema"
+version = "0.7.15"
+edition = "2024"
+description = "Wire DTOs for limpid schema-v1 metrics snapshots"
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
+syn = { version = "2", features = ["full", "visit"] }
