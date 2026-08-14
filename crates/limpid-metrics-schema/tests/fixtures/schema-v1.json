@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "metrics": [
+    {
+      "name": "requests_total",
+      "type": "counter",
+      "help": "Requests.",
+      "series": [
+        {
+          "labels": {
+            "route": "west"
+          },
+          "value": 7
+        }
+      ]
+    },
+    {
+      "name": "queue_depth",
+      "type": "gauge",
+      "help": "Queue depth.",
+      "series": [
+        {
+          "labels": {
+            "output": "sink"
+          },
+          "value": 3
+        }
+      ]
+    },
+    {
+      "name": "latency_seconds",
+      "type": "histogram",
+      "help": "Latency.",
+      "series": [
+        {
+          "labels": {
+            "route": "west"
+          },
+          "buckets": [
+            [0.5, 2],
+            [1.0, 3]
+          ],
+          "sum": 1.75,
+          "count": 4
+        }
+      ]
+    }
+  ]
+}

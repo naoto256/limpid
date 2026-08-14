@@ -14,7 +14,7 @@
 //! scrape segment behind a firewall — because anyone who can reach
 //! the port can read pipeline names and event counts.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
@@ -28,6 +28,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use limpid_metrics_schema::{MetricFamily, MetricType, MetricsSnapshot};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixStream};
@@ -200,7 +201,7 @@ async fn handle_request(
 
 /// Convert limpid JSON stats to Prometheus text exposition format.
 fn json_to_prometheus(json: &str) -> Result<String, String> {
-    let root: serde_json::Value =
+    let root: MetricsSnapshot =
         serde_json::from_str(json).map_err(|e| format!("invalid json: {}", e))?;
     let families = parse_snapshot(&root)?;
     Ok(render_snapshot(&families))
@@ -216,12 +217,11 @@ enum ExpositionType {
 }
 
 impl ExpositionType {
-    fn parse(value: &str) -> Result<Self, String> {
+    fn from_wire(value: MetricType) -> Self {
         match value {
-            "counter" => Ok(Self::Counter),
-            "gauge" => Ok(Self::Gauge),
-            "histogram" => Ok(Self::Histogram),
-            other => Err(format!("unsupported metric type: {other}")),
+            MetricType::Counter => Self::Counter,
+            MetricType::Gauge => Self::Gauge,
+            MetricType::Histogram => Self::Histogram,
         }
     }
 
@@ -270,43 +270,62 @@ struct ExpositionFamily {
 /// output; Prometheus text format has no display-order
 /// semantics, so this is a reproducibility contract, not
 /// Grafana display ordering.
-fn parse_snapshot(root: &serde_json::Value) -> Result<Vec<ExpositionFamily>, String> {
-    let root = root
-        .as_object()
-        .ok_or_else(|| "schema-v1 snapshot must be an object".to_string())?;
-    if root.get("schema").and_then(serde_json::Value::as_u64) != Some(1) {
+fn parse_snapshot(root: &MetricsSnapshot) -> Result<Vec<ExpositionFamily>, String> {
+    if root.schema != 1 {
         return Err("unsupported or missing metrics schema".to_string());
     }
-    let metrics = root
-        .get("metrics")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| "schema-v1 snapshot requires a metrics array".to_string())?;
 
     let mut names = BTreeSet::new();
-    let mut families = Vec::with_capacity(metrics.len());
-    for metric in metrics {
-        let metric = metric
-            .as_object()
-            .ok_or_else(|| "metric family must be an object".to_string())?;
-        let name = required_nonempty_string(metric, "name", "metric family")?.to_string();
+    let mut families = Vec::with_capacity(root.metrics.len());
+    for metric in &root.metrics {
+        let name = metric.name().to_string();
+        if name.is_empty() {
+            return Err("metric family field name must not be empty".to_string());
+        }
         if !is_legacy_metric_name(&name) {
             return Err(format!("invalid Prometheus metric name: {name:?}"));
         }
         if !names.insert(name.clone()) {
             return Err(format!("duplicate metric family: {name}"));
         }
-        let metric_type = ExpositionType::parse(required_string(metric, "type", &name)?)?;
-        let help = required_nonempty_string(metric, "help", &name)?.to_string();
-        let raw_series = metric
-            .get("series")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| format!("metric {name} requires a series array"))?;
+        let metric_type = ExpositionType::from_wire(metric.metric_type());
+        let help = metric.help().to_string();
+        if help.is_empty() {
+            return Err(format!("{name} field help must not be empty"));
+        }
 
         let mut labelsets = BTreeSet::new();
         let mut family_label_keys = None;
-        let mut series = Vec::with_capacity(raw_series.len());
-        for raw in raw_series {
-            let parsed = parse_series(raw, metric_type, &name)?;
+        let mut series = Vec::new();
+        match metric {
+            MetricFamily::Counter { series: raw, .. } | MetricFamily::Gauge { series: raw, .. } => {
+                series.reserve(raw.len());
+                for raw in raw {
+                    let labels = parse_labels(&raw.labels, &name)?;
+                    series.push(ExpositionSeries::Value {
+                        labels,
+                        value: raw.value,
+                    });
+                }
+            }
+            MetricFamily::Histogram { series: raw, .. } => {
+                series.reserve(raw.len());
+                for raw in raw {
+                    let labels = parse_labels(&raw.labels, &name)?;
+                    let buckets = parse_buckets(&raw.buckets, &name)?;
+                    if !raw.sum.is_finite() {
+                        return Err(format!("metric {name} sum must be finite"));
+                    }
+                    series.push(ExpositionSeries::Histogram {
+                        labels,
+                        buckets,
+                        sum: raw.sum,
+                        count: raw.count,
+                    });
+                }
+            }
+        }
+        for parsed in &series {
             if !labelsets.insert(parsed.labels().clone()) {
                 return Err(format!("metric {name} contains a duplicate labelset"));
             }
@@ -324,7 +343,6 @@ fn parse_snapshot(root: &serde_json::Value) -> Result<Vec<ExpositionFamily>, Str
                 None => family_label_keys = Some(label_keys),
                 _ => {}
             }
-            series.push(parsed);
         }
         validate_exported_labelsets(&series, metric_type, &name)?;
         series.sort_by(|left, right| left.labels().cmp(right.labels()));
@@ -380,48 +398,7 @@ fn validate_histogram_namespaces(
     Ok(())
 }
 
-fn parse_series(
-    value: &serde_json::Value,
-    metric_type: ExpositionType,
-    metric_name: &str,
-) -> Result<ExpositionSeries, String> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| format!("metric {metric_name} series must be an object"))?;
-    let labels = parse_labels(object.get("labels"), metric_name)?;
-    match metric_type {
-        ExpositionType::Counter | ExpositionType::Gauge => {
-            let value = object
-                .get("value")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| format!("metric {metric_name} value must be a u64"))?;
-            Ok(ExpositionSeries::Value { labels, value })
-        }
-        ExpositionType::Histogram => {
-            let buckets = parse_buckets(object.get("buckets"), metric_name)?;
-            let sum = object
-                .get("sum")
-                .and_then(serde_json::Value::as_f64)
-                .filter(|value| value.is_finite())
-                .ok_or_else(|| format!("metric {metric_name} sum must be finite"))?;
-            let count = object
-                .get("count")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| format!("metric {metric_name} count must be a u64"))?;
-            Ok(ExpositionSeries::Histogram {
-                labels,
-                buckets,
-                sum,
-                count,
-            })
-        }
-    }
-}
-
-fn parse_labels(value: Option<&serde_json::Value>, metric_name: &str) -> Result<Labels, String> {
-    let labels = value
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| format!("metric {metric_name} labels must be an object"))?;
+fn parse_labels(labels: &BTreeMap<String, String>, metric_name: &str) -> Result<Labels, String> {
     let mut parsed = Vec::with_capacity(labels.len());
     for (key, value) in labels {
         if !is_legacy_label_name(key) {
@@ -429,10 +406,7 @@ fn parse_labels(value: Option<&serde_json::Value>, metric_name: &str) -> Result<
                 "metric {metric_name} has invalid Prometheus label name: {key:?}"
             ));
         }
-        let value = value
-            .as_str()
-            .ok_or_else(|| format!("metric {metric_name} label {key} must be a string"))?;
-        parsed.push((key.clone(), value.to_string()));
+        parsed.push((key.clone(), value.clone()));
     }
     parsed.sort();
     Ok(parsed)
@@ -465,26 +439,12 @@ fn is_legacy_label_name(name: &str) -> bool {
                     .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_'))
 }
 
-fn parse_buckets(
-    value: Option<&serde_json::Value>,
-    metric_name: &str,
-) -> Result<Vec<(f64, u64)>, String> {
-    let raw = value
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| format!("metric {metric_name} buckets must be an array"))?;
+fn parse_buckets(raw: &[(f64, u64)], metric_name: &str) -> Result<Vec<(f64, u64)>, String> {
     let mut buckets = Vec::with_capacity(raw.len());
-    for bucket in raw {
-        let tuple = bucket
-            .as_array()
-            .filter(|tuple| tuple.len() == 2)
-            .ok_or_else(|| format!("metric {metric_name} bucket must be a pair"))?;
-        let bound = tuple[0]
-            .as_f64()
-            .filter(|bound| bound.is_finite())
-            .ok_or_else(|| format!("metric {metric_name} bucket bound must be finite"))?;
-        let count = tuple[1]
-            .as_u64()
-            .ok_or_else(|| format!("metric {metric_name} bucket count must be a u64"))?;
+    for &(bound, count) in raw {
+        if !bound.is_finite() {
+            return Err(format!("metric {metric_name} bucket bound must be finite"));
+        }
         if let Some((previous_bound, previous_count)) = buckets.last() {
             if previous_bound >= &bound {
                 return Err(format!(
@@ -500,30 +460,6 @@ fn parse_buckets(
         buckets.push((bound, count));
     }
     Ok(buckets)
-}
-
-fn required_string<'a>(
-    object: &'a serde_json::Map<String, serde_json::Value>,
-    field: &str,
-    context: &str,
-) -> Result<&'a str, String> {
-    object
-        .get(field)
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| format!("{context} requires string field {field}"))
-}
-
-fn required_nonempty_string<'a>(
-    object: &'a serde_json::Map<String, serde_json::Value>,
-    field: &str,
-    context: &str,
-) -> Result<&'a str, String> {
-    let value = required_string(object, field, context)?;
-    if value.is_empty() {
-        Err(format!("{context} field {field} must not be empty"))
-    } else {
-        Ok(value)
-    }
 }
 
 fn render_snapshot(families: &[ExpositionFamily]) -> String {
@@ -721,6 +657,15 @@ mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
     use tokio::net::{TcpStream, UnixListener};
+
+    #[test]
+    fn schema_v1_fixture_parses_through_the_shared_wire_dto() {
+        let fixture = include_str!("../../limpid-metrics-schema/tests/fixtures/schema-v1.json");
+        let shared: limpid_metrics_schema::MetricsSnapshot = serde_json::from_str(fixture).unwrap();
+        let expected = json_to_prometheus(fixture).unwrap();
+        let families = parse_snapshot(&shared).unwrap();
+        assert_eq!(render_snapshot(&families), expected);
+    }
 
     #[test]
     fn schema_v1_rejects_inconsistent_and_colliding_labelsets() {

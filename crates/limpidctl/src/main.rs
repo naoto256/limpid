@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
+use limpid_metrics_schema::{MetricFamily, MetricType, MetricsSnapshot};
 
 const DEFAULT_SOCKET: &str = "/var/run/limpid/control.sock";
 
@@ -477,7 +478,10 @@ const OUTPUT_METRICS: [&str; 7] = [
 type MetricValues = BTreeMap<String, u64>;
 
 fn format_stats(json: &str) {
-    match render_default_stats(json) {
+    let rendered = serde_json::from_str::<MetricsSnapshot>(json)
+        .ok()
+        .and_then(|snapshot| render_default_stats(&snapshot));
+    match rendered {
         Some(rendered) => print!("{}", rendered),
         None => print!("{}", json),
     }
@@ -491,37 +495,31 @@ fn format_stats(json: &str) {
 /// family that fails validation returns `None`, so the caller falls
 /// back to the raw response rather than emit a partial table that
 /// omits or lies about a counter.
-fn render_default_stats(json: &str) -> Option<String> {
-    let snapshot: serde_json::Value = serde_json::from_str(json).ok()?;
-    if snapshot.get("schema")?.as_u64()? != 1 {
+fn render_default_stats(snapshot: &MetricsSnapshot) -> Option<String> {
+    if snapshot.schema != 1 {
         return None;
     }
-    let metrics = snapshot.get("metrics")?.as_array()?;
     let mut families = BTreeMap::<String, MetricValues>::new();
 
-    for metric in metrics {
-        let metric = metric.as_object()?;
-        let name = metric.get("name")?.as_str()?;
+    for metric in &snapshot.metrics {
+        let name = metric.name();
         let Some(label_name) = known_metric_label(name) else {
             continue;
         };
-        if metric.get("type")?.as_str()? != "counter" || families.contains_key(name) {
+        if metric.metric_type() != MetricType::Counter || families.contains_key(name) {
             return None;
         }
-        let series = metric.get("series")?.as_array()?;
+        let series = metric.value_series()?;
         if series.is_empty() {
             return None;
         }
         let mut values = MetricValues::new();
         for item in series {
-            let item = item.as_object()?;
-            let labels = item.get("labels")?.as_object()?;
-            if labels.len() != 1 {
+            if item.labels.len() != 1 {
                 return None;
             }
-            let scope = labels.get(label_name)?.as_str()?;
-            let value = item.get("value")?.as_u64()?;
-            if values.insert(scope.to_owned(), value).is_some() {
+            let scope = item.labels.get(label_name)?;
+            if values.insert(scope.clone(), item.value).is_some() {
                 return None;
             }
         }
@@ -663,20 +661,21 @@ struct HistogramDetail {
 }
 
 fn format_stats_details(json: &str) {
-    match render_stats_details(json) {
+    let rendered = serde_json::from_str::<MetricsSnapshot>(json)
+        .ok()
+        .and_then(|snapshot| render_stats_details(&snapshot));
+    match rendered {
         Some(rendered) => print!("{}", rendered),
         None => print!("{}", json),
     }
 }
 
-fn render_stats_details(json: &str) -> Option<String> {
-    let snapshot: serde_json::Value = serde_json::from_str(json).ok()?;
-    if snapshot.get("schema")?.as_u64()? != 1 {
+fn render_stats_details(snapshot: &MetricsSnapshot) -> Option<String> {
+    if snapshot.schema != 1 {
         return None;
     }
     let mut metrics: Vec<DetailMetric> = snapshot
-        .get("metrics")?
-        .as_array()?
+        .metrics
         .iter()
         .map(parse_detail_metric)
         .collect::<Option<_>>()?;
@@ -689,7 +688,7 @@ fn render_stats_details(json: &str) -> Option<String> {
     if metrics
         .iter()
         .any(|metric| known_metric_label(&metric.name).is_some())
-        && render_default_stats(json).is_none()
+        && render_default_stats(snapshot).is_none()
     {
         return None;
     }
@@ -737,28 +736,26 @@ impl DetailKind {
     }
 }
 
-fn parse_detail_metric(value: &serde_json::Value) -> Option<DetailMetric> {
-    let metric = value.as_object()?;
-    let name = metric.get("name")?.as_str()?.to_owned();
-    let help = metric.get("help")?.as_str()?.to_owned();
-    let series = metric.get("series")?.as_array()?;
-    let kind = match metric.get("type")?.as_str()? {
-        "counter" => DetailKind::Counter(parse_value_details(series)?),
-        "gauge" => DetailKind::Gauge(parse_value_details(series)?),
-        "histogram" => DetailKind::Histogram(parse_histogram_details(series)?),
-        _ => return None,
+fn parse_detail_metric(metric: &MetricFamily) -> Option<DetailMetric> {
+    let name = metric.name().to_owned();
+    let help = metric.help().to_owned();
+    let kind = match metric.metric_type() {
+        MetricType::Counter => DetailKind::Counter(parse_value_details(metric.value_series()?)?),
+        MetricType::Gauge => DetailKind::Gauge(parse_value_details(metric.value_series()?)?),
+        MetricType::Histogram => {
+            DetailKind::Histogram(parse_histogram_details(metric.histogram_series()?)?)
+        }
     };
     Some(DetailMetric { name, help, kind })
 }
 
-fn parse_value_details(series: &[serde_json::Value]) -> Option<Vec<ValueDetail>> {
+fn parse_value_details(series: &[limpid_metrics_schema::ValueSeries]) -> Option<Vec<ValueDetail>> {
     let mut parsed: Vec<ValueDetail> = series
         .iter()
         .map(|value| {
-            let value = value.as_object()?;
             Some(ValueDetail {
-                labels: parse_labels(value.get("labels")?)?,
-                value: value.get("value")?.as_u64()?,
+                labels: parse_labels(&value.labels),
+                value: value.value,
             })
         })
         .collect::<Option<_>>()?;
@@ -772,27 +769,16 @@ fn parse_value_details(series: &[serde_json::Value]) -> Option<Vec<ValueDetail>>
     Some(parsed)
 }
 
-fn parse_histogram_details(series: &[serde_json::Value]) -> Option<Vec<HistogramDetail>> {
+fn parse_histogram_details(
+    series: &[limpid_metrics_schema::HistogramSeries],
+) -> Option<Vec<HistogramDetail>> {
     let mut parsed: Vec<HistogramDetail> = series
         .iter()
         .map(|value| {
-            let value = value.as_object()?;
-            let buckets = value
-                .get("buckets")?
-                .as_array()?
-                .iter()
-                .map(|bucket| {
-                    let bucket = bucket.as_array()?;
-                    if bucket.len() != 2 {
-                        return None;
-                    }
-                    let bound = bucket[0].as_f64()?;
-                    if !bound.is_finite() {
-                        return None;
-                    }
-                    Some((bound, bucket[1].as_u64()?))
-                })
-                .collect::<Option<Vec<_>>>()?;
+            let buckets = value.buckets.clone();
+            if buckets.iter().any(|(bound, _)| !bound.is_finite()) {
+                return None;
+            }
             if buckets.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
                 return None;
             }
@@ -803,15 +789,15 @@ fn parse_histogram_details(series: &[serde_json::Value]) -> Option<Vec<Histogram
             // independent atomics in the daemon, so observe ordering
             // permits a transient last-bucket count that exceeds the
             // total — do not reject on that inequality.
-            let sum = value.get("sum")?.as_f64()?;
+            let sum = value.sum;
             if !sum.is_finite() {
                 return None;
             }
             Some(HistogramDetail {
-                labels: parse_labels(value.get("labels")?)?,
+                labels: parse_labels(&value.labels),
                 buckets,
                 sum,
-                count: value.get("count")?.as_u64()?,
+                count: value.count,
             })
         })
         .collect::<Option<_>>()?;
@@ -825,14 +811,13 @@ fn parse_histogram_details(series: &[serde_json::Value]) -> Option<Vec<Histogram
     Some(parsed)
 }
 
-fn parse_labels(value: &serde_json::Value) -> Option<Vec<(String, String)>> {
+fn parse_labels(value: &BTreeMap<String, String>) -> Vec<(String, String)> {
     let mut labels: Vec<(String, String)> = value
-        .as_object()?
         .iter()
-        .map(|(key, value)| Some((key.clone(), value.as_str()?.to_owned())))
-        .collect::<Option<_>>()?;
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
     labels.sort();
-    Some(labels)
+    labels
 }
 
 fn format_labels(labels: &[(String, String)]) -> String {
@@ -1015,6 +1000,87 @@ impl ReplayState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn canonical_shared_snapshot(extra_family: bool) -> limpid_metrics_schema::MetricsSnapshot {
+        let mut metrics = PIPELINE_METRICS
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "type": "counter",
+                    "help": "Pipeline counter.",
+                    "series": [{"labels": {"pipeline": "route"}, "value": 1}]
+                })
+            })
+            .chain(INPUT_METRICS.iter().map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "type": "counter",
+                    "help": "Input counter.",
+                    "series": [{"labels": {"input": "ingress"}, "value": 2}]
+                })
+            }))
+            .chain(OUTPUT_METRICS.iter().map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "type": "counter",
+                    "help": "Output counter.",
+                    "series": [{"labels": {"output": "egress"}, "value": 3}]
+                })
+            }))
+            .collect::<Vec<_>>();
+        if extra_family {
+            metrics.push(serde_json::json!({
+                "name": "future_metric",
+                "type": "gauge",
+                "help": "Future metric.",
+                "series": [{"labels": {"scope": "future"}, "value": 9}]
+            }));
+        }
+        serde_json::from_value(serde_json::json!({"schema": 1, "metrics": metrics})).unwrap()
+    }
+
+    #[test]
+    fn default_stats_renders_the_shared_snapshot_and_ignores_unknown_families() {
+        let shared = canonical_shared_snapshot(true);
+        let render: fn(&limpid_metrics_schema::MetricsSnapshot) -> Option<String> =
+            render_default_stats;
+        let rendered = render(&shared).unwrap();
+        assert!(rendered.contains("Pipelines:"));
+        assert!(rendered.contains("route"));
+        assert!(rendered.contains("Inputs:"));
+        assert!(rendered.contains("ingress"));
+        assert!(rendered.contains("Outputs:"));
+        assert!(rendered.contains("egress"));
+        assert!(!rendered.contains("future_metric"));
+    }
+
+    #[test]
+    fn default_stats_rejects_a_semantically_ambiguous_shared_snapshot() {
+        let mut fixture = serde_json::to_value(canonical_shared_snapshot(false)).unwrap();
+        let duplicate = fixture["metrics"][0]["series"][0].clone();
+        fixture["metrics"][0]["series"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        let shared: limpid_metrics_schema::MetricsSnapshot =
+            serde_json::from_value(fixture).unwrap();
+        let render: fn(&limpid_metrics_schema::MetricsSnapshot) -> Option<String> =
+            render_default_stats;
+        assert!(render(&shared).is_none());
+    }
+
+    #[test]
+    fn details_render_all_shared_wire_family_types() {
+        let fixture = include_str!("../../limpid-metrics-schema/tests/fixtures/schema-v1.json");
+        let shared: limpid_metrics_schema::MetricsSnapshot = serde_json::from_str(fixture).unwrap();
+        let render: fn(&limpid_metrics_schema::MetricsSnapshot) -> Option<String> =
+            render_stats_details;
+        let rendered = render(&shared).unwrap();
+        assert!(rendered.contains("requests_total"));
+        assert!(rendered.contains("queue_depth"));
+        assert!(rendered.contains("latency_seconds"));
+    }
 
     #[test]
     fn valid_names_match_daemon_ident_grammar() {
