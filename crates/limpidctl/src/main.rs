@@ -340,40 +340,68 @@ fn generate_node_key(path: &std::path::Path) -> Result<String, String> {
 }
 
 fn write_new_private_key(path: &std::path::Path, contents: &[u8]) -> Result<(), String> {
-    write_new_private_key_with(path, contents, |file, contents| {
-        file.write_all(contents)?;
-        file.sync_all()
-    })
+    write_new_private_key_with(
+        path,
+        contents,
+        |file, contents| {
+            file.write_all(contents)?;
+            file.sync_all()
+        },
+        || Ok(()),
+        |parent| std::fs::File::open(parent)?.sync_all(),
+    )
 }
 
-fn write_new_private_key_with<F>(
+fn write_new_private_key_with<W, B, S>(
     path: &std::path::Path,
     contents: &[u8],
-    write_and_sync: F,
+    write_and_sync: W,
+    before_publish: B,
+    sync_parent: S,
 ) -> Result<(), String>
 where
-    F: FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+    W: FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+    B: FnOnce() -> std::io::Result<()>,
+    S: FnOnce(&std::path::Path) -> std::io::Result<()>,
 {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
 
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|error| format!("cannot create node key '{}': {error}", path.display()))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".limpid-node-key.")
+        .tempfile_in(parent)
+        .map_err(|error| {
+            format!(
+                "cannot create temporary node key beside '{}': {error}",
+                path.display()
+            )
+        })?;
 
-    let persisted = file
+    temporary
+        .as_file()
         .set_permissions(std::fs::Permissions::from_mode(0o600))
-        .and_then(|()| write_and_sync(&mut file, contents));
-    if let Err(error) = persisted {
-        drop(file);
-        let _ = std::fs::remove_file(path);
-        return Err(format!(
-            "failed to persist node key '{}': {error}",
+        .and_then(|()| write_and_sync(temporary.as_file_mut(), contents))
+        .map_err(|error| format!("failed to persist node key '{}': {error}", path.display()))?;
+    before_publish()
+        .map_err(|error| format!("failed to publish node key '{}': {error}", path.display()))?;
+
+    let final_file = temporary.persist_noclobber(path).map_err(|error| {
+        format!(
+            "cannot publish node key '{}': {}",
+            path.display(),
+            error.error
+        )
+    })?;
+    sync_parent(parent).map_err(|error| {
+        format!(
+            "node key '{}' was published but parent directory sync failed: {error}",
             path.display()
-        ));
-    }
+        )
+    })?;
+    drop(final_file);
     Ok(())
 }
 
@@ -1272,6 +1300,7 @@ mod tests {
             &spki[ED25519_SPKI_PREFIX.len()..],
             key_pair.public_key().as_ref()
         );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]
@@ -1281,24 +1310,143 @@ mod tests {
         std::fs::write(&path, b"existing material").unwrap();
 
         let error = generate_node_key(&path).unwrap_err();
-        assert!(error.contains("cannot create node key"));
+        assert!(error.contains("cannot publish node key"));
         assert_eq!(std::fs::read(&path).unwrap(), b"existing material");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]
-    fn keygen_removes_only_the_file_it_created_after_a_write_failure() {
+    fn keygen_cleans_temporary_files_after_write_and_file_sync_failures() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("failed.pem");
         let private_material = b"DO-NOT-LEAK-PRIVATE-MATERIAL";
-        let error = write_new_private_key_with(&path, private_material, |file, contents| {
-            file.write_all(&contents[..8])?;
-            Err(std::io::Error::other("injected sync failure"))
-        })
+        let write_path = dir.path().join("write-failed.pem");
+        let write_error = write_new_private_key_with(
+            &write_path,
+            private_material,
+            |_file, _contents| Err(std::io::Error::other("injected write failure")),
+            || Ok(()),
+            |_parent| Ok(()),
+        )
+        .unwrap_err();
+        assert!(write_error.contains("injected write failure"));
+        assert!(!write_error.contains(std::str::from_utf8(private_material).unwrap()));
+        assert!(!write_path.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        let sync_path = dir.path().join("sync-failed.pem");
+        let sync_error = write_new_private_key_with(
+            &sync_path,
+            private_material,
+            |file, contents| {
+                file.write_all(contents)?;
+                Err(std::io::Error::other("injected file sync failure"))
+            },
+            || Ok(()),
+            |_parent| Ok(()),
+        )
+        .unwrap_err();
+        assert!(sync_error.contains("injected file sync failure"));
+        assert!(!sync_error.contains(std::str::from_utf8(private_material).unwrap()));
+        assert!(!sync_path.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn keygen_publish_never_replaces_a_competing_final_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("competing.pem");
+        let private_material = b"new private material";
+        let preserved = b"competing path contents";
+
+        let error = write_new_private_key_with(
+            &path,
+            private_material,
+            |file, contents| {
+                file.write_all(contents)?;
+                file.sync_all()
+            },
+            || std::fs::write(&path, preserved),
+            |_parent| Ok(()),
+        )
         .unwrap_err();
 
-        assert!(error.contains("injected sync failure"));
-        assert!(!error.contains(std::str::from_utf8(private_material).unwrap()));
-        assert!(!path.exists(), "failed keygen must remove its partial file");
+        assert!(error.contains("cannot publish node key"));
+        assert_eq!(std::fs::read(&path).unwrap(), preserved);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn keygen_parent_sync_failure_preserves_the_published_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("published.pem");
+        let private_material = b"complete private material";
+
+        let error = write_new_private_key_with(
+            &path,
+            private_material,
+            |file, contents| {
+                file.write_all(contents)?;
+                file.sync_all()
+            },
+            || Ok(()),
+            |_parent| Err(std::io::Error::other("injected parent sync failure")),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("published but parent directory sync failed"));
+        assert_eq!(std::fs::read(&path).unwrap(), private_material);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn keygen_orders_file_sync_publish_and_parent_sync() {
+        use std::cell::RefCell;
+        use std::os::unix::fs::PermissionsExt;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ordered.pem");
+        let private_material = b"ordered private material";
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let write_events = Rc::clone(&events);
+        let publish_events = Rc::clone(&events);
+        let parent_events = Rc::clone(&events);
+
+        write_new_private_key_with(
+            &path,
+            private_material,
+            |file, contents| {
+                assert!(!path.exists());
+                assert_eq!(file.metadata()?.permissions().mode() & 0o7777, 0o600);
+                file.write_all(contents)?;
+                file.sync_all()?;
+                write_events.borrow_mut().push("file-sync");
+                Ok(())
+            },
+            || {
+                assert!(!path.exists());
+                publish_events.borrow_mut().push("before-publish");
+                Ok(())
+            },
+            |_parent| {
+                assert_eq!(std::fs::read(&path)?, private_material);
+                parent_events.borrow_mut().push("parent-sync");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["file-sync", "before-publish", "parent-sync"]
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     fn canonical_shared_snapshot(extra_family: bool) -> limpid_metrics_schema::MetricsSnapshot {
