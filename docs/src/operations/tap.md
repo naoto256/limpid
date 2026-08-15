@@ -18,7 +18,7 @@ sudo limpidctl tap process enrich_fortigate
 sudo limpidctl list
 ```
 
-By default, tap emits each event's `egress` bytes as a line of text. Add `--json` to emit the Event as one JSON object per line. Top-level keys are always `received_at`, `source`, `ingress`, and `egress`. `workspace` inclusion depends on the tap point:
+By default, tap emits each event's `egress` bytes as a line of text. Add `--json` to emit the Event as one JSON object per line. Top-level keys are always `key`, `received_at`, `source`, `ingress`, and `egress`. `key` is the event's immutable UUIDv7 identity; it is minted before fan-out and survives queue persistence, DLQ capture, and JSON replay. `workspace` inclusion depends on the tap point:
 
 - **`tap process <name> --json`** — `workspace` is included when non-empty. This is the tap point that shows workspace state, because process bodies are the only DSL construct that mutates it.
 - **`tap input <name> --json`** — `workspace` is always absent (input events start with an empty workspace).
@@ -30,6 +30,9 @@ sudo limpidctl tap output ama --json | jq -r '[.source.ip, .egress] | @tsv'
 
 # Workspace state after a named process
 sudo limpidctl tap process enrich_fortigate --json | jq '.workspace'
+
+# Correlate the same event across tap points
+sudo limpidctl tap process enrich_fortigate --json | jq -r '.key'
 ```
 
 ## How it works
@@ -76,6 +79,10 @@ limpidctl inject output ama < messages.log
 limpidctl inject input fw_syslog --json < events.jsonl
 limpidctl inject output ama --json < events.jsonl
 ```
+
+JSON captured before 0.8.0 has no `key`. On its first read, limpid assigns a
+new UUIDv7; JSON that already contains a key must use the canonical hyphenated
+lowercase UUIDv7 form. Replaying a current capture preserves its existing key.
 
 On success, `limpidctl inject` prints the number of events injected:
 

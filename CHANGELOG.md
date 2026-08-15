@@ -8,6 +8,14 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+### Added — immutable event identity
+
+Every event now receives a UUIDv7 `key` before fan-out. The key is preserved
+through clones, queue persistence, dead-letter capture, and JSON replay, and is
+visible in `tap --json` without changing the default raw tap stream or the DSL.
+Pre-0.8 Event JSON without a key is assigned one when first read. The dead-letter
+record schema is now version 3 because its `event` object carries the key.
+
 ### Changed — dropped metrics use one rooted hierarchy (breaking)
 
 `limpid_pipeline_events_dropped_total{pipeline}` is replaced by the

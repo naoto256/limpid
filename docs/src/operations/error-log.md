@@ -20,7 +20,7 @@ Three behaviours were considered:
 - **Discard** makes the bug visible (counter goes up) but is itself a strong failure mode: a security telemetry pipeline that drops events to a config typo is the wrong default.
 - **DLQ** preserves the data and the bug signal: `events_errored` ticks up *and* the original event is recoverable. This is the Logstash / Fluentd `@ERROR` pattern.
 
-The runtime cannot guess what the operator intended at the failure point — `egress` may have been partially rewritten by earlier processes in the chain, the next process expected a workspace key that was never produced, etc. So the DLQ deliberately preserves only the *original* event (ingress / source / received_at) for the Process flavor, and the pre-rendered wire payload (with `egress`) for the Output flavor, and lets the operator re-run from the appropriate boundary after the fix.
+The runtime cannot guess what the operator intended at the failure point — `egress` may have been partially rewritten by earlier processes in the chain, the next process expected a workspace key that was never produced, etc. So the DLQ deliberately preserves only the *original* event (key / ingress / source / received_at) for the Process flavor, and the pre-rendered wire payload (with `egress`) for the Output flavor, and lets the operator re-run from the appropriate boundary after the fix.
 
 ## Configuring the DLQ
 
@@ -86,7 +86,7 @@ Operators with stricter retention needs (compliance: hold N days of forensic-qua
 
 ## Record format
 
-Each line is a sum-typed JSON record. Since 0.7.8 the record carries an explicit `schema_version: 2` and a `kind` discriminator (`"process"` or `"output"`) that selects a per-kind block at the top level. Process flavor records carry `process: { name }` and a minimal event (ingress only); Output flavor records carry `output: { name }` and the pre-rendered `event.egress`.
+Each line is a sum-typed JSON record. The current format is `schema_version: 3`; the `kind` discriminator (`"process"` or `"output"`) selects a per-kind block at the top level. Both flavors carry the immutable event key. Process flavor records carry `process: { name }` and a minimal event (ingress only); Output flavor records carry `output: { name }` and the pre-rendered `event.egress`.
 
 ### Process flavor
 
@@ -94,13 +94,14 @@ A pipeline-side failure (process body raised, pipeline-skeleton eval failed, exp
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "timestamp": "2026-04-27T03:28:39.178046123Z",
   "reason": "unknown identifier: timestamp",
   "pipeline": "journal_forward",
   "kind": "process",
   "process": { "name": "wrap_journal" },
   "event": {
+    "key": "0198a3b4-4d7e-7c20-8b11-9f4e6a2d1357",
     "source": {"ip": "10.0.0.1", "port": 514},
     "received_at": 1745719719178046000,
     "ingress": "<134>1 2026-04-27T03:28:39Z host app 1234 - - hello"
@@ -114,13 +115,14 @@ A sink-side failure (retry budget exhausted, batched-output shutdown drain, runt
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "timestamp": "2026-04-27T03:31:02.998742000Z",
   "reason": "output write failed after 5 attempts: connection refused",
   "pipeline": "",
   "kind": "output",
   "output": { "name": "mysink" },
   "event": {
+    "key": "0198a3b4-4d7e-7c20-8b11-9f4e6a2d1357",
     "source": {"ip": "10.0.0.1", "port": 514},
     "received_at": 1745719719178046000,
     "ingress": "<134>1 2026-04-27T03:28:39Z host app 1234 - - hello",
@@ -133,11 +135,12 @@ A sink-side failure (retry budget exhausted, batched-output shutdown drain, runt
 
 | Field | Meaning |
 |-------|---------|
-| `schema_version` | Integer `2`. Identifies the v2 sum-typed shape; v1 is a hard break (see [Schema migration v1 → v2](#schema-migration-v1--v2) below). |
+| `schema_version` | Integer `3`. Identifies the event-identity shape; v2 records omit `event.key` (see [Schema migration v2 → v3](#schema-migration-v2--v3) below). |
 | `timestamp` | RFC3339 with nanosecond precision; wall-clock at which the failure was raised. |
 | `reason` | Stringified failure reason. Stable enough for `grep` / classification but not a stable API. The runbook below maps reason patterns back to producer sites. |
 | `pipeline` | Pipeline name (`def pipeline <name>`). Populated for every Process record; for Output records it carries the originating pipeline only when the failure happened *at the pipeline → output boundary* (= enqueue failure). Retry-exhausted and shutdown-drain Output records have an empty `pipeline` field because the event had already left its source pipeline by then. |
 | `kind` | Discriminator: `"process"` or `"output"`. Selects which per-kind block is present and which `event.*` fields are populated. |
+| `event.key` | Canonical hyphenated lowercase UUIDv7. Immutable across fan-out, capture, and replay. |
 | `event.source` | Originating peer as `{ip, port}` object. Same shape as `tap --json` and as the DSL `source` ident. |
 | `event.received_at` | i64 unix nanoseconds (matches OTLP `time_unix_nano`). Same shape as `tap --json`. |
 | `event.ingress` | Original wire bytes. UTF-8-clean payloads serialise as a JSON string; non-UTF-8 payloads use the `$bytes_b64` marker the rest of the JSON layer already uses for `tap --json`. |
@@ -148,7 +151,7 @@ A sink-side failure (retry budget exhausted, batched-output shutdown drain, runt
 |-------|---------|
 | `process` | `{ "name": "<site>" }` block. `name` is the failing `def process` name, `(inline)` for an inline `process { ... }` block, `(pipeline)` for a pipeline-statement `error <expr>`, or `(pipeline body)` for a pipeline-skeleton expression failure (`if` condition, `switch` scrutinee, `error <expr>` argument, or a body expression evaluated inside the pipeline). |
 
-`event` carries only `{ source, received_at, ingress }` — no `egress`, no `workspace`. Replay re-runs the pipeline from scratch on `ingress`.
+`event` carries only `{ key, source, received_at, ingress }` — no `egress`, no `workspace`. Replay re-runs the pipeline from scratch on `ingress` while retaining the same event identity.
 
 ### Output-flavor extras
 
@@ -173,7 +176,7 @@ Process flavor (4 sites — replay via `inject input`):
 Output flavor (3 sites — replay via `inject output`):
 
 5. **`<output_name>`** — the output exhausted its `retry { ... }` budget against the destination. A batched output's per-event render failure inside `flush()` is also routed here with `reason = "render failed during batch flush: ..."`. `pipeline` is empty.
-6. **`<output_name> shutdown`** — a batched output (`http`, `otlp_http`, `otlp_grpc`) was **gracefully shut down** (`SIGTERM`, `SIGHUP` reload, `systemctl stop`, or an explicit `shutdown()` API call) with events still buffered and the bounded final drain failed. The drain runs one flush attempt per payload bounded by `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT` (3 s) plus a per-actor in-flight cancel; transport timeout, in-flight cancel, or retry exhaustion all route here. The `shutdown()` impl walks the remaining `(Event, QueueAckHandle)` buffer entries (one record per parked event) through this writer. `pipeline` is empty. The per-event `source`, `received_at`, `ingress`, and `egress` come from the original `Event` that was parked in the buffer at `consume()` time; nothing is synthesised. (Earlier 0.7.7 drafts of this flavor carried synthetic shutdown-time metadata; the 0.7.8 ack-lifecycle work parks the source `Event` alongside the ack handle so each shutdown-drain record now reflects the real per-event provenance.) **`SIGKILL` (`kill -9`) cannot reach this path** — actor tasks are aborted and the stack-local buffer is lost without an error_log write. Production deployments must not send `SIGKILL` directly to the daemon; keep systemd's `KillSignal=SIGTERM` default.
+6. **`<output_name> shutdown`** — a batched output (`http`, `otlp_http`, `otlp_grpc`) was **gracefully shut down** (`SIGTERM`, `SIGHUP` reload, `systemctl stop`, or an explicit `shutdown()` API call) with events still buffered and the bounded final drain failed. The drain runs one flush attempt per payload bounded by `SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT` (3 s) plus a per-actor in-flight cancel; transport timeout, in-flight cancel, or retry exhaustion all route here. The `shutdown()` impl walks the remaining `(Event, QueueAckHandle)` buffer entries (one record per parked event) through this writer. `pipeline` is empty. The per-event `key`, `source`, `received_at`, `ingress`, and `egress` come from the original `Event` that was parked in the buffer at `consume()` time; nothing is synthesised. (Earlier 0.7.7 drafts of this flavor carried synthetic shutdown-time metadata; the 0.7.8 ack-lifecycle work parks the source `Event` alongside the ack handle so each shutdown-drain record now reflects the real per-event provenance.) **`SIGKILL` (`kill -9`) cannot reach this path** — actor tasks are aborted and the stack-local buffer is lost without an error_log write. Production deployments must not send `SIGKILL` directly to the daemon; keep systemd's `KillSignal=SIGTERM` default.
 7. **`<output_name> enqueue`** — `runtime.rs` could not hand an event to the named output's queue (queue closed, disk-queue write error, unknown output). `pipeline` is the name of the originating pipeline — the only Output-flavor site that keeps it populated. Per-failed-output split: a single pipeline-eval result with N failed-output enqueues produces N records (one per failing output).
 
 The `reason` field distinguishes sites 5 / 6 / 7 within a single output name: retry exhaustion uses `"output write failed after N attempts: ..."`, shutdown drain uses `"shutdown flush failed: ..."`, enqueue failure uses `"output enqueue failed (queue closed, disk write error, or unknown output)"`. A batched output's per-event render failure inside `flush()` uses `"render failed during batch flush: ..."`. The runbook's [root-cause heuristics table](#step-3--root-cause-heuristics-by-site) lists the full patterns.
@@ -188,7 +191,7 @@ The trade-off: an operator who needs to know *which peer failed* for an `<output
 
 ### Schema stability
 
-`schema_version: 2` is the operator-visible discriminator. Pre-1.0, the schema may add fields to existing kinds, or add new kinds, both of which bump `schema_version`. Field renames within an existing kind also bump it. After 1.0 the format will be locked under semantic versioning.
+`schema_version: 3` is the operator-visible discriminator. Pre-1.0, the schema may add fields to existing kinds, or add new kinds, both of which bump `schema_version`. Field renames within an existing kind also bump it. After 1.0 the format will be locked under semantic versioning.
 
 `event.source` changed shape from a flat `"ip:port"` string to a `{ip, port}` object in v0.5.6 (independent of `schema_version`, but worth knowing if you're reading captures from that era).
 
@@ -360,7 +363,7 @@ jq -c 'select(.kind == "process" and (.reason | test("parse_json"))) | .event' \
     | limpidctl inject input <input_name> --json
 ```
 
-**Shutdown-drain caveat.** Output-flavor records with `reason` starting with `shutdown flush failed: ...` are *per-event* records, not per-batch — the batched output's shutdown helper walks every still-buffered `(Event, QueueAckHandle)` entry and writes one record per parked event, so `event.source`, `event.received_at`, `event.ingress`, and `event.egress` all reflect the original per-event provenance (no synthetic shutdown-time metadata). `event.egress` carries the per-event pre-rendered payload (= the bytes the output had built for the wire on each event, before the unsent batch wrapper was applied), so `inject output <name>` is the correct replay path — the sink takes the per-event pre-rendered bytes and re-routes via its `consume()` path, applying the current batch wrapper / headers / compression as if the event had just been enqueued. Do **not** route shutdown-drain records through `inject input <name>`: doing so feeds the per-event pre-rendered payload back into the pipeline as raw `ingress`, which is almost never what you want.
+**Shutdown-drain caveat.** Output-flavor records with `reason` starting with `shutdown flush failed: ...` are *per-event* records, not per-batch — the batched output's shutdown helper walks every still-buffered `(Event, QueueAckHandle)` entry and writes one record per parked event, so `event.key`, `event.source`, `event.received_at`, `event.ingress`, and `event.egress` all reflect the original per-event provenance (no synthetic shutdown-time metadata). `event.egress` carries the per-event pre-rendered payload (= the bytes the output had built for the wire on each event, before the unsent batch wrapper was applied), so `inject output <name>` is the correct replay path — the sink takes the per-event pre-rendered bytes and re-routes via its `consume()` path, applying the current batch wrapper / headers / compression as if the event had just been enqueued. Do **not** route shutdown-drain records through `inject input <name>`: doing so feeds the per-event pre-rendered payload back into the pipeline as raw `ingress`, which is almost never what you want.
 
 **OTLP `partial_success` attribution caveat.** For `output otlp_http` and `output otlp_grpc`, Output-flavor records with `reason == "collector reported partial_success rejection"` are an **approximate** attribution of a batch-level rejection: the OTLP response carries a rejected *count*, not the identity of each rejected log record. limpid splits the batch into Delivered + Recovered along the trailing N entries (where N = `rejected_log_records`) and writes one DLQ record per Recovered tail entry, but the collector did not identify those exact events. Metric totals (`events_written`, `events_failed`) are accurate; per-event provenance in `event.*` is correct (it is the original Event); the *attribution* — which specific event was rejected — is not. For replay purposes treat these records as a batch-level rejection split into per-event records, not as proof of which records the collector rejected. `inject output <name>` still works the same way; if the underlying cause is a payload-shape issue, the rejection will simply re-occur on the rejected subset of the replay (and the same approximate split will apply on the new response).
 
@@ -441,7 +444,7 @@ $ echo 'sample event' \
 [input] → ingress: <134>sample event
 [process]  wrap_journal → error: process failed: unknown identifier: timestamp (event → error_log)
 
-[error_log]  {"schema_version":2,"timestamp":"...","reason":"...","pipeline":"journal_forward","kind":"process","process":{"name":"wrap_journal"},"event":{"source":{"ip":"127.0.0.1","port":0},"received_at":...,"ingress":"<134>sample event"}}
+[error_log]  {"schema_version":3,"timestamp":"...","reason":"...","pipeline":"journal_forward","kind":"process","process":{"name":"wrap_journal"},"event":{"key":"0198a3b4-4d7e-7c20-8b11-9f4e6a2d1357","source":{"ip":"127.0.0.1","port":0},"received_at":...,"ingress":"<134>sample event"}}
 ```
 
 This is useful for confirming the JSONL shape, the `kind` / per-kind name discriminator, and that the original ingress is captured correctly — all without booting the daemon or touching any file. The Output-flavor shape can be observed by triggering a sink retry exhaustion against an unroutable peer; `--test-pipeline` does not directly emit Output records (it stops at pipeline-side disposition).
@@ -514,6 +517,19 @@ Two boundaries the shutdown drain does not cover. Both are protocol-level and bo
 Both limitations are surfaced deliberately. `events_failed` on the output ticks for every event that took the DLQ path; the DLQ record captures the payload. Neither is treated as an excuse for further silent gaps inside the runtime.
 
 **`SIGKILL` (`kill -9`) still bypasses the entire graceful-shutdown path.** Actor tasks are aborted with their handles unresolved, and batched outputs lose whatever was mid-flush. Production deployments must keep systemd's `KillSignal=SIGTERM` default and give the daemon its 10 s budget.
+
+## Schema migration v2 → v3
+
+Version 3 adds `event.key`, the immutable UUIDv7 shared with `tap --json` and
+the queue persistence format. New records retain the same key when replayed,
+so a failure can be correlated with observations made before and after the
+DLQ boundary.
+
+Version 2 records remain replayable: their event object has no key, so limpid
+assigns a UUIDv7 when it first reads that event object. No rewrite is required
+unless external tooling validates `schema_version`; such tooling should accept both
+versions during migration and treat a missing v2 key as unavailable rather
+than synthesising one independently.
 
 ## Schema migration v1 → v2
 

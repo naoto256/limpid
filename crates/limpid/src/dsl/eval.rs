@@ -1126,15 +1126,12 @@ mod tests {
         let ev = make_event();
         let bev = ev.view_in(&arena);
         let f = make_funcs();
-        assert!(
-            eval_expr(
-                &e(ExprKind::Ident(vec!["typo_field".into()])),
-                &bev,
-                &f,
-                &arena
-            )
-            .is_err()
-        );
+        for ident in ["typo_field", "key"] {
+            assert!(
+                eval_expr(&e(ExprKind::Ident(vec![ident.into()])), &bev, &f, &arena).is_err(),
+                "{ident} must not be visible to the DSL"
+            );
+        }
     }
 
     #[test]

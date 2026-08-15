@@ -1,11 +1,11 @@
 //! Dead-letter queue (DLQ) writer for events that fail their main-flow
 //! disposition.
 //!
-//! Records are sum-typed (`schema_version: 2`): every record carries a
+//! Records are sum-typed (`schema_version: 3`): every record carries a
 //! `kind` discriminator (`"process"` or `"output"`) and a per-kind block
 //! (`process: { name }` or `output: { name }`) naming the failure site.
 //! The Output flavor additionally carries the rendered `egress` in
-//! `event.egress`; the Process flavor only has `event.{source,
+//! `event.egress`; the Process flavor only has `event.{key, source,
 //! received_at, ingress}`.
 //!
 //! Seven producer sites map to the two flavors:
@@ -96,7 +96,7 @@ impl ErroredEventContext {
     ///
     /// ```text
     /// {
-    ///   "schema_version": 2,
+    ///   "schema_version": 3,
     ///   "timestamp": "<RFC3339 nanos UTC>",
     ///   "reason": "<error msg>",
     ///   "pipeline": "<def pipeline name or empty>",
@@ -104,6 +104,7 @@ impl ErroredEventContext {
     ///   "process": { "name": "<process_name>" },   // kind=process only
     ///   "output":  { "name": "<output_name>" },    // kind=output only
     ///   "event": {
+    ///     "key": "<UUIDv7>",
     ///     "source": { "ip": ..., "port": ... },
     ///     "received_at": <unix nanos>,
     ///     "ingress": "...",
@@ -112,8 +113,8 @@ impl ErroredEventContext {
     /// }
     /// ```
     ///
-    /// `schema_version: 2` is the operator-visible discriminator for
-    /// the v0.7.8 schema break. Output records intentionally carry
+    /// `schema_version: 3` is the operator-visible discriminator for
+    /// immutable event identity. Output records intentionally carry
     /// *only* `{ name }` — no address, dest, path, key, topic,
     /// partition, endpoint, URL, peer, target, or workspace. Replay
     /// (`limpidctl inject output <name>`) hands the event back to the
@@ -125,7 +126,7 @@ impl ErroredEventContext {
     /// construct it, but the JSONL shape is `error_log`'s to own.
     pub fn to_jsonl(&self) -> String {
         // Rebuild a minimal Event so we can reuse the canonical
-        // `to_json_value` serialiser for source / received_at /
+        // `to_json_value` serialiser for key / source / received_at /
         // ingress / egress. We construct it from the snapshot rather
         // than carrying a full OwnedEvent so we never accidentally
         // leak workspace fragments into the DLQ.
@@ -138,6 +139,7 @@ impl ErroredEventContext {
                 event,
             } => {
                 let ev = OwnedEvent {
+                    key: event.key,
                     received_at: event.received_at,
                     source: event.source,
                     ingress: event.ingress.clone(),
@@ -174,6 +176,7 @@ impl ErroredEventContext {
                 event,
             } => {
                 let ev = OwnedEvent {
+                    key: event.key,
                     received_at: event.received_at,
                     source: event.source,
                     ingress: event.ingress.clone(),
@@ -205,7 +208,7 @@ impl ErroredEventContext {
         // Merge kind discriminator block + per-kind name block into
         // the top-level record. Using a Map keeps key ordering stable.
         let mut record = serde_json::Map::new();
-        record.insert("schema_version".into(), serde_json::json!(2));
+        record.insert("schema_version".into(), serde_json::json!(3));
         record.insert(
             "timestamp".into(),
             serde_json::Value::String(
@@ -1041,15 +1044,16 @@ mod tests {
         assert_eq!(lines.len(), 2);
         for line in &lines {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
-            assert_eq!(v["schema_version"], 2);
+            assert_eq!(v["schema_version"], 3);
             assert_eq!(v["kind"], "process");
             assert_eq!(v["pipeline"], "p");
             assert_eq!(v["process"]["name"], "wrap");
             assert!(v["output"].is_null());
             assert!(v["reason"].as_str().unwrap().contains("timestamp"));
-            // event sub-object keeps only source / received_at / ingress
+            // event sub-object keeps only key / source / received_at / ingress
             // for Process records — egress and workspace are omitted.
             let event = &v["event"];
+            assert!(event.get("key").is_some());
             assert!(event.get("source").is_some());
             assert!(event.get("received_at").is_some());
             assert!(event.get("ingress").is_some());
@@ -1542,7 +1546,7 @@ mod tests {
     // to_jsonl wire-format tests
     // -----------------------------------------------------------------
     //
-    // The JSONL shape (schema_version = 2, `Process`/`Output` sum
+    // The JSONL shape (schema_version = 3, `Process`/`Output` sum
     // discriminants, forbidden routing fields on Output, event sub-object
     // replayable through `Event::from_json`) is `error_log`'s to own —
     // that contract is what `limpidctl inject --json` and any downstream
@@ -1562,22 +1566,25 @@ mod tests {
 
     #[test]
     fn process_variant_jsonl_has_no_egress_no_output_block() {
+        let event = sample_owned_event();
+        let expected_key = event.key;
         let ctx = ErroredEventContext::Process {
             timestamp: chrono::DateTime::from_timestamp_nanos(1_700_000_000_000_000_000),
             pipeline: "p".into(),
             site: "wrap".into(),
             reason: "boom".into(),
-            event: crate::pipeline::ProcessEvent::from_owned(&sample_owned_event()),
+            event: crate::pipeline::ProcessEvent::from_owned(&event),
         };
         let line = ctx.to_jsonl();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(v["schema_version"], 2);
+        assert_eq!(v["schema_version"], 3);
         assert_eq!(v["kind"], "process");
         assert_eq!(v["pipeline"], "p");
         assert_eq!(v["reason"], "boom");
         assert_eq!(v["process"]["name"], "wrap");
         assert!(v["output"].is_null(), "Process must not carry output block");
         assert_eq!(v["event"]["ingress"], "hello");
+        assert_eq!(v["event"]["key"], expected_key.hyphenated().to_string());
         assert!(
             v["event"]["egress"].is_null(),
             "Process event must omit egress"
@@ -1587,17 +1594,19 @@ mod tests {
 
     #[test]
     fn output_variant_jsonl_carries_egress_and_output_block() {
+        let event = sample_owned_event();
+        let expected_key = event.key;
         let ctx = ErroredEventContext::Output {
             timestamp: chrono::DateTime::from_timestamp_nanos(1_700_000_000_000_000_000),
             pipeline: String::new(),
             site: "sink enqueue".into(),
             reason: "queue closed".into(),
             output_name: "sink".into(),
-            event: crate::pipeline::OutputEvent::from_owned(&sample_owned_event()),
+            event: crate::pipeline::OutputEvent::from_owned(&event),
         };
         let line = ctx.to_jsonl();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(v["schema_version"], 2);
+        assert_eq!(v["schema_version"], 3);
         assert_eq!(v["kind"], "output");
         assert_eq!(v["pipeline"], "");
         assert_eq!(v["output"]["name"], "sink");
@@ -1607,15 +1616,17 @@ mod tests {
         );
         assert_eq!(v["event"]["ingress"], "hello");
         assert_eq!(v["event"]["egress"], "goodbye");
+        assert_eq!(v["event"]["key"], expected_key.hyphenated().to_string());
         assert!(v["event"]["workspace"].is_null());
     }
 
     #[test]
     fn output_variant_jsonl_must_not_carry_sink_routing_metadata() {
         // Pin the DLQ no-address contract: the Output record carries
-        // ONLY `{ name }`. No address, dest, path, key, topic,
-        // partition, endpoint, url, peer, target, or workspace at any
-        // level.
+        // ONLY `{ name }`. No address, dest, path, routing key, topic,
+        // partition, endpoint, url, peer, target, or workspace at the
+        // top level or in the output block. The event sub-object carries
+        // its unrelated immutable event identity under `key`.
         let ctx = ErroredEventContext::Output {
             timestamp: chrono::Utc::now(),
             pipeline: "p".into(),
@@ -1630,7 +1641,6 @@ mod tests {
             "address",
             "dest",
             "path",
-            "key",
             "topic",
             "partition",
             "endpoint",
@@ -1652,10 +1662,12 @@ mod tests {
             );
             assert!(
                 v["event"].get(f).is_none(),
-                "event block must not carry forbidden field {}",
-                f
+                "event block must not carry {f}"
             );
         }
+        assert!(v.get("key").is_none());
+        assert!(v["output"].get("key").is_none());
+        assert!(v["event"].get("key").is_some());
         // output block must have *only* `name`.
         let obj = v["output"].as_object().expect("output is an object");
         assert_eq!(obj.len(), 1, "output block must carry only `name`");
@@ -1667,13 +1679,15 @@ mod tests {
         // The Output event sub-object must be replayable through
         // `Event::from_json` so `limpidctl inject output --json` can
         // reconstruct the egress payload end-to-end.
+        let event = sample_owned_event();
+        let expected_key = event.key;
         let ctx = ErroredEventContext::Output {
             timestamp: chrono::Utc::now(),
             pipeline: String::new(),
             site: "sink enqueue".into(),
             reason: "queue closed".into(),
             output_name: "sink".into(),
-            event: crate::pipeline::OutputEvent::from_owned(&sample_owned_event()),
+            event: crate::pipeline::OutputEvent::from_owned(&event),
         };
         let line = ctx.to_jsonl();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -1682,16 +1696,19 @@ mod tests {
             crate::event::Event::from_json(&event_str).expect("event sub-object must replay");
         assert_eq!(&replayed.ingress[..], b"hello");
         assert_eq!(&replayed.egress[..], b"goodbye");
+        assert_eq!(replayed.key, expected_key);
     }
 
     #[test]
     fn process_variant_round_trip_via_event_from_json() {
+        let event = sample_owned_event();
+        let expected_key = event.key;
         let ctx = ErroredEventContext::Process {
             timestamp: chrono::Utc::now(),
             pipeline: "p".into(),
             site: "wrap".into(),
             reason: "boom".into(),
-            event: crate::pipeline::ProcessEvent::from_owned(&sample_owned_event()),
+            event: crate::pipeline::ProcessEvent::from_owned(&event),
         };
         let line = ctx.to_jsonl();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -1703,6 +1720,7 @@ mod tests {
         // sees a self-consistent starting state.
         assert_eq!(&replayed.ingress[..], b"hello");
         assert_eq!(&replayed.egress[..], b"hello");
+        assert_eq!(replayed.key, expected_key);
     }
 
     #[tokio::test]

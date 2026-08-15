@@ -2007,9 +2007,10 @@ def output o {{
         assert_eq!(lines.len(), 2);
         for line in &lines {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
-            assert_eq!(v["schema_version"], 2);
+            assert_eq!(v["schema_version"], 3);
             assert_eq!(v["kind"], "output");
             assert_eq!(v["output"]["name"], "myout");
+            assert!(v["event"]["key"].is_string());
             // The reason carries the underlying transport error from
             // `flush_events`; the exact wording is implementation
             // detail.

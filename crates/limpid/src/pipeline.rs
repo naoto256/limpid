@@ -250,7 +250,7 @@ pub enum PipelineTermination {
 /// - [`Process`](ErroredEventContext::Process) — a `process` step (named
 ///   `def process` invocation, inline `process { ... }` block, or a
 ///   top-level `error` statement) failed during pipeline execution.
-///   The captured [`ProcessEvent`] holds the original ingress / source /
+///   The captured [`ProcessEvent`] holds the original key / ingress / source /
 ///   received_at; egress is not snapshotted because at the failure
 ///   point it may hold partial output of an earlier process in the
 ///   chain, which would confuse replay. Replay re-runs the pipeline
@@ -285,7 +285,7 @@ pub enum ErroredEventContext {
         site: String,
         /// Stringified `ProcessError` / `anyhow::Error` from the failure.
         reason: String,
-        /// Pre-failure event snapshot (ingress / source / received_at only).
+        /// Pre-failure event snapshot (key / ingress / source / received_at only).
         event: ProcessEvent,
     },
     Output {
@@ -304,7 +304,7 @@ pub enum ErroredEventContext {
         /// Output name — the *only* sink-routing metadata captured.
         /// Replay = `limpidctl inject output <output_name>`.
         output_name: String,
-        /// Event snapshot (ingress + egress + source + received_at).
+        /// Event snapshot (key + ingress + egress + source + received_at).
         event: OutputEvent,
     },
 }
@@ -317,6 +317,7 @@ pub enum ErroredEventContext {
 /// point it may hold partial output of an earlier process step.
 #[derive(Debug, Clone)]
 pub struct ProcessEvent {
+    pub key: uuid::Uuid,
     pub source: std::net::SocketAddr,
     pub received_at: chrono::DateTime<chrono::Utc>,
     pub ingress: bytes::Bytes,
@@ -330,6 +331,7 @@ pub struct ProcessEvent {
 /// re-rendering / re-shipping.
 #[derive(Debug, Clone)]
 pub struct OutputEvent {
+    pub key: uuid::Uuid,
     pub source: std::net::SocketAddr,
     pub received_at: chrono::DateTime<chrono::Utc>,
     pub ingress: bytes::Bytes,
@@ -340,6 +342,7 @@ impl ProcessEvent {
     /// Snapshot the process-flavor fields from an [`OwnedEvent`].
     pub fn from_owned(ev: &OwnedEvent) -> Self {
         Self {
+            key: ev.key,
             source: ev.source,
             received_at: ev.received_at,
             ingress: ev.ingress.clone(),
@@ -351,6 +354,7 @@ impl OutputEvent {
     /// Snapshot the output-flavor fields from an [`OwnedEvent`].
     pub fn from_owned(ev: &OwnedEvent) -> Self {
         Self {
+            key: ev.key,
             source: ev.source,
             received_at: ev.received_at,
             ingress: ev.ingress.clone(),
@@ -1885,7 +1889,7 @@ fn exec_pipeline_stmt<'bump>(
             //   the `workspace` (via `to_owned_without_workspace`).
             //   The downstream sink reads `egress` (and, for `file`
             //   and `kafka`, `source` / `received_at` / `source.ip`),
-            //   the DLQ path projects to `OutputEvent`'s four fields,
+            //   the DLQ path projects to `OutputEvent`'s five fields,
             //   and the output-flavor `tap` strips `workspace` on the
             //   emit side too — so nobody observes the missing
             //   workspace.
@@ -2123,7 +2127,7 @@ def pipeline p {
         }
         assert!(result.outputs.is_empty());
         let line = ctx.to_jsonl();
-        assert!(line.contains("\"schema_version\":2"));
+        assert!(line.contains("\"schema_version\":3"));
         assert!(line.contains("\"kind\":\"process\""));
         assert!(line.contains("\"pipeline\":\"p\""));
         assert!(line.contains("\"name\":\"wrap\""));

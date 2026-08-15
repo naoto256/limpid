@@ -589,6 +589,7 @@ fn clone_borrowed_event<'bump>(
         workspace.push((*k, *v));
     }
     BorrowedEvent {
+        key: src.key,
         received_at: src.received_at,
         source: src.source,
         ingress: src.ingress.clone(),
@@ -603,6 +604,7 @@ mod tests {
     use bytes::Bytes;
     use std::net::SocketAddr;
 
+    use crate::dsl::arena::EventArena;
     use crate::dsl::exec::*;
     use crate::event::{BorrowedEvent, Event};
     use crate::functions::FunctionRegistry;
@@ -619,6 +621,19 @@ mod tests {
         let table_store = crate::functions::table::TableStore::from_configs(vec![]).unwrap();
         crate::functions::register_builtins(&mut reg, table_store);
         reg
+    }
+
+    #[test]
+    fn borrowed_event_clone_preserves_identity() {
+        let original = make_event();
+        let expected_key = original.key;
+        let bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let borrowed = original.view_in(&arena);
+
+        let cloned = clone_borrowed_event(&borrowed, &arena);
+
+        assert_eq!(cloned.key, expected_key);
     }
 
     /// Spanless [`Expr`] construction shortcut — see `eval_test::tests::e`.
