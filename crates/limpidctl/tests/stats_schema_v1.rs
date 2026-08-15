@@ -488,6 +488,18 @@ fn process_default_validator_only_defects() -> Vec<(&'static str, Value)> {
     });
     cases.push(("non-numeric step", non_numeric_step));
 
+    let mut malformed_path = process_snapshot();
+    for_each_process_family_mut(&mut malformed_path, |family| {
+        first_process_series_mut(family)["labels"]["process_path"] = json!("/dispatch//leaf");
+    });
+    cases.push(("malformed process path", malformed_path));
+
+    let mut mismatched_leaf = process_snapshot();
+    for_each_process_family_mut(&mut mismatched_leaf, |family| {
+        first_process_series_mut(family)["labels"]["process_name"] = json!("other");
+    });
+    cases.push(("process name differs from path leaf", mismatched_leaf));
+
     cases
 }
 
