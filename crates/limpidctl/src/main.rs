@@ -19,6 +19,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use limpid_metrics_schema::{
@@ -72,6 +73,17 @@ enum Command {
         #[command(subcommand)]
         kind: InjectKind,
     },
+    /// Manage LTP node identity material
+    Ltp {
+        #[command(subcommand)]
+        command: LtpCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum LtpCommand {
+    /// Generate a new Ed25519 node key without overwriting an existing path
+    Keygen { path: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -291,7 +303,78 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Command::Ltp { command } => match command {
+            LtpCommand::Keygen { path } => match generate_node_key(&path) {
+                Ok(public_key) => {
+                    println!("{public_key}");
+                    eprintln!("generated Ed25519 node key at {}", path.display());
+                }
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    std::process::exit(1);
+                }
+            },
+        },
     }
+}
+
+const ED25519_SPKI_PREFIX: [u8; 12] = [
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
+
+fn generate_node_key(path: &std::path::Path) -> Result<String, String> {
+    use ring::signature::KeyPair as _;
+
+    let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+        .map_err(|_| "failed to generate Ed25519 private key".to_owned())?;
+    let key_pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
+        .map_err(|_| "generated Ed25519 private key failed validation".to_owned())?;
+    let private_pem = pem::encode(&pem::Pem::new("PRIVATE KEY", pkcs8.as_ref()));
+    write_new_private_key(path, private_pem.as_bytes())?;
+
+    let mut spki =
+        Vec::with_capacity(ED25519_SPKI_PREFIX.len() + key_pair.public_key().as_ref().len());
+    spki.extend_from_slice(&ED25519_SPKI_PREFIX);
+    spki.extend_from_slice(key_pair.public_key().as_ref());
+    Ok(base64::engine::general_purpose::STANDARD.encode(spki))
+}
+
+fn write_new_private_key(path: &std::path::Path, contents: &[u8]) -> Result<(), String> {
+    write_new_private_key_with(path, contents, |file, contents| {
+        file.write_all(contents)?;
+        file.sync_all()
+    })
+}
+
+fn write_new_private_key_with<F>(
+    path: &std::path::Path,
+    contents: &[u8],
+    write_and_sync: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+{
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| format!("cannot create node key '{}': {error}", path.display()))?;
+
+    let persisted = file
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .and_then(|()| write_and_sync(&mut file, contents));
+    if let Err(error) = persisted {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(format!(
+            "failed to persist node key '{}': {error}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn run_tap(socket: &PathBuf, command: &str) {
@@ -1157,6 +1240,66 @@ impl ReplayState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keygen_writes_a_signing_key_and_returns_matching_rfc8410_spki() {
+        use ring::signature::KeyPair as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.pem");
+        let public_key = generate_node_key(&path).unwrap();
+
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
+        let document = pem::parse(std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(document.tag(), "PRIVATE KEY");
+        let key_pair = ring::signature::Ed25519KeyPair::from_pkcs8(document.contents()).unwrap();
+        let message = b"limpid ltp node identity";
+        let signature = key_pair.sign(message);
+        ring::signature::UnparsedPublicKey::new(
+            &ring::signature::ED25519,
+            key_pair.public_key().as_ref(),
+        )
+        .verify(message, signature.as_ref())
+        .unwrap();
+
+        let spki = base64::engine::general_purpose::STANDARD
+            .decode(public_key)
+            .unwrap();
+        assert_eq!(&spki[..ED25519_SPKI_PREFIX.len()], &ED25519_SPKI_PREFIX);
+        assert_eq!(
+            &spki[ED25519_SPKI_PREFIX.len()..],
+            key_pair.public_key().as_ref()
+        );
+    }
+
+    #[test]
+    fn keygen_never_overwrites_an_existing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.pem");
+        std::fs::write(&path, b"existing material").unwrap();
+
+        let error = generate_node_key(&path).unwrap_err();
+        assert!(error.contains("cannot create node key"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing material");
+    }
+
+    #[test]
+    fn keygen_removes_only_the_file_it_created_after_a_write_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("failed.pem");
+        let private_material = b"DO-NOT-LEAK-PRIVATE-MATERIAL";
+        let error = write_new_private_key_with(&path, private_material, |file, contents| {
+            file.write_all(&contents[..8])?;
+            Err(std::io::Error::other("injected sync failure"))
+        })
+        .unwrap_err();
+
+        assert!(error.contains("injected sync failure"));
+        assert!(!error.contains(std::str::from_utf8(private_material).unwrap()));
+        assert!(!path.exists(), "failed keygen must remove its partial file");
+    }
 
     fn canonical_shared_snapshot(extra_family: bool) -> limpid_metrics_schema::MetricsSnapshot {
         let mut metrics = PIPELINE_METRICS

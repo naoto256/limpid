@@ -11,6 +11,8 @@ pub struct Config {
     /// Optional operator-supplied node identity. The runtime resolves
     /// the host name once at startup when this is absent.
     pub(crate) node_id: Option<String>,
+    /// Optional path to the node's Ed25519 PKCS#8 private key.
+    pub(crate) node_key: Option<String>,
     pub definitions: Vec<Definition>,
     /// Global config blocks (e.g. `geoip { ... }`, `control { ... }`)
     pub global_blocks: Vec<GlobalBlock>,

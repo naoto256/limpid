@@ -1,7 +1,13 @@
-//! LTP metadata and complete-frame wire encoding.
+//! LTP metadata, complete-frame wire encoding, and node-key preflight.
 
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::path::Path;
+
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use prost::Message;
+use ring::signature::Ed25519KeyPair;
 use thiserror::Error;
 
 pub(crate) const FRAME_MAGIC: &[u8; 4] = b"LTP\0";
@@ -122,9 +128,89 @@ pub(crate) fn decode_frame(frame: &Bytes) -> Result<(LtpMeta, Bytes), FrameError
     Ok((meta, frame.slice(payload_len_end..payload_end)))
 }
 
+/// Verifies an operator-declared node key before runtime tasks start.
+///
+/// The path is opened without following a final symlink. Every later
+/// operation (metadata and read) uses that same descriptor, so a path
+/// replacement cannot redirect validation to a different inode.
+pub(crate) fn preflight_node_key(path: &Path) -> Result<()> {
+    preflight_node_key_with_open_hook(path, || {})
+}
+
+fn preflight_node_key_with_open_hook<F>(path: &Path, after_open: F) -> Result<()>
+where
+    F: FnOnce(),
+{
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("node_key '{}': secure open failed", path.display()))?;
+
+    after_open();
+
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("node_key '{}': fstat failed", path.display()))?;
+    if !metadata.is_file() {
+        bail!("node_key '{}': not a regular file", path.display());
+    }
+
+    let euid = unsafe { libc::geteuid() };
+    if !node_key_owner_matches(metadata.uid(), euid) {
+        bail!(
+            "node_key '{}': owner uid {} does not match daemon euid {}",
+            path.display(),
+            metadata.uid(),
+            euid
+        );
+    }
+
+    let mode = metadata.permissions().mode() & 0o7777;
+    if mode != 0o400 && mode != 0o600 {
+        bail!(
+            "node_key '{}': mode 0o{:o} must be exactly 0o400 or 0o600",
+            path.display(),
+            mode
+        );
+    }
+
+    let mut encoded = Vec::new();
+    file.read_to_end(&mut encoded)
+        .with_context(|| format!("node_key '{}': read failed", path.display()))?;
+    let document = pem::parse(&encoded)
+        .map_err(|_| anyhow::anyhow!("node_key '{}': invalid PRIVATE KEY PEM", path.display()))?;
+    if document.tag() != "PRIVATE KEY" {
+        bail!("node_key '{}': expected PRIVATE KEY PEM", path.display());
+    }
+    Ed25519KeyPair::from_pkcs8_maybe_unchecked(document.contents()).map_err(|_| {
+        anyhow::anyhow!(
+            "node_key '{}': invalid Ed25519 PKCS#8 private key",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn node_key_owner_matches(owner_uid: u32, daemon_euid: u32) -> bool {
+    owner_uid == daemon_euid
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
+    use std::fs;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use ring::rand::SystemRandom;
 
     fn sample_meta() -> LtpMeta {
         LtpMeta {
@@ -146,6 +232,132 @@ mod tests {
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(payload);
         Bytes::from(frame)
+    }
+
+    fn write_ed25519_key(path: &Path, mode: u32) {
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        fs::write(
+            path,
+            pem::encode(&pem::Pem::new("PRIVATE KEY", pkcs8.as_ref())),
+        )
+        .unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn node_key_preflight_accepts_generated_ed25519_at_exact_modes() {
+        for mode in [0o400, 0o600] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("node-{mode:o}.pem"));
+            write_ed25519_key(&path, mode);
+            preflight_node_key(&path).unwrap();
+        }
+    }
+
+    #[test]
+    fn node_key_preflight_accepts_standard_pkcs8_v1_ed25519() {
+        // RFC 8032 section 7.1 test vector 1 seed, wrapped in the
+        // RFC 8410 version-1 PrivateKeyInfo structure.
+        let mut pkcs8 = vec![
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        pkcs8.extend_from_slice(&[
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec,
+            0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03,
+            0x1c, 0xae, 0x7f, 0x60,
+        ]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node-v1.pem");
+        fs::write(&path, pem::encode(&pem::Pem::new("PRIVATE KEY", pkcs8))).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        preflight_node_key(&path).unwrap();
+    }
+
+    #[test]
+    fn node_key_preflight_rejects_symlinks_and_other_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("node.pem");
+        write_ed25519_key(&key, 0o600);
+        let link = dir.path().join("node-link.pem");
+        symlink(&key, &link).unwrap();
+        assert!(
+            format!("{:#}", preflight_node_key(&link).unwrap_err()).contains("secure open failed")
+        );
+
+        for mode in [0o440, 0o644, 0o700, 0o4600] {
+            fs::set_permissions(&key, fs::Permissions::from_mode(mode)).unwrap();
+            let error = preflight_node_key(&key).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("must be exactly 0o400 or 0o600"),
+                "mode {mode:o}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_key_preflight_rejects_a_fifo_without_waiting_for_a_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node-key.fifo");
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            tx.send(preflight_node_key(&path)).unwrap();
+        });
+        let error = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("secure open must not block while opening a FIFO")
+            .unwrap_err();
+        handle.join().unwrap();
+        assert!(format!("{error:#}").contains("not a regular file"));
+    }
+
+    #[test]
+    fn node_key_owner_must_match_the_daemon_even_for_root() {
+        assert!(node_key_owner_matches(501, 501));
+        assert!(node_key_owner_matches(0, 0));
+        assert!(!node_key_owner_matches(0, 501));
+        assert!(!node_key_owner_matches(501, 0));
+    }
+
+    #[test]
+    fn node_key_preflight_rejects_garbage_and_wrong_algorithm_without_leaking_material() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("node.pem");
+        let secret = "DO-NOT-LEAK-PRIVATE-MATERIAL";
+        fs::write(&key, secret).unwrap();
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+        let diagnostic = format!("{:#?}", preflight_node_key(&key).unwrap_err());
+        assert!(!diagnostic.contains(secret));
+        assert!(diagnostic.contains("invalid PRIVATE KEY PEM"));
+
+        let wrong = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        fs::write(
+            &key,
+            pem::encode(&pem::Pem::new("PRIVATE KEY", wrong.serialize_der())),
+        )
+        .unwrap();
+        let diagnostic = format!("{:#?}", preflight_node_key(&key).unwrap_err());
+        assert!(diagnostic.contains("invalid Ed25519 PKCS#8 private key"));
+    }
+
+    #[test]
+    fn node_key_preflight_fstats_and_reads_the_open_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("node.pem");
+        let moved = dir.path().join("opened-node.pem");
+        write_ed25519_key(&key, 0o600);
+
+        preflight_node_key_with_open_hook(&key, || {
+            fs::rename(&key, &moved).unwrap();
+            fs::write(&key, "replacement that is not a key").unwrap();
+            fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+        })
+        .expect("validation must stay bound to the originally opened key inode");
     }
 
     #[test]

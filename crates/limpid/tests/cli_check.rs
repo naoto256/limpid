@@ -85,6 +85,70 @@ def pipeline p {{ input i; output o }}
     }
 }
 
+#[test]
+fn check_accepts_node_key_without_accessing_the_filesystem() {
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("node-key-check.conf");
+    let missing = dir.path().join("intentionally-missing-private-key.pem");
+    fs::write(
+        &conf,
+        format!(
+            r#"node_key {:?}
+def input i {{ type syslog_tcp bind "0.0.0.0:514" }}
+def output o {{ type stdout }}
+def pipeline p {{ input i; output o }}
+"#,
+            missing.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let out = run_check(&conf);
+    assert!(
+        out.status.success(),
+        "--check must validate node_key syntax without filesystem preflight: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!missing.exists());
+}
+
+#[test]
+fn check_rejects_invalid_node_key_declarations() {
+    for (case, declaration, diagnostic) in [
+        ("empty", "node_key \"\"\n", "node_key must be non-empty"),
+        (
+            "wrong-type",
+            "node_key 42\n",
+            "node_key requires a string value",
+        ),
+        (
+            "duplicate",
+            "node_key \"one.pem\"\nnode_key \"two.pem\"\n",
+            "duplicate node_key",
+        ),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let conf = dir.path().join(format!("node-key-{case}.conf"));
+        fs::write(
+            &conf,
+            format!(
+                r#"{declaration}def input i {{ type syslog_tcp bind "0.0.0.0:514" }}
+def output o {{ type stdout }}
+def pipeline p {{ input i; output o }}
+"#
+            ),
+        )
+        .unwrap();
+        let out = run_check(&conf);
+        assert!(!out.status.success(), "{case} node_key must be rejected");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(diagnostic),
+            "{case} diagnostic: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 fn assert_node_id_rejected(case: &str, node_id: &str, diagnostic: &str) {
     let dir = TempDir::new().unwrap();
     let conf = dir.path().join(format!("node-id-{case}.conf"));
