@@ -1120,6 +1120,7 @@ dependencies = [
  "maxminddb",
  "md-5",
  "opentelemetry-proto",
+ "pem",
  "pest",
  "pest_derive",
  "pkg-config",
@@ -1128,6 +1129,7 @@ dependencies = [
  "rdkafka",
  "regex-lite",
  "reqwest",
+ "ring",
  "rustls",
  "serde",
  "serde_json",
@@ -1172,11 +1174,15 @@ dependencies = [
 name = "limpidctl"
 version = "0.7.15"
 dependencies = [
+ "base64",
  "chrono",
  "clap",
  "libc",
  "limpid-metrics-schema",
+ "pem",
+ "ring",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

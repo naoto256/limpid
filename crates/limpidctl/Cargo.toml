@@ -14,6 +14,12 @@ limpid-metrics-schema = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
+base64 = { workspace = true }
+pem = { workspace = true }
+ring = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

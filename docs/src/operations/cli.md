@@ -110,6 +110,9 @@ limpidctl stats --json
 # Health check
 limpidctl health
 limpidctl health --json
+
+# Create a new 0600 Ed25519 private key and print its SPKI public key as base64
+limpidctl ltp keygen /etc/limpid/node-key.pem
 ```
 
 `limpidctl stats` renders the established operator table from the schema-v1
@@ -118,6 +121,12 @@ family and series in deterministic human-readable order. `stats --json` prints
 the complete control-socket response unchanged. `--details` and `--json` are
 mutually exclusive. See [Metrics](./metrics.md#viewing-metrics-with-limpidctl)
 for the formatting, validation, and raw-fallback contracts.
+
+`limpidctl ltp keygen` never overwrites an existing path and does not create a
+missing parent directory. Stdout contains only the base64 SPKI public key line,
+so it can be redirected safely; status and errors are emitted on stderr. See
+[LTP node key](../configuration.md#ltp-node-key) for the daemon-side startup
+checks.
 
 ### Global options
 

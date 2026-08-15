@@ -45,6 +45,28 @@ multiple instances omit it, they expose the same host-derived identity;
 assigning distinct identities in that deployment is the operator's
 responsibility.
 
+## LTP node key
+
+The optional top-level `node_key` names an Ed25519 private-key file without
+rewriting or resolving the configured path:
+
+```limpid
+node_key "/etc/limpid/node-key.pem"
+```
+
+When declared, daemon startup and reload open the final path without following
+a symlink and require a regular file owned by the daemon's effective user with
+mode exactly `0400` or `0600`. The file must contain an Ed25519 PKCS#8
+`PRIVATE KEY` PEM. Validation and reading stay bound to the same open file
+descriptor. A failure stops startup; `limpid --check` validates only the
+configuration syntax and does not access the key file.
+
+Generate a new key with `limpidctl ltp keygen <path>`. The command creates the
+private-key file at mode `0600` without creating parent directories or
+overwriting any existing path. Its single stdout line is the RFC 8410 SPKI DER
+public key encoded as base64; the human-readable creation message is written to
+stderr.
+
 ## Global blocks
 
 ### control

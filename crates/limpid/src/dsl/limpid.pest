@@ -10,6 +10,7 @@ top_level_item = {
     definition
   | include_directive
   | node_id_directive
+  | node_key_directive
   | global_block
 }
 
@@ -23,6 +24,11 @@ node_id_directive = {
     kw_node_id ~ expr
 }
 
+// Optional Ed25519 identity key loaded by LTP-enabled runtimes.
+node_key_directive = {
+    kw_node_key ~ expr
+}
+
 definition = {
     def_input
   | def_output
@@ -33,7 +39,7 @@ definition = {
 
 // Global config block: `name { key value ... }` (no `def` keyword)
 global_block = {
-    !kw_def ~ !kw_include ~ !kw_node_id ~ ident ~ "{" ~ property* ~ "}"
+    !kw_def ~ !kw_include ~ !kw_node_id ~ !kw_node_key ~ ident ~ "{" ~ property* ~ "}"
 }
 
 // -- Comments & whitespace ---------------------------------------------------
@@ -65,6 +71,7 @@ kw_false    = _{ "false" }
 kw_null     = _{ "null" }
 kw_include  = _{ "include" }
 kw_node_id  = @{ "node_id" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_node_key = @{ "node_key" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_let      = _{ "let" }
 kw_function = _{ "function" }
 
