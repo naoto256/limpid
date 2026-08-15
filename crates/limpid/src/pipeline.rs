@@ -317,7 +317,7 @@ pub enum ErroredEventContext {
 /// point it may hold partial output of an earlier process step.
 #[derive(Debug, Clone)]
 pub struct ProcessEvent {
-    pub key: uuid::Uuid,
+    key: uuid::Uuid,
     pub source: std::net::SocketAddr,
     pub received_at: chrono::DateTime<chrono::Utc>,
     pub ingress: bytes::Bytes,
@@ -331,7 +331,7 @@ pub struct ProcessEvent {
 /// re-rendering / re-shipping.
 #[derive(Debug, Clone)]
 pub struct OutputEvent {
-    pub key: uuid::Uuid,
+    key: uuid::Uuid,
     pub source: std::net::SocketAddr,
     pub received_at: chrono::DateTime<chrono::Utc>,
     pub ingress: bytes::Bytes,
@@ -342,11 +342,16 @@ impl ProcessEvent {
     /// Snapshot the process-flavor fields from an [`OwnedEvent`].
     pub fn from_owned(ev: &OwnedEvent) -> Self {
         Self {
-            key: ev.key,
+            key: ev.key(),
             source: ev.source,
             received_at: ev.received_at,
             ingress: ev.ingress.clone(),
         }
+    }
+
+    /// Return the immutable identity of the captured event.
+    pub fn key(&self) -> uuid::Uuid {
+        self.key
     }
 }
 
@@ -354,12 +359,17 @@ impl OutputEvent {
     /// Snapshot the output-flavor fields from an [`OwnedEvent`].
     pub fn from_owned(ev: &OwnedEvent) -> Self {
         Self {
-            key: ev.key,
+            key: ev.key(),
             source: ev.source,
             received_at: ev.received_at,
             ingress: ev.ingress.clone(),
             egress: ev.egress.clone(),
         }
+    }
+
+    /// Return the immutable identity of the captured event.
+    pub fn key(&self) -> uuid::Uuid {
+        self.key
     }
 }
 

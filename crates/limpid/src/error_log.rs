@@ -92,7 +92,7 @@ use crate::pipeline::ErroredEventContext;
 impl ErroredEventContext {
     /// Serialise as a single-line JSON record for the dead-letter queue.
     ///
-    /// Layout (v2 — hard break from v1):
+    /// Layout (v3):
     ///
     /// ```text
     /// {
@@ -115,7 +115,7 @@ impl ErroredEventContext {
     ///
     /// `schema_version: 3` is the operator-visible discriminator for
     /// immutable event identity. Output records intentionally carry
-    /// *only* `{ name }` — no address, dest, path, key, topic,
+    /// *only* `{ name }` — no address, dest, path, routing key, topic,
     /// partition, endpoint, URL, peer, target, or workspace. Replay
     /// (`limpidctl inject output <name>`) hands the event back to the
     /// sink's `consume()`, which re-routes internally.
@@ -138,15 +138,13 @@ impl ErroredEventContext {
                 reason,
                 event,
             } => {
-                let ev = OwnedEvent {
-                    key: event.key,
-                    received_at: event.received_at,
-                    source: event.source,
-                    ingress: event.ingress.clone(),
-                    egress: event.ingress.clone(),
-                    workspace: std::collections::HashMap::new(),
-                    ack: None,
-                };
+                let ev = OwnedEvent::from_persisted_parts(
+                    event.key(),
+                    event.received_at,
+                    event.source,
+                    event.ingress.clone(),
+                    event.ingress.clone(),
+                );
                 let mut event_json = ev.to_json_value();
                 if let serde_json::Value::Object(ref mut map) = event_json {
                     // ProcessEvent has no egress concept — strip it so
@@ -175,15 +173,13 @@ impl ErroredEventContext {
                 output_name,
                 event,
             } => {
-                let ev = OwnedEvent {
-                    key: event.key,
-                    received_at: event.received_at,
-                    source: event.source,
-                    ingress: event.ingress.clone(),
-                    egress: event.egress.clone(),
-                    workspace: std::collections::HashMap::new(),
-                    ack: None,
-                };
+                let ev = OwnedEvent::from_persisted_parts(
+                    event.key(),
+                    event.received_at,
+                    event.source,
+                    event.ingress.clone(),
+                    event.egress.clone(),
+                );
                 let mut event_json = ev.to_json_value();
                 if let serde_json::Value::Object(ref mut map) = event_json {
                     // Output records must never carry workspace —
@@ -1567,7 +1563,7 @@ mod tests {
     #[test]
     fn process_variant_jsonl_has_no_egress_no_output_block() {
         let event = sample_owned_event();
-        let expected_key = event.key;
+        let expected_key = event.key();
         let ctx = ErroredEventContext::Process {
             timestamp: chrono::DateTime::from_timestamp_nanos(1_700_000_000_000_000_000),
             pipeline: "p".into(),
@@ -1595,7 +1591,7 @@ mod tests {
     #[test]
     fn output_variant_jsonl_carries_egress_and_output_block() {
         let event = sample_owned_event();
-        let expected_key = event.key;
+        let expected_key = event.key();
         let ctx = ErroredEventContext::Output {
             timestamp: chrono::DateTime::from_timestamp_nanos(1_700_000_000_000_000_000),
             pipeline: String::new(),
@@ -1680,7 +1676,7 @@ mod tests {
         // `Event::from_json` so `limpidctl inject output --json` can
         // reconstruct the egress payload end-to-end.
         let event = sample_owned_event();
-        let expected_key = event.key;
+        let expected_key = event.key();
         let ctx = ErroredEventContext::Output {
             timestamp: chrono::Utc::now(),
             pipeline: String::new(),
@@ -1696,13 +1692,13 @@ mod tests {
             crate::event::Event::from_json(&event_str).expect("event sub-object must replay");
         assert_eq!(&replayed.ingress[..], b"hello");
         assert_eq!(&replayed.egress[..], b"goodbye");
-        assert_eq!(replayed.key, expected_key);
+        assert_eq!(replayed.key(), expected_key);
     }
 
     #[test]
     fn process_variant_round_trip_via_event_from_json() {
         let event = sample_owned_event();
-        let expected_key = event.key;
+        let expected_key = event.key();
         let ctx = ErroredEventContext::Process {
             timestamp: chrono::Utc::now(),
             pipeline: "p".into(),
@@ -1720,7 +1716,7 @@ mod tests {
         // sees a self-consistent starting state.
         assert_eq!(&replayed.ingress[..], b"hello");
         assert_eq!(&replayed.egress[..], b"hello");
-        assert_eq!(replayed.key, expected_key);
+        assert_eq!(replayed.key(), expected_key);
     }
 
     #[tokio::test]

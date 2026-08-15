@@ -103,7 +103,7 @@ A pipeline-side failure (process body raised, pipeline-skeleton eval failed, exp
   "event": {
     "key": "0198a3b4-4d7e-7c20-8b11-9f4e6a2d1357",
     "source": {"ip": "10.0.0.1", "port": 514},
-    "received_at": 1745719719178046000,
+    "received_at": 1777260519178046000,
     "ingress": "<134>1 2026-04-27T03:28:39Z host app 1234 - - hello"
   }
 }
@@ -124,7 +124,7 @@ A sink-side failure (retry budget exhausted, batched-output shutdown drain, runt
   "event": {
     "key": "0198a3b4-4d7e-7c20-8b11-9f4e6a2d1357",
     "source": {"ip": "10.0.0.1", "port": 514},
-    "received_at": 1745719719178046000,
+    "received_at": 1777260519178046000,
     "ingress": "<134>1 2026-04-27T03:28:39Z host app 1234 - - hello",
     "egress": "<134>1 2026-04-27T03:28:39Z host app 1234 - - hello\n"
   }
@@ -183,7 +183,7 @@ The `reason` field distinguishes sites 5 / 6 / 7 within a single output name: re
 
 ### Address-free Output records
 
-The Output record carries `output: { name }` and nothing more. No peer address, endpoint URL, partition, topic, path, target, key, or workspace fragment leaks into the recovery record.
+The Output record carries `output: { name }` and nothing more. No peer address, endpoint URL, partition, topic, path, target, routing key, or workspace fragment leaks into the recovery record.
 
 Why: replay calls `limpidctl inject output <name>`, which hands the event back to the sink. The sink re-routes via the same `consume()` path it uses for live traffic — round-robin peer selection, retry budget, batching, headers, all of it. There is no "send this exact record to this exact peer" mode; the sink owns routing. Carrying address details on the record would create two failure modes: (a) replay vs. live diverging when the operator updates the sink config between failure and replay, and (b) sensitive routing metadata (peer hostnames, internal endpoint URLs) leaking into the DLQ file.
 
