@@ -13,6 +13,8 @@ mod dsl;
 mod error_log;
 mod event;
 mod functions;
+#[allow(dead_code)]
+mod ltp;
 mod metrics;
 mod modules;
 mod pipeline;
