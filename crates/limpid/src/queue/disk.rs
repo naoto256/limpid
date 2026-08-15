@@ -676,6 +676,7 @@ mod tests {
     #[test]
     fn test_event_roundtrip() {
         let mut event = make_event("<134>test");
+        let expected_key = event.key;
         event
             .workspace
             .insert("key".into(), crate::dsl::OwnedValue::String("val".into()));
@@ -684,6 +685,7 @@ mod tests {
         let json_str = serde_json::to_string(&json).unwrap();
         let recovered = Event::from_json(&json_str).unwrap();
 
+        assert_eq!(recovered.key, expected_key);
         assert_eq!(String::from_utf8_lossy(&recovered.ingress), "<134>test");
         assert_eq!(
             recovered.workspace["key"],
@@ -727,14 +729,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (tx, mut rx) = create_disk_queue(dir.path().to_str().unwrap(), 0).unwrap();
 
-        tx.send(make_event("<134>msg1")).await.unwrap();
-        tx.send(make_event("<134>msg2")).await.unwrap();
+        let first = make_event("<134>msg1");
+        let second = make_event("<134>msg2");
+        let first_key = first.key;
+        let second_key = second.key;
+        tx.send(first).await.unwrap();
+        tx.send(second).await.unwrap();
 
         let (e1, _p1) = rx.recv().await.unwrap();
         assert_eq!(String::from_utf8_lossy(&e1.ingress), "<134>msg1");
+        assert_eq!(e1.key, first_key);
 
         let (e2, _p2) = rx.recv().await.unwrap();
         assert_eq!(String::from_utf8_lossy(&e2.ingress), "<134>msg2");
+        assert_eq!(e2.key, second_key);
     }
 
     #[test]

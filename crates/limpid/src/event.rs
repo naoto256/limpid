@@ -1,10 +1,10 @@
 //! Event: the internal message representation flowing through pipelines.
 //!
-//! Each event carries an immutable `ingress` (bytes as received from
-//! the input) and a mutable `egress` (bytes that will be handed to the
-//! output), plus typed metadata and a free-form `workspace` (pipeline-
-//! local scratch namespace). `ingress` / `egress` frame the hop
-//! contract: what came in, what goes out.
+//! Each event carries an immutable UUIDv7 `key`, an immutable `ingress`
+//! (bytes as received from the input), and a mutable `egress` (bytes that
+//! will be handed to the output), plus typed metadata and a free-form
+//! `workspace` (pipeline-local scratch namespace). `ingress` / `egress`
+//! frame the hop contract: what came in, what goes out.
 //!
 //! Two representations live side by side:
 //!
@@ -168,6 +168,9 @@ impl Drop for AckHandle {
 
 #[derive(Debug, Clone)]
 pub struct OwnedEvent {
+    /// Immutable event identity, minted once at the input boundary before
+    /// fan-out and retained by clones, persistence, and replay.
+    pub key: uuid::Uuid,
     /// Wall-clock time at which this hop received the event. Set once
     /// by the input layer (`OwnedEvent::new` → `Utc::now()`); never
     /// overwritten from payload contents (Principle 2: input is dumb
@@ -196,6 +199,7 @@ pub struct OwnedEvent {
 impl OwnedEvent {
     pub fn new(ingress: Bytes, source: SocketAddr) -> Self {
         Self {
+            key: uuid::Uuid::now_v7(),
             received_at: Utc::now(),
             source,
             egress: ingress.clone(),
@@ -213,6 +217,7 @@ impl OwnedEvent {
     /// the end of `runtime::process_event`.
     pub fn with_ack(ingress: Bytes, source: SocketAddr, ack: Arc<AckHandle>) -> Self {
         Self {
+            key: uuid::Uuid::now_v7(),
             received_at: Utc::now(),
             source,
             egress: ingress.clone(),
@@ -235,6 +240,7 @@ impl OwnedEvent {
             workspace.push((arena.alloc_str(k), v.view_in(arena)));
         }
         BorrowedEvent {
+            key: self.key,
             received_at: self.received_at,
             source: self.source,
             ingress: self.ingress.clone(),
@@ -267,6 +273,10 @@ impl OwnedEvent {
 
     fn to_json_value_with(&self, include_workspace: bool) -> JsonValue {
         let mut map = serde_json::Map::new();
+        map.insert(
+            "key".into(),
+            JsonValue::String(self.key.hyphenated().to_string()),
+        );
         // Wire form is unix nanoseconds (i64) — matches OTLP
         // `time_unix_nano` and is lossless against RFC3339. Receivers
         // (`inject --json`, downstream tooling) parse the integer back
@@ -313,6 +323,20 @@ impl OwnedEvent {
     /// `OwnedValue::Bytes`.
     pub fn from_json(json_str: &str) -> Option<Self> {
         let v: JsonValue = serde_json::from_str(json_str).ok()?;
+        let key = match v.get("key") {
+            Some(JsonValue::String(raw)) => {
+                let parsed = uuid::Uuid::parse_str(raw).ok()?;
+                if parsed.get_version_num() != 7
+                    || parsed.get_variant() != uuid::Variant::RFC4122
+                    || parsed.hyphenated().to_string() != *raw
+                {
+                    return None;
+                }
+                parsed
+            }
+            Some(_) => return None,
+            None => uuid::Uuid::now_v7(),
+        };
         let ingress = json_to_bytes(v.get("ingress")?)?;
         // Source is the v0.5.6+ object form `{ip, port}` — matches the
         // DSL ident shape and what `to_json_value` emits. The legacy
@@ -338,6 +362,7 @@ impl OwnedEvent {
             .unwrap_or_else(|| ingress.clone());
 
         let mut event = Self {
+            key,
             received_at,
             source,
             ingress,
@@ -380,7 +405,7 @@ pub type Event = OwnedEvent;
 ///
 /// Semantics mirror [`OwnedEvent`]:
 ///
-/// - `received_at` / `source` — typed metadata, scalar, copy-cheap.
+/// - `key` / `received_at` / `source` — typed metadata, scalar, copy-cheap.
 /// - `ingress` / `egress` — `bytes::Bytes`. These are reference-counted
 ///   buffers, so handing them across the boundary is a refcount bump,
 ///   not a copy. They are NOT alloc'd inside `arena`, by design — the
@@ -393,6 +418,7 @@ pub type Event = OwnedEvent;
 ///   hash + entry-table indirection on a per-event basis (see the
 ///   v0.6.0 baseline — `IndexMap` ops were 11.8% on-CPU).
 pub struct BorrowedEvent<'bump> {
+    pub key: uuid::Uuid,
     pub received_at: DateTime<Utc>,
     pub source: SocketAddr,
     pub ingress: Bytes,
@@ -411,6 +437,7 @@ impl<'bump> BorrowedEvent<'bump> {
             workspace.insert((*k).to_string(), v.to_owned_value());
         }
         OwnedEvent {
+            key: self.key,
             received_at: self.received_at,
             source: self.source,
             ingress: self.ingress.clone(),
@@ -435,7 +462,7 @@ impl<'bump> BorrowedEvent<'bump> {
     /// `consume` reads `egress` (with `file`'s dynamic path evaluator
     /// reading `source` / `received_at` and `kafka`'s optional key
     /// reading `source.ip`), the DLQ record projection stores only
-    /// `OutputEvent`'s four fields, and the analyzer rejects
+    /// `OutputEvent`'s five fields, and the analyzer rejects
     /// `workspace` on the output config side at load time. Skipping
     /// the workspace deep-clone here avoids the per-event `HashMap<
     /// String, OwnedValue>` allocation + string-key allocations +
@@ -452,6 +479,7 @@ impl<'bump> BorrowedEvent<'bump> {
     /// of `to_owned` / `to_owned_without_workspace` to invoke.
     pub fn to_owned_without_workspace(&self) -> OwnedEvent {
         OwnedEvent {
+            key: self.key,
             received_at: self.received_at,
             source: self.source,
             ingress: self.ingress.clone(),
@@ -499,6 +527,7 @@ impl<'bump> BorrowedEvent<'bump> {
             workspace.push(*entry);
         }
         BorrowedEvent {
+            key: self.key,
             received_at: self.received_at,
             source: self.source,
             ingress: self.ingress.clone(),
@@ -608,6 +637,7 @@ mod boundary_tests {
         let arena = EventArena::new(&bump);
         let borrowed = original.view_in(&arena);
         let recovered: OwnedEvent = borrowed.to_owned();
+        assert_eq!(recovered.key, original.key);
         assert_eq!(recovered.received_at, original.received_at);
         assert_eq!(recovered.source, original.source);
         assert_eq!(recovered.ingress, original.ingress);
@@ -628,9 +658,14 @@ mod boundary_tests {
         // routes through the `$bytes_b64` escape pathway).
         let original = sample_event();
         let json = original.to_json_value();
+        assert_eq!(
+            json["key"].as_str(),
+            Some(original.key.hyphenated().to_string().as_str())
+        );
         let serialized = serde_json::to_string(&json).unwrap();
         let recovered =
             OwnedEvent::from_json(&serialized).expect("from_json must accept its own to_json");
+        assert_eq!(recovered.key, original.key);
         assert_eq!(recovered.received_at, original.received_at);
         assert_eq!(recovered.source, original.source);
         assert_eq!(recovered.ingress, original.ingress);
@@ -685,6 +720,7 @@ mod boundary_tests {
         let borrowed = original.view_in(&arena);
         let light = borrowed.to_owned_without_workspace();
         assert!(light.workspace.is_empty(), "workspace must be empty");
+        assert_eq!(light.key, original.key);
         // Every other DLQ / sink-relevant field must survive verbatim,
         // matching the same round-trip guarantees as `to_owned`.
         assert_eq!(light.received_at, original.received_at);
@@ -721,6 +757,7 @@ mod boundary_tests {
         let arena = EventArena::new(&bump);
         let mut view = original.view_in(&arena);
         let snapshot = view.snapshot_in(&arena);
+        assert_eq!(snapshot.key, original.key);
 
         // Mutate the source view after snapshotting.
         view.workspace_set_str(&arena, "added_after_snapshot", Value::Int(42));
@@ -814,5 +851,85 @@ mod boundary_tests {
             recovered.received_at.timestamp_nanos_opt(),
             original.received_at.timestamp_nanos_opt()
         );
+    }
+
+    #[test]
+    fn constructors_mint_distinct_version_7_keys_before_fan_out() {
+        let source = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
+        let first = OwnedEvent::new(Bytes::from_static(b"first"), source);
+        let second = OwnedEvent::new(Bytes::from_static(b"second"), source);
+
+        let (ack_tx, _ack_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ack = Arc::new(AckHandle::new(
+            AckPosition::Offset {
+                generation: 1,
+                offset: 2,
+            },
+            ack_tx,
+        ));
+        let third = OwnedEvent::with_ack(Bytes::from_static(b"third"), source, Arc::clone(&ack));
+        let fourth = OwnedEvent::with_ack(Bytes::from_static(b"fourth"), source, ack);
+
+        let _: uuid::Uuid = first.key;
+        let keys = [first.key, second.key, third.key, fourth.key];
+        assert!(keys.iter().all(|key| key.get_version_num() == 7));
+        assert!(
+            keys.iter()
+                .all(|key| key.get_variant() == uuid::Variant::RFC4122)
+        );
+        assert_eq!(
+            keys.into_iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            4
+        );
+        assert_eq!(first.clone().key, first.key);
+    }
+
+    #[test]
+    fn legacy_json_without_key_mints_one_on_first_read() {
+        let original = sample_event();
+        let mut json = original.to_json_value();
+        json.as_object_mut().unwrap().remove("key");
+
+        let encoded = serde_json::to_string(&json).unwrap();
+        let first = OwnedEvent::from_json(&encoded).unwrap();
+        let second = OwnedEvent::from_json(&encoded).unwrap();
+        assert_eq!(first.key.get_version_num(), 7);
+        assert_eq!(second.key.get_version_num(), 7);
+        assert_ne!(first.key, original.key);
+        assert_ne!(second.key, original.key);
+        assert_ne!(first.key, second.key);
+    }
+
+    #[test]
+    fn present_event_key_must_be_a_canonical_version_7_uuid() {
+        let original = sample_event();
+        let mut json = original.to_json_value();
+
+        json["key"] = JsonValue::String("not-a-uuid".into());
+        assert!(OwnedEvent::from_json(&serde_json::to_string(&json).unwrap()).is_none());
+
+        json["key"] = JsonValue::String("550e8400-e29b-41d4-a716-446655440000".into());
+        assert!(OwnedEvent::from_json(&serde_json::to_string(&json).unwrap()).is_none());
+
+        json["key"] = JsonValue::String(original.key.simple().to_string());
+        assert!(OwnedEvent::from_json(&serde_json::to_string(&json).unwrap()).is_none());
+
+        json["key"] = JsonValue::String("0198A3B4-4D7E-7C20-8B11-9F4E6A2D1357".into());
+        assert!(OwnedEvent::from_json(&serde_json::to_string(&json).unwrap()).is_none());
+
+        json["key"] = JsonValue::String("0198a3b4-4d7e-7c20-0b11-9f4e6a2d1357".into());
+        assert!(OwnedEvent::from_json(&serde_json::to_string(&json).unwrap()).is_none());
+
+        for invalid in [
+            JsonValue::Null,
+            JsonValue::Number(7.into()),
+            JsonValue::Bool(true),
+            serde_json::json!({ "uuid": original.key.hyphenated().to_string() }),
+        ] {
+            json["key"] = invalid;
+            assert!(OwnedEvent::from_json(&serde_json::to_string(&json).unwrap()).is_none());
+        }
     }
 }
