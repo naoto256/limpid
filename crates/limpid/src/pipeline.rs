@@ -40,6 +40,7 @@ use crate::tap::TapRegistry;
 #[derive(Clone)]
 pub struct CompiledConfig {
     pub(crate) node_id: Option<String>,
+    pub(crate) node_key: Option<String>,
     pub inputs: HashMap<String, InputDef>,
     pub outputs: HashMap<String, OutputDef>,
     pub processes: HashMap<String, ProcessDef>,
@@ -102,6 +103,7 @@ impl CompiledConfig {
 
         let compiled = Self {
             node_id: config.node_id,
+            node_key: config.node_key,
             inputs,
             outputs,
             processes,
@@ -2028,6 +2030,12 @@ mod tests {
 
     fn compile(src: &str) -> Result<CompiledConfig> {
         CompiledConfig::from_config(parse_config(src)?)
+    }
+
+    #[test]
+    fn compile_preserves_node_key_path_without_normalizing_it() {
+        let config = compile(r#"node_key "../identity/node.pem""#).unwrap();
+        assert_eq!(config.node_key.as_deref(), Some("../identity/node.pem"));
     }
 
     #[test]

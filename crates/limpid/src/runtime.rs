@@ -74,6 +74,9 @@ impl Runtime {
         let func_registry = Arc::new(func_registry);
 
         config.validate()?;
+        if let Some(node_key) = &config.node_key {
+            crate::ltp::preflight_node_key(Path::new(node_key))?;
+        }
         let node_id = match &config.node_id {
             Some(node_id) => node_id.clone(),
             None => resolve_hostname()?,
@@ -2186,6 +2189,87 @@ def pipeline p { process a }
     #[tokio::test]
     async fn startup_without_node_id_resolves_hostname_once_and_registers_that_value() {
         assert_startup_build_info(None, "resolved-host-1", 1).await;
+    }
+
+    #[tokio::test]
+    async fn startup_preflights_a_declared_node_key_and_ignores_an_omitted_one() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o750))
+            .expect("secure control parent");
+        let socket = dir.path().join("control.sock");
+        let key = dir.path().join("node-key.pem");
+        let pkcs8 =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .expect("generate key");
+        std::fs::write(
+            &key,
+            pem::encode(&pem::Pem::new("PRIVATE KEY", pkcs8.as_ref())),
+        )
+        .expect("write key");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600))
+            .expect("secure key mode");
+
+        let source = format!(
+            "node_id \"node-a\"\nnode_key {:?}\ncontrol {{ socket {:?} }}",
+            key.display().to_string(),
+            socket.display().to_string()
+        );
+        let runtime = Runtime::start(
+            compiled_config(&source),
+            PathBuf::from("node-key-startup-test.limpid"),
+        )
+        .await
+        .expect("declared valid key must pass startup preflight");
+        runtime.shutdown().await;
+
+        let omitted_socket = dir.path().join("omitted-control.sock");
+        let omitted = format!(
+            "node_id \"node-a\"\ncontrol {{ socket {:?} }}",
+            omitted_socket.display().to_string()
+        );
+        let runtime = Runtime::start(
+            compiled_config(&omitted),
+            PathBuf::from("missing-path-is-not-consulted.limpid"),
+        )
+        .await
+        .expect("omitted node_key must not trigger filesystem preflight");
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn startup_fails_before_tasks_when_a_declared_node_key_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o750))
+            .expect("secure control parent");
+        let socket = dir.path().join("control.sock");
+        let missing = dir.path().join("missing-node-key.pem");
+        let source = format!(
+            "node_id \"node-a\"\nnode_key {:?}\ncontrol {{ socket {:?} }}",
+            missing.display().to_string(),
+            socket.display().to_string()
+        );
+
+        let error = match Runtime::start(
+            compiled_config(&source),
+            PathBuf::from("node-key-failure-test.limpid"),
+        )
+        .await
+        {
+            Ok(runtime) => {
+                runtime.shutdown().await;
+                panic!("declared missing node_key must fail startup")
+            }
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("secure open failed"));
+        assert!(
+            !socket.exists(),
+            "control task must not start before key preflight"
+        );
     }
 
     #[tokio::test]

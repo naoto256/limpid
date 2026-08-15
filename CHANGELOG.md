@@ -8,6 +8,15 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+### Added — LTP node key provisioning
+
+The optional top-level `node_key` selects an Ed25519 PKCS#8 private-key file.
+Daemon startup and reload validate its owner, exact `0400`/`0600` mode, regular
+file type, and key format through one non-symlink-following file descriptor.
+`limpidctl ltp keygen <path>` creates a new `0600` key without overwriting an
+existing path and prints the matching RFC 8410 SPKI public key as one base64
+line.
+
 ### Added — immutable event identity
 
 Every event now receives a UUIDv7 `key` before fan-out. The key is preserved

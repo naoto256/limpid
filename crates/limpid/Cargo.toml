@@ -41,7 +41,9 @@ sha2 = "0.10"
 sha1 = "0.10"
 md-5 = "0.10"
 digest = "0.10"
-base64 = "0.22"
+base64 = { workspace = true }
+pem = { workspace = true }
+ring = { workspace = true }
 indexmap = { version = "2", features = ["serde"] }
 # Per-event bump arena for the DSL `Value` tree. Each event allocates
 # transient `Value::Object` / `Value::Array` / `Value::String` /

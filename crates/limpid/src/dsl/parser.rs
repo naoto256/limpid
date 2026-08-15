@@ -35,6 +35,7 @@ pub fn parse_config_with_file_id(input: &str, file_id: u32) -> Result<Config> {
     let mut global_blocks = Vec::new();
     let mut includes = Vec::new();
     let mut node_id = None;
+    let mut node_key = None;
 
     for pair in config_pair.into_inner() {
         match pair.as_rule() {
@@ -88,6 +89,24 @@ pub fn parse_config_with_file_id(input: &str, file_id: u32) -> Result<Config> {
                             bail!("duplicate node_id");
                         }
                     }
+                    Rule::node_key_directive => {
+                        let mut directive = inner.into_inner();
+                        let keyword = directive.next().expect("pest grammar invariant");
+                        debug_assert_eq!(keyword.as_rule(), Rule::kw_node_key);
+                        let value = parse_expr_from_pair(
+                            directive.next().expect("pest grammar invariant"),
+                            file_id,
+                        )?;
+                        let ExprKind::StringLit(value) = value.kind else {
+                            bail!("node_key requires a string value");
+                        };
+                        if value.is_empty() {
+                            bail!("node_key must be non-empty");
+                        }
+                        if node_key.replace(value).is_some() {
+                            bail!("duplicate node_key");
+                        }
+                    }
                     Rule::global_block => {
                         global_blocks.push(parse_global_block(inner, file_id)?);
                     }
@@ -101,6 +120,7 @@ pub fn parse_config_with_file_id(input: &str, file_id: u32) -> Result<Config> {
 
     Ok(Config {
         node_id,
+        node_key,
         definitions,
         global_blocks,
         includes,
@@ -1113,6 +1133,30 @@ fn first_inner(pair: Pair<Rule>) -> Result<Pair<Rule>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_key_accepts_one_non_empty_string_and_preserves_the_path() {
+        let config = parse_config(r#"node_key "../identity/node.pem""#).unwrap();
+        assert_eq!(config.node_key.as_deref(), Some("../identity/node.pem"));
+    }
+
+    #[test]
+    fn node_key_rejects_empty_non_string_and_duplicate_values() {
+        for (source, expected) in [
+            (r#"node_key """#, "node_key must be non-empty"),
+            ("node_key 1", "node_key requires a string value"),
+            (
+                "node_key \"one.pem\"\nnode_key \"two.pem\"",
+                "duplicate node_key",
+            ),
+        ] {
+            let error = parse_config(source).expect_err("invalid node_key must fail");
+            assert!(
+                format!("{error:#}").contains(expected),
+                "{source:?} did not report {expected:?}: {error:#}"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_input_def() {
