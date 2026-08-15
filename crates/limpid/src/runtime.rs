@@ -738,7 +738,7 @@ async fn run_pipeline_with_outputs_inner(
     let outputs = std::mem::take(&mut result.outputs);
     // Each failed enqueue carries a per-output snapshot of just the
     // fields the DLQ record actually stores (`OutputEvent`:
-    // `source`, `received_at`, `ingress`, `egress` — the same shape
+    // `key`, `source`, `received_at`, `ingress`, `egress` — the same shape
     // `inject output` replay needs). Snapshotting `OutputEvent` here
     // rather than the whole `OwnedEvent` avoids the workspace
     // `HashMap<String, OwnedValue>` deep clone on every success:
@@ -755,7 +755,7 @@ async fn run_pipeline_with_outputs_inner(
     for (output_name, event) in outputs {
         if let Some(sender) = ctx.output_senders.get(&output_name) {
             // Snapshot the DLQ-relevant fields before the send
-            // consumes `event`. Cheap: four Copy scalars + two
+            // consumes `event`. Cheap: five Copy scalars + two
             // `Bytes` refcount bumps; workspace is not touched.
             let snapshot = crate::pipeline::OutputEvent::from_owned(&event);
             if let Err(e) = sender.send(event).await {
