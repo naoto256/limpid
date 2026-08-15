@@ -23,7 +23,7 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use limpid_metrics_schema::{
     DROPPED_ROOT_PROCESS_NAME, DROPPED_ROOT_STEP, EVENTS_DROPPED_TOTAL, MetricFamily, MetricType,
-    MetricsSnapshot, PROCESS_PATH_ROOT,
+    MetricsSnapshot, PROCESS_PATH_ROOT, process_path_leaf,
 };
 
 const DEFAULT_SOCKET: &str = "/var/run/limpid/control.sock";
@@ -562,11 +562,16 @@ fn render_default_stats_inner(
                     if item.labels.len() != 4 {
                         return None;
                     }
+                    let process_path = item.labels.get("process_path")?.clone();
+                    let process_name = item.labels.get("process_name")?.clone();
+                    if process_path_leaf(&process_path)? != process_name {
+                        return None;
+                    }
                     let identity = ProcessIdentity {
                         pipeline: item.labels.get("pipeline")?.clone(),
                         step: item.labels.get("step")?.parse().ok()?,
-                        process_path: item.labels.get("process_path")?.clone(),
-                        process_name: item.labels.get("process_name")?.clone(),
+                        process_path,
+                        process_name,
                     };
                     if process_values.insert(identity, item.value).is_some() {
                         return None;
