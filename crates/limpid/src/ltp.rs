@@ -137,6 +137,24 @@ pub(crate) fn preflight_node_key(path: &Path) -> Result<()> {
     preflight_node_key_with_open_hook(path, || {})
 }
 
+const MAX_NODE_KEY_FILE_LEN: usize = 64 * 1024;
+
+fn read_node_key_bounded<R: Read>(reader: &mut R, path: &Path) -> Result<Vec<u8>> {
+    let mut encoded = Vec::new();
+    reader
+        .take((MAX_NODE_KEY_FILE_LEN + 1) as u64)
+        .read_to_end(&mut encoded)
+        .with_context(|| format!("node_key '{}': read failed", path.display()))?;
+    if encoded.len() > MAX_NODE_KEY_FILE_LEN {
+        bail!(
+            "node_key '{}': file exceeds {} bytes",
+            path.display(),
+            MAX_NODE_KEY_FILE_LEN
+        );
+    }
+    Ok(encoded)
+}
+
 fn preflight_node_key_with_open_hook<F>(path: &Path, after_open: F) -> Result<()>
 where
     F: FnOnce(),
@@ -179,9 +197,7 @@ where
         );
     }
 
-    let mut encoded = Vec::new();
-    file.read_to_end(&mut encoded)
-        .with_context(|| format!("node_key '{}': read failed", path.display()))?;
+    let encoded = read_node_key_bounded(&mut file, path)?;
     let document = pem::parse(&encoded)
         .map_err(|_| anyhow::anyhow!("node_key '{}': invalid PRIVATE KEY PEM", path.display()))?;
     if document.tag() != "PRIVATE KEY" {
@@ -211,6 +227,19 @@ mod tests {
     use std::time::Duration;
 
     use ring::rand::SystemRandom;
+
+    struct CountingReader<R> {
+        inner: R,
+        bytes_read: usize,
+    }
+
+    impl<R: Read> Read for CountingReader<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.inner.read(buffer)?;
+            self.bytes_read += count;
+            Ok(count)
+        }
+    }
 
     fn sample_meta() -> LtpMeta {
         LtpMeta {
@@ -343,6 +372,34 @@ mod tests {
         .unwrap();
         let diagnostic = format!("{:#?}", preflight_node_key(&key).unwrap_err());
         assert!(diagnostic.contains("invalid Ed25519 PKCS#8 private key"));
+    }
+
+    #[test]
+    fn node_key_preflight_enforces_the_exact_64_kib_file_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("node.pem");
+        fs::write(&key, vec![b'x'; MAX_NODE_KEY_FILE_LEN]).unwrap();
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+        let exact_limit = format!("{:#}", preflight_node_key(&key).unwrap_err());
+        assert!(exact_limit.contains("invalid PRIVATE KEY PEM"));
+        assert!(!exact_limit.contains("file exceeds"));
+
+        fs::write(&key, vec![b'x'; MAX_NODE_KEY_FILE_LEN + 1]).unwrap();
+        let over_limit = format!("{:#}", preflight_node_key(&key).unwrap_err());
+        assert!(over_limit.contains("file exceeds 65536 bytes"));
+    }
+
+    #[test]
+    fn node_key_bounded_reader_stops_after_limit_plus_one() {
+        let input = vec![b'x'; MAX_NODE_KEY_FILE_LEN + 4096];
+        let mut reader = CountingReader {
+            inner: std::io::Cursor::new(input),
+            bytes_read: 0,
+        };
+        let error = read_node_key_bounded(&mut reader, Path::new("counted.pem")).unwrap_err();
+
+        assert!(format!("{error:#}").contains("file exceeds 65536 bytes"));
+        assert_eq!(reader.bytes_read, MAX_NODE_KEY_FILE_LEN + 1);
     }
 
     #[test]
