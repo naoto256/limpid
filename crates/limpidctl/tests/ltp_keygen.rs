@@ -112,6 +112,11 @@ fn keygen_removes_the_created_file_when_persisting_fails() {
         !path.exists(),
         "failed subprocess must not leave key residue"
     );
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        0,
+        "failed subprocess must not leave a temporary file"
+    );
 }
 
 #[test]
@@ -136,4 +141,28 @@ fn keygen_enforces_mode_0600_even_under_a_restrictive_umask() {
         std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
         0o600
     );
+}
+
+#[test]
+fn keygen_publishes_a_bare_relative_path_in_the_current_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_limpidctl"));
+    command
+        .current_dir(dir.path())
+        .arg("ltp")
+        .arg("keygen")
+        .arg("node.pem");
+
+    let output = command.output().expect("run relative-path keygen");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let path = dir.path().join("node.pem");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+        0o600
+    );
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 }
