@@ -1977,13 +1977,15 @@ def output o {{
         props
     }
 
-    async fn buffer_two(output: &OtlpHttpOutput) {
+    async fn buffer_two(output: &OtlpHttpOutput) -> [uuid::Uuid; 2] {
+        let mut keys = Vec::with_capacity(2);
         for ts in [1u64, 2u64] {
-            consume(output, &event_with_egress(singleton_bytes(ts)))
-                .await
-                .unwrap();
+            let event = event_with_egress(singleton_bytes(ts));
+            keys.push(event.key());
+            consume(output, &event).await.unwrap();
         }
         assert_eq!(output.sink.inner.batch.lock().await.len(), 2);
+        keys.try_into().unwrap()
     }
 
     #[tokio::test]
@@ -1997,7 +1999,7 @@ def output o {{
             ..crate::modules::BuildContext::for_testing()
         };
         let output = OtlpHttpOutput::from_properties("myout", &mp(&props), &ctx).unwrap();
-        buffer_two(&output).await;
+        let expected_keys = buffer_two(&output).await;
 
         output.shutdown(Some(&writer)).await.unwrap();
         assert_eq!(output.sink.inner.batch.lock().await.len(), 0);
@@ -2005,12 +2007,12 @@ def output o {{
         let body = tokio::fs::read_to_string(&path).await.unwrap();
         let lines: Vec<&str> = body.lines().collect();
         assert_eq!(lines.len(), 2);
-        for line in &lines {
+        for (line, expected_key) in lines.iter().zip(expected_keys) {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
             assert_eq!(v["schema_version"], 3);
             assert_eq!(v["kind"], "output");
             assert_eq!(v["output"]["name"], "myout");
-            assert!(v["event"]["key"].is_string());
+            assert_eq!(v["event"]["key"], expected_key.hyphenated().to_string());
             // The reason carries the underlying transport error from
             // `flush_events`; the exact wording is implementation
             // detail.

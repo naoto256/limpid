@@ -170,7 +170,7 @@ impl Drop for AckHandle {
 pub struct OwnedEvent {
     /// Immutable event identity, minted once at the input boundary before
     /// fan-out and retained by clones, persistence, and replay.
-    pub key: uuid::Uuid,
+    key: uuid::Uuid,
     /// Wall-clock time at which this hop received the event. Set once
     /// by the input layer (`OwnedEvent::new` → `Utc::now()`); never
     /// overwritten from payload contents (Principle 2: input is dumb
@@ -227,6 +227,30 @@ impl OwnedEvent {
         }
     }
 
+    /// Return this event's immutable identity.
+    pub fn key(&self) -> uuid::Uuid {
+        self.key
+    }
+
+    /// Reconstruct an event from persisted fields while retaining its identity.
+    pub(crate) fn from_persisted_parts(
+        key: uuid::Uuid,
+        received_at: DateTime<Utc>,
+        source: SocketAddr,
+        ingress: Bytes,
+        egress: Bytes,
+    ) -> Self {
+        Self {
+            key,
+            received_at,
+            source,
+            ingress,
+            egress,
+            workspace: HashMap::new(),
+            ack: None,
+        }
+    }
+
     /// Copy this owned event into `arena` and return a [`BorrowedEvent`]
     /// view. Workspace string keys are alloc'd into the arena and each
     /// value is recursively viewed (see [`OwnedValue::view_in`]).
@@ -240,7 +264,7 @@ impl OwnedEvent {
             workspace.push((arena.alloc_str(k), v.view_in(arena)));
         }
         BorrowedEvent {
-            key: self.key,
+            key: self.key(),
             received_at: self.received_at,
             source: self.source,
             ingress: self.ingress.clone(),
@@ -418,7 +442,7 @@ pub type Event = OwnedEvent;
 ///   hash + entry-table indirection on a per-event basis (see the
 ///   v0.6.0 baseline — `IndexMap` ops were 11.8% on-CPU).
 pub struct BorrowedEvent<'bump> {
-    pub key: uuid::Uuid,
+    key: uuid::Uuid,
     pub received_at: DateTime<Utc>,
     pub source: SocketAddr,
     pub ingress: Bytes,
@@ -427,6 +451,11 @@ pub struct BorrowedEvent<'bump> {
 }
 
 impl<'bump> BorrowedEvent<'bump> {
+    /// Return this event's immutable identity.
+    pub fn key(&self) -> uuid::Uuid {
+        self.key
+    }
+
     /// Heap-allocate a fresh [`OwnedEvent`] from this borrowed view.
     /// Called at `run_pipeline` exit and at error path setup
     /// (`ErroredEventContext` holds an `OwnedEvent` because the DLQ
@@ -437,7 +466,7 @@ impl<'bump> BorrowedEvent<'bump> {
             workspace.insert((*k).to_string(), v.to_owned_value());
         }
         OwnedEvent {
-            key: self.key,
+            key: self.key(),
             received_at: self.received_at,
             source: self.source,
             ingress: self.ingress.clone(),
@@ -479,7 +508,7 @@ impl<'bump> BorrowedEvent<'bump> {
     /// of `to_owned` / `to_owned_without_workspace` to invoke.
     pub fn to_owned_without_workspace(&self) -> OwnedEvent {
         OwnedEvent {
-            key: self.key,
+            key: self.key(),
             received_at: self.received_at,
             source: self.source,
             ingress: self.ingress.clone(),
@@ -527,7 +556,7 @@ impl<'bump> BorrowedEvent<'bump> {
             workspace.push(*entry);
         }
         BorrowedEvent {
-            key: self.key,
+            key: self.key(),
             received_at: self.received_at,
             source: self.source,
             ingress: self.ingress.clone(),
@@ -870,8 +899,8 @@ mod boundary_tests {
         let third = OwnedEvent::with_ack(Bytes::from_static(b"third"), source, Arc::clone(&ack));
         let fourth = OwnedEvent::with_ack(Bytes::from_static(b"fourth"), source, ack);
 
-        let _: uuid::Uuid = first.key;
-        let keys = [first.key, second.key, third.key, fourth.key];
+        let _: uuid::Uuid = first.key();
+        let keys = [first.key(), second.key(), third.key(), fourth.key()];
         assert!(keys.iter().all(|key| key.get_version_num() == 7));
         assert!(
             keys.iter()
