@@ -123,6 +123,22 @@ impl CompiledConfig {
     /// already reject unknown types at build time), so there is
     /// nothing left here that needs the registry.
     pub fn validate(&self) -> Result<()> {
+        if self.node_key.is_none()
+            && self
+                .outputs
+                .values()
+                .any(|output| output.properties.type_name() == "ltp")
+        {
+            bail!("output type 'ltp' requires top-level node_key");
+        }
+        for (name, output) in &self.outputs {
+            if output.properties.type_name() == "ltp" {
+                crate::modules::output::ltp::validate_static_properties(
+                    name,
+                    output.properties.user_properties(),
+                )?;
+            }
+        }
         for (name, pipeline) in &self.pipelines {
             for stmt in &pipeline.body {
                 self.validate_pipeline_stmt(name, stmt)?;
@@ -2036,6 +2052,25 @@ mod tests {
     fn compile_preserves_node_key_path_without_normalizing_it() {
         let config = compile(r#"node_key "../identity/node.pem""#).unwrap();
         assert_eq!(config.node_key.as_deref(), Some("../identity/node.pem"));
+    }
+
+    #[test]
+    fn ltp_output_requires_node_key_without_touching_the_filesystem() {
+        let config = compile(
+            r#"
+def output out {
+    type ltp
+    peer {
+        node_id "peer-a"
+        pubkey "MCowBQYDK2VwAyEA//////////////////////////////////////////8="
+        endpoint "collector.example"
+    }
+}
+"#,
+        )
+        .unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(format!("{error:#}").contains("node_key"));
     }
 
     #[test]

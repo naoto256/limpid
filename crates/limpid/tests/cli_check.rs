@@ -113,6 +113,87 @@ def pipeline p {{ input i; output o }}
 }
 
 #[test]
+fn check_validates_ltp_statically_without_accessing_node_key() {
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("ltp-check.conf");
+    let missing = dir.path().join("intentionally-missing-private-key.pem");
+    fs::write(
+        &conf,
+        format!(
+            r#"node_key {:?}
+def output out {{
+    type ltp
+    peer {{
+        node_id "peer-a"
+        pubkey "MCowBQYDK2VwAyEA//////////////////////////////////////////8="
+        endpoint "collector.example"
+    }}
+}}
+"#,
+            missing.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let out = run_check(&conf);
+    assert!(
+        out.status.success(),
+        "--check must remain filesystem-free: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!missing.exists());
+}
+
+#[test]
+fn check_rejects_ltp_requiredness_spki_and_endpoint_errors() {
+    for (case, prefix, pubkey, endpoint, expected) in [
+        (
+            "missing-node-key",
+            "",
+            "MCowBQYDK2VwAyEA//////////////////////////////////////////8=",
+            "collector.example",
+            "requires top-level node_key",
+        ),
+        (
+            "invalid-spki",
+            "node_key \"missing.pem\"\n",
+            "bm90LWFuLWVkaWZmLTE5LXNwa2k=",
+            "collector.example",
+            "Ed25519 SPKI",
+        ),
+        (
+            "invalid-endpoint",
+            "node_key \"missing.pem\"\n",
+            "MCowBQYDK2VwAyEA//////////////////////////////////////////8=",
+            "collector.example:70000",
+            "endpoint port",
+        ),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let conf = dir.path().join(format!("ltp-{case}.conf"));
+        fs::write(
+            &conf,
+            format!(
+                r#"{prefix}def output out {{
+    type ltp
+    peer {{ node_id "peer-a" pubkey "{pubkey}" endpoint "{endpoint}" }}
+}}
+"#
+            ),
+        )
+        .unwrap();
+
+        let out = run_check(&conf);
+        assert!(!out.status.success(), "{case} must fail");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(expected),
+            "{case}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
 fn check_rejects_invalid_node_key_declarations() {
     for (case, declaration, diagnostic) in [
         ("empty", "node_key \"\"\n", "node_key must be non-empty"),
