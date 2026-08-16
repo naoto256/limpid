@@ -1145,6 +1145,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "webpki-roots",
+ "zeroize",
 ]
 
 [[package]]
