@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use prost::Message;
-use ring::signature::Ed25519KeyPair;
+use ring::signature::{Ed25519KeyPair, KeyPair as _};
 use thiserror::Error;
 
 pub(crate) const FRAME_MAGIC: &[u8; 4] = b"LTP\0";
@@ -17,6 +17,9 @@ pub(crate) const PAYLOAD_LEN_SIZE: usize = size_of::<u32>();
 pub(crate) const FRAME_PREFIX_SIZE: usize = FRAME_MAGIC.len() + 1 + META_LEN_SIZE;
 pub(crate) const MAX_META_LEN: usize = 64 * 1024;
 pub(crate) const MAX_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
+pub(crate) const ED25519_SPKI_PREFIX: [u8; 12] = [
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
 
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct LtpMeta {
@@ -34,6 +37,30 @@ pub(crate) struct HopStamp {
     pub(crate) arrival_unix_nano: u64,
     #[prost(fixed64, tag = "3")]
     pub(crate) departure_unix_nano: u64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub(crate) struct LtpHello {
+    #[prost(string, tag = "1")]
+    pub(crate) node_id: String,
+}
+
+/// Key bytes read and validated from one securely opened descriptor.
+/// Runtime keeps this value in memory so LTP outputs never reopen the
+/// operator path after the startup preflight.
+pub(crate) struct ValidatedNodeKey {
+    pkcs8_der: Vec<u8>,
+    public_key_spki: Vec<u8>,
+}
+
+impl ValidatedNodeKey {
+    pub(crate) fn pkcs8_der(&self) -> &[u8] {
+        &self.pkcs8_der
+    }
+
+    pub(crate) fn public_key_spki(&self) -> &[u8] {
+        &self.public_key_spki
+    }
 }
 
 #[derive(Debug, Error)]
@@ -55,6 +82,14 @@ pub(crate) enum FrameError {
 }
 
 pub(crate) fn encode_frame(meta: &LtpMeta, payload: &[u8]) -> Result<Vec<u8>, FrameError> {
+    encode_message_frame(meta, payload)
+}
+
+pub(crate) fn encode_hello_frame(hello: &LtpHello) -> Result<Vec<u8>, FrameError> {
+    encode_message_frame(hello, &[])
+}
+
+fn encode_message_frame<M: Message>(meta: &M, payload: &[u8]) -> Result<Vec<u8>, FrameError> {
     let meta_len = meta.encoded_len();
     if meta_len > MAX_META_LEN {
         return Err(FrameError::MetaTooLarge(meta_len));
@@ -134,7 +169,7 @@ pub(crate) fn decode_frame(frame: &Bytes) -> Result<(LtpMeta, Bytes), FrameError
 /// operation (metadata and read) uses that same descriptor, so a path
 /// replacement cannot redirect validation to a different inode.
 pub(crate) fn preflight_node_key(path: &Path) -> Result<()> {
-    preflight_node_key_with_open_hook(path, || {})
+    load_node_key(path).map(|_| ())
 }
 
 const MAX_NODE_KEY_FILE_LEN: usize = 64 * 1024;
@@ -155,7 +190,18 @@ fn read_node_key_bounded<R: Read>(reader: &mut R, path: &Path) -> Result<Vec<u8>
     Ok(encoded)
 }
 
+pub(crate) fn load_node_key(path: &Path) -> Result<ValidatedNodeKey> {
+    load_node_key_with_open_hook(path, || {})
+}
+
 fn preflight_node_key_with_open_hook<F>(path: &Path, after_open: F) -> Result<()>
+where
+    F: FnOnce(),
+{
+    load_node_key_with_open_hook(path, after_open).map(|_| ())
+}
+
+fn load_node_key_with_open_hook<F>(path: &Path, after_open: F) -> Result<ValidatedNodeKey>
 where
     F: FnOnce(),
 {
@@ -203,13 +249,20 @@ where
     if document.tag() != "PRIVATE KEY" {
         bail!("node_key '{}': expected PRIVATE KEY PEM", path.display());
     }
-    Ed25519KeyPair::from_pkcs8_maybe_unchecked(document.contents()).map_err(|_| {
+    let pkcs8_der = document.contents().to_vec();
+    let key_pair = Ed25519KeyPair::from_pkcs8_maybe_unchecked(&pkcs8_der).map_err(|_| {
         anyhow::anyhow!(
             "node_key '{}': invalid Ed25519 PKCS#8 private key",
             path.display()
         )
     })?;
-    Ok(())
+    let mut public_key_spki = Vec::with_capacity(ED25519_SPKI_PREFIX.len() + 32);
+    public_key_spki.extend_from_slice(&ED25519_SPKI_PREFIX);
+    public_key_spki.extend_from_slice(key_pair.public_key().as_ref());
+    Ok(ValidatedNodeKey {
+        pkcs8_der,
+        public_key_spki,
+    })
 }
 
 fn node_key_owner_matches(owner_uid: u32, daemon_euid: u32) -> bool {
@@ -271,6 +324,44 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn secure_node_key_load_returns_the_validated_material_from_the_open_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("node.pem");
+        let moved = dir.path().join("opened-node.pem");
+        write_ed25519_key(&key, 0o600);
+
+        let loaded = load_node_key_with_open_hook(&key, || {
+            fs::rename(&key, &moved).unwrap();
+            fs::write(&key, "replacement that is not a key").unwrap();
+            fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+        })
+        .expect("load must stay bound to the originally opened key inode");
+
+        assert_eq!(loaded.public_key_spki().len(), 44);
+        assert_eq!(&loaded.public_key_spki()[..12], &ED25519_SPKI_PREFIX);
+        assert!(!loaded.pkcs8_der().is_empty());
+    }
+
+    #[test]
+    fn hello_uses_the_outer_frame_and_has_empty_payload() {
+        let encoded = encode_hello_frame(&LtpHello {
+            node_id: "node-a".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(
+            encoded,
+            [
+                FRAME_MAGIC.as_slice(),
+                &[FRAME_VERSION],
+                &8_u32.to_be_bytes(),
+                &[0x0a, 0x06, b'n', b'o', b'd', b'e', b'-', b'a'],
+                &0_u32.to_be_bytes(),
+            ]
+            .concat()
+        );
     }
 
     #[test]

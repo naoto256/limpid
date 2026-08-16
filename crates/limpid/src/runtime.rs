@@ -74,9 +74,13 @@ impl Runtime {
         let func_registry = Arc::new(func_registry);
 
         config.validate()?;
-        if let Some(node_key) = &config.node_key {
-            crate::ltp::preflight_node_key(Path::new(node_key))?;
-        }
+        let ltp_node_key = config
+            .node_key
+            .as_deref()
+            .map(Path::new)
+            .map(crate::ltp::load_node_key)
+            .transpose()?
+            .map(Arc::new);
         let node_id = match &config.node_id {
             Some(node_id) => node_id.clone(),
             None => resolve_hostname()?,
@@ -157,6 +161,8 @@ impl Runtime {
             error_log: error_log.as_ref().map(Arc::clone),
             error_log_fallback,
             shutdown_signal: shutdown_rx.clone(),
+            ltp_node_id: Some(Arc::<str>::from(node_id.clone())),
+            ltp_node_key,
         };
 
         // --- 1. Create outputs (each output owns its own OutputMetrics) ---
@@ -2193,6 +2199,8 @@ def pipeline p { process a }
 
     #[tokio::test]
     async fn startup_preflights_a_declared_node_key_and_ignores_an_omitted_one() {
+        use base64::Engine as _;
+        use ring::signature::KeyPair as _;
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2210,11 +2218,17 @@ def pipeline p { process a }
         .expect("write key");
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600))
             .expect("secure key mode");
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let mut spki = crate::ltp::ED25519_SPKI_PREFIX.to_vec();
+        spki.extend_from_slice(pair.public_key().as_ref());
+        let peer_pubkey = base64::engine::general_purpose::STANDARD.encode(spki);
 
         let source = format!(
-            "node_id \"node-a\"\nnode_key {:?}\ncontrol {{ socket {:?} }}",
+            "node_id \"node-a\"\nnode_key {:?}\ncontrol {{ socket {:?} }}\n\
+             def output ltp_out {{ type ltp peer {{ node_id \"peer-a\" pubkey {:?} endpoint \"127.0.0.1:1\" }} }}",
             key.display().to_string(),
-            socket.display().to_string()
+            socket.display().to_string(),
+            peer_pubkey,
         );
         let runtime = Runtime::start(
             compiled_config(&source),

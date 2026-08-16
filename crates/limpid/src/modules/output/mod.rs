@@ -6,6 +6,7 @@ pub mod http;
 pub(crate) mod http_util;
 #[cfg(feature = "kafka")]
 pub mod kafka;
+pub mod ltp;
 pub mod otlp;
 pub(crate) mod persistent_conn;
 pub mod stdout;
