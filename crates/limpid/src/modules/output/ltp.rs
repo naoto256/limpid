@@ -9,11 +9,7 @@ use chrono::{DateTime, Utc};
 use rustls::client::AlwaysResolvesClientRawPublicKeys;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::WebPkiSupportedAlgorithms;
-use rustls::pki_types::{
-    CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, SubjectPublicKeyInfoDer,
-    UnixTime,
-};
-use rustls::sign::CertifiedKey;
+use rustls::pki_types::{CertificateDer, ServerName, SubjectPublicKeyInfoDer, UnixTime};
 use rustls::{
     CertificateError, ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme,
 };
@@ -208,16 +204,6 @@ fn build_rpk_connector(
 ) -> Result<TlsConnector> {
     crate::tls::install_default_crypto_provider();
     let provider = rustls::crypto::aws_lc_rs::default_provider();
-    let signing_key = provider
-        .key_provider
-        .load_private_key(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            node_key.pkcs8_der().to_vec(),
-        )))
-        .context("load validated LTP node key into rustls")?;
-    let certified_key = CertifiedKey::new(
-        vec![CertificateDer::from(node_key.public_key_spki().to_vec())],
-        signing_key,
-    );
     let verifier = PinnedRpkVerifier {
         expected_spki: expected_peer_spki.to_vec(),
         algorithms: provider.signature_verification_algorithms,
@@ -227,9 +213,9 @@ fn build_rpk_connector(
         .context("configure TLS 1.3 for LTP")?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier))
-        .with_client_cert_resolver(Arc::new(AlwaysResolvesClientRawPublicKeys::new(Arc::new(
-            certified_key,
-        ))));
+        .with_client_cert_resolver(Arc::new(AlwaysResolvesClientRawPublicKeys::new(
+            node_key.certified_key(),
+        )));
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
@@ -629,8 +615,10 @@ mod tests {
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
     use rustls::DistinguishedName;
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
     use rustls::server::AlwaysResolvesServerRawPublicKeys;
     use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+    use rustls::sign::CertifiedKey;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
     use tokio_rustls::TlsAcceptor;
@@ -712,6 +700,30 @@ mod tests {
 
     fn build_context(node_id: &str) -> crate::modules::BuildContext {
         build_context_and_spki(node_id).0
+    }
+
+    #[test]
+    fn multiple_outputs_share_the_startup_parsed_certified_key() {
+        let (ctx, _) = build_context_and_spki("node-a");
+        let identity = ctx.ltp_node_key.as_ref().unwrap();
+        let initial = identity.certified_key_strong_count();
+        let (_, peer_key) = generated_pair();
+        let properties = ModuleProperties::from_parts(
+            "ltp",
+            vec![peer_property(
+                "peer-a",
+                &encoded_spki(&peer_key),
+                "127.0.0.1:7514",
+            )],
+        );
+
+        let first = LtpOutput::build("out-a", &properties, &ctx).unwrap();
+        assert_eq!(identity.certified_key_strong_count(), initial + 1);
+        let second = LtpOutput::build("out-b", &properties, &ctx).unwrap();
+        assert_eq!(identity.certified_key_strong_count(), initial + 2);
+
+        drop((first, second));
+        assert_eq!(identity.certified_key_strong_count(), initial);
     }
 
     fn output_for(endpoint: &str) -> LtpOutput {
