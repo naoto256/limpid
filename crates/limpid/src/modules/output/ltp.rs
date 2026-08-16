@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use prost::Message as _;
 use rustls::client::AlwaysResolvesClientRawPublicKeys;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::WebPkiSupportedAlgorithms;
@@ -23,8 +24,8 @@ use crate::dsl::ast::{ExprKind, Property};
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
 use crate::event::Event;
 use crate::ltp::{
-    ED25519_SPKI_PREFIX, HopStamp, LtpHello, LtpMeta, MAX_PAYLOAD_LEN, ValidatedNodeKey,
-    encode_frame, encode_hello_frame,
+    ED25519_SPKI_PREFIX, HopStamp, LtpHello, LtpMeta, MAX_META_LEN, MAX_PAYLOAD_LEN,
+    ValidatedNodeKey, encode_frame, encode_hello_frame,
 };
 use crate::metrics::OutputMetrics;
 use crate::modules::output::syslog_peers::{
@@ -109,6 +110,12 @@ impl Module for LtpOutput {
             ctx.ltp_node_id.as_ref().cloned().ok_or_else(|| {
                 anyhow::anyhow!("output '{name}': LTP node identity is unavailable")
             })?;
+        let event_meta_len = event_meta(&node_id, &[0; 16], 1, 1).encoded_len();
+        if event_meta_len > MAX_META_LEN {
+            bail!(
+                "output '{name}': node_id makes LTP event metadata {event_meta_len} bytes (maximum {MAX_META_LEN})"
+            );
+        }
         let node_key = ctx
             .ltp_node_key
             .as_ref()
@@ -343,6 +350,22 @@ enum WriteOutcome {
     Err(anyhow::Error),
 }
 
+fn event_meta(
+    node_id: &str,
+    key: &[u8; 16],
+    arrival_unix_nano: u64,
+    departure_unix_nano: u64,
+) -> LtpMeta {
+    LtpMeta {
+        key: key.to_vec(),
+        stamps: vec![HopStamp {
+            node_id: node_id.to_owned(),
+            arrival_unix_nano,
+            departure_unix_nano,
+        }],
+    }
+}
+
 impl LtpOutput {
     fn event_frame(&self, event: &Event) -> Result<Bytes> {
         let arrival_unix_nano = event
@@ -355,14 +378,12 @@ impl LtpOutput {
             .and_then(|value| u64::try_from(value).ok())
             .unwrap_or(0);
         Ok(Bytes::from(encode_frame(
-            &LtpMeta {
-                key: event.key().as_bytes().to_vec(),
-                stamps: vec![HopStamp {
-                    node_id: self.node_id.to_string(),
-                    arrival_unix_nano,
-                    departure_unix_nano,
-                }],
-            },
+            &event_meta(
+                &self.node_id,
+                event.key().as_bytes(),
+                arrival_unix_nano,
+                departure_unix_nano,
+            ),
             &event.egress,
         )?))
     }
@@ -611,7 +632,6 @@ mod tests {
     use std::task::{Context as TaskContext, Poll};
 
     use chrono::TimeZone as _;
-    use prost::Message as _;
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
     use rustls::DistinguishedName;
@@ -974,6 +994,58 @@ mod tests {
                 .to_string()
                 .contains("port")
         );
+    }
+
+    #[test]
+    fn build_accepts_the_exact_event_metadata_limit_and_rejects_limit_plus_one() {
+        let key = [0; 16];
+        let mut low = 0;
+        let mut high = MAX_META_LEN + 1;
+        while low < high {
+            let middle = (low + high).div_ceil(2);
+            if event_meta(&"n".repeat(middle), &key, 1, 1).encoded_len() <= MAX_META_LEN {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+
+        let exact_node_id = "n".repeat(low);
+        let oversized_node_id = "n".repeat(low + 1);
+        assert_eq!(
+            event_meta(&exact_node_id, &key, 1, 1).encoded_len(),
+            MAX_META_LEN
+        );
+        assert_eq!(
+            event_meta(&oversized_node_id, &key, 1, 1).encoded_len(),
+            MAX_META_LEN + 1
+        );
+        assert!(
+            encode_hello_frame(&LtpHello {
+                node_id: oversized_node_id.clone(),
+            })
+            .is_ok(),
+            "the hello fits even though the real event metadata does not"
+        );
+
+        let (_, peer_key) = generated_pair();
+        let properties = ModuleProperties::from_parts(
+            "ltp",
+            vec![peer_property(
+                "peer-a",
+                &encoded_spki(&peer_key),
+                "127.0.0.1:7514",
+            )],
+        );
+        let (mut context, _) = build_context_and_spki(&exact_node_id);
+        LtpOutput::build("exact", &properties, &context).unwrap();
+
+        context.ltp_node_id = Some(Arc::<str>::from(oversized_node_id));
+        let error = match LtpOutput::build("oversized", &properties, &context) {
+            Ok(_) => panic!("event metadata above the wire limit was accepted"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("LTP event metadata 65537 bytes"));
     }
 
     fn now_200() -> DateTime<Utc> {

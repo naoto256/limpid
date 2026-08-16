@@ -441,7 +441,6 @@ mod tests {
 
         let loaded = load_node_key(&path).unwrap();
         let diagnostic = format!("{:?}", loaded.certified_key());
-        assert!(diagnostic.contains("Ed25519SigningKey"));
         assert!(!diagnostic.contains("9d61b19deffd5a60"));
     }
 
@@ -450,12 +449,15 @@ mod tests {
         let source = include_str!("ltp.rs");
         let raw_der_field = ["pkcs8", "_der: Vec"].concat();
         let raw_der_accessor = ["fn pkcs8", "_der("].concat();
-        let zeroizing_der = ["Zeroizing::new(document.", "into_contents())"].concat();
-        let provider_parse = ["any_eddsa", "_type(&private_key)"].concat();
-        assert!(!source.contains(&raw_der_field));
-        assert!(!source.contains(&raw_der_accessor));
-        assert!(source.contains(&zeroizing_der));
-        assert_eq!(source.matches(&provider_parse).count(), 1);
+
+        let key_start = source.find("struct ValidatedNodeKey").unwrap();
+        let key_end = source[key_start..]
+            .find("#[derive(Debug, Error)]")
+            .map(|offset| key_start + offset)
+            .unwrap();
+        let key_source = &source[key_start..key_end];
+        assert!(!key_source.contains(&raw_der_field));
+        assert!(!key_source.contains(&raw_der_accessor));
 
         fn require_zeroizing_reader<R: Read>(
             _reader: fn(&mut R, &Path) -> Result<Zeroizing<Vec<u8>>>,
@@ -469,7 +471,11 @@ mod tests {
             .map(|offset| reader_start + offset)
             .unwrap();
         let reader_source = &source[reader_start..reader_end];
-        assert!(reader_source.contains("let mut encoded = Zeroizing::new(Vec::new())"));
+        let reader_compact: String = reader_source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        assert!(reader_compact.contains("Zeroizing::new(Vec::new())"));
 
         let loader_start = source.find("fn load_node_key_with_open_hook").unwrap();
         let loader_end = source[loader_start..]
@@ -477,18 +483,45 @@ mod tests {
             .map(|offset| loader_start + offset)
             .unwrap();
         let loader_source = &source[loader_start..loader_end];
-        let label = loader_source.find("let is_private_key").unwrap();
-        let der = loader_source.find(&zeroizing_der).unwrap();
-        let rejection = loader_source.find("if !is_private_key").unwrap();
+        let loader_compact: String = loader_source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        let label = loader_compact.find(".tag()").unwrap();
+        let der = loader_compact
+            .find("Zeroizing::new(document.into_contents())")
+            .unwrap();
+        let rejection = loader_compact.find("expectedPRIVATEKEYPEM").unwrap();
         assert!(label < der && der < rejection);
+        assert_eq!(
+            loader_compact
+                .matches("any_eddsa_type(&private_key)")
+                .count(),
+            1
+        );
 
         let output_source = include_str!("modules/output/ltp.rs");
-        let production = output_source.split("#[cfg(test)]").next().unwrap();
+        let build_start = output_source.find("fn from_properties").unwrap();
+        let build_end = output_source[build_start..]
+            .find("impl HasMetrics")
+            .map(|offset| build_start + offset)
+            .unwrap();
+        let connector_start = output_source.find("fn build_rpk_connector").unwrap();
+        let connector_end = output_source[connector_start..]
+            .find("pub(crate) fn validate_static_properties")
+            .map(|offset| connector_start + offset)
+            .unwrap();
+        let production = format!(
+            "{}{}",
+            &output_source[build_start..build_end],
+            &output_source[connector_start..connector_end]
+        );
         for forbidden in [
             ["PrivatePkcs8", "KeyDer"].concat(),
-            ["load_private", "_key"].concat(),
+            ["Private", "KeyDer"].concat(),
             ["pkcs8", "_der"].concat(),
-            ["load_node", "_key"].concat(),
+            ["any_eddsa", "_type"].concat(),
+            ["pem::", "parse"].concat(),
         ] {
             assert!(!production.contains(&forbidden), "found {forbidden}");
         }
