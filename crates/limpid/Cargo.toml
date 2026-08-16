@@ -44,6 +44,7 @@ digest = "0.10"
 base64 = { workspace = true }
 pem = { workspace = true }
 ring = { workspace = true }
+zeroize = { workspace = true }
 indexmap = { version = "2", features = ["serde"] }
 # Per-event bump arena for the DSL `Value` tree. Each event allocates
 # transient `Value::Object` / `Value::Array` / `Value::String` /

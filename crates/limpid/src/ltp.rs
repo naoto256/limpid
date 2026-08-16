@@ -3,12 +3,15 @@
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use prost::Message;
-use ring::signature::{Ed25519KeyPair, KeyPair as _};
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use rustls::sign::CertifiedKey;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 pub(crate) const FRAME_MAGIC: &[u8; 4] = b"LTP\0";
 pub(crate) const FRAME_VERSION: u8 = 1;
@@ -45,21 +48,25 @@ pub(crate) struct LtpHello {
     pub(crate) node_id: String,
 }
 
-/// Key bytes read and validated from one securely opened descriptor.
-/// Runtime keeps this value in memory so LTP outputs never reopen the
-/// operator path after the startup preflight.
+/// Signing identity built from one securely opened descriptor.
+/// Runtime shares the parsed key so LTP outputs never retain DER or
+/// reopen the operator path after the startup preflight.
 pub(crate) struct ValidatedNodeKey {
-    pkcs8_der: Vec<u8>,
-    public_key_spki: Vec<u8>,
+    certified_key: Arc<CertifiedKey>,
 }
 
 impl ValidatedNodeKey {
-    pub(crate) fn pkcs8_der(&self) -> &[u8] {
-        &self.pkcs8_der
+    pub(crate) fn certified_key(&self) -> Arc<CertifiedKey> {
+        Arc::clone(&self.certified_key)
     }
 
     pub(crate) fn public_key_spki(&self) -> &[u8] {
-        &self.public_key_spki
+        self.certified_key.cert[0].as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn certified_key_strong_count(&self) -> usize {
+        Arc::strong_count(&self.certified_key)
     }
 }
 
@@ -174,8 +181,8 @@ pub(crate) fn preflight_node_key(path: &Path) -> Result<()> {
 
 const MAX_NODE_KEY_FILE_LEN: usize = 64 * 1024;
 
-fn read_node_key_bounded<R: Read>(reader: &mut R, path: &Path) -> Result<Vec<u8>> {
-    let mut encoded = Vec::new();
+fn read_node_key_bounded<R: Read>(reader: &mut R, path: &Path) -> Result<Zeroizing<Vec<u8>>> {
+    let mut encoded = Zeroizing::new(Vec::new());
     reader
         .take((MAX_NODE_KEY_FILE_LEN + 1) as u64)
         .read_to_end(&mut encoded)
@@ -244,24 +251,38 @@ where
     }
 
     let encoded = read_node_key_bounded(&mut file, path)?;
-    let document = pem::parse(&encoded)
+    let document = pem::parse(encoded.as_slice())
         .map_err(|_| anyhow::anyhow!("node_key '{}': invalid PRIVATE KEY PEM", path.display()))?;
-    if document.tag() != "PRIVATE KEY" {
+    let is_private_key = document.tag() == "PRIVATE KEY";
+    let pkcs8_der = Zeroizing::new(document.into_contents());
+    if !is_private_key {
         bail!("node_key '{}': expected PRIVATE KEY PEM", path.display());
     }
-    let pkcs8_der = document.contents().to_vec();
-    let key_pair = Ed25519KeyPair::from_pkcs8_maybe_unchecked(&pkcs8_der).map_err(|_| {
+    let private_key = PrivatePkcs8KeyDer::from(pkcs8_der.as_slice());
+    let signing_key =
+        rustls::crypto::aws_lc_rs::sign::any_eddsa_type(&private_key).map_err(|_| {
+            anyhow::anyhow!(
+                "node_key '{}': invalid Ed25519 PKCS#8 private key",
+                path.display()
+            )
+        })?;
+    let public_key_spki = signing_key.public_key().ok_or_else(|| {
         anyhow::anyhow!(
-            "node_key '{}': invalid Ed25519 PKCS#8 private key",
+            "node_key '{}': Ed25519 key has no public SPKI",
             path.display()
         )
     })?;
-    let mut public_key_spki = Vec::with_capacity(ED25519_SPKI_PREFIX.len() + 32);
-    public_key_spki.extend_from_slice(&ED25519_SPKI_PREFIX);
-    public_key_spki.extend_from_slice(key_pair.public_key().as_ref());
+    if public_key_spki.len() != ED25519_SPKI_PREFIX.len() + 32
+        || !public_key_spki.starts_with(&ED25519_SPKI_PREFIX)
+    {
+        bail!("node_key '{}': invalid Ed25519 public SPKI", path.display());
+    }
+    let certified_key = CertifiedKey::new(
+        vec![CertificateDer::from(public_key_spki.as_ref().to_vec())],
+        signing_key,
+    );
     Ok(ValidatedNodeKey {
-        pkcs8_der,
-        public_key_spki,
+        certified_key: Arc::new(certified_key),
     })
 }
 
@@ -280,6 +301,7 @@ mod tests {
     use std::time::Duration;
 
     use ring::rand::SystemRandom;
+    use ring::signature::Ed25519KeyPair;
 
     struct CountingReader<R> {
         inner: R,
@@ -326,6 +348,21 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
 
+    fn standard_pkcs8_v1_ed25519() -> Vec<u8> {
+        // RFC 8032 section 7.1 test vector 1 seed, wrapped in the
+        // RFC 8410 version-1 PrivateKeyInfo structure.
+        let mut pkcs8 = vec![
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        pkcs8.extend_from_slice(&[
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec,
+            0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03,
+            0x1c, 0xae, 0x7f, 0x60,
+        ]);
+        pkcs8
+    }
+
     #[test]
     fn secure_node_key_load_returns_the_validated_material_from_the_open_inode() {
         let dir = tempfile::tempdir().unwrap();
@@ -342,7 +379,6 @@ mod tests {
 
         assert_eq!(loaded.public_key_spki().len(), 44);
         assert_eq!(&loaded.public_key_spki()[..12], &ED25519_SPKI_PREFIX);
-        assert!(!loaded.pkcs8_der().is_empty());
     }
 
     #[test]
@@ -376,24 +412,103 @@ mod tests {
 
     #[test]
     fn node_key_preflight_accepts_standard_pkcs8_v1_ed25519() {
-        // RFC 8032 section 7.1 test vector 1 seed, wrapped in the
-        // RFC 8410 version-1 PrivateKeyInfo structure.
-        let mut pkcs8 = vec![
-            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
-            0x04, 0x20,
-        ];
-        pkcs8.extend_from_slice(&[
-            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec,
-            0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03,
-            0x1c, 0xae, 0x7f, 0x60,
-        ]);
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("node-v1.pem");
-        fs::write(&path, pem::encode(&pem::Pem::new("PRIVATE KEY", pkcs8))).unwrap();
+        fs::write(
+            &path,
+            pem::encode(&pem::Pem::new("PRIVATE KEY", standard_pkcs8_v1_ed25519())),
+        )
+        .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
 
         preflight_node_key(&path).unwrap();
+    }
+
+    #[test]
+    fn parsed_runtime_identity_is_send_sync_and_debug_elides_private_material() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ValidatedNodeKey>();
+        assert_send_sync::<CertifiedKey>();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node-v1.pem");
+        fs::write(
+            &path,
+            pem::encode(&pem::Pem::new("PRIVATE KEY", standard_pkcs8_v1_ed25519())),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let loaded = load_node_key(&path).unwrap();
+        let diagnostic = format!("{:?}", loaded.certified_key());
+        assert!(diagnostic.contains("Ed25519SigningKey"));
+        assert!(!diagnostic.contains("9d61b19deffd5a60"));
+    }
+
+    #[test]
+    fn runtime_key_architecture_keeps_der_temporary_and_output_reparse_free() {
+        let source = include_str!("ltp.rs");
+        let raw_der_field = ["pkcs8", "_der: Vec"].concat();
+        let raw_der_accessor = ["fn pkcs8", "_der("].concat();
+        let zeroizing_der = ["Zeroizing::new(document.", "into_contents())"].concat();
+        let provider_parse = ["any_eddsa", "_type(&private_key)"].concat();
+        assert!(!source.contains(&raw_der_field));
+        assert!(!source.contains(&raw_der_accessor));
+        assert!(source.contains(&zeroizing_der));
+        assert_eq!(source.matches(&provider_parse).count(), 1);
+
+        fn require_zeroizing_reader<R: Read>(
+            _reader: fn(&mut R, &Path) -> Result<Zeroizing<Vec<u8>>>,
+        ) {
+        }
+        require_zeroizing_reader::<std::io::Cursor<Vec<u8>>>(read_node_key_bounded);
+
+        let reader_start = source.find("fn read_node_key_bounded").unwrap();
+        let reader_end = source[reader_start..]
+            .find("pub(crate) fn load_node_key")
+            .map(|offset| reader_start + offset)
+            .unwrap();
+        let reader_source = &source[reader_start..reader_end];
+        assert!(reader_source.contains("let mut encoded = Zeroizing::new(Vec::new())"));
+
+        let loader_start = source.find("fn load_node_key_with_open_hook").unwrap();
+        let loader_end = source[loader_start..]
+            .find("fn node_key_owner_matches")
+            .map(|offset| loader_start + offset)
+            .unwrap();
+        let loader_source = &source[loader_start..loader_end];
+        let label = loader_source.find("let is_private_key").unwrap();
+        let der = loader_source.find(&zeroizing_der).unwrap();
+        let rejection = loader_source.find("if !is_private_key").unwrap();
+        assert!(label < der && der < rejection);
+
+        let output_source = include_str!("modules/output/ltp.rs");
+        let production = output_source.split("#[cfg(test)]").next().unwrap();
+        for forbidden in [
+            ["PrivatePkcs8", "KeyDer"].concat(),
+            ["load_private", "_key"].concat(),
+            ["pkcs8", "_der"].concat(),
+            ["load_node", "_key"].concat(),
+        ] {
+            assert!(!production.contains(&forbidden), "found {forbidden}");
+        }
+    }
+
+    #[test]
+    fn wrong_pem_label_is_rejected_after_secret_contents_move_to_owned_zeroizing_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wrong-label.pem");
+        let secret = standard_pkcs8_v1_ed25519();
+        fs::write(&path, pem::encode(&pem::Pem::new("CERTIFICATE", secret))).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = match load_node_key(&path) {
+            Ok(_) => panic!("wrong PEM label was accepted"),
+            Err(error) => error,
+        };
+        let diagnostic = format!("{error:#?}");
+        assert!(diagnostic.contains("expected PRIVATE KEY PEM"));
+        assert!(!diagnostic.contains("9d61b19deffd5a60"));
     }
 
     #[test]

@@ -21,3 +21,4 @@ limpid-metrics-schema = { version = "0.7.15", path = "crates/limpid-metrics-sche
 base64 = "0.22.1"
 pem = "3.0.6"
 ring = "0.17.14"
+zeroize = "1.8.2"
