@@ -65,6 +65,11 @@ pub struct BuildContext {
     /// Batched sinks have their own actor-local shutdown notify and
     /// do not need this receiver.
     pub shutdown_signal: tokio::sync::watch::Receiver<bool>,
+    /// Startup-resolved LTP identity. The private key was read and
+    /// validated from one securely opened descriptor; output modules
+    /// receive the in-memory material and never reopen `node_key`.
+    pub(crate) ltp_node_id: Option<Arc<str>>,
+    pub(crate) ltp_node_key: Option<Arc<crate::ltp::ValidatedNodeKey>>,
 }
 
 /// Shared retry-backoff helper for unbatched sinks: sleep `wait`, but
@@ -163,6 +168,8 @@ impl BuildContext {
             error_log: None,
             error_log_fallback: crate::error_log::ErrorLogFallback::default(),
             shutdown_signal: rx,
+            ltp_node_id: None,
+            ltp_node_key: None,
         }
     }
 }
@@ -1422,6 +1429,7 @@ pub fn register_builtins(registry: &mut ModuleRegistry) {
     register_output_type::<output::otlp::grpc::OtlpGrpcOutput>(registry, "otlp_grpc");
     register_output_type::<output::syslog_udp::SyslogUdpOutput>(registry, "syslog_udp");
     register_output_type::<output::stdout::StdoutOutput>(registry, "stdout");
+    register_output_type::<output::ltp::LtpOutput>(registry, "ltp");
     #[cfg(feature = "kafka")]
     register_output_type::<output::kafka::KafkaOutput>(registry, "kafka");
 
