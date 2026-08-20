@@ -70,6 +70,7 @@ pub struct BuildContext {
     /// receive the in-memory material and never reopen `node_key`.
     pub(crate) ltp_node_id: Option<Arc<str>>,
     pub(crate) ltp_node_key: Option<Arc<crate::ltp::ValidatedNodeKey>>,
+    pub(crate) ltp_metrics: Option<Arc<crate::metrics::LtpMetrics>>,
 }
 
 /// Shared retry-backoff helper for unbatched sinks: sleep `wait`, but
@@ -170,6 +171,7 @@ impl BuildContext {
             shutdown_signal: rx,
             ltp_node_id: None,
             ltp_node_key: None,
+            ltp_metrics: None,
         }
     }
 }
