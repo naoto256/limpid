@@ -186,6 +186,10 @@ pub struct OwnedEvent {
     pub ingress: Bytes,
     pub egress: Bytes,
     pub workspace: HashMap<String, OwnedValue>,
+    /// LTP hop history is persisted and forwarded but intentionally absent
+    /// from the DSL workspace. Sharing the immutable slice keeps ordinary
+    /// event clones cheap.
+    ltp_stamps: Arc<[crate::ltp::HopStamp]>,
     /// Optional drop-fired ack used by inputs that persist a cursor
     /// (tail / journal). `None` for inputs that don't have a position to
     /// advance (syslog, OTLP, unix_socket, …) and for events synthesised
@@ -205,6 +209,7 @@ impl OwnedEvent {
             egress: ingress.clone(),
             ingress,
             workspace: HashMap::new(),
+            ltp_stamps: Arc::from([]),
             ack: None,
         }
     }
@@ -223,6 +228,7 @@ impl OwnedEvent {
             egress: ingress.clone(),
             ingress,
             workspace: HashMap::new(),
+            ltp_stamps: Arc::from([]),
             ack: Some(ack),
         }
     }
@@ -232,13 +238,40 @@ impl OwnedEvent {
         self.key
     }
 
-    /// Reconstruct an event from persisted fields while retaining its identity.
-    pub(crate) fn from_persisted_parts(
+    pub(crate) fn ltp_stamps(&self) -> &[crate::ltp::HopStamp] {
+        &self.ltp_stamps
+    }
+
+    pub(crate) fn ltp_stamps_arc(&self) -> Arc<[crate::ltp::HopStamp]> {
+        Arc::clone(&self.ltp_stamps)
+    }
+
+    pub(crate) fn from_ltp_parts(
+        key: uuid::Uuid,
+        received_at: DateTime<Utc>,
+        source: SocketAddr,
+        payload: Bytes,
+        stamps: Vec<crate::ltp::HopStamp>,
+    ) -> Self {
+        Self {
+            key,
+            received_at,
+            source,
+            ingress: payload.clone(),
+            egress: payload,
+            workspace: HashMap::new(),
+            ltp_stamps: Arc::from(stamps),
+            ack: None,
+        }
+    }
+
+    pub(crate) fn from_persisted_parts_with_stamps(
         key: uuid::Uuid,
         received_at: DateTime<Utc>,
         source: SocketAddr,
         ingress: Bytes,
         egress: Bytes,
+        stamps: Arc<[crate::ltp::HopStamp]>,
     ) -> Self {
         Self {
             key,
@@ -247,6 +280,7 @@ impl OwnedEvent {
             ingress,
             egress,
             workspace: HashMap::new(),
+            ltp_stamps: stamps,
             ack: None,
         }
     }
@@ -269,6 +303,7 @@ impl OwnedEvent {
             source: self.source,
             ingress: self.ingress.clone(),
             egress: self.egress.clone(),
+            ltp_stamps: Arc::clone(&self.ltp_stamps),
             workspace,
         }
     }
@@ -320,6 +355,23 @@ impl OwnedEvent {
         map.insert("source".into(), JsonValue::Object(source_obj));
         map.insert("ingress".into(), bytes_to_json(&self.ingress));
         map.insert("egress".into(), bytes_to_json(&self.egress));
+        if !self.ltp_stamps.is_empty() {
+            map.insert(
+                "ltp_stamps".into(),
+                JsonValue::Array(
+                    self.ltp_stamps
+                        .iter()
+                        .map(|stamp| {
+                            serde_json::json!({
+                                "node_id": stamp.node_id,
+                                "arrival_unix_nano": stamp.arrival_unix_nano,
+                                "departure_unix_nano": stamp.departure_unix_nano,
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+        }
         if include_workspace && !self.workspace.is_empty() {
             let ws: Map = self
                 .workspace
@@ -385,6 +437,23 @@ impl OwnedEvent {
             .and_then(json_to_bytes)
             .unwrap_or_else(|| ingress.clone());
 
+        let ltp_stamps: Arc<[crate::ltp::HopStamp]> = match v.get("ltp_stamps") {
+            None => Arc::from([]),
+            Some(JsonValue::Array(stamps)) => Arc::from(
+                stamps
+                    .iter()
+                    .map(|stamp| {
+                        Some(crate::ltp::HopStamp {
+                            node_id: stamp.get("node_id")?.as_str()?.to_owned(),
+                            arrival_unix_nano: stamp.get("arrival_unix_nano")?.as_u64()?,
+                            departure_unix_nano: stamp.get("departure_unix_nano")?.as_u64()?,
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            Some(_) => return None,
+        };
+
         let mut event = Self {
             key,
             received_at,
@@ -392,6 +461,7 @@ impl OwnedEvent {
             ingress,
             egress,
             workspace: HashMap::new(),
+            ltp_stamps,
             // Deserialised events are by definition past the input boundary
             // (DLQ replay, control-plane inject) — no upstream cursor to
             // advance, so no ack token.
@@ -447,6 +517,7 @@ pub struct BorrowedEvent<'bump> {
     pub source: SocketAddr,
     pub ingress: Bytes,
     pub egress: Bytes,
+    ltp_stamps: Arc<[crate::ltp::HopStamp]>,
     pub workspace: bumpalo::collections::Vec<'bump, (&'bump str, Value<'bump>)>,
 }
 
@@ -471,6 +542,7 @@ impl<'bump> BorrowedEvent<'bump> {
             source: self.source,
             ingress: self.ingress.clone(),
             egress: self.egress.clone(),
+            ltp_stamps: Arc::clone(&self.ltp_stamps),
             workspace,
             // BorrowedEvent does not carry an ack — it's the per-event arena
             // view. Cloning back to owned for DLQ / disk-queue persistence
@@ -513,6 +585,7 @@ impl<'bump> BorrowedEvent<'bump> {
             source: self.source,
             ingress: self.ingress.clone(),
             egress: self.egress.clone(),
+            ltp_stamps: Arc::clone(&self.ltp_stamps),
             // `HashMap::new()` here does not allocate a backing table
             // — that only happens on the first `insert`. So this is a
             // zero-heap-touch construction; the four Bytes/scalar
@@ -561,6 +634,7 @@ impl<'bump> BorrowedEvent<'bump> {
             source: self.source,
             ingress: self.ingress.clone(),
             egress: self.egress.clone(),
+            ltp_stamps: Arc::clone(&self.ltp_stamps),
             workspace,
         }
     }
@@ -708,6 +782,51 @@ mod boundary_tests {
             Some(OwnedValue::Bytes(b)) => assert_eq!(&b[..], &[0xff, 0x00, 0xab]),
             other => panic!("k_bytes round-tripped as wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn hidden_ltp_stamps_round_trip_through_persistent_and_tap_json() {
+        let stamps = vec![
+            crate::ltp::HopStamp {
+                node_id: "peer-a".to_owned(),
+                arrival_unix_nano: 10,
+                departure_unix_nano: 20,
+            },
+            crate::ltp::HopStamp {
+                node_id: "self".to_owned(),
+                arrival_unix_nano: 30,
+                departure_unix_nano: 0,
+            },
+        ];
+        let event = OwnedEvent::from_ltp_parts(
+            uuid::Uuid::now_v7(),
+            Utc::now(),
+            "192.0.2.10:7514".parse().unwrap(),
+            Bytes::from_static(b"payload"),
+            stamps.clone(),
+        );
+
+        let persisted = event.to_json_string();
+        let recovered = OwnedEvent::from_json(&persisted).unwrap();
+        assert_eq!(recovered.ltp_stamps(), stamps);
+
+        let tap = event.to_json_value_without_workspace();
+        assert_eq!(tap["ltp_stamps"].as_array().unwrap().len(), 2);
+        assert!(tap.get("workspace").is_none());
+
+        let bump = bumpalo::Bump::new();
+        let arena = EventArena::new(&bump);
+        let round_trip = event.view_in(&arena).to_owned();
+        assert_eq!(round_trip.ltp_stamps(), stamps);
+    }
+
+    #[test]
+    fn legacy_event_json_without_ltp_stamps_defaults_to_empty() {
+        let event = sample_event();
+        let mut json = event.to_json_value();
+        json.as_object_mut().unwrap().remove("ltp_stamps");
+        let recovered = OwnedEvent::from_json(&serde_json::to_string(&json).unwrap()).unwrap();
+        assert!(recovered.ltp_stamps().is_empty());
     }
 
     #[test]

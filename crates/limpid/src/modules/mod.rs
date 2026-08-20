@@ -1411,6 +1411,7 @@ pub fn register_builtins(registry: &mut ModuleRegistry) {
     // Inputs
     register_input_type::<input::syslog_udp::SyslogUdpInput>(registry, "syslog_udp");
     register_input_type::<input::syslog_tcp::SyslogTcpInput>(registry, "syslog_tcp");
+    register_input_type::<input::ltp::LtpInput>(registry, "ltp");
     register_input_type::<input::tail::TailInput>(registry, "tail");
     register_input_type::<input::otlp::http::OtlpHttpInput>(registry, "otlp_http");
     register_input_type::<input::otlp::grpc::OtlpGrpcInput>(registry, "otlp_grpc");
