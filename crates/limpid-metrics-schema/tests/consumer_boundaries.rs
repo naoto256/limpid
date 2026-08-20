@@ -292,8 +292,8 @@ fn limpidctl_typed_renderer_violations(source: &str) -> Vec<String> {
         for callee in facts.local_calls {
             if functions.contains_key(&callee) {
                 pending.push(callee);
-            } else if !serde_imports.constructors.contains(&callee)
-                && !(serde_imports.glob && is_serde_constructor(&callee))
+            } else if !(serde_imports.constructors.contains(&callee)
+                || serde_imports.glob && is_serde_constructor(&callee))
             {
                 violations.push(format!("{name} has unresolved top-level helper {callee}"));
             }
