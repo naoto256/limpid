@@ -27,7 +27,7 @@ use crate::ltp::{
     ED25519_SPKI_PREFIX, HopStamp, LtpHello, LtpMeta, MAX_META_LEN, MAX_PAYLOAD_LEN,
     ValidatedNodeKey, encode_frame, encode_hello_frame,
 };
-use crate::metrics::OutputMetrics;
+use crate::metrics::{LtpPeerMetrics, OutputMetrics};
 use crate::modules::output::syslog_peers::{
     PEER_CONNECT_TIMEOUT, PEER_HANDSHAKE_TIMEOUT, PEER_WRITE_TIMEOUT,
 };
@@ -91,6 +91,7 @@ pub struct LtpOutput {
     error_log: Option<Arc<crate::error_log::ErrorLogWriter>>,
     error_log_fallback: crate::error_log::ErrorLogFallback,
     metrics: Arc<OutputMetrics>,
+    peer_metrics: LtpPeerMetrics,
     shutdown_signal: tokio::sync::watch::Receiver<bool>,
     now: fn() -> DateTime<Utc>,
 }
@@ -106,6 +107,11 @@ impl Module for LtpOutput {
         ctx: &crate::modules::BuildContext,
     ) -> Result<Self> {
         let peer = parse_peer(name, properties.user_properties())?;
+        let peer_metrics = ctx
+            .ltp_metrics
+            .as_ref()
+            .and_then(|metrics| metrics.peer(&peer.node_id))
+            .ok_or_else(|| anyhow::anyhow!("output '{name}': LTP peer metrics are unavailable"))?;
         let node_id =
             ctx.ltp_node_id.as_ref().cloned().ok_or_else(|| {
                 anyhow::anyhow!("output '{name}': LTP node identity is unavailable")
@@ -136,6 +142,7 @@ impl Module for LtpOutput {
             error_log: ctx.error_log.as_ref().map(Arc::clone),
             error_log_fallback: ctx.error_log_fallback,
             metrics: OutputMetrics::register(&ctx.metrics, name)?,
+            peer_metrics,
             shutdown_signal: ctx.shutdown_signal.clone(),
             now: Utc::now,
         })
@@ -471,6 +478,13 @@ impl LtpOutput {
         let frame = self.event_frame(working, payload)?;
         Self::write_bytes(stream, &frame).await?;
         self.metrics.bytes_written.inc_by(frame.len() as u64);
+        let stamp = &working.meta.stamps[working.local_stamp];
+        let delta = stamp
+            .departure_unix_nano
+            .saturating_sub(stamp.arrival_unix_nano);
+        self.peer_metrics
+            .intra_latency
+            .observe(delta as f64 / 1_000_000_000.0);
         Ok(())
     }
 
@@ -771,14 +785,19 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        (
-            crate::modules::BuildContext {
-                ltp_node_id: Some(Arc::<str>::from(node_id)),
-                ltp_node_key: Some(Arc::new(crate::ltp::load_node_key(&path).unwrap())),
-                ..crate::modules::BuildContext::for_testing()
-            },
-            spki,
-        )
+        let mut context = crate::modules::BuildContext {
+            ltp_node_id: Some(Arc::<str>::from(node_id)),
+            ltp_node_key: Some(Arc::new(crate::ltp::load_node_key(&path).unwrap())),
+            ..crate::modules::BuildContext::for_testing()
+        };
+        context.ltp_metrics = Some(
+            crate::metrics::LtpMetrics::register(
+                &context.metrics,
+                &std::collections::BTreeSet::from(["peer-a".to_owned()]),
+            )
+            .unwrap(),
+        );
+        (context, spki)
     }
 
     fn build_context(node_id: &str) -> crate::modules::BuildContext {
@@ -1282,6 +1301,7 @@ mod tests {
         let mut output = output_for("127.0.0.1:1");
         output.now = now_200;
         let mut event = Event::new(Bytes::new(), "127.0.0.1:1".parse().unwrap());
+        event.received_at = Utc.timestamp_nanos(100);
         event.egress = Bytes::from_static(b"payload");
         let mut working = output.working_event_meta(&event);
         let expected_len = output
@@ -1299,6 +1319,7 @@ mod tests {
         assert_eq!(flush_failure.bytes.len(), expected_len as usize);
         assert_eq!(flush_failure.flushes, 1);
         assert_eq!(output.metrics.bytes_written.load(Ordering::Relaxed), 0);
+        assert_eq!(output.peer_metrics.intra_latency.count(), 0);
 
         let mut success = ScriptedWriter::new(3, FlushAction::Ok);
         output
@@ -1311,6 +1332,11 @@ mod tests {
             output.metrics.bytes_written.load(Ordering::Relaxed),
             expected_len,
             "a retry success owns exactly one event-frame byte increment"
+        );
+        assert_eq!(output.peer_metrics.intra_latency.count(), 1);
+        assert_eq!(
+            output.peer_metrics.intra_latency.sum(),
+            100.0 / 1_000_000_000.0
         );
     }
 
@@ -1551,6 +1577,7 @@ mod tests {
             event_frame.len() as u64,
             "shutdown success owns exactly one event-frame byte increment"
         );
+        assert_eq!(output.peer_metrics.intra_latency.count(), 1);
     }
 
     #[tokio::test]
@@ -1774,6 +1801,7 @@ mod tests {
         output.consume(&event, ack).await.unwrap();
         assert_eq!(output.metrics.retries.load(Ordering::Relaxed), 1);
         assert_eq!(output.metrics.bytes_written.load(Ordering::Relaxed), 0);
+        assert_eq!(output.peer_metrics.intra_latency.count(), 0);
         assert!(matches!(
             ack_rx.recv().await,
             Some((_, AckDisposition::Recovered))
