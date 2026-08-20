@@ -205,7 +205,7 @@ impl ServerCertVerifier for PinnedRpkVerifier {
     }
 }
 
-fn build_rpk_connector(
+pub(crate) fn build_rpk_connector(
     node_key: &ValidatedNodeKey,
     expected_peer_spki: &[u8],
 ) -> Result<TlsConnector> {
@@ -366,26 +366,57 @@ fn event_meta(
     }
 }
 
+struct WorkingEventMeta {
+    meta: LtpMeta,
+    local_stamp: usize,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static STAMP_CLONE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl LtpOutput {
-    fn event_frame(&self, event: &Event) -> Result<Bytes> {
+    fn working_event_meta(&self, event: &Event) -> WorkingEventMeta {
         let arrival_unix_nano = event
             .received_at
             .timestamp_nanos_opt()
             .and_then(|value| u64::try_from(value).ok())
             .unwrap_or(0);
+        #[cfg(test)]
+        STAMP_CLONE_COUNT.set(STAMP_CLONE_COUNT.get() + 1);
+        let mut stamps = event.ltp_stamps().to_vec();
+        let local_stamp = match stamps.last() {
+            Some(stamp)
+                if stamp.node_id == self.node_id.as_ref() && stamp.departure_unix_nano == 0 =>
+            {
+                stamps.len() - 1
+            }
+            _ => {
+                stamps.push(HopStamp {
+                    node_id: self.node_id.to_string(),
+                    arrival_unix_nano,
+                    departure_unix_nano: 0,
+                });
+                stamps.len() - 1
+            }
+        };
+        WorkingEventMeta {
+            meta: LtpMeta {
+                key: event.key().as_bytes().to_vec(),
+                stamps,
+            },
+            local_stamp,
+        }
+    }
+
+    fn event_frame(&self, working: &mut WorkingEventMeta, payload: &[u8]) -> Result<Bytes> {
         let departure_unix_nano = (self.now)()
             .timestamp_nanos_opt()
             .and_then(|value| u64::try_from(value).ok())
             .unwrap_or(0);
-        Ok(Bytes::from(encode_frame(
-            &event_meta(
-                &self.node_id,
-                event.key().as_bytes(),
-                arrival_unix_nano,
-                departure_unix_nano,
-            ),
-            &event.egress,
-        )?))
+        working.meta.stamps[working.local_stamp].departure_unix_nano = departure_unix_nano;
+        Ok(Bytes::from(encode_frame(&working.meta, payload)?))
     }
 
     async fn connect(&self) -> Result<TlsStream<TcpStream>> {
@@ -428,27 +459,38 @@ impl LtpOutput {
         Ok(())
     }
 
-    async fn write_event<W>(&self, stream: &mut W, event: &Event) -> Result<()>
+    async fn write_event<W>(
+        &self,
+        stream: &mut W,
+        working: &mut WorkingEventMeta,
+        payload: &[u8],
+    ) -> Result<()>
     where
         W: AsyncWrite + Unpin,
     {
-        let frame = self.event_frame(event)?;
+        let frame = self.event_frame(working, payload)?;
         Self::write_bytes(stream, &frame).await?;
         self.metrics.bytes_written.inc_by(frame.len() as u64);
         Ok(())
     }
 
-    async fn write_hello_and_event<W>(&self, stream: &mut W, event: &Event) -> Result<()>
+    async fn write_hello_and_event<W>(
+        &self,
+        stream: &mut W,
+        working: &mut WorkingEventMeta,
+        payload: &[u8],
+    ) -> Result<()>
     where
         W: AsyncWrite + Unpin,
     {
         Self::write_bytes(stream, &self.hello_frame).await?;
-        self.write_event(stream, event).await
+        self.write_event(stream, working, payload).await
     }
 
     async fn write_attempt(
         &self,
-        event: &Event,
+        working: &mut WorkingEventMeta,
+        payload: &[u8],
         shutdown: &mut tokio::sync::watch::Receiver<bool>,
     ) -> WriteOutcome {
         let mut guard = self.connection.lock().await;
@@ -466,7 +508,10 @@ impl LtpOutput {
                 return WriteOutcome::PreSendShutdown;
             }
             let mut stream = stream;
-            return match self.write_hello_and_event(&mut stream, event).await {
+            return match self
+                .write_hello_and_event(&mut stream, working, payload)
+                .await
+            {
                 Ok(()) => {
                     *guard = Some(stream);
                     WriteOutcome::Delivered
@@ -474,7 +519,10 @@ impl LtpOutput {
                 Err(error) => WriteOutcome::Err(error),
             };
         }
-        match self.write_event(guard.as_mut().unwrap(), event).await {
+        match self
+            .write_event(guard.as_mut().unwrap(), working, payload)
+            .await
+        {
             Ok(()) => WriteOutcome::Delivered,
             Err(error) => {
                 *guard = None;
@@ -483,25 +531,31 @@ impl LtpOutput {
         }
     }
 
-    async fn write_shutdown_attempt(&self, event: &Event) -> Result<()> {
+    async fn write_shutdown_attempt(
+        &self,
+        working: &mut WorkingEventMeta,
+        payload: &[u8],
+    ) -> Result<()> {
         let mut guard = self.connection.lock().await;
         let Some(mut stream) = guard.take() else {
             let mut stream = self.connect().await?;
-            self.write_hello_and_event(&mut stream, event).await?;
+            self.write_hello_and_event(&mut stream, working, payload)
+                .await?;
             *guard = Some(stream);
             return Ok(());
         };
-        self.write_event(&mut stream, event).await?;
+        self.write_event(&mut stream, working, payload).await?;
         *guard = Some(stream);
         Ok(())
     }
 
     async fn write_shutdown_with_timeout(
         &self,
-        event: &Event,
+        working: &mut WorkingEventMeta,
+        payload: &[u8],
         timeout: std::time::Duration,
     ) -> Result<()> {
-        tokio::time::timeout(timeout, self.write_shutdown_attempt(event))
+        tokio::time::timeout(timeout, self.write_shutdown_attempt(working, payload))
             .await
             .map_err(|_| anyhow::anyhow!("LTP shutdown write timed out"))?
     }
@@ -538,11 +592,15 @@ impl Output for LtpOutput {
             return Ok(());
         }
 
+        let mut working = self.working_event_meta(event);
         let mut attempt = 0u32;
         let mut wait = self.retry.initial_wait;
         let mut shutdown = self.shutdown_signal.clone();
         loop {
-            match self.write_attempt(event, &mut shutdown).await {
+            match self
+                .write_attempt(&mut working, &event.egress, &mut shutdown)
+                .await
+            {
                 WriteOutcome::Delivered => {
                     self.metrics.in_retry.set(0);
                     self.metrics.events_written.inc();
@@ -603,8 +661,13 @@ impl Output for LtpOutput {
             .await;
             return Ok(());
         }
+        let mut working = self.working_event_meta(event);
         let result = self
-            .write_shutdown_with_timeout(event, crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT)
+            .write_shutdown_with_timeout(
+                &mut working,
+                &event.egress,
+                crate::modules::SHUTDOWN_FLUSH_ATTEMPT_TIMEOUT,
+            )
             .await;
         crate::modules::finalize_shutdown_singleton_disposition_ambiguous(
             result,
@@ -1081,7 +1144,8 @@ mod tests {
             crate::dsl::value::OwnedValue::String("no".into()),
         );
 
-        let frame = output.event_frame(&event).unwrap();
+        let mut working = output.working_event_meta(&event);
+        let frame = output.event_frame(&mut working, &event.egress).unwrap();
         let (meta, payload) = crate::ltp::decode_frame(&frame).unwrap();
         assert_eq!(meta.key, event.key().as_bytes());
         assert_eq!(meta.stamps.len(), 1);
@@ -1094,12 +1158,120 @@ mod tests {
     }
 
     #[test]
+    fn sixteen_hop_delivery_clones_once_and_reuses_working_metadata_across_attempts() {
+        let output = output_for("127.0.0.1:1");
+        let mut stamps: Vec<HopStamp> = (0..15)
+            .map(|index| HopStamp {
+                node_id: format!("peer-{index}"),
+                arrival_unix_nano: index,
+                departure_unix_nano: index + 1,
+            })
+            .collect();
+        stamps.push(HopStamp {
+            node_id: "node-a".to_owned(),
+            arrival_unix_nano: 100,
+            departure_unix_nano: 0,
+        });
+        let event = Event::from_ltp_parts(
+            uuid::Uuid::now_v7(),
+            Utc.timestamp_nanos(100),
+            "127.0.0.1:7514".parse().unwrap(),
+            Bytes::from_static(b"payload"),
+            stamps.clone(),
+        );
+
+        STAMP_CLONE_COUNT.set(0);
+        let mut working = output.working_event_meta(&event);
+        let first = output.event_frame(&mut working, &event.egress).unwrap();
+        let second = output.event_frame(&mut working, &event.egress).unwrap();
+
+        assert_eq!(STAMP_CLONE_COUNT.get(), 1);
+        assert_eq!(working.meta.stamps.len(), 16);
+        assert_eq!(working.local_stamp, 15);
+        assert_eq!(event.ltp_stamps(), stamps);
+        for frame in [first, second] {
+            let (meta, payload) = crate::ltp::decode_frame(&frame).unwrap();
+            assert_eq!(meta.stamps.len(), 16);
+            assert_eq!(meta.stamps[..15], stamps[..15]);
+            assert_eq!(meta.stamps[15].node_id, "node-a");
+            assert_ne!(meta.stamps[15].departure_unix_nano, 0);
+            assert_eq!(payload, Bytes::from_static(b"payload"));
+        }
+    }
+
+    #[test]
+    fn exact_metadata_limit_from_input_encodes_through_the_real_output_path() {
+        let key = uuid::Uuid::now_v7();
+        let node_id = ((MAX_META_LEN - 128)..=MAX_META_LEN)
+            .find_map(|len| {
+                let node_id = "n".repeat(len);
+                let meta = LtpMeta {
+                    key: key.as_bytes().to_vec(),
+                    stamps: vec![HopStamp {
+                        node_id: node_id.clone(),
+                        arrival_unix_nano: 123,
+                        departure_unix_nano: 1,
+                    }],
+                };
+                (meta.encoded_len() == MAX_META_LEN).then_some(node_id)
+            })
+            .unwrap();
+        let mut output = output_for("127.0.0.1:1");
+        output.node_id = Arc::from(node_id.clone());
+        output.now = now_200;
+        let event = Event::from_ltp_parts(
+            key,
+            Utc.timestamp_nanos(123),
+            "127.0.0.1:7514".parse().unwrap(),
+            Bytes::from_static(b"payload"),
+            vec![HopStamp {
+                node_id,
+                arrival_unix_nano: 123,
+                departure_unix_nano: 0,
+            }],
+        );
+
+        let mut working = output.working_event_meta(&event);
+        let frame = output.event_frame(&mut working, &event.egress).unwrap();
+        let (meta, payload) = crate::ltp::decode_frame(&frame).unwrap();
+        assert_eq!(meta.encoded_len(), MAX_META_LEN);
+        assert_eq!(meta.stamps.last().unwrap().departure_unix_nano, 200);
+        assert_eq!(payload, Bytes::from_static(b"payload"));
+    }
+
+    #[test]
+    fn output_appends_one_local_stamp_when_input_history_ends_at_a_peer() {
+        let output = output_for("127.0.0.1:1");
+        let stamps: Vec<HopStamp> = (0..15)
+            .map(|index| HopStamp {
+                node_id: format!("peer-{index}"),
+                arrival_unix_nano: index,
+                departure_unix_nano: index + 1,
+            })
+            .collect();
+        let event = Event::from_ltp_parts(
+            uuid::Uuid::now_v7(),
+            Utc.timestamp_nanos(100),
+            "127.0.0.1:7514".parse().unwrap(),
+            Bytes::from_static(b"payload"),
+            stamps,
+        );
+
+        let working = output.working_event_meta(&event);
+        assert_eq!(working.meta.stamps.len(), 16);
+        assert_eq!(working.local_stamp, 15);
+        assert_eq!(working.meta.stamps[15].node_id, "node-a");
+        assert_eq!(working.meta.stamps[15].departure_unix_nano, 0);
+    }
+
+    #[test]
     fn negative_or_unrepresentable_timestamps_map_to_zero() {
         let mut output = output_for("127.0.0.1:1");
         output.now = now_negative;
         let mut event = Event::new(Bytes::new(), "127.0.0.1:1".parse().unwrap());
         event.received_at = Utc.timestamp_nanos(-1);
-        let frame = output.event_frame(&event).unwrap();
+        let mut working = output.working_event_meta(&event);
+        let frame = output.event_frame(&mut working, &event.egress).unwrap();
         let (meta, _) = crate::ltp::decode_frame(&frame).unwrap();
         assert_eq!(meta.stamps[0].arrival_unix_nano, 0);
         assert_eq!(meta.stamps[0].departure_unix_nano, 0);
@@ -1111,12 +1283,16 @@ mod tests {
         output.now = now_200;
         let mut event = Event::new(Bytes::new(), "127.0.0.1:1".parse().unwrap());
         event.egress = Bytes::from_static(b"payload");
-        let expected_len = output.event_frame(&event).unwrap().len() as u64;
+        let mut working = output.working_event_meta(&event);
+        let expected_len = output
+            .event_frame(&mut working, &event.egress)
+            .unwrap()
+            .len() as u64;
 
         let mut flush_failure = ScriptedWriter::new(2, FlushAction::Error);
         assert!(
             output
-                .write_event(&mut flush_failure, &event)
+                .write_event(&mut flush_failure, &mut working, &event.egress)
                 .await
                 .is_err()
         );
@@ -1125,7 +1301,10 @@ mod tests {
         assert_eq!(output.metrics.bytes_written.load(Ordering::Relaxed), 0);
 
         let mut success = ScriptedWriter::new(3, FlushAction::Ok);
-        output.write_event(&mut success, &event).await.unwrap();
+        output
+            .write_event(&mut success, &mut working, &event.egress)
+            .await
+            .unwrap();
         assert_eq!(success.bytes.len(), expected_len as usize);
         assert_eq!(success.flushes, 1);
         assert_eq!(
@@ -1159,8 +1338,9 @@ mod tests {
         let mut writer = ScriptedWriter::new(usize::MAX, FlushAction::Ok);
         writer.mark_first_flush = true;
 
+        let mut working = output.working_event_meta(&event);
         output
-            .write_hello_and_event(&mut writer, &event)
+            .write_hello_and_event(&mut writer, &mut working, &event.egress)
             .await
             .unwrap();
 
@@ -1422,9 +1602,14 @@ mod tests {
 
         let mut pending = Event::new(Bytes::new(), "127.0.0.1:1".parse().unwrap());
         pending.egress = Bytes::from(vec![0; MAX_PAYLOAD_LEN]);
+        let mut pending_working = output.working_event_meta(&pending);
         assert!(
             output
-                .write_shutdown_with_timeout(&pending, std::time::Duration::from_millis(100))
+                .write_shutdown_with_timeout(
+                    &mut pending_working,
+                    &pending.egress,
+                    std::time::Duration::from_millis(100),
+                )
                 .await
                 .is_err()
         );
@@ -1434,7 +1619,11 @@ mod tests {
         );
 
         let next = Event::new(Bytes::from_static(b"next"), "127.0.0.1:1".parse().unwrap());
-        output.write_shutdown_attempt(&next).await.unwrap();
+        let mut next_working = output.working_event_meta(&next);
+        output
+            .write_shutdown_attempt(&mut next_working, &next.egress)
+            .await
+            .unwrap();
 
         let (first_hello, first_event, second_hello, second_event) = server.await.unwrap();
         for hello in [&first_hello, &second_hello] {
@@ -1557,8 +1746,9 @@ mod tests {
         output.now = retry_now;
         let mut event = Event::new(Bytes::from_static(b"x"), "127.0.0.1:1".parse().unwrap());
         event.received_at = Utc.timestamp_nanos(100);
-        let first = output.event_frame(&event).unwrap();
-        let second = output.event_frame(&event).unwrap();
+        let mut working = output.working_event_meta(&event);
+        let first = output.event_frame(&mut working, &event.egress).unwrap();
+        let second = output.event_frame(&mut working, &event.egress).unwrap();
         let first_meta = crate::ltp::decode_frame(&first).unwrap().0;
         let second_meta = crate::ltp::decode_frame(&second).unwrap().0;
         assert_eq!(first_meta.key, second_meta.key);

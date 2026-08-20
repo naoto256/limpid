@@ -145,6 +145,64 @@ def output out {{
 }
 
 #[test]
+fn check_validates_ltp_input_without_accessing_node_key() {
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("ltp-input-check.conf");
+    let missing = dir.path().join("intentionally-missing-private-key.pem");
+    fs::write(
+        &conf,
+        format!(
+            r#"node_key {:?}
+def input incoming {{
+    type ltp
+    peer {{
+        node_id "peer-a"
+        pubkey "MCowBQYDK2VwAyEA//////////////////////////////////////////8="
+    }}
+    max_hops 16
+}}
+"#,
+            missing.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let out = run_check(&conf);
+    assert!(
+        out.status.success(),
+        "--check must keep LTP input key preflight filesystem-free: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!missing.exists());
+}
+
+#[test]
+fn check_requires_node_key_for_ltp_input() {
+    let dir = TempDir::new().unwrap();
+    let conf = dir.path().join("ltp-input-missing-key.conf");
+    fs::write(
+        &conf,
+        r#"def input incoming {
+    type ltp
+    peer {
+        node_id "peer-a"
+        pubkey "MCowBQYDK2VwAyEA//////////////////////////////////////////8="
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let out = run_check(&conf);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("requires top-level node_key"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn check_rejects_ltp_requiredness_spki_and_endpoint_errors() {
     for (case, prefix, pubkey, endpoint, expected) in [
         (
