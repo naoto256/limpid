@@ -138,12 +138,13 @@ impl ErroredEventContext {
                 reason,
                 event,
             } => {
-                let ev = OwnedEvent::from_persisted_parts(
+                let ev = OwnedEvent::from_persisted_parts_with_stamps(
                     event.key(),
                     event.received_at,
                     event.source,
                     event.ingress.clone(),
                     event.ingress.clone(),
+                    event.ltp_stamps(),
                 );
                 let mut event_json = ev.to_json_value();
                 if let serde_json::Value::Object(ref mut map) = event_json {
@@ -173,12 +174,13 @@ impl ErroredEventContext {
                 output_name,
                 event,
             } => {
-                let ev = OwnedEvent::from_persisted_parts(
+                let ev = OwnedEvent::from_persisted_parts_with_stamps(
                     event.key(),
                     event.received_at,
                     event.source,
                     event.ingress.clone(),
                     event.egress.clone(),
+                    event.ltp_stamps(),
                 );
                 let mut event_json = ev.to_json_value();
                 if let serde_json::Value::Object(ref mut map) = event_json {
@@ -1693,6 +1695,61 @@ mod tests {
         assert_eq!(&replayed.ingress[..], b"hello");
         assert_eq!(&replayed.egress[..], b"goodbye");
         assert_eq!(replayed.key(), expected_key);
+    }
+
+    #[test]
+    fn output_dlq_round_trip_preserves_hidden_ltp_stamps() {
+        let stamps = vec![crate::ltp::HopStamp {
+            node_id: "peer-a".to_owned(),
+            arrival_unix_nano: 10,
+            departure_unix_nano: 20,
+        }];
+        let event = Event::from_ltp_parts(
+            uuid::Uuid::now_v7(),
+            chrono::Utc::now(),
+            "192.0.2.10:7514".parse().unwrap(),
+            Bytes::from_static(b"payload"),
+            stamps.clone(),
+        );
+        let ctx = ErroredEventContext::Output {
+            timestamp: chrono::Utc::now(),
+            pipeline: String::new(),
+            site: "sink enqueue".into(),
+            reason: "queue closed".into(),
+            output_name: "sink".into(),
+            event: crate::pipeline::OutputEvent::from_owned(&event),
+        };
+
+        let record: serde_json::Value = serde_json::from_str(&ctx.to_jsonl()).unwrap();
+        let replayed = Event::from_json(&serde_json::to_string(&record["event"]).unwrap()).unwrap();
+        assert_eq!(replayed.ltp_stamps(), stamps);
+    }
+
+    #[test]
+    fn process_dlq_round_trip_preserves_hidden_ltp_stamps() {
+        let stamps = vec![crate::ltp::HopStamp {
+            node_id: "peer-a".to_owned(),
+            arrival_unix_nano: 10,
+            departure_unix_nano: 20,
+        }];
+        let event = Event::from_ltp_parts(
+            uuid::Uuid::now_v7(),
+            chrono::Utc::now(),
+            "192.0.2.10:7514".parse().unwrap(),
+            Bytes::from_static(b"payload"),
+            stamps.clone(),
+        );
+        let ctx = ErroredEventContext::Process {
+            timestamp: chrono::Utc::now(),
+            pipeline: "pipeline".into(),
+            site: "process".into(),
+            reason: "failed".into(),
+            event: crate::pipeline::ProcessEvent::from_owned(&event),
+        };
+
+        let record: serde_json::Value = serde_json::from_str(&ctx.to_jsonl()).unwrap();
+        let replayed = Event::from_json(&serde_json::to_string(&record["event"]).unwrap()).unwrap();
+        assert_eq!(replayed.ltp_stamps(), stamps);
     }
 
     #[test]

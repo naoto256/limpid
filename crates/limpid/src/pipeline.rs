@@ -124,12 +124,24 @@ impl CompiledConfig {
     /// nothing left here that needs the registry.
     pub fn validate(&self) -> Result<()> {
         if self.node_key.is_none()
-            && self
+            && (self
                 .outputs
                 .values()
                 .any(|output| output.properties.type_name() == "ltp")
+                || self
+                    .inputs
+                    .values()
+                    .any(|input| input.properties.type_name() == "ltp"))
         {
-            bail!("output type 'ltp' requires top-level node_key");
+            bail!("module type 'ltp' requires top-level node_key");
+        }
+        for (name, input) in &self.inputs {
+            if input.properties.type_name() == "ltp" {
+                crate::modules::input::ltp::validate_static_properties(
+                    name,
+                    input.properties.user_properties(),
+                )?;
+            }
         }
         for (name, output) in &self.outputs {
             if output.properties.type_name() == "ltp" {
@@ -339,6 +351,7 @@ pub struct ProcessEvent {
     pub source: std::net::SocketAddr,
     pub received_at: chrono::DateTime<chrono::Utc>,
     pub ingress: bytes::Bytes,
+    ltp_stamps: std::sync::Arc<[crate::ltp::HopStamp]>,
 }
 
 /// Output-flavor event snapshot for the DLQ.
@@ -354,6 +367,7 @@ pub struct OutputEvent {
     pub received_at: chrono::DateTime<chrono::Utc>,
     pub ingress: bytes::Bytes,
     pub egress: bytes::Bytes,
+    ltp_stamps: std::sync::Arc<[crate::ltp::HopStamp]>,
 }
 
 impl ProcessEvent {
@@ -364,12 +378,17 @@ impl ProcessEvent {
             source: ev.source,
             received_at: ev.received_at,
             ingress: ev.ingress.clone(),
+            ltp_stamps: ev.ltp_stamps_arc(),
         }
     }
 
     /// Return the immutable identity of the captured event.
     pub fn key(&self) -> uuid::Uuid {
         self.key
+    }
+
+    pub(crate) fn ltp_stamps(&self) -> std::sync::Arc<[crate::ltp::HopStamp]> {
+        std::sync::Arc::clone(&self.ltp_stamps)
     }
 }
 
@@ -382,12 +401,17 @@ impl OutputEvent {
             received_at: ev.received_at,
             ingress: ev.ingress.clone(),
             egress: ev.egress.clone(),
+            ltp_stamps: ev.ltp_stamps_arc(),
         }
     }
 
     /// Return the immutable identity of the captured event.
     pub fn key(&self) -> uuid::Uuid {
         self.key
+    }
+
+    pub(crate) fn ltp_stamps(&self) -> std::sync::Arc<[crate::ltp::HopStamp]> {
+        std::sync::Arc::clone(&self.ltp_stamps)
     }
 }
 

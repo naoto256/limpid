@@ -745,6 +745,28 @@ mod tests {
         assert_eq!(e2.key(), second_key);
     }
 
+    #[tokio::test]
+    async fn disk_queue_round_trip_preserves_hidden_ltp_stamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = create_disk_queue(dir.path().to_str().unwrap(), 0).unwrap();
+        let stamps = vec![crate::ltp::HopStamp {
+            node_id: "peer-a".to_owned(),
+            arrival_unix_nano: 10,
+            departure_unix_nano: 20,
+        }];
+        let event = Event::from_ltp_parts(
+            uuid::Uuid::now_v7(),
+            chrono::Utc::now(),
+            "192.0.2.10:7514".parse().unwrap(),
+            Bytes::from_static(b"payload"),
+            stamps.clone(),
+        );
+
+        tx.send(event).await.unwrap();
+        let (recovered, _) = rx.recv().await.unwrap();
+        assert_eq!(recovered.ltp_stamps(), stamps);
+    }
+
     #[test]
     fn disk_queue_depth_is_the_saturating_write_acked_sequence_difference() {
         let dir = tempfile::tempdir().unwrap();
