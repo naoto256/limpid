@@ -107,6 +107,13 @@ impl ErroredEventContext {
     ///     "key": "<UUIDv7>",
     ///     "source": { "ip": ..., "port": ... },
     ///     "received_at": <unix nanos>,
+    ///     "ltp_stamps": [
+    ///       {
+    ///         "node_id": "<node id>",
+    ///         "arrival_unix_nano": <unix nanos>,
+    ///         "departure_unix_nano": <unix nanos>
+    ///       }
+    ///     ],                                      // non-empty LTP hop history only
     ///     "ingress": "...",
     ///     "egress":  "..."                         // kind=output only
     ///   }
