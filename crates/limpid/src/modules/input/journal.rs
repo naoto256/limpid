@@ -525,6 +525,101 @@ fn run_journal_reader(
     }
 }
 
+/// Anchor the journal read pointer at "just after the last matching
+/// entry" — so the poll loop's `next()` advances to the FIRST entry
+/// that arrives after daemon start, and no history is replayed.
+///
+/// The obvious `seek_tail()` + `previous()` sequence works when the
+/// active `match` view has at least one past entry (`previous`
+/// returns `n > 0`), but silently fails when the view is empty
+/// (`previous` returns `0` and the read pointer is
+/// implementation-defined). Branch on `previous()`'s return so the
+/// empty-match-view case (`Ok(0)`) falls through to `seek_head()` —
+/// with no history to replay by definition, `seek_head` + poll-loop
+/// `next()` picks up the first future match cleanly.
+///
+/// A `previous()` **error** is deliberately NOT treated the same way:
+/// `Err` does not imply an empty view — a non-empty view can also
+/// error here — and `seek_head` on a non-empty view would replay
+/// every past matching entry. On `Err` we keep the tail-anchored
+/// position established by the preceding `seek_tail()` and let the
+/// poll loop's `next()` advance from there; the operator sees the
+/// warn line.
+///
+/// Errors are logged (`warn!`) but not fatal: `seek_tail` / `previous`
+/// / `seek_head` failing here means the reader will still call
+/// `next()` in the poll loop against whatever cursor state the
+/// journal actually holds, and the operator will see the log line.
+/// Terminating the reader on a seek error would be stricter than
+/// necessary — the caller already made match_add work, and a poll
+/// loop against an inherited cursor is safer than crashing.
+fn anchor_at_tail_or_head(journal: &mut Journal) {
+    if let Err(e) = journal.seek_tail() {
+        warn!(
+            "journal: seek_tail failed, poll loop will start from whatever position the journal \
+             defaulted to: {}",
+            e
+        );
+        return;
+    }
+    match journal.previous() {
+        Ok(n) if n > 0 => {
+            // Anchored at the last matching entry; the poll loop's
+            // `next()` will advance past it into new arrivals.
+        }
+        Ok(_) => {
+            // Empty match view — no past matching entries. `seek_tail`
+            // may have left the read pointer in an implementation-
+            // defined state, so re-anchor at head. Since the match
+            // view is empty by construction there is no history to
+            // replay; the very next `next()` in the poll loop will
+            // wait until a matching entry actually appears.
+            if let Err(e) = journal.seek_head() {
+                warn!(
+                    "journal: seek_head fallback failed after empty-match previous(); poll loop \
+                     may not detect new matching entries reliably: {}",
+                    e
+                );
+            }
+        }
+        Err(e) => {
+            // Journal-level error walking backward. Do NOT fall back
+            // to `seek_head`: the view may be non-empty, and re-
+            // seeking to head would replay historical matching
+            // entries. Keep the tail-anchored position from
+            // `seek_tail()` and let the poll loop's `next()` advance
+            // from there.
+            warn!(
+                "journal: previous() after seek_tail failed ({}) — keeping the tail-anchored \
+                 position from seek_tail; poll loop will advance from there",
+                e
+            );
+        }
+    }
+}
+
+fn load_cursor(path: &PathBuf) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn save_cursor(path: &PathBuf, cursor: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp_path = path.with_extension("tmp");
+    if let Err(e) = std::fs::write(&tmp_path, cursor).and_then(|_| std::fs::rename(&tmp_path, path))
+    {
+        warn!(
+            "journal: failed to save cursor: {} — events may be re-delivered on restart",
+            e
+        );
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -803,100 +898,5 @@ def pipeline p { input j; output o }
             "should not over-sleep wildly; took {:?}",
             elapsed
         );
-    }
-}
-
-/// Anchor the journal read pointer at "just after the last matching
-/// entry" — so the poll loop's `next()` advances to the FIRST entry
-/// that arrives after daemon start, and no history is replayed.
-///
-/// The obvious `seek_tail()` + `previous()` sequence works when the
-/// active `match` view has at least one past entry (`previous`
-/// returns `n > 0`), but silently fails when the view is empty
-/// (`previous` returns `0` and the read pointer is
-/// implementation-defined). Branch on `previous()`'s return so the
-/// empty-match-view case (`Ok(0)`) falls through to `seek_head()` —
-/// with no history to replay by definition, `seek_head` + poll-loop
-/// `next()` picks up the first future match cleanly.
-///
-/// A `previous()` **error** is deliberately NOT treated the same way:
-/// `Err` does not imply an empty view — a non-empty view can also
-/// error here — and `seek_head` on a non-empty view would replay
-/// every past matching entry. On `Err` we keep the tail-anchored
-/// position established by the preceding `seek_tail()` and let the
-/// poll loop's `next()` advance from there; the operator sees the
-/// warn line.
-///
-/// Errors are logged (`warn!`) but not fatal: `seek_tail` / `previous`
-/// / `seek_head` failing here means the reader will still call
-/// `next()` in the poll loop against whatever cursor state the
-/// journal actually holds, and the operator will see the log line.
-/// Terminating the reader on a seek error would be stricter than
-/// necessary — the caller already made match_add work, and a poll
-/// loop against an inherited cursor is safer than crashing.
-fn anchor_at_tail_or_head(journal: &mut Journal) {
-    if let Err(e) = journal.seek_tail() {
-        warn!(
-            "journal: seek_tail failed, poll loop will start from whatever position the journal \
-             defaulted to: {}",
-            e
-        );
-        return;
-    }
-    match journal.previous() {
-        Ok(n) if n > 0 => {
-            // Anchored at the last matching entry; the poll loop's
-            // `next()` will advance past it into new arrivals.
-        }
-        Ok(_) => {
-            // Empty match view — no past matching entries. `seek_tail`
-            // may have left the read pointer in an implementation-
-            // defined state, so re-anchor at head. Since the match
-            // view is empty by construction there is no history to
-            // replay; the very next `next()` in the poll loop will
-            // wait until a matching entry actually appears.
-            if let Err(e) = journal.seek_head() {
-                warn!(
-                    "journal: seek_head fallback failed after empty-match previous(); poll loop \
-                     may not detect new matching entries reliably: {}",
-                    e
-                );
-            }
-        }
-        Err(e) => {
-            // Journal-level error walking backward. Do NOT fall back
-            // to `seek_head`: the view may be non-empty, and re-
-            // seeking to head would replay historical matching
-            // entries. Keep the tail-anchored position from
-            // `seek_tail()` and let the poll loop's `next()` advance
-            // from there.
-            warn!(
-                "journal: previous() after seek_tail failed ({}) — keeping the tail-anchored \
-                 position from seek_tail; poll loop will advance from there",
-                e
-            );
-        }
-    }
-}
-
-fn load_cursor(path: &PathBuf) -> Option<String> {
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-fn save_cursor(path: &PathBuf, cursor: &str) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let tmp_path = path.with_extension("tmp");
-    if let Err(e) = std::fs::write(&tmp_path, cursor).and_then(|_| std::fs::rename(&tmp_path, path))
-    {
-        warn!(
-            "journal: failed to save cursor: {} — events may be re-delivered on restart",
-            e
-        );
-        let _ = std::fs::remove_file(&tmp_path);
     }
 }
