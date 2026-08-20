@@ -6,7 +6,7 @@
 //! helper materialises its canonical fully-labelled counter series
 //! in the shared registry.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,6 +32,76 @@ pub(crate) fn register_build_info(
         .build()?;
     build_info.set(1);
     Ok(())
+}
+
+pub(crate) const LTP_HOP_LATENCY_BUCKETS: [f64; 8] =
+    [0.0001, 0.001, 0.005, 0.025, 0.1, 0.5, 2.5, 10.0];
+
+#[derive(Clone)]
+pub(crate) struct LtpPeerMetrics {
+    pub(crate) network_latency: Arc<registry_core::Histogram>,
+    pub(crate) intra_latency: Arc<registry_core::Histogram>,
+    pub(crate) negative_delta: Arc<registry_core::Counter>,
+    pub(crate) loop_dropped: Arc<registry_core::Counter>,
+}
+
+pub(crate) struct LtpMetrics {
+    peers: BTreeMap<String, LtpPeerMetrics>,
+    pub(crate) rejected_unknown_peer: Arc<registry_core::Counter>,
+}
+
+impl LtpMetrics {
+    pub(crate) fn register(
+        registry: &Registry,
+        peers: &BTreeSet<String>,
+    ) -> Result<Arc<Self>, MetricsError> {
+        let rejected_unknown_peer = registry
+            .counter("limpid_ltp_rejected_unknown_peer_total")
+            .help("Total LTP peer connection attempts rejected for an undeclared key or mismatched node identity.")
+            .build()?;
+        let mut handles = BTreeMap::new();
+        for peer in peers {
+            let histogram = |segment| {
+                registry
+                    .histogram("limpid_ltp_hop_latency_seconds")
+                    .label("peer", peer)
+                    .label("segment", segment)
+                    .help("LTP hop latency between authenticated peers.")
+                    .buckets(&LTP_HOP_LATENCY_BUCKETS)
+                    .build()
+            };
+            let counter = |name, help| {
+                registry
+                    .counter(name)
+                    .label("peer", peer)
+                    .help(help)
+                    .build()
+            };
+            handles.insert(
+                peer.clone(),
+                LtpPeerMetrics {
+                    network_latency: histogram("network")?,
+                    intra_latency: histogram("intra")?,
+                    negative_delta: counter(
+                        "limpid_ltp_negative_delta_total",
+                        "Total negative cross-host LTP latency deltas clamped to zero.",
+                    )?,
+                    loop_dropped: counter(
+                        "limpid_ltp_loop_dropped_total",
+                        "Total LTP events dropped because of a cycle or hop limit.",
+                    )?,
+                },
+            );
+        }
+        Ok(Arc::new(Self {
+            peers: handles,
+            rejected_unknown_peer,
+        }))
+    }
+
+    pub(crate) fn peer(&self, peer: &str) -> Option<LtpPeerMetrics> {
+        self.peers.get(peer).cloned()
+    }
 }
 
 pub struct InputMetrics {
@@ -545,6 +615,16 @@ mod registry_core {
                     Err(observed) => current = observed,
                 }
             }
+        }
+
+        #[cfg(test)]
+        pub(crate) fn count(&self) -> u64 {
+            self.count.load(Ordering::Relaxed)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn sum(&self) -> f64 {
+            f64::from_bits(self.sum_bits.load(Ordering::Relaxed))
         }
     }
 
@@ -1113,9 +1193,11 @@ pub(crate) use registry_core::{MetricsError, Registry};
 #[cfg(test)]
 mod registry_tests {
     use super::{
-        InputMetrics, MetricsError, MetricsSnapshot, OutputMetrics, PipelineMetrics, Registry,
+        InputMetrics, LTP_HOP_LATENCY_BUCKETS, LtpMetrics, MetricsError, MetricsSnapshot,
+        OutputMetrics, PipelineMetrics, Registry,
     };
     use serde_json::Value;
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     fn build_ok<T>(result: Result<T, MetricsError>) -> T {
@@ -1271,6 +1353,95 @@ mod registry_tests {
             }])
         );
         assert_eq!(snapshot["metrics"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ltp_metrics_prepopulate_the_static_peer_union_with_exact_metadata() {
+        let registry = Registry::new();
+        let peers = BTreeSet::from([
+            "peer-b".to_owned(),
+            "peer-a".to_owned(),
+            "peer-a".to_owned(),
+        ]);
+        let metrics = LtpMetrics::register(&registry, &peers).unwrap();
+
+        let first_peer_a = metrics.peer("peer-a").unwrap();
+        let second_peer_a = metrics.peer("peer-a").unwrap();
+        assert!(Arc::ptr_eq(
+            &first_peer_a.network_latency,
+            &second_peer_a.network_latency
+        ));
+        assert!(Arc::ptr_eq(
+            &first_peer_a.intra_latency,
+            &second_peer_a.intra_latency
+        ));
+        assert!(Arc::ptr_eq(
+            &first_peer_a.negative_delta,
+            &second_peer_a.negative_delta
+        ));
+        assert!(Arc::ptr_eq(
+            &first_peer_a.loop_dropped,
+            &second_peer_a.loop_dropped
+        ));
+        assert!(metrics.peer("peer-b").is_some());
+        assert!(metrics.peer("unknown").is_none());
+
+        let snapshot = snapshot_json(&registry);
+        let latency = metric(&snapshot, "limpid_ltp_hop_latency_seconds");
+        assert_eq!(latency["type"], "histogram");
+        assert_eq!(
+            latency["help"],
+            "LTP hop latency between authenticated peers."
+        );
+        let series = latency["series"].as_array().unwrap();
+        assert_eq!(series.len(), 4);
+        assert_eq!(
+            series
+                .iter()
+                .map(|series| (
+                    series["labels"]["peer"].as_str().unwrap(),
+                    series["labels"]["segment"].as_str().unwrap(),
+                    series["count"].as_u64().unwrap(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("peer-a", "network", 0),
+                ("peer-a", "intra", 0),
+                ("peer-b", "network", 0),
+                ("peer-b", "intra", 0),
+            ]
+        );
+        for series in series {
+            let buckets = series["buckets"].as_array().unwrap();
+            assert_eq!(buckets.len(), LTP_HOP_LATENCY_BUCKETS.len());
+            for (actual, expected) in buckets.iter().zip(LTP_HOP_LATENCY_BUCKETS) {
+                assert_eq!(actual[0].as_f64().unwrap(), expected);
+                assert_eq!(actual[1], 0);
+            }
+        }
+
+        for (name, labels) in [
+            ("limpid_ltp_negative_delta_total", 2),
+            ("limpid_ltp_loop_dropped_total", 2),
+            ("limpid_ltp_rejected_unknown_peer_total", 1),
+        ] {
+            let family = metric(&snapshot, name);
+            assert_eq!(family["type"], "counter");
+            assert_eq!(family["series"].as_array().unwrap().len(), labels);
+            assert!(
+                family["series"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|s| s["value"] == 0)
+            );
+        }
+        assert!(
+            metric(&snapshot, "limpid_ltp_rejected_unknown_peer_total")["series"][0]["labels"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn metric<'a>(snapshot: &'a Value, name: &str) -> &'a Value {

@@ -4,7 +4,7 @@
 //! Runtime does NOT count metrics — each component counts its own.
 //! Runtime distributes one shared metrics registry to every component.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -17,7 +17,7 @@ use crate::dsl::ast::*;
 use crate::dsl::props;
 use crate::event::Event;
 use crate::functions::FunctionRegistry;
-use crate::metrics::{PipelineMetrics, Registry};
+use crate::metrics::{LtpMetrics, PipelineMetrics, Registry};
 use crate::modules::{self, HasMetrics, ModuleRegistry};
 use crate::pipeline::CompiledConfig;
 use crate::queue::{self, QueueConfig, QueueSender};
@@ -28,6 +28,39 @@ pub struct Runtime {
     handles: Vec<tokio::task::JoinHandle<()>>,
     config_file: PathBuf,
     compiled_config: CompiledConfig,
+}
+
+fn configured_ltp_peer_ids(config: &CompiledConfig) -> Result<BTreeSet<String>> {
+    let mut peers = BTreeSet::new();
+    for (kind, name, properties) in config
+        .inputs
+        .iter()
+        .map(|(name, def)| ("input", name, &def.properties))
+        .chain(
+            config
+                .outputs
+                .iter()
+                .map(|(name, def)| ("output", name, &def.properties)),
+        )
+        .filter(|(_, _, properties)| properties.type_name() == "ltp")
+    {
+        for peer in properties
+            .user_properties()
+            .iter()
+            .filter_map(|property| match property {
+                Property::Block {
+                    key, properties, ..
+                } if key == "peer" => Some(properties.as_slice()),
+                _ => None,
+            })
+        {
+            let node_id = props::get_string(peer, "node_id").ok_or_else(|| {
+                anyhow::anyhow!("{kind} '{name}': peer node_id requires a string value")
+            })?;
+            peers.insert(node_id);
+        }
+    }
+    Ok(peers)
 }
 
 impl Runtime {
@@ -74,6 +107,12 @@ impl Runtime {
         let func_registry = Arc::new(func_registry);
 
         config.validate()?;
+        let ltp_peer_ids = configured_ltp_peer_ids(&config)?;
+        let ltp_metrics = if ltp_peer_ids.is_empty() {
+            None
+        } else {
+            Some(LtpMetrics::register(&metrics_registry, &ltp_peer_ids)?)
+        };
         let ltp_node_key = config
             .node_key
             .as_deref()
@@ -163,6 +202,7 @@ impl Runtime {
             shutdown_signal: shutdown_rx.clone(),
             ltp_node_id: Some(Arc::<str>::from(node_id.clone())),
             ltp_node_key,
+            ltp_metrics,
         };
 
         // --- 1. Create outputs (each output owns its own OutputMetrics) ---
@@ -1051,6 +1091,29 @@ mod tests {
     fn compiled_config(src: &str) -> CompiledConfig {
         CompiledConfig::from_config(parse_config(src).expect("parse config"))
             .expect("compile config")
+    }
+
+    #[test]
+    fn ltp_peer_metric_registration_uses_the_deduplicated_static_config_union() {
+        use base64::Engine as _;
+
+        let mut spki = crate::ltp::ED25519_SPKI_PREFIX.to_vec();
+        spki.extend_from_slice(&[7; 32]);
+        let pubkey = base64::engine::general_purpose::STANDARD.encode(spki);
+        let config = compiled_config(&format!(
+            "def input ltp_in {{ type ltp peer {{ node_id \"peer-input\" pubkey {pubkey:?} }} }}\n\
+             def output ltp_out_a {{ type ltp peer {{ node_id \"peer-a\" pubkey {pubkey:?} endpoint \"127.0.0.1:7514\" }} }}\n\
+             def output ltp_out_b {{ type ltp peer {{ node_id \"peer-b\" pubkey {pubkey:?} endpoint \"127.0.0.1:7515\" }} }}"
+        ));
+
+        assert_eq!(
+            configured_ltp_peer_ids(&config).unwrap(),
+            BTreeSet::from([
+                "peer-a".to_owned(),
+                "peer-b".to_owned(),
+                "peer-input".to_owned(),
+            ])
+        );
     }
 
     fn metric_series(registry: &Registry, name: &str) -> Vec<serde_json::Value> {

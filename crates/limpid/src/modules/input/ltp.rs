@@ -1,6 +1,7 @@
 //! Authenticated LTP listener.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::io;
 use std::sync::Arc;
 
@@ -30,7 +31,7 @@ use crate::ltp::{
     ED25519_SPKI_PREFIX, FRAME_MAGIC, FRAME_PREFIX_SIZE, FRAME_VERSION, HopStamp, LtpHello,
     LtpMeta, MAX_META_LEN, MAX_PAYLOAD_LEN, PAYLOAD_LEN_SIZE, ValidatedNodeKey,
 };
-use crate::metrics::InputMetrics;
+use crate::metrics::{InputMetrics, LtpMetrics, LtpPeerMetrics};
 use crate::modules::{HasMetrics, Input, Module};
 
 const DEFAULT_LTP_PORT: u16 = 7514;
@@ -110,6 +111,7 @@ pub struct LtpInput {
     max_hops: usize,
     max_connections: usize,
     metrics: Arc<InputMetrics>,
+    ltp_metrics: Arc<LtpMetrics>,
     now: fn() -> DateTime<Utc>,
     #[cfg(test)]
     hello_started: Option<Arc<tokio::sync::Notify>>,
@@ -123,6 +125,7 @@ struct ConnectionContext {
     max_hops: usize,
     now: fn() -> DateTime<Utc>,
     metrics: Arc<InputMetrics>,
+    ltp_metrics: Arc<LtpMetrics>,
     tx: tokio::sync::mpsc::Sender<Event>,
     #[cfg(test)]
     hello_started: Option<Arc<tokio::sync::Notify>>,
@@ -148,7 +151,12 @@ impl Module for LtpInput {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("input '{name}': LTP node key is unavailable"))?;
         let peers = parse_peers(name, properties)?;
-        let acceptor = build_rpk_acceptor(node_key, &peers)?;
+        let ltp_metrics = ctx
+            .ltp_metrics
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("input '{name}': LTP metrics are unavailable"))?;
+        let acceptor = build_rpk_acceptor(node_key, &peers, Arc::clone(&ltp_metrics))?;
         let bind_addr = props::get_string(properties, "bind")
             .unwrap_or_else(|| format!("0.0.0.0:{DEFAULT_LTP_PORT}"));
         let max_hops = props::get_positive_int(properties, "max_hops")?.unwrap_or(DEFAULT_MAX_HOPS);
@@ -167,6 +175,7 @@ impl Module for LtpInput {
             max_hops: max_hops as usize,
             max_connections: max_connections as usize,
             metrics: InputMetrics::register(&ctx.metrics, name)?,
+            ltp_metrics,
             now: Utc::now,
             #[cfg(test)]
             hello_started: None,
@@ -218,6 +227,7 @@ impl LtpInput {
                         max_hops: self.max_hops,
                         now: self.now,
                         metrics: Arc::clone(&self.metrics),
+                        ltp_metrics: Arc::clone(&self.ltp_metrics),
                         tx: tx.clone(),
                         #[cfg(test)]
                         hello_started: self.hello_started.clone(),
@@ -248,10 +258,20 @@ impl Input for LtpInput {
     }
 }
 
-#[derive(Debug)]
 struct DeclaredClientVerifier {
     allowed_spki: Arc<HashSet<Vec<u8>>>,
     algorithms: WebPkiSupportedAlgorithms,
+    ltp_metrics: Arc<LtpMetrics>,
+}
+
+impl fmt::Debug for DeclaredClientVerifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeclaredClientVerifier")
+            .field("allowed_spki", &self.allowed_spki)
+            .field("algorithms", &self.algorithms)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ClientCertVerifier for DeclaredClientVerifier {
@@ -265,7 +285,18 @@ impl ClientCertVerifier for DeclaredClientVerifier {
         intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> std::result::Result<ClientCertVerified, TlsError> {
-        if !intermediates.is_empty() || !self.allowed_spki.contains(end_entity.as_ref()) {
+        if !intermediates.is_empty() {
+            return Err(TlsError::InvalidCertificate(
+                CertificateError::UnknownIssuer,
+            ));
+        }
+        if !self.allowed_spki.contains(end_entity.as_ref()) {
+            let candidate = end_entity.as_ref();
+            if candidate.len() == ED25519_SPKI_PREFIX.len() + 32
+                && candidate.starts_with(&ED25519_SPKI_PREFIX)
+            {
+                self.ltp_metrics.rejected_unknown_peer.inc();
+            }
             return Err(TlsError::InvalidCertificate(
                 CertificateError::UnknownIssuer,
             ));
@@ -305,12 +336,17 @@ impl ClientCertVerifier for DeclaredClientVerifier {
     }
 }
 
-fn build_rpk_acceptor(node_key: &ValidatedNodeKey, peers: &PeerRegistry) -> Result<TlsAcceptor> {
+fn build_rpk_acceptor(
+    node_key: &ValidatedNodeKey,
+    peers: &PeerRegistry,
+    ltp_metrics: Arc<LtpMetrics>,
+) -> Result<TlsAcceptor> {
     crate::tls::install_default_crypto_provider();
     let provider = rustls::crypto::aws_lc_rs::default_provider();
     let verifier = DeclaredClientVerifier {
         allowed_spki: Arc::new(peers.node_by_spki.keys().cloned().collect()),
         algorithms: provider.signature_verification_algorithms,
+        ltp_metrics,
     };
     let config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -466,6 +502,10 @@ async fn handle_connection(
         .peers
         .node_for_certificate(peer_certificate.as_ref())
         .ok_or_else(|| anyhow::anyhow!("LTP peer raw public key is not declared"))?;
+    let peer_metrics = context
+        .ltp_metrics
+        .peer(&authenticated_node_id)
+        .ok_or_else(|| anyhow::anyhow!("LTP peer metrics were not registered"))?;
 
     #[cfg(test)]
     if let Some(hello_started) = &context.hello_started {
@@ -481,6 +521,7 @@ async fn handle_connection(
     }
     let hello = LtpHello::decode(hello_frame.metadata).context("invalid LTP hello metadata")?;
     if hello.node_id != authenticated_node_id.as_ref() {
+        context.ltp_metrics.rejected_unknown_peer.inc();
         bail!("LTP hello node_id does not match the authenticated peer key");
     }
 
@@ -507,6 +548,7 @@ async fn handle_connection(
             &context.node_id,
             context.max_hops,
             context.now,
+            &peer_metrics,
         ) {
             Ok(decision) => decision,
             Err(error) => {
@@ -546,6 +588,7 @@ fn event_from_frame(
     node_id: &str,
     max_hops: usize,
     now: fn() -> DateTime<Utc>,
+    peer_metrics: &LtpPeerMetrics,
 ) -> Result<FrameDecision> {
     let key: [u8; 16] = meta
         .key
@@ -557,10 +600,12 @@ fn event_from_frame(
         bail!("LTP event key must be an RFC 4122 UUIDv7");
     }
     if meta.stamps.iter().any(|stamp| stamp.node_id == node_id) {
+        peer_metrics.loop_dropped.inc();
         warn!("LTP event dropped because its hop history already contains this node");
         return Ok(FrameDecision::DropCycle);
     }
     if meta.stamps.len() >= max_hops {
+        peer_metrics.loop_dropped.inc();
         warn!("LTP event dropped because its hop history reached max_hops");
         return Ok(FrameDecision::DropMaxHops);
     }
@@ -569,6 +614,20 @@ fn event_from_frame(
         .timestamp_nanos_opt()
         .and_then(|value| u64::try_from(value).ok())
         .unwrap_or(0);
+    if let Some(previous) = meta.stamps.last()
+        && previous.departure_unix_nano != 0
+    {
+        let delta = match arrival_unix_nano.checked_sub(previous.departure_unix_nano) {
+            Some(delta) => delta,
+            None => {
+                peer_metrics.negative_delta.inc();
+                0
+            }
+        };
+        peer_metrics
+            .network_latency
+            .observe(delta as f64 / 1_000_000_000.0);
+    }
     meta.stamps.push(HopStamp {
         node_id: node_id.to_owned(),
         arrival_unix_nano,
@@ -731,6 +790,18 @@ mod tests {
         InputMetrics::for_testing()
     }
 
+    fn test_ltp_metrics(peer: &str) -> Arc<LtpMetrics> {
+        LtpMetrics::register(
+            &crate::metrics::Registry::new(),
+            &std::collections::BTreeSet::from([peer.to_owned()]),
+        )
+        .unwrap()
+    }
+
+    fn test_peer_metrics(peer: &str) -> LtpPeerMetrics {
+        test_ltp_metrics(peer).peer(peer).unwrap()
+    }
+
     fn node_id_for_departed_meta_len(target: usize) -> String {
         ((target - 128)..=target)
             .find_map(|len| {
@@ -790,12 +861,24 @@ mod tests {
     #[test]
     fn event_validation_requires_uuid_v7_key_and_orders_cycle_before_hop_limit() {
         let source = "127.0.0.1:7514".parse().unwrap();
+        let peer_metrics = test_peer_metrics("peer");
         for key_len in [0, 15, 17] {
             let meta = LtpMeta {
                 key: vec![7; key_len],
                 stamps: Vec::new(),
             };
-            assert!(event_from_frame(meta, Bytes::new(), source, "self", 16, fixed_now).is_err());
+            assert!(
+                event_from_frame(
+                    meta,
+                    Bytes::new(),
+                    source,
+                    "self",
+                    16,
+                    fixed_now,
+                    &peer_metrics,
+                )
+                .is_err()
+            );
         }
 
         for invalid_key in [
@@ -822,6 +905,7 @@ mod tests {
                     "self",
                     16,
                     fixed_now,
+                    &peer_metrics,
                 )
                 .is_err()
             );
@@ -836,7 +920,16 @@ mod tests {
             }],
         };
         assert!(matches!(
-            event_from_frame(cycle, Bytes::new(), source, "self", 1, fixed_now).unwrap(),
+            event_from_frame(
+                cycle,
+                Bytes::new(),
+                source,
+                "self",
+                1,
+                fixed_now,
+                &peer_metrics,
+            )
+            .unwrap(),
             FrameDecision::DropCycle
         ));
 
@@ -849,9 +942,31 @@ mod tests {
             }],
         };
         assert!(matches!(
-            event_from_frame(full, Bytes::new(), source, "self", 1, fixed_now).unwrap(),
+            event_from_frame(
+                full,
+                Bytes::new(),
+                source,
+                "self",
+                1,
+                fixed_now,
+                &peer_metrics,
+            )
+            .unwrap(),
             FrameDecision::DropMaxHops
         ));
+        assert_eq!(
+            peer_metrics
+                .loop_dropped
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert_eq!(peer_metrics.network_latency.count(), 0);
+        assert_eq!(
+            peer_metrics
+                .negative_delta
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]
@@ -863,6 +978,7 @@ mod tests {
             departure_unix_nano: 11,
         };
         let source = "127.0.0.1:7514".parse().unwrap();
+        let peer_metrics = test_peer_metrics("peer");
         let decision = event_from_frame(
             LtpMeta {
                 key: key.to_vec(),
@@ -873,6 +989,7 @@ mod tests {
             "self",
             16,
             fixed_now,
+            &peer_metrics,
         )
         .unwrap();
         let FrameDecision::Forward(event) = decision else {
@@ -882,6 +999,8 @@ mod tests {
         assert_eq!(event.ingress, Bytes::from_static(b"payload"));
         assert_eq!(event.egress, Bytes::from_static(b"payload"));
         assert_eq!(event.ltp_stamps()[0], peer_stamp);
+        assert_eq!(peer_metrics.network_latency.count(), 1);
+        assert_eq!(peer_metrics.network_latency.sum(), 112.0 / 1_000_000_000.0);
         assert_eq!(
             event.ltp_stamps()[1],
             HopStamp {
@@ -889,6 +1008,42 @@ mod tests {
                 arrival_unix_nano: 123,
                 departure_unix_nano: 0,
             }
+        );
+    }
+
+    #[test]
+    fn network_latency_skips_unsealed_history_and_clamps_negative_deltas() {
+        let source = "127.0.0.1:7514".parse().unwrap();
+        let peer_metrics = test_peer_metrics("peer");
+        for departure_unix_nano in [0, 124] {
+            assert!(matches!(
+                event_from_frame(
+                    LtpMeta {
+                        key: v7_key(departure_unix_nano as u8).to_vec(),
+                        stamps: vec![HopStamp {
+                            node_id: "upstream".to_owned(),
+                            arrival_unix_nano: 1,
+                            departure_unix_nano,
+                        }],
+                    },
+                    Bytes::new(),
+                    source,
+                    "self",
+                    16,
+                    fixed_now,
+                    &peer_metrics,
+                )
+                .unwrap(),
+                FrameDecision::Forward(_)
+            ));
+        }
+        assert_eq!(peer_metrics.network_latency.count(), 1);
+        assert_eq!(peer_metrics.network_latency.sum(), 0.0);
+        assert_eq!(
+            peer_metrics
+                .negative_delta
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
         );
     }
 
@@ -906,6 +1061,7 @@ mod tests {
             &exact_node,
             16,
             fixed_now,
+            &test_peer_metrics("peer"),
         )
         .unwrap() else {
             panic!("metadata at the exact output boundary must be accepted");
@@ -932,6 +1088,7 @@ mod tests {
                 &oversized_node,
                 16,
                 fixed_now,
+                &test_peer_metrics("peer"),
             )
             .unwrap(),
             FrameDecision::DropMetadataTooLarge
@@ -1020,7 +1177,9 @@ mod tests {
         let (server_identity, server_spki) = generated_identity();
         let (client_identity, client_spki) = generated_identity();
         let peers = peer_registry("peer-a", client_spki);
-        let acceptor = build_rpk_acceptor(&server_identity, &peers).unwrap();
+        let ltp_metrics = test_ltp_metrics("peer-a");
+        let acceptor =
+            build_rpk_acceptor(&server_identity, &peers, Arc::clone(&ltp_metrics)).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
@@ -1038,6 +1197,7 @@ mod tests {
                     max_hops: 16,
                     now: fixed_now,
                     metrics: server_metrics,
+                    ltp_metrics,
                     tx,
                     hello_started: None,
                 },
@@ -1108,7 +1268,9 @@ mod tests {
         let (server_identity, server_spki) = generated_identity();
         let (client_identity, client_spki) = generated_identity();
         let peers = peer_registry("peer-a", client_spki);
-        let acceptor = build_rpk_acceptor(&server_identity, &peers).unwrap();
+        let ltp_metrics = test_ltp_metrics("peer-a");
+        let acceptor =
+            build_rpk_acceptor(&server_identity, &peers, Arc::clone(&ltp_metrics)).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -1126,6 +1288,7 @@ mod tests {
                     max_hops: 16,
                     now: fixed_now,
                     metrics: server_metrics,
+                    ltp_metrics,
                     tx,
                     hello_started: None,
                 },
@@ -1185,7 +1348,9 @@ mod tests {
         let (server_identity, server_spki) = generated_identity();
         let (client_identity, client_spki) = generated_identity();
         let peers = peer_registry("peer-a", client_spki);
-        let acceptor = build_rpk_acceptor(&server_identity, &peers).unwrap();
+        let ltp_metrics = test_ltp_metrics("peer-a");
+        let acceptor =
+            build_rpk_acceptor(&server_identity, &peers, Arc::clone(&ltp_metrics)).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
@@ -1204,6 +1369,7 @@ mod tests {
                     max_hops: 16,
                     now: fixed_now,
                     metrics: server_metrics,
+                    ltp_metrics,
                     tx,
                     hello_started: None,
                 },
@@ -1245,7 +1411,9 @@ mod tests {
         let (server_identity, server_spki) = generated_identity();
         let (client_identity, client_spki) = generated_identity();
         let peers = peer_registry("peer-a", client_spki);
-        let acceptor = build_rpk_acceptor(&server_identity, &peers).unwrap();
+        let ltp_metrics = test_ltp_metrics("peer-a");
+        let acceptor =
+            build_rpk_acceptor(&server_identity, &peers, Arc::clone(&ltp_metrics)).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let metrics = test_metrics();
@@ -1259,6 +1427,7 @@ mod tests {
             max_hops: 16,
             max_connections: 1,
             metrics,
+            ltp_metrics,
             now: fixed_now,
             hello_started: Some(Arc::clone(&hello_started)),
         };
@@ -1301,11 +1470,14 @@ mod tests {
         let (server_identity, server_spki) = generated_identity();
         let (client_identity, client_spki) = generated_identity();
         let peers = peer_registry("peer-a", client_spki);
-        let acceptor = build_rpk_acceptor(&server_identity, &peers).unwrap();
+        let ltp_metrics = test_ltp_metrics("peer-a");
+        let acceptor =
+            build_rpk_acceptor(&server_identity, &peers, Arc::clone(&ltp_metrics)).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let metrics = test_metrics();
+        let server_ltp_metrics = Arc::clone(&ltp_metrics);
         let server = tokio::spawn(async move {
             let (stream, peer_address) = listener.accept().await.unwrap();
             handle_connection(
@@ -1318,6 +1490,7 @@ mod tests {
                     max_hops: 16,
                     now: fixed_now,
                     metrics,
+                    ltp_metrics: server_ltp_metrics,
                     tx,
                     hello_started: None,
                 },
@@ -1341,6 +1514,12 @@ mod tests {
         let error = server.await.unwrap().unwrap_err().to_string();
         assert!(error.contains("hello node_id"));
         assert!(rx.try_recv().is_err());
+        assert_eq!(
+            ltp_metrics
+                .rejected_unknown_peer
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1349,7 +1528,9 @@ mod tests {
         let (_, declared_spki) = generated_identity();
         let (unknown_identity, _) = generated_identity();
         let peers = peer_registry("peer-a", declared_spki);
-        let acceptor = build_rpk_acceptor(&server_identity, &peers).unwrap();
+        let ltp_metrics = test_ltp_metrics("peer-a");
+        let acceptor =
+            build_rpk_acceptor(&server_identity, &peers, Arc::clone(&ltp_metrics)).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -1367,6 +1548,46 @@ mod tests {
         let server_result = server.await.unwrap();
         assert!(client_result.is_err() || server_result.is_err());
         assert!(server_result.is_err());
+        assert_eq!(
+            ltp_metrics
+                .rejected_unknown_peer
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn non_rpk_and_intermediate_certificate_failures_do_not_count_unknown_peers() {
+        let (_, declared_spki) = generated_identity();
+        let ltp_metrics = test_ltp_metrics("peer-a");
+        let verifier = DeclaredClientVerifier {
+            allowed_spki: Arc::new(HashSet::from([declared_spki.clone()])),
+            algorithms: rustls::crypto::aws_lc_rs::default_provider()
+                .signature_verification_algorithms,
+            ltp_metrics: Arc::clone(&ltp_metrics),
+        };
+        let now = UnixTime::since_unix_epoch(std::time::Duration::ZERO);
+
+        assert!(
+            verifier
+                .verify_client_cert(&CertificateDer::from(vec![1, 2, 3]), &[], now)
+                .is_err()
+        );
+        assert!(
+            verifier
+                .verify_client_cert(
+                    &CertificateDer::from(declared_spki),
+                    &[CertificateDer::from(vec![4, 5, 6])],
+                    now,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            ltp_metrics
+                .rejected_unknown_peer
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1374,7 +1595,9 @@ mod tests {
         let (server_identity, server_spki) = generated_identity();
         let (client_identity, client_spki) = generated_identity();
         let peers = peer_registry("peer-a", client_spki);
-        let acceptor = build_rpk_acceptor(&server_identity, &peers).unwrap();
+        let ltp_metrics = test_ltp_metrics("peer-a");
+        let acceptor =
+            build_rpk_acceptor(&server_identity, &peers, Arc::clone(&ltp_metrics)).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -1393,6 +1616,7 @@ mod tests {
                         max_hops: 16,
                         now: fixed_now,
                         metrics: Arc::clone(&metrics),
+                        ltp_metrics: Arc::clone(&ltp_metrics),
                         tx: tx.clone(),
                         hello_started: None,
                     },
@@ -1437,7 +1661,9 @@ mod tests {
         let (server_identity, _) = generated_identity();
         let (_, client_spki) = generated_identity();
         let peers = peer_registry("peer-a", client_spki);
-        let acceptor = build_rpk_acceptor(&server_identity, &peers).unwrap();
+        let ltp_metrics = test_ltp_metrics("peer-a");
+        let acceptor =
+            build_rpk_acceptor(&server_identity, &peers, Arc::clone(&ltp_metrics)).unwrap();
         let context = crate::modules::BuildContext::for_testing();
         let input = LtpInput {
             name: "in".to_owned(),
@@ -1448,6 +1674,7 @@ mod tests {
             max_hops: 16,
             max_connections: 2,
             metrics: InputMetrics::register(&context.metrics, "in").unwrap(),
+            ltp_metrics,
             now: fixed_now,
             hello_started: None,
         };
