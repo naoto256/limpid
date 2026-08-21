@@ -17,9 +17,10 @@ does not create another hop.
 
 ## Provision identities
 
-Every participating daemon needs a `node_key`. If `node_id` is omitted, limpid
-uses the hostname resolved once at startup; deployments with multiple instances
-on the same host should set an explicit, deployment-unique `node_id`:
+Every daemon that uses an LTP input or output needs a `node_key`. If `node_id`
+is omitted, limpid uses the hostname resolved once at startup; deployments with
+multiple instances on the same host should set an explicit, deployment-unique
+`node_id`:
 
 ```bash
 limpidctl ltp keygen /etc/limpid/node-key.pem
@@ -97,7 +98,10 @@ outer event frame only; TLS, TCP, and hello overhead are excluded.
 
 The receiver applies normal channel backpressure, and shutdown uses the same
 bounded drain semantics as other outputs. LTP adds no application
-acknowledgement; a successful final write and flush is the delivery boundary.
+acknowledgement; a successful final write and flush is the sender-side handoff
+boundary, not confirmation of peer acceptance or durable storage. An ambiguous
+connection or write failure follows ordinary retry behavior and can therefore
+deliver a duplicate.
 
 ## Hop timing
 

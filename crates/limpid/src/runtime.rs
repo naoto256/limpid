@@ -1118,6 +1118,7 @@ mod tests {
     #[tokio::test]
     async fn two_runtimes_deliver_one_event_over_mutual_rpk_ltp() {
         use std::os::unix::fs::PermissionsExt as _;
+        use tokio::io::AsyncWriteExt as _;
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1150,15 +1151,15 @@ def pipeline receive {{ input from_a; output delivered }}
             .await
             .unwrap();
 
-        let udp_listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let udp_addr = udp_listener.local_addr().unwrap();
-        drop(udp_listener);
+        let tcp_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        drop(tcp_listener);
         let node_a_config = compiled_config(&format!(
             r#"
 node_id "node-a"
 node_key {node_a_key:?}
 control {{ socket {node_a_socket:?} }}
-def input source {{ type syslog_udp bind "{udp_addr}" }}
+def input source {{ type syslog_tcp bind "{tcp_addr}" }}
 def output to_b {{
     type ltp
     peer {{ node_id "node-b" pubkey {node_b_spki:?} endpoint "{ltp_addr}" }}
@@ -1171,14 +1172,26 @@ def pipeline relay {{ input source; output to_b }}
             .unwrap();
 
         let marker = b"<13>two-runtime-mutual-rpk";
-        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut frame = marker.to_vec();
+        frame.push(b'\n');
+        let mut sender = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match tokio::net::TcpStream::connect(tcp_addr).await {
+                    Ok(stream) => break stream,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+                }
+            }
+        })
+        .await
+        .expect("syslog TCP input did not become ready");
+        sender.write_all(&frame).await.unwrap();
+        sender.flush().await.unwrap();
         let delivered = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                sender.send_to(marker, udp_addr).await.unwrap();
                 if let Ok(bytes) = tokio::fs::read(&delivered_path).await
-                    && bytes.windows(marker.len()).any(|window| window == marker)
+                    && bytes == frame
                 {
-                    break bytes;
+                    break;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
@@ -1187,12 +1200,8 @@ def pipeline relay {{ input source; output to_b }}
 
         node_a.shutdown().await;
         node_b.shutdown().await;
-        let delivered = delivered.expect("two-daemon LTP delivery timed out");
-        assert!(
-            delivered
-                .windows(marker.len())
-                .any(|window| window == marker)
-        );
+        delivered.expect("two-daemon LTP delivery timed out");
+        assert_eq!(tokio::fs::read(&delivered_path).await.unwrap(), frame);
     }
 
     #[test]
