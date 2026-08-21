@@ -938,14 +938,13 @@ impl ProcessMetricPlanValidator<'_> {
                 let expected = if let Some(existing) = self.edges.get(&(parent, name.clone())) {
                     *existing
                 } else {
+                    let step = self.next_step;
+                    self.next_step += 1;
                     let identity = self.raw.identities.get(*token).ok_or_else(|| {
                         anyhow::anyhow!("compiled nested process token is out of range")
                     })?;
-                    let parent_identity = self.raw.identities.get(parent).ok_or_else(|| {
-                        anyhow::anyhow!("compiled parent process token is out of range")
-                    })?;
                     if identity.parent != Some(parent)
-                        || identity.step != parent_identity.step
+                        || identity.step != step
                         || identity.kind != ProcessMetricNodeKind::Named(name.clone())
                     {
                         anyhow::bail!("compiled nested process token identity mismatch");
@@ -1092,8 +1091,6 @@ impl ProcessMetricsBuilder<'_> {
             PipelineStatement::ProcessChain(chain) => {
                 let mut nodes = Vec::with_capacity(chain.len());
                 for element in chain {
-                    let step = self.next_step;
-                    self.next_step += 1;
                     let (name, kind, body) = match element {
                         ProcessChainElement::Named(name) => (
                             name.as_str(),
@@ -1109,11 +1106,8 @@ impl ProcessMetricsBuilder<'_> {
                         ),
                     };
                     nodes.push(self.add_node(
-                        ProcessMetricNodeIdentity {
-                            parent: None,
-                            step,
-                            kind,
-                        },
+                        None,
+                        kind,
                         name,
                         format!("/{name}"),
                         body,
@@ -1149,14 +1143,16 @@ impl ProcessMetricsBuilder<'_> {
 
     fn add_node(
         &mut self,
-        identity: ProcessMetricNodeIdentity,
+        parent: Option<usize>,
+        kind: ProcessMetricNodeKind,
         name: &str,
         path: String,
         body: Option<&[ProcessStatement]>,
         ancestors: &mut Vec<(String, usize)>,
     ) -> Result<usize, crate::metrics::MetricsError> {
+        let step = self.next_step;
+        self.next_step += 1;
         let id = self.nodes.len();
-        let step = identity.step;
         self.nodes.push(ProcessMetricNode {
             counters: crate::metrics::ProcessCounters::register(
                 self.registry,
@@ -1169,11 +1165,12 @@ impl ProcessMetricsBuilder<'_> {
             #[cfg(test)]
             call_sites: Vec::new(),
         });
-        self.identities.push(identity);
+        self.identities
+            .push(ProcessMetricNodeIdentity { parent, step, kind });
         self.children.push(HashMap::new());
         ancestors.push((name.to_owned(), id));
         if let Some(body) = body {
-            self.nodes[id].body_plan = self.process_body(id, &path, step, body, ancestors)?;
+            self.nodes[id].body_plan = self.process_body(id, &path, body, ancestors)?;
         }
         ancestors.pop();
         Ok(id)
@@ -1183,14 +1180,11 @@ impl ProcessMetricsBuilder<'_> {
         &mut self,
         parent: usize,
         parent_path: &str,
-        step: usize,
         body: &[ProcessStatement],
         ancestors: &mut Vec<(String, usize)>,
     ) -> Result<Vec<ProcessMetricStatement>, crate::metrics::MetricsError> {
         body.iter()
-            .map(|statement| {
-                self.process_statement(parent, parent_path, step, statement, ancestors)
-            })
+            .map(|statement| self.process_statement(parent, parent_path, statement, ancestors))
             .collect()
     }
 
@@ -1198,7 +1192,6 @@ impl ProcessMetricsBuilder<'_> {
         &mut self,
         parent: usize,
         parent_path: &str,
-        step: usize,
         statement: &ProcessStatement,
         ancestors: &mut Vec<(String, usize)>,
     ) -> Result<ProcessMetricStatement, crate::metrics::MetricsError> {
@@ -1223,11 +1216,8 @@ impl ProcessMetricsBuilder<'_> {
                         .get(name)
                         .map(|process| process.body.as_slice());
                     let child = self.add_node(
-                        ProcessMetricNodeIdentity {
-                            parent: Some(parent),
-                            step,
-                            kind: ProcessMetricNodeKind::Named(name.clone()),
-                        },
+                        Some(parent),
+                        ProcessMetricNodeKind::Named(name.clone()),
                         name,
                         format!("{parent_path}/{name}"),
                         body,
@@ -1244,14 +1234,12 @@ impl ProcessMetricsBuilder<'_> {
                 let branches = chain
                     .branches
                     .iter()
-                    .map(|(_, body)| {
-                        self.process_branch(parent, parent_path, step, body, ancestors)
-                    })
+                    .map(|(_, body)| self.process_branch(parent, parent_path, body, ancestors))
                     .collect::<Result<Vec<_>, _>>()?;
                 let else_body = chain
                     .else_body
                     .as_deref()
-                    .map(|body| self.process_branch(parent, parent_path, step, body, ancestors))
+                    .map(|body| self.process_branch(parent, parent_path, body, ancestors))
                     .transpose()?;
                 Ok(ProcessMetricStatement::If {
                     branches,
@@ -1260,19 +1248,13 @@ impl ProcessMetricsBuilder<'_> {
             }
             ProcessStatement::Switch(_, arms) => Ok(ProcessMetricStatement::Switch(
                 arms.iter()
-                    .map(|arm| self.process_branch(parent, parent_path, step, &arm.body, ancestors))
+                    .map(|arm| self.process_branch(parent, parent_path, &arm.body, ancestors))
                     .collect::<Result<Vec<_>, _>>()?,
             )),
             ProcessStatement::TryCatch(try_body, catch_body) => {
                 Ok(ProcessMetricStatement::TryCatch {
-                    try_body: self.process_body(parent, parent_path, step, try_body, ancestors)?,
-                    catch_body: self.process_body(
-                        parent,
-                        parent_path,
-                        step,
-                        catch_body,
-                        ancestors,
-                    )?,
+                    try_body: self.process_body(parent, parent_path, try_body, ancestors)?,
+                    catch_body: self.process_body(parent, parent_path, catch_body, ancestors)?,
                 })
             }
             _ => Ok(ProcessMetricStatement::None),
@@ -1283,14 +1265,13 @@ impl ProcessMetricsBuilder<'_> {
         &mut self,
         parent: usize,
         parent_path: &str,
-        step: usize,
         body: &[BranchBody],
         ancestors: &mut Vec<(String, usize)>,
     ) -> Result<Vec<ProcessMetricStatement>, crate::metrics::MetricsError> {
         body.iter()
             .map(|item| match item {
                 BranchBody::Process(statement) => {
-                    self.process_statement(parent, parent_path, step, statement, ancestors)
+                    self.process_statement(parent, parent_path, statement, ancestors)
                 }
                 BranchBody::Pipeline(_) => Ok(ProcessMetricStatement::None),
             })
