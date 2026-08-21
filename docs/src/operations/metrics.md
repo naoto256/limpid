@@ -322,31 +322,45 @@ confirmed by `send`.
 # Operator-focused table: Pipelines, Inputs, Outputs, then Processes when present
 sudo limpidctl stats
 
-# Generic human view of every schema-v1 family and series
+# Expanded human view with process identity and structured metric families
 sudo limpidctl stats --details
 
-# Complete raw control-socket response, byte-for-byte
+# Complete legacy generic family-and-series text
+sudo limpidctl stats --raw
+
+# Complete schema-v1 control-socket response, byte-for-byte
 sudo limpidctl stats --json
 ```
 
 The default table preserves the established component-counter view and appends
-a `Processes` invocation table when all four process families are present and
-valid. Process rows sort by pipeline, numeric step, path, and name. Component
-names are sorted and alarm fields such as `wedged` and `errored_unwritable` are
-shown under their existing conditional rules. Unknown future families are
-ignored in this mode. If a known family is missing, duplicated, has the wrong
-type or value, or does not have exactly its fixed labels, limpidctl prints the
-raw response rather than inventing a zero or a partial table.
+a `Processes` invocation table only when all four process families pass their
+strict validation. Process rows sort by pipeline, numeric step, path, and name.
+Component names are sorted and alarm fields such as `wedged` and
+`errored_unwritable` are shown under their existing conditional rules. Unknown
+future families are ignored in this mode. If the response fails wire, schema,
+or base canonical-family validation, the human modes print the raw response
+rather than inventing a zero or a partial table.
 
-`--details` replaces the default table with a generic view. Families are sorted
-by metric name, series by their canonical label key/value tuples, and labels by
-key. Every family shows its name, type, help, complete labels, and values.
-Histograms show the finite cumulative buckets stored in schema v1 plus `sum`
-and `count`; they do not synthesize `+Inf` in this human view.
+`--details` expands the human view. When strict process validation succeeds, it
+keeps the default component tables and process tree, adds each process's
+numeric `step` and `process_path` beneath its row, and presents every metric
+family in a structured `Metrics` section. Families are sorted by metric name,
+series by their canonical label key/value tuples, and labels by key. Counters
+and gauges show their labels and values; histograms show the finite cumulative
+buckets stored in schema v1 plus `sum` and `count`. This view does not
+synthesize `+Inf`. A DTO-valid process-only semantic defect or incomplete
+process-family set instead preserves the base component summary, omits
+`Processes`, and retains each process family in `Metrics` with
+`series: unavailable as a process summary; use --raw`.
+
+`--raw` prints the complete legacy generic family-and-series text. It retains
+each family's name, type, help, complete labels, and value or histogram data,
+including process labels that the human views organize into the process tree.
 
 `--json` bypasses parsing and formatting. It cannot be combined with
-`--details`. Invalid JSON, unsupported schemas, and malformed schema-v1 data
-retain the existing successful raw-response fallback for the human modes.
+`--details` or `--raw`; the three options are mutually exclusive. Wire,
+schema, and base canonical-family validation failures retain the existing
+successful raw-response fallback for the human modes.
 
 The deterministic human ordering is for reproducibility and testing only. It
 does not assign display or query semantics to a metric, series, or dashboard.
