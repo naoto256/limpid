@@ -222,8 +222,10 @@ upstream peer.
 succeeds: the event's persisted local arrival to that successful attempt's
 departure, labeled with the declared destination peer. Failed attempts and
 retries do not add observations. The histogram uses the fixed upper bounds
-`0.0001`, `0.001`, `0.005`, `0.025`, `0.1`, `0.5`, `2.5`, and `10` seconds,
-plus the exported `+Inf` bucket.
+`0.0001`, `0.001`, `0.005`, `0.025`, `0.1`, `0.5`, `2.5`, and `10` seconds as
+the schema-v1 registry's eight finite bounds. The Prometheus exporter derives
+the `+Inf` bucket from `count`; `limpidctl stats --json` contains no explicit
+`+Inf` bucket.
 
 An undeclared SPKI is counted at the raw-public-key verifier, and a declared key
 with the wrong hello identity is counted after the handshake. TLS timeouts,
