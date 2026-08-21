@@ -513,7 +513,7 @@ fn line_tokens(text: &str, token: &str) -> Vec<String> {
 }
 
 #[test]
-fn process_counters_render_a_numerically_sorted_default_invocation_table() {
+fn process_counters_render_a_source_ordered_tree_and_preserve_raw_modes() {
     let payload = process_snapshot();
     let response = format!("{payload}\n");
 
@@ -528,78 +528,101 @@ fn process_counters_render_a_numerically_sorted_default_invocation_table() {
         .split_whitespace()
         .collect::<Vec<_>>();
     assert_eq!(process_header, ["Processes:"]);
+    let pipeline_row = default
+        .lines()
+        .find(|line| line.trim() == "compact")
+        .expect("pipeline heading");
+    assert_eq!(pipeline_row, "  compact");
     let root_row = default
         .lines()
-        .find(|line| line.contains("/dispatch "))
+        .find(|line| line.split_whitespace().nth(1) == Some("dispatch"))
         .expect("root process row");
     assert_eq!(
         root_row,
         format!(
-            "  {:<16} {:>4}  {:<32} {:<16} {:>8} in  {:>8} out  {:>8} dropped  {:>8} errored",
-            "compact", 2, "/dispatch", "dispatch", 4, 4, 0, 0
+            "  {:<11} {:>8} in  {:>8} out  {:>8} dropped  {:>8} errored",
+            "└─ dispatch", 4, 4, 0, 0
         )
     );
     let leaf_row = default
         .lines()
-        .find(|line| line.contains("/dispatch/leaf "))
+        .find(|line| line.split_whitespace().nth(1) == Some("leaf"))
         .expect("leaf process row");
     assert_eq!(
         leaf_row,
         format!(
-            "  {:<16} {:>4}  {:<32} {:<16} {:>8} in  {:>8} out  {:>8} dropped  {:>8} errored",
-            "compact", 10, "/dispatch/leaf", "leaf", 3, 1, 1, 1
+            "  {:<11} {:>8} in  {:>8} out  {:>8} dropped  {:>8} errored",
+            "   └─ leaf", 3, 1, 1, 1
         )
     );
     assert_eq!(
-        line_tokens(&default, "/dispatch"),
+        line_tokens(&default, "dispatch"),
         [
-            "compact",
-            "2",
-            "/dispatch",
-            "dispatch",
-            "4",
-            "in",
-            "4",
-            "out",
-            "0",
-            "dropped",
-            "0",
-            "errored",
+            "└─", "dispatch", "4", "in", "4", "out", "0", "dropped", "0", "errored",
         ]
     );
     assert_eq!(
-        line_tokens(&default, "/dispatch/leaf"),
+        line_tokens(&default, "leaf"),
         [
-            "compact",
-            "10",
-            "/dispatch/leaf",
-            "leaf",
-            "3",
-            "in",
-            "1",
-            "out",
-            "1",
-            "dropped",
-            "1",
-            "errored",
+            "└─", "leaf", "3", "in", "1", "out", "1", "dropped", "1", "errored",
         ]
     );
-    let root = default.find("/dispatch ").expect("root row");
-    let leaf = default.find("/dispatch/leaf ").expect("leaf row");
-    assert!(root < leaf, "step 2 must sort before step 10 numerically");
+    assert!(!default.contains("/dispatch"));
+    let root = default.find(root_row).expect("root row");
+    let leaf = default.find(leaf_row).expect("leaf row");
+    assert!(root < leaf, "source-order step 2 must sort before step 10");
 
     let details = run_stats(&response, &["--details"]);
     assert!(details.status.success(), "{details:?}");
     let details = stdout(&details);
+    assert!(details.contains("  └─ dispatch"));
+    assert!(details.contains("     step: 2  path: /dispatch"));
+    assert!(details.contains("     └─ leaf"));
+    assert!(details.contains("        step: 10  path: /dispatch/leaf"));
+    assert_eq!(details.matches("limpid_process_events_in_total").count(), 1);
+    assert!(details.contains("series: summarized in Processes above"));
+    assert!(!details.contains("process_path: \"/dispatch"));
+    let process_summary = details
+        .split_once("\nMetrics:\n")
+        .map(|(summary, _)| summary)
+        .expect("expanded metrics section");
+    let expected_process_summary = format!(
+        concat!(
+            "{}",
+            "\nProcesses:\n",
+            "  compact\n",
+            "  {:<11} {:>8} in  {:>8} out  {:>8} dropped  {:>8} errored\n",
+            "     step: 2  path: /dispatch\n",
+            "  {:<11} {:>8} in  {:>8} out  {:>8} dropped  {:>8} errored\n",
+            "        step: 10  path: /dispatch/leaf\n",
+        ),
+        expected_default_table(),
+        "└─ dispatch",
+        4,
+        4,
+        0,
+        0,
+        "   └─ leaf",
+        3,
+        1,
+        1,
+        1,
+    );
+    assert_eq!(process_summary, expected_process_summary);
+    assert!(!process_summary.contains('\t'));
+
+    let raw = run_stats(&response, &["--raw"]);
+    assert!(raw.status.success(), "{raw:?}");
+    let raw = stdout(&raw);
     for name in [
         "limpid_process_events_in_total",
         "limpid_process_events_out_total",
         "limpid_events_dropped_total",
         "limpid_process_events_errored_total",
     ] {
-        assert!(details.contains(name), "missing {name}");
+        assert!(raw.contains(name), "missing {name}");
     }
-    assert!(details.contains(
+    assert!(raw.contains(
         r#"pipeline="compact", process_name="leaf", process_path="/dispatch/leaf", step="10""#
     ));
 
@@ -686,7 +709,7 @@ fn malformed_dropped_hierarchy_roots_fall_back_to_the_raw_response() {
         ("missing root", missing_root),
     ] {
         let response = format!("{payload}\n");
-        for args in [&[][..], &["--details"][..]] {
+        for args in [&[][..], &["--details"][..], &["--raw"][..]] {
             let output = run_stats(&response, args);
             assert!(output.status.success(), "{name}: {output:?}");
             assert_eq!(output.stdout, response.as_bytes(), "{name}: {args:?}");
@@ -695,7 +718,7 @@ fn malformed_dropped_hierarchy_roots_fall_back_to_the_raw_response() {
 }
 
 #[test]
-fn details_remains_generic_for_process_default_validator_only_defects() {
+fn details_omit_the_process_summary_when_process_validation_fails() {
     for (name, payload) in process_default_validator_only_defects() {
         let response = format!("{payload}\n");
         let output = run_stats(&response, &["--details"]);
@@ -703,14 +726,22 @@ fn details_remains_generic_for_process_default_validator_only_defects() {
         assert_ne!(
             output.stdout,
             response.as_bytes(),
-            "{name} is DTO-valid and must remain generic in details mode"
+            "{name} is DTO-valid and must remain human-readable in details mode"
         );
-        assert!(stdout(&output).contains("limpid_process_events_in_total"));
+        let text = stdout(&output);
+        assert!(text.contains("Pipelines:"));
+        assert!(!text.contains("Processes:"));
+        assert!(text.contains("limpid_process_events_in_total"));
+        assert!(text.contains("series: unavailable as a process summary; use --raw"));
+
+        let raw = run_stats(&response, &["--raw"]);
+        assert!(raw.status.success(), "{name}: {raw:?}");
+        assert!(stdout(&raw).contains("limpid_process_events_in_total"));
     }
 }
 
 #[test]
-fn details_remains_generic_when_process_families_are_incomplete() {
+fn details_omit_the_process_summary_when_process_families_are_incomplete() {
     let mut payload = process_snapshot();
     payload["metrics"]
         .as_array_mut()
@@ -721,7 +752,15 @@ fn details_remains_generic_when_process_families_are_incomplete() {
     let output = run_stats(&response, &["--details"]);
     assert!(output.status.success(), "{output:?}");
     assert_ne!(output.stdout, response.as_bytes());
-    assert!(stdout(&output).contains("limpid_process_events_in_total"));
+    let text = stdout(&output);
+    assert!(text.contains("Pipelines:"));
+    assert!(!text.contains("Processes:"));
+    assert!(text.contains("limpid_process_events_in_total"));
+    assert!(text.contains("series: unavailable as a process summary; use --raw"));
+
+    let raw = run_stats(&response, &["--raw"]);
+    assert!(raw.status.success(), "{raw:?}");
+    assert!(stdout(&raw).contains("limpid_process_events_in_total"));
 }
 
 #[test]
@@ -742,7 +781,7 @@ fn json_mode_preserves_the_complete_control_response() {
 }
 
 #[test]
-fn details_renders_all_types_with_deterministic_order_and_complete_fields() {
+fn details_and_raw_render_all_types_with_deterministic_complete_fields() {
     let payload = json!({
         "schema": 1,
         "metrics": [
@@ -784,42 +823,65 @@ fn details_renders_all_types_with_deterministic_order_and_complete_fields() {
         "stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let text = stdout(&output);
+    let expected_details = concat!(
+        "Metrics:\n",
+        "  metric_alpha\n",
+        "    type: counter\n",
+        "    help: Accepted events.\n",
+        "    series:\n",
+        "      - labels:\n",
+        "          a: \"one\"\n",
+        "          z: \"last\"\n",
+        "        value: 1\n",
+        "      - labels:\n",
+        "          a: \"two\"\n",
+        "          z: \"first\"\n",
+        "        value: 2\n",
+        "  metric_middle\n",
+        "    type: gauge\n",
+        "    help: Current depth.\n",
+        "    series:\n",
+        "      - labels:\n",
+        "          env: \"prod\\\"east\\\\one\\nline\"\n",
+        "        value: 9\n",
+        "  metric_zeta\n",
+        "    type: histogram\n",
+        "    help: Latency distribution.\n",
+        "    series:\n",
+        "      - labels:\n",
+        "          route: \"west\"\n",
+        "        buckets:\n",
+        "          <= 0.125: 17\n",
+        "          <= 0.875: 29\n",
+        "        sum: 13.75\n",
+        "        count: 31\n",
+    );
+    assert_eq!(stdout(&output), expected_details);
 
-    let counter = text.find("metric_alpha").unwrap();
-    let gauge = text.find("metric_middle").unwrap();
-    let histogram = text.find("metric_zeta").unwrap();
-    assert!(counter < gauge && gauge < histogram);
-    let counter_block = &text[counter..gauge];
-    let gauge_block = &text[gauge..histogram];
-    let histogram_block = &text[histogram..];
-    assert!(counter_block.contains("counter"));
-    assert!(counter_block.contains("Accepted events."));
-    assert!(text.find("a=\"one\"").unwrap() < text.find("a=\"two\"").unwrap());
-    assert!(counter_block.contains(
-        r#"  labels: a="one", z="last"
-    value: 1
-"#
-    ));
-    assert!(counter_block.contains(
-        r#"  labels: a="two", z="first"
-    value: 2
-"#
-    ));
-    assert!(gauge_block.contains("gauge"));
-    assert!(gauge_block.contains("Current depth."));
-    assert!(gauge_block.contains(
-        r#"  labels: env="prod\"east\\one\nline"
-    value: 9
-"#
-    ));
-    assert!(histogram_block.contains("histogram"));
-    assert!(histogram_block.contains("Latency distribution."));
-    assert!(histogram_block.contains("route=\"west\""));
-    assert!(histogram_block.contains("    buckets: 0.125 => 17 0.875 => 29\n"));
-    assert!(histogram_block.contains("    sum: 13.75\n"));
-    assert!(histogram_block.contains("    count: 31\n"));
-    assert!(!histogram_block.contains("+Inf"));
+    let raw = run_stats(&response, &["--raw"]);
+    assert!(raw.status.success(), "{raw:?}");
+    let expected_raw = concat!(
+        "metric_alpha:\n",
+        "  type: counter\n",
+        "  help: Accepted events.\n",
+        "  labels: a=\"one\", z=\"last\"\n",
+        "    value: 1\n",
+        "  labels: a=\"two\", z=\"first\"\n",
+        "    value: 2\n",
+        "metric_middle:\n",
+        "  type: gauge\n",
+        "  help: Current depth.\n",
+        "  labels: env=\"prod\\\"east\\\\one\\nline\"\n",
+        "    value: 9\n",
+        "metric_zeta:\n",
+        "  type: histogram\n",
+        "  help: Latency distribution.\n",
+        "  labels: route=\"west\"\n",
+        "    buckets: 0.125 => 17 0.875 => 29\n",
+        "    sum: 13.75\n",
+        "    count: 31\n",
+    );
+    assert_eq!(stdout(&raw), expected_raw);
 }
 
 #[test]
@@ -870,7 +932,7 @@ fn default_ignores_unknown_families_but_details_includes_them() {
     let details_output = run_stats(&response, &["--details"]);
     assert!(details_output.status.success(), "{:?}", details_output);
     assert!(stdout(&details_output).contains("future_metric"));
-    assert!(stdout(&details_output).contains("scope=\"future\""));
+    assert!(stdout(&details_output).contains("scope: \"future\""));
     assert!(stdout(&details_output).contains("42"));
 }
 
@@ -899,9 +961,15 @@ fn build_info_is_generic_in_details_and_does_not_change_default_or_raw_json() {
     assert!(details.contains("limpid_build_info"));
     assert!(details.contains("gauge"));
     assert!(details.contains("Build information for the running limpid node."));
-    assert!(details.contains("node_id=\"edge-a\""));
-    assert!(details.contains("version=\"0.7.15\""));
+    assert!(details.contains("node_id: \"edge-a\""));
+    assert!(details.contains("version: \"0.7.15\""));
     assert!(details.contains("value: 1"));
+
+    let raw_output = run_stats(&response, &["--raw"]);
+    assert!(raw_output.status.success(), "{raw_output:?}");
+    let raw = stdout(&raw_output);
+    assert!(raw.contains("node_id=\"edge-a\""));
+    assert!(raw.contains("version=\"0.7.15\""));
 
     let json_output = run_stats(&response, &["--json"]);
     assert!(json_output.status.success(), "{json_output:?}");
@@ -976,7 +1044,7 @@ fn invalid_and_unsupported_responses_preserve_raw_fallback() {
         "{\"schema\":2,\"metrics\":[]}\n",
         "{\"schema\":1,\"metrics\":\"wrong\"}\n",
     ] {
-        for args in [&[][..], &["--details"][..]] {
+        for args in [&[][..], &["--details"][..], &["--raw"][..]] {
             let output = run_stats(response, args);
             assert!(
                 output.status.success(),
@@ -992,15 +1060,34 @@ fn invalid_and_unsupported_responses_preserve_raw_fallback() {
 }
 
 #[test]
-fn json_and_details_are_mutually_exclusive() {
+fn stats_output_modes_are_mutually_exclusive_and_documented() {
     let _process_guard = process_lock();
-    let output = Command::new(env!("CARGO_BIN_EXE_limpidctl"))
-        .args(["stats", "--json", "--details"])
+    for (left, right) in [
+        ("--json", "--details"),
+        ("--json", "--raw"),
+        ("--details", "--raw"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_limpidctl"))
+            .args(["stats", left, right])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(left));
+        assert!(stderr.contains(right));
+        assert!(stderr.contains("cannot be used with"));
+    }
+
+    let help = Command::new(env!("CARGO_BIN_EXE_limpidctl"))
+        .args(["stats", "--help"])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("--json"));
-    assert!(stderr.contains("--details"));
-    assert!(stderr.contains("cannot be used with"));
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.contains("--details"));
+    assert!(help.contains("Show expanded human-readable metrics"));
+    assert!(help.contains("--raw"));
+    assert!(help.contains("legacy text format"));
+    assert!(help.contains("--json"));
+    assert!(help.contains("schema-v1 JSON"));
 }
