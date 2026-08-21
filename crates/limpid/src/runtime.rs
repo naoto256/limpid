@@ -1093,6 +1093,108 @@ mod tests {
             .expect("compile config")
     }
 
+    #[cfg(unix)]
+    fn write_ltp_test_identity(path: &Path) -> String {
+        use base64::Engine as _;
+        use ring::rand::SystemRandom;
+        use ring::signature::{Ed25519KeyPair, KeyPair as _};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        std::fs::write(
+            path,
+            pem::encode(&pem::Pem::new("PRIVATE KEY", pkcs8.as_ref())),
+        )
+        .unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut spki = crate::ltp::ED25519_SPKI_PREFIX.to_vec();
+        spki.extend_from_slice(pair.public_key().as_ref());
+        base64::engine::general_purpose::STANDARD.encode(spki)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn two_runtimes_deliver_one_event_over_mutual_rpk_ltp() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let node_a_key = dir.path().join("node-a.pem");
+        let node_b_key = dir.path().join("node-b.pem");
+        let node_a_spki = write_ltp_test_identity(&node_a_key);
+        let node_b_spki = write_ltp_test_identity(&node_b_key);
+        let delivered_path = dir.path().join("delivered.log");
+        let node_a_socket = dir.path().join("node-a.sock");
+        let node_b_socket = dir.path().join("node-b.sock");
+
+        let ltp_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ltp_addr = ltp_listener.local_addr().unwrap();
+        drop(ltp_listener);
+        let node_b_config = compiled_config(&format!(
+            r#"
+node_id "node-b"
+node_key {node_b_key:?}
+control {{ socket {node_b_socket:?} }}
+def input from_a {{
+    type ltp
+    bind "{ltp_addr}"
+    peer {{ node_id "node-a" pubkey {node_a_spki:?} }}
+}}
+def output delivered {{ type file path {delivered_path:?} }}
+def pipeline receive {{ input from_a; output delivered }}
+"#
+        ));
+        let node_b = Runtime::start(node_b_config, dir.path().join("node-b.limpid"))
+            .await
+            .unwrap();
+
+        let udp_listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let udp_addr = udp_listener.local_addr().unwrap();
+        drop(udp_listener);
+        let node_a_config = compiled_config(&format!(
+            r#"
+node_id "node-a"
+node_key {node_a_key:?}
+control {{ socket {node_a_socket:?} }}
+def input source {{ type syslog_udp bind "{udp_addr}" }}
+def output to_b {{
+    type ltp
+    peer {{ node_id "node-b" pubkey {node_b_spki:?} endpoint "{ltp_addr}" }}
+}}
+def pipeline relay {{ input source; output to_b }}
+"#
+        ));
+        let node_a = Runtime::start(node_a_config, dir.path().join("node-a.limpid"))
+            .await
+            .unwrap();
+
+        let marker = b"<13>two-runtime-mutual-rpk";
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                sender.send_to(marker, udp_addr).await.unwrap();
+                if let Ok(bytes) = tokio::fs::read(&delivered_path).await
+                    && bytes.windows(marker.len()).any(|window| window == marker)
+                {
+                    break bytes;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        let delivered = delivered.expect("two-daemon LTP delivery timed out");
+        assert!(
+            delivered
+                .windows(marker.len())
+                .any(|window| window == marker)
+        );
+    }
+
     #[test]
     fn ltp_peer_metric_registration_uses_the_deduplicated_static_config_union() {
         use base64::Engine as _;
