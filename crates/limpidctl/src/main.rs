@@ -622,7 +622,24 @@ impl ProcessIdentity {
 
 type ProcessMetricValues = BTreeMap<ProcessIdentity, u64>;
 
-fn process_tree_names(identities: &[&ProcessIdentity]) -> Vec<(String, String)> {
+fn process_tree_names(identities: &[&ProcessIdentity]) -> Option<Vec<(String, String)>> {
+    let mut active_ancestors: Vec<&ProcessIdentity> = Vec::new();
+    for identity in identities {
+        let depth = identity.depth();
+        if depth == 0 {
+            return None;
+        }
+        active_ancestors.truncate(depth - 1);
+        if depth > 1 {
+            let parent = active_ancestors.get(depth - 2)?;
+            let (parent_path, _) = identity.process_path.rsplit_once('/')?;
+            if parent.process_path != parent_path {
+                return None;
+            }
+        }
+        active_ancestors.push(*identity);
+    }
+
     let depths = identities
         .iter()
         .map(|identity| identity.depth())
@@ -639,7 +656,7 @@ fn process_tree_names(identities: &[&ProcessIdentity]) -> Vec<(String, String)> 
         .collect::<Vec<_>>();
 
     let mut ancestor_is_last = Vec::new();
-    identities
+    let names = identities
         .iter()
         .enumerate()
         .map(|(index, identity)| {
@@ -663,7 +680,8 @@ fn process_tree_names(identities: &[&ProcessIdentity]) -> Vec<(String, String)> 
             ancestor_is_last.push(is_last_sibling[index]);
             (rendered, detail_prefix)
         })
-        .collect()
+        .collect();
+    Some(names)
 }
 
 fn format_stats(json: &str) {
@@ -902,7 +920,7 @@ fn render_default_stats_inner(
                 identities[start..end]
                     .iter()
                     .copied()
-                    .zip(process_tree_names(&identities[start..end])),
+                    .zip(process_tree_names(&identities[start..end])?),
             );
             start = end;
         }
@@ -1772,15 +1790,61 @@ mod tests {
         });
         assert_eq!(
             process_tree_names(&identities.iter().collect::<Vec<_>>()),
-            [
+            Some(vec![
                 ("├─ first".to_owned(), "│  ".to_owned()),
                 ("├─ second".to_owned(), "│  ".to_owned()),
                 ("│  ├─ child_a".to_owned(), "│  │  ".to_owned()),
                 ("│  │  └─ leaf".to_owned(), "│  │     ".to_owned()),
                 ("│  └─ child_b".to_owned(), "│     ".to_owned()),
                 ("└─ third".to_owned(), "   ".to_owned()),
-            ]
+            ])
         );
+    }
+
+    #[test]
+    fn process_tree_names_reject_false_parent_topologies() {
+        let identities = |paths: &[&str]| {
+            paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| ProcessIdentity {
+                    pipeline: "pipeline".to_owned(),
+                    step: index + 1,
+                    process_path: (*path).to_owned(),
+                    process_name: path.rsplit('/').next().unwrap().to_owned(),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for paths in [
+            &["/a", "/b/c"][..],
+            &["/a", "/a/b/c"][..],
+            &["/a", "/a/b", "/a/c/d"][..],
+        ] {
+            let identities = identities(paths);
+            assert!(process_tree_names(&identities.iter().collect::<Vec<_>>()).is_none());
+        }
+    }
+
+    #[test]
+    fn false_process_topology_preserves_mode_specific_fallbacks() {
+        let mut fixture = serde_json::to_value(process_tree_snapshot()).unwrap();
+        for family in fixture["metrics"].as_array_mut().unwrap() {
+            let Some(series) = family["series"].as_array_mut() else {
+                continue;
+            };
+            for item in series {
+                if item["labels"]["process_path"] == "/root_two/child_a" {
+                    item["labels"]["process_path"] = "/missing/child_a".into();
+                }
+            }
+        }
+        let snapshot = serde_json::from_value(fixture).unwrap();
+
+        assert!(render_default_stats(&snapshot).is_none());
+        let details = render_stats_details(&snapshot).unwrap();
+        assert!(!details.contains("\nProcesses:\n"));
+        assert!(details.contains("series: unavailable as a process summary; use --raw"));
     }
 
     #[test]
