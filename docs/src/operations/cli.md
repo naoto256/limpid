@@ -105,6 +105,7 @@ limpidctl list --json
 # Show metrics
 limpidctl stats
 limpidctl stats --details
+limpidctl stats --raw
 limpidctl stats --json
 
 # Health check
@@ -115,12 +116,14 @@ limpidctl health --json
 limpidctl ltp keygen /etc/limpid/node-key.pem
 ```
 
-`limpidctl stats` renders the established operator table from the schema-v1
-snapshot. `stats --details` instead renders every counter, gauge, and histogram
-family and series in deterministic human-readable order. `stats --json` prints
-the complete control-socket response unchanged. `--details` and `--json` are
-mutually exclusive. See [Metrics](./metrics.md#viewing-metrics-with-limpidctl)
-for the formatting, validation, and raw-fallback contracts.
+`limpidctl stats` renders the human operator summary from the schema-v1
+snapshot. `stats --details` expands that view with each process's step and path
+and a structured human-readable view of every metric family. `stats --raw`
+prints the complete legacy generic family-and-series text. `stats --json`
+prints the complete schema-v1 control-socket response unchanged. `--details`,
+`--raw`, and `--json` are mutually exclusive. See
+[Metrics](./metrics.md#viewing-metrics-with-limpidctl) for the formatting,
+validation, and raw-fallback contracts.
 
 `limpidctl ltp keygen` never overwrites an existing path and does not create a
 missing parent directory. Stdout contains only the base64 SPKI public key line,
