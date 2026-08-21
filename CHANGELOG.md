@@ -8,6 +8,20 @@ Pre-1.0 releases may introduce breaking changes freely as the DSL and runtime sh
 
 ## [Unreleased]
 
+### Added — authenticated LTP node transport
+
+Limpid nodes can now exchange events through an unbatched `input ltp` and
+`output ltp` pair authenticated with mutual TLS 1.3 raw public keys. Static peer
+configuration binds each Ed25519 SPKI key to a `node_id`; connections send a
+hello before events, preserve UUIDv7 event keys, reject cycles and bounded hop
+histories, and retain hop stamps across disk queues and dead-letter replay.
+Outputs use the existing queue, retry, shutdown, and dead-letter dispositions.
+
+LTP telemetry pre-registers the configured peer union and reports network and
+intra-node hop-latency histograms, negative-delta clamps, loop or hop-limit
+drops, and undeclared-key or mismatched-identity connection rejections. Peer
+labels are derived only from authenticated or declared configuration.
+
 ### Added — LTP node key provisioning
 
 The optional top-level `node_key` selects an Ed25519 PKCS#8 private-key file.

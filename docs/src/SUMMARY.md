@@ -45,6 +45,7 @@
 
 # Protocol Notes
 
+- [LTP — authenticated node transport](./ltp.md)
 - [OTLP — design rationale](./otlp.md)
 
 # Operations

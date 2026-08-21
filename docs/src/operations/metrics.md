@@ -198,6 +198,38 @@ registry series; `limpid_events_dropped_total` remains authoritative.
 Keeping `received` and `injected` separate makes source traffic distinguishable
 from synthetic and replay traffic.
 
+### LTP
+
+LTP series are registered at startup from the deduplicated union of configured
+input and output peers. The `peer` label therefore comes from authenticated or
+declared configuration, never from untrusted wire metadata, and every series
+exists at zero before traffic arrives.
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `limpid_ltp_hop_latency_seconds` | `peer`, `segment` | Hop latency histogram. `segment` is `network` or `intra`. |
+| `limpid_ltp_negative_delta_total` | `peer` | Negative cross-host latency deltas clamped to zero. |
+| `limpid_ltp_loop_dropped_total` | `peer` | Events dropped because the incoming history contains this node or has reached `max_hops`. |
+| `limpid_ltp_rejected_unknown_peer_total` | *(none)* | Connection attempts rejected for an undeclared public key or a hello node identity that does not match its authenticated key. |
+
+`network` is observed by the receiving input after cycle and hop-limit checks:
+the previous hop's nonzero departure to the local arrival. Empty history and an
+unsealed departure of zero are skipped. A negative wall-clock delta is observed
+as zero and increments `limpid_ltp_negative_delta_total` for the authenticated
+upstream peer.
+
+`intra` is observed once, only after an output's final event write and flush
+succeeds: the event's persisted local arrival to that successful attempt's
+departure, labeled with the declared destination peer. Failed attempts and
+retries do not add observations. The histogram uses the fixed upper bounds
+`0.0001`, `0.001`, `0.005`, `0.025`, `0.1`, `0.5`, `2.5`, and `10` seconds,
+plus the exported `+Inf` bucket.
+
+An undeclared SPKI is counted at the raw-public-key verifier, and a declared key
+with the wrong hello identity is counted after the handshake. TLS timeouts,
+malformed handshakes, cipher failures, X.509 certificates, and intermediate
+certificates are not classified as unknown peers.
+
 ### Outputs
 
 | Metric | Label | Meaning |
