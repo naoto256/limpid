@@ -1293,18 +1293,18 @@ def pipeline topology {
         ];
         let expected = [
             ("1", "/parent_one", "parent_one"),
-            ("1", "/parent_one/leaf", "leaf"),
-            ("2", "/parent_two", "parent_two"),
-            ("2", "/parent_two/leaf", "leaf"),
-            ("3", "/repeated", "repeated"),
-            ("4", "/repeated", "repeated"),
-            ("5", "/dispatch", "dispatch"),
-            ("5", "/dispatch/leaf", "leaf"),
-            ("6", "/branch_then", "branch_then"),
-            ("7", "/branch_else", "branch_else"),
-            ("8", "/arm_first", "arm_first"),
-            ("9", "/arm_default", "arm_default"),
-            ("10", "/(inline)", "(inline)"),
+            ("2", "/parent_one/leaf", "leaf"),
+            ("3", "/parent_two", "parent_two"),
+            ("4", "/parent_two/leaf", "leaf"),
+            ("5", "/repeated", "repeated"),
+            ("6", "/repeated", "repeated"),
+            ("7", "/dispatch", "dispatch"),
+            ("8", "/dispatch/leaf", "leaf"),
+            ("9", "/branch_then", "branch_then"),
+            ("10", "/branch_else", "branch_else"),
+            ("11", "/arm_first", "arm_first"),
+            ("12", "/arm_default", "arm_default"),
+            ("13", "/(inline)", "(inline)"),
         ];
         for family in process_families {
             let series = metric_series(&registry, family);
@@ -1413,8 +1413,8 @@ def pipeline p {
         .expect("compile process metric plan");
 
         let parent_one = plan.root_token_for_testing(1).expect("parent_one token");
-        let parent_two = plan.root_token_for_testing(2).expect("parent_two token");
-        let dispatch = plan.root_token_for_testing(3).expect("dispatch token");
+        let parent_two = plan.root_token_for_testing(3).expect("parent_two token");
+        let dispatch = plan.root_token_for_testing(5).expect("dispatch token");
         let parent_one_leaf = plan
             .child_token_for_testing(parent_one, 0)
             .expect("parent_one leaf token");
@@ -1503,7 +1503,7 @@ def pipeline execute { process dispatch; finish }
             &execution_registry,
             &[
                 ("pipeline", "execute"),
-                ("step", "1"),
+                ("step", "2"),
                 ("process_path", "/dispatch/leaf"),
                 ("process_name", "leaf"),
             ],
@@ -1771,9 +1771,9 @@ def pipeline p_fallback { process defaults; finish }
             "p_nonfirst",
             &[
                 ("1", "/nonfirst", "nonfirst", [1, 1, 0, 0]),
-                ("1", "/nonfirst/first", "first", [0, 0, 0, 0]),
-                ("1", "/nonfirst/selected", "selected", [2, 2, 0, 0]),
-                ("1", "/nonfirst/fallback", "fallback", [0, 0, 0, 0]),
+                ("2", "/nonfirst/first", "first", [0, 0, 0, 0]),
+                ("3", "/nonfirst/selected", "selected", [2, 2, 0, 0]),
+                ("4", "/nonfirst/fallback", "fallback", [0, 0, 0, 0]),
             ],
         )
         .await;
@@ -1782,9 +1782,9 @@ def pipeline p_fallback { process defaults; finish }
             "p_fallback",
             &[
                 ("1", "/defaults", "defaults", [1, 1, 0, 0]),
-                ("1", "/defaults/first", "first", [0, 0, 0, 0]),
-                ("1", "/defaults/selected", "selected", [0, 0, 0, 0]),
-                ("1", "/defaults/fallback", "fallback", [2, 2, 0, 0]),
+                ("2", "/defaults/first", "first", [0, 0, 0, 0]),
+                ("3", "/defaults/selected", "selected", [0, 0, 0, 0]),
+                ("4", "/defaults/fallback", "fallback", [2, 2, 0, 0]),
             ],
         )
         .await;
@@ -1818,10 +1818,10 @@ def pipeline p_fallback {
             SOURCE,
             "p_nonfirst",
             &[
-                ("2", "/parent", "parent", [1, 1, 0, 0]),
-                ("2", "/parent/leaf", "leaf", [1, 1, 0, 0]),
-                ("5", "/parent", "parent", [1, 1, 0, 0]),
-                ("5", "/parent/leaf", "leaf", [1, 1, 0, 0]),
+                ("3", "/parent", "parent", [1, 1, 0, 0]),
+                ("4", "/parent/leaf", "leaf", [1, 1, 0, 0]),
+                ("9", "/parent", "parent", [1, 1, 0, 0]),
+                ("10", "/parent/leaf", "leaf", [1, 1, 0, 0]),
             ],
         )
         .await;
@@ -1829,10 +1829,10 @@ def pipeline p_fallback {
             SOURCE,
             "p_fallback",
             &[
-                ("3", "/parent", "parent", [1, 1, 0, 0]),
-                ("3", "/parent/leaf", "leaf", [1, 1, 0, 0]),
-                ("6", "/parent", "parent", [1, 1, 0, 0]),
+                ("5", "/parent", "parent", [1, 1, 0, 0]),
                 ("6", "/parent/leaf", "leaf", [1, 1, 0, 0]),
+                ("11", "/parent", "parent", [1, 1, 0, 0]),
+                ("12", "/parent/leaf", "leaf", [1, 1, 0, 0]),
             ],
         )
         .await;
@@ -1995,10 +1995,10 @@ def pipeline p { process dispatch; finish }
             fixture_event(),
         )
         .await;
-        for path in ["/dispatch", "/dispatch/leaf"] {
+        for (step, path) in [("1", "/dispatch"), ("2", "/dispatch/leaf")] {
             let labels = [
                 ("pipeline", "p"),
-                ("step", "1"),
+                ("step", step),
                 ("process_path", path),
                 ("process_name", path.rsplit('/').next().unwrap()),
             ];
@@ -2016,10 +2016,13 @@ def pipeline p { process dispatch; finish }
             fixture_event(),
         )
         .await;
-        for (path, name) in [("/dispatch", "dispatch"), ("/dispatch/leaf", "leaf")] {
+        for (step, path, name) in [
+            ("1", "/dispatch", "dispatch"),
+            ("2", "/dispatch/leaf", "leaf"),
+        ] {
             let labels = [
                 ("pipeline", "p"),
-                ("step", "1"),
+                ("step", step),
                 ("process_path", path),
                 ("process_name", name),
             ];
@@ -2064,7 +2067,7 @@ def pipeline p { process catcher; finish }
             &caught,
             &[
                 ("pipeline", "p"),
-                ("step", "1"),
+                ("step", "2"),
                 ("process_path", "/catcher/fail"),
                 ("process_name", "fail"),
             ],
@@ -2091,10 +2094,10 @@ def pipeline p { process outer; finish }
             fixture_event(),
         )
         .await;
-        for (path, name) in [("/outer", "outer"), ("/outer/fail", "fail")] {
+        for (step, path, name) in [("1", "/outer", "outer"), ("2", "/outer/fail", "fail")] {
             let labels = [
                 ("pipeline", "p"),
-                ("step", "1"),
+                ("step", step),
                 ("process_path", path),
                 ("process_name", name),
             ];
@@ -2164,12 +2167,12 @@ def pipeline nested { process outer; finish }
             ),
             1
         );
-        for (path, name) in [("/outer", "outer"), ("/outer/leaf", "leaf")] {
+        for (step, path, name) in [("1", "/outer", "outer"), ("2", "/outer/leaf", "leaf")] {
             assert_process_vector(
                 &nested,
                 &[
                     ("pipeline", "nested"),
-                    ("step", "1"),
+                    ("step", step),
                     ("process_path", path),
                     ("process_name", name),
                 ],

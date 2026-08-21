@@ -7,7 +7,7 @@
 //!   limpidctl inject input <name> [--json]  Inject stdin lines into a named input
 //!   limpidctl inject output <name> [--json] Inject stdin lines into a named output queue
 //!   limpidctl list [--json]                 List pipelines and tap points
-//!   limpidctl stats [--json]                Show pipeline/output metrics
+//!   limpidctl stats [--details|--raw|--json] Show pipeline/output metrics
 //!   limpidctl health [--json]               Check daemon health
 //!
 //! Connects to limpid's control socket (default: /var/run/limpid/control.sock).
@@ -55,12 +55,15 @@ enum Command {
     },
     /// Show pipeline/input/output metrics
     Stats {
-        /// Output raw JSON instead of formatted text
-        #[arg(long, conflicts_with = "details")]
+        /// Output schema-v1 JSON instead of formatted text
+        #[arg(long, conflicts_with_all = ["details", "raw"])]
         json: bool,
-        /// Show every metric family and series with complete labels
-        #[arg(long, conflicts_with = "json")]
+        /// Show expanded human-readable metrics
+        #[arg(long, conflicts_with_all = ["json", "raw"])]
         details: bool,
+        /// Show every metric family and series in the legacy text format
+        #[arg(long, conflicts_with_all = ["json", "details"])]
+        raw: bool,
     },
     /// Check daemon health
     Health {
@@ -237,11 +240,13 @@ fn main() {
                 format_list(&response);
             }
         }
-        Command::Stats { json, details } => {
+        Command::Stats { json, details, raw } => {
             let response = query_command(&cli.socket, "stats");
             exit_on_daemon_error(&response);
             if json {
                 print!("{}", response);
+            } else if raw {
+                format_stats_raw(&response);
             } else if details {
                 format_stats_details(&response);
             } else {
@@ -606,7 +611,60 @@ struct ProcessIdentity {
     process_name: String,
 }
 
+impl ProcessIdentity {
+    fn depth(&self) -> usize {
+        self.process_path
+            .bytes()
+            .filter(|byte| *byte == b'/')
+            .count()
+    }
+}
+
 type ProcessMetricValues = BTreeMap<ProcessIdentity, u64>;
+
+fn process_tree_names(identities: &[&ProcessIdentity]) -> Vec<(String, String)> {
+    let depths = identities
+        .iter()
+        .map(|identity| identity.depth())
+        .collect::<Vec<_>>();
+    let is_last_sibling = depths
+        .iter()
+        .enumerate()
+        .map(|(index, depth)| {
+            depths[index + 1..]
+                .iter()
+                .find(|next_depth| **next_depth <= *depth)
+                .is_none_or(|next_depth| *next_depth < *depth)
+        })
+        .collect::<Vec<_>>();
+
+    let mut ancestor_is_last = Vec::new();
+    identities
+        .iter()
+        .enumerate()
+        .map(|(index, identity)| {
+            ancestor_is_last.truncate(identity.depth().saturating_sub(1));
+            let mut rendered = String::new();
+            for is_last in &ancestor_is_last {
+                rendered.push_str(if *is_last { "   " } else { "│  " });
+            }
+            let mut detail_prefix = rendered.clone();
+            rendered.push_str(if is_last_sibling[index] {
+                "└─ "
+            } else {
+                "├─ "
+            });
+            detail_prefix.push_str(if is_last_sibling[index] {
+                "   "
+            } else {
+                "│  "
+            });
+            rendered.push_str(&identity.process_name);
+            ancestor_is_last.push(is_last_sibling[index]);
+            (rendered, detail_prefix)
+        })
+        .collect()
+}
 
 fn format_stats(json: &str) {
     let rendered = serde_json::from_str::<MetricsSnapshot>(json)
@@ -621,18 +679,19 @@ fn format_stats(json: &str) {
 /// Renders the operator table (Pipelines, Inputs, Outputs) from a
 /// schema v1 snapshot. Families outside the canonical 16 are
 /// skipped here so the layout stays operator-runbook-shaped —
-/// well-formed non-canonical families render under `--details`,
-/// malformed ones trigger the raw fallback there too. A canonical
+/// `--details` adds them in a separate human-readable section, while
+/// `--raw` preserves the complete legacy family exposition. A canonical
 /// family that fails validation returns `None`, so the caller falls
 /// back to the raw response rather than emit a partial table that
 /// omits or lies about a counter.
 fn render_default_stats(snapshot: &MetricsSnapshot) -> Option<String> {
-    render_default_stats_inner(snapshot, true)
+    render_default_stats_inner(snapshot, true, false)
 }
 
 fn render_default_stats_inner(
     snapshot: &MetricsSnapshot,
     validate_process_families: bool,
+    show_process_identity: bool,
 ) -> Option<String> {
     if snapshot.schema != 1 {
         return None;
@@ -830,20 +889,52 @@ fn render_default_stats_inner(
     }
     if let Some(identities) = process_identities {
         writeln!(rendered, "\nProcesses:").ok()?;
-        for identity in identities.keys() {
+        let identities = identities.keys().collect::<Vec<_>>();
+        let mut process_rows = Vec::with_capacity(identities.len());
+        let mut start = 0;
+        while start < identities.len() {
+            let pipeline = &identities[start].pipeline;
+            let end = identities[start..]
+                .iter()
+                .position(|identity| identity.pipeline != *pipeline)
+                .map_or(identities.len(), |offset| start + offset);
+            process_rows.extend(
+                identities[start..end]
+                    .iter()
+                    .copied()
+                    .zip(process_tree_names(&identities[start..end])),
+            );
+            start = end;
+        }
+        let name_width = process_rows
+            .iter()
+            .map(|(_, (name, _))| name.chars().count())
+            .max()
+            .unwrap_or(0);
+        let mut current_pipeline = None;
+        for (identity, (process_name, detail_prefix)) in process_rows {
+            if current_pipeline != Some(identity.pipeline.as_str()) {
+                writeln!(rendered, "  {}", identity.pipeline).ok()?;
+                current_pipeline = Some(identity.pipeline.as_str());
+            }
             writeln!(
                 rendered,
-                "  {:<16} {:>4}  {:<32} {:<16} {:>8} in  {:>8} out  {:>8} dropped  {:>8} errored",
-                identity.pipeline,
-                identity.step,
-                identity.process_path,
-                identity.process_name,
+                "  {:<name_width$} {:>8} in  {:>8} out  {:>8} dropped  {:>8} errored",
+                process_name,
                 process_metric_value(&process_families, PROCESS_METRICS[0], identity)?,
                 process_metric_value(&process_families, PROCESS_METRICS[1], identity)?,
                 process_metric_value(&process_families, PROCESS_METRICS[2], identity)?,
                 process_metric_value(&process_families, PROCESS_METRICS[3], identity)?,
             )
             .ok()?;
+            if show_process_identity {
+                writeln!(
+                    rendered,
+                    "  {detail_prefix}step: {}  path: {}",
+                    identity.step, identity.process_path
+                )
+                .ok()?;
+            }
         }
     }
     Some(rendered)
@@ -938,6 +1029,16 @@ fn format_stats_details(json: &str) {
     }
 }
 
+fn format_stats_raw(json: &str) {
+    let rendered = serde_json::from_str::<MetricsSnapshot>(json)
+        .ok()
+        .and_then(|snapshot| render_stats_raw(&snapshot));
+    match rendered {
+        Some(rendered) => print!("{}", rendered),
+        None => print!("{}", json),
+    }
+}
+
 fn render_stats_details(snapshot: &MetricsSnapshot) -> Option<String> {
     if snapshot.schema != 1 {
         return None;
@@ -953,10 +1054,104 @@ fn render_stats_details(snapshot: &MetricsSnapshot) -> Option<String> {
     // subset leaks. Well-formed non-canonical families are
     // intentionally unaffected — the fallback scopes to the
     // canonical subset only.
+    let has_canonical_metrics = metrics.iter().any(|metric| is_default_metric(&metric.name));
+    let (summary, has_process_summary) = if has_canonical_metrics {
+        let base = render_default_stats_inner(snapshot, false, false)?;
+        match render_default_stats_inner(snapshot, true, true) {
+            Some(summary) => {
+                let has_process_summary = summary.contains("\nProcesses:\n");
+                (summary, has_process_summary)
+            }
+            None => (base, false),
+        }
+    } else {
+        (String::new(), false)
+    };
+    metrics.sort_by(|left, right| left.name.cmp(&right.name));
+    if metrics.windows(2).any(|pair| pair[0].name == pair[1].name) {
+        return None;
+    }
+
+    let metrics = metrics;
+    let mut rendered = summary;
+    if !metrics.is_empty() {
+        if !rendered.is_empty() {
+            rendered.push('\n');
+        }
+        writeln!(rendered, "Metrics:").ok()?;
+    }
+    for metric in metrics {
+        writeln!(rendered, "  {}", metric.name).ok()?;
+        writeln!(rendered, "    type: {}", metric.kind.name()).ok()?;
+        writeln!(rendered, "    help: {}", metric.help).ok()?;
+        if PROCESS_METRICS.contains(&metric.name.as_str()) {
+            let summary = if has_process_summary {
+                if metric.name == DROPPED_EVENTS_METRIC {
+                    "summarized in Pipelines and Processes above"
+                } else {
+                    "summarized in Processes above"
+                }
+            } else {
+                "unavailable as a process summary; use --raw"
+            };
+            writeln!(rendered, "    series: {summary}").ok()?;
+            continue;
+        }
+        writeln!(rendered, "    series:").ok()?;
+        match metric.kind {
+            DetailKind::Counter(series) | DetailKind::Gauge(series) => {
+                for item in series {
+                    render_detail_labels(&mut rendered, &item.labels)?;
+                    writeln!(rendered, "        value: {}", item.value).ok()?;
+                }
+            }
+            DetailKind::Histogram(series) => {
+                for item in series {
+                    render_detail_labels(&mut rendered, &item.labels)?;
+                    writeln!(rendered, "        buckets:").ok()?;
+                    for (bound, count) in item.buckets {
+                        writeln!(rendered, "          <= {bound}: {count}").ok()?;
+                    }
+                    writeln!(rendered, "        sum: {}", item.sum).ok()?;
+                    writeln!(rendered, "        count: {}", item.count).ok()?;
+                }
+            }
+        }
+    }
+    Some(rendered)
+}
+
+fn is_default_metric(name: &str) -> bool {
+    known_metric_label(name).is_some()
+        || PROCESS_METRICS.contains(&name)
+        || name == DROPPED_EVENTS_METRIC
+}
+
+fn render_detail_labels(rendered: &mut String, labels: &[(String, String)]) -> Option<()> {
+    if labels.is_empty() {
+        writeln!(rendered, "      - labels: none").ok()?;
+        return Some(());
+    }
+    writeln!(rendered, "      - labels:").ok()?;
+    for (key, value) in labels {
+        writeln!(rendered, "          {key}: \"{}\"", value.escape_default()).ok()?;
+    }
+    Some(())
+}
+
+fn render_stats_raw(snapshot: &MetricsSnapshot) -> Option<String> {
+    if snapshot.schema != 1 {
+        return None;
+    }
+    let mut metrics: Vec<DetailMetric> = snapshot
+        .metrics
+        .iter()
+        .map(parse_detail_metric)
+        .collect::<Option<_>>()?;
     if metrics
         .iter()
         .any(|metric| known_metric_label(&metric.name).is_some())
-        && render_default_stats_inner(snapshot, false).is_none()
+        && render_default_stats_inner(snapshot, false, false).is_none()
     {
         return None;
     }
@@ -1496,6 +1691,167 @@ mod tests {
             }));
         }
         serde_json::from_value(serde_json::json!({"schema": 1, "metrics": metrics})).unwrap()
+    }
+
+    fn process_tree_snapshot() -> limpid_metrics_schema::MetricsSnapshot {
+        let mut payload = serde_json::to_value(canonical_shared_snapshot(false)).unwrap();
+        let identities = [
+            ("compact", 2, "/root_one", "root_one"),
+            ("compact", 3, "/root_two", "root_two"),
+            ("compact", 4, "/root_two/child_a", "child_a"),
+            (
+                "compact",
+                5,
+                "/root_two/child_a/parse_paloalto_cef_normalize_severity",
+                "parse_paloalto_cef_normalize_severity",
+            ),
+            ("compact", 6, "/root_two/child_b", "child_b"),
+            ("compact", 7, "/root_two/child_b/leaf", "leaf"),
+            ("compact", 8, "/duplicate_root", "duplicate_root"),
+            ("compact", 9, "/duplicate_root", "duplicate_root"),
+            ("full", 1, "/only_root", "only_root"),
+        ];
+        let process_series = || {
+            identities
+                .iter()
+                .map(|(pipeline, step, process_path, process_name)| {
+                    serde_json::json!({
+                        "labels": {
+                            "pipeline": pipeline,
+                            "step": step.to_string(),
+                            "process_path": process_path,
+                            "process_name": process_name,
+                        },
+                        "value": step,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        for name in [
+            "limpid_process_events_in_total",
+            "limpid_process_events_out_total",
+            "limpid_process_events_errored_total",
+        ] {
+            payload["metrics"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "name": name,
+                    "type": "counter",
+                    "help": "Process invocation fixture.",
+                    "series": process_series(),
+                }));
+        }
+        payload["metrics"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|family| family["name"] == DROPPED_EVENTS_METRIC)
+            .unwrap()["series"]
+            .as_array_mut()
+            .unwrap()
+            .extend(process_series());
+        serde_json::from_value(payload).unwrap()
+    }
+
+    #[test]
+    fn process_tree_names_render_siblings_and_ancestor_continuations() {
+        let identities = [
+            (1, "/first", "first"),
+            (2, "/second", "second"),
+            (3, "/second/child_a", "child_a"),
+            (4, "/second/child_a/leaf", "leaf"),
+            (5, "/second/child_b", "child_b"),
+            (6, "/third", "third"),
+        ]
+        .map(|(step, process_path, process_name)| ProcessIdentity {
+            pipeline: "pipeline".to_owned(),
+            step,
+            process_path: process_path.to_owned(),
+            process_name: process_name.to_owned(),
+        });
+        assert_eq!(
+            process_tree_names(&identities.iter().collect::<Vec<_>>()),
+            [
+                ("├─ first".to_owned(), "│  ".to_owned()),
+                ("├─ second".to_owned(), "│  ".to_owned()),
+                ("│  ├─ child_a".to_owned(), "│  │  ".to_owned()),
+                ("│  │  └─ leaf".to_owned(), "│  │     ".to_owned()),
+                ("│  └─ child_b".to_owned(), "│     ".to_owned()),
+                ("└─ third".to_owned(), "   ".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn process_tree_is_byte_exact_grouped_and_dynamically_aligned() {
+        let rendered = render_default_stats(&process_tree_snapshot()).unwrap();
+        let processes = rendered
+            .split_once("Processes:\n")
+            .map(|(_, processes)| processes)
+            .expect("process section");
+        let expected = format!(
+            concat!(
+                "  compact\n",
+                "  {:<46} {:>8} in  {:>8} out  {:>8} dropped  {:>8} errored\n",
+                "  {:<46} {:>8} in  {:>8} out  {:>8} dropped  {:>8} errored\n",
+                "  {:<46} {:>8} in  {:>8} out  {:>8} dropped  {:>8} errored\n",
+                "  {:<46} {:>8} in  {:>8} out  {:>8} dropped  {:>8} errored\n",
+                "  {:<46} {:>8} in  {:>8} out  {:>8} dropped  {:>8} errored\n",
+                "  {:<46} {:>8} in  {:>8} out  {:>8} dropped  {:>8} errored\n",
+                "  {:<46} {:>8} in  {:>8} out  {:>8} dropped  {:>8} errored\n",
+                "  {:<46} {:>8} in  {:>8} out  {:>8} dropped  {:>8} errored\n",
+                "  full\n",
+                "  {:<46} {:>8} in  {:>8} out  {:>8} dropped  {:>8} errored\n",
+            ),
+            "├─ root_one",
+            2,
+            2,
+            2,
+            2,
+            "├─ root_two",
+            3,
+            3,
+            3,
+            3,
+            "│  ├─ child_a",
+            4,
+            4,
+            4,
+            4,
+            "│  │  └─ parse_paloalto_cef_normalize_severity",
+            5,
+            5,
+            5,
+            5,
+            "│  └─ child_b",
+            6,
+            6,
+            6,
+            6,
+            "│     └─ leaf",
+            7,
+            7,
+            7,
+            7,
+            "├─ duplicate_root",
+            8,
+            8,
+            8,
+            8,
+            "└─ duplicate_root",
+            9,
+            9,
+            9,
+            9,
+            "└─ only_root",
+            1,
+            1,
+            1,
+            1,
+        );
+        assert_eq!(processes, expected);
+        assert!(!processes.contains('\t'));
     }
 
     #[test]
