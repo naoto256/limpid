@@ -110,6 +110,7 @@ for the same-host multi-instance deployment caveat.
 | `limpid_pipeline_events_errored_unwritable_total` | `pipeline` | Pipeline-side error-log writes that failed. |
 | `limpid_pipeline_inflight` | `pipeline` | Pipeline executions currently in progress, including terminal bookkeeping. |
 | `limpid_pipeline_processing_seconds` | `pipeline`, `output` | Local input arrival to the emission of that output statement's event snapshot. |
+| `limpid_pipeline_processing_negative_delta_total` | `pipeline`, `output` | Processing durations clamped to zero after a wall-clock reversal. |
 
 `events_discarded` is a possible routing-misconfiguration signal: the event
 completed the pipeline but was never sent anywhere.
@@ -129,6 +130,9 @@ snapshots. Reaching an Output statement therefore adds one processing
 observation, including each branch of a fan-out. Its finite bucket bounds are
 `0.0001`, `0.001`, `0.005`, `0.025`,
 `0.1`, `0.5`, `2.5`, and `10` seconds.
+If the wall clock moves backward between input arrival and output emission, the
+duration is clamped to zero and
+`limpid_pipeline_processing_negative_delta_total` increments.
 
 ### Process invocations
 
@@ -257,6 +261,7 @@ certificates are not classified as unknown peers.
 | `limpid_output_queue_depth` | `output` | Current unread or unacknowledged output queue depth. |
 | `limpid_output_in_retry` | `output` | Whether an output retry cycle is active (`0` or `1`). |
 | `limpid_output_delivery_seconds` | `output` | Output emission or direct injection to confirmed delivery. |
+| `limpid_output_delivery_negative_delta_total` | `output` | Delivery durations clamped to zero after a wall-clock reversal. |
 
 `events_failed` includes retry-budget exhaustion, per-event render failures in
 batched output flushes, shutdown-drain leftovers after a final flush failure,
@@ -281,6 +286,9 @@ Dropped, wedge, and enqueue-failure paths do not contribute. This is therefore
 a delivered-event latency distribution, not a success-rate denominator. Its
 finite bucket bounds are `0.001`, `0.005`, `0.025`, `0.1`, `0.5`, `2.5`, `10`,
 `30`, `60`, `300`, `900`, and `3600` seconds.
+If the wall clock moves backward between emission and delivery, including
+across a daemon restart, the duration is clamped to zero and
+`limpid_output_delivery_negative_delta_total` increments.
 
 Each event resolved as Delivered adds one delivery observation. Batched
 outputs share a single delivery-time sample for the accepted prefix, but every
