@@ -1,0 +1,42 @@
+groups:
+  - name: limpid
+    rules:
+      - alert: LimpidOutputWedged
+        expr: increase(limpid_output_events_wedged_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: Output queue entered a fail-stop wedge
+          description: An output could not safely advance its durable queue cursor.
+
+      - alert: LimpidPipelineUnwritable
+        expr: increase(limpid_pipeline_events_errored_unwritable_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: Pipeline failure record could not be written
+          description: A pipeline error could not be persisted to the configured recovery log.
+
+      - alert: LimpidOutputUnwritable
+        expr: increase(limpid_output_events_errored_unwritable_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: Output failure record could not be written
+          description: An output error could not be persisted to the configured recovery log.
+
+      # queue_depth is an event count for memory queues and a segment-distance
+      # gauge for disk queues. A backend-neutral numeric capacity threshold
+      # would therefore be misleading; a non-zero value sustained for 15
+      # minutes detects persistent backlog without pretending the units match.
+      - alert: LimpidOutputQueueBacklog
+        expr: limpid_output_queue_depth > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Output queue has a persistent backlog
+          description: The output queue depth has remained non-zero for 15 minutes.

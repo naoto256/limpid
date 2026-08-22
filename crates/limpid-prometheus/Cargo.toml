@@ -44,6 +44,8 @@ depends = "limpid"
 assets = [
     ["target/release/limpid-prometheus", "usr/bin/", "755"],
     ["../../packaging/limpid-prometheus.default", "etc/default/limpid-prometheus", "644"],
+    ["../../packaging/grafana/limpid-dashboard.json", "usr/share/limpid/grafana/", "644"],
+    ["../../packaging/grafana/limpid-alerts.yaml", "usr/share/limpid/grafana/", "644"],
 ]
 # start = false mirrors limpid.service. Without it, cargo-deb's
 # dh_installsystemd port defaults `start` to true and would start the
