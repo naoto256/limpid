@@ -431,6 +431,77 @@ complete schema-v1 snapshot and emits Prometheus text exposition format 0.0.4:
 This ordering is a reproducible exposition surface only; it has no PromQL or
 Grafana ordering meaning.
 
+### Scrape every limpid node
+
+Bind each exporter to a management address reachable by Prometheus, and apply
+the same network-access policy used for the node's other management services.
+Do not expose the exporter to an untrusted network. A three-node forwarding
+topology can use one job:
+
+```yaml
+scrape_configs:
+  - job_name: limpid
+    static_configs:
+      - targets:
+          - sender-a.example.com:9100
+          - sender-b.example.com:9100
+          - receiver.example.com:9100
+```
+
+Scraping only a receiver gives an incomplete view. In an LTP topology the
+receiver observes the network hop, while each sender observes its local
+intra-daemon hop and output-delivery latency. Pipeline processing latency is
+also local to the daemon that runs the pipeline. The dashboard remains
+portable across one or several jobs; its `job` and `instance` variables are
+derived from `limpid_build_info` rather than fixed deployment names.
+
+After Prometheus reloads the checked configuration, verify all expected nodes
+and both latency boundaries:
+
+```promql
+count(up{job="limpid"} == 1)
+count(limpid_build_info{job="limpid"})
+sum by (instance) (limpid_pipeline_processing_seconds_count{job="limpid"})
+sum by (instance) (limpid_output_delivery_seconds_count{job="limpid"})
+sum by (instance, segment) (limpid_ltp_hop_latency_seconds_count{job="limpid"})
+```
+
+The expected node count is deployment-specific. A zero histogram count is a
+valid pre-registered series before traffic; a missing node or missing family is
+not equivalent to zero.
+
+### Import the dashboard and alert rules
+
+The `limpid-prometheus` package installs these operator assets:
+
+- `/usr/share/limpid/grafana/limpid-dashboard.json`
+- `/usr/share/limpid/grafana/limpid-alerts.yaml`
+
+For an interactive Grafana import, open **Dashboards → New → Import**, upload
+`limpid-dashboard.json`, and map its Prometheus input to the deployment's
+Prometheus datasource. The stable dashboard UID is `limpid-health-flow`, so an
+update replaces that dashboard instead of creating another copy.
+
+For file provisioning, render `${DS_PROMETHEUS}` in the JSON to the provisioned
+Prometheus datasource UID, remove the top-level `__inputs` import metadata, and
+place the rendered JSON under a Grafana dashboard provider's configured path.
+Validate the resulting dashboard has the intended datasource before restarting
+or reloading Grafana.
+
+Before deploying the alert rules, validate them with the same Prometheus
+version that will load them:
+
+```bash
+promtool check rules limpid-alerts.yaml
+```
+
+Copy the checked file into the Prometheus server's configuration-managed rules
+directory, add that path to `rule_files`, validate the complete Prometheus
+configuration, and use the deployment's supported reload mechanism. The rules
+cover output wedges, unwritable pipeline/output recovery records, and a
+persistent non-zero output backlog. They intentionally do not define alert
+routing or receivers.
+
 The translator validates the entire snapshot before exposing any samples. It
 rejects malformed or unsupported families, duplicate family names, inconsistent
 label-name sets within a family, duplicate source or mapped labelsets, invalid
