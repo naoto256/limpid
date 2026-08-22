@@ -2784,10 +2784,14 @@ mod consumer_lifecycle_tests {
         // not span cancellations. We only assert the declaration
         // shape; a rename of `batch` would only fail this pin (not
         // the correctness of the code) and force a deliberate update.
+        // Assemble the declaration so this test cannot satisfy its own
+        // source-text assertion when the production declaration drifts.
+        let batch_declaration = concat!(
+            "let mut batch: Vec<(Queued",
+            "Event, AckPosition)> = Vec::with_capacity(RECV_BATCH_MAX);"
+        );
         assert!(
-            src.contains(
-                "let mut batch: Vec<(Event, AckPosition)> = Vec::with_capacity(RECV_BATCH_MAX);"
-            ),
+            src.contains(batch_declaration),
             "batch buffer must be declared once outside the select loop"
         );
         // The steady-state arm must dispatch through `recv_many` and

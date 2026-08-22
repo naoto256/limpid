@@ -75,6 +75,7 @@ impl DurationHistogram {
 #[derive(Clone)]
 pub(crate) struct PipelineOutputTimer {
     histogram: DurationHistogram,
+    negative_delta: Arc<registry_core::Counter>,
 }
 
 impl PipelineOutputTimer {
@@ -95,6 +96,12 @@ impl PipelineOutputTimer {
                     .buckets(&PIPELINE_PROCESSING_BUCKETS)
                     .build()?,
             ),
+            negative_delta: registry
+                .counter("limpid_pipeline_processing_negative_delta_total")
+                .label("pipeline", pipeline)
+                .label("output", output)
+                .help("Total pipeline processing durations clamped to zero after a wall-clock reversal.")
+                .build()?,
         })
     }
 
@@ -103,8 +110,11 @@ impl PipelineOutputTimer {
         received_at: crate::time::UnixNanos,
         emitted_at: crate::time::UnixNanos,
     ) {
-        self.histogram
-            .observe(emitted_at.elapsed_since(received_at).duration);
+        let elapsed = emitted_at.elapsed_since(received_at);
+        if elapsed.reversed {
+            self.negative_delta.inc();
+        }
+        self.histogram.observe(elapsed.duration);
     }
 
     #[cfg(test)]
@@ -427,6 +437,7 @@ pub struct OutputMetrics {
     pub(crate) queue_depth: Arc<registry_core::Gauge>,
     pub(crate) in_retry: Arc<registry_core::Gauge>,
     pub(crate) delivery_seconds: DurationHistogram,
+    pub(crate) delivery_negative_delta: Arc<registry_core::Counter>,
 }
 
 impl OutputMetrics {
@@ -495,6 +506,10 @@ impl OutputMetrics {
                     .buckets(&OUTPUT_DELIVERY_BUCKETS)
                     .build()?,
             ),
+            delivery_negative_delta: counter!(
+                "limpid_output_delivery_negative_delta_total",
+                "Total output delivery durations clamped to zero after a wall-clock reversal."
+            ),
         }))
     }
 
@@ -503,8 +518,11 @@ impl OutputMetrics {
         emitted_at: crate::time::UnixNanos,
         delivered_at: crate::time::UnixNanos,
     ) {
-        self.delivery_seconds
-            .observe(delivered_at.elapsed_since(emitted_at).duration);
+        let elapsed = delivered_at.elapsed_since(emitted_at);
+        if elapsed.reversed {
+            self.delivery_negative_delta.inc();
+        }
+        self.delivery_seconds.observe(elapsed.duration);
     }
 
     #[cfg(test)]
@@ -1317,8 +1335,10 @@ mod registry_tests {
 
         pipeline.observe_between(start, crate::time::UnixNanos::new(1_000_000_000));
         pipeline.observe_between(start, crate::time::UnixNanos::new(2_250_000_000));
+        pipeline.observe_between(start, crate::time::UnixNanos::new(2_500_000_000));
         output.observe_delivery(start, crate::time::UnixNanos::new(1_000_000_000));
         output.observe_delivery(start, crate::time::UnixNanos::new(3_500_000_000));
+        output.observe_delivery(start, crate::time::UnixNanos::new(2_500_000_000));
 
         let snapshot = snapshot_json(&registry);
         for (name, labels, bounds, expected_sum) in [
@@ -1326,26 +1346,42 @@ mod registry_tests {
                 "limpid_pipeline_processing_seconds",
                 serde_json::json!({"pipeline": "route", "output": "egress"}),
                 PIPELINE_PROCESSING_BUCKETS.as_slice(),
-                0.25,
+                0.75,
             ),
             (
                 "limpid_output_delivery_seconds",
                 serde_json::json!({"output": "egress"}),
                 OUTPUT_DELIVERY_BUCKETS.as_slice(),
-                1.5,
+                2.0,
             ),
         ] {
             let family = metric(&snapshot, name);
             assert_eq!(family["type"], "histogram");
             let series = &family["series"][0];
             assert_eq!(series["labels"], labels);
-            assert_eq!(series["count"], 2);
+            assert_eq!(series["count"], 3);
             assert_eq!(series["sum"].as_f64(), Some(expected_sum));
             let buckets = series["buckets"].as_array().unwrap();
             assert_eq!(buckets.len(), bounds.len());
             for (bucket, bound) in buckets.iter().zip(bounds) {
                 assert_eq!(bucket[0].as_f64(), Some(*bound));
             }
+        }
+
+        for (name, labels) in [
+            (
+                "limpid_pipeline_processing_negative_delta_total",
+                serde_json::json!({"pipeline": "route", "output": "egress"}),
+            ),
+            (
+                "limpid_output_delivery_negative_delta_total",
+                serde_json::json!({"output": "egress"}),
+            ),
+        ] {
+            let family = metric(&snapshot, name);
+            assert_eq!(family["type"], "counter");
+            assert_eq!(family["series"][0]["labels"], labels);
+            assert_eq!(family["series"][0]["value"], 1);
         }
     }
 
@@ -2134,6 +2170,7 @@ mod registry_tests {
         inc!(output.retries, 14);
         inc!(output.events_wedged, 15);
         inc!(output.events_errored_unwritable, 16);
+        inc!(output.delivery_negative_delta, 17);
         output.bytes_written.inc_by(23);
         output.queue_depth.set(3);
         output.in_retry.set(1);
@@ -2144,7 +2181,7 @@ mod registry_tests {
             .expect("metrics must be an array");
         assert_eq!(
             metrics.len(),
-            22,
+            23,
             "only the documented metric set is registered"
         );
 
@@ -2204,6 +2241,12 @@ mod registry_tests {
                 "output",
                 "egress",
                 16,
+            ),
+            (
+                "limpid_output_delivery_negative_delta_total",
+                "output",
+                "egress",
+                17,
             ),
             ("limpid_output_bytes_written_total", "output", "egress", 23),
         ];
