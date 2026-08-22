@@ -1,0 +1,98 @@
+rule_files:
+  - limpid-alerts.yaml
+
+evaluation_interval: 1m
+
+tests:
+  - name: critical counters fire on a new event
+    interval: 1m
+    input_series:
+      - series: 'limpid_output_events_wedged_total{instance="node-a",output="sink-a"}'
+        values: '0 0 0 1 1 1'
+      - series: 'limpid_pipeline_events_errored_unwritable_total{instance="node-a",pipeline="main"}'
+        values: '0 0 0 1 1 1'
+      - series: 'limpid_output_events_errored_unwritable_total{instance="node-a",output="sink-a"}'
+        values: '0 0 0 1 1 1'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: LimpidOutputWedged
+        exp_alerts:
+          - exp_labels:
+              instance: node-a
+              output: sink-a
+              severity: critical
+            exp_annotations:
+              summary: Output queue entered a fail-stop wedge
+              description: An output could not safely advance its durable queue cursor.
+      - eval_time: 4m
+        alertname: LimpidPipelineUnwritable
+        exp_alerts:
+          - exp_labels:
+              instance: node-a
+              pipeline: main
+              severity: critical
+            exp_annotations:
+              summary: Pipeline failure record could not be written
+              description: A pipeline error could not be persisted to the configured recovery log.
+      - eval_time: 4m
+        alertname: LimpidOutputUnwritable
+        exp_alerts:
+          - exp_labels:
+              instance: node-a
+              output: sink-a
+              severity: critical
+            exp_annotations:
+              summary: Output failure record could not be written
+              description: An output error could not be persisted to the configured recovery log.
+
+  - name: a pure counter reset and absent series do not fire
+    interval: 1m
+    input_series:
+      - series: 'limpid_output_events_wedged_total{instance="node-a",output="sink-a"}'
+        values: '5 5 5 0 0 0'
+      - series: 'limpid_pipeline_events_errored_unwritable_total{instance="node-a",pipeline="main"}'
+        values: '8 8 8 0 0 0'
+      - series: 'limpid_output_events_errored_unwritable_total{instance="node-a",output="sink-a"}'
+        values: '7 7 7 0 0 0'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: LimpidOutputWedged
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: LimpidPipelineUnwritable
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: LimpidOutputUnwritable
+        exp_alerts: []
+
+  - name: queue backlog waits for the full hold duration
+    interval: 1m
+    input_series:
+      - series: 'limpid_output_queue_depth{instance="node-a",output="sink-a"}'
+        values: '1+0x20'
+      - series: 'limpid_output_queue_depth{instance="node-a",output="sink-zero"}'
+        values: '0+0x20'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: LimpidOutputQueueBacklog
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: LimpidOutputQueueBacklog
+        exp_alerts:
+          - exp_labels:
+              instance: node-a
+              output: sink-a
+              severity: warning
+            exp_annotations:
+              summary: Output queue has a persistent backlog
+              description: The output queue depth has remained non-zero for 15 minutes.
+
+  - name: queue recovery before the hold duration does not fire
+    interval: 1m
+    input_series:
+      - series: 'limpid_output_queue_depth{instance="node-a",output="sink-a"}'
+        values: '1+0x10 0+0x10'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: LimpidOutputQueueBacklog
+        exp_alerts: []
