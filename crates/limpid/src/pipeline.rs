@@ -28,7 +28,7 @@ use crate::dsl::exec::{
     CompiledProcessRegistry, ExecResult, ProcessError, ProcessMetricStatement, ProcessRegistry,
     exec_process_body, exec_process_body_with_metric_plan,
 };
-use crate::event::{BorrowedEvent, OwnedEvent};
+use crate::event::{BorrowedEvent, OwnedEvent, QueuedEvent};
 use crate::functions::FunctionRegistry;
 use crate::tap::TapRegistry;
 
@@ -458,7 +458,7 @@ impl ErroredEventContext {
 /// passes its own `Vec` and reads it back directly after the call;
 /// the daemon hot path passes `None` and never allocates one.
 pub struct PipelineRunResult {
-    pub outputs: Vec<(String, OwnedEvent)>,
+    pub outputs: Vec<(String, QueuedEvent)>,
     /// True iff at least one `output` statement was reached during
     /// execution (i.e. `outputs` was non-empty *before* the runtime
     /// drained it into the per-output queues). Needed because the
@@ -524,6 +524,7 @@ enum ProcessMetricNodeKind {
 
 enum PipelineMetricStatement {
     None,
+    Output(crate::metrics::PipelineOutputTimer),
     ProcessChain(Vec<usize>),
     If {
         branches: Vec<Vec<PipelineMetricStatement>>,
@@ -554,6 +555,7 @@ impl PipelineProcessMetrics {
             identities: Vec::new(),
             children: Vec::new(),
             next_step: 1,
+            output_timers: HashMap::new(),
         };
         let statements = builder.pipeline_body(&pipeline.body)?;
         Ok(RawPipelineProcessMetrics {
@@ -857,9 +859,9 @@ impl ProcessMetricPlanValidator<'_> {
                     self.pipeline_branch(&arm.body, arm_plan)?;
                 }
             }
+            (PipelineStatement::Output(_), PipelineMetricStatement::Output(_)) => {}
             (
                 PipelineStatement::Input(_)
-                | PipelineStatement::Output(_)
                 | PipelineStatement::Drop
                 | PipelineStatement::Finish
                 | PipelineStatement::Error(_),
@@ -1059,6 +1061,7 @@ struct ProcessMetricsBuilder<'a> {
     identities: Vec<ProcessMetricNodeIdentity>,
     children: Vec<HashMap<String, usize>>,
     next_step: usize,
+    output_timers: HashMap<String, crate::metrics::PipelineOutputTimer>,
 }
 
 impl ProcessMetricsBuilder<'_> {
@@ -1088,6 +1091,21 @@ impl ProcessMetricsBuilder<'_> {
         statement: &PipelineStatement,
     ) -> Result<PipelineMetricStatement, crate::metrics::MetricsError> {
         match statement {
+            PipelineStatement::Output(name) => {
+                let timer = match self.output_timers.get(name) {
+                    Some(timer) => timer.clone(),
+                    None => {
+                        let timer = crate::metrics::PipelineOutputTimer::register(
+                            self.registry,
+                            self.pipeline,
+                            name,
+                        )?;
+                        self.output_timers.insert(name.clone(), timer.clone());
+                        timer
+                    }
+                };
+                Ok(PipelineMetricStatement::Output(timer))
+            }
             PipelineStatement::ProcessChain(chain) => {
                 let mut nodes = Vec::with_capacity(chain.len());
                 for element in chain {
@@ -1648,7 +1666,7 @@ struct PipelineExecOut<'a> {
     /// computing throwaway `String`s on every event just to push them
     /// into a `Vec` nobody drains.
     trace: Option<&'a mut Vec<TraceEntry>>,
-    outputs: &'a mut Vec<(String, OwnedEvent)>,
+    outputs: &'a mut Vec<(String, QueuedEvent)>,
     errored: &'a mut Vec<ErroredEventContext>,
 }
 
@@ -1941,7 +1959,17 @@ fn exec_pipeline_stmt<'bump>(
             } else {
                 event.to_owned_without_workspace()
             };
-            out.outputs.push((name.clone(), snapshot));
+            let emitted_at = crate::time::UnixNanos::now();
+            if let Some(PipelineMetricStatement::Output(timer)) = metric_stmt {
+                timer.observe_between(
+                    crate::time::UnixNanos::from_datetime(event.received_at),
+                    emitted_at,
+                );
+            } else if ctx.registry.process_metrics.is_some() {
+                bail!("compiled pipeline output metric entry is missing");
+            }
+            out.outputs
+                .push((name.clone(), QueuedEvent::new(snapshot, emitted_at)));
             cont(event)
         }
 
@@ -2502,6 +2530,68 @@ def pipeline p {
             result.outputs[1].1.workspace.is_empty(),
             "output 'b' snapshot must have empty workspace under StripAll"
         );
+    }
+
+    #[test]
+    fn output_statements_stamp_each_snapshot_and_fold_same_name_latency_series() {
+        use crate::event::OwnedEvent;
+        use crate::functions::{FunctionRegistry, register_builtins, table::TableStore};
+        use bytes::Bytes;
+
+        let cfg = compile(
+            r#"
+def input i { type syslog_tcp bind "0.0.0.0:514" }
+def output sink { type stdout }
+def pipeline p {
+    input i
+    output sink
+    output sink
+    finish
+}
+"#,
+        )
+        .unwrap();
+        let pipeline = cfg.pipelines.get("p").unwrap();
+        let registry = crate::metrics::Registry::new();
+        let output_metrics =
+            PipelineProcessMetrics::register(pipeline, &cfg.processes, &registry).unwrap();
+        let mut funcs = FunctionRegistry::new();
+        register_builtins(&mut funcs, TableStore::from_configs(vec![]).unwrap());
+        let mut event = OwnedEvent::new(
+            Bytes::from_static(b"payload"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        event.received_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+
+        let result = run_pipeline_with_process_metrics(
+            pipeline,
+            &event,
+            &cfg,
+            &funcs,
+            None,
+            None,
+            OutputCapturePolicy::StripAll,
+            &mut bumpalo::Bump::new(),
+            &output_metrics,
+        )
+        .unwrap();
+
+        assert_eq!(result.outputs.len(), 2);
+        assert!(result.outputs.iter().all(|(_, queued)| {
+            queued.emitted_ns() >= crate::time::UnixNanos::from_datetime(event.received_at)
+        }));
+        let timers: Vec<&crate::metrics::PipelineOutputTimer> = output_metrics
+            .statements
+            .iter()
+            .filter_map(|stmt| match stmt {
+                PipelineMetricStatement::Output(timer) => Some(timer),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(timers.len(), 2);
+        assert_eq!(timers[0].count(), 2);
+        assert_eq!(timers[1].count(), 2);
+        assert!(timers[0].sum() >= 2.0);
     }
 
     #[test]

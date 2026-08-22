@@ -13,7 +13,9 @@ use tracing::{info, warn};
 use crate::dsl::ast::Property;
 use crate::dsl::props;
 use crate::dsl::schema::{PropertySpec, PropertyValueKind};
+#[cfg(test)]
 use crate::event::Event;
+use crate::event::QueuedEvent;
 
 // ---------------------------------------------------------------------------
 // Declarative schema for the per-output `queue { ... }` sub-block
@@ -254,7 +256,7 @@ pub struct QueueSender {
 
 #[derive(Clone)]
 enum SenderInner {
-    Memory(tokio::sync::mpsc::Sender<Event>),
+    Memory(tokio::sync::mpsc::Sender<QueuedEvent>),
     Disk(disk::DiskQueueSender),
 }
 
@@ -267,7 +269,7 @@ impl QueueSender {
     /// serialise the same `Event` to JSON for replay. There is no
     /// longer a `Rendered`-vs-`Owned` discriminator at this level
     /// because the queue does not see sink-specific payloads anymore.
-    pub async fn send(&self, event: Event) -> Result<(), QueueSendError> {
+    pub async fn send(&self, event: QueuedEvent) -> Result<(), QueueSendError> {
         let result: Result<(), QueueSendError> = match &self.inner {
             SenderInner::Memory(tx) => tx
                 .send(event)
@@ -521,7 +523,7 @@ pub struct QueueReceiver {
 }
 
 enum ReceiverInner {
-    Memory(tokio::sync::mpsc::Receiver<Event>),
+    Memory(tokio::sync::mpsc::Receiver<QueuedEvent>),
     Disk(disk::DiskQueueReceiver),
 }
 
@@ -570,7 +572,7 @@ impl QueueReceiver {
     /// disposition. The position is captured at the moment of read,
     /// not at ack time — that distinction is what makes the disk
     /// cursor correct under batched, out-of-order acks.
-    pub async fn recv(&mut self) -> Option<(Event, AckPosition)> {
+    pub async fn recv(&mut self) -> Option<(QueuedEvent, AckPosition)> {
         match &mut self.inner {
             ReceiverInner::Memory(rx) => rx.recv().await.map(|e| (e, AckPosition::Memory)),
             ReceiverInner::Disk(rx) => rx.recv().await,
@@ -590,7 +592,7 @@ impl QueueReceiver {
     /// use `close() + recv().await`-until-`None` to avoid dropping
     /// mid-write permit-holder sends. Do not lift `try_recv()` into
     /// any exit path.
-    pub fn try_recv(&mut self) -> Option<(Event, AckPosition)> {
+    pub fn try_recv(&mut self) -> Option<(QueuedEvent, AckPosition)> {
         match &mut self.inner {
             ReceiverInner::Memory(rx) => rx.try_recv().ok().map(|e| (e, AckPosition::Memory)),
             ReceiverInner::Disk(rx) => rx.try_recv(),
@@ -646,7 +648,11 @@ impl QueueReceiver {
     ///    `elapsed()` after — the duration is fed to `record_park`
     ///    so the controller can grow the budget when it sees a park
     ///    that spinning could plausibly have caught.
-    pub async fn recv_many(&mut self, buf: &mut Vec<(Event, AckPosition)>, max: usize) -> usize {
+    pub async fn recv_many(
+        &mut self,
+        buf: &mut Vec<(QueuedEvent, AckPosition)>,
+        max: usize,
+    ) -> usize {
         if max == 0 {
             return 0;
         }
@@ -902,7 +908,6 @@ pub enum AckDisposition {
 /// after `consume` returned `Ok`. The handle's `Drop` impl falls back
 /// to [`AckDisposition::Dropped`] for the unhealthy paths, and
 /// `debug_assert!`s the contract was met.
-#[derive(Debug)]
 pub struct QueueAckHandle {
     tx: Option<tokio::sync::mpsc::UnboundedSender<(AckPosition, AckDisposition)>>,
     /// Position the handle's event occupied in the source queue,
@@ -918,17 +923,23 @@ pub struct QueueAckHandle {
     /// distinguish "resolved cleanly" (silence the debug_assert) from
     /// "dropped without resolve" (fire the assert + send `Dropped`).
     resolved: bool,
+    emitted_ns: crate::time::UnixNanos,
+    metrics: Arc<crate::metrics::OutputMetrics>,
 }
 
 impl QueueAckHandle {
     pub fn new(
         tx: tokio::sync::mpsc::UnboundedSender<(AckPosition, AckDisposition)>,
         position: AckPosition,
+        emitted_ns: crate::time::UnixNanos,
+        metrics: Arc<crate::metrics::OutputMetrics>,
     ) -> Self {
         Self {
             tx: Some(tx),
             position,
             resolved: false,
+            emitted_ns,
+            metrics,
         }
     }
 
@@ -946,7 +957,13 @@ impl QueueAckHandle {
     }
 
     /// Signal that the event was durably delivered. Consumes the handle.
-    pub fn resolve_delivered(mut self) {
+    pub fn resolve_delivered(self) {
+        self.resolve_delivered_at(crate::time::UnixNanos::now());
+    }
+
+    /// Signal delivery using a caller-sampled wall-clock boundary.
+    pub(crate) fn resolve_delivered_at(mut self, delivered_at: crate::time::UnixNanos) {
+        self.metrics.observe_delivery(self.emitted_ns, delivered_at);
         self.resolved = true;
         if let Some(tx) = self.tx.take() {
             let _ = tx.send((self.position, AckDisposition::Delivered));
@@ -1000,7 +1017,15 @@ impl QueueAckHandle {
         tokio::sync::mpsc::UnboundedReceiver<(AckPosition, AckDisposition)>,
     ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (Self::new(tx, AckPosition::Memory), rx)
+        (
+            Self::new(
+                tx,
+                AckPosition::Memory,
+                crate::time::UnixNanos::now(),
+                crate::metrics::OutputMetrics::for_testing(),
+            ),
+            rx,
+        )
     }
 
     /// Test-only constructor that also sets the carried position.
@@ -1012,7 +1037,15 @@ impl QueueAckHandle {
         tokio::sync::mpsc::UnboundedReceiver<(AckPosition, AckDisposition)>,
     ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (Self::new(tx, position), rx)
+        (
+            Self::new(
+                tx,
+                position,
+                crate::time::UnixNanos::now(),
+                crate::metrics::OutputMetrics::for_testing(),
+            ),
+            rx,
+        )
     }
 }
 
@@ -1080,7 +1113,7 @@ pub async fn run_queue_consumer(
     // is cancel-safe up to its first pushed event, and the drain that
     // follows the first push is synchronous, the only state that can
     // survive across select re-entries is an empty buffer.
-    let mut batch: Vec<(Event, AckPosition)> = Vec::with_capacity(RECV_BATCH_MAX);
+    let mut batch: Vec<(QueuedEvent, AckPosition)> = Vec::with_capacity(RECV_BATCH_MAX);
     metrics.queue_depth.set(receiver.depth());
 
     loop {
@@ -1136,7 +1169,12 @@ pub async fn run_queue_consumer(
                                 if let Some(tap) = &tap {
                                     tap.emit(&format!("output {}", name), &event).await;
                                 }
-                                let handle = QueueAckHandle::new(ack_tx.clone(), position);
+                                let handle = QueueAckHandle::new(
+                                    ack_tx.clone(),
+                                    position,
+                                    event.emitted_ns(),
+                                    Arc::clone(&metrics),
+                                );
                                 in_flight += 1;
                                 // `consume_shutdown` (not `consume`) — the
                                 // shutdown contract forbids the steady-state
@@ -1247,7 +1285,12 @@ pub async fn run_queue_consumer(
                         if let Some(tap) = &tap {
                             tap.emit(&format!("output {}", name), &event).await;
                         }
-                        let handle = QueueAckHandle::new(ack_tx.clone(), position);
+                        let handle = QueueAckHandle::new(
+                            ack_tx.clone(),
+                            position,
+                            event.emitted_ns(),
+                            Arc::clone(&metrics),
+                        );
                         in_flight += 1;
                         if let Err(e) = writer.consume(&event, handle).await {
                             // Reaching here means the output returned an
@@ -1459,7 +1502,7 @@ mod wedge_transition_helper_tests {
     #[test]
     fn first_dropped_on_disk_sets_wedge_and_bumps() {
         let mut wedged = false;
-        let metrics = OutputMetrics::for_testing();
+        let metrics = crate::metrics::OutputMetrics::for_testing();
         record_wedge_transition_if_first(
             disk_pos(1),
             AckDisposition::Dropped,
@@ -1541,10 +1584,13 @@ mod consumer_lifecycle_tests {
     use std::sync::Mutex;
     use std::sync::atomic::Ordering;
 
-    fn owned_event() -> Event {
-        Event::new(
-            Bytes::from_static(b"x"),
-            "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+    fn owned_event() -> QueuedEvent {
+        QueuedEvent::new(
+            Event::new(
+                Bytes::from_static(b"x"),
+                "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            ),
+            crate::time::UnixNanos::now(),
         )
     }
 
@@ -1784,6 +1830,75 @@ mod consumer_lifecycle_tests {
             Some((AckPosition::Memory, AckDisposition::Recovered))
         );
         assert_eq!(rx.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn delivery_latency_is_observed_only_for_delivered_dispositions() {
+        let metrics = crate::metrics::OutputMetrics::for_testing();
+        let emitted_at = crate::time::UnixNanos::new(1_000_000_000);
+
+        let (delivered_tx, mut delivered_rx) = tokio::sync::mpsc::unbounded_channel();
+        QueueAckHandle::new(
+            delivered_tx,
+            AckPosition::Memory,
+            emitted_at,
+            Arc::clone(&metrics),
+        )
+        .resolve_delivered_at(crate::time::UnixNanos::new(3_000_000_000));
+        assert_eq!(
+            delivered_rx.recv().await,
+            Some((AckPosition::Memory, AckDisposition::Delivered))
+        );
+        assert_eq!(metrics.delivery_seconds.count(), 1);
+        assert!(metrics.delivery_seconds.sum() >= 2.0);
+
+        let (recovered_tx, mut recovered_rx) = tokio::sync::mpsc::unbounded_channel();
+        QueueAckHandle::new(
+            recovered_tx,
+            AckPosition::Memory,
+            emitted_at,
+            Arc::clone(&metrics),
+        )
+        .resolve_recovered();
+        assert_eq!(
+            recovered_rx.recv().await,
+            Some((AckPosition::Memory, AckDisposition::Recovered))
+        );
+        assert_eq!(metrics.delivery_seconds.count(), 1);
+
+        let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
+        QueueAckHandle::new(
+            dropped_tx,
+            AckPosition::Memory,
+            emitted_at,
+            Arc::clone(&metrics),
+        )
+        .resolve_dropped();
+        assert_eq!(
+            dropped_rx.recv().await,
+            Some((AckPosition::Memory, AckDisposition::Dropped))
+        );
+        assert_eq!(metrics.delivery_seconds.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn accepted_batch_can_resolve_multiple_acks_at_one_delivery_boundary() {
+        let metrics = crate::metrics::OutputMetrics::for_testing();
+        let delivered_at = crate::time::UnixNanos::new(10_000_000_000);
+        for emitted_at in [
+            crate::time::UnixNanos::new(7_000_000_000),
+            crate::time::UnixNanos::new(8_000_000_000),
+        ] {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            QueueAckHandle::new(tx, AckPosition::Memory, emitted_at, Arc::clone(&metrics))
+                .resolve_delivered_at(delivered_at);
+            assert_eq!(
+                rx.recv().await,
+                Some((AckPosition::Memory, AckDisposition::Delivered))
+            );
+        }
+        assert_eq!(metrics.delivery_seconds.count(), 2);
+        assert_eq!(metrics.delivery_seconds.sum(), 5.0);
     }
 
     #[tokio::test]
@@ -2560,13 +2675,16 @@ mod consumer_lifecycle_tests {
                 Bytes::copy_from_slice(&i.to_le_bytes()),
                 "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
             );
-            sender.send(e).await.unwrap();
+            sender
+                .send(QueuedEvent::new(e, crate::time::UnixNanos::now()))
+                .await
+                .unwrap();
         }
         // Give the sends time to land so recv_many drains the whole
         // backlog in one call (deterministic single-batch scenario).
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
-        let mut buf: Vec<(Event, AckPosition)> = Vec::with_capacity(16);
+        let mut buf: Vec<(QueuedEvent, AckPosition)> = Vec::with_capacity(16);
         let n = receiver.recv_many(&mut buf, 16).await;
         assert_eq!(n, 8, "single-batch drain must collect all 8 events");
         for (i, (event, _)) in buf.iter().enumerate() {
@@ -2605,7 +2723,7 @@ mod consumer_lifecycle_tests {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
-        let mut buf: Vec<(Event, AckPosition)> = Vec::with_capacity(8);
+        let mut buf: Vec<(QueuedEvent, AckPosition)> = Vec::with_capacity(8);
         let n = receiver.recv_many(&mut buf, 8).await;
         assert_eq!(n, 5);
         let mut seen: std::collections::HashSet<AckPosition> = std::collections::HashSet::new();
@@ -2643,7 +2761,7 @@ mod consumer_lifecycle_tests {
         sender.send(owned_event()).await.unwrap();
         drop(sender);
 
-        let mut buf: Vec<(Event, AckPosition)> = Vec::with_capacity(8);
+        let mut buf: Vec<(QueuedEvent, AckPosition)> = Vec::with_capacity(8);
         let n = receiver.recv_many(&mut buf, 8).await;
         assert_eq!(n, 3, "closing after 3 sends must still yield those 3");
         buf.clear();
@@ -2846,7 +2964,7 @@ mod consumer_lifecycle_tests {
 
         // Warm-up round: prove that Some path is exercised.
         sender.send(owned_event()).await.unwrap();
-        let mut buf: Vec<(Event, AckPosition)> = Vec::with_capacity(4);
+        let mut buf: Vec<(QueuedEvent, AckPosition)> = Vec::with_capacity(4);
         assert_eq!(receiver.recv_many(&mut buf, 4).await, 1);
         buf.clear();
 
@@ -2882,7 +3000,7 @@ mod consumer_lifecycle_tests {
         let src = include_str!("mod.rs");
         // Locate the recv_many body between the pub-async signature
         // and the trailing brace at the end of the fn.
-        let sig_marker = "pub async fn recv_many(&mut self, buf: &mut Vec<(Event, AckPosition)>, max: usize) -> usize {";
+        let sig_marker = "pub async fn recv_many(\n        &mut self,\n        buf: &mut Vec<(QueuedEvent, AckPosition)>,\n        max: usize,\n    ) -> usize {";
         let start = src
             .find(sig_marker)
             .expect("recv_many signature marker must exist");

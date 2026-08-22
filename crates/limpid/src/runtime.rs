@@ -2648,9 +2648,12 @@ def pipeline p { process a }
         )
         .expect("memory queue");
         queue_sender
-            .send(Event::new(
-                Bytes::from_static(b"filler"),
-                "127.0.0.1:0".parse().unwrap(),
+            .send(crate::event::QueuedEvent::new(
+                Event::new(
+                    Bytes::from_static(b"filler"),
+                    "127.0.0.1:0".parse().unwrap(),
+                ),
+                crate::time::UnixNanos::now(),
             ))
             .await
             .expect("prefill queue");
