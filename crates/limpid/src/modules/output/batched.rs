@@ -617,8 +617,9 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
         self.metrics.events_written.inc_by(written);
         let split = (count - rejected) as usize;
         let mut iter = shippable.into_iter();
+        let delivered_at = (split != 0).then(crate::time::UnixNanos::now);
         for (_, ack, _permit) in iter.by_ref().take(split) {
-            ack.resolve_delivered();
+            ack.resolve_delivered_at(delivered_at.expect("non-empty accepted prefix has a time"));
         }
         // Per-event DLQ routing for the trailing `rejected` entries.
         // `events_failed` is bumped by `resolve_ack_from_dlq_outcome`
@@ -912,6 +913,34 @@ impl<P: BatchSinkPolicy> SinkShared<P> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn accepted_batch_samples_delivery_time_once_before_resolving_each_ack() {
+        let src = include_str!("batched.rs");
+        let start = src
+            .find("async fn resolve_send_success(&self, shippable: Vec<ParkedEvent>")
+            .expect("success resolver must exist");
+        let body = &src[start..];
+        let sample = body
+            .find("let delivered_at = (split != 0).then(crate::time::UnixNanos::now);")
+            .expect("accepted prefix must sample one shared delivery time");
+        let loop_start = body
+            .find("for (_, ack, _permit) in iter.by_ref().take(split)")
+            .expect("accepted-prefix loop must exist");
+        assert!(sample < loop_start, "time must be sampled outside the loop");
+        assert_eq!(
+            body[..loop_start]
+                .matches("crate::time::UnixNanos::now")
+                .count(),
+            1,
+            "the accepted batch must take exactly one wall-clock sample"
+        );
+        assert!(
+            body[loop_start..].starts_with("for (_, ack, _permit) in iter.by_ref().take(split)"),
+            "accepted-prefix loop identity changed"
+        );
+        assert!(body[loop_start..].contains("ack.resolve_delivered_at(delivered_at"));
+    }
+
     /// Structural pin: `flush_events`' shutdown-cancel arm and
     /// `flush_events_at_shutdown`'s `Elapsed` arm both route through
     /// `route_shutdown_batch_ambiguous_to_dlq`, not the plain

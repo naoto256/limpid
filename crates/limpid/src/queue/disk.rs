@@ -26,11 +26,25 @@ use std::sync::{Arc, Mutex};
 
 use tracing::{debug, error, warn};
 
-use crate::event::Event;
+use crate::event::{Event, QueuedEvent};
 use crate::queue::AckPosition;
 
 const SEGMENT_MAX_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB per segment
 const NEWLINE: u8 = b'\n';
+
+#[cfg(test)]
+std::thread_local! {
+    static CORRUPT_WARNING_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn warn_corrupt_line(segment: u64, offset: u64) {
+    #[cfg(test)]
+    CORRUPT_WARNING_COUNT.set(CORRUPT_WARNING_COUNT.get() + 1);
+    warn!(
+        "disk queue: skipping corrupted line in segment {} at byte offset {}",
+        segment, offset
+    );
+}
 
 /// One in-flight (read but not yet acked) event tracked by
 /// [`DiskQueueReceiver`]. `start_*` is the position the
@@ -194,8 +208,17 @@ pub fn create_disk_queue(
 }
 
 impl DiskQueueSender {
-    pub async fn send(&self, event: Event) -> Result<(), super::QueueSendError> {
-        let serialized = match serde_json::to_string(&event.to_json_value()) {
+    pub async fn send(&self, event: QueuedEvent) -> Result<(), super::QueueSendError> {
+        let (event, emitted_ns) = event.into_parts();
+        let mut value = event.to_json_value();
+        let Some(object) = value.as_object_mut() else {
+            unreachable!("event JSON is always an object")
+        };
+        object.insert(
+            "emitted_ns".to_owned(),
+            serde_json::Value::Number(emitted_ns.get().into()),
+        );
+        let serialized = match serde_json::to_string(&value) {
             Ok(s) => s,
             Err(e) => {
                 error!("disk queue: failed to serialize event: {}", e);
@@ -236,7 +259,7 @@ impl DiskQueueReceiver {
         state.write_seq.saturating_sub(state.acked_seq)
     }
 
-    pub async fn recv(&mut self) -> Option<(Event, AckPosition)> {
+    pub async fn recv(&mut self) -> Option<(QueuedEvent, AckPosition)> {
         loop {
             // Register for notification BEFORE checking — prevents missed-wakeup race.
             // Clone the Arc to avoid borrowing self across the await.
@@ -258,7 +281,7 @@ impl DiskQueueReceiver {
     /// on empty (regardless of whether the queue has been closed) —
     /// closure observation is left to a subsequent `recv().await`.
     /// Used as the greedy-drain step inside `QueueReceiver::recv_many`.
-    pub fn try_recv(&mut self) -> Option<(Event, AckPosition)> {
+    pub fn try_recv(&mut self) -> Option<(QueuedEvent, AckPosition)> {
         self.try_read_next()
     }
 
@@ -359,7 +382,7 @@ impl DiskQueueReceiver {
         self.sync_acked_seq();
     }
 
-    fn try_read_next(&mut self) -> Option<(Event, AckPosition)> {
+    fn try_read_next(&mut self) -> Option<(QueuedEvent, AckPosition)> {
         loop {
             let seg_path = segment_path(&self.dir, self.read_seq);
             if !seg_path.exists() {
@@ -432,7 +455,18 @@ impl DiskQueueReceiver {
                 // ack, restart re-reads from `acked_offset` and
                 // replays this event.
 
-                if let Some(event) = Event::from_json(trimmed) {
+                let queued = serde_json::from_str::<serde_json::Value>(trimmed)
+                    .ok()
+                    .and_then(|mut value| {
+                        let emitted_nanos =
+                            value.as_object_mut()?.remove("emitted_ns")?.as_i64()?;
+                        let event = Event::from_json_value(value)?;
+                        Some(QueuedEvent::new(
+                            event,
+                            crate::time::UnixNanos::new(emitted_nanos),
+                        ))
+                    });
+                if let Some(event) = queued {
                     self.in_flight_positions.push_back(InFlight {
                         start_seq,
                         start_offset,
@@ -449,10 +483,7 @@ impl DiskQueueReceiver {
                     ));
                 }
 
-                warn!(
-                    "disk queue: skipping corrupted line in segment {} at byte offset {}",
-                    self.read_seq, self.read_offset
-                );
+                warn_corrupt_line(self.read_seq, self.read_offset);
             }
 
             // Finished this segment — try next
@@ -669,8 +700,11 @@ mod tests {
     use super::*;
     use bytes::Bytes;
 
-    fn make_event(msg: &str) -> Event {
-        Event::new(Bytes::from(msg.to_string()), "127.0.0.1:0".parse().unwrap())
+    fn make_event(msg: &str) -> QueuedEvent {
+        QueuedEvent::new(
+            Event::new(Bytes::from(msg.to_string()), "127.0.0.1:0".parse().unwrap()),
+            crate::time::UnixNanos::now(),
+        )
     }
 
     #[test]
@@ -732,6 +766,7 @@ mod tests {
         let first = make_event("<134>msg1");
         let second = make_event("<134>msg2");
         let first_key = first.key();
+        let first_emitted_at = first.emitted_ns();
         let second_key = second.key();
         tx.send(first).await.unwrap();
         tx.send(second).await.unwrap();
@@ -739,10 +774,56 @@ mod tests {
         let (e1, _p1) = rx.recv().await.unwrap();
         assert_eq!(String::from_utf8_lossy(&e1.ingress), "<134>msg1");
         assert_eq!(e1.key(), first_key);
+        assert_eq!(e1.emitted_ns(), first_emitted_at);
 
         let (e2, _p2) = rx.recv().await.unwrap();
         assert_eq!(String::from_utf8_lossy(&e2.ingress), "<134>msg2");
         assert_eq!(e2.key(), second_key);
+    }
+
+    #[tokio::test]
+    async fn required_emission_timestamp_adds_one_exact_wal_field_per_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = create_disk_queue(dir.path().to_str().unwrap(), 0).unwrap();
+        let event = Event::new(
+            Bytes::from_static(b"<134>size"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let base_len = serde_json::to_vec(&event.to_json_value()).unwrap().len();
+        let emitted_at = crate::time::UnixNanos::new(1_234_567_890_123_456_789);
+        let emitted_nanos = emitted_at.get();
+        let field_len = format!(",\"emitted_ns\":{emitted_nanos}").len();
+
+        tx.send(QueuedEvent::new(event, emitted_at)).await.unwrap();
+        let wal = std::fs::read(segment_path(dir.path(), 0)).unwrap();
+
+        assert_eq!(wal.last(), Some(&NEWLINE));
+        assert_eq!(wal.len() - 1 - base_len, field_len);
+        assert_eq!(
+            field_len, 33,
+            "WAL overhead must remain one fixed key plus i64"
+        );
+    }
+
+    #[test]
+    fn disk_queue_rejects_records_without_required_output_emission_timestamp() {
+        let warnings_before = CORRUPT_WARNING_COUNT.get();
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = Event::new(
+            Bytes::from_static(b"legacy"),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let mut line = serde_json::to_string(&legacy.to_json_value()).unwrap();
+        line.push('\n');
+        fs::write(segment_path(dir.path(), 0), line).unwrap();
+
+        let (_tx, mut rx) = create_disk_queue(dir.path().to_str().unwrap(), 0).unwrap();
+        assert!(rx.try_recv().is_none());
+        assert_eq!(
+            CORRUPT_WARNING_COUNT.get(),
+            warnings_before + 1,
+            "rejecting an incompatible WAL record must remain operator-visible"
+        );
     }
 
     #[tokio::test]
@@ -762,7 +843,9 @@ mod tests {
             stamps.clone(),
         );
 
-        tx.send(event).await.unwrap();
+        tx.send(QueuedEvent::new(event, crate::time::UnixNanos::now()))
+            .await
+            .unwrap();
         let (recovered, _) = rx.recv().await.unwrap();
         assert_eq!(recovered.ltp_stamps(), stamps);
     }

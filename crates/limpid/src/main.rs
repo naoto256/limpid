@@ -22,6 +22,7 @@ mod queue;
 mod runtime;
 mod signal;
 mod tap;
+mod time;
 mod tls;
 
 use std::net::SocketAddr;
