@@ -1104,12 +1104,16 @@ async fn handle_inject(
                 sent
             }
             Target::Output(tx) => {
-                // Inject is a cold path that hands an OwnedEvent
-                // straight to the output's queue. After this change
-                // every queue carries `Event` end-to-end, so there is no
-                // longer a separate `send_owned` codepath — `send`
-                // is the only entry.
-                let sent = tx.send(event).await.is_ok();
+                // A direct output injection has no pipeline Output statement,
+                // so its queue-entry boundary is stamped here, immediately
+                // before the potentially blocking enqueue.
+                let sent = tx
+                    .send(crate::event::QueuedEvent::new(
+                        event,
+                        crate::time::UnixNanos::now(),
+                    ))
+                    .await
+                    .is_ok();
                 if sent && let Some(m) = tx.metrics() {
                     m.events_injected.inc();
                 }

@@ -109,6 +109,7 @@ for the same-host multi-instance deployment caveat.
 | `limpid_pipeline_events_errored_total` | `pipeline` | Events that failed at a pipeline-side producer site and were routed to the [error log](./error-log.md). |
 | `limpid_pipeline_events_errored_unwritable_total` | `pipeline` | Pipeline-side error-log writes that failed. |
 | `limpid_pipeline_inflight` | `pipeline` | Pipeline executions currently in progress, including terminal bookkeeping. |
+| `limpid_pipeline_processing_seconds` | `pipeline`, `output` | Local input arrival to the emission of that output statement's event snapshot. |
 
 `events_discarded` is a possible routing-misconfiguration signal: the event
 completed the pipeline but was never sent anywhere.
@@ -119,6 +120,15 @@ completed the pipeline but was never sent anywhere.
 failures are counted under the corresponding output's `events_failed`. The
 original event is preserved when the configured error-log write succeeds; see
 [Error Log → Replay](./error-log.md#replay).
+
+`limpid_pipeline_processing_seconds` is registered once for every configured
+`pipeline`/`output` pair. Each Output statement observes the interval from the
+event's local input `received_at` to that statement's snapshot; repeated calls
+to the same output share one series, while fan-out outputs observe independent
+snapshots. Reaching an Output statement therefore adds one processing
+observation, including each branch of a fan-out. Its finite bucket bounds are
+`0.0001`, `0.001`, `0.005`, `0.025`,
+`0.1`, `0.5`, `2.5`, and `10` seconds.
 
 ### Process invocations
 
@@ -246,6 +256,7 @@ certificates are not classified as unknown peers.
 | `limpid_output_bytes_written_total` | `output` | Logical bytes whose transfer to the destination was confirmed. |
 | `limpid_output_queue_depth` | `output` | Current unread or unacknowledged output queue depth. |
 | `limpid_output_in_retry` | `output` | Whether an output retry cycle is active (`0` or `1`). |
+| `limpid_output_delivery_seconds` | `output` | Output emission or direct injection to confirmed delivery. |
 
 `events_failed` includes retry-budget exhaustion, per-event render failures in
 batched output flushes, shutdown-drain leftovers after a final flush failure,
@@ -260,6 +271,28 @@ and OTLP `partial_success.rejected_log_records`. Evaluate it with the DLQ file,
 
 See the [output disposition contract](../outputs/README.md#disposition-contract)
 and [Error Log → When the DLQ write itself fails](./error-log.md#when-the-dlq-write-itself-fails).
+
+`limpid_output_delivery_seconds` starts at the per-output statement snapshot,
+or immediately before a direct output injection enters the queue. It includes
+remaining pipeline work, enqueue blocking, memory or disk queue residence,
+batching, retries, transport work, and replay after restart. An observation is
+added only when the queue acknowledgement resolves as Delivered; Recovered,
+Dropped, wedge, and enqueue-failure paths do not contribute. This is therefore
+a delivered-event latency distribution, not a success-rate denominator. Its
+finite bucket bounds are `0.001`, `0.005`, `0.025`, `0.1`, `0.5`, `2.5`, `10`,
+`30`, `60`, `300`, `900`, and `3600` seconds.
+
+Each event resolved as Delivered adds one delivery observation. Batched
+outputs share a single delivery-time sample for the accepted prefix, but every
+Delivered event still increments the histogram count. Together with the
+per-Output processing observation above, telemetry work scales proportionally
+with fan-out.
+
+> **Upgrade note:** The disk output-queue record format changed with these
+> latency boundaries. Drain disk-backed output queues before stopping the old
+> daemon and upgrading. Older queued records do not contain the required
+> `emitted_ns` field; the new daemon rejects them and emits the existing
+> corrupted-record warning rather than mixing incompatible latency samples.
 
 Useful relationships are approximate during concurrent updates:
 

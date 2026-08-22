@@ -8,7 +8,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+#[cfg(test)]
+use chrono::Utc;
 use prost::Message as _;
 use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::pki_types::{CertificateDer, SubjectPublicKeyInfoDer, UnixTime};
@@ -112,7 +113,7 @@ pub struct LtpInput {
     max_connections: usize,
     metrics: Arc<InputMetrics>,
     ltp_metrics: Arc<LtpMetrics>,
-    now: fn() -> DateTime<Utc>,
+    now: fn() -> crate::time::ClockSample,
     #[cfg(test)]
     hello_started: Option<Arc<tokio::sync::Notify>>,
 }
@@ -123,7 +124,7 @@ struct ConnectionContext {
     peers: PeerRegistry,
     node_id: Arc<str>,
     max_hops: usize,
-    now: fn() -> DateTime<Utc>,
+    now: fn() -> crate::time::ClockSample,
     metrics: Arc<InputMetrics>,
     ltp_metrics: Arc<LtpMetrics>,
     tx: tokio::sync::mpsc::Sender<Event>,
@@ -176,7 +177,7 @@ impl Module for LtpInput {
             max_connections: max_connections as usize,
             metrics: InputMetrics::register(&ctx.metrics, name)?,
             ltp_metrics,
-            now: Utc::now,
+            now: crate::time::ClockSample::now,
             #[cfg(test)]
             hello_started: None,
         })
@@ -587,7 +588,7 @@ fn event_from_frame(
     source: std::net::SocketAddr,
     node_id: &str,
     max_hops: usize,
-    now: fn() -> DateTime<Utc>,
+    now: fn() -> crate::time::ClockSample,
     peer_metrics: &LtpPeerMetrics,
 ) -> Result<FrameDecision> {
     let key: [u8; 16] = meta
@@ -609,24 +610,18 @@ fn event_from_frame(
         warn!("LTP event dropped because its hop history reached max_hops");
         return Ok(FrameDecision::DropMaxHops);
     }
-    let received_at = now();
-    let arrival_unix_nano = received_at
-        .timestamp_nanos_opt()
-        .and_then(|value| u64::try_from(value).ok())
-        .unwrap_or(0);
+    let received = now();
+    let received_at = received.utc;
+    let arrival_unix_nano = received.unix_nanos.to_wire_u64();
     if let Some(previous) = meta.stamps.last()
         && previous.departure_unix_nano != 0
     {
-        let delta = match arrival_unix_nano.checked_sub(previous.departure_unix_nano) {
-            Some(delta) => delta,
-            None => {
-                peer_metrics.negative_delta.inc();
-                0
-            }
-        };
-        peer_metrics
-            .network_latency
-            .observe(delta as f64 / 1_000_000_000.0);
+        let elapsed =
+            crate::time::ElapsedNanos::between_u64(arrival_unix_nano, previous.departure_unix_nano);
+        if elapsed.reversed {
+            peer_metrics.negative_delta.inc();
+        }
+        peer_metrics.network_latency.observe(elapsed.duration);
     }
     meta.stamps.push(HopStamp {
         node_id: node_id.to_owned(),
@@ -775,8 +770,8 @@ mod tests {
         client.shutdown().await.unwrap();
     }
 
-    fn fixed_now() -> DateTime<Utc> {
-        Utc.timestamp_nanos(123)
+    fn fixed_now() -> crate::time::ClockSample {
+        crate::time::ClockSample::from_datetime(Utc.timestamp_nanos(123))
     }
 
     fn v7_key(seed: u8) -> [u8; 16] {
@@ -996,6 +991,7 @@ mod tests {
             panic!("valid frame was dropped");
         };
         assert_eq!(event.key().as_bytes(), &key);
+        assert_eq!(event.received_at, fixed_now().utc);
         assert_eq!(event.ingress, Bytes::from_static(b"payload"));
         assert_eq!(event.egress, Bytes::from_static(b"payload"));
         assert_eq!(event.ltp_stamps()[0], peer_stamp);

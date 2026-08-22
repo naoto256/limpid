@@ -5,7 +5,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+#[cfg(test)]
+use chrono::Utc;
 use prost::Message as _;
 use rustls::client::AlwaysResolvesClientRawPublicKeys;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -93,7 +94,7 @@ pub struct LtpOutput {
     metrics: Arc<OutputMetrics>,
     peer_metrics: LtpPeerMetrics,
     shutdown_signal: tokio::sync::watch::Receiver<bool>,
-    now: fn() -> DateTime<Utc>,
+    now: fn() -> crate::time::UnixNanos,
 }
 
 impl Module for LtpOutput {
@@ -144,7 +145,7 @@ impl Module for LtpOutput {
             metrics: OutputMetrics::register(&ctx.metrics, name)?,
             peer_metrics,
             shutdown_signal: ctx.shutdown_signal.clone(),
-            now: Utc::now,
+            now: crate::time::UnixNanos::now,
         })
     }
 }
@@ -385,11 +386,8 @@ std::thread_local! {
 
 impl LtpOutput {
     fn working_event_meta(&self, event: &Event) -> WorkingEventMeta {
-        let arrival_unix_nano = event
-            .received_at
-            .timestamp_nanos_opt()
-            .and_then(|value| u64::try_from(value).ok())
-            .unwrap_or(0);
+        let arrival_unix_nano =
+            crate::time::UnixNanos::from_datetime(event.received_at).to_wire_u64();
         #[cfg(test)]
         STAMP_CLONE_COUNT.set(STAMP_CLONE_COUNT.get() + 1);
         let mut stamps = event.ltp_stamps().to_vec();
@@ -418,10 +416,7 @@ impl LtpOutput {
     }
 
     fn event_frame(&self, working: &mut WorkingEventMeta, payload: &[u8]) -> Result<Bytes> {
-        let departure_unix_nano = (self.now)()
-            .timestamp_nanos_opt()
-            .and_then(|value| u64::try_from(value).ok())
-            .unwrap_or(0);
+        let departure_unix_nano = (self.now)().to_wire_u64();
         working.meta.stamps[working.local_stamp].departure_unix_nano = departure_unix_nano;
         Ok(Bytes::from(encode_frame(&working.meta, payload)?))
     }
@@ -484,7 +479,7 @@ impl LtpOutput {
             .saturating_sub(stamp.arrival_unix_nano);
         self.peer_metrics
             .intra_latency
-            .observe(delta as f64 / 1_000_000_000.0);
+            .observe(crate::time::DurationNanos::new(delta));
         Ok(())
     }
 
@@ -1130,22 +1125,22 @@ mod tests {
         assert!(format!("{error:#}").contains("LTP event metadata 65537 bytes"));
     }
 
-    fn now_200() -> DateTime<Utc> {
-        Utc.timestamp_nanos(200)
+    fn now_200() -> crate::time::UnixNanos {
+        crate::time::UnixNanos::new(200)
     }
 
-    fn now_negative() -> DateTime<Utc> {
-        Utc.timestamp_nanos(-1)
+    fn now_negative() -> crate::time::UnixNanos {
+        crate::time::UnixNanos::new(-1)
     }
 
     static HELLO_FLUSHED: AtomicBool = AtomicBool::new(false);
 
-    fn now_after_hello_flush() -> DateTime<Utc> {
+    fn now_after_hello_flush() -> crate::time::UnixNanos {
         assert!(
             HELLO_FLUSHED.load(Ordering::SeqCst),
             "departure time must be sampled after the hello has flushed"
         );
-        Utc.timestamp_nanos(200)
+        crate::time::UnixNanos::new(200)
     }
 
     #[test]
@@ -1762,8 +1757,8 @@ mod tests {
 
     static RETRY_NOW: AtomicI64 = AtomicI64::new(300);
 
-    fn retry_now() -> DateTime<Utc> {
-        Utc.timestamp_nanos(RETRY_NOW.fetch_add(1, Ordering::SeqCst))
+    fn retry_now() -> crate::time::UnixNanos {
+        crate::time::UnixNanos::new(RETRY_NOW.fetch_add(1, Ordering::SeqCst))
     }
 
     #[test]

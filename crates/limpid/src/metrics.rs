@@ -36,11 +36,92 @@ pub(crate) fn register_build_info(
 
 pub(crate) const LTP_HOP_LATENCY_BUCKETS: [f64; 8] =
     [0.0001, 0.001, 0.005, 0.025, 0.1, 0.5, 2.5, 10.0];
+pub(crate) const PIPELINE_PROCESSING_BUCKETS: [f64; 8] =
+    [0.0001, 0.001, 0.005, 0.025, 0.1, 0.5, 2.5, 10.0];
+pub(crate) const OUTPUT_DELIVERY_BUCKETS: [f64; 12] = [
+    0.001, 0.005, 0.025, 0.1, 0.5, 2.5, 10.0, 30.0, 60.0, 300.0, 900.0, 3600.0,
+];
+
+#[derive(Clone)]
+pub(crate) struct DurationHistogram {
+    histogram: Arc<registry_core::Histogram>,
+}
+
+impl DurationHistogram {
+    fn new(histogram: Arc<registry_core::Histogram>) -> Self {
+        Self { histogram }
+    }
+
+    pub(crate) fn observe(&self, duration: crate::time::DurationNanos) {
+        self.histogram.observe(duration.as_seconds_f64());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn count(&self) -> u64 {
+        self.histogram.count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sum(&self) -> f64 {
+        self.histogram.sum()
+    }
+
+    #[cfg(test)]
+    fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.histogram, &other.histogram)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct PipelineOutputTimer {
+    histogram: DurationHistogram,
+}
+
+impl PipelineOutputTimer {
+    pub(crate) fn register(
+        registry: &Registry,
+        pipeline: &str,
+        output: &str,
+    ) -> Result<Self, MetricsError> {
+        Ok(Self {
+            histogram: DurationHistogram::new(
+                registry
+                    .histogram("limpid_pipeline_processing_seconds")
+                    .label("pipeline", pipeline)
+                    .label("output", output)
+                    .help(
+                        "Time from local input arrival to emission at this pipeline output statement.",
+                    )
+                    .buckets(&PIPELINE_PROCESSING_BUCKETS)
+                    .build()?,
+            ),
+        })
+    }
+
+    pub(crate) fn observe_between(
+        &self,
+        received_at: crate::time::UnixNanos,
+        emitted_at: crate::time::UnixNanos,
+    ) {
+        self.histogram
+            .observe(emitted_at.elapsed_since(received_at).duration);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn count(&self) -> u64 {
+        self.histogram.count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sum(&self) -> f64 {
+        self.histogram.sum()
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct LtpPeerMetrics {
-    pub(crate) network_latency: Arc<registry_core::Histogram>,
-    pub(crate) intra_latency: Arc<registry_core::Histogram>,
+    pub(crate) network_latency: DurationHistogram,
+    pub(crate) intra_latency: DurationHistogram,
     pub(crate) negative_delta: Arc<registry_core::Counter>,
     pub(crate) loop_dropped: Arc<registry_core::Counter>,
 }
@@ -69,6 +150,7 @@ impl LtpMetrics {
                     .help("LTP hop latency between authenticated peers.")
                     .buckets(&LTP_HOP_LATENCY_BUCKETS)
                     .build()
+                    .map(DurationHistogram::new)
             };
             let counter = |name, help| {
                 registry
@@ -344,6 +426,7 @@ pub struct OutputMetrics {
     pub(crate) bytes_written: Arc<registry_core::Counter>,
     pub(crate) queue_depth: Arc<registry_core::Gauge>,
     pub(crate) in_retry: Arc<registry_core::Gauge>,
+    pub(crate) delivery_seconds: DurationHistogram,
 }
 
 impl OutputMetrics {
@@ -404,7 +487,24 @@ impl OutputMetrics {
                 "limpid_output_in_retry",
                 "Whether this output currently has an active retry cycle."
             ),
+            delivery_seconds: DurationHistogram::new(
+                registry
+                    .histogram("limpid_output_delivery_seconds")
+                    .label("output", output)
+                    .help("Time from output-statement emission or direct output injection to confirmed delivery.")
+                    .buckets(&OUTPUT_DELIVERY_BUCKETS)
+                    .build()?,
+            ),
         }))
+    }
+
+    pub(crate) fn observe_delivery(
+        &self,
+        emitted_at: crate::time::UnixNanos,
+        delivered_at: crate::time::UnixNanos,
+    ) {
+        self.delivery_seconds
+            .observe(delivered_at.elapsed_since(emitted_at).duration);
     }
 
     #[cfg(test)]
@@ -1194,7 +1294,8 @@ pub(crate) use registry_core::{MetricsError, Registry};
 mod registry_tests {
     use super::{
         InputMetrics, LTP_HOP_LATENCY_BUCKETS, LtpMetrics, MetricsError, MetricsSnapshot,
-        OutputMetrics, PipelineMetrics, Registry,
+        OUTPUT_DELIVERY_BUCKETS, OutputMetrics, PIPELINE_PROCESSING_BUCKETS, PipelineMetrics,
+        PipelineOutputTimer, Registry,
     };
     use serde_json::Value;
     use std::collections::BTreeSet;
@@ -1204,6 +1305,47 @@ mod registry_tests {
         match result {
             Ok(value) => value,
             Err(error) => panic!("metric registration failed: {error}"),
+        }
+    }
+
+    #[test]
+    fn output_latency_histograms_have_exact_labels_buckets_and_nonnegative_time() {
+        let registry = Registry::new();
+        let pipeline = build_ok(PipelineOutputTimer::register(&registry, "route", "egress"));
+        let output = build_ok(OutputMetrics::register(&registry, "egress"));
+        let start = crate::time::UnixNanos::new(2_000_000_000);
+
+        pipeline.observe_between(start, crate::time::UnixNanos::new(1_000_000_000));
+        pipeline.observe_between(start, crate::time::UnixNanos::new(2_250_000_000));
+        output.observe_delivery(start, crate::time::UnixNanos::new(1_000_000_000));
+        output.observe_delivery(start, crate::time::UnixNanos::new(3_500_000_000));
+
+        let snapshot = snapshot_json(&registry);
+        for (name, labels, bounds, expected_sum) in [
+            (
+                "limpid_pipeline_processing_seconds",
+                serde_json::json!({"pipeline": "route", "output": "egress"}),
+                PIPELINE_PROCESSING_BUCKETS.as_slice(),
+                0.25,
+            ),
+            (
+                "limpid_output_delivery_seconds",
+                serde_json::json!({"output": "egress"}),
+                OUTPUT_DELIVERY_BUCKETS.as_slice(),
+                1.5,
+            ),
+        ] {
+            let family = metric(&snapshot, name);
+            assert_eq!(family["type"], "histogram");
+            let series = &family["series"][0];
+            assert_eq!(series["labels"], labels);
+            assert_eq!(series["count"], 2);
+            assert_eq!(series["sum"].as_f64(), Some(expected_sum));
+            let buckets = series["buckets"].as_array().unwrap();
+            assert_eq!(buckets.len(), bounds.len());
+            for (bucket, bound) in buckets.iter().zip(bounds) {
+                assert_eq!(bucket[0].as_f64(), Some(*bound));
+            }
         }
     }
 
@@ -1367,14 +1509,16 @@ mod registry_tests {
 
         let first_peer_a = metrics.peer("peer-a").unwrap();
         let second_peer_a = metrics.peer("peer-a").unwrap();
-        assert!(Arc::ptr_eq(
-            &first_peer_a.network_latency,
-            &second_peer_a.network_latency
-        ));
-        assert!(Arc::ptr_eq(
-            &first_peer_a.intra_latency,
-            &second_peer_a.intra_latency
-        ));
+        assert!(
+            first_peer_a
+                .network_latency
+                .ptr_eq(&second_peer_a.network_latency)
+        );
+        assert!(
+            first_peer_a
+                .intra_latency
+                .ptr_eq(&second_peer_a.intra_latency)
+        );
         assert!(Arc::ptr_eq(
             &first_peer_a.negative_delta,
             &second_peer_a.negative_delta
@@ -1941,6 +2085,29 @@ mod registry_tests {
             assert_eq!(series[0]["value"], 0, "{name} must start at zero");
         }
 
+        let delivery = metric(&initial, "limpid_output_delivery_seconds");
+        assert_eq!(delivery["type"], "histogram");
+        assert_eq!(
+            delivery["help"],
+            "Time from output-statement emission or direct output injection to confirmed delivery."
+        );
+        let series = delivery["series"]
+            .as_array()
+            .expect("delivery histogram series array");
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0]["labels"], serde_json::json!({"output": "egress"}));
+        assert_eq!(series[0]["count"], 0);
+        assert_eq!(series[0]["sum"], 0.0);
+        assert_eq!(
+            series[0]["buckets"],
+            serde_json::Value::Array(
+                OUTPUT_DELIVERY_BUCKETS
+                    .iter()
+                    .map(|bound| serde_json::json!([bound, 0]))
+                    .collect()
+            )
+        );
+
         macro_rules! inc {
             ($counter:expr, $times:expr) => {
                 for _ in 0..$times {
@@ -1977,7 +2144,7 @@ mod registry_tests {
             .expect("metrics must be an array");
         assert_eq!(
             metrics.len(),
-            21,
+            22,
             "only the documented metric set is registered"
         );
 

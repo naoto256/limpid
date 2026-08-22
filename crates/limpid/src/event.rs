@@ -200,6 +200,48 @@ pub struct OwnedEvent {
     pub ack: Option<Arc<AckHandle>>,
 }
 
+/// Event snapshot after crossing one concrete pipeline `output` boundary.
+///
+/// The timestamp belongs to the queue item rather than [`OwnedEvent`]: one
+/// input event may fan out through several output statements at different
+/// times, while the event itself remains unchanged.  Keeping the field
+/// required makes every queue producer choose the correct local boundary and
+/// lets disk replay preserve output-delivery latency across daemon restarts.
+#[derive(Debug)]
+pub(crate) struct QueuedEvent {
+    event: OwnedEvent,
+    emitted_ns: crate::time::UnixNanos,
+}
+
+impl QueuedEvent {
+    pub(crate) fn new(event: OwnedEvent, emitted_ns: crate::time::UnixNanos) -> Self {
+        Self { event, emitted_ns }
+    }
+
+    pub(crate) fn emitted_ns(&self) -> crate::time::UnixNanos {
+        self.emitted_ns
+    }
+
+    pub(crate) fn into_parts(self) -> (OwnedEvent, crate::time::UnixNanos) {
+        (self.event, self.emitted_ns)
+    }
+}
+
+impl std::ops::Deref for QueuedEvent {
+    type Target = OwnedEvent;
+
+    fn deref(&self) -> &Self::Target {
+        &self.event
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for QueuedEvent {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.event
+    }
+}
+
 impl OwnedEvent {
     pub fn new(ingress: Bytes, source: SocketAddr) -> Self {
         Self {
@@ -399,6 +441,10 @@ impl OwnedEvent {
     /// `OwnedValue::Bytes`.
     pub fn from_json(json_str: &str) -> Option<Self> {
         let v: JsonValue = serde_json::from_str(json_str).ok()?;
+        Self::from_json_value(v)
+    }
+
+    pub(crate) fn from_json_value(v: JsonValue) -> Option<Self> {
         let key = match v.get("key") {
             Some(JsonValue::String(raw)) => {
                 let parsed = uuid::Uuid::parse_str(raw).ok()?;
