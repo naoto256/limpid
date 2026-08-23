@@ -1,8 +1,7 @@
 //! Black-box contract tests for coalescing logical LTP inputs onto one listener.
 //!
-//! These tests intentionally drive the released CLI/runtime surface. They are
-//! RED until the runtime owns LTP listener groups instead of letting every
-//! logical `input ltp` bind independently.
+//! These tests intentionally drive the released CLI/runtime surface, pinning
+//! the runtime-owned LTP listener-group contract as black-box behavior.
 
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -220,6 +219,11 @@ fn identical_bind_requires_matching_listener_settings() {
     );
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("LTP listener max_connections mismatch"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("between inputs 'from_a' and 'from_b'"),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
