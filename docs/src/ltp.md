@@ -102,7 +102,10 @@ listeners. Whether `[::]:7514` also conflicts with `0.0.0.0:7514` depends on
 the platform's dual-stack socket policy, so that cross-family pair may pass
 static overlap validation and then fail at bind time. A bind failure aborts
 startup for the whole group and names all affected inputs; Limpid does not
-continue with a partially active group.
+continue with a partially active group. After a listener has bound, an accept
+error is logged and the same listener retries after 100 ms, doubling the delay
+after consecutive errors up to 5 seconds. A successful accept resets the delay
+to 100 ms, and shutdown interrupts a pending retry delay immediately.
 
 The wire key must be exactly 16 bytes, use the RFC 4122 variant, and identify a
 UUIDv7. Limpid never replaces an invalid or missing key. After authentication,
