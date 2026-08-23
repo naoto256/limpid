@@ -18,7 +18,7 @@ use crate::dsl::props;
 use crate::event::Event;
 use crate::functions::FunctionRegistry;
 use crate::metrics::{LtpMetrics, PipelineMetrics, Registry};
-use crate::modules::{self, HasMetrics, ModuleRegistry};
+use crate::modules::{self, HasMetrics, Module, ModuleRegistry};
 use crate::pipeline::CompiledConfig;
 use crate::queue::{self, QueueConfig, QueueSender};
 use crate::tap::TapRegistry;
@@ -319,6 +319,7 @@ impl Runtime {
             String,
             (mpsc::Sender<Event>, Arc<crate::metrics::InputMetrics>),
         > = HashMap::new();
+        let mut ltp_inputs = Vec::new();
 
         for (input_name, pipelines) in input_pipelines {
             let input_def = config
@@ -353,6 +354,32 @@ impl Runtime {
                 run_pipeline_workers(event_rx, &workers, &ctx, &iname, shutdown_for_worker).await;
             }));
 
+            if input_def.properties.type_name() == "ltp" {
+                let input = match modules::input::ltp::LtpInput::build(
+                    &input_name,
+                    &input_def.properties,
+                    &build_ctx,
+                ) {
+                    Ok(input) => input,
+                    Err(error) => {
+                        error!(
+                            "failed to create input '{}': {} — aborting startup",
+                            input_name, error
+                        );
+                        for handle in &handles {
+                            handle.abort();
+                        }
+                        for handle in handles {
+                            let _ = handle.await;
+                        }
+                        return Err(error);
+                    }
+                };
+                input_senders.insert(input_name.clone(), (sender_for_inject, input.metrics()));
+                ltp_inputs.push((input, event_tx));
+                continue;
+            }
+
             // Input — registry builds, spawns, and returns metrics handle.
             // `input_def.properties` carries the resolved `type`; no separate
             // type_name argument needed (see ModuleProperties rationale).
@@ -384,6 +411,23 @@ impl Runtime {
             );
             handles.push(created.handle);
         }
+
+        let ltp_handles =
+            match modules::input::ltp::start_listener_groups(ltp_inputs, shutdown_rx.clone()).await
+            {
+                Ok(handles) => handles,
+                Err(error) => {
+                    error!("failed to start LTP listener groups: {error:#} — aborting startup");
+                    for handle in &handles {
+                        handle.abort();
+                    }
+                    for handle in handles {
+                        let _ = handle.await;
+                    }
+                    return Err(error);
+                }
+            };
+        handles.extend(ltp_handles);
 
         // --- 4. Start control socket (after all metrics are registered) ---
         let control_path = config
