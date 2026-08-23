@@ -143,6 +143,12 @@ impl CompiledConfig {
                 )?;
             }
         }
+        crate::modules::input::ltp::validate_listener_groups(
+            self.inputs
+                .iter()
+                .filter(|(_, input)| input.properties.type_name() == "ltp")
+                .map(|(name, input)| (name.as_str(), input.properties.user_properties())),
+        )?;
         for (name, output) in &self.outputs {
             if output.properties.type_name() == "ltp" {
                 crate::modules::output::ltp::validate_static_properties(

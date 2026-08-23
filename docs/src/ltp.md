@@ -65,6 +65,45 @@ def input from_edge {
 | `max_hops` | `16` | Incoming hop limit, from 1 through 16. An event already at the limit is dropped. |
 | `max_connections` | `1024` | Maximum concurrent accepted connections. |
 
+Multiple logical LTP inputs may use the exact same `bind` string. Limpid opens
+one physical listener for that group, authenticates against the union of its
+declared peers, and dispatches each connection to the logical input that owns
+the presented public key. The hello `node_id` must then match that key. Events,
+input counters, and pipeline delivery belong only to the selected input; the
+hello frame is not counted as an input payload.
+
+```limpid
+def input ltp_jump01 {
+    type ltp
+    bind "0.0.0.0:7514"
+    peer { node_id "jump01" pubkey "<jump01 SPKI base64>" }
+    max_connections 1024
+}
+
+def input ltp_jump02 {
+    type ltp
+    bind "0.0.0.0:7514"
+    peer { node_id "jump02" pubkey "<jump02 SPKI base64>" }
+    max_connections 1024
+}
+
+def pipeline from_jump01 { input ltp_jump01; finish }
+def pipeline from_jump02 { input ltp_jump02; finish }
+```
+
+Peer `node_id` and public keys must be unique across a shared-listener group.
+`max_connections` is listener-wide and must have the same value on every group
+member; `max_hops` remains specific to each logical input. Exact bind-string
+equality is required for sharing—hostnames and equivalent textual addresses
+are not normalized. Non-identical IP binds on the same port are rejected when
+their scopes overlap, such as `0.0.0.0:7514` with `127.0.0.1:7514`, or
+`[::]:7514` with `[::1]:7514`. Distinct specific addresses remain separate
+listeners. Whether `[::]:7514` also conflicts with `0.0.0.0:7514` depends on
+the platform's dual-stack socket policy, so that cross-family pair may pass
+static overlap validation and then fail at bind time. A bind failure aborts
+startup for the whole group and names all affected inputs; Limpid does not
+continue with a partially active group.
+
 The wire key must be exactly 16 bytes, use the RFC 4122 variant, and identify a
 UUIDv7. Limpid never replaces an invalid or missing key. After authentication,
 the hello `node_id` must match the identity assigned to the presented public
