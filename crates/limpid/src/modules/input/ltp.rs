@@ -40,6 +40,8 @@ const DEFAULT_LTP_PORT: u16 = 7514;
 const DEFAULT_MAX_HOPS: u64 = 16;
 const DEFAULT_MAX_CONNECTIONS: u64 = 1024;
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const ACCEPT_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(100);
+const ACCEPT_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(not(test))]
 const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 #[cfg(test)]
@@ -192,6 +194,74 @@ struct SharedListenerGroup {
     ltp_metrics: Arc<LtpMetrics>,
 }
 
+#[async_trait::async_trait]
+trait ListenerAccept {
+    type Connection: Send;
+
+    async fn accept(&self) -> io::Result<Self::Connection>;
+}
+
+#[async_trait::async_trait]
+impl ListenerAccept for TcpListener {
+    type Connection = (TcpStream, SocketAddr);
+
+    async fn accept(&self) -> io::Result<Self::Connection> {
+        TcpListener::accept(self).await
+    }
+}
+
+async fn run_accept_loop<A, F>(
+    accept_source: A,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    group_names: &str,
+    mut on_accepted: F,
+) where
+    A: ListenerAccept + Sync,
+    F: FnMut(A::Connection),
+{
+    let mut retry_delay = ACCEPT_RETRY_INITIAL;
+    loop {
+        tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown) => {
+                break;
+            }
+            accepted = accept_source.accept() => {
+                match accepted {
+                    Ok(connection) => {
+                        retry_delay = ACCEPT_RETRY_INITIAL;
+                        on_accepted(connection);
+                    }
+                    Err(error) => {
+                        warn!(
+                            "ltp listener group [{}]: accept failed: {error}; retrying in {} ms",
+                            group_names,
+                            retry_delay.as_millis()
+                        );
+                        tokio::select! {
+                            biased;
+                            _ = wait_for_shutdown(&mut shutdown) => {
+                                break;
+                            }
+                            _ = tokio::time::sleep(retry_delay) => {}
+                        }
+                        retry_delay =
+                            retry_delay.saturating_mul(2).min(ACCEPT_RETRY_MAX);
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn wait_for_shutdown(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
 impl HasMetrics for LtpInput {
     type Stats = InputMetrics;
 
@@ -275,7 +345,7 @@ impl SharedListenerGroup {
     async fn run_on_listener(
         self,
         listener: TcpListener,
-        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
         info!(
             "ltp listener group [{}] listening on {}",
@@ -283,49 +353,34 @@ impl SharedListenerGroup {
             self.bind_addr
         );
         let mut connections = Vec::<tokio::task::JoinHandle<()>>::new();
-
-        loop {
+        let names = self.member_names.join(", ");
+        run_accept_loop(listener, shutdown, &names, |(stream, address)| {
             connections.retain(|handle| !handle.is_finished());
-            tokio::select! {
-                biased;
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
-                        for handle in &connections {
-                            handle.abort();
-                        }
-                        break;
-                    }
-                }
-                accepted = listener.accept() => {
-                    let (stream, address) = accepted?;
-                    connections.retain(|handle| !handle.is_finished());
-                    if connections.len() >= self.max_connections {
-                        warn!(
-                            "ltp listener group [{}]: max connections reached; rejecting {}",
-                            self.member_names.join(", "),
-                            address
-                        );
-                        continue;
-                    }
-                    let acceptor = self.acceptor.clone();
-                    let routes = Arc::clone(&self.routes);
-                    let ltp_metrics = Arc::clone(&self.ltp_metrics);
-                    let names = self.member_names.join(", ");
-                    connections.push(tokio::spawn(async move {
-                        let result = handle_connection(
-                            stream,
-                            address,
-                            acceptor,
-                            routes,
-                            ltp_metrics,
-                        )
-                        .await;
-                        if let Err(error) = result {
-                            debug!("ltp listener group '[{}]': closing {}: {error:#}", names, address);
-                        }
-                    }));
-                }
+            if connections.len() >= self.max_connections {
+                warn!(
+                    "ltp listener group [{}]: max connections reached; rejecting {}",
+                    names, address
+                );
+                return;
             }
+            let acceptor = self.acceptor.clone();
+            let routes = Arc::clone(&self.routes);
+            let ltp_metrics = Arc::clone(&self.ltp_metrics);
+            let connection_names = names.clone();
+            connections.push(tokio::spawn(async move {
+                let result =
+                    handle_connection(stream, address, acceptor, routes, ltp_metrics).await;
+                if let Err(error) = result {
+                    debug!(
+                        "ltp listener group '[{}]': closing {}: {error:#}",
+                        connection_names, address
+                    );
+                }
+            }));
+        })
+        .await;
+        for handle in &connections {
+            handle.abort();
         }
         Ok(())
     }
@@ -915,7 +970,9 @@ mod tests {
     use chrono::TimeZone as _;
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
+    use std::collections::VecDeque;
     use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::Mutex;
     use tokio::io::AsyncWriteExt as _;
     use tokio_rustls::TlsConnector;
 
@@ -2227,6 +2284,234 @@ mod tests {
         let (first, second) = server.await.unwrap();
         assert!(first.is_ok());
         assert!(second.is_ok());
+    }
+
+    #[derive(Clone)]
+    struct ScriptedAccept {
+        state: Arc<Mutex<ScriptedAcceptState>>,
+    }
+
+    struct ScriptedAcceptState {
+        outcomes: VecDeque<std::result::Result<usize, io::ErrorKind>>,
+        fallback_error: Option<io::ErrorKind>,
+        attempts: Vec<tokio::time::Instant>,
+    }
+
+    impl ScriptedAccept {
+        fn finite(
+            outcomes: impl IntoIterator<Item = std::result::Result<usize, io::ErrorKind>>,
+        ) -> Self {
+            Self::new(outcomes, None)
+        }
+
+        fn permanent(error: io::ErrorKind) -> Self {
+            Self::new([], Some(error))
+        }
+
+        fn new(
+            outcomes: impl IntoIterator<Item = std::result::Result<usize, io::ErrorKind>>,
+            fallback_error: Option<io::ErrorKind>,
+        ) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(ScriptedAcceptState {
+                    outcomes: outcomes.into_iter().collect(),
+                    fallback_error,
+                    attempts: Vec::new(),
+                })),
+            }
+        }
+
+        fn attempts(&self) -> Vec<tokio::time::Instant> {
+            self.state.lock().unwrap().attempts.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ListenerAccept for ScriptedAccept {
+        type Connection = usize;
+
+        async fn accept(&self) -> io::Result<Self::Connection> {
+            let outcome = {
+                let mut state = self.state.lock().unwrap();
+                let fallback_error = state.fallback_error;
+                state
+                    .outcomes
+                    .pop_front()
+                    .or_else(|| fallback_error.map(Err))
+            };
+            let Some(outcome) = outcome else {
+                return std::future::pending().await;
+            };
+            self.state
+                .lock()
+                .unwrap()
+                .attempts
+                .push(tokio::time::Instant::now());
+            outcome.map_err(|kind| io::Error::new(kind, "scripted accept failure"))
+        }
+    }
+
+    async fn wait_for_attempts(acceptor: &ScriptedAccept, expected: usize) {
+        for _ in 0..20 {
+            if acceptor.attempts().len() >= expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(acceptor.attempts().len(), expected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accept_retry_errors_back_off_100_then_200_ms_and_process_connection() {
+        let started = tokio::time::Instant::now();
+        let acceptor = ScriptedAccept::finite([
+            Err(io::ErrorKind::ConnectionAborted),
+            Err(io::ErrorKind::ConnectionReset),
+            Ok(7),
+        ]);
+        let observed = acceptor.clone();
+        let processed = Arc::new(Mutex::new(Vec::new()));
+        let processed_by_loop = Arc::clone(&processed);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            run_accept_loop(acceptor, shutdown_rx, "test", move |connection| {
+                processed_by_loop.lock().unwrap().push(connection);
+            })
+            .await
+        });
+
+        wait_for_attempts(&observed, 1).await;
+        tokio::time::advance(std::time::Duration::from_millis(99)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(observed.attempts().len(), 1);
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        wait_for_attempts(&observed, 2).await;
+        tokio::time::advance(std::time::Duration::from_millis(199)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(observed.attempts().len(), 2);
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        wait_for_attempts(&observed, 3).await;
+        assert_eq!(*processed.lock().unwrap(), [7]);
+        assert_eq!(
+            observed
+                .attempts()
+                .iter()
+                .map(|attempt| attempt.duration_since(started))
+                .collect::<Vec<_>>(),
+            [
+                std::time::Duration::ZERO,
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_millis(300),
+            ]
+        );
+
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accept_retry_permanent_errors_use_exact_bounded_backoff_without_busy_spin() {
+        let acceptor = ScriptedAccept::permanent(io::ErrorKind::ConnectionAborted);
+        let observed = acceptor.clone();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_accept_loop(acceptor, shutdown_rx, "test", |_| {}));
+        let waits = [
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(200),
+            std::time::Duration::from_millis(400),
+            std::time::Duration::from_millis(800),
+            std::time::Duration::from_millis(1_600),
+            std::time::Duration::from_millis(3_200),
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
+        ];
+
+        wait_for_attempts(&observed, 1).await;
+        for (index, wait) in waits.iter().enumerate() {
+            let attempts_before_wait = observed.attempts().len();
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                observed.attempts().len(),
+                attempts_before_wait,
+                "accept loop must not spin while backoff time is paused"
+            );
+            tokio::time::advance(*wait).await;
+            wait_for_attempts(&observed, index + 2).await;
+        }
+
+        let observed_waits = observed
+            .attempts()
+            .windows(2)
+            .map(|attempts| attempts[1].duration_since(attempts[0]))
+            .collect::<Vec<_>>();
+        assert_eq!(observed_waits, waits);
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accept_retry_shutdown_interrupts_backoff_immediately() {
+        let acceptor = ScriptedAccept::permanent(io::ErrorKind::ConnectionAborted);
+        let observed = acceptor.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_accept_loop(acceptor, shutdown_rx, "test", |_| {}));
+
+        wait_for_attempts(&observed, 1).await;
+        assert!(!task.is_finished());
+        let before_shutdown = tokio::time::Instant::now();
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap();
+        assert_eq!(tokio::time::Instant::now(), before_shutdown);
+        assert_eq!(observed.attempts().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accept_retry_success_resets_delay_to_100_ms() {
+        let started = tokio::time::Instant::now();
+        let acceptor = ScriptedAccept::finite([
+            Err(io::ErrorKind::ConnectionAborted),
+            Ok(1),
+            Err(io::ErrorKind::ConnectionReset),
+            Ok(2),
+        ]);
+        let observed = acceptor.clone();
+        let processed = Arc::new(Mutex::new(Vec::new()));
+        let processed_by_loop = Arc::clone(&processed);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            run_accept_loop(acceptor, shutdown_rx, "test", move |connection| {
+                processed_by_loop.lock().unwrap().push(connection);
+            })
+            .await
+        });
+
+        wait_for_attempts(&observed, 1).await;
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        wait_for_attempts(&observed, 3).await;
+        assert_eq!(*processed.lock().unwrap(), [1]);
+        tokio::time::advance(std::time::Duration::from_millis(99)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(observed.attempts().len(), 3);
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        wait_for_attempts(&observed, 4).await;
+        assert_eq!(*processed.lock().unwrap(), [1, 2]);
+        assert_eq!(
+            observed
+                .attempts()
+                .iter()
+                .map(|attempt| attempt.duration_since(started))
+                .collect::<Vec<_>>(),
+            [
+                std::time::Duration::ZERO,
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_millis(200),
+            ]
+        );
+
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap();
     }
 
     #[tokio::test]
